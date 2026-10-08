@@ -2676,7 +2676,9 @@ Guardian ladder must check these.
   counts as this stop's); or the pass would start `kBaselineStopLatestStart` (15 s, the
   20 s grace minus one 5 s KV busy timeout) or more after the mark AND an earlier stage of
   this same `stop()` (the two journal flushes, the worker join, the loss-ledger write) ran
-  SLOW, at least a busy timeout (`note_stop_store_trouble`). A stage that failed FAST is not
+  SLOW, at least `kBaselineStopTroubleThreshold` (4.5 s: the 5 s busy timeout minus a 0.5 s
+  timer-rounding slack, because Windows `Sleep()` can return early; `note_stop_store_trouble`).
+  A stage that failed FAST is not
   evidence: a BUSY store costs a whole busy timeout per write, so it cannot hide behind a
   fast stage, and a store that fails fast fails the Stop pass fast too. A late start with no
   slow stage runs, so an `apply_rules` that held `mtx_` for 15 s does not cost the staged

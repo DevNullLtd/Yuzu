@@ -1219,9 +1219,9 @@ flip, with a red-first test each:
     written (a slow store, or more than roughly 2,000 to 3,000 waiting captures on a
     healthy one; logged, not counted), or the flush was skipped, either because a write
     that failed slowly ended at or after the start of that stop or because it could not
-    start within 15 s of it after an earlier shutdown step had run slow, taking a full
-    busy timeout or more (a step that failed quickly is not such a sign; logged, not
-    counted), or the 20 s shutdown watchdog ended the
+    start within 15 s of it after an earlier shutdown step had run slow, taking at least
+    4.5 s (the busy timeout minus a 0.5 s timer-rounding slack; a step that failed quickly
+    is not such a sign; logged, not counted), or the 20 s shutdown watchdog ended the
     process while the stop was still running (`hard_exit(4)`: the flush and the later
     shutdown steps are cut, a Windows service is restarted by the SCM, and no log line is
     written anywhere, so exit code 4 is the only evidence). A capture whose write is
@@ -2151,10 +2151,11 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   shutdown step, and its earlier stages (two journal flushes, the loss-ledger write, the
   worker join) are under no deadline of their own. #4045 took the stop mark before the
   engine mutex and skips ITS pass when that pass would start 15 s or more after the stop
-  began AND an earlier stage of that stop ran slow, at least a busy timeout (a stage that
-  failed quickly is not evidence; a late start with no slow stage runs, because a healthy
-  pass takes well under a millisecond per capture, though it can use its whole 1 s wall
-  plus one write and so run into the watchdog when it starts in the last second). What
+  began AND an earlier stage of that stop ran slow, at least 4.5 s (the busy timeout minus
+  a 0.5 s timer-rounding slack; a stage that failed quickly is not evidence; a late start
+  with no slow stage runs, because a healthy pass takes well under a millisecond per
+  capture, though it can use its whole 1 s wall plus one write and so run into the
+  watchdog when it starts in the last second). What
   remains: the pass's first write always runs (the wall is checked between tuples), so one
   that starts just inside the cutoff can still spend a 5 s busy timeout, and a pass that
   runs its full 1 s wall before the store turns BUSY ends about 6 s after it started; the
