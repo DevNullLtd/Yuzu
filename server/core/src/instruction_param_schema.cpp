@@ -718,7 +718,8 @@ prepare_param_validator(std::string_view stored_schema_json) {
     }
     impl->retained_bytes = kParamValidatorFixedBytes +
                            impl->props.size() * kParamValidatorPerPropertyBytes +
-                           enum_members * kParamValidatorPerEnumMemberBytes + text.size() +
+                           enum_members * kParamValidatorPerEnumMemberBytes +
+                           trim(stored_schema_json).size() +
                            patterns * static_cast<std::size_t>(mcp::kPatternMaxMem);
 
     impl->schema.emplace(std::move(*compiled));
