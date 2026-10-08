@@ -747,7 +747,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         // store or a genuinely-disabled one still denies here; a degraded
         // view (open, but a stale cached "disabled" that never observed a
         // real toggle) is treated as still-enforced and falls through to
-        // fail closed via `check_role_has_permission` on that same handle
+        // fail closed via `authz::service_ceiling_check` on that same handle
         // instead — deny-on-degrade either way, just a more accurate reason.
         if (!rbac_store_ || !rbac_enforcement_in_effect(rbac_store_)) {
             audit_log(req, "auth.permission_required", "denied", "", "",
@@ -759,7 +759,21 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                             "application/json");
             return false;
         }
-        if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
+        // Shared ceiling helper (authz::service_ceiling_check). Unlike require_scoped_permission
+        // and require_fleet_read, this gate does NOT answer a Degraded verdict (a failed read)
+        // with a retryable 503 up front: the allow-list check below refuses every pair today
+        // (kServiceScopeGlobalSafe is empty), so a retry hint here would advertise a recovery that
+        // cannot happen. A Degraded read therefore continues to that allow-list check and is
+        // answered by its definitive default-deny 403 with the same status, body and metrics as
+        // for a healthy read; only the audit detail differs, by a trailing marker. A definitive
+        // Deny keeps its own 403 (and audit text) before the allow-list.
+        const auto ceiling = authz::service_ceiling_check(*rbac_store_, securable_type, operation);
+        const bool ceiling_degraded = ceiling.verdict == authz::CeilingVerdict::Degraded;
+        // Everything that is not an explicit Admit is refused: a Deny verdict, and any
+        // out-of-range value, which must never fall through to the admit. A Degraded verdict is
+        // the one exception that continues (see above); it can only leave this function as a
+        // refusal through the allow-list check or the guard after it.
+        if (!ceiling_degraded && ceiling.verdict != authz::CeilingVerdict::Admit) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
@@ -774,9 +788,14 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             return false;
         }
         if (!service_scope_admits(securable_type, operation)) {
+            // The marker is audit-only: a Degraded ceiling read is answered by this same 403
+            // (status, body and metrics unchanged), so without it an outage would be
+            // indistinguishable from a healthy default-deny in the audit row. The text before
+            // the marker is the healthy row's detail, byte for byte.
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: default-deny (" + perm +
-                          " not on the service-scope global-safe allow-list)");
+                          " not on the service-scope global-safe allow-list)" +
+                          (ceiling_degraded ? "; ceiling read degraded" : ""));
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_service_scope_default_denied_total",
                            {{"permission", perm},
@@ -793,6 +812,18 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                               "needs an explicit confined path via require_fleet_read/"
                               "confine_agent_target)";
             res.set_content(detail::a4_denial(res, 403, msg), "application/json");
+            return false;
+        }
+        // Safety net, unreachable in production: the allow-list above is empty, so nothing gets
+        // past it. It exists so that a future populated allow-list can never admit on a failed
+        // ceiling read; test_authz_gates.cpp pins it through the allow-list's test override.
+        // Reaching here with a Degraded verdict means the allow-list alone would have admitted
+        // the request; refuse it as the retryable outage it is.
+        if (ceiling_degraded) {
+            respond_ceiling_degraded(req, res, "auth.permission_required",
+                                     "service-scoped token blocked: RBAC read degraded "
+                                     "resolving the ITServiceOwner ceiling",
+                                     ceiling);
             return false;
         }
         return true;
@@ -1093,7 +1124,21 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             return false;
         }
         // Check that the ITServiceOwner role grants this permission type
-        if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
+        // Shared ceiling helper (authz::service_ceiling_check). A Degraded verdict (a failed
+        // read) is a retryable 503 through the shared respond_ceiling_degraded, the same as
+        // require_fleet_read: an outage is not a missing grant. Still fail CLOSED (the request
+        // is refused). Only a definitive Deny is the 403 below.
+        const auto ceiling = authz::service_ceiling_check(*rbac_store_, securable_type, operation);
+        if (ceiling.verdict == authz::CeilingVerdict::Degraded) {
+            respond_ceiling_degraded(req, res, "auth.scoped_permission_required",
+                                     "service-scoped token blocked: RBAC read degraded "
+                                     "resolving the ITServiceOwner ceiling",
+                                     ceiling);
+            return false;
+        }
+        // Everything that is not an explicit Admit is refused: a Deny verdict, and any
+        // out-of-range value, which must never fall through to the admit.
+        if (ceiling.verdict != authz::CeilingVerdict::Admit) {
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
@@ -1324,6 +1369,8 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
     // flat list-read gate has no single agent_id to scope the token's
     // service against, so admitting it would hand a service-scoped token the
     // WHOLE fleet's data.
+    // No `.permission` on the body (routed-concern clause 5): this is a blanket deny of the
+    // credential class, so granting `perm` to anyone would not admit this caller.
     if (!session->token_scope_service.empty()) {
         audit_log(req, "auth.permission_required", "denied", "", "",
                   "service-scoped token '" + session->token_scope_service +
@@ -1331,8 +1378,7 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
         res.status = 403;
         res.set_content(
             detail::a4_denial(res, 403,
-                              "service-scoped tokens cannot read the fleet-wide status rollup",
-                              detail::A4ErrorOpts{.permission = perm}),
+                              "service-scoped tokens cannot read the fleet-wide status rollup"),
             "application/json");
         return gate;
     }

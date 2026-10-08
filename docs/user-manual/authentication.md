@@ -748,8 +748,9 @@ Service-scoped tokens:
 - Cannot access any `/api/v1/admin/*` routes (403 Forbidden)
 - Require RBAC to be enabled; rejected if RBAC is disabled (403 Forbidden)
 - Carry a session role floored to the base `user` level regardless of the
-  minting principal's own role — an `ITServiceOwner` RBAC grant is the sole
-  authority ceiling for a service-scoped token, never the minter's role
+  minting principal's own role — an `ITServiceOwner` RBAC grant is the
+  authority ceiling for a service-scoped token, never the minter's role, and
+  it is applied by the permission gates and by the fleet-read gate alike
 
 **Default-deny (guardian-confinement-2298 PR 3 — "the flip").** Holding
 `ITServiceOwner` for a given `securable:operation` is necessary but no

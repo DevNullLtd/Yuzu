@@ -1628,9 +1628,9 @@ tests:
   # that scoping, both directions.
 
   # CASE 47 -- the two observe-only reasons alone must not page
-  # YuzuRbacReadDegraded ("callers being denied fleet-wide" would be false).
+  # YuzuRbacReadDegraded ("requests are being denied" would be false).
   - interval: 1m
-    name: rbac read degraded - observe-only reasons do not page fleet-wide-denial
+    name: rbac read degraded - observe-only reasons do not page the denying-reasons alert
     input_series:
       - series: 'yuzu_server_rbac_read_degrade_total{job="yuzu",instance="s1",reason="rbac_enabled_non_canonical"}'
         values: "0+1x20"
@@ -1653,6 +1653,127 @@ tests:
         eval_time: 15m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing", reason="query_error", severity="critical"}'
+            value: 1
+
+  # CASE 48b -- the other two denying reasons page as well, so a regression of
+  # the alert's reason regex that drops one of them is caught (the ceiling
+  # read's breaker-open and pool-timeout denials are counted under
+  # pool_acquire_timeout; a generation refresh failure past the stale-serve
+  # window is generation_refresh_failed).
+  - interval: 1m
+    name: rbac read degraded - pool_acquire_timeout still pages
+    input_series:
+      - series: 'yuzu_server_rbac_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing", reason="pool_acquire_timeout", severity="critical"}'
+            value: 1
+
+  # CASE 48c -- generation_refresh_failed (denying) pages.
+  - interval: 1m
+    name: rbac read degraded - generation_refresh_failed still pages
+    input_series:
+      - series: 'yuzu_server_rbac_read_degrade_total{job="yuzu",instance="s1",reason="generation_refresh_failed"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing", reason="generation_refresh_failed", severity="critical"}'
+            value: 1
+
+  # ── YuzuRbacBreakerOpen ──────────────────────────────────────────────────
+  #
+  # A breaker that STAYS open for 5m means authorization reads on that replica
+  # keep failing. The gauge is per replica and the rule keeps the `instance`
+  # label, so these cases pin: a sustained open breaker fires for the replica
+  # that has it (and only that one), and neither a flapping breaker nor one
+  # open for less than the `for:` window pages. RED against dropping `for:`
+  # (CASES 48e, 48f and 48g would fire), against shortening it (CASE 48g would
+  # fire), against lengthening it (CASE 48h would not fire) and against
+  # changing the `== 1` match (CASE 48d would not fire).
+
+  # CASE 48d -- replica s1 open for 15 minutes fires; replica s2, closed the
+  # whole time, does not (the alert is per instance).
+  - interval: 1m
+    name: rbac breaker open - a sustained open breaker fires for that replica only
+    input_series:
+      - series: 'yuzu_server_rbac_breaker_open{job="yuzu",instance="s1"}'
+        values: "1x20"
+      - series: 'yuzu_server_rbac_breaker_open{job="yuzu",instance="s2"}'
+        values: "0x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing", instance="s1", severity="critical"}'
+            value: 1
+
+  # CASE 48e -- a breaker that flaps open and closed every minute never holds
+  # the condition for 5m, so it must not page.
+  - interval: 1m
+    name: rbac breaker open - a flapping breaker stays quiet
+    input_series:
+      - series: 'yuzu_server_rbac_breaker_open{job="yuzu",instance="s1"}'
+        values: "0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE 48f -- a short open spell, then closed, must not page: that is a
+  # transient blip, not a persistently failing authorization read. The series is
+  # 0 for samples 0 to 5, 1 for samples 6 to 9 (four consecutive samples, so the
+  # breaker has been open for three minutes at the last of them), then 0 from
+  # sample 10.
+  - interval: 1m
+    name: rbac breaker open - open for less than five minutes stays quiet
+    input_series:
+      - series: 'yuzu_server_rbac_breaker_open{job="yuzu",instance="s1"}'
+        values: "0x5 1x3 0x15"
+    promql_expr_test:
+      # Evaluated while the breaker is still open (one minute after it opened), so a rule without
+      # `for:` would be firing here; with `for: 5m` it is only pending.
+      - expr: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+
+  # CASE 48g -- pins the `for:` window from below. The breaker opens at sample 2
+  # and is still open at sample 6, four minutes later, then closes. At the
+  # 6m evaluation the alert is pending: a `for:` of 4m or less would already be
+  # firing there, so it must stay quiet.
+  - interval: 1m
+    name: rbac breaker open - open for four minutes stays quiet
+    input_series:
+      - series: 'yuzu_server_rbac_breaker_open{job="yuzu",instance="s1"}'
+        values: "0x1 1x4 0x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+
+  # CASE 48h -- pins the `for:` window from above. The breaker opens at sample 2
+  # and stays open through sample 9. At the 7m evaluation it has been open for
+  # five minutes, so it fires, and it is still firing at 8m. A `for:` longer
+  # than 5m would still be pending at 7m.
+  - interval: 1m
+    name: rbac breaker open - open for five continuous minutes fires
+    input_series:
+      - series: 'yuzu_server_rbac_breaker_open{job="yuzu",instance="s1"}'
+        values: "0x1 1x7 0x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing", instance="s1", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing", instance="s1", severity="critical"}'
             value: 1
 
   # ── YuzuRbacEnforcementChanged (A1) ──────────────────────────────────────
