@@ -2434,11 +2434,20 @@ std::string SettingsRoutes::render_updates_fragment() {
 
     html += "</tbody></table>";
 
-    html += "<div class=\"add-user-form\">"
-            "<form hx-post=\"/api/settings/updates/upload\" "
+    // #5572 follow-up (security-guardian Gate 2) — the class belongs on the
+    // <form> itself, not a wrapping <div>: a wrapping div isn't the flex
+    // container (the <form>'s own inline `display:flex` is), so
+    // `.add-user-form`'s `flex-wrap: wrap` never reached the row it was
+    // meant to protect. It worked anyway, by coincidence — the row fits
+    // today purely from the `min-width:0`/`max-width:180px` compression —
+    // but a future wider row would silently overflow again. Matching the
+    // other `.add-user-form` consumers (add-user, enrollment-token,
+    // api-token, engine-principal: class on the <form>, no div wrapper, no
+    // duplicated inline flex properties) makes `flex-wrap` real here too.
+    html += "<form class=\"add-user-form\" hx-post=\"/api/settings/updates/upload\" "
             "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
             "hx-encoding=\"multipart/form-data\" "
-            "style=\"display:flex;gap:0.5rem;align-items:flex-end;width:100%\">"
+            "style=\"width:100%\">"
             "<div class=\"mini-field\">"
             "<label>Platform</label>"
             "<select name=\"platform\" style=\"width:100px\">"
@@ -2473,7 +2482,7 @@ std::string SettingsRoutes::render_updates_fragment() {
             "<label>Mandatory</label>"
             "<input type=\"checkbox\" name=\"mandatory\" value=\"true\"></div>"
             "<button class=\"btn btn-primary\" type=\"submit\">Upload</button>"
-            "</form></div>"
+            "</form>"
             "<div class=\"feedback\" id=\"updates-feedback\"></div>";
 
     return html;
