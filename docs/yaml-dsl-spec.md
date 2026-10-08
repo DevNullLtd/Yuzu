@@ -160,6 +160,18 @@ Each parameter descriptor supports:
 | `minimum` | number | `int32`, `int64` | Minimum numeric value (inclusive). |
 | `maximum` | number | `int32`, `int64` | Maximum numeric value (inclusive). |
 
+#### Constructs shipped definitions use beyond the tables above
+
+The server's parameter-schema canonicaliser accepts these forms and publishes the result as `input_schema` (`GET /api/v1/discover/instructions`, MCP `discover_instructions`):
+
+- `type: integer` is accepted next to `int32`/`int64`. `int32` is a numeric string on the wire (Section 10) but is published as `integer` with the int32 range.
+- `type: array` with `items: {type: string}`.
+- `required: true` on a property is the same as listing it in the root `required`.
+- `maxLength`, `minLength`, `pattern`, `enum`, `minimum` and `maximum` may be written flat on the property; a flat key beats the same key under `validation`.
+- `hidden: true` is accepted as a no-op hint (no effect on validation; not published). `displayName` is dropped from the published schema.
+
+Shipped definitions under `content/definitions/` must meet the description-lint floors enforced by `scripts/ci/check-definition-descriptions.py`: `metadata.description` of at least 40 characters (and not just the name or id), every parameter description at least 10 characters, every result column described, and `metadata.tags` non-empty. To fix a baselined failure, edit the YAML and delete the fixed entry from `scripts/ci/definition-descriptions-baseline.json`, otherwise the STALE check fails.
+
 #### `spec.result`
 
 | Field | Type | Required | Default | Description |

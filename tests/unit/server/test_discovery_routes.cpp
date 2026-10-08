@@ -591,6 +591,92 @@ TEST_CASE("discover.instructions: an uncanonicalisable stored schema nulls input
     CHECK(seen == 4);
 }
 
+// The documented limit: canonicalisation does not compile RE2, so a legacy row whose pattern does
+// not compile still publishes an input_schema (and a null error) although the execute route's
+// validator refuses it. This pins the wording in the docs, the tool description and the OpenAPI
+// entry; the store's write gate keeps new rows like this out.
+TEST_CASE("discover.instructions: a legacy uncompilable pattern still publishes an input_schema",
+          "[discovery][instructions][input-schema][pg]") {
+    DiscoverHarness h;
+    const std::string stored =
+        R"({"type":"object","properties":{"p":{"type":"string","pattern":"("}}})";
+    auto id = h.instr->create_definition(make_def("Legacy Pattern", /*enabled=*/true, "{}"));
+    REQUIRE(id.has_value());
+    yuzu::server::test::force_parameter_schema(*h.rbac_pool, *id, stored);
+    REQUIRE_FALSE(yuzu::server::instr::prepare_param_validator(stored).has_value());
+
+    auto res = h.sink.Get("/api/v1/discover/instructions");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto j = nlohmann::json::parse(res->body);
+    int seen = 0;
+    for (const auto& d : j["instructions"]) {
+        if (d["id"] != *id)
+            continue;
+        ++seen;
+        REQUIRE(d["input_schema"].is_object());
+        CHECK(d["input_schema"]["properties"]["p"]["pattern"] == "(");
+        CHECK(d["input_schema_error"].is_null());
+    }
+    CHECK(seen == 1);
+}
+
+// The canonicalisation budget: canonical schemas are not cached, so one request canonicalises at
+// most `canonical_budget_bytes` of stored schema text. Definitions come back ordered by name, so
+// the first ones are published and the rest carry the fixed budget token with their raw
+// parameter_schema intact; a definition that declares no schema costs nothing and never gets it.
+TEST_CASE("discover.instructions: the canonicalisation budget degrades later definitions to a token",
+          "[discovery][instructions][input-schema][budget][pg]") {
+    DiscoverHarness h;
+    const std::string stored = R"({"type":"object","properties":{"p":{"type":"string"}}})";
+    std::vector<std::string> ids;
+    for (const char* name : {"A1", "A2", "A3", "A4"}) {
+        auto id = h.instr->create_definition(make_def(name, /*enabled=*/true, stored));
+        REQUIRE(id.has_value());
+        ids.push_back(*id);
+    }
+    auto none_id = h.instr->create_definition(make_def("Z None", /*enabled=*/true, "{}"));
+    REQUIRE(none_id.has_value());
+
+    // Room for exactly two of the four schemas.
+    const auto doc = yuzu::server::build_instructions_catalog(*h.instr, 2 * stored.size());
+    const auto j = nlohmann::json::parse(doc.json);
+
+    std::vector<std::string> published, budget_hit;
+    bool saw_none = false;
+    for (const auto& d : j["instructions"]) {
+        const std::string id = d["id"];
+        if (id == *none_id) {
+            saw_none = true;
+            CHECK(d["input_schema"].is_null());
+            CHECK(d["input_schema_error"].is_null());  // nothing declared: not a budget casualty
+            continue;
+        }
+        REQUIRE(d["parameter_schema"].is_object());  // the raw schema is present either way
+        if (d["input_schema"].is_object()) {
+            published.push_back(id);
+            CHECK(d["input_schema_error"].is_null());
+        } else {
+            budget_hit.push_back(id);
+            CHECK(d["input_schema"].is_null());
+            CHECK(d["input_schema_error"] == "input_schema_budget_exceeded");
+        }
+    }
+    CHECK(saw_none);
+    CHECK(published == std::vector<std::string>{ids[0], ids[1]});
+    CHECK(budget_hit == std::vector<std::string>{ids[2], ids[3]});
+
+    const auto description = j["description"].get<std::string>();
+    CHECK(description.find("input_schema_budget_exceeded") != std::string::npos);
+    CHECK(description.find("POST /api/instructions/{id}/execute") != std::string::npos);
+    CHECK(description.find("/api/v1/instructions/execute") == std::string::npos);
+
+    // The default budget publishes all four.
+    const auto full = nlohmann::json::parse(yuzu::server::build_instructions_catalog(*h.instr).json);
+    for (const auto& d : full["instructions"])
+        CHECK(d["input_schema_error"].is_null());
+}
+
 // json-dump-depth-guard fix (#2437-class): parameter_schema is stored
 // VERBATIM at write time. instruction_store.cpp's own import-path write-side
 // guard rejects a too-deep value from now on, but a row written before that

@@ -9,6 +9,7 @@
  */
 
 #include "bundled_content.hpp"
+#include "discover_routes.hpp"
 #include "instruction_param_schema.hpp"
 #include "mcp_input_schema.hpp"
 
@@ -16,6 +17,7 @@
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 using nlohmann::json;
@@ -30,6 +32,15 @@ json canonical_of(const std::string& stored) {
     if (!*r)
         FAIL("expected a schema, got the no-schema form");
     return **r;
+}
+
+// `a{1000}` repeated `reps` times: a 7-bytes-per-repeat pattern whose RE2 program has about
+// 1000 instructions per repeat (see test_instruction_param_schema.cpp, rep_pattern).
+std::string rep_pattern(int reps) {
+    std::string p;
+    for (int i = 0; i < reps; ++i)
+        p += "a{1000}";
+    return p;
 }
 
 // "n" is an int32 with a display name (DSL-only keyword), inline-required.
@@ -174,4 +185,55 @@ TEST_CASE("canonical-schema: every shipped definition canonicalises exactly when
         }
     }
     CHECK(with_schema > 0);
+}
+
+TEST_CASE("canonical-schema: what only the enforcement path rejects (the documented limit)",
+          "[instr][param-schema][canonical]") {
+    // Each schema below is shape-valid, so it canonicalises, and each is refused by
+    // prepare_param_validator. They are the reasons a non-null input_schema can still be
+    // refused at execute: this pins the wording published in the docs and tool description.
+    const std::string over_budget =
+        R"({"type":"object","properties":{"p":{"type":"string","pattern":")" +
+        rep_pattern(40) + R"("}}})";  // valid RE2, ~40004 instructions > kMaxPatternProgramSize
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"pattern over the RE2 program budget", over_budget},
+        {"default violates its own constraints",
+         R"({"type":"object","properties":{"n":{"type":"integer","maximum":5,"default":9}}})"},
+        {"inverted bounds",
+         R"({"type":"object","properties":{"n":{"type":"integer","minimum":9,"maximum":1}}})"},
+        {"non-numeric bound",
+         R"({"type":"object","properties":{"n":{"type":"integer","maximum":"ten"}}})"},
+        {"keyword on the wrong type",
+         R"({"type":"object","properties":{"b":{"type":"boolean","minLength":1}}})"},
+    };
+    for (const auto& [why, stored] : cases) {
+        INFO(why);
+        auto canonical = canonicalise_param_schema(stored);
+        REQUIRE(canonical.has_value());
+        CHECK(canonical->has_value());
+        CHECK_FALSE(prepare_param_validator(stored).has_value());
+    }
+
+    // The first case is refused for the program size specifically, not for RE2 memory.
+    auto refused = prepare_param_validator(over_budget);
+    REQUIRE_FALSE(refused.has_value());
+    REQUIRE_FALSE(refused.error().empty());
+    CHECK(refused.error().front().find("compiles to a program larger than") !=
+          std::string::npos);
+}
+
+TEST_CASE("canonical-schema: the default discovery budget admits the whole shipped catalogue",
+          "[instr][param-schema][canonical][budget]") {
+    // build_instructions_catalog charges the stored schema text of each definition against
+    // kDiscoveryCanonicalBudgetBytes; the shipped set must never reach it.
+    std::size_t total = 0;
+    for (const auto& raw : yuzu::server::kBundledDefinitions) {
+        const json env = json::parse(raw, nullptr, false);
+        REQUIRE_FALSE(env.is_discarded());
+        if (env.contains("parameter_schema") && env["parameter_schema"].is_string())
+            total += env["parameter_schema"].get_ref<const std::string&>().size();
+    }
+    INFO("shipped stored schema bytes=" << total);
+    CHECK(total > 0);
+    CHECK(total * 8 < yuzu::server::kDiscoveryCanonicalBudgetBytes);
 }

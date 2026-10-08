@@ -45,6 +45,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cstddef>
 #include <functional>
 #include <optional>
 #include <string>
@@ -81,6 +82,15 @@ struct DiscoveryDoc {
 /// throwaway response — they must not 403 the whole route.
 DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store, bool include_roles);
 
+/// Total stored `parameter_schema` bytes that one `/discover/instructions` request canonicalises.
+/// Canonical schemas are not cached, so without a bound a large catalogue of near-cap schemas
+/// (each up to instr::kMaxParameterSchemaBytes) costs CPU and memory in proportion to the whole
+/// catalogue on every request. The bundled catalogue stores 98,475 bytes of schema text across
+/// 279 definitions (largest 19,314); 4 MiB is about 43x that, and still admits 16 schemas at the
+/// 256 KiB per-schema cap. A definition that would pass the budget publishes
+/// `input_schema: null` with `input_schema_error: "input_schema_budget_exceeded"`.
+inline constexpr std::size_t kDiscoveryCanonicalBudgetBytes = 4 * 1024 * 1024;
+
 /// `/discover/instructions`. Subsets InstructionStore::query_definitions
 /// (enabled_only=true — only invokable definitions are published) to
 /// {id, name, plugin, action, description, parameter_schema, input_schema,
@@ -89,10 +99,15 @@ DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store, bool include_roles
 /// JSON AND is itself an object, else emitted as `null` (an array/string/
 /// number/bool value is nulled out too). `input_schema` is the canonical JSON
 /// Schema the execute route enforces (instr::canonicalise_param_schema, no RE2
-/// compile): null when no schema is stored (`input_schema_error` null) or the
-/// stored one cannot be canonicalised (`input_schema_error` is a fixed token).
+/// compile): null when no schema is stored (`input_schema_error` null), the
+/// stored one cannot be canonicalised (`parameter_schema_not_canonicalisable`),
+/// or `canonical_budget_bytes` of stored schema text were already canonicalised
+/// in this call (`input_schema_budget_exceeded`). The budget is a parameter so a
+/// test can exercise it without thousands of rows.
 /// `instruction_store` must be non-null.
-DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store);
+DiscoveryDoc build_instructions_catalog(
+    InstructionStore& instruction_store,
+    std::size_t canonical_budget_bytes = kDiscoveryCanonicalBudgetBytes);
 
 /// `/discover/routes`. Subsets the OpenAPI document
 /// (`yuzu::server::openapi_spec_json()`, openapi_spec_access.hpp) to

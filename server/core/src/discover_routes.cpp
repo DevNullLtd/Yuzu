@@ -222,7 +222,8 @@ DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store, bool include_roles
 
 // ── /discover/instructions ─────────────────────────────────────────────────
 
-DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
+DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store,
+                                        std::size_t canonical_budget_bytes) {
     InstructionQuery q;
     q.enabled_only = true; // "published" == invokable; a disabled definition with
                            // no visible flag would be the misleading option here.
@@ -239,6 +240,8 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
     const auto& defs = *defs_result;
 
     json arr = json::array();
+    // Stored schema bytes canonicalised so far in THIS request (see kDiscoveryCanonicalBudgetBytes).
+    std::size_t canonical_bytes = 0;
     for (const auto& d : defs) {
         // #2437-class guard: parameter_schema is stored VERBATIM at write
         // time (instruction_store.cpp import path) with no depth check
@@ -267,16 +270,26 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
             param_schema = std::move(parsed);
 
         // input_schema: the canonical JSON Schema the execute route enforces, produced by the
-        // SAME canonicaliser prepare_param_validator uses (no RE2 compile, so cheap per request).
+        // SAME canonicaliser prepare_param_validator uses (it does not compile RE2). Nothing is
+        // cached, so the stored bytes canonicalised per request are budgeted: a definition whose
+        // schema would take the running total past the budget publishes the budget token instead.
         // null with a null input_schema_error = no schema stored (nothing is enforced); null with
-        // a token = a stored schema that cannot be canonicalised (execute refuses it).
+        // a token = no canonical schema is published for this definition.
         json input_schema;
         json input_schema_error;
-        if (auto canonical = instr::canonicalise_param_schema(d.parameter_schema)) {
-            if (*canonical)
-                input_schema = std::move(**canonical);
+        const bool trivially_absent = d.parameter_schema.empty() || d.parameter_schema == "{}";
+        if (!trivially_absent &&
+            d.parameter_schema.size() > canonical_budget_bytes - canonical_bytes) {
+            input_schema_error = "input_schema_budget_exceeded";
         } else {
-            input_schema_error = "parameter_schema_not_canonicalisable";
+            if (!trivially_absent)
+                canonical_bytes += d.parameter_schema.size();
+            if (auto canonical = instr::canonicalise_param_schema(d.parameter_schema)) {
+                if (*canonical)
+                    input_schema = std::move(**canonical);
+            } else {
+                input_schema_error = "parameter_schema_not_canonicalisable";
+            }
         }
 
         arr.push_back({
@@ -298,13 +311,16 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
         {"description",
          "Published (enabled) InstructionDefinition catalog — the commands an "
          "agentic worker may dispatch via execute_instruction / "
-         "POST /api/v1/instructions/execute. parameter_schema is the stored "
+         "POST /api/instructions/{id}/execute. parameter_schema is the stored "
          "definition schema, verbatim (YAML-DSL types such as int32 and displayName), "
          "when it parses as a JSON object, else null. input_schema is the canonical "
          "JSON Schema the server enforces on POST /api/instructions/{id}/execute: "
          "shape params with it. It is null when the definition declares no parameters "
-         "(input_schema_error is then null) or when the stored schema cannot be "
-         "canonicalised (input_schema_error is then a token and execute refuses it)."},
+         "(input_schema_error is then null), when the stored schema cannot be "
+         "canonicalised (input_schema_error is parameter_schema_not_canonicalisable and "
+         "execute refuses it), or when the per-request canonicalisation budget was "
+         "already spent (input_schema_error is input_schema_budget_exceeded; "
+         "parameter_schema is still present)."},
         {"count", arr.size()},
         {"truncated", defs.size() >= static_cast<std::size_t>(q.limit)},
         {"instructions", std::move(arr)},
@@ -585,7 +601,7 @@ DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& ag
          "(deduplicated by plugin name; the richest reported action list wins). "
          "NOT a build-time manifest — a plugin no currently-connected agent "
          "reports is absent from this list. To dispatch an action, call "
-         "execute_instruction / POST /api/v1/instructions/execute with its "
+         "execute_instruction / POST /api/command with its "
          "plugin+action; supply the params from parameter_schema where present. "
          "Each plugin's docs field is a documentation summary {summary, kind, platforms, "
          "readme, resource} when the plugin has adopted the README standard, else "

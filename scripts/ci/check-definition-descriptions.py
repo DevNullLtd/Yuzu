@@ -6,7 +6,8 @@ The description text of a shipped InstructionDefinition is what an agentic worke
 check it, so this lints the objectively checkable part, per definition:
 
   definition-description        metadata.description is present, at least 40 characters after
-                                whitespace collapse, and not just the definition's name or id
+                                whitespace collapse, and not just the definition's displayName
+                                or id (compared case-insensitively)
   parameter-description         every parameter under spec.parameters.properties has a
                                 description of at least 10 characters (after collapse)
   result-column-description      every column under spec.result.columns has a non-blank description
@@ -19,8 +20,9 @@ that already existed when the rule landed:
   (b) a baselined failure that no longer fails ALSO fails the run (the baseline may only shrink:
       delete the entry in the same change that fixed it).
 
-`--update-baseline` rewrites the baseline from the current tree. It is for the lead to run after
-reviewing a deliberate change; it never runs in CI.
+`--update-baseline` rewrites the baseline from the current tree. Run it deliberately, after
+reviewing a change that legitimately alters the tree or the rules, never to hide a new failure; it
+never runs in CI.
 
 Entry keys: `<definition id>` for definition-level rules, `<definition id>:<parameter>` and
 `<definition id>:<column>` for the per-item rules.
@@ -54,6 +56,20 @@ RULES = (
     "result-column-description",
     "tags",
 )
+
+# What a failing entry has to satisfy, printed with every NEW violation so a failing author need
+# not open this script.
+REQUIREMENTS = {
+    "definition-description": (
+        f"metadata.description must be at least {MIN_DEFINITION_DESCRIPTION} characters and not "
+        "just the definition's displayName or id"
+    ),
+    "parameter-description": (
+        f"the parameter needs a description of at least {MIN_PARAMETER_DESCRIPTION} characters"
+    ),
+    "result-column-description": "the result column needs a non-blank description",
+    "tags": "metadata.tags must list at least one non-blank tag",
+}
 
 
 def collapse(value: object) -> str:
@@ -138,7 +154,7 @@ def write_baseline(path: Path, failures: dict[str, set[str]]) -> None:
         "_comment": (
             "Ratchet baseline for scripts/ci/check-definition-descriptions.py: the definition "
             "description failures that existed when the rule landed. It may only shrink: delete an "
-            "entry in the same change that fixes it. Regenerate with --update-baseline (lead only)."
+            "entry in the same change that fixes it. Regenerate with --update-baseline, run deliberately, never to hide a new failure."
         ),
         "baseline": {rule: sorted(failures[rule]) for rule in RULES},
     }
@@ -150,7 +166,7 @@ def compare(failures: dict[str, set[str]], baseline: dict[str, set[str]]) -> lis
     problems: list[str] = []
     for rule in RULES:
         for key in sorted(failures[rule] - baseline[rule]):
-            problems.append(f"NEW      {rule}: {key}")
+            problems.append(f"NEW      {rule}: {key} ({REQUIREMENTS[rule]})")
         for key in sorted(baseline[rule] - failures[rule]):
             problems.append(
                 f"STALE    {rule}: {key} no longer fails (or no longer exists): "
@@ -164,7 +180,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--definitions", type=Path, default=DEFAULT_DEFINITIONS)
     parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
     parser.add_argument("--update-baseline", action="store_true",
-                        help="rewrite the baseline from the current tree (lead only)")
+                        help="rewrite the baseline from the current tree (run deliberately, never "
+                             "to hide a new failure)")
     args = parser.parse_args(argv)
 
     try:

@@ -167,7 +167,7 @@ class Ratchet(unittest.TestCase):
 
     def run_main(self, *extra):
         out = subprocess.run(
-            [sys.executable, "-I", str(SCRIPT), "--definitions", str(self.dir),
+            [sys.executable, str(SCRIPT), "--definitions", str(self.dir),
              "--baseline", str(self.baseline), *extra],
             capture_output=True, text=True, check=False)
         return out.returncode, out.stdout + out.stderr
@@ -212,6 +212,76 @@ class Ratchet(unittest.TestCase):
         self.assertIn("STALE    definition-description: t.bad.one", out)
         self.assertNotIn("NEW", out)
 
+    def _defective(self, def_id, parameter_description=GOOD_DESCRIPTION[:9], tags="[x]"):
+        """One definition whose only defects are a short parameter description and/or tags."""
+        return (
+            "---\n"
+            "kind: InstructionDefinition\n"
+            "metadata:\n"
+            f"  id: {def_id}\n"
+            f"  description: {GOOD_DESCRIPTION}\n"
+            f"  tags: {tags}\n"
+            "spec:\n"
+            "  parameters:\n"
+            "    type: object\n"
+            "    properties:\n"
+            "      p:\n"
+            "        type: string\n"
+            f"        description: {parameter_description}\n"
+        )
+
+    def test_new_and_stale_for_the_parameter_description_rule(self):
+        self.write_yaml("a.yaml", self._defective("t.par.one"))
+        self.assertEqual(self.run_main("--update-baseline")[0], 0)
+        baseline = json.loads(self.baseline.read_text(encoding="utf-8"))["baseline"]
+        self.assertEqual(baseline["parameter-description"], ["t.par.one:p"])
+        self.assertEqual(self.run_main()[0], 0)
+
+        self.write_yaml("b.yaml", self._defective("t.par.two"))
+        rc, out = self.run_main()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NEW      parameter-description: t.par.two:p", out)
+        self.assertIn("at least 10 characters", out)  # the message states the threshold
+        self.assertNotIn("STALE", out)
+
+        (self.dir / "b.yaml").unlink()
+        self.write_yaml("a.yaml", self._defective("t.par.one", parameter_description="Long enough."))
+        rc, out = self.run_main()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("STALE    parameter-description: t.par.one:p", out)
+        self.assertNotIn("NEW", out)
+
+    def test_new_and_stale_for_the_tags_rule(self):
+        self.write_yaml("a.yaml", self._defective("t.tag.one", parameter_description="Long enough.",
+                                                  tags="[]"))
+        self.assertEqual(self.run_main("--update-baseline")[0], 0)
+        baseline = json.loads(self.baseline.read_text(encoding="utf-8"))["baseline"]
+        self.assertEqual(baseline["tags"], ["t.tag.one"])
+        self.assertEqual(self.run_main()[0], 0)
+
+        self.write_yaml("b.yaml", self._defective("t.tag.two", parameter_description="Long enough.",
+                                                  tags="[]"))
+        rc, out = self.run_main()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NEW      tags: t.tag.two", out)
+        self.assertNotIn("STALE", out)
+
+        (self.dir / "b.yaml").unlink()
+        self.write_yaml("a.yaml", self._defective("t.tag.one", parameter_description="Long enough.",
+                                                  tags="[x]"))
+        rc, out = self.run_main()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("STALE    tags: t.tag.one", out)
+        self.assertNotIn("NEW", out)
+
+    def test_new_definition_description_violation_states_the_threshold(self):
+        self.write_yaml("a.yaml", self.DEFECTIVE)
+        self.assertEqual(self.run_main("--update-baseline")[0], 0)
+        self.write_yaml("b.yaml", self.DEFECTIVE.replace("t.bad.one", "t.bad.two"))
+        rc, out = self.run_main()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("at least 40 characters", out)
+
     def test_deleting_a_baselined_definition_is_stale(self):
         self.write_yaml("a.yaml", self.DEFECTIVE)
         self.assertEqual(self.run_main("--update-baseline")[0], 0)
@@ -237,7 +307,7 @@ class Ratchet(unittest.TestCase):
 
 class RepoGate(unittest.TestCase):
     def test_shipped_definitions_match_the_baseline(self):
-        out = subprocess.run([sys.executable, "-I", str(SCRIPT)], capture_output=True,
+        out = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True,
                              text=True, check=False, cwd=str(ROOT))
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 

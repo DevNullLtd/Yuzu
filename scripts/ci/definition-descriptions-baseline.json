@@ -1,5 +1,5 @@
 {
-  "_comment": "Ratchet baseline for scripts/ci/check-definition-descriptions.py: the definition description failures that existed when the rule landed. It may only shrink: delete an entry in the same change that fixes it. Regenerate with --update-baseline (lead only).",
+  "_comment": "Ratchet baseline for scripts/ci/check-definition-descriptions.py: the definition description failures that existed when the rule landed. It may only shrink: delete an entry in the same change that fixes it. Regenerate with --update-baseline, run deliberately, never to hide a new failure.",
   "baseline": {
     "definition-description": [],
     "parameter-description": [],
