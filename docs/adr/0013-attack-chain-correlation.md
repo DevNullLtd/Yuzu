@@ -197,7 +197,7 @@ the response loop closed through Guardian.
 - **Residual — ground truth is sparse and adversary-controlled** (§5); chain patterns stay
   observe-only until precision holds on real outcomes.
 - **Residual — through-gateway identity is app-layer** (`gateway_observed_peer`) until the
-  gRPC gateway-hop identity binding lands (ADR-0066, under #4722; QUIC was withdrawn); cross-host chains that traverse the gateway inherit that limitation.
+  gRPC gateway-hop identity binding lands (#5578, ADR-0066; QUIC was withdrawn); cross-host chains that traverse the gateway inherit that limitation.
 
 ## Future (deferred — recorded so they are not lost)
 

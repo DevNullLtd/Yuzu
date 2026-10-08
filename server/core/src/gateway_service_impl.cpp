@@ -398,12 +398,14 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
     // trusted for the rest of the process lifetime.
     //
     // The trusted-set is now populated ONLY when the proxy enrollment
-    // succeeds. The set still assumes the gateway-upstream listener (:50055)
-    // is itself authenticated via TLS/mTLS at the operator's network
-    // boundary — without that, an attacker who reaches the port AND knows
-    // a valid enrollment token could still add themselves. The upstream
-    // listener is strict mTLS (PKI PR5); per-gateway peer pinning on it is
-    // owned by the gateway-hop identity work under #4722 (ADR-0066).
+    // succeeds. The set still assumes the caller on the gateway-upstream
+    // listener (:50055) is an authorized gateway. With TLS on, that listener
+    // requires a client certificate and GatewayPeerGuardedService enforces an
+    // SPKI-pinned gateway peer (boot refuses an unpinned config); only the
+    // acknowledged --no-tls --insecure-gateway-peer dev mode runs it
+    // plaintext, where an attacker who reaches the port AND knows a valid
+    // enrollment token could still add themselves. Per-gateway agent_id
+    // scoping/attestation is #1292 (design: #5578, ADR-0066).
 
     // Fast path: agent already enrolled from a prior connection
     {

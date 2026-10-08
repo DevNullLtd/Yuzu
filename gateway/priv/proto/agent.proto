@@ -73,13 +73,14 @@ message RegisterRequest {
   //
   // Transport-agnostic by design: the field lives in the message, not in
   // transport metadata. The gateway can source it from `x-forwarded-for`
-  // (proxied deployments); sourcing it from the real grpcbox peer address is
-  // #1172 (gRPC is the permanent transport, ADR-0066 — the QUIC plan, #376,
+  // (proxied deployments). grpcbox holds the agent's socket but does not
+  // expose its peer address to service handlers; a vendored accessor that does
+  // is #1172 (gRPC is the permanent transport, ADR-0066 — the QUIC plan, #376,
   // was withdrawn). Empty = not provided → server falls back to the transport peer.
   //
-  // Gateway-side population is deferred to a follow-up: grpcbox can't observe
-  // the direct transport peer (only mTLS peercert); the grpcbox peer-address
-  // fix is #1172 (ADR-0066). Mirror kept in sync with the
+  // Gateway-side population is deferred to a follow-up: grpcbox does not pass
+  // the transport peer address to handlers (only the mTLS peercert, to
+  // auth_fun); the vendored accessor is #1172 (ADR-0066). Mirror kept in sync with the
   // canonical proto so gpb regenerates with the field present when the
   // population work lands.
   string gateway_observed_peer  = 6;

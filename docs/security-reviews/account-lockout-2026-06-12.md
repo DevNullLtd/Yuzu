@@ -184,5 +184,5 @@ anti-enumeration design. Findings:
   adversarial C4 trace).
 - Monotonic-clock consideration for the `locked_until` window vs backward wall-
   clock jumps (UP-2) — revisit in the QUIC-era auth work.
-  *(Update 2026-10-08: the QUIC work was withdrawn, ADR-0066 — this item needs its own owner
-  and no longer waits on a transport change.)*
+  *(Update 2026-10-08: the QUIC work was withdrawn, ADR-0066 — now tracked in #5579,
+  no longer waiting on a transport change.)*

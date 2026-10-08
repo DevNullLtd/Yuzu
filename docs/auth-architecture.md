@@ -3860,8 +3860,9 @@ defence against a compromised gateway (which is inside the trust boundary and
 can set any value) — both `source_ip` and the gateway's `gateway_ip` are
 recorded so an auditor can cross-check. **Server-side consumption ships now; the
 gateway-side population is a follow-up** — today's grpcbox transport can only
-source it from `x-forwarded-for` (proxied deployments); sourcing it from the
-real grpcbox peer address is #1172.
+source it from `x-forwarded-for` (proxied deployments); grpcbox does not yet
+expose the transport peer to the gateway's handlers, and the vendored accessor
+that will is #1172.
 
 ## HTTPS and bind defaults (hard invariants)
 
@@ -4069,7 +4070,7 @@ functional on the data plane. PR5d closes the *issuance* half of this gap
 CSR-signing, so the identity exists and is recorded/revocable in `ca_store`), but
 *enforcing* that revocation at the gateway edge is future work: durable
 cryptographic through-gateway identity (and therefore through-gateway revocation)
-arrives with the gRPC gateway-hop identity design under #4722 (ADR-0066; the
+arrives with the gRPC gateway-hop identity design, #5578 (ADR-0066; the
 QUIC migration, #376, was withdrawn). Until then, to revoke a
 gateway-proxied agent promptly, revoke at the gateway/management layer (disconnect
 the agent) in addition to `POST /api/v1/ca/revoke`. This is the same
@@ -4108,7 +4109,7 @@ Compensating controls (why this is accepted for M1, not a live break):
 The actual cryptographic remediation — gateway agent-identity **attestation** +
 per-gateway issuance **scoping** so a gateway can only obtain leaves for the
 `agent_id`s it legitimately fronts — is tracked in **#1292** (cryptographic
-through-gateway binding is the gRPC gateway-hop identity design under #4722, ADR-0066). Full threat model:
+through-gateway binding is the gRPC gateway-hop identity design, #5578, ADR-0066). Full threat model:
 `docs/security-reviews/pki-pr5-gateway-tls.md`; also summarised in
 `docs/pki-architecture.md`.
 

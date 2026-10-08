@@ -73,8 +73,9 @@ message RegisterRequest {
   //
   // Transport-agnostic by design: the field lives in the message, not in
   // transport metadata. The gateway can source it from `x-forwarded-for`
-  // (proxied deployments); sourcing it from the real grpcbox peer address is
-  // #1172 (gRPC is the permanent transport, ADR-0066 — the QUIC plan, #376,
+  // (proxied deployments). grpcbox holds the agent's socket but does not
+  // expose its peer address to service handlers; a vendored accessor that does
+  // is #1172 (gRPC is the permanent transport, ADR-0066 — the QUIC plan, #376,
   // was withdrawn). Empty = not provided → server falls back to the transport peer.
   string gateway_observed_peer  = 6;
 
@@ -95,7 +96,7 @@ message RegisterRequest {
   // (PR5c), so the gateway never REQUESTS the agent's client cert (verify_none) and
   // mutual auth is not yet performed there; the leaf is used for the direct-connect
   // mTLS path, inventory, and revocation. Full mutual auth on the gateway hop is
-  // owned by the gRPC gateway-hop identity design under #4722 (ADR-0066). SECURITY: because the gateway relays both agent_id
+  // owned by the gRPC gateway-hop identity design, #5578 (ADR-0066). SECURITY: because the gateway relays both agent_id
   // and csr_pem over an unauthenticated-at-the-app-layer hop, a compromised gateway
   // can swap the CSR to forge a leaf for any relayed agent_id — a bounded, accepted
   // M1 residual (R-5 in docs/security-reviews/pki-pr5-gateway-tls.md; the leaf is
