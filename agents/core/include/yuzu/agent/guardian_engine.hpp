@@ -320,9 +320,10 @@ public:
     /// attempt) or displaced a capture (a retarget that replaced a still-unpersisted capture;
     /// GuardianSparkRuntime::staged_baseline_drops), and passes that found a capture staged
     /// with no KV store to write it to. A stop-time loss that is not a failed write (the stop
-    /// flush ran out of wall budget, or was skipped after a slow failure or a late start) is
-    /// logged, NOT counted here; a stop cut off by the shutdown watchdog leaves not even a log
-    /// line (exit code 4). Zero while
+    /// flush ran out of wall budget, was skipped after a slow failure or a late start that
+    /// followed store trouble, or a capture could not be staged again at stop) is logged, NOT
+    /// counted here; a stop cut off by the shutdown watchdog leaves not even a log line
+    /// (exit code 4). Zero while
     /// healthy, quiescent, or inert (prefer_spark off). Surfaced SPARSELY as
     /// `yuzu.guardian_baseline_persist_failures` via emit_guardian_baseline_persist_heartbeat_tags.
     /// Spark path ONLY: a legacy FileGuard persist failure is logged, not counted. Because it
@@ -347,6 +348,11 @@ public:
     /// incomplete (the ERROR line docs/user-manual/metrics.md names). No production caller.
     [[nodiscard]] std::uint64_t baseline_stop_incomplete_logs_for_test() const noexcept {
         return baseline_stop_incomplete_logs_.load(std::memory_order_relaxed);
+    }
+    /// TEST-ONLY: how many times stop() logged that committed captures could not be staged again
+    /// at stop (the ERROR line docs/user-manual/metrics.md names). No production caller.
+    [[nodiscard]] std::uint64_t baseline_stop_unstaged_logs_for_test() const noexcept {
+        return baseline_stop_unstaged_logs_.load(std::memory_order_relaxed);
     }
 
     /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was
@@ -708,6 +714,22 @@ public:
         apply_post_drain_hook_for_test_ = std::move(hook);
     }
 
+    /// TEST-ONLY (#4045): fires inside stop(), mtx_ HELD, at the end of each store stage that
+    /// feeds the late-start skip's evidence ("journal_flush_1", "worker_join", "ledger",
+    /// "journal_flush_2"), before the stage's duration is read from the persister's clock: a
+    /// test advances an injected clock here to make that stage look slow. Same CONTRACT as
+    /// set_apply_post_drain_hook_for_test. No production caller.
+    void set_stop_stage_hook_for_test(std::function<void(const char* stage)> hook) {
+        std::lock_guard lock(mtx_);
+        stop_stage_hook_for_test_ = std::move(hook);
+    }
+    /// TEST-ONLY (#4045): forget the published persister pointer, as if stop() had read it just
+    /// before wire_spark_engine published it. The heartbeat getters then read 0. No production
+    /// caller.
+    void unpublish_baseline_persister_for_test() noexcept {
+        baseline_persister_published_.store(nullptr, std::memory_order_release);
+    }
+
     /// TEST-ONLY (#4045): fires inside reconcile_rule_locked, with mtx_ HELD and (under
     /// prefer_spark) the baseline-persister's seed fence held, immediately after a
     /// baseline-on-arm rule's seed read and before the attach. The deterministic stand-in for
@@ -928,7 +950,21 @@ private:
     /// slow-but-successful KvStore writes. Every one-shot caller (boot re-arm,
     /// apply_rules, and both shutdown flushes) passes unbounded because each has to
     /// drain what it was given.
-    void persist_lifecycle_journal_locked(std::size_t max_batches, std::size_t max_records);
+    /// Returns false iff records remain pending after the call (a failed or short write); true
+    /// when nothing was pending or the journal is gated off. Only stop() reads it (its two
+    /// flushes are unbounded, so "remaining" there means a store failure); the bounded
+    /// maintenance callers ignore it.
+    bool persist_lifecycle_journal_locked(std::size_t max_batches, std::size_t max_records);
+    /// stop() only (mtx_ held, noexcept): one unbounded journal flush, timed and reported to the
+    /// baseline persister as store-failure evidence for the late-start skip (stage name `stage`
+    /// is for the test hook).
+    void stop_journal_flush_locked(const char* stage) noexcept;
+    /// stop() only: bracket one store stage. begin returns the persister clock's reading (a
+    /// default time_point when no persister is wired); note runs the test hook, then records
+    /// store trouble when `ok` is false or the stage took at least kKvStoreBusyTimeout.
+    [[nodiscard]] std::chrono::steady_clock::time_point stop_stage_begin_locked() const noexcept;
+    void note_stop_stage_locked(const char* stage, std::chrono::steady_clock::time_point began,
+                                bool ok) noexcept;
 
     /// #4045: drain Spark's staged baseline-on-arm captures into the #4021 KV record via the
     /// engine-owned GuardianBaselinePersister. mtx_ held. Gated EXACTLY like the journal
@@ -1176,6 +1212,7 @@ private:
     /// TEST-ONLY (#4045): see set_apply_post_drain_hook_for_test / set_seed_read_hook_for_test.
     /// mtx_-guarded; null = no-op.
     std::function<void()> apply_post_drain_hook_for_test_;
+    std::function<void(const char*)> stop_stage_hook_for_test_;
     std::function<void(const std::string&)> seed_read_hook_for_test_;
     std::function<void(const std::string&)> post_attach_hook_for_test_;
     /// TEST-ONLY drain-worker timing overrides (see set_drain_worker_timing_for_test);
@@ -1262,6 +1299,9 @@ private:
     /// TEST-ONLY: "final flush incomplete" ERROR lines emitted by stop() (the log has no
     /// cross-image capture), see baseline_stop_incomplete_logs_for_test().
     std::atomic<std::uint64_t> baseline_stop_incomplete_logs_{0};
+    /// TEST-ONLY: "could not be staged at stop" ERROR lines, see
+    /// baseline_stop_unstaged_logs_for_test().
+    std::atomic<std::uint64_t> baseline_stop_unstaged_logs_{0};
     std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
     std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
 };

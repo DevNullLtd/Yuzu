@@ -4585,20 +4585,26 @@ bool GuardianSparkRuntime::salvage_unstaged_baseline_locked(
     return stage_baseline_locked(rule_id, file->path, rg.eval.baseline_hash);
 }
 
-void GuardianSparkRuntime::stage_unstaged_baselines() {
+std::size_t GuardianSparkRuntime::stage_unstaged_baselines() {
     std::lock_guard<std::mutex> lk{registry_mu_};
+    unstaged_sweep_stopping_for_test_.store(stopping_ ? 1 : 0, std::memory_order_relaxed);
+    std::size_t still_unstaged = 0;
     for (auto& [rule_id, rg] : rules_) {
         if (!rg->baseline_unstaged)
             continue;
         try {
             if (salvage_unstaged_baseline_locked(rule_id, *rg, index_->key_for_rule(rule_id)))
                 rg->baseline_unstaged = false;
+            else
+                ++still_unstaged;
         } catch (...) {
             // key_for_rule allocates: an allocation failure here is one more failed staging
             // attempt for this capture, counted like stage_baseline_locked's own.
             staged_baseline_drops_->fetch_add(1, std::memory_order_relaxed);
+            ++still_unstaged;
         }
     }
+    return still_unstaged;
 }
 
 std::vector<GuardianSparkRuntime::CapturedBaseline>

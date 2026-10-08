@@ -70,7 +70,8 @@
  * committed in its generation's eval state, flagged RuleGeneration::baseline_unstaged; the
  * flag is read and written only under registry_mu_ (evaluate_key's commit retries staging;
  * attach_core and every withdrawal stage the generation's committed hash before it is replaced
- * or dropped).
+ * or dropped, attach_core reads staging again after the withdrawal, and
+ * stage_unstaged_baselines() stages what is left once more when the engine stops).
  *
  * Rung 3 builds this against FAKE seams (IStateReader, ISparkBackend). The real
  * platform readers are rung 5; the convergence scheduler that also drives
@@ -633,9 +634,18 @@ public:
     /// persist pass: a stop withdraws no rule, so the withdrawal staging would never run and the
     /// capture would die with the process. Not gated on stopping_ (like snapshot_staged_baselines);
     /// an entry that cannot be staged again is counted by stage_baseline_locked and the capture is
-    /// then lost to this process. Idempotent: a staged generation's flag is cleared. May throw
-    /// only from the lock itself or a key lookup; the engine firewalls it.
-    void stage_unstaged_baselines();
+    /// then lost to this process. Idempotent: a staged generation's flag is cleared, and a
+    /// failed one stays flagged, so a repeated call retries it. Returns how many captures are
+    /// STILL unstaged afterwards (the engine logs a non-zero count: the drop counter dies with
+    /// the process). May throw only from the lock itself; the engine firewalls it.
+    [[nodiscard]] std::size_t stage_unstaged_baselines();
+    /// TEST-ONLY: whether stopping_ was already set when the last stage_unstaged_baselines() ran
+    /// (1 yes, 0 no, -1 it has not run). Pins the sweep AFTER the runtime's begin_stop(): moved
+    /// earlier, a commit could still stage between the sweep and the Stop pass. No production
+    /// caller.
+    [[nodiscard]] int unstaged_sweep_stopping_for_test() const noexcept {
+        return unstaged_sweep_stopping_for_test_.load(std::memory_order_relaxed);
+    }
     [[nodiscard]] std::size_t staged_baseline_count_for_test() const;
     /// TEST-ONLY: stage `rule_id`'s capture through the production staging rule (first capture
     /// wins on one path; a different path replaces and is counted). No production caller.
@@ -666,7 +676,10 @@ public:
     /// later evaluation of the generation, each failed retry counted again, so a capture that
     /// eventually stages still leaves its failed attempts here), or a retarget that replaced a
     /// still-unpersisted capture of another path (that capture is gone; legacy loses it on any
-    /// failed write too, with no retry). GuardianBaselinePersister reads this
+    /// failed write too, with no retry). It also counts the one failure that is not a staging
+    /// attempt: attach_core's read-back of a capture that staged successfully, when the copy
+    /// of its hash throws (the staged original stays, the live arm captures afresh; no separate
+    /// counter, the effect is the same one the tag already reports). GuardianBaselinePersister reads this
     /// through staged_baseline_drops_source() so the heartbeat getter needs no runtime lock.
     /// A retarget landing in the instant between a capture's write and its erase also counts:
     /// the count is an upper bound on lost captures, never an under-count.
@@ -1187,8 +1200,10 @@ private:
         /// be staged (an allocation failure, counted). registry_mu_-guarded, like staging itself.
         /// Runtime-owned on purpose: RuleEvalState is shared evaluator code and must not learn
         /// about persistence. While set, evaluate_key retries staging the COMMITTED hash on
-        /// every commit and attach_core stages it before a same-path replacement reads staging,
-        /// so the baseline keeps detecting drift meanwhile instead of being re-captured.
+        /// every commit, attach_core stages it before a same-path replacement reads staging (and
+        /// reads staging again after the withdrawal, which retries it once more), a withdrawal
+        /// stages it, and the engine's stop() sweeps what is left; the baseline keeps detecting
+        /// drift meanwhile instead of being re-captured.
         bool baseline_unstaged{false};
     };
 
@@ -2608,6 +2623,8 @@ private:
     std::atomic<int> fail_next_stage_baseline_{0}; ///< TEST-ONLY allocation-failure seam (count)
     mutable std::atomic<bool> fail_next_snapshot_{false}; ///< TEST-ONLY snapshot-throw seam
     std::atomic<bool> fail_next_inherit_copy_{false};     ///< TEST-ONLY attach_core copy seam
+    /// TEST-ONLY: see unstaged_sweep_stopping_for_test().
+    std::atomic<int> unstaged_sweep_stopping_for_test_{-1};
     /// registry_mu_ held. First capture wins on one path; a different path (a retarget)
     /// replaces the unpersisted capture and counts a drop. Never throws, so a throw cannot split
     /// evaluate_key's enqueue from its commit. Returns false iff the capture could NOT be staged
@@ -2621,10 +2638,11 @@ private:
     /// detach_all as a full_sync does before it re-arms) whose capture is committed but unstaged
     /// (RuleGeneration::baseline_unstaged) stages its committed hash first, on the path of its
     /// key's spec, so the replacement generation's staged read still inherits it. Never throws;
-    /// a second staging failure is counted by stage_baseline_locked and the capture is then lost
-    /// to the replacement (the one remaining window).
+    /// a second staging failure is counted by stage_baseline_locked, and the capture is then
+    /// lost to the replacement unless a later retry (attach_core's own, or its read-back after
+    /// the withdrawal) stages it.
     /// Returns true iff the hash is now staged.
-    bool salvage_unstaged_baseline_locked(const std::string& rule_id, const RuleGeneration& rg,
+    [[nodiscard]] bool salvage_unstaged_baseline_locked(const std::string& rule_id, const RuleGeneration& rg,
                                           const std::optional<std::string>& key) noexcept;
     std::unique_ptr<SparkKeyRuleIndex> index_;                          // key <-> rule fan-out + refcount
     std::unordered_map<std::string, std::shared_ptr<RuleGeneration>> rules_; // rule_id -> generation

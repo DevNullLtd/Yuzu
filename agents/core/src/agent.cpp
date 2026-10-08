@@ -114,7 +114,9 @@ constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 // and run()'s teardown ScopeExit. NOT a measured value — named sub-budgets inside the
 // blocking chain sum to roughly 15-20s (GuardianEngine's two persist_lifecycle_journal_
 // locked calls, each documented as "worst case one KvStore 5s busy timeout"; SparkEngine's
-// kConsumerJoinBudgetMs = 2'000) but dex_observer_'s drain wait and stop_all_guards_
+// kConsumerJoinBudgetMs = 2'000; GuardianEngine::stop()'s own comment lists the timelines
+// measured against a BUSY store, 10 s to 25 s and more with a worker write in flight) but
+// dex_observer_'s drain wait and stop_all_guards_
 // locked()'s per-guard stops have NO named bound at all — so this sits AT that named floor,
 // not comfortably above it (corrected per external review, PR #3737 — the earlier wording
 // overstated the margin), without claiming to be a derived guarantee (matching

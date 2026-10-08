@@ -61,6 +61,7 @@
 #include <cstdlib>
 #include <charconv>
 #include <chrono>
+#include <format>
 #include <cstdint>
 #include <set>
 #include <string>
@@ -649,11 +650,18 @@ std::string GuardianBaselinePersister::stop_skip_log_line(StopSkip why) {
            "process (#4045)";
 }
 
+std::string GuardianBaselinePersister::stop_unstaged_log_line(std::size_t unstaged) {
+    return std::format("Guardian: {} committed Spark baseline capture(s) could not be staged for "
+                       "the final flush at stop; they are lost to this process (#4045)",
+                       unstaged);
+}
+
 std::string GuardianBaselinePersister::stop_incomplete_log_line(std::size_t failed,
                                                                 bool budget_exhausted) {
-    return "Guardian: the final Spark baseline flush at stop was incomplete (failed=" +
-           std::to_string(failed) + ", budget_exhausted=" + (budget_exhausted ? "true" : "false") +
-           "); staged captures are lost to this process (#4045)";
+    return std::format("Guardian: the final Spark baseline flush at stop was incomplete "
+                       "(failed={}, budget_exhausted={}); staged captures are lost to this "
+                       "process (#4045)",
+                       failed, budget_exhausted ? "true" : "false");
 }
 
 void GuardianBaselinePersister::note_failed_pass() {
@@ -732,13 +740,17 @@ GuardianBaselinePersister::persist_staged(GuardianSparkRuntime& rt, Trigger trig
         // store burns a busy timeout per write) ended at or after the begin_stop() mark: one
         // more attempt would spend another busy timeout. A stall that ended before the mark
         // spent none of it, so it is not a reason to skip. (2) This pass could not start within
-        // kBaselineStopLatestStart of the mark: its first write always runs and may cost a busy
-        // timeout, which would end past the grace.
+        // kBaselineStopLatestStart of the mark AND an earlier stage of this stop failed or took
+        // a busy timeout (note_stop_store_trouble): its first write always runs and may cost a
+        // busy timeout, which would end past the grace. Elapsed time alone is not evidence of a
+        // bad store (an apply_rules can hold the engine mutex that long on a healthy one, and a
+        // healthy pass takes about a millisecond), so a late start with no trouble runs.
         const Clock::rep stop_began = stop_began_rep_.load(std::memory_order_relaxed);
         std::optional<StopSkip> why;
         if (stalled_ && stalled_at_ >= stop_began)
             why = StopSkip::Stalled;
-        else if (now() - Clock::time_point{Clock::duration{stop_began}} >= kBaselineStopLatestStart)
+        else if (stop_store_trouble_.load(std::memory_order_acquire) &&
+                 now() - Clock::time_point{Clock::duration{stop_began}} >= kBaselineStopLatestStart)
             why = StopSkip::LateStart;
         if (why) {
             (*why == StopSkip::Stalled ? out.skipped_after_stall : out.skipped_late_start) = true;
@@ -1154,6 +1166,12 @@ void GuardianEngine::stop() {
     if (auto* persister = baseline_persister_published_.load(std::memory_order_acquire))
         persister->begin_stop();
     std::lock_guard lock(mtx_);
+    // A stop() that loaded the published pointer just BEFORE wire_spark_engine published it
+    // (wire runs under mtx_, so it finished while this call waited for the lock) has no mark
+    // yet. Mark now: first call wins, so a mark already taken above is untouched, and this one
+    // is at worst the lock-acquire time.
+    if (baseline_persister_)
+        baseline_persister_->begin_stop();
     // Spark teardown FIRST, in this order (rung 7): (1) runtime phase 1 - fast,
     // wakes any bounded reader waiter, makes a concurrent spark event a no-op;
     // (2) the convergence scheduler - joins its lane threads, CV-interruptible
@@ -1177,11 +1195,7 @@ void GuardianEngine::stop() {
     // KvStore write to do it first. The post-join flush stays: it catches anything the worker
     // staged while it was winding down, and re-running is safe because persist() erases the
     // durably-written prefix, so a record is never written under two keys.
-    try {
-        persist_lifecycle_journal_locked(kJournalPersistUnbounded, kJournalPersistUnbounded);
-    } catch (...) {
-        journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
-    }
+    stop_journal_flush_locked("journal_flush_1");
     if (spark_runtime_)
         spark_runtime_->begin_stop();
     // rung 9c PR-2 Unit 6 (§R5.5): retire acknowledgment candidates and prevent
@@ -1192,8 +1206,11 @@ void GuardianEngine::stop() {
     ack_ledger_->retire();
     if (spark_scheduler_)
         spark_scheduler_->stop();
-    if (spark_drain_worker_)
+    if (spark_drain_worker_) {
+        const auto began = stop_stage_begin_locked();
         spark_drain_worker_->stop();
+        note_stop_stage_locked("worker_join", began, /*ok=*/true);
+    }
     stop_all_guards_locked();
     // #4783: stop legacy_sink_executor_ from admitting NEW sends only AFTER the
     // guards above have joined — by the time stop_all_guards_locked() returns, every
@@ -1234,18 +1251,22 @@ void GuardianEngine::stop() {
     // whole path is reached from the (implicitly noexcept) destructor, so an
     // escape here must be caught, not left to std::terminate.
     if (kv_) {
+        const auto began = stop_stage_begin_locked();
+        bool ledger_ok = false;
         try {
             std::lock_guard<std::mutex> persist_lk(legacy_sink_persist_mu_);
             const auto snap = legacy_sink_executor_->snapshot();
-            if (persist_legacy_sink_loss_ledger(kv_, snap))
+            if (persist_legacy_sink_loss_ledger(kv_, snap)) {
                 legacy_sink_last_persisted_gen_ = snap.change_gen;
-            else
+                ledger_ok = true;
+            } else
                 spdlog::warn("Guardian: failed to persist the legacy-sink loss ledger during "
                             "shutdown (change_gen={}) - a restart may see stale (though never "
                             "corrupt) loss/gap state",
                             snap.change_gen);
         } catch (...) {
         }
+        note_stop_stage_locked("ledger", began, ledger_ok);
     }
     // F7: stop() is terminal - nothing reconciles again afterward, so there is no
     // re-log/false-transition risk (unlike apply_rules's full_sync, which must sweep
@@ -1257,23 +1278,24 @@ void GuardianEngine::stop() {
     // circuit-broken (worst case one KvStore 5 s busy-timeout). FIREWALLED: stop() is reached
     // from the (implicitly noexcept) ~GuardianEngine destructor, so a throw here would
     // std::terminate (review B4a).
-    try {
-        persist_lifecycle_journal_locked(kJournalPersistUnbounded, kJournalPersistUnbounded);
-    } catch (...) {
-        journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
-    }
+    stop_journal_flush_locked("journal_flush_2");
     // #4045: flush Spark's staged baseline captures, LAST. The drain worker is joined and the
     // runtime refuses new commits after begin_stop(), so no new capture can stage; the snapshot
     // is deliberately not gated on stopping_ for exactly this call. First the committed-but-
-    // unstaged captures are staged (a stop withdraws no rule, so nothing else would), then ONE
+    // unstaged captures are staged (a stop withdraws no rule, so nothing else would; one that
+    // cannot be staged again is logged, its count would die with the process), then ONE
     // Stop-trigger pass: no tuple cap, ONE failure and 1 s of wall between tuples (so at most
     // that plus one in-flight write). A capture still unpersisted afterwards is lost to this
     // process (next boot recaptures): the engine logs it and the persister counts a failed
     // pass. The pass is SKIPPED, with its own logged line, when
     //  (1) a write that failed slowly ended at or after the begin_stop() mark taken at the top
     //      of this function (the stall already spent this stop's deadline), or
-    //  (2) it would start at or after kBaselineStopLatestStart (15 s) past that mark: its first
-    //      write always runs, and on a BUSY store one write costs a whole 5 s busy timeout.
+    //  (2) it would start at or after kBaselineStopLatestStart (15 s) past that mark AND an
+    //      earlier stage of this same stop() failed or took a busy timeout (the two journal
+    //      flushes, the worker join and the loss-ledger write feed note_stop_store_trouble()):
+    //      its first write always runs, and on a BUSY store one write costs a whole 5 s busy
+    //      timeout. A late start with no such evidence (an apply_rules that held mtx_ for 15 s
+    //      on a healthy store) runs: a healthy pass takes about a millisecond.
     //
     // Ordering: this flush runs after the journal flush and the loss-ledger write, so it is the
     // one a stall skips; the integrity-relevant flusher yields to the audit-replay one only
@@ -1282,26 +1304,38 @@ void GuardianEngine::stop() {
     //
     // THE SHARED DEADLINE. Every stage of this function shares ONE 20 s deadline,
     // kShutdownDeadlineGrace (agent.cpp), which AgentImpl::stop() arms BEFORE it calls this
-    // function and which also covers the DEX/Spark/plugin teardown after it and
-    // thread_pool_.reset(). When it expires hard_exit(4) ends the process: later teardown steps
-    // are cut, a Windows service is restarted by the SCM, and neither hard_exit nor
-    // ShutdownDeadlineGuard writes any log line, so exit code 4 is the only evidence. Measured
-    // with real SQLITE_BUSY (a second connection holding BEGIN IMMEDIATE), 5 s busy timeout,
-    // staged captures present (stop() entry to exit):
-    //   idle worker, no journal record pending ..... ledger 5 + this pass 5 .......... 10 s
-    //   idle worker, journal record pending ........ journal 5 + ledger 5 + journal 5
-    //                                                 = 15 s, this pass SKIPPED (starts at 15 s)
-    //   worker baseline write in flight, journal ... 20 s, this pass skipped by the stall
-    //     record pending                              (its BUSY write held KvStore::mu_ first)
-    // The last row is on the watchdog. The worker's OTHER KV writes (journal sent-markers) take
-    // KvStore::mu_ too, so a worker mid-write puts its own busy timeout in front of every stage
-    // here: the earlier review rounds measured 23 s to 25 s with this pass skipped and 28 s when
-    // it still ran (before the late-start skip existed; with it the 28 s row should end at
-    // 23 s, which was not re-measured), all past the 20 s grace, with or without #4045.
-    // #4045 adds at most ONE busy timeout to that (the join waiting for the worker's baseline
-    // write, or this pass, never both) and, with the late-start skip, no longer adds one at
-    // all once the earlier stages have used 15 s. What it cannot bound: the journal and
-    // ledger stages above and the worker's non-baseline writes.
+    // function. It also covers what AgentImpl::stop() runs after this function (the DEX
+    // observer, the Spark engine and the updater stops); run()'s exit teardown (plugin
+    // shutdown, thread_pool_.reset()) is under a second, independent 20 s guard of its own.
+    // When the guard expires hard_exit(4) ends the process: later teardown steps are cut, a
+    // Windows service is restarted by the SCM, and neither hard_exit nor ShutdownDeadlineGuard
+    // writes any log line, so exit code 4 is the only evidence.
+    //
+    // Measured on this code with real SQLITE_BUSY (a second connection holding BEGIN
+    // IMMEDIATE), 5 s KvStore busy timeout, 3 staged captures, stop() entry to exit:
+    //   quiet worker, nothing else pending ......... ledger 5 + this pass 5 ........ 10.01 s
+    //                                                 (the pass runs and fails)
+    //   quiet worker, journal record pending ....... journal 5 + ledger 5 + journal 5
+    //                                                 = 15.02 s, this pass SKIPPED (starts at
+    //                                                 15 s, margin about 15 ms: each BUSY stage
+    //                                                 is its 5 s sleep plus overhead)
+    //   worker baseline write in flight, journal ... 20 s to 25 s (25.02 s in three runs of one
+    //     record pending                              harness, 20.016 s to 25.03 s across
+    //                                                 alignments), this pass skipped by the stall:
+    //                                                 up to TWO busy timeouts are added, the
+    //                                                 in-flight write that holds KvStore::mu_
+    //                                                 first, and a second baseline write when
+    //                                                 the worker's 5 s retry backoff expires
+    //                                                 just as journal flush 1 ends
+    //   worker baseline write in flight, no journal  10.01 s, this pass skipped by the stall
+    // The last two rows are on the watchdog when they pass 20 s. The worker's OTHER KV writes
+    // (journal sent-markers) take KvStore::mu_ too, so a worker mid sent-marker write puts its
+    // own busy timeout in front of every stage here: measured 21.5 s to 28.2 s with the pass
+    // skipped by the stall, all past the 20 s grace, with or without #4045 (the same trigger
+    // already costs 23 s and more before #4045). What the shared deadline cannot bound: the
+    // journal and ledger stages above, the worker's non-baseline writes, and the worker's retry
+    // write. A Worker pass is deliberately NOT deferred once the mark is taken: a store that
+    // heals mid-stop gets its worker retry, and the Stop pass then runs instead of skipping.
     persist_staged_baselines_locked(/*at_stop=*/true);
     stopped_ = true;
     started_ = false;
@@ -1344,7 +1378,37 @@ void GuardianEngine::WorkerHostileMutex::abort_if_worker_thread() noexcept {
 #endif
 }
 
-void GuardianEngine::persist_lifecycle_journal_locked(std::size_t max_batches,
+std::chrono::steady_clock::time_point GuardianEngine::stop_stage_begin_locked() const noexcept {
+    return baseline_persister_ ? baseline_persister_->stop_stage_begin()
+                               : std::chrono::steady_clock::time_point{};
+}
+
+void GuardianEngine::note_stop_stage_locked(const char* stage,
+                                           std::chrono::steady_clock::time_point began,
+                                           bool ok) noexcept {
+    if (!baseline_persister_)
+        return;
+    try {
+        if (stop_stage_hook_for_test_)
+            stop_stage_hook_for_test_(stage);
+    } catch (...) {
+    }
+    baseline_persister_->stop_stage_end(began, ok);
+}
+
+void GuardianEngine::stop_journal_flush_locked(const char* stage) noexcept {
+    const auto began = stop_stage_begin_locked();
+    bool ok = true;
+    try {
+        ok = persist_lifecycle_journal_locked(kJournalPersistUnbounded, kJournalPersistUnbounded);
+    } catch (...) {
+        journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        ok = false;
+    }
+    note_stop_stage_locked(stage, began, ok);
+}
+
+bool GuardianEngine::persist_lifecycle_journal_locked(std::size_t max_batches,
                                                      std::size_t max_records) {
     // mtx_ held. Gated: no durable journal work unless spark is the ACTIVE backend and
     // the path is wired (rev-4.1 §7 inertness - at prefer_spark_=false a pre-populated
@@ -1353,14 +1417,14 @@ void GuardianEngine::persist_lifecycle_journal_locked(std::size_t max_batches,
     // PRAGMA synchronous check + a namespace_size() size probe to seed the gauges. Those
     // two boot-time reads are the only thing that touches the store while inert.
     if (!prefer_spark_ || !spark_runtime_ || !lifecycle_journal_)
-        return;
+        return true;
     // The overflow-drop counter comes back FROM the snapshot, read under its lock: the erase
     // below has to identify the prefix it wrote, and a concurrent drop-oldest shifts positions
     // (#2345 Gate 8b).
     const auto snap = spark_runtime_->snapshot_pending();
     const auto& pending = snap.records;
     if (pending.empty())
-        return;
+        return true;
     // snapshot released outbox_mu_; persist() does KV I/O holding NO runtime lock (so the
     // WRITE chain never nests outbox_mu_ under KvStore.mu_); erase re-takes outbox_mu_ for
     // ONLY the prefix persist() durably wrote (circuit-broken on the first failure - the
@@ -1379,6 +1443,7 @@ void GuardianEngine::persist_lifecycle_journal_locked(std::size_t max_batches,
             if (!b.event_ids.empty())
                 spark_runtime_->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());
     }
+    return written >= pending.size();
 }
 
 void GuardianEngine::persist_staged_baselines_locked(bool at_stop) noexcept {
@@ -1399,7 +1464,16 @@ void GuardianEngine::persist_staged_baselines_locked(bool at_stop) noexcept {
         // commits, so nothing races this; a failure here costs only that capture (counted by
         // the runtime's drop counter) and must not skip the flush of the others.
         try {
-            spark_runtime_->stage_unstaged_baselines();
+            const std::size_t unstaged = spark_runtime_->stage_unstaged_baselines();
+            if (unstaged != 0) {
+                // The runtime counted each failed attempt, but that count dies with the
+                // process: this line is the only evidence the capture was lost.
+                try {
+                    spdlog::error("{}", GuardianBaselinePersister::stop_unstaged_log_line(unstaged));
+                    baseline_stop_unstaged_logs_.fetch_add(1, std::memory_order_relaxed);
+                } catch (...) {
+                }
+            }
         } catch (...) {
             baseline_persister_->note_firewalled_exception();
         }

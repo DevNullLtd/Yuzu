@@ -48,9 +48,12 @@
  * deadline, and retrying it costs at most one failing write under the single-failure budget, so
  * it is not a reason to skip. A fast failure (a dropped table, a read-only file) costs nothing
  * to retry and never counts as a stall. (2) The pass would start kBaselineStopLatestStart (15 s)
- * or more after begin_stop(): its first write always runs, and one write against a BUSY store
- * costs a busy timeout, which would end past the 20 s grace. Neither skip touches the store;
- * the engine logs each with its own line.
+ * or more after begin_stop() AND an earlier stage of this same stop() failed or took at least
+ * a busy timeout (note_stop_store_trouble()): its first write always runs, and one write
+ * against a BUSY store costs a busy timeout, which would end past the 20 s grace. A late start
+ * with no such evidence (an apply_rules that held the engine mutex for 15 s on a healthy store)
+ * runs: a healthy pass takes about a millisecond. Neither skip touches the store; the
+ * persister logs each with its own line.
  *
  * YIELDING: apply_rules takes the seed fence once per baseline-on-arm rule, so a worker pass
  * that kept the lock for its whole budget would make each of those fences wait. A Worker pass
@@ -177,10 +180,11 @@ inline constexpr GuardianBaselinePassBudget kBaselinePassBudget{64, 3,
 /// which can spend a 5 s busy timeout (GuardianEngine::stop() lists the measured timelines), so
 /// this pass gets ONE failure and 1 s of wall between tuples, and is skipped when a slow
 /// failure during this stop already spent the deadline or when it could not start in time
-/// (see BOUNDED PASSES). It has NO tuple cap: a healthy store persists a staged capture in well
-/// under a millisecond, and a cap would abandon the rest at a few dozen captures. The 1 s wall
-/// is the limit instead: above roughly 2,000 to 3,000 staged captures the pass ends on it with
-/// the remainder lost to this process (logged as incomplete), even on a healthy store.
+/// after this stop saw store trouble (see BOUNDED PASSES). It has NO tuple cap: a healthy
+/// store persists a staged capture in well under a millisecond, and a cap would abandon the
+/// rest at a few dozen captures. The 1 s wall is the limit instead: above roughly 2,000 to
+/// 3,000 staged captures the pass ends on it with the remainder lost to this process (logged as
+/// incomplete), even on a healthy store.
 inline constexpr GuardianBaselinePassBudget kBaselineStopBudget{
     (std::numeric_limits<std::size_t>::max)(), 1, std::chrono::milliseconds{1000}};
 
@@ -189,13 +193,16 @@ inline constexpr GuardianBaselinePassBudget kBaselineStopBudget{
 /// ShutdownDeadlineGuard hard-exits the process (exit code 4) with no log line.
 inline constexpr std::chrono::milliseconds kBaselineShutdownGrace{20'000};
 
-/// A Stop pass that has not STARTED this long after GuardianEngine::stop() began is skipped
-/// (logged), because it cannot be allowed to finish inside kBaselineShutdownGrace: the wall
+/// A Stop pass that has not STARTED this long after GuardianEngine::stop() began, AND whose
+/// stop() already saw store trouble (note_stop_store_trouble()), is skipped (logged): the wall
 /// budget is checked only BETWEEN tuples, so the first write always runs, and against a BUSY
 /// store that one write costs a whole kKvStoreBusyTimeout. Grace minus one busy timeout (15 s)
-/// is the latest start at which that single write still fits. It is a bound on this pass only:
-/// the earlier stop() stages (two journal flushes, the loss ledger) and the worker's own KV
-/// writes are not under it.
+/// is the latest start at which that single write still fits. Elapsed time alone is not
+/// enough: on a healthy store the same pass takes about a millisecond and finishes with most
+/// of the grace left. It is a bound on this pass only: the earlier stop() stages (two journal
+/// flushes, the loss ledger) and the worker's own KV writes are not under it, and the pass
+/// itself can cost its 1 s wall plus one busy write (about 6 s) when the store turns BUSY
+/// mid-pass, so a start just under 15 s can still end about a second past the grace.
 inline constexpr std::chrono::milliseconds kBaselineStopLatestStart =
     kBaselineShutdownGrace - kKvStoreBusyTimeout;
 
@@ -265,9 +272,32 @@ public:
     /// A Stop pass skips (1) a stall observed at or after this mark: a failed write that took a
     /// busy timeout during this stop spent the shared deadline, and one more would spend again;
     /// a stall that ended before the mark spent none of it, so it is not a reason to skip; and
-    /// (2) when it could not start within kBaselineStopLatestStart of the mark. A Stop pass
-    /// with no begin_stop() never skips. Lock-free, so it cannot wait behind a pass.
+    /// (2) when it could not start within kBaselineStopLatestStart of the mark AND this stop
+    /// already saw store trouble (note_stop_store_trouble). A Stop pass with no begin_stop()
+    /// never skips. Lock-free, so it cannot wait behind a pass.
     void begin_stop() noexcept;
+
+    /// Store-failure evidence for THIS stop (read by the late-start skip). GuardianEngine::stop()
+    /// feeds it from its own store stages (the two journal flushes, the worker join, the loss
+    /// ledger) through stop_stage_begin()/stop_stage_end(): a stage that failed, or that took at
+    /// least kKvStoreBusyTimeout of this persister's clock, is trouble. stop() is terminal, so
+    /// the flag needs no reset: it can only describe the one stop that raised it. A stall of the
+    /// persister's own passes needs no entry here: one that ended at or after the mark skips the
+    /// pass by itself (rule (1) of begin_stop()). Lock-free and noexcept.
+    void note_stop_store_trouble() noexcept {
+        stop_store_trouble_.store(true, std::memory_order_release);
+    }
+    [[nodiscard]] Clock::time_point stop_stage_begin() const noexcept { return now(); }
+    /// `ok` false, or `began` at least kKvStoreBusyTimeout ago on this persister's clock, records
+    /// store trouble.
+    void stop_stage_end(Clock::time_point began, bool ok) noexcept {
+        if (!ok || now() - began >= kKvStoreBusyTimeout)
+            note_stop_store_trouble();
+    }
+    /// TEST-ONLY: whether store trouble has been recorded for this stop.
+    [[nodiscard]] bool stop_store_trouble_for_test() const noexcept {
+        return stop_store_trouble_.load(std::memory_order_acquire);
+    }
 
     /// Why a Stop pass was skipped (see begin_stop()).
     enum class StopSkip { Stalled, LateStart };
@@ -278,6 +308,10 @@ public:
     /// behind (a failed write or the wall budget). Pure and static, like stop_skip_log_line.
     [[nodiscard]] static std::string stop_incomplete_log_line(std::size_t failed,
                                                               bool budget_exhausted);
+    /// The exact ERROR line GuardianEngine::stop() logs when `unstaged` captures could not be
+    /// staged again at stop (the stop-time sweep failed after the commit-time attempt did). The
+    /// count only: no rule id, path or hash. Pure and static, like stop_skip_log_line.
+    [[nodiscard]] static std::string stop_unstaged_log_line(std::size_t unstaged);
     /// TEST-ONLY: true once begin_stop() has stored its mark. Lets a test prove the mark was
     /// taken while another thread still held the engine mutex. No production caller.
     [[nodiscard]] bool stop_begun_for_test() const noexcept {
@@ -480,6 +514,8 @@ private:
     /// separate state, not a sentinel rep, so a clock that reads 0 cannot disable the skip.
     std::atomic<std::uint8_t> stop_state_{0};
     std::atomic<Clock::rep> stop_began_rep_{0};
+    /// Set by note_stop_store_trouble (release), read by the Stop pass (acquire).
+    std::atomic<bool> stop_store_trouble_{false};
     std::atomic<std::uint64_t> stop_skip_stalled_logs_{0}; ///< TEST-ONLY, stop_skip_logs_for_test
     std::atomic<std::uint64_t> stop_skip_late_logs_{0};    ///< TEST-ONLY, stop_skip_logs_for_test
     std::atomic<std::uint64_t> backoff_deferrals_{0}; ///< TEST-ONLY, see its accessor

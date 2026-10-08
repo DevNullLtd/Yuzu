@@ -5958,6 +5958,7 @@ struct HookGuard4045 {
         e.set_apply_post_drain_hook_for_test(nullptr);
         e.set_seed_read_hook_for_test(nullptr);
         e.set_post_attach_hook_for_test(nullptr);
+        e.set_stop_stage_hook_for_test(nullptr);
         if (auto* p = e.baseline_persister_for_test()) {
             p->set_post_snapshot_hook_for_test(nullptr);
             p->set_post_write_hook_for_test(nullptr);
@@ -8012,6 +8013,10 @@ TEST_CASE("#4045 E44: a clean stop() stages a capture whose staging failed, so t
         CHECK(rt->staged_baseline_count_for_test() == 0);
         Spark4045Target::write(target, "content B, longer"); // the file changes before the stop
         f.engine->stop();
+        // RED if the sweep ran before the runtime began stopping: a commit could then still
+        // stage between the sweep and the Stop pass and be lost.
+        CHECK(rt->unstaged_sweep_stopping_for_test() == 1);
+        CHECK(f.engine->baseline_stop_unstaged_logs_for_test() == 0);
         const auto rec = baseline_record_4045(*f.kv, "r1");
         REQUIRE(rec.has_value()); // RED: absent, the capture was never staged at stop
         CHECK(rec->value("hash", std::string{}) == h_a);
@@ -8025,6 +8030,11 @@ TEST_CASE("#4045 E44: a clean stop() stages a capture whose staging failed, so t
         f.engine->stop();
         CHECK(rt->staged_baseline_drops() == 2);
         CHECK_FALSE(baseline_record_4045(*f.kv, "r1").has_value());
+        // The loss has a log line (the drop counter dies with the process): one ERROR line from
+        // the real stop(), and none from the destructor's second stop().
+        CHECK(f.engine->baseline_stop_unstaged_logs_for_test() == 1);
+        f.engine->stop();
+        CHECK(f.engine->baseline_stop_unstaged_logs_for_test() == 1);
     }
     SECTION("a capture that did stage normally is not staged again (no extra drop, one record)") {
         f.apply(make_file_hash_rule("r1", target.string()));
@@ -8096,7 +8106,7 @@ TEST_CASE("#4045 E45: stop() marks its start BEFORE it waits for the engine mute
 }
 
 TEST_CASE("#4045 E46: a Stop pass that cannot start inside kBaselineStopLatestStart of the stop "
-          "mark is skipped and logged, one that can is not",
+          "mark, after this stop saw store trouble, is skipped and logged, one that can is not",
           "[spark][guardian][baseline][reconcile]") {
     using namespace std::chrono_literals;
     using Trig = GuardianBaselinePersister::Trigger;
@@ -8119,6 +8129,7 @@ TEST_CASE("#4045 E46: a Stop pass that cannot start inside kBaselineStopLatestSt
 
     stage_n_4045(*rt, 3, "e46");
     persister->begin_stop();
+    persister->note_stop_store_trouble(); // the evidence rule is E53's; this case pins the bound
 
     SECTION("one millisecond before the latest start: the pass runs") {
         clock.advance(14'999);
@@ -8140,8 +8151,6 @@ TEST_CASE("#4045 E46: a Stop pass that cannot start inside kBaselineStopLatestSt
         CHECK(rt->staged_baseline_count_for_test() == 3);
         CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 1);
         CHECK(persister->stop_skip_logs_for_test(Skip::Stalled) == 0);
-        // Stop() is the only caller of a Stop pass and runs it once; the late skip is the same
-        // on a HEALTHY store (it bounds the time, not the store's health).
         CHECK(persister->persist_staged(*rt, Trig::Forced).written == 3);
     }
     SECTION("a skipped pass with nothing staged is silent") {
@@ -8159,8 +8168,8 @@ TEST_CASE("#4045 E46: a Stop pass that cannot start inside kBaselineStopLatestSt
 
 TEST_CASE("#4045 E47: the stop mark does not depend on the clock reading a non-zero value",
           "[spark][guardian][baseline][reconcile]") {
-    // A clock whose epoch is 0 used to read as "no stop begun" (the mark's 0 sentinel), which
-    // silently disabled the skip.
+    // A clock whose epoch reads 0 must still produce a valid mark: the mark's validity is its
+    // own state, not a sentinel value of the timestamp.
     using Trig = GuardianBaselinePersister::Trigger;
     SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
     f.engine->drain_worker_for_test()->stop();
@@ -8183,7 +8192,7 @@ TEST_CASE("#4045 E47: the stop mark does not depend on the clock reading a non-z
     ms->fetch_add(1);
     persister->begin_stop(); // a second call must not move the mark either
     const auto stop = persister->persist_staged(*rt, Trig::Stop);
-    CHECK(stop.skipped_after_stall); // RED while rep 0 meant "no stop begun"
+    CHECK(stop.skipped_after_stall); // RED if a rep-0 mark were read as "no stop begun"
 }
 
 TEST_CASE("#4045 E48: the operator-visible stop-time lines are emitted at their call sites and "
@@ -8206,33 +8215,14 @@ TEST_CASE("#4045 E48: the operator-visible stop-time lines are emitted at their 
     for (const auto& line : {skip_stalled, skip_late, incomplete})
         CHECK(line.find('\n') == std::string::npos);
 
-    // metrics.md names the wording an operator greps for.
-    const std::filesystem::path doc = [] {
-        const std::filesystem::path rel{"docs/user-manual/metrics.md"};
-        for (auto base : {std::filesystem::current_path(),
-                          std::filesystem::absolute(std::filesystem::path(__FILE__)).parent_path()}) {
-            for (int up = 0; up < 6; ++up) {
-                if (std::filesystem::exists(base / rel))
-                    return base / rel;
-                if (!base.has_parent_path())
-                    break;
-                base = base.parent_path();
-            }
-        }
-        return std::filesystem::path{};
-    }();
-    REQUIRE_FALSE(doc.empty());
-    std::ifstream in(doc);
-    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    for (const char* phrase : {"the final Spark baseline flush at stop was incomplete",
-                               "skipped the final Spark baseline flush at stop"}) {
-        INFO("metrics.md must name: " << phrase);
-        CHECK(text.find(phrase) != std::string::npos);
-    }
     CHECK(skip_stalled.find("skipped the final Spark baseline flush at stop") != std::string::npos);
     CHECK(skip_late.find("skipped the final Spark baseline flush at stop") != std::string::npos);
     CHECK(incomplete.find("the final Spark baseline flush at stop was incomplete") !=
           std::string::npos);
+    CHECK(GuardianBaselinePersister::stop_unstaged_log_line(2) ==
+          "Guardian: 2 committed Spark baseline capture(s) could not be staged for the final "
+          "flush at stop; they are lost to this process (#4045)");
+    CHECK(GuardianBaselinePersister::stop_unstaged_log_line(1).find('\n') == std::string::npos);
 
     SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
     f.engine->drain_worker_for_test()->stop();
@@ -8510,5 +8500,282 @@ TEST_CASE("#4045 E52: the test-hook and budget setters wait for a pass in flight
         s.join();
         pass.join();
         CHECK(returned.load() == 1);
+    }
+}
+
+// ── #4045: the late-start skip is health-gated ─────────────────────────────────────────────
+TEST_CASE("#4045 E48b: metrics.md names the stop-time lines an operator is told to search for",
+          "[spark][guardian][baseline][reconcile]") {
+    namespace fs = std::filesystem;
+    // Locate the doc without a build-injected root: $MESON_SOURCE_ROOT, then walking up from the
+    // working directory, then from this source file. A binary run from outside the tree finds
+    // none of them and SKIPS (a loud message, not a failure of the code under test).
+    const fs::path rel{"docs/user-manual/metrics.md"};
+    std::vector<fs::path> starts;
+    if (const char* root = std::getenv("MESON_SOURCE_ROOT"))
+        starts.emplace_back(root);
+    std::error_code ec;
+    starts.emplace_back(fs::current_path(ec));
+    starts.emplace_back(fs::absolute(fs::path(__FILE__), ec).parent_path());
+    fs::path doc;
+    for (auto base : starts) {
+        for (int up = 0; up < 8 && doc.empty(); ++up) {
+            if (fs::exists(base / rel, ec))
+                doc = base / rel;
+            if (!base.has_parent_path() || base.parent_path() == base)
+                break;
+            base = base.parent_path();
+        }
+        if (!doc.empty())
+            break;
+    }
+    if (doc.empty())
+        SKIP("docs/user-manual/metrics.md not found from $MESON_SOURCE_ROOT, the working "
+             "directory or this source file: run the binary from inside the source tree");
+    std::ifstream in(doc);
+    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    REQUIRE_FALSE(text.empty());
+    for (const char* phrase : {"the final Spark baseline flush at stop was incomplete",
+                               "skipped the final Spark baseline flush at stop",
+                               "could not be staged for the final flush at stop"}) {
+        INFO("metrics.md must name: " << phrase);
+        CHECK(text.find(phrase) != std::string::npos);
+    }
+}
+
+TEST_CASE("#4045 E53: store trouble is a stage that failed or took a busy timeout, and only "
+          "with it does a late start skip the Stop pass",
+          "[spark][guardian][baseline][reconcile]") {
+    using Trig = GuardianBaselinePersister::Trigger;
+    using Skip = GuardianBaselinePersister::StopSkip;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+
+    SECTION("stop_stage_end: a stage under a busy timeout is not trouble, one at it is") {
+        auto began = persister->stop_stage_begin();
+        clock.advance(4'999);
+        persister->stop_stage_end(began, true);
+        CHECK_FALSE(persister->stop_store_trouble_for_test());
+        began = persister->stop_stage_begin();
+        clock.advance(5'000);
+        persister->stop_stage_end(began, true);
+        CHECK(persister->stop_store_trouble_for_test());
+    }
+    SECTION("a stage that failed fast is trouble") {
+        persister->stop_stage_end(persister->stop_stage_begin(), false);
+        CHECK(persister->stop_store_trouble_for_test());
+    }
+    SECTION("a late start with NO trouble runs: a healthy pass is not cut for being late") {
+        stage_n_4045(*rt, 3, "e53a");
+        persister->begin_stop();
+        clock.advance(16'000);
+        const auto out = persister->persist_staged(*rt, Trig::Stop);
+        CHECK_FALSE(out.skipped_late_start);
+        CHECK(out.written == 3);
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+    }
+    SECTION("a late start WITH trouble skips") {
+        stage_n_4045(*rt, 3, "e53b");
+        persister->begin_stop();
+        persister->note_stop_store_trouble();
+        clock.advance(15'000);
+        const auto out = persister->persist_staged(*rt, Trig::Stop);
+        CHECK(out.skipped_late_start);
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 1);
+    }
+    SECTION("trouble with an early start does not skip") {
+        stage_n_4045(*rt, 3, "e53c");
+        persister->begin_stop();
+        persister->note_stop_store_trouble();
+        clock.advance(14'999);
+        CHECK(persister->persist_staged(*rt, Trig::Stop).written == 3);
+    }
+    SECTION("a stall that ended after the mark and a late start: the stall reason wins") {
+        stage_n_4045(*rt, 2, "e53d");
+        fail_baseline_writes_4045(f.db_.path);
+        persister->begin_stop();
+        persister->set_post_write_hook_for_test([&] { clock.advance(16'000); });
+        CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 1);
+        persister->set_post_write_hook_for_test(nullptr);
+        const auto out = persister->persist_staged(*rt, Trig::Stop);
+        CHECK(out.skipped_after_stall);
+        CHECK(persister->stop_skip_logs_for_test(Skip::Stalled) == 1);
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+    }
+    SECTION("the late-start clock is read when the Stop pass HAS the lock, not at its entry") {
+        // A Stop pass queued behind a parked pass for 16 s of injected time is late once it
+        // gets the lock.
+        stage_n_4045(*rt, 2, "e53e");
+        persister->begin_stop();
+        persister->note_stop_store_trouble();
+        std::atomic<bool> in_pass{false}, release{false};
+        persister->set_post_snapshot_hook_for_test([&] {
+            in_pass.store(true);
+            (void)yuzu::test::spin_until([&] { return release.load(); });
+        });
+        std::thread a([&] { (void)persister->persist_staged(*rt, Trig::Forced); });
+        Join4045 ja{a};
+        yuzu::test::ScopeExit up{[&] { release.store(true); }};
+        REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
+        GuardianBaselinePersister::Outcome stop;
+        std::thread t([&] { stop = persister->persist_staged(*rt, Trig::Stop); });
+        Join4045 jt{t};
+        REQUIRE(yuzu::test::spin_until([&] { return persister->lock_waiters_for_test() == 1; }));
+        clock.advance(16'000);
+        release.store(true);
+        a.join();
+        t.join();
+        CHECK(stop.skipped_late_start);
+    }
+}
+
+TEST_CASE("#4045 E54: engine stop() on a HEALTHY store persists the captures although its mutex "
+          "wait ate 15 s, and skips only when one of its own store stages showed trouble",
+          "[spark][guardian][baseline][reconcile]") {
+    using Skip = GuardianBaselinePersister::StopSkip;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+
+    // Per case: how long stop() waited for the engine mutex (injected clock), whether the
+    // loss-ledger write really fails, and which stage the hook makes slow by how much.
+    std::int64_t hold_ms = 16'000;
+    bool fail_ledger = false;
+    std::string slow_stage;
+    std::int64_t slow_ms = 0;
+    bool expect_skip = false;
+
+    SECTION("H1 shape: healthy store, apply_rules held the mutex for 16 s: the pass runs") {
+        expect_skip = false;
+    }
+    SECTION("the same wait, but the loss-ledger write fails (a BUSY store): skipped") {
+        fail_ledger = true;
+        expect_skip = true;
+    }
+    SECTION("the same failing ledger with a wait under 15 s: the pass still runs") {
+        fail_ledger = true;
+        hold_ms = 14'999;
+        expect_skip = false;
+    }
+    SECTION("the second journal flush takes a busy timeout: skipped") {
+        hold_ms = 10'000;
+        slow_stage = "journal_flush_2";
+        slow_ms = 5'000;
+        expect_skip = true;
+    }
+    SECTION("the second journal flush takes just under a busy timeout: not trouble, runs") {
+        hold_ms = 10'001;
+        slow_stage = "journal_flush_2";
+        slow_ms = 4'999;
+        expect_skip = false;
+    }
+    SECTION("the first journal flush takes a busy timeout: skipped") {
+        hold_ms = 10'000;
+        slow_stage = "journal_flush_1";
+        slow_ms = 5'000;
+        expect_skip = true;
+    }
+    SECTION("the worker join takes a busy timeout: skipped") {
+        hold_ms = 10'000;
+        slow_stage = "worker_join";
+        slow_ms = 5'000;
+        expect_skip = true;
+    }
+
+    f.engine->set_stop_stage_hook_for_test([&](const char* stage) {
+        if (slow_stage == stage)
+            clock.advance(slow_ms);
+    });
+
+    // stop() queued behind a parked apply_rules, as in E45.
+    std::atomic<bool> in_apply{false};
+    std::atomic<bool> release{false};
+    int apply_rc = -1;
+    f.engine->set_apply_post_drain_hook_for_test([&] {
+        in_apply.store(true);
+        (void)yuzu::test::spin_until([&] { return release.load(); });
+    });
+    std::thread apply_thread([&] {
+        apply_rc = f.dispatch_raw(make_service_rule("r1", /*enabled=*/false), false).exit_code;
+    });
+    Join4045 join_apply{apply_thread};
+    yuzu::test::ScopeExit unpark_apply{[&] { release.store(true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return in_apply.load(); }));
+    // apply_rules ran its one Forced pass at its start; what is staged now stays staged.
+    stage_n_4045(*rt, 3, "e54");
+    if (fail_ledger)
+        fail_baseline_writes_4045(f.db_.path, "legacy_sink_loss_ledger");
+    std::thread stop_thread([&] { f.engine->stop(); });
+    Join4045 join_stop{stop_thread};
+    yuzu::test::ScopeExit unpark_stop{[&] { release.store(true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return persister->stop_begun_for_test(); }));
+    clock.advance(hold_ms);
+    release.store(true);
+    apply_thread.join();
+    stop_thread.join();
+    CHECK(apply_rc == 0);
+
+    if (expect_skip) {
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 1);
+        CHECK(rt->staged_baseline_count_for_test() == 3);
+        CHECK_FALSE(baseline_record_4045(*f.kv, "r0").has_value());
+    } else {
+        // RED if the late start were judged on elapsed time alone (the H1 loss).
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+        CHECK(persister->stop_skip_logs_for_test(Skip::Stalled) == 0);
+        CHECK(rt->staged_baseline_count_for_test() == 0);
+        for (const char* id : {"r0", "r1", "r2"})
+            CHECK(baseline_record_4045(*f.kv, id).has_value());
+    }
+}
+
+TEST_CASE("#4045 E55: a stop() that read the persister pointer before wire published it still "
+          "gets its mark once it holds the engine mutex",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(persister != nullptr);
+    // The top-of-stop() read finds null, exactly as if wire_spark_engine had not yet published.
+    f.engine->unpublish_baseline_persister_for_test();
+    REQUIRE_FALSE(persister->stop_begun_for_test());
+    f.engine->stop();
+    CHECK(persister->stop_begun_for_test()); // RED without the post-lock begin_stop()
+}
+
+TEST_CASE("#4045 E56: a lifecycle-journal flush that fails at stop() is store trouble, and a "
+          "clean stop records none",
+          "[spark][guardian][baseline][reconcile]") {
+    SparkReconcileFixture f;
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(persister != nullptr);
+    // Leave a journal record pending: the arm resolves on a worker after apply_rules' own exit
+    // flush, so nothing but stop() flushes it (the same ordering gate as the tick-retry case).
+    f.mechanism->hang_next_watch();
+    REQUIRE(f.dispatch_raw(make_service_rule("r1")).exit_code == 0);
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(5)));
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 1; }));
+    REQUIRE_FALSE(persister->stop_store_trouble_for_test());
+
+    SECTION("the first flush fails (the injected write failure): trouble") {
+        f.engine->lifecycle_journal_for_test()->inject_write_failures_for_test(1);
+        f.engine->stop();
+        CHECK(persister->stop_store_trouble_for_test()); // RED if the flush result were dropped
+    }
+    SECTION("nothing fails: no trouble recorded") {
+        f.engine->stop();
+        CHECK_FALSE(persister->stop_store_trouble_for_test());
     }
 }

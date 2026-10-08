@@ -15507,3 +15507,103 @@ TEST_CASE("#4045 R10: a failing inherit copy in attach_core leaves the PRIOR gen
                                       e.drift.expected_value == "h" && e.drift.detected_value == "h2");
     CHECK(drift_again);
 }
+
+
+// ── #4045: re-push inheritance guards and the stop-time sweep contract ─────────────────────
+TEST_CASE("#4045 R11: an explicit expected_hash re-push is NOT overridden by a staged leftover",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    const auto key = spark_key(file_spec("/a"));
+    rt->evaluate_key(key, EvalReason::Initial); // captured "h" and staged
+    REQUIRE(rt->staged_baseline_count_for_test() == 1);
+    (void)drain_all(*rt);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1", "explicit"), true));
+    rt->evaluate_key(key, EvalReason::Initial);
+    bool drift_vs_explicit = false;
+    for (const auto& e : drain_all(*rt))
+        drift_vs_explicit = drift_vs_explicit ||
+                            (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                             e.drift.expected_value == "explicit");
+    CHECK(drift_vs_explicit);
+}
+TEST_CASE("#4045 R11b: same, with the staging retry failing at attach (re-read path)",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    const auto key = spark_key(file_spec("/a"));
+    rt->fail_next_stage_baseline_for_test(2);
+    rt->evaluate_key(key, EvalReason::Initial); // not staged
+    (void)drain_all(*rt);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1", "explicit"), true));
+    rt->evaluate_key(key, EvalReason::Initial);
+    bool drift_vs_explicit = false;
+    for (const auto& e : drain_all(*rt))
+        drift_vs_explicit = drift_vs_explicit ||
+                            (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                             e.drift.expected_value == "explicit");
+    CHECK(drift_vs_explicit);
+}
+TEST_CASE("#4045 R12: a kind-switching re-push with a staged leftover counts no spurious drop",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    REQUIRE(rt->staged_baseline_count_for_test() == 1);
+    REQUIRE(rt->attach_rule("r1", svc_spec("svc"), svc_running_rule("r1"), true));
+    CHECK(rt->staged_baseline_drops() == 0);
+}
+TEST_CASE("#4045 R13: the stop-time sweep is idempotent (a staged generation is not staged again)",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->fail_next_stage_baseline_for_test();
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial); // unstaged
+    CHECK(rt->stage_unstaged_baselines() == 0);
+    REQUIRE(rt->staged_baseline_count_for_test() == 1);
+    const auto snap = rt->snapshot_staged_baselines();
+    rt->erase_staged_baselines_if_unchanged(snap); // "persisted"
+    REQUIRE(rt->staged_baseline_count_for_test() == 0);
+    CHECK(rt->stage_unstaged_baselines() == 0);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    CHECK(rt->staged_baseline_drops() == 1); // the arm-time failure only: no second attempt
+}
+TEST_CASE("#4045 R13b: a sweep whose staging failed leaves the capture retryable",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->fail_next_stage_baseline_for_test(2);
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial); // unstaged (fail 1)
+    CHECK(rt->stage_unstaged_baselines() == 1);                        // fail 2: still unstaged
+    REQUIRE(rt->staged_baseline_count_for_test() == 0);
+    CHECK(rt->stage_unstaged_baselines() == 0); // the flag stayed set, so the next call retries
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    CHECK(rt->staged_baseline_drops() == 2);
+}
+
+TEST_CASE("#4045 R14: the stop-time sweep runs only AFTER the runtime began stopping",
+          "[spark][runtime][baseline]") {
+    // GuardianEngine::stop() sweeps after the runtime's begin_stop(), so no commit can stage
+    // between the sweep and the final flush (evaluate_key's commit refuses once stopping_).
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    CHECK(rt->unstaged_sweep_stopping_for_test() == -1); // not run yet
+    (void)rt->stage_unstaged_baselines();
+    CHECK(rt->unstaged_sweep_stopping_for_test() == 0);
+    rt->begin_stop();
+    (void)rt->stage_unstaged_baselines();
+    CHECK(rt->unstaged_sweep_stopping_for_test() == 1);
+}
