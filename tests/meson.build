@@ -1374,6 +1374,8 @@ if build_server
       'unit/server/test_secret_file.cpp', # #5272 --postgres-dsn-file / --oidc-client-secret-file
       'unit/server/test_mcp_body_cap.cpp',
       'unit/server/test_dispatch_target_shape.cpp',
+      'unit/server/test_instruction_param_schema.cpp',
+      'unit/server/test_instruction_param_golden.cpp', # golden accept/reject table over the shipped definitions
       'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',

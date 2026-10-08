@@ -297,6 +297,7 @@ spec:
         displayName: Line Limit
         description: >
           Maximum number of lines to return. Default: 100, max: 10000.
+          Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.
         default: 100
         validation:
           minimum: 1
@@ -796,6 +797,7 @@ spec:
         displayName: Maximum Depth
         description: >
           Maximum directory recursion depth. Default: 3, max: 10.
+          Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.
         default: 3
         validation:
           minimum: 1
