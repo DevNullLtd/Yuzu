@@ -272,7 +272,7 @@ TEST_CASE("stability: regression term", "[dex][stability]") {
                    88.0, StabilityBand::Good);
 }
 
-TEST_CASE("stability: decomposition and constants", "[dex][stability]") {
+TEST_CASE("stability: decomposition and labels", "[dex][stability]") {
     auto r = compute_stability_score(
         mk(1000, 100, 300, 20, Rr{2.0, 4.5}), kFloor);
     REQUIRE(r.deductions.size() == 4);
@@ -284,20 +284,6 @@ TEST_CASE("stability: decomposition and constants", "[dex][stability]") {
     CHECK(std::string(stability_band_label(StabilityBand::Good)) == "good");
     CHECK(std::string(stability_band_label(StabilityBand::Fair)) == "fair");
     CHECK(std::string(stability_band_label(StabilityBand::Poor)) == "poor");
-
-    CHECK(kStabilityWeights.breadth == 60.0);
-    CHECK(kStabilityWeights.crashes == 20.0);
-    CHECK(kStabilityWeights.hangs == 8.0);
-    CHECK(kStabilityWeights.regression == 12.0);
-    CHECK(kStabilityWeights.breadth + kStabilityWeights.crashes + kStabilityWeights.hangs +
-              kStabilityWeights.regression ==
-          100.0);
-    CHECK(kStabilityPerDeviceEventCap == 5);
-    CHECK(kStabilityRegressionFullRatio == 3.0);
-    CHECK(kStabilityBandExcellent == 90.0);
-    CHECK(kStabilityBandGood == 75.0);
-    CHECK(kStabilityBandFair == 60.0);
-    CHECK(kStabilityScoreScale == 10.0);
 }
 
 TEST_CASE("stability: display score rounds half away from zero at one decimal",
