@@ -1560,6 +1560,7 @@ if build_server
       'unit/server/test_guardian_journal_fleet_tags.cpp',
       'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin
       'unit/server/test_guardian_reconcile_budget.cpp', # #5513 — reconcile admission budget (leaky bucket)
+      'unit/server/test_guardian_reconcile_gate.cpp', # #5513 — reconcile claim map + admit-before-claim ordering
       'unit/server/test_guardian_generation_cache.cpp', # #5513 — TTL-cached policy-generation read
       'unit/server/test_guardian_rule_bundle.cpp', # #5513 — per-generation rule-bundle memo
       'unit/server/test_agent_registry_scope_for_agent.cpp', # #5513 — single-agent scope evaluator
