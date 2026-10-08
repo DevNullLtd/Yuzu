@@ -1351,6 +1351,7 @@ TEST_CASE("executions list: a gate 503 is rewritten to a 200 degrade note withou
     CHECK(res.get_header_value("Content-Type").find("text/html") != std::string::npos);
     CHECK(res.body.find("data-degraded=\"gate\"") != std::string::npos);
     CHECK(res.body.find("Retry shortly.") != std::string::npos);
+    CHECK(res.body.find("No executions yet") == std::string::npos);
     CHECK_FALSE(res.has_header("Retry-After"));
     CHECK_FALSE(leaks_gate_body(res.body));
     CHECK(res.body.find("data-execution-id") == std::string::npos);

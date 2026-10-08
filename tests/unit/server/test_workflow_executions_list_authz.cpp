@@ -166,7 +166,10 @@ struct ListRig {
     // The audit rows (via svc_auth) with this action, as "result|detail".
     std::vector<std::string> audit(const std::string& action) {
         std::vector<std::string> out;
-        auto rows = audit_store.query({});
+        AuditQuery q;
+        q.action = action;
+        q.limit = 1000;
+        auto rows = audit_store.query(q);
         REQUIRE(rows.has_value());
         for (const auto& row : *rows)
             if (row.action == action)
@@ -203,6 +206,7 @@ void check_degraded_note(const ListRig::Resp& r) {
     CHECK(r.status == 200);
     CHECK(has(r.body, "data-degraded=\"gate\""));
     CHECK(has(r.body, "Retry shortly."));
+    CHECK_FALSE(has(r.body, "No executions yet"));
     CHECK(r.ids.empty());
     CHECK_FALSE(has(r.body, "data-execution-id"));
     CHECK_FALSE(has(r.body, "data-denied"));
@@ -446,10 +450,11 @@ TEST_CASE("fragments/executions real gate: with RBAC off (the default) every aut
         CHECK(got.status == 200);
         CHECK(got.ids == everything);
     }
+    const auto rows_before = r.audit("auth.fleet_read_required").size();
     auto svc = r.get(svc_token, /*use_tag_aware_auth=*/true);
     check_denied_note(svc);
-    // The refused service token left a denied gate row (dave's control denial is the other).
-    CHECK_FALSE(r.audit("auth.fleet_read_required").empty());
+    // The refused service token itself wrote one more denied gate row.
+    CHECK(r.audit("auth.fleet_read_required").size() == rows_before + 1);
 }
 
 // The service axis needs a tag read to resolve the token's scope; when the tag store is
