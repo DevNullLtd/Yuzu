@@ -7,7 +7,6 @@
 #
 # Usage (as the installer runs it):
 #   $env:YUZU_SETUP_ADMIN_USER / $env:YUZU_SETUP_ADMIN_PASS          (required)
-#   $env:YUZU_SETUP_OPERATOR_USER / $env:YUZU_SETUP_OPERATOR_PASS    (optional pair)
 #   the installer reads this file as text and runs it as a script block, with
 #   -ConfigPath "<locked dir>\yuzu-server.cfg" -ReasonPath "<file>"
 #
@@ -31,8 +30,10 @@
 #
 # FRESH INSTALLS ONLY, in effect: the file it writes only SEEDS the first
 # administrator into an empty auth database (#5274), so the installer refuses
-# a password on an upgrade (exit code 11) and never runs this script then. The
-# operator entry is not provisioned on a PostgreSQL auth store today (#5343).
+# a password on an upgrade (exit code 11) and never runs this script then. It
+# writes the administrator ONLY (#5343): a second entry was never provisioned
+# on a PostgreSQL auth store and could not sign in; further accounts are created
+# in Settings > User Management.
 
 param(
     [Parameter(Mandatory=$true)][string]$ConfigPath,
@@ -93,8 +94,6 @@ $tmp = $null
 try {
     $adminUser = $env:YUZU_SETUP_ADMIN_USER
     $adminPass = $env:YUZU_SETUP_ADMIN_PASS
-    $opUser = $env:YUZU_SETUP_OPERATOR_USER
-    $opPass = $env:YUZU_SETUP_OPERATOR_PASS
 
     Test-Username $adminUser 'admin'
     Test-Password $adminPass 'admin'
@@ -107,13 +106,6 @@ try {
         ''
     )
     $lines += New-PBKDF2Entry $adminUser $adminPass 'admin'
-
-    if (-not [string]::IsNullOrEmpty($opUser)) {
-        Test-Username $opUser 'operator'
-        if ($opUser -eq $adminUser) { Fail 'operator username must differ from the admin username' }
-        Test-Password $opPass 'operator'
-        $lines += New-PBKDF2Entry $opUser $opPass 'user'
-    }
 
     $dir = [System.IO.Path]::GetDirectoryName($ConfigPath)
     if (-not [System.IO.Directory]::Exists($dir)) { Fail "the data directory does not exist: $dir" }

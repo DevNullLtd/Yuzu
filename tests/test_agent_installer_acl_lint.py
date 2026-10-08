@@ -51,6 +51,15 @@ What they pin, each verified on Windows Server 2022:
   to secure the directory says what that attempt left there (a non-empty
   Outcome). These checks read the [Code] text with its comments removed, so a
   commented-out call does not satisfy them.
+- The server installer writes the administrator ONLY (#5343). The second
+  first-run account (/OPERATOR_USER, /OPERATOR_PASS, the operator wizard page
+  and the YUZU_SETUP_OPERATOR_* hand-off to generate-config.ps1) was written to
+  yuzu-server.cfg alone and could never sign in on PostgreSQL. None of it may
+  come back: the identifiers are gone from both files, generate-config.ps1
+  emits exactly one cfg entry, and a non-empty /OPERATOR_USER= or /OPERATOR_PASS=
+  is refused in CheckInputs (exit 7) -- the ONE place the installer reads
+  /OPERATOR_USER. InitializeSetup's upgrade refusal (exit 11) is a separate
+  check on /OPERATOR_PASS and stays.
 - No line in either [Code] section starts (after blanks) with `[` or `#`, and
   none contains `{#` or ends in ` \`. Inno reads a line starting with `[` as a
   section header even inside a { } comment -- efc4f162c failed to compile with
@@ -71,6 +80,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ISS = ROOT / "deploy" / "packaging" / "windows" / "yuzu-agent.iss"
 SERVER_ISS = ROOT / "deploy" / "packaging" / "windows" / "yuzu-server.iss"
+GEN_CONFIG = ROOT / "deploy" / "packaging" / "windows" / "generate-config.ps1"
 MANUAL = ROOT / "docs" / "user-manual" / "server-admin.md"
 
 ROOT_ACES = r"\(A;OICI;FA;;;(SY|BA)\)\(A;OICI;FA;;;(SY|BA)\)$"
@@ -245,8 +255,35 @@ def in_order(body: str, *needles) -> bool:
     return True
 
 
-def problems(iss: str, md: str, server: str = "") -> list:
+def second_account_problems(server: str, genconf: str) -> list:
+    """#5343: the second first-run account must stay removed from the server installer."""
     found = []
+    for name, text in (("yuzu-server.iss", server), ("generate-config.ps1", genconf)):
+        for ident in ("YUZU_SETUP_OPERATOR", "OperatorPage", "OperatorUser", "OperatorPass",
+                      "OpUser", "OpPass"):
+            if ident in text:
+                found.append(f"{name} still mentions {ident} (the second first-run account, removed in #5343)")
+    pas = strip_pascal_comments(code_section(server))
+    if pas.count("GetCmdParam('OPERATOR_USER')") != 1:
+        found.append("yuzu-server.iss must read /OPERATOR_USER exactly once, in the CheckInputs refusal (#5343)")
+    check = routine(pas, "function CheckInputs(")
+    if not in_order(check, "GetCmdParam('OPERATOR_USER') <> ''", "GetCmdParam('OPERATOR_PASS') <> ''",
+                    "Result :=", "else if Inp.AdminPass <> '' then"):
+        found.append("CheckInputs no longer refuses a non-empty /OPERATOR_USER= or /OPERATOR_PASS= before anything else (#5343)")
+    init = routine(pas, "function InitializeSetup(")
+    if not in_order(init, "GetCmdParam('OPERATOR_PASS') <> ''", "ExitProcess(UpgradePasswordExitCode)"):
+        found.append("InitializeSetup no longer refuses /OPERATOR_PASS= on an upgrade with exit code 11 (#5274)")
+    if len(re.findall(r"New-PBKDF2Entry\s+\$", genconf)) != 1:
+        found.append("generate-config.ps1 must emit exactly one cfg entry (the administrator, #5343)")
+    if re.search(r"New-PBKDF2Entry[^\n]*'user'", genconf):
+        found.append("generate-config.ps1 writes a role 'user' cfg entry (#5343)")
+    return found
+
+
+def problems(iss: str, md: str, server: str = "", genconf: str = "") -> list:
+    found = []
+    if server and genconf:
+        found += second_account_problems(server, genconf)
     code = re.sub(r"\{[^}]*\}|\(\*.*?\*\)|//[^\n]*|^;[^\n]*", "", iss, flags=re.S | re.M)
     if re.search(r"(?i)takeown", code) or re.search(r"(?i)takeown", pascal_script(iss)):
         found.append("the installer runs takeown, which has no /L and may act on a link's target")
@@ -401,9 +438,10 @@ class InstallerAclLint(unittest.TestCase):
         self.iss = ISS.read_text(encoding="utf-8")
         self.md = MANUAL.read_text(encoding="utf-8")
         self.server = SERVER_ISS.read_text(encoding="utf-8")
+        self.genconf = GEN_CONFIG.read_text(encoding="utf-8")
 
     def test_source_is_clean(self):
-        self.assertEqual(problems(self.iss, self.md, self.server), [])
+        self.assertEqual(problems(self.iss, self.md, self.server, self.genconf), [])
 
     def test_mutations_are_caught(self):
         grant = grant_exec_args(self.iss)
@@ -466,16 +504,26 @@ class InstallerAclLint(unittest.TestCase):
             "server abort text says sc start": ("server", "or run: sc.exe start YuzuServer';", "or run: sc start YuzuServer';"),
             "server message says bare sc config": ("server", "(sc.exe config YuzuServer start= disabled)", "(sc config YuzuServer start= disabled)"),
             "server [Code] line starts with [": ("server", "// Appended to every abort message while", "[Run] entries never see this.\n// Appended to every abort message while"),
+            "second account: operator page back (#5343)": ("server", "  AdminPage: TInputQueryWizardPage;\n", "  AdminPage: TInputQueryWizardPage;\n  OperatorPage: TInputQueryWizardPage;\n"),
+            "second account: record fields back (#5343)": ("server", "    AdminUser, AdminPass: string;", "    AdminUser, AdminPass, OpUser, OpPass: string;"),
+            "second account: env hand-off back (#5343)": ("server", "  SetEnvironmentVariable('YUZU_SETUP_ADMIN_PASS', Inp.AdminPass);\n", "  SetEnvironmentVariable('YUZU_SETUP_ADMIN_PASS', Inp.AdminPass);\n  SetEnvironmentVariable('YUZU_SETUP_OPERATOR_USER', '');\n"),
+            "second account: silent read back (#5343)": ("server", "    R.AdminPass := GetCmdParam('ADMIN_PASS');\n", "    R.AdminPass := GetCmdParam('ADMIN_PASS');\n    R.OpName := GetCmdParam('OPERATOR_USER');\n"),
+            "second account: refusal dropped (#5343)": ("server", "if (GetCmdParam('OPERATOR_USER') <> '') or (GetCmdParam('OPERATOR_PASS') <> '') then", "if False then"),
+            "second account: refusal no longer first (#5343)": ("server", "\n  else if Inp.AdminPass <> '' then\n  begin\n    if BadUsername", ";\n  if Inp.AdminPass <> '' then\n  begin\n    if BadUsername"),
+            "second account: upgrade refusal (exit 11) dropped": ("server", "ExitProcess(UpgradePasswordExitCode);", "Log('x');"),
+            "second account: env read back in the script (#5343)": ("genconf", "    $adminPass = $env:YUZU_SETUP_ADMIN_PASS\n", "    $adminPass = $env:YUZU_SETUP_ADMIN_PASS\n    $opUser = $env:YUZU_SETUP_OPERATOR_USER\n"),
+            "second account: user cfg entry back (#5343)": ("genconf", "    $lines += New-PBKDF2Entry $adminUser $adminPass 'admin'\n", "    $lines += New-PBKDF2Entry $adminUser $adminPass 'admin'\n    $lines += New-PBKDF2Entry 'op' $adminPass 'user'\n"),
             "completion never recorded": ("iss", "    InstallCompleted := True;", "    Log('done');"),
             "restart Exec dropped": ("iss", "Exec(ExpandConstant('{sys}\\sc.exe'), 'start YuzuAgent'", "Exec(ExpandConstant('{sys}\\sc.exe'), 'query YuzuAgent'"),
             "attempted abort without outcome": ("iss", "True, NotCreated);", "True, '');"),
         }
         for name, (which, old, new) in mutations.items():
             with self.subTest(mutation=name):
-                srcs = {"iss": self.iss, "md": self.md, "server": self.server}
+                srcs = {"iss": self.iss, "md": self.md, "server": self.server,
+                        "genconf": self.genconf}
                 self.assertIn(old, srcs[which], f"mutation anchor for {name!r} not found")
                 srcs[which] = srcs[which].replace(old, new, 1)
-                self.assertNotEqual(problems(srcs["iss"], srcs["md"], srcs["server"]), [],
+                self.assertNotEqual(problems(srcs["iss"], srcs["md"], srcs["server"], srcs["genconf"]), [],
                                     f"{name!r} was not caught")
 
 
