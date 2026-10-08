@@ -355,6 +355,9 @@ class ComposeWizardCerts(unittest.TestCase):
             ("tls-key", "/srv/server.key"),
             ("tls-ca-cert", "ca.pem"),
             ("tls-cert", f"{TLS_DIR}"),
+            # Written into double-quoted YAML: a quote or backslash would break it.
+            ("tls-cert", f'{TLS_DIR}/a"b.pem'),
+            ("tls-key", f"{TLS_DIR}/a\\b.key"),
         ]:
             with self.subTest(field=field, path=path):
                 out = self._generate(**{field: path})

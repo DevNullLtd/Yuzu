@@ -7,7 +7,7 @@
   `/etc/yuzu/certs` the same writable volume as the other modes (the named `server-certs`
   volume when named volumes are on or Postgres is external). The `--cert`/`--key`/`--ca-cert`
   paths default to `/etc/yuzu/tls/...`, and the wizard refuses any of them outside
-  `/etc/yuzu/tls/`. The server refuses a private key that group or others can read, so
+  `/etc/yuzu/tls/`. The server refuses a private key with any group or other permission bit set, so
   `server.key` must be owned by uid 999 with mode 0600; the generated header says how. **If
   you generated an Operator-mode compose before this fix:** change its `./certs` mount to
   `./certs:/etc/yuzu/tls:ro`, point the three paths at `/etc/yuzu/tls/`, and add

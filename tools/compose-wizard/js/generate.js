@@ -158,7 +158,14 @@ function operatorPathsOutsideTlsDir(...paths) {
     }
     return '/' + out.join('/');
   };
+  // A path is accepted only if it is absolute, already in normal form (the
+  // `norm(p) === p` test is what makes the `..` handling in norm() a refusal
+  // rather than a rewrite: `/etc/yuzu/tls/../certs/k` normalises to a different
+  // string and is refused), sits under OPERATOR_TLS_DIR, and contains no quote,
+  // backslash or control character (the paths are written into double-quoted
+  // YAML items, so any of those would break the generated compose).
   return paths.filter(p => p && !(p.startsWith('/') &&
+                                  !/["\\\x00-\x1f]/.test(p) &&
                                   norm(p).startsWith(OPERATOR_TLS_DIR + '/') &&
                                   norm(p) === p));
 }
@@ -300,8 +307,8 @@ ${c.tlsMode === 'default' ? `## ⚠️ REQUIRES SECURE-BY-DEFAULT IMAGES. This T
 ` : ``}${c.tlsMode === 'operator' ? `## OPERATOR CERTS — before the first \`docker compose up\`:
 ##   Put server.pem, server.key and ca.pem in ./certs next to this file. They
 ##   are mounted READ-ONLY at ${OPERATOR_TLS_DIR} and must be readable by the
-##   container's yuzu user (uid 999). The server refuses a key that group or
-##   others can read, so the key must be OWNED by uid 999 with mode 0600:
+##   container's yuzu user (uid 999). The server refuses a key with any group or
+##   other permission bit set, so the key must be OWNED by uid 999 with mode 0600:
 ##     sudo chown 999:999 ./certs/server.key && sudo chmod 600 ./certs/server.key
 ##   /etc/yuzu/certs is a separate, WRITABLE volume the server owns (its
 ##   internal CA + the secrets KEK registered in Postgres). Back it up with the

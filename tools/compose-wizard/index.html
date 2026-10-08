@@ -149,7 +149,7 @@
             <strong>read-only</strong> at <code>/etc/yuzu/tls</code>, so every path must be
             under <code>/etc/yuzu/tls/</code>. The files must be readable by the container's
             <code>yuzu</code> user (uid 999 in the Debian <code>yuzu-server</code> image), and the
-            server refuses a private key that group or others can read, so give the key to
+            server refuses a private key with any group or other permission bit set, so give the key to
             that user with mode 0600:
             <code>sudo chown 999:999 ./certs/server.key &amp;&amp; sudo chmod 600 ./certs/server.key</code>.
           </div>
