@@ -186,6 +186,12 @@ function buildReview() {
     if (!val('tls-ca-cert')) {
       warnings.push('⚠️ Operator certs need a CA path — the server refuses to start with operator certs and no CA (mandatory mTLS client verification).');
     }
+    // #5420: ./certs is mounted read-only at OPERATOR_TLS_DIR (generate.js);
+    // /etc/yuzu/certs is the server's own writable volume, not the PEMs.
+    // (Warnings render via innerHTML, so the user-typed paths are not echoed.)
+    if (operatorPathsOutsideTlsDir(val('tls-cert'), val('tls-key'), val('tls-ca-cert')).length) {
+      warnings.push('⚠️ Operator cert/key/CA paths must all be under ' + OPERATOR_TLS_DIR + '/ (where ./certs is mounted read-only). /etc/yuzu/certs is the server\'s own writable directory, not your PEM files.');
+    }
   } else if (tlsMode === 'plaintext') {
     warnings.push('⚠️ Plaintext TLS mode: the agent↔server channel is unencrypted (--no-tls --no-https). Dev only — do not internet-expose port 50051.');
   }
