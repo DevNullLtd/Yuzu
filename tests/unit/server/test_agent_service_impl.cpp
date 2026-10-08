@@ -1171,6 +1171,56 @@ TEST_CASE("Register: rejects empty agent_id with INVALID_ARGUMENT (W1.4 R2 / UP-
     CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", labels).value() == 1.0);
 }
 
+TEST_CASE("Register: rejects an agent_id with an embedded NUL with INVALID_ARGUMENT",
+          "[pg][agent_service][register][failclosed]") {
+    // libpq text binds are NUL-terminated C strings, so an id containing a NUL byte is refused
+    // at the door with its own metric reason, and the length reason must NOT tick (a NUL id is
+    // within the length bound).
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id(std::string("agent-a\0x", 9));
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+
+    apb::RegisterResponse resp;
+    auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+
+    CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+    CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", yuzu::Labels{{"reason", "nul"}})
+              .value() == 1.0);
+    CHECK(h.metrics
+              .counter("yuzu_register_invalid_agent_id_total", yuzu::Labels{{"reason", "length"}})
+              .value() == 0.0);
+}
+
+TEST_CASE("ProxyRegister: rejects an agent_id with an embedded NUL with INVALID_ARGUMENT",
+          "[pg][agent_service][register][gateway][failclosed]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id(std::string("agent-a\0x", 9));
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+
+    apb::RegisterResponse resp;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+
+    CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+    yuzu::Labels labels{{"reason", "nul"}, {"source", "gateway_proxy"}};
+    CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", labels).value() == 1.0);
+    CHECK(h.registry.trusted_gateway_peer_count() == 0);
+}
+
 TEST_CASE("ProxyRegister: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 R2 / UP-H1)",
           "[pg][agent_service][register][gateway][w1_4_r2][up_h1]") {
     // Mirror of the direct-Register path. ProxyRegister carries the same

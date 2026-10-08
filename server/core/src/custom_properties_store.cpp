@@ -32,11 +32,13 @@ constexpr const char* kStoreName = "custom_properties_store";
 // wait a little; none may block unboundedly on a saturated pool.
 constexpr std::chrono::milliseconds kAcquireTimeout{2000};
 
-// agent_id read guard. The same predicate as tag_store.cpp's valid_agent_id (file-local there;
+// agent_id guard (reads AND writes). The same predicate as tag_store.cpp's valid_agent_id (file-local there;
 // duplicated rather than shared so the two stores stay independent): libpq's text binds are
 // C strings, so an id containing a NUL byte cannot be represented at the DB seam. A malformed
-// id has no properties by definition, so the reads below answer empty / nullopt instead of
-// touching the database. Length cap matches the REST/gRPC agent_id bound (256).
+// id has no properties by definition, so the reads below answer empty /
+// nullopt instead of touching the database, and the writes refuse (set_property returns an
+// error, delete_property answers not-found, delete_all_properties is a logged no-op), exactly
+// as TagStore's write seams do. Length cap matches the REST/gRPC agent_id bound (256).
 bool valid_agent_id(const std::string& agent_id) {
     return !agent_id.empty() && agent_id.size() <= 256 &&
            agent_id.find('\0') == std::string::npos;
@@ -411,6 +413,8 @@ CustomPropertiesStore::set_property(const std::string& agent_id, const std::stri
                                     const std::string& value, const std::string& type) {
     if (!open_)
         return std::unexpected(std::string(kCustomPropertiesDbErrorPrefix) + "store not open");
+    if (!valid_agent_id(agent_id))
+        return std::unexpected("invalid agent id (1-256 bytes, no NUL)");
     if (!validate_key(key))
         return std::unexpected("invalid property key (1-64 chars, alphanumeric/._:-)");
     if (!validate_value(value))
@@ -465,6 +469,10 @@ CustomPropertiesStore::set_property(const std::string& agent_id, const std::stri
 bool CustomPropertiesStore::delete_property(const std::string& agent_id, const std::string& key) {
     if (!open_)
         return false;
+    // Honest not-found, as TagStore::delete_tag: the write guard means no row can exist under
+    // such an identity.
+    if (!valid_agent_id(agent_id))
+        return false;
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::delete_property: no connection in time ({})",
@@ -487,6 +495,11 @@ bool CustomPropertiesStore::delete_property(const std::string& agent_id, const s
 void CustomPropertiesStore::delete_all_properties(const std::string& agent_id) {
     if (!open_)
         return;
+    if (!valid_agent_id(agent_id)) {
+        spdlog::warn("CustomPropertiesStore::delete_all_properties: refused an invalid agent id "
+                     "(1-256 bytes, no NUL)");
+        return;
+    }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::delete_all_properties: no connection in time ({})",

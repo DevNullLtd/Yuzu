@@ -108,6 +108,16 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                             "agent_id length exceeds 256 chars or empty");
     }
+    // Defence in depth: libpq text binds take agent_id as a NUL-terminated string, so an id
+    // containing a NUL byte is refused here as well, instead of relying on the earlier
+    // pending-status check alone. No legitimate agent produces one. Distinct `reason` label
+    // from the length check; the id itself is not logged (client-supplied).
+    if (info.agent_id().find('\0') != std::string::npos) {
+        spdlog::warn("Register rejected: agent_id contains an embedded NUL");
+        metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "nul"}}).increment();
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "agent_id contains an embedded NUL");
+    }
 
     // PR3: Register is bootstrap-exempt. A first-enrollment agent presents NO
     // client cert (it obtains one via this very call), so a no-cert Register is

@@ -610,6 +610,18 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                             "agent_id length exceeds 256 chars or empty");
     }
+    // Embedded NUL: same rejection as the direct Register (see AgentServiceImpl::Register).
+    if (info.agent_id().find('\0') != std::string::npos) {
+        spdlog::warn("[gateway] ProxyRegister rejected: agent_id contains an embedded NUL");
+        if (metrics_) {
+            metrics_
+                ->counter("yuzu_register_invalid_agent_id_total",
+                          {{"reason", "nul"}, {"source", "gateway_proxy"}})
+                .increment();
+        }
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "agent_id contains an embedded NUL");
+    }
 
     // -- Tiered enrollment (same logic as AgentServiceImpl::Register) ----------
     //

@@ -296,6 +296,46 @@ TEST_CASE("CustomPropertiesStore: delete all properties for agent",
     CHECK(props.empty());
 }
 
+TEST_CASE("CustomPropertiesStore: writes reject an agent_id with an embedded NUL",
+          "[pg][custom_props][crud][failclosed]") {
+    // libpq text binds are NUL-terminated C strings: every write seam refuses an id containing
+    // a NUL byte and leaves the row of the id before the NUL untouched. Mirrors TagStore's
+    // write guard.
+    PROPS_SHARED(store, pool);
+    require_ok(store.set_property("agent-a", "owner", "alice"));
+    const std::string nul_id("agent-a\0x", 9);
+
+    SECTION("set_property reports failure and writes nothing") {
+        auto r = store.set_property(nul_id, "owner", "bob");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("invalid agent id") != std::string::npos);
+        // The error is a caller error, not a store-degrade error (the REST route maps the
+        // latter to 503).
+        CHECK(r.error().rfind(kCustomPropertiesDbErrorPrefix, 0) != 0);
+        auto v = store.get_value("agent-a", "owner");
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK(**v == "alice");
+        CHECK(require_ok(store.get_properties("agent-a")).size() == 1);
+    }
+    SECTION("delete_property answers not-found and leaves the row of agent-a") {
+        CHECK_FALSE(store.delete_property(nul_id, "owner"));
+        auto v = store.get_value("agent-a", "owner");
+        REQUIRE(v.has_value());
+        CHECK(v->has_value());
+    }
+    SECTION("delete_all_properties leaves the rows of agent-a") {
+        store.delete_all_properties(nul_id);
+        CHECK(require_ok(store.get_properties("agent-a")).size() == 1);
+    }
+    SECTION("empty and oversized ids are refused the same way") {
+        CHECK_FALSE(store.set_property("", "k", "v").has_value());
+        CHECK_FALSE(store.set_property(std::string(257, 'a'), "k", "v").has_value());
+        CHECK_FALSE(store.delete_property("", "k"));
+        CHECK_FALSE(store.delete_property(std::string(257, 'a'), "k"));
+    }
+}
+
 TEST_CASE("CustomPropertiesStore: get_properties lists all for agent",
           "[pg][custom_props][crud]") {
     PROPS_SHARED(store, pool);
