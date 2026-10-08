@@ -1163,7 +1163,8 @@ void GuardianEngine::journal_maintenance_tick() {
             // policy_generation_), so a clear nested inside it would never fire.
             if (boot_unresolved_) {
                 boot_unresolved_ = false;
-                spdlog::info("Guardian: boot re-arm resolved (the ack-drain tick applied cleanly), "
+                spdlog::info("Guardian: boot re-arm flag cleared (the ack-drain tick saw no arm "
+                             "failure; a legacy arm that returned false is not detected, #2797), "
                              "reporting policy_generation={} again",
                              policy_generation_);
             }
@@ -1825,8 +1826,9 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     const bool clean = reconcile_failures == 0 && ack_ledger_->can_advance();
     if (clean && boot_unresolved_) {
         boot_unresolved_ = false;
-        spdlog::info("Guardian: boot re-arm resolved (this push applied cleanly), reporting "
-                     "policy_generation={} again",
+        spdlog::info("Guardian: boot re-arm flag cleared (this push applied without an arm "
+                     "failure; a legacy arm that returned false is not detected, #2797), "
+                     "reporting policy_generation={} again",
                      policy_generation_);
     }
     if (clean && push.policy_generation() > policy_generation_) {
