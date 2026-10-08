@@ -4,7 +4,7 @@ Reference for the authentication and authorization features implemented in the Y
 
 ## Transport and identity
 
-- **mTLS** for agent ↔ server gRPC connections. Note that a migration from gRPC->QUIC is intended.
+- **mTLS** for agent ↔ server gRPC connections. gRPC is the permanent transport (ADR-0066; the QUIC migration, #376, was withdrawn).
 - **Windows certificate store integration** — agent can read mTLS client cert + private key from the Windows cert store instead of PEM files. Uses CryptoAPI/CNG (`CertOpenStore`, `CertFindCertificateInStore`, `NCryptExportKey`). Searches Local Machine first, falls back to Current User. Exports full certificate chain (leaf + intermediates) as PEM. CLI flags: `--cert-store MY --cert-subject "yuzu-agent"` or `--cert-thumbprint "AB12..."`.
 - **Certificate hot-reload** — HTTPS cert/key PEM files are polled for changes (default 60s interval) and hot-swapped without server restart. Validates PEM parse, cert/key match, and key file permissions before applying. gRPC TLS reload not supported. CLI: `--no-cert-reload`, `--cert-reload-interval`. Audit action: `cert.reload`. Metrics: `yuzu_server_cert_reloads_total`, `yuzu_server_cert_reload_failures_total`.
 
@@ -3855,8 +3855,8 @@ CIDR containment in `cidr_match.{hpp,cpp}`.
 **Gateway origin-IP attribution (#1064).** On the gateway `ProxyRegister` path
 the server's transport peer is the *gateway's* IP, so audit rows would
 mis-attribute the source (SOC 2 IR-2). `RegisterRequest.gateway_observed_peer`
-(an optional, gateway-authoritative, transport-agnostic field — survives the
-planned gRPC→QUIC move) carries the agent's origin IP; the server records
+(an optional, gateway-authoritative, transport-agnostic field — carried in the
+message, not in transport metadata) carries the agent's origin IP; the server records
 `source_ip`=agent origin and `gateway_ip`=transport peer, falling back to the
 gateway IP (`origin_observed=false`) when absent. The *direct* Register path
 ignores the field, so a *direct* agent cannot forge a source IP. It is **not** a
@@ -3864,8 +3864,9 @@ defence against a compromised gateway (which is inside the trust boundary and
 can set any value) — both `source_ip` and the gateway's `gateway_ip` are
 recorded so an auditor can cross-check. **Server-side consumption ships now; the
 gateway-side population is a follow-up** — today's grpcbox transport can only
-source it from `x-forwarded-for` (proxied deployments), and the durable
-direct-mode source arrives with the QUIC transport (#376) that owns its socket.
+source it from `x-forwarded-for` (proxied deployments); grpcbox does not yet
+expose the transport peer to the gateway's handlers, and the vendored accessor
+that will is #1172.
 
 ## HTTPS and bind defaults (hard invariants)
 
@@ -4073,7 +4074,8 @@ functional on the data plane. PR5d closes the *issuance* half of this gap
 CSR-signing, so the identity exists and is recorded/revocable in `ca_store`), but
 *enforcing* that revocation at the gateway edge is future work: durable
 cryptographic through-gateway identity (and therefore through-gateway revocation)
-arrives with the QUIC single-connection migration (#376). Until then, to revoke a
+arrives with the gRPC gateway-hop identity design, #5578 (ADR-0066; the
+QUIC migration, #376, was withdrawn). Until then, to revoke a
 gateway-proxied agent promptly, revoke at the gateway/management layer (disconnect
 the agent) in addition to `POST /api/v1/ca/revoke`. This is the same
 direct-connect-authoritative caveat called out in `docs/pki-architecture.md`
@@ -4111,7 +4113,7 @@ Compensating controls (why this is accepted for M1, not a live break):
 The actual cryptographic remediation — gateway agent-identity **attestation** +
 per-gateway issuance **scoping** so a gateway can only obtain leaves for the
 `agent_id`s it legitimately fronts — is tracked in **#1292** (cryptographic
-through-gateway binding lands with the QUIC migration, #376). Full threat model:
+through-gateway binding is the gRPC gateway-hop identity design, #5578, ADR-0066). Full threat model:
 `docs/security-reviews/pki-pr5-gateway-tls.md`; also summarised in
 `docs/pki-architecture.md`.
 
