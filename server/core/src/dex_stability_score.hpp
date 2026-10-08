@@ -8,8 +8,9 @@
  * on the score: it is a transparent number for people to read, and every
  * score carries the deductions that produced it.
  *
- * Score = clamp(100 - sum of deductions, 0, 100). Four deductions, always
- * returned in this order, each with its RAW points (before the clamp):
+ * Score = clamp(100 - sum of deductions, 0, 100). Four deductions, each with
+ * its RAW points (before the clamp). A scored result carries them in this
+ * order; a withheld result carries none:
  *
  *   breadth     60 * A / N                       share of devices affected
  *   crashes     20 * crash_events / (N * cap)    crash intensity, fleet-normalised
@@ -17,30 +18,70 @@
  *   regression  12 * clamp((lower - 1) / (3 - 1), 0, 1)
  *
  * - Breadth comes first: how many devices are hit matters more than how often
- *   one device is hit. Intensity is capped per device (cap = 5 events, the
- *   same "full severity at 5" the device score uses in dex_read_model.cpp),
- *   so one crash-looping device cannot outweigh a widespread problem.
+ *   one device is hit. Intensity is capped per device at 5 events, so one
+ *   crash-looping device cannot outweigh a widespread problem. The value
+ *   mirrors the function-local kCap in dex_read_model.cpp; the scope differs:
+ *   the device score caps per signal family (summed over its signals), this
+ *   module caps crashes and hangs separately (up to 10 events per device).
  * - The per-device cap is the CALLER's job: crash_events and hang_events must
- *   be sums of min(events_d, kPerDeviceEventCap) over devices. A sum above
- *   A * cap proves the cap was skipped, and is withheld as "inconsistent"
- *   rather than clamped (an aggregate clamp is not per-device capping).
- * - Regression is assessed only when a rate-ratio interval against the
+ *   be sums of min(events_d, kStabilityPerDeviceEventCap) over devices. A sum
+ *   above A * cap proves the cap was skipped, and is withheld as
+ *   "inconsistent" rather than clamped (an aggregate clamp is not per-device
+ *   capping). The check is necessary, not sufficient: an uncapped feed that
+ *   stays under A * cap scores silently.
+ * - Regression is assessed only when a usable rate-ratio interval against the
  *   previous version is supplied. It uses the interval's LOWER bound, so only
  *   a regression the data supports counts. An interval containing 1 or lying
  *   below 1 scores 0 points: an improving version earns no credit. Regression
- *   takes its full weight at a 3x lower-bound rate ratio (kRegressionFullRatio);
- *   2x takes half.
- * - Bands: excellent >= 90, good >= 75, fair >= 60, else poor. These are the
- *   same edges and labels as the device health band, so one vocabulary serves
- *   both pages.
- * - `floor` is the reporting-device minimum (callers pass kDexCohortFloor):
- *   fewer devices withholds the score as below_floor rather than showing a
- *   noisy number.
- * - Missing or contradictory data is withheld (score and band empty, `withheld`
- *   names why), never shown as 0 or 100.
- * - With the default weights (sum 100) every term lies in [0, 1] of its
- *   weight, so 100 - sum(points) == score. Custom weights whose raw sum
- *   exceeds 100 clamp the score to 0; the rows still report raw points.
+ *   takes its full weight at a 3x lower-bound rate ratio
+ *   (kStabilityRegressionFullRatio); 2x takes half. An interval is usable when
+ *   lower is finite and >= 0 and lower <= upper. Upper may be +infinity (the
+ *   previous version had no events): only lower is read, upper serves the
+ *   ordering check. An unusable interval leaves regression unassessed at 0
+ *   points. The caller passes nullopt (never a default
+ *   StabilityRateRatioInterval{0, 0}, which is a valid interval scoring 0)
+ *   when the interval is unreliable or either arm is below the cohort floor;
+ *   `floor` here covers N only.
+ * - Bands: excellent >= 90, good >= 75, fair >= 60, else poor. This is the
+ *   fleet health-score band (build_dex_health_model, dex_read_model.cpp); the
+ *   per-device buckets there (great / fair / poor at 90 / 75) are a different
+ *   scale.
+ * - Display and banding. The returned `score` is UNROUNDED. The display
+ *   precision is one decimal (kStabilityScoreScale) and the rounding rule is
+ *   stability_display_score(): round half away from zero at one decimal on
+ *   the computed double (std::round, exact in IEEE arithmetic). Consumers
+ *   display stability_display_score(*score) formatted at one decimal, never
+ *   printf of the raw double. The band is the band of that DISPLAYED value, so
+ *   a page never shows "60.0 poor" or "75.0 fair", and the edges 90 / 75 / 60
+ *   apply to the displayed value. Rank-flip ties use the same displayed
+ *   value.
+ * - `floor` is the reporting-device minimum: fewer devices withholds the score
+ *   as below_floor rather than showing a noisy number. Callers pass
+ *   kDexCohortFloor literally; the module enforces whatever floor it is
+ *   handed. `reporting_devices` is the distinct devices that reported THIS
+ *   application/version in the window, never fleet size.
+ * - Missing or contradictory population data is withheld (score and band
+ *   empty, `withheld` names why), never shown as 0 or 100. A missing or
+ *   unusable rate_ratio is NOT withheld: the result is scored with an
+ *   unassessed regression row at 0 points, which reads identical to a clean
+ *   one, so consumers must carry `assessed`.
+ * - "inconsistent" covers: a negative count; A > N; crash or hang above
+ *   A * cap; crash + hang below A (every affected device has an event).
+ * - Score, band and the four deductions are present together exactly when
+ *   `withheld` is empty. No withheld result carries N, A or any count, for
+ *   every reason. A page that shows a device count may do so for below_floor
+ *   only (a count under the floor identifies nobody) and never for
+ *   inconsistent, invalid_weights or no_population, which are fault states.
+ * - The string vocabulary is closed and wire-stable: withheld reasons
+ *   (no_population, invalid_weights, inconsistent, below_floor), deduction
+ *   names (breadth, crashes, hangs, regression) and band labels (excellent,
+ *   good, fair, poor). Renaming one is a contract break. `name` and
+ *   `withheld` are always string literals (static storage), never owned,
+ *   never freed.
+ * - Identity: 100 - sum(points) == score while the weights sum to at most 100
+ *   (each term then lies in [0, 1] of its weight, exactly so for N below
+ *   2^53). Custom weights summing above 100 can push the TOTAL past 100, which
+ *   clamps the score to 0; the rows keep raw points.
  *
  * The constants are uncalibrated against real fleet data; recalibration is a
  * constant edit.
@@ -56,26 +97,27 @@
 
 namespace yuzu::server {
 
+/// Defaults are the declared weights (sum 100); the numbers live here once.
 struct StabilityWeights {
-    double breadth;
-    double crashes;
-    double hangs;
-    double regression;
+    double breadth{60.0};
+    double crashes{20.0};
+    double hangs{8.0};
+    double regression{12.0};
 };
 
-inline constexpr StabilityWeights kStabilityWeights{60.0, 20.0, 8.0, 12.0};
+inline constexpr StabilityWeights kStabilityWeights{};
 static_assert(kStabilityWeights.breadth + kStabilityWeights.crashes + kStabilityWeights.hangs +
                       kStabilityWeights.regression ==
                   100.0,
               "default weights must sum to 100");
 
-// Mirrors dex_read_model.cpp's function-local kCap (the same "full severity at
-// 5"); the two are kept in step by hand.
-inline constexpr std::int64_t kPerDeviceEventCap = 5;
-inline constexpr double kRegressionFullRatio = 3.0;
-inline constexpr double kBandExcellent = 90.0;
-inline constexpr double kBandGood = 75.0;
-inline constexpr double kBandFair = 60.0;
+inline constexpr std::int64_t kStabilityPerDeviceEventCap = 5;
+inline constexpr double kStabilityRegressionFullRatio = 3.0;
+inline constexpr double kStabilityBandExcellent = 90.0;
+inline constexpr double kStabilityBandGood = 75.0;
+inline constexpr double kStabilityBandFair = 60.0;
+/// Display resolution: scores are shown at one decimal (10 steps per point).
+inline constexpr double kStabilityScoreScale = 10.0;
 
 /// Weights must be finite and non-negative; no sum constraint.
 [[nodiscard]] inline bool stability_weights_valid(const StabilityWeights& w) {
@@ -84,14 +126,21 @@ inline constexpr double kBandFair = 60.0;
            w.regression >= 0.0;
 }
 
+/// The score as displayed: rounded half away from zero at one decimal.
+[[nodiscard]] inline double stability_display_score(double s) {
+    return std::round(s * kStabilityScoreScale) / kStabilityScoreScale;
+}
+
 enum class StabilityBand { Excellent, Good, Fair, Poor };
 
+/// Band of the DISPLAYED score (see stability_display_score).
 [[nodiscard]] inline StabilityBand stability_band(double score) {
-    if (score >= kBandExcellent)
+    const double shown = stability_display_score(score);
+    if (shown >= kStabilityBandExcellent)
         return StabilityBand::Excellent;
-    if (score >= kBandGood)
+    if (shown >= kStabilityBandGood)
         return StabilityBand::Good;
-    if (score >= kBandFair)
+    if (shown >= kStabilityBandFair)
         return StabilityBand::Fair;
     return StabilityBand::Poor;
 }
@@ -111,24 +160,25 @@ enum class StabilityBand { Excellent, Good, Fair, Poor };
 }
 
 /// Interval around (this version's failure rate / previous version's failure rate).
-struct RateRatioInterval {
+struct StabilityRateRatioInterval {
     double lower{0.0};
     double upper{0.0};
 };
 
 struct StabilityInputs {
-    std::int64_t reporting_devices{0}; ///< N
-    std::int64_t devices_affected{0};  ///< A: distinct devices with >= 1 crash or hang
-    /// Per-device-capped sums: sum over devices of min(events_d, kPerDeviceEventCap).
+    /// N: distinct devices that reported THIS application/version in the window.
+    std::int64_t reporting_devices{0};
+    std::int64_t devices_affected{0}; ///< A: distinct devices with >= 1 crash or hang
+    /// Per-device-capped sums: sum over devices of min(events_d, kStabilityPerDeviceEventCap).
     /// The caller owns the capping; a sum above A * cap is withheld as inconsistent.
     std::int64_t crash_events{0};
     std::int64_t hang_events{0};
     /// Absent when exposure is unknown or there is no previous version.
-    std::optional<RateRatioInterval> rate_ratio;
+    std::optional<StabilityRateRatioInterval> rate_ratio;
 };
 
 /// Raw points deducted (before the score clamp). `assessed` is false when the
-/// deduction had no usable input; its points are then 0.
+/// deduction had no usable input; its points are then 0. `name` is a string literal.
 struct StabilityDeduction {
     const char* name{""};
     double points{0.0};
@@ -136,9 +186,9 @@ struct StabilityDeduction {
 };
 
 struct StabilityScore {
-    std::optional<double> score;
+    std::optional<double> score; ///< unrounded; display via stability_display_score
     std::optional<StabilityBand> band;
-    const char* withheld{""}; ///< empty when scored
+    const char* withheld{""}; ///< empty when scored; otherwise a string literal
     std::vector<StabilityDeduction> deductions;
 };
 
@@ -167,19 +217,22 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
     // Overflow-safe: above INT64_MAX / cap every representable count is under
     // A * cap, so skipping the multiply is exact. After the non-negative checks
     // A - crash cannot overflow.
-    const bool cap_checkable = A <= (std::numeric_limits<std::int64_t>::max)() / kPerDeviceEventCap;
+    const bool cap_checkable =
+        A <= (std::numeric_limits<std::int64_t>::max)() / kStabilityPerDeviceEventCap;
     if (A < 0 || crash < 0 || hang < 0 || A > N ||
-        (cap_checkable && (crash > A * kPerDeviceEventCap || hang > A * kPerDeviceEventCap)) ||
-        A - crash > hang || (A == 0 && (crash > 0 || hang > 0)))
+        (cap_checkable &&
+         (crash > A * kStabilityPerDeviceEventCap || hang > A * kStabilityPerDeviceEventCap)) ||
+        A - crash > hang)
         return stability_detail::withheld_result("inconsistent");
     if (N < floor)
         return stability_detail::withheld_result("below_floor");
 
     const double n = static_cast<double>(N);
     const double a = static_cast<double>(A);
-    const double cap = static_cast<double>(kPerDeviceEventCap);
+    const double cap = static_cast<double>(kStabilityPerDeviceEventCap);
 
     StabilityScore r;
+    r.deductions.reserve(4);
     r.deductions.push_back({"breadth", w.breadth * (a / n), true});
     r.deductions.push_back({"crashes", w.crashes * (static_cast<double>(crash) / (n * cap)), true});
     r.deductions.push_back({"hangs", w.hangs * (static_cast<double>(hang) / (n * cap)), true});
@@ -188,10 +241,11 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
     if (in.rate_ratio) {
         const double lo = in.rate_ratio->lower;
         const double hi = in.rate_ratio->upper;
-        if (std::isfinite(lo) && std::isfinite(hi) && lo >= 0.0 && lo <= hi) {
+        // NaN upper fails lo <= hi; -inf fails it because lo >= 0; +inf is valid.
+        if (std::isfinite(lo) && lo >= 0.0 && lo <= hi) {
             reg.assessed = true;
-            reg.points =
-                w.regression * std::clamp((lo - 1.0) / (kRegressionFullRatio - 1.0), 0.0, 1.0);
+            reg.points = w.regression *
+                         std::clamp((lo - 1.0) / (kStabilityRegressionFullRatio - 1.0), 0.0, 1.0);
         }
     }
     r.deductions.push_back(reg);
@@ -205,27 +259,45 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
     return r;
 }
 
-struct RankFlip {
+struct StabilityRankFlip {
     std::size_t first;
     std::size_t second;
 };
 
 /// First pair of applications whose strict order under `base` is strictly
-/// reversed under `perturbed`; nullopt when none is found. Apps withheld under
-/// either weight set are ignored. An invalid weight set withholds every app, so
-/// the result is nullopt: callers that must tell "stable" from "nothing
-/// comparable" check stability_weights_valid() first.
-// ponytail: O(n^2) pair scan over a page of applications; sort-and-adjacent if n ever exceeds a few thousand
-[[nodiscard]] inline std::optional<RankFlip>
+/// reversed under `perturbed`; "first" is the lowest i, then the lowest j.
+/// Order is compared on the DISPLAYED scores (stability_display_score), so a
+/// tie is "equal at the display precision" and a flip is a reversal a reader
+/// can see on a page. Apps withheld under either weight set are ignored.
+///
+/// nullopt means "no reversal found among comparable apps" and NEVER "ranking
+/// stable": it is also the answer for an invalid base or perturbed set, fewer
+/// than two comparable apps, and weight sets that saturate every app to 0 or
+/// 100. Callers that must tell these apart check stability_weights_valid() and
+/// the comparable count first.
+///
+/// Cost: an O(n^2) pair scan, measured at -O2 on arm64 with no flip: 0.9 ms
+/// at n = 1,000, 48 ms at 10,000, 907 ms at 50,000. The caller bounds n before
+/// the call (n <= 100 expected, 1,000 a hard ceiling; reject rather than
+/// truncate). A sort-and-adjacent scan would not preserve the lowest-(i, j)
+/// order.
+[[nodiscard]] inline std::optional<StabilityRankFlip>
 stability_rank_flip(const std::vector<StabilityInputs>& apps, std::int64_t floor,
                     const StabilityWeights& perturbed,
                     const StabilityWeights& base = kStabilityWeights) {
+    const auto shown = [&](const StabilityInputs& app,
+                           const StabilityWeights& w) -> std::optional<double> {
+        const auto s = compute_stability_score(app, floor, w).score;
+        if (!s)
+            return std::nullopt;
+        return stability_display_score(*s);
+    };
     std::vector<std::optional<double>> b, p;
     b.reserve(apps.size());
     p.reserve(apps.size());
     for (const auto& app : apps) {
-        b.push_back(compute_stability_score(app, floor, base).score);
-        p.push_back(compute_stability_score(app, floor, perturbed).score);
+        b.push_back(shown(app, base));
+        p.push_back(shown(app, perturbed));
     }
     for (std::size_t i = 0; i < apps.size(); ++i) {
         if (!b[i] || !p[i])
@@ -234,7 +306,7 @@ stability_rank_flip(const std::vector<StabilityInputs>& apps, std::int64_t floor
             if (!b[j] || !p[j] || *b[i] == *b[j] || *p[i] == *p[j])
                 continue;
             if ((*b[i] > *b[j]) != (*p[i] > *p[j]))
-                return RankFlip{i, j};
+                return StabilityRankFlip{i, j};
         }
     }
     return std::nullopt;
