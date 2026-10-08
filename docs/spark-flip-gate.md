@@ -1125,8 +1125,8 @@ flip, with a red-first test each:
     the default 30 s heartbeat is one push per heartbeat, 2880 pushes per day (the push
     interval is `ceil(25 s / heartbeat) x heartbeat`, so a 25 s heartbeat gives at most about
     3456 per day and other intervals scale; a heartbeat that arrives just under 25 s after
-    the last push is rate limited and that push waits for the next heartbeat; a replica that sheds under load lengthens the cadence further); each admitted push reads the policy generation fresh (one Postgres read), plus point reads of that
-    agent's tags and properties when a rule's scope names them, with the rule list and the deployed member rule ids loaded once per generation per replica and reused for up to 60 s (#5513), writes one `guaranteed_state.reconcile` audit row (a synchronous
+    the last push is rate limited and that push waits for the next heartbeat; a replica that sheds under load lengthens the cadence further); each admitted push reads the policy generation fresh (one Postgres read), plus up to two point reads (the agent's tag map and property map) per DISTINCT scope
+    expression a rule names, with the rule list and the deployed member rule ids loaded once per generation per replica and reused for up to 60 s (#5513), writes one `guaranteed_state.reconcile` audit row (a synchronous
     `AuditStore::log` insert on the heartbeat-ingestion path), kept for the default audit
     retention of 365 days, and logs one `spdlog::info` line ("Guardian: reconciled agent
     ...") in the server's heartbeat reconcile callback. The server applies no per-agent backoff while the
