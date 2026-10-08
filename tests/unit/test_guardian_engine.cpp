@@ -1745,7 +1745,7 @@ TEST_CASE("GuardianEngine #5513: a non-std::exception throw at boot is contained
         if (rule_id == "r2")
             throw 42; // NOT derived from std::exception
     });
-    REQUIRE(b.engine->start_local().has_value()); // today: the throw escapes instead
+    REQUIRE(b.engine->start_local().has_value()); // the non-standard throw is contained
 
     // The walk visits keys in sorted order, so r3 was reached AFTER the throw.
     const std::set<std::string> expected_visited{"r1", "r2", "r3"};
