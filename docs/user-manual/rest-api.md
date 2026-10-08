@@ -5898,9 +5898,10 @@ step's dispatch-time target-agent count) — stripped above for a confined calle
 
 #### `GET /api/v1/executions`
 
-**Permission:** `Execution:Read`, gated on the fleet-read chokepoint (ADR-0017) — **not** the plain
-permission check `GET /fragments/executions` uses; a confined caller sees only executions
-involving at least one visible agent (or that they dispatched). The v1 twin of
+**Permission:** `Execution:Read`, gated on the fleet-read chokepoint (ADR-0017), as is
+`GET /fragments/executions` (which used the plain permission check until #3526; its admission
+change is in `docs/user-manual/upgrading.md`; unlike this route, the fragment renders a gate `403`/`503` as an HTTP `200` note, and this route keeps its real `403`/`503`); a confined caller sees only executions
+involving at least one visible agent (or that they dispatched; the fragment, unlike this route, does not apply the dispatched-by rule to service-scoped tokens, see #5557). The v1 twin of
 `GET /fragments/executions`, MCP twin `list_executions` (widened by this PR to the same field set).
 Accepts `definition_id`, `status`, and `limit` (capped at 500) query parameters.
 
@@ -6268,7 +6269,7 @@ Published (`enabled_only=true`) `InstructionDefinition` catalog — the commands
 }
 ```
 
-`parameter_schema` is a nested JSON Schema **object** (not a string) when the stored value parses as JSON *and* is itself a JSON object; `null` when the stored value fails to parse (the authoring path always stores at least `{}`, so this case needs a non-standard write to reach), or when it parses to something other than an object — e.g. an array or string (reachable via the ordinary create/update/import paths, which don't validate the stored value's shape). Same rule `GET /api/v1/discover/plugins` already follows for its inline `parameter_schema`.
+`parameter_schema` is a nested JSON Schema **object** (not a string) when the stored value parses as JSON *and* is itself a JSON object; `null` when the stored value fails to parse (the authoring path always stores at least `{}`, so this case needs a non-standard write to reach), or when it parses to something other than an object, e.g. an array or string (only a legacy or non-standard write can store one: the store refuses a non-object schema, and the only REST route that can supply a `parameter_schema` at all is `POST /api/instructions/import`). Same rule `GET /api/v1/discover/plugins` already follows for its inline `parameter_schema`.
 
 #### `GET /api/v1/discover/routes`
 
@@ -9526,7 +9527,8 @@ Execute an instruction definition by dispatching it to agents. Requires `Executi
 > Refusals increment `yuzu_server_dispatch_target_rejected_total{route="instruction_execute"}`
 > and write an `instruction.execute` audit row with `result=denied`. The body must be a JSON
 > object; anything else is `400`.
-- `params` (optional) — key-value parameters passed to the plugin
+- `params` (optional): an object of parameters passed to the plugin. When the definition stores a
+  `parameter_schema`, it is validated against that schema (below). Omitted and `null` mean "no params".
 
 **Response (200):**
 ```json
@@ -9549,7 +9551,37 @@ Returned when the definition's `approval_mode` is `role-gated` or `always` and t
 }
 ```
 
-**Errors:** 404 (definition not found), 400 (invalid body), 202 (approval required -- execution queued, not yet dispatched), 403 (workflow blocked by approval-gated instruction and caller lacks execute-bypass permission), 503 (no agents reached or store unavailable).
+**Parameter validation.** The `params` are checked against the definition's stored `parameter_schema`
+**after** the permission checks and **before** the approval gate, strictly: an undeclared name, a wrong
+type, a value outside `enum`, `pattern`, `minimum`/`maximum` or `minLength`/`maxLength`, a missing
+required name, a string containing a NUL, or a `params` that is not an object is refused. The values you
+send are never modified and no `default` is injected.
+
+- **`400`**: `error.message` is `invalid params: <path>: <reason>`, where `<path>` is `/<name>`,
+  `/<name>/<index>`, `/*` for an undeclared name or `(root)`. The message never contains a submitted
+  value. No approval ticket, execution row or dispatch is created.
+- **`500`**: the definition's stored schema cannot be prepared, so the call fails closed:
+  `error.message` is `stored parameter schema for this instruction is invalid` and `error.remediation`
+  says to export the definition, delete it and import it again with a corrected `parameter_schema`
+  (signed, unless the server allows unsigned definitions; see
+  [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)). Nothing is
+  dispatched. The audit row is `instruction.execute` with `result=failure` and detail
+  `reason=param_schema_invalid`.
+- A definition whose stored schema is empty, whitespace or `{}` declares nothing and is **not
+  validated**. This is how a definition saved from the YAML editor behaves.
+
+A schema is also checked when it is written. `POST /api/instructions/import` refuses a
+`parameter_schema` over 262144 bytes (`400 parameter_schema is larger than the 262144-byte limit`),
+one that cannot be prepared (`400 parameter_schema is not a valid parameter schema: <up to 3 problems>[; and N more]`;
+the problems name the property and a fixed reason, never a schema value) and one the server could not
+finish checking (`400 parameter_schema could not be checked`). Updating a definition (`PUT
+/api/instructions/{id}`, the YAML editor, response-template changes) keeps its stored schema.
+
+> **Not a security boundary.** Only this route validates `params`. Workflow steps, schedules, policy
+> remediation, the result-set producers, MCP `execute_instruction` and `POST /api/command` do not
+> validate against the stored schema yet.
+
+**Errors:** 404 (definition not found), 400 (invalid body, or invalid `params`), 202 (approval required -- execution queued, not yet dispatched), 403 (workflow blocked by approval-gated instruction and caller lacks execute-bypass permission), 500 (stored parameter schema invalid), 503 (no agents reached or store unavailable).
 
 ---
 
@@ -9979,6 +10011,8 @@ Aggregate response data for a command (counts, summaries).
 #### `GET /api/responses/{id}/export`
 
 Export response data in CSV format.
+
+**Audit caveat (#5556).** Legacy `GET /api/responses/*` writes no `result=success` audit row and does not fail closed on audit-persist failure; use `/api/v1/responses` for SIEM evidence of response reads.
 
 **Confined (#1634).** All three readers are gated by `require_fleet_read` (ADR-0017 admit-then-filter) — a management-group-confined operator is admitted and sees only their in-scope agents' rows, real cross-operator isolation rather than the earlier inert per-row filter. `/export` and the catch-all GET push the visible-agent set into the underlying SQL query before `LIMIT`/`OFFSET` (ADR-0017 INV-3), so a confined caller's page reflects only their own visible rows. All three now share ONE gate's failure posture: a **null/unopened response store** returns `503`; an **open but corrupt RBAC store** fails **closed** with `403` (`rbac_enforcement_in_effect` holds, so `require_fleet_read`'s underlying permission check denies rather than falling through to the legacy read path) — for all three readers alike, not the differentiated no-rows-vs-503 split of the pre-migration gate. Scripted/Grafana consumers that start receiving `503`/`403` after an upgrade should check `/readyz` and the server log for `RbacStore` open/migrate errors.
 

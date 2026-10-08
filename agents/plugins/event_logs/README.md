@@ -66,10 +66,10 @@ Binaries/subprocesses/network: none on Windows (wevtapi is in-process) and none 
 | Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
 | `device.event_logs.errors` | `log` | string | no | System | maxLength 128 | The event log to query, e.g. "System" or "Application". Windows only — the value is accepted but has no effect on Linux/macOS, which always read the system journal / unified log. Default: "System". |
-| `device.event_logs.errors` | `hours` | int32 | no | 24 | minimum 1 · maximum 720 | Number of hours to look back for error events, e.g. 24 or 168. Range: 1-720 (30 days). Default: 24. |
+| `device.event_logs.errors` | `hours` | int32 | no | 24 | minimum 1 · maximum 720 | Number of hours to look back for error events, e.g. 24 or 168. Range: 1-720 (30 days). Default: 24. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute. |
 | `device.event_logs.query` | `log` | string | yes | - | minLength 1 · maxLength 128 | The event log to search, e.g. "System" or "Application". On Windows this selects the channel; on Linux/macOS the value is accepted but does not select a log (both always read the journal / unified log). |
 | `device.event_logs.query` | `filter` | string | yes | - | minLength 1 · maxLength 256 | Keyword to search for in event messages, e.g. "error" or "disk-warning". Case-insensitive substring match. Only alphanumeric characters, spaces, dots, hyphens, underscores, and slashes are allowed. |
-| `device.event_logs.query` | `count` | int32 | no | 50 | minimum 1 · maximum 500 | Maximum number of recent events EXAMINED for a match on Windows (the filter is applied within that window); the maximum number of matches returned on Linux and macOS. Range: 1-500. Default: 50. |
+| `device.event_logs.query` | `count` | int32 | no | 50 | minimum 1 · maximum 500 | Maximum number of recent events EXAMINED for a match on Windows (the filter is applied within that window); the maximum number of matches returned on Linux and macOS. Range: 1-500. Default: 50. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute. |
 <!-- END GENERATED -->
 
 ### Outputs

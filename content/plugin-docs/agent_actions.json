@@ -108,19 +108,11 @@
   "inputs": [
     {
       "constraints": {
-        "enum": [
-          "trace",
-          "debug",
-          "info",
-          "warn",
-          "error",
-          "critical",
-          "off"
-        ]
+        "pattern": "^(?i:trace|debug|info|warn|warning|err|error|critical|off)$"
       },
       "default": null,
       "definition_id": "device.agent_actions.set_log_level",
-      "description": "The desired spdlog log level, case-insensitive: trace, debug, info, warn, error, critical, or off (e.g. \"info\").\n",
+      "description": "The desired spdlog log level, case-insensitive: trace, debug, info, warn, error, critical, or off (e.g. \"info\", \"INFO\" and \"Info\" are all accepted). The agent also accepts \"warning\" and \"err\" (spdlog's long and short names), and the pattern admits them. Declared as a case-insensitive pattern rather than an enum because the server's enum check is case-sensitive.\n",
       "name": "level",
       "required": true,
       "type": "string"

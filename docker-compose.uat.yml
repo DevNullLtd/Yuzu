@@ -199,6 +199,12 @@ services:
     environment:
       - YUZU_LOG_LEVEL=info
       - YUZU_LOG_FORMAT=json
+      # Plaintext rig: no peer certificate exists, so gateway peer authorization
+      # is explicitly acknowledged as disabled here. Not for production. Set as an
+      # environment variable, not a CLI flag, because this file pulls published
+      # release images and an image that predates the flag exits on an unknown
+      # argument but ignores an unknown environment variable.
+      - YUZU_INSECURE_GATEWAY_PEER=1
       # Postgres substrate DSN (ADR-0006, #1318) — inert until #1320 wires
       # the server-side consumer; env var (not CLI flag) on purpose because
       # the current binary rejects unknown flags. ⚠ DEV/UAT-ONLY default

@@ -25,8 +25,9 @@
 ##
 ## Gateway scale-out plane: this single-server reference does NOT include the
 ## Erlang gateway. For the multi-container (server + gateway + agents) TLS
-## topology — which uses a shared /etc/yuzu/certs volume + `--cert-group` so the
-## different-uid containers can read the shared certs — see
+## topology, which shares the certificate volume between the server and gateway
+## containers (`--cert-group` lets the different-uid gateway read it); the agent
+## container there mounts the `ca-public` volume, see
 ## docker-compose.reference-gateway.yml.
 ##
 ## ⚠  Still NOT a turnkey production deployment: set a strong admin password in
