@@ -32,6 +32,16 @@ constexpr const char* kStoreName = "custom_properties_store";
 // wait a little; none may block unboundedly on a saturated pool.
 constexpr std::chrono::milliseconds kAcquireTimeout{2000};
 
+// agent_id read guard. The same predicate as tag_store.cpp's valid_agent_id (file-local there;
+// duplicated rather than shared so the two stores stay independent): libpq's text binds are
+// C strings, so an id containing a NUL byte cannot be represented at the DB seam. A malformed
+// id has no properties by definition, so the reads below answer empty / nullopt instead of
+// touching the database. Length cap matches the REST/gRPC agent_id bound (256).
+bool valid_agent_id(const std::string& agent_id) {
+    return !agent_id.empty() && agent_id.size() <= 256 &&
+           agent_id.find('\0') == std::string::npos;
+}
+
 std::int64_t now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -236,6 +246,8 @@ CustomPropertiesStore::validate_against_schema(PGconn* conn, const std::string& 
 
 std::expected<std::vector<CustomProperty>, CustomPropertiesReadError>
 CustomPropertiesStore::get_properties(const std::string& agent_id) const {
+    if (!valid_agent_id(agent_id))
+        return std::vector<CustomProperty>{};  // see valid_agent_id
     if (!open_) {
         if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_props_sampler))
             spdlog::warn("CustomPropertiesStore::get_properties: store not open");
@@ -276,6 +288,8 @@ CustomPropertiesStore::get_properties(const std::string& agent_id) const {
 
 std::expected<std::optional<CustomProperty>, CustomPropertiesReadError>
 CustomPropertiesStore::get_property(const std::string& agent_id, const std::string& key) const {
+    if (!valid_agent_id(agent_id))
+        return std::optional<CustomProperty>{std::nullopt};  // see valid_agent_id
     if (!open_) {
         if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_prop_sampler))
             spdlog::warn("CustomPropertiesStore::get_property: store not open");
@@ -322,6 +336,8 @@ CustomPropertiesStore::get_value(const std::string& agent_id, const std::string&
 
 std::expected<std::unordered_map<std::string, std::string>, CustomPropertiesReadError>
 CustomPropertiesStore::get_property_map(const std::string& agent_id) const {
+    if (!valid_agent_id(agent_id))
+        return std::unordered_map<std::string, std::string>{};  // see valid_agent_id
     if (!open_) {
         if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_map_sampler))
             spdlog::warn("CustomPropertiesStore::get_property_map: store not open");
