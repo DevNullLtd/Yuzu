@@ -1,5 +1,5 @@
 /**
- * test_server_guardian_reconcile_options.cpp — the operator-facing contract for the Guardian
+ * test_server_guardian_reconcile_options.cpp: the operator-facing contract for the Guardian
  * heartbeat-reconcile admission budget knobs (#5513): flag names, defaults, env spellings,
  * validation. Same shape and same reason as test_server_ota_options.cpp: a misspelled envname(),
  * a default drifted from docs/user-manual/server-admin.md, a binding pointed at the wrong Config
@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdlib> // setenv/unsetenv (POSIX), _putenv_s (MSVC)
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -39,30 +40,57 @@ bool parse(const std::vector<std::string>& args, Config& cfg) {
     }
 }
 
-// RAII environment override. The platform split is load-bearing: setenv/unsetenv are POSIX only
+std::optional<std::string> get_env(const std::string& name) {
+#ifdef _WIN32
+    char* buf = nullptr;
+    std::size_t len = 0;
+    if (_dupenv_s(&buf, &len, name.c_str()) != 0 || buf == nullptr)
+        return std::nullopt;
+    std::string v(buf);
+    std::free(buf);
+    return v;
+#else
+    if (const char* v = std::getenv(name.c_str()))
+        return std::string(v);
+    return std::nullopt;
+#endif
+}
+
+void put_env(const std::string& name, const std::optional<std::string>& value) {
+#ifdef _WIN32
+    (void)_putenv_s(name.c_str(), value ? value->c_str() : "");
+#else
+    if (value)
+        ::setenv(name.c_str(), value->c_str(), 1);
+    else
+        ::unsetenv(name.c_str());
+#endif
+}
+
+// RAII environment override that RESTORES the previous state (value or absence) on exit, so a
+// test cannot leak into, or be perturbed by, the surrounding environment. nullopt unsets the
+// variable for the scope. The platform split is load-bearing: setenv/unsetenv are POSIX only
 // and this file is built on every platform (see test_server_ota_options.cpp for the full reason).
 struct ScopedEnv {
     std::string name;
-    ScopedEnv(const std::string& n, const std::string& v) : name(n) {
-#ifdef _WIN32
-        (void)_putenv_s(name.c_str(), v.c_str());
-#else
-        ::setenv(name.c_str(), v.c_str(), 1);
-#endif
+    std::optional<std::string> previous;
+    ScopedEnv(const std::string& n, const std::optional<std::string>& v)
+        : name(n), previous(get_env(n)) {
+        put_env(name, v);
     }
-    ~ScopedEnv() {
-#ifdef _WIN32
-        (void)_putenv_s(name.c_str(), "");
-#else
-        ::unsetenv(name.c_str());
-#endif
-    }
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+    ~ScopedEnv() { put_env(name, previous); }
 };
 
 } // namespace
 
 TEST_CASE("Guardian reconcile options: defaults match the documented values",
           "[guardian][reconcile][options]") {
+    // The defaults must not depend on the environment the test runs in.
+    ScopedEnv a("YUZU_GUARDIAN_RECONCILE_BUDGET_MS_PER_S", std::nullopt);
+    ScopedEnv b("YUZU_GUARDIAN_RECONCILE_BURST_MS", std::nullopt);
+    ScopedEnv c("YUZU_GUARDIAN_RECONCILE_MAX_PER_S", std::nullopt);
     Config cfg;
     REQUIRE(parse({}, cfg));
     // These are the defaults published in docs/user-manual/server-admin.md.

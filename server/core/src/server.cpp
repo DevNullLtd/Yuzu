@@ -5872,17 +5872,6 @@ public:
             // unchanged from pre-WS-5.
             registry_.configure_presence(offline_endpoint_store_.get(), cfg_.session_timeout);
 
-            // Guardian heartbeat reconcile (M5 / #1209). The agent reports its
-            // applied policy generation on every heartbeat; if it trails the
-            // current generation it missed a push (was offline when the push fired,
-            // or has just reconnected — sync_with_server is a no-op pull), so
-            // re-push its applicable rules. An agent also reports generation 0
-            // (intermittently, see the agent's back-off) while
-            // a boot re-arm failure is unresolved (#5513), however current its
-            // persisted generation is; the same full_sync re-push is the catch-up
-            // for that case too. Reads the generation, never bumps it, so
-            // catching one lagging agent up does not make the rest of the fleet look
-            // stale (the cascade M6's monotonic counter is designed to avoid).
             // #5513: reconcile admission outcomes and duration. The counter family is bounded
             // (a closed `result` set), so every value is pre-seeded to 0 per
             // docs/observability-conventions.md; absent()-based alerting then stays meaningful
@@ -5891,7 +5880,8 @@ public:
             metrics_.describe("yuzu_server_guardian_reconciles_total",
                               "Guardian heartbeat reconcile outcomes by result: sent (re-push "
                               "dispatched), rate_limited (per-agent 25 s slot), shed (replica "
-                              "admission budget exhausted, nothing sent, no audit row), degraded "
+                              "admission budget exhausted or in-flight cap reached, nothing sent, "
+                              "no audit row), degraded "
                               "(a store read failed, re-push aborted), no_session",
                               "counter");
             for (auto result : {"sent", "rate_limited", "shed", "degraded", "no_session"})
@@ -5911,13 +5901,40 @@ public:
                 spdlog::info("Guardian reconcile admission (per replica): budget {} ms/s, burst {} "
                              "ms, max {} admissions/s",
                              eff.budget_ms_per_s, eff.burst_ms, eff.max_per_s);
-                if (eff.budget_ms_per_s != cfg_.guardian_reconcile_budget_ms_per_s ||
-                    eff.burst_ms != cfg_.guardian_reconcile_burst_ms ||
-                    eff.max_per_s != cfg_.guardian_reconcile_max_per_s)
-                    spdlog::warn("Guardian reconcile admission: a configured value was outside the "
-                                 "supported range and was clamped to the values logged above");
+                if (eff.budget_ms_per_s != cfg_.guardian_reconcile_budget_ms_per_s)
+                    spdlog::warn("Guardian reconcile admission: --guardian-reconcile-budget-ms-per-s "
+                                 "{} was outside the supported range and was clamped to {}",
+                                 cfg_.guardian_reconcile_budget_ms_per_s, eff.budget_ms_per_s);
+                if (eff.burst_ms != cfg_.guardian_reconcile_burst_ms)
+                    spdlog::warn("Guardian reconcile admission: --guardian-reconcile-burst-ms {} "
+                                 "was outside the supported range and was clamped to {}",
+                                 cfg_.guardian_reconcile_burst_ms, eff.burst_ms);
+                if (eff.max_per_s != cfg_.guardian_reconcile_max_per_s)
+                    spdlog::warn("Guardian reconcile admission: --guardian-reconcile-max-per-s {} "
+                                 "was outside the supported range and was clamped to {}",
+                                 cfg_.guardian_reconcile_max_per_s, eff.max_per_s);
             }
 
+            // Guardian heartbeat reconcile (M5 / #1209). The agent reports its
+            // applied policy generation on every heartbeat; if it trails the
+            // current generation it missed a push (was offline when the push fired,
+            // or has just reconnected — sync_with_server is a no-op pull), so
+            // re-push its applicable rules. An agent also reports generation 0
+            // (intermittently, see the agent's back-off) while
+            // a boot re-arm failure is unresolved (#5513), however current its
+            // persisted generation is; the same full_sync re-push is the catch-up
+            // for that case too. Reads the generation, never bumps it, so
+            // catching one lagging agent up does not make the rest of the fleet look
+            // stale (the cascade M6's monotonic counter is designed to avoid).
+            //
+            // Admission (#1209 hardening, then #5513): a claim in guardian_reconcile_gate_
+            // rate-limits an agent to one re-push per 25 s. The claim is written on Admit and
+            // kept while an agent that has meanwhile converged is still younger than the
+            // interval (so an agent alternating generation 0 / current cannot buy a push on
+            // every second heartbeat); a claim older than the interval is erased on
+            // convergence, and the maintenance sweep bounds the rest. The cached generation
+            // (<= 2 s old) only drives that decision; an ADMITTED push re-reads the
+            // generation fresh and labels the push with it.
             heartbeat_ingestion_->set_guardian_reconcile_fn(
                 [this, reconcile_duration](std::string_view agent_id_sv,
                                            std::uint64_t agent_gen) {
@@ -5929,7 +5946,9 @@ public:
                     // The read goes through guardian_generation_cache_ (#5513): a
                     // short-TTL single-flight cache whose error arm is the store's
                     // nullopt, so this early return is unchanged; a failed read is
-                    // negative-cached for a shorter TTL.
+                    // negative-cached for a shorter TTL. The value may be up to the TTL
+                    // stale (only ever LOWER than the store's), so it decides converged /
+                    // rate-limited / shed and is never used to label a push.
                     const auto current_res = guardian_generation_cache_.get();
                     if (!current_res) {
                         metrics_
@@ -5941,15 +5960,15 @@ public:
                     const std::uint64_t current = *current_res;
                     const std::string agent_id(agent_id_sv);
 
-                    // Convergence, per-agent rate limit and replica admission budget, in ONE
-                    // ordered decision under one mutex (guardian_reconcile_gate.hpp; the
-                    // order is the safety invariant). The per-agent claim (#1209 hardening:
-                    // sec-MED1/perf-S1/S2) is taken under the lock BEFORE any work so
-                    // concurrent heartbeats from the same agent can't both reconcile, and a
-                    // stuck/hostile agent can't turn every heartbeat into a registry scan.
-                    // Wall-clock based so it self-heals a re-registered/wiped agent after
-                    // the interval. A SHED never writes the claim, so the agent earns no
-                    // holdoff for a push that never happened.
+                    // Convergence, per-agent rate limit, in-flight cap and replica admission
+                    // budget, in ONE ordered decision under one mutex
+                    // (guardian_reconcile_gate.hpp; the order is the safety invariant). The
+                    // per-agent claim (#1209 hardening: sec-MED1/perf-S1/S2) is taken under
+                    // the lock BEFORE any work so concurrent heartbeats from the same agent
+                    // can't both reconcile, and a stuck/hostile agent can't turn every
+                    // heartbeat into a registry scan. Wall-clock based so it self-heals a
+                    // re-registered/wiped agent after the interval. A SHED never writes the
+                    // claim, so the agent earns no holdoff for a push that never happened.
                     switch (guardian_reconcile_gate_.decide(agent_id, agent_gen, current)) {
                     case GuardianReconcileGate::Decision::Converged:
                         return;  // agent already at or ahead of current policy
@@ -5981,7 +6000,8 @@ public:
                                          "exhausted, shedding re-pushes (agents retry on their "
                                          "next heartbeat; {} shed so far; this line is logged at "
                                          "most once a minute)",
-                                         guardian_reconcile_budget_.shed_total());
+                                         guardian_reconcile_budget_.shed_total() +
+                                             guardian_reconcile_gate_.in_flight_shed_total());
                         return;
                     }
                     case GuardianReconcileGate::Decision::Admit:
@@ -6039,14 +6059,46 @@ public:
                         }
                     };
 
+                    // Time spent inside the single-flight rule-bundle load (possibly waiting on
+                    // another thread's) is not this push's cost; it is excluded from the
+                    // budget debit (Scoped::exclude). The fresh generation read is NOT
+                    // excluded: it is this push's own store read.
+                    const auto excluding = [&admitted](auto&& fn) {
+                        const auto t0 = std::chrono::steady_clock::now();
+                        auto r = fn();
+                        admitted.exclude(std::chrono::steady_clock::now() - t0);
+                        return r;
+                    };
+
                     auto sess = registry_.get_session(agent_id);
                     if (!sess) {
                         metrics_
                             .counter("yuzu_server_guardian_reconciles_total",
                                      {{"result", "no_session"}})
                             .increment();
+                        // The push never happened, so the agent earned no holdoff: forget the
+                        // claim Admit wrote or it would be rate-limited for nothing.
+                        guardian_reconcile_gate_.release(agent_id);
                         return;
                     }
+                    // The generation that LABELS this push, read fresh from the store (cache
+                    // bypassed). The cached `current` can be up to its TTL stale; if a REST
+                    // fan-out already delivered a newer generation, building from the stale
+                    // one would send older content under an older label and the agent (which
+                    // keeps the highest generation it has seen) would never regain a
+                    // lower-labelled guard. Read BEFORE the bundle load so the bundle is at
+                    // least as new as its label (guardian_rule_bundle.hpp).
+                    const auto fresh_res = guardian_generation_cache_.get_fresh();
+                    if (!fresh_res) {
+                        spdlog::warn("Guardian heartbeat reconcile: policy generation unreadable "
+                                     "({}) - aborting re-push for agent_id={}",
+                                     fresh_res.error(), ::yuzu::log_token(agent_id));
+                        abort_degraded("policy generation unreadable", fresh_res.error());
+                        return;
+                    }
+                    const std::uint64_t fresh_generation = *fresh_res;
+                    if (fresh_generation <= agent_gen)
+                        return;  // converged against the fresh value: nothing to send
                     // The rule bundle for this generation (#5513), loaded at most once per
                     // generation per replica. list_rules is type-distinguishable (ADR-0038
                     // catastrophic-read set): a degraded read MUST abort this reconcile
@@ -6060,42 +6112,43 @@ public:
                     // "nothing deployed". A failed load is never cached.
                     // The generation was read BEFORE this call (guardian_rule_bundle.hpp's
                     // ordering requirement): rows read inside the loader are at least as new
-                    // as `current`.
-                    const auto bundle_result = guardian_rule_bundle_cache_.get(
-                        current,
-                        [this]() -> std::expected<guardian::Bundle, guardian::BundleLoadError> {
-                            using Source = guardian::BundleLoadError::Source;
-                            auto rules_result = guaranteed_state_store_->list_rules();
-                            if (!rules_result)
-                                return std::unexpected(
-                                    guardian::BundleLoadError{Source::rules, rules_result.error()});
-                            auto deployed_result = deployed_member_rule_ids();
-                            if (!deployed_result)
-                                return std::unexpected(guardian::BundleLoadError{
-                                    Source::deployed, deployed_result.error()});
-                            return guardian::make_bundle(
-                                guardian::filter_deployed_members(*rules_result, *deployed_result),
-                                std::move(*deployed_result));
-                        });
+                    // as `fresh_generation`. The bundle is keyed by the FRESH generation,
+                    // never the agent's or the cached one. The load itself is
+                    // guardian::load_reconcile_bundle, which is unit-tested for its
+                    // evaluation order (the filter must see the deployed set before it is
+                    // moved into the bundle).
+                    const auto bundle_result = excluding([&] {
+                        return guardian_rule_bundle_cache_.get(
+                            fresh_generation,
+                            [this]() -> std::expected<guardian::Bundle, guardian::BundleLoadError> {
+                                if (!guaranteed_state_store_)
+                                    return std::unexpected(guardian::BundleLoadError{
+                                        guardian::BundleLoadError::Source::rules,
+                                        "guaranteed-state store not wired"});
+                                return guardian::load_reconcile_bundle(
+                                    [this] { return guaranteed_state_store_->list_rules(); },
+                                    [this] { return deployed_member_rule_ids(); });
+                            });
+                    });
                     if (!bundle_result) {
                         const auto& err = bundle_result.error();
                         switch (err.source) {
                         case guardian::BundleLoadError::Source::rules:
                             spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) — "
                                          "aborting re-push for agent_id={}",
-                                         err.detail, agent_id);
+                                         err.detail, ::yuzu::log_token(agent_id));
                             abort_degraded("rule store degraded", err.detail);
                             break;
                         case guardian::BundleLoadError::Source::deployed:
                             spdlog::warn("Guardian heartbeat reconcile: deployed_member_rule_ids "
                                          "degraded ({}) — aborting re-push for agent_id={}",
-                                         err.detail, agent_id);
+                                         err.detail, ::yuzu::log_token(agent_id));
                             abort_degraded("baseline store degraded", err.detail);
                             break;
                         case guardian::BundleLoadError::Source::other:
                             spdlog::warn("Guardian heartbeat reconcile: rule bundle load failed "
                                          "({}) - aborting re-push for agent_id={}",
-                                         err.detail, agent_id);
+                                         err.detail, ::yuzu::log_token(agent_id));
                             abort_degraded("rule bundle load failed", err.detail);
                             break;
                         }
@@ -6155,18 +6208,18 @@ public:
                             scope_member.emplace(expr, member);
                             return member;
                         },
-                        /*full_sync=*/true, current, &metrics_);
+                        /*full_sync=*/true, fresh_generation, &metrics_);
                     if (scope_degraded) {
                         spdlog::warn("Guardian heartbeat reconcile: scope evaluation store degraded "
                                      "({}) - aborting re-push for agent_id={}",
-                                     scope_degraded_detail, agent_id);
+                                     scope_degraded_detail, ::yuzu::log_token(agent_id));
                         abort_degraded("scope store degraded", scope_degraded_detail);
                         return;  // send NOTHING: a narrowed full_sync would disarm the rule
                     }
                     // Unique per re-push (random suffix) so a same-generation reconcile
                     // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).
                     const auto command_id =
-                        "__guard__-reconcile-" + std::to_string(current) + "-" +
+                        "__guard__-reconcile-" + std::to_string(fresh_generation) + "-" +
                         auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
                     // PR1.9c: system caller — __guard__.push_rules is
                     // `system_reserved` (capdecls::core_dispatch_capabilities.hpp).
@@ -6190,7 +6243,7 @@ public:
                                      {{"reason", "reconcile"}})
                             .increment();
                         metrics_.gauge("yuzu_server_guardian_policy_generation")
-                            .set(static_cast<double>(current));
+                            .set(static_cast<double>(fresh_generation));
                         // Durable audit of a system-initiated enforcement re-deploy
                         // (SOC2 CC7.2/CC7.4 — comp-F1). Deduped above → at most one
                         // row per agent per interval, not per heartbeat.
@@ -6206,12 +6259,12 @@ public:
                             ev.target_id = agent_id;
                             ev.detail = "heartbeat reconcile re-push (generation " +
                                         std::to_string(agent_gen) + " -> " +
-                                        std::to_string(current) + ")";
+                                        std::to_string(fresh_generation) + ")";
                             ev.result = "success";
                             (void)audit_store_->log(ev);
                         }
                         spdlog::info("Guardian: reconciled agent {} (generation {} -> {})",
-                                     agent_id, agent_gen, current);
+                                     agent_id, agent_gen, fresh_generation);
                     }
                 });
         }
@@ -9181,6 +9234,7 @@ public:
                 // and scan caps are in guardian_reconcile_gate.hpp). Not a retention pass
                 // over durable data, and it adds no thread.
                 try {
+                    YUZU_ASSERT_BACKGROUND_JOB("guardian_reconcile_gate.sweep"); // WS-10 ReplicaSafe
                     (void)guardian_reconcile_gate_.sweep();
                 } catch (const std::exception& e) {
                     spdlog::warn("Guardian reconcile claim sweep failed: {}", e.what());
@@ -19811,6 +19865,12 @@ private:
             (guardian_push_fn_ = [this](const std::string& scope, bool full_sync) -> int {
                 if (!guaranteed_state_store_)
                     return 0;
+                // Callers reach here right after a local policy-generation bump (baseline
+                // deploy/delete, the enforcement toggle, the REST push). Drop the heartbeat
+                // reconcile's cached generation (<= 2 s stale) and held bundle so the next
+                // heartbeat decides from the post-bump state instead of waiting out the TTL.
+                guardian_generation_cache_.invalidate();
+                guardian_rule_bundle_cache_.invalidate();
                 const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
                                        std::chrono::system_clock::now().time_since_epoch())
                                        .count();
@@ -21341,11 +21401,13 @@ private:
     // Guardian heartbeat-reconcile admission (#1209 hardening: sec-MED1 / perf-S1 / perf-S2,
     // then #5513). Without it, a lagging (or hostile, tight-looping) agent turns EVERY
     // heartbeat into a full reconcile, an asymmetric CPU amplifier, and at fleet scale a
-    // policy bump makes a large share of the fleet eligible at once. Two bounds, both
+    // policy bump makes a large share of the fleet eligible at once. Three bounds, all
     // decided inside `guardian_reconcile_gate_.decide()` under one mutex (the order is the
     // safety invariant, see guardian_reconcile_gate.hpp): a per-agent claim (at most one
-    // re-push per agent per 25 s; a genuinely-once-lagging agent still converges on its
-    // first heartbeat) and a per-replica leaky-bucket budget debited by the measured wall
+    // re-push per agent per 25 s: the claim is kept while it is younger than 25 s even if
+    // the agent converges meanwhile, and erased on convergence once it is older; a
+    // genuinely-once-lagging agent still converges on its first heartbeat), an in-flight cap
+    // and a per-replica leaky-bucket budget debited by the measured wall
     // time of each admitted push (`guardian_reconcile_budget_`, the three
     // --guardian-reconcile-* flags). In memory and per replica: it protects per-replica
     // resources, so store load is the budget times the replica count.

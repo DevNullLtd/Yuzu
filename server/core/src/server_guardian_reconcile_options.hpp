@@ -9,8 +9,11 @@
 ///
 /// The three values feed `GuardianReconcileBudget` (guardian_reconcile_budget.hpp). That class
 /// CLAMPS an out-of-range value rather than refusing it, so the refusal of a non-positive or
-/// non-finite value lives here, at the operator-facing edge, and the budget's clamp is only a
-/// backstop for a value above its documented maximum.
+/// non-finite value lives here, at the operator-facing edge. The budget's clamp is a backstop
+/// for what gets through: a value above its documented maximum, and also a positive value below
+/// the documented minimum (a budget or burst in (0, 1) ms is raised to 1.0, see
+/// `kMinBudgetMsPerS` / `kMinBurstMs`; `max_per_s` is capped at 1,000,000). The server logs a
+/// warning naming each flag that was clamped.
 
 #include <CLI/CLI.hpp>
 
