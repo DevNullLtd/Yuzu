@@ -1197,7 +1197,8 @@ flip, with a red-first test each:
     maintenance tick runs on the per-connection heartbeat thread, and the retry owner is
     the server's `full_sync` re-push. Agent restart gap: the boot Application opens at the
     loaded acknowledged generation with an empty `content_id`. A failed boot re-arm is
-    resolved (#5513): the agent reports generation 0 with the sparse companion tag
+    resolved (#5513): the agent reports generation 0 (except while backing off between failed
+    catch-ups, when it reports its real generation) with the sparse companion tag
     `yuzu.guardian_boot_rearm_unresolved` until a push applies cleanly, so the server's
     existing reconcile catches it up, and the persisted generation is never rewritten. A
     push that omits or disables the failed rule clears the flag too, because it is a clean
@@ -1214,9 +1215,11 @@ flip, with a red-first test each:
     repeated `guaranteed_state.reconcile` audit rows reading `generation 0 -> N` for one
     agent id, and the fleet-wide `yuzu_server_guardian_reconciles_total{result="sent"}`
     rate. Fleet-wide detection of the tag and the alert decision are #5558. A persistently
-    failing rule is re-pushed about every 30 s per agent at the default heartbeat (never
-    faster than 25 s), one audit row per push, with no back-off (the back-off decision in #5504 would also
-    cover this loop). Residuals: a legacy guard that returns false at arm
+    failing rule is re-pushed with an agent-side back-off (after each failed catch-up the
+    agent reports its real generation for the next 1, 2, 4, 8, then 10 heartbeats before
+    reporting 0 again; about 60 s, 90 s, 150 s, 270 s, then 330 s apart at the default 30 s
+    heartbeat), one audit row per push, so the loop is closed here and #5504 stays the Spark
+    flip cost measurement, not the owner of this back-off. Residuals: a legacy guard that returns false at arm
     (`ReconcileOutcome::Inert`) is the boot-path
     analogue of #2797's `apply_rules` defect and is not covered, a server whose current
     generation is 0 does not push, and the catch-up applies only where a legacy guard

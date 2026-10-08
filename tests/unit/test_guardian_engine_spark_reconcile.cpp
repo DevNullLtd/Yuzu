@@ -1636,6 +1636,241 @@ TEST_CASE("#5513 dormant (prefer_spark=true): a persistently failing rule holds 
     CHECK(r.engine->spark_armed_rule_count() == 1);
 }
 
+namespace {
+
+/// #5513 back-off rig: the boot arm is refused SYNCHRONOUSLY (the runtime is stopped before the
+/// boot walk, exactly as the "refuses SYNCHRONOUSLY" case above), and it stays stopped, so every
+/// later push of the rule is refused too and reaches apply_rules()' tail with the flag still set.
+/// That is the only deterministic way to produce several FAILED catch-ups in a row, hence
+/// [dormant] (prefer_spark=true).
+void stage_refused_boot_5513(BootRig5513& r) {
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+    r.construct(true, true);
+    r.wire(); // production order
+    auto* rt = r.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    rt->begin_stop();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+}
+
+/// Consumes exactly `real` heartbeat reports and asserts each is the REAL persisted generation
+/// with the companion still set, then ONE more asserting the holdoff is spent (reported 0,
+/// companion set). Calls generation_report() exactly real + 1 times.
+void expect_backoff_reports_5513(GuardianEngine& e, std::uint32_t real) {
+    for (std::uint32_t i = 0; i < real; ++i) {
+        const auto rep = e.generation_report();
+        CHECK(rep.reported == kGen5513);
+        CHECK(rep.boot_rearm_unresolved);
+    }
+    const auto spent = e.generation_report();
+    CHECK(spent.reported == 0);
+    CHECK(spent.boot_rearm_unresolved);
+    CHECK(e.boot_report_holdoff_for_test() == 0);
+}
+
+} // namespace
+
+TEST_CASE("#5513 back-off dormant (prefer_spark=true): each failed catch-up earns the next "
+          "heartbeats' real report, escalating 1, 2, 4, 8, 10, 10, and a re-push replaces it",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Reported-value sequence asserted (R = the real persisted kGen5513 with the companion set,
+    // Z = 0 with the companion set): after the boot failure alone Z (no failed catch-up yet);
+    // after catch-up #1: R Z; #2: R R Z; #3 (only ONE of its 4 consumed, so a re-push replaces
+    // the remainder): R; #4: exactly 8 R then Z; #5 and #6: 10 R then Z each. policy_generation()
+    // (the const accessor __guard__ replies use) is 0 throughout, and the internal generation is
+    // never touched. Mutations: dropping the holdoff set leaves Z at #1; dropping the cap
+    // reports 16 R at #5/#6; `holdoff +=` instead of `=` reports 11 R at #4; consuming nothing
+    // in generation_report() never reaches Z.
+    BootRig5513 r;
+    stage_refused_boot_5513(r);
+
+    // The boot failure alone is not a failed catch-up: no holdoff, so the report is 0 and it
+    // does not decay across repeated reads.
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+    for (int i = 0; i < 3; ++i) {
+        const auto rep = r.engine->generation_report();
+        CHECK(rep.reported == 0);
+        CHECK(rep.boot_rearm_unresolved);
+    }
+
+    const std::uint32_t expected[] = {1, 2, 4, 8, 10, 10};
+    for (std::uint32_t i = 0; i < 6; ++i) {
+        r.push_ok({make_service_rule("r1")}, kGen5513); // refused again: the tail sees !clean
+        CHECK(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->policy_generation() == 0);
+        CHECK(r.engine->boot_catchup_failures_for_test() == i + 1);
+        CHECK(r.engine->boot_report_holdoff_for_test() == expected[i]);
+        if (i == 2) {
+            // Consume ONE of the 4: the next push must REPLACE the remaining 3, not add to it.
+            const auto rep = r.engine->generation_report();
+            CHECK(rep.reported == kGen5513);
+            CHECK(rep.boot_rearm_unresolved);
+            CHECK(r.engine->boot_report_holdoff_for_test() == 3);
+            continue;
+        }
+        expect_backoff_reports_5513(*r.engine, expected[i]);
+        CHECK(r.engine->policy_generation() == 0); // reads never leak the holdoff
+    }
+    // The internal value is untouched by any of it: a clean push at the same generation clears
+    // the flag and the reported value returns to it.
+    r.push_ok({}, kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513);
+}
+
+TEST_CASE("#5513 back-off dormant (prefer_spark=true): the failure counter saturates, the holdoff "
+          "holds at the cap, and a clean push clears the back-off",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // 40 failed catch-ups: past the counter's 16 cap and past 32, where an uncapped counter
+    // would shift by >= 32 (undefined; on x86 it wraps and the holdoff collapses to 1). The
+    // holdoff must still be exactly the 10-heartbeat ceiling. Then a clean push with holdoff
+    // still unspent: the flag clears, the back-off state is reset, and the report is the real
+    // value with no companion. Mutations: no counter cap (holdoff 1 or UBSan at failure 33);
+    // no reset of the two members on the tail clear (accessors stay 16 / 10 after the clear).
+    BootRig5513 r;
+    stage_refused_boot_5513(r);
+
+    for (std::uint32_t i = 1; i <= 40; ++i) {
+        r.push_ok({make_service_rule("r1")}, kGen5513);
+        REQUIRE(r.engine->boot_catchup_failures_for_test() == std::min<std::uint32_t>(i, 16));
+        if (i >= 5)
+            REQUIRE(r.engine->boot_report_holdoff_for_test() ==
+                    GuardianEngine::kBootReportBackoffMaxHeartbeats);
+    }
+    CHECK(r.engine->boot_report_holdoff_for_test() == 10);
+    CHECK(r.engine->policy_generation() == 0);
+
+    r.push_ok({}, kGen5513); // clean: the operator removed the refused rule
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+    for (int i = 0; i < 3; ++i) {
+        const auto rep = r.engine->generation_report();
+        CHECK(rep.reported == kGen5513);
+        CHECK_FALSE(rep.boot_rearm_unresolved);
+    }
+    CHECK(r.engine->policy_generation() == kGen5513);
+}
+
+TEST_CASE("#5513 back-off dormant (prefer_spark=true): a failed push with NO unresolved boot "
+          "re-arm neither counts nor holds off, and a healthy boot always reports the real "
+          "generation",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Healthy boot (flag never set), then a later push of the rule is refused once: that is an
+    // ordinary held push, not a boot catch-up. Mutations: dropping the
+    // `boot_unresolved_` term of the tail's else-if counts it (accessors 1 / 1); applying or
+    // consuming holdoff without the flag would show here only through those accessors, since
+    // the report would read {G, false} either way.
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+    r.construct(true, true);
+    r.wire();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.tick_until([&] { return r.engine->spark_armed_rule_count() == 1; }));
+    r.quiesce();
+    for (int i = 0; i < 3; ++i) {
+        const auto rep = r.engine->generation_report();
+        CHECK(rep.reported == kGen5513);
+        CHECK_FALSE(rep.boot_rearm_unresolved);
+    }
+
+    // A single-shot refusal (resolved synchronously or drained, the case does not depend on
+    // which): the push reaches the tail !clean, but the flag was never set.
+    const auto failures_before = r.engine->arm_failure_count();
+    r.mechanism->set_fail_next_watch();
+    r.push_ok({make_service_rule("r1")}, kGen5513);
+    r.quiesce();
+    CHECK(r.engine->arm_failure_count() > failures_before); // the push did fail to arm
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+    const auto rep = r.engine->generation_report();
+    CHECK(rep.reported == kGen5513);
+    CHECK_FALSE(rep.boot_rearm_unresolved);
+}
+
+TEST_CASE("#5513 back-off live (prefer_spark=false): pushes that return before the tail (invalid "
+          "rule id, KV refusal) are not failed catch-ups and earn no holdoff",
+          "[spark][guardian][reconcile][boot][5513]") {
+    // The #4665 reject and the put_rule early return both leave the boot application's flag
+    // owned by it and must not count. Mutation: moving the count to the top of apply_rules (or
+    // counting any non-ok return) reports the real generation after the first refused push.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+
+    CHECK(r.push({make_file_rule("")}, kGen5513).exit_code != 0); // invalid rule_id: rejected
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+
+    drop_kv_store_table_for_test(r.db_.path);
+    for (int i = 0; i < 2; ++i) {
+        CHECK(r.push({make_file_rule("r1")}, kGen5513).exit_code != 0); // put_rule refused
+        CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+        CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+        const auto rep = r.engine->generation_report();
+        CHECK(rep.reported == 0);
+        CHECK(rep.boot_rearm_unresolved);
+    }
+
+    recreate_kv_store_table_for_test(r.db_.path);
+    r.push_ok({make_file_rule("r1")}, kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    const auto cleared = r.engine->generation_report();
+    CHECK(cleared.reported == kGen5513);
+    CHECK_FALSE(cleared.boot_rearm_unresolved);
+}
+
+TEST_CASE("#5513 back-off dormant (prefer_spark=true): the tick's can_advance() clear resets the "
+          "back-off",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Boot arm drained as a failure (flag set by the tick), then a catch-up whose arm is parked
+    // (Accepted, pending): the tail sees !clean and starts the back-off (failure 1, holdoff 1);
+    // ticks while it is pending neither clear nor consume it. Releasing the arm lets the TICK
+    // clear the flag, and that clear (not the tail's) must reset both members. Mutation:
+    // deleting the two resets from the tick's clear leaves 1 / 1 after the flag is gone.
+    using namespace std::chrono_literals;
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire();
+    r.mechanism->hang_next_watch();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s));
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0); // the boot failure is not a catch-up
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+
+    r.mechanism->set_park_all_watches();
+    REQUIRE(r.push({make_service_rule("r1")}, kGen5513).exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return r.mechanism->parked_watch_count() == 1; }));
+    CHECK(r.engine->boot_catchup_failures_for_test() == 1);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 1);
+    for (int i = 0; i < 3; ++i) {
+        r.engine->journal_maintenance_tick();
+        CHECK(r.engine->boot_catchup_failures_for_test() == 1);
+        CHECK(r.engine->boot_report_holdoff_for_test() == 1);
+    }
+
+    r.mechanism->release_park_all();
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+    const auto rep = r.engine->generation_report();
+    CHECK(rep.reported == kGen5513);
+    CHECK_FALSE(rep.boot_rearm_unresolved);
+}
+
 TEST_CASE("#5513 dormant (prefer_spark=true): one rule fixed and one still failing keeps the "
           "reported generation at 0 until a fully clean application",
           "[spark][guardian][reconcile][boot][5513][dormant]") {

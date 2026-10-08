@@ -300,7 +300,8 @@ void collect_guardian_spark_health_tags(const Engine& eng, TagMap& tags,
 /// re-arm is unresolved (GuardianEngine::boot_rearm_unresolved()), ABSENT otherwise - sparse by
 /// design, since a 0 here carries no information and dormancy is absence. It explains a reported
 /// yuzu.guardian_generation of 0 (an unresolved boot re-arm, not "never had a push
-/// acknowledged"). A per-heartbeat wire diagnostic: the health store overwrites status_tags on
+/// acknowledged"); during the engine's report back-off after a failed catch-up the generation
+/// is the real persisted value while this tag stays "1". A per-heartbeat wire diagnostic: the health store overwrites status_tags on
 /// every heartbeat and no server reader consumes this key today.
 inline constexpr char kGuardianBootRearmUnresolvedTag[] = "yuzu.guardian_boot_rearm_unresolved";
 

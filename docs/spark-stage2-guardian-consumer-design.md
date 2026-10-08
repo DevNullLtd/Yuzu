@@ -821,8 +821,8 @@ a push that omits a still-desired rule is; follow-up FU-12 in the flip gate, #55
 agent restart gap (the boot
 Application opens at the loaded acknowledged generation with an empty `content_id`;
 a failed boot re-arm, formerly never retried, is resolved by #5513: the agent reports
-generation 0 with the `yuzu.guardian_boot_rearm_unresolved` tag until a push applies
-cleanly; a legacy guard that returns false at arm is the boot-path analogue of #2797's
+generation 0 (intermittently, with an agent-side back-off between failed catch-ups) with the
+`yuzu.guardian_boot_rearm_unresolved` tag until a push applies cleanly; a legacy guard that returns false at arm is the boot-path analogue of #2797's
 `apply_rules` defect and stays uncovered); a content-identity gap (an
 identical re-observation matches `rule_id` and spec only, #5512); a wedge that is adopted or
 settles before the agent has retained it costs one avoidable Reapply on the next identical
@@ -1167,7 +1167,8 @@ design is mentioned it is named as the earlier design.
 - **Known limits #5459 does NOT fix (record, do not widen scope).** Agent restart gap:
   the boot Application opens at the loaded acknowledged generation with an empty
   `content_id`. A failed boot re-arm, formerly never retried, is resolved by #5513 (the
-  agent reports generation 0 with the `yuzu.guardian_boot_rearm_unresolved` tag until a
+  agent reports generation 0, intermittently with an agent-side back-off between failed
+  catch-ups, with the `yuzu.guardian_boot_rearm_unresolved` tag until a
   push applies cleanly; a legacy guard that returns false at arm is the boot-path analogue
   of #2797's `apply_rules` defect and stays uncovered, and a server at generation 0 does
   not push); an acknowledgment

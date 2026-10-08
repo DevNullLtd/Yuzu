@@ -1163,6 +1163,8 @@ void GuardianEngine::journal_maintenance_tick() {
             // policy_generation_), so a clear nested inside it would never fire.
             if (boot_unresolved_) {
                 boot_unresolved_ = false;
+                boot_catchup_failures_ = 0; // see apply_rules' identical clear
+                boot_report_holdoff_ = 0;
                 spdlog::info("Guardian: boot re-arm flag cleared (the ack-drain tick saw no arm "
                              "failure; a legacy arm that returned false is not detected, #2797), "
                              "reporting policy_generation={} again",
@@ -1317,6 +1319,16 @@ std::size_t GuardianEngine::ack_pending_count_for_test() const {
 std::size_t GuardianEngine::ack_failed_receipt_count_for_test() const {
     std::lock_guard lock(mtx_);
     return ack_ledger_->failed_receipt_count_for_test();
+}
+
+std::uint32_t GuardianEngine::boot_catchup_failures_for_test() const {
+    std::lock_guard lock(mtx_);
+    return boot_catchup_failures_;
+}
+
+std::uint32_t GuardianEngine::boot_report_holdoff_for_test() const {
+    std::lock_guard lock(mtx_);
+    return boot_report_holdoff_;
 }
 
 std::optional<GuardianArmStats> GuardianEngine::arm_stats() const {
@@ -1826,10 +1838,29 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     const bool clean = reconcile_failures == 0 && ack_ledger_->can_advance();
     if (clean && boot_unresolved_) {
         boot_unresolved_ = false;
+        boot_catchup_failures_ = 0; // the back-off belongs to the unresolved episode
+        boot_report_holdoff_ = 0;
         spdlog::info("Guardian: boot re-arm flag cleared (this push applied without an arm "
                      "failure; a legacy arm that returned false is not detected, #2797), "
                      "reporting policy_generation={} again",
                      policy_generation_);
+    } else if (!clean && boot_unresolved_) {
+        // #5513 back-off (governance finding P-1): this catch-up did not resolve the boot
+        // re-arm, and reporting 0 on every heartbeat would make the server re-push a full sync
+        // about every heartbeat for as long as the rule keeps failing. Only an application that
+        // reached this tail counts: the #4665 reject, the Suppress return, the begin_application
+        // and put_rule early returns above all leave the counters alone. A pending Spark arm
+        // also lands here (!can_advance()); the tick clears the flag, and the counters, once it
+        // commits, so at worst the real generation is reported for a few heartbeats first. The
+        // internal generation is untouched; only the next generation_report() calls change.
+        if (boot_catchup_failures_ < kBootCatchupFailuresCap)
+            ++boot_catchup_failures_;
+        boot_report_holdoff_ = std::min<std::uint32_t>(1u << (boot_catchup_failures_ - 1),
+                                                       kBootReportBackoffMaxHeartbeats);
+        spdlog::info("Guardian: boot re-arm still unresolved after catch-up push #{} - reporting "
+                     "the real policy_generation={} for the next {} heartbeat(s) before asking "
+                     "the server again",
+                     boot_catchup_failures_, policy_generation_, boot_report_holdoff_);
     }
     if (clean && push.policy_generation() > policy_generation_) {
         if (persist_generation_locked(push.policy_generation()))
@@ -2005,8 +2036,16 @@ std::uint64_t GuardianEngine::policy_generation() const {
     return boot_unresolved_ ? 0 : policy_generation_;
 }
 
-GuardianEngine::GenerationReport GuardianEngine::generation_report() const {
+GuardianEngine::GenerationReport GuardianEngine::generation_report() {
     std::lock_guard lock(mtx_);
+    // #5513 back-off: one call is one heartbeat's report. While the boot re-arm is unresolved
+    // and a failed catch-up left holdoff, report the real persisted generation (the server then
+    // stops re-pushing for that heartbeat) but keep the companion flag set, so the pair still
+    // says "unresolved". Holdoff is never consumed or applied when the flag is not set.
+    if (boot_unresolved_ && boot_report_holdoff_ > 0) {
+        --boot_report_holdoff_;
+        return GenerationReport{.reported = policy_generation_, .boot_rearm_unresolved = true};
+    }
     return GenerationReport{.reported = boot_unresolved_ ? 0 : policy_generation_,
                             .boot_rearm_unresolved = boot_unresolved_};
 }
