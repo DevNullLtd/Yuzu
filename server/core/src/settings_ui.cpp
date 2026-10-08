@@ -158,7 +158,10 @@ extern const char* const kSettingsHtml =
       border: 1px solid var(--border); border-radius: 0.3rem;
       font-size: 0.8rem; outline: none;
     }
-    .pw-form { flex-wrap: wrap; margin-top: 0.25rem; padding-top: 0; border-top: none; }
+    // #5572 — flex-wrap now comes from the .add-user-form base rule; this
+    // override only needs the layout tweaks still specific to the nested
+    // password-change variant.
+    .pw-form { margin-top: 0.25rem; padding-top: 0; border-top: none; }
 
     /* ── Token reveal ──────────────────────────────────────── */
     .token-reveal {
