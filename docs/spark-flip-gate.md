@@ -1218,8 +1218,19 @@ flip, with a red-first test each:
     failing rule is re-pushed with an agent-side back-off (after each failed catch-up the
     agent reports its real generation for the next 1, 2, 4, 8, then 10 heartbeats before
     reporting 0 again; about 60 s, 90 s, 150 s, 270 s, then 330 s apart at the default 30 s
-    heartbeat), one audit row per push, so the loop is closed here and #5504 stays the Spark
-    flip cost measurement, not the owner of this back-off. Residuals: a legacy guard that returns false at arm
+    heartbeat, and the cadence scales with the interval only for intervals of about 12.5 s
+    or more, because the server's own 25 s per-agent limit dominates shorter ones), one
+    audit row per push. The loop is closed for catch-ups that reach the apply_rules tail
+    with the persisted generation equal to the server's current generation. It is NOT
+    closed for: an agent whose persisted generation is behind the server's (or is 0), which
+    keeps being re-pushed at the server's 25 s limit because the held-back report is still
+    below the server's generation; a push that returns before the tail (a persistent KV
+    write failure on rule persist, a begin_application throw, the invalid-rule-id reject),
+    which earns no holdoff; and repeats suppressed under prefer_spark=true (an accepted
+    Spark arm still pending, or a wedge outstanding), which do not extend it. These are the
+    pre-existing held-generation retry, unchanged; a generic server-side per-agent back-off
+    for it is a follow-up, and #5504 stays the
+    Spark flip cost measurement, not the owner of this back-off. Residuals: a legacy guard that returns false at arm
     (`ReconcileOutcome::Inert`) is the boot-path
     analogue of #2797's `apply_rules` defect and is not covered, a server whose current
     generation is 0 does not push, and the catch-up applies only where a legacy guard

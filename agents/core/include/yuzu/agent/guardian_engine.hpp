@@ -503,9 +503,11 @@ public:
     /// heartbeat that ships both tags can never pair a value from before an apply_rules clear
     /// with a flag from after it (#5513). `reported` is what policy_generation() would return at
     /// the same instant, EXCEPT during the back-off: while the boot re-arm is unresolved and
-    /// boot_report_holdoff_ is positive, `reported` is the real persisted generation (the
-    /// server then sees an agent that is caught up and stops re-pushing for that many
-    /// heartbeats) while `boot_rearm_unresolved` stays true.
+    /// boot_report_holdoff_ is positive, `reported` is the real persisted generation while
+    /// `boot_rearm_unresolved` stays true. Only an agent whose persisted generation EQUALS the
+    /// server's current generation is left alone by the server for that many heartbeats; one
+    /// whose persisted generation is behind the server's (or is 0) is still re-pushed at the
+    /// server's 25 s per-agent limit (the pre-existing held-generation retry, unchanged).
     ///
     /// NOT const, and NOT idempotent: each call is exactly ONE heartbeat's report and consumes
     /// one unit of holdoff, so it must be called once per heartbeat (agent.cpp does) and never
@@ -883,9 +885,10 @@ private:
     bool started_{false};
     bool stopped_{false};
     std::uint64_t policy_generation_{0};
-    /// #5513: true while a boot re-arm is unresolved; policy_generation() and
-    /// generation_report() then report 0 (policy_generation_ itself is never touched, so the
-    /// persisted value and the two `> policy_generation_` advance gates are unchanged). Set by
+    /// #5513: true while a boot re-arm is unresolved; policy_generation() then reports 0, and
+    /// generation_report() reports 0 except during the back-off holdoff below
+    /// (policy_generation_ itself is never touched, so the persisted value and the two
+    /// `> policy_generation_` advance gates are unchanged). Set by
     /// note_boot_rearm_failure_locked() (start_local's walk) and by the maintenance tick when a
     /// receipt of the still-open boot application drains as a failure; cleared by any clean
     /// application (apply_rules' tail, or the tick's can_advance() block). Under mtx_, no atomics.
@@ -901,7 +904,13 @@ private:
     /// #5513 back-off: the number of upcoming generation_report() calls (one per heartbeat) that
     /// report the REAL persisted generation instead of 0 while boot_unresolved_ is set. Without
     /// it an unresolved boot re-arm reports 0 on every heartbeat, so the server re-pushes a full
-    /// sync about every heartbeat forever if the rule keeps failing. Set by a failed catch-up to
+    /// sync about every heartbeat forever if the rule keeps failing. The back-off bites only
+    /// when the persisted generation equals the server's current one and the failed catch-up
+    /// reaches apply_rules' tail: a push that returns before the tail earns no holdoff, a
+    /// Suppress repeat under prefer_spark_ does not extend it, and an agent whose persisted
+    /// generation is behind the server's keeps being re-pushed at the server's 25 s per-agent
+    /// limit (the pre-existing held-generation retry; a generic server-side back-off for it is
+    /// a follow-up). Set by a failed catch-up to
     /// min(2^(boot_catchup_failures_-1), kBootReportBackoffMaxHeartbeats) (1, 2, 4, 8, 10, 10,
     /// ...), consumed one per generation_report(), reset to 0 when the flag clears. Touches
     /// neither policy_generation_ (the persisted and internal value is never altered) nor

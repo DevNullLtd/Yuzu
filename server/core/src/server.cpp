@@ -5800,7 +5800,8 @@ public:
             // applied policy generation on every heartbeat; if it trails the
             // current generation it missed a push (was offline when the push fired,
             // or has just reconnected — sync_with_server is a no-op pull), so
-            // re-push its applicable rules. An agent also reports generation 0 while
+            // re-push its applicable rules. An agent also reports generation 0
+            // (intermittently, see the agent's back-off) while
             // a boot re-arm failure is unresolved (#5513), however current its
             // persisted generation is; the same full_sync re-push is the catch-up
             // for that case too. Reads the generation, never bumps it, so
