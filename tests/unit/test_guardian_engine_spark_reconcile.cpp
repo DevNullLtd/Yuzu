@@ -8055,9 +8055,6 @@ TEST_CASE("#4045 E45: stop() marks its start BEFORE it waits for the engine mute
     int apply_rc = -1;
     FakeClock4045 clock{*persister};
     HookGuard4045 hooks{*f.engine};
-    // Declared after everything the hooks and threads capture; destructs first, so a failing
-    // REQUIRE below still lets the parked apply_rules return and both threads join.
-    yuzu::test::ScopeExit unpark{[&] { release.store(true); }};
 
     f.engine->set_apply_post_drain_hook_for_test([&] { // runs inside apply_rules, mtx_ held
         in_apply.store(true);
@@ -8067,6 +8064,7 @@ TEST_CASE("#4045 E45: stop() marks its start BEFORE it waits for the engine mute
         apply_rc = f.dispatch_raw(make_service_rule("r1", /*enabled=*/false), false).exit_code;
     });
     Join4045 join_apply{apply_thread};
+    yuzu::test::ScopeExit unpark_apply{[&] { release.store(true); }}; // before join_apply joins
     REQUIRE(yuzu::test::spin_until([&] { return in_apply.load(); }));
 
     // apply_rules holds mtx_. Captures staged now, and a store that fails SLOWLY.
@@ -8078,6 +8076,7 @@ TEST_CASE("#4045 E45: stop() marks its start BEFORE it waits for the engine mute
     });
     std::thread stop_thread([&] { f.engine->stop(); });
     Join4045 join_stop{stop_thread};
+    yuzu::test::ScopeExit unpark_stop{[&] { release.store(true); }}; // before join_stop joins
     // stop() cannot have the mutex, yet its mark is already taken. RED if the mark is taken
     // after the lock: it would only appear once the apply_rules below returns.
     REQUIRE(yuzu::test::spin_until([&] { return persister->stop_begun_for_test(); }));
@@ -8363,7 +8362,6 @@ TEST_CASE("#4045 E50: a waiter that has come and gone leaves no yield behind: th
     std::atomic<bool> release{false};
     std::atomic<bool> armed{true};
     HookGuard4045 hooks{*f.engine};
-    yuzu::test::ScopeExit unpark{[&] { release.store(true); }};
     persister->set_post_write_hook_for_test([&] {
         if (!armed.exchange(false))
             return;
@@ -8373,11 +8371,15 @@ TEST_CASE("#4045 E50: a waiter that has come and gone leaves no yield behind: th
     GuardianBaselinePersister::Outcome worker;
     std::thread a([&] { worker = persister->persist_staged(*rt, Trig::Worker); });
     Join4045 join_a{a};
+    // Declared after the join guards, so a failing REQUIRE releases the parked pass BEFORE any
+    // of them tries to join it.
+    yuzu::test::ScopeExit unpark{[&] { release.store(true); }};
     REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
 
     SECTION("a seed-fence waiter") {
         std::thread b([&] { auto fence = persister->hold_seed_fence(); });
         Join4045 join_b{b};
+        yuzu::test::ScopeExit unpark_b{[&] { release.store(true); }};
         REQUIRE(yuzu::test::spin_until([&] { return persister->lock_waiters_for_test() == 1; }));
         release.store(true);
         a.join();
@@ -8392,6 +8394,7 @@ TEST_CASE("#4045 E50: a waiter that has come and gone leaves no yield behind: th
         GuardianBaselinePersister::Outcome forced;
         std::thread b([&] { forced = persister->persist_staged(*rt, Trig::Forced); });
         Join4045 join_b{b};
+        yuzu::test::ScopeExit unpark_b{[&] { release.store(true); }};
         REQUIRE(yuzu::test::spin_until([&] { return persister->lock_waiters_for_test() == 1; }));
         release.store(true);
         a.join();
@@ -8456,7 +8459,6 @@ TEST_CASE("#4045 E52: the test-hook and budget setters wait for a pass in flight
     std::atomic<bool> release{false};
     std::atomic<int> returned{0};
     HookGuard4045 hooks{*f.engine};
-    yuzu::test::ScopeExit unpark{[&] { release.store(true); }};
     const auto parked = [&] {
         in_pass.store(true);
         (void)yuzu::test::spin_until([&] { return release.load(); });
@@ -8471,6 +8473,7 @@ TEST_CASE("#4045 E52: the test-hook and budget setters wait for a pass in flight
         persister->set_post_snapshot_hook_for_test(parked);
         std::thread pass([&] { (void)persister->persist_staged(*rt, Trig::Forced); });
         Join4045 join_pass{pass};
+        yuzu::test::ScopeExit unpark_pass{[&] { release.store(true); }};
         REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
         std::thread s1([&] {
             persister->set_post_write_hook_for_test(nullptr);
@@ -8495,6 +8498,7 @@ TEST_CASE("#4045 E52: the test-hook and budget setters wait for a pass in flight
         persister->set_post_write_hook_for_test(parked);
         std::thread pass([&] { (void)persister->persist_staged(*rt, Trig::Forced); });
         Join4045 join_pass{pass};
+        yuzu::test::ScopeExit unpark_pass{[&] { release.store(true); }};
         REQUIRE(yuzu::test::spin_until([&] { return in_pass.load(); }));
         std::thread s([&] {
             persister->set_post_snapshot_hook_for_test(nullptr);
