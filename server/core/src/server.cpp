@@ -5953,9 +5953,9 @@ public:
             // interval (so an agent alternating generation 0 / current cannot buy a push on
             // every second heartbeat); a claim older than the interval is erased on
             // convergence, and the maintenance sweep bounds the rest. Nothing releases a claim
-            // early: an agent with no session (Registered, not yet Subscribed) is admitted at
-            // most once per interval, however often it heartbeats. The cached generation
-            // (<= 2 s old) only drives that decision; an ADMITTED push re-reads the
+            // early: an agent whose push ends without sending (no session, or a failed send)
+            // is admitted at most once per interval, however often it heartbeats. The cached
+            // generation (<= 2 s old) only drives that decision; an ADMITTED push re-reads the
             // generation fresh and labels the push with it.
             heartbeat_ingestion_->set_guardian_reconcile_fn(
                 [this, reconcile_duration](std::string_view agent_id_sv,
@@ -5969,8 +5969,9 @@ public:
                     // short-TTL single-flight cache whose error arm is the store's
                     // nullopt, so this early return is unchanged; a failed read is
                     // negative-cached for a shorter TTL. The value may be up to the TTL
-                    // stale (only ever LOWER than the store's), so it decides converged /
-                    // rate-limited / shed and is never used to label a push.
+                    // stale (only ever LOWER than the store's, assuming a monotonic store),
+                    // so it decides converged / rate-limited / shed and is never used to
+                    // label a push.
                     const auto current_res = guardian_generation_cache_.get();
                     if (!current_res) {
                         metrics_
@@ -6103,12 +6104,17 @@ public:
                             .counter("yuzu_server_guardian_reconciles_total",
                                      {{"result", "no_session"}})
                             .increment();
-                        // The claim Admit wrote is deliberately KEPT. An agent that has
-                        // Registered but not Subscribed has no session and heartbeats
-                        // generation 0 in a loop; releasing the claim here would make every
-                        // such heartbeat a fresh admission and let one credential drain the
-                        // shared budget. Kept, it is at most one admission per
-                        // min_interval (25 s) per agent. No audit row is written on this path.
+                        // The claim Admit wrote is deliberately KEPT. This arm fires only when
+                        // the session was removed (reap, revoke, teardown) while the
+                        // pending-map session id still resolved, or on a deregistration race.
+                        // (An agent that has Registered but not yet Subscribed is NOT here:
+                        // register_agent installs its session at Register, so it takes the full
+                        // push path and the send fails, visible only as
+                        // yuzu_server_system_reserved_push_total{result="undelivered"}.)
+                        // Releasing the claim would let a looping agent turn every heartbeat
+                        // into a fresh admission and drain the shared budget; kept, it is at
+                        // most one admission per min_interval (25 s) per agent. No audit row
+                        // is written on this path.
                         return;
                     }
                     // The generation that LABELS this push, read fresh from the store (cache
@@ -6139,7 +6145,9 @@ public:
                     // enabled-but-undeployed Guard is never reconciled onto an agent.
                     // ADR-0055 catastrophic-read set: a degraded deployed-set read MUST also
                     // abort, never fan out an empty deployed-set it cannot distinguish from
-                    // "nothing deployed". A failed load is never cached.
+                    // "nothing deployed". A failed load is never HELD as the bundle; it is
+                    // remembered briefly (negative cache, guardian_rule_bundle.hpp) so a slow
+                    // failing store is not re-probed by every admitted push.
                     // The generation was read BEFORE this call (guardian_rule_bundle.hpp's
                     // ordering requirement): rows read inside the loader are at least as new
                     // as `fresh_generation`. The bundle is keyed by the FRESH generation,
@@ -9263,6 +9271,22 @@ public:
                 // F2a PR3: per-cohort fleet perf gauges — same cycle, same
                 // staleness window as the fleet families above.
                 publish_cohort_perf_gauges();
+                // #5513: saturation gauges for the Guardian reconcile admission control,
+                // published BEFORE the reap and the claim sweep below and in their own try, so
+                // a throwing reap or sweep cannot freeze them: in-flight pushes (the cap), the
+                // budget balance (negative is debt) and the claim table size.
+                try {
+                    metrics_.gauge("yuzu_server_guardian_reconcile_in_flight")
+                        .set(static_cast<double>(guardian_reconcile_gate_.in_flight()));
+                    metrics_.gauge("yuzu_server_guardian_reconcile_budget_balance_ms")
+                        .set(guardian_reconcile_budget_.balance_ms());
+                    metrics_.gauge("yuzu_server_guardian_reconcile_claims")
+                        .set(static_cast<double>(guardian_reconcile_gate_.claims_size()));
+                } catch (const std::exception& e) {
+                    spdlog::warn("Guardian reconcile gauge publish failed: {}", e.what());
+                } catch (...) {
+                    spdlog::warn("Guardian reconcile gauge publish failed: unknown exception");
+                }
                 // Reap Subscribe streams for agents that missed heartbeats
                 registry_.reap_stale_sessions(cfg_.session_timeout);
                 // #5513: bound the Guardian reconcile per-agent claim map. In-memory,
@@ -9274,15 +9298,6 @@ public:
                 try {
                     YUZU_ASSERT_BACKGROUND_JOB("guardian_reconcile_gate.sweep"); // WS-10 ReplicaSafe
                     (void)guardian_reconcile_gate_.sweep();
-                    // Saturation gauges for the reconcile admission control, published from
-                    // the same tick: in-flight pushes (the cap), the budget balance (negative
-                    // is debt) and the claim table size.
-                    metrics_.gauge("yuzu_server_guardian_reconcile_in_flight")
-                        .set(static_cast<double>(guardian_reconcile_gate_.in_flight()));
-                    metrics_.gauge("yuzu_server_guardian_reconcile_budget_balance_ms")
-                        .set(guardian_reconcile_budget_.balance_ms());
-                    metrics_.gauge("yuzu_server_guardian_reconcile_claims")
-                        .set(static_cast<double>(guardian_reconcile_gate_.claims_size()));
                 } catch (const std::exception& e) {
                     spdlog::warn("Guardian reconcile claim sweep failed: {}", e.what());
                 } catch (...) {
@@ -17428,7 +17443,7 @@ private:
             guaranteed_state_store_.get(),
             baseline_store_.get(),
             [this]() -> std::string { return registry_.to_json(); },
-            // Dashboard enforcement toggle deploys via the same push fan-out the
+            // Baseline deploy / delete of a deployed Baseline push via the same fan-out the
             // REST endpoint uses. guardian_push_fn_ is assigned just below during
             // REST wiring; this lambda reads it at toggle-time (runtime), never at
             // registration time, so the ordering is fine.
@@ -19908,16 +19923,16 @@ private:
             // `__guard__`/push_rules CommandRequest via the agent dispatch path (reuses
             // the instruction-dispatch scope→send_to idiom). Returns the agent count, or
             // -1 on an unparseable scope. See docs/guardian-mvp-contract.md (step 3/G12).
-            // Also stored into guardian_push_fn_ (member) so the dashboard enforcement
-            // toggle deploys via this exact fan-out. The parenthesised assignment yields
-            // the assigned std::function, which is what gets passed here by value.
+            // Also stored into guardian_push_fn_ (member) so baseline deploy / delete of a
+            // deployed Baseline push via this exact fan-out. The parenthesised assignment
+            // yields the assigned std::function, which is what gets passed here by value.
             (guardian_push_fn_ = [this](const std::string& scope, bool full_sync) -> int {
                 if (!guaranteed_state_store_)
                     return 0;
                 // Callers reach here right after a local policy-generation bump (baseline
-                // deploy/delete, the enforcement toggle, the REST push). Drop the heartbeat
-                // reconcile's cached generation (<= 2 s stale) and held bundle so the next
-                // heartbeat decides from the post-bump state instead of waiting out the TTL.
+                // deploy, delete of a DEPLOYED baseline) or an explicit push (REST, MCP). Drop
+                // the heartbeat reconcile's cached generation (<= 2 s stale) and held bundle
+                // so the next heartbeat decides from the post-bump state instead of waiting out the TTL.
                 guardian_generation_cache_.invalidate();
                 guardian_rule_bundle_cache_.invalidate();
                 const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
@@ -21433,8 +21448,8 @@ private:
     std::unique_ptr<VerifyRoutes> verify_routes_;
     std::unique_ptr<DeploymentRoutes> deployment_routes_;
     std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
-    // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
-    // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
+    // Guardian push fan-out, shared by baseline deploy / delete of a deployed Baseline, the
+    // REST /push endpoint and the MCP push. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by
     // which point it is set.
     //

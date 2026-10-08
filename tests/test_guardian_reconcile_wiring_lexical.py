@@ -30,7 +30,10 @@ removed, string-literal contents reduced to [A-Za-z0-9_], whitespace collapsed):
   j. Control flow: the Converged, RateLimited and Shed cases each `return;` (a case that falls
      through would run the push for an agent that must not get one); the RateLimited case counts
      result="rate_limited".
-  k. decide() is called with its real argument order, `decide(agent_id, agent_gen, current)`.
+  k. decide() is the direct operand of the `switch` and is called with its real argument order
+     INCLUDING the `&shed_cause` out-parameter, `decide(agent_id, agent_gen, current, &shed_cause)`
+     (the out-parameter is mandatory: the Shed log is worded by it; a `true ||` bypass in front
+     of the call is also red).
   l. The push is labelled with the FRESH generation: `fresh_generation` is read through
      `guardian_generation_cache_.get_fresh()` AFTER decide and BEFORE the bundle get, and the
      bundle get and `build_agent_push(` are keyed by it, never by `agent_gen` or the cached
@@ -39,12 +42,12 @@ removed, string-literal contents reduced to [A-Za-z0-9_], whitespace collapsed):
   m. `abort_degraded` increments the `degraded` counter AND writes the audit event; the rule,
      baseline and bundle-load degrade branches each reach it.
   n. A session-less Admit KEEPS its claim: the reconcile lambda never calls `release(` (an agent
-     that Registered but did not Subscribe heartbeats generation 0 in a loop; releasing the claim
-     would turn each heartbeat into a fresh admission and let one credential drain the shared
-     budget), and the `no_session` branch counts then returns. Only the time spent BLOCKED
-     on another thread's rule-set load is excluded from the debit (`admitted.exclude(bundle_waited)`
-     fed by the cache's `waited` out-parameter); the generic `excluding(` wrapper that also
-     excluded the owner's own load must not return.
+     heartbeating generation 0 in a loop would, with the claim released, turn each heartbeat into a
+     fresh admission and let one credential drain the shared budget), and the `no_session` branch
+     counts then returns. Only the time spent BLOCKED on another thread's rule-set load is excluded
+     from the debit: there is EXACTLY ONE `admitted.exclude(` in the lambda, `exclude(bundle_waited)`
+     fed by the cache's `waited` out-parameter (a second would double-subtract); the generic
+     `excluding(` wrapper that also excluded the owner's own load must not return.
   o. The bundle load goes through `guardian::load_reconcile_bundle(` (unit-tested for its
      evaluation order), and no statement anywhere in server.cpp or guardian_push_builder.cpp
      combines `filter_deployed_members(` with `std::move(`: `make_bundle` takes both arguments
@@ -54,12 +57,15 @@ removed, string-literal contents reduced to [A-Za-z0-9_], whitespace collapsed):
      invalidates both reconcile caches.
   r. After the fresh-generation read: an unreadable result aborts through `abort_degraded(` AND
      returns (else `*fresh_res` is dereferenced), `if (fresh_generation <= agent_gen)` returns
-     (a reconcile whose fresh value is not ahead sends nothing), the policy-generation gauge is
-     set from `fresh_generation` (never the cached `current`), and `admitted.exclude(` comes
-     after the bundle get whose waited value it takes.
-  q. The 15 s maintenance tick that calls `guardian_reconcile_gate_.sweep(` also publishes the
-     three saturation gauges (`yuzu_server_guardian_reconcile_in_flight`,
-     `..._budget_balance_ms`, `..._claims`) from the gate and budget, in the same try block.
+     BEFORE the bundle get (a reconcile whose fresh value is not ahead sends nothing and must not
+     pay for a load), no policy-generation gauge `.set(` anywhere in the lambda takes the cached
+     `current` (only `fresh_generation`), and `admitted.exclude(` comes after the bundle get whose
+     waited value it takes.
+  q. The 15 s maintenance tick publishes the three saturation gauges
+     (`yuzu_server_guardian_reconcile_in_flight`, `..._budget_balance_ms`, `..._claims`) from the
+     gate and budget in their OWN try block with both catch arms (`std::exception` and `...`),
+     BEFORE the `guardian_reconcile_gate_.sweep(` call, so a throwing reap or sweep cannot freeze
+     them; and the sweep itself sits in a try with both catch arms.
 
 LEXICAL ONLY. It cannot see a relocation that keeps the tokens but changes control flow (that
 stays review-enforced), and the behavioural guarantees are the building blocks' own unit tests.
@@ -285,10 +291,12 @@ def problems(src):
             r' ?\.increment\(\)', rl):
         out.append('the RateLimited case no longer increments result="rate_limited" (j)')
 
-    # (k) the real argument order.
+    # (k) the real argument order, the mandatory &shed_cause out-parameter, and decide() as the
+    # direct switch operand (so a `true ||` bypass in front of it is red).
     if decide and not re.search(
-            r"guardian_reconcile_gate_\.decide\( ?agent_id, ?agent_gen, ?current(?:, ?&shed_cause)? ?\)", b):
-        out.append("decide( is no longer called as decide(agent_id, agent_gen, current[, &shed_cause]) (k)")
+            r"\bswitch \( ?guardian_reconcile_gate_\.decide\( ?agent_id, ?agent_gen, ?current, ?&shed_cause ?\) ?\) ?\{", b):
+        out.append("decide( is no longer the direct switch operand called as "
+                   "decide(agent_id, agent_gen, current, &shed_cause) (k)")
     # (k2) the shed log is worded by cause: both causes are distinguished.
     shed_body = case_body(b, "Shed", "Admit")
     if decide and shed_body is not None and not (
@@ -321,6 +329,13 @@ def problems(src):
                    "whose fresh generation is not ahead of the agent would still push (r)")
     if not re.search(r'\.gauge\( ?"yuzu_server_guardian_policy_generation" ?\) ?\.set\( ?static_cast<double>\( ?fresh_generation ?\) ?\)', b):
         out.append("the policy-generation gauge is no longer set from fresh_generation (r)")
+    for gm in re.finditer(r'\.gauge\( ?"yuzu_server_guardian_policy_generation"[^;]*;', b):
+        if re.search(r"\bcurrent\b", gm.group(0)):
+            out.append("a policy-generation gauge .set( takes the cached `current` in the reconcile lambda (r)")
+    early = re.search(r"\bif \( ?fresh_generation <= agent_gen ?\) ?return ?;", b)
+    if early and bundle_get and not early.start() < bundle_get.start():
+        out.append("the `fresh_generation <= agent_gen` return is no longer BEFORE the bundle get: a "
+                   "reconcile that sends nothing would still pay for a rule-set load (r)")
     ex = re.search(r"\badmitted\.exclude\(", b)
     if bundle_get and ex and not bundle_get.start() < ex.start():
         out.append("admitted.exclude( is no longer after the bundle get that produces its argument (r)")
@@ -345,6 +360,9 @@ def problems(src):
                    "or an unsubscribed agent's heartbeats become unbounded admissions (n)")
     if not re.search(r'\{ ?\{ ?"result", ?"no_session" ?\} ?\} ?\) ?\.increment\(\) ?; ?return ?;', b):
         out.append("the no_session branch is no longer counter-then-return (n)")
+    if len(re.findall(r"\badmitted\.exclude\(", b)) != 1:
+        out.append("the reconcile lambda no longer has exactly one admitted.exclude( (a second would "
+                   "subtract the same wait twice) (n)")
     if not re.search(r"\badmitted\.exclude\( ?bundle_waited ?\)", b):
         out.append("the time blocked on another thread's rule-bundle load is no longer excluded from "
                    "the budget debit (n)")
@@ -372,18 +390,37 @@ def problems(src):
             if not re.search(cache + r"\.invalidate\(\)", push_body):
                 out.append(f"guardian_push_fn_ no longer calls {cache}.invalidate() (p)")
 
-    # (q) the saturation gauges are published from the tick that runs the claim sweep.
-    sweep_site = re.search(r"guardian_reconcile_gate_\.sweep\(\)(.*?)\} ?catch ?\(", t.replace(b, ""))
+    # (q) the saturation gauges are published in their own guarded block BEFORE the claim sweep,
+    # and the sweep itself is guarded by both catch arms.
+    t2 = t.replace(b, "")
+    sweep_site = re.search(r"guardian_reconcile_gate_\.sweep\(\) ?; ?(\} ?catch ?\( ?const std::exception ?& ?\w+ ?\) ?\{[^{}]*\} ?"
+                           r"catch ?\( ?\.\.\. ?\) ?\{)?", t2)
     if not sweep_site:
-        out.append("could not isolate the claim sweep's try block (q)")
+        out.append("could not find the claim sweep call outside the reconcile lambda (q)")
     else:
-        tick = sweep_site.group(1)
-        for name, src in (("yuzu_server_guardian_reconcile_in_flight", r"guardian_reconcile_gate_\.in_flight\(\)"),
-                          ("yuzu_server_guardian_reconcile_budget_balance_ms",
-                           r"guardian_reconcile_budget_\.balance_ms\(\)"),
-                          ("yuzu_server_guardian_reconcile_claims", r"guardian_reconcile_gate_\.claims_size\(\)")):
-            if not re.search(r'metrics_ ?\.gauge\( ?"' + name + r'" ?\) ?\.set\([^;]*' + src, tick):
-                out.append(f"{name} is no longer set from {src.replace(chr(92), '')} at the claim sweep site (q)")
+        if not sweep_site.group(1):
+            out.append("the claim sweep is no longer followed by BOTH catch arms, catch (const std::exception&) "
+                       "and catch (...) (q)")
+        gauge_try = None
+        for m in re.finditer(r"\btry ?\{([^{}]*)\} ?catch ?\( ?const std::exception ?& ?\w+ ?\) ?\{[^{}]*\} ?"
+                             r"catch ?\( ?\.\.\. ?\) ?\{", t2):
+            if "yuzu_server_guardian_reconcile_in_flight" in m.group(1):
+                gauge_try = m
+                break
+        if gauge_try is None:
+            out.append("the three saturation gauges are no longer published inside their own try with BOTH "
+                       "catch arms (std::exception and ...) (q)")
+        else:
+            tick = gauge_try.group(1)
+            if gauge_try.start() > sweep_site.start():
+                out.append("the saturation gauges are published AFTER the claim sweep: a throwing reap or "
+                           "sweep would freeze them (q)")
+            for name, src in (("yuzu_server_guardian_reconcile_in_flight", r"guardian_reconcile_gate_\.in_flight\(\)"),
+                              ("yuzu_server_guardian_reconcile_budget_balance_ms",
+                               r"guardian_reconcile_budget_\.balance_ms\(\)"),
+                              ("yuzu_server_guardian_reconcile_claims", r"guardian_reconcile_gate_\.claims_size\(\)")):
+                if not re.search(r'metrics_ ?\.gauge\( ?"' + name + r'" ?\) ?\.set\([^;]*' + src, tick):
+                    out.append(f"{name} is no longer set from {src.replace(chr(92), '')} in the gauge block (q)")
     return out
 
 
@@ -429,6 +466,18 @@ BEGIN = "auto admitted = guardian_reconcile_gate_.begin_admitted();"
 SHED_OPEN = "case GuardianReconcileGate::Decision::Shed: {"
 EVAL = "const auto eval = registry_.evaluate_scope_for_agent("
 ABORT = 'abort_degraded("scope store degraded", scope_degraded_detail);'
+
+def _move_gauges_after_sweep(s):
+    """Cut the gauge try block out and paste it after the sweep's catch arms (tokens all present)."""
+    m = re.search(r"[ \t]*try \{\s*metrics_\s*\.gauge\(\"yuzu_server_guardian_reconcile_in_flight\"\).*?"
+                  r"Guardian reconcile gauge publish failed: unknown exception\"\);\s*\}\n", s, re.S)
+    assert m, "gauge block not found (stale pattern)"
+    block = m.group(0)
+    s = s[:m.start()] + s[m.end():]
+    n = re.search(r"Guardian reconcile claim sweep failed: unknown exception\"\);\s*\}\n", s)
+    assert n, "sweep block not found (stale pattern)"
+    return s[:n.end()] + block + s[n.end():]
+
 
 # (name, mutator, expected letter-tagged substring of the joined problems)
 MUTATIONS = [
@@ -490,8 +539,9 @@ MUTATIONS += [
     ("baseline store degrade no longer aborts",
      _sub('abort_degraded("baseline store degraded", err.detail);', "(void)0;"), "(m)"),
     ("session-less Admit releases its claim again",
-     _sub("No audit row is written on this path.",
-          "No audit row is written on this path.\n guardian_reconcile_gate_.release(agent_id);"), "(n)"),
+     _resub(r'(\{\{"result", "no_session"\}\}\)\s*\.increment\(\);)', r"\1 guardian_reconcile_gate_.release(agent_id);"), "(n)"),
+    ("a second admitted.exclude( is added",
+     _sub("admitted.exclude(bundle_waited);", "admitted.exclude(bundle_waited); admitted.exclude(bundle_waited);"), "(n)"),
     ("no_session branch no longer returns right after counting",
      _resub(r'(\{\{"result", "no_session"\}\}\)\s*\.increment\(\);)', r"\1 (void)0;"), "(n)"),
     ("time blocked on another thread's load charged to the budget",
@@ -522,14 +572,35 @@ MUTATIONS += [
     ("invalidate moved out of the push fn into unrelated code",
      lambda s: _sub("guardian_generation_cache_.invalidate();", "(void)0;")(s)
      + "\nvoid elsewhere() { guardian_generation_cache_.invalidate(); }\n", "(p)"),
-    ("in-flight gauge no longer published at the sweep site",
-     _sub('metrics_.gauge("yuzu_server_guardian_reconcile_in_flight")\n                        .set(static_cast<double>(guardian_reconcile_gate_.in_flight()));',
-          "(void)0;"), "(q)"),
-    ("budget balance gauge no longer published at the sweep site",
+    ("in-flight gauge no longer published in the gauge block",
+     _resub(r'metrics_\s*\.gauge\("yuzu_server_guardian_reconcile_in_flight"\)\s*\.set\(static_cast<double>\(guardian_reconcile_gate_\.in_flight\(\)\)\);',
+            "(void)0;"), "(q)"),
+    ("budget balance gauge no longer published in the gauge block",
      _sub('.set(guardian_reconcile_budget_.balance_ms());', ".set(0.0);"), "(q)"),
-    ("claims gauge no longer published at the sweep site",
-     _sub('metrics_.gauge("yuzu_server_guardian_reconcile_claims")\n                        .set(static_cast<double>(guardian_reconcile_gate_.claims_size()));',
-          "(void)0;"), "(q)"),
+    ("claims gauge no longer published in the gauge block",
+     _resub(r'metrics_\s*\.gauge\("yuzu_server_guardian_reconcile_claims"\)\s*\.set\(static_cast<double>\(guardian_reconcile_gate_\.claims_size\(\)\)\);',
+            "(void)0;"), "(q)"),
+    ("gauge block loses its catch (...) arm",
+     _resub(r'(Guardian reconcile gauge publish failed: \{\}", e\.what\(\)\);\s*\})\s*catch \(\.\.\.\) \{\s*spdlog::warn\("Guardian reconcile gauge publish failed: unknown exception"\);\s*\}',
+            r"\1"), "(q)"),
+    ("claim sweep loses its catch (...) arm",
+     _resub(r'(Guardian reconcile claim sweep failed: \{\}", e\.what\(\)\);\s*\})\s*catch \(\.\.\.\) \{\s*spdlog::warn\("Guardian reconcile claim sweep failed: unknown exception"\);\s*\}',
+            r"\1"), "(q)"),
+    ("claim sweep loses its catch (const std::exception&) arm",
+     _resub(r'\}\s*catch \(const std::exception& e\) \{\s*spdlog::warn\("Guardian reconcile claim sweep failed: \{\}", e\.what\(\)\);\s*\}(\s*catch \(\.\.\.\) \{\s*spdlog::warn\("Guardian reconcile claim sweep failed)',
+            r"}\1"), "(q)"),
+    ("gauges moved after the claim sweep",
+     lambda s: _move_gauges_after_sweep(s), "(q)"),
+    ("a policy-generation gauge takes the cached current as well",
+     _sub("set(static_cast<double>(fresh_generation));",
+          "set(static_cast<double>(fresh_generation)); metrics_.gauge(\"yuzu_server_guardian_policy_generation\").set(static_cast<double>(current));"), "(r)"),
+    ("fresh-not-ahead return moved after the bundle get",
+     lambda s: _resub(r"if \(fresh_generation <= agent_gen\)\s*return;[^\n]*", "(void)0;")(s).replace(
+         "admitted.exclude(bundle_waited);", "admitted.exclude(bundle_waited); if (fresh_generation <= agent_gen) return;", 1), "(r)"),
+    ("decide( loses its &shed_cause out-parameter",
+     _wsub(DECIDE_SWITCH, "switch (guardian_reconcile_gate_.decide(agent_id, agent_gen, current))"), "(k)"),
+    ("decide( bypassed by a leading true ||",
+     _wsub(DECIDE_SWITCH, "switch (true || guardian_reconcile_gate_.decide(agent_id, agent_gen, current, &shed_cause))"), "(k)"),
 ]
 
 # Mutations over guardian_push_builder.cpp (the bundle loader's evaluation order).
