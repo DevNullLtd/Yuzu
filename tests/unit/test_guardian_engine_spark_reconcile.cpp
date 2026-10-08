@@ -6556,8 +6556,8 @@ TEST_CASE("#4045 E14b: a drain waiting on an in-flight worker pass makes that pa
     // A worker pass is parked mid-flight (post-snapshot hook, persist_mu_ held) while
     // apply_rules' own drain arrives and waits behind it. The worker pass yields to the waiter
     // before its first write, and the apply's pass attempts at most max_failures (3) writes
-    // (the old unbudgeted loop made 6 for the 6 staged captures, the first-failure abort made
-    // 1), and the staged captures stay visible to attach_core (still in staging) the whole time.
+    // (an unbudgeted loop would make 6 for the 6 staged captures, one that stops at the first
+    // failure would make 1), and the staged captures stay visible to attach_core (still in staging) the whole time.
     Spark4045Target t;
     SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
     const fs::path target = t.file();
@@ -6710,7 +6710,7 @@ TEST_CASE("#4045 E17: a pass launched between the seed read and the attach canno
 }
 
 // C4045-2: every staging-loss channel must reach the heartbeat aggregate.
-TEST_CASE("#4045 E15: captures dropped from staging surface on the heartbeat tag",
+TEST_CASE("#4045 E15: failed staging attempts and displaced captures surface on the heartbeat tag",
           "[spark][guardian][baseline][reconcile]") {
     SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
     // Parked first: a worker pass between the inserts would persist and erase them.
@@ -6786,8 +6786,8 @@ TEST_CASE("#4045 E18: a failing tuple does NOT block the ones behind it (no head
     for (int i = 0; i < 5; ++i)
         rt->stage_baseline_for_test("r" + std::to_string(i), "/yuzu_test_4045_e18/" + std::to_string(i),
                                     std::string(64, 'a'));
-    // r0, the FIRST tuple in rule_id order, fails for real on every pass (a per-key fault). The
-    // first-failure abort of the previous round persisted none of the five behind it.
+    // r0, the FIRST tuple in rule_id order, fails for real on every pass (a per-key fault). A
+    // pass that stopped at the first failure would persist none of the five behind it.
     fail_baseline_writes_4045(f.db_.path, "baseline:r0");
 
     const auto out = persist_now_4045(*f.engine);
@@ -6833,7 +6833,7 @@ TEST_CASE("#4045 E19: staging has no cap and a pass has a tuple budget: 300 capt
     auto* persister = f.engine->baseline_persister_for_test();
     REQUIRE(rt != nullptr);
     REQUIRE(persister != nullptr);
-    constexpr int kN = 300; // the old staging cap was 256
+    constexpr int kN = 300; // more than a fixed staging cap of 256 would hold
     // Only the tuple budget is under test; a 1 h wall keeps a host stall from ending a pass early.
     // The limits are the production ones, so a changed kBaselinePassBudget goes RED here.
     persister->set_budgets_for_test(
@@ -7582,8 +7582,9 @@ TEST_CASE("#4045 E34: a pass polls its stop predicate before every tuple: a stop
 TEST_CASE("#4045 E35: stop() persists EVERY staged capture on a healthy store (the stop budget "
           "has no tuple cap), at the persister and through the engine",
           "[spark][guardian][baseline][reconcile]") {
-    // RED while the stop budget carried the 64-tuple cap: 200 staged, 64 persisted, 136 lost on a
-    // healthy store in a few milliseconds (a 1 s wall and ONE failure already bound the pass).
+    // A tuple cap on the stop budget would abandon the rest on a healthy store: at a cap of 64,
+    // 200 staged would persist 64 and lose 136 in a few milliseconds (a 1 s wall and ONE failure
+    // already bound the pass).
     SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
     f.engine->drain_worker_for_test()->stop();
     auto* persister = f.engine->baseline_persister_for_test();

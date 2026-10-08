@@ -80,19 +80,19 @@
  * read through the attach: at the KV read every capture is durable or still staged, and
  * attach_core reads staging next. Because passes are budgeted and a Worker pass yields
  * (YIELDING above), the pass a fence waits behind is one in-flight write for a Worker pass and
- * at most the wall budget plus one write for a Forced one, however many captures are staged. Order: engine mtx_ -> persist_mu_ -> registry_mu_
- * (snapshot/erase/attach) and persist_mu_ -> KvStore::mu_; the worker takes persist_mu_ ->
- * registry_mu_ and never mtx_ (WorkerHostileMutex). persist_mu_ is never taken under any
- * runtime lock.
+ * at most the wall budget plus one write for a Forced one, however many captures are staged.
+ * Order: engine mtx_ -> persist_mu_ -> registry_mu_ (snapshot/erase/attach) and persist_mu_ ->
+ * KvStore::mu_; the worker takes persist_mu_ -> registry_mu_ and never mtx_
+ * (WorkerHostileMutex). persist_mu_ is never taken under any runtime lock.
  *
  * HEARTBEAT: failure_signals() takes no lock (atomics only, no mtx_), so reading THIS tag
  * cannot be blocked by a long apply_rules. That is a property of this accessor only: the same
  * heartbeat tick also calls GuardianEngine getters that do take mtx_ (policy_generation(),
- * journal_stats(), ...), so the tick as a whole can still wait. The engine reads this object through an atomic
- * pointer published at wire time; the object lives until the engine's destructor, which runs
- * after the heartbeat thread is gone and after the drain worker is joined (agent.cpp declares
- * kv_store_ before guardian_). The runtime's drop counter is held by shared_ptr, so it stays
- * valid regardless of runtime teardown order.
+ * journal_stats(), ...), so the tick as a whole can still wait. The engine reads this object
+ * through an atomic pointer published at wire time; the object lives until the engine's
+ * destructor, which runs after the heartbeat thread is gone and after the drain worker is
+ * joined (agent.cpp declares kv_store_ before guardian_). The runtime's drop counter is held by
+ * shared_ptr, so it stays valid regardless of runtime teardown order.
  *
  * CALLERS of persist_staged (exactly three, and NEVER only from a connection-gated thread, or
  * a pre-network boot re-arm would lose its capture on a crash): GuardianEngine::apply_rules
@@ -102,8 +102,10 @@
  * apply_rules pass leaves the rest staged: attach_core still inherits it for a re-armed rule
  * and the worker persists it on its next cycle (an apply_rules leftover waits for the worker's
  * re-check or its next wake or 5 s backstop). A stop() pass that ends on its wall budget with
- * captures left, on its single failure, or by skipping leaves them lost to this process, and
- * the engine logs that the flush was incomplete.
+ * captures left, or on its single failure, leaves them lost to this process, and the engine
+ * logs that the flush was incomplete; a pass that is skipped (see BOUNDED PASSES) loses them
+ * just the same and logs its own, different line. A stop() still running when the shutdown
+ * deadline expires is ended by hard_exit(4), which logs nothing at all.
  * Not journal_maintenance_tick: it runs only on a live connection. The drain is NOT what
  * orders an in-flight evaluation's capture against a replacement's seed (one can stage after
  * any drain); the fence above and attach_core's staged read do.
@@ -334,10 +336,10 @@ public:
     }
 
     /// The heartbeat aggregate (`yuzu.guardian_baseline_persist_failures`): failed persist
-    /// passes + captures dropped from staging + passes that found a capture and no store +
-    /// firewalled throws. Cumulative since boot, so a flat non-zero value does not by itself
-    /// say whether anything is still failing. Lock-free (atomics only): safe from the
-    /// heartbeat thread while apply_rules holds the engine mtx_.
+    /// passes + failed attempts to stage a capture and captures displaced from staging + passes
+    /// that found a capture and no store + firewalled throws. Cumulative since boot, so a flat
+    /// non-zero value does not by itself say whether anything is still failing. Lock-free
+    /// (atomics only): safe from the heartbeat thread while apply_rules holds the engine mtx_.
     [[nodiscard]] std::uint64_t failure_signals() const noexcept {
         return persist_failures() + no_store_pending() + firewalled_exceptions() +
                (staging_drops_ ? staging_drops_->load(std::memory_order_relaxed) : 0);
@@ -429,8 +431,9 @@ public:
     }
     /// TEST-ONLY: runs inside a pass, with persist_mu_ held, right after the snapshot is taken
     /// and before the first write: the deterministic stand-in for "a worker pass is mid-flight".
-    /// Must not re-enter the persister. Safe against a live worker, like set_post_write_hook_for_test
-    /// (waits for a pass in flight; not callable from inside a hook). No production caller.
+    /// Must not re-enter the persister. Safe against a live worker, like
+    /// set_post_write_hook_for_test (waits for a pass in flight; not callable from inside a
+    /// hook). No production caller.
     void set_post_snapshot_hook_for_test(std::function<void()> hook) {
         std::lock_guard<std::mutex> lk{persist_mu_};
         post_snapshot_hook_ = std::move(hook);

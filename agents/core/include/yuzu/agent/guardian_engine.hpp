@@ -320,8 +320,9 @@ public:
     /// attempt) or displaced a capture (a retarget that replaced a still-unpersisted capture;
     /// GuardianSparkRuntime::staged_baseline_drops), and passes that found a capture staged
     /// with no KV store to write it to. A stop-time loss that is not a failed write (the stop
-    /// flush ran out of wall budget, or was skipped after a slow failure) is logged, NOT counted
-    /// here. Zero while
+    /// flush ran out of wall budget, or was skipped after a slow failure or a late start) is
+    /// logged, NOT counted here; a stop cut off by the shutdown watchdog leaves not even a log
+    /// line (exit code 4). Zero while
     /// healthy, quiescent, or inert (prefer_spark off). Surfaced SPARSELY as
     /// `yuzu.guardian_baseline_persist_failures` via emit_guardian_baseline_persist_heartbeat_tags.
     /// Spark path ONLY: a legacy FileGuard persist failure is logged, not counted. Because it

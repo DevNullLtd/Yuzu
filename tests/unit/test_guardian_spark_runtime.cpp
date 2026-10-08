@@ -15110,7 +15110,7 @@ TEST_CASE("#4045 R5: staging has NO cap: 300 captures all stay staged, none drop
     GuardianSparkRuntime::Config cfg;
     cfg.outbox_capacity = 4096; // every compliant edge must enqueue
     auto rt = make_rt(r, b, cfg);
-    constexpr std::size_t kN = 300; // the old cap was 256
+    constexpr std::size_t kN = 300; // more than a fixed staging cap of 256 would hold
     for (std::size_t i = 0; i < kN; ++i) {
         const std::string id = "r" + std::to_string(i);
         const std::string path = "/p" + std::to_string(i);

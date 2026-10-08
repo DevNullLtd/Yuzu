@@ -942,8 +942,9 @@ flip, with a red-first test each:
   #4045 change itself. Tracking issue: **TODO, issue to be filed** (none exists yet; this
   entry and the section 5 register entry are the only record until it does). The
   agent-side `baseline_persist_refusals` count (a refused write: a live rule possibly judged
-  against re-captured content until its next re-arm, AC-10 case 5) has no tag either and is
-  part of the same fleet-signal decision.
+  against re-captured content until its next re-arm, AC-10 case 6) has no tag either and is
+  part of the same fleet-signal decision. A stop ended by the agent's own shutdown watchdog
+  (exit code 4, AC-10 case 2) is logged nowhere on the agent and belongs to that decision too.
 - **Real-File-mechanism run for #4045: NOT done; the operator required it BEFORE MERGE.**
   The one manual `prefer_spark` run on the Windows test box of a baseline-on-arm
   `file-hash-equals` rule through the real File mechanism (capture, then an agent restart
@@ -1192,8 +1193,8 @@ flip, with a red-first test each:
     bounds the dependence on the suppress classification (it is not a recovery guarantee
     against a classifier that misidentifies a dead claim). The counter resets only in
     `begin_application()`/`retire()`. Because it re-arms every rule in the push, the forced
-    Reapply (a) can recapture a Spark-first `FileHashEquals` baseline that was lost or
-    never written (#4045, AC-10) and (b) while a same-type mechanism call is hung, can withdraw healthy same-type
+    Reapply (a) can recapture a Spark-first `FileHashEquals` baseline that was lost,
+    never written or overwritten (#4045, AC-10) and (b) while a same-type mechanism call is hung, can withdraw healthy same-type
     siblings, after which every later push is a Reapply (AC-16). If the budget is already spent when a retained wedge's late success is
     adopted, the next identical push is a forced Reapply of the just-armed rule: one wasted
     teardown, never an acknowledgment.
@@ -1209,20 +1210,27 @@ flip, with a red-first test each:
     the remaining cases below (the known cases; the same eight are listed in the user
     manual and design s24): (1) a crash came before the capture landed (the crash
     window, which includes captures an `apply_rules` pass left for the worker); (2) a
-    stop lost waiting captures: its single allowed write failed (a failing local KV
-    store: staged, retried with a worker backoff, error-logged and counted in
-    `yuzu.guardian_baseline_persist_failures`), or its one second of wall between
-    writes ran out before every capture was written (a slow but succeeding store; logged,
-    not counted), or the flush was skipped because a write that failed slowly ended at or
-    after the start of that stop (logged, not counted); a capture whose write is merely
-    failing is NOT lost to a re-arm, because the new arm inherits the waiting capture
-    from memory; (3) an allocation failure while staging a capture: the baseline stays
-    live (a later change is still drift against it) and staging is retried at every
-    later evaluation, so this is a window only until a retry succeeds; it can recapture
-    only if the rule is re-pushed in that window (a delta push, or a full_sync, which withdraws every rule first) and the retries at the withdrawal and at the re-attach also fail,
-    in which case the new arm captures whatever the file then holds (counted, once per
-    failed attempt); (4) the rule's path re-authored while the first capture was still
-    unwritten (counted), and an A to B to A re-authoring re-baselines A even with a
+    stop lost waiting captures, in one of four ways: its single allowed write failed (a
+    failing local KV store; error-logged and added to
+    `yuzu.guardian_baseline_persist_failures`, a count that dies with the exiting process,
+    and not tried again), or its one second of wall between writes ran out before every capture was
+    written (a slow store, or more than roughly 2,000 to 3,000 waiting captures on a
+    healthy one; logged, not counted), or the flush was skipped, either because a write
+    that failed slowly ended at or after the start of that stop or because it could not
+    start within 15 s of it (logged, not counted), or the 20 s shutdown watchdog ended the
+    process while the stop was still running (`hard_exit(4)`: the flush and the later
+    shutdown steps are cut, a Windows service is restarted by the SCM, and no log line is
+    written anywhere, so exit code 4 is the only evidence). A capture whose write is
+    merely failing during normal operation is NOT lost to a re-arm, because the new arm
+    inherits the waiting capture from memory; (3) an allocation failure while staging a
+    capture: the baseline stays live (a later change is still drift against it) and
+    staging is retried at every later evaluation, at a re-push, at a withdrawal and once
+    more at shutdown before the final flush, so this is a window only until a retry
+    succeeds; a crash or hard kill in it loses the capture (case 1), and a re-push in it
+    (a delta push, which retries twice, or a full_sync, which withdraws every rule first
+    and retries once) recaptures only if every retry also fails, in which case the new arm
+    captures whatever the file then holds (counted, once per failed attempt); (4) the
+    rule's path re-authored while the first capture was still unwritten (counted), and an A to B to A re-authoring re-baselines A even with a
     healthy store, the same as legacy; (5) the arm-time read of the record failed and
     the write-time re-check read failed again, so the guard wrote the fresh capture
     anyway: two failed reads suffice, a transient read fault is enough, not only a
@@ -2128,13 +2136,27 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   reported rather than laundered) BEFORE the #4045 change merges. Not performed as of this
   entry; section 3a carries the full wording and where to record the outcome. Issue to be
   filed (TODO, no number yet) if it is not done before merge.
+- **`GuardianEngine::stop()` has no remaining-deadline wall (#4045): partly addressed, the
+  rest recorded here.** `stop()` shares the 20 s `kShutdownDeadlineGrace` (armed at
+  `AgentImpl::stop()` entry, so it also covers the DEX, Spark and plugin teardown after it)
+  with every later shutdown step, and its earlier stages (two journal flushes, the
+  loss-ledger write, the worker join) are under no deadline of their own. #4045 took the
+  stop mark before the engine mutex and skips ITS pass when that pass would start 15 s or
+  more after the stop began. What remains: the pass's first write always runs (the wall is
+  checked between tuples), so one that starts just inside the cutoff can still spend a 5 s
+  busy timeout; the delivery worker's non-baseline KV writes serialise on `KvStore::mu_`
+  and put their own busy timeout in front of every stage (measured 23 s to 25 s against a
+  store that stays busy); and a stop that reaches the watchdog exits with code 4 and writes
+  no log line. A remaining-deadline wall threaded through every stage was considered and
+  not done. Issue to be filed (TODO, no number yet).
 - Owner: not assigned for any item above.
 - Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + three pre-PR-5 GATING items
   (guard.errored census recognition; the three sre observability gaps; the
   yuzu.guardian_backend server-side-reader gap; plus, from #4045, the fleet-visible
-  baseline-persist signal (F14 precondition, section 3a) and the pre-merge real-File-
-  mechanism run (NOT done)) - no issue numbers, tracked here; the two #4045 items have
-  **issues to be filed** (TODO markers, no number yet).
+  baseline-persist signal (F14 precondition, section 3a), the pre-merge real-File-
+  mechanism run (NOT done) and the missing remaining-deadline wall in `stop()`) - no issue
+  numbers, tracked here; the three #4045 items have **issues to be filed** (TODO markers,
+  no number yet).
 - Revisit trigger: before PR-5's sign-off, everything above re-checked; #4051 specifically
   re-checked before any production fleet (dedup races become far more frequent under
   real load than in this PR's own governance testing).

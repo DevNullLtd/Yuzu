@@ -183,7 +183,6 @@ std::string hex_decode(std::string_view hex) {
 // bounded by the worker's 5 s backstop, backed off after a failed pass and unbounded while the
 // KV write keeps failing), where legacy writes synchronously at the capture. See
 // guardian_baseline_persister.hpp.
-// Closes #4045 (adversarial-review K4/C2-3).
 constexpr int kBaselineSchemaVersion = 1;
 
 std::string make_baseline_key(const std::string& rule_id) {
