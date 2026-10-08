@@ -291,7 +291,7 @@ function generateCompose(c) {
 ##   docker compose logs -f
 ##   docker compose down -v    # ⚠️ -v removes data volumes!
 ##
-${tls ? `## ⚠️ REQUIRES SECURE-BY-DEFAULT IMAGES. This TLS config relies on the server
+${c.tlsMode === 'default' ? `## ⚠️ REQUIRES SECURE-BY-DEFAULT IMAGES. This TLS config relies on the server
 ##    auto-generating a per-install CA + leaf certs on first boot and serving HTTPS
 ##    on 8443 — behaviour from the secure-by-default release (v0.13.0+, tracked by
 ##    the 'latest' tag). Older images (incl. 0.12.0) don't support it; use Plaintext
@@ -316,8 +316,10 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
 ${c.tlsMode === 'plaintext'
   ? `##   yuzu-agent --server localhost:${c.gateway ? c.gwAgentPort : c.grpcPort} --no-tls`
   : c.tlsMode === 'operator'
-  ? `##   # TLS is on with YOUR certs. Give the agent the CA that signed server.pem:
-##   yuzu-agent --server localhost:${c.gateway ? c.gwAgentPort : c.grpcPort} --ca-cert ./certs/ca.pem`
+  ? `##   # TLS is on with YOUR certs, and the server REQUIRES agent client certs
+##   # (mTLS). Issue each agent a client cert + key from the same CA as server.pem:
+##   yuzu-agent --server localhost:${c.gateway ? c.gwAgentPort : c.grpcPort} --ca-cert ./certs/ca.pem \\
+##     --client-cert agent.pem --client-key agent.key`
   : `##   # TLS is on. Give the agent the server's CA so it can verify the cert:
 ##   #   curl -sk ${webScheme}://localhost:${c.dashboardPort}/api/v1/ca/root -o ca.pem
 ##   yuzu-agent --server localhost:${c.gateway ? c.gwAgentPort : c.grpcPort} --ca-cert ca.pem`}

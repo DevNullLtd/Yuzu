@@ -59,6 +59,10 @@ GENERATE_JS = Path(os.environ.get("YUZU_WIZARD_GENERATE_JS")
 CERTS = "/etc/yuzu/certs"
 TLS_DIR = "/etc/yuzu/tls"
 NODE = shutil.which("node")
+if NODE is None and os.environ.get("YUZU_REQUIRE_NODE") == "1":
+    # docs-lint.yml runs this on a hosted image that ships node: a missing node
+    # there must fail, not silently skip the only check of the wizard (#5420).
+    raise SystemExit("YUZU_REQUIRE_NODE=1 but node is not on PATH")
 
 # Node driver: loads generate.js into a fresh vm context (classic-script
 # semantics, like the browser's <script> tag) and either calls the pure
