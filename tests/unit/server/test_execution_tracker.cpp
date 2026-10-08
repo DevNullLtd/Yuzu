@@ -327,6 +327,162 @@ TEST_CASE("ExecutionTracker: get_agent_statuses_for_executions_checked groups by
     CHECK(empty_result->empty());
 }
 
+// The agent filter bounds the READ in SQL (a confined caller must not pull every agent row
+// of a wide execution). The returned vector size is the observable: dropping the
+// `agent_id = ANY(...)` predicate returns all 5 rows here, not 2.
+TEST_CASE("ExecutionTracker: the visible-agents filter bounds the status read in SQL "
+          "(batched and single)",
+          "[pg][execution_tracker][confinement]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id_a = tracker.create_execution(make_execution("def-a"));
+    auto id_b = tracker.create_execution(make_execution("def-b"));
+    REQUIRE(id_a.has_value());
+    REQUIRE(id_b.has_value());
+    for (const char* agent : {"in-1", "in-2", "out-1", "out-2", "out-3"}) {
+        AgentExecStatus a;
+        a.agent_id = agent;
+        a.status = "success";
+        tracker.update_agent_status(*id_a, a);
+    }
+    AgentExecStatus only_out;
+    only_out.agent_id = "out-1";
+    only_out.status = "success";
+    tracker.update_agent_status(*id_b, only_out);
+
+    const std::optional<std::vector<std::string>> visible{{"in-1", "in-2"}};
+
+    // Unfiltered (default): every row, byte-unchanged behaviour for existing callers.
+    auto all = tracker.get_agent_statuses_for_executions_checked({*id_a, *id_b});
+    REQUIRE(all.has_value());
+    CHECK(all->at(*id_a).size() == 5);
+    CHECK(all->at(*id_b).size() == 1);
+
+    // Filtered: only in-scope rows; an execution with only out-of-scope rows has no key.
+    auto scoped = tracker.get_agent_statuses_for_executions_checked({*id_a, *id_b}, visible);
+    REQUIRE(scoped.has_value());
+    REQUIRE(scoped->find(*id_a) != scoped->end());
+    CHECK(scoped->at(*id_a).size() == 2);
+    CHECK(scoped->at(*id_a)[0].agent_id == "in-1");
+    CHECK(scoped->at(*id_a)[1].agent_id == "in-2");
+    CHECK(scoped->find(*id_b) == scoped->end());
+
+    // Engaged-empty is deny-all (zero rows, success), NOT unfiltered.
+    auto none = tracker.get_agent_statuses_for_executions_checked(
+        {*id_a}, std::optional<std::vector<std::string>>{std::vector<std::string>{}});
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+
+    // Single-execution twin.
+    auto single_all = tracker.get_agent_statuses_checked(*id_a);
+    REQUIRE(single_all.has_value());
+    CHECK(single_all->size() == 5);
+    auto single_scoped = tracker.get_agent_statuses_checked(*id_a, visible);
+    REQUIRE(single_scoped.has_value());
+    CHECK(single_scoped->size() == 2);
+    auto single_none = tracker.get_agent_statuses_checked(
+        *id_a, std::optional<std::vector<std::string>>{std::vector<std::string>{}});
+    REQUIRE(single_none.has_value());
+    CHECK(single_none->empty());
+}
+
+// The visible set is bound as ONE Postgres array literal (pg::to_text_array); an id carrying
+// the literal's own metacharacters (double quote, backslash, comma, brace) or a space must
+// round-trip as a single element and match exactly its row, never split, truncate or widen.
+TEST_CASE("ExecutionTracker: the visible-agents filter matches ids carrying array-literal "
+          "metacharacters exactly",
+          "[pg][execution_tracker][confinement]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution("def-meta"));
+    REQUIRE(id.has_value());
+    const std::vector<std::string> nasty = {"q\"uote", "back\\slash", "com,ma", "br{ace}",
+                                            "sp ace"};
+    for (const auto& agent : nasty) {
+        AgentExecStatus a;
+        a.agent_id = agent;
+        a.status = "success";
+        tracker.update_agent_status(*id, a);
+    }
+    for (const char* agent : {"plain", "q", "com", "ma", "sp"}) { // fragments must NOT match
+        AgentExecStatus a;
+        a.agent_id = agent;
+        a.status = "success";
+        tracker.update_agent_status(*id, a);
+    }
+
+    auto agent_ids = [](const std::vector<AgentExecStatus>& rows) {
+        std::vector<std::string> out;
+        for (const auto& r : rows)
+            out.push_back(r.agent_id);
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    auto want = nasty;
+    std::sort(want.begin(), want.end());
+
+    auto single = tracker.get_agent_statuses_checked(*id, std::optional<std::vector<std::string>>{nasty});
+    REQUIRE(single.has_value());
+    CHECK(agent_ids(*single) == want);
+
+    auto batched = tracker.get_agent_statuses_for_executions_checked(
+        {*id}, std::optional<std::vector<std::string>>{nasty});
+    REQUIRE(batched.has_value());
+    REQUIRE(batched->find(*id) != batched->end());
+    CHECK(agent_ids(batched->at(*id)) == want);
+
+    // The same literal in the list-scope EXISTS predicate.
+    ExecutionListScope scope;
+    scope.visible_agents = nasty;
+    auto listed = tracker.query_executions_checked(ExecutionQuery{}, scope);
+    REQUIRE(listed.has_value());
+    REQUIRE(listed->size() == 1);
+    CHECK((*listed)[0].id == *id);
+
+    // A single nasty id alone selects only its own row.
+    auto one = tracker.get_agent_statuses_checked(
+        *id, std::optional<std::vector<std::string>>{std::vector<std::string>{"com,ma"}});
+    REQUIRE(one.has_value());
+    REQUIRE(one->size() == 1);
+    CHECK((*one)[0].agent_id == "com,ma");
+}
+
+// A service-scoped session has no owner disjunct (the fragment clears it): empty owner with a
+// non-empty visible set must admit ONLY via the visible-agent EXISTS, never as an owner match on
+// an empty dispatched_by, and never as a no-filter.
+TEST_CASE("ExecutionTracker: query_executions_checked scope with no owner and a visible set "
+          "admits only through the visible agents",
+          "[pg][execution_tracker][confinement]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto via_agent = tracker.create_execution(make_execution("def-via", "scope", "minter"));
+    auto other_agent = tracker.create_execution(make_execution("def-other", "scope", "minter"));
+    auto no_rows = tracker.create_execution(make_execution("def-none", "scope", "minter"));
+    auto empty_owner_row = tracker.create_execution(make_execution("def-eo", "scope", ""));
+    REQUIRE(via_agent.has_value());
+    REQUIRE(other_agent.has_value());
+    REQUIRE(no_rows.has_value());
+    REQUIRE(empty_owner_row.has_value());
+    AgentExecStatus in;
+    in.agent_id = "agent-in";
+    in.status = "success";
+    tracker.update_agent_status(*via_agent, in);
+    AgentExecStatus out;
+    out.agent_id = "agent-out";
+    out.status = "success";
+    tracker.update_agent_status(*other_agent, out);
+
+    ExecutionListScope scope; // owner deliberately empty
+    scope.visible_agents = {"agent-in"};
+    auto checked = tracker.query_executions_checked(ExecutionQuery{}, scope);
+    REQUIRE(checked.has_value());
+    REQUIRE(checked->size() == 1);
+    CHECK((*checked)[0].id == *via_agent);
+}
+
 TEST_CASE("ExecutionTracker: get_children_checked distinguishes genuinely-no-children "
           "from a degraded read",
           "[pg][execution_tracker]") {

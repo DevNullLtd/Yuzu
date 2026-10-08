@@ -9,6 +9,11 @@
 #   ./scripts/integration-test.sh --agents 10        # 10 agents
 #   ./scripts/integration-test.sh --agents 100 --tls # 100 agents with mTLS
 #
+# Gateway hop: the server is started with --insecure-gateway-peer in both
+# modes (peer authorization on the gateway-upstream service is acknowledged as
+# disabled, test rig only). The gateway hop is therefore not exercised by this
+# script in either mode; see the comment at the server start below.
+#
 # Prerequisites:
 #   - C++ binaries built:  build-<os>/server/core/yuzu-server
 #                           build-<os>/agents/core/yuzu-agent
@@ -463,6 +468,17 @@ fi
 if ! $REUSE_STACK; then
     log "Starting C++ server (ports: agent=$SERVER_AGENT_PORT, mgmt=$SERVER_MGMT_PORT, web=$SERVER_WEB_PORT)..."
 
+    # The gateway-upstream service requires an authorized gateway peer (an
+    # SPKI pin) or an explicit acknowledgement. This script passes the
+    # acknowledgement in BOTH the plaintext and the --tls branch, so peer
+    # authorization on the gateway hop is disabled here and is NOT exercised
+    # by this script. The gateway's generated sys.config below dials the
+    # upstream over a plaintext `http` channel with no client certificate and
+    # no gateway leaf is pinned, so in the --tls branch the flag is passed so
+    # the server boots; --tls covers only the server's own certificate set and
+    # the agent-side flags. Test rig only, not a production pattern. The
+    # server is always the build under test ($BUILDDIR), never a published
+    # release, so the flag form (not the environment form) is correct.
     "$BUILDDIR/server/core/yuzu-server" \
         --config "$SERVER_CFG" \
         --listen "127.0.0.1:$SERVER_AGENT_PORT" \
@@ -471,6 +487,7 @@ if ! $REUSE_STACK; then
         --no-https \
         --gateway-mode \
         --gateway-upstream "127.0.0.1:$SERVER_GW_PORT" \
+        --insecure-gateway-peer \
         $TLS_SERVER_FLAGS \
         > "$WORK_DIR/server.log" 2>&1 &
     SERVER_PID=$!

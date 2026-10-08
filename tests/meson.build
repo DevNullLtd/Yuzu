@@ -1374,6 +1374,8 @@ if build_server
       'unit/server/test_secret_file.cpp', # #5272 --postgres-dsn-file / --oidc-client-secret-file
       'unit/server/test_mcp_body_cap.cpp',
       'unit/server/test_dispatch_target_shape.cpp',
+      'unit/server/test_instruction_param_schema.cpp',
+      'unit/server/test_instruction_param_golden.cpp', # golden accept/reject table over the shipped definitions
       'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',
@@ -1427,6 +1429,7 @@ if build_server
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
       'unit/server/test_legacy_executions_scope_authz.cpp', # #3789: legacy /api/executions* fleet-read confinement
+      'unit/server/test_workflow_executions_list_authz.cpp', # #3526: /fragments/executions real fleet-read confinement
       'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
@@ -1581,6 +1584,8 @@ if build_server
       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
       'unit/server/test_authz_gates.cpp', # service-scope-confinement PR2: require_fleet_read / confine_agent_target
+      'unit/server/test_fleet_read_ceiling_routes_authz.cpp', # #3526: ITServiceOwner ceiling through real fleet-read routes (Execution x3, Enrollment, a four-securable table, and the Policy and Workflow sites)
+      'unit/server/test_upload_grants_service_scope.cpp', # #3526: GET /api/v1/upload-grants refuses a service-scoped token (real AuthRoutes)
       'unit/server/test_agent_properties_scope_authz.cpp', # #3700: require_scoped_permission on /api/agents/:id/properties
       'unit/server/test_authz_topology_floor.cpp', # #2376: the RBAC-off legacy-fallback topology floor (AccessReview/UserManagement/EnginePrincipal Read)
       'unit/server/test_body_cap_policy.cpp', # #2407: pre-auth request-body cap policy table (method+segment-boundary path -> cap/requires_measurable/metric label)
@@ -1638,6 +1643,10 @@ if build_server
       'unit/server/test_ota_total_admission.cpp', # server-wide OTA gate occupancy (#913)
       'unit/server/test_ota_audit_key.cpp', # OTA identity-deny audit bucket key (#416/#913)
       'unit/server/test_ota_identity_mtls.cpp', # OTA identity audit bound over real mTLS (#416)
+      'unit/server/test_gateway_peer_policy.cpp', # gateway-upstream peer authorization: certificate facts, pin set, admission policy
+      'unit/server/test_gateway_peer_guard.cpp', # gateway-upstream peer authorization: guard over real mTLS, descriptor sweep, audit budget
+      'unit/server/test_gateway_peer_resolution.cpp', # gateway-upstream peer authorization: boot resolution matrix + boot pin set
+      'unit/server/test_server_gateway_peer_options.cpp', # gateway-upstream peer authorization: CLI/env contract
       'unit/server/test_grpc_tls_policy.cpp', # #4722: TLS 1.2 floor + cipher allow-list over REAL handshakes against the production builders
       'unit/server/test_ota_stalled_write.cpp', # TryCancel unblocks a stalled sync Write (#911 UP-101)
       'unit/server/test_server_ota_options.cpp', # OTA CLI/env contract + gRPC bound derivation (#913/#911)
@@ -2734,6 +2743,17 @@ test('compose certs volume',
   timeout: 30,
 )
 
+# Compose Wizard (#5420): every generated mode gives the server a writable,
+# persistent /etc/yuzu/certs (KEK + internal CA), and Operator mode mounts the
+# operator's PEMs read-only at /etc/yuzu/tls instead of over it. Runs the real
+# tools/compose-wizard/js/generate.js under node; skips when node is absent.
+test('compose wizard certs',
+  _python3_test,
+  args: [files('test_compose_wizard.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # README Docker Compose quickstart (#5419): the compose the README downloads must
 # pull released images at ${YUZU_VERSION}, persist /etc/yuzu/certs, publish 8443,
 # and take the headless admin seed at the image's --config path. Stdlib only;
@@ -3062,6 +3082,15 @@ if _bash_test.found()
       suite: 'docs',
       timeout: 60,
     )
+    # The yuzu-server package upgrade pre-flight (RPM %pre / deb preinst): runs the
+    # real scriptlet text against synthetic /etc trees under YUZU_PKG_ROOT. No built
+    # binary, no Postgres, no root, no rpm/dpkg tooling.
+    test('server package upgrade gateway-peer warning',
+      _bash_test,
+      args: [files('shell/test_server_package_upgrade_warning.sh')],
+      suite: 'docs',
+      timeout: 60,
+    )
     # #5333: start-UAT.sh kill_stale signals only PIDs it recorded and refuses on
     # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
     # replaced by functions; spawns and signals nothing. The decoy command line
@@ -3139,6 +3168,20 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   _python3_test,
   args: [files('test_agent_ota_wiring_lexical.py')],
   suite: 'agent',
+  timeout: 30,
+)
+
+# Gateway-upstream peer authorization: static lexical gate pinning that server.cpp registers
+# the gateway-upstream service ONLY through GatewayPeerGuardedService (nothing constructs
+# ServerImpl, so no unit test can see the registration site). Carries its own negative-control
+# self-test (in-memory mutated copies, plus benign controls). No build required. Python, not
+# bash, like the OTA gate above (#5428): one process on every OS. Suite 'docs', like the
+# tier-policy wiring gate below: scripts/ci/assert-suite-cover.py has no bare 'server' entry in
+# its --suite lists, so a no-build gate labelled 'server' fails that check on the Windows legs.
+test('gateway-upstream guard registration lexical gate',
+  _python3_test,
+  args: [files('test_gateway_peer_registration_lexical.py')],
+  suite: 'docs',
   timeout: 30,
 )
 
@@ -3220,6 +3263,16 @@ test('assert-suite-cover selftest',
 test('issue lifecycle docs',
   _python3_test,
   args: [files('test_issue_docs.py')],
+  suite: 'docs',
+  timeout: 10,
+)
+
+# Gateway-upstream peer authorization docs lint: every place that tells an operator to restart the
+# gateway after a refusal carries its #5183 caveat and a conditional marker in the same paragraph,
+# and the expiry runbook says a gateway redial is required. No build required.
+test('gateway peer restart-advice docs lint',
+  _python3_test,
+  args: [files('test_gateway_peer_restart_advice_lint.py')],
   suite: 'docs',
   timeout: 10,
 )

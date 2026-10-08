@@ -1,0 +1,80 @@
+=== RBAC ON ===
+[RBAC-ON] principal=P_global(gary) plain(Execution:Read)=ADMIT fleet_read=ADMIT-ALL(unfiltered)(-1)
+    (1) fragment: status=200 out_of_scope_data=YES rows_def-OUTONLY=yes SECRET-OUT-ERR=yes
+    (2) mcp summarize(X2 out-of-scope-only): status=200 reveals_exec=YES vs not-found=oracle-distinguishable | body={"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"kind\":\"execution\",\"id\":\"01edf7f4a3ea5f2a75236ee501cd83fc\",\"limit\":25,\"narrative\":\"Execution 01edf7f4a3ea5f2a75236ee501cd83fc is completed with t
+    (v1 twin) GET /api/v1/executions: status=200 includes_def-OUTONLY=yes SECRET-OUT-ERR=yes
+[RBAC-ON] principal=P_scoped(bob) plain(Execution:Read)=DENY(403) fleet_read=SCOPED{a_in,}(-1)
+    (1) fragment: status=403 out_of_scope_data=no rows_def-OUTONLY=no SECRET-OUT-ERR=no
+    (2) mcp summarize(X2 out-of-scope-only): status=403 reveals_exec=no vs not-found=n/a | body={"error":{"code":403,"message":"permission denied: Execution:Read","correlation_id":"req-1a108d96f4b-3","retry_after_ms":null,"permission":"Execution:Read"},"meta":{"api_version":"v1"}}
+    (v1 twin) GET /api/v1/executions: status=200 includes_def-OUTONLY=no SECRET-OUT-ERR=no
+[RBAC-ON] principal=P_service(bob,svc=printers) plain(Execution:Read)=DENY(403) fleet_read=SCOPED{a_in,}(-1)
+    (1) fragment: status=403 out_of_scope_data=no rows_def-OUTONLY=no SECRET-OUT-ERR=no
+    (2) mcp summarize(X2 out-of-scope-only): status=200 reveals_exec=no vs not-found=n/a | body={"jsonrpc":"2.0","error":{"code":-32003,"message":"service-scoped tokens cannot call this tool","data":{"correlation_id":"req-1a108d96f82-8","retry_after_ms":null,"remediation":"this tool has no per-agent/service confine
+    (v1 twin) GET /api/v1/executions: status=200 includes_def-OUTONLY=no SECRET-OUT-ERR=no
+[RBAC-ON] principal=P_service(gary,svc=printers) plain(Execution:Read)=DENY(403) fleet_read=SCOPED{a_in,}(-1)
+    (1) fragment: status=403 out_of_scope_data=no rows_def-OUTONLY=no SECRET-OUT-ERR=no
+    (2) mcp summarize(X2 out-of-scope-only): status=200 reveals_exec=no vs not-found=n/a | body={"jsonrpc":"2.0","error":{"code":-32003,"message":"service-scoped tokens cannot call this tool","data":{"correlation_id":"req-1a108d96fba-d","retry_after_ms":null,"remediation":"this tool has no per-agent/service confine
+    (v1 twin) GET /api/v1/executions: status=200 includes_def-OUTONLY=no SECRET-OUT-ERR=no
+[RBAC-ON] principal=P_mcp_readonly(bob) plain(Execution:Read)=DENY(403) fleet_read=SCOPED{a_in,}(-1)
+    (1) fragment: status=403 out_of_scope_data=no rows_def-OUTONLY=no SECRET-OUT-ERR=no
+    (2) mcp summarize(X2 out-of-scope-only): status=403 reveals_exec=no vs not-found=n/a | body={"error":{"code":403,"message":"permission denied: Execution:Read","correlation_id":"req-1a108d96ff1-12","retry_after_ms":null,"permission":"Execution:Read"},"meta":{"api_version":"v1"}}
+    (v1 twin) GET /api/v1/executions: status=200 includes_def-OUTONLY=no SECRET-OUT-ERR=no
+[RBAC-ON] principal=P_mcp_operator(bob) plain(Execution:Read)=DENY(403) fleet_read=SCOPED{a_in,}(-1)
+    (1) fragment: status=403 out_of_scope_data=no rows_def-OUTONLY=no SECRET-OUT-ERR=no
+    (2) mcp summarize(X2 out-of-scope-only): status=403 reveals_exec=no vs not-found=n/a | body={"error":{"code":403,"message":"permission denied: Execution:Read","correlation_id":"req-1a108d97029-17","retry_after_ms":null,"permission":"Execution:Read"},"meta":{"api_version":"v1"}}
+    (v1 twin) GET /api/v1/executions: status=200 includes_def-OUTONLY=no SECRET-OUT-ERR=no
+[RBAC-ON] principal=P_mcp_supervised(bob) plain(Execution:Read)=DENY(403) fleet_read=SCOPED{a_in,}(-1)
+    (1) fragment: status=403 out_of_scope_data=no rows_def-OUTONLY=no SECRET-OUT-ERR=no
+    (2) mcp summarize(X2 out-of-scope-only): status=403 reveals_exec=no vs not-found=n/a | body={"error":{"code":403,"message":"permission denied: Execution:Read","correlation_id":"req-1a108d97061-1c","retry_after_ms":null,"permission":"Execution:Read"},"meta":{"api_version":"v1"}}
+    (v1 twin) GET /api/v1/executions: status=200 includes_def-OUTONLY=no SECRET-OUT-ERR=no
+[RBAC-ON] principal=P_mcp_readonly(gary) plain(Execution:Read)=ADMIT fleet_read=ADMIT-ALL(unfiltered)(-1)
+    (1) fragment: status=200 out_of_scope_data=YES rows_def-OUTONLY=yes SECRET-OUT-ERR=yes
+    (2) mcp summarize(X2 out-of-scope-only): status=200 reveals_exec=YES vs not-found=oracle-distinguishable | body={"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"kind\":\"execution\",\"id\":\"01edf7f4a3ea5f2a75236ee501cd83fc\",\"limit\":25,\"narrative\":\"Execution 01edf7f4a3ea5f2a75236ee501cd83fc is completed with t
+    (v1 twin) GET /api/v1/executions: status=200 includes_def-OUTONLY=yes SECRET-OUT-ERR=yes
+[RBAC-ON] principal=P_mcp_svc(bob,readonly,svc) plain(Execution:Read)=DENY(403) fleet_read=SCOPED{a_in,}(-1)
+    (1) fragment: status=403 out_of_scope_data=no rows_def-OUTONLY=no SECRET-OUT-ERR=no
+    (2) mcp summarize(X2 out-of-scope-only): status=200 reveals_exec=no vs not-found=n/a | body={"jsonrpc":"2.0","error":{"code":-32003,"message":"service-scoped tokens cannot call this tool","data":{"correlation_id":"req-1a108d970d3-22","retry_after_ms":null,"remediation":"this tool has no per-agent/service confin
+    (v1 twin) GET /api/v1/executions: status=200 includes_def-OUTONLY=no SECRET-OUT-ERR=no
+=== RBAC OFF ===
+[RBAC-OFF] principal=P_global(gary) plain(Execution:Read)=ADMIT fleet_read=ADMIT-ALL(unfiltered)(-1)
+    (1) fragment: status=200 out_of_scope_data=YES rows_def-OUTONLY=yes SECRET-OUT-ERR=yes
+    (2) mcp summarize(X2 out-of-scope-only): status=200 reveals_exec=YES vs not-found=oracle-distinguishable | body={"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"kind\":\"execution\",\"id\":\"e4b333d8a615ab47ee0482e438669a33\",\"limit\":25,\"narrative\":\"Execution e4b333d8a615ab47ee0482e438669a33 is completed with t
+    (v1 twin) GET /api/v1/executions: status=200 includes_def-OUTONLY=yes SECRET-OUT-ERR=yes
+[RBAC-OFF] principal=P_scoped(bob) plain(Execution:Read)=ADMIT fleet_read=ADMIT-ALL(unfiltered)(-1)
+    (1) fragment: status=200 out_of_scope_data=YES rows_def-OUTONLY=yes SECRET-OUT-ERR=yes
+    (2) mcp summarize(X2 out-of-scope-only): status=200 reveals_exec=YES vs not-found=oracle-distinguishable | body={"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"kind\":\"execution\",\"id\":\"e4b333d8a615ab47ee0482e438669a33\",\"limit\":25,\"narrative\":\"Execution e4b333d8a615ab47ee0482e438669a33 is completed with t
+    (v1 twin) GET /api/v1/executions: status=200 includes_def-OUTONLY=yes SECRET-OUT-ERR=yes
+[RBAC-OFF] principal=P_service(bob,svc=printers) plain(Execution:Read)=DENY(403) fleet_read=DENIED(403)
+    (1) fragment: status=403 out_of_scope_data=no rows_def-OUTONLY=no SECRET-OUT-ERR=no
+    (2) mcp summarize(X2 out-of-scope-only): status=200 reveals_exec=no vs not-found=n/a | body={"jsonrpc":"2.0","error":{"code":-32003,"message":"service-scoped tokens cannot call this tool","data":{"correlation_id":"req-1a108d97566-2d","retry_after_ms":null,"remediation":"this tool has no per-agent/service confin
+    (v1 twin) GET /api/v1/executions: status=403 includes_def-OUTONLY=no SECRET-OUT-ERR=no
+[RBAC-OFF] principal=P_mcp_readonly(bob) plain(Execution:Read)=ADMIT fleet_read=ADMIT-ALL(unfiltered)(-1)
+    (1) fragment: status=200 out_of_scope_data=YES rows_def-OUTONLY=yes SECRET-OUT-ERR=yes
+    (2) mcp summarize(X2 out-of-scope-only): status=200 reveals_exec=YES vs not-found=oracle-distinguishable | body={"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"kind\":\"execution\",\"id\":\"e4b333d8a615ab47ee0482e438669a33\",\"limit\":25,\"narrative\":\"Execution e4b333d8a615ab47ee0482e438669a33 is completed with t
+    (v1 twin) GET /api/v1/executions: status=200 includes_def-OUTONLY=yes SECRET-OUT-ERR=yes
+=== LEGACY RESPONSES AUDIT ===
+legacy /api/responses/cmd-1 principal=bob(scoped) audit_persists=yes -> status=200 out_of_scope_data=no in_scope_data=yes audit_rows=[response.read/denied(scope_dropped=1 surface=get) ]
+  v1 twin /api/v1/responses/cmd-1 principal=bob(scoped) audit_persists=yes -> status=200 out_of_scope_data=no audit_rows=[response.read/denied(scope_dropped=1 surface=v1_get) response.read/success(REST v1 response query cid=req-1a108d97973-31) ]
+legacy /api/responses/cmd-1/aggregate principal=bob(scoped) audit_persists=yes -> status=200 out_of_scope_data=no in_scope_data=yes audit_rows=[response.read/denied(scope_dropped=1 surface=aggregate) ]
+  v1 twin /api/v1/responses/cmd-1/aggregate principal=bob(scoped) audit_persists=yes -> status=200 out_of_scope_data=no audit_rows=[response.read/denied(scope_dropped=1 surface=v1_aggregate) response.read/success(REST v1 response aggregate cid=req-1a108d97979-32) ]
+legacy /api/responses/cmd-1 principal=bob(scoped) audit_persists=NO -> status=200 out_of_scope_data=no in_scope_data=yes audit_rows=[response.read/denied(scope_dropped=1 surface=get) ]
+  v1 twin /api/v1/responses/cmd-1 principal=bob(scoped) audit_persists=NO -> status=503 out_of_scope_data=no audit_rows=[response.read/denied(scope_dropped=1 surface=v1_get) ]
+legacy /api/responses/cmd-1/aggregate principal=bob(scoped) audit_persists=NO -> status=200 out_of_scope_data=no in_scope_data=yes audit_rows=[response.read/denied(scope_dropped=1 surface=aggregate) ]
+  v1 twin /api/v1/responses/cmd-1/aggregate principal=bob(scoped) audit_persists=NO -> status=503 out_of_scope_data=no audit_rows=[response.read/denied(scope_dropped=1 surface=v1_aggregate) ]
+legacy /api/responses/cmd-1 principal=gary(global) audit_persists=yes -> status=200 out_of_scope_data=YES in_scope_data=yes audit_rows=[]
+  v1 twin /api/v1/responses/cmd-1 principal=gary(global) audit_persists=yes -> status=200 out_of_scope_data=YES audit_rows=[response.read/success(REST v1 response query cid=req-1a108d97989-35) ]
+legacy /api/responses/cmd-1/aggregate principal=gary(global) audit_persists=yes -> status=200 out_of_scope_data=no in_scope_data=yes audit_rows=[]
+  v1 twin /api/v1/responses/cmd-1/aggregate principal=gary(global) audit_persists=yes -> status=200 out_of_scope_data=no audit_rows=[response.read/success(REST v1 response aggregate cid=req-1a108d9798d-36) ]
+legacy /api/responses/cmd-1 principal=gary(global) audit_persists=NO -> status=200 out_of_scope_data=YES in_scope_data=yes audit_rows=[]
+  v1 twin /api/v1/responses/cmd-1 principal=gary(global) audit_persists=NO -> status=503 out_of_scope_data=no audit_rows=[response.read/success(REST v1 response query cid=req-1a108d97991-37) ]
+legacy /api/responses/cmd-1/aggregate principal=gary(global) audit_persists=NO -> status=200 out_of_scope_data=no in_scope_data=yes audit_rows=[]
+  v1 twin /api/v1/responses/cmd-1/aggregate principal=gary(global) audit_persists=NO -> status=503 out_of_scope_data=no audit_rows=[response.read/success(REST v1 response aggregate cid=req-1a108d97995-38) ]
+=== ENGINE (RBAC ON) ===
+[RBAC-ON] principal=P_engine(no grant) plain(Execution:Read)=DENY(403) fleet_read=DENIED(403)
+    (1) fragment: status=403 out_of_scope_data=no rows_def-OUTONLY=no SECRET-OUT-ERR=no
+    (2) mcp summarize(X2 out-of-scope-only): status=403 reveals_exec=no vs not-found=n/a | body={"error":{"code":403,"message":"permission denied: Infrastructure:Read","correlation_id":"req-1a108db9f1e-3","retry_after_ms":null,"permission":"Infrastructure:Read"},"meta":{"api_version":"v1"}}
+    (v1 twin) GET /api/v1/executions: status=403 includes_def-OUTONLY=no SECRET-OUT-ERR=no
+[RBAC-ON] principal=P_engine(global Execution:Read) plain(Execution:Read)=ADMIT fleet_read=ADMIT-ALL(unfiltered)(-1)
+    (1) fragment: status=200 out_of_scope_data=YES rows_def-OUTONLY=yes SECRET-OUT-ERR=yes
+    (2) mcp summarize(X2 out-of-scope-only): status=200 reveals_exec=YES vs not-found=oracle-distinguishable | body={"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"kind\":\"execution\",\"id\":\"02329b8c26ce31c4d1df91dcb5188856\",\"limit\":25,\"narrative\":\"Execution 02329b8c26ce31c4d1df91dcb5188856 is completed with t
+    (v1 twin) GET /api/v1/executions: status=200 includes_def-OUTONLY=yes SECRET-OUT-ERR=yes

@@ -18,11 +18,78 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Guardian file-hash `max_bytes` now has a hard ceiling (#2233).** An authored `file-hash-equals` rule's `max_bytes` (the hashing-DoS cap) was previously accepted unbounded from the authoring API. It is now clamped to 1 GiB (`kMaxFileHashBytes`) on the agent, and the server rejects a new/edited rule authoring a value above that ceiling in either JSON wire form (400). **Operator-visible only if you have a PRE-EXISTING `file-hash-equals` rule authored (before this release) with `max_bytes` above 1 GiB, watching a file at or above that size:** after upgrade, that file reports `<oversize>` instead of being hashed — a compliance-verdict change with no authoring-time signal (the rule already exists, so the new server-side reject cannot retroactively catch it). List your rules via `GET /api/v1/guaranteed-state/rules` (the route returns every rule; there is no server-side filter), check any `file-hash-equals` rule for `max_bytes` over 1073741824, and re-author within the ceiling if the larger cap was intentional. No operator action required otherwise. **DEX and management-group reads now fail closed on a degraded read instead of answering a healthy/empty result (#4855, #1762)** — see "Behaviour change: DEX device score and management-group member reads now fail closed on a degraded read (#4855, #1762)" below. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`BatchHeartbeatResponse` gains `unknown_session_ids` and `unknown_session_ids_truncated` (#1197), and the gateway now acts on them - restart the gateway to deploy (this disconnects every agent it holds, and released v0.13.0 and v0.14.0-rc6 agents stayed wedged after a graceful gateway restart in testing, so upgrade agents to a build with the #5183 fix first or expect to restart the agent service on them; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts)); no wire change and no new required configuration.** The server lists, per `BatchHeartbeat`, the session ids it does not hold, and the new gateway reads that list and re-registers exactly the sessions it still holds (the registration-replay drip, bounded by a per-session guard and a queue cap). The behavioural change is that, after a server restart, agents behind a new gateway become known to the server again without operator action; before, they stayed unknown (`/health` `agents.online` stayed 0 in the observed runs). Any pairing interoperates: an OLD server never sends the fields, so a new gateway sees an empty list and does nothing; an OLD gateway ignores the added response fields (proto3 unknown fields, field numbers 2 and 3) and keeps the old behaviour. Recovery needs the new gateway and a server that sends the fields. Observed on a local rig: the agent was known again about 17 s after the server was healthy, on its first heartbeat after that; after an outage long enough to open the gateway circuit breaker, recovery waits for the breaker's remaining backoff (58 s observed after a 300 s outage with 1 agent; with 10 and 30 agents the breaker opened in later runs and the breaker's own replay recovered them, with all agents online 85.2 s and 50.4 s after the server was healthy; the backoff is capped at 300 s, and steps above 160 s were not observed). A second operator-visible change is a new `yuzu_server_gateway_route_desync_total{op="batch_heartbeat",outcome="malformed_session_id"}` series (pre-seeded at 0, expected to stay 0, no alert): over-length (more than 64 bytes) unknown session ids in a `BatchHeartbeat` are now counted under that series, per entry, instead of under `op="renew_leases", outcome="unknown_session"`. The gateway adds three counters and two optional application-env tunables, described under [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts), which also states what the reconcile does not promise (fleet completion inside a route lease, dispatch reachability after the session is adopted, several core replicas). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway heartbeat admission is now bound to the connection that opened the session (gateway restart required; breaking for L7-fronted gateways).** The gateway admits an agent `Heartbeat` only on the HTTP/2 connection that opened the session's `Subscribe` stream; any other heartbeat is answered `NOT_FOUND` and not forwarded. Deploy with a gateway restart, and check for an HTTP/2-terminating hop in front of `:50051` first. A rejected agent recovers by re-registering. That logic exists from v0.13.0, but the released v0.13.0 and v0.14.0-rc6 agents wedge in their reconnect path with default settings (bug #2182, fixed by PR #5183, in no release yet) and recover only with `--no-auto-update`; v0.12.0 never recovers by itself (observed; older versions were not tested). Upgrade the agents first, then the gateway, with a build that includes the #2182 fix once released; until then restart an agent that stays rejected. Agents that do not connect through the gateway are not affected by this requirement (see Older agents). No wire or server change. See the section "Breaking: gateways fronted by an HTTP/2-terminating proxy or mesh sidecar" below and [Heartbeat admission](gateway.md#heartbeat-admission). |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **`--gateway-upstream` now refuses to start without gateway peer authorization (breaking for own-certificate and plaintext installs).** The gateway-upstream service admits only a gateway whose certificate key (SPKI SHA-256) is pinned, which carries `serverAuth` and is inside its validity window; the server exits at boot, before binding a port, when `--gateway-upstream` is set and that cannot be arranged. Generated default certificates are pinned automatically; your own certificates need `--gateway-peer-pin` / `--gateway-peer-pin-file` first; a plaintext (`--no-tls`) rig needs `--insecure-gateway-peer`; the Linux package unit passes `--gateway-upstream` unconditionally. Agents and gateways are unaffected on the wire. See the section "Breaking: `--gateway-upstream` now refuses to start without gateway peer authorization" below. |
 | 0.14.x | 0.12.0 | 0.12.0 | **Fleet visualization intra-cube edges (PR 8).** `/viz/fleet` now draws faint white lines (opacity `0.3`) inside each machine cube connecting process dots that are reciprocal ends of a loopback TCP socket (127.0.0.1 / ::1). Two operator-visible changes: (a) **wire shape** — `/api/v1/viz/fleet/topology` `schema_minor` bumps `1 → 2` and a new optional `dst_pid` field appears on `scope: local` connection edges. Renderers that ignore unknown keys per the contract see no break; strict-validating consumers pinned to `schema_minor == 1` should relax their validator to `minimum: 1`. (b) **dropped unmatched halves** — unpaired Local-scope edges (kernel snapshot race during teardown, agent's 4096-connection cap cutting a partner) are now dropped server-side before serialisation. Integrations counting `connections` array length per machine as a proxy for active IPC pairs should re-baseline after upgrade; the count trends marginally lower. Lines appear only when the host has active loopback flows (e.g. Prometheus scraping node_exporter, a client talking to local Redis / Postgres); a fresh agent with no inter-process loopback shows process dots but no lines — expected, not a regression. **Windows agent (#5196):** set update-signing options in the `YuzuAgent` service's `Environment` registry value, not its binary path. Every installer run rewrites the binary path and silently drops them, and uninstalling deletes the `Environment` value, so a deployment that uninstalls first must set it again (*Windows: the service's `Environment` value* in `server-admin.md`). Agent installers from 0.14.0-rc1 to rc5 also stop with exit code 7 wherever PowerShell runs in Constrained Language Mode; use this release's. **Before upgrading Windows agents:** this installer stops with exit code 7, naming the reason in its `/LOG=` file, if `C:\ProgramData\Yuzu\agent-certs` exists but is not secured (for example a folder created or pre-staged by hand, or one a Group Policy adds permissions to), if a file in it is not owned by Administrators or SYSTEM, or if it or anything in it is a junction, symbolic link, hard link or subdirectory (a backup subfolder, say). The agent service is left running when it stops. Provision the bundle after installing, by copying it in as an administrator. The trust-anchor procedure block in `server-admin.md` stops on the same conditions, naming the reason (and on a healthy or rc1–rc5 endpoint completes, repairing rc files, as long as each file in it is owned by Administrators or SYSTEM; `icacls "<file>" /setowner *S-1-5-32-544 /L` fixes one you placed yourself): run it on a few endpoints first, and pilot the upgrade before a fleet-wide push. **Linux native packages need a recent distribution:** the server needs Ubuntu 26.04 or Fedora 42 class, the agent Ubuntu 24.04 class or newer; Ubuntu 22.04, Debian 12 and RHEL/Rocky 9 are not supported by the native packages. Check before upgrading older hosts, or use the container images (*Supported Platforms* in the user manual README, #5143). |
 | 0.13.x | 0.12.0 | 0.12.0 | **Fleet visualization process layer.** `/viz/fleet` now renders interior process dots inside each machine cube, coloured by category (system/browser/database/web/runtime/other) — no operator action required, but operators upgrading from a 0.12.x build will see the dashboard suddenly populated with thousands of small spheres on next page load. Process data was already collected via `tar.fleet_snapshot` since 0.12.x; PR 7 only renders it. To suppress process visibility for specific agents (privacy-sensitive hosts, regulated workloads), set `process_enabled=false` on those agents via `tar.configure` — this also suppresses their dots on the visualization. Hover a dot to see pid/name/user/category; agent-controlled string fields are HTML-escaped and length-clamped before render. Per-cube dot count is soft-capped at 1000 for graceful degradation on heavily-threaded hosts; the cube tooltip still shows the true reported count. |
 | 0.12.x | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
+
+## Behaviour change: `POST /api/instructions/{id}/execute` now validates `params` against the stored schema
+
+**What changed.** The route checks the request's `params` against the definition's stored
+`parameter_schema` and answers `400` (`invalid params: <path>: <reason>`) when they do not conform. The
+check runs after the permission checks and before the approval gate, so a refused call creates no
+approval ticket, execution row or dispatch. It is strict: a name the schema does not declare, a value of
+the wrong type or outside `enum`, `pattern`, `minimum`/`maximum` or length bounds, a missing required
+parameter, a string containing a NUL, and a non-object `params` are all refused. A definition with no
+stored schema (empty, whitespace or `{}`) is not validated. A stored schema that cannot be prepared makes
+the route answer `500` instead of dispatching. A schema is also checked when it is written:
+`POST /api/instructions/import` refuses an over-limit or invalid `parameter_schema` with a `400`, and a
+bundled definition that fails the same check makes the server refuse to boot (the golden test guards the
+shipped content). Updating a definition (`PUT`, the YAML editor, response templates) keeps its stored
+schema. Details: [REST API](rest-api.md), [Instructions](instructions.md#parameter-validation).
+
+**Who is affected.** Callers that send something the stored schema does not accept:
+
+- **Names the definition does not declare.** They used to ride through to the plugin; they are now `400`
+  (path `/*`, the name is not echoed). Six shipped definitions under-declared what their plugin reads and
+  are corrected in this release: `agent.content_dist.cleanup` (`hours`), `agent.content_dist.execute_staged`
+  (`expected_hash`), `device.wol.check` (`timeout_ms`), `device.agent_actions.set_log_level` (any letter
+  case, plus `warning` and `err`, which the agent accepts), `workflow.config_search_and_replace`
+  (declares `path`, `search`, `replacement`, `regex`, `case_sensitive`, `dry_run`, `max_replacements`
+  and the retained `base_dir`) and `workflow.version_compliance_check` (declares `path`, `minimum_version`
+  and `base_dir`). The two `workflow.*` definitions used to declare
+  parameter names their plugin never read.
+- **Values outside an enum or a bound.** `enum` is case-sensitive (`"True"` and `"1"` are refused for a
+  `true`/`false` enum), and a value above a declared `maximum` (or below a `minimum`) is `400` where a plugin
+  may have clamped it (for example `device.agent_logging.get_log` `lines` above 500).
+- **`""` and `null` for optional parameters.** They are values, not omissions: they are refused for an optional
+  integer, `enum` or `pattern` parameter. Omit the key instead.
+
+**Not affected.** The 7 shipped definitions that have no `parameters:` block and so store no schema
+(`windows.app_control.wdac_policy`, `windows.app_control.applocker_policy`,
+`crossplatform.local_security_policy.password_policy`, `...lockout_policy`, `...audit_policy`,
+`...sudoers` and `windows.rdp.status`), definitions saved from YAML or created in the dashboard, and every
+other dispatch surface (workflow steps, schedules, policy remediation, result-set producers, MCP
+`execute_instruction`, `POST /api/command`), which do not validate yet.
+
+**A stored schema is not refreshed by an upgrade.** The bundled reseed inserts a definition only when its id
+is absent (`ON CONFLICT (id) DO NOTHING`), so the six corrections above reach fresh installs only; an existing
+install keeps the old stored schema and keeps refusing the same calls until it is replaced (export the
+definition, delete it and import it again, signed unless the server allows unsigned definitions; see [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)). Comparing the
+parameter declarations at `v0.14.0` with this release, exactly 6 definitions differ in what the server
+enforces (the six above), and 13 more differ only in `description` text and enforce what they did
+(`agent.content_dist.upload_file`, `device.agent_logging.get_log`, `device.event_logs.errors`,
+`device.event_logs.query`, `device.filesystem.find_by_hash`, `device.filesystem.read`,
+`device.filesystem.search`, `device.filesystem.search_dir`, `device.script_exec.bash`,
+`device.script_exec.exec`, `device.script_exec.powershell`, `device.windows_updates.patch_connectivity`,
+`workflow.patch_connectivity_audit`).
+
+**Detecting it.** Each refusal writes an `instruction.execute` audit row: `result=denied` with detail
+`reason=param_schema path=<path>` for a `400`, or `result=failure` with `reason=param_schema_invalid` for the
+`500`. Each also increments
+`yuzu_server_instruction_param_rejected_total{route="instruction_execute",reason}`. See
+[Audit log](audit-log.md) and [Metrics](metrics.md).
+
+**Rollback.** No migration and no schema change. Rolling the server back removes the check, and while replicas
+run different releases the same call can be refused by one and accepted by another. A release without the check
+still rewrites a stored schema in one case: a YAML-editor save on the older release writes `{}` over it, because
+that route builds the definition from the YAML alone. The other update routes of the older release (`PUT`,
+response templates) write back the schema they loaded. A definition that was hit this way is not validated, on
+this release or any other, until its schema is replaced (see
+[Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)); rolling forward
+does not restore it.
 
 ## Operator note: the software-inventory store migration (v7) is a hard cutover (#5172)
 
@@ -273,6 +340,245 @@ Only case (e) means the key files are gone. Nothing inside the server can rebuil
   3. This database cannot be brought back by any supported means. Every start checks each registered KEK and refuses. The one-shot modes `--mfa-reset` and `--break-glass-arm` run after that check, so they stop with the same `kek_unresolvable` error. What is gone: the CA private key, so every agent certificate it issued no longer chains and every agent must enroll again; and every secret sealed under the KEK, including TOTP enrolments, webhook signing secrets and the other secret columns listed in `docs/user-manual/server-admin.md` "Key management (secrets KEK)". Passwords and API tokens are hashed, not sealed, but they live in the same database.
   4. Start a new install. With the bundled Postgres, `docker compose down -v` deletes the Postgres volume along with the others. `down -v` does not reset an external Postgres: that database still registers the lost KEK, so a new install against it fails the same way. Give the new install a new, empty database. Then provision the admin account again, re-enroll your agents, and re-create your configuration.
 
+## Behaviour change: the executions list fragment and MCP `summarize_working_set` (execution kind) use the fleet-read gate (#3526, #4753)
+
+`GET /fragments/executions` (the dashboard executions list) and the `execution` kind of the MCP tool
+`summarize_working_set` moved from a plain `Execution:Read` permission check onto the
+management-group-aware fleet-read gate that `GET /api/v1/executions` already used. This is
+hardening plus an admission change, not a fix for a leak: the old gate only admitted callers
+holding a global grant, and those callers were never filtered. An author-run reachability probe
+(not independently adjudicated; the JIT-elevated case was checked by code reading only) found nothing
+served through the old gate that the unconfined `GET /api/v1/executions` would not serve the same
+principal, with RBAC on or off (with RBAC off every non-service, non-engine caller whose tier allows it is unconfined by design; an engine principal is refused with 403)
+(`docs/security-reviews/3526-confinement-reachability-probe-2026-10-05.md`). **There is no
+admission change for a caller with a global `Execution:Read` grant, and nothing changes with RBAC
+off for such a caller. What changes for every caller is the degrade and audit behaviour below,
+plus one new prerequisite.**
+
+- **RBAC off (the shipped default).** With RBAC off, both surfaces are unconfined for every authenticated non-service, non-engine caller whose tier allows it (an engine principal is refused with 403 with RBAC off),
+  before and after the move to the fleet-read gate; a service-scoped token is refused
+  (`403` on the REST and MCP twins, the permission note described under "Degraded store, fragment"
+  on the fragment). Confinement on these two surfaces takes effect only with RBAC enforcement on.
+- **Admission prerequisite (applies to every caller on these two surfaces).** The fleet-read gate
+  needs both the authorization store and the management-group store open. When the RBAC store is
+  not open, every caller except a JIT-elevated non-service session (which returns before any store
+  check) gets a retryable `503` (`retry_after_ms` 5000) from the gate; when the management-group
+  store is not open, every caller except an elevated session and an engine principal does (an
+  engine principal is resolved from the RBAC store alone, and gets the `503` only when that store
+  is not open). A global-grant administrator is included in both cases; the old plain gate never
+  needed the management-group store. The REST and MCP twins show the `503` itself. On the dashboard
+  fragment the gate still audits the refusal, but the response is replaced with an HTTP `200` note
+  (`data-degraded="gate"`, see "Degraded store, fragment"), because the dashboard drops `4xx`/`5xx`
+  bodies; `GET /api/v1/executions` keeps its real `503`.
+- **Group-scoped-only operators** (an `Execution:Read` grant held only through a management group)
+  previously got `403` from the **fragment** and now get a confined view: only executions that
+  touched one of their agents or that they dispatched, with the counters and the error preview
+  recomputed from their visible agents only. **`summarize_working_set` is different:** its first
+  gate is still a plain `Infrastructure:Read` check, so a group-scoped-only operator still gets
+  `403` there. Only a caller who holds a GLOBAL `Infrastructure:Read` plus a group-scoped
+  `Execution:Read` is newly admitted to the confined execution view, and its narrative carries the
+  same projected counts.
+- **Service-scoped API tokens** get a confined view from `GET /fragments/executions` where
+  they got `403`, but only when RBAC enforcement is ON, the `ITServiceOwner` role holds
+  `Execution:Read` (the seeded default; see the next item) and the tag store is reachable. With RBAC
+  enforcement off the gate still refuses it ("service-scoped tokens require RBAC to be
+  enabled"), and a missing or degraded tag store is a retryable `503` (`retry_after_ms` 5000) on the
+  REST twin; the fragment shows the matching note at HTTP `200`. In a
+  normal deployment the tag store always exists (the server refuses to boot without it). On this
+  fragment a service-scoped token sees only executions that touched an in-scope agent (see "Owner
+  disjunct" below); its own just-dispatched execution stays invisible until an in-scope agent
+  replies. `summarize_working_set` is unchanged for service-scoped tokens: it stays denied.
+- **`ITServiceOwner` ceiling (applied by PR #5546, not by the executions-list move).** A service-scoped
+  token is subject to the `ITServiceOwner` authority ceiling on the fleet-read gate. The executions-list move
+  relies on that ceiling but does not add it. Its Breaking effect (`403` from
+  `GET /api/v1/enrollment/pending-agents` for a service-scoped token), the retryable `503` for a
+  failed ceiling read, the remediation and the audit search are in "Behaviour change:
+  service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and
+  `GET /api/v1/upload-grants` (#3526)" below.
+- **Degraded store, fragment.** Every refusal or failure on `GET /fragments/executions` now renders
+  an operator-visible note at HTTP `200`, because the dashboard drops `4xx`/`5xx` bodies and a
+  refusal used to leave the panel on "Loading..." forever. There are three degrade kinds, set in the
+  `data-degraded` attribute on `<div class="empty-state">`: `tracker` (the execution query or the
+  agent-status read failed), `unavailable` (the fleet-read gate or the execution tracker is not
+  wired, or a confined read has an empty principal: an administrator or a bug) and `gate` (the
+  authorization gate refused with `503`: the RBAC store, the management-group store or the tag
+  store is not open or unavailable, or the `ITServiceOwner` ceiling read is degraded; the text is
+  "Executions unavailable (the authorization service could not be reached). Retry shortly."). A gate
+  `403` (no `Execution:Read`, RBAC off for a service-scoped token, the ceiling denial, an engine
+  principal without a grant) renders `<div class="empty-state" data-denied="true">` with "You do not
+  have permission to view executions." and no reason text. A `401` for an unauthenticated request
+  passes through unchanged. The gate still writes its audit row first, and no `Retry-After` header is
+  sent with the note. Detect the notes with the `data-degraded` and `data-denied` attributes; none of
+  them is the "No executions yet" text. **Monitoring blind spot:** `/fragments/executions` no longer
+  answers `403` or `503` for these cases, so an HTTP-status monitor, a reverse-proxy access log or
+  a synthetic check that treats `200` as healthy will not see them. The signals are the gate's audit
+  rows (`auth.fleet_read_required` with `result=denied`), the panel text, and, for the ceiling case,
+  `yuzu_server_rbac_read_degrade_total`. `GET /api/v1/executions` is unchanged and keeps its real
+  `403`/`503`.
+- **Runbook, degrade note on the Executions panel.** `data-degraded="tracker"` means the execution
+  tracker or its agent-status read failed: check `ExecutionTracker` warnings in the server log and
+  PostgreSQL availability. `data-degraded="unavailable"` is a misconfiguration or bug branch (the
+  fleet-read gate or the execution tracker is not wired, or a confined read has an empty
+  principal), not a storage fault: it needs an administrator or a bug report, and a Postgres check
+  will not clear it. `data-degraded="gate"` means the authorization gate could not decide. Look for
+  audit rows `auth.fleet_read_required` with `result=denied` (detail `fleet read blocked:
+  management-group store unavailable`, or the ceiling detail from the `ITServiceOwner` section
+  below) and `yuzu_server_rbac_read_degrade_total` (it moves ONLY for the `ITServiceOwner`
+  ceiling-read case: the management-group-store-unavailable refusal writes an audit row but does not
+  move it). The server keeps no per-request access log. None of the notes clears on its own: the
+  panel is loaded once, when the Instructions page reveals it (`hx-trigger="revealed"`, no polling),
+  so after the cause is fixed reload the Instructions page (or reopen the Execution History
+  section).
+- **Degraded store, MCP.** `summarize_working_set` returns an error carrying `retry_after_ms`
+  where it used to say the execution "was not found".
+- **Empty confined page.** A confined caller who sees zero executions gets "No executions visible in
+  your scope." instead of "No executions yet.", because out-of-scope executions may exist. Until an
+  in-scope agent replies, a confined caller sees no trace of an execution they did not dispatch,
+  because per-agent status rows are written as responses arrive; the panel can therefore show this
+  text while an execution is in flight. MCP `list_executions` shows a confined caller only the
+  executions they dispatched, not the in-scope executions of others (see
+  `docs/user-manual/mcp.md`). The
+  per-row status badge is still the execution's fleet-wide status while the counters are projected
+  to the caller's agents (the same as the REST twin, SSE and the MCP detail view).
+- **Owner disjunct.** Ordinary callers keep it: a principal's own dispatches are shown even when
+  none of their agents replied, with the counters still projected. Service-scoped tokens do NOT get
+  it on `GET /fragments/executions`. **Known limit (#5557):** a service-scoped token's session
+  username is the account that minted it. On `GET /api/v1/executions`, `/{id}`, `/children`, MCP
+  `get_execution_status`, MCP `list_executions`, legacy `/api/executions*`, the detail fragment,
+  the SSE channel `/sse/executions/{id}` and `GET /api/v1/events`, a service-scoped token is
+  therefore also shown executions its MINTER dispatched, even outside the service scope (counters
+  projected, but id, definition, status and timing visible). Mint service tokens from an account
+  that dispatches only inside the service scope. Executions the minting account has already
+  dispatched stay visible to its service tokens on those surfaces, so a token minted from an
+  account with unscoped history is exposed to that history.
+- **Audit and SIEM.** For `kind=execution`, a CONFINED caller whose id is absent or outside scope
+  now produces `action=mcp.summarize_working_set`, `result=denied`, detail
+  `not found or outside caller's fleet-read scope: <id>` (the id is neutralised for `k=v` and
+  CR/LF forgery and capped at 128 bytes; the `success` row's id gets the same treatment for EVERY `summarize_working_set` kind, not only `execution`). Only callers newly admitted by the move to the fleet-read gate can produce
+  that row (the plain gate admitted only unconfined, global-grant callers, and confined callers got
+  `403` before), so an existing rule keyed on `result=success` loses nothing for the callers it
+  already saw; a rule keyed on `result=denied` for this action may now see the new callers. An
+  UNCONFINED caller's absent id stays `result=success` (no denial occurred). The scope-collapse
+  `denied` row (detail `not found or outside caller's fleet-read scope: <id>`) is written only for
+  a CONFINED caller on `kind=execution`, so it is never written with RBAC off. Other `denied` rows
+  on this action (tier refusal, permission-gate refusal, service-scoped default-deny) are separate
+  and can occur regardless of RBAC state. The same neutralise-and-cap (128 bytes) now applies to
+  the id in the `get_execution_status` `denied` rows and the `get_agent_details` `denied` and
+  `failure` rows. A NUL byte in a `summarize_working_set` `kind=execution` id or a
+  `get_execution_status` id is rejected with an invalid-params error before any lookup. The
+  degraded-store errors of `get_execution_status` (agent-status read) and `list_executions` now
+  carry `retry_after_ms`, like `summarize_working_set`.
+  The `denied` row cannot tell a typo from an out-of-scope probe; that is intentional (no
+  existence oracle). The narrative for an absent id is a success-shaped result, unlike
+  `get_execution_status`, which returns an error for the same input.
+- **Still unscoped.** `summarize_working_set` with `kind=fleet` or `kind=result_set` returns the
+  whole-registry agent count (tracked in #4753, whose checklist, including `kind=fleet` and
+  `get_fleet_posture_fast`, stays open; the executions-list move covers only `kind=execution`). The same
+  whole-registry branch is also reached by `kind=execution` or `kind=agent` with an EMPTY id, or
+  when the execution tracker is unavailable (not separately tracked). `GET
+  /api/v1/execution-statistics/agents` has no per-agent filter (#3526).
+
+**Rollback.** Redeploy the previous binary. The plain `Execution:Read` gate returns, so
+group-scoped-only operators go back to `403` on the fragment. The `visible_agents` filter is a
+read-time parameter with no stored state, so there is nothing to migrate or clean up. Audit rows
+already written with `result=denied` for `mcp.summarize_working_set` remain in the audit store.
+
+## Behaviour change: service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and `GET /api/v1/upload-grants` (#3526)
+
+Two chokepoints let a service-scoped API token reach more than the `ITServiceOwner` role allows (found
+in a review of the fleet-read gate, #3526). Both now refuse it. This is a tightening for service-scoped tokens only;
+non-service callers, elevated sessions and engine principals are unaffected.
+
+**Breaking for service-scoped tokens, 1: `GET /api/v1/enrollment/pending-agents` now answers `403`.**
+The management-group-aware fleet-read gate (`require_fleet_read`, ADR-0017) did not apply the
+`ITServiceOwner` authority ceiling that `require_permission` applies to a service-scoped token. It now
+does, through one shared helper (`authz::service_ceiling_check`): the token is refused (`403`,
+"service-scoped token does not grant <securable>:<operation> (the ITServiceOwner role does not hold
+it)", no `permission` field, audit `auth.fleet_read_required` / `denied`) unless that role itself holds
+the pair, whatever its minter holds. `ITServiceOwner` does not hold `Enrollment:Read`, so a
+service-scoped token that used to receive a pending-agent view narrowed to its tagged agents now gets
+the `403`. **Remediation:** `Enrollment:Read` is intentionally NOT granted to `ITServiceOwner`; use an
+Administrator-minted non-service token for that route. The cost is that this replaces a confined
+credential with an Administrator-grade one, and there is no narrower option today: `Enrollment:Read` is
+Administrator-only by default and custom-role authoring is not reachable through REST, MCP or the
+dashboard yet.
+
+**Breaking for service-scoped tokens, 2: `GET /api/v1/upload-grants` now answers `403`.** The route's
+only gate evaluated the minter's username, so a service-scoped token inherited its minter's
+`UploadGrant:Read` view (every grant, for a minter holding a global grant). It is now refused before any
+grant is read (`403`, "service-scoped tokens may not list upload grants", no `permission` field, audit
+`upload_grant.list.access_denied`). The MCP tool `list_upload_grants` already refused a service-scoped
+token. **Remediation:** list grants with a non-service token. Non-service sessions are unchanged.
+
+**The ceiling applies wherever a seeded `ITServiceOwner` permission is absent.** With the seeded
+defaults `ITServiceOwner` holds every other pair the fleet-read routes pass, so nothing else changes
+for `Execution`, `Response`, `Inventory`, `Infrastructure`, `Policy`, `GuaranteedState` and
+`Workflow:Read`. No REST, MCP or CLI surface removes a seeded `ITServiceOwner` permission today, and a
+direct database `DELETE` of the row is re-seeded at the next boot unless the pair is recorded in
+`revoked_seed_defaults`, so a refusal on one of those pairs does not arise in a default deployment; the
+rule is the safeguard for a pair removed through `RbacStore::remove_permission` (which records it) and for
+any future surface that narrows the role.
+
+**Failure behaviour.** A FAILED read of the `ITServiceOwner` role's permissions is a retryable `503`
+(`retry_after_ms` 5000, an audit row with detail "RBAC read degraded resolving the ITServiceOwner
+ceiling", and `yuzu_server_rbac_read_degrade_total` increments) rather than `403`, because an outage
+is not a missing grant; it still fails closed (the dashboard executions fragment shows it as the HTTP `200` `data-degraded="gate"` note). This holds on the fleet-read gate and equally on
+`require_scoped_permission`, which answered `403` for this failure before this change; only a
+definitive deny is `403`. `require_permission` is different: a service-scoped token is refused there by
+the default-deny allow-list whatever the ceiling read returns, so a retry could not succeed, and a
+failed read answers the same default-deny `403` as a healthy one (no `retry_after_ms`, no
+`yuzu_server_rbac_read_degrade_total` increment); only its audit row differs, ending with
+"; ceiling read degraded". The ceiling read goes through the RBAC authz circuit breaker with a 250 ms acquire budget, so a degraded
+store fails quickly and, once the breaker is open, requests are answered without touching the pool; an
+open breaker is counted under the `pool_acquire_timeout` reason. The
+breaker bounds how many requests wait, not how long an already admitted read holds its connection:
+such a read can still wait up to the pool's `lock_timeout` (10 s default) or `statement_timeout`
+(30 s default). On a dark network path (no reply at all) the wait is bounded instead by the pool's
+`tcp_user_timeout` (10 s), which is confirmed on Linux, unconfirmed on Windows and a no-op on macOS, and
+until two failures have returned, up to the pool size (16 by default, `--postgres-pool-size`) of these
+reads can each hold a connection for that long. The breaker is the one operator permission checks use,
+so ceiling-read failures can open it and an open breaker denies operators' cache-miss checks too (fail
+closed). The breaker counts consecutive failures and any successful authz read, a ceiling read
+included, resets the count, so a partial fault that lets the `role_permissions` read succeed while
+other authz reads fail can delay the breaker opening for operators' cache-miss checks.
+
+**New alert: `YuzuRbacBreakerOpen` (critical).** `docs/prometheus/yuzu-alerts.yml` now ships a per-replica
+alert that fires when `yuzu_server_rbac_breaker_open` has stayed at `1` on a replica for 5 minutes. It
+means authorization reads on that replica keep failing. While the breaker is open the replica refuses
+(fail closed) the operator permission checks that miss its permission cache and sheds service-token
+ceiling reads; cached decisions keep being served for at most about 5 seconds.
+A breaker that closes again within 5 minutes does not page. Load the updated rule file if you maintain
+your own copy of the shipped alerts.
+
+**List-read A4 body.** The A4 body of a service-scoped token's `403` from the list-read gate no longer carries a `permission` field; clients should not read it.
+
+**The sibling gates changed their budget.** `require_permission` and `require_scoped_permission` now
+read the ceiling with the 250 ms authz acquire budget behind that shared breaker. Before, they acquired
+with the 2000 ms `kReadTimeout` and were not breaker-gated, but the pool clamps a bounded acquire to
+500 ms when it is already saturated at entry (`PgPool` `saturated_fast_fail`), so on a saturated pool the
+wait was up to about 500 ms, not 2 s (a pool that saturated only after the call entered it was bounded
+by the full 2 s). The change lowers that bound to 250 ms and, once the breaker is open, answers the
+request without a pool touch.
+
+**Rollback.** Downgrading the binary restores the previous behaviour for all of the above. The change
+adds no schema and persists no state.
+
+To find affected callers, search the audit log for `action=auth.fleet_read_required` with
+`result=denied` and a detail containing "ITServiceOwner permission" (definitive deny, `403`) versus
+"RBAC read degraded" (store fault, `503`), for the sibling gate `action=auth.scoped_permission_required`
+with the same two details ("lacks ITServiceOwner permission" for the `403`, "RBAC read degraded" for
+the `503`), and for `action=upload_grant.list.access_denied`. `action=auth.permission_required` never
+carries the "RBAC read degraded" detail: a service token on a route behind the plain permission gate is
+refused by the default-deny allow-list ("default-deny", `403`) whatever the ceiling read returns, and
+during an outage of the `ITServiceOwner` read that row ends with "ceiling read degraded" (a healthy
+default-deny row does not), so rows from `require_permission` routes with that ending mark the outage. For
+`Execution:Read` the affected routes are the executions drawer's
+`/fragments/executions/{id}/detail` fragment, the legacy `GET /api/executions*` routes,
+`GET /api/v1/executions` with its `/{id}`, `/children` and `/api/v1/events` twins, and the MCP tools on
+that gate that service tokens can reach at all. `POST /api/executions/{id}/rerun` and `/cancel` are not
+affected: a service-scoped token is already refused at their first gate, `Execution:Execute`.
+`kServiceScopeGlobalSafe` is not widened.
+
 ## Behaviour change: vuln_scan reports an unreadable config check as UNREADABLE and adds a summary row (#4961)
 
 On Linux, `vuln_scan` (`scan`, `config_scan`) now reports a config file it could not read (`/proc/sys/kernel/randomize_va_space`, `/proc/sys/fs/suid_dumpable`, `/etc/ssh/sshd_config`, `/proc/mounts`) as `UNREADABLE|config|<title>|<path>: <cause>` instead of a HIGH/MEDIUM finding. `summary` always emits a seventh row, `summary|UNREADABLE|<n>`, and an absent `sshd_config` reads INFO "not applicable" with the SSH password row now emitted.
@@ -333,6 +639,87 @@ here. See `docs/user-manual/audit-log.md`.
 `yuzu_server_ca_unpublished_revocation_check_failures_total` (the freshness pass's own
 self-heal *check* failing — distinct from a publish failing outright). See
 `docs/user-manual/metrics.md`. No operator action required; both are additive.
+
+## ⚠️ Breaking: `--gateway-upstream` now refuses to start without gateway peer authorization
+
+Affects you if the server runs with `--gateway-upstream` (or `YUZU_GATEWAY_UPSTREAM`). **The Linux package's systemd unit passes `--gateway-upstream` unconditionally**, so a Linux package install is affected even when you run no gateway: with your own certificates it will not start until you pin or drop the flag (see the table). The gateway-upstream service now requires an authorized gateway peer (an SPKI public-key pin, or an explicit acknowledgement). The decision is made at boot, before any listener is bound: a configuration that cannot be authorized makes the server exit non-zero with a message naming the flag to change. Nothing is silently downgraded, so check the steps for your deployment type **before** upgrading the server. Full reference: [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization).
+
+**Check before you upgrade the server.** Read the arguments the server will actually start with, on the host, and apply the decision rule below.
+
+| Deployment | Command |
+|---|---|
+| Linux package (systemd) | `systemctl cat yuzu-server \| grep -v '^[[:space:]]*#' \| grep -E -- '--(management-)?(cert\|key\|ca-cert)\|--no-tls\|--gateway-upstream\|YUZU_(CERT\|KEY\|CA_CERT\|GATEWAY\|INSECURE_GATEWAY)'` and, for the environment file, `grep -v '^[[:space:]]*#' /etc/yuzu/yuzu-server.env \| grep -E 'YUZU_(CERT\|KEY\|CA_CERT\|GATEWAY\|INSECURE_GATEWAY)'`. `systemctl cat` prints the unit and every drop-in, so a flag or an `Environment=` line added by a drop-in is covered. `YUZU_CERT`, `YUZU_KEY` and `YUZU_CA_CERT` are the environment names of `--cert`, `--key` and `--ca-cert`, so a unit with `Environment="YUZU_CERT=..."` plus `--gateway-upstream` refuses to start the same way a flag does. The `grep -v` drops comment lines: the shipped unit's comment block mentions every one of these flags, so without it the output is mostly comments (on the shipped unit the filtered output is the single `--gateway-upstream` line, and on the shipped `yuzu-server.env.example` it is empty) |
+| Docker / Compose | From the directory of the compose file you actually use: `docker compose -f <file> config \| grep -E -- '--(management-)?(cert\|key\|ca-cert)\|--no-tls\|--gateway-upstream\|YUZU_(CERT\|KEY\|CA_CERT\|GATEWAY\|INSECURE_GATEWAY)'`, and the same two-stage `grep` (`grep -v '^[[:space:]]*#'` first) over any `env_file:` it names |
+| Windows | `sc.exe qc YuzuServer` (the flags are in `BINARY_PATH_NAME`: look for `--ca-cert`, `--cert`, `--key`, the `--management-*` overrides, `--no-tls` and `--gateway-upstream`), and `dir "%ProgramData%\Yuzu Server\certs"`: a `grpc-cert.pem` or `ca-cert.pem` means your own gRPC certificates, a `gateway-peer-pin` file is a stored pin |
+
+Decision rule (`--cert-san` and `--cert-group` matches do not count as certificates; the `--management-cert`, `--management-key` and `--management-ca-cert` overrides exist only as command-line flags, so no environment-file check can find them):
+
+1. **No `--gateway-upstream` and no `YUZU_GATEWAY_UPSTREAM`:** not affected.
+2. **`--gateway-upstream` and `--no-tls`:** add `--insecure-gateway-peer` (or `YUZU_INSECURE_GATEWAY_PEER=1`), or the server will not start.
+3. **`--gateway-upstream` and your own certificates (`--cert`, `--key`, `--ca-cert` or their `YUZU_` variables), or any management override (`--management-cert`, `--management-key`, `--management-ca-cert`):** a `--ca-cert` given without `--cert` and `--key`, and any management override, make the gRPC listener credentials operator-supplied, so the automatic pin does not apply and the server refuses to start without a pin. One corner: the server compares the path (`server.cpp`, `agent_creds_are_default_files`), so a `--ca-cert` given without `--cert` and `--key` whose value is exactly `<ca-dir>/default-ca.pem` is the generated default, not your own, and the automatic pin still applies. You need a pin (`--gateway-peer-pin`, `--gateway-peer-pin-file` or their variables) **before** the upgrade. If you run no gateway, remove `--gateway-upstream` instead.
+4. **`--gateway-upstream` and none of the above (generated default certificates):** nothing to set; the server pins its own gateway certificate.
+5. **A pin and `--insecure-gateway-peer` together:** refused. Remove one.
+
+A literal dry run (a `--check-config`-style command that evaluates this decision without starting the server) does not exist; it is listed as a deferred follow-up in the decision record, so use the check above.
+
+**Back up the pin sources, and know what a restore does.** The pin is configuration the server reads once at boot, and it lives outside the database. Add these to your pre-upgrade backup: any explicit pin files (wherever you keep them; under the packaged unit they must be under `/etc/yuzu`), `/etc/yuzu/yuzu-server.env` (or your compose file and its env file), and on Windows `%ProgramData%\Yuzu Server\certs\gateway-peer-pin`. Restoring the server **without** the pin file makes it refuse to boot (a missing explicit pin source never falls back to the automatic pin). Restoring an **older** certificate directory under the automatic pin pins the old gateway key, so a gateway that presents a newer one is refused until the server's certificate directory and the gateway's certificate match again (then restart the server).
+
+**What the service exposed before.** The service was reachable on every port the server's single gRPC server listens on, not only on `--gateway-upstream`. On the generated default certificates the agent port (`--listen`, default 50051) requests but does not require a client certificate, so a caller with no certificate could reach it. On the strict ports (management, gateway-upstream, and every port once you supply your own certificates) any holder of a client certificate signed by the install CA could, including an agent leaf. A caller whose `ProxyRegister` passed the handler's enrollment checks was also recorded as a trusted gateway peer by IP address, and under `--gateway-mode` that relaxes the Subscribe peer-IP binding for that address. This is exposure, not a demonstrated end-to-end exploit. The change closes the service to anything but a pinned gateway key; it does not change what the agent listener itself accepts.
+
+**What it is now.** Every call must come from a TLS-authenticated peer whose certificate lists `serverAuth`, whose public key (SHA-256 of the SubjectPublicKeyInfo) is in the pin set, and which is inside its validity window. Pins are fixed at boot: changing them needs a server restart. There is no pin reload and no revocation read on this path.
+
+| Your deployment | What happens | What to do |
+|---|---|---|
+| **Generated default certificates** (no `--cert`/`--key`, no `--management-*` overrides), TLS on, gateway presents the server's generated `default-gateway.pem` (the Docker reference gateway compose does; the Linux packages and the Windows installer with `/GATEWAY` also start the server on its generated certificates, so the same pin applies, but the gateway you deploy must present that certificate: the `yuzu-gateway` package's shipped configuration dials the upstream in plaintext and does not connect to a TLS server at all, see the comment block in `deploy/systemd/yuzu-server.service`) | The server pins `default-gateway.pem` automatically and boots. With `--cert-group` set it logs a warning that every process in the group holds gateway authority. | Check key custody: the gateway key file is the credential that authorizes a gateway. For a Docker reference-compose install, the shipped compose file now mounts only the public CA certificate into the agent container (a one-shot `ca-export` service fills a `ca-public` volume), and pulling the new file changes nothing until the agent container is recreated: from `deploy/docker` run `YUZU_ENROLL_TOKEN=<token> docker compose -f docker-compose.reference-gateway.yml up -d` for the **whole** stack (the file refuses to start without `YUZU_ENROLL_TOKEN`; any value works for an agent that is already enrolled), not `up -d server gateway`, which leaves a running agent on its old mounts. If an agent container ever held the old mount, treat the gateway key as exposed: replace it and withdraw its pin (changing mounts cannot invalidate a copied key). A gateway on another host that does **not** present `default-gateway.pem` is denied until you pin its key. |
+| **Your own certificates** (`--cert`/`--key`/`--ca-cert`), gateway connected over TLS | **Refuses to start** until a pin is configured. | Compute the pin with `openssl x509 -pubkey -noout -in gw.pem \| openssl pkey -pubin -outform DER \| openssl dgst -sha256 \| awk '{print $NF}'` and pass `--gateway-peer-pin <hex>` (or `--gateway-peer-pin-file <pem>`; env `YUZU_GATEWAY_PEER_PINS` / `YUZU_GATEWAY_PEER_PIN_FILE`). On Windows, which has no `awk`, prefer `--gateway-peer-pin-file <cert.pem>` with the gateway's leaf certificate: the byte pipeline is not documented for Windows PowerShell 5.1, whose text pipeline may corrupt the binary DER, and a wrong-looking hash is the commonest mistake (see "Lockout diagnostic" in the operator guide). The gateway certificate must carry `serverAuth` and `clientAuth`. |
+| **HTTPS on generated defaults but gRPC on your own certificates** | Treated as your own certificates: no automatic pin. | As the row above. |
+| **Plaintext** (`--no-tls`) with a gateway | **Refuses to start.** `--no-tls` is not an acknowledgement. | Add `--insecure-gateway-peer` (env `YUZU_INSECURE_GATEWAY_PEER=1`). Peer authorization is then **disabled on every port the service is reachable on**, with a boot error line and a boot audit row. Never combine it with a pin flag: that also refuses to start. |
+| TLS on but no client CA (`--insecure-skip-client-verify`) | **Refuses to start**: no pin could ever match. | Supply `--ca-cert`, or use `--insecure-gateway-peer` on a development rig. |
+| **Linux packages** (systemd unit) | The shipped unit passes `--gateway-upstream` unconditionally and runs TLS on generated certificates, so the automatic pin applies and it boots. An install that gave the server its **own** certificates refuses to start unless a pin is set, **even when it runs no gateway**. The deb `postinst` only enables the service, so the failure surfaces at the next restart or reboot; the RPM restarts the service on upgrade, and systemd stops retrying after 3 failed starts in 60 seconds. The RPM `%pre` and the deb `preinst` of this release print an advisory warning on stderr during an upgrade when `/etc/yuzu/yuzu-server.env` or a `yuzu-server.service` override under `/etc/systemd/system` shows your own certificates with `--gateway-upstream` and no pin or acknowledgement; it never fails or changes the upgrade, it reads only those files, and the check above remains the authority. | With your own certificates, set the pin in `/etc/yuzu/yuzu-server.env`. If you run **no** gateway, omit `--gateway-upstream` with a drop-in (the literal block is under the table); a package upgrade overwrites the unit file, a drop-in survives. A `--no-tls` drop-in now also needs `--insecure-gateway-peer`. Pin files must be readable by the `yuzu` user and live outside `/home` and `/tmp` (`ProtectHome` and `PrivateTmp` hide them): keep them under `/etc/yuzu`. |
+| **Windows installer** | `/GATEWAY` with `/NOTLS` adds `--insecure-gateway-peer`. `/GATEWAY` with generated certificates needs nothing, but a gateway on **another machine** must either present the server's generated `default-gateway.pem` or have its key pinned. `/GATEWAY` with your own gRPC certificate and key needs a pin the first time: the installer refuses an upgrade or install that would start gateway mode on your own certificates with no pin, before anything is changed. | Give `/GATEWAY_PEER_PIN_FILE=<cert.pem>` (preferred: the leaf certificate only, because a chain file pins every block) or `/GATEWAY_PEER_PIN=<64 hex>`; the two are mutually exclusive, and the interactive wizard has no pin page, so a pin is given on the command line only. The installer stores it as `gateway-peer-pin` in the `certs` folder under the data directory (`%ProgramData%\Yuzu Server\certs`) and, whenever gateway mode is selected, TLS is not skipped and that file exists, passes `--gateway-peer-pin-file` for it on every run, so the pin survives later upgrades. With `/NOTLS` the file is kept but not passed, because the server refuses the acknowledgement together with a pin, and `/GATEWAY /NOTLS` given **together with** a pin parameter is refused by the installer with nothing changed. A refused silent install exits with code 7 and the reason is only in the `/LOG=` file on a line starting `PrepareToInstall:` (deployment tools that report only the exit code do not show the reason); the existing service is left as it was. If you later revert the install to the generated default certificates, delete `certs\gateway-peer-pin`: the stored pin keeps being passed and replaces the automatic pin, so the generated gateway certificate would be refused. The installer checks that `/GATEWAY_PEER_PIN` is exactly 64 hexadecimal characters and applies only cheap checks to a pin file (it exists, is not empty, has no NUL byte); the server validates the contents when it starts. Giving either parameter again replaces the stored pin, so rotation with an overlap needs a multi-entry pin file. A service command line edited by hand is rebuilt by the installer on every run, so do not rely on it. |
+| **Compose wizard output** (plaintext stacks) | A stack generated by an earlier wizard revision refuses to start after an image pull: its server runs `--gateway-upstream` with `--no-tls` and no acknowledgement. | Add the variable to the server's `environment:` block in that block's own style (the wizard's list form `- YUZU_INSECURE_GATEWAY_PEER=1`, or `YUZU_INSECURE_GATEWAY_PEER: "1"` in a mapping block; compose rejects mixing the two), or regenerate the stack: the wizard now emits the list-form variable for a gateway stack without TLS. |
+
+The repository's own plaintext rigs already carry the acknowledgement in this release. Four scripts and three compose files pass it as a flag: `scripts/start-stack.sh`, `scripts/start-UAT.sh`, `scripts/win-start-UAT.sh` and `scripts/integration-test.sh` (which passes it in both its plaintext and its `--tls` branch, so neither branch exercises a pinned gateway hop), and `deploy/docker/docker-compose.full-uat.yml`, `docker-compose.sanitizer-uat.yml` and `docker-compose.viz-uat.yml`. The two compose files that pull published release images, the root `docker-compose.uat.yml` and `deploy/docker/docker-compose.demo.yml`, set it as the environment variable `YUZU_INSECURE_GATEWAY_PEER`, as does the compose wizard's plaintext gateway output. `deploy/docker/docker-compose.reference-gateway.yml` runs TLS on generated certificates and needs no acknowledgement. `scripts/ci/qa-stack.sh` launches no server of its own: it runs that reference-gateway compose on published release images, so the automatic pin applies and it needs no acknowledgement either (only a comment changed there). `deploy/config/docker.env.example` and `deploy/config/yuzu-server.env.example` document the new variables and `deploy/systemd/yuzu-server.service` carries a comment block for the unit. If you keep a modified copy of any of these files, carry the change over by hand. Release images that predate the acknowledgement ignore the environment variable, so with such an image the variable is harmless; to get the new behaviour set `YUZU_VERSION` to a release that includes it, or rebuild the images locally (a stale local image does not have it either).
+
+**Linux package, own certificates, no gateway.** The shipped unit passes `--gateway-upstream` unconditionally. Run `systemctl cat yuzu-server` to see the unit you actually have (a local edit may differ), then run `systemctl edit yuzu-server` and enter the following, which first clears the inherited command and then repeats it without `--gateway-upstream` (this is the shipped `ExecStart` of `deploy/systemd/yuzu-server.service` minus that one line; keep any other arguments your unit carries):
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/yuzu-server \
+    --listen 0.0.0.0:50051 \
+    --web-port 8080 \
+    --data-dir /var/lib/yuzu
+```
+
+Then `systemctl restart yuzu-server`. If you do run a gateway, leave the unit alone and set the pin in `/etc/yuzu/yuzu-server.env` instead.
+
+**Rotating or withdrawing a pin is a restart.** Pins are read once at boot. To rotate, list the old and the new pin together, **in the same source** (a command-line pin makes the matching environment variable ignored, not merged), on every replica, roll the replicas, switch the gateway (it presents a new certificate only after it redials; a gateway redials after its connection drops and reads its certificate and key from the configured files when it does, inferred from reading the grpcbox code and not tested), confirm `yuzu_server_gateway_peer_denied_total{reason="not_pinned"}` stays flat on every replica, then remove the old pin and roll again. To withdraw a key, remove its pin from every source and restart every serving replica. Revoking a certificate serial in the CA store does not remove a key pin. The procedure, including what to do after a refusal window, is in [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization).
+
+**After a refusal window, work out which side the cause was on first.** A gateway that was refused (gRPC status 16) does not retry a refused `NotifyStreamStatus`, so a session whose CONNECTED notice was refused can stay unplaced. The step-by-step runbook, with a verification after each step, is in [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization); in short, there are three cause classes.
+
+- **A, the cause was on the server side** (a wrong or missing pin or acknowledgement, other server configuration; the gateway's certificate is unchanged): restart the serving replicas with the corrected configuration and do not restart the gateways first, unless the placement check below fails (class C), because on agents without the #5183 fix (in no release yet) a gateway restart leaves released agents wedged. A gateway that includes the #1197 heartbeat-verdict consumer (#5383) recovers through its replay path, after at most one breaker open period (300 s at most, and only if it opened), the agent heartbeat interval and the replay drip. To roll the change back, revert the pin or acknowledgement on every replica and restart the replicas (the pin set is fixed at boot). Verify with three separate checks: `sum(yuzu_gw_agents_current) - sum(yuzu_agents_connected{job="yuzu-server"})` (summed across all gateway nodes and all replicas; the server gauge also counts direct agents and counts registration, not placement), no rise in `yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"}` or `yuzu_gw_upstream_notify_dropped_total` over the window, and a successful read-only command to a sample agent, confirmed by that agent's own result (the exact request and the limits of the check are in the runbook). Agreeing counts alone do not prove placement.
+- **B, the cause is on the gateway side** (its certificate expired or was renewed, its key rotated, renaming `default-marker.json` minted a new leaf, or it points at the wrong certificate): the gateway presents its current files only when it redials, and a server restart or any dropped connection forces a redial, so first check whether it already has: the raw counters `yuzu_server_gateway_peer_denied_total` and `yuzu_gw_upstream_rpc_errors_total{code="16"}` have stopped rising (read them twice, a minute apart, not through `increase()`: the gateway series is not pre-seeded), no new `spki=` denial line appears in the server log, and the certificate file the gateway is configured with has the expected SPKI prefix. A redial can still present the previous certificate for about 2 minutes after the files change (the Erlang ssl PEM cache cleans every 120 s; measured on OTP 28.4.2 with a stub by a reviewer, not on a Yuzu gateway), so wait about 2 minutes. A same-key renewal needs no server restart. Restart that gateway node, one node at a time, only if denials continue and its agents can take the disconnect: a gateway restart disconnects every agent the node holds, and unless the agents run a build with the #5183 fix (in no release yet) released agents stay wedged afterwards; see [Gateway](gateway.md), "What happens when the server restarts". Plan renewals before `notAfter`, inside a maintenance window.
+- **C, placement loss is suspected after a refusal window** (notify errors or drops rose, or a sample agent is unreachable although the counts agree): restart the agent service on the specific unreachable agents, which [Gateway](gateway.md) records as the observed fix. Restart the gateway node, one node at a time, only if many agents behind one node are affected and the class A checks still fail after the timing allowances in the runbook, with the same #5183 caveat: unless the agents run a build with that fix, released agents stay wedged afterwards. The gateway restart is inferred from the code and untested.
+
+**Certificate expiry is class B.** A gateway whose connection outlives its certificate's `notAfter` is refused on every call and does not redial by itself, so renew the certificate before `notAfter`, inside a maintenance window, and follow class B above to tell whether the gateway has already redialled.
+
+**Mixed replicas (HA).** Give every replica the same pin set (on the generated defaults each replica pins its own `default-gateway.pem`, so if you ever give replicas different certificate directories, supply the same explicit pin on all of them). Compare the pin prefixes in each replica's boot log line. Roll the replicas first; a gateway needs a restart afterwards only if the cause is on the gateway side and denials continue (class B above), because unless the agents run a build with the #5183 fix (in no release yet) released agents stay wedged after one. While replicas run different versions an old replica admits calls that a new one refuses.
+
+### Rollback / temporary exception
+
+Rolling back is a binary-only change: gateway peer authorization has no schema or store change. But the **previous binary has no gateway peer authorization at all**, so a rollback is itself a risk acceptance of the same kind as `--insecure-gateway-peer`. Record who accepted it, the date, **and the date by which it will be remediated** (a pin in place on the new binary), and schedule that work rather than leaving the old binary running.
+
+**Remove the new flags BEFORE rolling the binary back.** An **older** binary rejects an unknown flag at startup (a command-line parsing error) but ignores an unknown environment variable, so a configuration that passes `--insecure-gateway-peer`, `--gateway-peer-pin` or `--gateway-peer-pin-file` on the command line fails to start on the old binary, while the same settings supplied as `YUZU_INSECURE_GATEWAY_PEER`, `YUZU_GATEWAY_PEER_PINS` or `YUZU_GATEWAY_PEER_PIN_FILE` are simply ignored. Remove the flags wherever they live:
+
+- **Windows service.** The command line is the service's `ImagePath` (`HKLM\SYSTEM\CurrentControlSet\Services\YuzuServer`), which the installer writes. Reinstall with the previous version's installer rather than editing the registry value by hand. The previous installer does not know the stored `certs\gateway-peer-pin` file and never passes it.
+- **Linux package.** The unit file or the drop-in under `/etc/systemd/system/yuzu-server.service.d/`; `/etc/yuzu/yuzu-server.env` carries only environment variables, which an old binary ignores.
+- **Compose files and local start scripts.** The seven flag-based rigs (`docker-compose.full-uat.yml`, `docker-compose.sanitizer-uat.yml`, `docker-compose.viz-uat.yml`, `scripts/start-stack.sh`, `scripts/start-UAT.sh`, `scripts/win-start-UAT.sh`, `scripts/integration-test.sh`): use the previous revision of each file, because the new revision passes a flag the old binary rejects. The environment-based files (`docker-compose.uat.yml`, `docker-compose.demo.yml`, wizard output) need no change, and neither does `scripts/ci/qa-stack.sh`, whose only change is a comment.
+- **Reference gateway compose.** The previous revision of the compose file mounts the whole certificate volume into the agent container again. That restores the key exposure described above; do not roll the compose file back without the same risk record.
+
+To keep a new binary running while you fix a pin, `--insecure-gateway-peer` is an exception, not a fix: it disables peer authorization on every port the service is reachable on. Treat it as a time-boxed risk acceptance too: record who accepted it, the date and the remediation date, put the pin in place, and remove the flag. On a TLS server with a client CA the exception is reported as `yuzu_server_gateway_peer_authz_mode{mode="insecure_ack_tls"}` and raises `YuzuGatewayPeerAuthzDisabledWithTls`; every start with it writes a `server.gateway_peer_authz_disabled` audit row.
+
+New flags and series: `--gateway-peer-pin`, `--gateway-peer-pin-file`, `--insecure-gateway-peer`; `yuzu_server_gateway_peer_*` (see [Metrics](metrics.md)).
 
 ## ⚠️ Breaking: gateways fronted by an HTTP/2-terminating proxy or mesh sidecar (#3869)
 
@@ -943,9 +1330,9 @@ the handler.
 
 Both surfaces share one builder (`build_instructions_catalog`) that parses each `InstructionDefinition`'s stored `parameter_schema` text. It previously forwarded any value that parsed as JSON, even a non-object (an array, string, number, or boolean). It now forwards it only when the parsed value is itself a JSON object — a non-object value is reported as `null` instead, matching `GET /api/v1/discover/plugins`' existing behavior for the same field.
 
-**Who this affects:** an operator or integration that authored an `InstructionDefinition` with a non-object `parameter_schema` — reachable via the ordinary `create`/`update`/`import` paths, which don't validate the field's shape on write. No shipped content sets `parameter_schema` to anything but an object or leaves it unset (defaults to `{}`), so this affects only a deliberately or accidentally malformed definition.
+**Who this affects:** an operator or integration that authored an `InstructionDefinition` with a non-object `parameter_schema`, written before the write-time schema check existed, or by a non-standard write (the store now refuses a non-object `parameter_schema`, and `POST /api/instructions/import` is the only REST route that can supply one). No shipped content sets `parameter_schema` to anything but an object or leaves it unset (defaults to `{}`), so this affects only a deliberately or accidentally malformed definition.
 
-**What to do:** if you have such a definition and relied on the old raw-forwarding behavior, re-author `parameter_schema` as a JSON Schema object. No action is required otherwise.
+**What to do:** if you have such a definition and relied on the old raw-forwarding behavior, re-author `parameter_schema` as a JSON Schema object (see [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)). No action is required otherwise.
 
 ## Behaviour change: webhook and offload-target deliveries, and enrollment/execution-failure notifications, now actually fire (#3261)
 
@@ -2098,7 +2485,16 @@ a rollback is genuinely needed.
   probe succeeds (the next attempt after its ~1 s cooldown), it closes
   again automatically and normal service resumes. Watch
   `yuzu_server_rbac_breaker_open` (gauge) and
-  `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade.
+  `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade. A
+  companion alert, `YuzuRbacBreakerOpen` (`docs/prometheus/yuzu-alerts.yml`), is
+  added in the current release, not this one: see "Behaviour change:
+  service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and
+  `GET /api/v1/upload-grants`" above. It fires, per replica, when the gauge stays
+  at `1` for 5 minutes, and complements `YuzuRbacReadDegraded`, which is a rate
+  summed across replicas by reason.
+  The gauge changes only when an authorization read reports its outcome, so a
+  replica that receives no authorization checks keeps its last value after the
+  database recovers.
 - **If you alert on the raw `generation_refresh_failed` reason label,
   re-baseline after upgrade.** This release splits what was previously a
   single reason into two: `generation_refresh_failed` (still denying —
