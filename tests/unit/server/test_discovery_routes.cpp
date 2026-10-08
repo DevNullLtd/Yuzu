@@ -25,7 +25,9 @@
 #include "agent_registry.hpp"
 #include "discover_routes.hpp"
 #include "event_bus.hpp"
+#include "instruction_param_schema.hpp"
 #include "instruction_store.hpp"
+#include "mcp_input_schema.hpp"
 #include "pg/pg_pool.hpp"
 #include "rbac_store.hpp"
 #include "scope_engine.hpp"
@@ -475,6 +477,118 @@ TEST_CASE("discover.instructions: non-object parameter_schema nulls out, matchin
     CHECK(saw_array);
     CHECK(saw_bool);
     CHECK(saw_string);
+}
+
+// input_schema (additive): the canonical JSON Schema the execute route enforces, built by the
+// SAME canonicaliser as prepare_param_validator. parameter_schema keeps the stored text
+// verbatim for existing readers.
+TEST_CASE("discover.instructions: input_schema is the canonical schema, parameter_schema is "
+          "unchanged",
+          "[discovery][instructions][input-schema][pg]") {
+    DiscoverHarness h;
+    const std::string stored =
+        R"({"type":"object","properties":{"n":{"type":"int32","displayName":"Count",)"
+        R"("description":"how many","required":true}}})";
+    auto typed_id = h.instr->create_definition(make_def("Typed", /*enabled=*/true, stored));
+    REQUIRE(typed_id.has_value());
+    auto none_id = h.instr->create_definition(make_def("None", /*enabled=*/true));
+    REQUIRE(none_id.has_value());
+    auto empty_object_id =
+        h.instr->create_definition(make_def("EmptyObject", /*enabled=*/true, R"({"type":"object"})"));
+    REQUIRE(empty_object_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/discover/instructions");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto j = nlohmann::json::parse(res->body);
+
+    bool saw_typed = false, saw_none = false, saw_empty_object = false;
+    for (const auto& d : j["instructions"]) {
+        REQUIRE(d.contains("input_schema"));
+        REQUIRE(d.contains("input_schema_error"));
+        if (d["id"] == *typed_id) {
+            saw_typed = true;
+            CHECK(d["parameter_schema"] == nlohmann::json::parse(stored));  // verbatim
+            REQUIRE(d["input_schema"].is_object());
+            CHECK(d["input_schema_error"].is_null());
+            CHECK(d["input_schema"]["properties"]["n"]["type"] == "integer");
+            CHECK(d["input_schema"]["properties"]["n"]["maximum"] == 2147483647LL);
+            CHECK_FALSE(d["input_schema"]["properties"]["n"].contains("displayName"));
+            CHECK(d["input_schema"]["required"] == nlohmann::json::array({"n"}));
+            CHECK(d["input_schema"].value("additionalProperties", true) == false);
+
+            // What is published decides what the execute route's validator decides.
+            auto compiled = yuzu::server::mcp::compile_input_schema(d["input_schema"].dump());
+            REQUIRE(compiled.has_value());
+            auto validator = yuzu::server::instr::prepare_param_validator(stored);
+            REQUIRE(validator.has_value());
+            for (const auto& probe :
+                 {nlohmann::json{{"n", 2147483647LL}}, nlohmann::json{{"n", 2147483648LL}},
+                  nlohmann::json::object()})
+                CHECK(compiled->validate(probe).has_value() == validator->check(probe).has_value());
+        }
+        if (d["id"] == *none_id) {
+            saw_none = true;  // stored as "{}": nothing is enforced
+            CHECK(d["input_schema"].is_null());
+            CHECK(d["input_schema_error"].is_null());
+        }
+        if (d["id"] == *empty_object_id) {
+            saw_empty_object = true;  // declared, with no parameters
+            REQUIRE(d["input_schema"].is_object());
+            CHECK(d["input_schema"].value("type", "") == "object");
+            CHECK(d["input_schema"]["properties"].empty());
+            CHECK(d["input_schema"].value("additionalProperties", true) == false);
+            CHECK(d["input_schema_error"].is_null());
+        }
+    }
+    CHECK(saw_typed);
+    CHECK(saw_none);
+    CHECK(saw_empty_object);
+}
+
+TEST_CASE("discover.instructions: an uncanonicalisable stored schema nulls input_schema with a "
+          "token and does not fail the catalogue",
+          "[discovery][instructions][input-schema][pg]") {
+    DiscoverHarness h;
+    auto seed_legacy = [&](const std::string& name, const std::string& raw) {
+        auto id = h.instr->create_definition(make_def(name, /*enabled=*/true, "{}"));
+        REQUIRE(id.has_value());
+        yuzu::server::test::force_parameter_schema(*h.rbac_pool, *id, raw);
+        return *id;
+    };
+    // The store refuses these at write time, so each is written straight into the column.
+    const auto bad_type =
+        seed_legacy("Bad Type", R"({"type":"object","properties":{"p":{"type":"nope"}}})");
+    const auto not_object = seed_legacy("Not Object", "[1,2,3]");
+    const auto no_root_type = seed_legacy("No Root Type", R"({"properties":{}})");
+    auto healthy = h.instr->create_definition(make_def(
+        "Healthy", /*enabled=*/true, R"({"type":"object","properties":{"p":{"type":"string"}}})"));
+    REQUIRE(healthy.has_value());
+
+    auto res = h.sink.Get("/api/v1/discover/instructions");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto j = nlohmann::json::parse(res->body);
+
+    int seen = 0;
+    for (const auto& d : j["instructions"]) {
+        if (d["id"] == bad_type || d["id"] == not_object || d["id"] == no_root_type) {
+            ++seen;
+            CHECK(d["input_schema"].is_null());
+            CHECK(d["input_schema_error"] == "parameter_schema_not_canonicalisable");
+        }
+        if (d["id"] == bad_type)
+            CHECK(d["parameter_schema"].is_object());  // the stored text still shows through
+        if (d["id"] == not_object)
+            CHECK(d["parameter_schema"].is_null());
+        if (d["id"] == *healthy) {
+            ++seen;
+            REQUIRE(d["input_schema"].is_object());
+            CHECK(d["input_schema"]["properties"]["p"]["type"] == "string");
+            CHECK(d["input_schema_error"].is_null());
+        }
+    }
+    CHECK(seen == 4);
 }
 
 // json-dump-depth-guard fix (#2437-class): parameter_schema is stored

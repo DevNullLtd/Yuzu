@@ -83,10 +83,14 @@ DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store, bool include_roles
 
 /// `/discover/instructions`. Subsets InstructionStore::query_definitions
 /// (enabled_only=true — only invokable definitions are published) to
-/// {id, name, plugin, action, description, parameter_schema, platforms,
-/// approval_mode}. `parameter_schema` is parsed into a nested JSON Schema
-/// object when the stored value is valid JSON AND is itself an object, else
-/// emitted as `null` (an array/string/number/bool value is nulled out too).
+/// {id, name, plugin, action, description, parameter_schema, input_schema,
+/// input_schema_error, platforms, approval_mode}. `parameter_schema` is the
+/// stored schema, parsed into a nested object when the stored value is valid
+/// JSON AND is itself an object, else emitted as `null` (an array/string/
+/// number/bool value is nulled out too). `input_schema` is the canonical JSON
+/// Schema the execute route enforces (instr::canonicalise_param_schema, no RE2
+/// compile): null when no schema is stored (`input_schema_error` null) or the
+/// stored one cannot be canonicalised (`input_schema_error` is a fixed token).
 /// `instruction_store` must be non-null.
 DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store);
 

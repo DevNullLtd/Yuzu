@@ -3,6 +3,7 @@
 #include "agent_registry.hpp"
 #include "bundled_content.hpp"
 #include "http_route_sink.hpp"
+#include "instruction_param_schema.hpp" // canonicalise_param_schema: the enforced shape, published as input_schema
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "openapi_spec_access.hpp"
 #include "rest_a4_envelope_http.hpp"
@@ -265,6 +266,19 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
         if (!parsed.is_discarded() && parsed.is_object())
             param_schema = std::move(parsed);
 
+        // input_schema: the canonical JSON Schema the execute route enforces, produced by the
+        // SAME canonicaliser prepare_param_validator uses (no RE2 compile, so cheap per request).
+        // null with a null input_schema_error = no schema stored (nothing is enforced); null with
+        // a token = a stored schema that cannot be canonicalised (execute refuses it).
+        json input_schema;
+        json input_schema_error;
+        if (auto canonical = instr::canonicalise_param_schema(d.parameter_schema)) {
+            if (*canonical)
+                input_schema = std::move(**canonical);
+        } else {
+            input_schema_error = "parameter_schema_not_canonicalisable";
+        }
+
         arr.push_back({
             {"id", d.id},
             {"name", d.name},
@@ -272,6 +286,8 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
             {"action", d.action},
             {"description", d.description},
             {"parameter_schema", std::move(param_schema)},
+            {"input_schema", std::move(input_schema)},
+            {"input_schema_error", std::move(input_schema_error)},
             {"platforms", d.platforms},
             {"approval_mode", d.approval_mode},
         });
@@ -282,8 +298,13 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
         {"description",
          "Published (enabled) InstructionDefinition catalog — the commands an "
          "agentic worker may dispatch via execute_instruction / "
-         "POST /api/v1/instructions/execute. parameter_schema is a nested JSON "
-         "Schema object when the stored value parses, else null."},
+         "POST /api/v1/instructions/execute. parameter_schema is the stored "
+         "definition schema, verbatim (YAML-DSL types such as int32 and displayName), "
+         "when it parses as a JSON object, else null. input_schema is the canonical "
+         "JSON Schema the server enforces on POST /api/instructions/{id}/execute: "
+         "shape params with it. It is null when the definition declares no parameters "
+         "(input_schema_error is then null) or when the stored schema cannot be "
+         "canonicalised (input_schema_error is then a token and execute refuses it)."},
         {"count", arr.size()},
         {"truncated", defs.size() >= static_cast<std::size_t>(q.limit)},
         {"instructions", std::move(arr)},

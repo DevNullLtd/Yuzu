@@ -6261,12 +6261,16 @@ Published (`enabled_only=true`) `InstructionDefinition` catalog — the commands
       "action": "query",
       "description": "...",
       "parameter_schema": {"type": "object", "properties": {}},
+      "input_schema": {"type": "object", "properties": {}, "additionalProperties": false},
+      "input_schema_error": null,
       "platforms": "windows,linux,darwin",
       "approval_mode": "auto"
     }
   ]
 }
 ```
+
+`input_schema` is the **canonical JSON Schema** the server enforces on `POST /api/instructions/{id}/execute`: build `params` from it. It is produced by the same canonicaliser as that route's validator (DSL types such as `int32` become `integer` with the int32 range, `displayName` and other DSL-only keys are dropped, an inline `required` is hoisted to the root, and the root carries `additionalProperties: false`, so an undeclared parameter is refused). It is `null` in two cases that `input_schema_error` tells apart: `input_schema_error` is `null` when the definition declares no parameter schema (stored empty or `{}`: nothing is enforced), and the fixed token `parameter_schema_not_canonicalisable` when a stored schema cannot be canonicalised (the execute route refuses such a definition with a `500`). The canonicaliser does not compile regular-expression patterns, so a legacy stored schema whose pattern does not compile still publishes an `input_schema`, and the execute route refuses it all the same. `parameter_schema` is unchanged and kept for existing readers; prefer `input_schema`.
 
 `parameter_schema` is a nested JSON Schema **object** (not a string) when the stored value parses as JSON *and* is itself a JSON object; `null` when the stored value fails to parse (the authoring path always stores at least `{}`, so this case needs a non-standard write to reach), or when it parses to something other than an object, e.g. an array or string (only a legacy or non-standard write can store one: the store refuses a non-object schema, and the only REST route that can supply a `parameter_schema` at all is `POST /api/instructions/import`). Same rule `GET /api/v1/discover/plugins` already follows for its inline `parameter_schema`.
 

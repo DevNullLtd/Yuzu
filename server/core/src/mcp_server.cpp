@@ -2781,8 +2781,27 @@ static const ToolDef kTools[] = {
      R"j(},"required":["username"]})j",
      R"j({"type":"object","properties":{"username":{"type":"string"},"unlocked":{"type":"boolean"},"audit_emitted":{"type":"boolean"}},"required":["username","unlocked","audit_emitted"]})j"},
     {"discover_instructions",
-     "Published (enabled) InstructionDefinition catalog with parameter_schema — the "
-     "commands this worker may dispatch via execute_instruction. Read-only catalog.",
+     "List every enabled InstructionDefinition (the published catalogue) with the schema needed "
+     "to call it. Use it to learn WHICH commands exist and HOW to parameterise them before you "
+     "dispatch; it dispatches nothing and changes nothing. Each entry carries id, name, plugin, "
+     "action, description, platforms, approval_mode and two parameter schemas. input_schema is "
+     "the canonical JSON Schema the server enforces (declared names, types, required, enums, "
+     "bounds; additionalProperties is false, so an undeclared param is refused): build params "
+     "from it. parameter_schema is the stored definition schema verbatim (YAML-DSL types such as "
+     "int32, displayName), kept for existing readers: prefer input_schema. input_schema null "
+     "with input_schema_error null means the definition declares no parameter schema; null with "
+     "an input_schema_error token means the stored schema cannot be canonicalised and POST "
+     "/api/instructions/{id}/execute refuses that definition. CHAIN: pick an entry, then call "
+     "execute_instruction with that entry's plugin and action, params shaped by input_schema "
+     "(execute_instruction params are string-valued, so send every value as a string), and "
+     "agent_ids or scope. Stored-schema validation is currently enforced only by POST "
+     "/api/instructions/{id}/execute; execute_instruction takes plugin/action/params and looks "
+     "up no definition, so it does not apply the schema and the shape is yours to get right. "
+     "There are no filter arguments: the whole catalogue comes back (up to 5000 entries, "
+     "truncated=true past that), so filter on plugin/action yourself. count 0 with an empty "
+     "instructions list means no enabled definition exists; it is not an error. Requires "
+     "InstructionDefinition:Read. Read-only and safe to repeat. REST twin: GET "
+     "/api/v1/discover/instructions.",
      R"({"type":"object","properties":{}})",
      // #2986: build_instructions_catalog's envelope is fixed; each entry's
      // parameter_schema is itself an arbitrary nested JSON Schema document
@@ -2791,7 +2810,10 @@ static const ToolDef kTools[] = {
      // discover_routes.cpp's is_object() guard) — genuinely variable BY
      // DESIGN, so it is typed generically rather than pretending to know
      // its shape, same idiom as get_access_review's "campaign":{"type":"object"}.
-     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Nested JSON Schema when the stored value parses as JSON AND is itself an object, else null"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
+     // input_schema is the same kind of document (the canonical form of
+     // parameter_schema), typed the same way; input_schema_error is a fixed
+     // token or null.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Stored definition schema verbatim (YAML-DSL types such as int32) when the stored value parses as JSON AND is itself an object, else null"},"input_schema":{"type":["object","null"],"description":"Canonical JSON Schema the server enforces on POST /api/instructions/{id}/execute; null when the definition declares no schema or the stored schema cannot be canonicalised (see input_schema_error)"},"input_schema_error":{"type":["string","null"],"description":"Null unless the stored schema cannot be canonicalised, then the token parameter_schema_not_canonicalisable"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","input_schema","input_schema_error","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
     {"discover_routes",
      "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
      "serves. Hand-maintained source, so it can under-report an undocumented route "
