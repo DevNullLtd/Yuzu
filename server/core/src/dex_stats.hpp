@@ -6,11 +6,13 @@
  * except the one-sided rule of three):
  *   - dex_proportion      Wilson score interval for events / trials
  *   - dex_rule_of_three   plain-language upper bound when zero events were seen
- *   - dex_rate            exact (Garwood) Poisson interval for events / exposure
+ *   - dex_rate            Poisson interval for events / exposure: exact (Garwood)
+ *                         up to kDexStatsExactMaxEvents, Wilson-Hilferty above
  *   - dex_rate_ratio      rate A / rate B with the exact conditional (binomial,
  *                         Clopper-Pearson) interval and a minimum-exposure guard
- *   - dex_floored_*       the same, but only a COUNT is returned below the
- *                         cohort floor (kDexCohortFloor devices)
+ *   - dex_floored_*       the same for a proportion and a rate, but below the
+ *                         cohort floor (kDexCohortFloor devices) only the DEVICE
+ *                         count and a below-floor flag are returned
  *
  * Honesty rules:
  *   - std::optional carries ONE meaning: "no statistic can be stated for these
@@ -19,29 +21,64 @@
  *     domain; dex_rate has no such ceiling (Wilson-Hilferty to INT64_MAX). It is
  *     never zero. (The single documented infinity is a rate ratio whose
  *     denominator arm saw no events.)
- *   - A reliability flag is a label, never suppression: a statistic on fewer
- *     than kDexStatsReliableMinEvents (20) numerator events -- the NCHS
- *     small-count convention -- is still printed, marked indicative.
- *   - Below the cohort floor a count is honest and a rate singles people out,
- *     so the floored helpers always carry the counts and withhold only the
- *     statistics.
+ *   - A reliability flag is a label, never suppression: a statistic whose
+ *     numerator saw fewer than kDexStatsReliableMinEvents (20) events (for a
+ *     rate ratio, either arm falling short) -- the NCHS small-count convention --
+ *     is still printed, marked indicative.
+ *   - Below the cohort floor the number of devices is honest but their events
+ *     and rates single people out, so the floored helpers return only the device
+ *     count and a below_floor flag, and withhold events and statistics.
+ *
+ * Consumer duties (this header does not enforce them; a surface must):
+ *   - The floor is per cohort. Floor every cohort a surface shows, complements
+ *     and nested or overlapping cohorts included: two cohorts that each clear
+ *     the floor difference to a remainder below it. dex_proportion, dex_rate and
+ *     dex_rate_ratio are unfloored primitives; there is no floored ratio helper,
+ *     so floor each rate-ratio arm by DEVICES before calling (the ratio's own
+ *     guard is on exposure, and one device over ten days passes it).
+ *   - `reliable` means "not flagged as small-count", never "precise":
+ *     dex_rate(20, 1.0) is [12.2, 30.9]. A ratio with a zero-event denominator
+ *     is always unreliable. Print the interval beside the flag, and send an
+ *     unbounded upper (+infinity) as null plus a typed flag. A consumer that
+ *     only uses the bounds need not gate on `reliable`.
+ *   - 95 percent coverage assumes independent Poisson events (independent
+ *     trials for a proportion). Events clustered on one crash-looping device
+ *     make the interval falsely narrow.
+ *   - Cost, at -O2 on one thread: about 0.4 ms per rate at one million events
+ *     and up to about 5 ms per rate ratio with imbalanced arms. Compute once per
+ *     window, or cap the calls per page.
+ *   - nullopt for input that meets the documented preconditions, or a floored
+ *     helper with below_floor == false and no stats, is a computation failure:
+ *     count it by reason in the consumer (nothing here counts).
+ *   - Round-to-nearest floating-point mode is assumed. Another mode can return
+ *     nullopt for some large-arm ratios and costs about 9x; a build that fuses
+ *     multiply-add needs many more continued-fraction iterations for the same
+ *     result, inside the cap.
+ *   - dex_rate has no minimum exposure: an exposure in the wrong unit yields a
+ *     confident finite number. Only dex_rate_ratio guards, at
+ *     kDexRateRatioMinExposure.
+ *   - Counts are assumed to stay below 2^53; above it the int64-to-double
+ *     conversion rounds and an interval can collapse to zero width.
  *
  * Numerical contract:
  *   - Rates: events up to kDexStatsExactMaxEvents use the exact kernels
  *     (regularised incomplete gamma inverted by bisection). Above it the
  *     Wilson-Hilferty chi-square quantile gives the bounds, within 1e-10
- *     relative of the exact ones at the switch (measured 1.6e-11, pinned by test).
+ *     relative of the exact ones at the switch (measured about 1.5e-11, pinned
+ *     by test).
  *   - Rate ratios: the exact conditional (Clopper-Pearson) bounds, from the
  *     regularised incomplete beta, for every arm up to kDexRateRatioMaxEvents,
- *     evaluated in double to within 2e-5 relative of the exact rational bounds.
- *     That envelope is libm-dependent: on one libm the worst measured was 1.1e-5,
- *     at an arm of 1 against about 9.8e8; for arms of 2 or more the measured
- *     worst was 2.8e-6, and about 1e-9 at 1e6 against 1. Another libm may land
- *     anywhere inside 2e-5. Above that limit no ratio is produced.
+ *     evaluated in double to within 2e-5 relative of the exact rational bounds
+ *     for a libm whose log is within 1 ulp. The worst measured, 1.1e-5 at an arm
+ *     of 1 against about 9.8e8, is deterministic double quantisation of the
+ *     conditional proportion near 1, not libm variation (four libms agree to
+ *     3e-16; the MSVC runtime is unmeasured). Arms of 2 or more measured 2.8e-6
+ *     at worst, and about 1e-9 at 1e6 against 1. Above the limit no ratio is
+ *     produced.
  *   - A kernel that cannot converge inside kDexStatsMaxIterations returns NaN,
- *     quantiles propagate it, and every public function that computes a bound
- *     ends with a finiteness check: a statistic is never returned after a
- *     convergence failure or an overflow.
+ *     quantiles propagate it, and every public function that computes an
+ *     interval ends with a finiteness check: a statistic is never returned
+ *     after a convergence failure or an overflow.
  *
  * Thread-safe and store-free: pure functions, no statics, and no C library
  * log-gamma (it writes the global signgam on glibc and Darwin). Header-only.
@@ -80,17 +117,20 @@ inline constexpr double kDexRateRatioMinExposure = static_cast<double>(kDexCohor
 /// closed-form bounds. Rate ratios have their own limit, kDexRateRatioMaxEvents.
 inline constexpr std::int64_t kDexStatsExactMaxEvents = 1'000'000;
 
-/// Largest arm dex_rate_ratio accepts. Beyond it the conditional proportion sits
-/// within 1e-16 * a / b of 0 or 1, so the odds lose double precision for any
-/// method (measured 1.2e-5 relative at 1e10, 3e-4 at 1e12), and the beta
-/// fraction no longer converges inside the iteration cap: no ratio is produced
-/// rather than an inaccurate one.
+/// Largest arm dex_rate_ratio accepts. Beyond it the odds lose double precision
+/// for any method that forms them from the conditional proportion: its
+/// complement sits about 0.025 / (a + b) from 1, so rounding costs up to about
+/// 2e-15 * a / b relative (1.1e-5 at 1e10, 1.9e-4 at 1e12 for the nearest
+/// double), and from a few billion events the beta fraction exceeds the
+/// iteration cap for some arms: no ratio is produced rather than an inaccurate
+/// one.
 inline constexpr std::int64_t kDexRateRatioMaxEvents = 1'000'000'000;
 
-/// Iteration cap of the series / continued fractions: over 2.1x the measured
-/// peaks over both exact domains (gamma 7,413 at one million events; beta about
-/// 23,200 near 29,500 against 1e9 - a different search lands a few thousand
-/// under that). Hitting it is a convergence failure (NaN), never a result.
+/// Iteration cap of the series / continued fractions: about 2x the measured
+/// peaks over both exact domains (gamma 7,413 at one million events; beta
+/// 22,000-25,700 near 25,000-34,000 against 1e9, moving by a few thousand with
+/// the arms and the search path). Hitting it is a convergence failure (NaN),
+/// never a result.
 inline constexpr int kDexStatsMaxIterations = 50000;
 
 namespace dex_stats_detail {
@@ -292,7 +332,7 @@ inline Bounds poisson_bounds_exact(double k) {
 /// Wilson-Hilferty approximation of the same bounds: chi2_p(nu) ~
 /// nu * (1 - 2 / (9 nu) + z_p * sqrt(2 / (9 nu)))^3. Used only above
 /// kDexStatsExactMaxEvents, where it is within 1e-10 relative of the exact
-/// bounds (measured 1.6e-11 at the switch).
+/// bounds (measured about 1.5e-11 at the switch).
 inline Bounds poisson_bounds_large(double k) {
     const auto chi2_half = [](double nu, double z) {
         const double t = 2.0 / (9.0 * nu);
@@ -361,10 +401,12 @@ struct DexInterval {
 }
 
 /// events over `exposure` (the caller's unit, device-days for the views) with
-/// the exact Poisson interval; `estimate` is events per unit of that exposure
-/// and `reliable` is events >= kDexStatsReliableMinEvents. nullopt iff events < 0
-/// or exposure is non-finite or <= 0, or the rate overflows a double (never
-/// infinity).
+/// the Poisson interval: exact (Garwood) up to kDexStatsExactMaxEvents events,
+/// the Wilson-Hilferty closed form above; `estimate` is events per unit of that
+/// exposure and `reliable` is events >= kDexStatsReliableMinEvents. There is no
+/// minimum exposure here (dex_rate_ratio has one). nullopt iff events < 0 or
+/// exposure is non-finite or <= 0, or the rate or a bound overflows a double
+/// (never infinity), or a kernel does not converge.
 [[nodiscard]] inline std::optional<DexInterval> dex_rate(std::int64_t events, double exposure) {
     if (events < 0 || !std::isfinite(exposure) || exposure <= 0.0)
         return std::nullopt;
@@ -427,27 +469,31 @@ dex_rate_ratio(std::int64_t events_a, double exposure_a, std::int64_t events_b, 
                            events_b >= kDexStatsReliableMinEvents};
 }
 
-/// A statistic that is withheld below the cohort floor; the counts are always
-/// carried.
+/// A statistic withheld below the cohort floor. Only the device count is carried:
+/// events are the behaviour the floor withholds. `below_floor` says why `stats`
+/// is absent; `stats` absent with `below_floor` false means invalid input or an
+/// unrepresentable result, which a consumer counts as a computation failure.
 struct DexFloored {
-    std::int64_t events;
     std::int64_t devices;
+    bool below_floor;
     std::optional<DexInterval> stats;
 };
 
-/// The floor is on the DEVICE population (the same floor every DEX surface
-/// uses), not on exposure: below kDexCohortFloor devices a count is honest and
-/// a proportion singles people out, so only the count is returned.
+/// The floor is on the DEVICE population (the cohort floor constant of the
+/// per-version trend reads), not on exposure: below kDexCohortFloor devices
+/// the events and the proportion single people out, so only the device count and
+/// below_floor are returned. A negative device count is invalid input, not a
+/// small cohort: below_floor is false.
 [[nodiscard]] inline DexFloored dex_floored_proportion(std::int64_t events,
                                                        std::int64_t devices) {
-    return {events, devices,
+    return {devices, devices >= 0 && devices < kDexCohortFloor,
             devices < kDexCohortFloor ? std::nullopt : dex_proportion(events, devices)};
 }
 
 /// As dex_floored_proportion: the floor is on devices, not exposure.
 [[nodiscard]] inline DexFloored dex_floored_rate(std::int64_t events, double exposure,
                                                  std::int64_t devices) {
-    return {events, devices,
+    return {devices, devices >= 0 && devices < kDexCohortFloor,
             devices < kDexCohortFloor ? std::nullopt : dex_rate(events, exposure)};
 }
 

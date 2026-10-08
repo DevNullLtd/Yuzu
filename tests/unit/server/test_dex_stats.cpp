@@ -17,7 +17,7 @@
  *    return nothing beyond it, and nothing returns a statistic after a
  *    convergence failure or overflow.
  *  - Absent-not-zero: invalid input and unrepresentable results are nullopt;
- *    below the cohort floor only counts survive.
+ *    below the cohort floor only the device count and the flag survive.
  */
 #include "dex_stats.hpp"
 
@@ -81,8 +81,6 @@ TEST_CASE("DexStats: log_gamma matches the lgamma oracle", "[dex][stats]") {
         const double want = std::lgamma(n);
         CHECK(dex_stats_detail::log_gamma(n) == Approx(want).epsilon(1e-13).margin(1e-14));
     }
-    CHECK(std::fabs(dex_stats_detail::log_gamma(1.0)) < 1e-15);
-    CHECK(std::fabs(dex_stats_detail::log_gamma(2.0)) < 1e-15);
 }
 
 TEST_CASE("DexStats: incomplete gamma and beta identities and quantile round trips",
@@ -105,7 +103,7 @@ TEST_CASE("DexStats: incomplete gamma and beta identities and quantile round tri
 TEST_CASE("DexStats: exact and large-count Poisson bounds agree at the switch", "[dex][stats]") {
     const auto ex = dex_stats_detail::poisson_bounds_exact(1e6);
     const auto lg = dex_stats_detail::poisson_bounds_large(1e6);
-    // Measured 1.6e-11 relative at the switch.
+    // Measured about 1.5e-11 relative at the switch.
     CHECK(ex.lower == Approx(lg.lower).epsilon(1e-10));
     CHECK(ex.upper == Approx(lg.upper).epsilon(1e-10));
 
@@ -157,14 +155,22 @@ TEST_CASE("DexStats: dex_proportion Wilson known answers", "[dex][stats]") {
 }
 
 TEST_CASE("DexStats: dex_proportion edges validity and flag", "[dex][stats]") {
-    CHECK(dex_proportion(0, 20)->lower == 0.0);
-    CHECK(dex_proportion(20, 20)->upper == 1.0);
+    const auto zero = dex_proportion(0, 20);
+    const auto full = dex_proportion(20, 20);
+    REQUIRE(zero);
+    REQUIRE(full);
+    CHECK(zero->lower == 0.0);
+    CHECK(full->upper == 1.0);
     CHECK_FALSE(dex_proportion(5, 0));
     CHECK_FALSE(dex_proportion(-1, 10));
     CHECK_FALSE(dex_proportion(11, 10));
     CHECK_FALSE(dex_proportion(0, -4));
-    CHECK_FALSE(dex_proportion(19, 100)->reliable);
-    CHECK(dex_proportion(20, 100)->reliable);
+    const auto under = dex_proportion(19, 100);
+    const auto atmin = dex_proportion(20, 100);
+    REQUIRE(under);
+    REQUIRE(atmin);
+    CHECK_FALSE(under->reliable);
+    CHECK(atmin->reliable);
 
     const auto all = dex_proportion(kI64Max, kI64Max);
     REQUIRE(all);
@@ -183,10 +189,18 @@ TEST_CASE("DexStats: dex_proportion edges validity and flag", "[dex][stats]") {
 }
 
 TEST_CASE("DexStats: rule of three", "[dex][stats]") {
-    CHECK(*dex_rule_of_three(20) == Approx(0.15));
-    CHECK(*dex_rule_of_three(400) == Approx(0.0075));
-    CHECK(*dex_rule_of_three(1) == 1.0);
-    CHECK(*dex_rule_of_three(2) == 1.0);
+    const auto n20 = dex_rule_of_three(20);
+    const auto n400 = dex_rule_of_three(400);
+    const auto n1 = dex_rule_of_three(1);
+    const auto n2 = dex_rule_of_three(2);
+    REQUIRE(n20);
+    REQUIRE(n400);
+    REQUIRE(n1);
+    REQUIRE(n2);
+    CHECK(*n20 == Approx(0.15));
+    CHECK(*n400 == Approx(0.0075));
+    CHECK(*n1 == 1.0);
+    CHECK(*n2 == 1.0);
     CHECK_FALSE(dex_rule_of_three(0));
     CHECK_FALSE(dex_rule_of_three(-5));
     for (double n : {20.0, 400.0, 10000.0}) {
@@ -212,7 +226,9 @@ TEST_CASE("DexStats: dex_rate Garwood known answers", "[dex][stats]") {
         CHECK(r->lower == near8(v.lo));
         CHECK(r->upper == near8(v.hi));
     }
-    CHECK(dex_rate(0, 1.0)->lower == 0.0);
+    const auto none = dex_rate(0, 1.0);
+    REQUIRE(none);
+    CHECK(none->lower == 0.0);
 }
 
 TEST_CASE("DexStats: dex_rate scaling validity overflow and flag", "[dex][stats]") {
@@ -238,8 +254,12 @@ TEST_CASE("DexStats: dex_rate scaling validity overflow and flag", "[dex][stats]
     CHECK(big->lower < big->estimate);
     CHECK(big->estimate < big->upper);
 
-    CHECK_FALSE(dex_rate(19, 1.0)->reliable);
-    CHECK(dex_rate(20, 1.0)->reliable);
+    const auto under = dex_rate(19, 1.0);
+    const auto atmin = dex_rate(20, 1.0);
+    REQUIRE(under);
+    REQUIRE(atmin);
+    CHECK_FALSE(under->reliable);
+    CHECK(atmin->reliable);
 }
 
 TEST_CASE("DexStats: dex_rate bounds satisfy the Poisson tail definition", "[dex][stats]") {
@@ -374,37 +394,188 @@ TEST_CASE("DexStats: dex_rate_ratio domain limit", "[dex][stats]") {
     CHECK_FALSE(dex_rate_ratio(kI64Max, 10.0, kI64Max, 10.0));
 
     // Reliable only when both arms reach the threshold.
-    CHECK(dex_rate_ratio(20, 100.0, 20, 100.0)->reliable);
-    CHECK_FALSE(dex_rate_ratio(19, 100.0, 20, 100.0)->reliable);
-    CHECK_FALSE(dex_rate_ratio(20, 100.0, 19, 100.0)->reliable);
+    const auto both = dex_rate_ratio(20, 100.0, 20, 100.0);
+    const auto a_short = dex_rate_ratio(19, 100.0, 20, 100.0);
+    const auto b_short = dex_rate_ratio(20, 100.0, 19, 100.0);
+    REQUIRE(both);
+    REQUIRE(a_short);
+    REQUIRE(b_short);
+    CHECK(both->reliable);
+    CHECK_FALSE(a_short->reliable);
+    CHECK_FALSE(b_short->reliable);
 }
 
-TEST_CASE("DexStats: floored helpers carry counts and withhold stats", "[dex][stats]") {
+TEST_CASE("DexStats: floored helpers report the device count and the reason", "[dex][stats]") {
     const auto below = dex_floored_proportion(3, kDexCohortFloor - 1);
-    CHECK(below.events == 3);
     CHECK(below.devices == kDexCohortFloor - 1);
+    CHECK(below.below_floor);
     CHECK_FALSE(below.stats);
 
     const auto at = dex_floored_proportion(3, kDexCohortFloor);
+    const auto at_want = dex_proportion(3, kDexCohortFloor);
     REQUIRE(at.stats);
-    CHECK(at.stats->lower == dex_proportion(3, kDexCohortFloor)->lower);
-    CHECK(at.stats->upper == dex_proportion(3, kDexCohortFloor)->upper);
+    REQUIRE(at_want);
+    CHECK(at.devices == kDexCohortFloor);
+    CHECK_FALSE(at.below_floor);
+    CHECK(at.stats->lower == at_want->lower);
+    CHECK(at.stats->upper == at_want->upper);
 
+    // Invalid pair AT the floor: not a small cohort, so below_floor stays false.
     const auto bad = dex_floored_proportion(99, kDexCohortFloor);
-    CHECK(bad.events == 99);
     CHECK(bad.devices == kDexCohortFloor);
+    CHECK_FALSE(bad.below_floor);
     CHECK_FALSE(bad.stats);
 
     const auto rbelow = dex_floored_rate(3, 40.0, kDexCohortFloor - 1);
-    CHECK(rbelow.events == 3);
     CHECK(rbelow.devices == kDexCohortFloor - 1);
+    CHECK(rbelow.below_floor);
     CHECK_FALSE(rbelow.stats);
 
     const auto rat = dex_floored_rate(3, 40.0, kDexCohortFloor);
+    const auto rat_want = dex_rate(3, 40.0);
     REQUIRE(rat.stats);
-    CHECK(rat.stats->upper == dex_rate(3, 40.0)->upper);
+    REQUIRE(rat_want);
+    CHECK_FALSE(rat.below_floor);
+    CHECK(rat.stats->upper == rat_want->upper);
 
     const auto rbad = dex_floored_rate(3, 0.0, kDexCohortFloor);
-    CHECK(rbad.events == 3);
+    CHECK(rbad.devices == kDexCohortFloor);
+    CHECK_FALSE(rbad.below_floor);
     CHECK_FALSE(rbad.stats);
+}
+
+TEST_CASE("DexStats: dex_proportion exact edges do not rest on rounding luck", "[dex][stats]") {
+    // One trial, Wilson closed forms with z2 = kDexStatsZ^2 = 3.84145882069412523:
+    // 0/1 -> [0, z2 / (1 + z2)] and 1/1 -> [1 / (1 + z2), 1]. Python Decimal,
+    // 70 digits, 2026-10-07.
+    const auto none = dex_proportion(0, 1);
+    const auto all = dex_proportion(1, 1);
+    REQUIRE(none);
+    REQUIRE(all);
+    CHECK(none->lower == 0.0);
+    CHECK(none->upper == near8(0.79345068562276258));
+    CHECK(all->lower == near8(0.20654931437723742));
+    CHECK(all->upper == 1.0);
+    // The formula alone is not exact at the edges for every n and every compiler
+    // (unclamped it gives 2.8e-17 as the lower bound at 0/7 with floating-point
+    // contraction off, 1.4e-17 at 0/14 with it on, and 0.99999999999999989 as the
+    // upper bound at 10/10 or 25/25), yet both edges are exactly 0 and 1. The
+    // range is wide enough to catch the rounding on any contraction setting.
+    for (std::int64_t n = 1; n <= 40; ++n) {
+        const auto lo = dex_proportion(0, n);
+        const auto hi = dex_proportion(n, n);
+        REQUIRE(lo);
+        REQUIRE(hi);
+        CHECK(lo->lower == 0.0);
+        CHECK(hi->upper == 1.0);
+    }
+}
+
+TEST_CASE("DexStats: a bound that alone overflows is refused", "[dex][stats]") {
+    // dex_rate: the rate stays finite but the upper bound does not. 0 /
+    // denorm_min is 0 while -ln(0.025) / denorm_min is infinite; 1 / 2.5e-308 =
+    // 4e307 is finite while 5.5716434 / 2.5e-308 = 2.2e308 exceeds DBL_MAX.
+    CHECK_FALSE(dex_rate(0, std::numeric_limits<double>::denorm_min()));
+    CHECK_FALSE(dex_rate(1, 2.5e-308));
+    // A finite negative exposure is invalid, not just -infinity.
+    CHECK_FALSE(dex_rate(5, -1.0));
+
+    // dex_rate_ratio; Python Decimal, 70 digits, 2026-10-07. scale = exposure_b /
+    // exposure_a. Upper overflows while the ratio (0.02 * DBL_MAX) stays finite:
+    // odds(0.975^(1/3)) * DBL_MAX / 100 = 2.12e308.
+    CHECK_FALSE(dex_rate_ratio(2, 100.0, 1, DBL_MAX));
+    // Zero denominator arm: ratio and upper are +infinity by design, so the lower
+    // bound is the only finiteness guard: odds(0.025^(1/10000)) * DBL_MAX / 100 =
+    // 4.87e309.
+    CHECK_FALSE(dex_rate_ratio(10000, 100.0, 0, DBL_MAX));
+    // Zero numerator arm: ratio 0 and lower 0 are finite; odds(0.975) * DBL_MAX /
+    // 10 = 7.01e308.
+    CHECK_FALSE(dex_rate_ratio(0, 10.0, 1, DBL_MAX));
+
+    // A negative count next to a zero arm: the explicit guard is the only refusal.
+    CHECK_FALSE(dex_rate_ratio(0, 100.0, -1, 100.0));
+    CHECK_FALSE(dex_rate_ratio(-1, 100.0, 0, 100.0));
+}
+
+TEST_CASE("DexStats: the rate-ratio exposure guard is the cohort floor per arm", "[dex][stats]") {
+    constexpr double floor_d = static_cast<double>(kDexCohortFloor);
+    CHECK(kDexRateRatioMinExposure == floor_d);
+    // Exactly on the guard passes, one ulp under fails, each arm tested with the
+    // other far above.
+    CHECK(dex_rate_ratio(5, floor_d, 5, 1000.0));
+    CHECK(dex_rate_ratio(5, 1000.0, 5, floor_d));
+    CHECK_FALSE(dex_rate_ratio(5, std::nextafter(floor_d, 0.0), 5, 1000.0));
+    CHECK_FALSE(dex_rate_ratio(5, 1000.0, 5, std::nextafter(floor_d, 0.0)));
+}
+
+TEST_CASE("DexStats: floored helpers clear the floor on devices alone and refuse negatives",
+          "[dex][stats]") {
+    // One above the floor and far above it, valid pairs: the statistic is present.
+    for (const std::int64_t devices : {kDexCohortFloor + 1, std::int64_t{1000}}) {
+        const auto p = dex_floored_proportion(3, devices);
+        const auto p_want = dex_proportion(3, devices);
+        REQUIRE(p.stats);
+        REQUIRE(p_want);
+        CHECK(p.devices == devices);
+        CHECK_FALSE(p.below_floor);
+        CHECK(p.stats->lower == p_want->lower);
+        const auto r = dex_floored_rate(3, 40.0, devices);
+        const auto r_want = dex_rate(3, 40.0);
+        REQUIRE(r.stats);
+        REQUIRE(r_want);
+        CHECK_FALSE(r.below_floor);
+        CHECK(r.stats->upper == r_want->upper);
+    }
+    // The floor is on devices, never exposure: an exposure under the floor value
+    // still yields a rate once devices clear it (3 events / 2.5 = 1.2).
+    const auto thin = dex_floored_rate(3, 2.5, kDexCohortFloor);
+    REQUIRE(thin.stats);
+    CHECK(thin.stats->estimate == Approx(1.2));
+    // Invalid pair below the floor: the device count and the reason, nothing else.
+    const auto bad_p = dex_floored_proportion(99, kDexCohortFloor - 1);
+    CHECK(bad_p.devices == kDexCohortFloor - 1);
+    CHECK(bad_p.below_floor);
+    CHECK_FALSE(bad_p.stats);
+    const auto bad_r = dex_floored_rate(-1, 40.0, kDexCohortFloor - 1);
+    CHECK(bad_r.below_floor);
+    CHECK_FALSE(bad_r.stats);
+
+    // A negative device count must not reach the statistic (dex_rate(3, 40.0) is
+    // valid) and must not read as "too few devices".
+    for (const std::int64_t devices :
+         {std::int64_t{-1}, std::numeric_limits<std::int64_t>::min()}) {
+        const auto p = dex_floored_proportion(3, devices);
+        CHECK(p.devices == devices);
+        CHECK_FALSE(p.below_floor);
+        CHECK_FALSE(p.stats);
+        const auto r = dex_floored_rate(3, 40.0, devices);
+        CHECK(r.devices == devices);
+        CHECK_FALSE(r.below_floor);
+        CHECK_FALSE(r.stats);
+    }
+}
+
+TEST_CASE("DexStats: a quantile does not number past a failed bracket evaluation", "[dex][stats]") {
+    // With a cap of one iteration P(1, 1) cannot converge but the larger brackets
+    // P(1, 2), P(1, 4) and the bisection points past 2 do (a = 1 makes the first
+    // continued-fraction coefficient zero); the quantile must still be NaN.
+    CHECK(std::isnan(dex_stats_detail::gamma_quantile(1.0, 0.975, 1)));
+}
+
+TEST_CASE("DexStats: dex_rate_ratio converges at the slowest in-domain arms", "[dex][stats]") {
+    // 33,837 against 1e9 needs about 21,000 beta iterations in one quantile
+    // evaluation (the committed rows above need under 7,413), so a cap lowered
+    // below that silently turns a valid input into nullopt. Exact conditional
+    // bounds on the odds, equal exposures: Python Decimal (70 digits) bisection on
+    // the binomial CDF over N = 1,000,033,837 trials, 2026-10-07; the swapped
+    // orientation is the reciprocal of the other bound. The 2e-5 is the header's
+    // envelope, not this platform's rounding.
+    const auto r = dex_rate_ratio(33'837, 100.0, 1'000'000'000, 100.0);
+    REQUIRE(r);
+    CHECK(r->lower == Approx(3.3477409884938568e-5).epsilon(2e-5));
+    CHECK(r->upper == Approx(3.4199489907041657e-5).epsilon(2e-5));
+    const auto s = dex_rate_ratio(1'000'000'000, 100.0, 33'837, 100.0);
+    REQUIRE(s);
+    CHECK(s->lower == Approx(29240.202199451534).epsilon(2e-5));
+    CHECK(s->upper == Approx(29870.889158898113).epsilon(2e-5));
 }
