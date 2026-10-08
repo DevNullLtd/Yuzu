@@ -1559,6 +1559,10 @@ if build_server
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
       'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin
+      'unit/server/test_guardian_reconcile_budget.cpp', # #5513 — reconcile admission budget (leaky bucket)
+      'unit/server/test_guardian_generation_cache.cpp', # #5513 — TTL-cached policy-generation read
+      'unit/server/test_guardian_rule_bundle.cpp', # #5513 — per-generation rule-bundle memo
+      'unit/server/test_agent_registry_scope_for_agent.cpp', # #5513 — single-agent scope evaluator
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',

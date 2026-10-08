@@ -1,0 +1,188 @@
+#pragma once
+
+/// @file guardian_generation_cache.hpp
+/// Short-TTL, single-flight cache for the Guardian policy generation read (#5513,
+/// Fable opinion sections A and F item 1).
+///
+/// WHY IT EXISTS. The heartbeat reconcile compares the agent's reported generation
+/// with `GuaranteedStateStore::current_policy_generation()`, a synchronous Postgres
+/// point read taken on every tagged heartbeat. At fleet scale that is one store read per
+/// heartbeat for a value that changes only on a rule-set mutation. The result is cached
+/// for a short TTL, and a failed read is cached for a shorter negative TTL so a degraded
+/// store is not hammered by every heartbeat during an outage. Same shape as
+/// `AgentRegistry::live_presence()` / `kPresenceCacheTtl` (agent_registry.hpp), which
+/// also caches the `std::expected` itself.
+///
+/// CONTRACT.
+///   - `get()` returns the cached result while it is fresh: `ttl` for a success,
+///     `negative_ttl` for an error. A reconcile that reads a generation up to `ttl`
+///     old is delayed by at most that long after a bump; it is never wrong, because the
+///     generation is monotonic and a stale value is only ever lower.
+///   - SINGLE FLIGHT. At most one thread runs the fetch at a time. While one is in
+///     flight, a concurrent caller returns the previously cached SUCCESS (stale by at
+///     most ttl plus the fetch time) if the last outcome was a success. If there is no
+///     value, or the last outcome was an error, the caller waits on the in-flight fetch
+///     through a `std::shared_future` and receives its result. An expired error is never
+///     served in place of a fresh attempt, and a stale success is never served after an
+///     error (that would hide a degraded store behind an old value).
+///   - A lower fetched value REPLACES a higher cached one. That is a store reset and is
+///     not hidden: `regressions()` counts it. Nothing here pins the generation upward.
+///   - `invalidate()` drops the cached outcome (tests, and any future "generation just
+///     bumped locally" hook). A fetch already in flight when `invalidate()` runs still
+///     returns its result to its own callers but does NOT repopulate the cache, so an
+///     invalidation can never be undone by an older read. It also ends single-flight
+///     for that fetch: the next `get()` starts its own fetch rather than waiting on the
+///     older one.
+///   - A fetch that throws is converted to an error result; the in-flight state is
+///     always cleared, so waiters never hang.
+///   - The fetch function runs WITHOUT the cache mutex held.
+///
+/// CLOCK INJECTION. `ClockFn` is `std::function<std::chrono::steady_clock::time_point()>`;
+/// null selects the real steady clock. Tests inject a manual clock and a fetch function
+/// that blocks on an event, so nothing sleeps. A clock that moves backwards leaves the
+/// cached entry fresh rather than re-fetching. The clock is called under the internal
+/// mutex and must not call back into the cache. The TTL is measured from when the fetch
+/// STARTED, which is the conservative end of the read's age.
+///
+/// Thread-safe.
+
+#include <chrono>
+#include <cstdint>
+#include <exception>
+#include <expected>
+#include <functional>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <utility>
+
+namespace yuzu::server {
+
+/// Cache TTLs (namespace scope so it can be a default argument).
+struct GuardianGenerationCacheConfig {
+    std::chrono::milliseconds ttl{2000};
+    std::chrono::milliseconds negative_ttl{1000};
+};
+
+class GuardianGenerationCache {
+public:
+    using Clock = std::chrono::steady_clock;
+    using ClockFn = std::function<Clock::time_point()>;
+    using Result = std::expected<std::uint64_t, std::string>;
+    using FetchFn = std::function<Result()>;
+
+    using Config = GuardianGenerationCacheConfig;
+
+    explicit GuardianGenerationCache(FetchFn fetch, Config cfg = {}, ClockFn clock = {})
+        : fetch_(std::move(fetch)), cfg_(cfg), clock_(clock ? std::move(clock) : ClockFn{&Clock::now}) {}
+
+    GuardianGenerationCache(const GuardianGenerationCache&) = delete;
+    GuardianGenerationCache& operator=(const GuardianGenerationCache&) = delete;
+
+    [[nodiscard]] Result get() {
+        std::shared_future<Result> waiting;
+        std::shared_ptr<std::promise<Result>> promise;
+        Clock::time_point started;
+        std::uint64_t epoch = 0;
+        {
+            std::lock_guard lk(mu_);
+            const auto now = clock_();
+            if (entry_ && fresh_locked(*entry_, now))
+                return entry_->result;
+            if (inflight_.valid()) {
+                if (entry_ && entry_->result.has_value())
+                    return entry_->result;  // stale success while a refresh is running
+                waiting = inflight_;
+            } else {
+                promise = std::make_shared<std::promise<Result>>();
+                inflight_ = promise->get_future().share();
+                started = now;
+                epoch = epoch_;
+            }
+        }
+        if (waiting.valid())
+            return waiting.get();
+
+        Result r = run_fetch();
+        {
+            std::lock_guard lk(mu_);
+            if (epoch == epoch_) {
+                if (r.has_value()) {
+                    if (last_served_ && *r < *last_served_)
+                        ++regressions_;
+                    last_served_ = *r;
+                }
+                entry_ = Entry{r, started};
+            }
+            if (epoch == epoch_)
+                inflight_ = {};  // an invalidate() already detached this flight
+        }
+        promise->set_value(r);
+        return r;
+    }
+
+    /// Drop the cached outcome. See the contract for the in-flight case.
+    void invalidate() {
+        std::lock_guard lk(mu_);
+        entry_.reset();
+        inflight_ = {};  // detach a running flight: the next get() starts a fresh fetch
+        ++epoch_;
+    }
+
+    /// Number of times the fetch function was started.
+    [[nodiscard]] std::uint64_t fetches() const {
+        std::lock_guard lk(mu_);
+        return fetches_;
+    }
+
+    /// Number of successful fetches that returned a LOWER generation than the previously
+    /// served one (a store reset). Informational: the lower value was served.
+    [[nodiscard]] std::uint64_t regressions() const {
+        std::lock_guard lk(mu_);
+        return regressions_;
+    }
+
+private:
+    struct Entry {
+        Result result;
+        Clock::time_point at;
+    };
+
+    bool fresh_locked(const Entry& e, Clock::time_point now) const {
+        if (now <= e.at)
+            return true;  // clock did not advance (or went backwards)
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - e.at);
+        return age < (e.result.has_value() ? cfg_.ttl : cfg_.negative_ttl);
+    }
+
+    Result run_fetch() {
+        {
+            std::lock_guard lk(mu_);
+            ++fetches_;
+        }
+        if (!fetch_)
+            return std::unexpected(std::string("generation fetch function not configured"));
+        try {
+            return fetch_();
+        } catch (const std::exception& e) {
+            return std::unexpected(std::string("generation fetch threw: ") + e.what());
+        } catch (...) {
+            return std::unexpected(std::string("generation fetch threw a non-standard exception"));
+        }
+    }
+
+    const FetchFn fetch_;
+    const Config cfg_;
+    const ClockFn clock_;
+    mutable std::mutex mu_;
+    std::optional<Entry> entry_;
+    std::shared_future<Result> inflight_;  // valid() iff a fetch is running
+    std::optional<std::uint64_t> last_served_;
+    std::uint64_t epoch_{0};
+    std::uint64_t fetches_{0};
+    std::uint64_t regressions_{0};
+};
+
+}  // namespace yuzu::server
