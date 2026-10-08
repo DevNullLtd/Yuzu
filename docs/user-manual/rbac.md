@@ -240,7 +240,7 @@ Recommended order for a fresh install:
 > only ever admitted global-grant callers, who are unfiltered anyway. With RBAC
 > off (the shipped default) both surfaces are unconfined for every authenticated
 > non-service, non-engine caller whose tier allows it (an engine principal is refused with
-> `403` with RBAC off), and a service-scoped token gets `403`. A service-scoped
+> `403` with RBAC off), and a service-scoped token is refused (`403`; the dashboard fragment shows a "You do not have permission to view executions." note at HTTP `200`). A service-scoped
 > token sees on the fragment only executions that touched an in-scope agent: the
 > owner disjunct (a principal's own dispatches) is suppressed for it, because its
 > session username is the account that minted it (the other execution read
@@ -248,9 +248,12 @@ Recommended order for a fresh install:
 > **Exception to
 > the degraded-store sentence above:** a degrade on the Executions panel is NOT a
 > `503` the operator sees. The fragment's own failure notes (tracker or status
-> read failure) render at HTTP `200` as a `data-degraded` note, because the
-> dashboard drops `4xx`/`5xx` bodies; the gate's own `403`/`503` JSON bodies
-> (store not open) are unchanged. See `upgrading.md`. The `ITServiceOwner` ceiling for service-scoped
+> read failure) and the gate's refusals (store not open becomes a
+> `data-degraded="gate"` note, a permission refusal a `data-denied="true"` note)
+> all render at HTTP `200`, because the dashboard drops `4xx`/`5xx` bodies; the
+> gate's audit row is still written. An HTTP-status monitor of the fragment
+> therefore no longer sees them, while `GET /api/v1/executions` keeps its real
+> `403`/`503`. See `upgrading.md`. The `ITServiceOwner` ceiling for service-scoped
 > tokens is applied by PR #5546 (the "Service-scoped tokens and `ITServiceOwner`"
 > paragraph above), not by the executions-panel change.
 >

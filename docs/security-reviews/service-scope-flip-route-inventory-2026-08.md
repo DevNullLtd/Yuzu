@@ -133,8 +133,10 @@ This inventory covers gate-less routes, and `GET /fragments/executions` was not 
 sole gate, the same shape as `/fragments/executions/{id}/detail`, so a service-scoped token is now
 ADMITTED and served the confined view (rows for executions that touched an in-scope agent, counters
 and `last_error_detail` projected to the in-scope agents, scope pushed into SQL before the 50-row limit). That holds only
-with RBAC enforcement ON (`authz_gates.cpp` still answers 403 with enforcement off) and a
-reachable `TagStore` (missing or degraded is 503, `retry_after_ms` 5000). It is a deliberate
+with RBAC enforcement ON (`authz_gates.cpp` still refuses with 403 with enforcement off) and a
+reachable `TagStore` (missing or degraded is 503, `retry_after_ms` 5000). The gate audits each
+refusal, but the fragment replaces its response with an HTTP 200 note (`data-denied="true"` for the
+403, `data-degraded="gate"` for the 503), because the dashboard drops 4xx/5xx bodies. It is a deliberate
 admission change with a real mechanism behind it, not a widening of `kServiceScopeGlobalSafe`.
 The owner disjunct (`dispatched_by == username`) is suppressed for service-scoped sessions on this
 fragment, because a service-scoped token's session username is the account that minted it and the

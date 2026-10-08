@@ -290,7 +290,8 @@ plus one new prerequisite.**
 
 - **RBAC off (the shipped default).** With RBAC off, both surfaces are unconfined for every authenticated non-service, non-engine caller whose tier allows it (an engine principal is refused with 403 with RBAC off),
   before and after the move to the fleet-read gate; a service-scoped token is refused
-  with `403`. Confinement on these two surfaces takes effect only with RBAC enforcement on.
+  (`403` on the REST and MCP twins, the permission note described under "Degraded store, fragment"
+  on the fragment). Confinement on these two surfaces takes effect only with RBAC enforcement on.
 - **Admission prerequisite (applies to every caller on these two surfaces).** The fleet-read gate
   needs both the authorization store and the management-group store open. When the RBAC store is
   not open, every caller except a JIT-elevated non-service session (which returns before any store
@@ -298,9 +299,10 @@ plus one new prerequisite.**
   store is not open, every caller except an elevated session and an engine principal does (an
   engine principal is resolved from the RBAC store alone, and gets the `503` only when that store
   is not open). A global-grant administrator is included in both cases; the old plain gate never
-  needed the management-group store. On the dashboard fragment that `503` is the gate's own JSON error body, which the dashboard
-  drops, so the panel can stay on "Loading..." until the store recovers (the REST and MCP twins show
-  the `503` itself).
+  needed the management-group store. The REST and MCP twins show the `503` itself. On the dashboard
+  fragment the gate still audits the refusal, but the response is replaced with an HTTP `200` note
+  (`data-degraded="gate"`, see "Degraded store, fragment"), because the dashboard drops `4xx`/`5xx`
+  bodies; `GET /api/v1/executions` keeps its real `503`.
 - **Group-scoped-only operators** (an `Execution:Read` grant held only through a management group)
   previously got `403` from the **fragment** and now get a confined view: only executions that
   touched one of their agents or that they dispatched, with the counters and the error preview
@@ -312,8 +314,9 @@ plus one new prerequisite.**
 - **Service-scoped API tokens** get a confined view from `GET /fragments/executions` where
   they got `403`, but only when RBAC enforcement is ON, the `ITServiceOwner` role holds
   `Execution:Read` (the seeded default; see the next item) and the tag store is reachable. With RBAC
-  enforcement off the gate still answers `403` ("service-scoped tokens require RBAC to be
-  enabled"), and a missing or degraded tag store answers `503` (`retry_after_ms` 5000). In a
+  enforcement off the gate still refuses it ("service-scoped tokens require RBAC to be
+  enabled"), and a missing or degraded tag store is a retryable `503` (`retry_after_ms` 5000) on the
+  REST twin; the fragment shows the matching note at HTTP `200`. In a
   normal deployment the tag store always exists (the server refuses to boot without it). On this
   fragment a service-scoped token sees only executions that touched an in-scope agent (see "Owner
   disjunct" below); its own just-dispatched execution stays invisible until an in-scope agent
@@ -325,29 +328,40 @@ plus one new prerequisite.**
   failed ceiling read, the remediation and the audit search are in "Behaviour change:
   service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and
   `GET /api/v1/upload-grants` (#3526)" below.
-- **Degraded store, fragment.** The fragment's own failure notes now render an honest
-  operator-visible note at HTTP `200` (`<div class="empty-state" data-degraded="tracker|unavailable">`),
-  because the dashboard drops `4xx`/`5xx` bodies and a `503` left the panel on "Loading..." forever.
-  Detect it with the `data-degraded` attribute; it is never the "No executions yet" text. A monitor
-  that treats HTTP `200` as healthy will not see these notes. The gate's own `403`/`503` JSON
-  bodies are unchanged.
+- **Degraded store, fragment.** Every refusal or failure on `GET /fragments/executions` now renders
+  an operator-visible note at HTTP `200`, because the dashboard drops `4xx`/`5xx` bodies and a
+  refusal used to leave the panel on "Loading..." forever. There are three degrade kinds, set in the
+  `data-degraded` attribute on `<div class="empty-state">`: `tracker` (the execution query or the
+  agent-status read failed), `unavailable` (the fleet-read gate or the execution tracker is not
+  wired, or a confined read has an empty principal: an administrator or a bug) and `gate` (the
+  authorization gate refused with `503`: the RBAC store, the management-group store or the tag
+  store is not open or unavailable, or the `ITServiceOwner` ceiling read is degraded; the text is
+  "Executions unavailable (the authorization service could not be reached). Retry shortly."). A gate
+  `403` (no `Execution:Read`, RBAC off for a service-scoped token, the ceiling denial, an engine
+  principal without a grant) renders `<div class="empty-state" data-denied="true">` with "You do not
+  have permission to view executions." and no reason text. A `401` for an unauthenticated request
+  passes through unchanged. The gate still writes its audit row first, and the gate's `Retry-After`
+  header is not sent. Detect the notes with the `data-degraded` and `data-denied` attributes; none of
+  them is the "No executions yet" text. **Monitoring blind spot:** `/fragments/executions` no longer
+  answers `403` or `503` for these cases, so an HTTP-status monitor, a reverse-proxy access log or
+  a synthetic check that treats `200` as healthy will not see them. The signals are the gate's audit
+  rows (`auth.fleet_read_required` with `result=denied`), the panel text, and, for the ceiling case,
+  `yuzu_server_rbac_read_degrade_total`. `GET /api/v1/executions` is unchanged and keeps its real
+  `403`/`503`.
 - **Runbook, degrade note on the Executions panel.** `data-degraded="tracker"` means the execution
   tracker or its agent-status read failed: check `ExecutionTracker` warnings in the server log and
   PostgreSQL availability. `data-degraded="unavailable"` is a misconfiguration or bug branch (the
   fleet-read gate or the execution tracker is not wired, or a confined read has an empty
   principal), not a storage fault: it needs an administrator or a bug report, and a Postgres check
-  will not clear it. Neither note clears on its own: the panel is loaded once, when the Instructions
-  page reveals it (`hx-trigger="revealed"`, no polling), so after the cause is fixed reload the
-  Instructions page (or reopen the Execution History section).
-- **Runbook, panel stuck on "Loading...".** That is the gate's own `403`/`503` JSON body being
-  dropped by the dashboard, not a fragment note. Look for: audit rows `auth.fleet_read_required`
-  with `result=denied` (detail `fleet read blocked: management-group store unavailable`, or the
-  ceiling detail from the `ITServiceOwner` section below); `yuzu_http_requests_total{status="503"}`
-  (fleet-wide, not per route); `yuzu_server_rbac_read_degrade_total` (it moves ONLY for the
-  `ITServiceOwner` ceiling-read case: the management-group-store-unavailable `503` writes an audit
-  row and a `503` but does not move it); and, outside the server, a `503` on
-  `/fragments/executions` in your reverse-proxy access log or the browser network tab. The server
-  keeps no per-request access log. After the store recovers, reload the Instructions page.
+  will not clear it. `data-degraded="gate"` means the authorization gate could not decide. Look for
+  audit rows `auth.fleet_read_required` with `result=denied` (detail `fleet read blocked:
+  management-group store unavailable`, or the ceiling detail from the `ITServiceOwner` section
+  below) and `yuzu_server_rbac_read_degrade_total` (it moves ONLY for the `ITServiceOwner`
+  ceiling-read case: the management-group-store-unavailable refusal writes an audit row but does not
+  move it). The server keeps no per-request access log. None of the notes clears on its own: the
+  panel is loaded once, when the Instructions page reveals it (`hx-trigger="revealed"`, no polling),
+  so after the cause is fixed reload the Instructions page (or reopen the Execution History
+  section).
 - **Degraded store, MCP.** `summarize_working_set` returns an error carrying `retry_after_ms`
   where it used to say the execution "was not found".
 - **Empty confined page.** A confined caller who sees zero executions gets "No executions visible in
@@ -441,7 +455,7 @@ any future surface that narrows the role.
 **Failure behaviour.** A FAILED read of the `ITServiceOwner` role's permissions is a retryable `503`
 (`retry_after_ms` 5000, an audit row with detail "RBAC read degraded resolving the ITServiceOwner
 ceiling", and `yuzu_server_rbac_read_degrade_total` increments) rather than `403`, because an outage
-is not a missing grant; it still fails closed. This holds on the fleet-read gate and equally on
+is not a missing grant; it still fails closed (the dashboard executions fragment shows it as the HTTP `200` `data-degraded="gate"` note). This holds on the fleet-read gate and equally on
 `require_scoped_permission`, which answered `403` for this failure before this change; only a
 definitive deny is `403`. `require_permission` is different: a service-scoped token is refused there by
 the default-deny allow-list whatever the ceiling read returns, so a retry could not succeed, and a

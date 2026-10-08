@@ -268,7 +268,10 @@ gate.
   probe, not independently adjudicated, found no leak through the old gate; see
   `docs/auth-architecture.md`'s "Sixth migration"). With RBAC off both surfaces are unconfined for every
   authenticated non-service, non-engine caller whose tier allows it (an engine principal is refused
-  with 403 with RBAC off). The fragment suppresses the owner disjunct for service-scoped sessions
+  with 403 with RBAC off). When the gate refuses the fragment it still audits, but the response is
+  replaced with an HTTP 200 note (`data-denied="true"` for a 403, `data-degraded="gate"` for a 503;
+  a 401 passes through), because the dashboard drops 4xx/5xx bodies; the REST and MCP twins keep the
+  real 403/503. The fragment suppresses the owner disjunct for service-scoped sessions
   (a service-scoped token's session username is its minter); the other execution read surfaces still show
   a minter's executions to a service-scoped token (#5557). The fragment pushes the scope into SQL
   before its LIMIT and bounds the agent-status read to the visible agents; MCP's first gate stays a
