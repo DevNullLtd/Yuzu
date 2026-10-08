@@ -341,8 +341,8 @@ header names only "CHANGELOG order" as its required check. It installs PyYAML fr
 importable), so it reaches PyPI and is its own job so that an outage reds only this check. The
 same test is registered as the `definition descriptions` test in `tests/meson.build` (suite
 `docs`), and the `linux` and `windows` jobs of `ci.yml` list `--suite docs`, so the ratchet is
-enforced on the required `Linux gcc-15 debug` and `Windows MSVC debug` legs without depending on the advisory
-job. A PR that changes only `docs/**` or root `*.md` builds nothing (see "Docs-only changes"),
+enforced on the required `Linux gcc-15 debug` and `Windows MSVC debug` legs without depending on
+the advisory job. A PR that changes only `docs/**` or root `*.md` builds nothing (see "Docs-only changes"),
 but it cannot touch `content/` or the baseline, which are classified as code.
 
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
