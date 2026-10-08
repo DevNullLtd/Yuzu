@@ -237,9 +237,10 @@ public:
         /// configuration never reached in production.
         const yuzu::server::CommandCapabilityRegistry* capability_registry{nullptr};
         /// The prepared `parameter_schema` validators for `POST /api/instructions/:id/execute`.
-        /// One cache owned by ServerImpl and shared by every call site, so its byte budget is
-        /// global rather than per route-registration. nullptr = register_routes creates a
-        /// private cache (test harnesses that build Deps by hand).
+        /// One cache owned by ServerImpl for all call sites that take it from Deps (today the
+        /// execute route), so its byte budget is global rather than per route-registration.
+        /// nullptr = register_routes creates a private cache (test harnesses that build Deps by
+        /// hand).
         std::shared_ptr<instr::ParamValidatorCache> param_validators;
     };
 

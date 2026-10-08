@@ -20835,9 +20835,11 @@ private:
     std::shared_ptr<spdlog::logger> file_logger_;
     std::unique_ptr<grpc::Server> agent_server_;
     std::unique_ptr<grpc::Server> mgmt_server_;
-    // Prepared `parameter_schema` validators (#5562): one byte-bounded cache for every call site.
-    // Declared BEFORE web_server_ so it is destroyed AFTER the HTTP server, whose route lambdas
-    // also hold a shared_ptr copy; the cache has no pointer into any other ServerImpl member.
+    // Prepared `parameter_schema` validators (#5562): one byte-bounded cache shared by the call
+    // sites that take it from WorkflowRoutes::Deps. Declare it BEFORE every consumer (the HTTP
+    // server, background threads, any later holder of a raw reference) so it is destroyed AFTER
+    // them; the shared_ptr copies in the route lambdas are a second layer. The cache itself has
+    // no pointer into any other ServerImpl member.
     std::shared_ptr<instr::ParamValidatorCache> param_validator_cache_ =
         std::make_shared<instr::ParamValidatorCache>();
     std::unique_ptr<httplib::Server> web_server_;

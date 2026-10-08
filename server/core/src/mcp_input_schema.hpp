@@ -65,7 +65,7 @@ namespace yuzu::server::mcp {
 // pattern and what that one pattern can retain after matching. It is not an aggregate
 // bound: a schema can hold many patterns. The prepared-validator cache
 // (instruction_param_schema.hpp) weighs each cached validator at kPatternMaxMem per compiled
-// pattern and caps the total in bytes.
+// pattern and caps the retained total in bytes.
 inline constexpr std::int64_t kPatternMaxMem = 512 * 1024;
 
 namespace detail {

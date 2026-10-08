@@ -658,6 +658,8 @@ TEST_CASE("param-schema cache: many threads first-calling one schema all get a v
         t.join();
     CHECK(bad == 0);
     CHECK(cache.size() == 2);
+    // Two ids, so two entries: a racing insert of one key must not be counted twice.
+    CHECK(cache.bytes() == 2 * build(s).estimated_retained_bytes());
 }
 
 namespace {
@@ -698,6 +700,10 @@ TEST_CASE("param-schema weight: text plus fixed, per-property, per-enum-member a
 
     const std::string enum2 = one_prop(R"({"type":"string","enum":["a","bb"]})");
     CHECK(weight_of(enum2) == expected_weight(enum2, 1, 2, 0));
+    // An array's `items` enum members are charged like a property's own.
+    const std::string items_enum =
+        one_prop(R"({"type":"array","items":{"type":"string","enum":["a","bb","ccc"]}})");
+    CHECK(weight_of(items_enum) == expected_weight(items_enum, 1, 3, 0));
 
     for (std::size_t n : {1u, 3u, 8u}) {
         const std::string s = many_props(n, "^a$");
@@ -811,7 +817,7 @@ TEST_CASE("param-schema cache: the entry ceiling is a safety net on top of the b
     CHECK(kParamValidatorCacheEntries > 128);
 }
 
-TEST_CASE("param-schema cache: hostile max-pattern schemas cannot push the total past the budget",
+TEST_CASE("param-schema cache: hostile max-pattern schemas are served but never retained",
           "[instr][param-schema][cache]") {
     ParamValidatorCache cache;  // the production bounds
     const std::string small = one_prop(R"({"type":"string"})");
@@ -850,6 +856,68 @@ TEST_CASE("param-schema cache: an entry over the per-entry cap is not retained a
     CHECK(cache.bytes() == w_light);
     // The production cap is below the budget so a single entry cannot take it all.
     CHECK(kParamValidatorCacheMaxEntryBytes < kParamValidatorCacheMaxBytes);
+
+    // The cap is inclusive: an entry weighing exactly the cap is retained, one byte over is not.
+    ParamValidatorCache at_cap(kParamValidatorCacheEntries, 100 * weight_of(heavy), w_light);
+    REQUIRE(at_cap.get("a", light).has_value());
+    CHECK(at_cap.size() == 1);
+    ParamValidatorCache over_cap(kParamValidatorCacheEntries, 100 * weight_of(heavy), w_light - 1);
+    REQUIRE(over_cap.get("a", light).has_value());
+    CHECK(over_cap.size() == 0);
+    CHECK(over_cap.bytes() == 0);
+}
+
+TEST_CASE("param-schema cache: one heavy insert evicts as many older entries as it needs",
+          "[instr][param-schema][cache]") {
+    const std::string light = one_prop(R"({"type":"string"})");
+    json members = json::array();
+    for (int i = 0; i < 40; ++i)
+        members.push_back("m" + std::to_string(i));
+    const std::string mid = prop({{"type", "string"}, {"enum", members}});
+    const std::size_t w = weight_of(light);
+    const std::size_t w_mid = weight_of(mid);
+    REQUIRE(2 * w <= w_mid + w / 2);  // both light entries are resident before `mid` arrives
+
+    // The budget fits `mid` alone but not `mid` plus one light entry, so after the first
+    // eviction the total is still over: both light entries must go, and `mid` itself stays.
+    ParamValidatorCache cache(kParamValidatorCacheEntries, w_mid + w / 2);
+    REQUIRE(cache.get("a", light).has_value());
+    REQUIRE(cache.get("b", light).has_value());
+    REQUIRE(cache.size() == 2);
+    auto m = cache.get("m", mid);
+    REQUIRE(m.has_value());
+    CHECK(cache.size() == 1);
+    CHECK(cache.bytes() == w_mid);
+    CHECK(cache.get("m", mid)->get() == m->get());  // resident
+}
+
+TEST_CASE("param-schema cache: entries just under the per-entry cap evict each other in turn",
+          "[instr][param-schema][cache]") {
+    // 63 patterns weigh about 31.5 MiB: under the 32 MiB cap, so every one is retained, and
+    // four fit the 128 MiB budget. The cap gives no per-definition fairness: a fifth such
+    // definition evicts the least recently used one, and a rotation over more than four of them
+    // rebuilds on every call. That is accepted behaviour; the retained total stays bounded.
+    const std::string s = many_props(63, "^a$");
+    const std::size_t w = weight_of(s);
+    REQUIRE(w <= kParamValidatorCacheMaxEntryBytes);
+    REQUIRE(4 * w <= kParamValidatorCacheMaxBytes);
+    REQUIRE(5 * w > kParamValidatorCacheMaxBytes);
+
+    ParamValidatorCache cache;  // the production bounds
+    std::vector<std::shared_ptr<const ParamValidator>> built;
+    for (std::size_t i = 0; i < 5; ++i) {
+        auto r = cache.get("d" + std::to_string(i), s);
+        REQUIRE(r.has_value());
+        built.push_back(*r);
+        CHECK(cache.bytes() <= kParamValidatorCacheMaxBytes);
+        CHECK(cache.size() == std::min<std::size_t>(i + 1, 4));
+        CHECK(cache.get("d" + std::to_string(i), s)->get() == built.back().get());  // retained
+    }
+    CHECK(cache.bytes() == 4 * w);
+    CHECK(cache.get("d4", s)->get() == built[4].get());
+    CHECK(cache.get("d1", s)->get() == built[1].get());
+    CHECK(cache.get("d0", s)->get() != built[0].get());  // the oldest was evicted, rebuilt
+    CHECK(cache.bytes() <= kParamValidatorCacheMaxBytes);
 }
 
 TEST_CASE("param-schema cache: the shipped catalogue fits in half the production budget",

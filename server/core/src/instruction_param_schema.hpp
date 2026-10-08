@@ -74,15 +74,15 @@ inline constexpr std::size_t kMaxSchemaPatternProgramSize = 65536;
 inline constexpr std::size_t kMaxPatternMatchedStringBytes = 64 * 1024;
 inline constexpr std::uint64_t kMaxPatternMatchWork = 16ULL * 1024 * 1024;
 inline constexpr std::int64_t kIntegerBoundLimit = 9007199254740992;  // 2^53
-// Cache bounds. The byte budget is the real bound; the entry ceiling only caps the per-entry
-// bookkeeping (key, list node, map node) for validators that weigh almost nothing. The budget is
-// twice what a 128-pattern schema is estimated at (128 x mcp::kPatternMaxMem is 64 MiB), and a
-// test pins the shipped catalogue's total estimate at or below half of it.
+// Cache bounds. The byte budget bounds the RETAINED total; the entry ceiling only caps the
+// per-entry bookkeeping (key, list node, map node) for validators that weigh almost nothing.
+// The budget is twice what a 128-pattern schema is estimated at (128 x mcp::kPatternMaxMem is
+// 64 MiB), and a test pins the shipped catalogue's total estimate at or below half of it.
 inline constexpr std::size_t kParamValidatorCacheEntries = 4096;
 inline constexpr std::size_t kParamValidatorCacheMaxBytes = 128ULL * 1024 * 1024;
 // No single entry heavier than this is retained, so one hostile schema (a 128-pattern schema is
-// estimated at 64 MiB, inside the budget) cannot evict the rest of the cache in one insert. A
-// test pins every bundled schema under it.
+// estimated at 64 MiB, inside the budget) cannot evict the rest of the cache in one insert; it is
+// instead rebuilt on every call. A test pins every bundled schema under it.
 inline constexpr std::size_t kParamValidatorCacheMaxEntryBytes = 32ULL * 1024 * 1024;
 // Weight terms of ParamValidator::estimated_retained_bytes(), besides the schema text length
 // and one mcp::kPatternMaxMem per compiled pattern: a fixed cost per validator, a cost per
@@ -138,23 +138,32 @@ prepare_param_validator(std::string_view stored_schema_json);
 // definition's schema on every call. Keyed by (definition id, schema length, SHA-256 of
 // the schema text): an edited definition has a new key, and the old entry ages out.
 // Compilation runs OUTSIDE the lock, so concurrent first calls for one schema may each
-// compile it (accepted: there is no single-flight). Failures and absent validators are
-// never cached. If the digest cannot be computed the call compiles without caching.
+// compile it (accepted: there is no single-flight). Failures, absent validators and oversized
+// validators (see below) are never cached. If the digest cannot be computed the call compiles
+// without caching.
 //
 // The cache is bounded by BYTES. Each entry is weighed by ParamValidator::
-// estimated_retained_bytes() and least-recently-used entries are evicted until the total is at
-// most the byte budget; the entry ceiling is only a safety net on bookkeeping. An entry whose
-// own weight exceeds the whole budget is returned to the caller but not retained, so it never
-// evicts anything. The most a schema can weigh is about kMaxSchemaProperties x
-// mcp::kPatternMaxMem; an entry that fits the budget can still displace older entries, but the
-// total never exceeds the budget. The weights are upper-bound estimates, so the budget bounds
-// the estimate, not a measured resident size.
+// estimated_retained_bytes() and least-recently-used entries are evicted until the retained
+// total is at most the byte budget; the entry ceiling is only a safety net on bookkeeping. An
+// entry is retained only if its weight is at most BOTH the byte budget and the per-entry cap
+// (max_entry_bytes); an oversized validator is returned to the caller but never retained, so it
+// evicts nothing. The most a schema can weigh is about kMaxSchemaProperties x
+// mcp::kPatternMaxMem; an entry that is admitted can still displace older entries, but the
+// RETAINED total never exceeds the budget. Peak memory is the retained total plus the validators
+// in flight: one per concurrent request, since there is no single-flight and concurrent first
+// calls for one schema each build their own. An entry over the cap or the budget is rebuilt on
+// every call, a deliberate trade of repeated CPU for a bounded cache (measured once, on one host
+// at -O2: a 128-pattern schema prepared in roughly 0.5 to 1 ms with a trivial `^a$` pattern and
+// about 15 ms with a `[a-zA-Z0-9_.-]{1,64}` pattern). The weights are upper-bound estimates, so the budget
+// bounds the estimate, not a measured resident size.
 class ParamValidatorCache {
   public:
     using Result =
         std::expected<std::shared_ptr<const ParamValidator>, std::vector<std::string>>;
 
-    // max_entries < 1 is read as 1. max_bytes == 0 retains nothing.
+    // max_entries < 1 is read as 1. max_bytes == 0 retains nothing. max_entry_bytes is the
+    // heaviest single entry retained: a validator weighing more than it (or than max_bytes) is
+    // returned but never cached.
     explicit ParamValidatorCache(std::size_t max_entries = kParamValidatorCacheEntries,
                                  std::size_t max_bytes = kParamValidatorCacheMaxBytes,
                                  std::size_t max_entry_bytes = kParamValidatorCacheMaxEntryBytes);

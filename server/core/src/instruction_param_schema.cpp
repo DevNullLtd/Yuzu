@@ -796,7 +796,7 @@ ParamValidatorCache::Result ParamValidatorCache::get(const std::string& definiti
             }
         }
     } catch (...) {
-        // Caching is an optimisation: an allocation failure leaves the cache usable.
+        // Caching is an optimisation: an allocation or lock failure leaves the cache usable.
     }
     return result;
 }
