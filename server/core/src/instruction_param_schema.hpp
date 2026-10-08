@@ -80,6 +80,10 @@ inline constexpr std::int64_t kIntegerBoundLimit = 9007199254740992;  // 2^53
 // test pins the shipped catalogue's total estimate at or below half of it.
 inline constexpr std::size_t kParamValidatorCacheEntries = 4096;
 inline constexpr std::size_t kParamValidatorCacheMaxBytes = 128ULL * 1024 * 1024;
+// No single entry heavier than this is retained, so one hostile schema (a 128-pattern schema is
+// estimated at 64 MiB, inside the budget) cannot evict the rest of the cache in one insert. A
+// test pins every bundled schema under it.
+inline constexpr std::size_t kParamValidatorCacheMaxEntryBytes = 32ULL * 1024 * 1024;
 // Weight terms of ParamValidator::estimated_retained_bytes(), besides the schema text length
 // and one mcp::kPatternMaxMem per compiled pattern: a fixed cost per validator, a cost per
 // declared property, and a cost per enum member (the compiled schema keeps each member as a
@@ -152,7 +156,8 @@ class ParamValidatorCache {
 
     // max_entries < 1 is read as 1. max_bytes == 0 retains nothing.
     explicit ParamValidatorCache(std::size_t max_entries = kParamValidatorCacheEntries,
-                                 std::size_t max_bytes = kParamValidatorCacheMaxBytes);
+                                 std::size_t max_bytes = kParamValidatorCacheMaxBytes,
+                                 std::size_t max_entry_bytes = kParamValidatorCacheMaxEntryBytes);
 
     [[nodiscard]] Result get(const std::string& definition_id, const std::string& stored_schema);
 
@@ -171,6 +176,7 @@ class ParamValidatorCache {
 
     const std::size_t max_entries_;
     const std::size_t max_bytes_;
+    const std::size_t max_entry_bytes_;
     mutable std::mutex mu_;
     std::list<Entry> lru_;  // front = most recently used
     std::unordered_map<std::string, std::list<Entry>::iterator> index_;

@@ -826,9 +826,30 @@ TEST_CASE("param-schema cache: hostile max-pattern schemas cannot push the total
         CHECK(cache.bytes() <= kParamValidatorCacheMaxBytes);
         ++admitted;
     }
-    // Each hostile schema weighs 128 patterns' worth, so they cannot all stay.
-    CHECK(cache.size() < 3 + admitted);
-    CHECK(cache.size() >= 1);
+    // Each hostile schema weighs 128 patterns' worth (above the per-entry cap), so none is
+    // retained and the resident entries are untouched.
+    CHECK(admitted == 4);
+    CHECK(cache.size() == 3);
+    CHECK(cache.bytes() == 3 * weight_of(small));
+}
+
+TEST_CASE("param-schema cache: an entry over the per-entry cap is not retained and evicts nothing",
+          "[instr][param-schema][cache]") {
+    const std::string light = one_prop(R"({"type":"string"})");
+    const std::string heavy = many_props(2, "^a$");  // two patterns
+    const std::size_t w_light = weight_of(light);
+    REQUIRE(weight_of(heavy) > 4 * w_light);
+
+    // Budget for everything, but a per-entry cap that admits only the light schema.
+    ParamValidatorCache cache(kParamValidatorCacheEntries, 100 * weight_of(heavy), 2 * w_light);
+    REQUIRE(cache.get("light", light).has_value());
+    auto big = cache.get("heavy", heavy);
+    REQUIRE(big.has_value());
+    CHECK_FALSE((*big)->check(json{{"p0", "a"}, {"p1", "a"}}).has_value());  // fully usable
+    CHECK(cache.size() == 1);
+    CHECK(cache.bytes() == w_light);
+    // The production cap is below the budget so a single entry cannot take it all.
+    CHECK(kParamValidatorCacheMaxEntryBytes < kParamValidatorCacheMaxBytes);
 }
 
 TEST_CASE("param-schema cache: the shipped catalogue fits in half the production budget",

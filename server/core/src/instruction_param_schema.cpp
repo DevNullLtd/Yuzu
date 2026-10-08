@@ -725,8 +725,10 @@ prepare_param_validator(std::string_view stored_schema_json) {
     return ParamValidator(std::move(impl));
 }
 
-ParamValidatorCache::ParamValidatorCache(std::size_t max_entries, std::size_t max_bytes)
-    : max_entries_(max_entries == 0 ? 1 : max_entries), max_bytes_(max_bytes) {}
+ParamValidatorCache::ParamValidatorCache(std::size_t max_entries, std::size_t max_bytes,
+                                         std::size_t max_entry_bytes)
+    : max_entries_(max_entries == 0 ? 1 : max_entries), max_bytes_(max_bytes),
+      max_entry_bytes_(max_entry_bytes) {}
 
 std::size_t ParamValidatorCache::size() const {
     std::lock_guard lk(mu_);
@@ -770,10 +772,10 @@ ParamValidatorCache::Result ParamValidatorCache::get(const std::string& definiti
     Result result = build();  // outside the lock
     if (!result || (*result)->absent())
         return result;
-    // An entry heavier than the whole budget is handed back but never retained: admitting it
-    // would evict every other entry, and it could not stay within the budget anyway.
+    // An entry heavier than the whole budget, or than the per-entry cap, is handed back but
+    // never retained: admitting it would evict most of the other entries in one insert.
     const std::size_t weight = (*result)->estimated_retained_bytes();
-    if (weight > max_bytes_)
+    if (weight > max_bytes_ || weight > max_entry_bytes_)
         return result;
     try {
         std::lock_guard lk(mu_);
