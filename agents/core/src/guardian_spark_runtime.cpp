@@ -3061,14 +3061,17 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         // A prior generation whose capture is committed but could not be staged
         // (baseline_unstaged: an allocation failure) is staged FIRST, on the same path, so the
         // lookup below inherits it. Without that, every identical re-push inside the failure
-        // window would re-capture whatever the file holds now. If this attempt fails too the
-        // replacement captures afresh (counted: stage_baseline_locked bumps the drop counter);
-        // that is the one remaining window and it closes at the first successful staging.
+        // window would re-capture whatever the file holds now. If this attempt fails too, the
+        // withdrawal below retries once more (detach_rule_locked salvages) and staging is read
+        // AGAIN after it; only if that fails as well does the replacement capture afresh
+        // (counted: stage_baseline_locked bumps the drop counter). That is the one remaining
+        // window, and it closes at the first successful staging.
         // key_for_rule may allocate; nothing has been mutated yet, so a throw is a plain unwind.
         std::string inherited_hash;
-        if (rg->assertion.kind == AssertionKind::FileHashEquals &&
-            rg->assertion.expected_hash.empty() &&
-            std::holds_alternative<FileSparkParams>(spec.params)) {
+        const bool baseline_on_arm_file = rg->assertion.kind == AssertionKind::FileHashEquals &&
+                                          rg->assertion.expected_hash.empty() &&
+                                          std::holds_alternative<FileSparkParams>(spec.params);
+        if (baseline_on_arm_file) {
             if (const auto prior = rules_.find(rule_id);
                 prior != rules_.end() && prior->second->baseline_unstaged &&
                 prior->second->eval.baseline_set) { // eval: registry_mu_ is enough, see its field doc
@@ -3092,6 +3095,24 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         }
 
         prior_disarm = detach_rule_locked(rule_id);
+        // The withdrawal above retries staging a still-unstaged capture too (its salvage), and
+        // may succeed where the attempt before it failed: read staging again, or the replacement
+        // captures afresh although the original is now staged. The prior generation is gone, so
+        // this copy must not unwind (a throw would leave the rule with no live arm); a failure
+        // costs only the inheritance, counted like any other failed staging attempt.
+        if (baseline_on_arm_file && inherited_hash.empty()) {
+            try {
+                if (const auto sit = staged_baselines_.find(rule_id);
+                    sit != staged_baselines_.end() &&
+                    sit->second.path == std::get<FileSparkParams>(spec.params).path) {
+                    if (fail_next_inherit_copy_.exchange(false, std::memory_order_relaxed))
+                        throw std::bad_alloc{}; // TEST-ONLY seam: the copy below failing
+                    inherited_hash = sit->second.hash;
+                }
+            } catch (...) {
+                staged_baseline_drops_->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (!inherited_hash.empty())
             rg->assertion.expected_hash = std::move(inherited_hash); // noexcept string move
 

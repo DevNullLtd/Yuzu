@@ -15370,6 +15370,69 @@ TEST_CASE("#4045 R9c: a same-id re-attach while the capture is unstaged inherits
     CHECK(rt2->staged_baseline_count_for_test() == 0);
 }
 
+TEST_CASE("#4045 R9c2: a delta re-push whose attach-time staging retry fails but whose "
+          "withdrawal retry succeeds still inherits the ORIGINAL hash",
+          "[spark][runtime][baseline]") {
+    // attach_core reads staging for the inherited hash BEFORE it detaches the prior generation,
+    // and the withdrawal's own staging retry runs inside that detach: the read has to be
+    // repeated afterwards, or the replacement captures afresh although the original is staged.
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    const auto key = spark_key(file_spec("/a"));
+    // Failure 1: the capture is not staged. Failure 2: the attach-time retry. The withdrawal's
+    // retry (inside detach_rule_locked) then succeeds.
+    rt->fail_next_stage_baseline_for_test(2);
+    rt->evaluate_key(key, EvalReason::Initial); // captured "h", NOT staged
+    REQUIRE(rt->staged_baseline_count_for_test() == 0);
+    (void)drain_all(*rt);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    CHECK(rt->staged_baseline_drops() == 2);
+    {
+        const auto got = rt->snapshot_staged_baselines();
+        REQUIRE(got.size() == 1);
+        CHECK(same_capture(got[0], "r1", "/a", "h")); // staged by the withdrawal
+    }
+    rt->evaluate_key(key, EvalReason::Initial);
+    bool drift_vs_original = false;
+    bool compliant_on_drifted_file = false;
+    for (const auto& e : drain_all(*rt)) {
+        if (e.domain != OutboxDomain::Compliance)
+            continue;
+        drift_vs_original = drift_vs_original || (!e.drift.compliant && e.drift.expected_value == "h" &&
+                                                  e.drift.detected_value == "h2");
+        compliant_on_drifted_file = compliant_on_drifted_file || e.drift.compliant;
+    }
+    // RED: the replacement captured "h2" afresh and reported compliant on the drifted file.
+    CHECK(drift_vs_original);
+    CHECK_FALSE(compliant_on_drifted_file);
+    CHECK(rt->staged_baseline_drops() == 2); // the replacement staged nothing further
+}
+
+TEST_CASE("#4045 R9c3: if reading the staged hash back after the withdrawal throws, the rule "
+          "keeps its live arm, the failure is counted, and only the inheritance is lost",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    const auto key = spark_key(file_spec("/a"));
+    rt->fail_next_stage_baseline_for_test(2); // not staged; the attach-time retry fails too
+    rt->evaluate_key(key, EvalReason::Initial);
+    (void)drain_all(*rt);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+    rt->fail_next_inherit_copy_for_test(); // the copy of the hash staged by the withdrawal
+    // The prior generation is already detached when the copy fails: attach must still succeed.
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    CHECK(rt->staged_baseline_drops() == 3); // two failed stagings + the failed read-back
+    CHECK(rt->staged_baseline_count_for_test() == 1); // the original is still staged for the persister
+    rt->evaluate_key(key, EvalReason::Initial); // the replacement captured afresh (the residual)
+    CHECK(rt->rule_count() == 1); // the rule is armed and evaluating
+}
+
 TEST_CASE("#4045 R9d: a withdrawal (detach_all, as a full_sync does, or detach_rule) while the "
           "capture is unstaged stages the committed hash first, so the re-attached rule still "
           "inherits the ORIGINAL baseline",
