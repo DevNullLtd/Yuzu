@@ -2145,8 +2145,8 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   more after the stop began. What remains: the pass's first write always runs (the wall is
   checked between tuples), so one that starts just inside the cutoff can still spend a 5 s
   busy timeout; the delivery worker's non-baseline KV writes serialise on `KvStore::mu_`
-  and put their own busy timeout in front of every stage (measured 23 s to 25 s against a
-  store that stays busy); and a stop that reaches the watchdog exits with code 4 and writes
+  and put their own busy timeout in front of every stage (23 s to 25 s, measured in an earlier
+  review round against a store that stays busy, before the late-start skip); and a stop that reaches the watchdog exits with code 4 and writes
   no log line. A remaining-deadline wall threaded through every stage was considered and
   not done. Issue to be filed (TODO, no number yet).
 - Owner: not assigned for any item above.

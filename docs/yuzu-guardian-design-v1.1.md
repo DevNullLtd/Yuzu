@@ -2682,7 +2682,8 @@ Guardian ladder must check these.
   ledger 5 + this pass 5); idle worker, a journal record pending 15 s (journal 5 + ledger
   5 + journal 5, this pass skipped because it would start at 15 s); worker mid-write on a
   baseline 20 s (this pass skipped); worker mid-write on its other KV traffic (journal
-  sent-markers, which also take `KvStore::mu_`) 23 s to 25 s, past the grace. #4045 adds at
+  sent-markers, which also take `KvStore::mu_`) 23 s to 25 s, past the grace (measured in
+  an earlier review round, before the late-start skip; not re-measured). #4045 adds at
   most one busy timeout to that (the join waiting for the worker's baseline write, or this
   pass, never both), and none once the earlier stages have used 15 s; the earlier stages
   and the worker's other writes are outside its control, and slow SUCCESSFUL writes are not

@@ -62,6 +62,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "guardian_backend.hpp"           // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
 #include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_persist_heartbeat_tags (#4045)
+#include "guardian_baseline_persister.hpp" // kBaselineShutdownGrace (#4045; static_assert below)
 #include "guardian_io_ceiling_heartbeat.hpp" // emit_guardian_io_ceiling_heartbeat_tags (rung 9c PR-3)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
 #include "guardian_legacy_sink_executor.hpp" // #4783: LegacySendOutcome (EventSink's return type)
@@ -175,6 +176,11 @@ constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 // TerminateProcess actually lands inside this margin before the SCM gives up waiting on
 // STOP_PENDING; see "Stopping a wedged agent" in docs/user-manual/server-admin.md.
 constexpr std::chrono::milliseconds kShutdownDeadlineGrace{20'000};
+// #4045: GuardianEngine::stop() skips its final baseline flush when it would start too close to
+// this deadline, using a mirror of it (the persister header cannot see this file-local
+// constant). A change here must be a conscious change there.
+static_assert(kShutdownDeadlineGrace == kBaselineShutdownGrace,
+              "guardian_baseline_persister.hpp's kBaselineShutdownGrace mirrors this deadline");
 
 // #2303 sec-L. The daily-sync scheduler (ADR-0016) persists last-hash / need_full state in this
 // kv_store namespace, keyed the same way plugin storage is (by the plugin's own declared name).

@@ -1295,11 +1295,13 @@ void GuardianEngine::stop() {
     //     record pending                              (its BUSY write held KvStore::mu_ first)
     // The last row is on the watchdog. The worker's OTHER KV writes (journal sent-markers) take
     // KvStore::mu_ too, so a worker mid-write puts its own busy timeout in front of every stage
-    // here: measured 23 s to 25 s with this pass skipped (28 s when it still ran), all past the
-    // 20 s grace, with or without #4045. #4045 adds at most ONE busy timeout to that (the join
-    // waiting for the worker's baseline write, or this pass, never both) and, with the late-
-    // start skip, no longer adds one at all once the earlier stages have used 15 s. What it
-    // cannot bound: the journal and ledger stages above and the worker's non-baseline writes.
+    // here: the earlier review rounds measured 23 s to 25 s with this pass skipped and 28 s when
+    // it still ran (before the late-start skip existed; with it the 28 s row should end at
+    // 23 s, which was not re-measured), all past the 20 s grace, with or without #4045.
+    // #4045 adds at most ONE busy timeout to that (the join waiting for the worker's baseline
+    // write, or this pass, never both) and, with the late-start skip, no longer adds one at
+    // all once the earlier stages have used 15 s. What it cannot bound: the journal and
+    // ledger stages above and the worker's non-baseline writes.
     persist_staged_baselines_locked(/*at_stop=*/true);
     stopped_ = true;
     started_ = false;

@@ -205,7 +205,7 @@ public:
 
     /// Who is draining. Worker honours the retry backoff and yields (see YIELDING); Forced
     /// (apply_rules) and Stop ignore the backoff. Stop also runs under the tighter
-    /// kBaselineStopBudget and skips its pass after a stall during this stop (begin_stop()).
+    /// kBaselineStopBudget and skips its pass in the two cases begin_stop() lists.
     /// persist_staged takes the trigger with no default: a caller must say which.
     enum class Trigger { Forced, Worker, Stop };
 
@@ -499,8 +499,8 @@ private:
     std::string cursor_;
     /// The last pass that attempted anything saw a failed write that took at least the stop
     /// wall budget (a BUSY store burns a busy timeout per write), and `stalled_at_` is when it
-    /// ended (steady_clock rep). persist_mu_-guarded. A Stop pass skips iff stalled_at_ is at or
-    /// after begin_stop()'s mark.
+    /// ended (steady_clock rep). persist_mu_-guarded. A Stop pass skips for a stall iff
+    /// stalled_at_ is at or after begin_stop()'s mark (it also skips a late start, see there).
     bool stalled_{false};
     Clock::rep stalled_at_{0};
     std::function<Clock::time_point()> clock_;
