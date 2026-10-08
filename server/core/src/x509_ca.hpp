@@ -11,12 +11,11 @@
 /// extracted into a lib shared with the agent (PR3) without dragging server
 /// state along.
 ///
-/// Algorithm policy (locked): ECDSA P-256 leaves, P-384 root. ECDSA is the
-/// roadmap-aligned choice for the planned gRPC→QUIC move (#376): QUIC mandates
-/// TLS 1.3, which treats ecdsa_secp256r1_sha256 / ecdsa_secp384r1_sha384 as
-/// first-class, and the smaller certs cost fewer bytes under QUIC's
-/// anti-amplification limit. The signature digest is chosen from the *issuer*
-/// key strength (P-384 CA → SHA-384, P-256 → SHA-256).
+/// Algorithm policy (locked): ECDSA P-256 leaves, P-384 root. TLS 1.3 (the
+/// gRPC transport's target floor, #4722/#1293) treats ecdsa_secp256r1_sha256 /
+/// ecdsa_secp384r1_sha384 as first-class, and the certs are smaller than RSA.
+/// (Originally also chosen for a planned QUIC move, withdrawn by ADR-0066.)
+/// The signature digest is chosen from the *issuer* key strength (P-384 CA → SHA-384, P-256 → SHA-256).
 ///
 /// Every function returns std::nullopt on failure and logs the OpenSSL error
 /// stack via spdlog. The implementation is compiled only when OpenSSL is

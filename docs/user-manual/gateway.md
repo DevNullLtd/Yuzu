@@ -933,8 +933,7 @@ the plaintext edge, but a *compromised gateway itself* can still inject commands
 to the fleet — the compensating controls are app-layer: the server's
 gateway-authoritative `gateway_observed_peer` attribution and the enrollment
 approval workflow. Full cryptographic agent-to-gateway identity (so the gateway
-can't forge an agent) arrives with the through-gateway attestation work gated on
-PR5d / the QUIC migration (#376).
+can't forge an agent) arrives with the through-gateway attestation work (#1292, under #4722).
 
 #### End-to-end enablement runbook (manual / interim)
 
@@ -1049,8 +1048,8 @@ yuzu-server --gateway-upstream "0.0.0.0:50055"
 > `RegisterRequest.gateway_observed_peer` field that carries the agent origin
 > (recording `source_ip`=agent origin and `gateway_ip`=transport peer when
 > present), but the gateway does not yet populate it — today's grpcbox transport
-> cannot observe the direct agent peer, and the durable source arrives with the
-> QUIC transport migration (#376). Until then, SIEM/audit consumers correlating
+> cannot observe the direct agent peer; the grpcbox peer-address fix is tracked
+> in #1172. Until then, SIEM/audit consumers correlating
 > `source_ip` with network logs on this path will see the gateway's address.
 
 ### What happens when the server restarts

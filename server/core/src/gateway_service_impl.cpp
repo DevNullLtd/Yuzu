@@ -401,8 +401,9 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
     // succeeds. The set still assumes the gateway-upstream listener (:50055)
     // is itself authenticated via TLS/mTLS at the operator's network
     // boundary — without that, an attacker who reaches the port AND knows
-    // a valid enrollment token could still add themselves; the post-PR-3
-    // native-QUIC redesign tightens this with mandatory peer-cert pinning.
+    // a valid enrollment token could still add themselves. The upstream
+    // listener is strict mTLS (PKI PR5); per-gateway peer pinning on it is
+    // owned by the gateway-hop identity work under #4722 (ADR-0066).
 
     // Fast path: agent already enrolled from a prior connection
     {

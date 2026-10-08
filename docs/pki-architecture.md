@@ -7,11 +7,11 @@ required — while still letting enterprises root Yuzu in their own CA later
 subsystem; the auth-facing detail lives in `docs/auth-architecture.md`
 ("Default certificates", "Per-agent mTLS").
 
-**Algorithm policy (locked):** ECDSA P-256 leaves, P-384 root. ECDSA is
-roadmap-aligned for the gRPC→QUIC move (#376): QUIC mandates TLS 1.3, which
-treats `ecdsa_secp256r1_sha256` / `ecdsa_secp384r1_sha384` as first-class, and
-the smaller certs cost fewer bytes under QUIC's anti-amplification limit. The
-signature digest follows the *issuer* key strength (P-384 → SHA-384, P-256 →
+**Algorithm policy (locked):** ECDSA P-256 leaves, P-384 root. TLS 1.3 (the
+gRPC transport's target floor, #4722/#1293) treats `ecdsa_secp256r1_sha256` /
+`ecdsa_secp384r1_sha384` as first-class, and ECDSA certs are smaller than RSA.
+(Originally also chosen for a gRPC→QUIC move; that move was withdrawn by ADR-0066.)
+The signature digest follows the *issuer* key strength (P-384 → SHA-384, P-256 →
 SHA-256). **100% OpenSSL 3.x** — no hand-rolled cryptographic primitives. RSA and
 a configurable key algorithm are explicit non-goals for Milestone 1.
 
@@ -409,7 +409,7 @@ source:
 > forwarded) while the agents still enrolled and received commands; behind an L4 TCP
 > forwarder (nginx `stream`) there were no rejections. The agent sees the same
 > `unknown session` for every rejection reason, so diagnose from the gateway
-> counters and summary log. The QUIC transport (#376) is the longer-term native path.
+> counters and summary log. The native fix is sourcing the peer from grpcbox itself (#1172); gRPC is the permanent transport (ADR-0066).
 
 The canonical correct gateway TLS config is `gateway/config/sys.config.prod`
 (upstream `{https,...}` mutual TLS + **one-way TLS on the agent listener** (PR5c) +
@@ -474,7 +474,8 @@ presented leaf); **denying** the agent is what stops re-enrollment/re-issuance
 agent↔gateway hop is one-way TLS (PR5c), so the issued leaf is presented to a
 non-verifying listener for now — issuing it completes per-agent-mTLS day-one
 (records the cert for inventory/revocation, future-proofs gateway mTLS), but
-*cryptographic* through-gateway identity binding remains the QUIC-era follow-up
+*cryptographic* through-gateway identity binding remains a follow-up (the gRPC
+gateway-hop identity design under #4722, ADR-0066)
 (agent identity across the gateway is still the app-layer `gateway_observed_peer`).
 
 ### Distribution flip — shipped as #1314
@@ -810,8 +811,8 @@ gateway-upstream service authenticates its caller as an authorized gateway by SP
 pin (which establishes WHICH gateway is calling, not which agents it may relay for)
 and every forged leaf is recorded in
 `ca_issued` + revocable, and a revoked `agent_id` is then re-issue-blocked by the
-#1239 HIGH-2 guard. Closed durably by gateway-mTLS / the QUIC through-gateway
-identity migration, #376); **gateway `_pb.erl` regen CI guard** — gpb generates
+#1239 HIGH-2 guard. Closed durably by gateway-hop mTLS + attestation — the gRPC
+design under #4722, ADR-0066); **gateway `_pb.erl` regen CI guard** — gpb generates
 self-contained modules, so a field added to the agent-listener `agent_pb` but not
 the `ProxyRegister` marshaller `gateway_pb` is silently stripped in transit (the
 PR5 `csr_pem` catch; `agent.proto:96`); a per-module roundtrip test covers it but a

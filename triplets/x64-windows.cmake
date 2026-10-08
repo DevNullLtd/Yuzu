@@ -72,11 +72,10 @@ set(VCPKG_LIBRARY_LINKAGE dynamic)
 # 'cmake', ...)` and gcc/clang's CRT-agnostic static linkage tolerates
 # mixed build types.
 #
-# ── Strategic escape: #376
+# ── Permanent, not a stopgap
 #
-# Moving off gRPC to QUIC would obsolete this entire comment. Tracked
-# as P1 #376 "Strategic: Migrate transport off gRPC to QUIC". Deferred
-# until current customer commitments ship.
+# The gRPC→QUIC "strategic escape" (#376) was withdrawn by ADR-0066:
+# gRPC is the permanent transport, so this override stays load-bearing.
 # ============================================================================
 
 # Force static linkage for the grpc stack — option D of #375.

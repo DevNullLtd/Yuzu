@@ -99,3 +99,8 @@ the network-layer mitigation is enforced for any exposed gateway and gateway rev
 paired with **deny**. The shipped reference config
 + proto fix are unit-proven (PR5: 194 eunit; PR5c: 200 eunit, dialyzer clean, real EC mutual-
 and one-way-TLS handshakes).
+
+**Update 2026-10-08:** the QUIC migration (#376) cited above as a durable path for R-5/R-6 was
+withdrawn by ADR-0066. The durable fix is now a gRPC gateway-hop identity design (optional
+client-cert verification on the agent listener + gateway attestation / per-gateway scoping,
+#1292) under #4722. The residual ratings above are unchanged.
