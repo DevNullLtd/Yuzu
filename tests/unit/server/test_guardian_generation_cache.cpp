@@ -1,7 +1,7 @@
 /**
- * test_guardian_generation_cache.cpp: GuardianGenerationCache (#5513, Fable opinion
- * sections A and F item 1). Injected fetch and clock; concurrency tests synchronise
- * on events, never on sleeps.
+ * test_guardian_generation_cache.cpp: GuardianGenerationCache (#5513). Injected fetch and
+ * clock; concurrency tests synchronise on events. The one real timeout (max_wait) is set to a
+ * few milliseconds.
  */
 
 #include "guardian_generation_cache.hpp"
@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -310,4 +311,166 @@ TEST_CASE("GuardianGenerationCache: an invalidate during a flight is not undone 
     CHECK(older == 7);            // its own caller still gets its result
     CHECK(c.get().value() == 8);  // but it did not repopulate the cache
     CHECK(calls.load() == 2);
+}
+
+TEST_CASE("GuardianGenerationCache: get_fresh bypasses the TTL and installs the result",
+          "[guardian][generation_cache]") {
+    ManualClock clk;
+    ScriptedFetch f;
+    GuardianGenerationCache c(f.fn(), {}, clk.fn());
+    REQUIRE(c.get().value() == 5);
+    f.value = 9;  // a bump the cached value has not seen
+    // Inside the TTL get() still serves the stale value: that is the hazard get_fresh closes.
+    CHECK(c.get().value() == 5);
+
+    CHECK(c.get_fresh().value() == 9);
+    CHECK(f.calls.load() == 2);
+    // The fresh read became the cached outcome, so get() now agrees with it.
+    CHECK(c.get().value() == 9);
+    CHECK(f.calls.load() == 2);
+    CHECK(c.fetches() == 2);
+}
+
+TEST_CASE("GuardianGenerationCache: a stale cached generation never labels a push",
+          "[guardian][generation_cache]") {
+    // The reconcile lambda decides from get() and labels from get_fresh(). Model that: after a
+    // bump the cached value is lower than the store's, and the two reads must disagree.
+    ManualClock clk;
+    ScriptedFetch f;
+    GuardianGenerationCache c(f.fn(), {}, clk.fn());
+    REQUIRE(c.get().value() == 5);
+    f.value = 6;
+    const std::uint64_t decide_from = c.get().value();
+    const std::uint64_t label_with = c.get_fresh().value();
+    CHECK(decide_from == 5);
+    CHECK(label_with == 6);
+    CHECK(label_with > decide_from);
+}
+
+TEST_CASE("GuardianGenerationCache: get_fresh reports a failed read and does not hide it",
+          "[guardian][generation_cache]") {
+    ManualClock clk;
+    ScriptedFetch f;
+    GuardianGenerationCache c(f.fn(), {}, clk.fn());
+    REQUIRE(c.get().value() == 5);
+    f.fail = true;
+    auto r = c.get_fresh();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == "store degraded");
+    // The failure is now the cached outcome (negative TTL), not the old success.
+    CHECK_FALSE(c.get().has_value());
+}
+
+TEST_CASE("GuardianGenerationCache: an invalidate during get_fresh is not undone by it",
+          "[guardian][generation_cache]") {
+    ManualClock clk;
+    Event entered, release;
+    std::atomic<int> calls{0};
+    GuardianGenerationCache c(
+        [&]() -> GuardianGenerationCache::Result {
+            if (calls.fetch_add(1) == 0) {
+                entered.set();
+                release.wait();
+                return 7;
+            }
+            return 8;
+        },
+        {}, clk.fn());
+    std::uint64_t older = 0;
+    std::thread t([&] { older = c.get_fresh().value(); });
+    entered.wait();
+    c.invalidate();
+    release.set();
+    t.join();
+    CHECK(older == 7);
+    CHECK(c.get().value() == 8);
+}
+
+TEST_CASE("GuardianGenerationCache: invalidate makes the next get() refetch",
+          "[guardian][generation_cache]") {
+    ManualClock clk;
+    ScriptedFetch f;
+    GuardianGenerationCache c(f.fn(), {}, clk.fn());
+    REQUIRE(c.get().value() == 5);
+    f.value = 6;
+    c.invalidate();
+    CHECK(c.get().value() == 6);
+    CHECK(f.calls.load() == 2);
+}
+
+TEST_CASE("GuardianGenerationCache: a waiter gives up after max_wait while the fetch runs on",
+          "[guardian][generation_cache]") {
+    ManualClock clk;
+    Event entered, release;
+    std::atomic<int> calls{0};
+    GuardianGenerationCache c(
+        [&]() -> GuardianGenerationCache::Result {
+            calls.fetch_add(1);
+            entered.set();
+            release.wait();
+            return 42;
+        },
+        {.max_wait = 10ms}, clk.fn());
+
+    std::uint64_t leader_got = 0;
+    std::thread leader([&] { leader_got = c.get().value(); });
+    entered.wait();
+    // No cached value, so this caller waits on the flight and must time out.
+    auto waiter = c.get();
+    REQUIRE_FALSE(waiter.has_value());
+    CHECK(waiter.error().find("timed out") != std::string::npos);
+    CHECK(calls.load() == 1);
+
+    release.set();  // the loader thread is unaffected by the waiter's timeout
+    leader.join();
+    CHECK(leader_got == 42);
+    CHECK(c.get().value() == 42);
+}
+
+TEST_CASE("GuardianGenerationCache: a fetch that throws bad_alloc leaves the cache usable",
+          "[guardian][generation_cache]") {
+    ManualClock clk;
+    std::atomic<int> calls{0};
+    GuardianGenerationCache c(
+        [&]() -> GuardianGenerationCache::Result {
+            if (calls.fetch_add(1) == 0)
+                throw std::bad_alloc();
+            return 11;
+        },
+        {}, clk.fn());
+    auto first = c.get();
+    REQUIRE_FALSE(first.has_value());
+    clk.advance(1s);  // negative entry expired
+    // The flight was cleared: a second caller fetches (it does not wait on a dead flight).
+    auto second = c.get();
+    REQUIRE(second.has_value());
+    CHECK(*second == 11);
+    CHECK(calls.load() == 2);
+}
+
+TEST_CASE("GuardianGenerationCache: get() racing a throwing flight never hangs",
+          "[guardian][generation_cache]") {
+    // A waiter registered on a flight whose fetch throws must wake with an error, not block
+    // for max_wait or forever.
+    ManualClock clk;
+    Event entered, release;
+    std::atomic<int> calls{0};
+    GuardianGenerationCache c(
+        [&]() -> GuardianGenerationCache::Result {
+            if (calls.fetch_add(1) == 0) {
+                entered.set();
+                release.wait();
+                throw std::runtime_error("boom");
+            }
+            return 3;
+        },
+        {.max_wait = 60'000ms}, clk.fn());  // a hang would show as a 60 s test, not a timeout pass
+    std::thread leader([&] { (void)c.get(); });
+    entered.wait();
+    GuardianGenerationCache::Result waiter = std::unexpected(std::string("unset"));
+    std::thread w([&] { waiter = c.get(); });
+    release.set();
+    leader.join();
+    w.join();
+    REQUIRE_FALSE(waiter.has_value());
 }

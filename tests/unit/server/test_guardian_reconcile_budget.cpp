@@ -1,6 +1,6 @@
 /**
- * test_guardian_reconcile_budget.cpp: GuardianReconcileBudget (#5513, Fable opinion
- * section C). Pure unit tests with an injected manual clock; nothing sleeps.
+ * test_guardian_reconcile_budget.cpp: GuardianReconcileBudget (#5513). Pure unit tests with an
+ * injected manual clock; nothing sleeps.
  */
 
 #include "guardian_reconcile_budget.hpp"

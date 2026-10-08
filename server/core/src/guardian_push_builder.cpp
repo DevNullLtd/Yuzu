@@ -130,6 +130,26 @@ filter_deployed_members(const std::vector<GuaranteedStateRuleRow>& rules,
     return out;
 }
 
+std::expected<Bundle, BundleLoadError> load_reconcile_bundle(const RuleRowsSource& list_rules,
+                                                             const DeployedIdsSource& deployed_ids) {
+    if (!list_rules || !deployed_ids)
+        return std::unexpected(
+            BundleLoadError{BundleLoadError::Source::other, "bundle sources not configured"});
+    auto rules_result = list_rules();
+    if (!rules_result)
+        return std::unexpected(
+            BundleLoadError{BundleLoadError::Source::rules, std::move(rules_result.error())});
+    auto deployed_result = deployed_ids();
+    if (!deployed_result)
+        return std::unexpected(
+            BundleLoadError{BundleLoadError::Source::deployed, std::move(deployed_result.error())});
+    // Sequenced on its own line: as two arguments of one call, `std::move(*deployed_result)`
+    // may be evaluated before the filter reads the set (unspecified order; GCC and MSVC move
+    // first), which emptied the bundle's rules.
+    auto filtered = filter_deployed_members(*rules_result, *deployed_result);
+    return make_bundle(std::move(filtered), std::move(*deployed_result));
+}
+
 bool os_target_matches(std::string_view target, std::string_view agent_os) {
     if (target.empty())
         return true;  // rule applies to every OS

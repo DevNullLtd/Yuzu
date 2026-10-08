@@ -2096,6 +2096,15 @@ AgentRegistry::evaluate_scope_for_agent(const std::string& agent_id,
         return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::Unresolvable, {}});
     }
 
+    // A malformed id is never a member and must never reach a store: libpq text binds take the
+    // id as a NUL-terminated string, so an id containing a NUL byte is rejected here, before
+    // any store read (defence in depth). Same predicate as TagStore / CustomPropertiesStore
+    // (empty, > 256 bytes, or an embedded NUL); the stores guard themselves too, this keeps
+    // the evaluator from even taking the session lookup for such an id.
+    if (agent_id.empty() || agent_id.size() > 256 ||
+        agent_id.find('\0') != std::string::npos)
+        return false;
+
     // Brief mu_ hold for the lookup only. The identity fields of a published
     // session are immutable (AgentSession IMMUTABILITY CONTRACT), so the
     // shared_ptr is read lock-free below and mu_ is never held across a store

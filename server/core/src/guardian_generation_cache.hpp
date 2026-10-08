@@ -1,8 +1,7 @@
 #pragma once
 
 /// @file guardian_generation_cache.hpp
-/// Short-TTL, single-flight cache for the Guardian policy generation read (#5513,
-/// Fable opinion sections A and F item 1).
+/// Short-TTL, single-flight cache for the Guardian policy generation read (#5513).
 ///
 /// WHY IT EXISTS. The heartbeat reconcile compares the agent's reported generation
 /// with `GuaranteedStateStore::current_policy_generation()`, a synchronous Postgres
@@ -15,26 +14,36 @@
 ///
 /// CONTRACT.
 ///   - `get()` returns the cached result while it is fresh: `ttl` for a success,
-///     `negative_ttl` for an error. A reconcile that reads a generation up to `ttl`
-///     old is delayed by at most that long after a bump; it is never wrong, because the
-///     generation is monotonic and a stale value is only ever lower.
+///     `negative_ttl` for an error. A value up to `ttl` old is LOWER than or equal to the
+///     store's, never higher, so it is safe for a "has anything changed" decision (admit,
+///     rate-limit, shed, converged) but it is NOT safe to LABEL a push with: the push
+///     content is read after the label, and a fan-out that already delivered a newer
+///     generation would then be answered with older content under an older label. A caller
+///     that is about to send must use `get_fresh()`.
+///   - `get_fresh()` ignores the TTL and any in-flight fetch, reads the store, and installs
+///     the result as the cached outcome (unless an `invalidate()` raced it). It is bounded
+///     by the caller's own admission control, not by single flight.
 ///   - SINGLE FLIGHT. At most one thread runs the fetch at a time. While one is in
 ///     flight, a concurrent caller returns the previously cached SUCCESS (stale by at
 ///     most ttl plus the fetch time) if the last outcome was a success. If there is no
 ///     value, or the last outcome was an error, the caller waits on the in-flight fetch
-///     through a `std::shared_future` and receives its result. An expired error is never
-///     served in place of a fresh attempt, and a stale success is never served after an
-///     error (that would hide a degraded store behind an old value).
+///     through a `std::shared_future` for at most `max_wait` and receives its result, or
+///     an error naming the timeout (the loader thread is unaffected; a blackholed store
+///     must not hold every heartbeat thread for the connect timeout). An expired error is
+///     never served in place of a fresh attempt, and a stale success is never served after
+///     an error (that would hide a degraded store behind an old value).
 ///   - A lower fetched value REPLACES a higher cached one. That is a store reset and is
 ///     not hidden: `regressions()` counts it. Nothing here pins the generation upward.
-///   - `invalidate()` drops the cached outcome (tests, and any future "generation just
-///     bumped locally" hook). A fetch already in flight when `invalidate()` runs still
+///   - `invalidate()` drops the cached outcome (called when the generation was just bumped
+///     locally, and by tests). A fetch already in flight when `invalidate()` runs still
 ///     returns its result to its own callers but does NOT repopulate the cache, so an
 ///     invalidation can never be undone by an older read. It also ends single-flight
 ///     for that fetch: the next `get()` starts its own fetch rather than waiting on the
 ///     older one.
-///   - A fetch that throws is converted to an error result; the in-flight state is
-///     always cleared, so waiters never hang.
+///   - A fetch that throws is converted to an error result. The in-flight state is cleared
+///     and the promise fulfilled on EVERY path out of the flight owner (a scope guard, with
+///     the bookkeeping inside try/catch), so an allocation failure between registering the
+///     flight and clearing it cannot wedge the cache with a flight nobody will complete.
 ///   - The fetch function runs WITHOUT the cache mutex held.
 ///
 /// CLOCK INJECTION. `ClockFn` is `std::function<std::chrono::steady_clock::time_point()>`;
@@ -64,6 +73,8 @@ namespace yuzu::server {
 struct GuardianGenerationCacheConfig {
     std::chrono::milliseconds ttl{2000};
     std::chrono::milliseconds negative_ttl{1000};
+    /// Longest a waiter blocks on another thread's in-flight fetch.
+    std::chrono::milliseconds max_wait{5000};
 };
 
 class GuardianGenerationCache {
@@ -76,7 +87,7 @@ public:
     using Config = GuardianGenerationCacheConfig;
 
     explicit GuardianGenerationCache(FetchFn fetch, Config cfg = {}, ClockFn clock = {})
-        : fetch_(std::move(fetch)), cfg_(cfg), clock_(clock ? std::move(clock) : ClockFn{&Clock::now}) {}
+        : fetch_(std::move(fetch)), cfg_(cfg), clock_(clock ? std::move(clock) : ClockFn{[] { return Clock::now(); }}) {}
 
     GuardianGenerationCache(const GuardianGenerationCache&) = delete;
     GuardianGenerationCache& operator=(const GuardianGenerationCache&) = delete;
@@ -103,23 +114,29 @@ public:
             }
         }
         if (waiting.valid())
-            return waiting.get();
+            return wait_for_flight(waiting);
 
+        // From here until `flight` is destroyed the cache has a registered flight that only
+        // this thread can complete. The guard makes completion unconditional.
+        FlightGuard flight{*this, epoch};
         Result r = run_fetch();
+        install(r, started, epoch);
+        flight.fulfil(*promise, r);
+        return r;
+    }
+
+    /// Read the store now, ignoring the TTL and any flight in progress, and install the
+    /// result as the cached outcome. Use before LABELLING a push (see the contract).
+    [[nodiscard]] Result get_fresh() {
+        Clock::time_point started;
+        std::uint64_t epoch = 0;
         {
             std::lock_guard lk(mu_);
-            if (epoch == epoch_) {
-                if (r.has_value()) {
-                    if (last_served_ && *r < *last_served_)
-                        ++regressions_;
-                    last_served_ = *r;
-                }
-                entry_ = Entry{r, started};
-            }
-            if (epoch == epoch_)
-                inflight_ = {};  // an invalidate() already detached this flight
+            started = clock_();
+            epoch = epoch_;
         }
-        promise->set_value(r);
+        Result r = run_fetch();
+        install(r, started, epoch);
         return r;
     }
 
@@ -157,21 +174,105 @@ private:
         return age < (e.result.has_value() ? cfg_.ttl : cfg_.negative_ttl);
     }
 
-    Result run_fetch() {
-        {
-            std::lock_guard lk(mu_);
-            ++fetches_;
-        }
-        if (!fetch_)
-            return std::unexpected(std::string("generation fetch function not configured"));
+    // Error text short enough for the small-string buffer of every supported standard
+    // library, so building it cannot allocate (it is the last-resort arm).
+    static Result nothrow_error() { return std::unexpected(std::string("fetch failed")); }
+
+    // Never throws.
+    Result run_fetch() noexcept {
         try {
-            return fetch_();
-        } catch (const std::exception& e) {
-            return std::unexpected(std::string("generation fetch threw: ") + e.what());
+            {
+                std::lock_guard lk(mu_);
+                ++fetches_;
+            }
+            if (!fetch_)
+                return std::unexpected(std::string("generation fetch function not configured"));
+            try {
+                return fetch_();
+            } catch (const std::exception& e) {
+                return std::unexpected(std::string("generation fetch threw: ") + e.what());
+            } catch (...) {
+                return std::unexpected(
+                    std::string("generation fetch threw a non-standard exception"));
+            }
         } catch (...) {
-            return std::unexpected(std::string("generation fetch threw a non-standard exception"));
+            return nothrow_error();  // building the message (or taking mu_) failed
         }
     }
+
+    // Record `r` as the cached outcome unless an invalidate() ran since `epoch`. Never throws:
+    // a failure here only means the next get() fetches again.
+    void install(const Result& r, Clock::time_point started, std::uint64_t epoch) noexcept {
+        try {
+            std::lock_guard lk(mu_);
+            if (epoch != epoch_)
+                return;
+            if (r.has_value()) {
+                if (last_served_ && *r < *last_served_)
+                    ++regressions_;
+                last_served_ = *r;
+            }
+            entry_ = Entry{r, started};
+        } catch (...) {
+            try {
+                std::lock_guard lk(mu_);
+                if (epoch == epoch_)
+                    entry_.reset();  // do not keep an entry that may be half-assigned
+            } catch (...) {
+            }
+        }
+    }
+
+    Result wait_for_flight(const std::shared_future<Result>& f) const noexcept {
+        try {
+            if (f.wait_for(cfg_.max_wait) != std::future_status::ready)
+                return std::unexpected(
+                    std::string("timed out waiting for in-flight generation fetch"));
+            return f.get();
+        } catch (...) {
+            return nothrow_error();  // broken promise, or the copy of the result threw
+        }
+    }
+
+    // Owns one registered flight. The destructor ALWAYS clears `inflight_` (when it is still
+    // this flight). The clear happens at most once: a second one could remove a NEWER flight
+    // registered by another thread after the first. A promise that is never fulfilled is
+    // broken by its own destructor, which wakes every waiter (wait_for_flight maps that to
+    // an error).
+    struct FlightGuard {
+        GuardianGenerationCache& c;
+        std::uint64_t epoch;
+        bool cleared{false};
+
+        ~FlightGuard() { clear(); }
+
+        void clear() noexcept {
+            if (cleared)
+                return;
+            try {
+                std::lock_guard lk(c.mu_);
+                if (epoch == c.epoch_)
+                    c.inflight_ = {};  // an invalidate() already detached a stale flight
+                cleared = true;
+            } catch (...) {
+                // mu_ could not be taken: the destructor retries once more.
+            }
+        }
+
+        // Clear the flight BEFORE publishing the value, as the original ordering did, so a
+        // waiter that wakes and calls get() again does not see this flight still registered.
+        void fulfil(std::promise<Result>& p, const Result& r) noexcept {
+            clear();
+            try {
+                p.set_value(r);
+            } catch (...) {
+                try {
+                    p.set_exception(std::current_exception());
+                } catch (...) {
+                }
+            }
+        }
+    };
 
     const FetchFn fetch_;
     const Config cfg_;

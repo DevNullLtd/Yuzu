@@ -1,6 +1,6 @@
 /**
- * test_guardian_reconcile_gate.cpp: GuardianReconcileGate (#5513, Fable opinion
- * sections C and D). Pure unit tests with an injected manual clock; nothing sleeps.
+ * test_guardian_reconcile_gate.cpp: GuardianReconcileGate (#5513). Pure unit tests with an
+ * injected manual clock; nothing sleeps.
  */
 
 #include "guardian_reconcile_gate.hpp"
@@ -13,7 +13,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -23,6 +25,7 @@ using namespace std::chrono_literals;
 using yuzu::server::GuardianReconcileBudget;
 using yuzu::server::GuardianReconcileGate;
 using Decision = yuzu::server::GuardianReconcileGate::Decision;
+using GateOptions = yuzu::server::GuardianReconcileGateOptions;
 
 namespace {
 
@@ -48,12 +51,17 @@ GuardianReconcileBudget::Config small_budget() {
     return {.budget_ms_per_s = 100.0, .burst_ms = 200.0, .max_per_s = 1000};
 }
 
+// No constructor reserve: the sweep tests reason about the bucket count tracking the table.
+GateOptions small_table() {
+    return {.max_reserve = 0};
+}
+
 constexpr std::uint64_t kBehind = 1;
 constexpr std::uint64_t kCurrent = 5;
 
 }  // namespace
 
-TEST_CASE("GuardianReconcileGate: Converged erases the claim and ignores the budget",
+TEST_CASE("GuardianReconcileGate: Converged erases an expired claim and ignores the budget",
           "[guardian][reconcile_gate]") {
     ManualClock clk;
     GuardianReconcileBudget budget(roomy(), clk.fn());
@@ -64,6 +72,7 @@ TEST_CASE("GuardianReconcileGate: Converged erases the claim and ignores the bud
     const auto admitted = budget.admitted_total();
     const auto shed = budget.shed_total();
 
+    clk.advance(25s);  // the claim can no longer limit anything
     CHECK(gate.decide("a", kCurrent, kCurrent) == Decision::Converged);  // equal
     CHECK(gate.claims_size() == 0);
     CHECK(gate.decide("a", kCurrent + 3, kCurrent) == Decision::Converged);  // ahead
@@ -74,6 +83,45 @@ TEST_CASE("GuardianReconcileGate: Converged erases the claim and ignores the bud
 
     // The erased claim no longer rate-limits a later regression of the same agent.
     CHECK(gate.decide("a", kBehind, kCurrent) == Decision::Admit);
+}
+
+TEST_CASE("GuardianReconcileGate: Converged keeps a young claim so a regression stays limited",
+          "[guardian][reconcile_gate]") {
+    ManualClock clk;
+    GuardianReconcileBudget budget(roomy(), clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn());
+
+    REQUIRE(gate.decide("a", kBehind, kCurrent) == Decision::Admit);
+    clk.advance(24s + 999'999'999ns);  // one nanosecond short of the interval
+    CHECK(gate.decide("a", kCurrent, kCurrent) == Decision::Converged);
+    CHECK(gate.claims_size() == 1);  // kept
+    CHECK(gate.decide("a", kBehind, kCurrent) == Decision::RateLimited);
+    clk.advance(1ns);  // now exactly min_interval old
+    CHECK(gate.decide("a", kCurrent, kCurrent) == Decision::Converged);
+    CHECK(gate.claims_size() == 0);  // expired claims are erased on convergence
+}
+
+TEST_CASE("GuardianReconcileGate: an agent alternating generation 0 / current gets one push per interval",
+          "[guardian][reconcile_gate]") {
+    // The boot re-arm catch-up report makes an agent report generation 0 intermittently. If
+    // a converged heartbeat erased the claim, every second heartbeat would be admitted.
+    ManualClock clk;
+    GuardianReconcileBudget budget(roomy(), clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn());
+
+    int admits = 0;
+    for (int i = 0; i < 20; ++i) {  // 20 heartbeats, 1 s apart: all inside one 25 s interval
+        const std::uint64_t reported = (i % 2 == 0) ? 0 : kCurrent;
+        if (gate.decide("flap", reported, kCurrent) == Decision::Admit)
+            ++admits;
+        clk.advance(1s);
+    }
+    CHECK(admits == 1);
+    CHECK(budget.admitted_total() == 1);
+
+    // After the interval the next regression is admitted once more.
+    clk.advance(10s);
+    CHECK(gate.decide("flap", 0, kCurrent) == Decision::Admit);
 }
 
 TEST_CASE("GuardianReconcileGate: Converged does not consult an exhausted budget",
@@ -216,7 +264,7 @@ TEST_CASE("GuardianReconcileGate: sweep erases only entries older than 2x min_in
           "[guardian][reconcile_gate]") {
     ManualClock clk;
     GuardianReconcileBudget budget(roomy(), clk.fn());
-    GuardianReconcileGate gate(budget, clk.fn());  // 25 s => cutoff 50 s
+    GuardianReconcileGate gate(budget, clk.fn(), 25s, small_table());  // 25 s => cutoff 50 s
 
     REQUIRE(gate.decide("old", kBehind, kCurrent) == Decision::Admit);  // t0
     clk.advance(30s);
@@ -243,7 +291,7 @@ TEST_CASE("GuardianReconcileGate: sweep leaves fresh entries and a backwards clo
           "[guardian][reconcile_gate]") {
     ManualClock clk;
     GuardianReconcileBudget budget(roomy(), clk.fn());
-    GuardianReconcileGate gate(budget, clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn(), 25s, small_table());
 
     for (int i = 0; i < 100; ++i)
         REQUIRE(gate.decide("agent-" + std::to_string(i), kBehind, kCurrent) == Decision::Admit);
@@ -258,7 +306,7 @@ TEST_CASE("GuardianReconcileGate: sweep respects max_erase and max_scan and resu
           "[guardian][reconcile_gate]") {
     ManualClock clk;
     GuardianReconcileBudget budget(roomy(), clk.fn());
-    GuardianReconcileGate gate(budget, clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn(), 25s, small_table());
 
     constexpr std::size_t kN = 1000;
     for (std::size_t i = 0; i < kN; ++i)
@@ -304,7 +352,7 @@ TEST_CASE("GuardianReconcileGate: claims_size stays bounded across 100k distinct
           "[guardian][reconcile_gate]") {
     ManualClock clk;
     GuardianReconcileBudget budget(roomy(), clk.fn());
-    GuardianReconcileGate gate(budget, clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn(), 25s, small_table());
 
     // 200 simulated seconds, 500 brand-new agents per second (100k distinct ids). Live
     // claims are useful for 25 s and kept for up to 50 s; with one default-bounded sweep per
@@ -333,18 +381,98 @@ TEST_CASE("GuardianReconcileGate: claims_size stays bounded across 100k distinct
     CHECK(gate.claims_size() == 0);
 }
 
-TEST_CASE("GuardianReconcileGate: 100k distinct ids erased by Converged heartbeats",
+TEST_CASE("GuardianReconcileGate: 100k distinct ids erased by Converged heartbeats once expired",
           "[guardian][reconcile_gate]") {
     ManualClock clk;
     GuardianReconcileBudget budget(roomy(), clk.fn());
-    GuardianReconcileGate gate(budget, clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn(), 25s, small_table());
     constexpr int kN = 100'000;
     for (int i = 0; i < kN; ++i)
         REQUIRE(gate.decide("c-" + std::to_string(i), kBehind, kCurrent) == Decision::Admit);
     CHECK(gate.claims_size() == static_cast<std::size_t>(kN));
+
+    // Young claims survive a converged heartbeat (the memory bound is the sweep's job then).
+    for (int i = 0; i < kN; ++i)
+        REQUIRE(gate.decide("c-" + std::to_string(i), kCurrent, kCurrent) == Decision::Converged);
+    CHECK(gate.claims_size() == static_cast<std::size_t>(kN));
+
+    // Once a claim is min_interval old the same converged heartbeat erases it: this is the
+    // steady-state memory bound for a fleet that has caught up.
+    clk.advance(25s);
     for (int i = 0; i < kN; ++i)
         REQUIRE(gate.decide("c-" + std::to_string(i), kCurrent, kCurrent) == Decision::Converged);
     CHECK(gate.claims_size() == 0);
+}
+
+TEST_CASE("GuardianReconcileGate: decide() is atomic across threads (one Admit per id)",
+          "[guardian][reconcile_gate]") {
+    // Frozen clock: no claim ever expires, so peek+claim must make exactly one of the eight
+    // racing threads win each id.
+    ManualClock clk;
+    GuardianReconcileBudget budget(roomy(), clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn());
+
+    constexpr int kThreads = 8;
+    constexpr int kIds = 2000;
+    std::mutex m;
+    std::condition_variable cv;
+    bool go = false;
+    std::atomic<std::uint64_t> admits{0}, limited{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t)
+        threads.emplace_back([&] {
+            {
+                std::unique_lock lk(m);
+                cv.wait(lk, [&] { return go; });
+            }
+            for (int i = 0; i < kIds; ++i) {
+                switch (gate.decide("race-" + std::to_string(i), kBehind, kCurrent)) {
+                case Decision::Admit:
+                    admits.fetch_add(1);
+                    break;
+                case Decision::RateLimited:
+                    limited.fetch_add(1);
+                    break;
+                default:
+                    FAIL_CHECK("unexpected decision under a roomy budget");
+                }
+            }
+        });
+    {
+        std::lock_guard lk(m);
+        go = true;
+    }
+    cv.notify_all();
+    for (auto& th : threads)
+        th.join();
+
+    CHECK(admits.load() == static_cast<std::uint64_t>(kIds));
+    CHECK(limited.load() == static_cast<std::uint64_t>(kIds) * (kThreads - 1));
+    CHECK(budget.admitted_total() == static_cast<std::uint64_t>(kIds));
+    CHECK(gate.claims_size() == static_cast<std::size_t>(kIds));
+}
+
+TEST_CASE("GuardianReconcileGate: the claim table is pre-sized from the budget config",
+          "[guardian][reconcile_gate]") {
+    ManualClock clk;
+    // 200 admissions/s over a 2 * 25 s horizon = 10000 entries without a rehash.
+    GuardianReconcileBudget budget(
+        {.budget_ms_per_s = 1'000'000.0, .burst_ms = 3'600'000.0, .max_per_s = 200}, clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn());
+    const auto buckets = gate.claims_buckets();
+    CHECK(buckets >= 10'000);
+    for (int i = 0; i < 10'000; ++i) {
+        REQUIRE(gate.decide("r-" + std::to_string(i), kBehind, kCurrent) == Decision::Admit);
+        if (i % 200 == 199)
+            clk.advance(1s);  // a fresh one-second admission window every 200 admits
+    }
+    CHECK(gate.claims_buckets() == buckets);  // filling it did not rehash
+
+    // The reserve is capped, however large the configured ceiling.
+    GuardianReconcileBudget huge(roomy(), clk.fn());
+    GuardianReconcileGate capped(huge, clk.fn(), 25s, {.max_reserve = 5000});
+    CHECK(capped.claims_buckets() >= 5000);
+    CHECK(capped.claims_buckets() < 50'000);
 }
 
 TEST_CASE("GuardianReconcileGate: Scoped debits the elapsed time exactly once",
@@ -480,4 +608,131 @@ TEST_CASE("GuardianReconcileGate: thread-safety smoke", "[guardian][reconcile_ga
     CHECK(gate.claims_size() <= 64);
     CHECK(admits.load() > 0);
     CHECK(converged.load() > 0);
+}
+
+TEST_CASE("GuardianReconcileGate: Scoped::exclude removes waited time from the debit",
+          "[guardian][reconcile_gate]") {
+    ManualClock clk;
+    GuardianReconcileBudget budget(small_budget(), clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn());
+    budget.debit(100ms);  // balance 100
+    REQUIRE(budget.balance_ms() == Catch::Approx(100.0));
+
+    SECTION("excluded time is not charged") {
+        {
+            auto s = gate.begin_admitted();
+            clk.advance(50ms);   // +5 ms refill
+            s.exclude(40ms);     // 50 - 40 = 10 ms charged
+        }
+        CHECK(budget.balance_ms() == Catch::Approx(100.0 + 5.0 - 10.0));
+    }
+    SECTION("excluding everything still charges the minimum cost") {
+        {
+            auto s = gate.begin_admitted();
+            clk.advance(50ms);
+            s.exclude(500ms);  // more than elapsed
+        }
+        CHECK(budget.balance_ms() == Catch::Approx(100.0 + 5.0 - 1.0));
+    }
+    SECTION("negative exclusions are ignored and exclusions accumulate") {
+        {
+            auto s = gate.begin_admitted();
+            clk.advance(50ms);
+            s.exclude(-10ms);
+            s.exclude(10ms);
+            s.exclude(10ms);  // 50 - 20 = 30 ms charged
+        }
+        CHECK(budget.balance_ms() == Catch::Approx(100.0 + 5.0 - 30.0));
+    }
+    SECTION("the exclusion travels with a move") {
+        {
+            auto a = gate.begin_admitted();
+            clk.advance(50ms);
+            a.exclude(40ms);
+            auto b = std::move(a);
+            (void)b;
+        }
+        CHECK(budget.balance_ms() == Catch::Approx(100.0 + 5.0 - 10.0));
+    }
+}
+
+TEST_CASE("GuardianReconcileGate: a zero-duration push is charged the minimum cost",
+          "[guardian][reconcile_gate]") {
+    ManualClock clk;
+    GuardianReconcileBudget budget(small_budget(), clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn());
+    REQUIRE(budget.balance_ms() == Catch::Approx(200.0));
+    {
+        auto s = gate.begin_admitted();  // the clock never advances
+    }
+    CHECK(budget.balance_ms() == Catch::Approx(199.0));  // 1 ms floor
+
+    // The floor is injectable.
+    GuardianReconcileBudget budget2(small_budget(), clk.fn());
+    GuardianReconcileGate gate2(budget2, clk.fn(), 25s, {.min_cost = 7ms});
+    {
+        auto s = gate2.begin_admitted();
+    }
+    CHECK(budget2.balance_ms() == Catch::Approx(193.0));
+}
+
+TEST_CASE("GuardianReconcileGate: the in-flight cap sheds and recovers", "[guardian][reconcile_gate]") {
+    ManualClock clk;
+    GuardianReconcileBudget budget(roomy(), clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn(), 25s, {.max_in_flight = 3});
+
+    std::vector<GuardianReconcileGate::Scoped> held;
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(gate.decide("a" + std::to_string(i), kBehind, kCurrent) == Decision::Admit);
+        held.push_back(gate.begin_admitted());
+    }
+    CHECK(gate.in_flight() == 3);
+
+    const auto budget_admitted = budget.admitted_total();
+    CHECK(gate.decide("over", kBehind, kCurrent) == Decision::Shed);
+    CHECK(gate.in_flight_shed_total() == 1);
+    CHECK(gate.claims_size() == 3);                       // the shed wrote no claim
+    CHECK(budget.admitted_total() == budget_admitted);    // and did not touch the budget
+    // A converged or rate-limited decision is unaffected by the cap.
+    CHECK(gate.decide("over", kCurrent, kCurrent) == Decision::Converged);
+    CHECK(gate.decide("a0", kBehind, kCurrent) == Decision::RateLimited);
+
+    held.pop_back();  // one push finishes
+    CHECK(gate.in_flight() == 2);
+    CHECK(gate.decide("over", kBehind, kCurrent) == Decision::Admit);
+    held.push_back(gate.begin_admitted());
+    CHECK(gate.in_flight() == 3);
+    held.clear();
+    CHECK(gate.in_flight() == 0);
+}
+
+TEST_CASE("GuardianReconcileGate: a moved-from Scoped does not release a slot twice",
+          "[guardian][reconcile_gate]") {
+    ManualClock clk;
+    GuardianReconcileBudget budget(roomy(), clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn(), 25s, {.max_in_flight = 2});
+    {
+        auto a = gate.begin_admitted();
+        auto b = std::move(a);
+        CHECK(gate.in_flight() == 1);
+        auto c = gate.begin_admitted();
+        c = std::move(b);  // c's own slot is released, b's carries over
+        CHECK(gate.in_flight() == 1);
+    }
+    CHECK(gate.in_flight() == 0);
+}
+
+TEST_CASE("GuardianReconcileGate: release erases only that agent's claim",
+          "[guardian][reconcile_gate]") {
+    ManualClock clk;
+    GuardianReconcileBudget budget(roomy(), clk.fn());
+    GuardianReconcileGate gate(budget, clk.fn());
+
+    REQUIRE(gate.decide("a", kBehind, kCurrent) == Decision::Admit);
+    REQUIRE(gate.decide("b", kBehind, kCurrent) == Decision::Admit);
+    gate.release("a");
+    gate.release("never-seen");  // harmless
+    CHECK(gate.claims_size() == 1);
+    CHECK(gate.decide("b", kBehind, kCurrent) == Decision::RateLimited);  // untouched
+    CHECK(gate.decide("a", kBehind, kCurrent) == Decision::Admit);        // not rate-limited
 }

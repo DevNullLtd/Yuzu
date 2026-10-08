@@ -1,18 +1,21 @@
 /**
- * test_guardian_rule_bundle.cpp: GuardianRuleBundleCache and make_bundle (#5513,
- * Fable opinion section B last paragraph and section F). Injected loaders; concurrency
- * tests synchronise on events, never on sleeps.
+ * test_guardian_rule_bundle.cpp: GuardianRuleBundleCache, make_bundle and
+ * load_reconcile_bundle (#5513). Injected loaders and a manual clock; concurrency tests
+ * synchronise on events. The one real timeout (max_wait) is set to a few milliseconds.
  */
 
+#include "guardian_push_builder.hpp"  // load_reconcile_bundle
 #include "guardian_rule_bundle.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -21,6 +24,7 @@
 
 using namespace yuzu::server;
 using namespace yuzu::server::guardian;
+using namespace std::chrono_literals;
 
 namespace {
 
@@ -63,6 +67,17 @@ GuardianRuleBundleCache::LoaderFn counting_loader(std::atomic<int>& calls, std::
         return std::expected<Bundle, BundleLoadError>(std::move(b));
     };
 }
+
+struct ManualClock {
+    std::atomic<std::int64_t> ns{1'000'000'000};
+    GuardianRuleBundleCache::Clock::time_point now() const {
+        return GuardianRuleBundleCache::Clock::time_point{std::chrono::nanoseconds{ns.load()}};
+    }
+    void advance(std::chrono::nanoseconds d) { ns.fetch_add(d.count()); }
+    GuardianRuleBundleCache::ClockFn fn() {
+        return [this] { return now(); };
+    }
+};
 
 }  // namespace
 
@@ -293,4 +308,157 @@ TEST_CASE("GuardianRuleBundleCache: invalidate drops the held bundle", "[guardia
     CHECK_FALSE(cache.held_generation().has_value());
     REQUIRE(cache.get(1, counting_loader(calls, "b")).has_value());
     CHECK(calls.load() == 2);
+}
+
+TEST_CASE("GuardianRuleBundleCache: a held bundle older than max_age is reloaded",
+          "[guardian][rule_bundle]") {
+    // A rule mutation commits and THEN bumps best-effort; a failed bump leaves the generation
+    // unchanged while the rules are newer. max_age is the backstop.
+    ManualClock clk;
+    GuardianRuleBundleCache cache({.max_age = 60s}, clk.fn());
+    std::atomic<int> calls{0};
+    const auto loader = counting_loader(calls, "r");
+
+    REQUIRE(cache.get(3, loader).has_value());
+    clk.advance(59s + 999ms);
+    REQUIRE(cache.get(3, loader).has_value());
+    CHECK(calls.load() == 1);  // younger than max_age: a hit
+
+    clk.advance(1ms);          // now exactly max_age old
+    REQUIRE(cache.get(3, loader).has_value());
+    CHECK(calls.load() == 2);  // reloaded
+    CHECK(cache.loads() == 2);
+
+    // The reload restarts the age.
+    clk.advance(59s);
+    REQUIRE(cache.get(3, loader).has_value());
+    CHECK(calls.load() == 2);
+}
+
+TEST_CASE("GuardianRuleBundleCache: an expired bundle is not served when its reload fails",
+          "[guardian][rule_bundle]") {
+    ManualClock clk;
+    GuardianRuleBundleCache cache({.max_age = 10s}, clk.fn());
+    std::atomic<int> calls{0};
+    REQUIRE(cache.get(1, counting_loader(calls, "ok")).has_value());
+    clk.advance(11s);
+    auto r = cache.get(1, [] {
+        return std::expected<Bundle, BundleLoadError>(
+            std::unexpected(BundleLoadError{BundleLoadError::Source::rules, "down"}));
+    });
+    REQUIRE_FALSE(r.has_value());  // fail closed: never the expired bundle
+    CHECK(r.error().source == BundleLoadError::Source::rules);
+}
+
+TEST_CASE("GuardianRuleBundleCache: a waiter gives up after max_wait while the load runs on",
+          "[guardian][rule_bundle]") {
+    GuardianRuleBundleCache cache({.max_wait = 10ms});
+    Event entered, release;
+    const GuardianRuleBundleCache::LoaderFn slow = [&] {
+        entered.set();
+        release.wait();
+        return std::expected<Bundle, BundleLoadError>(make_bundle({rule("x", "")}, {"x"}));
+    };
+    std::shared_ptr<const Bundle> loaded;
+    std::thread t([&] { loaded = cache.get(4, slow).value(); });
+    entered.wait();
+
+    auto waiter = cache.get(4, slow);
+    REQUIRE_FALSE(waiter.has_value());
+    CHECK(waiter.error().source == BundleLoadError::Source::other);
+    CHECK(waiter.error().detail.find("timed out") != std::string::npos);
+    CHECK(cache.loads() == 1);
+
+    release.set();
+    t.join();
+    REQUIRE(loaded != nullptr);
+    CHECK(loaded->generation == 4);
+    CHECK(cache.get(4, slow).has_value());  // the load installed
+}
+
+TEST_CASE("GuardianRuleBundleCache: a loader that throws bad_alloc leaves the cache usable",
+          "[guardian][rule_bundle]") {
+    GuardianRuleBundleCache cache;
+    auto r = cache.get(1, []() -> std::expected<Bundle, BundleLoadError> { throw std::bad_alloc(); });
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().source == BundleLoadError::Source::other);
+    std::atomic<int> calls{0};
+    auto ok = cache.get(1, counting_loader(calls, "ok"));  // not waiting on a dead flight
+    REQUIRE(ok.has_value());
+    CHECK(calls.load() == 1);
+}
+
+namespace {
+
+std::vector<GuaranteedStateRuleRow> three_rules() {
+    return {rule("r1", ""), rule("r2", "tag:env == \"prod\""), rule("r3", "")};
+}
+
+}  // namespace
+
+TEST_CASE("load_reconcile_bundle: a non-empty deployed set keeps its rules and ids",
+          "[guardian][rule_bundle]") {
+    // Regression for the unsequenced std::move: with the deployed set moved before the filter
+    // read it, the filter saw an empty set and bundle.rules came out empty, converging every
+    // agent to zero guards.
+    auto b = load_reconcile_bundle(
+        []() -> std::expected<std::vector<GuaranteedStateRuleRow>, std::string> {
+            return three_rules();
+        },
+        []() -> std::expected<std::unordered_set<std::string>, std::string> {
+            return std::unordered_set<std::string>{"r1", "r2"};
+        });
+    REQUIRE(b.has_value());
+    REQUIRE(b->rules.size() == 2);
+    CHECK(b->rules[0].rule_id == "r1");  // order preserved
+    CHECK(b->rules[1].rule_id == "r2");
+    CHECK(b->deployed_rule_ids == std::unordered_set<std::string>{"r1", "r2"});
+    CHECK(b->find_scope("tag:env == \"prod\"") != nullptr);
+}
+
+TEST_CASE("load_reconcile_bundle: nothing deployed is an empty rule set, a failed read is an error",
+          "[guardian][rule_bundle]") {
+    SECTION("empty deployed set is correct by model") {
+        auto b = load_reconcile_bundle(
+            []() -> std::expected<std::vector<GuaranteedStateRuleRow>, std::string> {
+                return three_rules();
+            },
+            []() -> std::expected<std::unordered_set<std::string>, std::string> {
+                return std::unordered_set<std::string>{};
+            });
+        REQUIRE(b.has_value());
+        CHECK(b->rules.empty());
+    }
+    SECTION("a failed rule read is Source::rules and the deployed read is not attempted") {
+        std::atomic<int> deployed_calls{0};
+        auto b = load_reconcile_bundle(
+            []() -> std::expected<std::vector<GuaranteedStateRuleRow>, std::string> {
+                return std::unexpected(std::string("rules down"));
+            },
+            [&]() -> std::expected<std::unordered_set<std::string>, std::string> {
+                deployed_calls.fetch_add(1);
+                return std::unordered_set<std::string>{"r1"};
+            });
+        REQUIRE_FALSE(b.has_value());
+        CHECK(b.error().source == BundleLoadError::Source::rules);
+        CHECK(b.error().detail == "rules down");
+        CHECK(deployed_calls.load() == 0);
+    }
+    SECTION("a failed deployed read is Source::deployed") {
+        auto b = load_reconcile_bundle(
+            []() -> std::expected<std::vector<GuaranteedStateRuleRow>, std::string> {
+                return three_rules();
+            },
+            []() -> std::expected<std::unordered_set<std::string>, std::string> {
+                return std::unexpected(std::string("baselines down"));
+            });
+        REQUIRE_FALSE(b.has_value());
+        CHECK(b.error().source == BundleLoadError::Source::deployed);
+        CHECK(b.error().detail == "baselines down");
+    }
+    SECTION("unconfigured sources are an error, not a crash") {
+        auto b = load_reconcile_bundle({}, {});
+        REQUIRE_FALSE(b.has_value());
+        CHECK(b.error().source == BundleLoadError::Source::other);
+    }
 }

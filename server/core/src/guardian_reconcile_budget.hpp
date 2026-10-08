@@ -1,8 +1,7 @@
 #pragma once
 
 /// @file guardian_reconcile_budget.hpp
-/// Admission budget for the Guardian heartbeat reconcile push (#5513, Fable opinion
-/// section C "Admission control").
+/// Admission budget for the Guardian heartbeat reconcile push (#5513).
 ///
 /// WHY IT EXISTS. The reconcile path runs on the heartbeat thread of every agent that
 /// reports a policy generation behind the server's. At fleet scale a policy bump (or a
@@ -61,8 +60,7 @@ namespace yuzu::server {
 
 /// Budget configuration (namespace scope so it can be a default argument; see the
 /// class comment for clamping). The defaults are provisional starting values, not
-/// derived from fleet measurement: the server flags own the real values (Fable
-/// opinion section C).
+/// derived from fleet measurement: the server flags own the real values.
 struct GuardianReconcileBudgetConfig {
     /// Reconcile-milliseconds replenished per wall second.
     double budget_ms_per_s{100.0};
@@ -91,7 +89,7 @@ public:
     using Config = GuardianReconcileBudgetConfig;
 
     explicit GuardianReconcileBudget(Config cfg = {}, ClockFn clock = {})
-        : cfg_(sanitize(cfg)), clock_(clock ? std::move(clock) : ClockFn{&Clock::now}),
+        : cfg_(sanitize(cfg)), clock_(clock ? std::move(clock) : ClockFn{[] { return Clock::now(); }}),
           balance_ms_(cfg_.burst_ms), last_refill_(clock_()), window_start_(last_refill_) {}
 
     GuardianReconcileBudget(const GuardianReconcileBudget&) = delete;

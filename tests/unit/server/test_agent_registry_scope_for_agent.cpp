@@ -529,3 +529,242 @@ TEST_CASE("evaluate_scope_for_agent: a degraded CustomPropertiesStore read retur
         CHECK(single.error().kind == ScopeEvalError::Kind::StoreDegraded);
     }
 }
+
+// -- Malformed agent ids (NUL / empty / oversized) ----------------------------
+
+TEST_CASE("evaluate_scope_for_agent: an empty, oversized or NUL-bearing id is never a member, "
+          "even under NOT, and takes no session lookup",
+          "[server][agent_registry][scope][failclosed]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    register_fleet(registry);
+
+    const std::string with_nul("agent-000\0x", 11);
+    const std::string oversized(257, 'a');
+    for (const char* text :
+         {R"X(ostype == "linux")X", R"X(NOT (ostype == "linux"))X", R"X(NOT (tag:env == "x"))X"}) {
+        INFO("scope expression: " << text);
+        const auto expr = parse_ok(text);
+        for (const std::string& id : {std::string{}, oversized, with_nul}) {
+            auto single = registry.evaluate_scope_for_agent(id, expr, nullptr);
+            REQUIRE(single.has_value());
+            CHECK_FALSE(*single);
+        }
+    }
+    // A 256-byte id is the largest legal one: the cap is exclusive of 257 only.
+    auto info = make_info(0);
+    info.set_agent_id(std::string(256, 'b'));
+    (void)registry.register_agent(info);
+    auto at_cap = registry.evaluate_scope_for_agent(std::string(256, 'b'),
+                                                    parse_ok(R"X(ostype == "linux")X"), nullptr);
+    REQUIRE(at_cap.has_value());
+    CHECK(*at_cap);
+}
+
+TEST_CASE("a NUL-bearing agent id is rejected before any store read",
+          "[pg][server][agent_registry][scope][failclosed]") {
+    // Defence in depth: libpq text binds take the id as a NUL-terminated string, so an id
+    // containing a NUL byte is rejected by the evaluator before any store read.
+    YUZU_REQUIRE_PG_DB_TPL(db, scope_for_agent_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    TagStore tags{pool};
+    CustomPropertiesStore props{pool};
+    REQUIRE(tags.is_open());
+    REQUIRE(props.is_open());
+
+    REQUIRE(tags.set_tag("agent-a", "env", "prod").has_value());
+    REQUIRE(props.set_property("agent-a", "owner", "alice").has_value());
+    const std::string nul_id("agent-a\0x", 9);
+
+    SECTION("the stores answer empty for the malformed id") {
+        auto pm = props.get_property_map(nul_id);
+        REQUIRE(pm.has_value());
+        CHECK(pm->empty());
+        auto p = props.get_property(nul_id, "owner");
+        REQUIRE(p.has_value());
+        CHECK_FALSE(p->has_value());
+        auto ps = props.get_properties(nul_id);
+        REQUIRE(ps.has_value());
+        CHECK(ps->empty());
+        auto v = props.get_value(nul_id, "owner");
+        REQUIRE(v.has_value());
+        CHECK_FALSE(v->has_value());
+        auto tm = tags.get_tag_map(nul_id);
+        REQUIRE(tm.has_value());
+        CHECK(tm->empty());
+        // The real id still reads normally.
+        auto real = props.get_property_map("agent-a");
+        REQUIRE(real.has_value());
+        CHECK(real->size() == 1);
+    }
+
+    SECTION("the evaluator rejects the id before any store read") {
+        EventBus bus;
+        yuzu::MetricsRegistry metrics;
+        AgentRegistry registry(bus, metrics);
+        auto info = make_info(1);
+        info.set_agent_id(nul_id);  // a session exists for the NUL id
+        (void)registry.register_agent(info);
+
+        // Positive atoms: rows stored under agent-a would make these true.
+        for (const char* text : {R"X(props.owner == "alice")X", R"X(tag:env == "prod")X"}) {
+            INFO("scope expression: " << text);
+            auto r = registry.evaluate_scope_for_agent(nul_id, parse_ok(text), &tags, &props);
+            REQUIRE(r.has_value());
+            CHECK_FALSE(*r);
+        }
+        // Under NOT a store that merely answered empty would turn the result into "member";
+        // the evaluator's own guard keeps it out.
+        for (const char* text :
+             {R"X(NOT (props.owner == "alice"))X", R"X(NOT (tag:env == "prod"))X"}) {
+            INFO("scope expression: " << text);
+            auto r = registry.evaluate_scope_for_agent(nul_id, parse_ok(text), &tags, &props);
+            REQUIRE(r.has_value());
+            CHECK_FALSE(*r);
+        }
+    }
+}
+
+// -- Value-shape and edge-case equivalence (gap tests) ------------------------
+
+namespace {
+
+// Seven agents whose `note` tag AND property carry LIKE/MATCHES/escape-significant text.
+const std::vector<std::string>& odd_values() {
+    static const std::vector<std::string> v = {
+        "a*b", "a?b", "50%", "a_b", R"(c:\dir)", R"(say "hi")", "axb"};
+    return v;
+}
+
+void populate_odd(AgentRegistry& registry, TagStore& tags, CustomPropertiesStore& props) {
+    for (int i = 0; i < static_cast<int>(odd_values().size()); ++i) {
+        (void)registry.register_agent(make_info(i));
+        REQUIRE(tags.set_tag(agent_name(i), "note", odd_values()[static_cast<std::size_t>(i)])
+                    .has_value());
+        REQUIRE(props.set_property(agent_name(i), "note", odd_values()[static_cast<std::size_t>(i)])
+                    .has_value());
+    }
+}
+
+} // namespace
+
+TEST_CASE("evaluate_scope_for_agent: values with * ? % _ backslash and quotes behave as the fleet "
+          "path does under ==, LIKE and MATCHES (no SQL LIKE semantics leak in)",
+          "[pg][server][agent_registry][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scope_for_agent_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    TagStore tags{pool};
+    CustomPropertiesStore props{pool};
+    REQUIRE(tags.is_open());
+    REQUIRE(props.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    populate_odd(registry, tags, props);
+
+    EquivalenceStats stats;
+    for (const char* attr : {"tag:note", "props.note"}) {
+        const std::string a = attr;
+        for (const std::string& text : std::vector<std::string>{
+                 a + R"( LIKE "a*b")", a + R"( LIKE "a?b")", a + R"( LIKE "a_b")",
+                 a + R"( LIKE "50%")", a + R"( == "50%")", a + R"( == "a*b")",
+                 a + R"( == "c:\\dir")", a + R"( == "say \"hi\"")",
+                 a + R"( MATCHES "^a.b$")", a + R"( MATCHES "^a_b$")", a + R"( MATCHES "^50%$")",
+                 a + R"( CONTAINS "%")", "NOT (" + a + R"( LIKE "a_b"))"})
+            check_equivalent(registry, text, &tags, &props, stats);
+    }
+    CHECK(stats.exprs == 26);
+
+    // Pin the semantics, not only the equivalence: `_` is a literal in LIKE here (a glob, not
+    // SQL LIKE), so only the agent whose value is literally "a_b" matches.
+    auto underscore = registry.evaluate_scope_local(parse_ok(R"X(tag:note LIKE "a_b")X"), &tags,
+                                                    &props);
+    REQUIRE(underscore.has_value());
+    CHECK(*underscore == std::vector<std::string>{"agent-003"});
+}
+
+TEST_CASE("evaluate_scope_for_agent: tag key case, NOT over an absent key and an empty property "
+          "value match the fleet path",
+          "[pg][server][agent_registry][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scope_for_agent_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    TagStore tags{pool};
+    CustomPropertiesStore props{pool};
+    REQUIRE(tags.is_open());
+    REQUIRE(props.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    for (int i = 0; i < 6; ++i)
+        (void)registry.register_agent(make_info(i));
+    REQUIRE(tags.set_tag("agent-000", "env", "prod").has_value());
+    REQUIRE(tags.set_tag("agent-002", "env", "prod").has_value());
+    REQUIRE(props.set_property("agent-001", "owner", "").has_value()); // empty value row
+    REQUIRE(props.set_property("agent-003", "owner", "alice").has_value());
+
+    EquivalenceStats stats;
+    for (const char* text : {
+             R"X(tag:Env == "prod")X",            // key case differs from the stored "env"
+             R"X(NOT (tag:Env == "prod"))X",
+             R"X(NOT (tag:nokey == "x"))X",       // key present on no agent anywhere
+             R"X(tag:nokey != "x")X",
+             R"X(NOT (props.nokey == "x"))X",
+             R"X(props.owner == "")X",            // the empty-value row
+             R"X(EXISTS props.owner)X",
+             R"X(NOT (props.owner == ""))X",
+             R"X(props.owner != "alice")X",
+         })
+        check_equivalent(registry, text, &tags, &props, stats);
+
+    // The key-absent NOT is a member for EVERY registered agent on the fleet path; the
+    // single-agent path must agree for each, not merely for the ones sampled above.
+    auto all_absent = registry.evaluate_scope_local(parse_ok(R"X(NOT (tag:nokey == "x"))X"), &tags,
+                                                    &props);
+    REQUIRE(all_absent.has_value());
+    CHECK(all_absent->size() == 6);
+}
+
+TEST_CASE("evaluate_scope_for_agent: a tag-only expression is unaffected by a null or broken "
+          "props store; a mixed expression degrades when only props is down",
+          "[pg][server][agent_registry][scope][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scope_for_agent_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    TagStore tags{pool};
+    CustomPropertiesStore props{pool};
+    REQUIRE(tags.is_open());
+    REQUIRE(props.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_info(0));
+    REQUIRE(tags.set_tag("agent-000", "env", "prod").has_value());
+
+    const auto tag_only = parse_ok(R"X(tag:env == "prod")X");
+    const auto mixed = parse_ok(R"X(tag:env == "prod" AND NOT (props.owner == "alice"))X");
+
+    auto with_null = registry.evaluate_scope_for_agent("agent-000", tag_only, &tags, nullptr);
+    REQUIRE(with_null.has_value());
+    CHECK(*with_null);
+
+    drop_table(db.dsn(), "DROP TABLE custom_properties_store.custom_properties CASCADE");
+
+    auto with_broken = registry.evaluate_scope_for_agent("agent-000", tag_only, &tags, &props);
+    REQUIRE(with_broken.has_value()); // no props atom, so no props read
+    CHECK(*with_broken);
+
+    auto degraded = registry.evaluate_scope_for_agent("agent-000", mixed, &tags, &props);
+    REQUIRE_FALSE(degraded.has_value()); // tags fine, props down: abort, never "member"
+    CHECK(degraded.error().kind == ScopeEvalError::Kind::StoreDegraded);
+    // And the mixed expression with a null props store is Unresolvable, not degraded.
+    auto unresolvable = registry.evaluate_scope_for_agent("agent-000", mixed, &tags, nullptr);
+    REQUIRE_FALSE(unresolvable.has_value());
+    CHECK(unresolvable.error().kind == ScopeEvalError::Kind::Unresolvable);
+}

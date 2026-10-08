@@ -1,17 +1,16 @@
 #pragma once
 
 /// @file guardian_rule_bundle.hpp
-/// Per-replica memo of the Guardian rule bundle, keyed by policy generation (#5513,
-/// Fable opinion section B last paragraph and section F).
+/// Per-replica memo of the Guardian rule bundle, keyed by policy generation (#5513).
 ///
 /// WHAT IS MEMOISED. Every heartbeat reconcile push does, before its per-agent step:
 /// `GuaranteedStateStore::list_rules()` (full rows with yaml_source and spec_json),
 /// `deployed_member_rule_ids()`, `guardian::filter_deployed_members(...)`, and then,
 /// inside the per-rule loop, a `yuzu::scope::parse` of each distinct scope_expr. All of
 /// that depends only on the rule set and the deployed-baseline set, and both are
-/// changed only by operations that bump the policy generation (Fable opinion section B:
-/// store create/update/delete in-txn, plus the explicit deploy/undeploy bumps). So one
-/// `Bundle` per generation is sound.
+/// changed only by operations that bump the policy generation (rule create/update/delete
+/// in the store, plus the explicit baseline deploy/undeploy bumps). So one `Bundle` per
+/// generation is sound, subject to the ordering and max-age rules below.
 ///
 /// WHAT IS NOT MEMOISED, AND MUST NOT BE. Scope MEMBERSHIP of an agent. Tags, custom
 /// properties, session OS and `scopable_tags` change with no generation bump, so a
@@ -24,11 +23,21 @@
 /// or an error; it never returns the bundle of any other generation. The cache stamps
 /// the generation itself (the loader cannot mislabel). ORDERING REQUIREMENT on callers:
 /// obtain the generation `g` BEFORE calling `get`, and have the loader read the stores
-/// inside `get`, not earlier. The generation is bumped in the same transaction as the
-/// mutation, so rows read after `g` was read are at least as new as `g`. A bundle can
-/// therefore be newer than its label (harmless: the pushed generation is then lower
-/// than the rules, the agent reports lower than current on its next heartbeat and is
-/// reconciled again) but never older.
+/// inside `get`, not earlier.
+///
+/// WHY THE ORDERING IS SUFFICIENT, AND WHAT IT DOES NOT COVER. The generation bump is NOT
+/// in the same transaction as the mutation: rule create/update/delete
+/// (`guaranteed_state_store.cpp`) commit the row and then bump best-effort, and baseline
+/// deploy/delete (`guardian_routes.cpp`) mutate the baseline store and then call
+/// `bump_policy_generation()`. The invariant therefore rests on ORDER: a mutation commits
+/// BEFORE its bump, so a reader that observes generation `g` and then reads the stores sees
+/// rows at least as new as `g`. A bundle can be newer than its label (harmless: the pushed
+/// generation is then lower than the rules, the agent reports lower than current on its
+/// next heartbeat and is reconciled again) but never older. What ordering cannot cover is a
+/// bump that FAILED after its mutation committed: the generation stays `g` while the rules
+/// are newer, and a bundle held for `g` would be served forever. `max_age` is the backstop:
+/// a held bundle older than it is a miss and is reloaded, so such a divergence heals within
+/// `max_age` instead of persisting until the next unrelated bump.
 ///
 /// SHAPE.
 ///   - ONE bundle is held (the most recently loaded). A request for a different
@@ -40,14 +49,22 @@
 ///   - SINGLE FLIGHT per generation: concurrent `get(g)` calls share one load through a
 ///     `std::shared_future`. Callers asking for a different generation than a running
 ///     load do not wait on it; they load their own. Loads are never run under the cache
-///     mutex.
+///     mutex. A waiter blocks for at most `max_wait` and then receives an error (source
+///     `other`, "timed out waiting for in-flight load"); the loading thread is unaffected.
 ///   - The cache hands out `std::shared_ptr<const Bundle>`. A reload replaces the held
 ///     pointer but cannot invalidate a bundle an in-flight push still holds.
-///   - A loader that throws is converted to a `BundleLoadError` with source `other`; the
-///     in-flight state is always cleared so waiters never hang.
+///   - A loader that throws is converted to a `BundleLoadError` with source `other`. The
+///     in-flight entry is erased and the promise fulfilled on EVERY path out of the flight
+///     owner (a scope guard, bookkeeping inside try/catch), so an allocation failure after
+///     the flight was registered cannot wedge that generation with a flight nobody will
+///     complete.
+///   - A held bundle older than `max_age` is a miss (see the safety invariant).
 ///
-/// CLOCK INJECTION. None: this cache has no time dependence (no TTL; validity is the
-/// generation). Tests drive it with an injected loader and events only.
+/// CLOCK INJECTION. `ClockFn` is `std::function<std::chrono::steady_clock::time_point()>`;
+/// null selects the real steady clock. It is called under the internal mutex and must not
+/// call back into the cache. A bundle's age is measured from when its load STARTED. A clock
+/// that moves backwards leaves the bundle fresh. Tests inject a manual clock and a loader
+/// that blocks on an event, so nothing sleeps.
 ///
 /// `Bundle` is move-only because `yuzu::scope::Expression` is. Build one with
 /// `make_bundle`, which parses each distinct non-empty scope_expr of the ENABLED rows
@@ -55,6 +72,7 @@
 ///
 /// Thread-safe. A `const Bundle` is immutable and may be read from any thread.
 
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <expected>
@@ -136,24 +154,40 @@ struct BundleLoadError {
     std::string detail;
 };
 
+/// Cache tuning (namespace scope so it can be a default argument).
+struct GuardianRuleBundleCacheConfig {
+    /// A held bundle older than this is reloaded even if its generation still matches.
+    std::chrono::milliseconds max_age{60'000};
+    /// Longest a waiter blocks on another thread's in-flight load.
+    std::chrono::milliseconds max_wait{5'000};
+};
+
 class GuardianRuleBundleCache {
 public:
     using Result = std::expected<std::shared_ptr<const Bundle>, BundleLoadError>;
     /// Builds a bundle from the stores. Called without any cache lock held.
     using LoaderFn = std::function<std::expected<Bundle, BundleLoadError>()>;
+    using Clock = std::chrono::steady_clock;
+    /// Null selects `steady_clock::now`.
+    using ClockFn = std::function<Clock::time_point()>;
+    using Config = GuardianRuleBundleCacheConfig;
 
-    GuardianRuleBundleCache() = default;
+    explicit GuardianRuleBundleCache(Config cfg = {}, ClockFn clock = {})
+        : cfg_(cfg), clock_(clock ? std::move(clock) : ClockFn{[] { return Clock::now(); }}) {}
     GuardianRuleBundleCache(const GuardianRuleBundleCache&) = delete;
     GuardianRuleBundleCache& operator=(const GuardianRuleBundleCache&) = delete;
 
     /// The bundle for exactly `generation`, loading it if the held bundle is for a
-    /// different generation. See the header for the ordering requirement on callers.
+    /// different generation or is older than `max_age`. See the header for the ordering
+    /// requirement on callers.
     [[nodiscard]] Result get(std::uint64_t generation, const LoaderFn& loader) {
         std::shared_future<Result> waiting;
         std::shared_ptr<std::promise<Result>> promise;
+        Clock::time_point started;
         {
             std::lock_guard lk(mu_);
-            if (held_ && held_->generation == generation)
+            const auto now = clock_();
+            if (held_ && held_->generation == generation && fresh_locked(now))
                 return held_;
             if (const auto it = inflight_.find(generation); it != inflight_.end()) {
                 waiting = it->second;
@@ -161,24 +195,23 @@ public:
                 promise = std::make_shared<std::promise<Result>>();
                 inflight_.emplace(generation, promise->get_future().share());
                 ++loads_;
+                started = now;
             }
         }
         if (waiting.valid())
-            return waiting.get();
+            return wait_for_flight(waiting);
 
+        // The registered flight is completed (erased) unconditionally by the guard.
+        FlightGuard flight{*this, generation};
         Result r = run_loader(generation, loader);
-        {
-            std::lock_guard lk(mu_);
-            if (r.has_value())
-                held_ = *r;  // failed loads are never installed
-            inflight_.erase(generation);
-        }
-        promise->set_value(r);
+        install(r, started);
+        flight.fulfil(*promise, r);
         return r;
     }
 
-    /// Drop the held bundle (tests; a future "rules changed locally" hook). A load in
-    /// flight still completes and installs, and is still stamped with its own generation.
+    /// Drop the held bundle (called when the generation was just bumped locally, and by
+    /// tests). A load in flight still completes and installs, and is still stamped with its
+    /// own generation.
     void invalidate() {
         std::lock_guard lk(mu_);
         held_.reset();
@@ -199,27 +232,106 @@ public:
     }
 
 private:
-    static Result run_loader(std::uint64_t generation, const LoaderFn& loader) {
-        if (!loader)
-            return std::unexpected(
-                BundleLoadError{BundleLoadError::Source::other, "no bundle loader configured"});
+    bool fresh_locked(Clock::time_point now) const {
+        if (now <= held_at_)
+            return true;  // clock did not advance (or went backwards)
+        return std::chrono::duration_cast<std::chrono::milliseconds>(now - held_at_) <
+               cfg_.max_age;
+    }
+
+    // Never throws: a failure here only means the next get() loads again.
+    void install(const Result& r, Clock::time_point started) noexcept {
         try {
-            auto loaded = loader();
-            if (!loaded)
-                return std::unexpected(std::move(loaded.error()));
-            loaded->generation = generation;  // the cache, not the loader, stamps validity
-            return std::make_shared<const Bundle>(std::move(*loaded));
-        } catch (const std::exception& e) {
-            return std::unexpected(BundleLoadError{BundleLoadError::Source::other,
-                                                   std::string("bundle loader threw: ") + e.what()});
+            std::lock_guard lk(mu_);
+            if (r.has_value()) {  // failed loads are never installed
+                held_ = *r;
+                held_at_ = started;
+            }
         } catch (...) {
-            return std::unexpected(BundleLoadError{
-                BundleLoadError::Source::other, "bundle loader threw a non-standard exception"});
         }
     }
 
+    Result wait_for_flight(const std::shared_future<Result>& f) const noexcept {
+        try {
+            if (f.wait_for(cfg_.max_wait) != std::future_status::ready)
+                return std::unexpected(BundleLoadError{
+                    BundleLoadError::Source::other, "timed out waiting for in-flight load"});
+            return f.get();
+        } catch (...) {
+            // Broken promise, or the copy of the result threw. A literal short enough for
+            // the small-string buffer, so building it cannot allocate.
+            return std::unexpected(
+                BundleLoadError{BundleLoadError::Source::other, "load failed"});
+        }
+    }
+
+    // Owns one registered flight; the destructor ALWAYS erases it. The erase happens at most
+    // once: a second one could remove a NEWER flight for the same generation that another
+    // thread registered after the first. A promise that is never fulfilled is broken by its
+    // own destructor, which wakes every waiter.
+    struct FlightGuard {
+        GuardianRuleBundleCache& c;
+        std::uint64_t generation;
+        bool erased{false};
+
+        ~FlightGuard() { clear(); }
+
+        void clear() noexcept {
+            if (erased)
+                return;
+            try {
+                std::lock_guard lk(c.mu_);
+                c.inflight_.erase(generation);
+                erased = true;
+            } catch (...) {
+                // mu_ could not be taken: the destructor retries once more.
+            }
+        }
+
+        // Erase the flight BEFORE publishing the value so a woken waiter that calls get()
+        // again does not find this flight still registered.
+        void fulfil(std::promise<Result>& p, const Result& r) noexcept {
+            clear();
+            try {
+                p.set_value(r);
+            } catch (...) {
+                try {
+                    p.set_exception(std::current_exception());
+                } catch (...) {
+                }
+            }
+        }
+    };
+
+    // Never throws.
+    static Result run_loader(std::uint64_t generation, const LoaderFn& loader) noexcept {
+        try {
+            if (!loader)
+                return std::unexpected(
+                    BundleLoadError{BundleLoadError::Source::other, "no bundle loader configured"});
+            try {
+                auto loaded = loader();
+                if (!loaded)
+                    return std::unexpected(std::move(loaded.error()));
+                loaded->generation = generation;  // the cache, not the loader, stamps validity
+                return std::make_shared<const Bundle>(std::move(*loaded));
+            } catch (const std::exception& e) {
+                return std::unexpected(BundleLoadError{
+                    BundleLoadError::Source::other, std::string("bundle loader threw: ") + e.what()});
+            } catch (...) {
+                return std::unexpected(BundleLoadError{
+                    BundleLoadError::Source::other, "bundle loader threw a non-standard exception"});
+            }
+        } catch (...) {
+            return std::unexpected(BundleLoadError{BundleLoadError::Source::other, "load failed"});
+        }
+    }
+
+    const Config cfg_;
+    const ClockFn clock_;
     mutable std::mutex mu_;
     std::shared_ptr<const Bundle> held_;
+    Clock::time_point held_at_{};
     std::map<std::uint64_t, std::shared_future<Result>> inflight_;
     std::uint64_t loads_{0};
 };
