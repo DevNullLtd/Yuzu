@@ -2743,6 +2743,17 @@ test('compose certs volume',
   timeout: 30,
 )
 
+# Compose Wizard (#5420): every generated mode gives the server a writable,
+# persistent /etc/yuzu/certs (KEK + internal CA), and Operator mode mounts the
+# operator's PEMs read-only at /etc/yuzu/tls instead of over it. Runs the real
+# tools/compose-wizard/js/generate.js under node; skips when node is absent.
+test('compose wizard certs',
+  _python3_test,
+  args: [files('test_compose_wizard.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # README Docker Compose quickstart (#5419): the compose the README downloads must
 # pull released images at ${YUZU_VERSION}, persist /etc/yuzu/certs, publish 8443,
 # and take the headless admin seed at the image's --config path. Stdlib only;
