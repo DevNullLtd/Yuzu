@@ -2293,8 +2293,8 @@ std::string SettingsRoutes::render_updates_fragment() {
         // writable); there is no --ota-enabled flag to tell the operator to
         // pass. Reaching here means it was explicitly disabled.
         html += "<span style=\"color:#484f58\">OTA updates are disabled "
-                "(remove <code>--no-ota</code> from the server's startup "
-                "flags to enable).</span>";
+                "(start the server without <code>--no-ota</code> to "
+                "enable).</span>";
         return html;
     }
 
