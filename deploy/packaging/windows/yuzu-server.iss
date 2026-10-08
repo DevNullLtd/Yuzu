@@ -22,7 +22,8 @@
 ;   /OPERATOR_USER, /OPERATOR_PASS   REMOVED in 0.15.0 (#5343). The second account
 ;                          they wrote went to yuzu-server.cfg only and could never
 ;                          sign in on PostgreSQL. A non-empty value is REFUSED
-;                          (exit code 7, nothing changed; on an upgrade a non-empty
+;                          (exit code 7, nothing changed, on a fresh install or on an
+;                          upgrade given /OPERATOR_USER= alone; on an upgrade a non-empty
 ;                          /OPERATOR_PASS= is exit code 11, as above). Create further
 ;                          accounts in Settings > User Management after the install.
 ;   /POSTGRES_DSN_FILE=f   File holding the PostgreSQL connection string. One of
@@ -92,7 +93,7 @@
 ; (Inno Setup's own exit codes are 0-8.)
 ;
 ; THE SETUP LOG RECORDS THE FULL COMMAND LINE, including any /ADMIN_PASS=,
-; /OPERATOR_PASS=, /POSTGRES_DSN= or /OIDC_CLIENT_SECRET= value. Prefer the
+; /POSTGRES_DSN= or /OIDC_CLIENT_SECRET= value. Prefer the
 ; *_FILE parameters, and protect or delete the log.
 ;
 ; KNOWN ISSUE (#1835, "Windows server binary has the identical SCM control-protocol

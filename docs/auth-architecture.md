@@ -422,9 +422,10 @@ upgrade to the stored one (behaviour change — see
 `docs/user-manual/upgrading.md`). The Windows server installer refuses a
 password on an upgrade for the same reason (exit code 11,
 `docs/user-manual/server-admin.md`). cfg-only non-admin accounts are a
-separate gap, closed by #5343: only the cfg admin is provisioned on a fresh
+separate gap, mitigated by #5343: only the cfg admin is provisioned on a fresh
 database, so the second first-run account and the installer's `/OPERATOR_USER`
-could never sign in on Postgres, and both were removed (first-run setup
+could never sign in on Postgres, and both generators were removed (a hand-written
+cfg-only entry still cannot sign in, and is named in a boot warning) (first-run setup
 creates the administrator only; further accounts come from Settings → User
 Management). A cfg entry that has no `auth.users` row is named in a warning at
 boot (`AuthManager::report_stale_cfg_credentials`; no metric).
