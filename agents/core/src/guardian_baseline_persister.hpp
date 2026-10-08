@@ -39,12 +39,18 @@
  * write, while apply_rules and stop() are not delayed by it. apply_rules (Trigger::Forced)
  * attempts regardless of the backoff. stop() (Trigger::Stop) attempts regardless too, with the
  * stop budget (no tuple cap: its 1 s wall and its single failure already bound it, and a cap
- * would abandon a healthy store's remaining captures), and SKIPS its pass iff a failed write
- * that took at least the stop wall budget ENDED at or after begin_stop(), i.e. a stall that
- * spent this stop's shared shutdown deadline (a BUSY store burns a busy timeout per write).
- * A stall that ended before stop began spent none of it and says nothing about the store now,
- * so it is not a reason to skip; a fast failure (a dropped table, a read-only file) costs
- * nothing to retry and never counts as a stall.
+ * would abandon a healthy store's remaining captures; the 1 s wall does end it, with captures
+ * left, once roughly 2,000 to 3,000 are staged, since a healthy write costs about a third of a
+ * millisecond), and SKIPS its pass in two cases. (1) A failed write that took at least the stop
+ * wall budget ENDED at or after begin_stop(): a BUSY store burns a whole busy timeout per
+ * write, so that stall spent this stop's share of the shared shutdown deadline and one more
+ * attempt would spend again. A stall that ended before the mark spent none of this stop's
+ * deadline, and retrying it costs at most one failing write under the single-failure budget, so
+ * it is not a reason to skip. A fast failure (a dropped table, a read-only file) costs nothing
+ * to retry and never counts as a stall. (2) The pass would start kBaselineStopLatestStart (15 s)
+ * or more after begin_stop(): its first write always runs, and one write against a BUSY store
+ * costs a busy timeout, which would end past the 20 s grace. Neither skip touches the store;
+ * the engine logs each with its own line.
  *
  * YIELDING: apply_rules takes the seed fence once per baseline-on-arm rule, so a worker pass
  * that kept the lock for its whole budget would make each of those fences wait. A Worker pass
@@ -124,7 +130,8 @@
  * around a pass.
  */
 
-#include <yuzu/plugin.h> // YUZU_EXPORT
+#include <yuzu/agent/kv_store.hpp> // kKvStoreBusyTimeout
+#include <yuzu/plugin.h>         // YUZU_EXPORT
 
 #include <atomic>
 #include <chrono>
@@ -165,13 +172,30 @@ inline constexpr GuardianBaselinePassBudget kBaselinePassBudget{64, 3,
 
 /// stop()'s final flush. stop() shares ONE 20 s deadline (agent.cpp's kShutdownDeadlineGrace)
 /// with the worker join, the legacy-sink loss-ledger write and two journal flushes, each of
-/// which can spend a 5 s busy timeout (GuardianEngine::stop() lists the worst case), so this
-/// pass gets ONE failure and 1 s of wall between tuples, and is skipped when a slow failure
-/// during this stop already spent the deadline (see BOUNDED PASSES). It has NO tuple cap: a
-/// healthy store persists every staged capture in a few milliseconds, and a cap would silently
-/// abandon the rest.
+/// which can spend a 5 s busy timeout (GuardianEngine::stop() lists the measured timelines), so
+/// this pass gets ONE failure and 1 s of wall between tuples, and is skipped when a slow
+/// failure during this stop already spent the deadline or when it could not start in time
+/// (see BOUNDED PASSES). It has NO tuple cap: a healthy store persists a staged capture in well
+/// under a millisecond, and a cap would abandon the rest at a few dozen captures. The 1 s wall
+/// is the limit instead: above roughly 2,000 to 3,000 staged captures the pass ends on it with
+/// the remainder lost to this process (logged as incomplete), even on a healthy store.
 inline constexpr GuardianBaselinePassBudget kBaselineStopBudget{
     (std::numeric_limits<std::size_t>::max)(), 1, std::chrono::milliseconds{1000}};
+
+/// The shutdown deadline AgentImpl::stop() arms (agent.cpp kShutdownDeadlineGrace, file-local
+/// there, so mirrored here) before it calls GuardianEngine::stop(): when it expires the
+/// ShutdownDeadlineGuard hard-exits the process (exit code 4) with no log line.
+inline constexpr std::chrono::milliseconds kBaselineShutdownGrace{20'000};
+
+/// A Stop pass that has not STARTED this long after GuardianEngine::stop() began is skipped
+/// (logged), because it cannot be allowed to finish inside kBaselineShutdownGrace: the wall
+/// budget is checked only BETWEEN tuples, so the first write always runs, and against a BUSY
+/// store that one write costs a whole kKvStoreBusyTimeout. Grace minus one busy timeout (15 s)
+/// is the latest start at which that single write still fits. It is a bound on this pass only:
+/// the earlier stop() stages (two journal flushes, the loss ledger) and the worker's own KV
+/// writes are not under it.
+inline constexpr std::chrono::milliseconds kBaselineStopLatestStart =
+    kBaselineShutdownGrace - kKvStoreBusyTimeout;
 
 class YUZU_EXPORT GuardianBaselinePersister {
 public:
@@ -203,6 +227,9 @@ public:
         bool budget_exhausted{false};
         /// A Stop pass skipped because a pass during this stop failed slowly (see begin_stop()).
         bool skipped_after_stall{false};
+        /// A Stop pass skipped because it could not start inside kBaselineStopLatestStart of
+        /// the begin_stop() mark (see there): the shutdown deadline is nearly spent.
+        bool skipped_late_start{false};
         /// A Worker pass that ended early, or never started, to let a waiter or an in-flight
         /// apply_rules go first (see YIELDING): not a failure, no backoff, nothing lost. The
         /// worker re-checks soon rather than at once.
@@ -229,12 +256,36 @@ public:
         GuardianBaselinePersister* p_;
     };
 
-    /// GuardianEngine::stop() calls this FIRST, before it joins the drain worker. Only the
-    /// FIRST call counts (a second stop() from the destructor must not move the mark). A Stop
-    /// pass skips only a stall observed at or after this mark: a stall that ended before stop
-    /// began has spent none of stop()'s shared shutdown deadline and says nothing about the
-    /// store now. A Stop pass with no begin_stop() never skips. Lock-free.
+    /// GuardianEngine::stop() calls this at its very top, BEFORE it waits for the engine mutex
+    /// (an apply_rules in flight can hold it for a long time) and before it joins the drain
+    /// worker, so the mark is the start of the shutdown deadline's share that stop() controls.
+    /// Only the FIRST call counts (a second stop() from the destructor must not move the mark).
+    /// A Stop pass skips (1) a stall observed at or after this mark: a failed write that took a
+    /// busy timeout during this stop spent the shared deadline, and one more would spend again;
+    /// a stall that ended before the mark spent none of it, so it is not a reason to skip; and
+    /// (2) when it could not start within kBaselineStopLatestStart of the mark. A Stop pass
+    /// with no begin_stop() never skips. Lock-free, so it cannot wait behind a pass.
     void begin_stop() noexcept;
+
+    /// Why a Stop pass was skipped (see begin_stop()).
+    enum class StopSkip { Stalled, LateStart };
+    /// The exact ERROR line logged when a Stop pass is skipped for `why`. Pure and static so a
+    /// test can pin the text docs/user-manual/metrics.md tells operators to search for.
+    [[nodiscard]] static std::string stop_skip_log_line(StopSkip why);
+    /// The exact ERROR line GuardianEngine::stop() logs when its Stop pass ran but left captures
+    /// behind (a failed write or the wall budget). Pure and static, like stop_skip_log_line.
+    [[nodiscard]] static std::string stop_incomplete_log_line(std::size_t failed,
+                                                              bool budget_exhausted);
+    /// TEST-ONLY: true once begin_stop() has stored its mark. Lets a test prove the mark was
+    /// taken while another thread still held the engine mutex. No production caller.
+    [[nodiscard]] bool stop_begun_for_test() const noexcept {
+        return stop_state_.load(std::memory_order_acquire) == 2;
+    }
+    /// TEST-ONLY: stop-skip ERROR lines emitted for `why` (the log has no cross-image capture).
+    [[nodiscard]] std::uint64_t stop_skip_logs_for_test(StopSkip why) const noexcept {
+        return (why == StopSkip::Stalled ? stop_skip_stalled_logs_ : stop_skip_late_logs_)
+            .load(std::memory_order_relaxed);
+    }
 
     /// Snapshot the runtime's staged captures, persist them in rotation order under the
     /// trigger's budget, erase the persisted ones from staging by identity. Thread-safe
@@ -421,8 +472,13 @@ private:
         WaiterGuard(const WaiterGuard&) = delete;
         WaiterGuard& operator=(const WaiterGuard&) = delete;
     };
-    /// begin_stop()'s mark (steady_clock rep, 0 = no stop begun): see begin_stop().
+    /// begin_stop()'s mark: `stop_state_` is 0 (no stop begun), 1 (a begin_stop() is storing the
+    /// mark) or 2 (`stop_began_rep_`, a steady_clock rep, is valid; published with release). A
+    /// separate state, not a sentinel rep, so a clock that reads 0 cannot disable the skip.
+    std::atomic<std::uint8_t> stop_state_{0};
     std::atomic<Clock::rep> stop_began_rep_{0};
+    std::atomic<std::uint64_t> stop_skip_stalled_logs_{0}; ///< TEST-ONLY, stop_skip_logs_for_test
+    std::atomic<std::uint64_t> stop_skip_late_logs_{0};    ///< TEST-ONLY, stop_skip_logs_for_test
     std::atomic<std::uint64_t> backoff_deferrals_{0}; ///< TEST-ONLY, see its accessor
     std::atomic<std::uint64_t> info_logs_{0};         ///< TEST-ONLY, see its accessor
     /// Retry backoff (Worker passes only). `next_attempt_rep_` is the steady_clock rep before

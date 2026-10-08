@@ -342,6 +342,11 @@ public:
     /// intact), and a benign duplicate (an erase threw after a successful write, so the next
     /// pass re-wrote the same capture and the guard refused it). Lock-free.
     [[nodiscard]] std::uint64_t baseline_persist_refusals() const;
+    /// TEST-ONLY: how many times stop() logged that its final Spark baseline flush was
+    /// incomplete (the ERROR line docs/user-manual/metrics.md names). No production caller.
+    [[nodiscard]] std::uint64_t baseline_stop_incomplete_logs_for_test() const noexcept {
+        return baseline_stop_incomplete_logs_.load(std::memory_order_relaxed);
+    }
 
     /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was
     /// edge-suppressed (M1). Surfaced sparsely on the heartbeat as
@@ -1253,6 +1258,9 @@ private:
     /// #4045: stop()'s final baseline flush has run once (mtx_-guarded): the destructor's second
     /// stop() must not flush, or log the skip, again.
     bool baseline_stop_flush_done_{false};
+    /// TEST-ONLY: "final flush incomplete" ERROR lines emitted by stop() (the log has no
+    /// cross-image capture), see baseline_stop_incomplete_logs_for_test().
+    std::atomic<std::uint64_t> baseline_stop_incomplete_logs_{0};
     std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
     std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
 };
