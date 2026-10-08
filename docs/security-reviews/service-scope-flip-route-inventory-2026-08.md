@@ -125,6 +125,40 @@ tar_tree) were not re-swept here; they already carry `deny_service_scoped_*`/
 `token_scope_service` handling from prior PRs in this saga (found by
 compliance-officer, Gate 6) and are not re-verified by this document.
 
+## Update (#3526, #4753): `GET /fragments/executions` now admits a service-scoped token, confined
+
+This inventory covers gate-less routes, and `GET /fragments/executions` was not one: it called
+`perm_fn(Execution, Read)`, so the flip denied a service-scoped token (403) like every other
+`require_permission` caller. It has since moved onto `fleet_read_fn` (`require_fleet_read`) as its
+sole gate, the same shape as `/fragments/executions/{id}/detail`, so a service-scoped token is now
+ADMITTED and served the confined view (rows for executions that touched an in-scope agent, counters
+and `last_error_detail` projected to the in-scope agents, scope pushed into SQL before the 50-row limit). That holds only
+with RBAC enforcement ON (`authz_gates.cpp` still refuses with 403 with enforcement off) and a
+reachable `TagStore` (missing or degraded is 503, `retry_after_ms` 5000). The gate audits each
+refusal, but the fragment replaces its response with an HTTP 200 note (`data-denied="true"` for the
+403, `data-degraded="gate"` for the 503), because the dashboard drops 4xx/5xx bodies. It is a deliberate
+admission change with a real mechanism behind it, not a widening of `kServiceScopeGlobalSafe`.
+The owner disjunct (`dispatched_by == username`) is suppressed for service-scoped sessions on this
+fragment, because a service-scoped token's session username is the account that minted it and the
+disjunct would list the minter's executions outside the service scope. Known limit (#5557): on
+`GET /api/v1/executions`, `/{id}`, `/children`, MCP `get_execution_status`, MCP `list_executions`,
+legacy `/api/executions*`, the detail fragment, the SSE channel `/sse/executions/{id}` and
+`GET /api/v1/events`, a service-scoped token is still also shown
+executions its minter dispatched, outside the service scope (counters projected, but id, definition,
+status and timing visible); closing that needs dispatch-time token attribution. Separately,
+`require_fleet_read` applies the `ITServiceOwner` ceiling on its service axis (added by
+PR #5546, not by the fragment migration; see `docs/auth-architecture.md`, "`require_fleet_read`
+now applies the `ITServiceOwner` authority ceiling"), so the fragment inherits it; `kServiceScopeGlobalSafe`
+is still not applied or widened there. It is also not a leak fix: an author-run reachability probe (not independently adjudicated) found that
+before the migration the route disclosed nothing out of scope to any principal it admitted
+(global-grant callers are unfiltered by design). Tests:
+`test_workflow_executions_list_authz.cpp` (real `require_fleet_read`, exact served-id sets).
+
+MCP `summarize_working_set` is unchanged on this axis: it keeps the default
+`ServiceScopeClass::denied`, because its `kind=agent` and `kind=fleet` have no mechanism on the
+service-scope axis and `confined` needs a real downstream mechanism for every kind. A test pins the
+denial before `fleet_read_fn_` runs.
+
 ## Update (#3526): `require_fleet_read` now applies the `ITServiceOwner` ceiling on its service axis
 
 This inventory covers gate-less routes. `require_fleet_read` is not one, but its service-scoped
