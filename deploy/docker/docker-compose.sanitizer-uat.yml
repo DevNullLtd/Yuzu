@@ -16,8 +16,11 @@ services:
       - "0.0.0.0:50051"
       - "--no-tls"
       - "--no-https"
+      # Plaintext rig: no peer certificate exists, so gateway peer authorization
+      # is explicitly acknowledged as disabled here. Not for production.
       - "--gateway-upstream"
       - "0.0.0.0:50055"
+      - "--insecure-gateway-peer"
       - "--gateway-mode"
       - "--gateway-command-addr"
       - "gateway:50063"

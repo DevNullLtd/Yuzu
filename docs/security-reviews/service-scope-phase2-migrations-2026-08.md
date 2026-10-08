@@ -191,9 +191,15 @@ not the numbers:
    `require_scoped_permission`, single-agent-shaped, not `require_fleet_read`).
 4. **§3d — the `authorize_list_read` supersede→intersect migration** (ADR-1006's deferred
    item; two twin-pairs, `plugin_config_routes.cpp`/MCP `list_plugin_config` and the
-   upload-grants resolver at `server.cpp:17722`/`:18307`). Separate stream — the
+   upload-grants list resolvers in `server.cpp`, the `authorize_list_read(username, "UploadGrant", "Read", ...)` call sites). Separate stream — the
    plugin-config pair has no agent dimension, so it needs a `kServiceScopeGlobalSafe`-style
    policy decision rather than a `meet()`, unlike upload-grants' clean intersection.
+   The upload-grants REST route no longer reaches that resolver for a service-scoped token:
+   `file_retrieval_routes.cpp`'s `register_list` refuses such a session with `403` before the
+   resolver runs (the MCP twin already refused it through `perm_fn`), so the service-token reach
+   on that pair is closed. That is an explicit deny shaped like the §3e denies, not this migration:
+   the supersede→intersect migration itself is still deferred for every caller listed here, the
+   upload-grants resolver included.
 5. **Bucket 3 — routes with no primary RBAC gate at all** (the `deny_service_scoped_session`
    family, the `/api/v1/result-sets` family, `/api/scope/estimate`, compliance fragments).
    **Explicitly out of scope for a `require_fleet_read` migration** — these need a gate added
@@ -212,3 +218,24 @@ Known open items this migration surfaced but did not resolve:
   genuinely supersede, zero `authorize_list_read` callers) with the actual §3d targets (4
   `authorize_list_read` callers, unrelated to dispatch). Not fixed here — out of this PR's
   diff scope; flag for whoever picks up §3d.
+
+## Note: `confined` MCP labels whose securable `ITServiceOwner` does not hold
+
+Not an issue; a label-versus-ceiling question that predates the executions-list work (#3526, #4753).
+Some MCP tools carry `ServiceScopeClass::confined` in `mcp_server.cpp`'s C8 table but are authorized by
+their own `scoped_perm_fn` gate (`AuthRoutes::require_scoped_permission`), not by `require_fleet_read`.
+`require_scoped_permission`'s service branch applies the `ITServiceOwner` ceiling, then the tag match
+(`auth_routes.cpp`, the `authz::service_ceiling_check` call in that function). Read from the seed in
+`rbac_store.cpp` (`seed_defaults`): where `ITServiceOwner` does not hold the tool's
+`(securable, operation)` pair, a service-scoped token is refused at the ceiling, so the `confined` label
+has no admit path under seeded defaults.
+
+- Examples of that shape: `get_agent_app_usage` (`Forensics:Read`) and `quarantine_device`
+  (`Security:Execute`). The two named are examples, not an exhaustive list.
+- Not affected: tools on securables `ITServiceOwner` holds. `set_tag`/`delete_tag` (`Tag:Write`/`Tag:Delete`)
+  are genuinely confined (ceiling, tag match and the #3289 mutation guard), and the `GuaranteedState:Read`
+  and `SoftwareLicensing:Read` tools (for example the `get_dex_*` family and `query_software_licenses`)
+  pass the ceiling because the seed grants `ITServiceOwner` those securables.
+
+Whether a label with no admit path should read `denied` is a separate decision. This was derived by
+reading the seed and the gate code; no test exercises it.

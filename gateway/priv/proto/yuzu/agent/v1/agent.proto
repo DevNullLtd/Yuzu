@@ -71,15 +71,16 @@ message RegisterRequest {
   // both this and the gateway's transport `gateway_ip` so an auditor can
   // cross-check the two.
   //
-  // Transport-agnostic by design (#376): the field lives in the message, so it
-  // carries over to a QUIC framing unchanged. Under today's grpcbox transport
-  // the gateway can only source it from `x-forwarded-for` (proxied
-  // deployments); the QUIC transport, owning its socket, will fill it from the
-  // real peer. Empty = not provided → server falls back to the transport peer.
+  // Transport-agnostic by design: the field lives in the message, not in
+  // transport metadata. The gateway can source it from `x-forwarded-for`
+  // (proxied deployments). grpcbox holds the agent's socket but does not
+  // expose its peer address to service handlers; a vendored accessor that does
+  // is #1172 (gRPC is the permanent transport, ADR-0066 — the QUIC plan, #376,
+  // was withdrawn). Empty = not provided → server falls back to the transport peer.
   //
-  // Gateway-side population is deferred to a follow-up: grpcbox can't observe
-  // the direct transport peer (only mTLS peercert), and the durable direct-mode
-  // source lands with the QUIC transport (#376). Mirror kept in sync with the
+  // Gateway-side population is deferred to a follow-up: grpcbox does not pass
+  // the transport peer address to handlers (only the mTLS peercert, to
+  // auth_fun); the vendored accessor is #1172 (ADR-0066). Mirror kept in sync with the
   // canonical proto so gpb regenerates with the field present when the
   // population work lands.
   string gateway_observed_peer  = 6;
@@ -92,7 +93,7 @@ message RegisterRequest {
   // server never saw the CSR. The gateway does NOT inspect or act on it; it
   // forwards verbatim and the server signs the leaf from the authenticated
   // enrollment (the CSR's own subject/SAN are ignored). Empty = legacy / no-mTLS.
-  // Transport-agnostic (#376): lives in the message, survives the QUIC move.
+  // Transport-agnostic: lives in the message, not in transport metadata.
   string csr_pem = 7;
 }
 

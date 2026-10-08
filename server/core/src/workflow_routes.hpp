@@ -35,6 +35,12 @@ namespace yuzu::server {
 
 class CommandCapabilityRegistry;
 
+/// Describe `yuzu_server_instruction_param_rejected_total{route,reason}` and pre-seed every
+/// (route, reason) series to 0 so the family exists before the first refusal. Called once at
+/// server start; idempotent. `route` is `instruction_execute` for
+/// `POST /api/instructions/{id}/execute`; `reason` is `shape`, `violation` or `schema_invalid`.
+void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics);
+
 /// Workflow, product-pack, execution fragment, and scope-estimate routes.
 /// Extracted from ServerImpl::start_web_server() for god-object decomposition.
 class WorkflowRoutes {
@@ -106,7 +112,8 @@ public:
 
     /// #1712 / #3290 Phase 2 — the injected-callback twin of
     /// `AuthRoutes::require_fleet_read`, backing the executions-drawer
-    /// detail route's real per-agent/service confinement (same shape as
+    /// detail route's and the executions LIST fragment's real
+    /// per-agent/service confinement (same shape as
     /// `McpServer::FleetReadFn`/`RestApiV1::FleetReadFn`/
     /// `DashboardRoutes::FleetReadFn` — server.cpp wires the SAME
     /// conversion lambda into all of them so they cannot drift). MUST be
@@ -139,9 +146,11 @@ public:
         AuthFn auth_fn;
         PermFn perm_fn;
         /// #1712 / #3290 Phase 2 — see FleetReadFn's doc comment above.
-        /// Used ONLY by the executions-drawer detail route
-        /// (/fragments/executions/{id}/detail); every other route in this
-        /// file keeps using `perm_fn` above unchanged.
+        /// Consumed by the executions-drawer detail route
+        /// (/fragments/executions/{id}/detail), the executions LIST
+        /// fragment (/fragments/executions, #3526), /sse/executions/{id} and
+        /// GET /api/workflow-executions/{id}; the remaining routes in this
+        /// file keep using `perm_fn` above unchanged.
         FleetReadFn fleet_read_fn;
         AuditFn audit_fn;
         EmitEventFn emit_fn;

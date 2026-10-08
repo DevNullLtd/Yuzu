@@ -783,23 +783,33 @@ ExecutionSummary ExecutionTracker::get_summary(const std::string& id) const {
 }
 
 std::optional<std::vector<AgentExecStatus>>
-ExecutionTracker::get_agent_statuses_checked(const std::string& execution_id) const {
+ExecutionTracker::get_agent_statuses_checked(
+    const std::string& execution_id,
+    const std::optional<std::vector<std::string>>& visible_agents) const {
     if (!open_) {
         spdlog::warn("ExecutionTracker::get_agent_statuses_checked degraded: tracker not open");
         return std::nullopt;
     }
+    // Build the SQL and the (possibly O(visible set)) array parameter BEFORE taking the
+    // pool lease, so no per-element work runs while a connection is held.
+    std::string sql =
+        "SELECT agent_id, status, dispatched_at, first_response_at, completed_at, exit_code, "
+        "error_detail, COALESCE(plugin_result_status, 0) FROM execution_tracker.agent_exec_status "
+        "WHERE execution_id = $1";
+    std::vector<std::string> params{execution_id};
+    if (visible_agents) {
+        std::vector<std::string_view> sv(visible_agents->begin(), visible_agents->end());
+        sql += " AND agent_id = ANY($2::text[])";
+        params.push_back(pg::to_text_array(sv));
+    }
+    sql += " ORDER BY agent_id";
+
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         spdlog::warn("ExecutionTracker::get_agent_statuses_checked degraded: pool exhausted");
         return std::nullopt;
     }
-
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT agent_id, status, dispatched_at, first_response_at, completed_at, exit_code, "
-        "error_detail, COALESCE(plugin_result_status, 0) FROM execution_tracker.agent_exec_status "
-        "WHERE execution_id = $1 ORDER BY agent_id",
-        std::vector<std::string>{execution_id});
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("ExecutionTracker::get_agent_statuses_checked degraded: query failed");
         return std::nullopt;
@@ -837,7 +847,8 @@ ExecutionTracker::get_agent_statuses_for_executions(
 
 std::optional<std::unordered_map<std::string, std::vector<AgentExecStatus>>>
 ExecutionTracker::get_agent_statuses_for_executions_checked(
-    const std::vector<std::string>& execution_ids) const {
+    const std::vector<std::string>& execution_ids,
+    const std::optional<std::vector<std::string>>& visible_agents) const {
     std::unordered_map<std::string, std::vector<AgentExecStatus>> by_execution;
     // Engaged-empty: zero requested executions means zero rows, without
     // touching the pool — success-empty, not degrade (matches
@@ -849,21 +860,28 @@ ExecutionTracker::get_agent_statuses_for_executions_checked(
             "ExecutionTracker::get_agent_statuses_for_executions_checked degraded: tracker not open");
         return std::nullopt;
     }
+    // SQL + array parameters are built BEFORE the pool lease (no O(set) work under a lease).
+    std::vector<std::string_view> sv(execution_ids.begin(), execution_ids.end());
+    std::string sql =
+        "SELECT execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, "
+        "exit_code, error_detail, COALESCE(plugin_result_status, 0) "
+        "FROM execution_tracker.agent_exec_status "
+        "WHERE execution_id = ANY($1::text[])";
+    std::vector<std::string> params{pg::to_text_array(sv)};
+    if (visible_agents) {
+        std::vector<std::string_view> av(visible_agents->begin(), visible_agents->end());
+        sql += " AND agent_id = ANY($2::text[])";
+        params.push_back(pg::to_text_array(av));
+    }
+    sql += " ORDER BY execution_id, agent_id";
+
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         spdlog::warn(
             "ExecutionTracker::get_agent_statuses_for_executions_checked degraded: pool exhausted");
         return std::nullopt;
     }
-
-    std::vector<std::string_view> sv(execution_ids.begin(), execution_ids.end());
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, "
-        "exit_code, error_detail, COALESCE(plugin_result_status, 0) "
-        "FROM execution_tracker.agent_exec_status "
-        "WHERE execution_id = ANY($1::text[]) ORDER BY execution_id, agent_id",
-        std::vector<std::string>{pg::to_text_array(sv)});
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn(
             "ExecutionTracker::get_agent_statuses_for_executions_checked degraded: query failed");

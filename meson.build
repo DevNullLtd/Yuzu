@@ -6,7 +6,7 @@ project(
   # once generated `int kVersionPatch = 1-dev;` and red-lined the whole C++
   # matrix (fca69e34). The suffix-tolerant split below (search
   # PROJECT_VERSION_PATCH) stays as defense-in-depth, not as licence.
-  version: '0.14.0',
+  version: '0.14.1',
   license: 'AGPL-3.0-or-later',
   meson_version: '>=1.3.0',
   default_options: [
@@ -127,7 +127,8 @@ if host_os == 'windows'
   # search dirs. Keep BOTH halves in sync; neither can be simplified
   # alone. Full diagnosis:
   #   .claude/agents/build-ci.md "Windows MSVC static-link history and #375"
-  # Strategic escape (P1): #376 "Migrate transport off gRPC to QUIC".
+  # Permanent: gRPC is the long-term transport (ADR-0066 withdrew the QUIC
+  # escape, #376), so this wiring is not a stopgap.
 
   _cxx = meson.get_compiler('cpp')
   _vcpkg_root_win = meson.project_source_root() / 'vcpkg_installed' / 'x64-windows'

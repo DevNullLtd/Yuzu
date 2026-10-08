@@ -293,6 +293,9 @@
 #include "cidr_match.hpp"
 #include "gateway_mgmt_stub_pool.hpp"
 #include "gateway_route_store.hpp"
+#include "gateway_peer_audit.hpp"
+#include "gateway_peer_guard.hpp"
+#include "gateway_peer_resolution.hpp"
 #include "gateway_service_impl.hpp"
 
 #include <grpc/grpc_security_constants.h>
@@ -1488,6 +1491,9 @@ public:
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
+        // Stored `parameter_schema` refusals on the instruction execute route: a separate
+        // family (a validation refusal, not a targeting one), seeded in workflow_routes.cpp.
+        seed_instruction_param_rejected_metrics(metrics_);
         // Wave 7 PR7.2: the Forensics single-target refusal — same routes as
         // its Destructive sibling above, since `evaluate_destructive_targeting`
         // is called generically for any classified capability on all of them
@@ -1945,8 +1951,8 @@ public:
                           "histogram");
         // RbacStore observability (ADR-0041). Described + zero-seeded up front so
         // the HELP/TYPE lines and closed dims exist on an idle server — critical
-        // here because a degrade means fleet-wide authz DENY (a PG blip denies
-        // every authorized request), so absent-series alerting must work before
+        // here because a degrade refuses the requests whose authorization read
+        // failed (fail-closed), so absent-series alerting must work before
         // the first degrade ever fires (Gate 6 sre BLOCKING / Gate 4 consistency).
         metrics_.describe("yuzu_server_rbac_read_degrade_total",
                           "Authorization reads/refreshes that hit a degraded store, by reason "
@@ -1959,8 +1965,11 @@ public:
                           "its existing decision from cache, this counts a data-quality or "
                           "staleness condition rather than a denied check - see the alert's "
                           "reason filter before assuming any nonzero rate here pages). "
-                          "A sustained non-zero rate in the denying reasons is a fleet-wide authz "
-                          "availability event, not mass access-denial - alert on it. "
+                          "A sustained non-zero rate in the denying reasons means authorization "
+                          "reads are failing and the requests that needed a failed read are "
+                          "refused (an operator check only on a permission-cache miss; a "
+                          "service-scoped token on every fleet-read or scoped-permission "
+                          "request whose ITServiceOwner ceiling read fails) - alert on it. "
                           "A circuit-breaker-open denial (#2703 Gate 7 item 1 commit B) is recorded "
                           "under pool_acquire_timeout, not a distinct reason - it is one of that "
                           "reason's own two contributing failure modes (see "
@@ -7889,6 +7898,129 @@ public:
         spdlog::error("**********************************************************************");
     }
 
+    /// Gateway-upstream peer authorization: resolve the mode, build the guard.
+    ///
+    /// Runs in run() AFTER certificate bootstrap (so the effective listener
+    /// credentials are known) and BEFORE the gRPC builder is created, so a refusal
+    /// exits before any port is bound. The decision itself is the pure
+    /// `gateway_peer::resolve_gateway_peer_authz`; this function only gathers its
+    /// inputs, logs, and constructs the one `GatewayPeerGuardedService` the builder
+    /// registers. Returns false on a refusal (the caller sets `startup_failed_`).
+    ///
+    /// Pins are fixed here, once: there is no reload, freshness window or revocation read.
+    ///
+    /// LIFETIME: the policy holds an immutable pin set by `shared_ptr`; the audit sink captures
+    /// `this` and runs on gRPC worker threads. That is safe for the same reason the CA wiring
+    /// above is: stop() runs `agent_server_->Shutdown(deadline)` BEFORE any member is destroyed.
+    /// `agent_server_` is declared after `gateway_peer_guard_` (the guard outlives the server's
+    /// last call), and `gateway_peer_guard_` after `gateway_service_` (the inner handler outlives
+    /// the guard).
+    [[nodiscard]] bool setup_gateway_peer_guard() {
+        namespace gp = yuzu::server::gateway_peer;
+
+        metrics_.describe(std::string{gp::kAuthzModeMetric},
+                          "Gateway-upstream peer authorization mode: 1 for the active mode "
+                          "(enforce; insecure_ack = acknowledged DISABLED on plaintext or without "
+                          "a client CA; insecure_ack_tls = acknowledged DISABLED while TLS and a "
+                          "client CA are on; disabled = service off)",
+                          "gauge");
+        for (const auto m : gp::kRunnableAuthzModes)
+            metrics_.gauge(std::string{gp::kAuthzModeMetric},
+                           {{"mode", std::string{gp::to_label(m)}}})
+                .set(0);
+
+        const bool mgmt_override = !cfg_.mgmt_tls_server_cert.empty() ||
+                                   !cfg_.mgmt_tls_server_key.empty() ||
+                                   !cfg_.mgmt_tls_ca_cert.empty();
+        gp::ListenerFacts facts;
+        facts.tls_enabled = cfg_.tls_enabled;
+        facts.using_default_certs = cfg_.using_default_certs;
+        facts.using_default_agent_certs = cfg_.using_default_agent_certs;
+        facts.mgmt_override = mgmt_override;
+        facts.agent_ca_present = !cfg_.tls_ca_cert.empty();
+        facts.mgmt_ca_present = !cfg_.mgmt_tls_ca_cert.empty();
+        facts.agent_creds_are_default_files =
+            !default_cert_set_.server_cert.empty() &&
+            cfg_.tls_server_cert == default_cert_set_.server_cert &&
+            !default_cert_set_.ca_cert.empty() && cfg_.tls_ca_cert == default_cert_set_.ca_cert;
+        const gp::ListenerPosture posture = gp::derive_listener_posture(facts);
+
+        gp::ResolutionInputs in;
+        in.service_enabled = (gateway_service_ != nullptr);
+        in.tls_enabled = cfg_.tls_enabled;
+        in.ca_present = posture.ca_present;
+        in.grpc_creds_are_default = posture.grpc_creds_are_default;
+        in.hex_pins = cfg_.gateway_peer_pins;
+        in.pin_files = cfg_.gateway_peer_pin_files;
+        in.insecure_ack = cfg_.insecure_gateway_peer;
+        in.cert_group = cfg_.cert_group;
+        in.default_gateway_cert_path = default_cert_set_.gateway_cert.string();
+
+        const gp::Resolution res = gp::resolve_gateway_peer_authz(in);
+        for (const auto& w : res.warnings)
+            spdlog::warn("gateway peer authorization: {}", w);
+
+        const auto set_mode = [this](gp::AuthzMode m) {
+            metrics_.gauge(std::string{gp::kAuthzModeMetric},
+                           {{"mode", std::string{gp::to_label(m)}}})
+                .set(1);
+        };
+
+        switch (res.mode) {
+        case gp::AuthzMode::Refuse:
+            spdlog::error("gateway peer authorization: {}", res.refusal);
+            return false;
+        case gp::AuthzMode::Disabled:
+            set_mode(res.mode);
+            return true;
+        case gp::AuthzMode::InsecureAck:
+        case gp::AuthzMode::InsecureAckTls:
+            set_mode(res.mode);
+            // The ONE loud line (the resolution's warnings do not repeat it).
+            spdlog::error("*** {}", res.alarm);
+            // Durable evidence that the acknowledged-disabled posture was in force. The audit
+            // store is constructed in the ServerImpl constructor, well before run() calls this
+            // function, so it is open here (the same shape as server.viz_disabled and
+            // server.unsigned_packs_allowed, which are written once the store exists).
+            // A skipped or failed write is warned about by the helper.
+            (void)gp::write_audit_row_or_warn(
+                audit_store_ && audit_store_->is_open(),
+                [this](const AuditEvent& ev) { return audit_store_->log(ev); },
+                gp::make_authz_disabled_audit_event(res.mode, in.tls_enabled));
+            gateway_peer_guard_ = std::make_unique<detail::GatewayPeerGuardedService>(
+                *gateway_service_, detail::GatewayPeerGuardedService::AcknowledgedInsecure{},
+                &metrics_);
+            return true;
+        case gp::AuthzMode::Enforce:
+            break;
+        }
+
+        auto boot = gp::build_boot_pins(in, res);
+        if (!boot) {
+            spdlog::error("gateway peer authorization: {}", boot.error());
+            return false;
+        }
+        for (const auto& w : boot->warnings)
+            spdlog::warn("gateway peer authorization: {}", w);
+        if (res.auto_pin) {
+            spdlog::info("gateway peer authorization: enforcing; the default gateway certificate "
+                         "({}) is pinned automatically (default gRPC certificates in use); {}",
+                         res.auto_pin_file, gp::format_pin_prefixes(*boot->pins));
+        } else {
+            spdlog::info("{}", gp::enforce_boot_line(*boot->pins, cfg_.gateway_peer_pins.size(),
+                                                     cfg_.gateway_peer_pin_files.size()));
+        }
+
+        detail::GatewayPeerGuardedService::AuditSink audit = [this](const AuditEvent& ev) {
+            return audit_store_ && audit_store_->is_open() && audit_store_->log(ev);
+        };
+        gateway_peer_guard_ = std::make_unique<detail::GatewayPeerGuardedService>(
+            *gateway_service_, gp::GatewayPeerPolicy{std::move(boot->pins)}, std::move(audit),
+            &metrics_);
+        set_mode(res.mode);
+        return true;
+    }
+
     ~ServerImpl() override { stop(); }
 
     [[nodiscard]] bool startup_failed() const override { return startup_failed_; }
@@ -8110,6 +8242,12 @@ public:
 
         grpc::EnableDefaultHealthCheckService(true);
 
+        // KEEP IN SYNC with `gateway_peer::derive_listener_posture` (gateway_peer_resolution.hpp):
+        // the credential choice below (management override, strict default set, reused operator
+        // credentials) is what that function mirrors to decide whether the gateway-upstream
+        // listener has a client CA and runs on the default set. Changing which credentials the
+        // gateway-upstream listener (`mgmt_creds`) uses without changing the function makes the
+        // boot decision describe a listener that no longer exists.
         std::shared_ptr<grpc::ServerCredentials> agent_creds = grpc::InsecureServerCredentials();
         std::shared_ptr<grpc::ServerCredentials> mgmt_creds = grpc::InsecureServerCredentials();
         if (cfg_.tls_enabled) {
@@ -8172,6 +8310,13 @@ public:
             }
         }
 
+        // Gateway-upstream peer authorization: decide the mode and build the guard
+        // BEFORE the builder exists, so a refusal exits before any port is bound.
+        if (!setup_gateway_peer_guard()) {
+            startup_failed_ = true;
+            return;
+        }
+
         grpc::ServerBuilder builder;
         // ADR-1005 Interim rules (execution-plan PR 1.1): one interceptor on the
         // ONE builder — covers agent, management, and gateway-upstream services
@@ -8219,13 +8364,28 @@ public:
         builder.AddListeningPort(cfg_.listen_address, agent_creds);
         builder.AddListeningPort(cfg_.management_address, mgmt_creds);
         builder.RegisterService(&agent_service_);
+        // ManagementService is a PLACEHOLDER with no RPCs today. When it gains its first real
+        // RPC, put that RPC behind a guard of the GatewayPeerGuardedService kind BEFORE it
+        // answers anything. The descriptor tripwire in
+        // tests/unit/server/test_gateway_peer_guard.cpp already covers this service: it fails
+        // if a method appears or if an unauthenticated call is not refused.
         builder.RegisterService(&mgmt_service_);
 
         if (gateway_service_) {
+            if (!gateway_peer_guard_) {
+                spdlog::error("gateway peer authorization: no guard was built; refusing to "
+                              "register the gateway-upstream service unguarded");
+                startup_failed_ = true;
+                return;
+            }
             // Gateway upstream uses the same credentials as the management listener
             // (internal traffic, typically mTLS between gateway and server).
             builder.AddListeningPort(cfg_.gateway_upstream_address, mgmt_creds);
-            builder.RegisterService(gateway_service_.get());
+            // REGISTER THE GUARD, NEVER gateway_service_: the guard is the only registration
+            // of the gateway-upstream service. It wraps the inner handler and decides who may
+            // call. tests/test_gateway_peer_registration_lexical.py fails if this site
+            // registers anything else.
+            builder.RegisterService(gateway_peer_guard_.get());
             spdlog::info("Gateway upstream service enabled on {}", cfg_.gateway_upstream_address);
         }
 
@@ -19083,6 +19243,10 @@ private:
                         }
                         return out;
                     },
+                    // REQUIRED: `register_file_retrieval_routes` throws
+                    // `std::invalid_argument` at registration if this is unbound (pinned by
+                    // test_upload_grants_service_scope.cpp).
+                    .deny_service_scoped_fn = deny_service_scoped_fn,
                     .audit_fn = audit_fn,
                     .store = upload_grant_store_.get(),
                     .blob_root = cfg_.db_dir() / "upload-blobs",
@@ -20659,6 +20823,11 @@ private:
     detail::AgentServiceImpl agent_service_;
     detail::ManagementServiceImpl mgmt_service_;
     std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;
+    // Gateway-upstream peer authorization. ORDER IS LOAD-BEARING: the guard is declared after
+    // `gateway_service_` (the inner handler it delegates to) and BEFORE `agent_server_` below (so
+    // the server is destroyed first and nothing can still be calling the guard). The OTA row's
+    // agent_service_/agent_server_ order is untouched.
+    std::unique_ptr<detail::GatewayPeerGuardedService> gateway_peer_guard_;
     // HA WS-4 4.3: replaces the pre-4.3 single gw_mgmt_channel_/gw_mgmt_stub_
     // pair — see the construction site's comment.
     std::unique_ptr<yuzu::server::GatewayMgmtStubPool> gw_mgmt_pool_;

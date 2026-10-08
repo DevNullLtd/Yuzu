@@ -1177,13 +1177,7 @@ private:
     }
 
     int do_cleanup(yuzu::CommandContext& ctx, yuzu::Params params) {
-        auto hours_str = params.get("hours");
-        int hours = 24;
-        if (!hours_str.empty()) {
-            try {
-                hours = std::stoi(std::string{hours_str});
-            } catch (...) {}
-        }
+        const int hours = yuzu::content_dist::exec::parse_cleanup_hours(params.get("hours"), 24);
 
         auto dir = staging_dir();
         auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(hours);
@@ -1191,7 +1185,14 @@ private:
         int removed = 0;
         yuzu::PluginContext pctx{g_ctx};
         for (const auto& entry : fs::directory_iterator(dir, ec)) {
-            if (entry.is_regular_file() && entry.last_write_time(ec) < cutoff) {
+            // Non-throwing queries; a file whose age cannot be read is left alone
+            // (see cleanup_is_stale).
+            std::error_code entry_ec;
+            if (!entry.is_regular_file(entry_ec) || entry_ec)
+                continue;
+            std::error_code mtime_ec;
+            const auto mtime = entry.last_write_time(mtime_ec);
+            if (yuzu::content_dist::exec::cleanup_is_stale(mtime_ec, mtime, cutoff)) {
                 auto fname = entry.path().filename().string();
                 fs::remove(entry.path(), ec);
                 // #808: also evict the staged-hash KV entry so an entry
