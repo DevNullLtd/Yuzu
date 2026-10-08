@@ -5891,10 +5891,30 @@ public:
                               "admission to every exit, including aborted ones); the sizing "
                               "input for --guardian-reconcile-budget-ms-per-s",
                               "histogram");
+            // Saturation gauges, set from the 15 s health-recompute tick (beside the claim
+            // sweep). Pre-seeded so the series exist before the first tick.
+            metrics_.describe("yuzu_server_guardian_reconcile_in_flight",
+                              "Guardian heartbeat reconcile pushes admitted and not yet finished "
+                              "on this replica; new admissions are shed when it "
+                              "reaches the in-flight cap",
+                              "gauge");
+            metrics_.gauge("yuzu_server_guardian_reconcile_in_flight").set(0.0);
+            metrics_.describe("yuzu_server_guardian_reconcile_budget_balance_ms",
+                              "Guardian heartbeat reconcile admission budget balance in "
+                              "milliseconds on this replica; negative means debt from slow "
+                              "pushes that sheds new admissions until it is repaid",
+                              "gauge");
+            metrics_.gauge("yuzu_server_guardian_reconcile_budget_balance_ms")
+                .set(guardian_reconcile_budget_.config().burst_ms);
+            metrics_.describe("yuzu_server_guardian_reconcile_claims",
+                              "Per-agent Guardian reconcile claims held on this replica (an "
+                              "agent has at most one; bounded by the claim sweep)",
+                              "gauge");
+            metrics_.gauge("yuzu_server_guardian_reconcile_claims").set(0.0);
             yuzu::Histogram* const reconcile_duration = &metrics_.histogram(
                 "yuzu_server_guardian_reconcile_duration_seconds",
                 std::vector<double>{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0,
-                                    2.5, 5.0});
+                                    2.5, 5.0, 10.0});
             {
                 // The values the budget actually enforces (it clamps to its documented bounds).
                 const auto eff = guardian_reconcile_budget_.config();
@@ -5932,7 +5952,9 @@ public:
             // kept while an agent that has meanwhile converged is still younger than the
             // interval (so an agent alternating generation 0 / current cannot buy a push on
             // every second heartbeat); a claim older than the interval is erased on
-            // convergence, and the maintenance sweep bounds the rest. The cached generation
+            // convergence, and the maintenance sweep bounds the rest. Nothing releases a claim
+            // early: an agent with no session (Registered, not yet Subscribed) is admitted at
+            // most once per interval, however often it heartbeats. The cached generation
             // (<= 2 s old) only drives that decision; an ADMITTED push re-reads the
             // generation fresh and labels the push with it.
             heartbeat_ingestion_->set_guardian_reconcile_fn(
@@ -5969,7 +5991,10 @@ public:
                     // heartbeat into a registry scan. Wall-clock based so it self-heals a
                     // re-registered/wiped agent after the interval. A SHED never writes the
                     // claim, so the agent earns no holdoff for a push that never happened.
-                    switch (guardian_reconcile_gate_.decide(agent_id, agent_gen, current)) {
+                    GuardianReconcileGate::ShedCause shed_cause =
+                        GuardianReconcileGate::ShedCause::None;
+                    switch (guardian_reconcile_gate_.decide(agent_id, agent_gen, current,
+                                                            &shed_cause)) {
                     case GuardianReconcileGate::Decision::Converged:
                         return;  // agent already at or ahead of current policy
                     case GuardianReconcileGate::Decision::RateLimited:
@@ -5995,13 +6020,26 @@ public:
                         auto last_rep = guardian_shed_log_last_.load(std::memory_order_relaxed);
                         if ((last_rep == kGuardianShedLogNever || now_rep - last_rep >= interval_rep) &&
                             guardian_shed_log_last_.compare_exchange_strong(
-                                last_rep, now_rep, std::memory_order_relaxed))
-                            spdlog::warn("Guardian heartbeat reconcile: replica admission budget "
-                                         "exhausted, shedding re-pushes (agents retry on their "
-                                         "next heartbeat; {} shed so far; this line is logged at "
-                                         "most once a minute)",
-                                         guardian_reconcile_budget_.shed_total() +
-                                             guardian_reconcile_gate_.in_flight_shed_total());
+                                last_rep, now_rep, std::memory_order_relaxed)) {
+                            // Worded by cause: the two have different remedies (a budget shed
+                            // means raise the budget or look at slow pushes; a cap shed means
+                            // pushes are stuck inside a store call).
+                            const auto shed_so_far =
+                                guardian_reconcile_budget_.shed_total() +
+                                guardian_reconcile_gate_.in_flight_shed_total();
+                            if (shed_cause == GuardianReconcileGate::ShedCause::InFlightCap)
+                                spdlog::warn("Guardian heartbeat reconcile: in-flight reconcile "
+                                             "cap reached, shedding re-pushes (agents retry on "
+                                             "their next heartbeat; {} shed so far; this line is "
+                                             "logged at most once a minute)",
+                                             shed_so_far);
+                            else
+                                spdlog::warn("Guardian heartbeat reconcile: replica admission "
+                                             "budget exhausted, shedding re-pushes (agents retry "
+                                             "on their next heartbeat; {} shed so far; this line "
+                                             "is logged at most once a minute)",
+                                             shed_so_far);
+                        }
                         return;
                     }
                     case GuardianReconcileGate::Decision::Admit:
@@ -6059,26 +6097,18 @@ public:
                         }
                     };
 
-                    // Time spent inside the single-flight rule-bundle load (possibly waiting on
-                    // another thread's) is not this push's cost; it is excluded from the
-                    // budget debit (Scoped::exclude). The fresh generation read is NOT
-                    // excluded: it is this push's own store read.
-                    const auto excluding = [&admitted](auto&& fn) {
-                        const auto t0 = std::chrono::steady_clock::now();
-                        auto r = fn();
-                        admitted.exclude(std::chrono::steady_clock::now() - t0);
-                        return r;
-                    };
-
                     auto sess = registry_.get_session(agent_id);
                     if (!sess) {
                         metrics_
                             .counter("yuzu_server_guardian_reconciles_total",
                                      {{"result", "no_session"}})
                             .increment();
-                        // The push never happened, so the agent earned no holdoff: forget the
-                        // claim Admit wrote or it would be rate-limited for nothing.
-                        guardian_reconcile_gate_.release(agent_id);
+                        // The claim Admit wrote is deliberately KEPT. An agent that has
+                        // Registered but not Subscribed has no session and heartbeats
+                        // generation 0 in a loop; releasing the claim here would make every
+                        // such heartbeat a fresh admission and let one credential drain the
+                        // shared budget. Kept, it is at most one admission per
+                        // min_interval (25 s) per agent. No audit row is written on this path.
                         return;
                     }
                     // The generation that LABELS this push, read fresh from the store (cache
@@ -6117,19 +6147,27 @@ public:
                     // guardian::load_reconcile_bundle, which is unit-tested for its
                     // evaluation order (the filter must see the deployed set before it is
                     // moved into the bundle).
-                    const auto bundle_result = excluding([&] {
-                        return guardian_rule_bundle_cache_.get(
-                            fresh_generation,
-                            [this]() -> std::expected<guardian::Bundle, guardian::BundleLoadError> {
-                                if (!guaranteed_state_store_)
-                                    return std::unexpected(guardian::BundleLoadError{
-                                        guardian::BundleLoadError::Source::rules,
-                                        "guaranteed-state store not wired"});
-                                return guardian::load_reconcile_bundle(
-                                    [this] { return guaranteed_state_store_->list_rules(); },
-                                    [this] { return deployed_member_rule_ids(); });
-                            });
-                    });
+                    //
+                    // Only the time THIS push spent BLOCKED waiting on another thread's
+                    // in-flight load is excluded from the budget debit (Scoped::exclude): that
+                    // wait is not this push's cost. The fresh generation read above and this
+                    // push's own load, when it is the thread that runs the loader, are charged
+                    // in full. A failed load is remembered for a short negative TTL by the
+                    // cache, so a failing store is not re-probed by every admitted push.
+                    std::chrono::nanoseconds bundle_waited{0};
+                    const auto bundle_result = guardian_rule_bundle_cache_.get(
+                        fresh_generation,
+                        [this]() -> std::expected<guardian::Bundle, guardian::BundleLoadError> {
+                            if (!guaranteed_state_store_)
+                                return std::unexpected(guardian::BundleLoadError{
+                                    guardian::BundleLoadError::Source::rules,
+                                    "guaranteed-state store not wired"});
+                            return guardian::load_reconcile_bundle(
+                                [this] { return guaranteed_state_store_->list_rules(); },
+                                [this] { return deployed_member_rule_ids(); });
+                        },
+                        &bundle_waited);
+                    admitted.exclude(bundle_waited);
                     if (!bundle_result) {
                         const auto& err = bundle_result.error();
                         switch (err.source) {
@@ -9236,8 +9274,19 @@ public:
                 try {
                     YUZU_ASSERT_BACKGROUND_JOB("guardian_reconcile_gate.sweep"); // WS-10 ReplicaSafe
                     (void)guardian_reconcile_gate_.sweep();
+                    // Saturation gauges for the reconcile admission control, published from
+                    // the same tick: in-flight pushes (the cap), the budget balance (negative
+                    // is debt) and the claim table size.
+                    metrics_.gauge("yuzu_server_guardian_reconcile_in_flight")
+                        .set(static_cast<double>(guardian_reconcile_gate_.in_flight()));
+                    metrics_.gauge("yuzu_server_guardian_reconcile_budget_balance_ms")
+                        .set(guardian_reconcile_budget_.balance_ms());
+                    metrics_.gauge("yuzu_server_guardian_reconcile_claims")
+                        .set(static_cast<double>(guardian_reconcile_gate_.claims_size()));
                 } catch (const std::exception& e) {
                     spdlog::warn("Guardian reconcile claim sweep failed: {}", e.what());
+                } catch (...) {
+                    spdlog::warn("Guardian reconcile claim sweep failed: unknown exception");
                 }
                 // PR3 H-1: tear down any live Subscribe stream whose agent leaf
                 // has since been revoked. The Subscribe establishment gate runs

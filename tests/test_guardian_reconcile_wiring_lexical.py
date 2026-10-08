@@ -38,14 +38,28 @@ removed, string-literal contents reduced to [A-Za-z0-9_], whitespace collapsed):
      unreadable"`.
   m. `abort_degraded` increments the `degraded` counter AND writes the audit event; the rule,
      baseline and bundle-load degrade branches each reach it.
-  n. A session-less Admit releases its claim (`guardian_reconcile_gate_.release(`) and the
-     single-flight waits are excluded from the debit (`.exclude(`).
+  n. A session-less Admit KEEPS its claim: the reconcile lambda never calls `release(` (an agent
+     that Registered but did not Subscribe heartbeats generation 0 in a loop; releasing the claim
+     would turn each heartbeat into a fresh admission and let one credential drain the shared
+     budget), and the `no_session` branch counts then returns. Only the time spent BLOCKED
+     on another thread's rule-set load is excluded from the debit (`admitted.exclude(bundle_waited)`
+     fed by the cache's `waited` out-parameter); the generic `excluding(` wrapper that also
+     excluded the owner's own load must not return.
   o. The bundle load goes through `guardian::load_reconcile_bundle(` (unit-tested for its
      evaluation order), and no statement anywhere in server.cpp or guardian_push_builder.cpp
      combines `filter_deployed_members(` with `std::move(`: `make_bundle` takes both arguments
      by value and the order of evaluation is unspecified, so a move of the deployed set can run
      before the filter reads it (GCC and MSVC do exactly that) and empty the bundle.
-  p. Outside the lambda, `guardian_push_fn_` invalidates both reconcile caches.
+  p. The body of the `guardian_push_fn_` lambda (not merely anywhere outside the reconcile lambda)
+     invalidates both reconcile caches.
+  r. After the fresh-generation read: an unreadable result aborts through `abort_degraded(` AND
+     returns (else `*fresh_res` is dereferenced), `if (fresh_generation <= agent_gen)` returns
+     (a reconcile whose fresh value is not ahead sends nothing), the policy-generation gauge is
+     set from `fresh_generation` (never the cached `current`), and `admitted.exclude(` comes
+     after the bundle get whose waited value it takes.
+  q. The 15 s maintenance tick that calls `guardian_reconcile_gate_.sweep(` also publishes the
+     three saturation gauges (`yuzu_server_guardian_reconcile_in_flight`,
+     `..._budget_balance_ms`, `..._claims`) from the gate and budget, in the same try block.
 
 LEXICAL ONLY. It cannot see a relocation that keeps the tokens but changes control flow (that
 stays review-enforced), and the behavioural guarantees are the building blocks' own unit tests.
@@ -272,8 +286,14 @@ def problems(src):
         out.append('the RateLimited case no longer increments result="rate_limited" (j)')
 
     # (k) the real argument order.
-    if decide and not re.search(r"guardian_reconcile_gate_\.decide\( ?agent_id, ?agent_gen, ?current ?\)", b):
-        out.append("decide( is no longer called as decide(agent_id, agent_gen, current) (k)")
+    if decide and not re.search(
+            r"guardian_reconcile_gate_\.decide\( ?agent_id, ?agent_gen, ?current(?:, ?&shed_cause)? ?\)", b):
+        out.append("decide( is no longer called as decide(agent_id, agent_gen, current[, &shed_cause]) (k)")
+    # (k2) the shed log is worded by cause: both causes are distinguished.
+    shed_body = case_body(b, "Shed", "Admit")
+    if decide and shed_body is not None and not (
+            re.search(r"\bShedCause::InFlightCap\b", shed_body) and re.search(r"\bshed_cause\b", shed_body)):
+        out.append("the Shed case no longer words its log by shed_cause (k)")
 
     # (l) the push is labelled with the FRESH generation.
     fresh_read = re.search(r"guardian_generation_cache_\.get_fresh\(\)", b)
@@ -292,6 +312,19 @@ def problems(src):
     if decide and fresh_read and bundle_get and not (decide.start() < fresh_read.start() < bundle_get.start()):
         out.append("order is no longer decide < get_fresh < bundle get (l)")
 
+    # (r) control flow after the fresh read, the generation gauge, and exclude-after-get.
+    if not re.search(r'abort_degraded\( ?"policy_generation_unreadable", ?\w+\.error\(\) ?\) ?; ?return ?;', b):
+        out.append("an unreadable fresh generation no longer aborts AND returns (the next line would "
+                   "dereference the error result) (r)")
+    if not re.search(r"\bif \( ?fresh_generation <= agent_gen ?\) ?return ?;", b):
+        out.append("the `if (fresh_generation <= agent_gen) return;` early exit is gone: a reconcile "
+                   "whose fresh generation is not ahead of the agent would still push (r)")
+    if not re.search(r'\.gauge\( ?"yuzu_server_guardian_policy_generation" ?\) ?\.set\( ?static_cast<double>\( ?fresh_generation ?\) ?\)', b):
+        out.append("the policy-generation gauge is no longer set from fresh_generation (r)")
+    ex = re.search(r"\badmitted\.exclude\(", b)
+    if bundle_get and ex and not bundle_get.start() < ex.start():
+        out.append("admitted.exclude( is no longer after the bundle get that produces its argument (r)")
+
     # (m) abort_degraded body, and the degrade branches that reach it.
     ab = block_after(b, "auto abort_degraded = [")
     if ab is None:
@@ -306,22 +339,51 @@ def problems(src):
         if not re.search(r'abort_degraded\( ?"' + site + '"', b):
             out.append(f'the "{site}" branch no longer reaches abort_degraded (m)')
 
-    # (n) release on no_session, exclusion of single-flight waits.
-    if not re.search(r"guardian_reconcile_gate_\.release\( ?agent_id ?\)", b):
-        out.append("a session-less Admit no longer releases its claim (n)")
-    if not re.search(r"\.exclude\(", b):
-        out.append("single-flight waits are no longer excluded from the budget debit (n)")
+    # (n) no_session keeps its claim; only a BLOCKED wait is excluded from the debit.
+    if re.search(r"\brelease\(", b):
+        out.append("the reconcile lambda calls release( again: a session-less Admit must KEEP its claim, "
+                   "or an unsubscribed agent's heartbeats become unbounded admissions (n)")
+    if not re.search(r'\{ ?\{ ?"result", ?"no_session" ?\} ?\} ?\) ?\.increment\(\) ?; ?return ?;', b):
+        out.append("the no_session branch is no longer counter-then-return (n)")
+    if not re.search(r"\badmitted\.exclude\( ?bundle_waited ?\)", b):
+        out.append("the time blocked on another thread's rule-bundle load is no longer excluded from "
+                   "the budget debit (n)")
+    if not re.search(r"guardian_rule_bundle_cache_\.get\(.*?, ?&bundle_waited ?\)", b):
+        out.append("the bundle get no longer reports how long it was blocked (&bundle_waited) (n)")
+    if re.search(r"\bexcluding\(", b):
+        out.append("a generic excluding( wrapper is back: it would also exclude the owner's own load "
+                   "from the debit (n)")
 
     # (o) the bundle load goes through the unit-tested loader.
     if not re.search(r"guardian::load_reconcile_bundle\(", b):
         out.append("the bundle loader is no longer guardian::load_reconcile_bundle( (o)")
     out.extend(move_filter_problems(t, "server.cpp"))
 
-    # (p) the bump fan-out drops both reconcile caches.
-    outside = t.replace(b, "")
-    for cache in ("guardian_generation_cache_", "guardian_rule_bundle_cache_"):
-        if not re.search(cache + r"\.invalidate\(\)", outside):
-            out.append(f"guardian_push_fn_ no longer calls {cache}.invalidate() (p)")
+    # (p) the bump fan-out drops both reconcile caches, INSIDE the guardian_push_fn_ body.
+    push_fn = re.search(r"\bguardian_push_fn_ = \[this\]\([^)]*\) -> int ?\{", t)
+    push_body = None
+    if push_fn:
+        close = match_close(t, push_fn.end() - 1, "{", "}")
+        push_body = None if close < 0 else t[push_fn.end() - 1:close + 1]
+    if push_body is None:
+        out.append("could not isolate the guardian_push_fn_ lambda body (p)")
+    else:
+        for cache in ("guardian_generation_cache_", "guardian_rule_bundle_cache_"):
+            if not re.search(cache + r"\.invalidate\(\)", push_body):
+                out.append(f"guardian_push_fn_ no longer calls {cache}.invalidate() (p)")
+
+    # (q) the saturation gauges are published from the tick that runs the claim sweep.
+    sweep_site = re.search(r"guardian_reconcile_gate_\.sweep\(\)(.*?)\} ?catch ?\(", t.replace(b, ""))
+    if not sweep_site:
+        out.append("could not isolate the claim sweep's try block (q)")
+    else:
+        tick = sweep_site.group(1)
+        for name, src in (("yuzu_server_guardian_reconcile_in_flight", r"guardian_reconcile_gate_\.in_flight\(\)"),
+                          ("yuzu_server_guardian_reconcile_budget_balance_ms",
+                           r"guardian_reconcile_budget_\.balance_ms\(\)"),
+                          ("yuzu_server_guardian_reconcile_claims", r"guardian_reconcile_gate_\.claims_size\(\)")):
+            if not re.search(r'metrics_ ?\.gauge\( ?"' + name + r'" ?\) ?\.set\([^;]*' + src, tick):
+                out.append(f"{name} is no longer set from {src.replace(chr(92), '')} at the claim sweep site (q)")
     return out
 
 
@@ -346,6 +408,13 @@ def _resub(pattern, repl):
     return lambda s: re.sub(pattern, repl, s, count=1, flags=re.S)
 
 
+def _wsub(old, new):
+    """Like _sub but whitespace-tolerant: `old` is matched with any run of whitespace between its
+    tokens, so a mutation survives a source line wrap (the decide( call is wrapped by clang-format)."""
+    pattern = r"\s*".join(re.escape(tok) for tok in re.split(r"\s+", old.strip()))
+    return lambda s: re.sub(pattern, lambda _m: new, s, count=1)
+
+
 def _after(marker, old, new):
     """Replace the first `old` that follows `marker` (for tokens that also occur earlier)."""
     def mut(s):
@@ -355,7 +424,7 @@ def _after(marker, old, new):
     return mut
 
 
-DECIDE_SWITCH = "switch (guardian_reconcile_gate_.decide(agent_id, agent_gen, current))"
+DECIDE_SWITCH = "switch (guardian_reconcile_gate_.decide(agent_id, agent_gen, current, &shed_cause))"
 BEGIN = "auto admitted = guardian_reconcile_gate_.begin_admitted();"
 SHED_OPEN = "case GuardianReconcileGate::Decision::Shed: {"
 EVAL = "const auto eval = registry_.evaluate_scope_for_agent("
@@ -363,8 +432,8 @@ ABORT = 'abort_degraded("scope store degraded", scope_degraded_detail);'
 
 # (name, mutator, expected letter-tagged substring of the joined problems)
 MUTATIONS = [
-    ("delete the decide call", _sub(DECIDE_SWITCH, "switch (GuardianReconcileGate::Decision::Admit)"), "(a)"),
-    ("comment the decide call out", _sub(DECIDE_SWITCH, "/* " + DECIDE_SWITCH + " */ switch (GuardianReconcileGate::Decision::Admit)"), "(a)"),
+    ("delete the decide call", _wsub(DECIDE_SWITCH, "switch (GuardianReconcileGate::Decision::Admit)"), "(a)"),
+    ("comment the decide call out", _wsub(DECIDE_SWITCH, "/* " + DECIDE_SWITCH + " */ switch (GuardianReconcileGate::Decision::Admit)"), "(a)"),
     ("drop the Shed case", _sub(SHED_OPEN, "case GuardianReconcileGate::Decision::RateLimited: {"), "(a)"),
     ("shed metric label changed", _sub('{{"result", "shed"}})', '{{"result", "rate_limited"}})'), "(b)"),
     ("Shed branch writes an audit row", _sub(SHED_OPEN, SHED_OPEN + " if (audit_store_) (void)audit_store_->log(AuditEvent{});"), "(b)"),
@@ -384,9 +453,9 @@ MUTATIONS = [
 # Mutations that move code so the ORDER invariant (h) must fire: the begin_admitted statement is
 # hoisted above the decide switch, keeping every token present.
 def _hoist_begin(s):
-    assert BEGIN in s and DECIDE_SWITCH in s
+    assert BEGIN in s
     s = s.replace(BEGIN, "(void)0;", 1)
-    return s.replace(DECIDE_SWITCH, BEGIN + " " + DECIDE_SWITCH, 1)
+    return _wsub(DECIDE_SWITCH, BEGIN + " " + DECIDE_SWITCH)(s)
 
 
 MUTATIONS.append(("begin_admitted hoisted above decide", _hoist_begin, "(h)"))
@@ -401,7 +470,7 @@ MUTATIONS += [
      _resub(r"return;(\s*\}\s*" + NEXT + r"Admit:)", r"\1"), "(j)"),
     ("rate_limited counter label changed", _sub('{{"result", "rate_limited"}})', '{{"result", "ratelimited"}})'), "(j)"),
     ("decide called with swapped generations",
-     _sub(DECIDE_SWITCH, "switch (guardian_reconcile_gate_.decide(agent_id, current, agent_gen))"), "(k)"),
+     _wsub(DECIDE_SWITCH, "switch (guardian_reconcile_gate_.decide(agent_id, current, agent_gen, &shed_cause))"), "(k)"),
     ("push labelled from the cached read (get_fresh -> get)",
      _sub("guardian_generation_cache_.get_fresh()", "guardian_generation_cache_.get()"), "(l)"),
     ("bundle keyed by the agent's generation",
@@ -420,10 +489,28 @@ MUTATIONS += [
      _sub('abort_degraded("rule store degraded", err.detail);', "(void)0;"), "(m)"),
     ("baseline store degrade no longer aborts",
      _sub('abort_degraded("baseline store degraded", err.detail);', "(void)0;"), "(m)"),
-    ("session-less Admit keeps its claim",
-     _sub("guardian_reconcile_gate_.release(agent_id);", "(void)0;"), "(n)"),
-    ("single-flight waits charged to the budget",
-     _sub("admitted.exclude(std::chrono::steady_clock::now() - t0);", "(void)t0;"), "(n)"),
+    ("session-less Admit releases its claim again",
+     _sub("No audit row is written on this path.",
+          "No audit row is written on this path.\n guardian_reconcile_gate_.release(agent_id);"), "(n)"),
+    ("no_session branch no longer returns right after counting",
+     _resub(r'(\{\{"result", "no_session"\}\}\)\s*\.increment\(\);)', r"\1 (void)0;"), "(n)"),
+    ("time blocked on another thread's load charged to the budget",
+     _sub("admitted.exclude(bundle_waited);", "(void)bundle_waited;"), "(n)"),
+    ("bundle get stops reporting its wait",
+     _sub("&bundle_waited);", "nullptr);"), "(n)"),
+    ("a generic excluding wrapper returns",
+     _sub("std::chrono::nanoseconds bundle_waited{0};",
+          "std::chrono::nanoseconds bundle_waited{0}; const auto wrapped = excluding([&] { return 0; });"), "(n)"),
+    ("unreadable fresh generation aborts but no longer returns",
+     _resub(r'(abort_degraded\("policy generation unreadable", fresh_res\.error\(\)\);)\s*return;', r"\1"), "(r)"),
+    ("converged-against-fresh early return removed",
+     _resub(r"if \(fresh_generation <= agent_gen\)\s*return;", "(void)0;"), "(r)"),
+    ("generation gauge set from the cached generation",
+     _sub("set(static_cast<double>(fresh_generation))", "set(static_cast<double>(current))"), "(r)"),
+    ("exclude hoisted above the bundle get",
+     _resub(r"(const auto bundle_result = guardian_rule_bundle_cache_\.get\()", r"admitted.exclude(bundle_waited); \1"), "(r)"),
+    ("Shed log no longer worded by cause",
+     _sub("shed_cause == GuardianReconcileGate::ShedCause::InFlightCap", "false"), "(k)"),
     ("bundle loader no longer load_reconcile_bundle",
      _sub("guardian::load_reconcile_bundle(", "guardian::make_bundle("), "(o)"),
     ("filter and std::move combined in one statement",
@@ -432,6 +519,17 @@ MUTATIONS += [
      _sub("guardian_generation_cache_.invalidate();", "(void)0;"), "(p)"),
     ("bump fan-out stops dropping the bundle cache",
      _sub("guardian_rule_bundle_cache_.invalidate();", "(void)0;"), "(p)"),
+    ("invalidate moved out of the push fn into unrelated code",
+     lambda s: _sub("guardian_generation_cache_.invalidate();", "(void)0;")(s)
+     + "\nvoid elsewhere() { guardian_generation_cache_.invalidate(); }\n", "(p)"),
+    ("in-flight gauge no longer published at the sweep site",
+     _sub('metrics_.gauge("yuzu_server_guardian_reconcile_in_flight")\n                        .set(static_cast<double>(guardian_reconcile_gate_.in_flight()));',
+          "(void)0;"), "(q)"),
+    ("budget balance gauge no longer published at the sweep site",
+     _sub('.set(guardian_reconcile_budget_.balance_ms());', ".set(0.0);"), "(q)"),
+    ("claims gauge no longer published at the sweep site",
+     _sub('metrics_.gauge("yuzu_server_guardian_reconcile_claims")\n                        .set(static_cast<double>(guardian_reconcile_gate_.claims_size()));',
+          "(void)0;"), "(q)"),
 ]
 
 # Mutations over guardian_push_builder.cpp (the bundle loader's evaluation order).
@@ -501,7 +599,7 @@ class GuardianReconcileWiringLexical(unittest.TestCase):
 
     def test_a_commented_out_decide_does_not_satisfy_the_gate(self):
         # Comment stripping must remove the call entirely, not merely hide it from one regex.
-        mutated = self.src.replace(DECIDE_SWITCH, "// " + DECIDE_SWITCH + "\n switch (GuardianReconcileGate::Decision::Admit)", 1)
+        mutated = _wsub(DECIDE_SWITCH, "// " + DECIDE_SWITCH + "\n switch (GuardianReconcileGate::Decision::Admit)")(self.src)
         self.assertNotEqual(mutated, self.src)
         self.assertIn("(a)", "\n".join(problems(mutated)))
 
