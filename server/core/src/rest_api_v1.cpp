@@ -7629,6 +7629,9 @@ void RestApiV1::register_routes(
         auto def = **def_result;
         ResponseTemplatesEngine engine;
         def.response_templates_spec = engine.serialise(templates);
+        // Only the templates change: blank the schema so update_definition keeps the stored
+        // column (an empty parameter_schema means "keep") instead of writing the loaded copy back.
+        def.parameter_schema.clear();
         auto upd = instruction_store->update_definition(def);
         if (!upd)
             return upd.error();

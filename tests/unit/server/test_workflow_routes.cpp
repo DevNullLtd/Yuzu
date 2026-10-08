@@ -23,6 +23,7 @@
 #include "execution_event_bus.hpp"
 #include "stream_budget.hpp"
 #include "execution_tracker.hpp"
+#include "instruction_schema_test_util.hpp"
 #include "instruction_store.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth
 #include "pg/pg_exec.hpp"
@@ -2545,6 +2546,179 @@ TEST_CASE("POST /api/instructions/:id/execute: a body nested past the depth limi
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(h.dispatch_calls == 0);
+}
+
+// -- Stored parameter_schema enforcement on POST /api/instructions/{id}/execute --
+
+namespace {
+
+void make_schema_def(ExecHarness& h, const std::string& id, const std::string& schema,
+                     const std::string& approval_mode = "auto") {
+    InstructionDefinition d;
+    d.id = id;
+    d.name = id;
+    d.type = "question";
+    d.plugin = "test";
+    d.action = "list";
+    d.parameter_schema = schema;
+    d.approval_mode = approval_mode;
+    REQUIRE(h.instructions->create_definition(d).has_value());
+}
+
+constexpr const char* kLevelSchema =
+    R"({"type":"object","properties":{"level":{"type":"string","enum":["info","debug"]},
+        "n":{"type":"int32","default":5}},"required":["level"]})";
+
+double rejected(ExecHarness& h, const char* reason) {
+    return h.metrics
+        .counter("yuzu_server_instruction_param_rejected_total",
+                 {{"route", "instruction_execute"}, {"reason", reason}})
+        .value();
+}
+
+} // namespace
+
+TEST_CASE("instruction execute: invalid params 400 BEFORE the approval gate, with no execution "
+          "row, no dispatch, a denied audit row and the counter",
+          "[pg][workflow][executions][execute][param-schema]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    // approval_mode "always" with no ApprovalManager in the harness: a call that reaches the
+    // approval gate answers 503, so a 400 proves validation ran first.
+    make_schema_def(h, "def-PS1", kLevelSchema, "always");
+
+    auto res = h.sink.Post("/api/instructions/def-PS1/execute",
+                           R"({"agent_ids":["agent-1"],"params":{"level":"SECRET-VALUE"}})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("invalid params: /level: ") != std::string::npos);
+    CHECK(res->body.find("SECRET-VALUE") == std::string::npos);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.tracker->query_executions(ExecutionQuery{}).empty());
+    REQUIRE_FALSE(h.audit_calls.empty());
+    CHECK(h.audit_calls.back().action == "instruction.execute");
+    CHECK(h.audit_calls.back().result == "denied");
+    CHECK(h.audit_calls.back().target_id == "def-PS1");
+    CHECK(h.audit_calls.back().detail == "reason=param_schema path=/level");
+    CHECK(rejected(h, "violation") == 1.0);
+
+    // The same definition with valid params reaches the approval gate (503 here): validation
+    // admits it, it does not bypass the gate.
+    auto ok = h.sink.Post("/api/instructions/def-PS1/execute",
+                          R"({"agent_ids":["agent-1"],"params":{"level":"info"}})");
+    REQUIRE(ok);
+    CHECK(ok->status == 503);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(rejected(h, "violation") == 1.0);
+}
+
+TEST_CASE("instruction execute: undeclared names, a missing required param and a non-object "
+          "params are refused, each counted under its own reason",
+          "[pg][workflow][executions][execute][param-schema]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    make_schema_def(h, "def-PS2", kLevelSchema);
+
+    auto undeclared = h.sink.Post("/api/instructions/def-PS2/execute",
+                                  R"({"agent_ids":["agent-1"],"params":{"level":"info","SECRET-KEY":1}})");
+    REQUIRE(undeclared);
+    CHECK(undeclared->status == 400);
+    CHECK(undeclared->body.find("invalid params: /*: ") != std::string::npos);
+    CHECK(undeclared->body.find("SECRET-KEY") == std::string::npos);
+    CHECK(h.audit_calls.back().detail == "reason=param_schema path=/*");
+
+    for (const char* body : {R"({"agent_ids":["agent-1"]})",
+                             R"({"agent_ids":["agent-1"],"params":null})"}) {
+        auto missing = h.sink.Post("/api/instructions/def-PS2/execute", body);
+        REQUIRE(missing);
+        CHECK(missing->status == 400);  // null and omitted are the same: `level` is required
+        CHECK(missing->body.find("invalid params: (root): ") != std::string::npos);
+        CHECK(missing->body.find("'level'") != std::string::npos);
+    }
+    CHECK(rejected(h, "violation") == 3.0);
+
+    auto shape = h.sink.Post("/api/instructions/def-PS2/execute",
+                             R"({"agent_ids":["agent-1"],"params":["SECRET"]})");
+    REQUIRE(shape);
+    CHECK(shape->status == 400);
+    CHECK(shape->body.find("invalid params: (root): ") != std::string::npos);
+    CHECK(shape->body.find("SECRET") == std::string::npos);
+    CHECK(h.audit_calls.back().detail == "reason=param_schema path=(root)");
+    CHECK(rejected(h, "shape") == 1.0);
+    CHECK(h.dispatch_calls == 0);
+}
+
+TEST_CASE("instruction execute: an uncompilable stored schema fails closed with a 500",
+          "[pg][workflow][executions][execute][param-schema]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    make_schema_def(h, "def-PS3", "{}");
+    // No store write path can now create this row: write it at the data layer.
+    yuzu::server::test::force_parameter_schema(
+        pool, "def-PS3",
+        R"({"type":"object","properties":{"SECRET-PROP":{"type":"number","SECRET-KW":1}}})");
+
+    auto res = h.sink.Post("/api/instructions/def-PS3/execute",
+                           R"({"agent_ids":["agent-1"],"params":{}})");
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["message"] == "stored parameter schema for this instruction is invalid");
+    CHECK(body["error"]["remediation"] ==
+          "An administrator must export the definition, delete it and import it again with a "
+          "corrected parameter_schema (signed, unless the server allows unsigned definitions); "
+          "see \"Replacing a stored parameter schema\" in the Instructions documentation.");
+    CHECK(res->body.find("SECRET") == std::string::npos);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.tracker->query_executions(ExecutionQuery{}).empty());
+    CHECK(h.audit_calls.back().result == "failure");
+    CHECK(h.audit_calls.back().detail == "reason=param_schema_invalid");
+    CHECK(rejected(h, "schema_invalid") == 1.0);
+    CHECK(rejected(h, "violation") == 0.0);
+}
+
+TEST_CASE("instruction execute: a definition with no stored schema skips validation, and a "
+          "valid call dispatches the params unchanged (no default injected)",
+          "[pg][workflow][executions][execute][param-schema]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.dispatch_cmd_override = "cmd-ps";
+    h.dispatch_sent_override = 1;
+    make_schema_def(h, "def-PS4", "{}");
+    make_schema_def(h, "def-PS5", "  ");
+    make_schema_def(h, "def-PS6", kLevelSchema);
+
+    for (const char* id : {"def-PS4", "def-PS5"}) {
+        auto res = h.sink.Post(std::string("/api/instructions/") + id + "/execute",
+                               R"({"agent_ids":["agent-1"],"params":{"anything":1,"x":["y"]}})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.last_dispatch_params.at("anything") == "1");
+    }
+    CHECK(rejected(h, "violation") + rejected(h, "shape") + rejected(h, "schema_invalid") == 0.0);
+
+    auto ok = h.sink.Post("/api/instructions/def-PS6/execute",
+                          R"({"agent_ids":["agent-1"],"params":{"level":"debug"}})");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.last_dispatch_params.size() == 1);  // `n` has a default: it is validated, not injected
+    CHECK(h.last_dispatch_params.at("level") == "debug");
+}
+
+TEST_CASE("instruction execute: seeding creates every (route, reason) series at 0",
+          "[workflow][param-schema]") {
+    yuzu::MetricsRegistry metrics;
+    seed_instruction_param_rejected_metrics(metrics);
+    const auto text = metrics.serialize();
+    for (const char* reason : {"shape", "violation", "schema_invalid"})
+        CHECK(text.find(std::string("yuzu_server_instruction_param_rejected_total{route=\"") +
+                        "instruction_execute\",reason=\"" + reason + "\"} 0") != std::string::npos);
+    for (const unsigned char c : text)
+        CHECK(c < 0x80);  // HELP and series text are ASCII
 }
 
 TEST_CASE("#2500 — a genuinely omitted target still broadcasts (the over-broadness guard)",

@@ -8,6 +8,7 @@
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
 #include "http_route_sink.hpp"
+#include "instruction_param_schema.hpp" // ParamValidatorCache: stored parameter_schema enforcement
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
@@ -35,6 +36,24 @@
 #include <vector>
 
 namespace yuzu::server {
+
+namespace {
+constexpr const char* kParamRejectRoute = "instruction_execute";
+constexpr const char* kParamRejectReasons[] = {"shape", "violation", "schema_invalid"};
+} // namespace
+
+void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics) {
+    metrics.describe("yuzu_server_instruction_param_rejected_total",
+                     "Instruction execute calls refused before any approval ticket or dispatch "
+                     "because of the definition's stored parameter schema. reason=shape: params "
+                     "is not a JSON object. reason=violation: the params do not match the schema "
+                     "(HTTP 400). reason=schema_invalid: the stored schema cannot be prepared, so "
+                     "the call fails closed (HTTP 500).",
+                     "counter");
+    for (const char* reason : kParamRejectReasons)
+        metrics.counter("yuzu_server_instruction_param_rejected_total",
+                        {{"route", kParamRejectRoute}, {"reason", reason}});
+}
 
 // #4029: `product_pack_error_status`/`product_pack_client_message` moved to
 // product_pack_model.hpp — the new GET /api/v1/product-packs* routes and the
@@ -2455,6 +2474,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
             });
 
+    // Prepared `parameter_schema` validators for the execute handler below.
+    auto param_validators = std::make_shared<instr::ParamValidatorCache>();
+
     // -- Single Instruction Execution API --------------------------------------
 
     // POST /api/instructions/:id/execute — dispatch a single instruction definition
@@ -2462,7 +2484,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                        instruction_store, cmd_dispatch,
                                                        cmd_dispatch_concurrency, caller_fn,
                                                        execution_tracker, approval_manager,
-                                                       metrics,
+                                                       metrics, param_validators,
                                                        capability_registry](const httplib::Request& req,
                                                                 httplib::Response& res) {
         if (!perm_fn(req, res, "Execution", "Execute"))
@@ -2590,6 +2612,74 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto session = auth_fn(req, res);
         if (!session)
             return;
+
+        // -- Stored parameter_schema enforcement (strict) ---------------------------
+        // Validates the RAW typed `params` against the definition's stored schema
+        // (instruction_param_schema.hpp) BEFORE the approval gate, so a refused call never
+        // queues an approval (a ticket does not bind the params), creates an execution row or
+        // dispatches. An empty or `{}` schema is not validated. `params` below is untouched:
+        // no default is injected. The audit row carries only the validator's path. The response
+        // also carries its reason, which can quote text the schema author wrote (enum members,
+        // bounds) but never a caller-supplied value.
+        {
+            const auto count_reject = [&](const char* reason) {
+                if (metrics)
+                    metrics->counter("yuzu_server_instruction_param_rejected_total",
+                                     {{"route", kParamRejectRoute}, {"reason", reason}})
+                        .increment();
+            };
+            auto validator = param_validators->get(def_id, def.parameter_schema);
+            if (!validator) {
+                // A stored schema that cannot be prepared: FAIL CLOSED, never "no validation".
+                spdlog::warn("instruction '{}' has an invalid stored parameter_schema; execute "
+                             "refused until it is replaced: {}",
+                             audit_token(def_id),
+                             validator.error().empty() ? std::string("(no detail)")
+                                                       : validator.error().front());
+                count_reject("schema_invalid");
+                if (audit_fn)
+                    audit_fn(req, "instruction.execute", "failure", "instruction", def_id,
+                             "reason=param_schema_invalid");
+                res.status = 500;
+                res.set_content(
+                    detail::a4_error(res, "stored parameter schema for this instruction is invalid",
+                                     {.remediation =
+                                          "An administrator must export the definition, delete "
+                                          "it and import it again with a corrected "
+                                          "parameter_schema (signed, unless the server allows "
+                                          "unsigned definitions); see \"Replacing a stored "
+                                          "parameter schema\" in the Instructions "
+                                          "documentation."}),
+                    "application/json");
+                return;
+            }
+            if (!(*validator)->absent()) {
+                // `params` omitted and `params: null` both mean no params.
+                static const nlohmann::json kNoParams = nullptr;
+                const nlohmann::json& raw_params = j.contains("params") ? j["params"] : kNoParams;
+                if (auto violation = (*validator)->check(raw_params)) {
+                    const bool root = violation->path.empty();
+                    count_reject(!raw_params.is_null() && !raw_params.is_object() ? "shape"
+                                                                                  : "violation");
+                    if (audit_fn)
+                        audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                                 "reason=param_schema path=" +
+                                     (root ? std::string("(root)") : audit_token(violation->path)));
+                    res.status = 400;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         "invalid params: " +
+                                             (root ? std::string("(root)") : violation->path) +
+                                             ": " + violation->reason,
+                                         {.remediation = "Correct params to match the "
+                                                         "instruction's parameter schema and "
+                                                         "re-call; nothing was dispatched and no "
+                                                         "approval ticket was created."}),
+                        "application/json");
+                    return;
+                }
+            }
+        }
 
         // --- Approval gate ---------------------------------------------------
         // If the definition requires approval and the approval manager is

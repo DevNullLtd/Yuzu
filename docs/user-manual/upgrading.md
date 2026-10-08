@@ -24,6 +24,72 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
+## Behaviour change: `POST /api/instructions/{id}/execute` now validates `params` against the stored schema
+
+**What changed.** The route checks the request's `params` against the definition's stored
+`parameter_schema` and answers `400` (`invalid params: <path>: <reason>`) when they do not conform. The
+check runs after the permission checks and before the approval gate, so a refused call creates no
+approval ticket, execution row or dispatch. It is strict: a name the schema does not declare, a value of
+the wrong type or outside `enum`, `pattern`, `minimum`/`maximum` or length bounds, a missing required
+parameter, a string containing a NUL, and a non-object `params` are all refused. A definition with no
+stored schema (empty, whitespace or `{}`) is not validated. A stored schema that cannot be prepared makes
+the route answer `500` instead of dispatching. A schema is also checked when it is written:
+`POST /api/instructions/import` refuses an over-limit or invalid `parameter_schema` with a `400`, and a
+bundled definition that fails the same check makes the server refuse to boot (the golden test guards the
+shipped content). Updating a definition (`PUT`, the YAML editor, response templates) keeps its stored
+schema. Details: [REST API](rest-api.md), [Instructions](instructions.md#parameter-validation).
+
+**Who is affected.** Callers that send something the stored schema does not accept:
+
+- **Names the definition does not declare.** They used to ride through to the plugin; they are now `400`
+  (path `/*`, the name is not echoed). Six shipped definitions under-declared what their plugin reads and
+  are corrected in this release: `agent.content_dist.cleanup` (`hours`), `agent.content_dist.execute_staged`
+  (`expected_hash`), `device.wol.check` (`timeout_ms`), `device.agent_actions.set_log_level` (any letter
+  case, plus `warning` and `err`, which the agent accepts), `workflow.config_search_and_replace`
+  (declares `path`, `search`, `replacement`, `regex`, `case_sensitive`, `dry_run`, `max_replacements`
+  and the retained `base_dir`) and `workflow.version_compliance_check` (declares `path`, `minimum_version`
+  and `base_dir`). The two `workflow.*` definitions used to declare
+  parameter names their plugin never read.
+- **Values outside an enum or a bound.** `enum` is case-sensitive (`"True"` and `"1"` are refused for a
+  `true`/`false` enum), and a value above a declared `maximum` (or below a `minimum`) is `400` where a plugin
+  may have clamped it (for example `device.agent_logging.get_log` `lines` above 500).
+- **`""` and `null` for optional parameters.** They are values, not omissions: they are refused for an optional
+  integer, `enum` or `pattern` parameter. Omit the key instead.
+
+**Not affected.** The 7 shipped definitions that have no `parameters:` block and so store no schema
+(`windows.app_control.wdac_policy`, `windows.app_control.applocker_policy`,
+`crossplatform.local_security_policy.password_policy`, `...lockout_policy`, `...audit_policy`,
+`...sudoers` and `windows.rdp.status`), definitions saved from YAML or created in the dashboard, and every
+other dispatch surface (workflow steps, schedules, policy remediation, result-set producers, MCP
+`execute_instruction`, `POST /api/command`), which do not validate yet.
+
+**A stored schema is not refreshed by an upgrade.** The bundled reseed inserts a definition only when its id
+is absent (`ON CONFLICT (id) DO NOTHING`), so the six corrections above reach fresh installs only; an existing
+install keeps the old stored schema and keeps refusing the same calls until it is replaced (export the
+definition, delete it and import it again, signed unless the server allows unsigned definitions; see [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)). Comparing the
+parameter declarations at `v0.14.0` with this release, exactly 6 definitions differ in what the server
+enforces (the six above), and 13 more differ only in `description` text and enforce what they did
+(`agent.content_dist.upload_file`, `device.agent_logging.get_log`, `device.event_logs.errors`,
+`device.event_logs.query`, `device.filesystem.find_by_hash`, `device.filesystem.read`,
+`device.filesystem.search`, `device.filesystem.search_dir`, `device.script_exec.bash`,
+`device.script_exec.exec`, `device.script_exec.powershell`, `device.windows_updates.patch_connectivity`,
+`workflow.patch_connectivity_audit`).
+
+**Detecting it.** Each refusal writes an `instruction.execute` audit row: `result=denied` with detail
+`reason=param_schema path=<path>` for a `400`, or `result=failure` with `reason=param_schema_invalid` for the
+`500`. Each also increments
+`yuzu_server_instruction_param_rejected_total{route="instruction_execute",reason}`. See
+[Audit log](audit-log.md) and [Metrics](metrics.md).
+
+**Rollback.** No migration and no schema change. Rolling the server back removes the check, and while replicas
+run different releases the same call can be refused by one and accepted by another. A release without the check
+still rewrites a stored schema in one case: a YAML-editor save on the older release writes `{}` over it, because
+that route builds the definition from the YAML alone. The other update routes of the older release (`PUT`,
+response templates) write back the schema they loaded. A definition that was hit this way is not validated, on
+this release or any other, until its schema is replaced (see
+[Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)); rolling forward
+does not restore it.
+
 ## Operator note: the software-inventory store migration (v7) is a hard cutover (#5172)
 
 Schema v7 of the software-inventory store adds `package_id` and `source` columns and a row id to
@@ -1039,9 +1105,9 @@ the handler.
 
 Both surfaces share one builder (`build_instructions_catalog`) that parses each `InstructionDefinition`'s stored `parameter_schema` text. It previously forwarded any value that parsed as JSON, even a non-object (an array, string, number, or boolean). It now forwards it only when the parsed value is itself a JSON object — a non-object value is reported as `null` instead, matching `GET /api/v1/discover/plugins`' existing behavior for the same field.
 
-**Who this affects:** an operator or integration that authored an `InstructionDefinition` with a non-object `parameter_schema` — reachable via the ordinary `create`/`update`/`import` paths, which don't validate the field's shape on write. No shipped content sets `parameter_schema` to anything but an object or leaves it unset (defaults to `{}`), so this affects only a deliberately or accidentally malformed definition.
+**Who this affects:** an operator or integration that authored an `InstructionDefinition` with a non-object `parameter_schema`, written before the write-time schema check existed, or by a non-standard write (the store now refuses a non-object `parameter_schema`, and `POST /api/instructions/import` is the only REST route that can supply one). No shipped content sets `parameter_schema` to anything but an object or leaves it unset (defaults to `{}`), so this affects only a deliberately or accidentally malformed definition.
 
-**What to do:** if you have such a definition and relied on the old raw-forwarding behavior, re-author `parameter_schema` as a JSON Schema object. No action is required otherwise.
+**What to do:** if you have such a definition and relied on the old raw-forwarding behavior, re-author `parameter_schema` as a JSON Schema object (see [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)). No action is required otherwise.
 
 ## Behaviour change: webhook and offload-target deliveries, and enrollment/execution-failure notifications, now actually fire (#3261)
 

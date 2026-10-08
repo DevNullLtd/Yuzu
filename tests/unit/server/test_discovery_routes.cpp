@@ -32,6 +32,7 @@
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
+#include "instruction_schema_test_util.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -437,14 +438,17 @@ TEST_CASE("discover.instructions: non-object parameter_schema nulls out, matchin
           "advertised object|null outputSchema",
           "[discovery][instructions][pg]") {
     DiscoverHarness h;
-    auto array_id = h.instr->create_definition(
-        make_def("Array Schema", /*enabled=*/true, "[1,2,3]"));
-    REQUIRE(array_id.has_value());
-    auto bool_id = h.instr->create_definition(make_def("Bool Schema", /*enabled=*/true, "true"));
-    REQUIRE(bool_id.has_value());
-    auto string_id =
-        h.instr->create_definition(make_def("String Schema", /*enabled=*/true, R"("not-a-schema")"));
-    REQUIRE(string_id.has_value());
+    // The store refuses a non-object schema at write time, so each row is created with a
+    // valid schema and the legacy shape is written straight into the column.
+    auto seed_legacy = [&](const std::string& name, const std::string& raw) {
+        auto id = h.instr->create_definition(make_def(name, /*enabled=*/true, "{}"));
+        REQUIRE(id.has_value());
+        yuzu::server::test::force_parameter_schema(*h.rbac_pool, *id, raw);
+        return id;
+    };
+    auto array_id = seed_legacy("Array Schema", "[1,2,3]");
+    auto bool_id = seed_legacy("Bool Schema", "true");
+    auto string_id = seed_legacy("String Schema", R"("not-a-schema")");
 
     auto res = h.sink.Get("/api/v1/discover/instructions");
     REQUIRE(res);
@@ -495,8 +499,11 @@ TEST_CASE("discover.instructions: parameter_schema nesting too deep excludes jus
           "[discovery][instructions][depth][pg]") {
     DiscoverHarness h;
     const std::string deep = R"({"a":)" + std::string(35, '[') + std::string(35, ']') + "}";
-    auto poisoned_id = h.instr->create_definition(make_def("Poisoned", /*enabled=*/true, deep));
+    auto poisoned_id = h.instr->create_definition(make_def("Poisoned", /*enabled=*/true, "{}"));
     REQUIRE(poisoned_id.has_value());
+    // The store refuses an unpreparable schema at write time: write the poisoned (legacy)
+    // shape straight into the column.
+    yuzu::server::test::force_parameter_schema(*h.rbac_pool, *poisoned_id, deep);
     auto healthy_id = h.instr->create_definition(
         make_def("Healthy", /*enabled=*/true, R"({"type":"object"})"));
     REQUIRE(healthy_id.has_value());
@@ -535,8 +542,11 @@ TEST_CASE("discover.plugins: parameter_schema nesting too deep skips enrichment 
     // proving nothing about the depth guard.
     const std::string deep = R"({"a":)" + std::string(35, '[') + std::string(35, ']') + "}";
     // Matches make_def's default plugin/action (system_info/query).
-    auto poisoned_id = h.instr->create_definition(make_def("Poisoned Query", /*enabled=*/true, deep));
+    auto poisoned_id =
+        h.instr->create_definition(make_def("Poisoned Query", /*enabled=*/true, "{}"));
     REQUIRE(poisoned_id.has_value());
+    // Written straight into the column: the store refuses an unpreparable schema.
+    yuzu::server::test::force_parameter_schema(*h.rbac_pool, *poisoned_id, deep);
     auto healthy_def =
         make_def("Healthy List", /*enabled=*/true, R"({"type":"object"})");
     healthy_def.plugin = "processes";
