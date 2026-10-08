@@ -34,6 +34,7 @@
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 #include "instruction_schema_test_util.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -565,10 +566,23 @@ TEST_CASE("discover.instructions: an uncanonicalisable stored schema nulls input
         "Healthy", /*enabled=*/true, R"({"type":"object","properties":{"p":{"type":"string"}}})"));
     REQUIRE(healthy.has_value());
 
-    auto res = h.sink.Get("/api/v1/discover/instructions");
-    REQUIRE(res);
-    REQUIRE(res->status == 200);
-    const auto j = nlohmann::json::parse(res->body);
+    // One summary warning per build names the count and the first affected id (never the payload),
+    // so an operator can see a bad legacy row or an exhausted budget. The server core is a static
+    // library linked into this binary, so the capture reaches its logging.
+    std::string logs;
+    nlohmann::json j;
+    {
+        yuzu::test::LogCapture capture;
+        auto res = h.sink.Get("/api/v1/discover/instructions");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        j = nlohmann::json::parse(res->body);
+        capture.stop();
+        logs = capture.text();
+    }
+    CHECK(logs.find("3 because their stored schema cannot be canonicalised") != std::string::npos);
+    CHECK(logs.find("0 definition(s) published without an input_schema because the") !=
+          std::string::npos);
 
     int seen = 0;
     for (const auto& d : j["instructions"]) {
@@ -638,9 +652,20 @@ TEST_CASE("discover.instructions: the canonicalisation budget degrades later def
     auto none_id = h.instr->create_definition(make_def("Z None", /*enabled=*/true, "{}"));
     REQUIRE(none_id.has_value());
 
-    // Room for exactly two of the four schemas.
-    const auto doc = yuzu::server::build_instructions_catalog(*h.instr, 2 * stored.size());
-    const auto j = nlohmann::json::parse(doc.json);
+    // Room for exactly two of the four schemas. The build logs one summary warning naming the
+    // count and the first casualty (and nothing when the default budget fits everything).
+    std::string logs;
+    nlohmann::json j;
+    {
+        yuzu::test::LogCapture capture;
+        const auto doc = yuzu::server::build_instructions_catalog(*h.instr, 2 * stored.size());
+        j = nlohmann::json::parse(doc.json);
+        capture.stop();
+        logs = capture.text();
+    }
+    CHECK(logs.find("2 definition(s) published without an input_schema because the " +
+                    std::to_string(2 * stored.size()) + "-byte canonicalisation budget was "
+                    "exhausted (first: '" + ids[2] + "')") != std::string::npos);
 
     std::vector<std::string> published, budget_hit;
     bool saw_none = false;
@@ -676,7 +701,15 @@ TEST_CASE("discover.instructions: the canonicalisation budget degrades later def
     CHECK(description.find("per definition") != std::string::npos);
     CHECK(description.find("already spent") == std::string::npos);
 
-    // The default budget publishes all four.
+    // The default budget publishes all four, with no warning.
+    logs.clear();
+    {
+        yuzu::test::LogCapture capture;
+        const auto doc = yuzu::server::build_instructions_catalog(*h.instr);
+        capture.stop();
+        logs = capture.text();
+    }
+    CHECK(logs.find("published without an input_schema") == std::string::npos);
     const auto full = nlohmann::json::parse(yuzu::server::build_instructions_catalog(*h.instr).json);
     for (const auto& d : full["instructions"])
         CHECK(d["input_schema_error"].is_null());

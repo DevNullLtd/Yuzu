@@ -242,6 +242,13 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store,
     json arr = json::array();
     // Stored schema bytes canonicalised so far in THIS request (see kDiscoveryCanonicalBudgetBytes).
     std::size_t canonical_bytes = 0;
+    // Definitions published without an input_schema because of the budget or because their stored
+    // schema cannot be canonicalised: counted so one warning per build tells an operator it is
+    // happening (the shipped catalogue never triggers either).
+    std::size_t budget_exceeded = 0;
+    std::size_t not_canonicalisable = 0;
+    std::string first_budget_id;
+    std::string first_uncanonicalisable_id;
     for (const auto& d : defs) {
         // #2437-class guard: parameter_schema is stored VERBATIM at write
         // time (instruction_store.cpp import path) with no depth check
@@ -297,6 +304,8 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store,
         const bool charged = within_cap && !trivially_absent;
         if (charged && stored.size() > canonical_budget_bytes - canonical_bytes) {
             input_schema_error = "input_schema_budget_exceeded";
+            if (budget_exceeded++ == 0)
+                first_budget_id = d.id;
         } else {
             if (charged)
                 canonical_bytes += stored.size();
@@ -305,6 +314,8 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store,
                     input_schema = std::move(**canonical);
             } else {
                 input_schema_error = "parameter_schema_not_canonicalisable";
+                if (not_canonicalisable++ == 0)
+                    first_uncanonicalisable_id = d.id;
             }
         }
 
@@ -320,6 +331,14 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store,
             {"platforms", d.platforms},
             {"approval_mode", d.approval_mode},
         });
+    }
+
+    if (budget_exceeded != 0 || not_canonicalisable != 0) {
+        spdlog::warn("discover/instructions: {} definition(s) published without an input_schema "
+                     "because the {}-byte canonicalisation budget was exhausted (first: '{}') and "
+                     "{} because their stored schema cannot be canonicalised (first: '{}')",
+                     budget_exceeded, canonical_budget_bytes, first_budget_id, not_canonicalisable,
+                     first_uncanonicalisable_id);
     }
 
     json body = {
