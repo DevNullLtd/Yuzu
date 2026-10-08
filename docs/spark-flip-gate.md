@@ -2170,8 +2170,10 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   independent reviewers on the revision before the last one (the BUSY stages are slow under
   either evidence rule), and the 10.01 s and 15.01 s rows were re-run on the final code
   (3 staged, two runs each: 10.008 and 10.010 s; 15.011 and 15.014 s); and a stop that
-  reaches the watchdog exits with code 4 and writes no log line. A remaining-deadline wall
-  threaded through every stage was considered and not done. Issue to be filed (TODO, no number yet).
+  reaches the watchdog exits with code 4 and writes no log line. Without #4045 the same
+  stops take 15 s (journal record pending), or 20 s and more with a worker sent-marker
+  write in flight. A remaining-deadline wall threaded through every stage was considered
+  and not done. Issue to be filed (TODO, no number yet).
 - Owner: not assigned for any item above.
 - Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + three pre-PR-5 GATING items
   (guard.errored census recognition; the three sre observability gaps; the
