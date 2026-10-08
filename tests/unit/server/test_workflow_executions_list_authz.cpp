@@ -16,7 +16,9 @@
  * GET /api/v1/executions already served.
  */
 
+#include "audit_store.hpp"
 #include "execution_tracker.hpp"
+#include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "tag_store.hpp"
 #include "test_response_execution_authz_pg_helper.hpp"
@@ -44,13 +46,20 @@ struct ListRig {
     yuzu::test::ResponseExecutionAuthzPgRig rig;
     ExecutionTracker tracker;
     TagStore tags;
+    // A real AuditStore on a second pool over the same database (its own schema), wired into
+    // svc_auth only: the gate's refusal is rewritten to a 200 note by the route, so the audit
+    // row is the one durable proof the gate still recorded the denial.
+    pg::PgPool audit_pool;
+    AuditStore audit_store;
     std::unique_ptr<AuthRoutes> svc_auth; // same stores + a TagStore: service-scoped tokens resolve
     std::string x_bob, x_mixed, x_alice, x_bob_own;
 
     explicit ListRig(const std::string& dsn)
-        : rig{dsn}, tracker{rig.pool}, tags{rig.pool} {
+        : rig{dsn}, tracker{rig.pool}, tags{rig.pool},
+          audit_pool{{.conninfo = dsn, .size = 2}}, audit_store{audit_pool} {
         REQUIRE(tracker.is_open());
         REQUIRE(tags.is_open());
+        REQUIRE(audit_store.is_open());
         // gary: GLOBAL Execution:Read. dave: no Execution grant at all.
         REQUIRE(rig.rbac.assign_role({"user", "gary", "ExecutionReader1634"}).has_value());
         REQUIRE(rig.auth_mgr.upsert_user("gary", "correct-horse-battery-staple",
@@ -60,7 +69,7 @@ struct ListRig {
         REQUIRE(tags.set_tag("bob-agent", "service", "printers").has_value());
         REQUIRE(tags.set_tag("alice-agent", "service", "scanners").has_value());
         svc_auth = std::make_unique<AuthRoutes>(rig.cfg, rig.auth_mgr, &rig.rbac,
-                                                rig.api_tokens.get(), /*audit_store=*/nullptr,
+                                                rig.api_tokens.get(), &audit_store,
                                                 &rig.mgmt, &tags, /*analytics_store=*/nullptr,
                                                 rig.oidc_mu, rig.oidc_provider);
         seed();
@@ -154,6 +163,16 @@ struct ListRig {
         std::sort(r.ids.begin(), r.ids.end());
         return r;
     }
+    // The audit rows (via svc_auth) with this action, as "result|detail".
+    std::vector<std::string> audit(const std::string& action) {
+        std::vector<std::string> out;
+        auto rows = audit_store.query({});
+        REQUIRE(rows.has_value());
+        for (const auto& row : *rows)
+            if (row.action == action)
+                out.push_back(row.result + "|" + row.detail);
+        return out;
+    }
     static std::vector<std::string> sorted(std::vector<std::string> v) {
         std::sort(v.begin(), v.end());
         return v;
@@ -162,6 +181,36 @@ struct ListRig {
 
 bool has(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
+}
+
+// The gate's refusal is rewritten by the route to a 200 text/html note. Assert the note, that no
+// row is served, and that nothing of the gate's A4 JSON body survived.
+void check_denied_note(const ListRig::Resp& r) {
+    CHECK(r.status == 200);
+    CHECK(has(r.body, "data-denied=\"true\""));
+    CHECK(has(r.body, "You do not have permission to view executions."));
+    CHECK(r.ids.empty());
+    CHECK_FALSE(has(r.body, "data-execution-id"));
+    CHECK_FALSE(has(r.body, "data-degraded"));
+    CHECK_FALSE(has(r.body, "\"error\""));
+    CHECK_FALSE(has(r.body, "retry_after_ms"));
+    CHECK_FALSE(has(r.body, "does not grant"));
+    CHECK_FALSE(has(r.body, "\"permission\""));
+    CHECK_FALSE(has(r.body, "ITServiceOwner"));
+    CHECK_FALSE(has(r.body, "SECRET-ALICE"));
+}
+void check_degraded_note(const ListRig::Resp& r) {
+    CHECK(r.status == 200);
+    CHECK(has(r.body, "data-degraded=\"gate\""));
+    CHECK(has(r.body, "Retry shortly."));
+    CHECK(r.ids.empty());
+    CHECK_FALSE(has(r.body, "data-execution-id"));
+    CHECK_FALSE(has(r.body, "data-denied"));
+    CHECK_FALSE(has(r.body, "\"error\""));
+    CHECK_FALSE(has(r.body, "retry_after_ms"));
+    CHECK_FALSE(has(r.body, "does not grant"));
+    CHECK_FALSE(has(r.body, "\"permission\""));
+    CHECK_FALSE(has(r.body, "SECRET-ALICE"));
 }
 
 } // namespace
@@ -227,12 +276,18 @@ TEST_CASE("fragments/executions real gate: a principal with no Execution:Read is
           "[pg][workflow][executions][list][confinement][authz]") {
     YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
     ListRig r{db.dsn()};
-    auto dave = r.get(r.mint("dave"));
-    CHECK(dave.status == 403);
-    CHECK(dave.ids.empty());
+    // Via svc_auth so the gate's audit row is observable (the plain rig has no AuditStore).
+    auto dave = r.get(r.mint("dave"), /*use_tag_aware_auth=*/true);
+    check_denied_note(dave);
+    // The rewrite happens AFTER the gate: its denied audit row is still written.
+    const auto rows = r.audit("auth.fleet_read_required");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].rfind("denied|", 0) == 0);
+    // Unauthenticated is NOT rewritten: still the gate's 401.
     auto anon = r.get("");
     CHECK(anon.status == 401);
     CHECK(anon.ids.empty());
+    CHECK_FALSE(has(anon.body, "data-denied"));
 }
 
 // ITServiceOwner AUTHORITY CEILING through the real fragment: the route's only gate is
@@ -255,13 +310,15 @@ TEST_CASE("fragments/executions real gate: revoking Execution:Read from ITServic
     REQUIRE(r.rig.rbac.remove_permission("ITServiceOwner", "Execution", "Read").has_value());
 
     auto g = r.get(svc_gary, /*use_tag_aware_auth=*/true);
-    CHECK(g.status == 403);
-    CHECK(g.ids.empty());
-    CHECK(has(g.body, "service-scoped token does not grant Execution:Read"));
-    CHECK_FALSE(has(g.body, "SECRET-ALICE"));
+    check_denied_note(g); // the gate's "service-scoped token does not grant" text is not echoed
+    // The gate's own audit row (written before the rewrite) still carries the reason.
+    auto rows = r.audit("auth.fleet_read_required");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].rfind("denied|", 0) == 0);
+    CHECK(has(rows[0], "lacks ITServiceOwner permission Execution:Read"));
     auto b = r.get(svc_bob, /*use_tag_aware_auth=*/true);
-    CHECK(b.status == 403);
-    CHECK(b.ids.empty());
+    check_denied_note(b);
+    CHECK(r.audit("auth.fleet_read_required").size() == 2);
 
     // Non-service principals are unaffected: global gary unfiltered, group-scoped bob confined.
     auto gary = r.get(r.mint("gary"), /*use_tag_aware_auth=*/true);
@@ -273,7 +330,7 @@ TEST_CASE("fragments/executions real gate: revoking Execution:Read from ITServic
 }
 
 // A FAILED ITServiceOwner ceiling read is an infrastructure fault, not a deny: the fragment
-// surfaces the gate's own retryable 503 (retry_after_ms 5000) and serves no row, while the
+// is rewritten from the gate's own retryable 503 to a 200 degrade note and serves no row, while the
 // siblings that keep the 403 mapping (require_permission) are pinned in test_authz_gates.cpp.
 TEST_CASE("fragments/executions real gate: a degraded ITServiceOwner ceiling read is a 503 for "
           "a service token and serves no rows",
@@ -291,11 +348,11 @@ TEST_CASE("fragments/executions real gate: a degraded ITServiceOwner ceiling rea
         REQUIRE(d.ok());
     }
     auto g = r.get(svc_gary, /*use_tag_aware_auth=*/true);
-    CHECK(g.status == 503);
-    CHECK(g.ids.empty());
-    CHECK(has(g.body, "\"retry_after_ms\":5000"));
-    CHECK_FALSE(has(g.body, "does not grant"));
-    CHECK_FALSE(has(g.body, "SECRET-ALICE"));
+    check_degraded_note(g);
+    // The gate's degraded-ceiling audit row (written before the rewrite) is still there.
+    const auto rows = r.audit("auth.fleet_read_required");
+    REQUIRE(rows.size() == 1);
+    CHECK(has(rows[0], "RBAC read degraded resolving the ITServiceOwner ceiling"));
 }
 
 // UP-2 (ADR-1006 ceiling): a service-scoped token's session username is its MINTER's identity, so
@@ -332,9 +389,7 @@ TEST_CASE("fragments/executions real gate: a service-scoped token never sees its
     // row (owner-keyed or otherwise) is ever served through it.
     REQUIRE(r.rig.rbac.remove_permission("ITServiceOwner", "Execution", "Read").has_value());
     auto revoked = r.get(token, /*use_tag_aware_auth=*/true);
-    CHECK(revoked.status == 403);
-    CHECK(revoked.ids.empty());
-    CHECK_FALSE(has(revoked.body, "data-execution-id"));
+    check_denied_note(revoked);
     // The ordinary owner is unaffected.
     CHECK(r.get(r.mint("bob"), /*use_tag_aware_auth=*/true).ids ==
           ListRig::sorted({r.x_bob, r.x_mixed, r.x_bob_own, x_bob_pending}));
@@ -382,7 +437,7 @@ TEST_CASE("fragments/executions real gate: with RBAC off (the default) every aut
     const auto svc_token = r.mint("gary", "printers");
     // Control (RBAC on, as the rig seeds it): bob is confined, dave refused.
     CHECK(r.get(bob_token, true).ids == ListRig::sorted({r.x_bob, r.x_mixed, r.x_bob_own}));
-    CHECK(r.get(dave_token, true).status == 403);
+    check_denied_note(r.get(dave_token, true));
 
     r.rig.rbac.set_rbac_enabled(false);
     const auto everything = ListRig::sorted({r.x_bob, r.x_mixed, r.x_alice, r.x_bob_own});
@@ -392,13 +447,14 @@ TEST_CASE("fragments/executions real gate: with RBAC off (the default) every aut
         CHECK(got.ids == everything);
     }
     auto svc = r.get(svc_token, /*use_tag_aware_auth=*/true);
-    CHECK(svc.status == 403);
-    CHECK(svc.ids.empty());
+    check_denied_note(svc);
+    // The refused service token left a denied gate row (dave's control denial is the other).
+    CHECK_FALSE(r.audit("auth.fleet_read_required").empty());
 }
 
 // The service axis needs a tag read to resolve the token's scope; when the tag store is
-// unreachable the gate answers its own retryable 503 and serves no row, while a non-service
-// caller (who needs no tag read) is unaffected.
+// unreachable the gate answers its own retryable 503 (rewritten by the route to a 200 degrade note) and
+// serves no row, while a non-service caller (who needs no tag read) is unaffected.
 TEST_CASE("fragments/executions real gate: an unreachable tag store is a 503 for a service "
           "token and serves no rows while an ordinary caller still gets 200",
           "[pg][workflow][executions][list][confinement][authz][service_scope]") {
@@ -414,10 +470,8 @@ TEST_CASE("fragments/executions real gate: an unreachable tag store is a 503 for
         REQUIRE(d.ok());
     }
     auto svc = r.get(svc_token, /*use_tag_aware_auth=*/true);
-    CHECK(svc.status == 503);
-    CHECK(svc.ids.empty());
-    CHECK(has(svc.body, "\"retry_after_ms\":5000"));
-    CHECK_FALSE(has(svc.body, "data-execution-id"));
+    check_degraded_note(svc);
+    CHECK_FALSE(r.audit("auth.fleet_read_required").empty());
 
     auto gary = r.get(r.mint("gary"), /*use_tag_aware_auth=*/true);
     CHECK(gary.status == 200);

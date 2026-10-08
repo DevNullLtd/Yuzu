@@ -183,7 +183,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // follows dex_routes.cpp /fragments/dex/perf/apps and verify_routes.hpp; the
         // data-degraded attribute itself is new here. The note is honest (never "No
         // executions yet") and carries data-degraded for machine detection. The gate's own
-        // A4 JSON 403/503 are untouched; only this fragment's OWN degrade bodies are 200.
+        // A4 JSON 403/503 are rewritten to a 200 note below for the same htmx reason (the
+        // gate's audit row is written before the rewrite and is unaffected); a 401 is left
+        // untouched so an unauthenticated caller still gets the gate's response.
         auto degraded = [&res](const char* kind, const char* text) {
             res.status = 200;
             res.set_content(std::string("<div class=\"empty-state\" data-degraded=\"") + kind +
@@ -198,8 +200,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         auto gate = fleet_read_fn(req, res, "Execution", "Read");
-        if (!gate.admitted)
-            return; // gate already wrote the A4 error body + status.
+        if (!gate.admitted) {
+            // The gate already wrote its A4 error body + status AND its audit row. htmx
+            // drops 4xx/5xx bodies, so a 503/403 would leave the panel on "Loading..."
+            // forever: replace those two with a 200 note. Any other status (401 etc.) is
+            // left exactly as the gate wrote it.
+            if (res.status == 503) {
+                res.headers.erase("Retry-After");
+                degraded("gate", "Executions unavailable (the authorization service could not "
+                                 "be reached). Retry shortly.");
+            } else if (res.status == 403) {
+                // Deliberately generic: nothing from the gate's body (reason, role or
+                // permission names) may reach the fragment.
+                res.status = 200;
+                res.set_content("<div class=\"empty-state\" data-denied=\"true\">You do not "
+                                "have permission to view executions.</div>",
+                                "text/html; charset=utf-8");
+            }
+            return;
+        }
         if (!execution_tracker) {
             degraded("unavailable", "Not available");
             return;

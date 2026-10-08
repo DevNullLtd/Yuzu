@@ -1253,9 +1253,16 @@ TEST_CASE("executions list: 403 when fleet_read_fn denies (sec-M1)",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ExecHarness h(pool);
     h.fleet_read_grant = false;
+    h.make_def("def-denied", "DeniedDef");
+    h.make_exec("def-denied", "completed", 1, 1, 0);
     auto res = h.sink.Get("/fragments/executions");
     REQUIRE(res);
-    CHECK(res->status == 403);
+    // The gate's 403 is rewritten to a 200 note: the htmx config drops 4xx/5xx bodies, so a
+    // 403 left the panel on "Loading..." forever. The denial is the absence of any row.
+    CHECK(res->status == 200);
+    CHECK(res->body.find("data-denied=\"true\"") != std::string::npos);
+    CHECK(res->body.find("data-execution-id") == std::string::npos);
+    CHECK(res->body.find("DeniedDef") == std::string::npos);
 }
 
 TEST_CASE("executions list: perm_fn is not a second gate on the (Execution Read) pair",
@@ -1289,6 +1296,84 @@ TEST_CASE("executions list: unwired fleet_read_fn renders a 200 degrade note and
     CHECK(res->body.find("No executions yet") == std::string::npos);
     CHECK(res->body.find("Unwired") == std::string::npos);
     CHECK(res->body.find("data-execution-id") == std::string::npos);
+}
+
+// The gate's refusal is rewritten by status: 503 -> 200 degrade note (data-degraded="gate"),
+// 403 -> 200 generic denied note (data-denied="true"), anything else (401) untouched. Each
+// fake gate writes an A4-shaped body carrying markers that must NOT reach the fragment. No
+// Postgres needed: the gate refuses before the tracker is read.
+namespace {
+httplib::Response list_fragment_through_gate(int gate_status, bool set_retry_after) {
+    yuzu::server::test::TestRouteSink sink;
+    WorkflowRoutes routes;
+    WorkflowRoutes::Deps d;
+    d.auth_fn = [](const httplib::Request&,
+                   httplib::Response&) -> std::optional<yuzu::server::auth::Session> {
+        yuzu::server::auth::Session s;
+        s.username = "tester";
+        return s;
+    };
+    d.perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                   const std::string&) { return true; };
+    d.fleet_read_fn = [gate_status, set_retry_after](
+                          const httplib::Request&, httplib::Response& res, const std::string&,
+                          const std::string&) -> yuzu::server::authz::FleetReadGate {
+        res.status = gate_status;
+        if (set_retry_after)
+            res.set_header("Retry-After", "5");
+        res.set_content("{\"error\":{\"code\":\"GATE-MARKER\",\"message\":\"role Foo does "
+                        "not grant Execution:Read\",\"retry_after_ms\":5000},"
+                        "\"permission\":\"Execution:Read\"}",
+                        "application/json");
+        return {false, yuzu::server::authz::deny_all()};
+    };
+    d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) {};
+    d.execution_tracker = nullptr;
+    routes.register_routes(sink, std::move(d));
+    auto res = sink.Get("/fragments/executions");
+    REQUIRE(res);
+    return *res;
+}
+bool leaks_gate_body(const std::string& body) {
+    for (const char* m : {"GATE-MARKER", "\"error\"", "retry_after_ms", "does not grant",
+                          "\"permission\"", "Execution:Read", "Foo"})
+        if (body.find(m) != std::string::npos)
+            return true;
+    return false;
+}
+} // namespace
+
+TEST_CASE("executions list: a gate 503 is rewritten to a 200 degrade note without A4 residue",
+          "[workflow][executions][list][rbac]") {
+    auto res = list_fragment_through_gate(503, /*set_retry_after=*/true);
+    CHECK(res.status == 200);
+    CHECK(res.get_header_value("Content-Type").find("text/html") != std::string::npos);
+    CHECK(res.body.find("data-degraded=\"gate\"") != std::string::npos);
+    CHECK(res.body.find("Retry shortly.") != std::string::npos);
+    CHECK_FALSE(res.has_header("Retry-After"));
+    CHECK_FALSE(leaks_gate_body(res.body));
+    CHECK(res.body.find("data-execution-id") == std::string::npos);
+}
+
+TEST_CASE("executions list: a gate 403 is rewritten to a generic 200 note that leaks nothing",
+          "[workflow][executions][list][rbac]") {
+    auto res = list_fragment_through_gate(403, /*set_retry_after=*/false);
+    CHECK(res.status == 200);
+    CHECK(res.get_header_value("Content-Type").find("text/html") != std::string::npos);
+    CHECK(res.body.find("data-denied=\"true\"") != std::string::npos);
+    CHECK(res.body.find("You do not have permission to view executions.") != std::string::npos);
+    CHECK_FALSE(leaks_gate_body(res.body));
+    CHECK(res.body.find("data-execution-id") == std::string::npos);
+}
+
+TEST_CASE("executions list: a gate 401 is passed through unchanged",
+          "[workflow][executions][list][rbac]") {
+    auto res = list_fragment_through_gate(401, /*set_retry_after=*/false);
+    CHECK(res.status == 401);
+    CHECK(res.body.find("GATE-MARKER") != std::string::npos);
+    CHECK(res.body.find("data-denied") == std::string::npos);
+    CHECK(res.body.find("data-degraded") == std::string::npos);
 }
 
 // ── Confinement of the LIST fragment (ADR-0017; mirrors GET /api/v1/executions)
