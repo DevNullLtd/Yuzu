@@ -340,8 +340,8 @@ plus one new prerequisite.**
   `403` (no `Execution:Read`, RBAC off for a service-scoped token, the ceiling denial, an engine
   principal without a grant) renders `<div class="empty-state" data-denied="true">` with "You do not
   have permission to view executions." and no reason text. A `401` for an unauthenticated request
-  passes through unchanged. The gate still writes its audit row first, and the gate's `Retry-After`
-  header is not sent. Detect the notes with the `data-degraded` and `data-denied` attributes; none of
+  passes through unchanged. The gate still writes its audit row first, and no `Retry-After` header is
+  sent with the note. Detect the notes with the `data-degraded` and `data-denied` attributes; none of
   them is the "No executions yet" text. **Monitoring blind spot:** `/fragments/executions` no longer
   answers `403` or `503` for these cases, so an HTTP-status monitor, a reverse-proxy access log or
   a synthetic check that treats `200` as healthy will not see them. The signals are the gate's audit
