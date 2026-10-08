@@ -7,7 +7,9 @@
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
+#include "execution_scope_rules.hpp" // execution_visible / confined_projection (shared with GET /api/v1/executions)
 #include "http_route_sink.hpp"
+#include "instruction_param_schema.hpp" // ParamValidatorCache: stored parameter_schema enforcement
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
@@ -32,9 +34,28 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
+
+namespace {
+constexpr const char* kParamRejectRoute = "instruction_execute";
+constexpr const char* kParamRejectReasons[] = {"shape", "violation", "schema_invalid"};
+} // namespace
+
+void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics) {
+    metrics.describe("yuzu_server_instruction_param_rejected_total",
+                     "Instruction execute calls refused before any approval ticket or dispatch "
+                     "because of the definition's stored parameter schema. reason=shape: params "
+                     "is not a JSON object. reason=violation: the params do not match the schema "
+                     "(HTTP 400). reason=schema_invalid: the stored schema cannot be prepared, so "
+                     "the call fails closed (HTTP 500).",
+                     "counter");
+    for (const char* reason : kParamRejectReasons)
+        metrics.counter("yuzu_server_instruction_param_rejected_total",
+                        {{"route", kParamRejectRoute}, {"reason", reason}});
+}
 
 // #4029: `product_pack_error_status`/`product_pack_client_message` moved to
 // product_pack_model.hpp — the new GET /api/v1/product-packs* routes and the
@@ -158,19 +179,67 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // The optional `definition_id` query param filters the list to one
     // definition. Click-handling on the trend sparkline (PR 4) and the
     // dashboard's per-instruction detail page (future) pass it through.
-    sink.Get("/fragments/executions", [auth_fn, perm_fn, execution_tracker, instruction_store](
-                                          const httplib::Request& req, httplib::Response& res) {
-        auto session = auth_fn(req, res);
-        if (!session)
+    //
+    // Confinement (ADR-0017): the SOLE gate is `fleet_read_fn`
+    // (require_fleet_read) -- never stacked with perm_fn on the same
+    // (Execution, Read) pair. A confined caller gets the SAME owner-or-visible
+    // view as the v1 twin GET /api/v1/executions, except service-scoped
+    // sessions, which get visible-only (the owner rule would expose the
+    // minter's identity; #5557): the admission predicate is pushed into SQL
+    // BEFORE the LIMIT (a page of 50 invisible rows must not starve the
+    // visible ones), each surviving row's counters and error preview are
+    // recomputed from the in-scope agent rows only (so neither the preview
+    // text nor the `title=` attribute can carry an out-of-scope agent's
+    // error), and a store degrade renders an honest 200 degrade note (data-degraded),
+    // never "No executions yet" (the htmx config drops 4xx/5xx bodies).
+    // An unconfined caller's output is unchanged.
+    sink.Get("/fragments/executions", [auth_fn, fleet_read_fn, execution_tracker,
+                                        instruction_store](const httplib::Request& req,
+                                                           httplib::Response& res) {
+        // Fragment-local degrade note. Rendered at HTTP 200, NOT 503: the dashboard htmx
+        // config (responseHandling `[45]..` swap:false) drops 4xx/5xx bodies, so a 503 here
+        // left the panel on "Loading..." forever. Only the HTTP-200-for-a-degrade part
+        // follows dex_routes.cpp /fragments/dex/perf/apps and verify_routes.hpp; the
+        // data-degraded attribute itself is new here. The note is honest (never "No
+        // executions yet") and carries data-degraded for machine detection. The gate's own
+        // A4 JSON 403/503 are rewritten to a 200 note below for the same htmx reason (the
+        // gate's audit row is written before the rewrite and is unaffected); a 401 is left
+        // untouched so an unauthenticated caller still gets the gate's response.
+        auto degraded = [&res](const char* kind, const char* text) {
+            res.status = 200;
+            res.set_content(std::string("<div class=\"empty-state\" data-degraded=\"") + kind +
+                                "\">" + text + "</div>",
+                            "text/html; charset=utf-8");
+        };
+        if (!fleet_read_fn) {
+            spdlog::error("/fragments/executions: fleet_read_fn unwired -- "
+                          "misconfigured call site; failing closed");
+            degraded("unavailable", "Executions unavailable (service not available). Contact "
+                                    "an administrator if this persists.");
             return;
-        // sec-M1: Execution:Read gate. The LIST exposes definition_name
-        // and last_error_detail (per-agent error preview) — same data
-        // class as the DETAIL handler, so it earns the same RBAC gate.
-        // Mirrors MCP list_executions and REST /api/v1/execution-statistics.
-        if (!perm_fn(req, res, "Execution", "Read"))
+        }
+        auto gate = fleet_read_fn(req, res, "Execution", "Read");
+        if (!gate.admitted) {
+            // The gate already wrote its A4 error body + status AND its audit row. htmx
+            // drops 4xx/5xx bodies, so a 503/403 would leave the panel on "Loading..."
+            // forever: replace those two with a 200 note. Any other status (401 etc.) is
+            // left exactly as the gate wrote it.
+            if (res.status == 503) {
+                res.headers.erase("Retry-After");
+                degraded("gate", "Executions unavailable (the authorization service could not "
+                                 "be reached). Retry shortly.");
+            } else if (res.status == 403) {
+                // Deliberately generic: nothing from the gate's body (reason, role or
+                // permission names) may reach the fragment.
+                res.status = 200;
+                res.set_content("<div class=\"empty-state\" data-denied=\"true\">You do not "
+                                "have permission to view executions.</div>",
+                                "text/html; charset=utf-8");
+            }
             return;
+        }
         if (!execution_tracker) {
-            res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
+            degraded("unavailable", "Not available");
             return;
         }
 
@@ -184,10 +253,89 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (req.has_param("definition_id")) {
             q.definition_id = req.get_param_value("definition_id");
         }
-        auto execs = execution_tracker->query_executions(q);
+
+        ExecutionScope scope_arg; // nullopt = unrestricted
+        std::string username;
+        if (gate.scope) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            username = session->username;
+            // #1634/#3789 precedent: an empty username under an engaged scope
+            // must never silently widen the owner disjunct to "no owner
+            // filter" for a confined caller.
+            if (username.empty()) {
+                spdlog::error("/fragments/executions: empty principal under a confined "
+                              "read -- failing closed");
+                degraded("unavailable", "Executions unavailable (service not available). "
+                                        "Contact an administrator if this persists.");
+                return;
+            }
+            // A service-scoped token's session username is its MINTER's identity, so the
+            // owner disjunct (dispatched_by == username) would list every execution the
+            // minter dispatched, outside the token's service tag scope (ADR-1006: the
+            // token must never see more than its tag scope). Suppress the owner disjunct
+            // for such a session, in SQL and in the per-row check below: it sees only
+            // executions that touched an in-scope agent. The other execution surfaces
+            // still carry the minter-keyed disjunct for service tokens (tracked in #5557).
+            if (!session->token_scope_service.empty())
+                username.clear();
+            ExecutionListScope s;
+            s.owner = username;
+            s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
+            scope_arg = std::move(s);
+        }
+
+        auto execs_opt = execution_tracker->query_executions_checked(q, scope_arg);
+        if (!execs_opt) {
+            degraded("tracker", "Execution tracker degraded, retry shortly.");
+            return;
+        }
+        std::vector<Execution> execs = std::move(*execs_opt);
+        if (gate.scope) {
+            std::vector<std::string> ids;
+            ids.reserve(execs.size());
+            for (const auto& e : execs)
+                ids.push_back(e.id);
+            // Scope the read in SQL: a confined caller must not pull every agent row of
+            // every listed execution (a fleet-wide execution has one row per agent).
+            // execution_visible/confined_projection ignore out-of-scope rows, so the
+            // served result is identical to the unfiltered read.
+            auto statuses_opt = execution_tracker->get_agent_statuses_for_executions_checked(
+                ids, scope_arg->visible_agents);
+            if (!statuses_opt) {
+                degraded("tracker", "Execution tracker degraded, retry shortly.");
+                return;
+            }
+            static const std::vector<AgentExecStatus> kEmptyStatuses;
+            std::vector<Execution> projected;
+            projected.reserve(execs.size());
+            for (const auto& e : execs) {
+                auto it = statuses_opt->find(e.id);
+                const auto& statuses = it != statuses_opt->end() ? it->second : kEmptyStatuses;
+                if (!execution_visible(e, statuses, gate.scope, username))
+                    continue;
+                auto counts = confined_projection(statuses, gate.scope);
+                Execution row = e;
+                row.agents_targeted = counts.agents_targeted;
+                row.agents_responded = counts.agents_responded;
+                row.agents_success = counts.agents_success;
+                row.agents_failure = counts.agents_failure;
+                // BOTH the inline preview and the title= attribute read this
+                // field below: the confined value, never the unscoped
+                // correlated-subquery text.
+                row.last_error_detail = counts.last_error_detail;
+                projected.push_back(std::move(row));
+            }
+            execs = std::move(projected);
+        }
         std::string html;
         if (execs.empty()) {
-            html = "<div class=\"empty-state\">No executions yet.</div>";
+            // A confined caller's empty page does NOT mean the fleet has no executions
+            // (out-of-scope ones may exist), so it gets its own, truthful wording.
+            html = gate.scope
+                       ? "<div class=\"empty-state\">No executions visible in your scope.</div>"
+                       : "<div class=\"empty-state\">No executions yet.</div>";
             res.set_content(html, "text/html; charset=utf-8");
             return;
         }
@@ -201,6 +349,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                "<th>Dispatched by</th>"
                "<th>Time</th>"
                "</tr></thead><tbody>";
+
+        // Per-request memo of the resolved (label, title) per definition_id: a page lists up
+        // to 50 rows but typically few distinct definitions, and each get_definition is a
+        // pool lease bounded at 2 s. The outcome is cached whatever it was (including the
+        // id-truncated fallback after a DB error), so a failing id is attempted once per
+        // request, not once per row.
+        std::unordered_map<std::string, std::pair<std::string, std::string>> def_labels;
 
         for (const auto& e : execs) {
             // Status hue + row stripe.
@@ -219,24 +374,33 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             int pending = targeted > responded ? (targeted - responded) : 0;
             int running = 0; // distinguishable only in the detail drawer
 
-            // Definition name (or fallback to truncated id).
-            std::string def_label;
-            std::string def_title;
-            if (instruction_store && instruction_store->is_open() && !e.definition_id.empty()) {
-                // ADR-0058: a DB-error outer result falls through to the id-truncated
-                // fallback below, same as a not-found inner optional did pre-migration
-                // — this is a best-effort display label, not a security/dispatch path.
-                auto def_result = instruction_store->get_definition(e.definition_id);
-                if (def_result && *def_result && !(*def_result)->name.empty()) {
-                    def_label = (*def_result)->name;
-                    def_title = e.definition_id;
+            // Definition name (or fallback to truncated id), memoized per request.
+            auto memo = def_labels.find(e.definition_id);
+            if (memo == def_labels.end()) {
+                std::string label;
+                std::string title;
+                if (instruction_store && instruction_store->is_open() && !e.definition_id.empty()) {
+                    // ADR-0058: a DB-error outer result falls through to the id-truncated
+                    // fallback below, same as a not-found inner optional did pre-migration
+                    // - this is a best-effort display label, not a security/dispatch path.
+                    auto def_result = instruction_store->get_definition(e.definition_id);
+                    if (def_result && *def_result && !(*def_result)->name.empty()) {
+                        label = (*def_result)->name;
+                        title = e.definition_id;
+                    }
                 }
-            }
-            if (def_label.empty()) {
-                def_label = e.definition_id.empty() ? std::string{"<unknown>"}
+                if (label.empty()) {
+                    label = e.definition_id.empty() ? std::string{"<unknown>"}
                                                     : e.definition_id.substr(0, 12);
-                def_title = e.definition_id;
+                    title = e.definition_id;
+                }
+                memo = def_labels
+                           .emplace(e.definition_id,
+                                    std::pair{std::move(label), std::move(title)})
+                           .first;
             }
+            const std::string& def_label = memo->second.first;
+            const std::string& def_title = memo->second.second;
 
             std::string first_error;
             if (failed > 0 && !e.last_error_detail.empty()) {
@@ -2455,6 +2619,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
             });
 
+    // Prepared `parameter_schema` validators for the execute handler below.
+    auto param_validators = std::make_shared<instr::ParamValidatorCache>();
+
     // -- Single Instruction Execution API --------------------------------------
 
     // POST /api/instructions/:id/execute — dispatch a single instruction definition
@@ -2462,7 +2629,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                        instruction_store, cmd_dispatch,
                                                        cmd_dispatch_concurrency, caller_fn,
                                                        execution_tracker, approval_manager,
-                                                       metrics,
+                                                       metrics, param_validators,
                                                        capability_registry](const httplib::Request& req,
                                                                 httplib::Response& res) {
         if (!perm_fn(req, res, "Execution", "Execute"))
@@ -2590,6 +2757,74 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto session = auth_fn(req, res);
         if (!session)
             return;
+
+        // -- Stored parameter_schema enforcement (strict) ---------------------------
+        // Validates the RAW typed `params` against the definition's stored schema
+        // (instruction_param_schema.hpp) BEFORE the approval gate, so a refused call never
+        // queues an approval (a ticket does not bind the params), creates an execution row or
+        // dispatches. An empty or `{}` schema is not validated. `params` below is untouched:
+        // no default is injected. The audit row carries only the validator's path. The response
+        // also carries its reason, which can quote text the schema author wrote (enum members,
+        // bounds) but never a caller-supplied value.
+        {
+            const auto count_reject = [&](const char* reason) {
+                if (metrics)
+                    metrics->counter("yuzu_server_instruction_param_rejected_total",
+                                     {{"route", kParamRejectRoute}, {"reason", reason}})
+                        .increment();
+            };
+            auto validator = param_validators->get(def_id, def.parameter_schema);
+            if (!validator) {
+                // A stored schema that cannot be prepared: FAIL CLOSED, never "no validation".
+                spdlog::warn("instruction '{}' has an invalid stored parameter_schema; execute "
+                             "refused until it is replaced: {}",
+                             audit_token(def_id),
+                             validator.error().empty() ? std::string("(no detail)")
+                                                       : validator.error().front());
+                count_reject("schema_invalid");
+                if (audit_fn)
+                    audit_fn(req, "instruction.execute", "failure", "instruction", def_id,
+                             "reason=param_schema_invalid");
+                res.status = 500;
+                res.set_content(
+                    detail::a4_error(res, "stored parameter schema for this instruction is invalid",
+                                     {.remediation =
+                                          "An administrator must export the definition, delete "
+                                          "it and import it again with a corrected "
+                                          "parameter_schema (signed, unless the server allows "
+                                          "unsigned definitions); see \"Replacing a stored "
+                                          "parameter schema\" in the Instructions "
+                                          "documentation."}),
+                    "application/json");
+                return;
+            }
+            if (!(*validator)->absent()) {
+                // `params` omitted and `params: null` both mean no params.
+                static const nlohmann::json kNoParams = nullptr;
+                const nlohmann::json& raw_params = j.contains("params") ? j["params"] : kNoParams;
+                if (auto violation = (*validator)->check(raw_params)) {
+                    const bool root = violation->path.empty();
+                    count_reject(!raw_params.is_null() && !raw_params.is_object() ? "shape"
+                                                                                  : "violation");
+                    if (audit_fn)
+                        audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                                 "reason=param_schema path=" +
+                                     (root ? std::string("(root)") : audit_token(violation->path)));
+                    res.status = 400;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         "invalid params: " +
+                                             (root ? std::string("(root)") : violation->path) +
+                                             ": " + violation->reason,
+                                         {.remediation = "Correct params to match the "
+                                                         "instruction's parameter schema and "
+                                                         "re-call; nothing was dispatched and no "
+                                                         "approval ticket was created."}),
+                        "application/json");
+                    return;
+                }
+            }
+        }
 
         // --- Approval gate ---------------------------------------------------
         // If the definition requires approval and the approval manager is

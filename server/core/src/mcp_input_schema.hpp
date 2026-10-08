@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -57,6 +58,13 @@
 //     lint — legal JSON Schema, but in a closed server-authored table an
 //     undeclared required name is always a typo).
 namespace yuzu::server::mcp {
+
+// RE2 memory budget (RE2::Options::max_mem) for every `pattern` this compiler builds,
+// in place of RE2's 8 MiB default. RE2 spends about two thirds of it on the compiled
+// program and the rest on lazily built DFA states, so it bounds the cost of compiling ONE
+// pattern and what that one pattern can retain after matching. It is not an aggregate
+// bound: a schema can hold many patterns and a cache of validators is capped by entry count.
+inline constexpr std::int64_t kPatternMaxMem = 512 * 1024;
 
 namespace detail {
 struct SchemaNode;

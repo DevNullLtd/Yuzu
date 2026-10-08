@@ -1628,9 +1628,9 @@ tests:
   # that scoping, both directions.
 
   # CASE 47 -- the two observe-only reasons alone must not page
-  # YuzuRbacReadDegraded ("callers being denied fleet-wide" would be false).
+  # YuzuRbacReadDegraded ("requests are being denied" would be false).
   - interval: 1m
-    name: rbac read degraded - observe-only reasons do not page fleet-wide-denial
+    name: rbac read degraded - observe-only reasons do not page the denying-reasons alert
     input_series:
       - series: 'yuzu_server_rbac_read_degrade_total{job="yuzu",instance="s1",reason="rbac_enabled_non_canonical"}'
         values: "0+1x20"
@@ -1653,6 +1653,127 @@ tests:
         eval_time: 15m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing", reason="query_error", severity="critical"}'
+            value: 1
+
+  # CASE 48b -- the other two denying reasons page as well, so a regression of
+  # the alert's reason regex that drops one of them is caught (the ceiling
+  # read's breaker-open and pool-timeout denials are counted under
+  # pool_acquire_timeout; a generation refresh failure past the stale-serve
+  # window is generation_refresh_failed).
+  - interval: 1m
+    name: rbac read degraded - pool_acquire_timeout still pages
+    input_series:
+      - series: 'yuzu_server_rbac_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing", reason="pool_acquire_timeout", severity="critical"}'
+            value: 1
+
+  # CASE 48c -- generation_refresh_failed (denying) pages.
+  - interval: 1m
+    name: rbac read degraded - generation_refresh_failed still pages
+    input_series:
+      - series: 'yuzu_server_rbac_read_degrade_total{job="yuzu",instance="s1",reason="generation_refresh_failed"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing", reason="generation_refresh_failed", severity="critical"}'
+            value: 1
+
+  # ── YuzuRbacBreakerOpen ──────────────────────────────────────────────────
+  #
+  # A breaker that STAYS open for 5m means authorization reads on that replica
+  # keep failing. The gauge is per replica and the rule keeps the `instance`
+  # label, so these cases pin: a sustained open breaker fires for the replica
+  # that has it (and only that one), and neither a flapping breaker nor one
+  # open for less than the `for:` window pages. RED against dropping `for:`
+  # (CASES 48e, 48f and 48g would fire), against shortening it (CASE 48g would
+  # fire), against lengthening it (CASE 48h would not fire) and against
+  # changing the `== 1` match (CASE 48d would not fire).
+
+  # CASE 48d -- replica s1 open for 15 minutes fires; replica s2, closed the
+  # whole time, does not (the alert is per instance).
+  - interval: 1m
+    name: rbac breaker open - a sustained open breaker fires for that replica only
+    input_series:
+      - series: 'yuzu_server_rbac_breaker_open{job="yuzu",instance="s1"}'
+        values: "1x20"
+      - series: 'yuzu_server_rbac_breaker_open{job="yuzu",instance="s2"}'
+        values: "0x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing", instance="s1", severity="critical"}'
+            value: 1
+
+  # CASE 48e -- a breaker that flaps open and closed every minute never holds
+  # the condition for 5m, so it must not page.
+  - interval: 1m
+    name: rbac breaker open - a flapping breaker stays quiet
+    input_series:
+      - series: 'yuzu_server_rbac_breaker_open{job="yuzu",instance="s1"}'
+        values: "0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE 48f -- a short open spell, then closed, must not page: that is a
+  # transient blip, not a persistently failing authorization read. The series is
+  # 0 for samples 0 to 5, 1 for samples 6 to 9 (four consecutive samples, so the
+  # breaker has been open for three minutes at the last of them), then 0 from
+  # sample 10.
+  - interval: 1m
+    name: rbac breaker open - open for less than five minutes stays quiet
+    input_series:
+      - series: 'yuzu_server_rbac_breaker_open{job="yuzu",instance="s1"}'
+        values: "0x5 1x3 0x15"
+    promql_expr_test:
+      # Evaluated while the breaker is still open (one minute after it opened), so a rule without
+      # `for:` would be firing here; with `for: 5m` it is only pending.
+      - expr: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+
+  # CASE 48g -- pins the `for:` window from below. The breaker opens at sample 2
+  # and is still open at sample 6, four minutes later, then closes. At the
+  # 6m evaluation the alert is pending: a `for:` of 4m or less would already be
+  # firing there, so it must stay quiet.
+  - interval: 1m
+    name: rbac breaker open - open for four minutes stays quiet
+    input_series:
+      - series: 'yuzu_server_rbac_breaker_open{job="yuzu",instance="s1"}'
+        values: "0x1 1x4 0x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+
+  # CASE 48h -- pins the `for:` window from above. The breaker opens at sample 2
+  # and stays open through sample 9. At the 7m evaluation it has been open for
+  # five minutes, so it fires, and it is still firing at 8m. A `for:` longer
+  # than 5m would still be pending at 7m.
+  - interval: 1m
+    name: rbac breaker open - open for five continuous minutes fires
+    input_series:
+      - series: 'yuzu_server_rbac_breaker_open{job="yuzu",instance="s1"}'
+        values: "0x1 1x7 0x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing", instance="s1", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacBreakerOpen", alertstate="firing", instance="s1", severity="critical"}'
             value: 1
 
   # ── YuzuRbacEnforcementChanged (A1) ──────────────────────────────────────
@@ -3004,4 +3125,474 @@ tests:
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuGuardianReadDegraded"}'
         eval_time: 20m
+        exp_samples: []
+
+  # -- Gateway-upstream peer authorization (group yuzu-security) -------------
+  #
+  # yuzu_server_gateway_peer_denied_total is pre-seeded to 0 at boot for every
+  # closed rpc x reason pair, so the first real denial is an increase and not a
+  # series that first appears at N. YuzuGatewayPeerDenied pages on the five reasons
+  # that are not anonymous refusals (bad_cert, no_server_auth_eku,
+  # not_pinned, outside_validity, internal_error). The three reasons with no usable
+  # client certificate (null_context, not_authenticated, no_cert) are deliberately
+  # not alerted: each has its own quiet case below, so a reason added to or dropped
+  # from the rule's regex turns a named case red. YuzuGatewayPeerAuthzDisabledWithTls
+  # fires on authz_mode{mode="insecure_ack_tls"} only.
+
+  # CASE A -- sustained denials of a pinned-gateway candidate fire the warning,
+  # labelled with instance and reason (the rpc label is aggregated away). RED if
+  # the rule lost the by (instance, reason) or the reason regex lost not_pinned.
+  - interval: 1m
+    name: gateway peer denied - authenticated denials fire with the reason label
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="not_pinned",event="security"}'
+        values: "0x5 0+10x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing", instance="s1", reason="not_pinned", severity="warning"}'
+            value: 1
+      # The posture rule must not fire on a denial series.
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerAuthzDisabledWithTls", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE B -- a healthy server (every series pre-seeded at 0, never moving) is quiet,
+  # for each of the five alerted reasons and the three that are not.
+  - interval: 1m
+    name: gateway peer denied - pre-seeded zero series stay quiet
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="bad_cert",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="no_server_auth_eku",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="not_pinned",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_inventory",reason="outside_validity",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="notify_stream_status",reason="internal_error",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="forward_guardian_message",reason="no_cert",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="not_authenticated",event="security"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="null_context",event="security"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuGatewayPeer.*", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE C -- one denial is pending at 6m (the step lands at t6, so it has not held
+  # for the 1m `for:` yet), fires at 7m, and clears once the [5m] window no longer
+  # holds the step. RED if the rule lost its `for:` (firing at 6m) or were
+  # rate-sustained rather than increase-based (nothing to fire on one step).
+  - interval: 1m
+    name: gateway peer denied - one denial fires then clears
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="outside_validity",event="security"}'
+        values: "0x5 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing", instance="s1", reason="outside_validity", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+
+  # CASE D -- the remaining alerted reasons each fire with their own reason label.
+  # not_pinned and outside_validity are CASE A and C. One series per reason, so a
+  # regex that lost one of the five names it in the failing expectation.
+  - interval: 1m
+    name: gateway peer denied - every remaining alerted reason fires with its own label
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="bad_cert",event="security"}'
+        values: "0x5 0+10x30"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="no_server_auth_eku",event="security"}'
+        values: "0x5 0+10x30"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_inventory",reason="internal_error",event="security"}'
+        values: "0x5 0+10x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing", instance="s1", reason="bad_cert", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing", instance="s1", reason="no_server_auth_eku", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing", instance="s1", reason="internal_error", severity="warning"}'
+            value: 1
+
+  # CASE E -- the reasons with no usable client certificate do NOT fire. One case per
+  # reason. A sustained 10 denials a minute is far above any threshold, so the quiet
+  # comes from the reason exclusion and nothing else (an anonymous probe on the
+  # request-not-require agent listener must not page).
+  - interval: 1m
+    name: gateway peer denied - anonymous reason null_context does not fire
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="null_context",event="security"}'
+        values: "0+10x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  - interval: 1m
+    name: gateway peer denied - anonymous reason not_authenticated does not fire
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="not_authenticated",event="security"}'
+        values: "0+10x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  - interval: 1m
+    name: gateway peer denied - anonymous reason no_cert does not fire
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="no_cert",event="security"}'
+        values: "0+10x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE F -- acknowledged-disabled on a TLS server with a client CA fires after the
+  # 5m `for:`, labelled with the mode. RED if the mode literal changed or the
+  # `== 1` were dropped (a 0 series is present for every runnable mode).
+  - interval: 1m
+    name: gateway peer authz disabled with tls - insecure_ack_tls fires
+    input_series:
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s1",mode="insecure_ack_tls"}'
+        values: "1x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s1",mode="enforce"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerAuthzDisabledWithTls", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerAuthzDisabledWithTls", alertstate="firing", instance="s1", job="yuzu", mode="insecure_ack_tls", severity="warning"}'
+            value: 1
+
+  # CASE G -- every other mode is quiet: insecure_ack (a plaintext rig, by design),
+  # enforce, and disabled each as the one active mode with the others at 0; an
+  # insecure_ack_tls series held at 0.
+  - interval: 1m
+    name: gateway peer authz disabled with tls - other modes stay quiet
+    input_series:
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s1",mode="insecure_ack"}'
+        values: "1x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s1",mode="insecure_ack_tls"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s1",mode="enforce"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s2",mode="enforce"}'
+        values: "1x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s2",mode="insecure_ack_tls"}'
+        values: "0x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s3",mode="disabled"}'
+        values: "1x40"
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s3",mode="insecure_ack_tls"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerAuthzDisabledWithTls", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE H -- an insecure_ack_tls blip shorter than the 5m `for:` (5 samples at 1,
+  # t6..t10) is still pending when evaluated at 10m, so nothing fires. RED if the
+  # `for:` were shortened below the blip.
+  - interval: 1m
+    name: gateway peer authz disabled with tls - a blip shorter than the for stays quiet
+    input_series:
+      - series: 'yuzu_server_gateway_peer_authz_mode{job="yuzu",instance="s4",mode="insecure_ack_tls"}'
+        values: "0x5 1x4 0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerAuthzDisabledWithTls", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+
+  # -- YuzuGatewayPeerDeniedBatchHeartbeat (group yuzu-security) ---------------
+  #
+  # The critical companion of YuzuGatewayPeerDenied: the same five certificate
+  # reasons, restricted to rpc="batch_heartbeat", with a `for: 5m`. BatchHeartbeat
+  # is the one RPC a gateway sends continuously, so a sustained denial on it means
+  # the gateway itself is refused (a total gateway-fronted outage), not a stray
+  # client. A lone denial must not page; a denial on another rpc must not fire it;
+  # the three anonymous reasons must not fire it.
+
+  # CASE I -- sustained BatchHeartbeat denials fire the critical alert, labelled
+  # with instance and reason, only after the 5m `for:` (quiet at 11m, firing at
+  # 15m), and the existing warning is active at the same time. RED if the rule
+  # lost its rpc matcher's reason list, its severity, or its `for:` (firing at 11m).
+  - interval: 1m
+    name: gateway peer denied batch heartbeat - sustained denials fire critical after for
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="not_pinned",event="security"}'
+        values: "0x5 0+10x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing", instance="s1", reason="not_pinned", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing", instance="s1", reason="not_pinned", severity="warning"}'
+            value: 1
+
+  # CASE J -- every alerted reason fires the critical rule on batch_heartbeat, one
+  # series per reason, so a regex that lost one names it in the failing expectation.
+  - interval: 1m
+    name: gateway peer denied batch heartbeat - every certificate reason fires
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="bad_cert",event="security"}'
+        values: "0x5 0+10x30"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="no_server_auth_eku",event="security"}'
+        values: "0x5 0+10x30"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="outside_validity",event="security"}'
+        values: "0x5 0+10x30"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="internal_error",event="security"}'
+        values: "0x5 0+10x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing", instance="s1", reason="bad_cert", severity="critical"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing", instance="s1", reason="internal_error", severity="critical"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing", instance="s1", reason="no_server_auth_eku", severity="critical"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing", instance="s1", reason="outside_validity", severity="critical"}'
+            value: 1
+
+  # CASE K -- sustained denials on every OTHER rpc do not fire the critical rule
+  # (the gateway itself is not proven refused), while the warning rule does fire.
+  # RED if the rpc="batch_heartbeat" matcher were dropped.
+  - interval: 1m
+    name: gateway peer denied batch heartbeat - other rpcs do not fire critical
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_register",reason="not_pinned",event="security"}'
+        values: "0x5 0+10x30"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="proxy_inventory",reason="not_pinned",event="security"}'
+        values: "0x5 0+10x30"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="notify_stream_status",reason="not_pinned",event="security"}'
+        values: "0x5 0+10x30"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="forward_guardian_message",reason="not_pinned",event="security"}'
+        values: "0x5 0+10x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDenied", alertstate="firing", instance="s1", reason="not_pinned", severity="warning"}'
+            value: 1
+
+  # CASE L -- sustained anonymous refusals on batch_heartbeat (a probe or a
+  # misdirected client on a listener that does not require a client certificate)
+  # do not fire the critical rule. RED if an anonymous reason were added to the
+  # regex.
+  - interval: 1m
+    name: gateway peer denied batch heartbeat - anonymous reasons do not fire
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="null_context",event="security"}'
+        values: "0+10x60"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="not_authenticated",event="security"}'
+        values: "0+10x60"
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="no_cert",event="security"}'
+        values: "0+10x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE M -- one isolated denial (a single step) is active for under the 5m
+  # `for:` and never fires; the warning rule (for: 1m) does fire on it. RED if the
+  # critical rule lost its `for:` (it would fire at 8m).
+  - interval: 1m
+    name: gateway peer denied batch heartbeat - one isolated denial does not fire
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="not_pinned",event="security"}'
+        values: "0x5 10x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE N -- the alert clears once the denials stop and the [5m] window no longer
+  # holds an increment (the last step is t16; the alert is still active at 18m, the
+  # reason the annotation says to check that the counter is flat, and gone by 25m).
+  - interval: 1m
+    name: gateway peer denied batch heartbeat - clears after the denials stop
+    input_series:
+      - series: 'yuzu_server_gateway_peer_denied_total{job="yuzu",instance="s1",rpc="batch_heartbeat",reason="not_pinned",event="security"}'
+        values: "0x5 0+10x10 100x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing", instance="s1", reason="not_pinned", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing"}'
+        eval_time: 18m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing", instance="s1", reason="not_pinned", severity="critical"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayPeerDeniedBatchHeartbeat", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # -- Gateway-side rules (group yuzu-gateway; scraped from the GATEWAY) --------
+  #
+  # yuzu_gw_upstream_rpc_errors_total and yuzu_gw_upstream_tls_handshake_failures_total
+  # are NOT pre-seeded to 0: a label set appears at its first value (modelled as
+  # `_x5 1+1x30`: absent for five steps, then 1, 2, 3, ...). increase() cannot see
+  # the step into the first sample, which CASE S pins as a known limit.
+
+  # CASE O -- sustained status-16 errors fire the warning after its 2m `for:`, with
+  # instance and rpc_name labels (the code label is aggregated away). RED if the
+  # code matcher changed or the `for:` were dropped.
+  - interval: 1m
+    name: gateway upstream auth refused - sustained code 16 fires after for
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="batch_heartbeat",code="16"}'
+        values: "_x5 1+1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamAuthRefused", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamAuthRefused", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamAuthRefused", alertstate="firing", instance="g1", rpc_name="batch_heartbeat", severity="warning"}'
+            value: 1
+
+  # CASE P -- sustained errors with every other code do not fire it: 14 is
+  # UNAVAILABLE and "exception" and "unknown" are the non-numeric codes the
+  # gateway emits (yuzu_gw_upstream.erl). RED if the matcher became a regex over
+  # more codes.
+  - interval: 1m
+    name: gateway upstream auth refused - other codes do not fire
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="proxy_register",code="14"}'
+        values: "_x5 1+1x40"
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="proxy_register",code="exception"}'
+        values: "_x5 1+1x40"
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="proxy_register",code="unknown"}'
+        values: "_x5 1+1x40"
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="proxy_register",code="9"}'
+        values: "_x5 1+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamAuthRefused", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE Q -- the alert clears once the refusals stop (the last increment is t15;
+  # still active at 18m, gone by 25m).
+  - interval: 1m
+    name: gateway upstream auth refused - clears after the refusals stop
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="batch_heartbeat",code="16"}'
+        values: "_x5 1+1x10 11x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamAuthRefused", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamAuthRefused", alertstate="firing", instance="g1", rpc_name="batch_heartbeat", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamAuthRefused", alertstate="firing"}'
+        eval_time: 18m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamAuthRefused", alertstate="firing", instance="g1", rpc_name="batch_heartbeat", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamAuthRefused", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE R -- a flat counter (a healthy gateway that had refusals long ago) is quiet.
+  - interval: 1m
+    name: gateway upstream auth refused - a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="batch_heartbeat",code="16"}'
+        values: "7x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamAuthRefused", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE S -- the documented limit: a label set that first appears already at 1 and
+  # never moves is invisible to increase(), so a single isolated first refusal on a
+  # fresh gateway is not alerted (the gateway retries a failing call, so a
+  # persistent cause is CASE O). This case pins the limit so a change that removes
+  # it (a pre-seeded series, or a different expression) is a deliberate edit.
+  - interval: 1m
+    name: gateway upstream auth refused - a series that first appears at 1 and stays is not seen
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="batch_heartbeat",code="16"}'
+        values: "_x5 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamAuthRefused", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE T -- sustained TLS handshake failures fire the warning after the 5m
+  # `for:`, labelled with instance and kind (the rpc_name label is aggregated
+  # away). RED if the `for:` were shortened (it would fire at 7m) or the aggregation
+  # lost `kind`.
+  - interval: 1m
+    name: gateway upstream tls handshake failures - sustained failures fire after for
+    input_series:
+      - series: 'yuzu_gw_upstream_tls_handshake_failures_total{job="yuzu-gateway",instance="g1",rpc_name="proxy_register",kind="unknown_ca"}'
+        values: "_x5 1+1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamTlsHandshakeFailures", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamTlsHandshakeFailures", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamTlsHandshakeFailures", alertstate="firing", instance="g1", kind="unknown_ca", severity="warning"}'
+            value: 1
+
+  # CASE U -- a flat counter is quiet, and a failure burst that stops clears (the
+  # last increment is t15; still active at 18m, gone by 30m).
+  - interval: 1m
+    name: gateway upstream tls handshake failures - flat is quiet and a burst clears
+    input_series:
+      - series: 'yuzu_gw_upstream_tls_handshake_failures_total{job="yuzu-gateway",instance="g1",rpc_name="proxy_register",kind="bad_tls_options"}'
+        values: "4x40"
+      - series: 'yuzu_gw_upstream_tls_handshake_failures_total{job="yuzu-gateway",instance="g2",rpc_name="batch_heartbeat",kind="certificate_expired"}'
+        values: "_x5 1+1x10 11x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamTlsHandshakeFailures", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamTlsHandshakeFailures", alertstate="firing", instance="g2", kind="certificate_expired", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamTlsHandshakeFailures", alertstate="firing"}'
+        eval_time: 18m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamTlsHandshakeFailures", alertstate="firing", instance="g2", kind="certificate_expired", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamTlsHandshakeFailures", alertstate="firing"}'
+        eval_time: 30m
         exp_samples: []

@@ -9,6 +9,7 @@
 #include <yuzu/agent/kv_store.hpp>
 
 #include "guaranteed_state.pb.h"
+#include "guardian_arm_ack.hpp" // kWedgeSuppressMaxDecisions (#5459: the held-generation valve test)
 #include "guardian_arm_heartbeat.hpp" // GuardianArmStats complete type (rung 9c PR-3)
 #include "guardian_backend.hpp" // guardian_backend_from_state/label (#2298 F13)
 #include "guardian_convergence_scheduler.hpp" // ConvergenceScheduler (started_for_test, #2238)
@@ -126,6 +127,10 @@ struct ScopedTestSqlite3 {
 void drop_kv_store_table_for_test(const std::filesystem::path& db_path) {
     ScopedTestSqlite3 db;
     REQUIRE(sqlite3_open(db_path.string().c_str(), &db.raw) == SQLITE_OK);
+    // The engine's own KvStore connection holds this file open in WAL mode with a 5 s busy
+    // timeout; this second connection must wait for it too, or the DDL races a checkpoint
+    // or a commit under load and fails SQLITE_BUSY (observed as rc 5 at 24-40 parallel runs).
+    sqlite3_busy_timeout(db.raw, 5000);
     char* err = nullptr;
     const int rc = sqlite3_exec(db.raw, "DROP TABLE kv_store", nullptr, nullptr, &err);
     if (err)
@@ -135,6 +140,10 @@ void drop_kv_store_table_for_test(const std::filesystem::path& db_path) {
 void recreate_kv_store_table_for_test(const std::filesystem::path& db_path) {
     ScopedTestSqlite3 db;
     REQUIRE(sqlite3_open(db_path.string().c_str(), &db.raw) == SQLITE_OK);
+    // The engine's own KvStore connection holds this file open in WAL mode with a 5 s busy
+    // timeout; this second connection must wait for it too, or the DDL races a checkpoint
+    // or a commit under load and fails SQLITE_BUSY (observed as rc 5 at 24-40 parallel runs).
+    sqlite3_busy_timeout(db.raw, 5000);
     char* err = nullptr;
     const int rc = sqlite3_exec(db.raw,
                                 "CREATE TABLE IF NOT EXISTS kv_store ("
@@ -178,17 +187,27 @@ public:
         // unlike watching_count() (reflects watched_, populated only past the hang
         // gate/failure checks below), this proves a SUPPRESSED retry never reaches the
         // mechanism at all, not merely that it hasn't (yet) committed.
-        watch_calls_.fetch_add(1, std::memory_order_relaxed);
+        // #5459 FU-10: the 1-based ORDER in which watch() calls entered (SparkEngine serialises a
+        // type's mechanism calls, so for one type this is the lock order).
+        const int ordinal = watch_calls_.fetch_add(1, std::memory_order_relaxed) + 1;
         bool hang = false;
         bool do_throw = false;
         {
             std::lock_guard<std::mutex> lk{mu_};
+            if (first_watch_key_.empty())
+                first_watch_key_ = key; // #5459: the key the (hung) first arm was for
             if (fail_next_watch_) {
                 fail_next_watch_ = false;
                 return std::unexpected("forced watch failure");
             }
             hang = hang_next_watch_;
             hang_next_watch_ = false;
+            if (hang_on_ordinal_ != 0 && ordinal == hang_on_ordinal_) {
+                hang = true; // #5459 FU-10: the Nth watch() to enter hangs, whichever rule it is for
+                hang_on_ordinal_ = 0;
+            }
+            if (hang)
+                hung_watch_key_ = key;
             do_throw = throw_next_watch_;
             throw_next_watch_ = false;
         }
@@ -228,6 +247,22 @@ public:
         // under memory pressure.
         if (do_throw)
             throw std::runtime_error("forced watch throw");
+        // #5459: a ONE-SHOT outcome decided AFTER the gate, i.e. while the arm is parked
+        // and only when it is finally released. fail_next_watch_ cannot do this (it
+        // returns before the gate, so the arm never hangs) and do_throw above is captured
+        // at ENTRY, so a test that decides the outcome after the arm is already parked
+        // needs this one. Consumed here, so a later watch() (a recovery attempt) is never
+        // affected: injection cannot be left on.
+        LateWatchOutcome late = LateWatchOutcome::None;
+        {
+            std::lock_guard<std::mutex> lk{mu_};
+            late = late_watch_outcome_;
+            late_watch_outcome_ = LateWatchOutcome::None;
+        }
+        if (late == LateWatchOutcome::Refuse)
+            return std::unexpected("forced late watch refusal");
+        if (late == LateWatchOutcome::Throw)
+            throw std::runtime_error("forced late watch throw");
         std::lock_guard<std::mutex> lk{mu_};
         watched_.insert(key);
         return {};
@@ -259,8 +294,11 @@ public:
             isolated_gate_cv_.notify_all();
             isolated_gate_cv_.wait(gate_lk, [this] { return isolated_released_; });
         }
-        std::lock_guard<std::mutex> lk{mu_};
-        watched_.erase(key);
+        {
+            std::lock_guard<std::mutex> lk{mu_};
+            watched_.erase(key);
+        }
+        unwatch_completed_.fetch_add(1, std::memory_order_relaxed);
     }
     void stop() override {}
     /// #4685: drives Guardian's capability-set inputs directly - both default false,
@@ -297,6 +335,38 @@ public:
         std::lock_guard<std::mutex> lk{mu_};
         hang_next_unwatch_ = true;
     }
+    /// #5459: what the next watch() does once it is released from the hang gate (see the
+    /// consume site in watch()). None = succeed. One-shot. Refuse returns an error; Throw
+    /// throws, which SparkEngine's watch_guarded() turns into the SAME refusal-shaped
+    /// failure (a mechanism throw can never surface as the runtime's IoFailure::WorkerThrew).
+    enum class LateWatchOutcome { None, Refuse, Throw };
+    void set_late_watch_outcome(LateWatchOutcome o) {
+        std::lock_guard<std::mutex> lk{mu_};
+        late_watch_outcome_ = o;
+    }
+    /// #5459: the key of the FIRST watch() this mechanism ever received; empty before one.
+    std::string first_watch_key() {
+        std::lock_guard<std::mutex> lk{mu_};
+        return first_watch_key_;
+    }
+    /// #5459 FU-10: the Nth watch() to ENTER this mechanism (1-based, counted from construction)
+    /// hangs on the shared gate, whichever rule it is for. Lets a test that arms two same-type
+    /// rules in ONE push hang exactly the second to enter without depending on which rule the
+    /// engine's two arm workers reach the type lock with first: the first one commits, the second
+    /// hangs. One-shot; 0 = off (the default, so every other test is unaffected).
+    void hang_watch_ordinal(int n) {
+        std::lock_guard<std::mutex> lk{mu_};
+        hang_on_ordinal_ = n;
+    }
+    /// #5459 FU-10: the key of the watch() that took the hang gate (either hang_next_watch() or
+    /// hang_watch_ordinal()); empty before one.
+    std::string hung_watch_key() {
+        std::lock_guard<std::mutex> lk{mu_};
+        return hung_watch_key_;
+    }
+    /// #5459: unwatch() calls that RAN TO COMPLETION (after any hang gate), so a test can
+    /// tell a stale subscription's disarm having finished from it merely being parked.
+    int unwatch_completed_count() const { return unwatch_completed_.load(std::memory_order_relaxed); }
     /// #4472: the next unwatch() parks on a gate independent of hang_next_watch()'s.
     void hang_next_unwatch_isolated() {
         std::lock_guard<std::mutex> lk{mu_};
@@ -358,6 +428,11 @@ public:
 
 private:
     std::atomic<int> watch_calls_{0};
+    std::atomic<int> unwatch_completed_{0}; ///< #5459
+    LateWatchOutcome late_watch_outcome_{LateWatchOutcome::None}; ///< #5459, guarded by mu_
+    std::string first_watch_key_;                                  ///< #5459, guarded by mu_
+    int hang_on_ordinal_{0};                                       ///< #5459 FU-10, guarded by mu_
+    std::string hung_watch_key_;                                   ///< #5459 FU-10, guarded by mu_
     std::atomic<bool> inert_for_test_{false};
     std::atomic<bool> boot_inert_for_test_{false};
     std::mutex mu_;
@@ -462,6 +537,11 @@ struct SparkReconcileFixture {
     std::unique_ptr<KvStore> kv;
     SparkEngine spark_engine;
     FakeServiceMechanism* mechanism{nullptr}; // borrowed; owned by spark_engine
+    /// #5459: a SECOND, independent mechanism registered under SparkType::Registry when the
+    /// fixture is built with `with_registry_sibling`, so a test can hold the Service type's
+    /// watch() parked (mechanism ops are serialised PER TYPE) while a healthy Registry rule arms,
+    /// commits and is observably torn down / re-armed (or, being suppressed, left alone).
+    FakeServiceMechanism* sibling_mechanism{nullptr}; // borrowed; owned by spark_engine
     std::unique_ptr<GuardianEngine> engine;
     std::mutex sent_mu;
     std::vector<OutboxEntry> sent;
@@ -480,7 +560,8 @@ struct SparkReconcileFixture {
     /// this changes only what the fixture registers it AS, nothing else.
     explicit SparkReconcileFixture(std::uint64_t periodic_bound_ms = 0,
                                    std::optional<std::chrono::milliseconds> backend_op_deadline = std::nullopt,
-                                   SparkType mechanism_type = SparkType::Service) {
+                                   SparkType mechanism_type = SparkType::Service,
+                                   bool with_registry_sibling = false) {
         auto opened = KvStore::open(db_.path);
         REQUIRE(opened.has_value());
         kv = std::make_unique<KvStore>(std::move(*opened));
@@ -488,6 +569,12 @@ struct SparkReconcileFixture {
         auto mech = std::make_unique<FakeServiceMechanism>();
         mechanism = mech.get();
         REQUIRE(spark_engine.register_mechanism(mechanism_type, std::move(mech)).has_value());
+        if (with_registry_sibling) {
+            REQUIRE(mechanism_type != SparkType::Registry);
+            auto sib = std::make_unique<FakeServiceMechanism>();
+            sibling_mechanism = sib.get();
+            REQUIRE(spark_engine.register_mechanism(SparkType::Registry, std::move(sib)).has_value());
+        }
         spark_engine.start();
 
         engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test", /*prefer_spark=*/true);
@@ -3310,19 +3397,26 @@ TEST_CASE("#2233 item 3: a timed-out arm holds policy_generation for retry, not 
 }
 
 // ---------------------------------------------------------------------------
-// #4472 post-K stranding, engine level. An operator withdraws a rule whose arm is hung and
-// re-adds the identical rule while the arm's late success is compensated: the late success lands
-// after the withdrawal (so it is disarmed, not adopted) and its compensating disarm is parked
-// inside unwatch(). The server's identical re-pushes then re-observe the same retained Wedged
-// claim; on the fourth identical application the heartbeat drain finds that claim K-eligible
-// (still the key's FIFO front) and, with the disarm still outstanding, K-waives the generation.
-// The disarm then finishes and pops the claim with no replacement arm. Pass condition: the
-// generation is NOT acknowledged while the disarm is outstanding AND the rule ends armed on the
-// mechanism. The runtime-level twin (test_guardian_spark_runtime.cpp, "#4472: ...") drives the
-// same ledger decision with the late success landing inside a single full_sync's detach_all /
-// re-attach window, which an engine test cannot park.
+// #4472 compensation hold, engine level (re-based on #5459 option D). An operator withdraws a
+// rule whose arm is hung and re-adds the identical rule while the arm's late success is
+// compensated: the late success lands after the withdrawal (so it is disarmed, not adopted) and
+// its compensating disarm is parked inside unwatch(). The re-add re-observes the same retained
+// Wedged claim and the generation is held. The server's identical re-pushes then arrive while the
+// compensating teardown is outstanding: each is SUPPRESSED (the ledger retains the claim as
+// compensation-pending), so none pays a teardown or a new watch(), and none acknowledges. The
+// disarm then finishes and pops the claim with no replacement arm; the next push is a Reapply.
+// Pass condition: the generation is NOT acknowledged while the disarm is outstanding, the held
+// pushes cost the mechanism nothing, AND the rule ends armed on the mechanism. The runtime-level
+// twin (test_guardian_spark_runtime.cpp, "#4472: ...") drives the same ledger decision with the
+// late success landing inside a single full_sync's detach_all / re-attach window, which an
+// engine test cannot park.
 // ---------------------------------------------------------------------------
 namespace {
+// These two mirror guardian_engine.cpp's file-local kKvNamespace / kKeyGen (the on-disk
+// layout of the persisted generation); a rename there must be mirrored here.
+constexpr std::string_view kGuardianKvNamespace5459 = "__guardian__";
+constexpr std::string_view kGuardianGenerationKey5459 = "meta:policy_generation";
+
 /// `finish_disarm_before_drain` false: the compensating disarm is still parked when the fourth
 /// identical application's heartbeat drain runs (the repro). True: it is released after that
 /// application's re-attach but before the drain (the control).
@@ -3375,22 +3469,41 @@ void run_post_k_4472_scenario(bool finish_disarm_before_drain) {
     f.mechanism->release_hang();
     REQUIRE(f.mechanism->wait_entered_isolated_unwatch(30s));
 
-    // The identical re-add, then three more identical re-applications (reapply_count 0..3), each
-    // followed by the heartbeat drain.
+    // The identical re-add (the one real application: it re-observes the retained claim), then
+    // three more identical pushes, each followed by the heartbeat drain. While the compensating
+    // teardown is outstanding each of those three is SUPPRESSED by decide_retry(): the open
+    // application survives (pending 0 / failed 1), and the mechanism sees no new watch() and no
+    // unwatch() completing. In the control the teardown is released AFTER the fourth push is
+    // decided, so that push is suppressed too.
+    int watches_after_readd = 0;
+    int unwatches_after_readd = 0;
     for (int i = 0; i < 4; ++i) {
         push(7, true);
+        if (i > 0) {
+            const auto s = f.engine->arm_stats();
+            REQUIRE(s.has_value());
+            CHECK(s->pending == 0); // no new application was opened: the push was suppressed
+            CHECK(s->failed == 1);  // the compensating wedge is still the open failure
+            CHECK(f.mechanism->watch_call_count() == watches_after_readd);
+            CHECK(f.mechanism->unwatch_completed_count() == unwatches_after_readd);
+        }
         if (i == 3 && finish_disarm_before_drain) {
             f.mechanism->release_isolated_unwatch_hang();
             REQUIRE(yuzu::test::spin_until([&] { return f.engine->active_io_workers() == 0; }, 10s));
         }
         drain_pending();
+        if (i == 0) {
+            watches_after_readd = f.mechanism->watch_call_count();
+            unwatches_after_readd = f.mechanism->unwatch_completed_count();
+        }
         if (i < 3)
             REQUIRE(f.engine->policy_generation() < 7);
     }
 
     // (a) With the disarm outstanding the generation must not have been acknowledged, or the
     // server stops re-sending (agent_gen >= current). In the control it is held too: the claim
-    // is gone, so the Wedged receipt is no longer K-eligible.
+    // is popped, the wedge is no longer outstanding, and the counted failure still holds the
+    // generation (nothing acknowledges it; only a later successful application can).
     const bool acknowledged = f.engine->policy_generation() >= 7;
     CHECK_FALSE(acknowledged);
     if (finish_disarm_before_drain)
@@ -3415,11 +3528,26 @@ void run_post_k_4472_scenario(bool finish_disarm_before_drain) {
     CHECK(f.engine->rule_count() == 1);
     CHECK(f.engine->spark_armed_rule_count() == 1);
     CHECK(f.mechanism->watching_count() == 1);
+    // The heal is exactly ONE fresh arm after the pop (the original hung arm's watch() plus the
+    // replacement), never a leaked second dispatch while the compensation was outstanding.
+    CHECK(f.mechanism->watch_call_count() == 2);
+    // The scenario's end state: the rule is armed, so the held generation is finally
+    // acknowledged by the heartbeat tick AND durably stored (the same final check the [5459]
+    // rig tests make).
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            f.engine->journal_maintenance_tick();
+            return f.engine->policy_generation() == 7;
+        },
+        10s));
+    const auto stored = f.kv->get(kGuardianKvNamespace5459, kGuardianGenerationKey5459);
+    REQUIRE(stored.has_value());
+    CHECK(std::stoull(*stored) == 7);
 }
 } // namespace
 
-TEST_CASE("#4472: a compensating disarm still outstanding at the heartbeat drain must not "
-          "K-waive the generation, and the rule must end armed",
+TEST_CASE("#4472: a compensating disarm still outstanding at the heartbeat drain is never "
+          "acknowledged, the held pushes are suppressed, and the rule must end armed",
           "[spark][guardian][reconcile][liveness][4472]") {
     run_post_k_4472_scenario(/*finish_disarm_before_drain=*/false);
 }
@@ -3941,9 +4069,10 @@ TEST_CASE("rung 9c PR-2 governance hardening: an IDENTICAL repeat push recovers 
     // reaching the tail-gate persist this test targets - this whole-table-drop
     // fault can't isolate "rules durably stored, only the generation marker's own
     // write fails" from "everything in the table fails together". decide_retry()'s
-    // pending.empty() fix does not itself depend on rule count or content (proven
-    // independently, rule-content-free, by the ledger-level "EMPTY pending map"
-    // unit test in test_guardian_arm_ack.cpp) - but a selective-KV-fault test
+    // nothing-outstanding fix does not itself depend on rule count or content (proven
+    // independently, rule-content-free, by the ledger-level "decide_retry(): no pending
+    // receipts and no retained outstanding work is Reapply" unit test in
+    // test_guardian_arm_ack.cpp) - but a selective-KV-fault test
     // exercising this exact tail-gate failure with real, already-armed rules
     // present is tracked as a follow-up, not fixed here.
     gpb::GuaranteedStatePush p;
@@ -4084,80 +4213,899 @@ TEST_CASE("governance UP-1 residual, round 2 (#4221): retargeting a rule onto an
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// rung 9c PR-5e (#4221, K-bound closeout, decision 1): end-to-end proof the
-// FULL production wiring - apply_rules() -> decide_retry()/begin_application()
-// -> journal_maintenance_tick()'s drain -> can_advance() -> persist+advance -
-// K-waives a persistently Wedged-only rule after exactly
-// kReapplyWaiverThreshold identical server retries, through the real
-// GuardianEngine entry point rather than the raw GuardianSparkRuntime/
-// GuardianArmAckLedger APIs the sibling ledger-level tests exercise directly.
+// #5459 (option D) - a still-hung arm HOLDS its generation; it is never acknowledged.
+//
+// History: rung 9c PR-5e (#4221, K-bound closeout) acknowledged a persistently Wedged-only
+// rule after three identical server retries. The server then stopped re-pushing
+// (agent_gen >= current), so if the parked call later FAILED, its completion callback popped
+// the claim with no replacement arm and the rule was desired, acknowledged and unarmed
+// (#5459). The waiver is DELETED: the generation stays honestly HELD, the server's re-push
+// keeps arriving, and GuardianArmAckLedger::decide_retry() Suppresses each identical held push
+// (no teardown, no re-arm, no new watch()) for as long as the wedge (or its compensating
+// teardown) is outstanding, up to kWedgeSuppressMaxDecisions, then forces ONE Reapply.
+// When the wedged claim pops, the next push is a Reapply and the rule re-arms.
+//
+// These cases live in the engine fixture because the ownership question is the ENGINE's:
+// nothing at the runtime or ledger level can say whether the rule ends armed once the held
+// generation is finally acknowledged, only the real GuardianEngine + SparkEngine + mechanism
+// can. Every end-state assertion is about the rule's LIVE subscription (right key, once, on a
+// fresh incarnation), never about a counter.
+//
+// What "live subscription for the correct rule and incarnation" means in this fixture: the
+// runtime holds r1 (spark_armed_rule_count), the mechanism is watching exactly the key the
+// first arm was for (not a sibling's, not a second key), the runtime's own status accessor
+// knows r1, and the replacement arm is exactly one MORE watch() call than the failed one.
+// FakeServiceMechanism ignores the incarnation argument, so that last count is the closest
+// this fixture gets to "the correct incarnation".
 // ═══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("rung 9c PR-5e (#4221): K-bound waives a persistently Wedged-only rule "
-          "after 3 identical server retries, advancing policy_generation, through "
-          "GuardianEngine::apply_rules()/journal_maintenance_tick() end to end",
-          "[spark][guardian][reconcile][liveness]") {
-    SparkReconcileFixture f{/*periodic_bound_ms=*/0,
-                            /*backend_op_deadline=*/std::chrono::milliseconds(50)};
-    REQUIRE(f.engine->policy_generation() == 0);
+namespace {
 
-    // hang_next_watch() is consumed by the FIRST watch() call only - up-2's
-    // Reobserved path means every SUBSEQUENT identical retry re-observes the
-    // SAME already-wedged claim without ever calling watch() again, so this
-    // single arm covers the whole test; no re-arming needed between retries.
-    f.mechanism->hang_next_watch();
-    struct ReleaseHangOnExit {
+/// How long the maintenance-driven recovery wait may take. The recovery is tick-driven, so a
+/// working fix needs a few ticks, not wall time and a passing run exits the poll at once; this
+/// bound only caps a failing run, and is the file's usual 10 s so a loaded runner (or the
+/// sanitizer scale applied by spin_until) cannot turn a slow worker re-arm into a false red.
+constexpr std::chrono::seconds kRecoveryWindow5459{10};
+
+/// The generation every rig push carries (the held one).
+constexpr std::uint64_t kHeldGeneration5459 = 5;
+
+struct LateFailureRig5459 {
+    SparkReconcileFixture f;
+    // Declared AFTER `f` so it destructs FIRST (before the engine is torn down) on every
+    // exit path, including a failed REQUIRE: both gates are released, so no parked worker
+    // outlives the fixture and engine.reset() cannot wait on a gate nobody will open.
+    struct ReleaseGatesOnExit {
         SparkReconcileFixture& fx;
-        ~ReleaseHangOnExit() { fx.mechanism->release_hang(); }
-    } release_parked{f};
+        ~ReleaseGatesOnExit() {
+            fx.mechanism->release_isolated_unwatch_hang();
+            fx.mechanism->release_hang();
+            // A worker still alive after both gates are open is a leak that must not read
+            // green. FAIL_CHECK records a failure without throwing (safe in a destructor,
+            // including during a failing REQUIRE's unwind) unless the binary runs with
+            // Catch2's --abort/-x, which makes it throw (then a real leak terminates the
+            // process instead of reporting a red assertion; nothing here uses -x).
+            if (auto* rt = fx.engine->spark_runtime_for_test()) {
+                const bool drained = yuzu::test::spin_until(
+                    [&] { return rt->active_backend_op_workers() == 0; }, std::chrono::seconds(10));
+                if (!drained)
+                    FAIL_CHECK("LateFailureRig5459: a backend worker was still alive after both "
+                               "gates were released (leaked parked worker)");
+            }
+        }
+    } release_gates{f};
 
-    gpb::GuaranteedStatePush p;
-    p.set_full_sync(true);
-    p.set_policy_generation(5);
-    *p.add_rules() = make_service_rule("r1");
-    const auto push_bytes = p.SerializeAsString(); // identical bytes every retry
+    std::string push_bytes;
+    std::string key; // the key the hung first arm was for
+    /// 1 when the push also carries a healthy sibling "r2", a REGISTRY rule on its own mechanism
+    /// (`f.sibling_mechanism`). Mechanism calls are serialised per type, so a Service-type sibling
+    /// could not arm while r1's watch() is parked; a Registry one can. r2 arms and commits normally
+    /// and is the observable victim of an unwanted teardown + re-arm of the whole push.
+    int siblings{0};
+    /// #5459 FU-10: 1 when the push also carries a healthy SAME-TYPE sibling "r3" (a second Service
+    /// rule, distinct service name so a distinct key, on the SAME mechanism and so under the same
+    /// per-type lock as r1). Which of r1/r3 hangs is not fixed: park_and_wedge() hangs the SECOND
+    /// watch() to enter the mechanism, so the first commits and is the sibling, whichever rule the
+    /// engine's two arm workers reach the type lock with first. `key` is the hung rule's key and
+    /// `sibling_key` the committed one.
+    bool same_type{false};
+    std::string sibling_key;
 
-    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
-    REQUIRE(dr.exit_code == 0);
-    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    f.engine->journal_maintenance_tick(); // drains: r1 resolves Wedged, retained+eligible
+    explicit LateFailureRig5459(std::uint64_t generation = kHeldGeneration5459,
+                                bool with_sibling = false, bool same_type_sibling = false)
+        : f(/*periodic_bound_ms=*/0, /*backend_op_deadline=*/std::nullopt, SparkType::Service,
+            with_sibling),
+          siblings(with_sibling ? 1 : 0), same_type(same_type_sibling) {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(generation);
+        *p.add_rules() = make_service_rule("r1");
+        if (with_sibling)
+            *p.add_rules() = make_registry_rule("r2");
+        if (same_type_sibling)
+            *p.add_rules() = make_service_rule("r3", true, "Notepad");
+        push_bytes = p.SerializeAsString(); // identical bytes on every re-application
+    }
 
-    CHECK(f.engine->policy_generation() == 0); // held - reapply_count 0 < K
-    {
+    yuzu::agent::GuardianSparkRuntime& runtime() {
+        auto* rt = f.engine->spark_runtime_for_test();
+        REQUIRE(rt != nullptr);
+        return *rt;
+    }
+    void push() {
+        const auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
+        REQUIRE(dr.exit_code == 0);
+    }
+    /// The generation as DURABLY stored (what a restart would read), not the in-memory value.
+    std::optional<std::uint64_t> persisted_generation() {
+        const auto v = f.kv->get(kGuardianKvNamespace5459, kGuardianGenerationKey5459);
+        if (!v)
+            return std::nullopt;
+        return static_cast<std::uint64_t>(std::stoull(*v));
+    }
+    /// The generation is HELD: neither the in-memory nor the durable value has moved.
+    void require_generation_held() {
+        REQUIRE(f.engine->policy_generation() == 0);
+        REQUIRE(persisted_generation().value_or(0) == 0);
+    }
+
+    /// Step 1. The first arm ENTERS its real backend call and parks there; its claim is
+    /// then expired with a synthetic clock (never a sleep), so the heartbeat drain sees a
+    /// retained outstanding Wedged receipt, and generation 5 is held.
+    void park_and_wedge() {
+        using namespace std::chrono_literals;
+        if (same_type)
+            f.mechanism->hang_watch_ordinal(2); // the first watch() commits, the second hangs
+        else
+            f.mechanism->hang_next_watch();
+        push();
+        REQUIRE(f.mechanism->wait_entered_hang(30s)); // event-driven: the arm is IN watch()
+        if (same_type) {
+            key = f.mechanism->hung_watch_key();
+            sibling_key = f.mechanism->first_watch_key();
+            REQUIRE_FALSE(key.empty());
+            REQUIRE_FALSE(sibling_key.empty());
+            REQUIRE(key != sibling_key);
+        } else {
+            key = f.mechanism->first_watch_key();
+            REQUIRE_FALSE(key.empty());
+        }
+        if (siblings > 0) {
+            // r1's Service arm is the parked one; the Registry sibling's arm commits on its own
+            // mechanism and key, independently.
+            REQUIRE(yuzu::test::spin_until(
+                [&] {
+                    return f.sibling_mechanism->watching_count() == 1 &&
+                           f.engine->spark_armed_rule_count() == 1;
+                },
+                10s));
+        }
+        if (same_type) {
+            // The first watch() returned before the second entered, so the sibling's subscription
+            // is physically registered; its commit into the runtime is the worker's next step.
+            REQUIRE(yuzu::test::spin_until(
+                [&] { return f.engine->spark_armed_rule_count() == 1; }, 10s));
+            REQUIRE(f.mechanism->watched_snapshot() == std::set<std::string>{sibling_key});
+        }
+        // Outstanding, and this key really is the claim's key (a wrong key would read 0).
+        REQUIRE(f.mechanism->watch_call_count() == (same_type ? 2 : 1));
+        REQUIRE(f.mechanism->watching_count() == (same_type ? 1u : 0u));
+        // Only r1's hung worker is left alive (a sibling's worker may still be unwinding).
+        // Resolved ONCE, outside every poll: runtime() contains a REQUIRE, and a REQUIRE
+        // inside a spin_until predicate runs once per poll and inflates the assertion count
+        // by a timing-dependent amount.
+        auto& rt = runtime();
+        REQUIRE(yuzu::test::spin_until([&] { return rt.active_backend_op_workers() == 1; }, 10s));
+        REQUIRE(rt.claim_queue_depth_for_test(key) == 1);
+        REQUIRE(f.engine->spark_armed_rule_count() ==
+                static_cast<std::size_t>(siblings + (same_type ? 1 : 0)));
+        REQUIRE(rt.expire_overdue_claims_at_for_test(std::chrono::steady_clock::now() + 600s) == 1);
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return f.engine->ack_pending_count_for_test() == 0;
+            },
+            10s));
+        require_generation_held();
+        // The wedge is the one retained failure the ledger's retry suppression keys on.
         const auto s = f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        REQUIRE(s->failed == 1);
+        REQUIRE(s->pending == 0);
+    }
+
+    /// One identical server re-push while the generation is still behind, expected to be
+    /// SUPPRESSED: the open Application survives (a Reapply would begin a fresh one, whose
+    /// arm_stats read pending 1 / failed 0 until its drain), nothing reaches the mechanism
+    /// (no new watch(), no unwatch() beyond `unwatch_baseline`), and nothing is acknowledged.
+    void suppressed_repush(int unwatch_baseline = 0) {
+        REQUIRE(f.engine->policy_generation() < kHeldGeneration5459); // server-like: only while behind
+        const int watches_before = f.mechanism->watch_call_count();
+        push();
+        const auto s = f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 0); // no new application: nothing was re-armed
+        CHECK(s->failed == 1);  // the wedge's failure is still on the open application
+        CHECK(f.mechanism->watch_call_count() == watches_before);
+        CHECK(f.mechanism->unwatch_completed_count() == unwatch_baseline);
+        CHECK(runtime().claim_queue_depth_for_test(key) == 1); // the same claim, still outstanding
+        f.engine->journal_maintenance_tick();
+        require_generation_held();
+    }
+    void suppressed_repushes(int n) {
+        for (int i = 0; i < n; ++i)
+            suppressed_repush();
+    }
+
+    /// Wait until the released call's completion callback has FINISHED: the worker has
+    /// returned and the claim is gone from its key's FIFO. Event-driven; no tick involved.
+    void await_late_result_landed() {
+        using namespace std::chrono_literals;
+        auto& rt = runtime(); // once, outside the poll (runtime() holds a REQUIRE)
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                return rt.active_backend_op_workers() == 0 && rt.claim_queue_depth_for_test(key) == 0;
+            },
+            10s));
+    }
+
+    /// After the late FAILURE has popped the claim: a bounded number of maintenance ticks (a
+    /// count, not a wait) neither arm the rule nor acknowledge the generation. The recovery
+    /// owner is the server's next re-push, and it is owed precisely because the generation
+    /// is still held.
+    void require_unarmed_and_still_held_after_failure() {
+        for (int i = 0; i < 20; ++i)
+            f.engine->journal_maintenance_tick();
+        REQUIRE(f.engine->spark_armed_rule_count() == 0);
+        REQUIRE(f.mechanism->watching_count() == 0);
+        require_generation_held();
+    }
+
+    [[nodiscard]] bool has_live_subscription() {
+        return f.engine->spark_armed_rule_count() == 1 && f.mechanism->watching_count() == 1;
+    }
+    /// Drive ONLY the heartbeat maintenance tick until the rule has a live subscription or
+    /// the window closes. Returns whether it got there; the caller asserts the individual
+    /// signals so a failure names the one that is missing.
+    bool recovers_by_maintenance_only() {
+        return yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return has_live_subscription();
+            },
+            kRecoveryWindow5459);
+    }
+    /// The end state: r1 is armed for the right key, once, and on a fresh incarnation
+    /// (`expected_watch_calls` counts every watch() including the failed first one).
+    void check_live_correct_subscription(int expected_watch_calls) {
+        REQUIRE(f.engine->spark_armed_rule_count() == 1); // the runtime holds r1 (not just rule_count())
+        CHECK(f.mechanism->watching_count() == 1);
+        CHECK(f.mechanism->watched_snapshot() == std::set<std::string>{key}); // THIS rule's key
+        CHECK(runtime().status_for_rule("r1").has_value());
+        CHECK(runtime().armed_key_count() == 1);
+        CHECK(f.mechanism->watch_call_count() == expected_watch_calls);
+        // A stale or doubled subscription would leave the failed arm's key still registered
+        // elsewhere or more watchers than keys; one key, one watcher is the whole picture.
+    }
+    /// The held generation is acknowledged AND durably stored - and only after the rule is
+    /// live (the callers assert the subscription first).
+    void require_acknowledged_after_arm(std::uint64_t generation = kHeldGeneration5459) {
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                f.engine->journal_maintenance_tick();
+                return f.engine->policy_generation() == generation;
+            },
+            std::chrono::seconds(10)));
+        REQUIRE(persisted_generation().has_value());
+        CHECK(*persisted_generation() == generation);
+    }
+    /// The server's next re-push after a late failure, sent because the agent still reports a
+    /// generation behind its own: the rule re-arms through the normal path, and only THEN is
+    /// the generation acknowledged and persisted.
+    void repush_rearms_then_acknowledges(int expected_watch_calls) {
+        REQUIRE(f.engine->policy_generation() < kHeldGeneration5459);
+        push();
+        REQUIRE(recovers_by_maintenance_only());
+        check_live_correct_subscription(expected_watch_calls);
+        require_acknowledged_after_arm();
+    }
+};
+
+} // namespace
+
+TEST_CASE("#5459 held generation: identical pushes while a hung arm is outstanding are "
+          "SUPPRESSED (no teardown, no new watch(), a healthy sibling untouched), never "
+          "acknowledged; the safety valve forces one Reapply that re-observes the SAME claim, "
+          "then suppression resumes",
+          "[spark][guardian][reconcile][liveness][5459][5459held]") {
+    using namespace std::chrono_literals;
+    // r1 (Service) hangs; r2 is a healthy sibling (Registry, its own mechanism and key). A
+    // teardown + re-arm of the whole push is the cost suppression avoids, and r2 is where that cost
+    // is observable: a suppressed push leaves its watch/unwatch counts and its live subscription
+    // exactly as they were, while a real Reapply moves both.
+    LateFailureRig5459 r{kHeldGeneration5459, /*with_sibling=*/true};
+    r.park_and_wedge();
+    auto& sib = *r.f.sibling_mechanism;
+    const auto sibling_watched = sib.watched_snapshot();
+    REQUIRE(sibling_watched.size() == 1);
+    REQUIRE(sib.watch_call_count() == 1);
+    REQUIRE(sib.unwatch_completed_count() == 0);
+
+    // Held: every identical push up to the budget is Suppressed. The Application survives
+    // each one (pending 0 / failed 1), the mechanisms see nothing, nothing is acknowledged.
+    r.suppressed_repushes(static_cast<int>(yuzu::agent::kWedgeSuppressMaxDecisions));
+    CHECK(r.f.mechanism->watch_call_count() == 1);
+    CHECK(r.f.mechanism->unwatch_completed_count() == 0);
+    CHECK(sib.watch_call_count() == 1);
+    CHECK(sib.unwatch_completed_count() == 0);
+    CHECK(sib.watched_snapshot() == sibling_watched); // the sibling's subscription untouched
+    CHECK(r.f.engine->spark_armed_rule_count() == 1);
+
+    // Budget exhausted: the NEXT identical push is a forced Reapply - a fresh Application whose
+    // re-attach re-observes the SAME retained claim (no new watch(): a forced Reapply does not
+    // unstick the worker, it only bounds the dependence on the suppress classification).
+    r.push();
+    {
+        const auto s = r.f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        // A new Application: r1's re-observed (hung) claim is registered in this application's
+        // pending set (its Wedged receipt is already terminal when registered, and it only moves
+        // to failed_receipts at the next drain tick, which has not run yet), so r1 contributes
+        // pending 1 deterministically. r2's re-arm is a separate worker that may or may not have
+        // resolved by now (it did under load: pending 1), so only r1's contribution is asserted
+        // here; r2's re-arm is awaited event-driven just below.
+        CHECK(s->pending >= 1);
+        CHECK(s->failed == 0);
+    }
+    CHECK(r.f.mechanism->watch_call_count() == 1);
+    CHECK(r.f.mechanism->unwatch_completed_count() == 0);
+    CHECK(r.runtime().claim_queue_depth_for_test(r.key) == 1); // the very same claim
+    // The real Reapply is what moves the sibling: its teardown unwatches r2 and the re-arm
+    // watches it again (+1 each).
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            return sib.unwatch_completed_count() == 1 && sib.watch_call_count() == 2 &&
+                   sib.watching_count() == 1;
+        },
+        10s));
+    CHECK(sib.watched_snapshot() == sibling_watched); // r2 re-armed on its own key
+    // Wedge ownership survived the valve: the next drain retains it again, and the generation
+    // is STILL held (the valve acknowledges nothing).
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return r.f.engine->ack_pending_count_for_test() == 0;
+        },
+        std::chrono::seconds(10)));
+    {
+        const auto s = r.f.engine->arm_stats();
         REQUIRE(s.has_value());
         CHECK(s->failed == 1);
+        CHECK(s->pending == 0);
     }
+    r.require_generation_held();
 
-    // 3 more identical server retries (4 established applications in total - see
-    // the sibling ledger-level K-bound test's own comment on this exact
-    // arithmetic: begin_application()'s reapply_count starts at 0 on the FIRST
-    // application, so K==3 needs 3 MORE identical begin_application() calls).
-    for (int i = 0; i < 3; ++i) {
-        dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
-        REQUIRE(dr.exit_code == 0);
-        f.engine->journal_maintenance_tick();
-        // governance Gate 4/happy-path finding: assert the intermediate ticks too,
-        // not just before/after the loop - proves the waiver genuinely fires at
-        // exactly the 3rd retry, not one (or more) retries early.
-        if (i < 2)
-            CHECK(f.engine->policy_generation() == 0);
-    }
+    // The budget is back to zero: the following push is Suppressed again, not another Reapply
+    // (suppressed_repush asserts no new Service watch() and no Service unwatch; the sibling is
+    // checked here).
+    r.suppressed_repush();
+    CHECK(sib.watch_call_count() == 2);
+    CHECK(sib.unwatch_completed_count() == 1);
+    CHECK(sib.watched_snapshot() == sibling_watched);
 
-    // The 3rd retry installed reapply_count == 3 == K, and the single remaining
-    // failure is still genuinely, settledly Wedged (the mechanism's watch() call
-    // is still parked in the hook this whole time) - K-waived. The generation
-    // advances and is durably persisted.
-    CHECK(f.engine->policy_generation() == 5);
-    {
-        const auto s = f.engine->arm_stats();
-        REQUIRE(s.has_value());
-        CHECK(s->failed == 1); // telemetry still reports it - K-waiver never erases it
-    }
-
-    // (the parked mechanism is released by `release_parked` above on every exit path)
+    // The claim was re-owned by the new Application (the rule is active again), so the hung
+    // arm's late SUCCESS is still adopted, and only then is the generation acknowledged.
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return r.f.engine->spark_armed_rule_count() == 2 && r.f.mechanism->watching_count() == 1;
+        },
+        kRecoveryWindow5459));
+    CHECK(r.f.mechanism->watch_call_count() == 1); // r1 adopted its ORIGINAL arm, no replacement
+    CHECK(r.f.mechanism->unwatch_completed_count() == 0);
+    CHECK(r.f.mechanism->is_watching(r.key));
+    CHECK(sib.watch_call_count() == 2);
+    CHECK(sib.unwatch_completed_count() == 1);
+    r.require_acknowledged_after_arm();
 }
+
+TEST_CASE("#5459 (a): a hung arm that later REFUSES holds its generation, ends armed on the "
+          "server's next re-push, and only then is acknowledged",
+          "[spark][guardian][reconcile][5459][5459a]") {
+    LateFailureRig5459 r;
+    r.park_and_wedge();
+    r.suppressed_repushes(3); // the held re-pushes while the arm is still hung cost nothing
+
+    // Only now does the parked call return, as a refusal.
+    r.f.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+
+    // The failure has landed; NOTHING was acknowledged (that is the whole fix) and nothing
+    // re-arms by maintenance alone - the owed recovery event is the held generation's re-push.
+    r.require_unarmed_and_still_held_after_failure();
+    r.repush_rearms_then_acknowledges(/*expected_watch_calls=*/2);
+}
+
+TEST_CASE("#5459 (a): a hung arm that later THROWS holds its generation, ends armed on the "
+          "server's next re-push, and only then is acknowledged",
+          "[spark][guardian][reconcile][5459][5459a]") {
+    // A mechanism throw is contained by SparkEngine's watch_guarded() and arrives at the
+    // runtime as the same refusal-shaped failure as the case above, NOT as the executor's
+    // IoFailure::WorkerThrew (no seam produces that AFTER a parked mechanism call). This case
+    // still earns its place: it is the other way a real mechanism fails.
+    LateFailureRig5459 r;
+    r.park_and_wedge();
+    r.suppressed_repushes(3);
+
+    r.f.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Throw);
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+
+    r.require_unarmed_and_still_held_after_failure();
+    r.repush_rearms_then_acknowledges(/*expected_watch_calls=*/2);
+}
+
+TEST_CASE("#5459 (b): a hung arm whose late SUCCESS fails to be adopted holds its generation "
+          "through the compensating disarm (pushes suppressed), ends armed on the next re-push, "
+          "and only then is acknowledged",
+          "[spark][guardian][reconcile][5459][5459b]") {
+    using namespace std::chrono_literals;
+    LateFailureRig5459 r;
+    r.park_and_wedge();
+    r.suppressed_repushes(2); // pre-compensation: the plain hung-wedge flavour
+    REQUIRE_FALSE(r.f.engine->oldest_outstanding_compensation_age_seconds().has_value());
+
+    // The late arm will SUCCEED, but its adoption fails (fault point 12: after index_->add
+    // moved the mapping), so on_arm_complete falls to the compensating-disarm path; that
+    // disarm is parked on its own isolated gate so the window can be held open.
+    r.runtime().set_drain_fault_point_for_test(12); // one-shot, self-clearing
+    r.f.mechanism->hang_next_unwatch_isolated();
+    r.f.mechanism->release_hang();
+    REQUIRE(r.f.mechanism->wait_entered_isolated_unwatch(30s)); // compensation is outstanding
+
+    // The claim is a compensating head now (CompensationPending, not a hung arm). The
+    // generation is still held, and the compensating-teardown flavour of the wedge is still
+    // tracked by the ledger, so held pushes stay Suppressed across it as well.
+    REQUIRE(r.f.engine->oldest_outstanding_compensation_age_seconds().has_value());
+    r.require_generation_held();
+
+    // No premature replacement arm while the compensation is outstanding: a bounded number of
+    // ticks (a count, not a wait) must not start a second watch(), and the claim is still the
+    // key's marker. The held re-pushes meanwhile are suppressed (no teardown, no re-arm).
+    for (int i = 0; i < 20; ++i)
+        r.f.engine->journal_maintenance_tick();
+    CHECK(r.f.mechanism->watch_call_count() == 1);
+    CHECK(r.runtime().claim_queue_depth_for_test(r.key) == 1);
+    CHECK(r.f.mechanism->unwatch_completed_count() == 0);
+    r.suppressed_repushes(3);
+    r.require_generation_held();
+
+    // The compensation finishes; the stale subscription is torn down and the claim popped.
+    r.f.mechanism->release_isolated_unwatch_hang();
+    r.await_late_result_landed();
+    CHECK(r.f.mechanism->unwatch_completed_count() == 1);
+
+    r.require_unarmed_and_still_held_after_failure();
+    r.repush_rearms_then_acknowledges(/*expected_watch_calls=*/2);
+}
+
+TEST_CASE("#5459 control: a hung arm whose late SUCCESS is adopted ends armed with no re-push "
+          "and only then acknowledges the held generation (the harness CAN observe a live "
+          "subscription)",
+          "[spark][guardian][reconcile][5459][5459control]") {
+    LateFailureRig5459 r;
+    r.park_and_wedge();
+    r.suppressed_repushes(2);
+
+    // The same scenario, released into SUCCESS instead of failure. #4508's late-adoption
+    // path commits the original subscription, so the recovery drain decrements the failure and
+    // the held generation is acknowledged by the maintenance tick alone. No replacement arm:
+    // the original watch() is the only one.
+    r.require_generation_held(); // still held right up to the release
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+    REQUIRE(r.recovers_by_maintenance_only());
+    r.check_live_correct_subscription(/*expected_watch_calls=*/1);
+    r.require_acknowledged_after_arm();
+    CHECK(r.f.mechanism->unwatch_completed_count() == 0);
+}
+
+TEST_CASE("#5459 valve spent, then the late success is adopted: the next identical push is at "
+          "most ONE forced Reapply (a teardown and re-arm of the just-armed rule), never an "
+          "acknowledgment, and the following ticks acknowledge",
+          "[spark][guardian][reconcile][5459][5459valve]") {
+    LateFailureRig5459 r;
+    r.park_and_wedge();
+    r.suppressed_repushes(static_cast<int>(yuzu::agent::kWedgeSuppressMaxDecisions)); // budget spent
+
+    // The hung arm succeeds and nobody withdrew the rule: adopted. NO tick runs between the
+    // adoption and the next push, so the ledger still holds the entry as Recovered-but-uncleared.
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+    REQUIRE(r.f.engine->spark_armed_rule_count() == 1);
+    REQUIRE(r.f.mechanism->watch_call_count() == 1);
+    REQUIRE(r.f.mechanism->unwatch_completed_count() == 0);
+    r.require_generation_held();
+
+    // The valve is spent, so this identical push is a forced Reapply: a fresh application, so
+    // the stale one's arm_stats (failed 1) is gone, and the push itself acknowledges nothing.
+    //
+    // The replacement arm is PARKED inside the mechanism for the duration of the push, so the
+    // "held, not acknowledged" state is observable deterministically. Without the park the
+    // re-armed rule could go live inside the push window and apply_rules would then legitimately
+    // acknowledge the generation inline: a timing-dependent outcome under load, not the property
+    // under test. (The one-shot hang gate latches open once released, so the re-armable park-all
+    // gate is the one to use here.)
+    struct ReleaseParkOnExit {
+        FakeServiceMechanism& m;
+        ~ReleaseParkOnExit() { m.release_park_all(); }
+    } release_park{*r.f.mechanism};
+    r.f.mechanism->set_park_all_watches();
+    r.push();
+    REQUIRE(yuzu::test::spin_until([&] { return r.f.mechanism->parked_watch_count() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(r.f.mechanism->watch_call_count() == 2);        // the replacement arm, in flight
+    CHECK(r.f.mechanism->unwatch_completed_count() == 1); // the just-armed one was torn down
+    CHECK(r.f.engine->spark_armed_rule_count() == 0);
+    r.require_generation_held();
+    {
+        const auto s = r.f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 0); // a NEW application (a Suppress would have kept failed == 1)
+    }
+
+    // Release the replacement arm. The following ticks acknowledge only once it is live; the
+    // whole cost is ONE teardown of the just-armed subscription and ONE replacement watch(),
+    // never an acknowledgment of the stale state.
+    r.f.mechanism->release_park_all();
+    REQUIRE(r.recovers_by_maintenance_only());
+    r.check_live_correct_subscription(/*expected_watch_calls=*/2);
+    r.require_acknowledged_after_arm();
+    CHECK(r.f.mechanism->unwatch_completed_count() == 1);
+    CHECK(r.f.mechanism->watch_call_count() == 2);
+}
+
+// FU-10 (AC-16, a flip precondition). The per-type mechanism lock is why a Service-type sibling
+// cannot arm while one Service watch() is parked, and it is also why the forced Reapply the safety
+// valve buys is not free for a healthy same-type sibling: the Reapply's teardown of the sibling,
+// and its re-arm, queue behind the hung call. The Registry sibling in [5459held] is on its OWN
+// mechanism and so cannot show this; this test puts the sibling on the SAME one.
+TEST_CASE("#5459 FU-10 (AC-16): the forced Reapply during a hung same-type watch() withdraws a "
+          "healthy same-type sibling; its teardown and re-arm queue behind the hung call, the "
+          "re-arm expires CongestionExpired, the generation stays held, and only once the hang is "
+          "released and the next push re-arms both rules is it acknowledged",
+          "[spark][guardian][reconcile][liveness][5459][5459fu10]") {
+    using namespace std::chrono_literals;
+    LateFailureRig5459 r{kHeldGeneration5459, /*with_sibling=*/false, /*same_type_sibling=*/true};
+    // Declared after `r` so it destructs first: the re-armable park gate is open on every exit path.
+    struct ReleaseParkOnExit {
+        FakeServiceMechanism& m;
+        ~ReleaseParkOnExit() { m.release_park_all(); }
+    } release_park{*r.f.mechanism};
+
+    r.park_and_wedge(); // `key` = the hung rule's key, `sibling_key` = the committed same-type one
+    auto& m = *r.f.mechanism;
+    auto& rt = r.runtime(); // once, outside every poll (runtime() holds a REQUIRE)
+    const std::string hung_key = r.key;
+    const std::string sib_key = r.sibling_key;
+    REQUIRE(r.f.engine->spark_armed_rule_count() == 1); // the sibling is live: the premise
+    REQUIRE(m.watch_call_count() == 2);
+
+    // The valve's budget is spent by identical retained-wedge pushes, none of which touches the
+    // healthy sibling (the contrast the forced Reapply below breaks).
+    r.suppressed_repushes(static_cast<int>(yuzu::agent::kWedgeSuppressMaxDecisions));
+    CHECK(m.watch_call_count() == 2);
+    CHECK(m.unwatch_completed_count() == 0);
+    CHECK(r.f.engine->spark_armed_rule_count() == 1);
+
+    // The forced Reapply: a fresh application whose full_sync teardown withdraws EVERY rule in
+    // the push, the healthy sibling included.
+    r.push();
+    CHECK(r.f.engine->spark_armed_rule_count() == 0); // the sibling's detection is logically off at once
+    {
+        const auto s = r.f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 0); // a NEW application (a Suppress would have kept failed == 1)
+    }
+    // Its teardown is a real disarm worker, alive but blocked behind the hung call on the same
+    // per-type lock, and its re-arm is queued behind that disarm on the same key: two claims.
+    REQUIRE(yuzu::test::spin_until([&] { return rt.active_backend_op_workers() == 2; }, 10s));
+    CHECK(rt.claim_queue_depth_for_test(sib_key) == 2);
+    CHECK(rt.claim_queue_depth_for_test(hung_key) == 1); // the very same hung claim, re-observed
+    // Nothing of the sibling's reaches the mechanism while the hang lasts: a bounded number of
+    // maintenance ticks (a count, not a wait) neither completes its teardown nor starts its re-arm.
+    for (int i = 0; i < 20; ++i)
+        r.f.engine->journal_maintenance_tick();
+    CHECK(m.unwatch_completed_count() == 0);
+    CHECK(m.watch_call_count() == 2);
+    CHECK(r.f.engine->spark_armed_rule_count() == 0);
+    r.require_generation_held();
+
+    // The re-arm ages past its deadline (a synthetic clock, never a sleep): a QUEUED arm claim is
+    // abandoned and ends CongestionExpired. The disarm ahead of it stays, so the key's queue
+    // loses exactly the arm claim.
+    REQUIRE(rt.expire_overdue_claims_at_for_test(std::chrono::steady_clock::now() + 600s) == 1);
+    CHECK(rt.claim_queue_depth_for_test(sib_key) == 1);
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return r.f.engine->ack_pending_count_for_test() == 0;
+        },
+        10s));
+    {
+        const auto s = r.f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 0);
+        CHECK(s->failed == 2); // the hung rule's wedge plus the sibling's expired re-arm
+    }
+    r.require_generation_held(); // in memory and on disk
+    CHECK(m.watch_call_count() == 2);
+    CHECK(m.unwatch_completed_count() == 0);
+
+    // The sibling's expiry ENDS the suppression: the application now counts two failures but
+    // retains only one wedge, so decide_retry() no longer Suppresses. The next identical push
+    // is a real Reapply (detach_all's epoch moves, a new application begins) and re-queues the
+    // sibling's re-arm behind its still-pending teardown, instead of the valve's "about every
+    // 330 s" for as long as the hang lasts. (Pinned so the docs cannot claim the bound for a
+    // push set with a same-type sibling.)
+    {
+        const auto epoch_before = rt.application_fence_for_test().first;
+        r.push();
+        CHECK(rt.application_fence_for_test().first == epoch_before + 1);
+        const auto s = r.f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 0); // a NEW application (a Suppress would have kept failed == 2)
+        CHECK(rt.claim_queue_depth_for_test(sib_key) == 2); // the same pending disarm, plus a new re-arm
+        CHECK(rt.claim_queue_depth_for_test(hung_key) == 1);
+        CHECK(r.f.engine->spark_armed_rule_count() == 0);
+        CHECK(m.watch_call_count() == 2); // still queued behind the hung call
+        CHECK(m.unwatch_completed_count() == 0);
+        r.require_generation_held();
+        // That new re-arm ages out like the first one, so the rest of the scenario is unchanged.
+        REQUIRE(rt.expire_overdue_claims_at_for_test(std::chrono::steady_clock::now() + 600s) == 1);
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                r.f.engine->journal_maintenance_tick();
+                return r.f.engine->ack_pending_count_for_test() == 0;
+            },
+            10s));
+        const auto s2 = r.f.engine->arm_stats();
+        REQUIRE(s2.has_value());
+        CHECK(s2->pending == 0);
+        CHECK(s2->failed == 2);
+        CHECK(rt.claim_queue_depth_for_test(sib_key) == 1);
+        r.require_generation_held();
+    }
+
+    // Release the hang. The hung arm's late success is adopted; the sibling's queued teardown
+    // now runs (its subscription is finally removed), but its expired re-arm is gone, so the
+    // sibling is NOT back, and the generation stays held with it unarmed.
+    m.release_hang();
+    r.await_late_result_landed();
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return m.unwatch_completed_count() == 1 && r.f.engine->spark_armed_rule_count() == 1;
+        },
+        kRecoveryWindow5459));
+    CHECK(m.watch_call_count() == 2); // no replacement arm for the sibling: its claim expired
+    CHECK(m.watched_snapshot() == std::set<std::string>{hung_key});
+    for (int i = 0; i < 20; ++i)
+        r.f.engine->journal_maintenance_tick();
+    r.require_generation_held();
+
+    // The server's next identical re-push is a real Reapply (the sibling's expired arm is a
+    // settled failure, not a retained wedge) and re-arms both rules. The re-arms are parked at
+    // the mechanism so "held until both are live" is observed, not raced.
+    m.set_park_all_watches();
+    r.push();
+    REQUIRE(yuzu::test::spin_until([&] { return m.parked_watch_count() == 1; }, 10s));
+    // Tick while the re-arms are parked. This loop is redundant by construction: both re-arms
+    // sit in `pending`, so can_advance() is already false through pending.empty() alone (the
+    // tick and the apply_rules tail both gate on it), and an early acknowledgment would
+    // already have failed the rig's earlier hold checks. It documents the held state at this
+    // phase rather than adding an observation the earlier phases do not make.
+    for (int i = 0; i < 20; ++i)
+        r.f.engine->journal_maintenance_tick();
+    r.require_generation_held();
+    CHECK(r.f.engine->spark_armed_rule_count() == 0);
+    m.release_park_all();
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return r.f.engine->spark_armed_rule_count() == 2 && m.watching_count() == 2;
+        },
+        kRecoveryWindow5459));
+    CHECK(m.watched_snapshot() == std::set<std::string>{hung_key, sib_key});
+    r.require_acknowledged_after_arm();
+}
+
+// FU-11 (a flip precondition). A subscription armed LATE (a wedged arm whose late success is
+// adopted) must stay live across the next identical push and the following acknowledgment.
+// [5459control] and the last phase of [5459held] pin adoption followed by the acknowledgment with
+// no push in between, and [5459valve] pins the push when the valve budget is already spent. What
+// they leave open, and this test pins: (1) the identical push that lands in the window between the
+// adoption and the next heartbeat tick, with the valve budget UNSPENT; (2) the identical push
+// that arrives AFTER the acknowledgment (the server may still send one).
+TEST_CASE("#5459 FU-11: a subscription armed late stays live across the next identical push and "
+          "the following acknowledgment; a re-push after the acknowledgment re-arms it to exactly "
+          "one live subscription with the generation still acknowledged",
+          "[spark][guardian][reconcile][liveness][5459][5459fu11]") {
+    using namespace std::chrono_literals;
+    LateFailureRig5459 r;
+    r.park_and_wedge();
+    r.suppressed_repushes(2); // budget NOT spent: a handful of the kWedgeSuppressMaxDecisions
+    auto& m = *r.f.mechanism;
+    auto& rt = r.runtime(); // once, outside every poll
+
+    // The hung arm's late success is adopted. NO maintenance tick runs after it, so the ledger
+    // still holds the entry as adopted-but-uncleared (the generation is not yet acknowledged).
+    m.release_hang();
+    r.await_late_result_landed();
+    REQUIRE(r.f.engine->spark_armed_rule_count() == 1);
+    REQUIRE(m.watch_call_count() == 1);
+    REQUIRE(m.unwatch_completed_count() == 0);
+    r.require_generation_held();
+
+    // The next identical push: adopted-but-uncleared is outstanding work, so with budget left it
+    // is SUPPRESSED, not a teardown. The same application survives (failed 1, nothing pending),
+    // the subscription is never withdrawn and no second watch() is made.
+    r.push();
+    {
+        const auto s = r.f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 0);
+        CHECK(s->failed == 1); // a Reapply would have begun a new application (failed 0)
+    }
+    CHECK(m.watch_call_count() == 1);
+    CHECK(m.unwatch_completed_count() == 0);
+    CHECK(r.f.engine->spark_armed_rule_count() == 1);
+    CHECK(m.watched_snapshot() == std::set<std::string>{r.key});
+    r.require_generation_held();
+
+    // The following ticks clear the adopted entry and acknowledge, on the ORIGINAL subscription.
+    REQUIRE(r.recovers_by_maintenance_only());
+    r.check_live_correct_subscription(/*expected_watch_calls=*/1);
+    r.require_acknowledged_after_arm();
+    CHECK(m.unwatch_completed_count() == 0);
+
+    // After the acknowledgment an identical push can still arrive. Nothing is outstanding, so it
+    // is a real Reapply (decide_retry's empty-pending case): the subscription is torn down and
+    // re-armed once. The end state is the invariant: one live subscription for the right key
+    // (not two), and the generation still acknowledged and durably stored.
+    r.push();
+    CHECK(r.f.engine->policy_generation() == kHeldGeneration5459); // the push itself never regresses it
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return m.watch_call_count() == 2 && m.unwatch_completed_count() == 1 &&
+                   r.has_live_subscription() && rt.active_backend_op_workers() == 0;
+        },
+        kRecoveryWindow5459));
+    r.check_live_correct_subscription(/*expected_watch_calls=*/2);
+    CHECK(m.unwatch_completed_count() == 1);
+    for (int i = 0; i < 20; ++i)
+        r.f.engine->journal_maintenance_tick();
+    CHECK(r.f.engine->spark_armed_rule_count() == 1);
+    CHECK(m.watching_count() == 1);
+    CHECK(m.watch_call_count() == 2); // no duplicate watch
+    CHECK(r.f.engine->policy_generation() == kHeldGeneration5459);
+    REQUIRE(r.persisted_generation().has_value());
+    CHECK(*r.persisted_generation() == kHeldGeneration5459);
+}
+
+TEST_CASE("#5459 valve spent, then the KV store fails mid-push: every push is a real Reapply "
+          "while the fault lasts (the rules stay torn down, the generation stays held in memory, "
+          "and on disk up to the fault), and once the store is back the next push re-arms every "
+          "rule and only then acknowledges",
+          "[spark][guardian][reconcile][5459][5459kv]") {
+    using namespace std::chrono_literals;
+    // r1 hangs (Service); r2 is a healthy sibling on its own mechanism, so a teardown is
+    // observable as an armed count that drops.
+    LateFailureRig5459 r{kHeldGeneration5459, /*with_sibling=*/true};
+    r.park_and_wedge();
+    auto& sib = *r.f.sibling_mechanism;
+    REQUIRE(r.f.engine->spark_armed_rule_count() == 1); // r2 only; r1 is the hung arm
+    r.suppressed_repushes(static_cast<int>(yuzu::agent::kWedgeSuppressMaxDecisions)); // budget spent
+
+    // Before the fault the generation is held both in memory and on disk (a real, readable
+    // store: this is the only point at which the on-disk half is meaningful).
+    r.require_generation_held();
+
+    // The store fails. The next identical push is the valve's forced Reapply: it tears the
+    // active set down (full_sync), then its rule persist fails and the push is refused.
+    drop_kv_store_table_for_test(r.f.db_.path);
+    const auto fault_push = [&] {
+        return yuzu::agent::guardian_dispatch_push_bytes_for_test(*r.f.engine, r.push_bytes);
+    };
+    for (int i = 0; i < 3; ++i) {
+        // i == 0 is the forced Reapply; i > 0 is a Reapply because the failed application
+        // latched a failure. Either way the push is NOT suppressed: the sibling stays torn down.
+        const auto dr = fault_push();
+        CHECK(dr.exit_code != 0);
+        CHECK(r.f.engine->spark_armed_rule_count() == 0);
+        // The mechanism-side unwatch completes on the teardown's own worker: event-driven wait.
+        CHECK(yuzu::test::spin_until([&] { return sib.watching_count() == 0; }, 10s));
+        r.f.engine->journal_maintenance_tick();
+        CHECK(r.f.engine->policy_generation() == 0); // held in memory (never published)
+    }
+    // The recreated table is empty, so nothing about the durable value can be read back here;
+    // the on-disk half was asserted before the fault, and the acknowledged-and-persisted
+    // generation is asserted after recovery below.
+    recreate_kv_store_table_for_test(r.f.db_.path);
+
+    // The store is healthy: the next push is applied in full. r1 re-observes its still-hung
+    // claim; r2 re-arms. Nothing is acknowledged until every rule is live.
+    r.push();
+    // Drain BEFORE the hung arm returns, so the ledger retains the re-observed wedge (a wedge
+    // first drained after its late success was adopted is the documented one-avoidable-Reapply
+    // limit, not what this case is about).
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return r.f.engine->ack_pending_count_for_test() == 0 && sib.watching_count() == 1;
+        },
+        10s));
+    r.require_generation_held();
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            r.f.engine->journal_maintenance_tick();
+            return r.f.engine->spark_armed_rule_count() == 2 && r.f.mechanism->watching_count() == 1;
+        },
+        kRecoveryWindow5459));
+    CHECK(r.f.mechanism->is_watching(r.key));
+    CHECK(sib.watching_count() == 1);
+    r.require_acknowledged_after_arm();
+}
+
+// Sub-class 3 of #5459 (the drain-to-persist gap), restated for option D. Under the waiver, a
+// drain observed the wedge "eligible", acknowledged the generation, and a completion that landed
+// between that observation and the persist stranded the rule. There is no waiver now: once a
+// drain has retained a wedge, can_advance() is false whether or not the claim has since popped,
+// so a pop between the retaining drain and the next tick changes nothing about acknowledgement.
+// Closed by construction, not by timing.
+TEST_CASE("#5459 sub-class 3: a pop between the drain that retained a wedge and the next tick "
+          "changes nothing, because can_advance() is false either way",
+          "[spark][guardian][reconcile][5459][5459subclass3]") {
+    LateFailureRig5459 r;
+    r.park_and_wedge(); // the drain retained the wedge; the generation is held
+    // Land the late failure with NO tick in between (the exact window the waiver lost).
+    r.f.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.f.mechanism->release_hang();
+    r.await_late_result_landed();
+    r.require_generation_held();      // checked before ANY further tick has observed the pop
+    r.require_unarmed_and_still_held_after_failure(); // and after a bounded run of them
+    r.repush_rearms_then_acknowledges(/*expected_watch_calls=*/2);
+}
+
+// OPTION D PROBE, NOT PART OF THE REGRESSION SET (hence no [5459] tag). Q1: after the late
+// failure has popped the claim, does a FRESH re-attach - a server re-push, which is the one
+// event a held generation keeps producing - take the normal arm path and arm the rule? Under D
+// it is the recovery owner, so this stays as the minimal statement of that fact, for both a
+// same-generation re-push and a distinct next generation.
+TEST_CASE("#5459 option D probe (NOT part of the regression set): after the late failure, a "
+          "server re-push re-arms the rule",
+          "[spark][guardian][reconcile][5459probe]") {
+    SECTION("the same generation (what a still-held generation re-pushes)") {
+        LateFailureRig5459 r;
+        r.park_and_wedge();
+        r.f.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+        r.f.mechanism->release_hang();
+        r.await_late_result_landed();
+        r.require_unarmed_and_still_held_after_failure(); // nothing re-arms by itself
+
+        r.push();
+        REQUIRE(r.recovers_by_maintenance_only());
+        r.check_live_correct_subscription(/*expected_watch_calls=*/2);
+        r.require_acknowledged_after_arm();
+    }
+    SECTION("the next generation (a distinct generation arriving)") {
+        LateFailureRig5459 r;
+        r.park_and_wedge();
+        r.f.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+        r.f.mechanism->release_hang();
+        r.await_late_result_landed();
+        r.require_unarmed_and_still_held_after_failure();
+
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(6);
+        *p.add_rules() = make_service_rule("r1");
+        const auto dr =
+            yuzu::agent::guardian_dispatch_push_bytes_for_test(*r.f.engine, p.SerializeAsString());
+        REQUIRE(dr.exit_code == 0);
+        REQUIRE(r.recovers_by_maintenance_only());
+        r.check_live_correct_subscription(/*expected_watch_calls=*/2);
+        // The new generation is acknowledged by the NEXT drain after its arm commits.
+        r.require_acknowledged_after_arm(6);
+    }
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // #4685 — Guardian's capability filter must key off `boot_inert` alone
@@ -4351,9 +5299,9 @@ void check_production_order_degraded_still_arms(SparkType type) {
 /// arm ATTEMPT that failed, never a misclassification into Unsupported (which would
 /// require boot_inert) and never a silent legacy fallback. Distinct from the
 /// hanging-watch Wedged case pinned elsewhere in this file: a synchronous refusal
-/// resolves Failed immediately, never eligible for the Wedged-only K-bound generation
-/// waiver, so the generation stays held across every identical retry - not just the
-/// first three.
+/// resolves Failed immediately, never an outstanding wedge (so never suppressed by
+/// decide_retry() and never acknowledged), so the generation stays held across every
+/// identical retry, each of which is a real Reapply.
 void check_boot_inert_false_but_watch_refused_stays_failed(SparkType type) {
     SparkReconcileFixture f{/*periodic_bound_ms=*/0, std::nullopt, type};
 
@@ -4378,7 +5326,7 @@ void check_boot_inert_false_but_watch_refused_stays_failed(SparkType type) {
             f.engine->journal_maintenance_tick();
             return f.engine->ack_pending_count_for_test() == 0 && f.engine->active_io_workers() == 0;
         }));
-        CHECK(f.engine->policy_generation() == 0); // held, every retry - no K-waiver for Failed
+        CHECK(f.engine->policy_generation() == 0); // held, every retry - a Failed arm is never acknowledged
         CHECK(f.engine->armed_guard_count() == 0); // no legacy fallback
         CHECK(f.engine->spark_armed_rule_count() == 0);
         CHECK(f.engine->unsupported_counts_by_type().count(type) == 0); // Failed, not Unsupported

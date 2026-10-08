@@ -71,7 +71,7 @@ This document is the architectural blueprint for that work.
 
 3. **Cross-platform by default.** Primitives target all three OSes. Platform-specific behavior is declared in the definition's `platforms` field and handled by the plugin layer.
 
-4. **Typed end-to-end.** Parameter schemas validate input before dispatch. Result schemas type output for downstream consumption (ClickHouse, Splunk, CSV export). No untyped string bags at the content layer.
+4. **Typed end-to-end.** Parameter schemas validate input before dispatch on `POST /api/instructions/{id}/execute` (no other dispatch surface validates yet). Result schemas type output for downstream consumption (ClickHouse, Splunk, CSV export). No untyped string bags at the content layer.
 
 5. **Governed execution.** Every state-changing action can require approval. Every execution is audited. Every response is persisted. The platform enforces organizational policy, not just technical capability.
 
@@ -1115,7 +1115,7 @@ InstructionDefinition.spec.execution.action  →  CommandRequest.action
 InstructionDefinition parameter values       →  CommandRequest.parameters (map<string,string>)
 ```
 
-There is no separate "legacy" or "ad-hoc" execution path. Ad-hoc commands sent from the dashboard or API are simply untyped InstructionDefinitions with `additionalProperties: {type: string}` parameter schemas.
+There is no separate "legacy" or "ad-hoc" execution path. Ad-hoc commands sent from the dashboard or API are simply untyped InstructionDefinitions. The definitions the server auto-generates (`legacy.<plugin>.<action>`) declare `additionalProperties: {type: string}` in their YAML source but store `{}` as their `parameter_schema`, so nothing is validated against it.
 
 ### 15.2 Auto-Generation from Plugin Descriptors
 
@@ -1139,7 +1139,7 @@ yuzu-admin generate-definitions --output definitions/
 
 ### 15.3 Schema Inference Roadmap
 
-**ABI v1 (current):** Plugins don't declare their parameter schemas. Auto-generated definitions use open `additionalProperties`.
+**ABI v1 (current):** Plugins don't declare their parameter schemas. Auto-generated definitions declare an open `additionalProperties` in their YAML source and store `{}` as the `parameter_schema`.
 
 **ABI v2 (future):** Add optional `parameter_schema` and `result_schema` fields to `YuzuPluginDescriptor`. Plugins that populate these get fully typed auto-generated definitions. Plugins that don't still get open-schema stubs.
 
@@ -1356,7 +1356,7 @@ Updated to reflect current state (Phase 0 and 1 complete, Phase 2 scaffolded).
 ### Phase B — Instruction Plane (Phase 2 core)
 
 6. `InstructionStore` business logic — CRUD with YAML source storage
-7. Parameter schema validation (JSON Schema via nlohmann-json)
+7. Parameter schema validation (JSON Schema via nlohmann-json; `POST /api/instructions/{id}/execute` only, no other dispatch surface validates yet)
 8. Result schema declaration and typed storage
 9. Legacy command shim — auto-generate definitions from plugin descriptors
 10. YAML authoring UI in dashboard (form mode + YAML mode)

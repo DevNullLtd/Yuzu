@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 /// @file authz_gates.hpp
@@ -42,9 +43,53 @@
 /// (`docs/security-reviews/service-scope-phase2-migrations-2026-08.md`).
 namespace yuzu::server {
 class AuthRoutes;
+class RbacStore;
 }
 
 namespace yuzu::server::authz {
+
+/// Outcome of the ITServiceOwner authority-ceiling read. TRI-STATE on purpose: the
+/// ceiling's callers disagree on what a failed read means, and the helper must not
+/// pre-decide it for them.
+///   Admit    - the role holds the pair as an `allow` row.
+///   Deny     - an explicit `deny` row, OR the pair is absent (which is also how an
+///              operator revoke looks: `remove_permission` DELETEs the row and records
+///              `revoked_seed_defaults`, so a revoked default is simply absent here).
+///   Degraded - the checked read itself failed (store closed, pool timeout, query error).
+/// `require_scoped_permission` and `require_fleet_read` map Degraded to a retryable 503 (an
+/// infrastructure fault, not a definitive deny), through
+/// `AuthRoutes::respond_ceiling_degraded`, and Deny to a 403. `require_permission` maps Deny
+/// to its 403 too, but a Degraded read continues to its service-scope allow-list check, which
+/// refuses every pair today (a 403 with no retry hint); it answers 503 only where a populated
+/// allow-list would otherwise admit. All three stay fail CLOSED.
+enum class CeilingVerdict : std::uint8_t { Admit, Deny, Degraded };
+
+/// The ceiling verdict and, for a Degraded verdict, the closed
+/// `yuzu_server_rbac_read_degrade_total` reason label, returned as ONE value so the two
+/// cannot be separated or read before they are set. `degrade_reason` points only at a
+/// string literal ("pool_acquire_timeout" or "query_error") and is `nullptr` for any
+/// verdict other than Degraded.
+struct CeilingResult {
+    CeilingVerdict verdict = CeilingVerdict::Deny;
+    const char* degrade_reason = nullptr;
+};
+
+/// THE one ITServiceOwner ceiling check (extend, never fork): a service-scoped token can
+/// never exceed what the ITServiceOwner role grants, whatever its minter holds. Both this
+/// and `RbacStore::role_permission_allowed_checked` use the one single-row read: the pair's
+/// row, `allow` admits, `deny`, another effect text or absent refuses; the failed-read case
+/// is reported as Degraded (with its reason label) instead of being folded into a deny. The
+/// helper itself never touches metrics.
+[[nodiscard]] CeilingResult service_ceiling_check(const RbacStore& store,
+                                                  const std::string& securable_type,
+                                                  const std::string& operation);
+
+/// Closed `yuzu_server_rbac_read_degrade_total` reason label for a failed role-permission
+/// read: a message starting `kRbacErrPoolAcquireTimeout` or `kRbacErrCircuitBreakerOpen`
+/// (rbac_store.hpp) => "pool_acquire_timeout", anything else => "query_error". Pure (no
+/// metrics, no store); split out of `service_ceiling_check` so the mapping is unit-testable
+/// without a store that can be made to time out.
+[[nodiscard]] const char* ceiling_degrade_reason(std::string_view read_error) noexcept;
 
 /// Why `require_fleet_read` did not produce a `ListAuthority`. This is
 /// structural bookkeeping, not a caller dispatch surface — every failure
@@ -61,7 +106,10 @@ enum class GateFailure : std::uint8_t {
     Degraded,        ///< 503 — infrastructure unavailable, retryable: a
                      ///< null/not-open RBAC store, or the service-scope
                      ///< axis's tag-store lookup failing (null `tag_store_`,
-                     ///< or a degraded/failed query).
+                     ///< or a degraded/failed query), or, for a service-scoped
+                     ///< token, the ITServiceOwner ceiling read failing
+                     ///< (`service_ceiling_check` returned Degraded; a
+                     ///< DEFINITIVE ceiling deny is Forbidden).
 };
 
 /// Move-only witness over an already-composed `VisibleSet` — the product of

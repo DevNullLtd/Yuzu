@@ -237,7 +237,7 @@
       },
       "default": 10,
       "definition_id": "device.windows_updates.patch_connectivity",
-      "description": "TCP connection timeout per target. Default: 10, min: 1, max: 60.\n",
+      "description": "TCP connection timeout per target. Default: 10, min: 1, max: 60. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.\n",
       "name": "timeout_seconds",
       "required": false,
       "type": "int32"
@@ -258,7 +258,7 @@
       },
       "default": 10,
       "definition_id": "workflow.patch_connectivity_audit",
-      "description": "TCP connection timeout per target.",
+      "description": "TCP connection timeout per target, 1-60 seconds. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.\n",
       "name": "timeout_seconds",
       "required": false,
       "type": "int32"

@@ -2520,7 +2520,13 @@ std::string SettingsRoutes::render_gateway_fragment() {
     } else {
         html += "<p style=\"font-size:0.75rem;color:#8b949e;margin-top:0.5rem\">"
                 "The gateway upstream service is not running. Start the server with "
-                "<code>--gateway-upstream 0.0.0.0:50055</code> to enable it.</p>";
+                "<code>--gateway-upstream 0.0.0.0:50055</code> to enable it. The service "
+                "requires an authorized gateway peer: pin the gateway's key with "
+                "<code>--gateway-peer-pin</code> or <code>--gateway-peer-pin-file</code> "
+                "(automatic on the built-in default certificates), or, on a plaintext "
+                "development rig only, acknowledge that peer authorization is disabled with "
+                "<code>--insecure-gateway-peer</code>. Without one of these the server "
+                "refuses to start. Pins are read once at boot; changing them needs a restart.</p>";
     }
 
     html += "<div style=\"margin-top:1rem;padding-top:0.75rem;border-top:1px solid var(--border)\">"
