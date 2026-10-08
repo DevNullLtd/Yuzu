@@ -730,8 +730,7 @@ public:
     /// feeds the late-start skip's evidence ("journal_flush_1", "worker_join", "ledger",
     /// "journal_flush_2"), after the stage's start is read from the persister's clock and
     /// before its body runs: a test advances an injected clock here to make that stage look
-    /// slow. Same CONTRACT as
-    /// set_apply_post_drain_hook_for_test. No production caller.
+    /// slow. Same CONTRACT as set_apply_post_drain_hook_for_test. No production caller.
     void set_stop_stage_hook_for_test(std::function<void(const char* stage)> hook) {
         std::lock_guard lock(mtx_);
         stop_stage_hook_for_test_ = std::move(hook);
@@ -972,7 +971,8 @@ private:
     /// default time_point when no persister is wired). The hook runs the test hook, right after
     /// begin and BEFORE the stage body, so a test can make the body look slow by advancing an
     /// injected clock there. end records store trouble when the stage took at least
-    /// kKvStoreBusyTimeout; a stage that failed fast is not trouble (see the persister).
+    /// kBaselineStopTroubleThreshold (4.5 s, the busy timeout less a timer-rounding slack); a
+    /// stage that failed fast is not trouble (see the persister).
     [[nodiscard]] std::chrono::steady_clock::time_point stop_stage_begin_locked() const noexcept;
     void stop_stage_hook_locked(const char* stage) noexcept;
     void stop_stage_end_locked(std::chrono::steady_clock::time_point began) noexcept;

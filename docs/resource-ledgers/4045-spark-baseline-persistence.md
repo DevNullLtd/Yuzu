@@ -15,7 +15,9 @@ Nothing in this change adds a file descriptor, HANDLE, SOCKET, `FILE*`, `sqlite3
 OpenSSL or BCrypt object, allocated C string, mapped library, temp path, subprocess or production
 thread. The persister runs on three existing threads: the engine's callers (`apply_rules`, `stop()`
 under `mtx_`) and the existing drain worker. A mechanical grep over the added production lines finds
-no `new` or `delete` expression (deleted special members aside), `malloc`, `free`, `reinterpret_cast`, `const_cast`, `string_view` or `detach`.
+no such expression in code (`new` or `delete` expressions, `malloc`, `free`, `reinterpret_cast`,
+`const_cast`, `string_view` or `detach`); the words occur only in comments and in deleted special
+members.
 
 ## Lock order, destruction order and publication protocol
 

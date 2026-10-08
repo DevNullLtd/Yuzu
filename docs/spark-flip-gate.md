@@ -1212,7 +1212,7 @@ flip, with a red-first test each:
     the remaining cases below (the known cases; the same eight are listed in the user
     manual and design s24): (1) a crash came before the capture landed (the crash
     window, which includes captures an `apply_rules` pass left for the worker); (2) a
-    stop lost waiting captures, in one of four ways: its single allowed write failed (a
+    stop lost waiting captures, in one of five ways: its single allowed write failed (a
     failing local KV store; error-logged and added to
     `yuzu.guardian_baseline_persist_failures`, a count that dies with the exiting process,
     and not tried again), or its one second of wall between writes ran out before every capture was
@@ -1221,7 +1221,9 @@ flip, with a red-first test each:
     that failed slowly ended at or after the start of that stop or because it could not
     start within 15 s of it after an earlier shutdown step had run slow, taking at least
     4.5 s (the busy timeout minus a 0.5 s timer-rounding slack; a step that failed quickly
-    is not such a sign; logged, not counted), or the 20 s shutdown watchdog ended the
+    is not such a sign; logged, not counted), or an allocation or lock failure cut the
+    flush, or the staging of captures the agent could not note, short (logged; any count
+    dies with the process), or the 20 s shutdown watchdog ended the
     process while the stop was still running (`hard_exit(4)`: the flush and the later
     shutdown steps are cut, a Windows service is restarted by the SCM, and no log line is
     written anywhere, so exit code 4 is the only evidence). A capture whose write is
@@ -2159,19 +2161,22 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   remains: the pass's first write always runs (the wall is checked between tuples), so one
   that starts just inside the cutoff can still spend a 5 s busy timeout, and a pass that
   runs its full 1 s wall before the store turns BUSY ends about 6 s after it started; the
-  evidence is sampled by the earlier stages, so a store that turns BUSY only after them,
-  with the stop already 15 s late, still gets the pass attempted and the watchdog may cut
-  it (a reviewer reproduced 21.0 s; the capture is lost either way and the loss has no log
-  line); a worker baseline write in flight with a journal record pending measured 20 to
-  25 s (the in-flight write plus a second write when the worker's 5 s retry backoff ends
+  evidence is sampled by the earlier stages, so a store that turns BUSY only after them, or
+  whose stages each stay under the 4.5 s threshold, with the stop already 15 s late, still
+  gets the pass attempted and the watchdog may cut it (a reviewer reproduced 21.0 s for the
+  first shape and 20.11 s for the second; the capture is lost either way and the loss has
+  no log line); a worker baseline write in flight with a journal record pending measured 20
+  to 25 s (the in-flight write plus a second write when the worker's 5 s retry backoff ends
   as journal flush 1 does); the delivery worker's non-baseline KV writes serialise on
   `KvStore::mu_` and put their own busy timeout in front of every stage (21.5 to 28.2 s in
   one review harness with 3 staged captures, 28.82 to 29.04 s in another with 5, against a
-  store that stays busy; arithmetic bound about 30 s); all rows were measured by
-  independent reviewers on the revision before the last one (the BUSY stages are slow under
-  either evidence rule), and the 10.01 s and 15.01 s rows were re-run on the final code
-  (3 staged, two runs each: 10.008 and 10.010 s; 15.011 and 15.014 s); and a stop that
-  reaches the watchdog exits with code 4 and writes no log line. Without #4045 the same
+  store that stays busy; arithmetic bound about 30 s); the 10.01 s and 15.01 s rows, the
+  no-journal in-flight row (at most 10.01 s; 7.51 to 9.71 s measured), one point of the
+  20 to 25 s row (24.72 s) and the sent-marker row were measured on the final code with 3
+  staged (10.008 s and 15.012 s by the implementer, the rest by a reviewer); the other
+  points came from the revision before the last one (the BUSY stages are slow under either
+  evidence rule), and the 28.82 to 29.04 s row was not re-run on the final code; and a
+  stop that reaches the watchdog exits with code 4 and writes no log line. Without #4045 the same
   stops take 15 s (journal record pending), or 20 s and more with a worker sent-marker
   write in flight. A remaining-deadline wall threaded through every stage was considered
   and not done. Issue to be filed (TODO, no number yet).

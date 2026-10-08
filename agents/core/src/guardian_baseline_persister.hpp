@@ -200,14 +200,15 @@ inline constexpr std::chrono::milliseconds kBaselineShutdownGrace{20'000};
 /// A Stop pass that has not STARTED this long after GuardianEngine::stop() began, AND whose
 /// stop() already ran a store stage SLOW (note_stop_store_trouble(): at least
 /// kBaselineStopTroubleThreshold, 4.5 s; a fast failure is not evidence), is skipped
-/// (logged): the wall budget is checked only BETWEEN tuples, so the first write always runs, and against a BUSY store that one write
-/// costs a whole kKvStoreBusyTimeout. Grace minus one busy timeout (15 s) is the latest start
-/// at which that single write still fits. Elapsed time alone is not enough: on a healthy store
-/// the same pass takes well under a millisecond per capture. It is a bound on this pass only:
-/// the earlier stop() stages (two journal flushes, the loss ledger) and the worker's own KV
-/// writes are not under it. A start with no trouble runs at ANY lateness, up to the watchdog,
-/// so on a healthy store the pass can cost its 1 s wall plus one write after a start just
-/// under the grace, and on a store that turns BUSY after the evidence stages it ends past the
+/// (logged): the wall budget is checked only BETWEEN tuples, so the first write always runs,
+/// and against a BUSY store that one write costs a whole kKvStoreBusyTimeout. Grace minus one
+/// busy timeout (15 s) is the latest start at which that single write still fits. Elapsed time
+/// alone is not enough: on a healthy store the same pass takes well under a millisecond per
+/// capture. It is a bound on this pass only: the earlier stop() stages (two journal flushes,
+/// the loss ledger) and the worker's own KV writes are not under it. A start with no trouble
+/// runs at ANY lateness, up to the watchdog, so on a healthy store the pass can cost its 1 s
+/// wall plus one write after a start just under the grace, and on a store that turns BUSY
+/// after the evidence stages, or whose stages each stay under the threshold, it ends past the
 /// grace (the evidence is sampled, not continuous).
 inline constexpr std::chrono::milliseconds kBaselineStopLatestStart =
     kBaselineShutdownGrace - kKvStoreBusyTimeout;
@@ -303,14 +304,14 @@ public:
     /// feeds it from its own store stages (the two journal flushes, the worker join, the loss
     /// ledger) through stop_stage_begin()/stop_stage_end(): a stage that took at least
     /// kBaselineStopTroubleThreshold (4.5 s) of this persister's clock is trouble, and ONLY
-    /// that. A stage that
-    /// failed FAST (a journal flush refused by the write ceiling, a non-BUSY ledger error) says
-    /// nothing about how slow a baseline write will be: a BUSY store costs a whole busy timeout
-    /// per write, so it cannot hide behind a fast stage, and a store that fails fast also fails
-    /// the Stop pass fast, so attempting it costs nothing. stop() is terminal, so the flag needs
-    /// no reset: it can only describe the one stop that raised it. A stall of the persister's
-    /// own passes needs no entry here: one that ended at or after the mark skips the pass by
-    /// itself (rule (1) of begin_stop()). Lock-free and noexcept.
+    /// that. A stage that failed FAST (a journal flush refused by the write ceiling, a
+    /// non-BUSY ledger error) says nothing about how slow a baseline write will be: a BUSY
+    /// store costs a whole busy timeout per write, so it cannot hide behind a fast stage, and
+    /// a store that fails fast also fails the Stop pass fast, so attempting it costs nothing.
+    /// stop() is terminal, so the flag needs no reset: it can only describe the one stop that
+    /// raised it. A stall of the persister's own passes needs no entry here: one that ended at
+    /// or after the mark skips the pass by itself (rule (1) of begin_stop()). Lock-free and
+    /// noexcept.
     void note_stop_store_trouble() noexcept {
         stop_store_trouble_.store(true, std::memory_order_release);
     }

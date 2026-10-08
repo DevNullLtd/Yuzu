@@ -1332,12 +1332,16 @@ void GuardianEngine::stop() {
     // writes any log line, so exit code 4 is the only evidence.
     //
     // Measured with real SQLITE_BUSY (a second connection holding BEGIN IMMEDIATE), 5 s KvStore
-    // busy timeout, stop() entry to exit. The 10.01 s and 15.01 s rows were re-run on this
-    // exact code (3 staged captures, two runs each: 10.008 and 10.010 s; 15.011 and 15.014 s).
-    // Every row was also measured by two independent reviewers on the previous revision
-    // (fbc816ac6), which differs only in the evidence rule (a BUSY stage is slow, so it is
-    // evidence under either rule): one with 3 staged captures, one with 5. The other rows
-    // below were NOT re-run on this exact code.
+    // busy timeout, stop() entry to exit. On this exact code, with 3 staged captures: 10.008 s
+    // and 15.012 s (the implementer), then 10.01 s, 15.01 s, 7.51 to 9.71 s (worker write in
+    // flight, no journal), 24.72 s (in flight, journal pending) and 21.7 to 28.2 s (worker
+    // mid sent-marker write; 21.5 to 28.2 s with 5 staged) (the unhappy-path reviewer). The rest
+    // was measured on the previous revision (fbc816ac6) with 5 staged captures: 10.007 s,
+    // 15.011 to 15.013 s, 20.015 to 25.02 s (journal pending, baseline write in flight) and
+    // 28.82 to 29.04 s (one non-baseline worker write per run). That revision differs from this
+    // one in the evidence rule, two ERROR lines and where a test hook fires, none of which
+    // changes a BUSY timeline (a BUSY stage is slow under either rule). The 28.82 to 29.04 s
+    // row was not re-run on this exact code.
     //   quiet worker, nothing else pending ......... ledger 5 + this pass 5 ........ 10.01 s
     //                                                 (the pass runs and fails)
     //   quiet worker, journal record pending ....... journal 5 + ledger 5 + journal 5
@@ -1346,14 +1350,16 @@ void GuardianEngine::stop() {
     //                                                 stage is its 5 s sleep plus overhead, so
     //                                                 the threshold is met with about 11 to 13 ms
     //                                                 to spare)
-    //   worker baseline write in flight, journal ... 20 s to 25 s (20.016 to 25.03 s across
-    //     record pending                              alignments in two harnesses), this pass
+    //   worker baseline write in flight, journal ... 20 s to 25 s (20.015 to 25.02 s across
+    //     record pending                              alignments, 24.72 s on this code), this pass
     //                                                 skipped by the stall: up to TWO busy
     //                                                 timeouts are added, the in-flight write
     //                                                 that holds KvStore::mu_ first, and a second
     //                                                 baseline write when the worker's 5 s retry
     //                                                 backoff expires just as journal flush 1 ends
-    //   worker baseline write in flight, no journal  10.01 s, this pass skipped by the stall
+    //   worker baseline write in flight, no journal  at most 10.01 s (7.51 to 9.71 s when the
+    //                                                 write is already under way), this pass
+    //                                                 skipped by the stall
     // The last two rows are on the watchdog when they pass 20 s. The worker's OTHER KV writes
     // (journal sent-markers) take KvStore::mu_ too, so a worker mid non-baseline write puts its
     // own busy timeout in front of every stage here: 21.5 s to 28.2 s in one harness (3 staged,
@@ -1363,9 +1369,11 @@ void GuardianEngine::stop() {
     // Without #4045 the same stops take 15 s (journal record pending) or 20 s and more (a worker
     // sent-marker write in flight). What the shared deadline cannot bound: the journal and
     // ledger stages above, the worker's non-baseline writes, and the worker's retry write. The
-    // evidence is SAMPLED by those stages: a store that turns BUSY only after them, with the stop
-    // already 15 s late, still lets the Stop pass run and the watchdog may cut it (a reviewer
-    // reproduced 21.0 s; the capture is lost either way and the loss has no log line). A
+    // evidence is SAMPLED by those stages: a store that turns BUSY only after them, or whose
+    // stages each stay under the 4.5 s threshold, with the stop already 15 s late, still lets
+    // the Stop pass run and the watchdog may cut it (a reviewer reproduced 21.0 s for the first
+    // shape and 20.11 s for the second, a 1.9 s hold plus three stages of 4.4 s plus a BUSY
+    // pass; the capture is lost either way and the loss has no log line). A
     // Worker pass is deliberately NOT deferred once the mark is taken: a store that heals
     // mid-stop gets its worker retry, and the Stop pass then runs instead of skipping.
     persist_staged_baselines_locked(/*at_stop=*/true);
