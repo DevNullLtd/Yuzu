@@ -114,7 +114,9 @@ struct InstructionDefinition {
     int64_t updated_at{0};
     // Extended fields (Phase 2)
     std::string yaml_source;      // verbatim YAML (source of truth)
-    std::string parameter_schema; // JSON Schema for parameters
+    // JSON Schema for parameters. create_definition treats empty as "{}" (no schema);
+    // update_definition treats empty as KEEP the stored schema.
+    std::string parameter_schema;
     std::string result_schema;    // result column definitions JSON
     std::string approval_mode;    // "auto", "role-gated", "always"
     std::string concurrency_mode; // "per-device", "per-definition", etc.
@@ -238,6 +240,12 @@ public:
     get_definition(const std::string& id) const;
 
     std::expected<std::string, std::string> create_definition(const InstructionDefinition& def);
+    /// An EMPTY `def.parameter_schema` keeps the stored column; a non-empty one replaces it
+    /// (checked as on create, unless it equals the stored text). A caller that round-trips a
+    /// loaded definition through here MUST blank `parameter_schema` first, or it writes the
+    /// loaded copy back: the PUT route and the response-template persist blank
+    /// `parameter_schema` on the loaded definition before calling this, and the YAML editor builds
+    /// its definition from the YAML, which carries none.
     std::expected<void, std::string> update_definition(const InstructionDefinition& def);
 
     /// `unexpected("not_found: ...")` when no definition with this id exists; any other

@@ -4090,8 +4090,17 @@ Compensating controls (why this is accepted for M1, not a live break):
   stamps `via=gateway_proxy` on the `ca.cert.issued` audit + issuance metric, so
   an incident responder can **scope and bulk-revoke the gateway-issued population**
   after a gateway compromise (the row the forensic control depends on).
-- The gateway authenticates to the server over **upstream mutual TLS** (a rogue
-  gateway cannot reach the issuance path without being an enrolled gateway).
+- The gateway-upstream service admits only an authorized gateway: the caller
+  must present a certificate whose SPKI public-key pin is configured on the
+  server (plus the `serverAuth` EKU, and a validity window that covers the call)
+  before any request is processed, and anything else is refused with
+  `UNAUTHENTICATED`. Pins are fixed at server boot; withdrawal is removing the
+  pin and restarting, with no revocation read on this path. The pin establishes
+  WHICH gateway is calling. It does not restrict which agents a gateway may relay
+  for, so a compromised pinned gateway can still assert identities and events for
+  the agents behind it: this residual stays accepted, and per-gateway scoping is
+  the tracked remediation below. Operator configuration: `docs/user-manual/server-admin.md`.
+  Decision record: `docs/security-reviews/gateway-peer-authz-minimal-2026-10-07.md`.
 - PR5c **one-way TLS** on the agent↔gateway edge mitigates the *on-path* (non-gateway-
   compromise) variant.
 

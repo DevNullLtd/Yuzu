@@ -165,9 +165,10 @@ COPY --from=builder /src/builddir/agents/plugins/                  /rootfs/usr/l
 RUN set -eux; \
     echo 'yuzu:x:1000:1000:Yuzu Agent:/var/lib/yuzu-agent:/usr/sbin/nologin' >> /rootfs/etc/passwd; \
     echo 'yuzu:x:1000:' >> /rootfs/etc/group; \
-    # Shared cert group (PKI #1289): FIXED gid 2000 yuzu-pki (member: yuzu),
-    # matching the server/gateway images, so the agent can read the shared install
-    # CA out of /etc/yuzu/certs when the server runs with --cert-group yuzu-pki.
+    # Cert group (PKI #1289): FIXED gid 2000 yuzu-pki (member: yuzu), matching
+    # the server/gateway images. The agent mounts a volume holding the public
+    # install CA (default-ca.pem) at /etc/yuzu/certs (the reference compose's
+    # ca-export service).
     echo 'yuzu-pki:x:2000:yuzu' >> /rootfs/etc/group; \
     printf 'passwd: files\ngroup: files\nhosts: files dns\n' > /rootfs/etc/nsswitch.conf; \
     install -d -m 0755 -o 1000 -g 1000 /rootfs/var/lib/yuzu-agent; \
@@ -189,15 +190,15 @@ COPY --from=chisel /rootfs /
 
 # MEDIUM (#1314): use the NAMED user, not numeric `USER 1000:1000`. runc only
 # resolves supplementary groups from /etc/group for a named USER — with a bare
-# numeric uid the `yuzu-pki` (gid 2000) membership baked above is dropped, so
-# `--cert-group yuzu-pki` would be inert and the agent could not read the shared
-# install CA. `yuzu` (uid 1000) is a member of yuzu-pki per /etc/group above.
+# numeric uid the `yuzu-pki` (gid 2000) membership baked above is dropped.
+# `yuzu` (uid 1000) is a member of yuzu-pki per /etc/group above.
 USER yuzu
 WORKDIR /var/lib/yuzu-agent
 
 # Secure by default (PKI #1289): connect to the gateway over TLS. With no
 # --ca-cert the agent auto-discovers the install CA at /etc/yuzu/certs/default-ca.pem
-# (mount the shared cert volume); a deployment may pass --ca-cert explicitly. Add
+# (mount a volume holding the public CA certificate at /etc/yuzu/certs); a
+# deployment may pass --ca-cert explicitly. Add
 # --no-tls only for a throwaway dev/demo stack.
 ENTRYPOINT ["/usr/local/bin/yuzu-agent"]
 CMD ["--server", "gateway:50051", "--plugin-dir", "/usr/lib/yuzu/plugins", "--data-dir", "/var/lib/yuzu-agent"]

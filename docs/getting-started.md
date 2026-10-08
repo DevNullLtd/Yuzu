@@ -20,7 +20,7 @@ Here are the key concepts you will use in this tutorial:
 
 - **Question vs. Action** -- Definitions have a `type` field. A `question` is read-only: it gathers information without modifying endpoint state (list services, read OS info, check disk space). An `action` may modify state (restart a service, install a package, change a registry value). This distinction drives the approval workflow -- questions can auto-execute, while actions can require sign-off.
 
-- **Parameters** -- Typed inputs with validation rules. Parameters are declared with a JSON Schema-style syntax (type, required fields, max length, allowed values) and validated before the command is dispatched to any agent.
+- **Parameters** -- Typed inputs with validation rules. Parameters are declared with a JSON Schema-style syntax (type, required fields, max length, allowed values) and `POST /api/instructions/{id}/execute` validates them before the command is dispatched to any agent (no other dispatch surface does yet).
 
 - **Result Schema** -- Typed output columns (string, int32, int64, bool, datetime) that describe the structure of response data. Typed results enable server-side aggregation (COUNT, SUM, AVG grouped by column) and clean export to CSV, JSON, ClickHouse, or Splunk.
 

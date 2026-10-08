@@ -35,6 +35,32 @@
 ;   /POSTGRES_DSN=dsn      The PostgreSQL connection string itself
 ;   /GATEWAY               Enable gateway mode
 ;   /GATEWAY_ADDR=h:p      Gateway command address (default: localhost:50063)
+;   /GATEWAY_PEER_PIN_FILE=f  File naming the gateway(s) the server accepts on its
+;                          gateway-upstream port: PEM certificates, or one SHA-256
+;                          SPKI pin (64 hex characters) per line. Stored as
+;                          certs\gateway-peer-pin and passed to the service as
+;                          --gateway-peer-pin-file on every install. Setup only checks
+;                          that the file is non-empty and not UTF-16 (no NUL bytes);
+;                          the server parses it when it starts.
+;   /GATEWAY_PEER_PIN=hex  One SHA-256 SPKI pin (exactly 64 hex characters, either
+;                          case), stored in the same file (use the FILE form for
+;                          several, or for a certificate). Give either this or
+;                          /GATEWAY_PEER_PIN_FILE, not both. Either one given
+;                          REPLACES the stored certs\gateway-peer-pin.
+;                          /GATEWAY with operator gRPC certificates (/GRPC_CERT or
+;                          /CA_CERT, now or from an earlier install) needs one
+;                          of them, or Setup refuses. With the generated default
+;                          certificates the server pins its own gateway certificate.
+;                          /GATEWAY with /NOTLS passes --insecure-gateway-peer
+;                          (gateway peer authorization disabled; dev only) and
+;                          no pin file, because the server refuses both together.
+;                          Giving /GATEWAY_PEER_PIN or /GATEWAY_PEER_PIN_FILE
+;                          together with /GATEWAY /NOTLS is REFUSED (exit code 7,
+;                          nothing changed): plaintext has nothing to pin.
+;                          The interactive wizard has no page for a pin. Both pin
+;                          parameters are command-line only, in the wizard and in
+;                          a silent install alike; a PEM certificate file given
+;                          with /GATEWAY_PEER_PIN_FILE= is accepted.
 ;   /OIDC_ISSUER=url       OIDC issuer URL
 ;   /OIDC_CLIENT_ID=id     OIDC client ID
 ;   /OIDC_CLIENT_SECRET=s  OIDC client secret
@@ -46,7 +72,9 @@
 ;   /GRPC_KEY=path         PEM private key for agent gRPC
 ;   /CA_CERT=path          PEM CA cert for mTLS agent verification
 ;   /NOHTTPS               Disable HTTPS (dev only)
-;   /NOTLS                 Disable gRPC TLS (dev only)
+;   /NOTLS                 Disable gRPC TLS (dev only). Any /GRPC_CERT, /GRPC_KEY or
+;                          /CA_CERT given with it is ignored and not copied, as in
+;                          the wizard.
 ;   /NOSTART               Do not start service after install
 ;
 ; Exit codes: 0 success; 7 the installation was stopped before any file was
@@ -67,6 +95,11 @@
 ; THE SETUP LOG RECORDS THE FULL COMMAND LINE, including any /ADMIN_PASS=,
 ; /OPERATOR_PASS=, /POSTGRES_DSN= or /OIDC_CLIENT_SECRET= value. Prefer the
 ; *_FILE parameters, and protect or delete the log.
+;
+; KNOWN ISSUE (#1835, "Windows server binary has the identical SCM control-protocol
+; defect as #1822 (agent)"): this installer registers yuzu-server.exe as the
+; YuzuServer service, and starting that service under the Windows service
+; manager was not tested for this installer because of that issue.
 ;
 ; Secrets are kept in "%ProgramData%\Yuzu Server", locked to Administrators
 ; and SYSTEM; the service's command line (readable by local users) carries
@@ -810,6 +843,8 @@ type
     UseOIDC: Boolean;
     OidcIssuer, OidcClientId, OidcSecret, OidcSecretFile, OidcAdminGroup: string;
     HttpsCert, HttpsKey, GrpcCert, GrpcKey, CaCert: string;
+    // Command-line only (no wizard page): the gateway peer pin, as a file or as one hex pin.
+    GatewayPeerPin, GatewayPeerPinFile: string;
   end;
 
 procedure GetInputs(var R: TInstallInputs);
@@ -831,6 +866,14 @@ begin
     R.GrpcCert := GetCmdParam('GRPC_CERT');
     R.GrpcKey := GetCmdParam('GRPC_KEY');
     R.CaCert := GetCmdParam('CA_CERT');
+    // As in the wizard: with gRPC TLS skipped the certificates are ignored by the
+    // service arguments, so they must not be copied into certs\ either.
+    if HasCmdFlag('NOTLS') then
+    begin
+      R.GrpcCert := '';
+      R.GrpcKey := '';
+      R.CaCert := '';
+    end;
   end
   else
   begin
@@ -865,11 +908,32 @@ begin
   // command line, and so out of a /LOG= file, which records it.
   R.DsnFile := GetCmdParam('POSTGRES_DSN_FILE');
   R.OidcSecretFile := GetCmdParam('OIDC_CLIENT_SECRET_FILE');
+  R.GatewayPeerPin := GetCmdParam('GATEWAY_PEER_PIN');
+  R.GatewayPeerPinFile := GetCmdParam('GATEWAY_PEER_PIN_FILE');
   if not R.UseOIDC then
   begin
     R.OidcSecret := '';
     R.OidcSecretFile := '';
   end;
+end;
+
+// Whether this run installs gateway mode, and whether gRPC TLS is skipped. One
+// definition, used by the service command line and by the pre-flight check, so
+// the two cannot disagree about the configuration the service will boot with.
+function GatewayRequested: Boolean;
+begin
+  if WizardSilent then
+    Result := HasCmdFlag('GATEWAY')
+  else
+    Result := GatewayCheckbox.Checked;
+end;
+
+function GrpcTlsSkipped: Boolean;
+begin
+  if WizardSilent then
+    Result := HasCmdFlag('NOTLS')
+  else
+    Result := NoTLSCheckbox.Checked;
 end;
 
 function ShouldStartService: Boolean;
@@ -1330,6 +1394,12 @@ begin
   if (Result = '') and (Inp.GrpcCert <> '') then Result := CopyInto(Inp.GrpcCert, C + '\grpc-cert.pem');
   if (Result = '') and (Inp.GrpcKey <> '') then Result := CopyInto(Inp.GrpcKey, C + '\grpc-key.pem');
   if (Result = '') and (Inp.CaCert <> '') then Result := CopyInto(Inp.CaCert, C + '\ca-cert.pem');
+  // The gateway peer pin: the server reads it once at start (a pin is not a
+  // secret, but this keeps it in the locked directory beside the certificates).
+  if (Result = '') and (Inp.GatewayPeerPinFile <> '') then
+    Result := CopyInto(Inp.GatewayPeerPinFile, C + '\gateway-peer-pin');
+  if (Result = '') and (Inp.GatewayPeerPin <> '') then
+    Result := WriteSecret(Inp.GatewayPeerPin, '', C + '\gateway-peer-pin');
 end;
 
 // ── Configuration (password hashes) ──────────────────────────────────────
@@ -1454,6 +1524,111 @@ begin
     Result := 'The file given with /' + Param + '= was not found, or is not a plain file: ' + Path;
 end;
 
+// True when S is exactly 64 hexadecimal digits (a SHA-256 SPKI pin), either case.
+function IsSha256Hex(const S: string): Boolean;
+var
+  I, C: Integer;
+begin
+  Result := Length(S) = 64;
+  if Result then
+    for I := 1 to Length(S) do
+    begin
+      C := Ord(S[I]);
+      if not (((C >= 48) and (C <= 57)) or ((C >= 65) and (C <= 70)) or
+              ((C >= 97) and (C <= 102))) then
+        Result := False;
+    end;
+end;
+
+// Cheap checks on a gateway peer pin file: readable, no NUL byte (a UTF-16 file
+// has them), not blank. Deliberately NOT a PEM or hex parser: the full parse
+// stays in the server (gateway_peer_pinset.cpp), which refuses to start on a
+// pin file it cannot use, so a second parser here could only drift from it.
+function PinFileProblem(const Path: string): string;
+var
+  Content: AnsiString;
+  I: Integer;
+begin
+  Result := '';
+  if not LoadStringFromFile(Path, Content) then
+  begin
+    Result := 'The file given with /GATEWAY_PEER_PIN_FILE= could not be read: ' + Path;
+    Exit;
+  end;
+  for I := 1 to Length(Content) do
+    if Ord(Content[I]) = 0 then
+    begin
+      Result := 'The file given with /GATEWAY_PEER_PIN_FILE= contains NUL bytes (is it UTF-16?). ' +
+                'Save it as ASCII or UTF-8 text: ' + Path;
+      Exit;
+    end;
+  if Trim(String(Content)) = '' then
+    Result := 'The file given with /GATEWAY_PEER_PIN_FILE= is empty: ' + Path;
+end;
+
+// The server refuses to start the gateway-upstream service on operator
+// certificates unless a gateway peer pin is configured (a certificate from the
+// operator's CA does not say which holder is the gateway). GetServiceArgs
+// rebuilds the command line from this run's inputs and the files in certs\ on
+// EVERY run, so an upgrade that re-selects gateway mode on an install carrying
+// operator certificates would otherwise install a service that does not boot.
+// Refused here, before anything changes. A /GATEWAY_PEER_PIN value must be 64
+// hex characters and a pin file passes only the cheap checks above; the server
+// does the full validation when it starts. A pin parameter given together with
+// /GATEWAY and /NOTLS is refused as well: the service would be started with
+// --insecure-gateway-peer and no pin file, so the pin could never be used.
+function CheckGatewayPeer(const Inp: TInstallInputs): string;
+var
+  CertDir: string;
+  OperatorCerts, HavePin: Boolean;
+begin
+  Result := '';
+  if (Inp.GatewayPeerPin <> '') and (Inp.GatewayPeerPinFile <> '') then
+  begin
+    Result := 'Give either /GATEWAY_PEER_PIN= or /GATEWAY_PEER_PIN_FILE=, not both.';
+    Exit;
+  end;
+  if (Inp.GatewayPeerPin <> '') and not IsSha256Hex(Inp.GatewayPeerPin) then
+  begin
+    Result := '/GATEWAY_PEER_PIN= must be exactly 64 hexadecimal characters (the SHA-256 of the ' +
+              'gateway certificate''s public key); the value given is ' +
+              IntToStr(Length(Inp.GatewayPeerPin)) + ' characters long or contains a character ' +
+              'that is not hexadecimal. For several pins, or a certificate, use /GATEWAY_PEER_PIN_FILE=.';
+    Exit;
+  end;
+  if Inp.GatewayPeerPinFile <> '' then
+  begin
+    Result := PinFileProblem(Inp.GatewayPeerPinFile);
+    if Result <> '' then Exit;
+  end;
+  if GatewayRequested and GrpcTlsSkipped and
+     ((Inp.GatewayPeerPin <> '') or (Inp.GatewayPeerPinFile <> '')) then
+  begin
+    Result := 'Gateway mode with /NOTLS (gRPC TLS skipped) runs without gateway peer authorization, ' +
+              'so a gateway peer pin has nothing to check, and the server refuses to start with both. ' +
+              'Leave out /GATEWAY_PEER_PIN= and /GATEWAY_PEER_PIN_FILE=, or leave out /NOTLS.';
+    Exit;
+  end;
+  if (not GatewayRequested) or GrpcTlsSkipped then Exit;
+  CertDir := CertDirPath(DataDirPath);
+  // What GetServiceArgs will pass: --cert/--key from grpc-cert.pem and grpc-key.pem, --ca-cert from ca-cert.pem.
+  OperatorCerts := (Inp.GrpcCert <> '') or (Inp.CaCert <> '') or
+                   FileExists(CertDir + '\grpc-cert.pem') or FileExists(CertDir + '\ca-cert.pem');
+  HavePin := (Inp.GatewayPeerPin <> '') or (Inp.GatewayPeerPinFile <> '') or
+             FileExists(CertDir + '\gateway-peer-pin');
+  if OperatorCerts and not HavePin then
+    Result := 'Gateway mode is selected with operator-supplied gRPC certificates (a gRPC certificate ' +
+              'or CA certificate is given, or is kept from an earlier install), and no gateway peer ' +
+              'pin is stored. The server refuses to start the gateway-upstream service in that ' +
+              'configuration. The pin cannot be entered in the wizard: supply it on the setup command line ' +
+              'with /GATEWAY_PEER_PIN_FILE=<file> (a PEM certificate file of the gateway works, or a ' +
+              'file of 64-hex-character pins) or /GATEWAY_PEER_PIN=<64 hex characters> (the SHA-256 of ' +
+              'the gateway certificate''s public key); it is kept in the data directory and used on ' +
+              'every later install. ' +
+              'If no gateway is used, leave /GATEWAY out. For a development rig, /NOTLS together ' +
+              'with /GATEWAY disables gateway peer authorization.';
+end;
+
 // The wizard pages validate an interactive install; a silent one was not
 // validated at all. Checked before the service is stopped or anything changes.
 function CheckInputs(const Inp: TInstallInputs): string;
@@ -1517,6 +1692,8 @@ begin
   if Result = '' then Result := CheckFileParam(Inp.GrpcCert, 'GRPC_CERT');
   if Result = '' then Result := CheckFileParam(Inp.GrpcKey, 'GRPC_KEY');
   if Result = '' then Result := CheckFileParam(Inp.CaCert, 'CA_CERT');
+  if Result = '' then Result := CheckFileParam(Inp.GatewayPeerPinFile, 'GATEWAY_PEER_PIN_FILE');
+  if Result = '' then Result := CheckGatewayPeer(Inp);
   if Result <> '' then
     Result := Result + #13#10#13#10 + 'Nothing has been changed.';
 end;
@@ -1576,18 +1753,12 @@ begin
   GetInputs(Inp);
   DataDir := DataDirPath;
   CertDir := CertDirPath(DataDir);
+  UseGateway := GatewayRequested;
+  SkipTLS := GrpcTlsSkipped;
   if WizardSilent then
-  begin
-    UseGateway := HasCmdFlag('GATEWAY');
-    SkipHTTPS := HasCmdFlag('NOHTTPS');
-    SkipTLS := HasCmdFlag('NOTLS');
-  end
+    SkipHTTPS := HasCmdFlag('NOHTTPS')
   else
-  begin
-    UseGateway := GatewayCheckbox.Checked;
     SkipHTTPS := NoHTTPSCheckbox.Checked;
-    SkipTLS := NoTLSCheckbox.Checked;
-  end;
 
   Result := '--config "' + DataDir + '\yuzu-server.cfg"' +
             ' --data-dir "' + DataDir + '\data"' +
@@ -1618,7 +1789,15 @@ begin
                        ' --https-key "' + CertDir + '\https-key.pem"';
 
   if SkipTLS then
-    Result := Result + ' --no-tls'
+  begin
+    Result := Result + ' --no-tls';
+    // Plaintext has no gateway certificate to pin, and --no-tls is not an
+    // acknowledgement: the server refuses gateway mode without it. A pin file
+    // is NOT passed here, because the server refuses the acknowledgement
+    // together with a pin.
+    if UseGateway then
+      Result := Result + ' --insecure-gateway-peer';
+  end
   else
   begin
     if FileExists(CertDir + '\grpc-cert.pem') and FileExists(CertDir + '\grpc-key.pem') then
@@ -1626,6 +1805,10 @@ begin
                          ' --key "' + CertDir + '\grpc-key.pem"';
     if FileExists(CertDir + '\ca-cert.pem') then
       Result := Result + ' --ca-cert "' + CertDir + '\ca-cert.pem"';
+    // Like ca-cert.pem: used whenever it is in the locked directory, supplied
+    // now or carried from the previous installation.
+    if UseGateway and FileExists(CertDir + '\gateway-peer-pin') then
+      Result := Result + ' --gateway-peer-pin-file "' + CertDir + '\gateway-peer-pin"';
   end;
 
   if Inp.UseOIDC then

@@ -67,7 +67,7 @@ report() { # <desc> <ok:0|1>
 
 # ── Ephemeral database (never mutates the shared base DB; safe on a shared runner) ──
 SALT="$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-DB="yuzu_gentok_$$_${SALT}"
+DB="yuzu_test_$(date +%s)_gentok_$$_${SALT}"
 dsn_base="${PG_DSN%%\?*}"
 dsn_query=""
 [ "$dsn_base" != "$PG_DSN" ] && dsn_query="?${PG_DSN#*\?}"

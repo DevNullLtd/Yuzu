@@ -44,7 +44,7 @@ A definition can exist standalone (without a set or pack). Sets group definition
 
 - **Substrate, not scripts.** Definitions target stable plugin primitives. OS-specific syscalls stay inside the plugin layer. Content authors never write shell commands.
 - **Everything is an InstructionDefinition.** Ad-hoc commands, scheduled tasks, policy checks, and remediation actions all use the same definition-to-execution-to-response pipeline.
-- **Typed end-to-end.** Parameter schemas validate input before dispatch. Result schemas type output for downstream consumption (ClickHouse, Splunk, CSV export).
+- **Typed end-to-end.** Parameter schemas validate input before dispatch on `POST /api/instructions/{id}/execute` (no other dispatch surface validates yet). Result schemas type output for downstream consumption (ClickHouse, Splunk, CSV export).
 - **Governed execution.** Every state-changing action can require approval. Every execution is audited. Every response is persisted.
 
 ### Two Definition Types
@@ -333,14 +333,14 @@ Parameters use a JSON Schema subset. The root object describes the input shape; 
 | `datetime` | ISO 8601 timestamp | String | `"2026-03-17T18:20:00Z"` |
 | `guid` | UUID / GUID | String | `"550e8400-e29b-41d4-a716-446655440000"` |
 
-Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. The server validates values against declared types and constraints before dispatch.
+Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. `POST /api/instructions/{id}/execute` validates the request's `params` against the declared types and constraints before dispatch (see [Parameter validation](#parameter-validation)); no other dispatch surface does yet.
 
 ### Validation Constraints
 
 | Constraint | Applicable Types | Description |
 |---|---|---|
-| `maxLength` | `string` | Maximum character count. |
-| `minLength` | `string` | Minimum character count. |
+| `maxLength` | `string` | Maximum length in bytes (UTF-8). |
+| `minLength` | `string` | Minimum length in bytes (UTF-8). |
 | `pattern` | `string` | Regex the value must match. |
 | `enum` | `string` | List of allowed values. |
 | `minimum` | `int32`, `int64` | Minimum value (inclusive). |
@@ -379,6 +379,90 @@ parameters:
       type: boolean
       default: false
 ```
+
+### Parameter validation
+
+`POST /api/instructions/{id}/execute` validates the request's `params` against the definition's stored
+`parameter_schema` before the approval gate, strictly (details and error bodies: [REST API](rest-api.md)).
+A refused call creates no approval ticket, execution row or dispatch. Enforced as declared:
+
+- a name the schema does not declare is refused (path `/*`); a required name without a `default` must
+  be sent; a `default` satisfies `required` but is **not** injected, so the plugin still receives only
+  what you sent;
+- `type`, `enum` (case-sensitive), `pattern` (anchor it: it is a search, not a full match), `minimum`/`maximum`
+  (`int32` also gets the 32-bit range) and `minLength`/`maxLength`;
+- an integer is a JSON integer or a string of digits with an optional leading `-` (`"+5"`, `" 5"`,
+  `"5.0"` and JSON `5.0` are refused); a boolean is `true`/`false` or the strings `"true"`/`"false"`;
+- `null` is never read as an omission: a parameter refuses it (omit the key instead);
+- a string containing a NUL character is refused.
+
+A definition that stores no schema (empty, whitespace or `{}`, which is what the YAML editor stores for a
+definition created there) is not validated. The YAML editor, `PUT /api/instructions/{id}` and
+response-template changes **keep** the stored schema: editing `spec.parameters` in the YAML editor does not
+change what execute enforces.
+
+Limits on a stored schema (a schema over a limit is refused when it is written, and a stored one that is
+over a limit makes execute answer `500`):
+
+| Limit | Value |
+|---|---|
+| schema text | 262144 bytes |
+| properties per schema | 128 |
+| members per `enum` | 256 |
+| `pattern` length | 1024 bytes |
+| compiled pattern size | 32768 RE2 instructions each, 65536 per schema, and RE2's 512 KiB memory budget per pattern |
+| integer `minimum`/`maximum` | magnitude below 2^53 |
+| string matched against a `pattern` | 64 KiB |
+| matching work per request (or per schema, for `default`s) | (bytes + 1) x pattern size, plus one unit per `enum` member compared, up to 16777216 |
+
+`enabled: false` hides a definition from the discovery catalog and stops its schedules (the schedule
+poller records `definition_disabled`), but it does **not** stop `POST /api/instructions/{id}/execute`:
+that route does not read `enabled`.
+
+### Replacing a stored parameter schema
+
+No route replaces a stored schema in place: `PUT /api/instructions/{id}`, the YAML editor and
+response-template changes keep it, and `POST /api/instructions/import` answers `409` for an id that
+already exists. To replace one (a wrong or legacy schema, a `500` from execute, or a corrected bundled
+definition on an existing install), export the definition, delete it and import it again with a
+corrected `parameter_schema`:
+
+1. `GET /api/instructions/{id}/export` (`InstructionDefinition:Read`) and keep the document. It carries
+   the fields import reads, including `yaml_source`, `instruction_set_id` and
+   `response_templates_spec`, which the delete removes (the delete and re-import also reset `created_at`,
+   which import never reads). It carries **no** `signature` or `publicKey`.
+2. Edit its `parameter_schema` (a string holding the schema JSON). Unless the server runs with
+   `--allow-unsigned-definitions`, the edited document must also be signed before import, or the import
+   answers `400` as unsigned: add a hex `signature` and `publicKey` (an Ed25519 signature over the exact
+   bytes of `yaml_source`, 128 and 64 hex characters). A definition whose `yaml_source` is empty cannot be
+   signed (import answers an error about a signature without `yaml_source`), so only the unsigned flag
+   works for it.
+3. Rehearse the import, because step 5 cannot be rehearsed (an existing id answers `409`) and a refused
+   import leaves the definition deleted: `POST /api/instructions/import` the corrected, signed document
+   once with a different `id` (import reads `id` from the document and accepts any id that is free), confirm
+   it is accepted, then `DELETE` that temporary id. The signature covers only the `yaml_source` bytes, so it
+   stays valid. The temporary definition is live until it is deleted.
+4. `DELETE /api/instructions/{id}` (`InstructionDefinition:Delete`, audit action `instruction.delete`).
+5. `POST /api/instructions/import` with the edited document (`InstructionDefinition:Write`, audit action
+   `instruction.import`). The schema is checked as it is written, so a bad one is refused with a `400`.
+
+The signature covers only the `yaml_source` bytes (not the schema, plugin, action, `approval_mode` or
+`created_by`), and the verifier takes `publicKey` from the request, so it is an integrity check and not
+publisher authentication. See [REST API](rest-api.md).
+
+- A bundled definition is tombstoned by the delete, so the bundled reseed does not bring the old one back.
+  Any public import skips the tombstone, whether signed or unsigned under `--allow-unsigned-definitions`
+  (both run as a non-seed insert), so the replacement lands and later boots leave it alone. The tombstone is
+  permanent: a replaced bundled definition never receives later bundled corrections from the reseed.
+- The delete removes only the definition row. A schedule that references the id has its occurrences skipped
+  and audited as `definition_unknown` until the id exists again. A policy does not name the instruction; its
+  fragment does (`check_instruction`, `fix_instruction` and `post_check_instruction`, which falls back to
+  `check_instruction`). Check, fix and verify dispatches that name a missing id log `unknown check/fix instruction`
+  and send nothing, a remediation then reports `fix dispatch failed (unknown instruction or no agents)`, `POST /api/workflows/{id}/execute` for
+  a workflow with a step that names it answers `400` (`references unknown instruction`), and a pending
+  approval keeps its `definition_id` (no foreign key was found). Check policy fragments, stored workflows and
+  pending approvals for the id before deleting. Other references were not checked.
+- Between steps 4 and 5 the definition does not exist, and a refused import leaves it deleted. Have the corrected (and, unless the unsigned flag is set, signed) document ready and rehearsed before step 4, and do both in one maintenance window.
 
 ---
 
@@ -1011,6 +1095,7 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 - `agent_ids` — optional array of specific agent IDs to target.
 - `scope` — optional scope expression (e.g., `group:servers`, `os:windows AND tag:prod`), or `__all__` for every enrolled agent. **Omit both `scope` and `agent_ids`** to broadcast. A *supplied* empty string, a non-string `scope`, an empty `agent_ids`, a non-array `agent_ids`, or a non-string entry is refused with `400` rather than widened to the whole fleet (#2500) — a target the caller named that resolves to nothing is an error, not a request for everything.
 - `params` — key-value parameters to pass to the plugin action. Keys should match the definition's `parameter_schema`.
+  This route checks them against it (see [Parameter validation](#parameter-validation)).
 
 **Response (200):**
 

@@ -450,6 +450,15 @@ build time and nothing at boot — it breaks only the healthcheck, so Compose pa
 every container `unhealthy` forever and anything with `depends_on: condition:
 service_healthy` never starts, with no application failure to point at.
 
+The `server` role also probes one non-healthcheck dependency of the same image:
+the reference compose's one-shot `ca-export` service
+(`deploy/docker/docker-compose.reference-gateway.yml`) runs the server image with
+`/bin/sh -ec` and calls `install`, so the probe checks that `/bin/sh` runs and
+`install` is on its path, and a base-image change that drops either fails the
+gate instead of leaving the agent's `depends_on: ca-export` waiting forever. It
+runs as the image's default user while `ca-export` runs as root, so it proves
+presence and executability, not that user's write access.
+
 `yuzu-postgres` is published and healthchecked too (`pg_isready` + `psql`), but it
 is `FROM postgres:*` — those tools are the image's whole purpose — so it has no
 role in the gate and `docker-publish-postgres` has no pre-push check. `agent-chisel`
@@ -599,6 +608,63 @@ of reading as NOT TESTED.
 - The gateway stays red on fedora:42 until #5171 is fixed: its bundled OTP
   crypto NIF needs OpenSSL SM4 symbols that Red Hat's OpenSSL lacks. The
   same defect is waiting behind #5143 on rockylinux:9.
+
+**Gateway-upstream peer authorization and the rigs.** The server refuses to start with
+`--gateway-upstream` unless gateway peer authorization is configured or acknowledged as disabled
+(`--insecure-gateway-peer`, or `YUZU_INSECURE_GATEWAY_PEER=1`). The rigs that run the server from
+the build under test pass the flag: `scripts/integration-test.sh` (in both its plaintext and
+`--tls` branches), `scripts/start-UAT.sh`, `scripts/win-start-UAT.sh`, `scripts/start-stack.sh`
+and the locally built full, sanitizer and viz UAT composes. None of them exercises a pinned
+gateway hop, and no workflow under `.github/` invokes `integration-test.sh` (it runs from
+`scripts/run-tests.sh`); running its `--tls` branch with a real pinned gateway leaf is a deferred
+follow-up. The pre-release `integration` job (`scripts/ci/qa-stack.sh`) starts no server itself:
+it runs this checkout's reference-gateway template on the release's published images, so any
+acknowledgement or pin that rig needs belongs in that template (an environment variable, which an
+image older than the flag ignores), not in the script.
+
+**Gateway peer authorization gates.** Four pieces enforce it in CI. (1) The `linux` job in
+`ci.yml` installs the `postgresql-client` apt package (it provides `psql`) and runs the step
+"Gateway peer boot-decision CLI test" (`tests/shell/test_gateway_peer_boot_refusal.sh`) against the
+built server with `YUZU_REQUIRE_PSQL=1`: the test creates one database per row through `psql`, so a
+missing `psql` is a failure under that variable (and under `GITHUB_ACTIONS=true`), never a skip, and
+a skipped step cannot be a green job that never ran. Besides the refusal and control rows (each
+boot configuration against its expected exit and message), the test places real calls against the
+listeners of the controls rows: anonymous calls (no client certificate) on the agent port, client-
+certificate calls that present the default gateway leaf (admitted by the automatic pin, answered by
+the real handler) and the default server leaf (a valid certificate of the same CA that is not the
+pinned one: status 16 with `not_pinned`), and listener-port rows that repeat the certificate pair on
+the dedicated gateway-upstream listener, where a call with no client certificate fails at the TLS
+handshake instead of being answered with status 16. One further row group covers the second
+deployment shape, operator-supplied certificates (`--cert/--key/--ca-cert` plus
+`--gateway-peer-pin-file` naming the gateway leaf): it generates an operator CA and leaves, asserts
+the enforce boot line carries the gateway leaf's SPKI prefix, and calls the gateway-upstream listener
+presenting the pinned leaf (answered by the real handler), an unpinned serverAuth leaf (status 16,
+`not_pinned`) and a clientAuth-only leaf (status 16, `no_server_auth_eku`). (2) The `docs` suite carries a lexical Python
+gate, `tests/test_gateway_peer_registration_lexical.py` (Meson test "gateway-upstream guard
+registration lexical gate", no build required), which fails if the gateway-upstream service is
+registered other than through the guard. It reads `server.cpp` after removing comments, blanking
+string and character literals (raw strings included, recognised only at an identifier boundary),
+stripping a leading byte-order mark, joining backslash-newline splices and removing C++14 digit
+separators, so none of those can hide a registration. Its rules: exactly three
+`builder.RegisterService` calls with the expected arguments; no generic service; one `ServerBuilder`
+that is never passed or copied; the unguarded handler used only in allow-listed contexts; the
+member order of `agent_service_`, `gateway_service_`, `gateway_peer_guard_` and `agent_server_`, all
+at the brace depth of the `ServerImpl` class body, with exactly two guard constructions; only header
+includes (and imports); and a tree-wide scan so no other source file under `server/` names
+`ServerBuilder` or a `Register*Service` API. It is lexical only, not a data-flow analysis. (3) The restart-advice lint
+`tests/test_gateway_peer_restart_advice_lint.py` runs as the "Gateway peer restart-advice lint"
+step of `docs-lint.yml` on every PR (docs-only PRs skip the Meson `docs` suite) and as the Meson
+test "gateway peer restart-advice docs lint": every place that gives gateway-restart advice
+after a peer-authorization refusal must carry the `5183` token (digit boundaries, so `15183`
+does not count) anywhere in the same paragraph, table row, list item or alert annotation, and a
+conditional marker (`only if` or `unless`) in the same sentence as the restart phrase or in the
+next one. Text is matched after markdown marks are stripped, advice that is negated (`do not
+restart the gateway`) is ignored, each file has a pinned minimum number of matching paragraphs so
+a reworded runbook cannot silently drop out of the lint's reach, and the expiry runbook must say a
+gateway redial is required. (4) The rigs
+above, which carry the acknowledgement. The decision record,
+[Gateway peer authorization (minimal), 2026-10-07](security-reviews/gateway-peer-authz-minimal-2026-10-07.md),
+states what none of these cover.
 
 ## Self-hosted runner topology
 

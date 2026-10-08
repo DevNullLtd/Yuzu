@@ -374,6 +374,10 @@ yuzu_server_core_lib = static_library(
     'src/agent_registry.cpp',
     'src/agent_service_impl.cpp',
     'src/gateway_service_impl.cpp',
+    'src/gateway_peer_cert.cpp', # gateway-upstream peer authorization: SPKI pin + EKU + validity facts
+    'src/gateway_peer_pinset.cpp', # gateway-upstream peer authorization: boot-fixed pin set + loader
+    'src/gateway_peer_guard.cpp', # gateway-upstream peer authorization: the guarded service wrapper
+    'src/gateway_peer_resolution.cpp', # gateway-upstream peer authorization: boot mode resolution + boot pin set
     'src/auth.cpp',
     'src/auth_db.cpp',
     'src/enrollment_cfg_import.cpp', # WS-6 6.2: one-time legacy enrollment .cfg -> Postgres import
@@ -495,6 +499,7 @@ yuzu_server_core_lib = static_library(
     'src/custom_properties_routes.cpp',
     'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',
+    'src/instruction_param_schema.cpp',
     'src/mcp_orientation.cpp',
     'src/mcp_session.cpp',
     'src/mcp_stream.cpp',

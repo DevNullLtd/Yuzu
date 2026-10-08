@@ -84,8 +84,8 @@ fi
 # database name in the URI. Two databases (not one, and not a reuse of
 # Case 1's) keep Case 2's assertions independent of any Case 1 regression.
 SALT="$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-DB_REFUSE="yuzu_fabtest_$$_${SALT}_refuse"
-DB_BOOT="yuzu_fabtest_$$_${SALT}_boot"
+DB_REFUSE="yuzu_test_$(date +%s)_fabtest_$$_${SALT}_refuse"
+DB_BOOT="yuzu_test_$(date +%s)_fabtest_$$_${SALT}_boot"
 dsn_base="${PG_DSN%%\?*}"                       # strip any ?query
 dsn_query=""
 [ "$dsn_base" != "$PG_DSN" ] && dsn_query="?${PG_DSN#*\?}"
