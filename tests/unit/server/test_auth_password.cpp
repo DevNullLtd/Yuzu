@@ -42,13 +42,16 @@
 #include "../../../server/core/src/totp.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -738,8 +741,23 @@ TEST_CASE("#5274: the boot check names and counts cfg users whose stored credent
     REQUIRE(boot.load_config(cfg));
     boot.set_metrics_registry(&metrics);
     boot.set_auth_db(db.get());
-    CHECK(boot.report_stale_cfg_credentials() == 1);
+    std::size_t stale = 0;
+    std::string logs;
+    {
+        yuzu::test::LogCapture capture{spdlog::level::warn};
+        stale = boot.report_stale_cfg_credentials();
+        capture.stop();
+        logs = capture.text();
+    }
+    CHECK(stale == 1);
     CHECK(metrics.gauge("yuzu_auth_cfg_credentials_stale").value() == 1.0);
+    // #5343: the no-row cfg entry is named (and only it) by the new WARN, and
+    // is still NOT counted as stale. alice (matching row) and bert (diverged
+    // row) must not get the no-row warning.
+    CHECK(logs.find("#5343 boot check: cfg entry 'cfgonly' has no auth.users row") !=
+          std::string::npos);
+    CHECK(logs.find("cfg entry 'alice' has no auth.users row") == std::string::npos);
+    CHECK(logs.find("cfg entry 'bert' has no auth.users row") == std::string::npos);
 
     AuthManager cfg_mode; // no AuthDB: nothing to compare against
     REQUIRE(cfg_mode.load_config(cfg));
@@ -827,4 +845,67 @@ TEST_CASE("verify_password / authenticate refuse an over-max password without a 
     CHECK_FALSE(mgr.authenticate("gus", over).has_value());
     // upsert_user enforces the same maximum when SETTING a password.
     CHECK_FALSE(mgr.upsert_user("hal", over, Role::user));
+}
+
+// ── #5343: first-run setup creates the administrator ONLY ────────────────────
+//
+// first_run_setup used to prompt for a SECOND, non-admin "user" account and
+// write it to yuzu-server.cfg. On the Postgres substrate only the admin cfg
+// entry is provisioned into auth.users at first boot, so that second account
+// could never sign in. The prompt is removed; this drives the real
+// first_run_setup through swapped std::cin/std::cout buffers.
+
+namespace {
+/// Swap std::cin/std::cout buffers for the scope; restore on exit.
+struct StdioSwap {
+    explicit StdioSwap(const std::string& input) : in_(input) {
+        old_in_ = std::cin.rdbuf(in_.rdbuf());
+        old_out_ = std::cout.rdbuf(out_.rdbuf());
+    }
+    ~StdioSwap() {
+        std::cin.rdbuf(old_in_);
+        std::cout.rdbuf(old_out_);
+    }
+    StdioSwap(const StdioSwap&) = delete;
+    StdioSwap& operator=(const StdioSwap&) = delete;
+    [[nodiscard]] std::string output() const { return out_.str(); }
+
+private:
+    std::istringstream in_;
+    std::ostringstream out_;
+    std::streambuf* old_in_ = nullptr;
+    std::streambuf* old_out_ = nullptr;
+};
+} // namespace
+
+TEST_CASE("#5343: first_run_setup creates exactly one administrator and no second account",
+          "[auth][password][5343]") {
+    yuzu::test::TempDir dir{"yuzu_test_firstrun_"};
+    fs::create_directories(dir.path);
+    const auto cfg = dir.path / "yuzu-server.cfg";
+
+    // Prompt order: admin name, admin password, confirm. The trailing lines
+    // would answer the REMOVED second-account prompts (default name, password,
+    // confirm); they must be left unread, so a regression that re-adds the
+    // prompt writes a second cfg entry and fails the assertions below instead
+    // of failing early on EOF.
+    std::string out;
+    bool ok = false;
+    {
+        StdioSwap io{"admin\nfirst-run-pw-12345\nfirst-run-pw-12345\n"
+                     "\nsecond-run-pw-12345\nsecond-run-pw-12345\n"};
+        ok = AuthManager::first_run_setup(cfg);
+        out = io.output();
+    }
+    CHECK(ok);
+    CHECK(out.find("User account") == std::string::npos);
+    CHECK(out.find("User password") == std::string::npos);
+
+    AuthManager mgr;
+    REQUIRE(mgr.load_config(cfg));
+    const auto users = mgr.list_users();
+    REQUIRE(users.size() == 1);
+    CHECK(users.front().role == Role::admin);
+    CHECK(mgr.get_user_role("admin") == Role::admin);
+    CHECK_FALSE(mgr.get_user_role("user").has_value());
 }

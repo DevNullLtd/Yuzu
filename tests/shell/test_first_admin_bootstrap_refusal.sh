@@ -40,6 +40,14 @@
 # DSN unset -> SKIP (local dev without Postgres); DSN set but unusable ->
 # FAIL.
 #
+# Case 3 (#5343, admin-only seed): a config file with an admin-role entry AND a
+# second user-role entry (what a pre-0.15.0 first-run setup or the Windows
+# installer's /OPERATOR_USER wrote), against a THIRD fresh empty database.
+# Only the admin is provisioned into auth.users; the second entry is cfg-only
+# and never becomes a row. This locks the deliberate admin-only seed that made
+# the second first-run account unusable (and is why it was removed): a future
+# change that starts provisioning it must update this assertion on purpose.
+#
 # Run:  bash tests/shell/test_first_admin_bootstrap_refusal.sh
 set -euo pipefail
 
@@ -86,12 +94,14 @@ fi
 SALT="$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 DB_REFUSE="yuzu_test_$(date +%s)_fabtest_$$_${SALT}_refuse"
 DB_BOOT="yuzu_test_$(date +%s)_fabtest_$$_${SALT}_boot"
+DB_SEED="yuzu_test_$(date +%s)_fabtest_$$_${SALT}_seed"
 dsn_base="${PG_DSN%%\?*}"                       # strip any ?query
 dsn_query=""
 [ "$dsn_base" != "$PG_DSN" ] && dsn_query="?${PG_DSN#*\?}"
 dsn_prefix="${dsn_base%/*}"                     # everything up to the last '/'
 CHILD_DSN_REFUSE="${dsn_prefix}/${DB_REFUSE}${dsn_query}"
 CHILD_DSN_BOOT="${dsn_prefix}/${DB_BOOT}${dsn_query}"
+CHILD_DSN_SEED="${dsn_prefix}/${DB_SEED}${dsn_query}"
 
 if ! psql "$PG_DSN" -v ON_ERROR_STOP=1 -qtAc "CREATE DATABASE \"${DB_REFUSE}\";" >/dev/null 2>&1; then
   echo "FAIL: could not CREATE DATABASE ${DB_REFUSE} on YUZU_TEST_POSTGRES_DSN — Postgres is set but unusable." >&2
@@ -102,9 +112,15 @@ if ! psql "$PG_DSN" -v ON_ERROR_STOP=1 -qtAc "CREATE DATABASE \"${DB_BOOT}\";" >
   psql "$PG_DSN" -qtAc "DROP DATABASE IF EXISTS \"${DB_REFUSE}\" WITH (FORCE);" >/dev/null 2>&1 || true
   exit 1
 fi
-# Extend the cleanup trap to drop both ephemeral DBs (FORCE closes any
+if ! psql "$PG_DSN" -v ON_ERROR_STOP=1 -qtAc "CREATE DATABASE \"${DB_SEED}\";" >/dev/null 2>&1; then
+  echo "FAIL: could not CREATE DATABASE ${DB_SEED} on YUZU_TEST_POSTGRES_DSN — Postgres is set but unusable." >&2
+  psql "$PG_DSN" -qtAc "DROP DATABASE IF EXISTS \"${DB_REFUSE}\" WITH (FORCE);" >/dev/null 2>&1 || true
+  psql "$PG_DSN" -qtAc "DROP DATABASE IF EXISTS \"${DB_BOOT}\" WITH (FORCE);" >/dev/null 2>&1 || true
+  exit 1
+fi
+# Extend the cleanup trap to drop all three ephemeral DBs (FORCE closes any
 # lingering backend) in addition to removing the temp dir.
-trap 'psql "$PG_DSN" -qtAc "DROP DATABASE IF EXISTS \"${DB_REFUSE}\" WITH (FORCE);" >/dev/null 2>&1 || true; psql "$PG_DSN" -qtAc "DROP DATABASE IF EXISTS \"${DB_BOOT}\" WITH (FORCE);" >/dev/null 2>&1 || true; rm -rf "$TMP"' EXIT
+trap 'psql "$PG_DSN" -qtAc "DROP DATABASE IF EXISTS \"${DB_REFUSE}\" WITH (FORCE);" >/dev/null 2>&1 || true; psql "$PG_DSN" -qtAc "DROP DATABASE IF EXISTS \"${DB_BOOT}\" WITH (FORCE);" >/dev/null 2>&1 || true; psql "$PG_DSN" -qtAc "DROP DATABASE IF EXISTS \"${DB_SEED}\" WITH (FORCE);" >/dev/null 2>&1 || true; rm -rf "$TMP"' EXIT
 
 # Both cases exit before Server::create() ever binds a port (the fatal
 # refusal returns before it; the --mfa-reset one-shot exits before it by
@@ -210,6 +226,40 @@ else
     pass=$((pass+1))
   else
     echo "FAIL - fresh-install bootstrap audit/role/grant (row='$row' want='system|system|User|admin|success'; role='$role' want='admin'; grant_count='$grant_count' want=1)"
+    fail=$((fail+1))
+  fi
+fi
+
+# ── Case 3 (#5343): admin + user in the cfg -> only the admin is provisioned ──
+mkdir -p "$TMP/seed-data" "$TMP/seed-ca"
+python3 -c "
+import hashlib, os
+for name, role in (('admin', 'admin'), ('bob', 'user')):
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac('sha256', 'pw'.encode(), salt, 100000, dklen=32)
+    print(f'{name}:{role}:{salt.hex()}:{dk.hex()}')
+" > "$TMP/seed.cfg"
+chmod 600 "$TMP/seed.cfg"
+
+set +e
+out="$(run_bin --config "$TMP/seed.cfg" --data-dir "$TMP/seed-data" \
+       --ca-dir "$TMP/seed-ca" --postgres-dsn "$CHILD_DSN_SEED" \
+       --mfa-reset admin </dev/null 2>&1)"
+got=$?
+set -e
+
+if [ "$got" != "0" ]; then
+  echo "FAIL - admin+user seed did not complete (--mfa-reset exit=$got want=0; out=$out)"
+  fail=$((fail+1))
+else
+  seed_count="$(psql "$CHILD_DSN_SEED" -qtAc "SELECT count(*) FROM auth.users;")"
+  seed_bob="$(psql "$CHILD_DSN_SEED" -qtAc "SELECT count(*) FROM auth.users WHERE username = 'bob';")"
+  seed_admin="$(psql "$CHILD_DSN_SEED" -qtAc "SELECT count(*) FROM auth.users WHERE username = 'admin' AND role = 'admin';")"
+  if [ "$seed_count" = "1" ] && [ "$seed_bob" = "0" ] && [ "$seed_admin" = "1" ]; then
+    echo "ok   - admin+user cfg: only the admin is provisioned (auth.users count=1, no cfg-only user row)"
+    pass=$((pass+1))
+  else
+    echo "FAIL - admin+user cfg seed (auth.users count='$seed_count' want=1; bob rows='$seed_bob' want=0; admin rows='$seed_admin' want=1)"
     fail=$((fail+1))
   fi
 fi

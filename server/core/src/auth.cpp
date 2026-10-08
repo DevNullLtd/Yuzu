@@ -408,7 +408,7 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
     std::cout << "║       Yuzu Server — First Run Setup      ║\n";
     std::cout << "╠══════════════════════════════════════════╣\n";
     std::cout << "║  No configuration file found.            ║\n";
-    std::cout << "║  Let's create your initial accounts.     ║\n";
+    std::cout << "║  Let's create the administrator account. ║\n";
     std::cout << "╚══════════════════════════════════════════╝\n\n";
 
     // Admin account
@@ -435,37 +435,10 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
 
     std::cout << '\n';
 
-    // User account
-    auto user_name = prompt("User account name", "user");
-    if (user_name.empty()) {
-        std::cerr << "Account name cannot be empty.\n";
-        return false;
-    }
-    if (user_name == admin_name) {
-        std::cerr << "User account must differ from admin account.\n";
-        return false;
-    }
-    auto user_pw = prompt_password("User password");
-    if (const auto verdict = check_password_policy(user_pw);
-        verdict != PasswordPolicyVerdict::kOk) {
-        if (verdict == PasswordPolicyVerdict::kTooShort)
-            std::cerr << std::format("Password must be at least {} bytes (UTF-8).\n",
-                                     kMinPasswordBytes);
-        else
-            std::cerr << std::format("Password must be at most {} bytes.\n", kMaxPasswordBytes);
-        return false;
-    }
-    auto user_pw2 = prompt_password("Confirm user password");
-    if (user_pw != user_pw2) {
-        std::cerr << "Passwords do not match.\n";
-        return false;
-    }
-
     // Build and save config
     AuthManager mgr;
     mgr.cfg_path_ = cfg_path;
     mgr.upsert_user(admin_name, admin_pw, Role::admin);
-    mgr.upsert_user(user_name, user_pw, Role::user);
 
     if (!mgr.save_config()) {
         std::cerr << "Failed to write config to " << cfg_path.string() << '\n';
@@ -2135,11 +2108,23 @@ std::size_t AuthManager::report_stale_cfg_credentials() {
     for (const auto& [name, cfg_hash] : cfg_entries) {
         auto row = auth_db_->get_user(name); // PG I/O outside mu_
         if (!row) {
-            if (row.error() != yuzu::server::AuthDBError::UserNotFound &&
-                row.error() != yuzu::server::AuthDBError::InvalidUsername)
+            if (row.error() == yuzu::server::AuthDBError::UserNotFound) {
+                // #5343: a cfg entry with no auth.users row can never sign in
+                // (the cfg is seed-only; only the first admin is provisioned).
+                // Typical sources: a pre-0.15.0 install's second first-run
+                // account / installer /OPERATOR_USER entry that was never
+                // provisioned, or an account since deleted. Not counted as
+                // "stale" (nothing in the store to shadow), and no new gauge.
+                spdlog::warn("#5343 boot check: cfg entry '{}' has no auth.users row (never "
+                             "provisioned - #5343 - or since deleted); cfg is seed-only so it "
+                             "cannot sign in; remove the line, create the account in Settings "
+                             "> User Management",
+                             name);
+            } else if (row.error() != yuzu::server::AuthDBError::InvalidUsername) {
                 spdlog::warn("#5274 boot check: could not read auth.users row for cfg user '{}' "
                              "(store error) - stale-credential check skipped for it",
                              name);
+            }
             continue; // no row: the cfg entry is not shadowing anything
         }
         if (!constant_time_compare(row->hash_hex, cfg_hash)) {
