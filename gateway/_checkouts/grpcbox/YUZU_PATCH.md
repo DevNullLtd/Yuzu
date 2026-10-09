@@ -75,15 +75,17 @@ from `handle_info`, which discards `end_stream`'s returned state, so
 the handler again; for client-streaming or bidi, it goes to the dead handler
 process and runs nothing. Only an admitted peer can be affected: a rejected
 stream already has `trailers_sent` set, so the guard drops its data even if the
-deadline fires. This is stock behaviour that neither this patch nor
-tsloughter/grpcbox#123 changes. Tracked in #5591 (late DATA after a deadline) and
-#5590 (core's `SendCommand` deadline equals the gateway fan-out timeout).
+deadline fires. This patch does not change that stock behaviour. Upstream,
+tsloughter/grpcbox#123 also fixes it, by having those `handle_info` clauses keep
+`end_stream`'s state. Tracked in #5591 (late DATA after a deadline) and #5590
+(core's `SendCommand` deadline equals the gateway fan-out timeout).
 
 An unknown method (UNIMPLEMENTED) is not affected: the method is never stored, so
 the stock `method=undefined` clause already drops the data.
 
-Reported upstream as tsloughter/grpcbox#122, with the same fix and a regression
-test in tsloughter/grpcbox#123. Still unfixed in v0.18.0, the latest release as of
+Reported upstream as tsloughter/grpcbox#122. tsloughter/grpcbox#123 carries the
+same guard, the `handle_info` fix for the two uncovered ends, and regression tests
+for both. Still unfixed in v0.18.0, the latest release as of
 2026-10-09.
 
 ### 3. `src/grpcbox_stream.erl`: typed accessors for the connection pid
@@ -145,7 +147,8 @@ upstreaming target is making `verify`/`fail_if_no_peer_cert` configurable in
 grpcbox itself (then this vendor can be dropped). Tracked with PR5c.
 
 Patch 2 can be dropped only once the vendored release drops data on **every**
-stream with `trailers_sent=true`, as tsloughter/grpcbox#123 does today. Check the
+stream with `trailers_sent=true` and keeps `trailers_sent` when `handle_info` ends a
+stream, as tsloughter/grpcbox#123 does today. Check the
 merged upstream code, not just the PR number, and keep `yuzu_gw_authz_rpc_tests`
 either way.
 
