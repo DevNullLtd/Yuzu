@@ -1,4 +1,4 @@
-# Vendored grpcbox (Yuzu patches: PKI PR5c, #1422, connection accessor)
+# Vendored grpcbox (Yuzu patches: PKI PR5c, #1422, connection accessor, #5591)
 
 This is a **vendored copy of grpcbox v0.17.1** (`github.com/tsloughter/grpcbox`,
 the tag the gateway pins in `rebar.config` / `rebar.lock`), carried in `_checkouts/`
@@ -6,7 +6,7 @@ so rebar3 uses it in place of the fetched dependency. Only the **source** is
 vendored (`src/`, `include/`, `rebar.config`, `LICENSE`); grpcbox's own deps
 (chatterbox, ctx, acceptor_pool, gproc) are still fetched normally.
 
-## The patch: three places
+## The patch: four places
 
 ### 1. `src/grpcbox_pool.erl` — configurable listener mTLS strictness (PKI PR5c)
 
@@ -68,24 +68,19 @@ covers one post-admission path: a decode or handler error caught in
 DATA frame from the (already admitted) peer runs the handler again while the
 client has been told the call failed. Do not narrow the guard to the auth path.
 
-Two other early ends are **not** covered. A `grpc-timeout` deadline
-(DEADLINE_EXCEEDED) and a spawned handler process exiting both end the stream
-from `handle_info`, which discards `end_stream`'s returned state, so
-`trailers_sent` stays false. For a server-streaming method, later DATA then runs
-the handler again; for client-streaming or bidi, it goes to the dead handler
-process and runs nothing. Only an admitted peer can be affected: a rejected
-stream already has `trailers_sent` set, so the guard drops its data even if the
-deadline fires. This patch does not change that stock behaviour. Upstream,
-tsloughter/grpcbox#123 also fixes this, by having those `handle_info` clauses keep
-`end_stream`'s state. Tracked in #5591 (late DATA after a deadline) and #5590
-(core's `SendCommand` deadline equals the gateway fan-out timeout).
+Two other early ends need patch 4 as well. In stock grpcbox a `grpc-timeout`
+deadline (DEADLINE_EXCEEDED) and a spawned handler process exiting both end the
+stream from `handle_info`, which discards `end_stream`'s returned state, so
+`trailers_sent` stays false and this guard never fires. Patch 4 keeps that state,
+so the guard covers both. The guard and patch 4 work together: do not drop one
+without the other.
 
 An unknown method (UNIMPLEMENTED) is not affected: the method is never stored, so
 the stock `method=undefined` clause already drops the data.
 
 Reported upstream as tsloughter/grpcbox#122. tsloughter/grpcbox#123 carries the
-same guard, the `handle_info` fix for the two uncovered ends, and regression tests
-for both. Neither fix is in v0.18.0, the latest release as of 2026-10-09.
+same guard, the same `handle_info` change as patch 4, and regression tests for
+both. Neither fix is in v0.18.0, the latest release as of 2026-10-09.
 
 ### 3. `src/grpcbox_stream.erl`: typed accessors for the connection pid
 
@@ -116,6 +111,48 @@ no authenticator and do not touch `auth_fun` (which stays forbidden on `:50051`)
 The `connection_pid/1` spec refers to chatterbox's `h2_stream_set:stream_set()`, which is
 why `gateway/rebar.config` lists `chatterbox` and `ssl` in the dialyzer `plt_extra_apps`.
 
+### 4. `src/grpcbox_stream.erl`: keep `end_stream`'s state in `handle_info` (#5591)
+
+In `handle_info/2` (search `YUZU PATCH (#5591)`), the four `'EXIT'` clauses and
+the `grpc-timeout` clause:
+
+```erlang
+%% before (stock v0.17.1):
+handle_info({timeout,_Ref,<<"grpc-timeout">>}, State) ->
+    end_stream(?GRPC_STATUS_DEADLINE_EXCEEDED, <<"Deadline expired">>, State),
+    State;
+%% after:
+handle_info({timeout,_Ref,<<"grpc-timeout">>}, State) ->
+    {ok, State1} = end_stream(?GRPC_STATUS_DEADLINE_EXCEEDED, <<"Deadline expired">>, State),
+    State1;
+```
+
+chatterbox stores `handle_info/2`'s return value as the stream's callback state.
+Stock grpcbox returned the state from *before* `end_stream`, so `trailers_sent`
+stayed false after a deadline or a handler exit, and request DATA arriving
+afterwards reached `handle_message`. For a server-streaming method such as
+`SendCommand` that ran the handler, and so a fleet fan-out, after the client had
+been told the call failed. For client-streaming or bidi, DATA after a handler
+exit went to the dead handler process and ran nothing, but DATA after a deadline
+still reached the live handler; both are now dropped. Only an admitted peer could
+be affected: a rejected stream already has `trailers_sent` set. Keeping the
+returned state also keeps `headers_sent`, and a second exit or timeout on the
+same stream no longer sends trailers twice. Every `end_stream` clause returns
+`{ok, State}`, so the match cannot fail.
+
+The drop is silent: the guard clause logs nothing and emits no metric (#5599).
+
+The guard only applies once the stream has ended. A second request message that
+arrives *before* the first handler exits, including one in the same DATA frame,
+still starts a second handler in stock grpcbox and with these patches; that is
+tracked in #5593.
+
+Regression-pinned by `yuzu_gw_authz_rpc_tests` (the two #5591 cases: DATA after
+the stream's deadline, and a second message after the handler exited). Same
+change as tsloughter/grpcbox#123. #5590 (core's `SendCommand` deadline equals the
+gateway fan-out timeout) is a separate problem this does not fix: the handler
+already running when the deadline fires still completes.
+
 ## Integrity gate (machine-verifiable)
 
 The exact change is committed as a canonical patch file,
@@ -134,9 +171,10 @@ bash gateway/scripts/verify-vendored-grpcbox.sh
 
 This is intentionally a *minimal* vendor of a *pinned* tag. To move to a newer
 grpcbox: re-copy `src/`+`include/`+`rebar.config`+`LICENSE` from the new tag,
-re-apply `grpcbox.yuzu.patch` (or the three `YUZU PATCH` sites:
-`grpcbox_pool.erl:init/1`, `grpcbox_stream.erl:on_receive_data/2` and the
-`connection_pid` accessors in `grpcbox_stream.erl`, by hand), regenerate
+re-apply `grpcbox.yuzu.patch` (or the four `YUZU PATCH` sites:
+`grpcbox_pool.erl:init/1`, `grpcbox_stream.erl:on_receive_data/2`, the
+`connection_pid` accessors in `grpcbox_stream.erl`, and
+`grpcbox_stream.erl:handle_info/2`, by hand), regenerate
 `grpcbox.yuzu.patch` against the new stock, bump the `{tag, "vX.Y.Z"}` pin in
 `rebar.config` (grpcbox stays OUT of `rebar.lock` — it is a checkout; rebar3
 refuses to lock it), update `EXPECTED_SHA` in
@@ -145,11 +183,11 @@ gateway suite + dialyzer, and re-run `verify-vendored-grpcbox.sh`. The
 upstreaming target is making `verify`/`fail_if_no_peer_cert` configurable in
 grpcbox itself (then this vendor can be dropped). Tracked with PR5c.
 
-Patch 2 can be dropped only once the vendored release drops data on **every**
-stream with `trailers_sent=true` and keeps `trailers_sent` when `handle_info` ends a
-stream, as tsloughter/grpcbox#123 does today. Check the
-merged upstream code, not just the PR number, and keep `yuzu_gw_authz_rpc_tests`
-either way.
+Patches 2 and 4 can be dropped together, and only once the vendored release
+drops data on **every** stream with `trailers_sent=true` and keeps
+`trailers_sent` when `handle_info` ends a stream, as tsloughter/grpcbox#123 does
+today. Check the merged upstream code, not just the PR number, and keep
+`yuzu_gw_authz_rpc_tests` either way.
 
 Any re-sync to grpcbox v0.18.0 or later (chatterbox 0.16) must also handle the
 chatterbox module rename: `h2_*` becomes `chatterbox_h2_*`. Three places use the
