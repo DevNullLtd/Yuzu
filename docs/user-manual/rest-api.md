@@ -6127,14 +6127,14 @@ a different order on each call; the export routes order ties by `id` descending.
 **Export body size cap (#4703).** Both export routes (this family's `GET /api/v1/responses/{id}/export`
 and the legacy `GET /api/responses/{id}/export`) also stop once the rows served carry 50 MiB of
 payload (`output` plus `error_detail`, as stored), on top of the row-count cap: each response's
-`output`/`error_detail` is cut to only 2 MiB of raw bytes at ingest (one exception, below), so a row-count cap alone still let a
+`output`/`error_detail` is cut to only 2 MiB of raw bytes at ingest (including the `error_detail` a terminal frame writes), so a row-count cap alone still let a
 10,000-row export serialize to tens of GB. The cut is made **inside the store query**: the database
 keeps rows while the payload of the rows before them is under the cap, so the fetch holds about 50
 MiB of payload plus one final row, not every row up to `limit`. The cap is on whole rows, so the
 last row kept can run past it by up to its own size. Each of `output` and `error_detail` is cut to
 2 MiB of raw bytes at ingest, and only afterwards is each invalid byte or NUL replaced by the 3-byte
 U+FFFD, so a row is about 4 MiB for text output and can reach about 12 MiB for output dense in
-invalid bytes or NULs. The exception is the `error_detail` written when a terminal frame closes a running row, which is sanitised but not cut at ingest and is bounded only by the gRPC receive message limit (4 MiB by default; the server does not override it), so a row can exceed these figures. At least one row is always served, so a single row larger than the cap is
+invalid bytes or NULs. That holds for the `error_detail` written when a terminal frame closes a running row too. At least one row is always served, so a single row larger than the cap is
 still returned. A second check while serializing counts what each format builds (CSV quoting and
 JSON framing make the serialized row larger than its raw payload): for JSON it is the serialized
 size of each row object, which excludes the commas between rows, the envelope and the legacy
@@ -6146,7 +6146,7 @@ with the unbounded `query()` fetch; other row shapes were not measured, and the 
 built afterwards is additional. These named routes are **not** covered by the byte cap: the plain
 list routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP
 `query_responses` and `GET /api/v1/executions/{id}/responses`) are capped by row count only (at
-most 1000 rows of up to 2 MiB of raw bytes per field, before the U+FFFD growth and the uncut terminal-frame `error_detail` described above);
+most 1000 rows of up to 2 MiB of raw bytes per field, before the U+FFFD growth described above);
 the dashboard results fragment's FILTERED branch (it reads by response id, not through
 `query_bounded`) is not bounded either. **Bounded by the same 50 MiB cap in SQL (#4644):** the
 execution visualization route (`GET /api/v1/executions/{id}/visualization`), the dashboard results

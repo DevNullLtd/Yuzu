@@ -5121,7 +5121,7 @@ routes must treat that `503` as retryable.
 MiB of payload plus one final row while it is fetched. The cap is on whole rows, so the last row
 kept can run past it by up to its own size (each of `output` and `error_detail` is cut to 2 MiB at
 ingest before invalid bytes and NULs become the 3-byte U+FFFD, so a row is about 4 MiB for text
-output and up to about 12 MiB for output dense in invalid bytes or NULs; the exception is the `error_detail` written when a terminal frame closes a running row, which is sanitised but not cut at ingest and is bounded only by the gRPC receive message limit, so a row can exceed these figures). The serialization-time
+output and up to about 12 MiB for output dense in invalid bytes or NULs; the `error_detail` written when a terminal frame closes a running row is cut the same way). The serialization-time
 backstop counts escaped bytes (the whole body so far for CSV, each serialized row object for JSON),
 so a result under 50 MiB of raw payload can still be cut and reported as `byte_cap`. One measurement, 400 rows
 of 512 KiB: the store query's peak resident memory rose by 99 MiB with the bounded fetch, against
@@ -5129,7 +5129,7 @@ of 512 KiB: the store query's peak resident memory rose by 99 MiB with the bound
 afterwards is additional. These named routes are not covered by the byte cap: the plain list
 routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP `query_responses`,
 `GET /api/v1/executions/{id}/responses`) are capped by row count only, at most 1000 rows of up to
-2 MiB of raw bytes per field (plus the uncut terminal-frame `error_detail`), and the dashboard
+2 MiB of raw bytes per field, and the dashboard
 results fragment's filtered branch (it reads by response id) has no byte bound. The execution
 visualization route, the dashboard results fragment's unfiltered read and the TAR
 retention-paused scan page's read are bounded by the same 50 MiB cap in SQL and say so when it

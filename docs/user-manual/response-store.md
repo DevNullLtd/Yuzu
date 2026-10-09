@@ -214,7 +214,7 @@ The CSV format includes the columns:
 carry 50 MiB of `output` plus `error_detail` (always on whole rows, and at least one row is
 served; the last row kept can run past the cap by up to its own size: about 4 MiB for text output,
 up to about 12 MiB for output dense in invalid bytes or NULs, because each field is cut to 2 MiB at
-ingest before invalid bytes and NULs are replaced by the 3-byte U+FFFD; the exception is the `error_detail` written when a terminal frame closes a running row, which is not cut at ingest and is bounded only by the gRPC receive message limit, so a row can exceed these figures). The cap is not
+ingest before invalid bytes and NULs are replaced by the 3-byte U+FFFD; this includes the `error_detail` written when a terminal frame closes a running row). The cap is not
 configurable. A cut export, whether by the row limit with more matching rows left, or by the byte
 cap, is marked, so check for it before trusting a bulk pull: the JSON envelope has a top-level
 `"result_truncated_by_cap": true`, and a CSV file ends with one extra trailer record,
