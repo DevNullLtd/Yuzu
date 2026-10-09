@@ -37,6 +37,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -58,7 +59,9 @@ namespace yuzu::server {
 
 /// Everything the flow reads that is not constructed by it. The references are the
 /// header-only collaborators (concrete, so a test drives the real gate, caches and budget with
-/// manual clocks); the callables are the pieces that stay in `ServerImpl`.
+/// manual clocks); the callables are the pieces that stay in `ServerImpl`. Every callable except
+/// `audit` and `now` is required: the constructor throws `std::invalid_argument` naming an
+/// empty one.
 struct GuardianReconcileFlowDeps {
     GuardianReconcileGate& gate;
     GuardianGenerationCache& generation_cache;
@@ -109,7 +112,18 @@ public:
           random_suffix_(std::move(deps.random_suffix)),
           now_(deps.now ? std::move(deps.now)
                         : std::function<std::chrono::steady_clock::time_point()>{
-                              [] { return std::chrono::steady_clock::now(); }}) {}
+                              [] { return std::chrono::steady_clock::now(); }}) {
+        // An empty std::function would otherwise surface as std::bad_function_call on the
+        // first heartbeat that reaches it, thrown from a heartbeat thread. Fail at
+        // construction, naming the dependency. (`audit` and `now` keep their defaults.)
+        require(store_wired_, "store_wired");
+        require(list_rules_, "list_rules");
+        require(deployed_ids_, "deployed_ids");
+        require(session_os_, "session_os");
+        require(eval_scope_, "eval_scope");
+        require(send_push_, "send_push");
+        require(random_suffix_, "random_suffix");
+    }
 
     GuardianReconcileFlow(const GuardianReconcileFlow&) = delete;
     GuardianReconcileFlow& operator=(const GuardianReconcileFlow&) = delete;
@@ -473,6 +487,13 @@ public:
     }
 
 private:
+    template <typename Fn>
+    static void require(const Fn& fn, const char* name) {
+        if (!fn)
+            throw std::invalid_argument(
+                std::string("GuardianReconcileFlow: required dependency is empty: ") + name);
+    }
+
     GuardianReconcileGate& guardian_reconcile_gate_;
     GuardianGenerationCache& guardian_generation_cache_;
     guardian::GuardianRuleBundleCache& guardian_rule_bundle_cache_;

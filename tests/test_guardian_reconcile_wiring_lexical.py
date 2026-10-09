@@ -103,7 +103,15 @@ Invariants over the WIRING (server.cpp):
      `send_push` builds a `DispatchCaller{.system = true}` for `__guard__`/`push_rules`, sends
      through `send_system_reserved(... guardian_push_rules)` and calls `forward_gateway_pending()`
      exactly once, only on the success branch; `audit` keeps the `audit_store_->is_open()` check;
-     `list_rules`, `deployed_ids`, `session_os` and `random_suffix` keep their sources.
+     `list_rules`, `deployed_ids`, `session_os` and `random_suffix` keep their sources. The
+     callables are also pinned to their exact reviewed BODIES (whitespace, wrapping and comments
+     are free; values are not), because the flow's tests stub them: `store_wired` is exactly
+     `static_cast<bool>(guaranteed_state_store_)`; `list_rules` is exactly
+     `guaranteed_state_store_->list_rules()`; `session_os` looks up `registry_.get_session(agent_id)`
+     and returns `sess->os`; `random_suffix` is `bytes_to_hex(random_bytes(8))`; `eval_scope`
+     passes its own `agent_id` and `expr` and the real `tag_store_.get()` /
+     `custom_properties_store_.get()`; `send_push` builds the command from its own `command_id`
+     and `push_bytes` and sends to its own `agent_id`.
 
 LEXICAL ONLY. It cannot see a relocation that keeps the tokens but changes control flow (that
 stays review-enforced), and the behavioural guarantees are the building blocks' own unit tests.
@@ -485,8 +493,38 @@ def problems(src):
             for pat in needs:
                 if not re.search(pat, blk):
                     out.append(f"the .{name} dependency no longer matches `{pat}` (u)")
+        # Exact bodies (whitespace and line wrapping tolerant: the text is lexed, comments gone,
+        # runs of whitespace collapsed). A callable that keeps the right TOKENS but feeds them the
+        # wrong values (a constant command id, an empty push, another agent's id, null stores) is
+        # exactly the wiring defect the flow's unit tests cannot see, because they stub these.
+        for name, pat in (
+                ("store_wired", r"^\{ ?return static_cast<bool>\( ?guaranteed_state_store_ ?\) ?; ?\}$"),
+                ("list_rules", r"^\{ ?return guaranteed_state_store_ ?-> ?list_rules\( ?\) ?; ?\}$"),
+                ("deployed_ids", r"^\{ ?return deployed_member_rule_ids\( ?\) ?; ?\}$"),
+                ("random_suffix", r"^\{ ?return (?:auth::)?AuthManager::bytes_to_hex\( ?(?:auth::)?AuthManager::"
+                                  r"random_bytes\(8\) ?\) ?; ?\}$"),
+                ("session_os", r"^\{ ?auto sess = registry_ ?\. ?get_session\( ?agent_id ?\) ?; ?"
+                               r"if ?\( ?! ?sess ?\) ?(?:\{ ?)?return std::nullopt ?; ?(?:\} ?)?"
+                               r"return sess ?-> ?os ?; ?\}$"),
+                ("eval_scope", r"^\{ ?return registry_ ?\. ?evaluate_scope_for_agent\( ?agent_id, ?expr, ?"
+                               r"tag_store_ ?\. ?get\( ?\), ?custom_properties_store_ ?\. ?get\( ?\) ?\) ?; ?\}$")):
+            blk = field_block(name)
+            if blk is not None and not re.search(pat, blk.strip()):
+                out.append(f"the .{name} dependency body is no longer exactly its reviewed form `{pat}` (u)")
         sp = field_block("send_push")
         if sp is not None:
+            # The command id and the push bytes are the lambda's OWN parameters, and the target is
+            # its agent_id: never a constant, an empty string or another variable.
+            if not re.search(r"\bbuild_classified_command\( ?yuzu::server::DispatchCaller ?\{ ?\.system = true ?\} ?, ?"
+                             r'"__guard__", ?"push_rules", ?command_id, ?\{ ?\} ?, ?push_bytes ?\)', sp):
+                out.append("the .send_push dependency no longer builds the command as "
+                           "build_classified_command(DispatchCaller{.system = true}, \"__guard__\", "
+                           "\"push_rules\", command_id, {}, push_bytes) with its own parameters (u)")
+            if not re.search(r"\bsend_system_reserved\( ?agent_id, ?\*classified, ?"
+                             r"yuzu::server::SystemReservedPush::guardian_push_rules ?\)", sp):
+                out.append("the .send_push dependency no longer sends with "
+                           "send_system_reserved(agent_id, *classified, guardian_push_rules) to its own "
+                           "agent_id (u)")
             if len(re.findall(r"\bforward_gateway_pending\(\)", sp)) != 1 or not re.search(
                     r"\bsend_system_reserved\([^{}]*?\) ?\) ?\{ ?forward_gateway_pending\(\) ?; ?return true ?;", sp):
                 out.append("the .send_push dependency must call forward_gateway_pending() exactly once, and only "
@@ -672,6 +710,19 @@ def _after(marker, old, new):
         i = s.index(marker)
         j = s.index(old, i)
         return s[:j] + new + s[j + len(old):]
+    return mut
+
+
+def _wafter(marker, old, new):
+    """Like _after but `old` is matched whitespace-tolerantly (tokens split on whitespace in `old`,
+    joined by \\s* in the pattern), so a mutation survives clang-format's wrapping of the wiring."""
+    pattern = r"\s*".join(re.escape(tok) for tok in re.split(r"\s+", old.strip()))
+
+    def mut(s):
+        i = s.index(marker)
+        m = re.compile(pattern).search(s, i)
+        assert m, "wafter: pattern not found after marker (stale pattern): " + old[:50]
+        return s[:m.start()] + new + s[m.end():]
     return mut
 
 
@@ -923,6 +974,35 @@ SERVER_MUTATIONS = [m for m in MUTATIONS if m[2] in SERVER_LETTERS] + [
      _after(FLOW_CTOR, "auto sess = registry_.get_session(agent_id);", "auto sess = std::shared_ptr<AgentSession>{};"), "(u)"),
     ("command id suffix no longer random",
      _after(FLOW_CTOR, "auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8))", "std::string(\"0\")"), "(u)"),
+    # (u) exact wiring bodies: the right tokens fed the wrong values.
+    ("push dependency sends an EMPTY push (ignores its push_bytes parameter)",
+     _wafter(FLOW_CTOR, "command_id, /*parameters=*/{}, push_bytes);", "command_id, /*parameters=*/{}, std::string{});"), "(u)"),
+    ("push dependency uses a CONSTANT command id (ignores its command_id parameter)",
+     _wafter(FLOW_CTOR, '"push_rules", command_id,', '"push_rules", std::string("fixed-id"),'), "(u)"),
+    ("push dependency sends to the wrong agent_id",
+     _wafter(FLOW_CTOR, "send_system_reserved( agent_id, *classified,", "send_system_reserved( other_agent_id_, *classified,"), "(u)"),
+    ("scope dependency passes null tag and property stores",
+     _wafter(FLOW_CTOR, "evaluate_scope_for_agent(agent_id, expr, tag_store_.get(), custom_properties_store_.get())",
+             "evaluate_scope_for_agent(agent_id, expr, nullptr, nullptr)"), "(u)"),
+    ("scope dependency passes only the tag store",
+     _wafter(FLOW_CTOR, "tag_store_.get(), custom_properties_store_.get())", "tag_store_.get(), nullptr)"), "(u)"),
+    ("scope dependency evaluates the wrong agent_id",
+     _wafter(FLOW_CTOR, "evaluate_scope_for_agent(agent_id, expr,", "evaluate_scope_for_agent(other_agent_id_, expr,"), "(u)"),
+    ("store_wired is constant true",
+     _wafter(FLOW_CTOR, "return static_cast<bool>(guaranteed_state_store_);", "return true;"), "(u)"),
+    ("store_wired inverted",
+     _wafter(FLOW_CTOR, "return static_cast<bool>(guaranteed_state_store_);", "return !static_cast<bool>(guaranteed_state_store_);"), "(u)"),
+    ("list_rules gains a side effect before the read",
+     _wafter(FLOW_CTOR, "return guaranteed_state_store_->list_rules();", "(void)deployed_member_rule_ids(); return guaranteed_state_store_->list_rules();"), "(u)"),
+    ("session lookup targets the wrong agent",
+     _wafter(FLOW_CTOR, "registry_.get_session(agent_id)", "registry_.get_session(other_agent_id_)"), "(u)"),
+    ("session os is a constant",
+     _wafter(FLOW_CTOR, "return sess->os;", 'return std::string("linux");'), "(u)"),
+    ("command id suffix uses fewer random bytes",
+     _wafter(FLOW_CTOR, "random_bytes(8)", "random_bytes(1)"), "(u)"),
+    ("command id suffix is random bytes without the hex encoding",
+     _wafter(FLOW_CTOR, "return auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));",
+             "return std::string(auth::AuthManager::random_bytes(8).begin(), auth::AuthManager::random_bytes(8).end());"), "(u)"),
     ("filter and std::move combined in one statement (server.cpp)",
      (lambda s: s + "\nauto b = guardian::make_bundle(guardian::filter_deployed_members(r, d), std::move(*deployed_result));\n"), "(o)"),
 ]
@@ -950,6 +1030,20 @@ BENIGN_FLOW = [
 ]
 
 BENIGN_SERVER = [
+    # (u) exact bodies must accept reflow and comments, only values matter.
+    ("scope dependency call re-wrapped, one argument per line",
+     _wafter(FLOW_CTOR, "evaluate_scope_for_agent(agent_id, expr, tag_store_.get(), custom_properties_store_.get());",
+             "evaluate_scope_for_agent(\n agent_id,\n expr,\n tag_store_.get(),\n custom_properties_store_.get());")),
+    ("push command built on one line with a comment on each argument",
+     _wafter(FLOW_CTOR, 'build_classified_command( yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules", command_id, /*parameters=*/{}, push_bytes);',
+             'build_classified_command(yuzu::server::DispatchCaller{.system = true}, /*caller*/ "__guard__", "push_rules", /*id*/ command_id, {}, /*bytes*/ push_bytes);')),
+    ("send_system_reserved call re-wrapped",
+     _wafter(FLOW_CTOR, "send_system_reserved( agent_id, *classified,", "send_system_reserved(\n agent_id,\n *classified,")),
+    ("store_wired body split across lines with a comment",
+     _wafter(FLOW_CTOR, "[this] { return static_cast<bool>(guaranteed_state_store_); }",
+             "[this] {\n // the store pointer is reset by stop()\n return static_cast<bool>(guaranteed_state_store_);\n }")),
+    ("session lookup with braces around the early return",
+     _wafter(FLOW_CTOR, "if (!sess) return std::nullopt;", "if (!sess) { return std::nullopt; }")),
     # (q) must accept restructurings that keep the invariant: the gate is about order and
     # placement, not about the exact text of the sweep try.
     ("the sweep result is consumed",

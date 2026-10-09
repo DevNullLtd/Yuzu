@@ -19,10 +19,12 @@
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <spdlog/sinks/ostream_sink.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -147,15 +149,27 @@ public:
                     clock.fn()),
           bundle_cache(guardian::GuardianRuleBundleCacheConfig{},
                        [this] {
+                           // Read BEFORE the hook: the hook may release a thread that advances
+                           // the clock, and a reader that took the value after that would see
+                           // the advance as if it had happened before this read.
+                           const auto t = clock.now();
                            if (bundle_clock_hook)
                                bundle_clock_hook();
-                           return clock.now();
+                           return t;
                        }),
           store_generation(o.store_generation) {
         duration = &metrics.histogram("yuzu_server_guardian_reconcile_duration_seconds",
                                       std::vector<double>{0.0001, 0.001, 0.01, 0.1, 1.0, 10.0});
         set_rules({rule("r1")});
-        flow = std::make_unique<GuardianReconcileFlow>(GuardianReconcileFlowDeps{
+        flow = std::make_unique<GuardianReconcileFlow>(make_deps());
+    }
+    Rig(const Rig&) = delete;
+    Rig& operator=(const Rig&) = delete;
+
+    // Every dependency wired to this rig's stubs. Public so a test can empty one and construct
+    // a second flow; the references and the captured `this` outlive that flow.
+    GuardianReconcileFlowDeps make_deps() {
+        return GuardianReconcileFlowDeps{
             .gate = gate,
             .generation_cache = gen_cache,
             .rule_bundle_cache = bundle_cache,
@@ -166,7 +180,7 @@ public:
             .list_rules = [this]() -> std::expected<std::vector<GuaranteedStateRuleRow>,
                                                     std::string> {
                 ++list_calls;
-                trace.push_back("list_rules");
+                note("list_rules");
                 if (list_hook)
                     list_hook();
                 if (rules_throw)
@@ -178,13 +192,13 @@ public:
             .deployed_ids = [this]() -> std::expected<std::unordered_set<std::string>,
                                                       std::string> {
                 ++deployed_calls;
-                trace.push_back("deployed_ids");
+                note("deployed_ids");
                 if (deployed_error)
                     return std::unexpected(*deployed_error);
                 return deployed;
             },
             .session_os = [this](const std::string& agent_id) -> std::optional<std::string> {
-                trace.push_back("session");
+                note("session");
                 session_agents.push_back(agent_id);
                 return session_os;
             },
@@ -192,7 +206,7 @@ public:
                                  const yuzu::scope::Expression& expr)
                 -> std::expected<bool, ScopeEvalError> {
                 ++eval_calls;
-                trace.push_back("eval_scope");
+                note("eval_scope");
                 eval_agents.push_back(agent_id);
                 const auto* cond = std::get_if<yuzu::scope::Condition>(&expr);
                 const auto it = scope_outcomes.find(cond ? cond->value : std::string{});
@@ -212,19 +226,17 @@ public:
             },
             .send_push = [this](const std::string& agent_id, const std::string& command_id,
                                 const std::string& bytes) {
-                trace.push_back("send_push");
+                note("send_push");
                 sent.push_back({agent_id, command_id, bytes});
                 return send_result;
             },
             .audit = [this](const AuditEvent& ev) {
-                trace.push_back("audit");
+                note("audit");
                 audits.push_back(ev);
             },
             .random_suffix = [this] { return "sfx" + std::to_string(++suffix_calls); },
-            .now = shed_clock.fn()});
+            .now = shed_clock.fn()};
     }
-    Rig(const Rig&) = delete;
-    Rig& operator=(const Rig&) = delete;
 
     void set_rules(std::vector<GuaranteedStateRuleRow> rs) {
         rules = std::move(rs);
@@ -282,7 +294,13 @@ public:
     std::function<void()> bundle_clock_hook;
 
     // ---- recorded effects ----
+    // Every stub call, in order, with the gate's in-flight count as the stub saw it.
+    void note(std::string what) {
+        trace.push_back(std::move(what));
+        inflight_at.push_back(gate.in_flight());
+    }
     std::vector<std::string> trace;
+    std::vector<std::size_t> inflight_at;
     std::vector<std::string> session_agents;
     std::vector<std::string> eval_agents;
     std::vector<SentPush> sent;
@@ -299,7 +317,7 @@ public:
 private:
     GuardianGenerationCache::Result fetch_generation() {
         ++fetch_calls;
-        trace.push_back("generation_read#" + std::to_string(fetch_calls));
+        note("generation_read#" + std::to_string(fetch_calls));
         if (on_fetch)
             return on_fetch(fetch_calls);
         if (!gen_error.empty())
@@ -739,6 +757,47 @@ TEST_CASE("GuardianReconcileFlow: a failed send counts, gauges and audits nothin
     CHECK(rig.suffix_calls == 1);
 }
 
+TEST_CASE("GuardianReconcileFlow: the rule bundle is keyed by the FRESH generation, never the cached one",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    // The cached read says 7 (what the decision used); the fresh read says 9 (what labels the
+    // push and keys the bundle).
+    rig.on_fetch = [](int n) -> GuardianGenerationCache::Result { return n == 1 ? 7 : 9; };
+    rig.set_rules({rule("fresh-only")});
+    // A bundle for the CACHED generation is already held, with different rules. Keying the
+    // lookup by `current` would hit it and push generation 7's rules under generation 9's label.
+    const auto stale = rig.bundle_cache.get(
+        7, []() -> std::expected<guardian::Bundle, guardian::BundleLoadError> {
+            return guardian::make_bundle({rule("stale-only")}, {"stale-only"});
+        });
+    REQUIRE(stale.has_value());
+    REQUIRE(rig.bundle_cache.held_generation() == 7);
+
+    rig.run("agent-1", 3);
+
+    REQUIRE(rig.sent.size() == 1);
+    const auto push = parse_push(rig.sent[0].bytes);
+    CHECK(rule_ids(push) == std::vector<std::string>{"fresh-only"});
+    CHECK(push.policy_generation() == 9);
+    CHECK(rig.list_calls == 1);  // the held generation-7 bundle was a miss for generation 9
+    CHECK(rig.bundle_cache.held_generation() == 9);
+}
+
+TEST_CASE("GuardianReconcileFlow: after a scope store degrades no later scoped rule is evaluated",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    rig.set_rules({rule("a", "", "tag:grp == alpha"), rule("b", "", "tag:grp == beta"),
+                   rule("c", "", "tag:grp == alpha")});
+    rig.scope_outcomes["alpha"] = ScopeOutcome::StoreDegraded;
+    rig.scope_outcomes["beta"] = ScopeOutcome::Member;
+    rig.run();
+    CHECK(rig.count("degraded") == 1.0);
+    CHECK(rig.sent.empty());
+    // One probe found the store down; probing it again for every remaining rule would multiply
+    // the load on a store that has just failed.
+    CHECK(rig.eval_calls == 1);
+}
+
 // ---------------------------------------------------------------------------------------
 // Order, budget accounting.
 // ---------------------------------------------------------------------------------------
@@ -774,11 +833,14 @@ TEST_CASE("GuardianReconcileFlow: the budget is charged for the generation read 
     CHECK(rig.budget.balance_ms() == Catch::Approx(10'000.0 - 240.0).margin(0.01));
 }
 
-TEST_CASE("GuardianReconcileFlow: only the wait on ANOTHER thread's load is excluded from the debit",
-          "[guardian][reconcile_flow]") {
-    RigOptions o;
-    o.budget = {.budget_ms_per_s = 1.0, .burst_ms = 10'000.0, .max_per_s = 1000};
-    Rig rig(o);
+namespace {
+
+// Drives one reconcile as the WAITER behind another thread's in-flight bundle load of the
+// generation the flow will ask for (7), a load that takes 300 ms on the manual clock and ends
+// in success or in the given error. The flow's fresh generation read adds 40 ms of its own.
+// Deterministic: the flow thread's second bundle-cache clock read (t0, taken just before it
+// blocks) releases the owner, so the 300 ms wait is neither racy nor slept.
+void run_behind_slow_owner(Rig& rig, std::optional<guardian::BundleLoadError> owner_error) {
     rig.on_fetch = [&](int n) -> GuardianGenerationCache::Result {
         if (n == 2)
             rig.clock.advance(40ms);  // charged: the fresh generation read
@@ -805,8 +867,8 @@ TEST_CASE("GuardianReconcileFlow: only the wait on ANOTHER thread's load is excl
         }
     };
 
-    // The owner: another thread's in-flight load of generation 7, 300 ms long on the clock.
-    std::thread owner([&] {
+    // jthreads: a failed REQUIRE below unwinds through their joins instead of terminating.
+    std::jthread owner([&] {
         (void)rig.bundle_cache.get(
             7, [&]() -> std::expected<guardian::Bundle, guardian::BundleLoadError> {
                 entered.set_value();
@@ -817,21 +879,53 @@ TEST_CASE("GuardianReconcileFlow: only the wait on ANOTHER thread's load is excl
                     cv.wait_for(lk, 10s, [&] { return release; });
                 }
                 rig.clock.advance(300ms);
+                if (owner_error)
+                    return std::unexpected(*owner_error);
                 return guardian::make_bundle({rule("r1")}, {"r1"});
             });
     });
-    entered_f.wait();
+    REQUIRE(entered_f.wait_for(10s) == std::future_status::ready);
 
-    std::thread flow_runner([&] {
+    std::jthread flow_runner([&] {
         flow_thread.store(std::this_thread::get_id());
         rig.run();
     });
     flow_runner.join();
     owner.join();
+}
+
+}  // namespace
+
+TEST_CASE("GuardianReconcileFlow: only the wait on ANOTHER thread's load is excluded from the debit",
+          "[guardian][reconcile_flow]") {
+    RigOptions o;
+    o.budget = {.budget_ms_per_s = 1.0, .burst_ms = 10'000.0, .max_per_s = 1000};
+    Rig rig(o);
+    run_behind_slow_owner(rig, std::nullopt);
 
     REQUIRE(rig.sent.size() == 1);
     CHECK(rig.list_calls == 0);  // the waiter never ran the loader
     // 340 ms elapsed, 300 ms of it spent blocked on the other thread: only the 40 ms read.
+    CHECK(rig.budget.balance_ms() == Catch::Approx(10'000.0 - 40.0).margin(0.01));
+}
+
+TEST_CASE("GuardianReconcileFlow: the wait is excluded from the debit when the awaited load FAILS",
+          "[guardian][reconcile_flow]") {
+    // The exclusion is applied on every outcome of the bundle get, not only a successful one:
+    // a failing store with many waiters is exactly when the budget must not be starved by
+    // time that was never this push's work.
+    RigOptions o;
+    o.budget = {.budget_ms_per_s = 1.0, .burst_ms = 10'000.0, .max_per_s = 1000};
+    Rig rig(o);
+    run_behind_slow_owner(rig, guardian::BundleLoadError{guardian::BundleLoadError::Source::rules,
+                                                         "owner load failed"});
+
+    CHECK(rig.sent.empty());
+    CHECK(rig.list_calls == 0);  // the waiter never ran the loader
+    CHECK(rig.count("degraded") == 1.0);
+    REQUIRE(rig.audits.size() == 1);
+    CHECK(rig.audits[0].detail == aborted("rule store degraded", "owner load failed"));
+    CHECK(rig.gate.in_flight() == 0);
     CHECK(rig.budget.balance_ms() == Catch::Approx(10'000.0 - 40.0).margin(0.01));
 }
 
@@ -919,8 +1013,30 @@ TEST_CASE("GuardianReconcileFlow: every exit path makes at most one result incre
             const auto durations_before = rig.duration_count();
             const auto admitted_before = rig.budget.admitted_total();
             const auto held = rig.held.has_value() ? 1u : 0u;
+            const double balance_before = rig.budget.balance_ms();
+            rig.trace.clear();
+            rig.inflight_at.clear();
 
             rig.run();
+
+            // An admitted exit, however early, charges at least min_cost (1 ms) on a path that
+            // takes no manual-clock time; a non-admitted exit charges nothing. The clock is
+            // static here, so the balance moves only by what is debited.
+            const double debited = balance_before - rig.budget.balance_ms();
+            CHECK(debited == Catch::Approx(sc.admitted ? 1.0 : 0.0).margin(0.01));
+
+            // The in-flight slot is held from admission: every stub from the session lookup on
+            // sees one more than the test itself holds, and nothing before it does.
+            REQUIRE(rig.trace.size() == rig.inflight_at.size());
+            const auto session_at = std::find(rig.trace.begin(), rig.trace.end(), "session");
+            CHECK((session_at != rig.trace.end()) == sc.admitted);
+            for (std::size_t i = 0; i < rig.trace.size(); ++i) {
+                const bool after_admission =
+                    session_at != rig.trace.end() &&
+                    i >= static_cast<std::size_t>(session_at - rig.trace.begin());
+                INFO("stub " << rig.trace[i]);
+                CHECK(rig.inflight_at[i] == held + (after_admission ? 1u : 0u));
+            }
 
             const double delta = rig.total() - labels_before;
             CHECK(delta <= 1.0);
@@ -930,4 +1046,49 @@ TEST_CASE("GuardianReconcileFlow: every exit path makes at most one result incre
             CHECK(rig.gate.in_flight() == held);  // only a slot the test itself holds remains
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Construction.
+// ---------------------------------------------------------------------------------------
+
+TEST_CASE("GuardianReconcileFlow: construction rejects every empty required dependency, naming it",
+          "[guardian][reconcile_flow]") {
+    using Deps = GuardianReconcileFlowDeps;
+    struct Case {
+        const char* name;
+        std::function<void(Deps&)> empty_it;
+    };
+    const Case cases[] = {
+        {"store_wired", [](Deps& d) { d.store_wired = nullptr; }},
+        {"list_rules", [](Deps& d) { d.list_rules = nullptr; }},
+        {"deployed_ids", [](Deps& d) { d.deployed_ids = nullptr; }},
+        {"session_os", [](Deps& d) { d.session_os = nullptr; }},
+        {"eval_scope", [](Deps& d) { d.eval_scope = nullptr; }},
+        {"send_push", [](Deps& d) { d.send_push = nullptr; }},
+        {"random_suffix", [](Deps& d) { d.random_suffix = nullptr; }},
+    };
+    Rig rig;
+    for (const auto& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            auto deps = rig.make_deps();
+            c.empty_it(deps);
+            CHECK_THROWS_AS(GuardianReconcileFlow(std::move(deps)), std::invalid_argument);
+            auto deps2 = rig.make_deps();
+            c.empty_it(deps2);
+            CHECK_THROWS_WITH(GuardianReconcileFlow(std::move(deps2)),
+                              Catch::Matchers::ContainsSubstring(c.name));
+        }
+    }
+}
+
+TEST_CASE("GuardianReconcileFlow: audit and now are optional and default", "[guardian][reconcile_flow]") {
+    Rig rig;
+    auto deps = rig.make_deps();
+    deps.audit = nullptr;  // empty = discard
+    deps.now = nullptr;    // empty = steady_clock::now
+    GuardianReconcileFlow flow(std::move(deps));
+    flow.run("agent-1", 3);  // a full successful reconcile with the defaults
+    CHECK(rig.sent.size() == 1);
+    CHECK(rig.audits.empty());
 }
