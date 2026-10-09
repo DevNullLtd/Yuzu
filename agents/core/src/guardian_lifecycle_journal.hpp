@@ -32,6 +32,13 @@
  * explicitly best-effort (see its own doc comment) - a redundant re-page from a
  * stale-observed label is the worst case, not a correctness break. Do NOT add a
  * second persist caller or a non-RMW gauge write.
+ *
+ * #4045 adds a caller into kv_ that is NOT this journal: the sibling
+ * GuardianBaselinePersister (guardian_baseline_persister.hpp) writes the #4021
+ * `baseline:<rule_id>` records from apply_rules / stop() under the engine mtx_ and from the
+ * drain worker's thread. It touches disjoint keys (`baseline:` vs this journal's own
+ * prefix) and relies on the same per-call serialisation of KvStore's single connection;
+ * it shares no state with this class.
  */
 
 #include "guardian_journal_format.hpp"

@@ -218,3 +218,24 @@ Known open items this migration surfaced but did not resolve:
   genuinely supersede, zero `authorize_list_read` callers) with the actual §3d targets (4
   `authorize_list_read` callers, unrelated to dispatch). Not fixed here — out of this PR's
   diff scope; flag for whoever picks up §3d.
+
+## Note: `confined` MCP labels whose securable `ITServiceOwner` does not hold
+
+Not an issue; a label-versus-ceiling question that predates the executions-list work (#3526, #4753).
+Some MCP tools carry `ServiceScopeClass::confined` in `mcp_server.cpp`'s C8 table but are authorized by
+their own `scoped_perm_fn` gate (`AuthRoutes::require_scoped_permission`), not by `require_fleet_read`.
+`require_scoped_permission`'s service branch applies the `ITServiceOwner` ceiling, then the tag match
+(`auth_routes.cpp`, the `authz::service_ceiling_check` call in that function). Read from the seed in
+`rbac_store.cpp` (`seed_defaults`): where `ITServiceOwner` does not hold the tool's
+`(securable, operation)` pair, a service-scoped token is refused at the ceiling, so the `confined` label
+has no admit path under seeded defaults.
+
+- Examples of that shape: `get_agent_app_usage` (`Forensics:Read`) and `quarantine_device`
+  (`Security:Execute`). The two named are examples, not an exhaustive list.
+- Not affected: tools on securables `ITServiceOwner` holds. `set_tag`/`delete_tag` (`Tag:Write`/`Tag:Delete`)
+  are genuinely confined (ceiling, tag match and the #3289 mutation guard), and the `GuaranteedState:Read`
+  and `SoftwareLicensing:Read` tools (for example the `get_dex_*` family and `query_software_licenses`)
+  pass the ceiling because the seed grants `ITServiceOwner` those securables.
+
+Whether a label with no admit path should read `denied` is a separate decision. This was derived by
+reading the seed and the gate code; no test exercises it.

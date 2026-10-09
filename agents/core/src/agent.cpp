@@ -61,6 +61,8 @@ __declspec(allocate(".CRT$XCB"))
 #include "guardian_arm_heartbeat.hpp"     // emit_guardian_arm_heartbeat_tags (rung 9c PR-3)
 #include "guardian_backend.hpp"           // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
+#include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_persist_heartbeat_tags (#4045)
+#include "guardian_baseline_persister.hpp" // kBaselineShutdownGrace (#4045; static_assert below)
 #include "guardian_io_ceiling_heartbeat.hpp" // emit_guardian_io_ceiling_heartbeat_tags (rung 9c PR-3)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
 #include "guardian_legacy_sink_executor.hpp" // #4783: LegacySendOutcome (EventSink's return type)
@@ -109,18 +111,21 @@ namespace gpb = ::yuzu::guardian::v1;
 constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 
 // #2233 item 3 ("S+"): ShutdownDeadlineGuard's grace period for both AgentImpl::stop()
-// and run()'s teardown ScopeExit. NOT a measured value — named sub-budgets inside the
-// blocking chain sum to roughly 15-20s (GuardianEngine's two persist_lifecycle_journal_
-// locked calls, each documented as "worst case one KvStore 5s busy timeout"; SparkEngine's
-// kConsumerJoinBudgetMs = 2'000) but dex_observer_'s drain wait and stop_all_guards_
-// locked()'s per-guard stops have NO named bound at all — so this sits AT that named floor,
-// not comfortably above it (corrected per external review, PR #3737 — the earlier wording
-// overstated the margin), without claiming to be a derived guarantee (matching
-// spark_file.cpp's arm_ancestor deadline comment: state plainly that it's not a wall-clock
-// bound where it isn't one). Also constrained from above: service_win.cpp reports a 30s
-// STOP_PENDING hint to the Windows SCM, so a SINGLE watchdog must stay under that — 20s
-// leaves only a 10s margin, not a comfortable one (matching service_win.cpp's own wording
-// on the same relationship, not "well under").
+// and run()'s teardown ScopeExit. NOT a measured value - the named sub-budgets listed here
+// are only PART of the blocking chain, and they sum to roughly 15-20s (GuardianEngine's two
+// persist_lifecycle_journal_locked calls, each documented as "worst case one KvStore 5s busy
+// timeout"; SparkEngine's kConsumerJoinBudgetMs = 2'000), and the loss-ledger write adds
+// another. #4045 adds the final baseline flush (up to one more busy timeout), and
+// GuardianEngine::stop()'s own comment lists the stop() timelines measured against a BUSY
+// store: 10s to 25s and more with a worker write in flight. dex_observer_'s
+// drain wait and stop_all_guards_locked()'s per-guard stops have NO named bound at all - so
+// this sits AT the named floor, not comfortably above it (corrected per external review, PR
+// #3737 - the earlier wording overstated the margin), without claiming to be a derived
+// guarantee (matching spark_file.cpp's arm_ancestor deadline comment: state plainly that it's
+// not a wall-clock bound where it isn't one). Also constrained from above: service_win.cpp
+// reports a 30s STOP_PENDING hint to the Windows SCM, so a SINGLE watchdog must stay under
+// that - 20s leaves only a 10s margin, not a comfortable one (matching service_win.cpp's own
+// wording on the same relationship, not "well under").
 //
 // TWO watchdogs on the external-trigger path, and their budgets are independent, not
 // shared: run()'s ScopeExit re-calls guardian_->stop() on EVERY exit (comment below),
@@ -174,6 +179,11 @@ constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 // TerminateProcess actually lands inside this margin before the SCM gives up waiting on
 // STOP_PENDING; see "Stopping a wedged agent" in docs/user-manual/server-admin.md.
 constexpr std::chrono::milliseconds kShutdownDeadlineGrace{20'000};
+// #4045: GuardianEngine::stop() skips its final baseline flush when it would start too close to
+// this deadline, using a mirror of it (the persister header cannot see this file-local
+// constant). A change here must be a conscious change there.
+static_assert(kShutdownDeadlineGrace == kBaselineShutdownGrace,
+              "guardian_baseline_persister.hpp's kBaselineShutdownGrace mirrors this deadline");
 
 // #2303 sec-L. The daily-sync scheduler (ADR-0016) persists last-hash / need_full state in this
 // kv_store namespace, keyed the same way plugin storage is (by the plugin's own declared name).
@@ -2427,6 +2437,7 @@ public:
                             kHbGuardianGeneration,
                             kHbGuardianTags,
                             kHbGuardianSparkHealth,
+                            kHbGuardianBaseline,
                             kHbGuardianGroupCount
                         };
                         std::array<std::uint64_t, kHbGuardianGroupCount> hb_guardian_failures{};
@@ -2599,17 +2610,21 @@ public:
                             // generation 0 — so an agent that has never received a
                             // push still converges once rules exist server-side.
                             if (guardian_) {
-                              // The Guardian emit block is four independently contained
-                              // groups (#4472 hardening): a bad_alloc / system_error from a
-                              // guardian accessor or a tag insert must never terminate the
+                              // The Guardian emit block is six independently contained
+                              // groups (#4472 hardening; the kHbGuardian* slot enum above
+                              // is the authoritative list): a bad_alloc / system_error from
+                              // a guardian accessor or a tag insert must never terminate the
                               // heartbeat thread, and one failing group must not silence the
-                              // others. Order matters: A maintenance (each call in its own
-                              // try), B the generation tag (heartbeat_ingestion.cpp reads it
-                              // to decide whether to run the M5 missed-push reconcile, so it
-                              // must survive an A throw), C the older tags, D the newer
-                              // monitor-only gauges LAST so a fault in them cannot drop the
-                              // older signals. A throw skips only the rest of its own group
-                              // for this tick; the next tick retries. Never logs tag text.
+                              // others. Order matters: A1/A2 maintenance and the legacy-sink
+                              // kick (each call in its own try), B the generation tag
+                              // (heartbeat_ingestion.cpp reads it to decide whether to run
+                              // the M5 missed-push reconcile, so it must survive an A
+                              // throw), C the older tags, then the newer monitor-only
+                              // gauges LAST, in order: D the Spark claim-health gauges, D2
+                              // the #4045 baseline-persist aggregate, so a fault in them
+                              // cannot drop the older signals (nor D2 a D). A throw skips
+                              // only the rest of its own group for this tick; the next tick
+                              // retries. Never logs tag text.
                               // None of this has a unit test (no fault-injection seam in the
                               // heartbeat loop, and none was added for it): the log lines
                               // and group boundaries are verified by reading.
@@ -2751,7 +2766,7 @@ public:
                                                       "rest of the older Guardian tags were "
                                                       "skipped this tick)");
                               }
-                              // Group D (LAST): #5404 / #5403 / #4472: the Spark claim-
+                              // Group D (newer gauges): #5404 / #5403 / #4472: the Spark claim-
                               // lifecycle counters, the retained-tombstone count and the two
                               // claim AGE gauges (the pending-Disarm age and the
                               // outstanding-compensation age; absent while nothing is
@@ -2768,6 +2783,27 @@ public:
                                                       "Guardian heartbeat claim-health gauges "
                                                       "failed (the claim-health tags were "
                                                       "skipped this tick)");
+                              }
+                              // Group D2 (after D, its own try so it can neither drop an older
+                              // tag nor be dropped by one): #4045, the Spark baseline-persist
+                              // aggregate (sparse, 0 omits the tag; every channel is listed on
+                              // GuardianEngine::baseline_persist_failures()). Spark path ONLY:
+                              // a legacy FileGuard persist failure is logged, not counted, so
+                              // an absent tag is NOT evidence that baselines persisted. Not
+                              // gated on prefer_spark_ (0 while Spark is inert). This accessor
+                              // takes no lock (the Group B/C accessors above do take mtx_).
+                              // Deleting THIS call site is not caught by any test, same as
+                              // Group D's: the emitter and the accessor are pinned (E10, E15,
+                              // E23 and the doc-scrape test), the call itself is verified by
+                              // reading. Deliberately no source-grep pin: it would break
+                              // out-of-tree and packaged builds that carry no source tree.
+                              try {
+                                emit_guardian_baseline_persist_heartbeat_tags(
+                                    tags, guardian_->baseline_persist_failures());
+                              } catch (...) {
+                                  hb_guardian_contain(kHbGuardianBaseline,
+                                                      "Guardian heartbeat baseline-persist tag "
+                                                      "failed (the tag was skipped this tick)");
                               }
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)

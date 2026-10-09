@@ -7,6 +7,7 @@
 
 #include "guardian_arm_heartbeat.hpp"     // rung 9c PR-3: doc/emitter cross-check union
 #include "guardian_backend.hpp"           // F7, #2298: doc/emitter cross-check union
+#include "guardian_baseline_heartbeat.hpp" // #4045: doc/emitter cross-check union
 #include "guardian_health_heartbeat.hpp"  // F7, #2298: doc/emitter cross-check union
 #include "guardian_io_ceiling_heartbeat.hpp" // rung 9c PR-3: doc/emitter cross-check union
 
@@ -28,6 +29,23 @@ TEST_CASE("journal heartbeat: a quiescent journal emits NO tags (sparse)",
     std::map<std::string, std::string> tags;
     emit_guardian_journal_heartbeat_tags(tags, GuardianJournalStats{});
     CHECK(tags.empty()); // every field 0 → nothing to report
+}
+
+TEST_CASE("baseline persist heartbeat: a zero count emits NO tag (sparse)",
+          "[guardian][baseline][heartbeat]") {
+    std::map<std::string, std::string> tags;
+    emit_guardian_baseline_persist_heartbeat_tags(tags, 0);
+    CHECK(tags.empty());
+}
+
+TEST_CASE("baseline persist heartbeat: a nonzero count emits the pinned key (#4045)",
+          "[guardian][baseline][heartbeat]") {
+    std::map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    emit_guardian_baseline_persist_heartbeat_tags(tags, 3);
+    REQUIRE(tags.size() == 2);
+    CHECK(tags.at("yuzu.os") == "linux");
+    CHECK(tags.at("yuzu.guardian_baseline_persist_failures") == "3");
 }
 
 TEST_CASE("journal heartbeat: only non-zero counters are emitted, with the pinned keys",
@@ -234,6 +252,9 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     GuardianArmStats arm_s{.pending = 1, .failed = 1};
     emit_guardian_arm_heartbeat_tags(emitted, std::optional{arm_s});
     emit_guardian_io_ceiling_heartbeat_tags(emitted, 1);
+    // #4045: yuzu.guardian_baseline_persist_failures, so a metrics.md mention of it is checked
+    // against its emitter instead of tripping this scrape with no way to satisfy it.
+    emit_guardian_baseline_persist_heartbeat_tags(emitted, 1);
     // Governance fix (Gate 8, doc-scrape false-negative): yuzu.guardian_generation is a
     // real, always-emitted heartbeat tag - a metrics.md doc edit mentioning it by name (the
     // arm-gauge alerting-hazard note) trips this scrape unless an emitter call covers it.

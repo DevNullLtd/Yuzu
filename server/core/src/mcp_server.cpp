@@ -326,6 +326,14 @@ int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
     return static_cast<int>(param_int(params, key, def));
 }
 
+/// Caller-supplied id as it may appear in an audit `detail` (CWE-117): capped at
+/// 128 bytes (a hostile caller must not bloat the audit row) and neutralised by
+/// `audit_token` (space, '=', ',' and control bytes such as CR/LF cannot forge an
+/// adjacent `k=v` field or split the line). Ordinary ids pass through unchanged.
+std::string audit_caller_id(std::string_view id) {
+    return audit_token(id.substr(0, 128));
+}
+
 // B5 (api-parity #2146) — mirrors rest_api_v1.cpp's file-local
 // `sw_deploy_error_status`/`sw_deploy_client_message` (both `static` there, so
 // TU-invisible here — duplicated rather than shared, same constraint the
@@ -2711,8 +2719,15 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"scenario":{"type":"string"},"title":{"type":"string"},"category":{"type":"string"},"classification":{"type":"string"},"expected_first_tool":{"type":"string"},"requires_connector":{"type":"string","description":"Empty when the playbook needs no external connector"},"summary":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"safety":{"type":"array","items":{"type":"string"}}},"required":["scenario","title","category","classification","expected_first_tool","requires_connector","summary","steps","safety"]})j"},
     {"summarize_working_set",
      "Summarize an agent/result-set/execution scope into a model-ready narrative with resource "
-     "links and next tools instead of dumping unbounded rows. Summarization only.",
-     R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string"},"limit":{"type":"integer","default":25,"maximum":100}}})",
+     "links and next tools instead of dumping unbounded rows. Summarization only. "
+     "kind=execution is confined by management group (admit-then-filter via the fleet-read "
+     "gate): counts are computed from only the caller's visible agents, and an execution "
+     "outside the caller's scope reads exactly like a nonexistent one (\"was not found\" "
+     "narrative, not an error). A store degrade returns an error carrying retry_after_ms. "
+     "An id containing a NUL byte is rejected with invalid-params for kind=execution. "
+     "kind=fleet and kind=result_set (and an empty id) return an unscoped whole-registry "
+     "agent count, not narrowed to the caller's scope.",
+     R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string","maxLength":128},"limit":{"type":"integer","default":25,"maximum":100}}})",
      // #2986: kind/id/limit echo the (possibly-defaulted) input; narrative,
      // resource_links, and recommended_next_tools are always populated
      // (empty id, or the fleet-fallback branch, still produce a narrative).
@@ -2781,8 +2796,28 @@ static const ToolDef kTools[] = {
      R"j(},"required":["username"]})j",
      R"j({"type":"object","properties":{"username":{"type":"string"},"unlocked":{"type":"boolean"},"audit_emitted":{"type":"boolean"}},"required":["username","unlocked","audit_emitted"]})j"},
     {"discover_instructions",
-     "Published (enabled) InstructionDefinition catalog with parameter_schema — the "
-     "commands this worker may dispatch via execute_instruction. Read-only catalog.",
+     "List every enabled InstructionDefinition (the published catalogue) with the schema needed "
+     "to call it. Use it to learn WHICH commands exist and HOW to parameterise them before you "
+     "dispatch; it dispatches nothing and changes nothing. Each entry carries id, name, plugin, "
+     "action, description, platforms, approval_mode, input_schema and parameter_schema. "
+     "input_schema is the canonical JSON Schema the server enforces (an undeclared param is "
+     "refused): build params from it. parameter_schema is the stored YAML-DSL form (int32, "
+     "displayName); prefer input_schema. input_schema null with input_schema_error null means no "
+     "declared parameters; null with a token means none is published "
+     "(parameter_schema_not_canonicalisable: execute refuses the definition; "
+     "input_schema_budget_exceeded: this schema did not fit the request's schema budget, which "
+     "depends on catalogue order (name, then id) and sizes, so retrying does not cure it; "
+     "parameter_schema is still present). A non-null input_schema can still be refused at "
+     "execute, for any reason its validator rejects that canonicalisation does not check (e.g. "
+     "a regex that does not compile). CHAIN: call execute_instruction with the entry's plugin and "
+     "action, params shaped by input_schema but sent as strings (\"24\", \"true\": "
+     "execute_instruction params are string-valued), and agent_ids or scope. The schema is "
+     "enforced only by POST /api/instructions/{id}/execute; execute_instruction looks up no "
+     "definition. There are no filter arguments: the whole catalogue comes back (truncated=true "
+     "at 5000 entries), so filter on plugin/action yourself. count 0 with an empty list means "
+     "no enabled definition is published; it is not an error. Requires "
+     "InstructionDefinition:Read. Read-only and safe to repeat. REST twin: GET "
+     "/api/v1/discover/instructions.",
      R"({"type":"object","properties":{}})",
      // #2986: build_instructions_catalog's envelope is fixed; each entry's
      // parameter_schema is itself an arbitrary nested JSON Schema document
@@ -2791,7 +2826,10 @@ static const ToolDef kTools[] = {
      // discover_routes.cpp's is_object() guard) — genuinely variable BY
      // DESIGN, so it is typed generically rather than pretending to know
      // its shape, same idiom as get_access_review's "campaign":{"type":"object"}.
-     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Nested JSON Schema when the stored value parses as JSON AND is itself an object, else null"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
+     // input_schema is the same kind of document (the canonical form of
+     // parameter_schema), typed the same way; input_schema_error is a fixed
+     // token or null.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Stored definition schema verbatim (YAML-DSL types such as int32) when the stored value parses as JSON AND is itself an object, else null"},"input_schema":{"type":["object","null"],"description":"Canonical JSON Schema the server enforces on POST /api/instructions/{id}/execute; null when the definition declares no schema or none is published (see input_schema_error)"},"input_schema_error":{"type":["string","null"],"enum":[null,"parameter_schema_not_canonicalisable","input_schema_budget_exceeded"],"description":"Null unless no canonical schema is published for a stored schema: parameter_schema_not_canonicalisable (it cannot be canonicalised) or input_schema_budget_exceeded (the request reached its schema budget)"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","input_schema","input_schema_error","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
     {"discover_routes",
      "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
      "serves. Hand-maintained source, so it can under-report an undocumented route "
@@ -8160,7 +8198,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     spdlog::debug("get_agent_details: out-of-scope {} -> not found before lookup",
                                   agent_id);
                     mcp_audit("denied", "agent not found or outside caller's fleet-read scope: " +
-                                            agent_id);
+                                            audit_caller_id(agent_id));
                     res.set_content(
                         error_response(id, kInvalidParams, "Agent not found: " + agent_id),
                         "application/json");
@@ -8171,7 +8209,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // masking it as a genuine miss (CDX-P2-04/K4). Reached only AFTER
                     // the in_scope deny above, so an out-of-scope caller still gets the
                     // identical not-found denial with zero backing read (#3564 intact).
-                    mcp_audit("failure", agent_id);
+                    mcp_audit("failure", audit_caller_id(agent_id));
                     res.set_content(
                         error_response(id, kInternalError, "device registry unavailable"),
                         "application/json");
@@ -8181,7 +8219,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     device_api->lookup_device(agent_id);
                 if (!result) { // DeviceReadError::kDegraded — id resolved, tag-store read failed
                                 // (in-scope only reaches here)
-                    mcp_audit("failure", agent_id);
+                    mcp_audit("failure", audit_caller_id(agent_id));
                     res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
                                     "application/json");
                     return;
@@ -8189,7 +8227,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!*result) { // genuine miss — identical denial to the out-of-scope case
                     spdlog::debug("get_agent_details: no match for {}", agent_id);
                     mcp_audit("denied", "agent not found or outside caller's fleet-read scope: " +
-                                            agent_id);
+                                            audit_caller_id(agent_id));
                     res.set_content(
                         error_response(id, kInvalidParams, "Agent not found: " + agent_id),
                         "application/json");
@@ -10630,6 +10668,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto exec_id = param_str(args, "execution_id");
+                // A NUL byte would make the store lookup (a C-string parameter, truncated at
+                // the NUL) resolve a different id than the audit rows record (the full id):
+                // reject it before any store read (same hazard and wording as
+                // summarize_working_set kind=execution).
+                if (exec_id.find('\0') != std::string::npos) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "id must not contain a NUL byte"),
+                                    "application/json");
+                    return;
+                }
                 // Governance fix (#2146 A2-R1 re-review): was the plain
                 // get_execution(), which collapses "row genuinely absent" and
                 // "read degraded" (pool/query failure) to the same nullopt --
@@ -10677,7 +10725,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     auto agents_opt = execution_tracker->get_agent_statuses_checked(exec_id);
                     if (!agents_opt) {
                         res.set_content(
-                            error_response(id, kInternalError, "execution tracker degraded"),
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                             "application/json");
                         return;
                     }
@@ -10690,7 +10739,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!exec || !visible) {
                     spdlog::debug("get_execution_status: {} exec_id={}",
                                   exec ? "outside caller fleet-read scope" : "no match", exec_id);
-                    mcp_audit("denied", "not found or outside caller's fleet-read scope: " + exec_id);
+                    mcp_audit("denied",
+                              "not found or outside caller's fleet-read scope: " +
+                                  audit_caller_id(exec_id));
                     res.set_content(
                         error_response(id, kInvalidParams, "Execution not found: " + exec_id),
                         "application/json");
@@ -10968,11 +11019,14 @@ McpServer::HandlerFn McpServer::build_handler(
             // fleet_read_fn_. Execution rows carry no single agent_id (they
             // fan out to many), so per-row visible-agent filtering would need
             // a per-execution agent-status lookup per row — an N+1 pattern
-            // (ADR-0017 INV-10). Until a batched version exists, a confined
-            // caller is restricted to their OWN dispatches (`dispatched_by`
-            // pushed into the SQL WHERE, ExecutionQuery::dispatched_by) —
-            // cheap, provably safe (never another operator's execution), and
-            // consistent with the dispatcher-ownership precedent elsewhere.
+            // (ADR-0017 INV-10). A batched status read exists and is used
+            // below to project the counts, but LIST ADMISSION stays owner-only
+            // (no visible-agent disjunct, unlike REST GET /api/v1/executions):
+            // a confined caller is restricted to their OWN dispatches
+            // (`dispatched_by` pushed into the SQL WHERE,
+            // ExecutionQuery::dispatched_by): cheap, provably safe (never
+            // another operator's execution), and consistent with the
+            // dispatcher-ownership precedent elsewhere.
             if (tool_name == "list_executions") {
                 if (!fleet_read_fn_) {
                     spdlog::error("list_executions: fleet_read_fn_ unwired; failing closed");
@@ -11026,7 +11080,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto execs_opt = execution_tracker->query_executions_checked(eq);
                 if (!execs_opt) {
                     res.set_content(
-                        error_response(id, kInternalError, "execution tracker degraded"),
+                        a4_error(kInternalError, "execution tracker degraded", {},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -11049,10 +11104,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     // zeroed every confined row's counts on a degrade
                     // instead of surfacing it.
                     auto statuses_opt =
-                        execution_tracker->get_agent_statuses_for_executions_checked(exec_ids);
+                        execution_tracker->get_agent_statuses_for_executions_checked(
+                            exec_ids,
+                            std::vector<std::string>(gate.scope->begin(), gate.scope->end()));
                     if (!statuses_opt) {
                         res.set_content(
-                            error_response(id, kInternalError, "execution tracker degraded"),
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                             "application/json");
                         return;
                     }
@@ -19503,10 +19561,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     kind = "fleet";
                 }
                 const std::string target_id = param_str(args, "id");
+                // A NUL byte would make the store lookup (a C string, truncated at the NUL)
+                // resolve a different id than the audit row records (tokenised full id):
+                // reject it before any store read.
+                if (kind == "execution" && target_id.find('\0') != std::string::npos) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "id must not contain a NUL byte"),
+                                    "application/json");
+                    return;
+                }
                 const int limit = std::clamp(param_int32(args, "limit", 25), 1, 100);
                 JArr links;
                 JArr next;
                 std::string narrative;
+                bool execution_not_visible = false; // confined caller: absent OR out of scope => `denied`
                 if (kind == "agent" && !target_id.empty()) {
                     // Group-scope gate (G-S2): an operator scoped to one
                     // management group must not be able to probe arbitrary
@@ -19535,25 +19603,85 @@ McpServer::HandlerFn McpServer::build_handler(
                                     " is not present in the current MCP agent registry.";
                     next.add("get_agent_details").add("get_agent_inventory").add("get_tags");
                 } else if (kind == "execution" && !target_id.empty() && execution_tracker) {
-                    // Execution data is a distinct securable — gate on
-                    // Execution:Read (tier + RBAC), not just the tool's generic
-                    // Infrastructure:Read (G-S2).
-                    if (!tier_allows(tier, "Execution", "Read")) {
-                        res.set_content(a4_error(kTierDenied,
-                                                 "MCP tier does not allow this operation",
-                                                 kTierRemediation),
+                    // Execution data is a distinct securable from the tool's
+                    // generic Infrastructure:Read gate above (G-S2), and it is
+                    // per-agent data: fleet_read_fn_ (require_fleet_read,
+                    // ADR-0017) is the SOLE gate on the (Execution, Read) pair
+                    // here -- tier + RBAC + management-group/service
+                    // confinement in one call, never stacked with a bare
+                    // tier_allows/perm_fn (same gate as get_execution_status,
+                    // but a stricter visibility rule and a success-shaped
+                    // "was not found" narrative where that sibling answers an
+                    // error). The counts below are the caller's confined
+                    // projection, and a confined-out execution reads EXACTLY
+                    // like an absent one (same narrative, denied audit row, no
+                    // success row) so existence is not an oracle (#3564).
+                    //
+                    // ServiceScopeClass stays `denied` for this tool: kind=agent
+                    // and kind=fleet have no mechanism on the service-scope
+                    // axis, and `confined` needs a real downstream mechanism
+                    // for EVERY kind (routed row, service-scope clause 3).
+                    if (!fleet_read_fn_) {
+                        spdlog::error("summarize_working_set(execution): fleet_read_fn_ "
+                                      "unwired; failing closed");
+                        res.set_content(error_response(id, kInternalError, "service unavailable"),
                                         "application/json");
                         return;
                     }
-                    if (!perm_fn(req, res, "Execution", "Read"))
+                    auto gate = fleet_read_fn_(req, res, "Execution", "Read");
+                    if (!gate.admitted)
+                        return; // gate already wrote the response.
+                    // get_execution_checked, not get_execution: a degrade must
+                    // not read as "was not found" (and must not write a denial
+                    // audit row for a legitimate caller).
+                    auto exec_r = execution_tracker->get_execution_checked(target_id);
+                    if (!exec_r) {
+                        res.set_content(
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
                         return;
-                    auto exec = execution_tracker->get_execution(target_id);
-                    if (exec) {
+                    }
+                    const auto& exec = *exec_r;
+                    std::vector<AgentExecStatus> exec_agents;
+                    if (gate.scope) {
+                        // Read whether or not the row exists, so an absent id
+                        // and an invisible one do the same backing work.
+                        // SQL-side agent filter: only the caller's in-scope rows are
+                        // read (execution_visible/confined_projection ignore the rest).
+                        auto agents_opt = execution_tracker->get_agent_statuses_checked(
+                            target_id,
+                            std::vector<std::string>(gate.scope->begin(), gate.scope->end()));
+                        if (!agents_opt) {
+                            res.set_content(a4_error(kInternalError,
+                                                     "execution tracker degraded", {},
+                                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                            "application/json");
+                            return;
+                        }
+                        exec_agents = std::move(*agents_opt);
+                    }
+                    if (exec && execution_visible(*exec, exec_agents, gate.scope,
+                                                  session->username)) {
+                        int agents_targeted = exec->agents_targeted;
+                        int agents_responded = exec->agents_responded;
+                        if (gate.scope) {
+                            const auto counts = confined_projection(exec_agents, gate.scope);
+                            agents_targeted = counts.agents_targeted;
+                            agents_responded = counts.agents_responded;
+                        }
                         narrative = "Execution " + target_id + " is " + exec->status +
-                                    " with targeted=" + std::to_string(exec->agents_targeted) +
-                                    " responded=" + std::to_string(exec->agents_responded) + ".";
+                                    " with targeted=" + std::to_string(agents_targeted) +
+                                    " responded=" + std::to_string(agents_responded) + ".";
                     } else {
                         narrative = "Execution " + target_id + " was not found.";
+                        // Audit `denied` only for a CONFINED caller, whose absent id and
+                        // out-of-scope id must stay indistinguishable. An UNCONFINED
+                        // caller can only miss on a genuinely absent id: no denial
+                        // occurred, so that stays the pre-existing `success` row (no
+                        // SIEM noise). The caller never sees the audit row, so the
+                        // split is not an existence oracle.
+                        execution_not_visible = gate.scope.has_value();
                     }
                     next.add("get_execution_status").add("query_responses");
                 } else {
@@ -19573,7 +19701,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                    .raw("recommended_next_tools", next.str())
                                    .str();
                 auto result = tool_result(payload, kObjectOutputSchema);
-                mcp_audit("success", kind + ":" + target_id);
+                if (execution_not_visible)
+                    // Caller-supplied id: neutralised (CRLF / k=v forgery) and capped.
+                    mcp_audit("denied",
+                              "not found or outside caller's fleet-read scope: " +
+                                  audit_caller_id(target_id));
+                else
+                    // Caller-supplied id (an unconfined absent id reaches here too):
+                    // neutralised (CRLF / k=v forgery) and capped like the denied row above.
+                    mcp_audit("success", kind + ":" +
+                                             audit_caller_id(target_id));
                 res.set_content(success_response(id, result), "application/json");
                 return;
             }
