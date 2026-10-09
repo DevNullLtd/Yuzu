@@ -553,12 +553,6 @@ The per-session peer-IP binding for the agent `Subscribe` RPC (#826/#1058/#1059,
 
 **Read-together interpretation.** Both counters share the `event` and `gateway_mode` labels so an analyst can join them by operator-mode dimension. A spike in `_peer_advisory_total` alone is expected multi-egress churn in NAT-relaxed deployments and is not actionable. A spike in BOTH simultaneously is the actionable signal: it can indicate a stolen-session replay landing inside a trusted range, where the legitimate agent triggers the reject and the attacker (also in-range) is admitted via advisory. The `AgentSubscribePeerAdvisoryCorrelatedSpike` alert below encodes exactly that pattern.
 
-### Agent registration input-shape rejections
-
-| Metric | Type | Labels | Description |
-|---|---|---|---|
-| `yuzu_register_invalid_agent_id_total` | counter | `reason="length"\|"nul"`; the `ProxyRegister` series also carries `source="gateway_proxy"` | An agent `Register` (direct) or `ProxyRegister` (through the gateway) was refused with `INVALID_ARGUMENT` because of the shape of its `agent_id`, before any enrollment, audit or store work. `reason="length"` covers an empty id and one over 256 bytes; `reason="nul"` an id with an embedded NUL byte. A direct `Register` series carries only `reason`; the gateway path adds `source="gateway_proxy"`, so the two are separate series. Each series is created on its first rejection, so it is absent from the scrape until then (not pre-seeded). Per replica. |
-
 ### Recommended alerts
 
 ```yaml
@@ -651,6 +645,12 @@ The per-session peer-IP binding for the agent `Subscribe` RPC (#826/#1058/#1059,
   annotations:
     summary: "Admin-denied identity repeatedly attempting Register (#1067) — credential-abuse / denied-flood signal"
 ```
+
+## Agent registration input-shape rejections
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `yuzu_register_invalid_agent_id_total` | counter | `reason="length"\|"nul"`; the `ProxyRegister` series also carries `source="gateway_proxy"` | An agent `Register` (direct) or `ProxyRegister` (through the gateway) was refused with `INVALID_ARGUMENT` because of the shape of its `agent_id`, before any enrollment, audit or store work. `reason="length"` covers an empty id and one over 256 bytes; `reason="nul"` an id with an embedded NUL byte. A direct `Register` series carries only `reason`; the gateway path adds `source="gateway_proxy"`, so the two are separate series. Each series is created on its first rejection, so it is absent from the scrape until then (not pre-seeded). Per replica. |
 
 ## Labels
 
