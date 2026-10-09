@@ -1066,6 +1066,7 @@ TEST_CASE("SettingsRoutes GET /fragments/settings/users: no password controls on
         CHECK(count_of(body, "data-pw-action=") == 2);
         CHECK(body.find("hx-on") == std::string::npos);
     }
+}
 
 // ── #4644 Gate 8 round 4: the API-token form's ttl_hours is strict, and refusal mints nothing ──
 // `ttl_hours` of `0x5` used to read as 0 (never expires) and a negative TTL still computes 0.
