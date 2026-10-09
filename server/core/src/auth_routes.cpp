@@ -140,8 +140,8 @@ static std::string find_cookie_value(const std::string& hdr, const std::string& 
 /// sides derive the name from the same flag.
 ///
 /// SameSite=Lax, not SAML's None: the IdP returns to /auth/callback by a top-level GET
-/// navigation, which a Lax cookie accompanies, while a cross-site subrequest or POST does not
-/// carry it. (SAML needs None only because its assertion arrives as a POST.) This relies
+/// navigation, which a Lax cookie accompanies; a Lax cookie is not sent on subrequests or
+/// POSTs. (SAML needs None only because its assertion arrives as a POST.) This relies
 /// on the default `query` response mode; a `form_post` return would not carry a Lax cookie.
 /// Max-Age=600 matches the pending flow's TTL (OidcProvider::kChallengeTtl).
 static const char* oidc_bind_cookie_name(bool https) {

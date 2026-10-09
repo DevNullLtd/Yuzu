@@ -159,16 +159,16 @@ public:
     ///
     /// `binding_secret` is the value of the binding cookie the CALLING browser presented. The
     /// flow proceeds only if SHA-256(binding_secret) equals the hash stored at
-    /// `start_auth_flow` (constant-time compare); an empty, wrong or unhashable secret is
-    /// refused with `kBrowserBindingMismatch`. The check runs BEFORE the pending flow is
-    /// consumed and a refusal leaves the flow in place: a refusal leaves the
-    /// pending flow available to the initiating browser. The flow is consumed (single use) only
-    /// once the binding matched. A digest failure is refused with `kBrowserBindingUnavailable`
-    /// and is likewise non-consuming.
+    /// `start_auth_flow` (constant-time compare); an empty or wrong secret is refused with
+    /// `kBrowserBindingMismatch`, and a digest failure with `kBrowserBindingUnavailable`. The
+    /// check runs BEFORE the pending flow is consumed and either refusal leaves the pending flow
+    /// available to the initiating browser. The flow is consumed (single use) only once the
+    /// binding matched.
     ///
     /// `binding_verified`, when non-null, is set false on entry and true ONLY once the presented
     /// secret matched. It is the sole signal that the calling browser's cookie proved a
-    /// pending flow (and so is spent); an unknown or expired state and a mismatch leave it false.
+    /// pending flow (and so is spent); an unknown or expired state, a mismatch and a digest
+    /// failure leave it false.
     /// Every failure after the match (token exchange, signature, claims) leaves it true.
     std::expected<IdTokenClaims, std::string> handle_callback(const std::string& code,
                                                               const std::string& state,

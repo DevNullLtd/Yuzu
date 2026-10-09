@@ -1215,7 +1215,7 @@ TEST_CASE("OIDC binding: end to end against a loopback IdP, a refusal never reac
     REQUIRE_FALSE(jwt.empty());
     idp.set_id_token(jwt);
 
-    // Another browser (a different browser): refused BEFORE any exchange,
+    // A different browser: refused BEFORE any exchange,
     // with no secret and with a wrong one.
     for (const std::string wrong : {std::string{}, std::string(64, 'e')}) {
         auto b = provider.handle_callback("other-code", state, wrong);

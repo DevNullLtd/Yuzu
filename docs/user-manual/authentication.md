@@ -314,6 +314,7 @@ Example startup:
 Browser           Yuzu Server               IdP (Entra ID)
   |                    |                          |
   |-- GET /auth/oidc/start -->                    |
+  |<-- 302 + Set-Cookie (binding) --|             |
   |                    |-- 302 authorize?... ---->|
   |                    |                          |
   |                    |          (user authenticates)
