@@ -305,10 +305,10 @@ Example startup:
 ### OIDC Login Flow
 
 1. User clicks "Sign in with SSO" on the login page.
-2. Browser is redirected to `GET /auth/oidc/start`, which generates a PKCE challenge and redirects to the IdP's authorization endpoint.
+2. Browser is redirected to `GET /auth/oidc/start`, which generates a PKCE challenge, sets the browser-binding cookie, and redirects to the IdP's authorization endpoint.
 3. User authenticates at the IdP.
-4. IdP redirects back to `GET /auth/callback` with an authorization code.
-5. Server exchanges the code for tokens, validates the ID token, extracts claims, and creates a local session.
+4. IdP redirects back to `GET /auth/callback` with an authorization code. The browser presents the binding cookie.
+5. Server checks the binding cookie, exchanges the code for tokens, validates the ID token, extracts claims, and creates a local session.
 
 ```
 Browser           Yuzu Server               IdP (Entra ID)
@@ -321,6 +321,12 @@ Browser           Yuzu Server               IdP (Entra ID)
   |                    |<--- 302 /auth/callback --|
   |<-- Set-Cookie -----|                          |
 ```
+
+### Browser binding
+
+The sign-in is bound to the browser that started it. `GET /auth/oidc/start` sets a short-lived (10 minute) `HttpOnly` cookie holding a random secret, and the server keeps only a SHA-256 digest of that secret beside the pending flow. `GET /auth/callback` refuses a request that does not present the matching cookie, so a callback URL only completes in the browser that began the flow. The cookie is `__Host-yuzu_oidc_bind` (`Secure`, `Path=/`) when the server runs with HTTPS, and `yuzu_oidc_bind` on plain HTTP, the same rule the session cookie follows. It is `SameSite=Lax` because the identity provider returns by a top-level GET. A refused callback does not consume the pending flow, so the original browser can still finish within the 10 minute window; the cookie is cleared once the flow it proved has been used. Refusals are audited as `auth.oidc_login_failed` with `reason=browser_binding_missing` or `reason=browser_binding_mismatch`, and the browser sees the usual generic `sso_failed` error.
+
+Starting a second SSO sign-in in the same browser replaces the cookie, so the earlier, unfinished sign-in in that browser must be restarted. The binding is held in server memory with the pending flow, so a sign-in that was started before a server upgrade or restart cannot be completed afterwards: the user restarts it from the login page.
 
 ### Group-to-Role Mapping
 
