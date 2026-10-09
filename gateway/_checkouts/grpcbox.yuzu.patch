@@ -65,8 +65,8 @@ index 7e9fa10..f7e5313 100644
  
  on_receive_data(_, State=#state{method=undefined}) ->
      {ok, State};
-+%% YUZU PATCH (#1422): once the server has terminated the stream (auth_fun
-+%% rejection, unimplemented method, ...) its trailers are sent, but stock
++%% YUZU PATCH (#1422): once auth_fun has rejected the peer and the stream's
++%% UNAUTHENTICATED trailers are sent, stock
 +%% grpcbox v0.17.1 still delivers subsequent DATA frames to handle_message —
 +%% which EXECUTES the service handler and merely discards the response
 +%% (end_stream is a no-op at trailers_sent=true). For an UNAUTHENTICATED-
