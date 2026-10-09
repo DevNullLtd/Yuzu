@@ -76,7 +76,7 @@ the handler again; for client-streaming or bidi, it goes to the dead handler
 process and runs nothing. Only an admitted peer can be affected: a rejected
 stream already has `trailers_sent` set, so the guard drops its data even if the
 deadline fires. This patch does not change that stock behaviour. Upstream,
-tsloughter/grpcbox#123 also fixes it, by having those `handle_info` clauses keep
+tsloughter/grpcbox#123 also fixes this, by having those `handle_info` clauses keep
 `end_stream`'s state. Tracked in #5591 (late DATA after a deadline) and #5590
 (core's `SendCommand` deadline equals the gateway fan-out timeout).
 
@@ -85,8 +85,7 @@ the stock `method=undefined` clause already drops the data.
 
 Reported upstream as tsloughter/grpcbox#122. tsloughter/grpcbox#123 carries the
 same guard, the `handle_info` fix for the two uncovered ends, and regression tests
-for both. Still unfixed in v0.18.0, the latest release as of
-2026-10-09.
+for both. Neither fix is in v0.18.0, the latest release as of 2026-10-09.
 
 ### 3. `src/grpcbox_stream.erl`: typed accessors for the connection pid
 
