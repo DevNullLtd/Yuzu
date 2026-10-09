@@ -41,7 +41,7 @@ requiring a client cert** — closing the plaintext agent↔gateway edge (a flee
 risk on an exposed gateway) while keeping bootstrap working. See
 `docs/pki-architecture.md` "Gateway TLS".
 
-### 2. `src/grpcbox_stream.erl` — terminated streams must not execute handlers (#1422)
+### 2. `src/grpcbox_stream.erl` — streams with trailers already sent must not execute handlers (#1422)
 
 In `on_receive_data/2` (search `YUZU PATCH`): one guard clause,
 
@@ -65,15 +65,18 @@ drops all data once `trailers_sent` is set. Regression-pinned by
 Only the `auth_fun` rejection path is an **authorization** bypass. The guard also
 covers one post-admission path: a decode or handler error caught in
 `on_receive_data` ends the stream with the method still set, so in stock a later
-DATA frame from the (already authenticated) peer runs the handler again while the
+DATA frame from the (already admitted) peer runs the handler again while the
 client has been told the call failed. Do not narrow the guard to the auth path.
 
 Two other early ends are **not** covered. A `grpc-timeout` deadline
-(DEADLINE_EXCEEDED) and a server-streaming handler process exiting both end the
-stream from `handle_info`, which discards `end_stream`'s returned state, so
-`trailers_sent` stays false and later DATA can still reach the handler. Both
-happen after the peer was admitted. This is stock behaviour that neither this
-patch nor tsloughter/grpcbox#123 changes.
+(DEADLINE_EXCEEDED) and a spawned handler process exiting both end the stream
+from `handle_info`, which discards `end_stream`'s returned state, so
+`trailers_sent` stays false. For a server-streaming method, later DATA then runs
+the handler again; for client-streaming or bidi, it goes to the dead handler
+process and runs nothing. Only an admitted peer can be affected: a rejected
+stream already has `trailers_sent` set, so the guard drops its data even if the
+deadline fires. This is stock behaviour that neither this patch nor
+tsloughter/grpcbox#123 changes.
 
 An unknown method (UNIMPLEMENTED) is not affected: the method is never stored, so
 the stock `method=undefined` clause already drops the data.
@@ -129,16 +132,29 @@ bash gateway/scripts/verify-vendored-grpcbox.sh
 
 This is intentionally a *minimal* vendor of a *pinned* tag. To move to a newer
 grpcbox: re-copy `src/`+`include/`+`rebar.config`+`LICENSE` from the new tag,
-re-apply `grpcbox.yuzu.patch` (or the three `YUZU PATCH` sites: `grpcbox_pool.erl:init/1`,
-`grpcbox_stream.erl:on_receive_data/2` and the `connection_pid` accessors in `grpcbox_stream.erl`, by hand), regenerate `grpcbox.yuzu.patch` against the new
-stock, bump the `{tag, "vX.Y.Z"}` pin in `rebar.config` (grpcbox stays OUT of
-`rebar.lock` — it is a checkout; rebar3 refuses to lock it), update `EXPECTED_SHA`
-in `gateway/scripts/verify-vendored-grpcbox.sh` to the new tag's commit, run the
-gateway suite + dialyzer, and re-run `verify-vendored-grpcbox.sh`. The upstreaming target is making
-`verify`/`fail_if_no_peer_cert` configurable in grpcbox itself (then this vendor can
-be dropped). Tracked with PR5c. Patch 2 can be dropped only once the vendored
-release drops data on **every** stream with `trailers_sent=true`, as
-tsloughter/grpcbox#123 does today. Check the merged upstream code, not just the PR
-number, and keep `yuzu_gw_authz_rpc_tests` either way. From grpcbox v0.18.0 (chatterbox 0.16)
-the `h2_*` modules are renamed `chatterbox_h2_*`, so patch 3's `connection_pid/1`
-must call `chatterbox_h2_stream_set:connection/1` after a re-sync.
+re-apply `grpcbox.yuzu.patch` (or the three `YUZU PATCH` sites:
+`grpcbox_pool.erl:init/1`, `grpcbox_stream.erl:on_receive_data/2` and the
+`connection_pid` accessors in `grpcbox_stream.erl`, by hand), regenerate
+`grpcbox.yuzu.patch` against the new stock, bump the `{tag, "vX.Y.Z"}` pin in
+`rebar.config` (grpcbox stays OUT of `rebar.lock` — it is a checkout; rebar3
+refuses to lock it), update `EXPECTED_SHA` in
+`gateway/scripts/verify-vendored-grpcbox.sh` to the new tag's commit, run the
+gateway suite + dialyzer, and re-run `verify-vendored-grpcbox.sh`. The
+upstreaming target is making `verify`/`fail_if_no_peer_cert` configurable in
+grpcbox itself (then this vendor can be dropped). Tracked with PR5c.
+
+Patch 2 can be dropped only once the vendored release drops data on **every**
+stream with `trailers_sent=true`, as tsloughter/grpcbox#123 does today. Check the
+merged upstream code, not just the PR number, and keep `yuzu_gw_authz_rpc_tests`
+either way.
+
+Any re-sync to grpcbox v0.18.0 or later (chatterbox 0.16) must also handle the
+chatterbox module rename: `h2_*` becomes `chatterbox_h2_*`. Three places use the
+old names: patch 3's `connection_pid/1` (call and `-spec`), the dialyzer comment
+on `h2_stream_set:stream_set()` in `gateway/rebar.config`, and
+`apps/yuzu_gw/test/yuzu_gw_heartbeat_conn_drain_tests.erl`, which calls
+`h2_stream_set:connection/1` and `h2_connection:send_frame/2` directly. A missed
+rename in patch 3 does not crash: `yuzu_gw_conn` catches the `undef` and returns
+`undefined`, and a session bound to `undefined` admits nothing, so every agent's
+heartbeat is refused fleet-wide. Dialyzer and the conn-drain test catch it; do
+not skip either.
