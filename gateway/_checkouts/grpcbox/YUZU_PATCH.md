@@ -41,7 +41,7 @@ requiring a client cert** — closing the plaintext agent↔gateway edge (a flee
 risk on an exposed gateway) while keeping bootstrap working. See
 `docs/pki-architecture.md` "Gateway TLS".
 
-### 2. `src/grpcbox_stream.erl` — streams with trailers already sent must not execute handlers (#1422)
+### 2. `src/grpcbox_stream.erl` — no handlers after trailers are sent (#1422)
 
 In `on_receive_data/2` (search `YUZU PATCH`): one guard clause,
 
@@ -76,7 +76,8 @@ the handler again; for client-streaming or bidi, it goes to the dead handler
 process and runs nothing. Only an admitted peer can be affected: a rejected
 stream already has `trailers_sent` set, so the guard drops its data even if the
 deadline fires. This is stock behaviour that neither this patch nor
-tsloughter/grpcbox#123 changes.
+tsloughter/grpcbox#123 changes. Tracked in #5591 (late DATA after a deadline) and
+#5590 (core's `SendCommand` deadline equals the gateway fan-out timeout).
 
 An unknown method (UNIMPLEMENTED) is not affected: the method is never stored, so
 the stock `method=undefined` clause already drops the data.
@@ -150,11 +151,15 @@ either way.
 
 Any re-sync to grpcbox v0.18.0 or later (chatterbox 0.16) must also handle the
 chatterbox module rename: `h2_*` becomes `chatterbox_h2_*`. Three places use the
-old names: patch 3's `connection_pid/1` (call and `-spec`), the dialyzer comment
+old names: patch 3's `connection_pid/1` call, the dialyzer comment
 on `h2_stream_set:stream_set()` in `gateway/rebar.config`, and
 `apps/yuzu_gw/test/yuzu_gw_heartbeat_conn_drain_tests.erl`, which calls
 `h2_stream_set:connection/1` and `h2_connection:send_frame/2` directly. A missed
 rename in patch 3 does not crash: `yuzu_gw_conn` catches the `undef` and returns
-`undefined`, and a session bound to `undefined` admits nothing, so every agent's
-heartbeat is refused fleet-wide. Dialyzer and the conn-drain test catch it; do
-not skip either.
+`undefined`. A session bound to `undefined` admits nothing, so every agent's
+heartbeat is refused fleet-wide, while Register and Subscribe still succeed and
+the per-connection session cap stops applying (an `undefined` key is never
+counted). Dialyzer and the conn-drain test catch it; do not skip either. After
+deploying a re-synced gateway, check one canary first: the symptom is
+`yuzu_gw_heartbeat_rejected_total{reason="no_connection"}` rising at about the
+fleet heartbeat rate.
