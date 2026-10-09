@@ -110,9 +110,9 @@ stream_late_data_after_deadline(#{chan_srv := Chan}) ->
     {ok, S} = grpcbox_client:stream(Ctx, ?SEND_PATH, send_command_def(),
                                     #{channel => Chan}),
     %% The server has ended the stream on its deadline before any DATA was
-    %% sent, so the send below is genuinely late. stream_ok/1 is the positive
-    %% control: the same open-then-send shape without a deadline runs the
-    %% handler once.
+    %% sent, so the send below is genuinely late. stream_ok/1 is the closest
+    %% positive control: a similar open-then-send stream without a deadline
+    %% runs the handler once.
     ?assertMatch({error, {<<"4">>, _}}, stream_result(S)),
     ok = grpcbox_client:send(S, #{agent_ids => [], timeout_seconds => 1}),
     ?assertEqual(0, invocations_within(1000)).

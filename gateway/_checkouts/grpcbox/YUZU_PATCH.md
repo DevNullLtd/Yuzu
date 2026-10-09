@@ -134,11 +134,13 @@ afterwards reached `handle_message`. For a server-streaming method such as
 `SendCommand` that ran the handler, and so a fleet fan-out, after the client had
 been told the call failed. For client-streaming or bidi, DATA after a handler
 exit went to the dead handler process and ran nothing, but DATA after a deadline
-still reached the live handler; both are now dropped. Only an admitted peer
-could be affected: a rejected stream already has `trailers_sent` set. Keeping the
-returned state also keeps `headers_sent`, and a second exit or timeout on the same
-stream no longer sends trailers twice. Every `end_stream` clause returns `{ok, State}`, so the
-match cannot fail.
+still reached the live handler; both are now dropped. Only an admitted peer could
+be affected: a rejected stream already has `trailers_sent` set. Keeping the
+returned state also keeps `headers_sent`, and a second exit or timeout on the
+same stream no longer sends trailers twice. Every `end_stream` clause returns
+`{ok, State}`, so the match cannot fail.
+
+The drop is silent: the guard clause logs nothing and emits no metric (#5599).
 
 The guard only applies once the stream has ended. A second request message that
 arrives *before* the first handler exits, including one in the same DATA frame,
@@ -171,8 +173,8 @@ This is intentionally a *minimal* vendor of a *pinned* tag. To move to a newer
 grpcbox: re-copy `src/`+`include/`+`rebar.config`+`LICENSE` from the new tag,
 re-apply `grpcbox.yuzu.patch` (or the four `YUZU PATCH` sites:
 `grpcbox_pool.erl:init/1`, `grpcbox_stream.erl:on_receive_data/2`, the
-`connection_pid` accessors in `grpcbox_stream.erl` and its `handle_info/2`, by
-hand), regenerate
+`connection_pid` accessors in `grpcbox_stream.erl`, and
+`grpcbox_stream.erl:handle_info/2`, by hand), regenerate
 `grpcbox.yuzu.patch` against the new stock, bump the `{tag, "vX.Y.Z"}` pin in
 `rebar.config` (grpcbox stays OUT of `rebar.lock` — it is a checkout; rebar3
 refuses to lock it), update `EXPECTED_SHA` in
