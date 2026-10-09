@@ -39,9 +39,12 @@ public:
         }
         cv_.notify_all();
     }
-    void wait() {
+    // Bounded: a test that never reaches set() (a failed REQUIRE upstream, a regression
+    // that stops a flight from registering) must fail, not hang the runner. The bound
+    // is a hang guard only; it elapses on a regression and never on the happy path.
+    bool wait(std::chrono::milliseconds bound = 30'000ms) {
         std::unique_lock lk(m_);
-        cv_.wait(lk, [&] { return set_; });
+        return cv_.wait_for(lk, bound, [&] { return set_; });
     }
 
 private:
@@ -98,9 +101,10 @@ struct CountingClock {
         cv.notify_all();
         return t;
     }
-    void wait_for_calls(int n) {
+    // Bounded for the same reason as Event::wait: returns false on timeout.
+    bool wait_for_calls(int n, std::chrono::milliseconds bound = 30'000ms) {
         std::unique_lock lk(m);
-        cv.wait(lk, [&] { return calls >= n; });
+        return cv.wait_for(lk, bound, [&] { return calls >= n; });
     }
     GuardianRuleBundleCache::ClockFn fn() {
         return [this] { return now(); };
@@ -300,7 +304,7 @@ TEST_CASE("GuardianRuleBundleCache: a load that fails after an invalidate does n
             std::unexpected(BundleLoadError{BundleLoadError::Source::rules, "late failure"}));
     };
     std::thread t([&] { (void)cache.get(8, slow_failing); });
-    entered.wait();
+    REQUIRE(entered.wait());
     cache.invalidate();  // the bump landed while the old load was still running
     release.set();
     t.join();
@@ -398,7 +402,7 @@ TEST_CASE("GuardianRuleBundleCache: concurrent callers for one generation share 
     std::vector<std::shared_ptr<const Bundle>> got(8);
     std::vector<std::thread> ts;
     ts.emplace_back([&] { got[0] = cache.get(4, slow).value(); });
-    entered.wait();  // the flight is registered before the loader body runs
+    REQUIRE(entered.wait());  // the flight is registered before the loader body runs
     for (std::size_t i = 1; i < got.size(); ++i)
         ts.emplace_back([&, i] { got[i] = cache.get(4, slow).value(); });
     release.set();
@@ -424,7 +428,7 @@ TEST_CASE("GuardianRuleBundleCache: a request for another generation does not wa
     };
     std::shared_ptr<const Bundle> slow_result;
     std::thread t([&] { slow_result = cache.get(1, slow).value(); });
-    entered.wait();
+    REQUIRE(entered.wait());
 
     std::atomic<int> calls{0};
     auto quick = cache.get(2, counting_loader(calls, "quick"));  // returns while gen 1 is blocked
@@ -555,7 +559,7 @@ TEST_CASE("GuardianRuleBundleCache: a waiter gives up after max_wait while the l
     };
     std::shared_ptr<const Bundle> loaded;
     std::thread t([&] { loaded = cache.get(4, slow).value(); });
-    entered.wait();
+    REQUIRE(entered.wait());
 
     auto waiter = cache.get(4, slow);
     REQUIRE_FALSE(waiter.has_value());
@@ -597,12 +601,12 @@ TEST_CASE("GuardianRuleBundleCache: waited reports the time a blocked waiter spe
 
     std::chrono::nanoseconds owner_waited{-1};
     std::thread owner([&] { (void)cache.get(4, slow, &owner_waited); });
-    entered.wait();  // the flight is registered; the owner has read the clock once
+    REQUIRE(entered.wait());  // the flight is registered; the owner has read the clock once
 
     std::chrono::nanoseconds waiter_waited{-1};
     std::thread waiter([&] { (void)cache.get(4, slow, &waiter_waited); });
     // Under the lock (read 2) and just before blocking (read 3): the waiter is about to block.
-    clk.wait_for_calls(3);
+    REQUIRE(clk.wait_for_calls(3));
     clk.base.advance(3s);  // 3 s pass while the waiter is blocked
     release.set();
     owner.join();

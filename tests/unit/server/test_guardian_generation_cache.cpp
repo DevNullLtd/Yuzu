@@ -52,9 +52,10 @@ struct CountingClock {
         cv.notify_all();
         return t;
     }
-    void wait_for_calls(int n) {
+    // Bounded for the same reason as Event::wait: returns false on timeout.
+    bool wait_for_calls(int n, std::chrono::milliseconds bound = 30'000ms) {
         std::unique_lock lk(m);
-        cv.wait(lk, [&] { return calls >= n; });
+        return cv.wait_for(lk, bound, [&] { return calls >= n; });
     }
     GuardianGenerationCache::ClockFn fn() {
         return [this] { return now(); };
@@ -71,9 +72,12 @@ public:
         }
         cv_.notify_all();
     }
-    void wait() {
+    // Bounded: a test that never reaches set() (a failed REQUIRE upstream, a regression
+    // that stops a flight from registering) must fail, not hang the runner. The bound
+    // is a hang guard only; it elapses on a regression and never on the happy path.
+    bool wait(std::chrono::milliseconds bound = 30'000ms) {
         std::unique_lock lk(m_);
-        cv_.wait(lk, [&] { return set_; });
+        return cv_.wait_for(lk, bound, [&] { return set_; });
     }
 
 private:
@@ -237,7 +241,7 @@ TEST_CASE("GuardianGenerationCache: single flight, concurrent callers share one 
     std::vector<std::uint64_t> got(8, 0);
     std::vector<std::thread> ts;
     ts.emplace_back([&] { got[0] = c.get().value(); });
-    entered.wait();  // the flight is registered before the fetch body runs
+    REQUIRE(entered.wait());  // the flight is registered before the fetch body runs
     for (std::size_t i = 1; i < got.size(); ++i)
         ts.emplace_back([&, i] { got[i] = c.get().value(); });
     release.set();
@@ -268,7 +272,7 @@ TEST_CASE("GuardianGenerationCache: a stale success is served while a refresh is
 
     std::uint64_t refreshed = 0;
     std::thread leader([&] { refreshed = c.get().value(); });
-    entered.wait();
+    REQUIRE(entered.wait());
     CHECK(c.get().value() == 5);  // returns immediately with the previous value
     CHECK(calls.load() == 2);
     release.set();
@@ -304,7 +308,7 @@ TEST_CASE("GuardianGenerationCache: a stale success is NOT served after an error
 
     std::uint64_t leader_got = 0, waiter_got = 0;
     std::thread leader([&] { leader_got = c.get().value(); });
-    entered.wait();
+    REQUIRE(entered.wait());
     std::thread waiter([&] { waiter_got = c.get().value(); });
     release.set();
     leader.join();
@@ -330,7 +334,7 @@ TEST_CASE("GuardianGenerationCache: an invalidate during a flight is not undone 
         {}, clk.fn());
     std::uint64_t older = 0;
     std::thread leader([&] { older = c.get().value(); });
-    entered.wait();
+    REQUIRE(entered.wait());
     c.invalidate();
     release.set();
     leader.join();
@@ -424,7 +428,7 @@ TEST_CASE("GuardianGenerationCache: an older read finishing last does not overwr
 
     std::uint64_t older = 0;
     std::thread t([&] { older = c.get_fresh().value(); });
-    older_entered.wait();
+    REQUIRE(older_entered.wait());
     clk.advance(1s);  // the second read starts strictly later
     REQUIRE(c.get_fresh().value() == 8);
     release_older.set();
@@ -467,7 +471,7 @@ TEST_CASE("GuardianGenerationCache: an invalidate during get_fresh is not undone
         {}, clk.fn());
     std::uint64_t older = 0;
     std::thread t([&] { older = c.get_fresh().value(); });
-    entered.wait();
+    REQUIRE(entered.wait());
     c.invalidate();
     release.set();
     t.join();
@@ -503,7 +507,7 @@ TEST_CASE("GuardianGenerationCache: a waiter gives up after max_wait while the f
 
     std::uint64_t leader_got = 0;
     std::thread leader([&] { leader_got = c.get().value(); });
-    entered.wait();
+    REQUIRE(entered.wait());
     // No cached value, so this caller waits on the flight and must time out.
     auto waiter = c.get();
     REQUIRE_FALSE(waiter.has_value());
@@ -555,13 +559,13 @@ TEST_CASE("GuardianGenerationCache: get() racing a throwing flight never hangs",
         },
         {.max_wait = 60'000ms}, clk.fn());  // a hang would show as a 60 s test, not a timeout pass
     std::thread leader([&] { (void)c.get(); });
-    entered.wait();
+    REQUIRE(entered.wait());
     GuardianGenerationCache::Result waiter = std::unexpected(std::string("unset"));
     std::thread w([&] { waiter = c.get(); });
     // get() reads the clock (read 2; the leader's was read 1) in the same critical section in
     // which it finds the flight registered, and the leader cannot clear the flight without that
     // lock. So once the read is seen the waiter is on the flight: no race with the release.
-    clk.wait_for_calls(2);
+    REQUIRE(clk.wait_for_calls(2));
     release.set();
     leader.join();
     w.join();
@@ -620,11 +624,11 @@ TEST_CASE("GuardianGenerationCache: a newer success that started inside a slow f
         },
         {}, clk.fn());
     std::thread ta([&] { (void)c.get(); });
-    a_in.wait();
+    REQUIRE(a_in.wait());
     clk.advance(1s);
     GuardianGenerationCache::Result b = std::unexpected(std::string("unset"));
     std::thread tb([&] { b = c.get_fresh(); });
-    b_in.wait();
+    REQUIRE(b_in.wait());
     rel_a.set();
     ta.join();  // the error installs: started at 0, completed at 1.5 s
     rel_b.set();
