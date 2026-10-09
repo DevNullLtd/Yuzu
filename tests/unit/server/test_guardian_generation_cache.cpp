@@ -597,3 +597,58 @@ TEST_CASE("GuardianGenerationCache: a slow failing read is negative-cached from 
     (void)c.get();
     CHECK(calls.load() == 2);
 }
+
+TEST_CASE("GuardianGenerationCache: a newer success that started inside a slow failing read still installs",
+          "[guardian][generation_cache]") {
+    // Pins that the monotonic install compares fetch START times. The failing read started
+    // first but finished last (completed-at 1.5 s), the success started at 1 s. Comparing
+    // the freshness reference instead would reject the newer success.
+    ManualClock clk;
+    Event a_in, rel_a, b_in, rel_b;
+    std::atomic<int> calls{0};
+    GuardianGenerationCache c(
+        [&]() -> GuardianGenerationCache::Result {
+            if (calls.fetch_add(1) == 0) {
+                a_in.set();
+                rel_a.wait();
+                clk.advance(500ms);
+                return std::unexpected(std::string("slow fail"));
+            }
+            b_in.set();
+            rel_b.wait();
+            return 9;
+        },
+        {}, clk.fn());
+    std::thread ta([&] { (void)c.get(); });
+    a_in.wait();
+    clk.advance(1s);
+    GuardianGenerationCache::Result b = std::unexpected(std::string("unset"));
+    std::thread tb([&] { b = c.get_fresh(); });
+    b_in.wait();
+    rel_a.set();
+    ta.join();  // the error installs: started at 0, completed at 1.5 s
+    rel_b.set();
+    tb.join();  // the success started at 1 s
+    REQUIRE(b.has_value());
+    CHECK(*b == 9);
+    auto g = c.get();
+    REQUIRE(g.has_value());
+    CHECK(*g == 9);
+}
+
+TEST_CASE("GuardianGenerationCache: a success ages from the start of its fetch",
+          "[guardian][generation_cache]") {
+    ManualClock clk;
+    std::atomic<int> calls{0};
+    GuardianGenerationCache c(
+        [&]() -> GuardianGenerationCache::Result {
+            calls.fetch_add(1);
+            clk.advance(1500ms);
+            return 5;
+        },
+        {}, clk.fn());
+    REQUIRE(c.get().has_value());
+    clk.advance(600ms);  // 2.1 s since the start, 0.6 s since completion; ttl is 2 s
+    (void)c.get();
+    CHECK(calls.load() == 2);
+}
