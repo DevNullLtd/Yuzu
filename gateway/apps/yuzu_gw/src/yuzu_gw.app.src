@@ -19,6 +19,8 @@
         public_key,
         ctx,
         grpcbox,
+        cowboy,
+        ranch,
         telemetry,
         prometheus,
         prometheus_httpd
