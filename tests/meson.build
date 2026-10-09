@@ -1564,6 +1564,7 @@ if build_server
       'unit/server/test_server_guardian_reconcile_options.cpp', # #5513: reconcile budget flags: names, defaults, env, validation
       'unit/server/test_guardian_generation_cache.cpp', # #5513: TTL-cached policy-generation read
       'unit/server/test_guardian_rule_bundle.cpp', # #5513: per-generation rule-bundle memo
+      'unit/server/test_guardian_reconcile_flow.cpp', # #5513: the heartbeat reconcile control flow (GuardianReconcileFlow::run)
       'unit/server/test_agent_registry_scope_for_agent.cpp', # #5513: single-agent scope evaluator
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin
       'unit/server/test_dex_alert_router.cpp',
@@ -3409,10 +3410,11 @@ test('guardian heartbeat generation wiring lexical gate (#5513)',
   timeout: 30,
 )
 
-# #5513: static lexical gate pinning the Guardian heartbeat reconcile wiring in server.cpp
-# (admission gate, rule-bundle cache, per-agent scope evaluator, abort on a degraded scope
-# store). The reconcile lambda lives inside ServerImpl, which no unit test constructs. Carries
-# its own in-memory mutation self-test. No build required. Suite 'docs', like the
+# #5513: static lexical gate pinning the Guardian heartbeat reconcile flow
+# (guardian_reconcile_flow.hpp: admission gate, rule-bundle cache, per-agent scope evaluator,
+# abort on a degraded scope store) and its wiring in server.cpp. The flow is also unit tested
+# (test_guardian_reconcile_flow.cpp); the wiring lives inside ServerImpl, which no unit test
+# constructs. Carries its own in-memory mutation self-test. No build required. Suite 'docs', like the
 # gateway-upstream gate above: assert-suite-cover.py has no bare 'server' entry for no-build gates.
 test('guardian reconcile wiring lexical gate (#5513)',
   _python3_test,

@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
-"""#5513 static lexical gate over the Guardian heartbeat-reconcile lambda in server.cpp.
+"""#5513 static lexical gate over the Guardian heartbeat-reconcile control flow and its wiring.
 
 ServerImpl is never constructed by a unit test, so nothing else would notice if the wiring that
 makes the reconcile path safe at fleet scale were reverted: the building blocks
 (guardian_reconcile_gate.hpp, guardian_reconcile_budget.hpp, guardian_generation_cache.hpp,
 guardian_rule_bundle.hpp, AgentRegistry::evaluate_scope_for_agent) are unit-tested in isolation,
 and every one of them could be silently bypassed with all those tests green. This gate pins the
-call sites. Invariants, over the argument of `set_guardian_reconcile_fn(` in server.cpp (comments
-removed, string-literal contents reduced to [A-Za-z0-9_], whitespace collapsed):
+call sites.
 
-  a. The lambda decides through `guardian_reconcile_gate_.decide(` and handles all four
+TWO TARGETS (the control flow moved out of server.cpp into guardian_reconcile_flow.hpp so that
+it is unit tested; tests/unit/server/test_guardian_reconcile_flow.cpp is now the behavioural
+guard and this gate is the cheap tripwire that stays beside it):
+
+  FLOW = the body of `void run(` in server/core/src/guardian_reconcile_flow.hpp (comments
+  removed, string-literal contents reduced to [A-Za-z0-9_], whitespace collapsed): invariants
+  a-h, j-o, r, s below.
+  WIRING = server.cpp: the `set_guardian_reconcile_fn(` call, the `GuardianReconcileFlowDeps`
+  construction feeding it, and the maintenance tick: invariants i, o (second half), p, q, t, u.
+
+Invariants over the FLOW:
+
+  a. The flow decides through `guardian_reconcile_gate_.decide(` and handles all four
      `GuardianReconcileGate::Decision` values (Converged, RateLimited, Shed, Admit).
   b. The Shed case increments `yuzu_server_guardian_reconciles_total{result="shed"}` and writes
-     NO audit row (no `audit_store_`, `AuditEvent` or `->log(` in that case).
+     NO audit row (no `audit_(`, `AuditEvent` or `->log(` in that case).
   c. Right after the Admit case, `begin_admitted()` is taken into a NAMED local (a discarded
      temporary would debit immediately instead of at every exit).
   d. The rule bundle comes from `guardian_rule_bundle_cache_.get(` and its `.rules` feed
      `build_agent_push(`.
-  e. Scope membership uses `evaluate_scope_for_agent(` and the lambda never calls
+  e. Scope membership uses the injected `eval_scope_(` and the flow never calls
      `evaluate_scope_local(` (that builds the fleet's matching-id vector under the registry lock).
   f. A StoreDegraded scope error sets `scope_degraded`, and `if (scope_degraded)` leads to
      `abort_degraded(` and a `return` (send nothing; never a narrowed full_sync).
-  g. The generation is read through `guardian_generation_cache_.get()`; the lambda never calls
+  g. The generation is read through `guardian_generation_cache_.get()`; the flow never calls
      `current_policy_generation(` itself.
-  h. Order inside the lambda: decide < begin_admitted < bundle get < evaluate_scope_for_agent.
-  i. Whole file: `guardian_last_reconcile_` and `guardian_reconcile_mu_` no longer exist; the
-     claim-map sweep (`guardian_reconcile_gate_.sweep(`) is called; and the pre-seed loop for
-     `yuzu_server_guardian_reconciles_total` includes "shed".
+  h. Order inside run(): decide < begin_admitted < bundle get < eval_scope_(.
   j. Control flow: the Converged, RateLimited and Shed cases each `return;` (a case that falls
      through would run the push for an agent that must not get one); the RateLimited case counts
      result="rate_limited".
@@ -41,26 +49,35 @@ removed, string-literal contents reduced to [A-Za-z0-9_], whitespace collapsed):
      unreadable"`.
   m. `abort_degraded` increments the `degraded` counter AND writes the audit event; the rule,
      baseline and bundle-load degrade branches each reach it.
-  n. A session-less Admit KEEPS its claim: the reconcile lambda never calls `release(` (an agent
+  n. A session-less Admit KEEPS its claim: the flow never calls `release(` (an agent
      heartbeating generation 0 in a loop would, with the claim released, turn each heartbeat into a
      fresh admission and let one credential drain the shared budget), and the `no_session` branch
      counts then returns. Only the time spent BLOCKED on another thread's rule-set load is excluded
-     from the debit: there is EXACTLY ONE `admitted.exclude(` in the lambda, `exclude(bundle_waited)`
+     from the debit: there is EXACTLY ONE `admitted.exclude(` in run(), `exclude(bundle_waited)`
      fed by the cache's `waited` out-parameter (a second would double-subtract); the generic
      `excluding(` wrapper that also excluded the owner's own load must not return.
   o. The bundle load goes through `guardian::load_reconcile_bundle(` (unit-tested for its
-     evaluation order), and no statement anywhere in server.cpp or guardian_push_builder.cpp
-     combines `filter_deployed_members(` with `std::move(`: `make_bundle` takes both arguments
-     by value and the order of evaluation is unspecified, so a move of the deployed set can run
-     before the filter reads it (GCC and MSVC do exactly that) and empty the bundle.
-  p. The body of the `guardian_push_fn_` lambda (not merely anywhere outside the reconcile lambda)
-     invalidates both reconcile caches.
+     evaluation order), and no statement anywhere in the flow, server.cpp or
+     guardian_push_builder.cpp combines `filter_deployed_members(` with `std::move(`:
+     `make_bundle` takes both arguments by value and the order of evaluation is unspecified, so a
+     move of the deployed set can run before the filter reads it (GCC and MSVC do exactly that)
+     and empty the bundle.
   r. After the fresh-generation read: an unreadable result aborts through `abort_degraded(` AND
      returns (else `*fresh_res` is dereferenced), `if (fresh_generation <= agent_gen)` returns
      BEFORE the bundle get (a reconcile whose fresh value is not ahead sends nothing and must not
-     pay for a load), no policy-generation gauge `.set(` anywhere in the lambda takes the cached
+     pay for a load), no policy-generation gauge `.set(` anywhere in run() takes the cached
      `current` (only `fresh_generation`), and `admitted.exclude(` comes after the bundle get whose
      waited value it takes.
+  s. The push is counted `sent`, and audited `success`, ONLY inside `if (send_push_(`: a failed
+     send must not count, gauge or audit a reconcile that did not happen.
+
+Invariants over the WIRING (server.cpp):
+
+  i. `guardian_last_reconcile_` and `guardian_reconcile_mu_` no longer exist; the claim-map sweep
+     (`guardian_reconcile_gate_.sweep(`) is called; and the pre-seed loop for
+     `yuzu_server_guardian_reconciles_total` includes "shed".
+  p. The body of the `guardian_push_fn_` lambda (not merely anywhere else) invalidates both
+     reconcile caches.
   q. The 15 s maintenance tick publishes the three saturation gauges
      (`yuzu_server_guardian_reconcile_in_flight`, `..._budget_balance_ms`, `..._claims`) from the
      gate and budget in their OWN try block with both catch arms (`std::exception`, named or not,
@@ -75,11 +92,23 @@ removed, string-literal contents reduced to [A-Za-z0-9_], whitespace collapsed):
      contains (consuming the result, further statements) is not pinned. Accepted limit: a
      construct that keeps all of the above yet stops the block running (a macro, a throwing
      statement the lexer does not recognise) is review-only.
+  t. `set_guardian_reconcile_fn(` is called exactly once, its lambda does nothing but call
+     `reconcile_flow->run(agent_id_sv, agent_gen)` (no inline `decide(`: a second, unreviewed copy
+     of the control flow would be the drift this extraction removed), and the lambda captures the
+     flow it runs. `GuardianReconcileFlowDeps{...}` is constructed exactly once and feeds the
+     gate, both caches, the budget, the metrics registry and the duration histogram from the
+     ServerImpl members of those names.
+  u. The dependency callables in that construction keep their security-relevant bodies:
+     `eval_scope` uses `registry_.evaluate_scope_for_agent(` and never `evaluate_scope_local(`;
+     `send_push` builds a `DispatchCaller{.system = true}` for `__guard__`/`push_rules`, sends
+     through `send_system_reserved(... guardian_push_rules)` and calls `forward_gateway_pending()`
+     exactly once, only on the success branch; `audit` keeps the `audit_store_->is_open()` check;
+     `list_rules`, `deployed_ids`, `session_os` and `random_suffix` keep their sources.
 
 LEXICAL ONLY. It cannot see a relocation that keeps the tokens but changes control flow (that
 stays review-enforced), and the behavioural guarantees are the building blocks' own unit tests.
-The self-test applies in-memory mutations to a COPY of the source and requires problems() to name
-the expected invariant on each; a mutation that changes nothing fails loudly (stale pattern).
+The self-test applies in-memory mutations to a COPY of each source and requires problems() (server.cpp)
+or flow_problems() (the flow header) to name the expected invariant on each; a mutation that changes nothing fails loudly (stale pattern).
 BENIGN controls prove a comment or string that merely mentions a token cannot trip or satisfy it.
 
 Modelled on tests/test_gateway_peer_registration_lexical.py and
@@ -87,8 +116,8 @@ tests/test_guardian_heartbeat_wiring_lexical.py. Sources are read as UTF-8. Pyth
 the other no-build lexical gates (#5428).
 
 Usage: python3 tests/test_guardian_reconcile_wiring_lexical.py
-       SERVER_CPP=<path> PUSH_BUILDER_CPP=<path> python3 -I tests/test_guardian_reconcile_wiring_lexical.py
-                                                                    (point at copies)
+       SERVER_CPP=<path> FLOW_HPP=<path> PUSH_BUILDER_CPP=<path> \\
+           python3 -I tests/test_guardian_reconcile_wiring_lexical.py        (point at copies)
 """
 import os
 import re
@@ -98,11 +127,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVER_CPP = Path(os.environ.get("SERVER_CPP", ROOT / "server" / "core" / "src" / "server.cpp"))
+FLOW_HPP = Path(os.environ.get("FLOW_HPP", ROOT / "server" / "core" / "src" / "guardian_reconcile_flow.hpp"))
 PUSH_BUILDER_CPP = Path(os.environ.get(
     "PUSH_BUILDER_CPP", ROOT / "server" / "core" / "src" / "guardian_push_builder.cpp"))
 TAG = "test_guardian_reconcile_wiring_lexical"
-HINT = (" (this gate pins the #5513 Guardian reconcile wiring; if server.cpp was legitimately "
-        "restructured, update tests/test_guardian_reconcile_wiring_lexical.py)")
+HINT = (" (this gate pins the #5513 Guardian reconcile flow and wiring; if server.cpp or "
+        "guardian_reconcile_flow.hpp was legitimately restructured, update "
+        "tests/test_guardian_reconcile_wiring_lexical.py)")
 
 # Comments -> one space; string literal contents sanitised; char literals blanked. Alternation
 # order matters: the scan is left to right, so a `//` inside a string literal is consumed by the
@@ -183,6 +214,15 @@ def lambda_body(t):
     return None if end < 0 else t[starts[0] + 1:end]
 
 
+def run_body(t):
+    """The text of the `void run(...) { ... }` body in the flow header, or None."""
+    starts = [m.end() - 1 for m in re.finditer(r"\bvoid run\([^()]*\) ?\{", t)]
+    if len(starts) != 1:
+        return None
+    end = match_close(t, starts[0], "{", "}")
+    return None if end < 0 else t[starts[0]:end + 1]
+
+
 DECISIONS = ("Converged", "RateLimited", "Shed", "Admit")
 D = "GuardianReconcileGate::Decision::"
 SHED_COUNTER = (r'\.counter\( ?"yuzu_server_guardian_reconciles_total", ?\{ ?\{ ?"result", ?"shed" ?\} ?\} ?\)'
@@ -221,19 +261,19 @@ def move_filter_problems(t, where):
             if re.search(r"\bfilter_deployed_members\(", st) and re.search(r"\bstd::move\(", st)]
 
 
-def problems(src):
-    """One message per violated invariant, lettered a..i; [] when clean."""
+def flow_problems(src):
+    """One message per violated FLOW invariant (guardian_reconcile_flow.hpp), lettered; [] when clean."""
     t, out = lex(src), []
-    b = lambda_body(t)
+    b = run_body(t)
     if b is None:
-        return ["server.cpp no longer has exactly one parseable set_guardian_reconcile_fn( call (a)"]
+        return ["guardian_reconcile_flow.hpp no longer has exactly one parseable `void run(` body (a)"]
 
     decide = re.search(r"guardian_reconcile_gate_\.decide\(", b)
     if not decide:
-        out.append("the reconcile lambda no longer calls guardian_reconcile_gate_.decide( (a)")
+        out.append("the reconcile flow no longer calls guardian_reconcile_gate_.decide( (a)")
     for d in DECISIONS:
         if not re.search(r"\bcase " + re.escape(D + d) + r" ?:", b):
-            out.append(f"the reconcile lambda no longer handles case {D}{d} (a)")
+            out.append(f"the reconcile flow no longer handles case {D}{d} (a)")
 
     shed = re.search(r"\bcase " + re.escape(D + "Shed") + r" ?:(.*?)\bcase " + re.escape(D + "Admit") + r" ?:", b)
     if not shed:
@@ -241,7 +281,7 @@ def problems(src):
     else:
         if not re.search(SHED_COUNTER, shed.group(1)):
             out.append('the Shed case no longer increments yuzu_server_guardian_reconciles_total{result="shed"} (b)')
-        if re.search(r"audit_store_|\bAuditEvent\b|->log\(|\.log\(", shed.group(1)):
+        if re.search(r"audit_store_|\baudit_ ?\(|\bAuditEvent\b|->log\(|\.log\(", shed.group(1)):
             out.append("the Shed case writes an audit row (it must be counter plus throttled log only) (b)")
 
     admitted = re.search(r"\bcase " + re.escape(D + "Admit") + r" ?: ?break; ?\} ?(?:const )?auto \w+ = "
@@ -251,15 +291,15 @@ def problems(src):
 
     bundle_get = re.search(r"guardian_rule_bundle_cache_\.get\(", b)
     if not bundle_get:
-        out.append("the reconcile lambda no longer gets its rules from guardian_rule_bundle_cache_.get( (d)")
+        out.append("the reconcile flow no longer gets its rules from guardian_rule_bundle_cache_.get( (d)")
     if not re.search(r"build_agent_push\( ?\w+\.rules\b", b):
         out.append("build_agent_push( is no longer fed the cached bundle's .rules (d)")
 
-    scope_for_agent = re.search(r"\bevaluate_scope_for_agent\(", b)
+    scope_for_agent = re.search(r"\beval_scope_\(", b)
     if not scope_for_agent:
-        out.append("scope membership no longer uses evaluate_scope_for_agent( (e)")
-    if re.search(r"\bevaluate_scope_local\(", b):
-        out.append("the reconcile lambda calls evaluate_scope_local( again (fleet-wide vector under the "
+        out.append("scope membership no longer uses the injected eval_scope_( (e)")
+    if re.search(r"\bevaluate_scope_local\(", t):
+        out.append("the reconcile flow calls evaluate_scope_local( (fleet-wide vector under the "
                    "registry lock) (e)")
 
     if not re.search(r"Kind::StoreDegraded\b[^;]*?\) ?\{ ?scope_degraded = true ?;", b):
@@ -270,22 +310,12 @@ def problems(src):
     if not re.search(r"guardian_generation_cache_\.get\(\)", b):
         out.append("the generation is no longer read through guardian_generation_cache_.get() (g)")
     if re.search(r"\bcurrent_policy_generation\(", b):
-        out.append("the reconcile lambda calls current_policy_generation( directly, bypassing the cache (g)")
+        out.append("the reconcile flow calls current_policy_generation( directly, bypassing the cache (g)")
 
     begin = re.search(r"guardian_reconcile_gate_\.begin_admitted\(", b)
     if decide and begin and bundle_get and scope_for_agent:
         if not (decide.start() < begin.start() < bundle_get.start() < scope_for_agent.start()):
-            out.append("order is no longer decide < begin_admitted < bundle get < evaluate_scope_for_agent (h)")
-
-    # (?<![\w"])/(?![\w"]): a string literal that is exactly the name is data, not a member.
-    if re.search(r'(?<![\w"])(?:guardian_last_reconcile_|guardian_reconcile_mu_)(?![\w"])', t):
-        out.append("guardian_last_reconcile_ / guardian_reconcile_mu_ exist again in server.cpp (i)")
-    if not re.search(r"guardian_reconcile_gate_\.sweep\(", t.replace(b, "")):
-        out.append("the claim-map sweep guardian_reconcile_gate_.sweep( is no longer called outside the "
-                   "reconcile lambda (i)")
-    if not re.search(r'for \( ?auto \w+ : \{[^{}]*"shed"[^{}]*\} ?\) ?metrics_\.counter\( ?'
-                     r'"yuzu_server_guardian_reconciles_total"', t):
-        out.append('the yuzu_server_guardian_reconciles_total pre-seed loop no longer includes "shed" (i)')
+            out.append("order is no longer decide < begin_admitted < bundle get < eval_scope_ (h)")
 
     # (j) control flow of the three non-push decisions, and the rate_limited label.
     for name, nxt in (("Converged", "RateLimited"), ("RateLimited", "Shed"), ("Shed", "Admit")):
@@ -340,7 +370,7 @@ def problems(src):
         out.append("the policy-generation gauge is no longer set from fresh_generation (r)")
     for gm in re.finditer(r'\.gauge\( ?"yuzu_server_guardian_policy_generation"[^;]*;', b):
         if re.search(r"\bcurrent\b", gm.group(0)):
-            out.append("a policy-generation gauge .set( takes the cached `current` in the reconcile lambda (r)")
+            out.append("a policy-generation gauge .set( takes the cached `current` in the reconcile flow (r)")
     early = re.search(r"\bif \( ?fresh_generation <= agent_gen ?\) ?return ?;", b)
     if early and bundle_get and not early.start() < bundle_get.start():
         out.append("the `fresh_generation <= agent_gen` return is no longer BEFORE the bundle get: a "
@@ -357,7 +387,7 @@ def problems(src):
         if not re.search(r'\.counter\( ?"yuzu_server_guardian_reconciles_total", ?\{ ?\{ ?"result", ?"degraded" ?\} ?\} ?\)'
                          r' ?\.increment\(\)', ab):
             out.append('abort_degraded no longer increments result="degraded" (m)')
-        if not (re.search(r"\bAuditEvent\b", ab) and re.search(r"audit_store_ ?->log\(", ab)):
+        if not (re.search(r"\bAuditEvent\b", ab) and re.search(r"\baudit_ ?\( ?ev ?\) ?;", ab)):
             out.append("abort_degraded no longer writes the audit event (m)")
     for site in ("rule_store_degraded", "baseline_store_degraded", "rule_bundle_load_failed"):
         if not re.search(r'abort_degraded\( ?"' + site + '"', b):
@@ -365,12 +395,12 @@ def problems(src):
 
     # (n) no_session keeps its claim; only a BLOCKED wait is excluded from the debit.
     if re.search(r"\brelease\(", b):
-        out.append("the reconcile lambda calls release( again: a session-less Admit must KEEP its claim, "
+        out.append("the reconcile flow calls release( again: a session-less Admit must KEEP its claim, "
                    "or an unsubscribed agent's heartbeats become unbounded admissions (n)")
     if not re.search(r'\{ ?\{ ?"result", ?"no_session" ?\} ?\} ?\) ?\.increment\(\) ?; ?return ?;', b):
         out.append("the no_session branch is no longer counter-then-return (n)")
     if len(re.findall(r"\badmitted\.exclude\(", b)) != 1:
-        out.append("the reconcile lambda no longer has exactly one admitted.exclude( (a second would "
+        out.append("the reconcile flow no longer has exactly one admitted.exclude( (a second would "
                    "subtract the same wait twice) (n)")
     if not re.search(r"\badmitted\.exclude\( ?bundle_waited ?\)", b):
         out.append("the time blocked on another thread's rule-bundle load is no longer excluded from "
@@ -384,6 +414,94 @@ def problems(src):
     # (o) the bundle load goes through the unit-tested loader.
     if not re.search(r"guardian::load_reconcile_bundle\(", b):
         out.append("the bundle loader is no longer guardian::load_reconcile_bundle( (o)")
+    out.extend(move_filter_problems(t, "guardian_reconcile_flow.hpp"))
+
+    # (s) sent / success audit only on a delivered push.
+    sent_if = re.search(r"\bif \( ?send_push_\([^;{}]*\) ?\) ?\{(.*)", b)
+    if not sent_if:
+        out.append("the push is no longer gated by `if (send_push_(...))` (s)")
+    else:
+        tail = sent_if.group(1)
+        if not re.search(r'^ ?metrics_ ?\.counter\( ?"yuzu_server_guardian_reconciles_total", ?\{ ?\{ ?"result", ?"sent" ?\} ?\} ?\)'
+                         r' ?\.increment\(\)', tail):
+            out.append('the `sent` counter is no longer the first statement of the delivered-push branch (s)')
+        if not re.search(r'\bev\.result = "success" ?; ?audit_\( ?ev ?\) ?;', tail):
+            out.append("the success audit row is no longer written inside the delivered-push branch (s)")
+    return out
+
+
+def problems(src):
+    """One message per violated WIRING invariant (server.cpp), lettered; [] when clean."""
+    t, out = lex(src), []
+    b = lambda_body(t)
+    if b is None:
+        return ["server.cpp no longer has exactly one parseable set_guardian_reconcile_fn( call (t)"]
+
+    # (t) the lambda is a thin call into the flow; the flow is built once, from the ServerImpl members.
+    if not re.search(r"^\[ ?reconcile_flow ?\]\( ?std::string_view agent_id_sv, ?std::uint64_t agent_gen ?\) ?\{ ?"
+                     r"reconcile_flow ?-> ?run\( ?agent_id_sv, ?agent_gen ?\) ?; ?\}$", b.strip()):
+        out.append("the set_guardian_reconcile_fn lambda is no longer exactly "
+                   "`[reconcile_flow](agent_id_sv, agent_gen) { reconcile_flow->run(agent_id_sv, agent_gen); }` (t)")
+    if re.search(r"guardian_reconcile_gate_\.decide\(", t):
+        out.append("server.cpp calls guardian_reconcile_gate_.decide( again: the control flow belongs in "
+                   "GuardianReconcileFlow::run, a second copy is the drift the extraction removed (t)")
+    ctor = [m.end() - 1 for m in re.finditer(r"\bstd::make_shared<GuardianReconcileFlow> ?\( ?GuardianReconcileFlowDeps ?\{", t)]
+    c = None
+    if len(ctor) != 1:
+        out.append("server.cpp no longer constructs exactly one GuardianReconcileFlow from "
+                   "GuardianReconcileFlowDeps{...} (t)")
+    else:
+        close = match_close(t, ctor[0], "{", "}")
+        c = None if close < 0 else t[ctor[0]:close + 1]
+        if c is None:
+            out.append("the GuardianReconcileFlowDeps{...} initializer is unbalanced (t)")
+    if c is not None:
+        for field, member in ((".gate", "guardian_reconcile_gate_"), (".generation_cache", "guardian_generation_cache_"),
+                              (".rule_bundle_cache", "guardian_rule_bundle_cache_"),
+                              (".budget", "guardian_reconcile_budget_"), (".metrics", "metrics_"),
+                              (".duration", "reconcile_duration")):
+            if not re.search(re.escape(field) + r" ?= ?" + member + r" ?,", c):
+                out.append(f"the flow is no longer constructed with {field} = {member} (t)")
+        if re.search(r"\bevaluate_scope_local\(", c):
+            out.append("the flow's dependencies call evaluate_scope_local( (fleet-wide vector under the "
+                       "registry lock) (u)")
+
+        def field_block(name):
+            return block_after(c, "." + name + " =")
+
+        for name, needs in (
+                ("eval_scope", (r"registry_ ?\.evaluate_scope_for_agent\(",)),
+                ("list_rules", (r"guaranteed_state_store_ ?-> ?list_rules\(\)",)),
+                ("deployed_ids", (r"\bdeployed_member_rule_ids\(\)",)),
+                ("session_os", (r"registry_ ?\. ?get_session\(", r"->os\b")),
+                ("random_suffix", (r"AuthManager::bytes_to_hex\( ?(?:auth::)?AuthManager::random_bytes\(8\) ?\)",)),
+                ("audit", (r"\baudit_store_ ?&& ?audit_store_ ?-> ?is_open\(\)", r"\baudit_store_ ?-> ?log\(")),
+                ("send_push", (r"yuzu::server::DispatchCaller ?\{ ?\.system = true ?\}", r'"__guard__"', r'"push_rules"',
+                               r"SystemReservedPush::guardian_push_rules"))):
+            blk = field_block(name)
+            if blk is None:
+                out.append(f"could not isolate the .{name} dependency in the flow construction (u)")
+                continue
+            for pat in needs:
+                if not re.search(pat, blk):
+                    out.append(f"the .{name} dependency no longer matches `{pat}` (u)")
+        sp = field_block("send_push")
+        if sp is not None:
+            if len(re.findall(r"\bforward_gateway_pending\(\)", sp)) != 1 or not re.search(
+                    r"\bsend_system_reserved\([^{}]*?\) ?\) ?\{ ?forward_gateway_pending\(\) ?; ?return true ?;", sp):
+                out.append("the .send_push dependency must call forward_gateway_pending() exactly once, and only "
+                           "inside the send_system_reserved success branch (u)")
+
+    # (i) whole-file items.
+    # (?<![\w"])/(?![\w"]): a string literal that is exactly the name is data, not a member.
+    if re.search(r'(?<![\w"])(?:guardian_last_reconcile_|guardian_reconcile_mu_)(?![\w"])', t):
+        out.append("guardian_last_reconcile_ / guardian_reconcile_mu_ exist again in server.cpp (i)")
+    if not re.search(r"guardian_reconcile_gate_\.sweep\(", t):
+        out.append("the claim-map sweep guardian_reconcile_gate_.sweep( is no longer called (i)")
+    if not re.search(r'for \( ?auto \w+ : \{[^{}]*"shed"[^{}]*\} ?\) ?metrics_\.counter\( ?'
+                     r'"yuzu_server_guardian_reconciles_total"', t):
+        out.append('the yuzu_server_guardian_reconciles_total pre-seed loop no longer includes "shed" (i)')
+
     out.extend(move_filter_problems(t, "server.cpp"))
 
     # (p) the bump fan-out drops both reconcile caches, INSIDE the guardian_push_fn_ body.
@@ -400,7 +518,7 @@ def problems(src):
                 out.append(f"guardian_push_fn_ no longer calls {cache}.invalidate() (p)")
 
     # (q) the saturation gauges and the claim sweep (see q_problems).
-    out.extend(q_problems(t.replace(b, "")))
+    out.extend(q_problems(t))
     return out
 
 
@@ -560,7 +678,7 @@ def _after(marker, old, new):
 DECIDE_SWITCH = "switch (guardian_reconcile_gate_.decide(agent_id, agent_gen, current, &shed_cause))"
 BEGIN = "auto admitted = guardian_reconcile_gate_.begin_admitted();"
 SHED_OPEN = "case GuardianReconcileGate::Decision::Shed: {"
-EVAL = "const auto eval = registry_.evaluate_scope_for_agent("
+EVAL = "const auto eval = eval_scope_("
 ABORT = 'abort_degraded("scope store degraded", scope_degraded_detail);'
 
 _GAUGE_BLOCK = re.compile(r"[ \t]*try \{\s*metrics_\s*\.gauge\(\"yuzu_server_guardian_reconcile_in_flight\"\).*?"
@@ -607,21 +725,22 @@ def _insert_after_gauges(text):
     return lambda s: (lambda m: s[:m.end()] + text + s[m.end():])(_GAUGE_BLOCK.search(s))
 
 
-# (name, mutator, expected letter-tagged substring of the joined problems)
+# (name, mutator, expected letter-tagged substring of the joined problems). One combined list;
+# FLOW_MUTATIONS / SERVER_MUTATIONS below route each entry to the source it mutates.
 MUTATIONS = [
     ("delete the decide call", _wsub(DECIDE_SWITCH, "switch (GuardianReconcileGate::Decision::Admit)"), "(a)"),
     ("comment the decide call out", _wsub(DECIDE_SWITCH, "/* " + DECIDE_SWITCH + " */ switch (GuardianReconcileGate::Decision::Admit)"), "(a)"),
     ("drop the Shed case", _sub(SHED_OPEN, "case GuardianReconcileGate::Decision::RateLimited: {"), "(a)"),
     ("shed metric label changed", _sub('{{"result", "shed"}})', '{{"result", "rate_limited"}})'), "(b)"),
-    ("Shed branch writes an audit row", _sub(SHED_OPEN, SHED_OPEN + " if (audit_store_) (void)audit_store_->log(AuditEvent{});"), "(b)"),
+    ("Shed branch writes an audit row", _sub(SHED_OPEN, SHED_OPEN + " audit_(AuditEvent{});"), "(b)"),
     ("drop begin_admitted", _sub(BEGIN, "(void)0;"), "(c)"),
     ("begin_admitted discarded temporary", _sub(BEGIN, "(void)guardian_reconcile_gate_.begin_admitted();"), "(c)"),
     ("bypass the rule bundle cache", _sub("guardian_rule_bundle_cache_.get(", "load_rules_directly("), "(d)"),
-    ("build_agent_push fed the wrong rules", _sub("bundle.rules, sess->os,", "rules_result_rules, sess->os,"), "(d)"),
+    ("build_agent_push fed the wrong rules", _sub("bundle.rules, *sess,", "rules_result_rules, *sess,"), "(d)"),
     ("call evaluate_scope_local again", _sub(EVAL, "const auto eval = registry_.evaluate_scope_local("), "(e)"),
     ("skip setting scope_degraded", _sub("scope_degraded = true;", "(void)0;"), "(f)"),
     ("skip the degraded abort", _sub(ABORT, "(void)0;"), "(f)"),
-    ("read the generation around the cache", _sub("guardian_generation_cache_.get()", "guaranteed_state_store_->current_policy_generation()"), "(g)"),
+    ("read the generation around the cache", _sub("guardian_generation_cache_.get()", "store.current_policy_generation()"), "(g)"),
     ("reintroduce guardian_last_reconcile_", lambda s: s + "\nstd::unordered_map<std::string, int> guardian_last_reconcile_;\n", "(i)"),
     ("drop the claim-map sweep", _sub("(void)guardian_reconcile_gate_.sweep();", "(void)0;"), "(i)"),
     ("drop shed from the pre-seed loop", _sub('"rate_limited", "shed", "degraded"', '"rate_limited", "degraded"'), "(i)"),
@@ -661,7 +780,7 @@ MUTATIONS += [
     ("abort_degraded stops counting",
      _after("auto abort_degraded = [", '{{"result", "degraded"}}', '{{"result", "degradedx"}}'), "(m)"),
     ("abort_degraded stops auditing",
-     _after("auto abort_degraded = [", "(void)audit_store_->log(ev);", "(void)0;"), "(m)"),
+     _after("auto abort_degraded = [", "audit_(ev);", "(void)0;"), "(m)"),
     ("rule store degrade no longer aborts",
      _sub('abort_degraded("rule store degraded", err.detail);', "(void)0;"), "(m)"),
     ("baseline store degrade no longer aborts",
@@ -752,6 +871,62 @@ MUTATIONS += [
      _wsub(DECIDE_SWITCH, "switch (true || guardian_reconcile_gate_.decide(agent_id, agent_gen, current, &shed_cause))"), "(k)"),
 ]
 
+# Invariants that live in server.cpp; every other lettered entry above mutates the flow header.
+SERVER_LETTERS = ("(i)", "(p)", "(q)")
+
+# (s) the delivered-push branch.
+SEND = "if (send_push_(agent_id, command_id, push.SerializeAsString())) {"
+MUTATIONS += [
+    ("sent counted without the send succeeding",
+     _sub(SEND, "if (true) { (void)send_push_(agent_id, command_id, push.SerializeAsString());"), "(s)"),
+    ("success audit dropped from the delivered-push branch",
+     _after('ev.result = "success";', "audit_(ev);", "(void)0;"), "(s)"),
+    ("sent counter label changed",
+     _sub('{{"result", "sent"}})', '{{"result", "sent_"}})'), "(s)"),
+]
+
+FLOW_MUTATIONS = [m for m in MUTATIONS if m[2] not in SERVER_LETTERS]
+
+# (t)/(u): the wiring in server.cpp.
+LAMBDA_CALL = "reconcile_flow->run(agent_id_sv, agent_gen);"
+FLOW_CTOR = "std::make_shared<GuardianReconcileFlow>("
+SERVER_MUTATIONS = [m for m in MUTATIONS if m[2] in SERVER_LETTERS] + [
+    ("lambda stops calling the flow", _sub(LAMBDA_CALL, "(void)0;"), "(t)"),
+    ("lambda runs the flow and then more",
+     _sub(LAMBDA_CALL, LAMBDA_CALL + " (void)guardian_reconcile_gate_.sweep();"), "(t)"),
+    ("inline decide( reappears in server.cpp",
+     lambda s: s + "\nvoid copy() { (void)guardian_reconcile_gate_.decide(a, b, c); }\n", "(t)"),
+    ("flow constructed with a different gate",
+     _sub(".gate = guardian_reconcile_gate_,", ".gate = other_gate_,"), "(t)"),
+    ("flow constructed with a different budget",
+     _sub(".budget = guardian_reconcile_budget_,", ".budget = other_budget_,"), "(t)"),
+    ("flow constructed with a different rule bundle cache",
+     _sub(".rule_bundle_cache = guardian_rule_bundle_cache_,", ".rule_bundle_cache = other_cache_,"), "(t)"),
+    ("flow constructed without the duration histogram",
+     _sub(".duration = reconcile_duration,", ".duration = nullptr,"), "(t)"),
+    ("scope dependency evaluates the fleet vector",
+     _after(FLOW_CTOR, "registry_.evaluate_scope_for_agent(agent_id, expr,", "registry_.evaluate_scope_local(agent_id, expr,"), "(u)"),
+    ("push dependency loses the system caller",
+     _after(FLOW_CTOR, "yuzu::server::DispatchCaller{.system = true}", "yuzu::server::DispatchCaller{}"), "(u)"),
+    ("push dependency forwards the gateway queue before knowing the send worked",
+     _sub("auto classified = build_classified_command(\n                        yuzu::server::DispatchCaller{.system = true}",
+          "forward_gateway_pending();\n                    auto classified = build_classified_command(\n                        yuzu::server::DispatchCaller{.system = true}"), "(u)"),
+    ("push dependency never forwards the gateway queue",
+     _after(FLOW_CTOR, "forward_gateway_pending();\n                        return true;", "return true;"), "(u)"),
+    ("audit dependency loses the is_open check",
+     _after(FLOW_CTOR, "if (audit_store_ && audit_store_->is_open())", "if (audit_store_)"), "(u)"),
+    ("rule source reads something else",
+     _after(FLOW_CTOR, "guaranteed_state_store_->list_rules()", "guaranteed_state_store_->list_rules_unfiltered()"), "(u)"),
+    ("deployed set source dropped",
+     _after(FLOW_CTOR, "return deployed_member_rule_ids();", "return DeployedSet{};"), "(u)"),
+    ("session lookup dropped",
+     _after(FLOW_CTOR, "auto sess = registry_.get_session(agent_id);", "auto sess = std::shared_ptr<AgentSession>{};"), "(u)"),
+    ("command id suffix no longer random",
+     _after(FLOW_CTOR, "auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8))", "std::string(\"0\")"), "(u)"),
+    ("filter and std::move combined in one statement (server.cpp)",
+     (lambda s: s + "\nauto b = guardian::make_bundle(guardian::filter_deployed_members(r, d), std::move(*deployed_result));\n"), "(o)"),
+]
+
 # Mutations over guardian_push_builder.cpp (the bundle loader's evaluation order).
 LOADER_SEQ = ("auto filtered = filter_deployed_members(*rules_result, *deployed_result);\n"
               "    return make_bundle(std::move(filtered), std::move(*deployed_result));")
@@ -765,13 +940,16 @@ PUSH_MUTATIONS = [
 ]
 
 # BENIGN controls: text that merely MENTIONS tokens must neither satisfy nor trip a rule.
-BENIGN = [
+BENIGN_FLOW = [
     ("comment mentions evaluate_scope_local(",
      _sub("bool scope_degraded = false;", "bool scope_degraded = false; // not evaluate_scope_local( any more")),
     ("string literal mentions guardian_last_reconcile_",
      _sub("bool scope_degraded = false;", 'bool scope_degraded = false; const char* old_name = "guardian_last_reconcile_";')),
     ("block comment mentions current_policy_generation(",
      _sub("bool scope_degraded = false;", "bool scope_degraded = false; /* current_policy_generation( */")),
+]
+
+BENIGN_SERVER = [
     # (q) must accept restructurings that keep the invariant: the gate is about order and
     # placement, not about the exact text of the sweep try.
     ("the sweep result is consumed",
@@ -804,40 +982,53 @@ BENIGN = [
 class GuardianReconcileWiringLexical(unittest.TestCase):
     def setUp(self):
         self.src = SERVER_CPP.read_text(encoding="utf-8")
+        self.flow_src = FLOW_HPP.read_text(encoding="utf-8")
         self.push_src = PUSH_BUILDER_CPP.read_text(encoding="utf-8")
 
-    def test_source_is_clean(self):
-        p = problems(self.src)
-        for m in p:
+    def _check_clean(self, found):
+        for m in found:
             print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
-        self.assertEqual(p, [])
+        self.assertEqual(found, [])
 
-    def test_mutations_are_caught(self):
-        for name, mutate, expected in MUTATIONS:
+    def _check_caught(self, mutations, source, check):
+        for name, mutate, expected in mutations:
             with self.subTest(mutation=name):
-                mutated = mutate(self.src)
-                self.assertNotEqual(mutated, self.src, "mutation changed nothing (stale pattern)")
-                p = problems(mutated)
+                mutated = mutate(source)
+                self.assertNotEqual(mutated, source, "mutation changed nothing (stale pattern)")
+                p = check(mutated)
                 self.assertTrue(p, "mutation was NOT detected by the gate")
                 self.assertIn(expected, "\n".join(p))
+
+    def test_flow_is_clean(self):
+        self._check_clean(flow_problems(self.flow_src))
+
+    def test_flow_mutations_are_caught(self):
+        self._check_caught(FLOW_MUTATIONS, self.flow_src, flow_problems)
+
+    def test_wiring_is_clean(self):
+        self._check_clean(problems(self.src))
+
+    def test_wiring_mutations_are_caught(self):
+        self._check_caught(SERVER_MUTATIONS, self.src, problems)
+
+    def test_every_mutation_is_routed_to_a_source(self):
+        # A mutation list entry whose letter belongs to neither source would silently never run.
+        self.assertEqual(len(FLOW_MUTATIONS) + len([m for m in MUTATIONS if m[2] in SERVER_LETTERS]),
+                         len(MUTATIONS))
 
     def test_push_builder_is_clean(self):
-        p = push_builder_problems(self.push_src)
-        for m in p:
-            print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
-        self.assertEqual(p, [])
+        self._check_clean(push_builder_problems(self.push_src))
 
     def test_push_builder_mutations_are_caught(self):
-        for name, mutate, expected in PUSH_MUTATIONS:
-            with self.subTest(mutation=name):
-                mutated = mutate(self.push_src)
-                self.assertNotEqual(mutated, self.push_src, "mutation changed nothing (stale pattern)")
-                p = push_builder_problems(mutated)
-                self.assertTrue(p, "mutation was NOT detected by the gate")
-                self.assertIn(expected, "\n".join(p))
+        self._check_caught(PUSH_MUTATIONS, self.push_src, push_builder_problems)
 
     def test_benign_text_is_not_flagged(self):
-        for name, mutate in BENIGN:
+        for name, mutate in BENIGN_FLOW:
+            with self.subTest(benign=name):
+                mutated = mutate(self.flow_src)
+                self.assertNotEqual(mutated, self.flow_src, "benign edit changed nothing (stale pattern)")
+                self.assertEqual(flow_problems(mutated), [])
+        for name, mutate in BENIGN_SERVER:
             with self.subTest(benign=name):
                 mutated = mutate(self.src)
                 self.assertNotEqual(mutated, self.src, "benign edit changed nothing (stale pattern)")
@@ -845,9 +1036,9 @@ class GuardianReconcileWiringLexical(unittest.TestCase):
 
     def test_a_commented_out_decide_does_not_satisfy_the_gate(self):
         # Comment stripping must remove the call entirely, not merely hide it from one regex.
-        mutated = _wsub(DECIDE_SWITCH, "// " + DECIDE_SWITCH + "\n switch (GuardianReconcileGate::Decision::Admit)")(self.src)
-        self.assertNotEqual(mutated, self.src)
-        self.assertIn("(a)", "\n".join(problems(mutated)))
+        mutated = _wsub(DECIDE_SWITCH, "// " + DECIDE_SWITCH + "\n switch (GuardianReconcileGate::Decision::Admit)")(self.flow_src)
+        self.assertNotEqual(mutated, self.flow_src)
+        self.assertIn("(a)", "\n".join(flow_problems(mutated)))
 
 
 if __name__ == "__main__":
