@@ -133,6 +133,30 @@ static std::string find_cookie_value(const std::string& hdr, const std::string& 
     return {};
 }
 
+/// OIDC browser-binding cookie. The name follows the transport the way the session cookie picks
+/// its `Secure` attribute (`session_cookie_attrs`): behind TLS the `__Host-` prefix (browser-
+/// enforced Secure + Path=/ + no Domain, as SAML's binding cookie) is used; on plain http a
+/// `__Host-` cookie would be rejected by the browser, so the unprefixed name is used. Both
+/// sides pick the name from the SAME flag, so a request can never satisfy the https callback
+/// with the weaker name.
+///
+/// SameSite=Lax, not SAML's None: the IdP returns to /auth/callback by a top-level cross-site
+/// GET, which a Lax cookie accompanies, while a cross-site subrequest or POST does not carry
+/// it. (SAML needs None only because its assertion arrives as a cross-site POST.) This relies
+/// on the default `query` response mode; a `form_post` return would not carry a Lax cookie.
+/// Max-Age=600 matches the pending flow's TTL (OidcProvider::kChallengeTtl).
+static const char* oidc_bind_cookie_name(bool https) {
+    return https ? "__Host-yuzu_oidc_bind" : "yuzu_oidc_bind";
+}
+static std::string oidc_bind_cookie_set(bool https, const std::string& secret) {
+    return std::string(oidc_bind_cookie_name(https)) + "=" + secret +
+           "; Path=/; HttpOnly; SameSite=Lax; Max-Age=600" + (https ? "; Secure" : "");
+}
+static std::string oidc_bind_cookie_clear(bool https) {
+    return std::string(oidc_bind_cookie_name(https)) +
+           "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (https ? "; Secure" : "");
+}
+
 } // namespace
 
 namespace detail {
@@ -3324,8 +3348,22 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             spdlog::error("OIDC auth flow blocked: redirect_uri not configured");
             return;
         }
-        auto auth_url = oidc_provider_->start_auth_flow(cfg_.oidc_redirect_uri);
-        res.set_redirect(auth_url);
+        // Bind this flow to THIS browser: the secret goes out only as a cookie on this very
+        // response (never in the redirect URL); the provider keeps its hash, and the callback
+        // must present the secret back. `start_auth_flow` throws if the platform crypto fails:
+        // answer a plain 500 and set nothing, never a redirect without a binding cookie.
+        oidc::OidcProvider::AuthFlowStart flow;
+        try {
+            flow = oidc_provider_->start_auth_flow(cfg_.oidc_redirect_uri);
+        } catch (const std::exception& e) {
+            spdlog::error("OIDC auth flow could not start: {}", e.what());
+            res.status = 500;
+            res.set_content(detail::a4_error(res, "could not start the SSO sign-in flow"),
+                            "application/json");
+            return;
+        }
+        res.set_header("Set-Cookie", oidc_bind_cookie_set(cfg_.https_enabled, flow.binding_secret));
+        res.set_redirect(flow.url);
     });
 
     sink.Get("/auth/callback", [this](const httplib::Request& req, httplib::Response& res) {
@@ -3366,8 +3404,45 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
-        auto result = oidc_provider_->handle_callback(code, state);
+        // Browser binding. Exact-name cookie match (a `foo__Host-yuzu_oidc_bind` cookie cannot
+        // shadow it). A MISSING cookie is refused here without consulting the provider, so the
+        // pending flow is left for the initiating browser (the usual benign cause is a link
+        // opened in a different browser or an expired cookie). A WRONG cookie is refused by the
+        // provider, which also leaves the flow in place. Both answer with the same generic
+        // `sso_failed` redirect as every other callback failure and differ only in the audited
+        // reason token.
+        const std::string binding_secret = find_cookie_value(
+            req.get_header_value("Cookie"), oidc_bind_cookie_name(cfg_.https_enabled));
+        if (binding_secret.empty()) {
+            spdlog::warn("OIDC callback: missing browser-binding cookie, login refused");
+            audit_log(req, "auth.oidc_login_failed", "failure", {}, {},
+                      "reason=browser_binding_missing");
+            emit_event("auth.oidc_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "browser_binding_missing"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+            }
+            res.set_redirect("/login?error=sso_failed");
+            return;
+        }
+
+        bool binding_verified = false;
+        auto result =
+            oidc_provider_->handle_callback(code, state, binding_secret, &binding_verified);
+        // The binding cookie is single-use and is cleared only when THIS visitor's cookie proved
+        // a pending flow (a success, or a failure after the match); a success then appends the
+        // session cookie after it. This route is reachable by any cross-site GET, so an unknown or
+        // expired `state` and a mismatch must not delete the cookie of a login the visitor has
+        // in progress. `binding_verified` is the provider's own answer, so
+        // a failure reason added to `handle_callback` later defaults to NOT clearing.
+        if (binding_verified)
+            res.set_header("Set-Cookie", oidc_bind_cookie_clear(cfg_.https_enabled));
         if (!result) {
+            // The binding refusal keeps the generic user-facing shape; only the audit detail
+            // names it. A fixed token, never the provider's free text.
+            const bool binding_refused =
+                result.error() == oidc::OidcProvider::kBrowserBindingMismatch;
             // No display=/email= detail here — handle_callback failed before
             // claims were extracted (token exchange, signature, or
             // validate_claims rejection incl. the #1837 governance sub/iss
@@ -3375,7 +3450,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // auth.oidc_login_failed / auth.sso_group_provision emission
             // below this point (claims successfully parsed) DOES carry it.
             spdlog::warn("OIDC callback failed: {}", result.error());
-            audit_log(req, "auth.oidc_login_failed", "failure");
+            audit_log(req, "auth.oidc_login_failed", "failure", {}, {},
+                      binding_refused ? "reason=browser_binding_mismatch" : std::string{});
             emit_event("auth.oidc_login_failed", req,
                        {{"source_ip", req.remote_addr}, {"error", result.error()}}, {},
                        Severity::kWarn);
