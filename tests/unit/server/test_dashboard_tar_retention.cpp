@@ -67,6 +67,7 @@ struct DashboardTarRetentionTestAccess {
         routes.response_store_ = rs;
         routes.mgmt_group_store_ = mg;
     }
+    void set_metrics(yuzu::MetricsRegistry* m) { routes.metrics_ = m; }
     void set_scan(const std::string& user, const std::string& cmd_id, int count, int64_t at) {
         routes.tar_scans_by_user_[user] = DashboardRoutes::TarScanState{cmd_id, count, at};
     }
@@ -559,6 +560,45 @@ TEST_CASE("retention-paused page: a cut read with no rows says the page cannot t
         CHECK(contains(html, "partial result, see below"));      // header counts qualified
         CHECK(contains(html, "data-result-truncated=\"true\"")); // one banner, not two
     }
+}
+
+// The yuzu_tar_retention_paused_devices gauge is set from the page's own scan read, so a scan
+// cut by the response-read cap UNDER-counts (it can read 0 with paused sources present on the
+// dropped agents). A cut scan must leave the last good value in place, not overwrite it.
+TEST_CASE("retention-paused page: a scan cut by the payload cap does not overwrite the "
+          "paused-devices gauge",
+          "[pg][server][tar][retention-render][cap][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-A", "agent-B", "agent-C"});
+    for (const char* agent : {"agent-A", "agent-B", "agent-C"})
+        rs.store(mk_resp(agent, 10,
+                         "config|process_enabled|false\nconfig|process_paused_at|1710000000\n"));
+
+    yuzu::MetricsRegistry metrics;
+    DashboardTarRetentionTestAccess acc;
+    acc.set_stores(&rs, &mg);
+    acc.set_metrics(&metrics);
+    acc.set_scan(kUser, kScan, 3, 1);
+    auto& process_gauge = metrics.gauge("yuzu_tar_retention_paused_devices", {{"source", "process"}});
+
+    // Positive control: an uncut scan DOES publish (all three agents have a paused process source).
+    (void)acc.render(kUser);
+    REQUIRE(process_gauge.value() == 3.0);
+
+    // A sentinel standing in for "the last good value"; the cut scan below would write 2.
+    process_gauge.set(7.0);
+    {
+        yuzu::test::ExportByteCapGuard guard(100);
+        const auto scan = acc.routes.gather_tar_retention_paused(kUser);
+        REQUIRE(scan.result_truncated_by_cap);
+        REQUIRE(scan.rows.size() < 3); // the row set under-counts
+        (void)acc.render(kUser);
+    }
+    CHECK(process_gauge.value() == 7.0);
 }
 
 } // namespace yuzu::server

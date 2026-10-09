@@ -529,7 +529,7 @@ TEST_CASE("ResponseStore: query with time range", "[pg][response_store]") {
     CHECK(results->size() == 3);
 }
 
-TEST_CASE("ResponseStore: ResponseQuery since and until are presence-tracked, a literal 0 is "
+TEST_CASE("ResponseStore: ResponseQuery since and until are presence-tracked so a literal 0 is "
           "not the unbounded sentinel (#4644)",
           "[pg][response_store][since_until]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

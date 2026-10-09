@@ -26,20 +26,29 @@
 #include "test_export_cap_guard.hpp"
 #include "test_route_sink.hpp"
 
+#include "audit_store.hpp"
+#include "auth_routes.hpp"
+#include "oidc_provider.hpp"
 #include "authz_model.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
+
+#include <yuzu/server/auth.hpp>
+#include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -884,7 +893,7 @@ TEST_CASE("legacy response routes count rejected numeric params and cut exports 
 }
 
 TEST_CASE("GET /api/responses/:id/export: an UNCUT CSV is byte-identical to the plain header + "
-          "rows body, with no trailer record (#4703)",
+          "rows body and has no trailer record (#4703)",
           "[server][routes][response_routes][rest][pg]") {
     PgHarness h;
     for (int i = 0; i < 2; ++i) {
@@ -961,7 +970,7 @@ TEST_CASE("GET /api/responses/:id (catch-all): a limit above the 1000 ceiling is
     CHECK_FALSE(few_body.contains("result_truncated_by_cap"));
 }
 
-TEST_CASE("export helpers: filename sanitisation, trailer record shape and cut cause "
+TEST_CASE("export helpers: filename sanitisation and trailer record shape and cut cause "
           "precedence (#4703)",
           "[server][routes][response_routes]") {
     using yuzu::server::ExportCut;
@@ -1318,4 +1327,46 @@ TEST_CASE("legacy get and aggregate: a rejected request parameter is a 400 and w
         CHECK(res->status == 400);
         CHECK(h.audits.empty());
     }
+}
+
+// CWE-117: the legacy catch-all `/api/responses/(.+)` takes an UNRESTRICTED instruction id and
+// PR1 now sends it as the audit target_id on every served read. When the audit row cannot be
+// persisted, AuthRoutes::audit_log warns with that id; a CR/LF in it must not forge a log
+// line, nor a space / '=' forge a key=value token (v1 restricts ids to [A-Za-z0-9_-]{1,128}).
+// No Postgres needed: an unroutable pool makes AuditStore::log fail.
+TEST_CASE("AuthRoutes::audit_log: a hostile target_id is neutralised in the persist-failure "
+          "warning",
+          "[server][routes][response_routes][audit]") {
+    yuzu::server::pg::PgPool bad{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    AuditStore audit_store(bad);
+    REQUIRE_FALSE(audit_store.is_open());
+
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    AuthRoutes routes(cfg, auth_mgr, /*rbac_store=*/nullptr, /*api_token_store=*/nullptr,
+                      &audit_store, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                      /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+
+    const std::string hostile = "evil\r\n[2099-01-01] [critical] forged target_id='x' y=z";
+    httplib::Request req;
+    bool persisted = true;
+    std::string logs;
+    {
+        yuzu::test::LogCapture capture(spdlog::level::warn);
+        persisted = routes.audit_log(req, "response.read", "success", "Execution", hostile,
+                                     "legacy response query cid=abc");
+        capture.stop();
+        logs = capture.text();
+    }
+    CHECK_FALSE(persisted);
+    // The warning was actually captured (guards against a vacuous negative below).
+    REQUIRE(logs.find("audit_log: AuditStore::log failed") != std::string::npos);
+    CHECK(logs.find("evil__[2099-01-01]_[critical]_forged_target_id_'x'_y_z") !=
+          std::string::npos);
+    // Exactly one physical line: spdlog's own terminator is the only '\n', and no raw CR at all.
+    CHECK(logs.find('\r') == std::string::npos);
+    CHECK(std::count(logs.begin(), logs.end(), '\n') == 1);
+    CHECK(logs.find("evil\r") == std::string::npos);
 }

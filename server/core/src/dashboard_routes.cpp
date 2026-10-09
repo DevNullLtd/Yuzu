@@ -219,7 +219,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
             "counter");
         metrics_->describe(
             "yuzu_tar_retention_paused_devices",
-            "Number of devices currently reporting a paused TAR source, by source name.",
+            "Number of devices currently reporting a paused TAR source, by source name. "
+            "Holds the last complete scan's value: a scan cut by the response-read cap does "
+            "not update it.",
             "gauge");
         metrics_->describe(
             "yuzu_tar_scan_dispatched_total",
@@ -3105,7 +3107,13 @@ std::string DashboardRoutes::render_tar_retention_paused(
     // already-iterated row set, clearing the gauge family first so an
     // operator's narrowed-by-visibility view doesn't leave stale values
     // when their group composition shrinks.
-    if (metrics_) {
+    //
+    // A scan whose response read was cut by the row / byte cap has dropped whole
+    // responses, so its row set UNDER-counts (it can read 0 with paused sources
+    // present on the dropped agents). Overwriting the gauge from it would publish
+    // that under-count as fleet posture, so a cut scan leaves the last good value
+    // in place (stale beats wrong; the page's own banner carries the cut signal).
+    if (metrics_ && !scan.result_truncated_by_cap) {
         std::unordered_map<std::string, int64_t> per_source_counts{
             {"process", 0}, {"tcp", 0}, {"service", 0}, {"user", 0}};
         for (const auto& r : rows) {

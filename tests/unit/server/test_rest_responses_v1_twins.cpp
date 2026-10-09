@@ -984,7 +984,7 @@ struct FakeNumericReq {
 };
 } // namespace
 
-TEST_CASE("apply_response_numeric_params: since and until are presence-tracked, until of zero is "
+TEST_CASE("apply_response_numeric_params: since and until are presence-tracked and until of zero is "
           "rejected and since of zero is a literal bound (#4644)",
           "[rest][responses][v1][numeric_params]") {
     using yuzu::server::apply_response_numeric_params;

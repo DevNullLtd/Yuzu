@@ -46,8 +46,15 @@
 ///     `surface` detail distinguishes `aggregate`/`export`/`get`.
 /// A row that does not durably persist (a false return or a throwing audit pipeline) answers
 /// 503 + `Sec-Audit-Failed` and serves no data, via the one local `audit_read_or_refuse`.
-/// Responses that never reach the read (400 parameter rejections, 503 store unavailable or
-/// degraded, an unadmitted gate) write no row.
+/// Which rows a refusal leaves behind depends on the route, because the `denied` row is
+/// written at a different point in each handler:
+///   - 400 parameter rejections and an unadmitted gate write no row, on every route;
+///   - get and export write BOTH rows after their store read, so any 503 for an unavailable
+///     or degraded store (including the scope-resolution read) writes no row;
+///   - aggregate writes its `denied` row BEFORE the main aggregate read (right after the
+///     scope-resolution read), so a confined caller with a scope drop whose aggregate read
+///     then degrades (503) has the `denied` row and no `success` row. A 503 from the
+///     scope-resolution read itself, before any drop is known, writes no row.
 ///
 /// Routes (3), gate in parens (all `fleet_read_fn`):
 ///   GET /api/responses/:id/aggregate  (Response:Read) — MUST register 1st
