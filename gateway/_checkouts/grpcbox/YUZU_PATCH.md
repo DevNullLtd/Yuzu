@@ -59,12 +59,24 @@ once `trailers_sent=true`). This is not a race: a normal unary client sends its
 HEADERS and DATA together, so it happens on every rejected call. For a peer the
 mgmt-plane auth_fun rejected, that is an authorization bypass: the client sees
 status 16 while the RPC's side effects (command fan-out!) still run. The guard
-drops all data on a terminated stream. Regression-pinned by
+drops all data once `trailers_sent` is set. Regression-pinned by
 `yuzu_gw_authz_rpc_tests` ("handler never runs" cases).
 
-Only the `auth_fun` rejection path is exposed. An unknown method
-(UNIMPLEMENTED) also ends the stream early, but there the method is never stored,
-so the stock `method=undefined` clause already drops the data.
+Only the `auth_fun` rejection path is an **authorization** bypass. The guard also
+covers one post-admission path: a decode or handler error caught in
+`on_receive_data` ends the stream with the method still set, so in stock a later
+DATA frame from the (already authenticated) peer runs the handler again while the
+client has been told the call failed. Do not narrow the guard to the auth path.
+
+Two other early ends are **not** covered. A `grpc-timeout` deadline
+(DEADLINE_EXCEEDED) and a server-streaming handler process exiting both end the
+stream from `handle_info`, which discards `end_stream`'s returned state, so
+`trailers_sent` stays false and later DATA can still reach the handler. Both
+happen after the peer was admitted. This is stock behaviour that neither this
+patch nor tsloughter/grpcbox#123 changes.
+
+An unknown method (UNIMPLEMENTED) is not affected: the method is never stored, so
+the stock `method=undefined` clause already drops the data.
 
 Reported upstream as tsloughter/grpcbox#122, with the same fix and a regression
 test in tsloughter/grpcbox#123. Still unfixed in v0.18.0, the latest release as of
@@ -124,5 +136,9 @@ stock, bump the `{tag, "vX.Y.Z"}` pin in `rebar.config` (grpcbox stays OUT of
 in `gateway/scripts/verify-vendored-grpcbox.sh` to the new tag's commit, run the
 gateway suite + dialyzer, and re-run `verify-vendored-grpcbox.sh`. The upstreaming target is making
 `verify`/`fail_if_no_peer_cert` configurable in grpcbox itself (then this vendor can
-be dropped). Tracked with PR5c. Patch 2 can be dropped once a release containing
-tsloughter/grpcbox#123 is vendored; keep `yuzu_gw_authz_rpc_tests` either way.
+be dropped). Tracked with PR5c. Patch 2 can be dropped only once the vendored
+release drops data on **every** stream with `trailers_sent=true`, as
+tsloughter/grpcbox#123 does today. Check the merged upstream code, not just the PR
+number, and keep `yuzu_gw_authz_rpc_tests` either way. From grpcbox v0.18.0 (chatterbox 0.16)
+the `h2_*` modules are renamed `chatterbox_h2_*`, so patch 3's `connection_pid/1`
+must call `chatterbox_h2_stream_set:connection/1` after a re-sync.
