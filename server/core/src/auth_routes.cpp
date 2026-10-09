@@ -137,12 +137,11 @@ static std::string find_cookie_value(const std::string& hdr, const std::string& 
 /// its `Secure` attribute (`session_cookie_attrs`): behind TLS the `__Host-` prefix (browser-
 /// enforced Secure + Path=/ + no Domain, as SAML's binding cookie) is used; on plain http a
 /// `__Host-` cookie would be rejected by the browser, so the unprefixed name is used. Both
-/// sides pick the name from the SAME flag, so a request can never satisfy the https callback
-/// with the weaker name.
+/// sides derive the name from the same flag.
 ///
-/// SameSite=Lax, not SAML's None: the IdP returns to /auth/callback by a top-level cross-site
-/// GET, which a Lax cookie accompanies, while a cross-site subrequest or POST does not carry
-/// it. (SAML needs None only because its assertion arrives as a cross-site POST.) This relies
+/// SameSite=Lax, not SAML's None: the IdP returns to /auth/callback by a top-level GET
+/// navigation, which a Lax cookie accompanies, while a cross-site subrequest or POST does not
+/// carry it. (SAML needs None only because its assertion arrives as a POST.) This relies
 /// on the default `query` response mode; a `form_post` return would not carry a Lax cookie.
 /// Max-Age=600 matches the pending flow's TTL (OidcProvider::kChallengeTtl).
 static const char* oidc_bind_cookie_name(bool https) {
@@ -3406,8 +3405,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         // Browser binding. Exact-name cookie match (a `foo__Host-yuzu_oidc_bind` cookie cannot
         // shadow it). A MISSING cookie is refused here without consulting the provider, so the
-        // pending flow is left for the initiating browser (the usual benign cause is a link
-        // opened in a different browser or an expired cookie). A WRONG cookie is refused by the
+        // pending flow is left for the initiating browser (for example a link opened in a
+        // different browser, or an expired cookie). A WRONG cookie is refused by the
         // provider, which also leaves the flow in place. Both answer with the same generic
         // `sso_failed` redirect as every other callback failure and differ only in the audited
         // reason token.
@@ -3432,17 +3431,21 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             oidc_provider_->handle_callback(code, state, binding_secret, &binding_verified);
         // The binding cookie is single-use and is cleared only when THIS visitor's cookie proved
         // a pending flow (a success, or a failure after the match); a success then appends the
-        // session cookie after it. This route is reachable by any cross-site GET, so an unknown or
-        // expired `state` and a mismatch must not delete the cookie of a login the visitor has
-        // in progress. `binding_verified` is the provider's own answer, so
-        // a failure reason added to `handle_callback` later defaults to NOT clearing.
+        // session cookie after it. A callback that matches no pending flow leaves the cookie in place,
+        // so a sign-in the visitor has in progress is not disturbed. `binding_verified` is the
+        // provider's own answer, so a failure reason added to `handle_callback` later defaults
+        // to NOT clearing.
         if (binding_verified)
             res.set_header("Set-Cookie", oidc_bind_cookie_clear(cfg_.https_enabled));
         if (!result) {
-            // The binding refusal keeps the generic user-facing shape; only the audit detail
-            // names it. A fixed token, never the provider's free text.
-            const bool binding_refused =
-                result.error() == oidc::OidcProvider::kBrowserBindingMismatch;
+            // A binding refusal keeps the generic user-facing shape; only the audit detail and
+            // the analytics event name it, by a fixed token (never the provider's free text).
+            // Empty for every other failure.
+            std::string binding_reason;
+            if (result.error() == oidc::OidcProvider::kBrowserBindingMismatch)
+                binding_reason = "browser_binding_mismatch";
+            else if (result.error() == oidc::OidcProvider::kBrowserBindingUnavailable)
+                binding_reason = "browser_binding_unavailable";
             // No display=/email= detail here — handle_callback failed before
             // claims were extracted (token exchange, signature, or
             // validate_claims rejection incl. the #1837 governance sub/iss
@@ -3451,9 +3454,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // below this point (claims successfully parsed) DOES carry it.
             spdlog::warn("OIDC callback failed: {}", result.error());
             audit_log(req, "auth.oidc_login_failed", "failure", {}, {},
-                      binding_refused ? "reason=browser_binding_mismatch" : std::string{});
+                      binding_reason.empty() ? std::string{} : "reason=" + binding_reason);
             emit_event("auth.oidc_login_failed", req,
-                       {{"source_ip", req.remote_addr}, {"error", result.error()}}, {},
+                       {{"source_ip", req.remote_addr},
+                        {"error", binding_reason.empty() ? result.error() : binding_reason}},
+                       {},
                        Severity::kWarn);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();

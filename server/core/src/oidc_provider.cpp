@@ -83,6 +83,7 @@ static std::string bytes_to_hex(const std::vector<uint8_t>& v) {
 }
 
 #ifdef _WIN32
+namespace {
 // File-local RAII owners for the two CNG handles sha256_raw opens: one owner per handle,
 // released exactly once on every path including a throw.
 class BcryptAlgHandle {
@@ -116,11 +117,11 @@ public:
 private:
     BCRYPT_HASH_HANDLE h_ = nullptr;
 };
+} // namespace
 #endif
 
 /// SHA-256 of `input`. THROWS (std::runtime_error, like `random_bytes` above) on ANY provider
-/// failure, so a failed digest can never be mistaken for a value: a zero-filled buffer would be
-/// the same "digest" for every input, for the PKCE challenge and for the binding hash alike.
+/// failure, so a failed digest is reported, never returned as a value.
 static std::vector<uint8_t> sha256_raw(const std::string& input) {
     std::vector<uint8_t> hash(32);
     bool ok = false;
@@ -130,6 +131,7 @@ static std::vector<uint8_t> sha256_raw(const std::string& input) {
             BCryptOpenAlgorithmProvider(alg.out(), BCRYPT_SHA256_ALGORITHM, nullptr, 0))) {
         BcryptHashHandle hh;
         if (BCRYPT_SUCCESS(BCryptCreateHash(alg.get(), hh.out(), nullptr, 0, nullptr, 0, 0))) {
+            // PUCHAR is a signature artefact: BCryptHashData only reads the input buffer.
             ok = BCRYPT_SUCCESS(BCryptHashData(
                      hh.get(), reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())),
                      static_cast<ULONG>(input.size()), 0)) &&
@@ -1160,7 +1162,7 @@ std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(
         provided_hash = binding_digest(binding_secret);
     } catch (const std::exception& e) {
         spdlog::error("OIDC handle_callback: binding hash failed ({}), login refused", e.what());
-        return std::unexpected(std::string(kBrowserBindingMismatch));
+        return std::unexpected(std::string(kBrowserBindingUnavailable));
     }
 
     PkceChallenge challenge;

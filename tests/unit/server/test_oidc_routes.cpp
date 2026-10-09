@@ -37,6 +37,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <filesystem>
 #include <memory>
@@ -286,7 +287,7 @@ TEST_CASE("OIDC — an untrimmed --oidc-admin-group would NOT match (regression 
 // Initiating-browser binding on /auth/oidc/start + /auth/callback.
 //
 // Two "browsers" (cookie jars) drive the real routes against one provider. Browser A starts a
-// flow and finishes it; browser V is handed A's callback URL. A fixture that merely checks the
+// flow and finishes it; browser B opens the same callback URL. A fixture that merely checks the
 // happy path would stay green with the binding deleted: every refusal case below asserts the IdP
 // was NEVER asked to exchange the code (`token_calls`), and the success cases assert a session
 // cookie.
@@ -330,20 +331,6 @@ std::vector<std::string> set_cookies(const httplib::Response& res) {
     return out;
 }
 
-bool has_cookie_named(const httplib::Response& res, const std::string& prefix) {
-    for (const auto& c : set_cookies(res))
-        if (c.starts_with(prefix))
-            return true;
-    return false;
-}
-
-bool binding_cookie_cleared(const httplib::Response& r) {
-    for (const auto& c : set_cookies(r))
-        if (c.starts_with("__Host-yuzu_oidc_bind=;") && c.find("Max-Age=0") != std::string::npos)
-            return true;
-    return false;
-}
-
 oidc::OidcConfig flow_cfg(const std::string& token_endpoint) {
     oidc::OidcConfig c;
     c.issuer = "https://idp.example.test";
@@ -362,6 +349,20 @@ oidc::OidcConfig flow_cfg(const std::string& token_endpoint) {
 #ifndef YUZU_OIDC_MOCK_IDP_TSAN
 
 namespace {
+
+bool has_cookie_named(const httplib::Response& res, const std::string& prefix) {
+    for (const auto& c : set_cookies(res))
+        if (c.starts_with(prefix))
+            return true;
+    return false;
+}
+
+bool binding_cookie_cleared(const httplib::Response& r) {
+    for (const auto& c : set_cookies(r))
+        if (c.starts_with("__Host-yuzu_oidc_bind=;") && c.find("Max-Age=0") != std::string::npos)
+            return true;
+    return false;
+}
 
 struct Started {
     std::string state;
@@ -402,7 +403,7 @@ struct BindingRig {
         return s;
     }
 
-    /// `b` visits the callback URL of flow `s` (a cross-site GET).
+    /// `b` visits the callback URL of flow `s` (a GET navigation).
     std::unique_ptr<httplib::Response> callback(Browser& b, const Started& s) {
         idp.set_id_token(s.jwt);
         return get(b, "/auth/callback?code=the-code&state=" + s.state);
@@ -489,15 +490,15 @@ TEST_CASE("OIDC binding route: a callback URL opened in a browser without the co
           "and the initiating browser still completes",
           "[pg][oidc][oidc_binding][auth_routes]") {
     BindingRig rig;
-    Browser a, v;
+    Browser a, b;
     const auto flow = rig.start(a);
 
-    // V has NO binding cookie (never started this flow).
-    auto r = rig.callback(v, flow);
+    // B has NO binding cookie (never started this flow).
+    auto r = rig.callback(b, flow);
     CHECK(r->status == 302);
     CHECK(r->get_header_value("Location") == "/login?error=sso_failed");
     CHECK_FALSE(has_cookie_named(*r, "yuzu_session="));
-    CHECK(v.jar.count("yuzu_session") == 0);
+    CHECK(b.jar.count("yuzu_session") == 0);
     CHECK(rig.idp.token_calls.load() == 0); // the code was never exchanged
     CHECK(rig.last_audit_detail() == "reason=browser_binding_missing");
     CHECK(rig.fix.counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}) ==
@@ -510,29 +511,29 @@ TEST_CASE("OIDC binding route: a callback URL opened in a browser without the co
     CHECK(rig.idp.token_calls.load() == 1);
 }
 
-TEST_CASE("OIDC binding route: a visitor holding ITS OWN cookie is refused on another flow, keeps "
-          "its cookie, and neither flow is consumed",
+TEST_CASE("OIDC binding route: a browser holding its own cookie is refused on another browser's flow, "
+          "keeps its cookie, and neither flow is consumed",
           "[pg][oidc][oidc_binding][auth_routes]") {
     BindingRig rig;
-    Browser a, v;
+    Browser a, b;
     const auto a_flow = rig.start(a);
-    const auto v_flow = rig.start(v); // V legitimately started a login of its own
-    const std::string v_cookie = v.jar["__Host-yuzu_oidc_bind"];
-    REQUIRE(v_cookie.size() == 64);
+    const auto b_flow = rig.start(b); // B started a sign-in of its own
+    const std::string b_cookie = b.jar["__Host-yuzu_oidc_bind"];
+    REQUIRE(b_cookie.size() == 64);
 
-    // V is sent A's callback URL: V's cookie is for V's flow, not A's.
-    auto r = rig.callback(v, a_flow);
+    // B opens A's callback URL: B's cookie is for B's flow, not A's.
+    auto r = rig.callback(b, a_flow);
     CHECK(r->get_header_value("Location") == "/login?error=sso_failed");
     CHECK_FALSE(has_cookie_named(*r, "yuzu_session="));
     CHECK(rig.idp.token_calls.load() == 0);
     CHECK(rig.last_audit_detail() == "reason=browser_binding_mismatch");
-    // V's cookie matched nothing, so it was not spent.
+    // B's cookie matched nothing, so it was not spent.
     CHECK_FALSE(binding_cookie_cleared(*r));
-    REQUIRE(v.jar.count("__Host-yuzu_oidc_bind") == 1);
-    CHECK(v.jar["__Host-yuzu_oidc_bind"] == v_cookie);
+    REQUIRE(b.jar.count("__Host-yuzu_oidc_bind") == 1);
+    CHECK(b.jar["__Host-yuzu_oidc_bind"] == b_cookie);
 
-    // Neither flow was consumed: V finishes its own, and A finishes A's.
-    CHECK(rig.callback(v, v_flow)->get_header_value("Location") == "/");
+    // Neither flow was consumed: B finishes its own, and A finishes A's.
+    CHECK(rig.callback(b, b_flow)->get_header_value("Location") == "/");
     CHECK(rig.callback(a, a_flow)->get_header_value("Location") == "/");
     CHECK(rig.idp.token_calls.load() == 2);
 }
@@ -543,10 +544,10 @@ TEST_CASE("OIDC binding route: only the exact cookie name counts",
     Browser a;
     const auto flow = rig.start(a);
     const std::string secret = a.jar["__Host-yuzu_oidc_bind"];
-    // A cookie that merely ENDS in the binding name cannot shadow it.
-    Browser shadow;
-    shadow.jar["foo__Host-yuzu_oidc_bind"] = secret;
-    auto r = rig.callback(shadow, flow);
+    // A cookie whose name merely ENDS in the binding name does not count.
+    Browser suffixed;
+    suffixed.jar["foo__Host-yuzu_oidc_bind"] = secret;
+    auto r = rig.callback(suffixed, flow);
     CHECK(r->get_header_value("Location") == "/login?error=sso_failed");
     CHECK(rig.idp.token_calls.load() == 0);
     CHECK(rig.last_audit_detail() == "reason=browser_binding_missing");
@@ -555,14 +556,14 @@ TEST_CASE("OIDC binding route: only the exact cookie name counts",
     sess.jar["yuzu_session"] = secret;
     CHECK(rig.callback(sess, flow)->get_header_value("Location") == "/login?error=sso_failed");
     CHECK(rig.idp.token_calls.load() == 0);
-    // The genuine browser still completes (neither probe consumed the flow).
+    // The genuine browser still completes (neither request consumed the flow).
     CHECK(rig.callback(a, flow)->get_header_value("Location") == "/");
 }
 
 TEST_CASE("OIDC binding route: a callback that matches no pending flow leaves the binding cookie alone",
           "[pg][oidc][oidc_binding][auth_routes]") {
-    // The callback is reachable by any cross-site GET. It must not delete the cookie of a
-    // visitor who is mid-login, or that visitor's own IdP return would then fail.
+    // A callback that matches no pending flow leaves the cookie in place, so a sign-in the
+    // visitor has in progress is not disturbed.
     BindingRig rig;
     for (const char* path : {"/auth/callback?error=access_denied", "/auth/callback",
                              "/auth/callback?code=c&state=zzz"}) {
@@ -573,13 +574,13 @@ TEST_CASE("OIDC binding route: a callback that matches no pending flow leaves th
         CHECK_FALSE(binding_cookie_cleared(*r));
         CHECK(b.jar.count("__Host-yuzu_oidc_bind") == 1);
     }
-    // A visitor mid-login survives those requests and still completes its own flow.
-    Browser v;
-    const auto flow = rig.start(v);
-    (void)rig.get(v, "/auth/callback?error=access_denied");
-    (void)rig.get(v, "/auth/callback?code=c&state=zzz");
-    REQUIRE(v.jar.count("__Host-yuzu_oidc_bind") == 1);
-    CHECK(rig.callback(v, flow)->get_header_value("Location") == "/");
+    // A browser mid-sign-in survives those requests and still completes its own flow.
+    Browser a;
+    const auto flow = rig.start(a);
+    (void)rig.get(a, "/auth/callback?error=access_denied");
+    (void)rig.get(a, "/auth/callback?code=c&state=zzz");
+    REQUIRE(a.jar.count("__Host-yuzu_oidc_bind") == 1);
+    CHECK(rig.callback(a, flow)->get_header_value("Location") == "/");
 }
 
 TEST_CASE("OIDC binding route: a failure after the binding matched still clears the cookie",
@@ -594,9 +595,9 @@ TEST_CASE("OIDC binding route: a failure after the binding matched still clears 
     CHECK(a.jar.count("__Host-yuzu_oidc_bind") == 0);
 }
 
-TEST_CASE("OIDC binding route: the IdP's cross-site GET callback is not subject to a same-origin rule",
+TEST_CASE("OIDC binding route: the IdP's GET callback is not subject to a same-origin rule",
           "[pg][oidc][oidc_binding][auth_routes]") {
-    // The legitimate callback arrives as a top-level cross-site navigation: the Lax cookie rides
+    // The legitimate callback arrives as a top-level navigation: the Lax cookie rides
     // along, Referer may be the IdP or absent. The binding is the protection; a same-origin
     // requirement on this route would break every login.
     BindingRig rig;
@@ -628,4 +629,47 @@ TEST_CASE("OIDC binding route: a digest failure at login start answers 500 with 
     CHECK(r->status == 500);
     CHECK(r->get_header_value("Location").empty());
     CHECK(set_cookies(*r).empty());
+    // The A4 error envelope: a correlation id and a body carrying the status.
+    CHECK_FALSE(r->get_header_value("X-Correlation-Id").empty());
+    const auto body = nlohmann::json::parse(r->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"].value("code", 0) == 500);
+    CHECK_FALSE(body["error"].value("correlation_id", std::string{}).empty());
+}
+
+TEST_CASE("OIDC binding route: a digest failure at the callback is audited as unavailable, "
+          "refuses with the generic redirect and keeps the flow and the cookie",
+          "[pg][oidc][oidc_binding][oidc_hash_failure][auth_routes]") {
+    // Reaches no network: every callback below is refused before a token exchange.
+    OidcRoutesFixture fix;
+    fix.oidc_provider = std::make_unique<oidc::OidcProvider>(flow_cfg("http://127.0.0.1:1/token"));
+    fix.cfg.oidc_redirect_uri = "https://yuzu.example.test/auth/callback";
+    const auto flow = fix.oidc_provider->start_auth_flow();
+    const auto state = yuzu::server::test::url_query_param(flow.url, "state");
+    REQUIRE_FALSE(state.empty());
+    const std::string path = "/auth/callback?code=c&state=" + state;
+    const std::unordered_map<std::string, std::string> cookie{
+        {"Cookie", "__Host-yuzu_oidc_bind=" + flow.binding_secret}};
+
+    fix.oidc_provider->set_binding_digest_failure_for_test(true);
+    auto r = fix.sink.dispatch("GET", path, {}, "application/json", cookie);
+    fix.oidc_provider->set_binding_digest_failure_for_test(false);
+    REQUIRE(r != nullptr);
+    CHECK(r->status == 302);
+    CHECK(r->get_header_value("Location") == "/login?error=sso_failed");
+    CHECK(set_cookies(*r).empty()); // nothing was proved, so nothing is cleared
+    auto events = fix.audit_events(1);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().detail == "reason=browser_binding_unavailable");
+
+    // The refusal consumed nothing: a mismatching cookie on the same flow is still a mismatch
+    // (not an unknown state), audited with its own reason.
+    auto wrong = fix.sink.dispatch("GET", path, {}, "application/json",
+                                   {{"Cookie", "__Host-yuzu_oidc_bind=" + std::string(64, 'e')}});
+    REQUIRE(wrong != nullptr);
+    CHECK(wrong->get_header_value("Location") == "/login?error=sso_failed");
+    events = fix.audit_events(1);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().detail == "reason=browser_binding_mismatch");
 }

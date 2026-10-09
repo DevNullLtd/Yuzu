@@ -10,7 +10,7 @@
 // product_pack_store.cpp) each carry their own pre-existing copy and are
 // untouched here - consolidating those is a separate, wider change, not
 // part of this fix. oidc_provider.cpp's sha256_raw now uses this wrapper;
-// its verify_jwt_signature still frees its own EVP_MD_CTX by hand.
+// that file's verify_jwt_signature still frees its own EVP_MD_CTX by hand.
 
 #include <openssl/evp.h>
 

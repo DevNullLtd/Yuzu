@@ -130,6 +130,11 @@ public:
     /// caller-controlled text.
     static constexpr const char* kBrowserBindingMismatch = "browser binding check failed";
 
+    /// The error `handle_callback` returns when the binding digest could not be computed (a
+    /// crypto-provider failure). Fail-closed like a mismatch and, like it, non-consuming, but a
+    /// distinct FIXED token so the audit trail tells a platform fault from a refused cookie.
+    static constexpr const char* kBrowserBindingUnavailable = "browser binding unavailable";
+
     /// The error `handle_callback` returns when `state` names no pending flow (never issued,
     /// already consumed, or swept). A FIXED token.
     static constexpr const char* kUnknownState = "unknown or expired state parameter";
@@ -156,9 +161,10 @@ public:
     /// flow proceeds only if SHA-256(binding_secret) equals the hash stored at
     /// `start_auth_flow` (constant-time compare); an empty, wrong or unhashable secret is
     /// refused with `kBrowserBindingMismatch`. The check runs BEFORE the pending flow is
-    /// consumed and a refusal leaves the flow in place: a presenter of a mismatched pair gains
-    /// nothing, and cannot deny the initiating browser its flow. The flow is consumed (single
-    /// use) only once the binding matched.
+    /// consumed and a refusal leaves the flow in place: a refusal leaves the
+    /// pending flow available to the initiating browser. The flow is consumed (single use) only
+    /// once the binding matched. A digest failure is refused with `kBrowserBindingUnavailable`
+    /// and is likewise non-consuming.
     ///
     /// `binding_verified`, when non-null, is set false on entry and true ONLY once the presented
     /// secret matched. It is the sole signal that the calling browser's cookie proved a
@@ -176,6 +182,7 @@ public:
     static std::string base64url_encode(const std::vector<uint8_t>& data);
     static std::string base64url_decode(const std::string& input);
     static std::string generate_code_verifier();
+    /// THROWS std::runtime_error if SHA-256 fails (like `start_auth_flow`).
     static std::string compute_code_challenge(const std::string& verifier);
     static std::expected<IdTokenClaims, std::string> parse_id_token(const std::string& jwt);
 

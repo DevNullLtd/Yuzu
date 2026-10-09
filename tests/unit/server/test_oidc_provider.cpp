@@ -1083,7 +1083,7 @@ TEST_CASE("OIDC binding: a callback from another browser is refused and the flow
     const auto state = state_of(flow);
     REQUIRE_FALSE(state.empty());
 
-    // Browser B presents browser A's callback (state) with ITS OWN secret, repeatedly.
+    // Browser B presents the flow's state with its own secret.
     for (int i = 0; i < 3; ++i) {
         bool verified = true;
         auto b = provider.handle_callback("code", state, std::string(64, 'b'), &verified);
@@ -1135,7 +1135,7 @@ TEST_CASE("OIDC binding: an unknown state is reported as unknown whatever the se
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == OidcProvider::kUnknownState);
     CHECK_FALSE(verified);
-    // The probe did not disturb the real pending flow.
+    // The refused attempts did not disturb the real pending flow.
     auto still = provider.handle_callback("code", state_of(flow), std::string(64, 'e'));
     REQUIRE_FALSE(still.has_value());
     CHECK(still.error() == OidcProvider::kBrowserBindingMismatch);
@@ -1143,8 +1143,9 @@ TEST_CASE("OIDC binding: an unknown state is reported as unknown whatever the se
 
 TEST_CASE("OIDC binding: a digest failure at start throws and a flow starts again afterwards",
           "[oidc][oidc_binding][oidc_hash_failure]") {
-    // sha256_raw used to ignore every provider return code, leaving an all-zero buffer that was
-    // returned as if it were a digest. A failure must throw, as random_bytes() does.
+    // The seam fires in binding_digest, before sha256_raw runs, so this covers the caller's
+    // fail-closed handling (a digest failure throws, as random_bytes() does). sha256_raw's own
+    // failure branch (a provider return code) is not reachable from a test and is not exercised.
     OidcProvider provider(binding_cfg());
     {
         DigestFailure fail(provider);
@@ -1168,7 +1169,7 @@ TEST_CASE("OIDC binding: a digest failure while checking the binding refuses and
         // no exception escapes.
         auto r = provider.handle_callback("code", state, flow.binding_secret, &verified);
         REQUIRE_FALSE(r.has_value());
-        CHECK(r.error() == OidcProvider::kBrowserBindingMismatch);
+        CHECK(r.error() == OidcProvider::kBrowserBindingUnavailable);
         CHECK_FALSE(verified);
     }
     // The refusal did not consume the flow.
@@ -1214,7 +1215,7 @@ TEST_CASE("OIDC binding: end to end against a loopback IdP, a refusal never reac
     REQUIRE_FALSE(jwt.empty());
     idp.set_id_token(jwt);
 
-    // Another browser (the callback URL delivered elsewhere): refused BEFORE any exchange,
+    // Another browser (a different browser): refused BEFORE any exchange,
     // with no secret and with a wrong one.
     for (const std::string wrong : {std::string{}, std::string(64, 'e')}) {
         auto b = provider.handle_callback("other-code", state, wrong);
@@ -1249,17 +1250,29 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
     static constexpr const char* kSeams[] = {"set_binding_digest_failure_for_test",
                                              "add_test_pending_flow"};
     std::size_t scanned = 0;
-    for (const auto& e : fs::recursive_directory_iterator(fs::path(YUZU_SERVER_SRC_DIR))) {
-        if (!e.is_regular_file())
-            continue;
-        const auto ext = e.path().extension();
-        if (ext != ".cpp" && ext != ".hpp" && ext != ".inc")
-            continue;
+    const fs::path src_dir = fs::path(YUZU_SERVER_SRC_DIR);
+    // The public headers live beside src/ (server/core/include/yuzu/server/).
+    const fs::path include_dir = src_dir.parent_path() / "include" / "yuzu" / "server";
+    const fs::path own_cpp = src_dir / "oidc_provider.cpp";
+    const fs::path own_hpp = src_dir / "oidc_provider.hpp";
+    std::vector<fs::path> files;
+    for (const auto& root : {src_dir, include_dir}) {
+        REQUIRE(fs::is_directory(root));
+        for (const auto& e : fs::recursive_directory_iterator(root)) {
+            if (!e.is_regular_file())
+                continue;
+            const auto ext = e.path().extension();
+            if (ext == ".cpp" || ext == ".hpp" || ext == ".h" || ext == ".cc" || ext == ".inc")
+                files.push_back(e.path());
+        }
+    }
+    for (const auto& path : files) {
         ++scanned;
-        const auto name = e.path().filename().string();
-        if (name == "oidc_provider.cpp" || name == "oidc_provider.hpp")
+        // Exempt the provider's own two files by FULL path, not by basename.
+        if (fs::equivalent(path, own_cpp) || fs::equivalent(path, own_hpp))
             continue;
-        std::ifstream in(e.path(), std::ios::binary);
+        const auto name = path.filename().string();
+        std::ifstream in(path, std::ios::binary);
         REQUIRE(in.is_open());
         std::ostringstream ss;
         ss << in.rdbuf();
