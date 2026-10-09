@@ -109,10 +109,13 @@ stream_late_data_after_deadline(#{chan_srv := Chan}) ->
     Ctx = ctx:with_deadline_after(ctx:new(), 200, millisecond),
     {ok, S} = grpcbox_client:stream(Ctx, ?SEND_PATH, send_command_def(),
                                     #{channel => Chan}),
-    timer:sleep(500),
+    %% The server has ended the stream on its deadline before any DATA was
+    %% sent, so the send below is genuinely late. stream_ok/1 is the positive
+    %% control: the same open-then-send shape without a deadline runs the
+    %% handler once.
+    ?assertMatch({error, {<<"4">>, _}}, stream_result(S)),
     ok = grpcbox_client:send(S, #{agent_ids => [], timeout_seconds => 1}),
-    timer:sleep(200),
-    ?assertEqual(0, yuzu_gw_authz_stub_svc:invocations()).
+    ?assertEqual(0, invocations_within(1000)).
 
 %% The server-streaming handler finishes and exits, ending the stream; the
 %% client then sends another request message on it. The handler must not
@@ -125,8 +128,27 @@ stream_message_after_handler_exit(#{chan_srv := Chan}) ->
     ?assertMatch({ok, {<<"0">>, _, _}}, stream_result(S)),
     ?assertEqual(1, yuzu_gw_authz_stub_svc:invocations()),
     ok = grpcbox_client:send(S, #{agent_ids => [], timeout_seconds => 1}),
-    timer:sleep(200),
-    ?assertEqual(1, yuzu_gw_authz_stub_svc:invocations()).
+    ?assertEqual(1, invocations_within(1000)).
+
+%% Watch the stub's invocation count for up to Ms, returning as soon as it
+%% changes. A regression shows up as soon as the handler runs; a passing
+%% case waits the whole window, so a slow runner cannot hide a late run
+%% inside a short fixed sleep.
+invocations_within(Ms) ->
+    Start = yuzu_gw_authz_stub_svc:invocations(),
+    Deadline = erlang:monotonic_time(millisecond) + Ms,
+    invocations_within(Start, Deadline).
+
+invocations_within(Start, Deadline) ->
+    case yuzu_gw_authz_stub_svc:invocations() of
+        Start ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> Start;
+                false -> timer:sleep(20), invocations_within(Start, Deadline)
+            end;
+        Changed ->
+            Changed
+    end.
 
 certless_mgmt_blocked(#{mgmt_port := Port, certs := #{ca := Ca}}) ->
     yuzu_gw_authz_stub_svc:init_counters(),

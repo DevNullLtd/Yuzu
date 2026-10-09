@@ -132,12 +132,18 @@ Stock grpcbox returned the state from *before* `end_stream`, so `trailers_sent`
 stayed false after a deadline or a handler exit, and request DATA arriving
 afterwards reached `handle_message`. For a server-streaming method such as
 `SendCommand` that ran the handler, and so a fleet fan-out, after the client had
-been told the call failed. For client-streaming or bidi it went to the dead
-handler process and ran nothing. Only an admitted peer could be affected: a
-rejected stream already has `trailers_sent` set. Keeping the returned state also
-keeps `headers_sent`, and a second exit or timeout on the same stream no longer
-sends trailers twice. Every `end_stream` clause returns `{ok, State}`, so the
+been told the call failed. For client-streaming or bidi, DATA after a handler
+exit went to the dead handler process and ran nothing, but DATA after a deadline
+still reached the live handler; both are now dropped. Only an admitted peer
+could be affected: a rejected stream already has `trailers_sent` set. Keeping the
+returned state also keeps `headers_sent`, and a second exit or timeout on the same
+stream no longer sends trailers twice. Every `end_stream` clause returns `{ok, State}`, so the
 match cannot fail.
+
+The guard only applies once the stream has ended. A second request message that
+arrives *before* the first handler exits, including one in the same DATA frame,
+still starts a second handler in stock grpcbox and with these patches; that is
+tracked in #5593.
 
 Regression-pinned by `yuzu_gw_authz_rpc_tests` (the two #5591 cases: DATA after
 the stream's deadline, and a second message after the handler exited). Same
