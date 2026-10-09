@@ -55,7 +55,7 @@ reporters leave it off; agents and maintainers set it at filing.
 
 `security` (public issues = hardening/defense-in-depth only — exploitable vulnerabilities go
 through private reporting, see `SECURITY.md`), `performance`, `reliability`, `observability`,
-`compliance`, `ci`, `auth`, `docker`, `plugin`, `TAR`, `tech-debt`, `test-infra`, `devops`,
+`compliance`, `ci`, `auth`, `docker`, `gateway`, `plugin`, `TAR`, `tech-debt`, `test-infra`, `devops`,
 `enterprise`, `enterprise-readiness`, `breaking-change`, `dependencies`, `github_actions`,
 `codex`, `good first issue`, `help wanted`.
 
