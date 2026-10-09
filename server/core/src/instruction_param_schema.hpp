@@ -134,6 +134,21 @@ class ParamValidator {
 [[nodiscard]] std::expected<ParamValidator, std::vector<std::string>>
 prepare_param_validator(std::string_view stored_schema_json);
 
+// The canonical JSON-Schema form of a stored `parameter_schema`: the exact object
+// prepare_param_validator() compiles (DSL types and `validation{}` rewritten, the root closed with
+// `additionalProperties: false`), for discovery to publish. nullopt means "no schema stored" (see
+// PRESENCE); an error list means the text could not be canonicalised (same messages and the same
+// size, depth and shape limits as prepare_param_validator, which calls the same code).
+// NO RE2 pattern is compiled, so this does not pay the RE2 compile cost. That also means a
+// non-null result can still be refused at execute time: prepare_param_validator() rejects, and
+// this does not check, a pattern that does not compile or exceeds the RE2 program budget, a
+// `default` that violates its own parameter's constraints, and anything else the shared schema
+// compiler (mcp::compile_input_schema) refuses, for example non-numeric bounds, inverted bounds
+// or a keyword on the wrong type. The write gate keeps such schemas out of the store; a legacy
+// row can still carry one.
+[[nodiscard]] std::expected<std::optional<nlohmann::json>, std::vector<std::string>>
+canonicalise_param_schema(std::string_view stored_schema_json);
+
 // Bounded LRU of prepared validators so the execute route does not re-compile a
 // definition's schema on every call. Keyed by (definition id, schema length, SHA-256 of
 // the schema text): an edited definition has a new key, and the old entry ages out.
