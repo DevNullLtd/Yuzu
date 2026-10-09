@@ -547,6 +547,29 @@ TEST_CASE("ResponseStore: finalize_terminal_status truncates an over-cap error_d
         CHECK(valid_utf8(stored));
     }
 
+    SECTION("a message of exactly the cap is stored whole and one byte over is cut") {
+        make_running("cmd-final-exact");
+        const std::string exact(kCap, 'x');
+        REQUIRE(store.finalize_terminal_status("cmd-final-exact", "agent-1", /*status=*/2, exact,
+                                               "exec-1", /*plugin_result_status=*/0) ==
+                ResponseStore::FinalizeResult::Updated);
+        auto at_cap = store.get_by_instruction("cmd-final-exact");
+        REQUIRE(at_cap.has_value());
+        REQUIRE(at_cap->size() == 1);
+        CHECK((*at_cap)[0].error_detail == exact); // <= cap: no marker, no cut
+
+        make_running("cmd-final-over");
+        const std::string over(kCap + 1, 'x');
+        REQUIRE(store.finalize_terminal_status("cmd-final-over", "agent-1", /*status=*/2, over,
+                                               "exec-1", /*plugin_result_status=*/0) ==
+                ResponseStore::FinalizeResult::Updated);
+        auto above = store.get_by_instruction("cmd-final-over");
+        REQUIRE(above.has_value());
+        REQUIRE(above->size() == 1);
+        const auto& e = (*above)[0].error_detail;
+        CHECK(e == std::string(kCap, 'x') + marker); // cap bytes kept, then the marker
+    }
+
     SECTION("short message is stored verbatim") {
         make_running("cmd-final-short");
         const std::string msg = "boom: caf\xC3\xA9 failed";

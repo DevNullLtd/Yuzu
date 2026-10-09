@@ -150,11 +150,9 @@ inline constexpr int kQueryRowLimitCap = 1000;
 ///      (a row is kept while the rows BEFORE it are under the cap, so the last kept row
 ///      can run past it by up to its own size: about 4 MiB for text output, up to about
 ///      12 MiB for output dense in invalid bytes or NULs, because each of the two fields
-///      is cut to 2 MiB at ingest BEFORE invalid bytes and NULs become 3-byte U+FFFD; the
-///      one exception is the `error_detail` that `finalize_terminal_status` writes when a
-///      terminal frame closes a running row, which is sanitised but NOT cut and is bounded
-///      only by the gRPC receive message limit, so a row can exceed even these figures) and
-///      never materialises the rest; and
+///      is cut to 2 MiB at ingest BEFORE invalid bytes and NULs become 3-byte U+FFFD; that
+///      includes the `error_detail` that `finalize_terminal_status` writes when a terminal
+///      frame closes a running row) and never materialises the rest; and
 ///   2. at serialization (`append_rows_until_byte_cap`) as a backstop, because CSV
 ///      escaping and JSON framing make the SERIALIZED row larger than its raw payload.
 /// Both cut on whole rows and always serve at least one row. The NAMED routes below are not
