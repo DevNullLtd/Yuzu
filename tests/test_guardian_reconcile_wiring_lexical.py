@@ -63,9 +63,18 @@ removed, string-literal contents reduced to [A-Za-z0-9_], whitespace collapsed):
      waited value it takes.
   q. The 15 s maintenance tick publishes the three saturation gauges
      (`yuzu_server_guardian_reconcile_in_flight`, `..._budget_balance_ms`, `..._claims`) from the
-     gate and budget in their OWN try block with both catch arms (`std::exception` and `...`),
-     BEFORE the `guardian_reconcile_gate_.sweep(` call, so a throwing reap or sweep cannot freeze
-     them; and the sweep itself sits in a try with both catch arms.
+     gate and budget in their OWN try block with both catch arms (`std::exception`, named or not,
+     and `...`, parsed from the try body's closing brace), placed after
+     `publish_cohort_perf_gauges();` and before `registry_.reap_stale_sessions(` and the
+     `guardian_reconcile_gate_.sweep(` call, so a throwing reap or sweep cannot freeze them. The
+     try must follow a complete statement (`;` or `}`, not `{`, `)` or `else`), publish_cohort_perf_gauges();,
+     the gauge try, the reap and the sweep try must all be statements of ONE block (an `if (false) {`
+     or a lambda body is a deeper block), and no return, continue, break, goto, throw, if, switch,
+     for or while may sit between publish_cohort_perf_gauges(); and the gauge try or between the
+     gauge try and the sweep. The sweep sits in a try with both catch arms; what else the sweep try
+     contains (consuming the result, further statements) is not pinned. Accepted limit: a
+     construct that keeps all of the above yet stops the block running (a macro, a throwing
+     statement the lexer does not recognise) is review-only.
 
 LEXICAL ONLY. It cannot see a relocation that keeps the tokens but changes control flow (that
 stays review-enforced), and the behavioural guarantees are the building blocks' own unit tests.
@@ -390,37 +399,124 @@ def problems(src):
             if not re.search(cache + r"\.invalidate\(\)", push_body):
                 out.append(f"guardian_push_fn_ no longer calls {cache}.invalidate() (p)")
 
-    # (q) the saturation gauges are published in their own guarded block BEFORE the claim sweep,
-    # and the sweep itself is guarded by both catch arms.
-    t2 = t.replace(b, "")
-    sweep_site = re.search(r"guardian_reconcile_gate_\.sweep\(\) ?; ?(\} ?catch ?\( ?const std::exception ?& ?\w+ ?\) ?\{[^{}]*\} ?"
-                           r"catch ?\( ?\.\.\. ?\) ?\{)?", t2)
-    if not sweep_site:
-        out.append("could not find the claim sweep call outside the reconcile lambda (q)")
+    # (q) the saturation gauges and the claim sweep (see q_problems).
+    out.extend(q_problems(t.replace(b, "")))
+    return out
+
+
+_CATCH_STD = re.compile(r" ?catch ?\( ?(?:const )?std::exception(?: const)? ?&(?: ?\w+)? ?\) ?\{")
+_CATCH_ALL = re.compile(r" ?catch ?\( ?\.\.\. ?\) ?\{")
+_CONTROL_FLOW = re.compile(r"\b(?:return|continue|break|goto|throw)\b|\bif ?\(|\bswitch ?\(|\b(?:for|while) ?\(")
+
+
+def _catch_arms(t, close):
+    """Parse the catch arms that must directly follow the try whose body closes at t[close].
+    Returns (None, index just past the last arm) or (what is wrong, -1)."""
+    m = _CATCH_STD.match(t, close + 1)
+    if not m:
+        return "no catch (const std::exception&) arm directly after the try", -1
+    c = match_close(t, m.end() - 1, "{", "}")
+    if c < 0:
+        return "the catch (const std::exception&) arm is unbalanced", -1
+    m = _CATCH_ALL.match(t, c + 1)
+    if not m:
+        return "no catch (...) arm directly after the catch (const std::exception&) arm", -1
+    c = match_close(t, m.end() - 1, "{", "}")
+    if c < 0:
+        return "the catch (...) arm is unbalanced", -1
+    return None, c + 1
+
+
+def _enclosing_block(t, pos):
+    """Index of the innermost `{` still open at t[pos], or -1 at namespace scope."""
+    stack = []
+    for m in re.finditer(r"[{}]", t[:pos]):
+        if m.group(0) == "{":
+            stack.append(m.start())
+        elif stack:
+            stack.pop()
+    return stack[-1] if stack else -1
+
+
+def q_problems(t2):
+    """(q) over the lexed source with the reconcile lambda removed. Each message names the
+    condition that failed. Accepted limit: a rewrite that keeps all of this and still stops the
+    block running (a macro, or a throwing statement the check does not recognise) is review-only."""
+    out = []
+    tries = []  # (open, close, keyword start) of every `try {`
+    for m in re.finditer(r"\btry ?\{", t2):
+        c = match_close(t2, m.end() - 1, "{", "}")
+        if c > 0:
+            tries.append((m.end() - 1, c, m.start()))
+
+    sweeps = [m.start() for m in re.finditer(r"guardian_reconcile_gate_\.sweep\(\)", t2)]
+    if len(sweeps) != 1:
+        out.append(f"expected exactly one guardian_reconcile_gate_.sweep() call outside the reconcile lambda, "
+                   f"found {len(sweeps)} (q)")
+        return out
+    sweep_pos = sweeps[0]
+    around = [x for x in tries if x[0] < sweep_pos < x[1]]
+    sweep_try = max(around) if around else None
+    if sweep_try is None:
+        out.append("the claim sweep is not inside a try block (q)")
     else:
-        if not sweep_site.group(1):
-            out.append("the claim sweep is no longer followed by BOTH catch arms, catch (const std::exception&) "
-                       "and catch (...) (q)")
-        gauge_try = None
-        for m in re.finditer(r"\btry ?\{([^{}]*)\} ?catch ?\( ?const std::exception ?& ?\w+ ?\) ?\{[^{}]*\} ?"
-                             r"catch ?\( ?\.\.\. ?\) ?\{", t2):
-            if "yuzu_server_guardian_reconcile_in_flight" in m.group(1):
-                gauge_try = m
-                break
-        if gauge_try is None:
-            out.append("the three saturation gauges are no longer published inside their own try with BOTH "
-                       "catch arms (std::exception and ...) (q)")
-        else:
-            tick = gauge_try.group(1)
-            if gauge_try.start() > sweep_site.start():
-                out.append("the saturation gauges are published AFTER the claim sweep: a throwing reap or "
-                           "sweep would freeze them (q)")
-            for name, src in (("yuzu_server_guardian_reconcile_in_flight", r"guardian_reconcile_gate_\.in_flight\(\)"),
-                              ("yuzu_server_guardian_reconcile_budget_balance_ms",
-                               r"guardian_reconcile_budget_\.balance_ms\(\)"),
-                              ("yuzu_server_guardian_reconcile_claims", r"guardian_reconcile_gate_\.claims_size\(\)")):
-                if not re.search(r'metrics_ ?\.gauge\( ?"' + name + r'" ?\) ?\.set\([^;]*' + src, tick):
-                    out.append(f"{name} is no longer set from {src.replace(chr(92), '')} in the gauge block (q)")
+        why, _ = _catch_arms(t2, sweep_try[1])
+        if why:
+            out.append(f"the claim sweep try: {why} (q)")
+
+    holding = [x for x in tries if "yuzu_server_guardian_reconcile_in_flight" in t2[x[0]:x[1]]]
+    gauge_try = max(holding) if holding else None
+    if gauge_try is None:
+        out.append("the saturation gauges are no longer published inside a try block (q)")
+        return out
+    why, gauge_end = _catch_arms(t2, gauge_try[1])
+    if why:
+        out.append(f"the gauge try: {why} (q)")
+        gauge_end = gauge_try[1] + 1
+    tick = t2[gauge_try[0]:gauge_try[1]]
+    for name, src in (("yuzu_server_guardian_reconcile_in_flight", r"guardian_reconcile_gate_\.in_flight\(\)"),
+                      ("yuzu_server_guardian_reconcile_budget_balance_ms",
+                       r"guardian_reconcile_budget_\.balance_ms\(\)"),
+                      ("yuzu_server_guardian_reconcile_claims", r"guardian_reconcile_gate_\.claims_size\(\)")):
+        if not re.search(r'metrics_ ?\.gauge\( ?"' + name + r'" ?\) ?\.set\([^;]*' + src, tick):
+            out.append(f"{name} is no longer set from {src.replace(chr(92), '')} in the gauge block (q)")
+
+    # Placement: after publish_cohort_perf_gauges(); before the reap; in the SAME block as the
+    # sweep, with nothing that can skip the block on either side.
+    pcpg = [m for m in re.finditer(r"\bpublish_cohort_perf_gauges\(\) ?;", t2) if m.end() <= gauge_try[0]]
+    if not pcpg:
+        out.append("the gauge block no longer follows a publish_cohort_perf_gauges(); call (q)")
+        return out
+    pcpg_end = pcpg[-1].end()
+    reaps = [m for m in re.finditer(r"\bregistry_\.reap_stale_sessions\(", t2) if m.start() >= pcpg_end]
+    if not reaps:
+        out.append("could not find registry_.reap_stale_sessions( after publish_cohort_perf_gauges(); (q)")
+        return out
+    reap_pos = reaps[0].start()
+    if reap_pos < gauge_try[1]:
+        out.append("the saturation gauges are published AFTER registry_.reap_stale_sessions(: a throwing reap "
+                   "would freeze them (q)")
+    if sweep_pos < gauge_try[1]:
+        out.append("the saturation gauges are published AFTER the claim sweep: a throwing sweep would "
+                   "freeze them (q)")
+    if _CONTROL_FLOW.search(t2[pcpg_end:gauge_try[2]]):
+        out.append("a return, continue, branch or loop sits between publish_cohort_perf_gauges(); and the "
+                   "gauge try and can skip the gauges (q)")
+    if not re.search(r"[;}] ?$", t2[:gauge_try[2]]):
+        out.append("the gauge try is not preceded by a complete statement (a `{`, `)` or `else` before it makes "
+                   "it conditional or part of a lambda) (q)")
+    if gauge_try[1] < sweep_pos:
+        between = t2[gauge_end:sweep_pos]
+        if _CONTROL_FLOW.search(between):
+            out.append("a return, continue, branch or loop sits between the gauge block and the claim sweep, "
+                       "so the block no longer runs unconditionally ahead of the sweep (q)")
+    if sweep_try is not None:
+        blocks = {_enclosing_block(t2, pcpg[-1].start()), _enclosing_block(t2, gauge_try[0]),
+                  _enclosing_block(t2, reap_pos), _enclosing_block(t2, sweep_try[0])}
+        if len(blocks) != 1:
+            out.append("publish_cohort_perf_gauges();, the gauge block, the reap and the claim sweep are no "
+                       "longer statements of one block (the gauge block is inside an `if`, a lambda or another "
+                       "function) (q)")
     return out
 
 
@@ -467,16 +563,48 @@ SHED_OPEN = "case GuardianReconcileGate::Decision::Shed: {"
 EVAL = "const auto eval = registry_.evaluate_scope_for_agent("
 ABORT = 'abort_degraded("scope store degraded", scope_degraded_detail);'
 
-def _move_gauges_after_sweep(s):
-    """Cut the gauge try block out and paste it after the sweep's catch arms (tokens all present)."""
-    m = re.search(r"[ \t]*try \{\s*metrics_\s*\.gauge\(\"yuzu_server_guardian_reconcile_in_flight\"\).*?"
-                  r"Guardian reconcile gauge publish failed: unknown exception\"\);\s*\}\n", s, re.S)
+_GAUGE_BLOCK = re.compile(r"[ \t]*try \{\s*metrics_\s*\.gauge\(\"yuzu_server_guardian_reconcile_in_flight\"\).*?"
+                          r"Guardian reconcile gauge publish failed: unknown exception\"\);\s*\}\n", re.S)
+
+
+def _cut_gauges(s):
+    """(source without the gauge try block, the block, where it was). Tokens all stay present."""
+    m = _GAUGE_BLOCK.search(s)
     assert m, "gauge block not found (stale pattern)"
-    block = m.group(0)
-    s = s[:m.start()] + s[m.end():]
+    return s[:m.start()] + s[m.end():], m.group(0), m.start()
+
+
+def _move_gauges_after_sweep(s):
+    """Cut the gauge try block out and paste it after the sweep's catch arms."""
+    s, block, _ = _cut_gauges(s)
     n = re.search(r"Guardian reconcile claim sweep failed: unknown exception\"\);\s*\}\n", s)
     assert n, "sweep block not found (stale pattern)"
     return s[:n.end()] + block + s[n.end():]
+
+
+def _gauges_wrapped(head, tail="}\n"):
+    """Keep the gauge block where it is but wrap it: head + block + tail."""
+    def mut(s):
+        _, block, at = _cut_gauges(s)
+        return s[:at] + head + block + tail + s[at + len(block):]
+    return mut
+
+
+def _gauges_moved_after(marker):
+    """Cut the gauge block and paste it right after `marker` (first occurrence)."""
+    def mut(s):
+        s, block, _ = _cut_gauges(s)
+        i = s.index(marker) + len(marker)
+        return s[:i] + "\n" + block + s[i:]
+    return mut
+
+
+def _insert_before_gauges(text):
+    return lambda s: (lambda m: s[:m.start()] + text + s[m.start():])(_GAUGE_BLOCK.search(s))
+
+
+def _insert_after_gauges(text):
+    return lambda s: (lambda m: s[:m.end()] + text + s[m.end():])(_GAUGE_BLOCK.search(s))
 
 
 # (name, mutator, expected letter-tagged substring of the joined problems)
@@ -591,6 +719,27 @@ MUTATIONS += [
             r"}\1"), "(q)"),
     ("gauges moved after the claim sweep",
      lambda s: _move_gauges_after_sweep(s), "(q)"),
+    ("gauge block inside if (false) { }", _gauges_wrapped("if (false) {\n"), "(q)"),
+    ("gauge block in an else arm", _gauges_wrapped("if (true) {} else\n", ""), "(q)"),
+    ("a conditional continue before the gauge block",
+     _insert_before_gauges("if (guardian_reconcile_budget_.balance_ms() < 0) continue;\n"), "(q)"),
+    ("a conditional return before the gauge block",
+     _insert_before_gauges("if (guardian_reconcile_budget_.balance_ms() < 0) return;\n"), "(q)"),
+    ("a conditional continue between the gauge block and the sweep",
+     _insert_after_gauges("if (guardian_reconcile_budget_.balance_ms() < 0) continue;\n"), "(q)"),
+    ("a bare return between the gauge block and the sweep", _insert_after_gauges("return;\n"), "(q)"),
+    ("gauge block between the reap and the sweep",
+     _gauges_moved_after("registry_.reap_stale_sessions(cfg_.session_timeout);"), "(q)"),
+    ("gauge block moved into an earlier unrelated function",
+     _gauges_moved_after("void bootstrap_default_certs() {"), "(q)"),
+    ("gauge block in a never-invoked lambda",
+     _gauges_wrapped("auto unused_publish = [&] {\n", "};\n"), "(q)"),
+    ("gauge block in a never-invoked lambda after another statement",
+     _gauges_wrapped("auto unused_publish = [&] { int pad = 0; (void)pad;\n", "};\n"), "(q)"),
+    ("claim sweep outside any try",
+     _resub(r'try \{\s*YUZU_ASSERT_BACKGROUND_JOB\("guardian_reconcile_gate\.sweep"\);.*?'
+            r'claim sweep failed: unknown exception"\);\s*\}',
+            "(void)guardian_reconcile_gate_.sweep();"), "(q)"),
     ("a policy-generation gauge takes the cached current as well",
      _sub("set(static_cast<double>(fresh_generation));",
           "set(static_cast<double>(fresh_generation)); metrics_.gauge(\"yuzu_server_guardian_policy_generation\").set(static_cast<double>(current));"), "(r)"),
@@ -623,6 +772,32 @@ BENIGN = [
      _sub("bool scope_degraded = false;", 'bool scope_degraded = false; const char* old_name = "guardian_last_reconcile_";')),
     ("block comment mentions current_policy_generation(",
      _sub("bool scope_degraded = false;", "bool scope_degraded = false; /* current_policy_generation( */")),
+    # (q) must accept restructurings that keep the invariant: the gate is about order and
+    # placement, not about the exact text of the sweep try.
+    ("the sweep result is consumed",
+     _sub("(void)guardian_reconcile_gate_.sweep();",
+          "const auto swept = guardian_reconcile_gate_.sweep(); (void)swept;")),
+    ("an extra statement follows the sweep in its try",
+     _sub("(void)guardian_reconcile_gate_.sweep();",
+          'const auto swept = guardian_reconcile_gate_.sweep(); spdlog::debug("swept {}", swept);')),
+    ("unnamed catch variables",
+     _resub(r"catch \(const std::exception& e\) \{(\s*)spdlog::warn\(\"Guardian reconcile claim sweep failed: \{\}\", e\.what\(\)\);",
+            r'catch (const std::exception&) {\1spdlog::warn("Guardian reconcile claim sweep failed");')),
+    ("unnamed catch variable on the gauge try",
+     _resub(r"catch \(const std::exception& e\) \{(\s*)spdlog::warn\(\"Guardian reconcile gauge publish failed: \{\}\", e\.what\(\)\);",
+            r'catch (const std::exception&) {\1spdlog::warn("Guardian reconcile gauge publish failed");')),
+    ("a brace initializer inside a catch body",
+     _sub('spdlog::warn("Guardian reconcile claim sweep failed: unknown exception");',
+          'spdlog::warn("Guardian reconcile claim sweep failed: unknown exception"); '
+          'const std::string tag{"x"}; (void)tag;')),
+    ("a nested block inside the gauge try",
+     _resub(r'(try \{)(\s*metrics_\s*\.gauge\("yuzu_server_guardian_reconcile_in_flight"\))',
+            r"\1 { int probe{0}; (void)probe; } \2")),
+    ("clang-format style reflow of the catch arms",
+     lambda s: re.sub(r"\} catch \(const std::exception& e\) \{", "}\n      catch (const std::exception &e)\n      {", s)),
+    ("an unrelated statement between the reap and the sweep",
+     _sub("registry_.reap_stale_sessions(cfg_.session_timeout);",
+          "registry_.reap_stale_sessions(cfg_.session_timeout); spdlog::debug(\"reaped\");")),
 ]
 
 

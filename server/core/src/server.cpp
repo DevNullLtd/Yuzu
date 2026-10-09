@@ -6105,8 +6105,9 @@ public:
                                      {{"result", "no_session"}})
                             .increment();
                         // The claim Admit wrote is deliberately KEPT. This arm fires only when
-                        // the session was removed (reap, revoke, teardown) while the
-                        // pending-map session id still resolved, or on a deregistration race.
+                        // the session was removed (reap, revoke, teardown) while a
+                        // pending-map or gateway-held session id still resolved, or on a
+                        // deregistration race.
                         // (An agent that has Registered but not yet Subscribed is NOT here:
                         // register_agent installs its session at Register, so it takes the full
                         // push path and the send fails, visible only as
@@ -17445,7 +17446,7 @@ private:
             [this]() -> std::string { return registry_.to_json(); },
             // Baseline deploy / delete of a deployed Baseline push via the same fan-out the
             // REST endpoint uses. guardian_push_fn_ is assigned just below during
-            // REST wiring; this lambda reads it at toggle-time (runtime), never at
+            // REST wiring; this lambda reads it when called (runtime), never at
             // registration time, so the ordering is fine.
             [this](const std::string& scope, bool full_sync) -> int {
                 return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
@@ -21450,15 +21451,15 @@ private:
     std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
     // Guardian push fan-out, shared by baseline deploy / delete of a deployed Baseline, the
     // REST /push endpoint and the MCP push. Assigned during REST wiring (the `(guardian_push_fn_ =
-    // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by
-    // which point it is set.
+    // ...)` site); GuardianRoutes captures `this` and reads it when a baseline deploy or
+    // delete calls it, by which point it is set.
     //
     // Return-value sentinel contract (ADR-0038): >= 0 is the count of agents the
     // push was addressed to; -1 = unparseable scope expression (REST maps this to
     // 400); -2 = the guaranteed-state store's `list_rules()` degraded — the push
     // was aborted rather than fan out a rule set indistinguishable from "no rules
     // configured" (REST maps this to 503, distinctly from -1's 400). The two
-    // guardian_routes.cpp dashboard-toggle call sites do not need to distinguish
+    // guardian_routes.cpp call sites (baseline deploy and delete) do not need to distinguish
     // -1 from -2 — both already collapse to "push not wired/failed" there.
     std::function<int(const std::string&, bool)> guardian_push_fn_;
 
