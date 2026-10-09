@@ -1119,7 +1119,7 @@ TEST_CASE("OIDC binding: an empty or near-miss secret never matches", "[oidc][oi
 TEST_CASE("OIDC binding: a stored hash that is empty is never honoured", "[oidc][oidc_binding]") {
     OidcProvider provider(binding_cfg());
     provider.add_test_pending_flow("unbound-state", std::string{});
-    for (const std::string secret : {std::string{}, std::string("anything")}) {
+    for (const std::string& secret : {std::string{}, std::string("anything")}) {
         auto r = provider.handle_callback("code", "unbound-state", secret);
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == OidcProvider::kBrowserBindingMismatch);
@@ -1217,7 +1217,7 @@ TEST_CASE("OIDC binding: end to end against a loopback IdP, a refusal never reac
 
     // A different browser: refused BEFORE any exchange,
     // with no secret and with a wrong one.
-    for (const std::string wrong : {std::string{}, std::string(64, 'e')}) {
+    for (const std::string& wrong : {std::string{}, std::string(64, 'e')}) {
         auto b = provider.handle_callback("other-code", state, wrong);
         REQUIRE_FALSE(b.has_value());
         CHECK(b.error() == OidcProvider::kBrowserBindingMismatch);
