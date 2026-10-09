@@ -1450,8 +1450,14 @@ TEST_CASE("AuthRoutes::audit_log: a hostile target_id is neutralised in the pers
     REQUIRE(logs.find("audit_log: AuditStore::log failed") != std::string::npos);
     CHECK(logs.find("evil__[2099-01-01]_[critical]_forged_target_id_'x'_y_z") !=
           std::string::npos);
-    // Exactly one physical line: spdlog's own terminator is the only '\n', and no raw CR at all.
-    CHECK(logs.find('\r') == std::string::npos);
-    CHECK(std::count(logs.begin(), logs.end(), '\n') == 1);
+    // Exactly one physical line. spdlog's own terminator is the only line ending ("\n", or
+    // "\r\n" on Windows), so strip ONE trailing terminator and require no CR or LF in the rest.
+    std::string body = logs;
+    if (body.size() >= 2 && body.compare(body.size() - 2, 2, "\r\n") == 0)
+        body.resize(body.size() - 2);
+    else if (!body.empty() && body.back() == '\n')
+        body.pop_back();
+    CHECK(body.find('\r') == std::string::npos);
+    CHECK(body.find('\n') == std::string::npos);
     CHECK(logs.find("evil\r") == std::string::npos);
 }
