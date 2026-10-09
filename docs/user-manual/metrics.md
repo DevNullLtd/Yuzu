@@ -408,6 +408,12 @@ same clock-guarded sweep the audit store uses.
 All reason/result/surface/cause dimensions are seeded to zero at boot, so absent-series alerting stays
 distinguishable from a scrape failure.
 
+## TAR dashboard metrics
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_tar_retention_paused_devices{source}` | gauge | Devices reporting a paused TAR source, by `source` (`process` / `tcp` / `service` / `user`). Set each time the retention-paused page renders, from the rows of the viewing operator's own most recent scan (limited to the agents that operator can see), so it is a per-render view, not a fleet total. A scan whose response read was cut by its 10,000-row / 50 MiB cap (`result_truncated_by_cap` on `GET /api/v1/tar/retention-paused`) does not update it: its rows would under-count (it could read `0` with paused sources present on the dropped agents), so the gauge keeps the last value from an uncut scan and can be stale. |
+
 ## MCP progress-bridge metrics
 
 The MCP Streamable-HTTP progress bridge projects live `notifications/progress` onto a

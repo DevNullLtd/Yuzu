@@ -111,12 +111,15 @@ too large for its type were already `400`.
   `response.read` **success** audit row on every served read and is **fail-closed**, like its v1
   twin. When the audit store is down (or the row cannot be persisted) the route answers `503` with
   `Sec-Audit-Failed: true`, an A4 envelope (`retry_after_ms: 5000`) and no data, where it used to
-  serve the read unaudited (`get` and `aggregate` used to answer `200` with the data even when the
-  audit write failed). The scope-drop `denied` row on all three is fail-closed too, so a
+  serve the read unaudited (all three routes, `get`, `aggregate` and `export`, used to answer `200` with the
+  data even when the audit write failed). The scope-drop `denied` row on all three is fail-closed too, so a
   management-group-scoped caller whose drop row cannot be persisted gets the same `503`. Retry on
   `503`. A SIEM rule keyed on `response.read` now sees `result=success` rows with
   `detail=legacy response <query|aggregate|export> cid=<id>` from these routes as well as the v1
   ones; a global (unscoped) caller used to leave no row at all on `get` and `aggregate`.
+  Every served read on these routes now adds one audit INSERT (the audit reaper's retention cap is the
+  only backpressure), so a script that polls `/api/responses/*` raises audit volume in proportion to its
+  request rate.
 - Scripts that send `until=0` or a **negative** `since` or `until` to a response route: it is `400`
   now. A negative bound, and `until=0`, used to be read as "unbounded", so a window computed as
   `now - n` that went past the epoch silently returned the whole result. Omit the parameter for

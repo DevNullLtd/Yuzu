@@ -6148,7 +6148,7 @@ list routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`,
 `query_responses` and `GET /api/v1/executions/{id}/responses`) are capped by row count only (at
 most 1000 rows of up to 2 MiB of raw bytes per field, before the U+FFFD growth and the uncut terminal-frame `error_detail` described above);
 the dashboard results fragment's FILTERED branch (it reads by response id, not through
-`query_bounded`) is not bounded either. **Bounded by the same 50 MiB cap in SQL (#4644 Gate 7):** the
+`query_bounded`) is not bounded either. **Bounded by the same 50 MiB cap in SQL (#4644):** the
 execution visualization route (`GET /api/v1/executions/{id}/visualization`), the dashboard results
 fragment's unfiltered read and the TAR retention-paused scan page's read, each up to 10,000 rows;
 a cut there is signalled (see those routes), never silent. Other internal reads
@@ -6167,9 +6167,9 @@ on the legacy route, 10 on v1). A strict CSV parser that expects a number in the
 on it; that is the intent, since a cut file must not be read as complete. An uncut export never has
 it and is byte-identical to an export without the feature. A quoted cell can legitimately contain
 text that looks like the trailer (agent output is arbitrary), so parse the file as CSV and read the
-**final record**; do not regex-match lines. Both formats also set two out-of-body
-signals: an `X-Result-Truncated-By-Cap: true` response header (CSV only; the JSON formats carry the
-field instead) and a download name of `responses-<id>-truncated.json` or `.csv` instead of
+**final record**; do not regex-match lines. Two out-of-body signals accompany a cut: the
+`X-Result-Truncated-By-Cap: true` response header (CSV only; the JSON formats carry the field
+instead) and the download name (both formats), `responses-<id>-truncated.json` or `.csv` instead of
 `responses-<id>.json` or `.csv` in `Content-Disposition`. Any character of `<id>` outside
 `[A-Za-z0-9._-]` is written as `_` there (only the legacy route's id pattern, `[^/]+`, can carry
 one; the v1 routes admit `[A-Za-z0-9_-]` only), so a legacy export of an id such as `cmd:1` is
@@ -6180,8 +6180,8 @@ merely ends on the row that crosses the cap is not truncated. Each cut also incr
 `yuzu_server_response_export_truncated_total{surface,cause}` with `cause` `row_cap` or `byte_cap`.
 
 Audit posture: all three routes below emit a `response.read` audit event, **REST fail-closed** (503
-on an audit-persist failure, `docs/api-twin-recipe.md` §4) — a deliberate addition vs. the legacy
-routes as they were before #4644 Gate 7; the legacy routes now audit successful reads the same way, fail-closed. A scope-drop
+on an audit-persist failure, `docs/api-twin-recipe.md` §4) — a deliberate addition vs. the
+legacy routes before #4644; the legacy routes now audit successful reads the same way, fail-closed. A scope-drop
 still emits its own distinct `denied` row (CC7.2 evidence), as the legacy routes do.
 
 #### `GET /api/v1/responses/{id}`
@@ -7283,7 +7283,7 @@ Render an execution's response set as chart-ready JSON, using the `spec.visualiz
 
 **Confined (#1634).** A management-group-confined operator is admitted and sees only their in-scope agents' rows in the rendered chart — real cross-operator isolation, not the earlier inert per-row filter. The visible-agent set is resolved and pushed into the underlying SQL query before the row cap (ADR-0017 INV-3), so `rows_capped` (below) reflects the CALLER's own scoped cap hit, not a raw-then-filtered one that could fire entirely inside another operator's rows. On a **corrupt or unavailable RBAC store** the endpoint still fails **closed** (`403`/`503`) rather than exposing the whole fleet. When rows are dropped, a SEPARATE `result=denied` audit row fires (`detail` carries `scope_dropped=<N>`), paired with the `result=success` row for the same request — this fires under ordinary operation for a confined caller whose execution spans agents outside their groups, not only on RBAC-store corruption.
 
-**Bounded read (#4644 Gate 7).** The response read behind the chart is capped at 10,000 rows AND 50 MiB of row payload (`output` plus `error_detail`), applied in SQL on whole rows with at least one row always read (the same fetch as the export routes, see [Command/Instruction Responses](#commandinstruction-responses--v1-read-twins-2146-a2-r2)). `rows_capped:true` with `rows_cap:10000` now means more matching rows existed beyond the row cap (it used to be set on a read of exactly 10,000 rows too). When either cap cut the read the payload also carries `result_truncated_by_cap:true` and `truncation_cause` (`row_cap` or `byte_cap`): a chart built from a cut read is a wrong picture, not a smaller one, so a client must show it as partial. The cut is logged but not counted on the export-cut counter, whose `surface` label is a closed set naming the export routes.
+**Bounded read (#4644).** The response read behind the chart is capped at 10,000 rows AND 50 MiB of row payload (`output` plus `error_detail`), applied in SQL on whole rows with at least one row always read (the same fetch as the export routes, see [Command/Instruction Responses](#commandinstruction-responses--v1-read-twins-2146-a2-r2)). `rows_capped:true` with `rows_cap:10000` now means more matching rows existed beyond the row cap (it used to be set on a read of exactly 10,000 rows too). When either cap cut the read the payload also carries `result_truncated_by_cap:true` and `truncation_cause` (`row_cap` or `byte_cap`): a chart built from a cut read is a wrong picture, not a smaller one, so a client must show it as partial. The cut is logged but not counted on the export-cut counter, whose `surface` label is a closed set naming the export routes.
 
 **Path parameters:**
 
@@ -10141,7 +10141,7 @@ value is `400`; omitting `since` or `until` leaves that side unbounded, `since=0
 twin: if the row cannot be persisted the export answers `503` with `Sec-Audit-Failed: true` and no data. The legacy list and
 aggregate routes behave the same way (see their sections above).
 
-**Audit (#4644, addresses #5556).** All three legacy routes (`GET /api/responses/{id}`, `/aggregate`, `/export`) write a `response.read` `result=success` audit row on every served read and fail closed with a `503` (`Sec-Audit-Failed: true`) when the row cannot be persisted, like their `/api/v1/responses` twins.
+**Audit (#4644).** All three legacy routes (`GET /api/responses/{id}`, `/aggregate`, `/export`) write a `response.read` `result=success` audit row on every served read and fail closed with a `503` (`Sec-Audit-Failed: true`) when the row cannot be persisted, like their `/api/v1/responses` twins.
 
 **Confined (#1634).** All three readers are gated by `require_fleet_read` (ADR-0017 admit-then-filter) — a management-group-confined operator is admitted and sees only their in-scope agents' rows, real cross-operator isolation rather than the earlier inert per-row filter. `/export` and the catch-all GET push the visible-agent set into the underlying SQL query before `LIMIT`/`OFFSET` (ADR-0017 INV-3), so a confined caller's page reflects only their own visible rows. All three now share ONE gate's failure posture: a **null/unopened response store** returns `503`; an **open but corrupt RBAC store** fails **closed** with `403` (`rbac_enforcement_in_effect` holds, so `require_fleet_read`'s underlying permission check denies rather than falling through to the legacy read path) — for all three readers alike, not the differentiated no-rows-vs-503 split of the pre-migration gate. Scripted/Grafana consumers that start receiving `503`/`403` after an upgrade should check `/readyz` and the server log for `RbacStore` open/migrate errors.
 
@@ -10736,7 +10736,7 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 
 **Request:** no parameters.
 
-**Response:** `{"data":{"scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows":[{"agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"}]},"meta":{"api_version":"v1"}}`. `result_truncated_by_cap` (#4644 Gate 7) is `true` when the scan's response read hit the 10,000-row or 50 MiB payload cap, so `rows` and the counters are partial: dropped responses read as agents that never answered, i.e. as "collecting normally". It is distinct from `store_degraded` (the read failed outright), but a cut scan ALSO reports `store_degraded: true` so a client that predates `result_truncated_by_cap` still sees an incomplete result; test `result_truncated_by_cap` first to tell a cut from a failed read. A client that retries on `store_degraded` should not retry a cut scan: the read is capped the same way each time, so only a narrower scan (a smaller management group) changes the result, whereas a failed read may succeed on retry. `scan_id` is `""` when the operator has not dispatched a scan yet — `POST /fragments/tar/retention-paused/scan` is dashboard-only today (a mutating dispatch route, out of scope for #4027).
+**Response:** `{"data":{"scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows":[{"agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"}]},"meta":{"api_version":"v1"}}`. `result_truncated_by_cap` (#4644) is `true` when the scan's response read hit the 10,000-row or 50 MiB payload cap, so `rows` and the counters are partial: dropped responses read as agents that never answered, i.e. as "collecting normally". It is distinct from `store_degraded` (the read failed outright), but a cut scan ALSO reports `store_degraded: true` so a client that predates `result_truncated_by_cap` still sees an incomplete result; test `result_truncated_by_cap` first to tell a cut from a failed read. A client that retries on `store_degraded` should not retry a cut scan: the read is capped the same way each time, so only a narrower scan (a smaller management group) changes the result, whereas a failed read may succeed on retry. `scan_id` is `""` when the operator has not dispatched a scan yet — `POST /fragments/tar/retention-paused/scan` is dashboard-only today (a mutating dispatch route, out of scope for #4027).
 
 **Headers:** `Cache-Control: no-store, private` + `Vary: Cookie` — per-operator-scoped data, same UP-11 posture as the fragment.
 

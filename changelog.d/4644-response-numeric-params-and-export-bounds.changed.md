@@ -19,7 +19,7 @@
   instead of materialising up to `limit` full rows first; a result under 50 MiB of raw
   payload can still be cut when its escaped serialized form crosses the cap. The plain list routes (`GET .../responses/{id}`, MCP
   `query_responses`, `GET /api/v1/executions/{id}/responses`) are still bounded by row count only, and so is the dashboard results fragment's filtered branch;
-  the execution visualization route, the dashboard results fragment's unfiltered read and the TAR retention-paused scan page now share the byte-aware fetch and report a cut (see the next entry); other internal reads, for example the pre-flight and deployment polls (50,000 rows), are also unbounded by bytes. A cut export, whether by the row cap
+  the execution visualization route, the dashboard results fragment's unfiltered read and the TAR retention-paused scan page now share the byte-aware fetch and report a cut (see the visualization entry); other internal reads, for example the pre-flight and deployment polls (50,000 rows), are also unbounded by bytes. A cut export, whether by the row cap
   or the byte cap, is marked: `pagination.result_truncated_by_cap` (v1 JSON) or a top-level `result_truncated_by_cap` field (legacy JSON,
   new), and a cut CSV ends with one extra trailer record `# result_truncated_by_cap cause=<row_cap|byte_cap>` padded to the header width
   (a CSV parser that expects a number in the `id` column fails on it, only on a cut file, on purpose; an uncut CSV is unchanged). A cut

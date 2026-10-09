@@ -39,13 +39,20 @@ def wait_for(exec_id, timeout=120):
     raise TimeoutError(f"Execution {exec_id} did not complete in {timeout}s")
 
 def get_responses(definition_id, exec_id=None, limit=1000):
-    """Fetch result rows for a definition (optionally filtered by execution)."""
-    params = {"limit": limit}
+    """Fetch result rows for a definition (optionally filtered by execution).
+
+    The route serves at most 1000 rows per request, so a full page means rows
+    may be missing: fail loudly rather than analyse a partial result.
+    """
+    params = {"limit": min(limit, 1000)}
     if exec_id:
         params["execution_id"] = exec_id
     r = requests.get(f"{YUZU}/api/responses/{definition_id}", headers=HEADERS, params=params)
     r.raise_for_status()
-    return r.json()
+    body = r.json()
+    if body.get("result_truncated_by_cap") or body["count"] >= params["limit"]:
+        raise RuntimeError("response page is full: narrow the scope or filter, or fetch it in pages")
+    return body
 ```
 
 ### Scope Expression Cheat Sheet
@@ -694,14 +701,19 @@ def wait_for(exec_id, timeout=300):
         time.sleep(3)
     raise TimeoutError(f"Execution {exec_id} timed out")
 
-def get_responses(definition_id, exec_id=None, limit=10000):
-    params = {"limit": limit}
+def get_responses(definition_id, exec_id=None, limit=1000):
+    # The route serves at most 1000 rows per request; a full page means rows may
+    # be missing, so raise instead of analysing a partial result.
+    params = {"limit": min(limit, 1000)}
     if exec_id:
         params["execution_id"] = exec_id
     r = requests.get(f"{YUZU}/api/responses/{definition_id}",
                      headers=HEADERS, params=params)
     r.raise_for_status()
-    return r.json()
+    body = r.json()
+    if body.get("result_truncated_by_cap") or body["count"] >= params["limit"]:
+        raise RuntimeError("response page is full: narrow the scope or filter, or fetch it in pages")
+    return body
 
 # ── Step 1: Query TAR on Windows machines for network events ─────────────
 # Scope to Windows first (cheapest filter — just an attribute check).

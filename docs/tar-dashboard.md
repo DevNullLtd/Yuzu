@@ -99,6 +99,8 @@ This avoids a new persistent server-side mirror, which would have to be reconcil
 - Manual **Refresh** button for ad-hoc re-fan-out (automatic background refresh is planned for Phase 15.G operational hardening)
 - Manual "Refresh" button for ad-hoc re-fan-out
 
+> **Bounded scan read (#4644).** The scan's response read goes through the byte-aware store fetch (10,000 rows / 50 MiB of response payload). A cut is reported, never silent: the page shows a "Partial result" banner, qualifies its header counts and, with no rows in the part that was read, replaces the "still in progress" / "all clear" empty states with one saying the page cannot tell; `GET /api/v1/tar/retention-paused` and `list_tar_retention_paused` carry `result_truncated_by_cap: true` and also set `store_degraded: true`. This page is a dispatch-and-poll view, not a capture source, so the CORE capture-source pattern (§8 of the implementer doc) does not apply.
+
 ### 3.2 Extending `tar.status`
 
 The action's response gains four lines per source (so 16 new lines total for the 4 sources):
@@ -129,8 +131,6 @@ The "Purge data" button on a row is more dangerous than re-enable — it tells t
 
 Server dispatches a new agent action `tar.purge_source` with `{source: <name>}`. The action is gated behind a typed-hostname confirmation ("type the device hostname to confirm purge of `process` data"), per the destructive-action discipline in the project root `CLAUDE.md`. Audit row: `action: tar.source.purge, principal: <session>, result: success|failure, detail: device=<id> source=<name>` — the dispatch audit row does **not** carry `rows_deleted` (see the as-shipped note below).
 
-> **Bounded scan read (#4644).** The scan's response read goes through the byte-aware store fetch (10,000 rows / 50 MiB of response payload). A cut is reported, never silent: the page shows a "Partial result" banner, qualifies its header counts and, with no rows in the part that was read, replaces the "still in progress" / "all clear" empty states with one saying the page cannot tell; `GET /api/v1/tar/retention-paused` and `list_tar_retention_paused` carry `result_truncated_by_cap: true` and also set `store_degraded: true`. This page is a dispatch-and-poll view, not a capture source, so the CORE capture-source pattern (§8 of the implementer doc) does not apply.
->
 > **As shipped (Phase 15.A, 2026-07-01).** Route `POST /fragments/tar/retention-paused/purge`; audit verb `tar.source.purge` (matching the `tar.source.reenable` sibling); metric `yuzu_tar_source_purge_total{result}`. The typed confirmation is a native `prompt()` ("type the device hostname"), not a bespoke modal — CSP-safe (no `hx-on`/eval), consistent with the native `confirm()` used for re-enable. **The paused-guard is agent-side and authoritative:** `tar.purge_source` refuses (`source_not_paused`) if the source is currently enabled, which closes the scan→purge TOCTOU. The server does **not** enforce a `SOURCE_NOT_PAUSED` check (§3.5) because the retention-paused frame is an ephemeral live scan with no persisted paused-state to check. Dispatch is fire-and-forget, so `rows_deleted` is computed agent-side and returned in the response record — it is not in the immediate dispatch audit row.
 >
 > **A1 REST parity + generic-dispatch hardening (2026-07-01).** Automation/MCP callers use the structured `POST /api/v1/tar/retention-paused/purge` (JSON body `{device_id, source}`, `Infrastructure:Delete` per-device-scoped, A4 error envelope, `202` + `command_id`; audited fail-closed — no dispatch without a durable audit row). Both the fragment and the REST route confirm the guard is agent-side authoritative. The generic `POST /api/command` escape hatch now also elevates destructive actions: `tar.purge_source` there additionally requires `Infrastructure:Delete` and is confined to the caller's visible agents with untargeted broadcast/scope fan-out refused, so it can't be a weaker path than the dedicated route. The atomic agent-side guard (check + delete under one lock) closes the agent-local check→delete race in addition to the scan→purge TOCTOU.
@@ -345,7 +345,7 @@ Per `docs/observability-conventions.md`:
 | Metric | Type | Labels | Status |
 |---|---|---|---|
 | `yuzu_tar_dashboard_view_total` | counter | `frame` (retention/sql/tree), `result` | shipped (PR-A.A) |
-| `yuzu_tar_retention_paused_devices` | gauge | `source` | shipped (PR-A.A). Set from the rows of the page's own scan read, so on a cut scan (`result_truncated_by_cap`, see the bounded-read note in §3) it counts only the part that was read and UNDER-counts; read it together with the in-band cut signal, not as a fleet total. |
+| `yuzu_tar_retention_paused_devices` | gauge | `source` | shipped (PR-A.A). Set from the rows of the page's own scan read. A cut scan (`result_truncated_by_cap`, see the bounded-read note in §3.1) does not update it, because its rows would under-count; the gauge keeps the last value from an uncut scan, so it can be stale. It is a per-render view, not a fleet total. |
 | `yuzu_tar_source_purge_total` | counter | `result` | **shipped** (Phase 15.A — dashboard fragment + `POST /api/v1/tar/retention-paused/purge`) |
 | `yuzu_tar_source_reenable_total` | counter | `result` | shipped (PR-A.A — dashboard fragment only, no REST twin) |
 | `yuzu_tar_scan_dispatched_total` | counter | `result` | shipped (PR-A.A) |

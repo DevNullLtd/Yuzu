@@ -906,7 +906,7 @@ curl -s "http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8/export?fo
   -b "$COOKIE" -o responses.csv
 ```
 
-(A cut export is marked; the "Export as CSV" section earlier in this guide shows how to tell a cut export from a complete one.)
+(A cut export is marked; the first "Export as CSV" section in this guide shows how to tell a cut export from a complete one.)
 
 The CSV file contains one row per agent response with headers:
 
