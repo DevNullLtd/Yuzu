@@ -18550,6 +18550,7 @@ private:
         // DashboardRoutes/McpServer above: capability_registry_ is a plain
         // ServerImpl member, never conditional on another store's presence.
         wf_deps.capability_registry = &capability_registry_;
+        wf_deps.param_validators = param_validator_cache_; // #5562: one byte-bounded cache
         workflow_routes_->register_routes(*web_server_, std::move(wf_deps));
 
         // NotificationRoutes — /api/notifications/*
@@ -20834,6 +20835,13 @@ private:
     std::shared_ptr<spdlog::logger> file_logger_;
     std::unique_ptr<grpc::Server> agent_server_;
     std::unique_ptr<grpc::Server> mgmt_server_;
+    // Prepared `parameter_schema` validators (#5562): one byte-bounded cache shared by the call
+    // sites that take it from WorkflowRoutes::Deps. Declare it BEFORE every consumer (the HTTP
+    // server, background threads, any later holder of a raw reference) so it is destroyed AFTER
+    // them; the shared_ptr copies in the route lambdas are a second layer. The cache itself has
+    // no pointer into any other ServerImpl member.
+    std::shared_ptr<instr::ParamValidatorCache> param_validator_cache_ =
+        std::make_shared<instr::ParamValidatorCache>();
     std::unique_ptr<httplib::Server> web_server_;
     std::thread web_thread_;
     // #2703 Gate 7 merge-slice item 2: signalled by web_thread_'s body right

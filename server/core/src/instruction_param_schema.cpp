@@ -579,6 +579,7 @@ struct ParamValidator::Impl {
     // nullopt = ABSENT (nothing declared).
     std::optional<mcp::CompiledInputSchema> schema;
     std::vector<PropInfo> props;
+    std::size_t retained_bytes = 0;  // see estimated_retained_bytes(); 0 when absent
 };
 
 ParamValidator::ParamValidator(std::unique_ptr<const Impl> impl) : impl_(std::move(impl)) {}
@@ -588,6 +589,10 @@ ParamValidator::~ParamValidator() = default;
 
 bool ParamValidator::absent() const noexcept {
     return impl_ && !impl_->schema;
+}
+
+std::size_t ParamValidator::estimated_retained_bytes() const noexcept {
+    return impl_ ? impl_->retained_bytes : 0;
 }
 
 std::optional<mcp::SchemaViolation> ParamValidator::check(const json& params) const {
@@ -701,16 +706,39 @@ prepare_param_validator(std::string_view stored_schema_json) {
     if (!errors.empty())
         return std::unexpected(std::move(errors));
 
+    // Every pattern in `props` (a user pattern, or the fixed datetime/guid one) is written into
+    // the canonical schema and compiled by compile_input_schema, one RE2 per pattern; every
+    // enum member is copied into the compiled schema as a JSON value.
+    std::size_t patterns = 0;
+    std::size_t enum_members = 0;
+    for (const auto& p : impl->props) {
+        patterns += static_cast<std::size_t>(p.has_pattern) +
+                    static_cast<std::size_t>(p.items_has_pattern);
+        enum_members += p.enum_members + p.items_enum_members;
+    }
+    impl->retained_bytes = kParamValidatorFixedBytes +
+                           impl->props.size() * kParamValidatorPerPropertyBytes +
+                           enum_members * kParamValidatorPerEnumMemberBytes +
+                           trim(stored_schema_json).size() +
+                           patterns * static_cast<std::size_t>(mcp::kPatternMaxMem);
+
     impl->schema.emplace(std::move(*compiled));
     return ParamValidator(std::move(impl));
 }
 
-ParamValidatorCache::ParamValidatorCache(std::size_t max_entries)
-    : max_entries_(max_entries == 0 ? 1 : max_entries) {}
+ParamValidatorCache::ParamValidatorCache(std::size_t max_entries, std::size_t max_bytes,
+                                         std::size_t max_entry_bytes)
+    : max_entries_(max_entries == 0 ? 1 : max_entries), max_bytes_(max_bytes),
+      max_entry_bytes_(max_entry_bytes) {}
 
 std::size_t ParamValidatorCache::size() const {
     std::lock_guard lk(mu_);
     return lru_.size();
+}
+
+std::size_t ParamValidatorCache::bytes() const {
+    std::lock_guard lk(mu_);
+    return total_bytes_;
 }
 
 ParamValidatorCache::Result ParamValidatorCache::get(const std::string& definition_id,
@@ -745,23 +773,31 @@ ParamValidatorCache::Result ParamValidatorCache::get(const std::string& definiti
     Result result = build();  // outside the lock
     if (!result || (*result)->absent())
         return result;
+    // An entry heavier than the whole budget, or than the per-entry cap, is handed back but
+    // never retained: admitting it would evict most of the other entries in one insert.
+    const std::size_t weight = (*result)->estimated_retained_bytes();
+    if (weight > max_bytes_ || weight > max_entry_bytes_)
+        return result;
     try {
         std::lock_guard lk(mu_);
         if (!index_.contains(key)) {  // another thread may have inserted it meanwhile
-            lru_.push_front(Entry{key, *result});
+            lru_.push_front(Entry{key, *result, weight});
             try {
                 index_.emplace(key, lru_.begin());
             } catch (...) {
                 lru_.pop_front();
                 throw;
             }
-            while (lru_.size() > max_entries_) {
+            total_bytes_ += weight;
+            // The new entry is at the front and fits alone, so this loop ends before it.
+            while (lru_.size() > max_entries_ || total_bytes_ > max_bytes_) {
+                total_bytes_ -= lru_.back().weight;
                 index_.erase(lru_.back().key);
                 lru_.pop_back();
             }
         }
     } catch (...) {
-        // Caching is an optimisation: an allocation failure leaves the cache usable.
+        // Caching is an optimisation: an allocation or lock failure leaves the cache usable.
     }
     return result;
 }
