@@ -236,8 +236,16 @@ TEST_CASE("alloc sweep: GuardianGenerationCache::get() never wedges after a fail
 
 TEST_CASE("alloc sweep: GuardianGenerationCache::get_fresh() never wedges after a failed allocation",
           "[guardian][generation_cache][alloc_sweep]") {
+    // {true, 1}: the fetch errors, so building and copying the 80-byte error string is the one
+    // allocation point inside the call. {false, 0}: the SUCCESS path. Measured on libstdc++, a
+    // successful get_fresh() allocates NOTHING (a uint64 result copied into an in-place
+    // optional<Entry>, no promise or map node, unlike get()), so this sweep ends at its first
+    // iteration and today proves only that the call neither throws nor wedges. It is kept, with
+    // a floor of 0, so that the day install()/run_fetch() gains an allocation on the success
+    // path (a string key, a heap-held Entry) every point of it is swept instead of nobody
+    // noticing the success arm is no longer allocation-free.
     for (const SweepSpec& spec : std::initializer_list<SweepSpec>
-         {{true, 1}}) {
+         {{true, 1}, {false, 0}}) {
         const bool err_first = spec.first;
         const long min_points = spec.second;
         INFO("first fetch/load is an error: " << err_first);
