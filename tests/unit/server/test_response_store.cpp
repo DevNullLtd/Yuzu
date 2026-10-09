@@ -483,6 +483,83 @@ TEST_CASE("ResponseStore: finalize_terminal_status sanitizes error_detail (inval
     CHECK((*results)[0].error_detail.find('\xff') == std::string::npos);
 }
 
+// The same ingest cap store() applies to error_detail must bound the terminal
+// frame's message too (ledger row error-detail-not-truncated-at-finalize-
+// terminal-status): a terminal frame's error message cannot exceed the
+// documented per-row worst case (2 MiB plus the truncation marker).
+TEST_CASE("ResponseStore: finalize_terminal_status truncates an over-cap error_detail",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    constexpr std::size_t kCap = 2ull * 1024 * 1024; // kMaxIngestBytes
+    const std::string marker = "\n...[truncated by server ingest cap]";
+
+    auto make_running = [&](const std::string& id) {
+        StoredResponse running;
+        running.instruction_id = id;
+        running.agent_id = "agent-1";
+        running.execution_id = "exec-1";
+        running.status = 0;
+        store.store(running);
+    };
+
+    // Structural UTF-8 validity (lead/continuation byte shape), enough to
+    // prove the cut multibyte character did not reach PG or the row raw.
+    auto valid_utf8 = [](const std::string& s) {
+        std::size_t i = 0;
+        while (i < s.size()) {
+            const auto c = static_cast<unsigned char>(s[i]);
+            std::size_t n = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3
+                          : (c >> 3) == 0x1E ? 4 : 0;
+            if (n == 0 || i + n > s.size())
+                return false;
+            for (std::size_t k = 1; k < n; ++k)
+                if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80)
+                    return false;
+            i += n;
+        }
+        return true;
+    };
+
+    SECTION("over-cap message with a multibyte char straddling the cut") {
+        make_running("cmd-final-overcap");
+        // U+20AC (E2 82 AC) begins one byte before the cap, so the raw-byte
+        // cut lands inside it and leaves a dangling lead byte.
+        const std::string big = std::string(kCap - 1, 'x') + "\xE2\x82\xAC" + std::string(500, 'y');
+        auto fr = store.finalize_terminal_status("cmd-final-overcap", "agent-1", /*status=*/2,
+                                                 big, "exec-1", /*plugin_result_status=*/0);
+        CHECK(fr == ResponseStore::FinalizeResult::Updated);
+
+        auto results = store.get_by_instruction("cmd-final-overcap");
+        REQUIRE(results.has_value());
+        REQUIRE(results->size() == 1);
+        const std::string& stored = (*results)[0].error_detail;
+        CHECK((*results)[0].status == 2);
+        CHECK(stored.size() < big.size()); // genuinely truncated
+        // Bounded: the cap plus the marker, plus at most a few bytes of
+        // U+FFFD expansion for the severed lead byte.
+        CHECK(stored.size() <= kCap + marker.size() + 6);
+        CHECK(stored.find("truncated by server ingest cap") != std::string::npos);
+        CHECK(stored.find(std::string(500, 'y')) == std::string::npos); // tail dropped
+        CHECK(stored.compare(0, kCap - 1, std::string(kCap - 1, 'x')) == 0);
+        CHECK(valid_utf8(stored));
+    }
+
+    SECTION("short message is stored verbatim") {
+        make_running("cmd-final-short");
+        const std::string msg = "boom: caf\xC3\xA9 failed";
+        auto fr = store.finalize_terminal_status("cmd-final-short", "agent-1", /*status=*/2, msg,
+                                                 "exec-1", /*plugin_result_status=*/0);
+        CHECK(fr == ResponseStore::FinalizeResult::Updated);
+        auto results = store.get_by_instruction("cmd-final-short");
+        REQUIRE(results.has_value());
+        REQUIRE(results->size() == 1);
+        CHECK((*results)[0].error_detail == msg);
+    }
+}
+
 TEST_CASE("ResponseStore: timestamp ordering", "[pg][response_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

@@ -432,6 +432,26 @@ TEST_CASE("GET /api/responses/:id (catch-all): an unconfined caller's genuinely-
 // #4644 / #4703: strict numeric parameters, export limit ceiling, export byte cap
 // ═══════════════════════════════════════════════════════════════════════════
 
+namespace {
+// The contract is the TEXT: asserted as a literal on purpose, never via a shared constant, so
+// a drifted string fails here.
+constexpr const char* kNumericParamMessage = "invalid numeric query parameter";
+
+// A 400 whose body is the A4 error envelope carrying exactly the numeric-param message.
+void check_numeric_400(const std::unique_ptr<httplib::Response>& res) {
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto body = json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"].is_object());
+    CHECK(body["error"]["code"] == 400);
+    CHECK(body["error"]["message"] == kNumericParamMessage);
+    REQUIRE(body.contains("meta"));
+    CHECK(body["meta"]["api_version"] == "v1");
+}
+} // namespace
+
 TEST_CASE("legacy response routes: a malformed numeric query parameter is a 400 not a "
           "different valid-looking filter (#4644)",
           "[server][routes][response_routes][rest][pg]") {
@@ -471,8 +491,73 @@ TEST_CASE("legacy response routes: limit and offset reject trailing garbage wher
         std::pair<std::string, std::string>{"/export", "limit="});
     INFO("route=" << route << " query=" << query);
     auto res = h.sink.Get("/api/responses/instr-strict-lim" + route + "?" + query);
-    REQUIRE(res);
-    CHECK(res->status == 400);
+    check_numeric_400(res);
+}
+
+TEST_CASE("legacy response routes: only the FIRST of a repeated numeric query parameter is "
+          "validated (current contract, #4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-repeat", "agent-1", 1);
+
+    // httplib keeps repeated keys in query order and get_param_value() returns the first, so a
+    // malformed SECOND value is ignored and a malformed FIRST one is the 400. Pinned as the
+    // present behaviour, not as an endorsement: a caller cannot rely on the second value.
+    const std::string route = GENERATE(as<std::string>{}, "", "/export");
+    INFO("route=" << route);
+    auto later_bad = h.sink.Get("/api/responses/instr-repeat" + route + "?limit=5&limit=abc");
+    REQUIRE(later_bad);
+    CHECK(later_bad->status == 200);
+    check_numeric_400(h.sink.Get("/api/responses/instr-repeat" + route + "?limit=abc&limit=5"));
+}
+
+TEST_CASE("legacy response routes: a 100-digit number is an out-of-range 400 for limit, since "
+          "and until (#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-longdigits", "agent-1", 1);
+
+    const std::string huge(100, '9');
+    for (const char* route : {"", "/export"}) {
+        for (const char* key : {"limit", "since", "until"}) {
+            INFO("route=" << route << " key=" << key);
+            check_numeric_400(h.sink.Get(std::string("/api/responses/instr-longdigits") + route +
+                                         "?" + key + "=" + huge));
+        }
+    }
+}
+
+TEST_CASE("legacy response routes: a percent-encoded plus (%2B1) is rejected as a literal sign, "
+          "and a bare '+1' is rejected as whitespace-led (#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-plus", "agent-1", 1);
+
+    // httplib decodes a bare '+' in a query to a space, so `+1` reaches the parser as " 1"
+    // (leading whitespace). `%2B1` is the only way to deliver a literal leading '+', which
+    // std::from_chars does not accept either. Both are 400.
+    for (const char* q : {"status=+1", "status=%2B1", "limit=%2B5", "since=%2B5", "until=%2B5"}) {
+        INFO(q);
+        check_numeric_400(h.sink.Get(std::string("/api/responses/instr-plus?") + q));
+    }
+}
+
+// One drift tripwire for the REST 400 text: every legacy response route that parses numeric
+// query parameters must answer a malformed one with this exact message in the A4 envelope.
+// (The string is copy-pasted per handler, so a single edited copy would otherwise go unseen.)
+TEST_CASE("legacy response routes: every route answers a malformed numeric parameter with the "
+          "same status, message and envelope (#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-parity", "agent-1", 1);
+
+    // The aggregate route takes no `limit`, so its malformed numeric is `status`.
+    const auto [route, query] = GENERATE(
+        std::pair<std::string, std::string>{"", "limit=abc"},
+        std::pair<std::string, std::string>{"/aggregate", "status=abc"},
+        std::pair<std::string, std::string>{"/export", "limit=abc"});
+    INFO("route=" << route << " query=" << query);
+    check_numeric_400(h.sink.Get("/api/responses/instr-parity" + route + "?" + query));
 }
 
 TEST_CASE("legacy response catch-all: a valid offset still paginates (#4644 must not break it)",

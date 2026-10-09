@@ -645,7 +645,12 @@ ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
     // finalized and no fallback frame — the #1593 "real result must surface"
     // gap, reopened on the finalize path. U+FFFD-defang (incl. NUL, see
     // sanitize_pg_text) keeps the finalize landing.
-    const std::string sanitized_error = sanitize_pg_text(error_detail);
+    //
+    // Bound it BEFORE sanitizing, exactly as store() does for error_detail
+    // (#2691): a terminal frame's message must not exceed the documented
+    // per-row worst case (kMaxIngestBytes plus the marker).
+    const std::string sanitized_error =
+        sanitize_pg_text(truncate_ingest(error_detail, kMaxIngestBytes));
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE response_store.responses SET status = $1::integer, error_detail = $2, "
