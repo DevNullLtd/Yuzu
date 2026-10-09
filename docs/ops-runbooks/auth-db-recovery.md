@@ -486,8 +486,8 @@ also clears the account's lockout, recording `auth.lockout.cleared`
 is no MCP tool for either (#5357 tracks a temporary-password reset tool).
 
 **Re-running the Windows server installer is not a reset.** On an upgrade it
-refuses `/ADMIN_PASS=` and `/OPERATOR_PASS=` with exit code 11 (the config
-file it would write only seeds an empty database).
+refuses `/ADMIN_PASS=` (and the removed `/OPERATOR_PASS=`) with exit code 11
+(the config file it would write only seeds an empty database).
 
 **Fallback — direct SQL**, when no administrator can sign in at all (the only
 admin forgot their password). This writes no audit row and revokes no
@@ -745,9 +745,11 @@ sudo systemctl restart yuzu-server
 ## What you cannot recover from
 
 - **Lost `yuzu-server.cfg` and an empty `auth` schema.** The config is the seed
-  for the admin account on first boot. If both are gone, run
-  `yuzu-server --first-run-setup` to create a new admin interactively and write
-  a fresh config.
+  for the admin account on first boot. If both are gone, start `yuzu-server`
+  interactively on a terminal with no `yuzu-server.cfg` at the configured path
+  (`--config`): it runs first-run setup, prompts for a new administrator and
+  writes a fresh config. (There is no `--first-run-setup` flag; setup runs
+  whenever the config file is absent and needs a TTY.)
 
 - <a id="kek-permanently-lost"></a>**KEK permanently lost.** First, the server
   **will not start** on a database that still registers the lost version.

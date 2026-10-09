@@ -110,6 +110,8 @@ and the free-space guidance are in [Installed-Software Inventory](inventory.md) 
 
 **Windows server installer.** On an upgrade (a `yuzu-server.cfg` already exists in `%ProgramData%\Yuzu Server`), the installer now **refuses** a non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` with **exit code 11** before it stops the service or changes anything, instead of writing a config file the server would ignore. The interactive wizard skips its account pages on an upgrade. Remove those parameters from your upgrade command lines (SCCM/Intune packages included); see the Windows server installer section of [Server Administration](server-admin.md) (#5196 note).
 
+**Breaking — the second first-run account and the Windows installer's `/OPERATOR_USER`/`/OPERATOR_PASS` are removed (#5343).** They were written to `yuzu-server.cfg` only and were never provisioned into the PostgreSQL auth store, so the account they created could never sign in. First-run setup now prompts for the administrator only, and a fresh Windows install that passes a non-empty `/OPERATOR_USER=` or `/OPERATOR_PASS=` is refused with **exit code 7** (nothing changed; an upgrade given `/OPERATOR_PASS=` still gets exit code 11, and an upgrade given `/OPERATOR_USER=` alone gets exit code 7). Remove both parameters from fresh-install command lines and create further accounts in Settings → User Management (`POST /api/settings/users`). Upgrades are unaffected: an existing installation keeps its accounts, and a leftover `yuzu-server.cfg` entry that has no stored account is reported by name in a warning at boot — delete that line.
+
 **Rolling upgrades with more than one server.** A server still on the previous release keeps checking `yuzu-server.cfg` first and caching hashes, so it can keep accepting an old password after a change or reset made on an upgraded server, and it has no password routes (`404`). Upgrade every server before using **Change password** / **Reset password**, or before relying on a password change to lock someone out.
 
 **Passwords over 1024 bytes stop working.** The new maximum applies at sign-in too: `/login` answers a password longer than 1024 bytes as a wrong password, without hashing it, and the attempt counts toward [account lockout](server-admin.md#server-cli-flags). An account whose existing password is longer than that (only possible if it was set outside the product, for example a hand-generated config entry) can no longer sign in. An administrator resets it to a shorter one (Settings → User Management → **Reset password**, then **Unlock** if it locked); if it is the only administrator, use the direct-SQL fallback in the [auth-db-recovery runbook](../ops-runbooks/auth-db-recovery.md#password-reset).
@@ -340,6 +342,149 @@ Only case (e) means the key files are gone. Nothing inside the server can rebuil
   3. This database cannot be brought back by any supported means. Every start checks each registered KEK and refuses. The one-shot modes `--mfa-reset` and `--break-glass-arm` run after that check, so they stop with the same `kek_unresolvable` error. What is gone: the CA private key, so every agent certificate it issued no longer chains and every agent must enroll again; and every secret sealed under the KEK, including TOTP enrolments, webhook signing secrets and the other secret columns listed in `docs/user-manual/server-admin.md` "Key management (secrets KEK)". Passwords and API tokens are hashed, not sealed, but they live in the same database.
   4. Start a new install. With the bundled Postgres, `docker compose down -v` deletes the Postgres volume along with the others. `down -v` does not reset an external Postgres: that database still registers the lost KEK, so a new install against it fails the same way. Give the new install a new, empty database. Then provision the admin account again, re-enroll your agents, and re-create your configuration.
 
+## Behaviour change: the executions list fragment and MCP `summarize_working_set` (execution kind) use the fleet-read gate (#3526, #4753)
+
+`GET /fragments/executions` (the dashboard executions list) and the `execution` kind of the MCP tool
+`summarize_working_set` moved from a plain `Execution:Read` permission check onto the
+management-group-aware fleet-read gate that `GET /api/v1/executions` already used. This is
+hardening plus an admission change, not a fix for a leak: the old gate only admitted callers
+holding a global grant, and those callers were never filtered. An author-run reachability probe
+(not independently adjudicated; the JIT-elevated case was checked by code reading only) found nothing
+served through the old gate that the unconfined `GET /api/v1/executions` would not serve the same
+principal, with RBAC on or off (with RBAC off every non-service, non-engine caller whose tier allows it is unconfined by design; an engine principal is refused with 403)
+(`docs/security-reviews/3526-confinement-reachability-probe-2026-10-05.md`). **There is no
+admission change for a caller with a global `Execution:Read` grant, and nothing changes with RBAC
+off for such a caller. What changes for every caller is the degrade and audit behaviour below,
+plus one new prerequisite.**
+
+- **RBAC off (the shipped default).** With RBAC off, both surfaces are unconfined for every authenticated non-service, non-engine caller whose tier allows it (an engine principal is refused with 403 with RBAC off),
+  before and after the move to the fleet-read gate; a service-scoped token is refused
+  (`403` on the REST and MCP twins, the permission note described under "Degraded store, fragment"
+  on the fragment). Confinement on these two surfaces takes effect only with RBAC enforcement on.
+- **Admission prerequisite (applies to every caller on these two surfaces).** The fleet-read gate
+  needs both the authorization store and the management-group store open. When the RBAC store is
+  not open, every caller except a JIT-elevated non-service session (which returns before any store
+  check) gets a retryable `503` (`retry_after_ms` 5000) from the gate; when the management-group
+  store is not open, every caller except an elevated session and an engine principal does (an
+  engine principal is resolved from the RBAC store alone, and gets the `503` only when that store
+  is not open). A global-grant administrator is included in both cases; the old plain gate never
+  needed the management-group store. The REST and MCP twins show the `503` itself. On the dashboard
+  fragment the gate still audits the refusal, but the response is replaced with an HTTP `200` note
+  (`data-degraded="gate"`, see "Degraded store, fragment"), because the dashboard drops `4xx`/`5xx`
+  bodies; `GET /api/v1/executions` keeps its real `503`.
+- **Group-scoped-only operators** (an `Execution:Read` grant held only through a management group)
+  previously got `403` from the **fragment** and now get a confined view: only executions that
+  touched one of their agents or that they dispatched, with the counters and the error preview
+  recomputed from their visible agents only. **`summarize_working_set` is different:** its first
+  gate is still a plain `Infrastructure:Read` check, so a group-scoped-only operator still gets
+  `403` there. Only a caller who holds a GLOBAL `Infrastructure:Read` plus a group-scoped
+  `Execution:Read` is newly admitted to the confined execution view, and its narrative carries the
+  same projected counts.
+- **Service-scoped API tokens** get a confined view from `GET /fragments/executions` where
+  they got `403`, but only when RBAC enforcement is ON, the `ITServiceOwner` role holds
+  `Execution:Read` (the seeded default; see the next item) and the tag store is reachable. With RBAC
+  enforcement off the gate still refuses it ("service-scoped tokens require RBAC to be
+  enabled"), and a missing or degraded tag store is a retryable `503` (`retry_after_ms` 5000) on the
+  REST twin; the fragment shows the matching note at HTTP `200`. In a
+  normal deployment the tag store always exists (the server refuses to boot without it). On this
+  fragment a service-scoped token sees only executions that touched an in-scope agent (see "Owner
+  disjunct" below); its own just-dispatched execution stays invisible until an in-scope agent
+  replies. `summarize_working_set` is unchanged for service-scoped tokens: it stays denied.
+- **`ITServiceOwner` ceiling (applied by PR #5546, not by the executions-list move).** A service-scoped
+  token is subject to the `ITServiceOwner` authority ceiling on the fleet-read gate. The executions-list move
+  relies on that ceiling but does not add it. Its Breaking effect (`403` from
+  `GET /api/v1/enrollment/pending-agents` for a service-scoped token), the retryable `503` for a
+  failed ceiling read, the remediation and the audit search are in "Behaviour change:
+  service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and
+  `GET /api/v1/upload-grants` (#3526)" below.
+- **Degraded store, fragment.** Every refusal or failure on `GET /fragments/executions` now renders
+  an operator-visible note at HTTP `200`, because the dashboard drops `4xx`/`5xx` bodies and a
+  refusal used to leave the panel on "Loading..." forever. There are three degrade kinds, set in the
+  `data-degraded` attribute on `<div class="empty-state">`: `tracker` (the execution query or the
+  agent-status read failed), `unavailable` (the fleet-read gate or the execution tracker is not
+  wired, or a confined read has an empty principal: an administrator or a bug) and `gate` (the
+  authorization gate refused with `503`: the RBAC store, the management-group store or the tag
+  store is not open or unavailable, or the `ITServiceOwner` ceiling read is degraded; the text is
+  "Executions unavailable (the authorization service could not be reached). Retry shortly."). A gate
+  `403` (no `Execution:Read`, RBAC off for a service-scoped token, the ceiling denial, an engine
+  principal without a grant) renders `<div class="empty-state" data-denied="true">` with "You do not
+  have permission to view executions." and no reason text. A `401` for an unauthenticated request
+  passes through unchanged. The gate still writes its audit row first, and no `Retry-After` header is
+  sent with the note. Detect the notes with the `data-degraded` and `data-denied` attributes; none of
+  them is the "No executions yet" text. **Monitoring blind spot:** `/fragments/executions` no longer
+  answers `403` or `503` for these cases, so an HTTP-status monitor, a reverse-proxy access log or
+  a synthetic check that treats `200` as healthy will not see them. The signals are the gate's audit
+  rows (`auth.fleet_read_required` with `result=denied`), the panel text, and, for the ceiling case,
+  `yuzu_server_rbac_read_degrade_total`. `GET /api/v1/executions` is unchanged and keeps its real
+  `403`/`503`.
+- **Runbook, degrade note on the Executions panel.** `data-degraded="tracker"` means the execution
+  tracker or its agent-status read failed: check `ExecutionTracker` warnings in the server log and
+  PostgreSQL availability. `data-degraded="unavailable"` is a misconfiguration or bug branch (the
+  fleet-read gate or the execution tracker is not wired, or a confined read has an empty
+  principal), not a storage fault: it needs an administrator or a bug report, and a Postgres check
+  will not clear it. `data-degraded="gate"` means the authorization gate could not decide. Look for
+  audit rows `auth.fleet_read_required` with `result=denied` (detail `fleet read blocked:
+  management-group store unavailable`, or the ceiling detail from the `ITServiceOwner` section
+  below) and `yuzu_server_rbac_read_degrade_total` (it moves ONLY for the `ITServiceOwner`
+  ceiling-read case: the management-group-store-unavailable refusal writes an audit row but does not
+  move it). The server keeps no per-request access log. None of the notes clears on its own: the
+  panel is loaded once, when the Instructions page reveals it (`hx-trigger="revealed"`, no polling),
+  so after the cause is fixed reload the Instructions page (or reopen the Execution History
+  section).
+- **Degraded store, MCP.** `summarize_working_set` returns an error carrying `retry_after_ms`
+  where it used to say the execution "was not found".
+- **Empty confined page.** A confined caller who sees zero executions gets "No executions visible in
+  your scope." instead of "No executions yet.", because out-of-scope executions may exist. Until an
+  in-scope agent replies, a confined caller sees no trace of an execution they did not dispatch,
+  because per-agent status rows are written as responses arrive; the panel can therefore show this
+  text while an execution is in flight. MCP `list_executions` shows a confined caller only the
+  executions they dispatched, not the in-scope executions of others (see
+  `docs/user-manual/mcp.md`). The
+  per-row status badge is still the execution's fleet-wide status while the counters are projected
+  to the caller's agents (the same as the REST twin, SSE and the MCP detail view).
+- **Owner disjunct.** Ordinary callers keep it: a principal's own dispatches are shown even when
+  none of their agents replied, with the counters still projected. Service-scoped tokens do NOT get
+  it on `GET /fragments/executions`. **Known limit (#5557):** a service-scoped token's session
+  username is the account that minted it. On `GET /api/v1/executions`, `/{id}`, `/children`, MCP
+  `get_execution_status`, MCP `list_executions`, legacy `/api/executions*`, the detail fragment,
+  the SSE channel `/sse/executions/{id}` and `GET /api/v1/events`, a service-scoped token is
+  therefore also shown executions its MINTER dispatched, even outside the service scope (counters
+  projected, but id, definition, status and timing visible). Mint service tokens from an account
+  that dispatches only inside the service scope. Executions the minting account has already
+  dispatched stay visible to its service tokens on those surfaces, so a token minted from an
+  account with unscoped history is exposed to that history.
+- **Audit and SIEM.** For `kind=execution`, a CONFINED caller whose id is absent or outside scope
+  now produces `action=mcp.summarize_working_set`, `result=denied`, detail
+  `not found or outside caller's fleet-read scope: <id>` (the id is neutralised for `k=v` and
+  CR/LF forgery and capped at 128 bytes; the `success` row's id gets the same treatment for EVERY `summarize_working_set` kind, not only `execution`). Only callers newly admitted by the move to the fleet-read gate can produce
+  that row (the plain gate admitted only unconfined, global-grant callers, and confined callers got
+  `403` before), so an existing rule keyed on `result=success` loses nothing for the callers it
+  already saw; a rule keyed on `result=denied` for this action may now see the new callers. An
+  UNCONFINED caller's absent id stays `result=success` (no denial occurred). The scope-collapse
+  `denied` row (detail `not found or outside caller's fleet-read scope: <id>`) is written only for
+  a CONFINED caller on `kind=execution`, so it is never written with RBAC off. Other `denied` rows
+  on this action (tier refusal, permission-gate refusal, service-scoped default-deny) are separate
+  and can occur regardless of RBAC state. The same neutralise-and-cap (128 bytes) now applies to
+  the id in the `get_execution_status` `denied` rows and the `get_agent_details` `denied` and
+  `failure` rows. A NUL byte in a `summarize_working_set` `kind=execution` id or a
+  `get_execution_status` id is rejected with an invalid-params error before any lookup. The
+  degraded-store errors of `get_execution_status` (agent-status read) and `list_executions` now
+  carry `retry_after_ms`, like `summarize_working_set`.
+  The `denied` row cannot tell a typo from an out-of-scope probe; that is intentional (no
+  existence oracle). The narrative for an absent id is a success-shaped result, unlike
+  `get_execution_status`, which returns an error for the same input.
+- **Still unscoped.** `summarize_working_set` with `kind=fleet` or `kind=result_set` returns the
+  whole-registry agent count (tracked in #4753, whose checklist, including `kind=fleet` and
+  `get_fleet_posture_fast`, stays open; the executions-list move covers only `kind=execution`). The same
+  whole-registry branch is also reached by `kind=execution` or `kind=agent` with an EMPTY id, or
+  when the execution tracker is unavailable (not separately tracked). `GET
+  /api/v1/execution-statistics/agents` has no per-agent filter (#3526).
+
+**Rollback.** Redeploy the previous binary. The plain `Execution:Read` gate returns, so
+group-scoped-only operators go back to `403` on the fragment. The `visible_agents` filter is a
+read-time parameter with no stored state, so there is nothing to migrate or clean up. Audit rows
+already written with `result=denied` for `mcp.summarize_working_set` remain in the audit store.
+
 ## Behaviour change: service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and `GET /api/v1/upload-grants` (#3526)
 
 Two chokepoints let a service-scoped API token reach more than the `ITServiceOwner` role allows (found
@@ -379,7 +524,7 @@ any future surface that narrows the role.
 **Failure behaviour.** A FAILED read of the `ITServiceOwner` role's permissions is a retryable `503`
 (`retry_after_ms` 5000, an audit row with detail "RBAC read degraded resolving the ITServiceOwner
 ceiling", and `yuzu_server_rbac_read_degrade_total` increments) rather than `403`, because an outage
-is not a missing grant; it still fails closed. This holds on the fleet-read gate and equally on
+is not a missing grant; it still fails closed (the dashboard executions fragment shows it as the HTTP `200` `data-degraded="gate"` note). This holds on the fleet-read gate and equally on
 `require_scoped_permission`, which answered `403` for this failure before this change; only a
 definitive deny is `403`. `require_permission` is different: a service-scoped token is refused there by
 the default-deny allow-list whatever the ceiling read returns, so a retry could not succeed, and a

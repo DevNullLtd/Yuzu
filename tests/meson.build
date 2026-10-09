@@ -1430,6 +1430,7 @@ if build_server
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
       'unit/server/test_legacy_executions_scope_authz.cpp', # #3789: legacy /api/executions* fleet-read confinement
+      'unit/server/test_workflow_executions_list_authz.cpp', # #3526: /fragments/executions real fleet-read confinement
       'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
@@ -2741,6 +2742,17 @@ test('compose certs volume',
   args: [files('test_compose_certs_volume.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Compose Wizard (#5420): every generated mode gives the server a writable,
+# persistent /etc/yuzu/certs (KEK + internal CA), and Operator mode mounts the
+# operator's PEMs read-only at /etc/yuzu/tls instead of over it. Runs the real
+# tools/compose-wizard/js/generate.js under node; skips when node is absent.
+test('compose wizard certs',
+  _python3_test,
+  args: [files('test_compose_wizard.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # README Docker Compose quickstart (#5419): the compose the README downloads must
