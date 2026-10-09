@@ -715,6 +715,38 @@ TEST_CASE("discover.instructions: the canonicalisation budget degrades later def
         CHECK(d["input_schema_error"].is_null());
 }
 
+// The summary warning is logged once per CHANGE, not per build: the build runs on every MCP call
+// and every 304 revalidation. Repeating the same outcome stays quiet, a different outcome warns
+// again, and a build with nothing to report re-arms it.
+TEST_CASE("discover.instructions: the budget warning is logged once until the outcome changes",
+          "[discovery][instructions][input-schema][budget][pg]") {
+    DiscoverHarness h;
+    const std::string stored = R"({"type":"object","properties":{"p":{"type":"string"}}})";
+    for (const char* name : {"W1", "W2", "W3"}) {
+        REQUIRE(h.instr->create_definition(make_def(name, /*enabled=*/true, stored)).has_value());
+    }
+    const auto count_warnings = [&](std::size_t budget) {
+        yuzu::test::LogCapture capture;
+        (void)yuzu::server::build_instructions_catalog(*h.instr, budget);
+        capture.stop();
+        std::size_t n = 0;
+        const std::string logs = capture.text();
+        for (auto at = logs.find("published without an input_schema"); at != std::string::npos;
+             at = logs.find("published without an input_schema", at + 1))
+            ++n;
+        return n;
+    };
+    const std::size_t two = 2 * stored.size();   // one casualty
+    const std::size_t one = stored.size();       // two casualties
+    CHECK(count_warnings(two) == 1);    // first sight of this outcome
+    CHECK(count_warnings(two) == 0);    // same outcome again: quiet
+    CHECK(count_warnings(two) == 0);
+    CHECK(count_warnings(one) == 1);    // a different outcome (two casualties)
+    CHECK(count_warnings(one) == 0);
+    CHECK(count_warnings(10 * stored.size()) == 0);  // nothing to report: re-arms
+    CHECK(count_warnings(one) == 1);    // the recurrence warns again
+}
+
 // A definition name is not unique, so the catalogue order (and therefore which definition is the
 // budget casualty) must not depend on the physical row order: ties on name break by id. The two
 // rows are rewritten in the order that puts the HIGHER id first in the heap, so a missing

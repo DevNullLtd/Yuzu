@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 #include <unordered_map>
 
 namespace yuzu::server {
@@ -333,12 +334,34 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store,
         });
     }
 
-    if (budget_exceeded != 0 || not_canonicalisable != 0) {
-        spdlog::warn("discover/instructions: {} definition(s) published without an input_schema "
-                     "because the {}-byte canonicalisation budget was exhausted (first: '{}') and "
-                     "{} because their stored schema cannot be canonicalised (first: '{}')",
-                     budget_exceeded, canonical_budget_bytes, first_budget_id, not_canonicalisable,
-                     first_uncanonicalisable_id);
+    // One warning per CHANGE, not per build: this runs on every MCP call and every 304
+    // revalidation (the ETag is compared after the catalogue is built), so a steady state of
+    // one starved definition would otherwise log on every request. The signature is the two
+    // counts plus the first affected id of each kind; a build with nothing to report clears it,
+    // so a recurrence warns again. Process-wide, guarded by a mutex (handlers run on a pool).
+    {
+        static std::mutex warn_mu;
+        static std::string last_warned;
+        const std::string signature =
+            (budget_exceeded == 0 && not_canonicalisable == 0)
+                ? std::string()
+                : std::to_string(budget_exceeded) + "|" + first_budget_id + "|" +
+                      std::to_string(not_canonicalisable) + "|" + first_uncanonicalisable_id +
+                      "|" + std::to_string(canonical_budget_bytes);
+        bool warn = false;
+        {
+            std::lock_guard lk(warn_mu);
+            warn = !signature.empty() && signature != last_warned;
+            last_warned = signature;
+        }
+        if (warn) {
+            spdlog::warn("discover/instructions: {} definition(s) published without an "
+                         "input_schema because the {}-byte canonicalisation budget was exhausted "
+                         "(first: '{}') and {} because their stored schema cannot be "
+                         "canonicalised (first: '{}'); logged once until this changes",
+                         budget_exceeded, canonical_budget_bytes, first_budget_id,
+                         not_canonicalisable, first_uncanonicalisable_id);
+        }
     }
 
     json body = {
