@@ -473,7 +473,7 @@ TEST_CASE("route: the retired /fragments/inventory devices/device/find/find/resu
     REQUIRE(r->get_header_value("Location") == "/hardware");
 }
 
-// #4644 Gate 7: `limit` is ONE base-10 integer or a 400 on all three software fragments; a
+// #4644 Gate 7: `limit` is ONE base-10 integer or a 400 on both software fragments; a
 // malformed page size used to become the default silently. A well-formed integer is clamped.
 TEST_CASE("route: software fragments refuse a malformed limit and clamp a well-formed one",
           "[inventory][route][numeric_params]") {
@@ -481,8 +481,7 @@ TEST_CASE("route: software fragments refuse a malformed limit and clamp a well-f
     for (const char* bad : {"50abc", "0x10", "1e2", "", "99999999999999999999"}) {
         INFO("limit=" << bad);
         for (const char* path : {"/fragments/inventory/software?limit=",
-                                 "/fragments/inventory/software/devices?name=Chrome&limit=",
-                                 "/fragments/inventory/find/results?name=Chrome&limit="}) {
+                                 "/fragments/inventory/software/devices?name=Chrome&limit="}) {
             auto res = h.sink.Get(std::string(path) + bad);
             REQUIRE(res);
             CHECK(res->status == 400);
