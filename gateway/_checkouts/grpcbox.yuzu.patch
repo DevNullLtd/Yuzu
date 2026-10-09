@@ -24,7 +24,7 @@ index 2adc28f..97f677a 100644
                                            {next_protocols_advertised, [<<"h2">>]}]};
                                 _ ->
 diff --git a/src/grpcbox_stream.erl b/src/grpcbox_stream.erl
-index 7e9fa10..5d44476 100644
+index 7e9fa10..7fd3bdc 100644
 --- a/src/grpcbox_stream.erl
 +++ b/src/grpcbox_stream.erl
 @@ -16,6 +16,8 @@
@@ -77,3 +77,41 @@ index 7e9fa10..5d44476 100644
  on_receive_data(Bin, State=#state{request_encoding=Encoding,
                                    buffer=Buffer}) ->
      try
+@@ -408,22 +437,27 @@ handle_info({add_trailers, Trailers}, State) ->
+     update_trailers(Trailers, State);
+ handle_info({send_proto, Message}, State) ->
+     send(false, Message, State);
++%% YUZU PATCH (#5591): stock grpcbox v0.17.1 called end_stream here and then
++%% returned the original State, so trailers_sent stayed false and DATA that
++%% arrived after a grpc-timeout deadline or a handler exit still ran the
++%% handler (the #1422 guard in on_receive_data never fired). Keep the state
++%% end_stream returns. Same change as tsloughter/grpcbox#123. See YUZU_PATCH.md.
+ handle_info({'EXIT', _, normal}, State) ->
+-    end_stream(State),
+-    State;
++    {ok, State1} = end_stream(State),
++    State1;
+ handle_info({'EXIT', _, {grpc_error, {Status, Message}}}, State) ->
+-    end_stream(Status, Message, State),
+-    State;
++    {ok, State1} = end_stream(Status, Message, State),
++    State1;
+ handle_info({'EXIT', _, {grpc_extended_error, #{status := Status, message := Message} = ErrorData}}, State) ->
+     State1 = add_trailers_from_error_data(ErrorData, State),
+-    end_stream(Status, Message, State1),
+-    State1;
++    {ok, State2} = end_stream(Status, Message, State1),
++    State2;
+ handle_info({'EXIT', _, _Other}, State) ->
+-    end_stream(?GRPC_STATUS_UNKNOWN, <<"process exited without reason">>, State),
+-    State;
++    {ok, State1} = end_stream(?GRPC_STATUS_UNKNOWN, <<"process exited without reason">>, State),
++    State1;
+ handle_info({timeout,_Ref,<<"grpc-timeout">>}, State) ->
+-    end_stream(?GRPC_STATUS_DEADLINE_EXCEEDED, <<"Deadline expired">>, State),
+-    State;
++    {ok, State1} = end_stream(?GRPC_STATUS_DEADLINE_EXCEEDED, <<"Deadline expired">>, State),
++    State1;
+ handle_info(_, State) ->
+     State.
+ 
