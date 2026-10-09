@@ -1924,7 +1924,8 @@ if build_server
   #     rebalancing a shard needs only the right suite: kwarg here, ci.yml
   #     is untouched, and the partition invariant below proves the property.
   #     ci.yml DOES still hardcode BY NAME: the 3 non-pg server test names
-  #     (A/B/C), 'mcp bridge teardown allocation budget', 'server pg shard
+  #     (A/B/C), 'mcp bridge teardown allocation budget', 'guardian cache
+  #     allocation-failure sweep', 'server pg shard
   #     partition invariant', and (Phase 2) 'server pg smoke' — renaming any
   #     of those, or adding a new top-level `suite:`
   #     anywhere in the build (tests/meson.build or the root meson.build —
@@ -2843,6 +2844,25 @@ if build_server
     test(
       'mcp bridge teardown allocation budget',
       mcp_bridge_alloc_budget_exe,
+      suite: ['server', 'server-checks'],
+      timeout: 60,
+    )
+
+    # ── #5513 Guardian single-flight cache allocation-failure sweep ──────────
+    # Fails every allocation inside GuardianGenerationCache / GuardianRuleBundleCache
+    # get() in turn and checks the NEXT call is not wedged (FlightGuard / noexcept
+    # install / run_fetch / run_loader). Replaces the global operator new, so: its own
+    # binary, absent from sanitizer builds, Linux-only (same reasons as the probe above).
+    # Both caches are header-only and self-contained: nothing from yuzu_server_core.
+    guardian_cache_alloc_sweep_exe = executable(
+      'yuzu_guardian_cache_alloc_sweep_tests',
+      files('unit/server/test_guardian_cache_alloc_sweep.cpp'),
+      cpp_args: test_partial_init_args,
+      dependencies: [catch2_dep],
+    )
+    test(
+      'guardian cache allocation-failure sweep',
+      guardian_cache_alloc_sweep_exe,
       suite: ['server', 'server-checks'],
       timeout: 60,
     )
