@@ -558,7 +558,8 @@ place, **Hardware** and **Software**, each its own page:
     source that found the software; chips narrow by kind, ecosystem and found-by; a host
     type-ahead shows a single device's software. The type-ahead lists the first 1,000
     named hosts by name and says so when the fleet has more; a name it does not list
-    cannot be selected, so open that device from Hardware instead. Active filters appear
+    cannot be selected, so open that device from Hardware instead. Two devices that share a
+    hostname resolve to the first one listed; open the other from Hardware. Active filters appear
     as pills with a Clear all, the URL hash carries them (so a view can be bookmarked or shared), and the
     exact REST call the view corresponds to is shown with a copy button. The filter box on an
     expanded devices table filters only the rows already loaded; the catalogue search

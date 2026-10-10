@@ -2921,6 +2921,8 @@ TEST_CASE("source_last_seen_bulk returns the receipt time per agent and omits th
             InventoryIngestOutcome::kStored);
     REQUIRE(store.apply_installed_software("agent-b", h, rows, 2000) ==
             InventoryIngestOutcome::kStored);
+    auto b_before = store.source_last_seen("agent-b", "installed_software");
+    REQUIRE(b_before.has_value());
     // A hash-only touch never regresses last_seen.
     REQUIRE(store.apply_installed_software("agent-b", h, std::nullopt, 3000) ==
             InventoryIngestOutcome::kTouched);
@@ -2931,7 +2933,7 @@ TEST_CASE("source_last_seen_bulk returns the receipt time per agent and omits th
     REQUIRE(got->size() == 2);
     // last_seen is the SERVER receipt time (#1685), never the caller-supplied timestamp.
     CHECK(got->at("agent-a") > 0);
-    CHECK(got->at("agent-b") >= got->at("agent-a"));
+    CHECK(got->at("agent-b") >= *b_before); // the touch never moves it backwards
     CHECK_FALSE(got->contains("agent-never")); // absent, never a 0
     // Same datum the Hardware record shows, read one device at a time.
     for (const char* id : {"agent-a", "agent-b"}) {
@@ -2954,6 +2956,32 @@ TEST_CASE("source_last_seen_bulk: empty inputs are a precondition miss, not a de
     auto no_source = store.source_last_seen_bulk("", {"agent-a"});
     REQUIRE(no_source.has_value());
     CHECK(no_source->empty());
+}
+
+TEST_CASE("source_last_seen_bulk degrades to nullopt, never an empty map", "[pg][software_inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    SECTION("schema dropped under an open store") {
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        SoftwareInventoryStore store{pool};
+        REQUIRE(store.is_open());
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        CHECK_FALSE(store.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
+    }
+    SECTION("pool starved (the only lease is held)") {
+        PgPool one{{.conninfo = db.dsn(), .size = 1}};
+        REQUIRE(one.valid());
+        SoftwareInventoryStore store{one};
+        REQUIRE(store.is_open());
+        auto held = one.acquire();
+        CHECK_FALSE(store.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
+    }
 }
 
 TEST_CASE("source_last_seen_bulk: a store that never opened is a degrade", "[pg][software_inventory]") {
