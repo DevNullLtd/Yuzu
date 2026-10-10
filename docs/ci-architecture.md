@@ -1120,6 +1120,24 @@ discipline the rest of this PR applies to the Windows widths — this
 paragraph exists to make the new fact visible to the next reviewer, not to
 resolve it unilaterally.
 
+**Re-derived 2026-10-11 after shards M, N and O (pg-shard rebalance).** The
+pg suite is now 15 shards: shards M and N were carved from C (12 tags moved,
+C 886 to 542 cases) and shard O from F (its `[dex]` clause, F 532 to 418
+cases; the 28 cases tagged both `[dex]` and `[mcp]` go to O), motivated by
+Windows C at 895s and F at 765s against the 700s per-shard timeout (Linux
+4-wide: C 629s, F 470s, every other shard 120-260s). The theoretical
+degenerate ceiling grows with the count, as the paragraph above predicted for
+any addition: 15 * 700 = 10500 test-seconds, and at `--num-processes 2` that
+is 8 rounds (the eighth runs a single shard), so BEST and WORST makespan are
+both 8 * 700 = 5600s, roughly 93 minutes before the cross-job slot wait. This
+is still a ceiling that requires every shard to hit its own cap, not an
+expected case. The expected case moves the other way: the two shards that set
+the makespan floor shrink, and the new shards' predicted costs are ESTIMATES
+until the first CI run on each platform measures them. The tag assignment is
+the tuning knob (move a tag between M and N, or O and F), documented in
+`tests/meson.build` above shard M. The per-shard timeout and the Linux
+`--num-processes 2` cap are deliberately unchanged here.
+
 **Drift risk — automated (#3443 Phase 1, 2026-08-26):** this used to hardcode
 the 10 pg shard names and the 3 non-pg server test names directly in `ci.yml`,
 hand-synced against `tests/meson.build`'s own tag filters and
