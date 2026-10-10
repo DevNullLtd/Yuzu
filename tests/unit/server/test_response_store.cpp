@@ -19,12 +19,16 @@
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
+#include <cstdint>
 #include <limits>
+#include <map>
 
 #include <libpq-fe.h>
 
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace yuzu::server;
@@ -1875,6 +1879,215 @@ TEST_CASE("ResponseStore: wide facet set (>64 distinct values) all persist via b
     auto results = store.get_by_instruction("cmd-wide");
     REQUIRE(results.has_value());
     CHECK(results->size() == 1);
+}
+
+// Deterministic incompressible text of exactly `n` bytes (lower-case hex from a
+// xorshift64 stream): the btree refuses an over-long INCOMPRESSIBLE value, so a
+// repeated-character filler would not prove the bound is enough.
+namespace {
+std::string incompressible_text(std::size_t n, std::uint64_t seed) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(n);
+    std::uint64_t x = seed | 1;
+    while (out.size() < n) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.push_back(kHex[x & 0xf]);
+    }
+    return out;
+}
+
+double dropped_count(yuzu::MetricsRegistry& m, const char* reason) {
+    return m.counter(kResponseFacetsDroppedMetric, {{"reason", reason}}).value();
+}
+} // namespace
+
+// #5623: one facet value the btree cannot index used to fail the whole multi-row
+// INSERT and lose EVERY facet of the response. A value over kMaxFacetValueBytes is now
+// excluded (not truncated) and the rest persist.
+TEST_CASE("ResponseStore: an over-long facet value is excluded, the other facets persist",
+          "[pg][response_store][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    yuzu::MetricsRegistry metrics;
+    seed_response_facet_metrics(metrics);
+    store.set_metrics(&metrics);
+
+    // Pre-seeded at zero before any traffic (idle server exports the series).
+    const auto text = metrics.serialize();
+    for (const char* reason : {"value_too_long", "cap", "batch_failed"})
+        CHECK(text.find(std::string(kResponseFacetsDroppedMetric) + "{reason=\"" + reason +
+                        "\"} 0") != std::string::npos);
+    CHECK(text.find(std::string("# HELP ") + kResponseFacetsDroppedMetric) != std::string::npos);
+
+    // vuln_scan schema: severity|category|title|detail. Line 1 carries a title of
+    // EXACTLY the bound (kept) and line 2 one byte over (excluded); line 3 carries a
+    // 20000 byte incompressible detail (excluded, well past the btree limit).
+    const std::string at_bound = incompressible_text(kMaxFacetValueBytes, 1);
+    const std::string over_bound = incompressible_text(kMaxFacetValueBytes + 1, 2);
+    const std::string huge = incompressible_text(20000, 3);
+    const std::string output = "high|cat-a|" + at_bound + "|detail-a\n" + "low|cat-b|" +
+                               over_bound + "|detail-b\n" + "low|cat-c|title-c|" + huge + "\n";
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-facet-toolong";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    resp.output = output;
+    store.store(resp);
+
+    // The response row and its output are intact.
+    auto rows = store.get_by_instruction("cmd-facet-toolong");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].output == output);
+
+    auto facet_set = [&](int col) {
+        std::vector<std::string> v;
+        auto f = store.facet_values("cmd-facet-toolong", col);
+        REQUIRE(f.has_value());
+        for (const auto& fv : *f)
+            v.push_back(fv.value);
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    CHECK(facet_set(0) == std::vector<std::string>{"high", "low"});
+    CHECK(facet_set(1) == std::vector<std::string>{"cat-a", "cat-b", "cat-c"});
+    // col 2 (title): the at-bound value persists, the over-bound one is absent.
+    std::vector<std::string> titles{at_bound, "title-c"};
+    std::sort(titles.begin(), titles.end());
+    CHECK(facet_set(2) == titles);
+    // col 3 (detail): the huge value is absent.
+    CHECK(facet_set(3) == std::vector<std::string>{"detail-a", "detail-b"});
+
+    // 2 distinct values excluded (over_bound, huge); nothing else dropped.
+    CHECK(dropped_count(metrics, "value_too_long") == 2.0);
+    CHECK(dropped_count(metrics, "cap") == 0.0);
+    CHECK(dropped_count(metrics, "batch_failed") == 0.0);
+}
+
+// #5623: the per-response cap used to keep whichever facets came first in
+// unordered_map iteration order, so WHICH facets survived was an accident of hashing.
+// The survivors are now chosen by a total order: higher line_count first, then
+// col_idx, then value bytes. Two responses with the same output in a different line
+// order must therefore keep the identical set, and it must be the documented one.
+TEST_CASE("ResponseStore: the facet cap keeps the most frequent facets, deterministically",
+          "[pg][response_store][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    yuzu::MetricsRegistry metrics;
+    seed_response_facet_metrics(metrics);
+    store.set_metrics(&metrics);
+
+    // vuln_scan: severity|category|title|detail. 6001 distinct categories, category i
+    // appearing 1 + (i % 3) times, plus one value each in columns 0, 2 and 3 on every
+    // line: 6004 distinct facets against the cap of 5000.
+    constexpr int kCategories = 6001;
+    constexpr std::size_t kCap = 5000;
+    std::vector<std::string> lines;
+    std::map<std::tuple<int, std::string>, int> expected_counts; // (col, value) -> count
+    for (int i = 0; i < kCategories; ++i) {
+        const std::string cat = "category-" + std::to_string(i);
+        for (int rep = 0; rep < 1 + (i % 3); ++rep) {
+            lines.push_back("high|" + cat + "|title|detail");
+            ++expected_counts[{0, "high"}];
+            ++expected_counts[{1, cat}];
+            ++expected_counts[{2, "title"}];
+            ++expected_counts[{3, "detail"}];
+        }
+    }
+    REQUIRE(expected_counts.size() == 6004);
+
+    // The documented order, computed independently of the store.
+    std::vector<std::tuple<int, int, std::string>> ranked; // (-count, col, value)
+    for (const auto& [key, count] : expected_counts)
+        ranked.emplace_back(-count, std::get<0>(key), std::get<1>(key));
+    std::sort(ranked.begin(), ranked.end());
+    ranked.resize(kCap);
+    std::map<std::tuple<int, std::string>, int> expected_kept;
+    for (const auto& [neg, col, value] : ranked)
+        expected_kept[{col, value}] = -neg;
+    REQUIRE(expected_kept.size() == kCap);
+
+    auto join = [](const std::vector<std::string>& v) {
+        std::string out;
+        for (const auto& l : v)
+            out += l + "\n";
+        return out;
+    };
+    auto stored_set = [&](const std::string& instruction_id) {
+        std::map<std::tuple<int, std::string>, int> got;
+        for (int col = 0; col < 4; ++col) {
+            auto f = store.facet_values(instruction_id, col);
+            REQUIRE(f.has_value());
+            for (const auto& fv : *f)
+                got[{col, fv.value}] = static_cast<int>(fv.line_count);
+        }
+        return got;
+    };
+
+    StoredResponse resp;
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+
+    resp.instruction_id = "cmd-cap-forward";
+    resp.output = join(lines);
+    store.store(resp);
+
+    std::vector<std::string> reversed(lines.rbegin(), lines.rend());
+    resp.instruction_id = "cmd-cap-reversed";
+    resp.output = join(reversed);
+    store.store(resp);
+
+    const auto forward = stored_set("cmd-cap-forward");
+    const auto backward = stored_set("cmd-cap-reversed");
+    CHECK(forward.size() == kCap);
+    CHECK(forward == backward);      // same output, different order: same facets
+    CHECK(forward == expected_kept); // and they are the documented ones
+    // 6004 distinct, 5000 kept, 1004 counted once per response stored.
+    CHECK(dropped_count(metrics, "cap") == 2.0 * (expected_counts.size() - kCap));
+    CHECK(dropped_count(metrics, "value_too_long") == 0.0);
+    CHECK(dropped_count(metrics, "batch_failed") == 0.0);
+}
+
+// A failed facet batch must be counted, not only logged. The batch is forced to fail
+// by an instruction_id too long for the (instruction_id, col_idx, value) index tuple,
+// which the response row's own (instruction_id, status) index still accepts.
+TEST_CASE("ResponseStore: a failed facet batch is counted and the response row persists",
+          "[pg][response_store][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    yuzu::MetricsRegistry metrics;
+    seed_response_facet_metrics(metrics);
+    store.set_metrics(&metrics);
+
+    // A 2500 byte incompressible id fits the response row's (instruction_id, status)
+    // index tuple, but with a 600 byte title (under the facet value bound) the facet
+    // index tuple is about 3100 bytes, over the 2704 byte btree limit.
+    StoredResponse resp;
+    resp.instruction_id = "cmd-" + incompressible_text(2500, 7);
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    resp.output = "high|cat|" + incompressible_text(600, 9) + "|detail\n";
+    store.store(resp);
+
+    auto rows = store.get_by_instruction(resp.instruction_id);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1); // the response row persisted
+    auto f = store.facet_values(resp.instruction_id, 0);
+    REQUIRE(f.has_value());
+    CHECK(f->empty()); // the whole facet batch was rolled back
+    CHECK(dropped_count(metrics, "batch_failed") == 4.0); // 4 facets lost
+    CHECK(dropped_count(metrics, "value_too_long") == 0.0);
+    CHECK(dropped_count(metrics, "cap") == 0.0);
 }
 
 // #2691 (Doomgoose finding #7): facet_agent_count/facet_line_count were a
