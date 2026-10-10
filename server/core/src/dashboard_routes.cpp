@@ -639,9 +639,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  // A filter value that matches no stored facet (over kMaxFacetValueBytes, or
                  // a NUL / line feed / invalid UTF-8) would build the group from an empty
-                 // set: refuse (#5623). The dashboard UI cannot produce this POST:
-                 // /fragments/create-group-form refuses such a filter first and renders no
-                 // form for it. 400 therefore is the honest status for the direct/automation
+                 // set: refuse (#5623). The dashboard UI cannot produce this POST for an
+                 // over-bound, NUL or invalid-UTF-8 value: /fragments/create-group-form
+                 // refuses such a filter first and renders no form for it. A stored value
+                 // holding a mid-value CR is the exception: the browser normalises the
+                 // hidden-input CR to a line feed on submit, so the POST carries an LF and
+                 // is refused here (before #5623 it answered 422 "no agents match"; htmx
+                 // drops both bodies). 400 is the honest status for the direct/automation
                  // caller (see NOTE above).
                  if (any_facet_filter_unmatchable(filters)) {
                      res.status = 400;
