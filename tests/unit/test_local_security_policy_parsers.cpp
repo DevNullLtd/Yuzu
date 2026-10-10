@@ -357,11 +357,30 @@ std::map<std::string, std::string> no_lockout_files() {
              "auth required pam_deny.so\naccount required pam_unix.so\n"}};
 }
 
-// Pinned literally, not built from kLockoutSearched: this is the wire contract.
+// Pinned literally: this is the wire contract. The `source` field names exactly the files READ
+// (login.defs, faillock.conf and system-auth for no_lockout_files()), in read order -- not a fixed
+// list. kNotFoundAllRow is the same row when all six standard sources were read.
 constexpr std::string_view kNotFoundRow =
+    "lockout_policy|lockout_keys|not_found|/etc/login.defs,/etc/security/faillock.conf,"
+    "/etc/pam.d/system-auth";
+constexpr std::string_view kNotFoundAllRow =
     "lockout_policy|lockout_keys|not_found|/etc/login.defs,/etc/security/faillock.conf,"
     "/etc/pam.d/common-auth,/etc/pam.d/common-account,/etc/pam.d/system-auth,"
     "/etc/pam.d/password-auth";
+
+// Reads `files` but answers `err` for `path` (an EACCES / EIO / absent-by-error source).
+FileReader reader_failing(std::map<std::string, std::string> files, std::string path, int err) {
+    return [files = std::move(files), path = std::move(path), err](const std::string& p) -> FileRead {
+        if (p == path) return {err, {}};
+        auto it = files.find(p);
+        return it == files.end() ? FileRead{ENOENT, {}} : FileRead{0, it->second};
+    };
+}
+
+bool has_prefix_row(const Collected& c, std::string_view prefix) {
+    return std::any_of(c.rows.begin(), c.rows.end(),
+                       [&](const std::string& r) { return r.rfind(prefix, 0) == 0; });
+}
 
 // Lockout rows of a collection, or nothing but its status when it is not OK.
 Collected collect_lockout(std::map<std::string, std::string> files) {
@@ -375,7 +394,7 @@ std::size_t count_row(const Collected& c, std::string_view row) {
 
 } // namespace
 
-TEST_CASE("local_security_policy collect_file_policy: lockout_policy with every source read and no "
+TEST_CASE("local_security_policy collect_file_policy: lockout_policy with sources read and no "
           "lockout key says so in one row",
           "[local_security_policy][parsers]") {
     const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout,
@@ -384,20 +403,50 @@ TEST_CASE("local_security_policy collect_file_policy: lockout_policy with every 
     CHECK(c.reason.empty());
     REQUIRE(c.rows.size() == 1);
     CHECK(c.rows[0] == kNotFoundRow);
-    // It names the four PAM files, not the directory, and never claims a verdict.
+    // It names exactly the files read (three here), never the directory or an absent file.
     CHECK(c.rows[0].find("/etc/pam.d/system-auth") != std::string::npos);
     CHECK(c.rows[0].find("/etc/pam.d,") == std::string::npos);
+    CHECK(c.rows[0].find("common-auth") == std::string::npos);
+    CHECK(c.rows[0].find("password-auth") == std::string::npos);
 }
 
-TEST_CASE("local_security_policy collect_file_policy: lockout_policy not_found row is only for an "
-          "otherwise empty result",
+TEST_CASE("local_security_policy collect_file_policy: not_found names the files actually read",
+          "[local_security_policy][parsers]") {
+    SECTION("all six standard sources exist and set nothing: the full standard set, in read order") {
+        std::map<std::string, std::string> files;
+        for (const char* f : {"/etc/login.defs", "/etc/security/faillock.conf",
+                              "/etc/pam.d/common-auth", "/etc/pam.d/common-account",
+                              "/etc/pam.d/system-auth", "/etc/pam.d/password-auth"})
+            files[f] = ""; // exists, empty
+        const auto c = collect_lockout(files);
+        CHECK(c.status == PolicyStatus::Ok);
+        REQUIRE(c.rows.size() == 1);
+        CHECK(c.rows[0] == kNotFoundAllRow);
+    }
+    SECTION("the source list is stable regardless of the reader's map order") {
+        const auto a = collect_lockout(no_lockout_files());
+        const auto b = collect_lockout(no_lockout_files());
+        REQUIRE(a.rows.size() == 1);
+        CHECK(a.rows == b.rows);
+    }
+    SECTION("only login.defs exists") {
+        const auto c = collect_lockout({{"/etc/login.defs", "PASS_MAX_DAYS 1\n"}});
+        CHECK(c.status == PolicyStatus::Ok);
+        CHECK(count_row(c, "lockout_policy|lockout_keys|not_found|/etc/login.defs") == 1);
+        CHECK(count_row(c, "lockout_policy|source_state|absent|/etc/security/faillock.conf") == 1);
+        CHECK(count_row(c, "lockout_policy|source_state|absent|/etc/pam.d") == 1);
+    }
+}
+
+TEST_CASE("local_security_policy collect_file_policy: lockout_policy not_found row is the default "
+          "only while no key row exists",
           "[local_security_policy][parsers]") {
     SECTION("a login.defs key suppresses it") {
         auto files = no_lockout_files();
         files["/etc/login.defs"] = "LOGIN_RETRIES 5\n";
         const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout,
                                            reader_from(files), empty_dir());
-        CHECK(count_row(c, kNotFoundRow) == 0);
+        CHECK_FALSE(has_prefix_row(c, "lockout_policy|lockout_keys|"));
         CHECK(count_row(c, "lockout_policy|LOGIN_RETRIES|5|/etc/login.defs") == 1);
     }
     SECTION("a faillock.conf key suppresses it") {
@@ -405,7 +454,7 @@ TEST_CASE("local_security_policy collect_file_policy: lockout_policy not_found r
         files["/etc/security/faillock.conf"] = "deny = 4\n";
         const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout,
                                            reader_from(files), empty_dir());
-        CHECK(count_row(c, kNotFoundRow) == 0);
+        CHECK_FALSE(has_prefix_row(c, "lockout_policy|lockout_keys|"));
         CHECK(count_row(c, "lockout_policy|deny|4|/etc/security/faillock.conf") == 1);
     }
     SECTION("a pam_faillock line suppresses it") {
@@ -413,30 +462,59 @@ TEST_CASE("local_security_policy collect_file_policy: lockout_policy not_found r
         files["/etc/pam.d/system-auth"] += "auth required pam_faillock.so authfail deny=3\n";
         const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout,
                                            reader_from(files), empty_dir());
-        CHECK(count_row(c, kNotFoundRow) == 0);
+        CHECK_FALSE(has_prefix_row(c, "lockout_policy|lockout_keys|"));
         CHECK(count_row(c, "lockout_policy|pam.auth.pam_faillock.so|required authfail deny=3|"
                            "/etc/pam.d/system-auth") == 1);
     }
-    SECTION("a refused source keeps its own row and no not_found claim") {
+    SECTION("faillock.conf absent AND a PAM lockout key: no not_found, the absent row stays") {
         auto files = no_lockout_files();
-        auto rd = [files](const std::string& path) -> FileRead {
-            if (path == "/etc/security/faillock.conf") return {EACCES, {}};
-            auto it = files.find(path);
-            return it == files.end() ? FileRead{ENOENT, {}} : FileRead{0, it->second};
-        };
-        const auto c =
-            collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout, rd, empty_dir());
+        files.erase("/etc/security/faillock.conf");
+        files["/etc/pam.d/system-auth"] += "auth required pam_faillock.so preauth deny=3\n";
+        const auto c = collect_lockout(files);
+        CHECK_FALSE(has_prefix_row(c, "lockout_policy|lockout_keys|"));
+        CHECK(count_row(c, "lockout_policy|source_state|absent|/etc/security/faillock.conf") == 1);
+        CHECK(count_row(c, "lockout_policy|pam.auth.pam_faillock.so|required preauth deny=3|"
+                           "/etc/pam.d/system-auth") == 1);
+        CHECK(c.status == PolicyStatus::Ok);
+    }
+    SECTION("a pam_tally2 line suppresses it too") {
+        auto files = no_lockout_files();
+        files["/etc/pam.d/system-auth"] += "auth required pam_tally2.so deny=5\n";
+        const auto c = collect_lockout(files);
+        CHECK_FALSE(has_prefix_row(c, "lockout_policy|lockout_keys|"));
+    }
+    SECTION("a refused sibling: not_found still written, naming only the files read") {
+        const auto c = collect_file_policy(
+            FileFlavor::Linux, LocalPolicyAction::Lockout,
+            reader_failing(no_lockout_files(), "/etc/security/faillock.conf", EACCES), empty_dir());
+        // Decided case: the CONSTRAINED status and the unreadable row carry the caveat.
         CHECK(c.status == PolicyStatus::Constrained);
-        CHECK(count_row(c, kNotFoundRow) == 0);
+        CHECK(count_row(c, "lockout_policy|lockout_keys|not_found|/etc/login.defs,"
+                           "/etc/pam.d/system-auth") == 1);
         CHECK(count_row(c, "lockout_policy|source_state|unreadable:permission_denied|"
                            "/etc/security/faillock.conf") == 1);
     }
-    SECTION("every source absent keeps the absent rows and no not_found claim") {
+    SECTION("an I/O error on a sibling behaves the same") {
+        const auto c = collect_file_policy(
+            FileFlavor::Linux, LocalPolicyAction::Lockout,
+            reader_failing(no_lockout_files(), "/etc/pam.d/system-auth", EIO), empty_dir());
+        CHECK(c.status == PolicyStatus::Constrained);
+        CHECK(count_row(c, "lockout_policy|lockout_keys|not_found|/etc/login.defs,"
+                           "/etc/security/faillock.conf") == 1);
+    }
+    SECTION("zero readable sources: no not_found, only the absent rows") {
         const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout,
                                            reader_from({}), empty_dir());
         CHECK(c.status == PolicyStatus::Ok);
-        CHECK(count_row(c, kNotFoundRow) == 0);
+        CHECK_FALSE(has_prefix_row(c, "lockout_policy|lockout_keys|"));
         CHECK(count_row(c, "lockout_policy|source_state|absent|/etc/pam.d") == 1);
+    }
+    SECTION("zero readable sources, one refused: no not_found, still not OK") {
+        const auto c = collect_file_policy(
+            FileFlavor::Linux, LocalPolicyAction::Lockout,
+            reader_failing({}, "/etc/login.defs", EACCES), empty_dir());
+        CHECK_FALSE(has_prefix_row(c, "lockout_policy|lockout_keys|"));
+        CHECK(c.status != PolicyStatus::Ok);
     }
 }
 
@@ -485,15 +563,16 @@ TEST_CASE("local_security_policy collect_file_policy: lockout_policy sees pam_fa
         files["/etc/pam.d/system-auth"] += sp.line;
         const auto c = collect_lockout(files);
         CHECK(count_row(c, sp.row) == 1);
-        CHECK(count_row(c, kNotFoundRow) == 0);
+        CHECK_FALSE(has_prefix_row(c, "lockout_policy|lockout_keys|"));
         CHECK(c.status == PolicyStatus::Ok);
     }
 }
 
-TEST_CASE("local_security_policy collect_file_policy: a failed or absent source never gets a "
-          "not_found claim, a merely empty one still does",
+TEST_CASE("local_security_policy collect_file_policy: a failed or absent source keeps its own row "
+          "beside the not_found default",
           "[local_security_policy][parsers]") {
-    // The routed clause "a failed read is never absent or empty", crossed with the new row.
+    // The routed clause "a failed read is never absent or empty", crossed with the not_found row:
+    // the failed/absent source is reported in its own right, never folded into the files read.
     const auto reading = [](std::map<std::string, std::string> files, std::string_view path,
                             int err, std::string data = {}) {
         return [files = std::move(files), p = std::string{path}, err,
@@ -508,35 +587,60 @@ TEST_CASE("local_security_policy collect_file_policy: a failed or absent source 
     };
     SECTION("EACCES on a PAM file, everything else clean") {
         const auto c = collect(reading(no_lockout_files(), "/etc/pam.d/system-auth", EACCES));
-        CHECK(count_row(c, kNotFoundRow) == 0);
         CHECK(count_row(c, "lockout_policy|source_state|unreadable:permission_denied|"
                            "/etc/pam.d/system-auth") == 1);
+        // The refused file is NOT in the list of files read.
+        CHECK(count_row(c, "lockout_policy|lockout_keys|not_found|/etc/login.defs,"
+                           "/etc/security/faillock.conf") == 1);
         CHECK(c.status == PolicyStatus::Constrained);
     }
     SECTION("an I/O error on faillock.conf") {
         const auto c = collect(reading(no_lockout_files(), "/etc/security/faillock.conf", EIO));
-        CHECK(count_row(c, kNotFoundRow) == 0);
+        CHECK(count_row(c, "lockout_policy|lockout_keys|not_found|/etc/login.defs,"
+                           "/etc/pam.d/system-auth") == 1);
         CHECK(c.status == PolicyStatus::Constrained);
     }
     SECTION("an embedded NUL in login.defs") {
         const auto c =
             collect(reading(no_lockout_files(), "/etc/login.defs", 0, std::string("A\0B\n", 4)));
-        CHECK(count_row(c, kNotFoundRow) == 0);
+        CHECK(count_row(c, "lockout_policy|lockout_keys|not_found|/etc/security/faillock.conf,"
+                           "/etc/pam.d/system-auth") == 1);
         CHECK(c.status == PolicyStatus::Constrained);
     }
     SECTION("login.defs absent, everything else readable and empty of keys") {
         auto files = no_lockout_files();
         files.erase("/etc/login.defs");
         const auto c = collect_lockout(files);
-        CHECK(count_row(c, kNotFoundRow) == 0); // one missing source is an absent row instead
+        // The absent row stays AND the default is still written, naming only what was read.
+        CHECK(count_row(c, "lockout_policy|lockout_keys|not_found|/etc/security/faillock.conf,"
+                           "/etc/pam.d/system-auth") == 1);
         CHECK(count_row(c, "lockout_policy|source_state|absent|/etc/login.defs") == 1);
+        CHECK(c.status == PolicyStatus::Ok);
+    }
+    SECTION("faillock.conf absent, nothing else configures lockout") {
+        auto files = no_lockout_files();
+        files.erase("/etc/security/faillock.conf");
+        const auto c = collect_lockout(files);
+        CHECK(count_row(c, "lockout_policy|lockout_keys|not_found|/etc/login.defs,"
+                           "/etc/pam.d/system-auth") == 1);
+        CHECK(count_row(c, "lockout_policy|source_state|absent|/etc/security/faillock.conf") == 1);
+        CHECK(c.status == PolicyStatus::Ok);
+    }
+    SECTION("every PAM file absent, login.defs and faillock.conf read and empty of keys") {
+        const auto c = collect_lockout({{"/etc/login.defs", "PASS_MAX_DAYS 99999\n"},
+                                        {"/etc/security/faillock.conf", "# deny = 3\n"}});
+        CHECK(count_row(c, "lockout_policy|lockout_keys|not_found|/etc/login.defs,"
+                           "/etc/security/faillock.conf") == 1);
+        CHECK(count_row(c, "lockout_policy|source_state|absent|/etc/pam.d") == 1);
         CHECK(c.status == PolicyStatus::Ok);
     }
     SECTION("a zero-byte PAM file beside readable siblings") {
         auto files = no_lockout_files();
         files["/etc/pam.d/password-auth"] = "";
         const auto c = collect_lockout(files);
-        CHECK(count_row(c, kNotFoundRow) == 1);
+        CHECK(count_row(c, "lockout_policy|lockout_keys|not_found|/etc/login.defs,"
+                           "/etc/security/faillock.conf,/etc/pam.d/system-auth,"
+                           "/etc/pam.d/password-auth") == 1);
     }
 }
 
@@ -554,6 +658,9 @@ TEST_CASE("local_security_policy collect_file_policy: lockout_policy is never OK
         "auth required pam_env.so\nauth sufficient pam_unix.so nullok\nauth required pam_deny.so\n";
     const Cohort cohorts[] = {
         {"A: RHEL 9 without the faillock feature", no_lockout_files(), false, true, nullptr},
+        {"D: faillock.conf absent, only login.defs and a stock PAM file",
+         {{"/etc/login.defs", "PASS_MAX_DAYS 99999\n"}, {"/etc/pam.d/system-auth", stock_auth}},
+         false, true, "lockout_policy|source_state|absent|/etc/security/faillock.conf"},
         {"B: RHEL 9 with-faillock",
          {{"/etc/login.defs", "PASS_MAX_DAYS 99999\n"},
           {"/etc/security/faillock.conf", "# deny = 3\n"},
@@ -572,7 +679,7 @@ TEST_CASE("local_security_policy collect_file_policy: lockout_policy is never OK
         const auto c = collect_lockout(co.files);
         CHECK_FALSE(c.rows.empty()); // the #5620 invariant: never OK with zero rows
         if (co.must_have) CHECK(count_row(c, co.must_have) == 1);
-        CHECK((count_row(c, kNotFoundRow) == 1) == co.not_found_row);
+        CHECK(has_prefix_row(c, "lockout_policy|lockout_keys|not_found|") == co.not_found_row);
         CHECK(std::any_of(c.rows.begin(), c.rows.end(), [](const std::string& r) {
                   return r.rfind("lockout_policy|pam.auth.pam_faillock.so|", 0) == 0;
               }) == co.pam_faillock_row);

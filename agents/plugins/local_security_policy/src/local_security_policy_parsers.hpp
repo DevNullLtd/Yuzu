@@ -273,12 +273,6 @@ inline constexpr std::string_view kPamPasswordModules[] = {"pam_pwquality.so", "
                                                             "pam_cracklib.so", "pam_unix.so"};
 inline constexpr std::string_view kPamLockoutModules[] = {"pam_faillock.so", "pam_tally2.so",
                                                            "pam_tally.so"};
-/// The `source` field of the `lockout_keys|not_found` row: the files the Linux lockout read
-/// covers -- the four named PAM alternatives (not the whole of /etc/pam.d), of which only those
-/// that exist are read.
-inline constexpr std::string_view kLockoutSearched =
-    "/etc/login.defs,/etc/security/faillock.conf,/etc/pam.d/common-auth,/etc/pam.d/common-account,"
-    "/etc/pam.d/system-auth,/etc/pam.d/password-auth";
 
 // ---- auditd rules -----------------------------------------------------------------
 
@@ -1044,6 +1038,11 @@ namespace detail {
 
 struct Tally {
     std::size_t readable = 0, denied = 0, failed = 0;
+    /// Rows that carry a setting (a key, a pam.<type>.<module> line) as opposed to a
+    /// `source_state` row; counted when produced, so a row the row cap later drops still counts.
+    std::size_t key_rows = 0;
+    /// Every path read SUCCESSFULLY, in read order (the `source` of `lockout_keys|not_found`).
+    std::vector<std::string> read_paths;
     yuzu::shared::ConstraintAccumulator acc;
     std::vector<std::string> rows;
     bool capped = false;
@@ -1117,6 +1116,7 @@ std::optional<std::string> read_source(const FileReader& rd, Tally& t, const std
     auto r = checked_read(rd, path);
     if (r.err == 0) {
         ++t.readable;
+        t.read_paths.push_back(path);
         return std::move(r.data);
     }
     state_row(t.state_of(classify_read_errno(r.err), path));
@@ -1130,8 +1130,10 @@ inline void kv_source(const FileReader& rd, Tally& t, std::string_view action, c
     });
     if (!text) return;
     for (const auto& [k, v] : parse_kv_lines(*text, seps))
-        if (allow.empty() || std::find(allow.begin(), allow.end(), k) != allow.end())
+        if (allow.empty() || std::find(allow.begin(), allow.end(), k) != allow.end()) {
+            ++t.key_rows;
             t.row(format_kv_row(action, k, v, path));
+        }
 }
 
 /// `files` are distro ALTERNATIVES (Debian common-*, RHEL system-auth/password-auth), so one
@@ -1148,11 +1150,14 @@ inline void pam_sources(const FileReader& rd, Tally& t, std::string_view action,
         if (r.err == 0) {
             ++exist;
             ++t.readable;
+            t.read_paths.push_back(path);
             for (const auto& p : parse_pam_lines(r.data))
                 if (std::find(types.begin(), types.end(), p.type) != types.end() &&
-                    std::find(modules.begin(), modules.end(), p.module) != modules.end())
+                    std::find(modules.begin(), modules.end(), p.module) != modules.end()) {
+                    ++t.key_rows;
                     t.row(format_kv_row(action, "pam." + p.type + "." + p.module,
                                         p.control + (p.args.empty() ? "" : " " + p.args), path));
+                }
             continue;
         }
         const auto st = t.state_of(classify_read_errno(r.err), path);
@@ -1222,17 +1227,23 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
                                               "password-auth"};
         constexpr std::string_view types[] = {"auth", "account"};
         detail::pam_sources(rd, t, prefix, files, types, kPamLockoutModules);
-        // Every source that exists was read and none set a lockout key (a stock RHEL 9 host
-        // without the faillock feature): say so, rather than hand back an OK result with no
-        // rows that reads like a dead agent. An absent (login.defs, faillock.conf, or every PAM
-        // file) or failed source already produced its own row above, and a single absent PAM
-        // alternative beside a readable sibling is silent by design, so an empty row set here
-        // means the sources that exist were read and set nothing; `readable > 0` is defensive.
-        // The wording is about what was READ: faillock.conf drop-ins, PAM include/substack
-        // targets and PAM services other than the four named files are not followed, so it is
-        // never "no lockout enforced".
-        if (t.rows.empty() && t.readable > 0)
-            t.row(format_kv_row(prefix, "lockout_keys", "not_found", kLockoutSearched));
+        // The DEFAULT "no lockout key found" answer (#5620): at least one source was read and
+        // NO key row (a login.defs / faillock.conf key, a pam.<type>.<module> line) was produced.
+        // An absent or unreadable sibling keeps its own `source_state` row and does not suppress
+        // this one -- a host with no faillock.conf and no PAM lockout line gets BOTH facts. Any
+        // key row at all (say faillock.conf absent but system-auth configures pam_faillock) means
+        // there is no "not found" to say. When a sibling was UNREADABLE (failed, not absent) the
+        // row is still written, naming only the files actually read; the CONSTRAINED status and
+        // that sibling's `unreadable` row carry the caveat. Zero readable sources: no row.
+        // `source` lists exactly the files read, in read order, so it never claims a file that was
+        // absent or refused. The wording is about what was READ: faillock.conf drop-ins, PAM
+        // include/substack targets, PAM services other than the four named files, IdM/SSSD and
+        // fail2ban are not read, so it is never "no lockout enforced".
+        if (t.key_rows == 0 && t.readable > 0) {
+            std::string files;
+            for (const auto& f : t.read_paths) files += (files.empty() ? "" : ",") + f;
+            t.row(format_kv_row(prefix, "lockout_keys", "not_found", files));
+        }
         break;
     }
     case LocalPolicyAction::Audit: {
