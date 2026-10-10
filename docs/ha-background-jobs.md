@@ -33,8 +33,10 @@ table disagree, the table wins.
 One thread multiplexes many passes of different classes — `result_set_maint_thread_`
 runs ~11 (the per-replica poll, several advisory-locked reaps, gauge refreshes) and
 `health_recompute_thread_` a cluster of read-only fleet gauges plus a fleet-wide CRL
-re-publish, a per-replica stream teardown, and the two per-replica MCP maintenance
-passes (bridge sweep + session gc). Classifying a thread wholesale would falsely
+re-publish, a per-replica stream teardown, the two per-replica MCP maintenance
+passes (bridge sweep + session gc), and (since #5513) the per-replica, in-memory
+`guardian_reconcile_gate.sweep` of the Guardian heartbeat-reconcile claim table
+(ReplicaSafe: it touches no store and each replica owns its own claims). Classifying a thread wholesale would falsely
 certify an unsafe pass riding a mostly-safe thread, so each `kBackgroundJobs` entry is
 one unit of work — with the caveat that the many trivially-identical read-only gauge
 passes on `health_recompute_thread_` are folded into a single
