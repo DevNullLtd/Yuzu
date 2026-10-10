@@ -22,11 +22,11 @@
 ///
 /// The legacy unversioned routes (`response_routes.cpp`'s `GET
 /// /api/responses/{instruction_id}`, `.../aggregate`, `.../export`) are NOT
-/// retrofitted onto these builders -- they are frozen read-only reference
-/// code for this PR (out of scope to touch), so a byte-for-byte "same
-/// function" claim across all three surfaces does not hold for them. REST
-/// v1 and MCP are the two callers this file exists to keep from drifting
-/// from EACH OTHER; the legacy route remains a third, independent, frozen
+/// retrofitted onto these builders, so a byte-for-byte "same function" claim
+/// across all three surfaces does not hold for them (they share only the
+/// strict numeric parser and export caps in `response_query_params.hpp`).
+/// REST v1 and MCP are the two callers this file exists to keep from
+/// drifting from EACH OTHER; the legacy route remains a third, independent
 /// copy of a narrower field set by explicit choice, not oversight.
 ///
 /// No httplib.h, no MCP-specific include -- pure, I/O-free.

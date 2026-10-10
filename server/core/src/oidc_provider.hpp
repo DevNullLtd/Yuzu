@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <expected>
 #include <memory>
@@ -50,6 +51,7 @@ struct PkceChallenge {
     std::string code_challenge;
     std::string state;
     std::string nonce;
+    std::string binding_hash; // hex SHA-256 of the initiating browser's binding secret
     std::string redirect_uri; // The exact redirect_uri used for this flow
     std::chrono::steady_clock::time_point expires_at;
 };
@@ -122,14 +124,56 @@ public:
 
     bool is_enabled() const;
 
-    /// Generate PKCE params, store them, return authorization URL for redirect.
+    /// The error `handle_callback` returns when the callback does not come from the browser
+    /// that started the flow. A FIXED token: the route audits it as
+    /// `reason=browser_binding_mismatch` and tests compare against it, so it never carries
+    /// caller-controlled text.
+    static constexpr const char* kBrowserBindingMismatch = "browser binding check failed";
+
+    /// The error `handle_callback` returns when the binding digest could not be computed (a
+    /// crypto-provider failure). Fail-closed like a mismatch and, like it, non-consuming, but a
+    /// distinct FIXED token so the audit trail tells a platform fault from a refused cookie.
+    static constexpr const char* kBrowserBindingUnavailable = "browser binding unavailable";
+
+    /// The error `handle_callback` returns when `state` names no pending flow (never issued,
+    /// already consumed, or swept). A FIXED token.
+    static constexpr const char* kUnknownState = "unknown or expired state parameter";
+
+    /// What `start_auth_flow` hands the route: the IdP redirect and the initiating-browser
+    /// binding secret. The route sets the secret as a cookie on the SAME response and requires
+    /// it back at the callback; the provider retains only its SHA-256, so the secret is never
+    /// in the redirect URL and never stored.
+    struct AuthFlowStart {
+        std::string url;            ///< authorization URL for the redirect
+        std::string binding_secret; ///< 32-byte CSPRNG secret (64 hex chars) for the binding cookie
+    };
+
+    /// Generate PKCE params and a browser-binding secret, store them, return the
+    /// authorization URL and the secret. THROWS (std::runtime_error) if the platform CSPRNG
+    /// or SHA-256 fails; nothing is stored in that case.
     /// @param request_redirect_uri If non-empty, overrides the configured redirect_uri
     ///        (derived from the request Host header for multi-origin support).
-    std::string start_auth_flow(const std::string& request_redirect_uri = {});
+    AuthFlowStart start_auth_flow(const std::string& request_redirect_uri = {});
 
     /// Exchange authorization code for tokens, validate ID token, return claims.
+    ///
+    /// `binding_secret` is the value of the binding cookie the CALLING browser presented. The
+    /// flow proceeds only if SHA-256(binding_secret) equals the hash stored at
+    /// `start_auth_flow` (constant-time compare); an empty or wrong secret is refused with
+    /// `kBrowserBindingMismatch`, and a digest failure with `kBrowserBindingUnavailable`. The
+    /// check runs BEFORE the pending flow is consumed and either refusal leaves the pending flow
+    /// available to the initiating browser. The flow is consumed (single use) only once the
+    /// binding matched.
+    ///
+    /// `binding_verified`, when non-null, is set false on entry and true ONLY once the presented
+    /// secret matched. It is the sole signal that the calling browser's cookie proved a
+    /// pending flow (and so is spent); an unknown or expired state, a mismatch and a digest
+    /// failure leave it false.
+    /// Every failure after the match (token exchange, signature, claims) leaves it true.
     std::expected<IdTokenClaims, std::string> handle_callback(const std::string& code,
-                                                              const std::string& state);
+                                                              const std::string& state,
+                                                              const std::string& binding_secret,
+                                                              bool* binding_verified = nullptr);
 
     /// Remove expired PKCE states.
     void cleanup_expired_states();
@@ -138,8 +182,19 @@ public:
     static std::string base64url_encode(const std::vector<uint8_t>& data);
     static std::string base64url_decode(const std::string& input);
     static std::string generate_code_verifier();
+    /// THROWS std::runtime_error if SHA-256 fails (like `start_auth_flow`).
     static std::string compute_code_challenge(const std::string& verifier);
     static std::expected<IdTokenClaims, std::string> parse_id_token(const std::string& jwt);
+
+    /// Test-only seams for the binding digest. `set_binding_digest_failure_for_test(true)` makes
+    /// this instance's binding SHA-256 fail exactly as a broken crypto provider would;
+    /// `add_test_pending_flow` plants a pending flow with a chosen binding hash (hex), bypassing
+    /// `start_auth_flow`, so the stored-hash validation can be driven with a value no honest
+    /// flow stores. TEST-ONLY: neither has a production caller, and tests/unit/server/
+    /// test_oidc_provider.cpp pins (source scan) that no other file in server/core/src
+    /// references them.
+    void set_binding_digest_failure_for_test(bool fail);
+    void add_test_pending_flow(const std::string& state, std::string binding_hash);
 
     /// Test-only seam (#1856): inject an RSA verifying key into the JWKS cache
     /// directly, bypassing the network fetch, so verify_jwt_signature can be
@@ -163,6 +218,9 @@ private:
                                                           const std::string& code_verifier,
                                                           const std::string& redirect_uri);
 
+    /// Hex SHA-256 of a binding secret. Throws on a digest failure.
+    std::string binding_digest(const std::string& secret) const;
+
     /// Cleanup expired pending challenges (must hold mu_).
     void cleanup_expired_states_locked();
 
@@ -173,6 +231,7 @@ private:
     std::string exchange_script_path_;
     mutable std::mutex mu_;
     std::unordered_map<std::string, PkceChallenge> pending_challenges_;
+    std::atomic<bool> binding_digest_forced_failure_{false}; // test seam only
 
     // JWKS cache for JWT signature verification (G2-SEC-A1-001)
     mutable std::mutex jwks_mu_;

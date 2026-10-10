@@ -91,6 +91,100 @@ this release or any other, until its schema is replaced (see
 [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)); rolling forward
 does not restore it.
 
+## Behaviour change: response routes parse numeric parameters strictly and exports are bounded (#4644, #4703)
+
+**Breaking for scripts that relied on a malformed value being silently misread.** On the legacy
+`/api/responses/{id}[/aggregate|/export]` routes, the `/api/v1/responses/{id}[/aggregate|/export]`
+routes, `GET /api/v1/executions/{id}/responses` and MCP `query_responses`, `status`, `since`,
+`until` and `limit` (and the legacy catch-all route's `offset`) must now be one whole base-10 integer.
+A value that used to be read as a different one is now `400` (`-32602` on MCP): `since=1e9` (was
+epoch second `1`), `status=0x1` (was `0`), `limit=100abc` (was `100`), `since=1.5` (was `1`),
+a leading `+`, whitespace, and a `status` below `-1` (was "no filter"). An empty value and a value
+too large for its type were already `400`.
+
+**Who is affected, and what to do.**
+
+- Scripts that build `since`/`until` from `date +%s.%N` or any fractional timestamp: send integer
+  seconds (`date +%s`).
+- **Breaking:** scripts and integrations that call the legacy `GET /api/responses/{id}`, `GET
+  /api/responses/{id}/aggregate` or `GET /api/responses/{id}/export`: each now writes a
+  `response.read` **success** audit row on every served read and is **fail-closed**, like its v1
+  twin. When the audit store is down (or the row cannot be persisted) the route answers `503` with
+  `Sec-Audit-Failed: true`, an A4 envelope (`retry_after_ms: 5000`) and no data, where it used to
+  serve the read unaudited (all three routes, `get`, `aggregate` and `export`, used to answer `200` with the
+  data even when the audit write failed). The scope-drop `denied` row on all three is fail-closed too, so a
+  management-group-scoped caller whose drop row cannot be persisted gets the same `503`. Retry on
+  `503`. A SIEM rule keyed on `response.read` now sees `result=success` rows with
+  `detail=legacy response <query|aggregate|export> cid=<id>` from these routes as well as the v1
+  ones; a global (unscoped) caller used to leave no row at all on `get` and `aggregate`.
+  Every served read on these routes now adds one audit INSERT (the audit reaper's retention cap is the
+  only backpressure), so a script that polls `/api/responses/*` raises audit volume in proportion to its
+  request rate.
+- Scripts that send `until=0` or a **negative** `since` or `until` to a response route: it is `400`
+  now. A negative bound, and `until=0`, used to be read as "unbounded", so a window computed as
+  `now - n` that went past the epoch silently returned the whole result. Omit the parameter for
+  "no bound on that side". `since=0` stays valid and matches exactly what omitting `since`
+  matches; no script that sends `since=0` changes behaviour.
+- MCP clients that send `"limit": null` or `"status": null`, or a float or string for either: omit
+  the key to get the default. A `status` above `2147483647` and an unsigned value above
+  `9223372036854775807` are `-32602` too (the latter used to wrap to `-1`, "any status"; the same
+  fix applies to every other MCP argument read with the strict integer reader, 16 call sites).
+- Callers that pass `limit=0` or a negative `limit` to the legacy export: it now serves one row
+  (clamped to `1..10000`, like the v1 export), and its JSON `count` is the number of rows served.
+  The legacy list route caps an explicit `limit` at 1000; zero or below still means its default of
+  100. When the caller asked for more than 1000 and got a full 1000-row page, the legacy list
+  body now carries `"result_truncated_by_cap": true` (absent otherwise).
+
+**Exports are bounded.** Both export routes stop at 50 MiB of row payload (`output` plus
+`error_detail`) in addition to the 10,000-row limit, and the cut is made inside the database query,
+so a large export no longer loads every row into the server first. The cap is not operator-tunable.
+A cut export (row limit with more rows left, or the byte cap) is marked with a top-level
+`result_truncated_by_cap: true` (legacy JSON) or `pagination.result_truncated_by_cap` (v1 JSON),
+and a cut CSV ends with one extra trailer record, `# result_truncated_by_cap cause=row_cap` (or
+`byte_cap`), padded to the header's width (7 fields legacy, 10 on v1). **A CSV parser that expects a
+number in the `id` column will fail on that record, and only on a cut file; that is deliberate, so a
+cut file is never read as complete.** An uncut CSV is byte-identical to before. A cut export also
+carries an `X-Result-Truncated-By-Cap: true` header (CSV) and a download name
+`responses-<id>-truncated.json` or `.csv`; a plain `curl -o out.csv ...` keeps neither, `curl -sS -D
+- -o out.csv ...` shows the header and `curl -OJ` keeps the name. The 50 MiB cap counts payload
+bytes, the last row kept can run past it by up to its own size (about 4 MiB for text output, up to
+about 12 MiB for output dense in invalid bytes or NULs; a terminal frame's `error_detail` is cut the same way), and a result under 50 MiB of raw payload can
+still be cut when its escaped serialized form crosses the cap. A legacy export of an id containing a
+character outside `[A-Za-z0-9._-]` is now downloaded under a name with that character written as `_`.
+A quoted CSV cell can contain text that looks like the trailer, so read the file as CSV and take the
+final record rather than matching lines. There is no
+cursor: to read past a cap pull once per `agent_id`, or set `until` to the oldest `timestamp`
+received (inclusive, so de-duplicate on `id`).
+
+**Rolling upgrade.** Replicas on the old and the new build answer a malformed value differently
+(`200` versus `400`), so a client can see both during the rollout. No configuration or data
+migration is needed. Two new counters report the effect:
+`yuzu_server_response_param_rejected_total{surface}` and
+`yuzu_server_response_export_truncated_total{surface,cause}`
+([Metrics](metrics.md#response-store-metrics)).
+
+## Behaviour change: a cut visualization, results fragment or TAR scan is reported (#4644)
+
+The execution visualization route (`GET /api/v1/executions/{id}/visualization`), the dashboard
+results fragment's unfiltered read and the TAR retention-paused scan page now read through the same
+SQL-side 50 MiB payload cap as the response exports, and say so when it cuts.
+
+- The visualization payload gains `result_truncated_by_cap: true` and `truncation_cause` (`row_cap`
+  or `byte_cap`) on a cut read; `rows_capped` is now exact (it also fired on a read of exactly
+  10,000 rows) and is the row cap only. The dashboard chart card shows a "Partial result" notice.
+- The results fragment shows a "truncated" notice in its result summary.
+- The TAR scan page shows a "Partial result" banner and qualifies its header counts; with no rows in
+  the part that was read, its empty state says it cannot tell, instead of "still in progress" or "all
+  clear". `GET /api/v1/tar/retention-paused` and `list_tar_retention_paused` gain a
+  `result_truncated_by_cap` boolean (always present) and **also set `store_degraded: true` on a cut
+  scan**, so a client that treats `store_degraded` as "the read failed" now sees it for a cut as
+  well: test `result_truncated_by_cap` first to tell the two apart.
+- None of these cuts is counted on a metric (see [Response export bounds](server-admin.md#response-export-bounds)),
+  and the dashboard fragment and the scan page apply management-group scope after the fetch, so a
+  confined caller can see the notice when every dropped row was outside their scope.
+- The filtered results-fragment branch, the plain list routes and the internal reads are not bounded
+  by this change.
+
 ## Operator note: the software-inventory store migration (v7) is a hard cutover (#5172)
 
 Schema v7 of the software-inventory store adds `package_id` and `source` columns and a row id to

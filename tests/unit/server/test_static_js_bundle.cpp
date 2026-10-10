@@ -1100,6 +1100,57 @@ TEST_CASE("static_js_bundle: kYuzuChartsJs renders an empty-state message on no 
     CHECK_THAT(yuzu::server::kYuzuChartsJs, ContainsSubstring("isEmptyData"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuChartsJs surfaces a cut visualization result in-card",
+          "[static-js][yuzu-charts]") {
+    // The visualization route stamps rows_capped (row cap only) and
+    // result_truncated_by_cap + truncation_cause (row_cap | byte_cap) on a cut
+    // payload. The chart is fetched independently of the results table, so the
+    // adapter is the only place an operator can see that the picture is partial.
+    // Pin that it consumes all three fields and renders the notice with
+    // textContent (never innerHTML) from the payload.
+    const auto& js = yuzu::server::kYuzuChartsJs;
+    CHECK_THAT(js, ContainsSubstring("function truncationNotice"));
+    CHECK_THAT(js, ContainsSubstring("data.result_truncated_by_cap"));
+    CHECK_THAT(js, ContainsSubstring("data.rows_capped"));
+    CHECK_THAT(js, ContainsSubstring("data.truncation_cause"));
+    CHECK_THAT(js, ContainsSubstring("yuzu-chart-truncated"));
+    CHECK_THAT(js, ContainsSubstring("result-degrade-banner"));
+    CHECK_THAT(js, ContainsSubstring("note.textContent = msg"));
+    CHECK_THAT(js, ContainsSubstring("Partial result:"));
+    // The call itself: a defined-but-never-invoked helper must not satisfy this test.
+    // Anchored to a line start so a commented-out call does not satisfy it.
+    CHECK_THAT(js, ContainsSubstring("\n    truncationNotice(target, data);"));
+    // The call must also be REACHED. render() has exactly two legitimate early exits before
+    // it (the null guard and the deferred-until-echarts-loads branch); any further `return`
+    // between the function's opening line and the call would make the notice dead code while
+    // the string checks above stayed green (a `return;` inserted there did exactly that).
+    // Limit, stated plainly: this pins the known set of early exits in the source text. It
+    // does not execute the JS, so a throw or an always-false branch before the call would
+    // not be caught; the ad hoc headless-Chrome check in the commit notes covers behaviour.
+    {
+        const std::string open_marker = "\n  function render(target, data) {";
+        const std::string call_marker = "\n    truncationNotice(target, data);";
+        const auto open_at = js.find(open_marker);
+        const auto call_at = js.find(call_marker);
+        REQUIRE(open_at != std::string::npos);
+        REQUIRE(call_at != std::string::npos);
+        REQUIRE(open_at < call_at);
+        const std::string span = js.substr(open_at, call_at - open_at);
+        std::size_t returns = 0;
+        for (auto at = span.find("return"); at != std::string::npos;
+             at = span.find("return", at + 1))
+            ++returns;
+        CHECK(returns == 2);
+        // And the notice runs before the error and empty-state branches, which return.
+        const auto error_at = js.find("\n    if (data.error) {", call_at);
+        REQUIRE(error_at != std::string::npos);
+        CHECK(call_at < error_at);
+    }
+    // CSP is script-src 'self' 'unsafe-inline' with no unsafe-eval.
+    CHECK_THAT(js, !ContainsSubstring("new Function("));
+    CHECK_THAT(js, !ContainsSubstring("eval("));
+}
+
 // ── Per-host page shell (PR 9-pre, /viz/host/<agent_id>) ────────────────────
 
 TEST_CASE("static_js_bundle: kVizHostPageHtml renders IPC graph mount point", "[viz-host][page]") {

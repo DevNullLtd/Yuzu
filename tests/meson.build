@@ -1435,6 +1435,7 @@ if build_server
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
       'unit/server/test_oidc_scim_link.cpp',
+      'unit/server/test_sha256_steps.cpp',
       'unit/server/test_oidc_routes.cpp',
       'unit/server/test_saml_principal.cpp',
       'unit/server/test_saml_provider.cpp',
@@ -1540,6 +1541,7 @@ if build_server
       'unit/server/test_dex_app_perf_model.cpp',
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
+      'unit/server/test_dex_stats.cpp', # pure known-answer statistics (dex_stats.hpp): no store, no I/O, no [pg]
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
       'unit/server/test_verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam

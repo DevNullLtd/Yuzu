@@ -1572,6 +1572,22 @@ visible without a local-password fallback):
   configured, its SSO button; SAML operators navigate to `GET /auth/saml/start`
   directly.
 
+### OIDC browser binding
+
+The OIDC sign-in is bound to the browser that started it, in the same way the SAML
+binding cookie above binds the ACS POST. `GET /auth/oidc/start` sets a 10 minute
+`HttpOnly` cookie (`__Host-yuzu_oidc_bind` on an HTTPS listener, `yuzu_oidc_bind` on
+plain HTTP) holding a random 256-bit secret; the pending flow keeps only its SHA-256
+digest, compared in constant time at `GET /auth/callback`. Deliberate differences from
+SAML: `SameSite=Lax` rather than `None` (the OIDC return is a top-level GET, and the
+server requests the default `query` response mode); the cookie name follows the
+server's own HTTPS flag, as the session cookie does, instead of being HTTPS-only; and a
+refusal is non-consuming, so the pending flow stays available to the initiating browser.
+A digest failure fails closed (`browser_binding_unavailable`, or a 500 with no cookie at
+start). The cookie is host-bound, so the sign-in must start on the host name of
+`--oidc-redirect-uri`. Operator-facing detail: `docs/user-manual/authentication.md`
+"Browser binding".
+
 ### HA / multi-replica
 
 Pending `AuthnRequest` state (the random `ID` stored for replay protection) is
@@ -1580,7 +1596,7 @@ sessions (session affinity)** must be configured on `GET /auth/saml/start` and
 `POST /saml/acs` so the ACS POST for a given request is always routed to the
 replica that generated it. Without affinity, approximately `(N−1)/N` of logins
 fail as "unsolicited" (no matching pending ID). OIDC shares this limitation via
-its in-process PKCE state.
+its in-process PKCE state and its browser-binding digest.
 
 ### Rotating the IdP signing certificate
 
