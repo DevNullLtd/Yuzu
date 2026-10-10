@@ -15,7 +15,11 @@
  *    include/substack controls are not followed, and a line that is not
  *    `type control module` is dropped without a row.
  *  - A file read successfully that sets none of the reported keys contributes no row
- *    (e.g. Debian's all-commented faillock.conf); login.defs is filtered to a fixed key
+ *    (e.g. Debian's all-commented faillock.conf), EXCEPT that a lockout_policy read where
+ *    every source was read and no row at all resulted writes one
+ *    `lockout_policy|lockout_keys|not_found|<files>` row (#5620), so a host with no
+ *    lockout configured never reads as an empty result. It describes the files read, not
+ *    the host: drop-ins and PAM includes are not followed. login.defs is filtered to a fixed key
  *    list per action; pwquality.conf.d, faillock drop-ins and /etc/audit/rules.d are
  *    not read.
  */

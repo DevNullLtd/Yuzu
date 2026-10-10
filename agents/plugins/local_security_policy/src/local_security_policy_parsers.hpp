@@ -261,6 +261,9 @@ inline constexpr std::string_view kPamPasswordModules[] = {"pam_pwquality.so", "
                                                             "pam_cracklib.so", "pam_unix.so"};
 inline constexpr std::string_view kPamLockoutModules[] = {"pam_faillock.so", "pam_tally2.so",
                                                            "pam_tally.so"};
+/// The `source` field of the `lockout_keys|not_found` row: the files the Linux lockout read covers.
+inline constexpr std::string_view kLockoutSearched =
+    "/etc/login.defs,/etc/security/faillock.conf,/etc/pam.d";
 
 // ---- auditd rules -----------------------------------------------------------------
 
@@ -1204,6 +1207,13 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
                                               "password-auth"};
         constexpr std::string_view types[] = {"auth", "account"};
         detail::pam_sources(rd, t, prefix, files, types, kPamLockoutModules);
+        // Every source read and none set a lockout key (a stock RHEL 9 host without the faillock
+        // feature): say so, rather than hand back an OK result with no rows that reads like a
+        // dead agent. An absent or failed source already produced its own row above, so an empty
+        // row set here means the reads succeeded. The wording is about what was READ -- faillock.conf
+        // drop-ins and PAM include/substack targets are not followed -- never "no lockout enforced".
+        if (t.rows.empty() && t.readable > 0)
+            t.row(format_kv_row(prefix, "lockout_keys", "not_found", kLockoutSearched));
         break;
     }
     case LocalPolicyAction::Audit: {

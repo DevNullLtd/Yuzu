@@ -346,6 +346,89 @@ TEST_CASE("local_security_policy collect_file_policy: password_policy over injec
 }
 
 
+namespace {
+
+// A RHEL 9 host without the faillock feature: every lockout source is readable and none sets a key.
+std::map<std::string, std::string> no_lockout_files() {
+    return {{"/etc/login.defs", "#LOGIN_RETRIES\t\t3\n#LOGIN_TIMEOUT\t\t60\nPASS_MAX_DAYS 99999\n"},
+            {"/etc/security/faillock.conf", "# deny = 3\n# unlock_time = 600\n"},
+            {"/etc/pam.d/system-auth",
+             "auth required pam_env.so\nauth sufficient pam_unix.so try_first_pass nullok\n"
+             "auth required pam_deny.so\naccount required pam_unix.so\n"}};
+}
+
+constexpr std::string_view kNotFoundRow =
+    "lockout_policy|lockout_keys|not_found|/etc/login.defs,/etc/security/faillock.conf,/etc/pam.d";
+
+std::size_t count_row(const Collected& c, std::string_view row) {
+    return static_cast<std::size_t>(std::count(c.rows.begin(), c.rows.end(), std::string{row}));
+}
+
+} // namespace
+
+TEST_CASE("local_security_policy collect_file_policy: lockout_policy with every source read and no "
+          "lockout key says so in one row",
+          "[local_security_policy][parsers]") {
+    const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout,
+                                       reader_from(no_lockout_files()), empty_dir());
+    CHECK(c.status == PolicyStatus::Ok); // nothing failed to read
+    CHECK(c.reason.empty());
+    REQUIRE(c.rows.size() == 1);
+    CHECK(c.rows[0] == kNotFoundRow);
+    // It is a statement about the files read, never a verdict that lockout is off.
+    CHECK(c.rows[0].find("none_enforced") == std::string::npos);
+}
+
+TEST_CASE("local_security_policy collect_file_policy: lockout_policy not_found row is only for an "
+          "otherwise empty result",
+          "[local_security_policy][parsers]") {
+    SECTION("a login.defs key suppresses it") {
+        auto files = no_lockout_files();
+        files["/etc/login.defs"] = "LOGIN_RETRIES 5\n";
+        const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout,
+                                           reader_from(files), empty_dir());
+        CHECK(count_row(c, kNotFoundRow) == 0);
+        CHECK(count_row(c, "lockout_policy|LOGIN_RETRIES|5|/etc/login.defs") == 1);
+    }
+    SECTION("a faillock.conf key suppresses it") {
+        auto files = no_lockout_files();
+        files["/etc/security/faillock.conf"] = "deny = 4\n";
+        const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout,
+                                           reader_from(files), empty_dir());
+        CHECK(count_row(c, kNotFoundRow) == 0);
+        CHECK(count_row(c, "lockout_policy|deny|4|/etc/security/faillock.conf") == 1);
+    }
+    SECTION("a pam_faillock line suppresses it") {
+        auto files = no_lockout_files();
+        files["/etc/pam.d/system-auth"] += "auth required pam_faillock.so authfail deny=3\n";
+        const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout,
+                                           reader_from(files), empty_dir());
+        CHECK(count_row(c, kNotFoundRow) == 0);
+        CHECK(count_row(c, "lockout_policy|pam.auth.pam_faillock.so|required authfail deny=3|"
+                           "/etc/pam.d/system-auth") == 1);
+    }
+    SECTION("a refused source keeps its own row and no not_found claim") {
+        auto files = no_lockout_files();
+        auto rd = [files](const std::string& path) -> FileRead {
+            if (path == "/etc/security/faillock.conf") return {EACCES, {}};
+            auto it = files.find(path);
+            return it == files.end() ? FileRead{ENOENT, {}} : FileRead{0, it->second};
+        };
+        const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout, rd, empty_dir());
+        CHECK(c.status == PolicyStatus::Constrained);
+        CHECK(count_row(c, kNotFoundRow) == 0);
+        CHECK(count_row(c, "lockout_policy|source_state|unreadable:permission_denied|"
+                           "/etc/security/faillock.conf") == 1);
+    }
+    SECTION("every source absent keeps the absent rows and no not_found claim") {
+        const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout,
+                                           reader_from({}), empty_dir());
+        CHECK(c.status == PolicyStatus::Ok);
+        CHECK(count_row(c, kNotFoundRow) == 0);
+        CHECK(count_row(c, "lockout_policy|source_state|absent|/etc/pam.d") == 1);
+    }
+}
+
 TEST_CASE("local_security_policy collect_file_policy: a refused read is PERMISSION_DENIED, never absent",
           "[local_security_policy][parsers]") {
     auto rd = [](const std::string& path) -> FileRead {
