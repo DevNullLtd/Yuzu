@@ -1435,6 +1435,7 @@ if build_server
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
       'unit/server/test_oidc_scim_link.cpp',
+      'unit/server/test_sha256_steps.cpp',
       'unit/server/test_oidc_routes.cpp',
       'unit/server/test_saml_principal.cpp',
       'unit/server/test_saml_provider.cpp',
@@ -1540,6 +1541,7 @@ if build_server
       'unit/server/test_dex_app_perf_model.cpp',
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
+      'unit/server/test_dex_stats.cpp', # pure known-answer statistics (dex_stats.hpp): no store, no I/O, no [pg]
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
       'unit/server/test_verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
@@ -3194,6 +3196,21 @@ test('gateway-upstream guard registration lexical gate',
   _python3_test,
   args: [files('test_gateway_peer_registration_lexical.py')],
   suite: 'docs',
+  timeout: 30,
+)
+
+# #5513: static lexical gate pinning that agent.cpp's heartbeat still calls
+# guardian_->generation_report() and feeds BOTH fields to emit_guardian_generation_heartbeat_tags()
+# (the boot re-arm companion tag) inside a contained try, after journal_maintenance_tick(), and
+# that the emitter inserts the companion before yuzu.guardian_generation. AgentImpl::run's
+# heartbeat loop has no unit-drivable seam (#1492), so deleting that call site would leave every
+# other test green while restoring the never-retry bug. Carries its own in-memory mutation
+# self-test. No build required. Python, not bash, for the same reason as the OTA gate above
+# (#5428). Never raise the budget -- port, split or host-gate instead.
+test('guardian heartbeat generation wiring lexical gate (#5513)',
+  _python3_test,
+  args: [files('test_guardian_heartbeat_wiring_lexical.py')],
+  suite: 'agent',
   timeout: 30,
 )
 

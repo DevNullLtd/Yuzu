@@ -21,6 +21,7 @@
 #endif
 
 #include <yuzu/metrics.hpp>
+#include "response_export_metrics.hpp"
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/tls_policy.hpp> // #4722: shared TLS 1.2 cipher allow-list
 #include "bundled_content.hpp"
@@ -2174,6 +2175,9 @@ public:
         for (const auto result : {"swept", "capped", "noop", "declined", "declined_no_anchor",
                                   "skipped_lock", "failed"})
             metrics_.counter("yuzu_server_response_reap_passes_total", {{"result", result}});
+        // #4644/#4703 response-route observability: strict-parse rejections and cut
+        // exports, closed label sets seeded by the same header the emit sites use.
+        seed_response_metrics(metrics_);
         // DEX app-perf-over-time (B1/B2) — ingest, rollup, and read-degrade signals.
         // Described up front so the HELP/TYPE lines exist on an idle server (a
         // low-traffic deployment otherwise ships these series invisible until the
@@ -5800,7 +5804,11 @@ public:
             // applied policy generation on every heartbeat; if it trails the
             // current generation it missed a push (was offline when the push fired,
             // or has just reconnected — sync_with_server is a no-op pull), so
-            // re-push its applicable rules. Reads the generation, never bumps it, so
+            // re-push its applicable rules. An agent also reports generation 0
+            // (intermittently, see the agent's back-off) while
+            // a boot re-arm failure is unresolved (#5513), however current its
+            // persisted generation is; the same full_sync re-push is the catch-up
+            // for that case too. Reads the generation, never bumps it, so
             // catching one lagging agent up does not make the rest of the fleet look
             // stale (the cascade M6's monotonic counter is designed to avoid).
             heartbeat_ingestion_->set_guardian_reconcile_fn(
@@ -15505,6 +15513,7 @@ private:
                              .fleet_read_fn = fleet_read_fn,
                              .audit_fn = audit_fn,
                              .store = response_store_.get(),
+                             .metrics = &metrics_,
                          });
 
         // #2542 PR-11: wraps AuthRoutes::deny_service_scoped_service_tag_mutation

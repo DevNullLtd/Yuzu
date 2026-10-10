@@ -1303,8 +1303,54 @@ flip, with a red-first test each:
   - (AC-13) **Recovery needs a live connection and a generation-tracking server.** The
     maintenance tick runs on the per-connection heartbeat thread, and the retry owner is
     the server's `full_sync` re-push. Agent restart gap: the boot Application opens at the
-    loaded acknowledged generation with an empty `content_id`, and a failed boot re-arm is
-    never retried (#5513); an acknowledgment persisted by the old waiver is not revoked.
+    loaded acknowledged generation with an empty `content_id`. A failed boot re-arm is
+    resolved (#5513): the agent reports generation 0 (except while backing off between failed
+    catch-ups, when it reports its real generation) with the sparse companion tag
+    `yuzu.guardian_boot_rearm_unresolved` until a push applies cleanly, so the server's
+    existing reconcile catches it up, and the persisted generation is never rewritten. A
+    push that omits or disables the failed rule clears the flag too, because it is a clean
+    application; the omission hazard is AC-11 (FU-12, #5547). The evidence is the `[5513]`
+    and `[boot_rearm]` tests in `test_guardian_engine.cpp`,
+    `test_guardian_engine_spark_reconcile.cpp` (its `wire_first` fixture flag and
+    `BootRig5513` run the production boot order) and `test_guardian_journal_heartbeat.cpp`,
+    plus the server case in `test_heartbeat_ingestion.cpp`. The `[5513]` tests passed on
+    Linux (also under a TSan build, which exercises no cross-thread interleaving of the new
+    state, because the new tests drive the engine from a single thread, parked
+    fake-mechanism workers aside), Windows (MSVC) and macOS, and the mutation
+    checks were run when the tests were written. Detection today has three routes and no
+    per-agent metric: the agent log WARN (`N cached rule(s) failed to re-arm at boot`),
+    repeated `guaranteed_state.reconcile` audit rows reading `generation 0 -> N` for one
+    agent id, and the fleet-wide `yuzu_server_guardian_reconciles_total{result="sent"}`
+    rate. Fleet-wide detection of the tag and the alert decision are #5558. A persistently
+    failing rule is re-pushed with an agent-side back-off (after each failed catch-up the
+    agent reports its real generation for the next 1, 2, 4, 8, then 10 heartbeats before
+    reporting 0 again; about 60 s, 90 s, 150 s, 270 s, then 330 s apart at the default 30 s
+    heartbeat, and the cadence scales with the interval only for intervals of about 12.5 s
+    or more, because the server's own 25 s per-agent limit dominates shorter ones), one
+    audit row per push. The loop is closed for catch-ups that reach the apply_rules tail
+    with the persisted generation equal to the server's current generation. It is NOT
+    closed for: an agent whose persisted generation is behind the server's (or is 0), which
+    keeps being re-pushed at the server's 25 s limit because the held-back report is still
+    below the server's generation; a push that returns before the tail (a persistent KV
+    write failure on rule persist, a begin_application throw, the invalid-rule-id reject),
+    which earns no holdoff; and repeats suppressed under prefer_spark=true (an accepted
+    Spark arm still pending, or a wedge outstanding), which do not extend it. These are the
+    pre-existing held-generation retry, unchanged; a generic server-side per-agent back-off
+    for it is a follow-up, and #5504 stays the
+    Spark flip cost measurement, not the owner of this back-off. Residuals: a legacy guard that returns false at arm
+    (`ReconcileOutcome::Inert`) is the boot-path
+    analogue of #2797's `apply_rules` defect and is not covered, a server whose current
+    generation is 0 does not push, and the catch-up applies only where a legacy guard
+    actually arms (Windows; Linux with libsystemd and a reachable system bus, Service
+    rules only; macOS legacy guards are stubs, so it does not apply there). The
+    Spark-path parts (a boot arm that fails late or is drained as a failure, and the latch
+    on the boot application) are dormant while `prefer_spark_` is false and are covered by
+    those tests alone. Two further dormant-Spark residuals: with `prefer_spark_` true, an
+    `apply_rules` throw after `begin_application()` and before the tail leaves the new
+    application unlatched, so the tick's clear could clear the boot flag early (to be
+    latched on unwind before the flip); and a boot `begin_application()` throw leaves no
+    boot application, so late boot receipts are not tracked (synchronous failures are
+    still caught). An acknowledgment persisted by the old waiver is not revoked.
   - (AC-14) **Content identity (#5512).** A re-observation of a wedged claim matches
     `rule_id` and spec only (the content-identity bug); recorded, not fixed here. Operator
     consequence: a wedged rule edited without changing its spec (its expected value, for

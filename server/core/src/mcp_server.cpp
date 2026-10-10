@@ -70,6 +70,7 @@
 #include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
 #include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
 #include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution row builders
+#include "response_export_metrics.hpp" // #4644/#4703: param-rejected counter (shared with REST)
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate row builders
 #include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
@@ -112,6 +113,7 @@
 #include <cstdio>
 #include <ctime>
 #include <iterator>
+#include <limits> // numeric_limits (query_responses status range, #4644)
 #include <map>
 #include <memory>
 #include <mutex>
@@ -277,6 +279,13 @@ std::optional<int64_t> param_int_strict(const nlohmann::json& params, const char
     if (!params.contains(key))
         return def;
     if (!params[key].is_number_integer())
+        return std::nullopt;
+    // nlohmann reports is_number_integer() for its UNSIGNED variant too, and
+    // get<int64_t>() wraps a value above INT64_MAX to a negative number (UINT64_MAX
+    // becomes -1, a documented "any" sentinel on several filters). Reject it as the
+    // malformed input it is rather than let it alias a different, valid value.
+    if (params[key].is_number_unsigned() &&
+        params[key].get<uint64_t>() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
         return std::nullopt;
     return params[key].get<int64_t>();
 }
@@ -555,9 +564,13 @@ static const ToolDef kTools[] = {
      "(agent, paused source). Requires Infrastructure:Read. Read-only twin of GET "
      "/fragments/tar/retention-paused / GET /api/v1/tar/retention-paused. Returns "
      "scan_id=\"\" when the operator has not dispatched a scan yet (call "
-     "POST /fragments/tar/retention-paused/scan first, dashboard-only today).",
+     "POST /fragments/tar/retention-paused/scan first, dashboard-only today). "
+     "result_truncated_by_cap=true means the scan's response read reached its "
+     "10,000-row / 50 MiB cap, so rows and the counters are PARTIAL (a dropped "
+     "response reads as an agent that never answered); store_degraded is then "
+     "also true, and result_truncated_by_cap tells a cut apart from a failed read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"scan_id":{"type":"string"},"scan_count":{"type":"integer"},"scan_at":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_with_no_paused_sources":{"type":"integer"},"agents_filtered_out_of_scope":{"type":"integer"},"store_degraded":{"type":"boolean"},"rows":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"agent_display":{"type":"string"},"source":{"type":"string"},"paused_at":{"type":"integer"},"live_rows":{"type":"integer"},"oldest_ts":{"type":"integer"},"value_error":{"type":"boolean"},"enabled_raw":{"type":"string"}},"required":["agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"]}}},"required":["scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","rows"]})j"},
+     R"j({"type":"object","properties":{"scan_id":{"type":"string"},"scan_count":{"type":"integer"},"scan_at":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_with_no_paused_sources":{"type":"integer"},"agents_filtered_out_of_scope":{"type":"integer"},"store_degraded":{"type":"boolean"},"result_truncated_by_cap":{"type":"boolean","description":"true when the scan's response read hit the 10,000-row or 50 MiB payload cap: rows and counts are partial"},"rows":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"agent_display":{"type":"string"},"source":{"type":"string"},"paused_at":{"type":"integer"},"live_rows":{"type":"integer"},"oldest_ts":{"type":"integer"},"value_error":{"type":"boolean"},"enabled_raw":{"type":"string"}},"required":["agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"]}}},"required":["scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows"]})j"},
 
     {"get_agent_details",
      "Get detailed info for a single agent including tags and inventory. "
@@ -625,6 +638,10 @@ static const ToolDef kTools[] = {
      "dispatch is still in flight; a result without it (even with zero rows) means "
      "no rows currently match, or (instruction_id-only queries) in-flight-ness "
      "could not be determined. "
+     "status and limit must be JSON integers: a string, float, boolean or null (omit "
+     "the key for the default), a status outside -1..2147483647, or an integer above "
+     "9223372036854775807 is rejected with -32602 invalid params rather than read as "
+     "\"any\"; a limit of 0 or below is served as 1 and one above 1000 as 1000. "
      "Confined by management group: a caller admitted through a management-group "
      "grant sees only their in-scope agents' rows, pushed into the underlying query "
      "before the row-limit cap so a confined caller's page is never truncated by "
@@ -635,8 +652,8 @@ static const ToolDef kTools[] = {
      "(server ingest wall-clock, 0 on legacy pre-v3 rows — distinct from the "
      "agent-claimed timestamp field, useful for spotting agent/server clock drift) "
      "(#2146 A2-R2).",
-     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
-     R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer","description":"The response row's own id"},"instruction_id":{"type":"string"},"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"error_detail":{"type":"string"},"timestamp":{"type":"integer"},"plugin":{"type":"string"},"received_at_ms":{"type":"integer","description":"Server ingest wall-clock in epoch ms; 0 on legacy pre-v3 rows"}},"required":["id","instruction_id","agent_id","execution_id","status","output","error_detail","timestamp","plugin","received_at_ms"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"retry_after_ms":{"type":"integer","description":"Present only when execution_id was supplied and its execution is confirmed non-terminal — minimum ms before polling again"}},"required":["responses"]})j"},
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","minimum":-1,"maximum":2147483647,"description":"CommandResponse status enum; omit or -1 for any. A non-integer, a value below -1 or above 2147483647 (including unsigned values beyond int64) is rejected (invalid params), never read as any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Rows to return, 1..1000 (default 100). A client that validates arguments against this schema rejects a value outside that range before sending it; the server itself clamps one that arrives (below 1 is served as 1, above 1000 as 1000) rather than rejecting it"}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
+     R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer","description":"The response row's own id"},"instruction_id":{"type":"string"},"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"error_detail":{"type":"string"},"timestamp":{"type":"integer"},"plugin":{"type":"string"},"received_at_ms":{"type":"integer","description":"Server ingest wall-clock in epoch ms; 0 on legacy pre-v3 rows"}},"required":["id","instruction_id","agent_id","execution_id","status","output","error_detail","timestamp","plugin","received_at_ms"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) when the served row count equals the effective limit: more rows may exist past it, and a result of exactly the limit also sets it"},"retry_after_ms":{"type":"integer","description":"Present only when execution_id was supplied and its execution is confirmed non-terminal — minimum ms before polling again"}},"required":["responses"]})j"},
 
     {"aggregate_responses",
      "Aggregate response data (COUNT, SUM, AVG, MIN, MAX) grouped by a column. `op_column` picks "
@@ -8644,7 +8661,35 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 ResponseQuery rq;
                 rq.agent_id = param_str(args, "agent_id");
-                rq.status = param_int32(args, "status", -1);
+                // #4644: param_int32 swallowed a wrong-typed status (a string, a float)
+                // into the default and wrapped an out-of-int32 value, so a malformed
+                // filter silently meant "any" or a different status. Strict like
+                // op_column/aggregate on aggregate_responses; -1 is the documented
+                // "any" sentinel, anything below it is neither a status nor "any".
+                const auto status_opt = param_int_strict(args, "status", -1);
+                if (!status_opt || *status_opt < -1 ||
+                    *status_opt > std::numeric_limits<int>::max()) {
+                    // retry-hint-exempt: malformed client input, not a store/query fault --
+                    // resending the same value fails identically.
+                    yuzu::server::count_response_param_rejected(metrics, "mcp");
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "status must be an integer between -1 and 2147483647 (-1 or omitted = any)"),
+                        "application/json");
+                    return;
+                }
+                rq.status = static_cast<int>(*status_opt);
+                const auto limit_opt = param_int_strict(args, "limit", 100);
+                if (!limit_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON type), not a
+                    // store/query fault -- resending the same value fails identically.
+                    yuzu::server::count_response_param_rejected(metrics, "mcp");
+                    res.set_content(a4_error(kInvalidParams,
+                                             "limit must be a JSON integer that fits in a "
+                                             "signed 64-bit value"),
+                                    "application/json");
+                    return;
+                }
                 // Clamp BOTH bounds. Upper alone is insufficient: a negative
                 // limit (or one that wraps negative through param_int32's
                 // int64->int32 cast) binds as SQLite `LIMIT -1`, which means
@@ -8660,8 +8705,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // int64->int cast wraps a limit > INT_MAX negative, which std::clamp
                 // would then pin to 1 (silently under-serving). Read the raw int64,
                 // clamp to [1,1000] first; the result always fits an int.
-                rq.limit = static_cast<int>(
-                    std::clamp<std::int64_t>(param_int(args, "limit", 100), 1, 1000));
+                rq.limit = static_cast<int>(std::clamp<std::int64_t>(*limit_opt, 1, 1000));
                 // When execution_id is supplied, route to the exact-correlation
                 // path so the agentic dispatch->collect loop closes cleanly:
                 // execute_instruction mints the execution_id, stamps it onto
