@@ -194,26 +194,26 @@ private:
     bool open_{false};
 };
 
-/// A REAL, RAII-scoped fault in the throwaway database: the durable `session_store.sessions`
-/// table is renamed aside, so `AuthManager::wipe_user_sessions_durable`'s DELETE genuinely fails
-/// while every other store keeps working. `repair()` is idempotent and noexcept and the
-/// destructor calls it, so a failing REQUIRE between `arm()` and the explicit repair can never
-/// leave the table renamed for a later test sharing the database.
-class SessionWipeFault {
+/// A REAL, RAII-scoped fault in the throwaway database: `apply_sql` breaks something (renames a
+/// table or column aside) and `undo_sql` puts it back. `repair()` is idempotent and noexcept and
+/// the destructor calls it, so a failing REQUIRE between `arm()` and the explicit repair can
+/// never leave the schema broken for a later test sharing the database. Declare it AFTER the
+/// pool owner (it borrows the pool) and BEFORE nothing that outlives the pool.
+class SqlFault {
 public:
-    explicit SessionWipeFault(yuzu::server::pg::PgPool& pool) : pool_(pool) {}
-    SessionWipeFault(const SessionWipeFault&) = delete;
-    SessionWipeFault& operator=(const SessionWipeFault&) = delete;
-    ~SessionWipeFault() noexcept { repair(); }
+    SqlFault(yuzu::server::pg::PgPool& pool, std::string apply_sql, std::string undo_sql)
+        : pool_(pool), apply_(std::move(apply_sql)), undo_(std::move(undo_sql)) {}
+    SqlFault(const SqlFault&) = delete;
+    SqlFault& operator=(const SqlFault&) = delete;
+    ~SqlFault() noexcept { repair(); }
 
     void arm() {
         if (armed_)
             return;
         auto lease = pool_.acquire();
         REQUIRE(lease);
-        yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
-            lease.get(), "ALTER TABLE session_store.sessions RENAME TO sessions_gone",
-            std::vector<std::string>{});
+        yuzu::server::pg::PgResult r =
+            yuzu::server::pg::exec_params(lease.get(), apply_.c_str(), std::vector<std::string>{});
         REQUIRE(r.status() == PGRES_COMMAND_OK);
         armed_ = true;
     }
@@ -227,18 +227,96 @@ public:
             if (!lease)
                 return;
             yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
-                lease.get(), "ALTER TABLE session_store.sessions_gone RENAME TO sessions",
-                std::vector<std::string>{});
+                lease.get(), undo_.c_str(), std::vector<std::string>{});
             if (r.status() != PGRES_COMMAND_OK)
-                std::fprintf(stderr, "SessionWipeFault: repair failed\n");
+                std::fprintf(stderr, "SqlFault: repair failed: %s\n", undo_.c_str());
         } catch (...) {
-            std::fprintf(stderr, "SessionWipeFault: repair threw\n");
+            std::fprintf(stderr, "SqlFault: repair threw: %s\n", undo_.c_str());
         }
     }
 
 private:
     yuzu::server::pg::PgPool& pool_;
+    std::string apply_;
+    std::string undo_;
     bool armed_{false};
+};
+
+/// The durable `session_store.sessions` table moved aside: `AuthManager::wipe_user_sessions_durable`'s
+/// DELETE genuinely fails while every other store keeps working (needs a SessionStore wired).
+class SessionWipeFault : public SqlFault {
+public:
+    explicit SessionWipeFault(yuzu::server::pg::PgPool& pool)
+        : SqlFault(pool, "ALTER TABLE session_store.sessions RENAME TO sessions_gone",
+                   "ALTER TABLE session_store.sessions_gone RENAME TO sessions") {}
+};
+
+/// `rbac_store.principal_roles` moved aside: every RbacStore grant read fails (the SCIM
+/// pre-provisioning Administrator-grant read answers "could not confirm").
+class GrantReadFault : public SqlFault {
+public:
+    explicit GrantReadFault(yuzu::server::pg::PgPool& pool)
+        : SqlFault(pool, "ALTER TABLE rbac_store.principal_roles RENAME TO principal_roles_gone",
+                   "ALTER TABLE rbac_store.principal_roles_gone RENAME TO principal_roles") {}
+};
+
+/// The `auth.users.role` column moved aside: a read of a user's role fails while the other
+/// columns (provisioning_source, is_active) still answer.
+class RoleColumnFault : public SqlFault {
+public:
+    explicit RoleColumnFault(yuzu::server::pg::PgPool& pool)
+        : SqlFault(pool, "ALTER TABLE auth.users RENAME COLUMN role TO role_gone",
+                   "ALTER TABLE auth.users RENAME COLUMN role_gone TO role") {}
+};
+
+/// A raw connection holding row locks inside an open transaction. Rolls back on destruction so a
+/// failing REQUIRE never leaves a worker blocked for a full lock_timeout. Declare it BEFORE the
+/// `Workers` that run requests against it (so the Workers are destroyed first and release it).
+class HeldLocks {
+public:
+    explicit HeldLocks(yuzu::server::pg::PgPool& pool) : lease_(pool.acquire()) {
+        REQUIRE(lease_);
+        pid_ = PQbackendPID(lease_.get());
+        REQUIRE(pid_ > 0);
+        run("BEGIN");
+    }
+    ~HeldLocks() { rollback(); }
+    HeldLocks(const HeldLocks&) = delete;
+    HeldLocks& operator=(const HeldLocks&) = delete;
+
+    [[nodiscard]] int pid() const noexcept { return pid_; }
+
+    /// The `rbac_enabled` row every guarded lifecycle write locks FOR UPDATE first.
+    void lock_rbac_enabled() {
+        run("SELECT value FROM rbac_store.rbac_meta WHERE key = 'rbac_enabled' FOR UPDATE");
+    }
+    /// The production lock statement, ORDER BY included.
+    void lock_counted_grants() {
+        run("SELECT pr.principal_id FROM rbac_store.principal_roles pr "
+            "JOIN auth.users u ON u.username = pr.principal_id "
+            "WHERE pr.role_name = 'Administrator' AND pr.principal_type = 'user' AND u.is_active "
+            "ORDER BY pr.principal_id FOR UPDATE OF pr");
+    }
+    void run(const std::string& sql) {
+        yuzu::server::pg::PgResult r =
+            yuzu::server::pg::exec_params(lease_.get(), sql.c_str(), std::vector<std::string>{});
+        REQUIRE(r.ok());
+    }
+    void commit() {
+        run("COMMIT");
+        lease_.reset();
+    }
+    void rollback() noexcept {
+        if (lease_) {
+            (void)yuzu::server::pg::exec_params(lease_.get(), "ROLLBACK",
+                                                std::vector<std::string>{});
+            lease_.reset();
+        }
+    }
+
+private:
+    yuzu::server::pg::PgPool::Lease lease_;
+    int pid_{0};
 };
 
 } // namespace yuzu::test
