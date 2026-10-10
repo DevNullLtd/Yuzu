@@ -332,8 +332,8 @@ operator-visible notes:
   refused with an error (the dashboard shows a message, REST answers 400 and
   MCP -32602) instead of reporting no match. The refusal means the filter is not
   supported, not that no agent has the value: a stored value containing a carriage return
-  can reach the server with a line feed when it is picked from the dashboard, and is refused
-  although an agent has it. On the dashboard the message says whether the refused filter is
+  can, depending on how the browser and htmx submit it, reach the server with a line feed
+  when it is picked from the dashboard, and would then be refused although an agent has it. On the dashboard the message says whether the refused filter is
   the one you set or the selected View's saved filter; a View's saved filter with an empty
   value is refused as well, because no stored field is ever empty. At
   most 5,000 facets are kept per response, chosen by most lines first, then

@@ -42,6 +42,8 @@
 
 #include <string>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 using namespace yuzu::server;
 using yuzu::server::pg::PgPool;
@@ -742,6 +744,154 @@ TEST_CASE("/fragments/results: a View equals default with an empty value is refu
     REQUIRE(at);
     CHECK_FALSE(contains(at->body, "data-filter-refused"));
     CHECK(contains(at->body, "Response store not available"));
+}
+
+// View-filter provenance INDEXING (#5623): the refusal names the column of the filter that is
+// actually bad, so view_filter_cols must stay index-aligned with the filters the View added.
+// A definition with several result columns and several `equals` defaults (name, value).
+namespace {
+std::string make_multi_filter_definition(
+    InstructionStore& is, const std::string& name, const std::vector<std::string>& columns,
+    const std::vector<std::pair<std::string, nlohmann::json>>& equals_defaults) {
+    nlohmann::json schema = nlohmann::json::array();
+    for (const auto& c : columns) schema.push_back({{"name", c}, {"type", "string"}});
+    nlohmann::json filters = nlohmann::json::array();
+    for (const auto& [col, val] : equals_defaults)
+        filters.push_back({{"column", col}, {"op", "equals"}, {"value", val}});
+    nlohmann::json tpl = {{"id", "tplmulti"},
+                          {"name", "multi"},
+                          {"columns", nlohmann::json::array({columns.front()})},
+                          {"filters", filters}};
+    InstructionDefinition def;
+    def.name = name;
+    def.version = "1.0.0";
+    def.plugin = "registry";
+    def.action = "list";
+    def.type = "question";
+    def.enabled = true;
+    def.result_schema = schema.dump();
+    def.response_templates_spec = nlohmann::json::array({tpl}).dump();
+    auto created = is.create_definition(def);
+    REQUIRE(created.has_value());
+    return *created;
+}
+} // namespace
+
+TEST_CASE("/fragments/results: a refusal names the View column that is bad, not the first one",
+          "[pg][server][dashboard][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, fragment_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+    const std::vector<std::string> cols{"Name", "Alpha", "Beta", "Gamma"};
+    const nlohmann::json over(std::string(2049, 'v'));
+    const nlohmann::json nul(std::string("a\0b", 3));
+    const nlohmann::json good("ok");
+    const nlohmann::json empty("");
+
+    FragmentResultsHarness h(/*response_store=*/nullptr, &is);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    const std::string base = "/fragments/results?command_id=cmd-multi-1&plugin=registry&";
+    const auto fetch = [&](const std::string& id) {
+        auto res = h.get(base + "definition_id=" + id + "&template_id=tplmulti");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        return res->body;
+    };
+
+    SECTION("a supported first default then a bad second names the SECOND (not [0])") {
+        int n = 0;
+        for (const auto& bad : {over, nul}) {
+            const auto id = make_multi_filter_definition(
+                is, "tpl-multi-second-" + std::to_string(n++), cols,
+                {{"Alpha", good}, {"Beta", bad}});
+            const auto body = fetch(id);
+            CHECK(contains(body, "data-filter-refused=\"true\""));
+            CHECK(contains(body, "The selected View&#39;s saved filter on Beta is not supported"));
+            CHECK_FALSE(contains(body, "saved filter on Alpha"));
+            CHECK_FALSE(contains(body, "Response store not available"));
+        }
+    }
+
+    SECTION("a first default on a column that does not resolve is skipped, the second is named") {
+        const auto id = make_multi_filter_definition(
+            is, "tpl-multi-unknown", cols, {{"NoSuchColumn", good}, {"Beta", over}});
+        const auto body = fetch(id);
+        CHECK(contains(body, "data-filter-refused=\"true\""));
+        CHECK(contains(body, "The selected View&#39;s saved filter on Beta is not supported"));
+        CHECK_FALSE(contains(body, "NoSuchColumn"));
+    }
+
+    SECTION("two bad defaults: the first bad one in the View's order is named") {
+        // Pins observed behaviour: the unsupported-value loop stops at the first bad filter.
+        const auto id = make_multi_filter_definition(is, "tpl-multi-two-bad", cols,
+                                                     {{"Alpha", over}, {"Beta", nul}});
+        const auto body = fetch(id);
+        CHECK(contains(body, "The selected View&#39;s saved filter on Alpha is not supported"));
+        CHECK_FALSE(contains(body, "saved filter on Beta"));
+    }
+
+    SECTION("an empty default is refused before an unsupported one, whatever the order") {
+        // Pins observed behaviour: view_empty_col is checked before the unsupported-value
+        // loop, so the EMPTY default's column is named even when it comes second.
+        const auto id = make_multi_filter_definition(is, "tpl-multi-empty-second", cols,
+                                                     {{"Alpha", over}, {"Beta", empty}});
+        const auto body = fetch(id);
+        CHECK(contains(body, "data-filter-refused=\"true\""));
+        CHECK(contains(body, "The selected View&#39;s saved filter on Beta has no value"));
+        CHECK_FALSE(contains(body, "saved filter on Alpha"));
+        CHECK_FALSE(contains(body, "is not supported"));
+    }
+
+    SECTION("two empty defaults: the first empty one is named") {
+        const auto id = make_multi_filter_definition(is, "tpl-multi-two-empty", cols,
+                                                     {{"Alpha", empty}, {"Beta", empty}});
+        const auto body = fetch(id);
+        CHECK(contains(body, "The selected View&#39;s saved filter on Alpha has no value"));
+        CHECK_FALSE(contains(body, "saved filter on Beta"));
+    }
+}
+
+// An explicit EMPTY f_* value is dropped by parse_filters, so it does not count as an operator
+// filter: a View whose `equals` default is also empty is still refused. A NON-empty explicit
+// filter on the same column replaces the View's defaults and is not refused. The View's column
+// is "Output", the one column the plugin's f_* params can address.
+TEST_CASE("/fragments/results: an explicit empty f_ value does not bypass an empty View default, "
+          "a non-empty one does",
+          "[pg][server][dashboard][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, fragment_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+    const auto id = make_multi_filter_definition(is, "tpl-multi-output-empty",
+                                                 {"Name", "Output"}, {{"Output", nlohmann::json("")}});
+
+    FragmentResultsHarness h(/*response_store=*/nullptr, &is);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    const std::string base = "/fragments/results?command_id=cmd-multi-2&plugin=registry&definition_id=" +
+                             id + "&template_id=tplmulti";
+
+    auto empty = h.get(base + "&f_output=");
+    REQUIRE(empty);
+    CHECK(empty->status == 200);
+    CHECK(contains(empty->body, "data-filter-refused=\"true\""));
+    CHECK(contains(empty->body, "The selected View&#39;s saved filter on Output has no value"));
+    CHECK(contains(empty->body, "set any filter of your own"));
+    CHECK_FALSE(contains(empty->body, "Response store not available"));
+
+    auto explicit_ok = h.get(base + "&f_output=ok");
+    REQUIRE(explicit_ok);
+    CHECK(explicit_ok->status == 200);
+    CHECK_FALSE(contains(explicit_ok->body, "data-filter-refused"));
+    CHECK(contains(explicit_ok->body, "Response store not available")); // reached render_results
 }
 
 // ── #4644 Gate 7 (row 6a): the unfiltered read is byte-bounded and a cut is visible ──

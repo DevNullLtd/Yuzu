@@ -93,13 +93,15 @@ inline constexpr std::size_t kMaxFacetValueBytes = 2048;
 ///     result_parsing.hpp) before any value is taken, so no stored value can contain one.
 /// A CR is deliberately NOT refused: a CR inside a value IS storable (only ONE trailing CR
 /// of a line, i.e. of its LAST column, is stripped), and this predicate judges one value at
-/// a time, so it cannot know the value's column position. (A stored CR does not make the
-/// dashboard path safe: a dropdown option / hidden input carrying it reaches the server with
-/// an LF, which this predicate then refuses although an agent has the value; see the
-/// refusal message builder below.) For the same reason the check is
-/// column-blind: e.g. a value ending in a backslash in a non-last column is read back as an
-/// escaped pipe on ingest and cannot be stored, so a reader gives an exact 0 for it. That is
-/// a known limit of a per-value predicate, not something it can refuse.
+/// a time, so it cannot know the value's column position. (A stored CR does not guarantee
+/// the dashboard path will match it: a dropdown option / hidden input carrying it may reach
+/// the server with an LF, which this predicate then refuses although an agent has the value;
+/// see the refusal message builder below.) For the same reason the check is
+/// column-blind: e.g. a value ending in a backslash in a non-last column IS stored, but the
+/// pipe decoder merges it into the next field (its last backslash escapes the delimiter), so
+/// the stored facet is not the value the operator typed and a reader gives an exact 0 for it
+/// (#5635: the pipe-row grammar cannot represent a trailing backslash in a non-last column).
+/// That is a known limit of a per-value predicate, not something it can refuse.
 /// The length is compared to the same bound ingest applies (to the sanitized form, which
 /// for a value passing the other two tests is the raw form). Every reader that builds a
 /// `FacetFilter` from caller input refuses the request when this is true, and never drops
@@ -121,9 +123,10 @@ inline constexpr std::size_t kMaxFacetValueBytes = 2048;
 
 /// Caller-facing text for the refusal above. Names every cause, never echoes the value, and
 /// deliberately does NOT claim that no agent has the value: the predicate refuses a line feed
-/// but accepts a CR, and a stored value holding a CR reaches the server with an LF when it is
-/// picked from the dashboard dropdown (the HTML parser and form submission normalise
-/// newlines), so it is refused here although an agent has it. Sentence case with no final
+/// but accepts a CR, and a stored value holding a CR may reach the server with an LF when it
+/// is picked from the dashboard dropdown (the HTML parser and form submission normalise
+/// newlines; reasoned from the HTML spec, not browser-verified), in which case it is refused
+/// here although an agent has it. Sentence case with no final
 /// period, so the dashboard can join message + ". " + <its own provenance sentence>; the REST
 /// and MCP envelopes carry the message and the remediation in their own fields.
 [[nodiscard]] inline std::string facet_filter_value_refusal_message() {

@@ -704,15 +704,15 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // or invalid-UTF-8 value (/fragments/create-group-form refuses it first and
                  // renders no form). A stored value holding a mid-value CR is the exception:
                  // the CR is stored, but it can reach the server as an LF, so it is refused
-                 // although an agent has it. The
-                 // mechanism is newline normalisation, not the POST: the HTML parser turns a
-                 // raw CR in markup text (so in an option or hidden-input attribute value)
-                 // into LF at input-stream preprocessing, and form submission normalises
-                 // newlines in submitted values too. That affects the GET dropdown path
-                 // (option value, then /fragments/create-group-form's hidden input) as much
-                 // as this POST. Reasoned from the HTML parsing and form-submission steps of
-                 // the HTML spec; NOT verified in a real browser here (whether a CR survives
-                 // depends on how the markup was escaped and how htmx builds the request).
+                 // although an agent has it. The mechanism is newline normalisation, not the
+                 // POST: the HTML parser turns a raw CR in markup text (so in an option or
+                 // hidden-input attribute value) into LF at input-stream preprocessing, and
+                 // form submission normalises newlines in submitted values too. That affects
+                 // the GET dropdown path (option value, then /fragments/create-group-form's
+                 // hidden input) as much as this POST. Reasoned from the HTML parsing and
+                 // form-submission steps of the HTML spec; NOT verified in a real browser
+                 // here (whether a CR survives depends on how the markup was escaped and
+                 // how htmx builds the request).
                  // Before #5623 the POST answered 422 "no agents match" (htmx drops both
                  // bodies). 400 is the honest status for the direct/automation caller (see
                  // NOTE above).
