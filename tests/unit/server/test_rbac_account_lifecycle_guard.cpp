@@ -27,9 +27,11 @@
 #include "pg/pg_raii.hpp"
 #include "rbac_store.hpp"
 #include "session_store.hpp"
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 #include "test_auth_db_pg_helper.hpp"
+#include "test_auth_db_rbac_pg_template.hpp" // clone already carries the rbac_store schema
 #include "test_principal_lock_gate.hpp" // Workers, SessionWipeFault, kLockWait*
 #include "../test_helpers.hpp"
 
@@ -57,7 +59,7 @@ namespace {
 
 // One AuthDbPg + one RbacStore on its pool: the production composition (ONE pg_pool_).
 #define LIFECYCLE_FIXTURE(store_var, auth_var)                                                    \
-    yuzu::test::AuthDbPg auth_var;                                                                \
+    yuzu::test::AuthDbPg auth_var{0, false, &yuzu::test::auth_db_rbac_pg_template};               \
     RbacStore store_var{auth_var.pool()};                                                         \
     REQUIRE(store_var.is_open())
 
@@ -160,52 +162,7 @@ std::vector<int> wait_for_blocked_backends(const std::string& dsn, int own_pid, 
     return pids;
 }
 
-// A raw connection holding row locks inside an open transaction. Rolls back on destruction so a
-// failing REQUIRE never leaves a worker blocked for a full lock_timeout.
-class HeldLocks {
-public:
-    explicit HeldLocks(PgPool& pool) : lease_(pool.acquire()) {
-        REQUIRE(lease_);
-        pid_ = PQbackendPID(lease_.get());
-        REQUIRE(pid_ > 0);
-        run("BEGIN");
-    }
-    ~HeldLocks() { rollback(); }
-    HeldLocks(const HeldLocks&) = delete;
-    HeldLocks& operator=(const HeldLocks&) = delete;
-
-    [[nodiscard]] int pid() const noexcept { return pid_; }
-
-    void lock_rbac_enabled() {
-        run("SELECT value FROM rbac_store.rbac_meta WHERE key = 'rbac_enabled' FOR UPDATE");
-    }
-    // The production lock statement, ORDER BY included.
-    void lock_counted_grants() {
-        run("SELECT pr.principal_id FROM rbac_store.principal_roles pr "
-            "JOIN auth.users u ON u.username = pr.principal_id "
-            "WHERE pr.role_name = 'Administrator' AND pr.principal_type = 'user' AND u.is_active "
-            "ORDER BY pr.principal_id FOR UPDATE OF pr");
-    }
-    void run(const std::string& sql) {
-        pg::PgResult r = pg::exec_params(lease_.get(), sql.c_str(), std::vector<std::string>{});
-        REQUIRE(r.ok());
-    }
-    void commit() {
-        run("COMMIT");
-        lease_.reset();
-    }
-    void rollback() noexcept {
-        if (lease_) {
-            (void)pg::exec_params(lease_.get(), "ROLLBACK", std::vector<std::string>{});
-            lease_.reset();
-        }
-    }
-
-private:
-    PgPool::Lease lease_;
-    int pid_{0};
-};
-
+using yuzu::test::HeldLocks;
 using yuzu::test::SessionWipeFault;
 using yuzu::test::Workers;
 
@@ -733,10 +690,11 @@ using yuzu::server::auth::UpdateRoleOutcome;
 // The production composition: AuthDB + RbacStore + SessionStore on ONE pool, wired into an
 // AuthManager. `wire_rbac = false` reproduces a server that forgot the injection.
 struct ManagerFx {
-    yuzu::test::AuthDbPg db;
+    yuzu::test::AuthDbPg db{0, false, &yuzu::test::auth_db_rbac_pg_template};
     RbacStore rbac;
     yuzu::server::SessionStore sessions{db.pool()};
     SessionWipeFault wipe_fault{db.pool()}; // RAII: repaired even when a REQUIRE unwinds
+    yuzu::MetricsRegistry metrics;
     AuthManager mgr;
 
     // `lock_timeout` is the lifecycle guard's lock bound: the production 2000 ms by default, a
@@ -748,10 +706,17 @@ struct ManagerFx {
         REQUIRE(sessions.is_open());
         mgr.set_auth_db(db.get());
         mgr.set_session_store(&sessions);
+        mgr.set_metrics_registry(&metrics);
         if (wire_rbac)
             mgr.set_rbac_store(&rbac);
     }
+    // `yuzu_server_rbac_lifecycle_store_failure_total{op}` as the lifecycle wrappers count it.
+    double store_failures(const char* op) {
+        return metrics.counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}})
+            .value();
+    }
     ~ManagerFx() {
+        mgr.set_metrics_registry(nullptr);
         mgr.set_rbac_store(nullptr);
         mgr.set_session_store(nullptr);
         mgr.set_auth_db(nullptr);
@@ -961,3 +926,128 @@ TEST_CASE("AuthManager lifecycle guard: UpdatedSessionWipeFailed says the role I
     CHECK(f.durable_sessions_of("uw_user") == 0);
     CHECK_FALSE(f.mgr.validate_session(token).has_value());
 }
+
+TEST_CASE("lifecycle guard: a name is_valid_username rejects is NotFound / not a member, before "
+          "any statement runs (embedded NUL, over-long, empty, forbidden characters)",
+          "[pg][auth_db][lifecycle_guard]") {
+    LIFECYCLE_FIXTURE(store, auth_db);
+    build_world(auth_db, store, /*rbac_on=*/true, {{"iv_admin", Role::admin, true}});
+
+    std::string with_nul = "iv_admin";
+    with_nul.push_back('\0');
+    with_nul += "x"; // a libpq parameter would be cut at the NUL, aliasing the real "iv_admin"
+    const std::vector<std::string> bad = {with_nul, std::string(65, 'a'), "", "iv admin",
+                                          "iv_admin;--", "oidc:iss#sub"};
+    for (const auto& name : bad) {
+        CAPTURE(name.size());
+        CHECK(store.deactivate_account(name).kind == DKind::kNotFound);
+        CHECK(store.set_local_role(name, Role::user).kind == RKind::kNotFound);
+        CHECK(store.set_local_role(name, Role::admin).kind == RKind::kNotFound);
+        const auto strand = store.would_strand_last_administrator(name);
+        CHECK(strand.ok);
+        CHECK_FALSE(strand.would_strand);
+    }
+    // The real account was never touched by any of them.
+    CHECK(account_active(auth_db.pool(), "iv_admin"));
+    CHECK(role_column(auth_db.pool(), "iv_admin") == "admin");
+    CHECK(counted_grant_holders(auth_db.pool()) == std::vector<std::string>{"iv_admin"});
+}
+
+TEST_CASE("AuthManager lifecycle guard: a StoreFailure from the guarded removal evicts the "
+          "TARGET's sessions (fail toward re-authentication), still answers StoreFailure, and is "
+          "counted",
+          "[pg][auth_db][lifecycle_guard]") {
+    ManagerFx f(/*wire_rbac=*/true, std::chrono::milliseconds(300));
+    seed(f.db, "ev_a", Role::admin);
+    seed(f.db, "ev_b", Role::admin);
+    seed(f.db, "ev_bystander", Role::user);
+    const auto target = f.mgr.create_local_session_for_test("ev_a", Role::admin, false);
+    const auto bystander = f.mgr.create_local_session_for_test("ev_bystander", Role::user, false);
+    REQUIRE_FALSE(target.empty());
+    REQUIRE_FALSE(bystander.empty());
+    REQUIRE(f.durable_sessions_of("ev_a") == 1);
+
+    HeldLocks hold(f.db.pool());
+    hold.lock_rbac_enabled();
+    RemoveUserOutcome out = RemoveUserOutcome::Removed;
+    Workers workers([&] { hold.rollback(); });
+    workers.add([&] { out = f.mgr.remove_user_checked("ev_a"); });
+    workers.join_all(); // the guarded write waits out the (shortened) lock_timeout and fails
+
+    CHECK(out == RemoveUserOutcome::StoreFailure);
+    CHECK(f.store_failures("deactivate") == 1.0);
+    CHECK(account_active(f.db.pool(), "ev_a")); // nothing committed
+    // The target's possibly-committed removal is not served stale: its session is gone in memory
+    // AND durably; a bystander's is untouched.
+    CHECK_FALSE(f.mgr.validate_session(target).has_value());
+    CHECK(f.durable_sessions_of("ev_a") == 0);
+    CHECK(f.mgr.validate_session(bystander).has_value());
+    CHECK(f.durable_sessions_of("ev_bystander") == 1);
+}
+
+TEST_CASE("AuthManager lifecycle guard: a StoreFailure from the guarded role write evicts the "
+          "TARGET's sessions, leaves the stored role alone, and is counted",
+          "[pg][auth_db][lifecycle_guard]") {
+    ManagerFx f(/*wire_rbac=*/true, std::chrono::milliseconds(300));
+    seed(f.db, "er_a", Role::admin);
+    seed(f.db, "er_b", Role::admin);
+    const auto target = f.mgr.create_local_session_for_test("er_b", Role::admin, false);
+    REQUIRE_FALSE(target.empty());
+
+    HeldLocks hold(f.db.pool());
+    hold.lock_rbac_enabled();
+    UpdateRoleOutcome out = UpdateRoleOutcome::Updated;
+    Workers workers([&] { hold.rollback(); });
+    workers.add([&] { out = f.mgr.update_role_checked("er_b", Role::user); });
+    workers.join_all();
+
+    CHECK(out == UpdateRoleOutcome::StoreFailure);
+    CHECK(f.store_failures("set_role") == 1.0);
+    CHECK(role_column(f.db.pool(), "er_b") == "admin"); // nothing committed
+    CHECK_FALSE(f.mgr.validate_session(target).has_value());
+    CHECK(f.durable_sessions_of("er_b") == 0);
+}
+
+TEST_CASE("AuthManager lifecycle guard: the unwired fail-closed arm counts a store failure but "
+          "evicts nothing (nothing was attempted)",
+          "[pg][auth_db][lifecycle_guard]") {
+    ManagerFx f(/*wire_rbac=*/false);
+    seed(f.db, "uw2_user", Role::user);
+    const auto token = f.mgr.create_local_session_for_test("uw2_user", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+
+    CHECK(f.mgr.remove_user_checked("uw2_user") == RemoveUserOutcome::StoreFailure);
+    CHECK(f.mgr.update_role_checked("uw2_user", Role::admin) == UpdateRoleOutcome::StoreFailure);
+    CHECK(f.store_failures("deactivate") == 1.0);
+    CHECK(f.store_failures("set_role") == 1.0);
+    CHECK(f.mgr.validate_session(token).has_value()); // the session survives: no write was tried
+}
+
+TEST_CASE("AuthManager lifecycle guard: the advisory read and the grant read count their own "
+          "store failures",
+          "[pg][auth_db][lifecycle_guard]") {
+    ManagerFx f;
+    seed(f.db, "sf_user", Role::user);
+    // Healthy first: both answer and neither counts.
+    REQUIRE(f.mgr.would_strand_last_administrator("sf_user").has_value());
+    REQUIRE(f.mgr.holds_administrator_grant("sf_user").has_value());
+    CHECK(f.store_failures("would_strand") == 0.0);
+    CHECK(f.store_failures("grant_read") == 0.0);
+    {
+        yuzu::test::SqlFault meta(f.db.pool(),
+                                  "ALTER TABLE rbac_store.rbac_meta RENAME TO rbac_meta_gone",
+                                  "ALTER TABLE rbac_store.rbac_meta_gone RENAME TO rbac_meta");
+        meta.arm();
+        CHECK_FALSE(f.mgr.would_strand_last_administrator("sf_user").has_value());
+        CHECK(f.store_failures("would_strand") == 1.0);
+    }
+    {
+        yuzu::test::GrantReadFault grants(f.db.pool());
+        grants.arm();
+        CHECK_FALSE(f.mgr.holds_administrator_grant("sf_user").has_value());
+        CHECK(f.store_failures("grant_read") == 1.0);
+    }
+    CHECK(f.store_failures("deactivate") == 0.0);
+    CHECK(f.store_failures("set_role") == 0.0);
+}
+

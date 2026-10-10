@@ -507,8 +507,9 @@ public:
     /// unassigns racing to remove the last two Administrator grants serialize
     /// instead of both observing "1 remaining" and both committing. The
     /// guard does NOT cover an `auth.users` row created concurrently for a
-    /// pre-provisioned grant, nor deactivation of a surviving Administrator
-    /// between the recount and COMMIT (#4966). Every other
+    /// pre-provisioned grant. (Deactivating a surviving Administrator is guarded
+    /// separately by `deactivate_account`, which takes the same grant-row locks in the
+    /// same order.) Every other
     /// role/principal_type combination — including both existing
     /// engine-only callers (the engine-principal unassign in `rest_api_v1.cpp`
     /// and `mcp_server.cpp`) — is unaffected: a pure idempotent DELETE, exactly as

@@ -549,10 +549,17 @@ enum class RemoveUserOutcome : std::uint8_t {
     StoreFailure,             ///< the guarded write did not complete, OR the guard is not wired
                               ///< while an AuthDB is (fail closed, never the unguarded path), OR
                               ///< a retry's session wipe failed on an already-inactive row.
-                              ///< The row may or may not be deactivated (a lost COMMIT ack):
-                              ///< a retry converges
+                              ///< The row may or may not be deactivated (a lost COMMIT ack). On
+                              ///< a failure of the guarded write itself the target's `users_`
+                              ///< entry and sessions are evicted anyway (fail toward
+                              ///< re-authentication). A repeated call (the dashboard DELETE)
+                              ///< can complete it; an IdP retry of a SCIM request is NOT
+                              ///< promised to (#5214)
     RemovedSessionWipeFailed, ///< the account IS deactivated (committed) but the durable session
-                              ///< wipe failed, so a live session may survive: retry the removal
+                              ///< wipe failed, so a live session may survive: a repeated
+                              ///< `remove_user_checked` re-runs the wipe (the dashboard DELETE
+                              ///< offers that); a SCIM retry is NOT promised to repeat it
+                              ///< (#5214)
 };
 
 /// Outcome of `AuthManager::update_role_checked` (#4966), the demotion twin of `RemoveUserOutcome`.
@@ -949,7 +956,8 @@ public:
     /// `nullopt` = could not be answered (RbacStore not wired or a store fault): callers refuse.
     [[nodiscard]] std::optional<bool> holds_administrator_grant(const std::string& username) const;
 
-    /// Bool wrapper over `remove_user_checked`: true iff `Removed`. Every refusal, absence and
+    /// Bool wrapper over `remove_user_checked` (GUARDED: it delegates). It has no production
+    /// caller (production uses the checked form); it exists for tests. True iff `Removed`. Every refusal, absence and
     /// failure (including `RemovedSessionWipeFailed`, which was `false` before this wrapper
     /// existed) is false; a caller that must tell them apart uses the checked form.
     bool remove_user(const std::string& username);
@@ -974,8 +982,9 @@ public:
     /// already held the requested role, so a retry converges after a failed wipe.
     [[nodiscard]] UpdateRoleOutcome update_role_checked(const std::string& username, Role new_role);
 
-    /// Bool wrapper over `update_role_checked`: true iff `Updated`. Returns false if user not
-    /// found, refused, or failed.
+    /// Bool wrapper over `update_role_checked` (GUARDED: it delegates). It has no production
+    /// caller (production uses the checked form); it exists for tests. True iff `Updated`.
+    /// Returns false if user not found, refused, or failed.
     bool update_role(const std::string& username, Role new_role);
 
     /// Look up a user's legacy role. Returns nullopt if user not found (or,
@@ -1520,6 +1529,17 @@ private:
     /// idempotent, so an operator retry after a false return is safe. No-op
     /// (true) without a store. Caller must NOT hold `mu_`.
     [[nodiscard]] bool wipe_user_sessions_durable(const std::string& username);
+
+    /// #4966: after a guarded lifecycle write answered StoreFailure (it MAY have committed: a
+    /// lost COMMIT ack), evict the TARGET's `users_` entry and in-memory sessions and attempt the
+    /// durable wipe, so a possibly-committed removal or demotion is not served stale. Fails
+    /// toward re-authentication; the caller still answers StoreFailure. Caller must NOT hold
+    /// `mu_`.
+    void evict_target_after_indeterminate_write(const std::string& username);
+
+    /// #4966: `yuzu_server_rbac_lifecycle_store_failure_total{op}` (deactivate | set_role |
+    /// would_strand | grant_read). No-op without a MetricsRegistry.
+    void note_lifecycle_store_failure(const char* op) const;
 
     /// Poll the durable write-generation on an interval; when it has advanced
     /// (a create/invalidate/elevate/mfa mutation landed, possibly on another

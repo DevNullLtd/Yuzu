@@ -782,6 +782,12 @@ RbacAdminAuthorityOwner::provision_first_admin(const std::string& username,
 // target itself.
 AccountDeactivationResult
 RbacAdminAuthorityOwner::deactivate_account(const std::string& username) const {
+    // A name `is_valid_username` rejects can never be a stored account (every writer validates),
+    // so it is `kNotFound` BEFORE any statement runs: an embedded NUL would truncate at the libpq
+    // parameter boundary and an over-long name is not a row. Same gate `provision_first_admin`
+    // applies.
+    if (!is_valid_username(username))
+        return {AccountDeactivationResult::Kind::kNotFound, {}};
     bool refused = false;
     bool removed = false;
     std::string err;
@@ -869,6 +875,8 @@ RbacAdminAuthorityOwner::deactivate_account(const std::string& username) const {
 LocalRoleChangeResult RbacAdminAuthorityOwner::set_local_role(const std::string& username,
                                                               auth::Role role) const {
     using Kind = LocalRoleChangeResult::Kind;
+    if (!is_valid_username(username)) // see deactivate_account: not a possible account
+        return {Kind::kNotFound, {}};
     const bool make_admin = (role == auth::Role::admin);
     Kind kind = Kind::kStoreFailure;
     bool refused = false;
@@ -955,6 +963,12 @@ LocalRoleChangeResult RbacAdminAuthorityOwner::set_local_role(const std::string&
 WouldStrandResult
 RbacAdminAuthorityOwner::would_strand_last_administrator(const std::string& username) const {
     WouldStrandResult out;
+    if (!is_valid_username(username)) {
+        // Not a possible account, so not a member of any protected population: a definite "no".
+        out.ok = true;
+        out.would_strand = false;
+        return out;
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         const std::string pool_err = pool_.last_error();

@@ -1995,11 +1995,45 @@ public:
                           "Settings and SCIM), by transport. A sustained non-zero rate is an "
                           "operator or IdP repeatedly trying to remove the fleet's last "
                           "administrator, not a store fault - compare against "
-                          "yuzu_server_rbac_read_degrade_total to rule that out.",
+                          "yuzu_server_rbac_read_degrade_total to rule that out. A SCIM "
+                          "compensation undo the guard refused is NOT counted here (it is not "
+                          "an IdP removal attempt); see yuzu_scim_compensation_failed_total.",
                           "counter");
         for (const auto transport : {"rest", "mcp", "dashboard", "scim"})
             metrics_.counter("yuzu_server_rbac_last_admin_guard_refused_total",
                              {{"transport", transport}});
+        // #4966: a store fault inside the account-lifecycle guard (a lock wait that expired, a
+        // lost connection, an unwired guard), by the guarded operation. NOT a refusal: the
+        // request was neither allowed nor judged. Counted in AuthManager, so the dashboard, SCIM
+        // and every other caller through it share one series. No alert rule ships with it yet
+        // (a later change owns the alerts).
+        metrics_.describe("yuzu_server_rbac_lifecycle_store_failure_total",
+                          "Store faults inside the account-lifecycle last-Administrator guard, "
+                          "by operation (deactivate: account removal; set_role: role write; "
+                          "would_strand: the advisory pre-check; grant_read: the SCIM "
+                          "pre-provisioning Administrator-grant read). A sustained non-zero "
+                          "rate means deprovisioning or role changes are being answered with a "
+                          "retryable error rather than judged: look at yuzu_pg_pool_waiters and "
+                          "yuzu_pg_acquire_wait_seconds, and for a stuck rbac_enabled row lock "
+                          "holder.",
+                          "counter");
+        for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read"})
+            metrics_.counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}});
+        // #4966: a SCIM same-request compensation (the guarded undo of a just-created or
+        // just-revived account) that did NOT complete. Written beside the
+        // scim.user.compensation_failed audit row and critical event.
+        metrics_.describe("yuzu_scim_compensation_failed_total",
+                          "SCIM provisioning compensations (the guarded undo of an account "
+                          "created or revived earlier in the same request) that did not "
+                          "complete, by outcome (guard_refused_last_administrator: the account "
+                          "is left active; deactivated_but_session_wipe_failed: deactivated, a "
+                          "session may survive; store_failure: state indeterminate; other). "
+                          "Every increment needs operator attention: check the account.",
+                          "counter");
+        for (const auto outcome : {"guard_refused_last_administrator",
+                                   "deactivated_but_session_wipe_failed", "store_failure",
+                                   "other"})
+            metrics_.counter("yuzu_scim_compensation_failed_total", {{"outcome", outcome}});
         // #2703 Gate 7 merge-slice item 1 commit C. Neither metric duplicates the
         // existing shared-pool signals (yuzu_pg_acquire_wait_seconds,
         // yuzu_pg_pool_in_use — both already cover every RbacStore acquire, since
@@ -6627,7 +6661,11 @@ public:
             auth::AuthManager::lifecycle_guard_unwired(auth_mgr_.auth_db_ptr() != nullptr,
                                                        auth_mgr_.has_rbac_store())) {
             spdlog::error("[PG] Refusing to start: AuthDB is configured but the RbacStore "
-                          "last-Administrator guard is not wired to AuthManager (#4966)");
+                          "last-Administrator guard is not wired to AuthManager (#4966). The "
+                          "RbacStore failed to open or the wiring is missing: see the RbacStore "
+                          "error logged above this line (a migration or database fault); the "
+                          "guard cannot run without it and no account can be removed or "
+                          "re-roled while it is absent");
             startup_failed_ = true;
         }
 

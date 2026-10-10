@@ -212,6 +212,10 @@ public:
     /// Not closed (disclosed): a grant INSERTed for the target after step 3 is not seen by this
     /// transaction; it lands on an account that is inactive once this commits, which
     /// `kAuthenticatableAdminGrantsFrom` does not count.
+    /// A `username` that `is_valid_username` rejects (empty, over 64 bytes, an embedded NUL or any
+    /// other character outside `[A-Za-z0-9._-]`) can never be a stored account: it answers
+    /// `kNotFound` before any statement runs, as do `set_local_role` and (as "not a member",
+    /// `ok` with `would_strand` false) `would_strand_last_administrator` below.
     [[nodiscard]] AccountDeactivationResult deactivate_account(const std::string& username) const;
 
     /// #4966: the guarded role-column write behind `AuthManager::update_role_checked`. ONE

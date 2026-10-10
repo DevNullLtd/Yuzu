@@ -36,7 +36,10 @@
 #include "rate_limiter.hpp"
 #include "refusal_log_throttle.hpp"
 #include "saml_principal.hpp"
+#include "session_store.hpp"
+#include "test_auth_db_rbac_pg_template.hpp" // clone already carries the rbac_store schema
 #include "test_loopback_http.hpp"
+#include "../test_log_capture.hpp"
 #include "test_principal_lock_gate.hpp"
 #include "test_route_sink.hpp"
 #include "web_utils.hpp"
@@ -80,7 +83,7 @@ namespace {
 /// TestRouteSink. PG-gated: SKIPs when YUZU_TEST_POSTGRES_DSN is unset,
 /// FAILs when set but broken (via yuzu::test::AuthDbPg).
 struct Fixture {
-    yuzu::test::AuthDbPg auth_db;
+    yuzu::test::AuthDbPg auth_db{0, false, &yuzu::test::auth_db_rbac_pg_template};
     // #4966: the last-Administrator guard AuthManager::remove_user/update_role now require (fail
     // closed without it), built on the same pool: the production composition.
     std::unique_ptr<yuzu::server::RbacStore> rbac_guard;
@@ -110,6 +113,12 @@ struct Fixture {
     // directly, mirroring ScimIntegrationServer's `metrics` member below.
     yuzu::MetricsRegistry metrics;
     const std::string token{"unit-test-scim-bearer-token-0123456789"};
+    // #4966: a durable SessionStore, wired only on request (`use_session_store()`), so a case can
+    // make the post-commit durable session wipe genuinely fail (`wipe_fault.arm()`). RAII: the
+    // renamed table is restored even when a REQUIRE unwinds. Declared after `auth_db` (they
+    // borrow its pool) and detached from `auth_mgr` in the destructor.
+    std::unique_ptr<yuzu::server::SessionStore> session_store;
+    yuzu::test::SessionWipeFault wipe_fault{auth_db.pool()};
 
     /// `broken_audit=true` points AuditStore at an unroutable pool so every
     /// `AuditStore::log()` call returns false thereafter — used to exercise
@@ -118,9 +127,16 @@ struct Fixture {
     /// `scim_admin_group` mirrors `Config::scim_admin_group` (#2021
     /// Groups->role) — empty (the default) means no SCIM group ever
     /// promotes to admin.
-    explicit Fixture(bool broken_audit = false, std::string scim_admin_group = {}) {
+    ///
+    /// `lifecycle_lock_timeout` is the account-lifecycle guard's lock bound: the production 2000 ms
+    /// by default, a short value for a case that needs a lock wait to EXPIRE (a StoreFailure from
+    /// the guarded write) without paying two seconds.
+    explicit Fixture(bool broken_audit = false, std::string scim_admin_group = {},
+                     std::chrono::milliseconds lifecycle_lock_timeout =
+                         yuzu::server::kDefaultLifecycleLockTimeout) {
         auth_mgr.set_auth_db(auth_db.get());
-        rbac_guard = std::make_unique<yuzu::server::RbacStore>(auth_db.pool());
+        rbac_guard = std::make_unique<yuzu::server::RbacStore>(auth_db.pool(),
+                                                               lifecycle_lock_timeout);
         REQUIRE(rbac_guard->is_open());
         auth_mgr.set_rbac_store(rbac_guard.get());
         // A second active admin: cases that demote/remove an admin test the write path, not the
@@ -155,11 +171,21 @@ struct Fixture {
     }
 
     ~Fixture() {
+        wipe_fault.repair();
+        auth_mgr.set_session_store(nullptr);
+        session_store.reset();
         routes.reset();
         audit_store.reset();
         analytics_store.reset();
         token_store.reset();
         scim_store.reset();
+    }
+
+    /// Wire a real durable SessionStore so the post-commit session wipe is a real DELETE.
+    void use_session_store() {
+        session_store = std::make_unique<yuzu::server::SessionStore>(auth_db.pool());
+        REQUIRE(session_store->is_open());
+        auth_mgr.set_session_store(session_store.get());
     }
 
     std::unordered_map<std::string, std::string> auth_header() const {
@@ -2583,7 +2609,7 @@ struct ScimIntegrationServer {
     // immediately followed by `ts.start();`, so folding AuthDB construction
     // into this struct's own member-init (rather than deferring it inside
     // start(), as the old SQLite AuthDB did) changes nothing observable.
-    yuzu::test::AuthDbPg auth_db;
+    yuzu::test::AuthDbPg auth_db{0, false, &yuzu::test::auth_db_rbac_pg_template};
     // #4966: the last-Administrator guard AuthManager::remove_user/update_role now require (fail
     // closed without it), built on the same pool: the production composition.
     std::unique_ptr<yuzu::server::RbacStore> rbac_guard;
@@ -4530,6 +4556,32 @@ std::vector<AuditEvent> audit_rows(Fixture& f, const std::string& action,
     return *rows;
 }
 
+/// The analytics events of one type (the severity channel the critical escalations use).
+std::vector<AnalyticsEvent> events_of(Fixture& f, const std::string& type) {
+    auto all = f.analytics_store->query_recent(100);
+    REQUIRE(all.has_value());
+    std::vector<AnalyticsEvent> out;
+    for (const auto& e : *all)
+        if (e.event_type == type)
+            out.push_back(e);
+    return out;
+}
+
+/// `yuzu_server_rbac_lifecycle_store_failure_total{op}` and
+/// `yuzu_scim_compensation_failed_total{outcome}` as the SCIM tests observe them.
+double lifecycle_failures(Fixture& f, const char* op) {
+    return f.metrics.counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}})
+        .value();
+}
+double compensation_failed(Fixture& f, const char* outcome) {
+    return f.metrics.counter("yuzu_scim_compensation_failed_total", {{"outcome", outcome}})
+        .value();
+}
+
+json activate_ops() {
+    return json{{"Operations", json::array({{{"op", "replace"}, {"value", {{"active", true}}}}})}};
+}
+
 } // namespace
 
 TEST_CASE("ScimRoutes: deprovisioning the fleet's last Administrator grant holder is refused "
@@ -4570,12 +4622,19 @@ TEST_CASE("ScimRoutes: deprovisioning the fleet's last Administrator grant holde
 
     const auto rows = audit_rows(f, kRefusedAction, id);
     REQUIRE(rows.size() == 1);
-    CHECK(rows[0].result == "failure");
+    CHECK(rows[0].result == "denied"); // vocabulary: a policy refusal, like provenance_denied
     CHECK(rows[0].detail.find("early_refusal=true") != std::string::npos);
     CHECK(rows[0].detail.find("credentials_revoked_before_refusal=false") != std::string::npos);
+    // What the refusal LEFT in place: the person's token is still live and no session was touched.
+    CHECK(rows[0].detail.find("live_api_tokens_slug=1") != std::string::npos);
+    CHECK(rows[0].detail.find("sessions_not_revoked=true") != std::string::npos);
     CHECK(audit_rows(f, "scim.user.deactivated", id).empty());
     CHECK(audit_rows(f, "scim.user.deleted", id).empty());
     CHECK(scim_refused(f) == 1.0);
+    // A terminated person whose account and credentials stay live is escalated, not only a 409.
+    const auto crit = events_of(f, kRefusedAction);
+    REQUIRE(crit.size() == 1);
+    CHECK(crit[0].severity == Severity::kCritical);
 }
 
 TEST_CASE("ScimRoutes: a repeated refusal is audited and counted EVERY time (#4966)",
@@ -4594,6 +4653,7 @@ TEST_CASE("ScimRoutes: a repeated refusal is audited and counted EVERY time (#49
     }
     CHECK(audit_rows(f, kRefusedAction, id).size() == 3);
     CHECK(scim_refused(f) == 3.0);
+    CHECK(events_of(f, kRefusedAction).size() == 3); // the critical event is never throttled
     CHECK(f.auth_mgr.get_user_role("bea").has_value());
 }
 
@@ -4668,8 +4728,14 @@ TEST_CASE("ScimRoutes: a LATE refusal (state changed after the early check) says
     CHECK(rows[0].detail.find("credentials_revoked_before_refusal=true") != std::string::npos);
     CHECK(rows[0].detail.find("api_tokens_revoked=1") != std::string::npos);
     CHECK(rows[0].detail.find("attempted_action=" + audit_action) != std::string::npos);
+    CHECK(rows[0].result == "denied");
+    CHECK(rows[0].detail.find("live_api_tokens_slug=0") != std::string::npos); // revoked
+    CHECK(rows[0].detail.find("identity_links_unchanged=true") != std::string::npos);
     CHECK(audit_rows(f, audit_action, id).empty()); // no success row for a refused termination
     CHECK(scim_refused(f) == 1.0);
+    const auto crit = events_of(f, kRefusedAction); // the LATE refusal is escalated too
+    REQUIRE(crit.size() == 1);
+    CHECK(crit[0].severity == Severity::kCritical);
 }
 
 TEST_CASE("ScimRoutes: POST active:false is a REQUESTED deactivation, guarded and typed 409 "
@@ -4822,7 +4888,11 @@ TEST_CASE("ScimRoutes: a compensation the guard refuses is a 500 that leaves the
     // Not the 409 uniqueness the IdP could act on: the undo did not happen, so a retryable 500.
     CHECK(res->status == 500);
     CHECK(f.auth_mgr.get_user_role("jo").has_value()); // left ACTIVE
-    CHECK(scim_refused(f) == 1.0);
+    // A refused undo is NOT an IdP removal attempt: it has its own counter and does not feed the
+    // refusal counter.
+    CHECK(scim_refused(f) == 0.0);
+    CHECK(compensation_failed(f, "guard_refused_last_administrator") == 1.0);
+    CHECK(compensation_failed(f, "store_failure") == 0.0);
 
     const auto rows = audit_rows(f, "scim.user.compensation_failed", "jo");
     REQUIRE(rows.size() == 1);
@@ -4853,6 +4923,308 @@ TEST_CASE("ScimRoutes: a compensation that SUCCEEDS still answers the original 4
     CHECK(json::parse(res->body)["scimType"] == "uniqueness");
     CHECK_FALSE(f.auth_mgr.get_user_role("lou").has_value()); // undone through the guard
     CHECK(audit_rows(f, "scim.user.compensation_failed", "lou").empty());
+}
+
+TEST_CASE("ScimRoutes: a hostile group displayName is neutralised in the demotion-refusal "
+          "audit detail AND its log line (CWE-117, #4966)",
+          "[pg][scim][routes][lastadmin][groups][logforge]") {
+    // The admin-group name is configuration, so the hostile name can be BOTH the configured admin
+    // group and the group the IdP sends: scim_json.cpp validates a displayName for NUL and a
+    // 256-byte cap only, so CR/LF and a forged "[error]" prefix reach the route.
+    const std::string hostile = "Yuzu-Admins\r\n[error] FORGED user=root";
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/hostile};
+    auto user = json::parse(f.post("/scim/v2/Users", {{"userName", "gus_log"}})->body);
+    const auto user_id = user["id"].get<std::string>();
+    auto group = json::parse(f.post("/scim/v2/Groups", {{"displayName", hostile}})->body);
+    const auto group_id = group["id"].get<std::string>();
+    json add_body{{"Operations",
+                   json::array({{{"op", "add"},
+                                 {"path", "members"},
+                                 {"value", json::array({{{"value", user_id}}})}}})}};
+    REQUIRE(f.patch("/scim/v2/Groups/" + group_id, add_body)->status == 200);
+    REQUIRE(f.auth_mgr.get_user_role("gus_log").value() == auth::Role::admin);
+    REQUIRE(f.auth_mgr.update_role_checked("spare_admin", auth::Role::user) ==
+            auth::UpdateRoleOutcome::Updated); // gus_log is now the ONLY active admin account
+
+    json remove_body{
+        {"Operations",
+         json::array({{{"op", "remove"}, {"path", "members[value eq \"" + user_id + "\"]"}}})}};
+    yuzu::test::LogCapture capture;
+    auto res = f.patch("/scim/v2/Groups/" + group_id, remove_body);
+    capture.stop(); // quiesce before reading the captured text
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(f.auth_mgr.get_user_role("gus_log").value() == auth::Role::admin);
+
+    const std::string neutral = "via_group=\"Yuzu-Admins__[error] FORGED user=root op=group_patch\"";
+    const auto refused = audit_rows(f, kRefusedAction, user_id);
+    REQUIRE(refused.size() == 1);
+    CHECK(refused[0].detail.find('\r') == std::string::npos);
+    CHECK(refused[0].detail.find('\n') == std::string::npos);
+    CHECK(refused[0].detail.find(neutral) != std::string::npos);
+    // The pre-existing role-change rows on the same path embed the same group name: neutralised too.
+    const auto changed = audit_rows(f, "scim.user.role_changed", user_id);
+    REQUIRE_FALSE(changed.empty());
+    for (const auto& r : changed) {
+        CHECK(r.detail.find('\r') == std::string::npos);
+        CHECK(r.detail.find('\n') == std::string::npos);
+    }
+
+    const std::string logs = capture.text();
+    CHECK(logs.find('\r') == std::string::npos);
+    // The forged prefix never starts a physical log line of its own ...
+    CHECK(logs.find("\n[error] FORGED") == std::string::npos);
+    // ... and the neutralised text does appear (on the refusal's own line).
+    CHECK(logs.find(neutral) != std::string::npos);
+    CHECK(logs.find("refused to remove the last protected administrator 'gus_log'") !=
+          std::string::npos);
+}
+
+TEST_CASE("enumerate_principals_for_audit neutralises an IdP-chosen principal string (CWE-117, "
+          "#4966)",
+          "[scim][lastadmin][logforge]") {
+    const std::vector<std::string> principals = {"slug", "oidc:https://iss#su\nb=1,x y"};
+    const auto out = enumerate_principals_for_audit(principals);
+    CHECK(out == " revoked_principals=slug,oidc:https://iss#su_b_1_x_y");
+    CHECK(out.find('\n') == std::string::npos);
+    // The field's own delimiters survive, so the parser still sees exactly two entries.
+    CHECK(std::count(out.begin(), out.end(), ',') == 1);
+}
+
+TEST_CASE("ScimRoutes: a StoreFailure from the guarded deactivation is a retryable 503 with the "
+          "account state stated, credentials revoked, counted (#4966)",
+          "[pg][scim][routes][lastadmin][storefailure]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/{}, std::chrono::milliseconds(300)};
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "sfa"}})->body);
+    const auto id = created["id"].get<std::string>();
+    auto token = f.token_store->create_token("t-sfa", "sfa");
+    REQUIRE(token.has_value());
+
+    std::unique_ptr<httplib::Response> res;
+    std::string audit_action;
+    yuzu::test::HeldLocks hold(f.auth_db.pool());
+    hold.lock_rbac_enabled(); // every guarded lifecycle write queues behind this row
+    yuzu::test::Workers workers([&] { hold.rollback(); });
+    SECTION("PATCH active:false") {
+        audit_action = "scim.user.deactivated";
+        workers.add([&] { res = f.patch("/scim/v2/Users/" + id, deactivate_ops()); });
+    }
+    SECTION("PUT active:false") {
+        audit_action = "scim.user.deactivated";
+        workers.add([&] { res = f.put("/scim/v2/Users/" + id, {{"userName", "sfa"}, {"active", false}}); });
+    }
+    SECTION("DELETE") {
+        audit_action = "scim.user.deleted";
+        workers.add([&] { res = f.del("/scim/v2/Users/" + id); });
+    }
+    SECTION("POST active:false") {
+        audit_action = "scim.user.provisioned";
+        workers.add([&] {
+            res = f.post("/scim/v2/Users", {{"userName", "sfb"}, {"active", false}});
+        });
+    }
+    workers.join_all(); // the guarded write waits out the shortened lock_timeout and fails
+
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    const auto body = json::parse(res->body);
+    CHECK(body["retry_after_ms"] == 2000);
+    CHECK(body["status"] == "503");
+    CHECK(body["detail"].get<std::string>().find("retry") != std::string::npos);
+
+    const bool post_case = audit_action == "scim.user.provisioned";
+    std::string target = id;
+    if (post_case) {
+        auto mapped = f.scim_store->get_by_username("sfb"); // the half-made account's mapping
+        REQUIRE(mapped.has_value());
+        target = mapped->scim_id;
+    }
+    const auto rows = audit_rows(f, audit_action, target);
+    REQUIRE_FALSE(rows.empty());
+    const auto& row = rows.back();
+    CHECK(row.result == "failure");
+    CHECK(row.detail.find("account_state=unknown credentials_revoked=true") != std::string::npos);
+    CHECK(lifecycle_failures(f, "deactivate") == 1.0);
+    CHECK(scim_refused(f) == 0.0); // a store fault is not a refusal
+    if (!post_case) {
+        // Credentials-first: the token IS gone, the account is untouched (nothing committed).
+        CHECK_FALSE(f.token_store->validate_token(*token).has_value());
+        CHECK(f.auth_mgr.get_user_role("sfa").has_value());
+    }
+}
+
+TEST_CASE("ScimRoutes: a failed durable session wipe after the deactivation is a 500 that says "
+          "the account IS deactivated (#4966)",
+          "[pg][scim][routes][lastadmin][wipefailed]") {
+    Fixture f;
+    f.use_session_store();
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "wfa"}})->body);
+    const auto id = created["id"].get<std::string>();
+    f.wipe_fault.arm();
+
+    std::unique_ptr<httplib::Response> res;
+    std::string audit_action;
+    SECTION("PATCH active:false") {
+        audit_action = "scim.user.deactivated";
+        res = f.patch("/scim/v2/Users/" + id, deactivate_ops());
+    }
+    SECTION("PUT active:false") {
+        audit_action = "scim.user.deactivated";
+        res = f.put("/scim/v2/Users/" + id, {{"userName", "wfa"}, {"active", false}});
+    }
+    SECTION("DELETE") {
+        audit_action = "scim.user.deleted";
+        res = f.del("/scim/v2/Users/" + id);
+    }
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    CHECK(res->get_header_value("Retry-After").empty()); // no retry promise: see #5214
+    CHECK_FALSE(f.auth_mgr.get_user_role("wfa").has_value()); // the account IS deactivated
+    const auto rows = audit_rows(f, audit_action, id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].result == "failure");
+    CHECK(rows[0].detail.find("account deactivated; durable session wipe failed") !=
+          std::string::npos);
+    CHECK(lifecycle_failures(f, "deactivate") == 0.0); // a wipe failure is not a guard failure
+}
+
+TEST_CASE("ScimRoutes: a failed durable session wipe on POST active:false is the same 500 "
+          "(#4966)",
+          "[pg][scim][routes][lastadmin][wipefailed]") {
+    Fixture f;
+    f.use_session_store();
+    f.wipe_fault.arm();
+    auto res = f.post("/scim/v2/Users", {{"userName", "wfp"}, {"active", false}});
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    CHECK_FALSE(f.auth_mgr.get_user_role("wfp").has_value());
+}
+
+TEST_CASE("ScimRoutes: a group role recompute STOPS at the first store failure instead of "
+          "paying a lock wait per remaining member (#4966)",
+          "[pg][scim][routes][lastadmin][groups][storefailure]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins",
+              std::chrono::milliseconds(300)};
+    json members = json::array();
+    std::vector<std::string> ids;
+    for (const char* name : {"gm1", "gm2", "gm3"}) {
+        auto u = json::parse(f.post("/scim/v2/Users", {{"userName", name}})->body);
+        ids.push_back(u["id"].get<std::string>());
+        members.push_back({{"value", ids.back()}});
+    }
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        yuzu::test::HeldLocks hold(f.auth_db.pool());
+        hold.lock_rbac_enabled();
+        yuzu::test::Workers workers([&] { hold.rollback(); });
+        workers.add([&] {
+            // All three members would be promoted; every promotion queues behind the held row.
+            res = f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"}, {"members", members}});
+        });
+        workers.join_all();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 201); // the Group op itself succeeded; the role side effect did not
+
+    // ONE member paid the wait and failed; the other two were skipped, not retried.
+    CHECK(lifecycle_failures(f, "set_role") == 1.0);
+    CHECK(f.metrics.counter("yuzu_scim_role_change_failures_total").value() == 1.0);
+    std::size_t failure_rows = 0;
+    for (const auto& id : ids)
+        for (const auto& r : audit_rows(f, "scim.user.role_changed", id))
+            if (r.result == "failure")
+                ++failure_rows;
+    CHECK(failure_rows == 1);
+    // Nothing was promoted; the next group mutation recomputes them.
+    for (const char* name : {"gm1", "gm2", "gm3"})
+        CHECK(f.auth_mgr.get_user_role(name).value() == auth::Role::user);
+}
+
+TEST_CASE("ScimRoutes: provisioning answers a retryable 503 when the Administrator-grant read "
+          "is unavailable, and 500 when a tombstone's role cannot be read (#4966)",
+          "[pg][scim][routes][lastadmin][precheck][storefailure]") {
+    Fixture f;
+    SECTION("grant read unavailable: 503 + Retry-After, nothing created") {
+        yuzu::test::GrantReadFault fault(f.auth_db.pool());
+        fault.arm();
+        auto res = f.post("/scim/v2/Users", {{"userName", "gr1"}});
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "2");
+        CHECK(json::parse(res->body)["retry_after_ms"] == 2000);
+        fault.repair();
+        CHECK_FALSE(f.auth_db->get_provisioning_source("gr1").has_value());
+        CHECK_FALSE(f.scim_store->get_by_username("gr1").has_value());
+        const auto rows = audit_rows(f, "scim.user.provisioned", "gr1");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].detail == "administrator grant check unavailable");
+        CHECK(lifecycle_failures(f, "grant_read") == 1.0);
+    }
+    SECTION("tombstone role unreadable: 500, never revived") {
+        auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "tr1"}})->body);
+        REQUIRE(f.del("/scim/v2/Users/" + created["id"].get<std::string>())->status == 204);
+        yuzu::test::RoleColumnFault fault(f.auth_db.pool());
+        fault.arm();
+        auto res = f.post("/scim/v2/Users", {{"userName", "tr1"}});
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        fault.repair();
+        CHECK_FALSE(f.auth_mgr.get_user_role("tr1").has_value()); // still a tombstone
+        const auto rows = audit_rows(f, "scim.user.provisioned", "tr1");
+        REQUIRE_FALSE(rows.empty());
+        CHECK(rows.back().detail == "tombstone role unreadable before revive");
+    }
+}
+
+TEST_CASE("ScimRoutes: PATCH/PUT active:true applies the same pre-checks as a POST revive "
+          "(#4966)",
+          "[pg][scim][routes][lastadmin][precheck][reactivate]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "rea"}})->body);
+    const auto id = created["id"].get<std::string>();
+    REQUIRE(f.patch("/scim/v2/Users/" + id, deactivate_ops())->status == 200);
+    REQUIRE_FALSE(f.auth_mgr.get_user_role("rea").has_value()); // deactivated
+
+    std::unique_ptr<httplib::Response> res;
+    std::string expect_detail;
+    int expect_status = 404;
+    SECTION("a username that now holds an Administrator grant is not reactivated") {
+        REQUIRE(f.rbac_guard->assign_role({"user", "rea", "Administrator"}).has_value());
+        res = f.patch("/scim/v2/Users/" + id, activate_ops());
+        expect_detail = "username holds an Administrator grant";
+    }
+    SECTION("a tombstone elevated outside SCIM is not reactivated (PUT)") {
+        auto lease = f.auth_db.pool().acquire();
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+            lease.get(), "UPDATE auth.users SET role = 'admin' WHERE username = 'rea'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+        lease.reset();
+        res = f.put("/scim/v2/Users/" + id, {{"userName", "rea"}, {"active", true}});
+        expect_detail = "tombstone role is not 'user' for username=rea";
+    }
+    SECTION("an unreadable grant answer fails closed with a retryable 503") {
+        yuzu::test::GrantReadFault fault(f.auth_db.pool());
+        fault.arm();
+        res = f.patch("/scim/v2/Users/" + id, activate_ops());
+        expect_status = 503;
+        expect_detail = "administrator grant check unavailable";
+        CHECK(res->get_header_value("Retry-After") == "2");
+    }
+    REQUIRE(res);
+    CHECK(res->status == expect_status);
+    CHECK_FALSE(f.auth_mgr.get_user_role("rea").has_value()); // never reactivated
+    auto resource = f.scim_store->get_by_scim_id(id);
+    REQUIRE(resource.has_value());
+    CHECK_FALSE(resource->active);
+    const std::string action = expect_status == 404 ? "scim.user.provenance_denied"
+                                                    : "scim.user.reactivated";
+    const auto rows = audit_rows(f, action, id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail == expect_detail);
 }
 
 TEST_CASE("RefusalLogThrottle: one warn per key per interval, bounded memory, clock-injected "

@@ -340,6 +340,10 @@ public:
     /// has already succeeded at the call site).
     void touch_last_login(const std::string& username);
 
+    /// UNGUARDED fixture primitive: production must use AuthManager::remove_user_checked (#4966).
+    /// This writes the soft delete WITHOUT the last-Administrator guard; tests/test_rbac_query_owner_seam.py
+    /// fails if any file under server/core/src other than auth_db.cpp calls it.
+    ///
     /// Soft-delete a user (sets is_active = false), clears MFA enrollment
     /// state (SOC 2 CC6.8 credential revocation on termination). Does NOT
     /// touch sessions (no session surface on this class — see file header;
@@ -350,6 +354,10 @@ public:
     /// Check if a user exists (active only).
     std::expected<bool, AuthDBError> user_exists(const std::string& username);
 
+    /// UNGUARDED fixture primitive: production must use AuthManager::update_role_checked (#4966).
+    /// This writes the role column WITHOUT the last-Administrator guard; the same seam test fails
+    /// if production code calls it.
+    ///
     /// Change a user's role. ONLY updates the role column — never touches
     /// password_hash or salt_hex. This is critical for security: role changes
     /// must never overwrite credentials (C1 fix, Red Team finding).

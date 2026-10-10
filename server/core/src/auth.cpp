@@ -1967,6 +1967,32 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     return true;
 }
 
+void AuthManager::note_lifecycle_store_failure(const char* op) const {
+    if (metrics_)
+        metrics_->counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}})
+            .increment();
+}
+
+void AuthManager::evict_target_after_indeterminate_write(const std::string& username) {
+    // The guarded write answered StoreFailure: the row MAY have committed (a lost COMMIT ack),
+    // so neither the `users_` entry (a possibly stale role / active flag) nor any session of the
+    // TARGET may keep being served. Fail toward re-authentication, never toward a stale grant:
+    // this evicts only the target's own in-memory state, then makes the durable wipe attempt
+    // (best effort here: the caller already answers StoreFailure, and a retry repeats it).
+    // mu_ is taken only after the owner call returned, never across it.
+    {
+        std::unique_lock lock(mu_);
+        users_.erase(username);
+        std::erase_if(sessions_,
+                      [&](const auto& pair) { return pair.second.username == username; });
+    }
+    if (!wipe_user_sessions_durable(username))
+        spdlog::warn("AuthManager: durable session wipe for '{}' after an indeterminate "
+                     "lifecycle write also failed; a durable session may survive until the "
+                     "operation is retried",
+                     username);
+}
+
 RemoveUserOutcome AuthManager::remove_user_checked(const std::string& username) {
     if (auth_db_) {
         // FAIL CLOSED (#4966): an AuthDB without the guard must never reach the unguarded
@@ -1976,7 +2002,8 @@ RemoveUserOutcome AuthManager::remove_user_checked(const std::string& username) 
             spdlog::error("AuthManager::remove_user_checked('{}'): the last-Administrator guard "
                           "is not wired (no RbacStore) - refusing to deactivate without it",
                           username);
-            return RemoveUserOutcome::StoreFailure;
+            note_lifecycle_store_failure("deactivate");
+            return RemoveUserOutcome::StoreFailure; // nothing was attempted: no eviction
         }
         // The guarded write FIRST, with no lock held: mu_ is never held across it (the
         // file-wide "never hold mu_ across a DB call" discipline, which
@@ -1989,6 +2016,11 @@ RemoveUserOutcome AuthManager::remove_user_checked(const std::string& username) 
         if (res.kind == Kind::kStoreFailure) {
             spdlog::error("AuthManager::remove_user_checked: guarded deactivation of '{}' failed: {}",
                           username, res.err);
+            note_lifecycle_store_failure("deactivate");
+            // The row may or may not be deactivated (a lost COMMIT ack). The target is the
+            // account being removed and its credentials are already revoked at every caller, so
+            // fail toward re-authentication; the answer is still StoreFailure, never success.
+            evict_target_after_indeterminate_write(username);
             return RemoveUserOutcome::StoreFailure;
         }
         const bool deactivated = (res.kind == Kind::kDeactivated);
@@ -2044,6 +2076,7 @@ std::optional<bool> AuthManager::would_strand_last_administrator(const std::stri
     if (!r.ok) {
         spdlog::warn("AuthManager::would_strand_last_administrator('{}'): advisory read failed: {}",
                      username, r.err);
+        note_lifecycle_store_failure("would_strand");
         return std::nullopt;
     }
     return r.would_strand;
@@ -2056,6 +2089,7 @@ std::optional<bool> AuthManager::holds_administrator_grant(const std::string& us
     if (!roles) {
         spdlog::warn("AuthManager::holds_administrator_grant('{}'): grant read failed: {}",
                      username, roles.error());
+        note_lifecycle_store_failure("grant_read");
         return std::nullopt;
     }
     return std::ranges::any_of(*roles, [](const auto& pr) { return pr.role_name == "Administrator"; });
@@ -2295,7 +2329,8 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
             spdlog::error("AuthManager::update_role_checked('{}'): the last-Administrator guard "
                           "is not wired (no RbacStore) - refusing to change the role without it",
                           username);
-            return UpdateRoleOutcome::StoreFailure;
+            note_lifecycle_store_failure("set_role");
+            return UpdateRoleOutcome::StoreFailure; // nothing was attempted: no eviction
         }
         // The guarded write FIRST, with no lock held (see remove_user_checked).
         const auto res = rbac_store_->set_local_role(username, new_role);
@@ -2312,6 +2347,10 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
         case Kind::kStoreFailure:
             spdlog::error("AuthManager::update_role_checked: guarded role write for '{}' failed: {}",
                           username, res.err);
+            note_lifecycle_store_failure("set_role");
+            // The write MAY have committed (a lost COMMIT ack): do not keep serving the cached
+            // role or a session minted at the old one. Fail toward re-authentication.
+            evict_target_after_indeterminate_write(username);
             return UpdateRoleOutcome::StoreFailure;
         case Kind::kChanged:
         case Kind::kUnchanged:

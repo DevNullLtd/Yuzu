@@ -21,8 +21,20 @@ if either half of that seam regresses:
      population, #4966) is not exactly ONE string literal under server/, in
      `auth_db_sql_helpers.hpp` (`kActiveLocalAdminPredicate`). The count helper, the owner's
      survivor list and the owner's per-target membership read all embed it by name; a second
-     literal is a drift the floor cannot tolerate. A copy that aliases the table
-     (`u.is_active`) or splits the predicate across statements is NOT seen by this textual scan.
+     literal is a drift the floor cannot tolerate. Also counted: the reversed order
+     (`is_active AND role = 'admin'`), an aliased copy (`u.role = 'admin' AND u.is_active`) and
+     `role IN ('admin')`. A copy that splits the predicate across statements is NOT seen by this
+     textual scan.
+  5. An unguarded fixture primitive is called from production code. `AuthDB::remove_user` and
+     `AuthDB::update_role` write the soft delete / role column WITHOUT the last-Administrator
+     guard (they exist for fixtures; production goes through `AuthManager::remove_user_checked` /
+     `update_role_checked`). No file under server/core/src other than `auth_db.cpp` may call
+     either through a `db` / `auth_db` / `auth_db_` / `auth_db_ptr()` receiver.
+  6. A statement that decreases the guarded populations is written outside the shared helpers:
+     `UPDATE auth.users SET is_active = FALSE` and `UPDATE auth.users SET role = ...` may appear
+     only in `auth_db_sql_helpers.hpp` (the soft delete and the role write the owner and `AuthDB`
+     share). `SET is_active = TRUE` (reactivation) is deliberately not in scope: it can only
+     GROW the population.
 
 It scans string literals only (a small tokenizer skips `//` and `/* */` comments), so a doc
 comment cannot trip it. Wired into tests/meson.build (suite 'docs') and docs-lint.yml.
@@ -49,8 +61,33 @@ CHAR_LIT = re.compile(
 STORE_PREFIX = "server/core/src/rbac_store"
 FOREIGN_RBAC = re.compile(r"\brbac_store\.[A-Za-z_]+", re.IGNORECASE)
 AUTH_PREFIXES = ("server/core/src/auth_db", "server/core/include/yuzu/server/auth_db")
-ADMIN_PREDICATE = re.compile(r"role\s*=\s*'admin'\s+AND\s+is_active\b", re.IGNORECASE)
+# Every spelling of "an active local admin" the column floor's population can be written as: the
+# canonical order, the reversed order, an aliased column (`u.role`, `u.is_active`), a redundant
+# `is_active = TRUE`, and a one-element `role IN ('admin')`.
+_COL = r"(?:\w+\.)?"
+ADMIN_PREDICATES = (
+    re.compile(_COL + r"role\s*=\s*'admin'\s+AND\s+" + _COL + r"is_active\b", re.IGNORECASE),
+    re.compile(_COL + r"is_active\b(?:\s*=\s*(?:TRUE|1))?\s+AND\s+" + _COL + r"role\s*=\s*'admin'",
+               re.IGNORECASE),
+    re.compile(_COL + r"role\s+IN\s*\(\s*'admin'\s*\)", re.IGNORECASE),
+)
 ADMIN_PREDICATE_FILE = "server/core/src/auth_db_sql_helpers.hpp"
+
+
+def admin_predicate_count(lit: str) -> int:
+    return sum(len(p.findall(lit)) for p in ADMIN_PREDICATES)
+
+
+# Rule 5: a production call of an unguarded fixture primitive.
+UNGUARDED_CALL = re.compile(
+    r"\b(?:auth_db_?|auth_db_ptr\s*\(\s*\)|db)\s*(?:->|\.)\s*(?:remove_user|update_role)\s*\("
+)
+UNGUARDED_CALL_ALLOWED = ("server/core/src/auth_db.cpp",)
+# Rule 6: a statement that can SHRINK the guarded populations.
+POPULATION_WRITE = re.compile(
+    r"UPDATE\s+auth\.users\s+SET\s+(?:is_active\s*=\s*(?:FALSE|0)\b|role\s*=)", re.IGNORECASE
+)
+POPULATION_WRITE_FILE = "server/core/src/auth_db_sql_helpers.hpp"
 
 
 def tokenize(src: str):
@@ -185,8 +222,43 @@ def _selfcheck() -> None:
     if foreign_match('docs only, no schema', FOREIGN_RBAC):
         raise SystemExit("selfcheck: a clean literal was reported by the rbac_store. scan")
     pred = 'const char* p = "x WHERE role = \'admin\' AND is_active";\n// role = \'admin\' AND is_active\n'
-    if sum(len(ADMIN_PREDICATE.findall(l)) for l in literals(pred)) != 1:
+    if sum(admin_predicate_count(l) for l in literals(pred)) != 1:
         raise SystemExit("selfcheck: the admin-predicate scan must count literals only")
+    # Each alternative spelling of the predicate is counted (rule 4 hardening, #4966) ...
+    for name, text in {
+        "reversed order": "x WHERE is_active AND role = 'admin'",
+        "reversed order with = TRUE": "x WHERE is_active = TRUE AND role = 'admin'",
+        "aliased canonical order": "x WHERE u.role = 'admin' AND u.is_active",
+        "aliased reversed order": "x WHERE u.is_active AND u.role = 'admin'",
+        "one-element IN": "x WHERE role IN ('admin')",
+        "aliased one-element IN": "x WHERE u.role IN ( 'admin' )",
+    }.items():
+        if admin_predicate_count(text) != 1:
+            raise SystemExit(f"selfcheck: the admin-predicate scan missed: {name}")
+    # ... and an unrelated literal is not.
+    for text in ("x WHERE role = 'user' AND is_active", "x WHERE role = $1 AND is_active",
+                 "x WHERE is_active AND role = $1", "role IN ('admin', 'user')"):
+        if admin_predicate_count(text) != 0:
+            raise SystemExit(f"selfcheck: the admin-predicate scan over-matched: {text!r}")
+    # Rule 5: the unguarded-primitive call scan finds the receivers it names and ignores the
+    # guarded API, comments and fixtures spelled through AuthManager.
+    for text in ("db->remove_user(u);", "auth_db_->update_role(u, r);", "auth_db.remove_user(u);",
+                 "auth_db_ptr()->update_role(u, r);", "x = db ->  remove_user (u);"):
+        if not UNGUARDED_CALL.search(code(text + "\n")):
+            raise SystemExit(f"selfcheck: the unguarded-call scan missed: {text!r}")
+    for text in ("auth_mgr_->remove_user_checked(u);", "auth_mgr.update_role_checked(u, r);",
+                 "auth_mgr_->remove_user(u);", "// db->remove_user(u);", "mydb->remove_user(u);"):
+        if UNGUARDED_CALL.search(code(text + "\n")):
+            raise SystemExit(f"selfcheck: the unguarded-call scan over-matched: {text!r}")
+    # Rule 6: a shrinking write is found in a literal, a growing one and a comment are not.
+    if sum(len(POPULATION_WRITE.findall(l)) for l in literals(
+            'a = "UPDATE auth.users SET is_active = FALSE WHERE x"; b = "UPDATE auth.users SET role = $1";\n')) != 2:
+        raise SystemExit("selfcheck: the population-write scan missed a shrinking write")
+    for text in ('a = "UPDATE auth.users SET is_active = TRUE WHERE x";\n',
+                 'a = "UPDATE auth.users SET last_login_at = now()";\n',
+                 '// "UPDATE auth.users SET role = $1"\n'):
+        if any(POPULATION_WRITE.search(l) for l in literals(text)):
+            raise SystemExit(f"selfcheck: the population-write scan over-matched: {text!r}")
     for text in ("#define " + FRAGMENT + " \"FROM x\"\n",
                  "static const char* " + FRAGMENT + " = \"FROM x\";\n"):
         if not DEFINITION.search(code(text)):
@@ -242,6 +314,8 @@ def main() -> int:
                 )
     # Rule 4: ONE active-local-admin predicate literal under server/.
     pred_sites = []
+    unguarded_calls = []
+    population_writes = []
     for rel in subprocess.run(
         ["git", "ls-files", "--", "server"],
         cwd=REPO_ROOT, capture_output=True, text=True, check=True,
@@ -250,12 +324,30 @@ def main() -> int:
             continue
         text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
         for lit in literals(text):
-            pred_sites.extend([rel] * len(ADMIN_PREDICATE.findall(lit)))
+            pred_sites.extend([rel] * admin_predicate_count(lit))
+        if rel.startswith("server/core/src/") and rel not in UNGUARDED_CALL_ALLOWED:
+            for _ in UNGUARDED_CALL.findall(code(text)):
+                unguarded_calls.append(rel)
+        for lit in literals(text):
+            for _ in POPULATION_WRITE.findall(lit):
+                population_writes.append(rel)
     if pred_sites != [ADMIN_PREDICATE_FILE]:
         failures.append(
             "the active-local-admin predicate (role = 'admin' AND is_active) must be exactly one "
             f"string literal under server/, in {ADMIN_PREDICATE_FILE} (kActiveLocalAdminPredicate); "
             f"found {pred_sites!r}"
+        )
+    if unguarded_calls:
+        failures.append(
+            "AuthDB::remove_user / update_role are UNGUARDED fixture primitives; production must "
+            "use AuthManager::remove_user_checked / update_role_checked (#4966). Called from: "
+            f"{sorted(set(unguarded_calls))!r}"
+        )
+    if population_writes != [POPULATION_WRITE_FILE] * len(population_writes) or not population_writes:
+        failures.append(
+            "`UPDATE auth.users SET is_active = FALSE` / `SET role =` may appear only in "
+            f"{POPULATION_WRITE_FILE} (the soft delete and role write the owner and AuthDB share); "
+            f"found {sorted(set(population_writes))!r} ({len(population_writes)} site(s))"
         )
     defs = []
     for rel in files:

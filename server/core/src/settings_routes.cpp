@@ -151,6 +151,18 @@ void respond_lifecycle_store_unavailable(httplib::Response& res, std::string_vie
                     "application/json");
 }
 
+// #4966: the answer for "the change COMMITTED but the durable session wipe failed" on the role
+// route. A plain 503 with NO retry hint (no `Retry-After`, no `retry_after_ms`): a repeat of the
+// role POST finds the role already set and answers 200 "Role unchanged" WITHOUT redoing the wipe,
+// so telling a client to retry would promise a convergence the route does not provide. The
+// operator finishes it by revoking the user's sessions.
+void respond_committed_no_retry(httplib::Response& res, std::string_view message) {
+    res.status = 503;
+    res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::string(message) +
+                                     R"(","level":"error"}})");
+    res.set_content(detail::a4_error(res, message), "application/json");
+}
+
 std::string highlight_yaml_value(const std::string& val) {
     if (val.empty())
         return {};
@@ -5272,7 +5284,9 @@ void SettingsRoutes::register_routes(
             spdlog::warn("DELETE /api/settings/users: '{}' is the last protected administrator; "
                          "refused after its credentials were revoked",
                          username);
-            audit_fn_(req, "user.delete", "denied", "User", username,
+            // `partial`, not `denied`: the credentials WERE revoked (a change was made) and
+            // the account stays active, so the audit result must not read as "nothing happened".
+            audit_fn_(req, "user.delete", "partial", "User", username,
                       "last_administrator_blocked credentials_revoked_before_refusal=true "
                       "account_remains_active=true " +
                           revoke_detail);
@@ -5283,12 +5297,13 @@ void SettingsRoutes::register_routes(
             return;
         case auth::RemoveUserOutcome::StoreFailure:
             // The row may or may not be deactivated (a lost COMMIT ack, or a fail-closed arm):
-            // say only that the delete did not complete and a retry converges.
+            // say only that the delete may not have completed; repeating the DELETE re-runs the
+            // guarded write and the session wipe.
             audit_fn_(req, "user.delete", "failure", "User", username,
                       "store_failure credentials_revoked_before_failure=true " + revoke_detail);
             respond_lifecycle_store_unavailable(
-                res, "User store unavailable; the delete did not complete. Linked credentials "
-                     "were revoked. Try again");
+                res, "User store unavailable; the delete may not have completed. Linked "
+                     "credentials were revoked. Try again");
             return;
         case auth::RemoveUserOutcome::RemovedSessionWipeFailed:
             // The account IS deactivated (committed) but the durable session wipe failed, so a
@@ -5474,10 +5489,13 @@ void SettingsRoutes::register_routes(
             res.set_content(detail::a4_error(res, "User not found"), "application/json");
             return;
         case auth::UpdateRoleOutcome::UpdatedSessionWipeFailed:
-            // The role IS changed (committed) but a session at the old role may survive.
+            // The role IS changed (committed) but a session at the old role may survive. No
+            // retry hint: a repeat answers 200 "Role unchanged" and never redoes the wipe.
             audit_fn_(req, "user.role_change", "partial", "User", target_username,
-                      "role_changed session_wipe_failed=true");
-            respond_lifecycle_store_unavailable(
+                      "role_changed session_wipe_failed=true old_role=" +
+                          auth::role_to_string(old_role) +
+                          " new_role=" + auth::role_to_string(new_role));
+            respond_committed_no_retry(
                 res,
                 "Role updated, but session cleanup failed. Revoke the user's sessions to finish");
             return;
@@ -5486,7 +5504,7 @@ void SettingsRoutes::register_routes(
             audit_fn_(req, "user.role_change", "failure", "User", target_username,
                       "store_failure");
             respond_lifecycle_store_unavailable(
-                res, "Role store unavailable; the change did not complete. Try again");
+                res, "Role store unavailable; the change may not have completed. Try again");
             return;
         }
 
