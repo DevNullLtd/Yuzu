@@ -89,18 +89,24 @@ static int param_int(const httplib::Request& req, const char* name, int def) {
 // -- Helper: /fragments/results refusal body ---------------------------------
 // /fragments/results refusal body (#5623): the empty-state row for the swap target plus the
 // same four OOB replacements render_results emits (thead, pagination, summary, chart deck),
-// each emptied. Without them the previous render's sort headers, "Showing a-b of n", result
-// count / "Create Group" button and chart deck would stay on screen beside the refusal. The
-// ids and swap attributes mirror render_results' own OOB elements (an empty chart-deck-host
-// is what it already emits to clear a prior deck).
+// each emptied, plus the open "Create Static Group" form slot. Without them the previous
+// render's sort headers, "Showing a-b of n", result count / "Create Group" button, chart deck
+// and group form (whose count would describe rows no longer shown) would stay on screen beside
+// the refusal. The ids and swap attributes mirror render_results' own OOB elements (an empty
+// chart-deck-host is what it already emits to clear a prior deck) and the help path's
+// group-form-slot clear. The cell carries `filter-refused` (dashboard_ui.cpp: wraps and uses
+// the row width; the generic `tbody td` rule would clip it to one 300px line) and a colspan
+// larger than any column count, because the header is emptied by the OOB clear above.
 static std::string results_refusal_html(const std::string& message) {
-    std::string html = "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\" "
+    std::string html = "<tbody id=\"results-tbody\"><tr>"
+                       "<td class=\"empty-state filter-refused\" colspan=\"99\" "
                        "data-filter-refused=\"true\">" +
                        html_escape(message) + "</td></tr></tbody>";
     html += "<thead id=\"results-thead\" hx-swap-oob=\"true\"><tr></tr></thead>";
     html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>";
     html += "<div id=\"result-summary\" hx-swap-oob=\"true\"></div>";
     html += R"(<div id="chart-deck-host" hx-swap-oob="innerHTML"></div>)";
+    html += R"(<div id="group-form-slot" hx-swap-oob="innerHTML"></div>)";
     return html;
 }
 

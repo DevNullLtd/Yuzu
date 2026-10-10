@@ -263,6 +263,13 @@ extern const char* const kDashboardIndexHtml =
       text-align: center; padding: 3rem 1rem; color: var(--mds-color-theme-outline-secondary);
       font-size: 0.85rem;
     }
+    /* #5623: the /fragments/results facet-filter refusal cell. `tbody td` above clips every cell
+       to one 300px line, which hid the provenance and remedy sentences; this wraps the message
+       across the full row. Same override as .result-detail td, scoped to the refusal. */
+    td.filter-refused {
+      white-space: normal; overflow: visible; text-overflow: clip; max-width: none;
+      text-align: left;
+    }
     /* #2691 finding 7: an honest "store degraded, not zero matches" banner —
        distinct from .empty-state so it doesn't visually read as "nothing here".
        Amber, not alarm-red (#2691 Gate 6 enterprise-readiness): this is a

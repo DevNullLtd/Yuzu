@@ -45,6 +45,9 @@
 #include <utility>
 #include <vector>
 
+// Defined in dashboard_ui.cpp (the served dashboard shell, CSS included).
+extern const char* const kDashboardIndexHtml;
+
 using namespace yuzu::server;
 using yuzu::server::pg::PgPool;
 
@@ -425,7 +428,31 @@ static void check_results_chrome_cleared(const std::string& body) {
     CHECK(contains(body, "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>"));
     CHECK(contains(body, "<div id=\"result-summary\" hx-swap-oob=\"true\"></div>"));
     CHECK(contains(body, "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>"));
+    // An open "Create Static Group" form would keep saying "N agents will be added" for rows
+    // that are no longer shown.
+    CHECK(contains(body, "<div id=\"group-form-slot\" hx-swap-oob=\"innerHTML\"></div>"));
     CHECK_FALSE(contains(body, "btn-create-group"));
+    // The refusal cell wraps and spans the (emptied-header) row: `tbody td` clips every cell
+    // to one 300px line, which hid everything after the first words of the message.
+    CHECK(contains(body, "<td class=\"empty-state filter-refused\" colspan=\"99\" "
+                         "data-filter-refused=\"true\">"));
+}
+
+// The cell class above is only useful if the served dashboard stylesheet overrides the generic
+// `tbody td` clipping for it (specificity: td.filter-refused beats tbody td).
+TEST_CASE("dashboard stylesheet: the facet refusal cell is allowed to wrap and use the row width",
+          "[server][dashboard][fragment]") {
+    const std::string css = kDashboardIndexHtml;
+    const auto rule = css.find("td.filter-refused {");
+    REQUIRE(rule != std::string::npos);
+    const auto end = css.find('}', rule);
+    REQUIRE(end != std::string::npos);
+    const std::string body = css.substr(rule, end - rule);
+    CHECK(contains(body, "white-space: normal"));
+    CHECK(contains(body, "overflow: visible"));
+    CHECK(contains(body, "max-width: none"));
+    // And the generic clip it overrides still exists, so the override is what makes it readable.
+    CHECK(contains(css, "tbody td {"));
 }
 
 // #5623: a facet value over kMaxFacetValueBytes (2048) is never stored, so a filter on it
