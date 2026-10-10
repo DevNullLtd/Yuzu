@@ -2191,10 +2191,11 @@ TEST_CASE("ResponseStore: facet_agent_count and facet_line_count distinguish deg
 //   - A value the predicate REFUSES must not be stored as itself (ingest rewrote it, or never
 //     stored it), which is the mismatch the refusal exists to prevent.
 // A LF is REFUSED by the predicate: ingest splits the output on '\n' before taking any value,
-// so a stored value can never contain one. A CR is deliberately NOT refused (a CR inside a value
-// is storable, and a trailing CR of the last column is stripped, a per-column fact the
-// per-value predicate cannot see); the readers' exact 0 for a trailing-CR filter is a true
-// zero. The last section asserts both.
+// so a stored value can never contain one. A CR is deliberately NOT refused: a CR inside a
+// value is storable, and split_output_lines strips exactly ONE trailing CR of a line, so
+// `d\r\r` stores `d\r` (a value ending in CR IS storable). The last sections assert the LF
+// split, the mid-value CR, and the trailing-CR strip against real stored facets. An exact 0 for
+// a CR-containing filter that matches nothing stored is just an ordinary zero.
 TEST_CASE("ResponseStore: the facet filter predicate agrees with what ingest stores",
           "[pg][response_store][facets]") {
     using namespace std::string_literals;
@@ -2289,29 +2290,81 @@ TEST_CASE("ResponseStore: the facet filter predicate agrees with what ingest sto
         CHECK(stored_col1(probe) == std::vector<std::string>{"a\xEF\xBF\xBD" "b"});
     }
 
-    // LF: refused by the predicate (never stored). Trailing CR: accepted, never stored, true
-    // zero.
-    CHECK(facet_filter_value_unmatchable("a\nb"));
-    CHECK_FALSE(facet_filter_value_unmatchable("d\r"));
-    StoredResponse lines;
-    lines.instruction_id = "cmd-facet-rt-lf";
-    lines.agent_id = "agent-rt-lf";
-    lines.status = 1;
-    lines.plugin = "vuln_scan";
-    // The LF splits one intended value into two lines; the CR ends the last field (detail).
-    lines.output = "high|a\nb|title|d\r\n";
-    store.store(lines);
-    for (int col = 0; col < 4; ++col) {
-        auto f = store.facet_values(lines.instruction_id, col);
+    // LF / CR premises behind the predicate, asserted on real stored facets. Every fixture is a
+    // 4-column vuln_scan line (severity|category|title|detail) with no unescaped pipe.
+    auto stored_col = [&](const std::string& instruction_id, int col) {
+        std::vector<std::string> out;
+        auto f = store.facet_values(instruction_id, col);
         REQUIRE(f.has_value());
-        for (const auto& fv : *f) {
-            CHECK(fv.value.find('\n') == std::string::npos);
-            CHECK(fv.value.find('\r') == std::string::npos);
-        }
+        for (const auto& fv : *f)
+            out.push_back(fv.value);
+        return out;
+    };
+    auto has = [](const std::vector<std::string>& v, const std::string& x) {
+        return std::find(v.begin(), v.end(), x) != v.end();
+    };
+    auto store_output = [&](const std::string& tag, const std::string& output) {
+        StoredResponse r;
+        r.instruction_id = "cmd-facet-rt-" + tag;
+        r.agent_id = "agent-rt-" + tag;
+        r.status = 1;
+        r.plugin = "vuln_scan";
+        r.output = output;
+        store.store(r);
+        return r;
+    };
+
+    // LF: refused by the predicate. The raw output `high|a\nb|title|detail` is two lines
+    // (`high|a` and `b|title|detail`), so "a" (column 1) and "b" (column 0) are stored as
+    // SEPARATE facets and no stored value, in any column, contains a LF.
+    CHECK(facet_filter_value_unmatchable("a\nb"));
+    {
+        const auto r = store_output("lf", "high|a\nb|title|detail");
+        CHECK(has(stored_col(r.instruction_id, 1), "a"));
+        CHECK(has(stored_col(r.instruction_id, 0), "b"));
+        CHECK_FALSE(has(stored_col(r.instruction_id, 1), "a\nb"));
+        for (int col = 0; col < 4; ++col)
+            for (const auto& v : stored_col(r.instruction_id, col))
+                CHECK(v.find('\n') == std::string::npos);
     }
-    auto cr_count = store.facet_agent_count(lines.instruction_id, {FacetFilter{3, "d\r"}});
-    REQUIRE(cr_count.has_value());
-    CHECK(*cr_count == 0);
+
+    // CR in the middle of a value is stored as is, and the reader finds it by that exact value
+    // (which the predicate accepts).
+    CHECK_FALSE(facet_filter_value_unmatchable("x\ry"));
+    {
+        const auto r = store_output("crmid", "high|x\ry|title|detail");
+        CHECK(stored_col(r.instruction_id, 1) == std::vector<std::string>{"x\ry"});
+        auto n = store.facet_agent_count(r.instruction_id, {FacetFilter{1, "x\ry"}});
+        REQUIRE(n.has_value());
+        CHECK(*n == 1);
+    }
+
+    // Trailing CR of the last column: split_output_lines strips exactly ONE per line, so
+    // `d\r\r\n` stores `d\r` (a CR survives), the predicate accepts `d\r`, and the reader
+    // finds it. A bare `d` filter is an ordinary zero against that row.
+    CHECK_FALSE(facet_filter_value_unmatchable("d\r"));
+    {
+        const auto r = store_output("crtail2", "high|a|title|d\r\r\n");
+        CHECK(stored_col(r.instruction_id, 3) == std::vector<std::string>{"d\r"});
+        auto hit = store.facet_agent_count(r.instruction_id, {FacetFilter{3, "d\r"}});
+        REQUIRE(hit.has_value());
+        CHECK(*hit == 1);
+        auto miss = store.facet_agent_count(r.instruction_id, {FacetFilter{3, "d"}});
+        REQUIRE(miss.has_value());
+        CHECK(*miss == 0);
+    }
+    // Control: a single trailing CR is the line ending and is stripped, so `e\r` is not stored
+    // (an ordinary zero for that filter) and `e` is.
+    {
+        const auto r = store_output("crtail1", "high|a|title|e\r\n");
+        CHECK(stored_col(r.instruction_id, 3) == std::vector<std::string>{"e"});
+        auto cr = store.facet_agent_count(r.instruction_id, {FacetFilter{3, "e\r"}});
+        REQUIRE(cr.has_value());
+        CHECK(*cr == 0);
+        auto plain = store.facet_agent_count(r.instruction_id, {FacetFilter{3, "e"}});
+        REQUIRE(plain.has_value());
+        CHECK(*plain == 1);
+    }
 }
 
 // ── CC-07 typed plugin result status (PR1.1 finding F11) ───────────────────

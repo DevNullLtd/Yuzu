@@ -461,11 +461,13 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview: an over-bound valu
 }
 
 // A NUL, line feed or invalid UTF-8 byte in a filter can never equal a stored value (ingest
-// rewrites each NUL / bad byte to U+FFFD and splits on every LF), and a NUL is C-string-truncated by the libpq bind, so `short%00zzz` used to
-// match the rows of `short` and be reported as an exact count. Refused like an over-bound
-// value, before any store access (the harness store is nullptr: 503 would mean it was reached).
-TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a NUL or invalid UTF-8 filter "
-          "value is refused (400), not matched as a prefix or answered as 0",
+// rewrites each NUL / bad byte to U+FFFD and splits on every LF), and a NUL is
+// C-string-truncated by the libpq bind, so `short%00zzz` used to match the rows of `short`
+// and be reported as an exact count. Refused like an over-bound value, before any store
+// access (the harness store is nullptr: 503 would mean it was reached).
+TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a filter value with a NUL / a "
+          "line break / invalid UTF-8 is refused (400), not matched as a prefix or answered "
+          "as 0",
           "[rest][devices]") {
     DeviceRestHarness h; // response_store stays nullptr
     const std::string base = "/api/v1/management-groups/agent-count-preview"

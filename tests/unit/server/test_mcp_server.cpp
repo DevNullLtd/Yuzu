@@ -20593,9 +20593,10 @@ TEST_CASE("MCP preview_management_group_agent_count: an over-bound value under a
     CHECK(res->body.find(over) == std::string::npos);
 }
 
-// JSON can carry a NUL (U+0000 escape) but not invalid UTF-8 (the request body fails to parse before
-// the handler), so the MCP leg of the unmatchable-value refusal is the NUL case. Like the
-// REST twin it is refused before any store access: -32602, not the unwired-store -32603.
+// JSON can carry a NUL (U+0000 escape) and a line feed but not invalid UTF-8 (the request
+// body fails to parse before the handler), so the MCP leg of the unmatchable-value refusal is
+// the NUL and line feed cases. Like the REST twin it is refused before any store access:
+// -32602, not the unwired-store -32603.
 TEST_CASE("MCP preview_management_group_agent_count: a filter value containing a NUL or a line "
           "feed is refused with -32602, not matched as a prefix",
           "[mcp][devices][security]") {

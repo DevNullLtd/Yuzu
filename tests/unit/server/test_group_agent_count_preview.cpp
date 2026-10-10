@@ -89,12 +89,13 @@ TEST_CASE("facet_filter_value_unmatchable: strictly over 2048 bytes", "[server][
     CHECK(facet_filter_value_unmatchable(wide));
 }
 
-// A filter value no stored facet can equal because ingest rewrote the byte: sanitize_pg_text
-// turns each NUL and each invalid UTF-8 byte into the 3-byte U+FFFD, so a stored value never
-// has either, and the length ingest bounds is the SANITIZED length. A reader that measured the
+// A filter value no stored facet can equal because ingest rewrote the byte or split on it:
+// sanitize_pg_text turns each NUL and each invalid UTF-8 byte into the 3-byte U+FFFD and
+// split_output_lines splits on every LF, so a stored value never has any of the three, and
+// the length ingest bounds is the SANITIZED length. A reader that measured the
 // raw bytes accepted a 683-byte all-NUL value (2049 bytes sanitized, so excluded at ingest) and
 // answered an exact 0; the libpq bind also C-string-truncates a NUL and matched the prefix.
-TEST_CASE("facet_filter_value_unmatchable: NUL and invalid UTF-8 are unmatchable",
+TEST_CASE("facet_filter_value_unmatchable: NUL / line break / invalid UTF-8 are unmatchable",
           "[server][devices]") {
     using namespace std::string_literals;
     // NUL in the middle, and NUL as the only content.
@@ -187,7 +188,7 @@ TEST_CASE("any_facet_filter_unmatchable: one over-bound value among valid ones r
     std::vector<FacetFilter> all_at{
         {0, std::string(2048, 'a')}, {1, std::string(2048, 'b')}, {2, std::string(2048, 'c')}};
     CHECK_FALSE(any_facet_filter_unmatchable(all_at));
-    // A NUL / invalid UTF-8 value refuses just like an over-bound one, in any position.
+    // A NUL / line feed / invalid UTF-8 value refuses just like an over-bound one, in any position.
     CHECK(any_facet_filter_unmatchable({{0, "x"}, {1, std::string("a\0b", 3)}}));
     CHECK(any_facet_filter_unmatchable({{0, "\xFF"}, {1, "y"}}));
     CHECK(any_facet_filter_unmatchable({{0, "x"}, {1, "a\nb"}}));
@@ -234,7 +235,7 @@ TEST_CASE("any_raw_filter_value_unmatchable: independent of whether the key reso
     CHECK(any_raw_filter_value_unmatchable(Fields{{"name", over}}));
     CHECK_FALSE(any_raw_filter_value_unmatchable(Fields{{"no_such_column", at}, {"name", "x"}}));
     CHECK_FALSE(any_raw_filter_value_unmatchable(Fields{}));
-    // NUL / invalid UTF-8 under an unrecognised key are refused the same way.
+    // NUL / line feed / invalid UTF-8 under an unrecognised key are refused the same way.
     CHECK(any_raw_filter_value_unmatchable(Fields{{"no_such_column", std::string("a\0b", 3)}}));
     CHECK(any_raw_filter_value_unmatchable(Fields{{"no_such_column", "\xC0\x80"}}));
 }

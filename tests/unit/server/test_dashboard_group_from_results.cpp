@@ -590,10 +590,11 @@ TEST_CASE("create-group-form: a filter value over the facet bound is refused, no
 }
 
 // A NUL / line feed / invalid UTF-8 filter value can never equal a stored value (ingest rewrites
-// each NUL / bad byte to U+FFFD and splits on every LF) and a NUL is truncated by the libpq bind, so `high%00ignored-suffix` used to show the
-// count of `high`. Refused like an over-bound value; visible_set_fn_calls == 0 shows no store
-// read or scope resolution happened. The matching `high` rows ARE seeded, so a dropped or
-// truncated filter would surface as "agents will be added".
+// each NUL / bad byte to U+FFFD and splits on every LF) and a NUL is truncated by the libpq
+// bind, so `high%00ignored-suffix` used to show the count of `high`. Refused like an
+// over-bound value; visible_set_fn_calls == 0 shows no store read or scope resolution
+// happened. The matching `high` rows ARE seeded, so a dropped or truncated filter would
+// surface as "agents will be added".
 TEST_CASE("create-group-form: a filter value with a NUL, line feed or invalid UTF-8 is refused, not "
           "previewed as the count of its prefix",
           "[pg][server][dashboard][group_from_results]") {
@@ -630,6 +631,27 @@ TEST_CASE("group-from-results: a filter value with a NUL is refused and creates 
     CHECK(contains(res->body, "data-filter-refused=\"true\""));
     CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
     CHECK_FALSE(h.mg.find_group_by_name("nul-group").has_value());
+    CHECK(h.visible_set_fn_calls == 0);
+}
+
+// The POST site refuses a line feed in a filter value the same way (#5623): ingest splits the
+// output on LF, so no stored value contains one and the group would be built from an empty
+// set. The matching f_category filter is present too, so a dropped LF filter would still
+// match both agents and a group would appear.
+TEST_CASE("group-from-results: a filter value with a line feed is refused and creates no group",
+          "[pg][server][dashboard][group_from_results]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+    for (const std::string value : {std::string("high%0Ax"), std::string("%0A")}) {
+        INFO(value);
+        auto res = h.post("group_name=lf-group&command_id=" + std::string{kCommandId} +
+                          "&plugin=" + kPlugin + "&f_category=cat-a&f_severity=" + value);
+        CHECK(res->status == 400);
+        CHECK(contains(res->body, "data-filter-refused=\"true\""));
+        CHECK(contains(res->body, "NUL byte, a line break or invalid UTF-8"));
+        CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
+        CHECK_FALSE(h.mg.find_group_by_name("lf-group").has_value());
+    }
     CHECK(h.visible_set_fn_calls == 0);
 }
 

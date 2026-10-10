@@ -453,11 +453,12 @@ TEST_CASE("/fragments/results: a filter value over the facet bound is refused, n
 }
 
 // A NUL, line feed or invalid UTF-8 byte in a filter value can never equal a stored value
-// (ingest rewrites each NUL / bad byte to U+FFFD and splits on every LF), and a NUL is C-string-truncated by the libpq bind, which matched the prefix
-// (`short%00zzz` showed the rows of `short`). Refused like an over-bound value, before any
-// store access (the store is nullptr: "Response store not available" would mean it was reached).
-TEST_CASE("/fragments/results: a filter value with a NUL or invalid UTF-8 is refused, not "
-          "matched as a prefix or rendered as an empty result",
+// (ingest rewrites each NUL / bad byte to U+FFFD and splits on every LF), and a NUL is
+// C-string-truncated by the libpq bind, which matched the prefix (`short%00zzz` showed the
+// rows of `short`). Refused like an over-bound value, before any store access (the store is
+// nullptr: "Response store not available" would mean it was reached).
+TEST_CASE("/fragments/results: a filter value with a NUL / a line break / invalid UTF-8 is "
+          "refused, not matched as a prefix or rendered as an empty result",
           "[server][dashboard][fragment]") {
     FragmentResultsHarness h(/*response_store=*/nullptr);
     h.routes.set_fleet_read_fn(

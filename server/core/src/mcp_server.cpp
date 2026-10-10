@@ -10023,10 +10023,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
 
                 // A value that can match no agent (over kMaxFacetValueBytes, or a NUL /
-                // line feed / invalid UTF-8) is refused (non-retryable) rather than answered as an
-                // exact 0 (#5623). Same check, bound and text as the REST twin, on the RAW values before key
-                // resolution (an unknown key is skipped by the resolver); the value is
-                // never echoed.
+                // line feed / invalid UTF-8) is refused (non-retryable) rather than answered
+                // as an exact 0 (#5623). Same check, bound and text as the REST twin, on the
+                // RAW values before key resolution (an unknown key is skipped by the
+                // resolver); the value is never echoed.
                 if (any_raw_filter_value_unmatchable(raw_fields)) {
                     res.set_content(a4_error(kInvalidParams, facet_filter_value_refusal_message(),
                                              facet_filter_value_refusal_remediation()),

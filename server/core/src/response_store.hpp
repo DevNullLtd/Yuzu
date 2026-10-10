@@ -91,9 +91,12 @@ inline constexpr std::size_t kMaxFacetValueBytes = 2048;
 ///     match the prefix as if it were the whole value); or
 ///   - containing a line feed ('\n'): ingest splits the output on '\n' (`split_output_lines`,
 ///     result_parsing.hpp) before any value is taken, so no stored value can contain one.
-/// A CR is deliberately NOT refused: a CR inside a value IS storable (only a trailing CR
-/// of a line's LAST column is stripped), and this predicate judges one value at a time, so
-/// it cannot know the value's column position.
+/// A CR is deliberately NOT refused: a CR inside a value IS storable (only ONE trailing CR
+/// of a line, i.e. of its LAST column, is stripped), and this predicate judges one value at
+/// a time, so it cannot know the value's column position. For the same reason the check is
+/// column-blind: e.g. a value ending in a backslash in a non-last column is read back as an
+/// escaped pipe on ingest and cannot be stored, so a reader gives an exact 0 for it. That is
+/// a known limit of a per-value predicate, not something it can refuse.
 /// The length is compared to the same bound ingest applies (to the sanitized form, which
 /// for a value passing the other two tests is the raw form). Every reader that builds a
 /// `FacetFilter` from caller input refuses the request when this is true, and never drops

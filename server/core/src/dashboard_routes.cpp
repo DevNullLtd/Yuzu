@@ -389,10 +389,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 }
 
                 // A filter value that can match no stored facet (over kMaxFacetValueBytes,
-                // or a NUL / line feed / invalid UTF-8: see facet_filter_value_unmatchable) is refused
-                // instead of rendering a plausible empty table (#5623). Covers the f_*
-                // params and a template `equals` filter alike. The refusal also clears the
-                // OOB chrome of the previous render (see results_refusal_html).
+                // or a NUL / line feed / invalid UTF-8: see facet_filter_value_unmatchable)
+                // is refused instead of rendering a plausible empty table (#5623). Covers
+                // the f_* params and a template `equals` filter alike. The refusal also
+                // clears the OOB chrome of the previous render (see results_refusal_html).
                 // Rendered at 200, not 400: the dashboard htmx config drops 4xx bodies
                 // (responseHandling swap:false), which would leave the old rows in place.
                 if (any_facet_filter_unmatchable(filters)) {
@@ -543,7 +543,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 auto plugin = req.get_param_value("plugin");
                 auto filters = parse_filters(req, plugin);
                 // Refuse a filter value no stored facet can equal (#5623: over the bound,
-                // or a NUL / line feed / invalid UTF-8) rather than preview an exact "0 agents". 200 for the same reason as /fragments/results.
+                // or a NUL / line feed / invalid UTF-8) rather than preview an exact
+                // "0 agents". 200 for the same reason as /fragments/results.
                 if (any_facet_filter_unmatchable(filters)) {
                     res.set_header("Cache-Control", "no-store, private");
                     res.set_header("Vary", "Cookie");
@@ -637,10 +638,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto filters = parse_filters(req, plugin);
 
                  // A filter value that matches no stored facet (over kMaxFacetValueBytes, or
-                 // a NUL / line feed / invalid UTF-8) would build the group from an empty set: refuse
-                 // (#5623). The dashboard UI cannot produce this POST: /fragments/create-group-form
-                 // refuses such a filter first and renders no form for it. 400 therefore
-                 // is the honest status for the direct/automation caller (see NOTE above).
+                 // a NUL / line feed / invalid UTF-8) would build the group from an empty
+                 // set: refuse (#5623). The dashboard UI cannot produce this POST:
+                 // /fragments/create-group-form refuses such a filter first and renders no
+                 // form for it. 400 therefore is the honest status for the direct/automation
+                 // caller (see NOTE above).
                  if (any_facet_filter_unmatchable(filters)) {
                      res.status = 400;
                      res.set_header("HX-Retarget", "#group-form-slot");
