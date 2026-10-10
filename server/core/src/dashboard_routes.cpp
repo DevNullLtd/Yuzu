@@ -439,7 +439,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // two is at fault (the operator's own filter, or the selected View's saved
                 // filter). A View `equals` default with an EMPTY value is refused too (view
                 // provenance): ingest never stores an empty field. An explicit empty f_*
-                // value is not affected: parse_filters drops it ("All"). The refusal also
+                // value is not itself refused: parse_filters drops it ("All"), so a View
+                // whose own `equals` default is empty still applies and is refused. The
+                // refusal also
                 // clears the OOB chrome of the previous render (see results_refusal_html).
                 // Rendered at 200, not 400: the dashboard htmx config drops 4xx bodies
                 // (responseHandling swap:false), which would leave the old rows in place.
