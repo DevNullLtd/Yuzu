@@ -4022,7 +4022,7 @@ Before upgrading any component:
   configuration (#1822) auto-restarts on a watchdog fire similarly to the
   Linux `Restart=always` unit, but the exit shows up as a generic unexpected
   termination rather than one of the SCM's own "specific error" buckets.
-  During shutdown the agent now waits at most 1 second (normally 5) for a
+  During shutdown the agent now waits at most 1 second (normally 5) at a time for a
   `kv_store.db` that another process holds locked, so the shutdown does not run
   into this deadline for that reason (#5604); a shutdown-time write to that store
   can fail where the longer wait would have succeeded. Live in every agent, that can

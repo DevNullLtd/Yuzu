@@ -271,11 +271,18 @@ public:
      * 15 ms on macOS, one run; Windows rounds it to its tick, about 15.6 ms, derived not
      * measured).
      * In WAL mode, which open() sets, every method takes the write lock at most once, so that is
-     * at most one budget per call. The rollback-journal fallback (WAL could not be enabled) lets
-     * del_keys() wait twice, so it can cost two. The bound is per BUSY WAIT, not per call, on
-     * Windows: SQLite's own file-I/O retries (winRetryIoerr, about 1.4 to 1.5 s per failing I/O,
-     * derived from the SQLite source, not measured here) and its WAL-index retry sleeps happen
-     * outside the busy handler, which cannot cut them short.
+     * at most one budget per call. The budget is per statement step, the same as
+     * sqlite3_busy_timeout()'s: a second lock wait inside ONE step (a rollback-journal step can
+     * wait for the writer lock and then for EXCLUSIVE at commit) shares the first wait's clock,
+     * and every public method starts with a fresh clock. The rollback-journal fallback (WAL could
+     * not be enabled) lets del_keys() wait twice, in two steps, so it can cost two.
+     *
+     * The bound is per BUSY WAIT, not per call, on every platform: SQLite's WAL-index retry
+     * sleeps happen outside the busy handler, which cannot cut them short. Measured on Linux
+     * (SQLite 3.52, a 1000 ms budget, a peer process holding the WAL index in recovery, one run
+     * per phasing): set() returned after 1741 ms in one phasing and 2046 ms in another. On
+     * Windows SQLite's own file-I/O retries (winRetryIoerr, about 1.4 to 1.5 s per failing I/O,
+     * derived from the SQLite source, not measured here) add to that.
      *
      * Production lowers it once (GuardianEngine::stop(), to kKvStoreStopBusyTimeout) and never
      * raises it: the stop budget is terminal. noexcept and never blocks. Thread-safety
@@ -290,7 +297,8 @@ public:
 
     /// TEST-ONLY: invoke the busy handler directly with SQLite's `count` (retries already made in
     /// this wait). Returns what SQLite would see: 1 after sleeping (retry), 0 (give up). Lets a
-    /// test drive the handler's per-thread wait clock without a contended database.
+    /// test drive the handler's per-thread wait clock without a contended database. It does not
+    /// reset the wait chain; every other public method does, on entry.
     [[nodiscard]] int busy_handler_for_test(int count) noexcept;
 
     /// TEST-ONLY: the retry sleep the handler uses for SQLite's `count` (1, 2, 5, then 10 ms).

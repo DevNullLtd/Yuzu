@@ -1098,7 +1098,7 @@ private:
     /// default time_point when no persister is wired). The hook runs the test hook, right after
     /// begin and BEFORE the stage body, so a test can make the body look slow by advancing an
     /// injected clock there. end records store trouble when the stage took at least
-    /// kBaselineStopTroubleThreshold (750 ms, the stop busy budget less a timer-rounding slack); a
+    /// kBaselineStopTroubleThreshold (750 ms, the stop busy budget less a measurement slack); a
     /// stage that failed fast is not trouble (see the persister).
     [[nodiscard]] std::chrono::steady_clock::time_point stop_stage_begin_locked() const noexcept;
     void stop_stage_hook_locked(const char* stage) noexcept;

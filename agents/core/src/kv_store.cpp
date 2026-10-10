@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <format>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -99,46 +100,75 @@ struct KvBusyState {
 
 namespace {
 
+// The wait clock of the busy handler below. Namespace-level and constinit, so it is constant
+// initialised (no TLS init wrapper or guard on the hot path, enforced by the compiler) and
+// trivially destructible. The wait runs entirely on the calling thread.
+constexpr int kNoPreviousCount = -2; // never a count SQLite passes, so the first call restarts
+
+struct WaitClock {
+    std::chrono::steady_clock::time_point start{};
+    int last_count{kNoPreviousCount};
+};
+constinit thread_local WaitClock t_wait;
+
+// Forget the previous handler call on this thread, so the next one restarts the clock.
+void reset_wait_chain() noexcept {
+    t_wait.last_count = kNoPreviousCount;
+}
+
 // sqlite3_busy_handler callback (#5604). Runs on the waiting thread WITH the connection mutex
 // held, so it may ONLY read the atomic budget and sleep: no logging, no locks, no allocation.
 //
 // `count` is the number of retries SQLite has already made in ONE lock wait. SQLite calls the
-// handler with consecutive counts 0, 1, 2, ... while a wait continues, and resets the count to 0
-// for every statement step, prepare and checkpoint that has to wait (not once per KV method: a
-// method that takes the lock twice, del_keys' rollback-journal fallback, starts two waits). The
-// wait's clock is a thread_local (the wait runs entirely on the calling thread) and restarts
-// whenever this call does not continue the previous one on this thread: count == 0, or a count
-// other than the previous count + 1. That covers a call with count > 0 on a thread that never
-// saw the matching count == 0 (a fresh thread, another store, a prepare-time wait that follows a
-// statement that waited). Continuity is judged by the count, not by elapsed time, so a
-// scheduler stall or one of SQLite's own sleeps inside a wait (its WAL read retries sleep
-// outside this handler) does not renew the budget. A coincidental continuation, a new wait whose
-// first observed count happens to equal the previous count + 1, is not known to occur in SQLite
-// and would at worst carry an older start. When the handler gives up it forgets the count, so
-// the next wait always restarts.
+// handler with consecutive counts 0, 1, 2, ... while a wait continues. It resets the count to 0
+// when a statement step starts, at the end of a prepare, and for a PRAGMA, a checkpoint and
+// sqlite3_busy_handler(); it does not reset it when a step ends. So the counts stay consecutive
+// across everything inside one step, including a second lock wait (a rollback-journal step can
+// wait for the writer lock and then again for EXCLUSIVE at commit).
+//
+// The clock restarts whenever a call does not continue the previous one on this thread: count
+// <= 0, or a count other than the previous count + 1 (a fresh thread, another store). Continuity
+// is judged by the count, not by elapsed time, so a scheduler stall or one of SQLite's own
+// sleeps inside a wait (its WAL-index retries sleep outside this handler) does not renew the
+// budget. Every public KvStore method also calls reset_wait_chain() on entry (CallLock), so a
+// handler call whose count happens to equal the last count of an EARLIER call, such as a
+// prepare-time wait after a step that waited, restarts instead of inheriting that call's start.
+// What remains is a second wait inside ONE statement step: it continues the first wait's count
+// and shares its clock, so the budget is per statement step, the same as
+// sqlite3_busy_timeout()'s. When the handler gives up it forgets the count too.
+//
+// `count <= 0` also keeps the `count - 1` below away from INT_MIN. For count == 0 it is
+// redundant today (last_count is never -1: it is either kNoPreviousCount or a count SQLite
+// passed), so it only guards inputs outside the contract.
 //
 // Returning 0 makes the pending call fail with SQLITE_BUSY. The budget is re-read on every retry,
 // so lowering it from another thread cuts a wait that is already in progress, which
 // sqlite3_busy_timeout() cannot do (it would block behind the connection mutex this wait holds).
 int kv_busy_handler(void* ctx, int count) noexcept {
-    struct WaitClock {
-        std::chrono::steady_clock::time_point start{};
-        int last_count{-2}; // never a count SQLite passes, so the first call always restarts
-    };
-    thread_local WaitClock wait;
     const auto now = std::chrono::steady_clock::now();
-    if (count <= 0 || count != wait.last_count + 1)
-        wait.start = now;
-    wait.last_count = count;
+    if (count <= 0 || count - 1 != t_wait.last_count)
+        t_wait.start = now;
+    t_wait.last_count = count;
     const auto* busy = static_cast<const KvBusyState*>(ctx);
     const auto limit = std::chrono::milliseconds{busy->budget_ms.load(std::memory_order_relaxed)};
-    if (now - wait.start >= limit) {
-        wait.last_count = -2;
+    if (now - t_wait.start >= limit) {
+        reset_wait_chain();
         return 0;
     }
     std::this_thread::sleep_for(busy_retry_sleep(count));
     return 1;
 }
+
+// Takes the connection mutex for one public KvStore call and starts the call with a fresh wait
+// chain (see kv_busy_handler). Every method that can touch the database uses it, so no call
+// can continue the count series of an earlier one.
+class CallLock {
+public:
+    explicit CallLock(std::mutex& mu) : lock_{mu} { reset_wait_chain(); }
+
+private:
+    std::lock_guard<std::mutex> lock_;
+};
 
 } // namespace
 
@@ -282,7 +312,7 @@ std::chrono::milliseconds KvStore::busy_timeout_for_test() const noexcept {
 }
 
 bool KvStore::set(std::string_view plugin, std::string_view key, std::string_view value) {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     if (!db_)
         return false;
 
@@ -314,7 +344,7 @@ bool KvStore::set(std::string_view plugin, std::string_view key, std::string_vie
 }
 
 std::optional<std::string> KvStore::get(std::string_view plugin, std::string_view key) {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     if (!db_)
         return std::nullopt;
 
@@ -340,7 +370,7 @@ std::optional<std::string> KvStore::get(std::string_view plugin, std::string_vie
 }
 
 bool KvStore::del(std::string_view plugin, std::string_view key) {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     if (!db_)
         return false;
 
@@ -366,7 +396,7 @@ bool KvStore::del(std::string_view plugin, std::string_view key) {
 }
 
 bool KvStore::exists(std::string_view plugin, std::string_view key) {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     if (!db_)
         return false;
 
@@ -388,7 +418,7 @@ bool KvStore::exists(std::string_view plugin, std::string_view key) {
 }
 
 std::vector<std::string> KvStore::list(std::string_view plugin, std::string_view prefix) {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     std::vector<std::string> result;
     if (!db_)
         return result;
@@ -418,7 +448,7 @@ std::vector<std::string> KvStore::list(std::string_view plugin, std::string_view
 }
 
 int KvStore::clear(std::string_view plugin) {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     if (!db_)
         return 0;
 
@@ -444,7 +474,7 @@ int KvStore::clear(std::string_view plugin) {
 
 std::expected<std::vector<KvRow>, KvStoreError>
 KvStore::list_entries(std::string_view plugin, std::string_view prefix) {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     std::vector<KvRow> result;
     if (!db_)
         return std::unexpected(KvStoreError{"kv_store is closed"});
@@ -485,7 +515,7 @@ KvStore::list_entries(std::string_view plugin, std::string_view prefix) {
 
 std::expected<KvNamespaceSize, KvStoreError>
 KvStore::namespace_size(std::string_view plugin, std::string_view prefix) {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     if (!db_)
         return std::unexpected(KvStoreError{"kv_store is closed"});
 
@@ -527,7 +557,7 @@ KvStore::namespace_size(std::string_view plugin, std::string_view prefix) {
 
 std::expected<std::vector<KvKeySize>, KvStoreError>
 KvStore::list_keys_sized(std::string_view plugin, std::string_view prefix) {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     std::vector<KvKeySize> result;
     if (!db_)
         return std::unexpected(KvStoreError{"kv_store is closed"});
@@ -565,7 +595,7 @@ KvStore::list_keys_sized(std::string_view plugin, std::string_view prefix) {
 
 std::expected<std::optional<std::string>, KvStoreError>
 KvStore::get_entry(std::string_view plugin, std::string_view key) {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     if (!db_)
         return std::unexpected(KvStoreError{"kv_store is closed"});
 
@@ -596,7 +626,7 @@ KvStore::get_entry(std::string_view plugin, std::string_view key) {
 
 KvInsert KvStore::insert_if_absent(std::string_view plugin, std::string_view key,
                                    std::string_view value) {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     if (!db_)
         return KvInsert::Error;
 
@@ -638,7 +668,7 @@ KvInsert KvStore::insert_if_absent(std::string_view plugin, std::string_view key
 
 KvRename KvStore::rename_key(std::string_view plugin, std::string_view from_key,
                              std::string_view to_key) {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     if (!db_)
         return KvRename::Error;
 
@@ -679,7 +709,7 @@ KvRename KvStore::rename_key(std::string_view plugin, std::string_view from_key,
 }
 
 int KvStore::del_keys(std::string_view plugin, const std::vector<std::string>& keys) {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     if (!db_ || keys.empty())
         return 0;
 
@@ -736,7 +766,7 @@ int KvStore::del_keys(std::string_view plugin, const std::vector<std::string>& k
 }
 
 int KvStore::pragma_synchronous() {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     if (!db_)
         return -1;
     sqlite3_stmt* raw_stmt = nullptr;
@@ -749,7 +779,7 @@ int KvStore::pragma_synchronous() {
 }
 
 void KvStore::enable_extended_result_codes_for_test() {
-    std::lock_guard lock(mu_);
+    CallLock lock(mu_);
     if (db_)
         sqlite3_extended_result_codes(db_, 1);
 }

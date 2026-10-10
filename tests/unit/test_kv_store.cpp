@@ -19,10 +19,12 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
@@ -1065,26 +1067,38 @@ TEST_CASE("#5604 KvStore: a handler call with count > 0 on a thread that never s
     auto t = make_test_store();
     t.store.set_busy_timeout(150ms);
 
-    // A fresh thread has no wait clock. count == 3 is a call SQLite could make for a wait this
+    // A fresh thread has no wait clock. count > 0 is a call SQLite could make for a wait this
     // thread's handler never began (a reset count after a prepare or checkpoint wait): reading
     // an empty start would see "elapsed since the epoch" and give up immediately. The call
     // restarts the clock instead, and the wait then ends at about the budget from THAT call.
-    int rc_fresh = -1;
-    double fresh_ms = 0.0;
-    double fresh_wait_ms = 0.0;
-    std::thread fresh([&] {
-        fresh_wait_ms = elapsed_ms_5604([&] {
-            fresh_ms = elapsed_ms_5604([&] { rc_fresh = t.store.busy_handler_for_test(3); });
-            int rc = rc_fresh;
-            for (int count = 4; rc == 1 && count < 10'000; ++count)
-                rc = t.store.busy_handler_for_test(count);
+    // Counts 1, 2 and 3 each start a fresh thread: the thread's initial "previous count" must
+    // not be a value that continues any of them (an initial 0 would continue count 1, an
+    // initial 1 count 2).
+    for (const int first_count : {1, 2, 3}) {
+        INFO("first count on the fresh thread: " << first_count);
+        int rc_fresh = -1;
+        double fresh_ms = 0.0;
+        double fresh_wait_ms = 0.0;
+        std::thread fresh([&] {
+            fresh_wait_ms = elapsed_ms_5604([&] {
+                fresh_ms = elapsed_ms_5604(
+                    [&] { rc_fresh = t.store.busy_handler_for_test(first_count); });
+                int rc = rc_fresh;
+                for (int count = first_count + 1; rc == 1 && count < 10'000; ++count)
+                    rc = t.store.busy_handler_for_test(count);
+            });
         });
-    });
-    fresh.join();
-    CHECK(rc_fresh == 1);   // RED without the restart: returned 0 at once
-    CHECK(fresh_ms >= 5.0); // it slept the ladder's tail (10 ms; a coarse timer may return early)
-    CHECK(fresh_wait_ms >= 150.0);
-    CHECK(fresh_wait_ms < 1500.0);
+        fresh.join();
+        CHECK(rc_fresh == 1); // RED without the restart: returned 0 at once
+        CHECK(fresh_wait_ms >= 150.0);
+        CHECK(fresh_wait_ms < 1500.0);
+        if (first_count == 3) {
+            // The sleep under test is the ladder's 10 ms tail. 5 ms is the loosest lower bound
+            // that still tells it from a handler that does not sleep (or sleeps the 1 ms head
+            // only); it is a loose bound, and rc_fresh == 1 is the assertion that matters.
+            CHECK(fresh_ms >= 5.0);
+        }
+    }
 
     // A normal wait: count 0, 1, 2, ... until the handler gives up. It must give up, and only
     // once the budget is spent.
@@ -1107,6 +1121,90 @@ TEST_CASE("#5604 KvStore: a handler call with count > 0 on a thread that never s
     CHECK(rc_zero == 0);
 }
 
+TEST_CASE("#5604 KvStore: the handler's count arithmetic is safe at the ends of the int range",
+          "[kv_store][busy]") {
+    using namespace std::chrono_literals;
+    auto t = make_test_store();
+    t.store.set_busy_timeout(5s);
+    constexpr int kMax = (std::numeric_limits<int>::max)();
+    constexpr int kMin = (std::numeric_limits<int>::min)();
+    // Two calls with INT_MAX in a row: the second compares against a previous count of INT_MAX,
+    // so a "previous + 1" would overflow a signed int (undefined behaviour; a UBSan failure).
+    // Neither continues the other's wait, so both restart and retry.
+    int rc_first = -1;
+    int rc_second = -1;
+    int rc_min = -1;
+    int rc_zero = -1;
+    std::thread th([&] {
+        rc_first = t.store.busy_handler_for_test(kMax);
+        rc_second = t.store.busy_handler_for_test(kMax);
+        rc_min = t.store.busy_handler_for_test(kMin); // outside the contract: restarts, no UB
+        rc_zero = t.store.busy_handler_for_test(0);
+    });
+    th.join();
+    CHECK(rc_first == 1);
+    CHECK(rc_second == 1);
+    CHECK(rc_min == 1);
+    CHECK(rc_zero == 1);
+}
+
+TEST_CASE("#5604 KvStore: every public method starts with a fresh wait chain",
+          "[kv_store][busy]") {
+    using namespace std::chrono_literals;
+    // SQLite resets its busy count when a step starts, at the end of a prepare, and for a PRAGMA
+    // or checkpoint, but never when a step ends. A handler call at the start of one KV call can
+    // therefore arrive with the count that follows the LAST call of the previous KV call on the
+    // same connection and thread. Without the per-call reset it would continue that wait and
+    // inherit its old start. The seam below stands in for SQLite: it leaves the chain at count 2,
+    // lets the budget run out, makes one public call, and then presents count 3.
+    auto t = make_test_store();
+    t.store.set_busy_timeout(20ms);
+
+    // Leave the chain at count 2 with a start that is, after the sleep, past the budget.
+    auto arm = [&] {
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            if (t.store.busy_handler_for_test(0) == 1 && t.store.busy_handler_for_test(1) == 1 &&
+                t.store.busy_handler_for_test(2) == 1) {
+                std::this_thread::sleep_for(30ms);
+                return true;
+            }
+        }
+        return false; // the thread was starved past the budget every time
+    };
+
+    // Control: with no public call in between, count 3 continues the wait and its old start is
+    // past the budget, so the handler gives up. This is what the reset has to prevent.
+    REQUIRE(arm());
+    CHECK(t.store.busy_handler_for_test(3) == 0);
+
+    const std::vector<std::pair<const char*, std::function<void()>>> calls = {
+        {"set", [&] { (void)t.store.set("p", "k", "v"); }},
+        {"get", [&] { (void)t.store.get("p", "k"); }},
+        {"del", [&] { (void)t.store.del("p", "none"); }},
+        {"exists", [&] { (void)t.store.exists("p", "k"); }},
+        {"list", [&] { (void)t.store.list("p", ""); }},
+        {"list_entries", [&] { (void)t.store.list_entries("p", ""); }},
+        {"namespace_size", [&] { (void)t.store.namespace_size("p", ""); }},
+        {"list_keys_sized", [&] { (void)t.store.list_keys_sized("p", ""); }},
+        {"get_entry", [&] { (void)t.store.get_entry("p", "k"); }},
+        {"insert_if_absent", [&] { (void)t.store.insert_if_absent("p", "k2", "v"); }},
+        {"rename_key", [&] { (void)t.store.rename_key("p", "k2", "k3"); }},
+        {"del_keys", [&] { (void)t.store.del_keys("p", {"k3"}); }},
+        {"pragma_synchronous", [&] { (void)t.store.pragma_synchronous(); }},
+        {"enable_extended_result_codes_for_test",
+         [&] { t.store.enable_extended_result_codes_for_test(); }},
+        {"clear", [&] { (void)t.store.clear("p"); }},
+    };
+    for (const auto& [name, call] : calls) {
+        INFO("public method: " << name);
+        REQUIRE(arm());
+        call();
+        // RED when the method does not reset the chain: count 3 continues the stale wait and the
+        // handler gives up (0) instead of restarting (1).
+        CHECK(t.store.busy_handler_for_test(3) == 1);
+    }
+}
+
 TEST_CASE("#5604 KvStore: a pause inside a continuing wait does not renew its budget",
           "[kv_store][busy]") {
     using namespace std::chrono_literals;
@@ -1116,38 +1214,58 @@ TEST_CASE("#5604 KvStore: a pause inside a continuing wait does not renew its bu
     // SQLite calls the handler with consecutive counts while one wait continues. A scheduler
     // stall, or one of SQLite's own sleeps outside the handler, between two such calls is part of
     // the same wait: the 300 ms pause between count 1 and count 2 below must not grant a fresh
-    // 400 ms. The wait ends at the budget from the FIRST call (plus one ladder sleep), not at the
-    // budget plus the pause (about 700 ms when the pause renews it).
+    // 400 ms. The wait ends at the budget from the FIRST call (plus one ladder sleep), so it
+    // ends well before the end of the pause plus the budget (about 700 ms in total when the
+    // pause renews it).
+    int rc0 = -1;
+    int rc1 = -1;
     int last_rc = 1;
     double total_ms = 0.0;
+    double pause_end_ms = 0.0;
     std::thread waiter([&] {
-        total_ms = elapsed_ms_5604([&] {
-            (void)t.store.busy_handler_for_test(0);
-            (void)t.store.busy_handler_for_test(1);
-            std::this_thread::sleep_for(300ms);
-            int count = 2;
-            while (last_rc == 1 && count < 10'000)
-                last_rc = t.store.busy_handler_for_test(count++);
-        });
+        const auto t0 = std::chrono::steady_clock::now();
+        rc0 = t.store.busy_handler_for_test(0);
+        rc1 = t.store.busy_handler_for_test(1);
+        std::this_thread::sleep_for(300ms);
+        pause_end_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count();
+        int count = 2;
+        while (last_rc == 1 && count < 10'000)
+            last_rc = t.store.busy_handler_for_test(count++);
+        total_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count();
     });
     waiter.join();
     CHECK(last_rc == 0);
     CHECK(total_ms >= 400.0);
-    CHECK(total_ms < 650.0); // RED if the pause renewed the budget: about 700 ms or more
+    // Measured from the end of the pause, so a slow scheduler that lengthens the pause itself
+    // does not move this result: a continuing wait has at most about 100 ms (400 ms minus the
+    // 300 ms pause) left when the pause ends, a renewed one a whole 400 ms. 250 ms leaves 150 ms
+    // of scheduling delay after the pause before this goes RED on a correct handler, and 150 ms
+    // of margin before it stops catching a renewing one. Skipped when calls 0 and 1 did not both
+    // retry: a thread starved past the whole budget there gave up before the pause.
+    if (rc0 == 1 && rc1 == 1)
+        CHECK(total_ms - pause_end_ms < 250.0); // RED if the pause renewed the budget
 
-    // The same property without an upper timing bound: a pause longer than the whole budget
-    // between two consecutive counts leaves the wait over budget, so the next call gives up. A
-    // slow scheduler can only lengthen the pause, so it cannot flip this result.
+    // The same property without any upper timing bound: a pause longer than the whole budget
+    // between two consecutive counts leaves the wait over budget, so the next call gives up.
     t.store.set_busy_timeout(150ms);
+    int rc_first = -1;
+    int rc_second = -1;
     int rc_after_pause = -1;
     std::thread paused([&] {
-        (void)t.store.busy_handler_for_test(0);
-        (void)t.store.busy_handler_for_test(1);
+        rc_first = t.store.busy_handler_for_test(0);
+        rc_second = t.store.busy_handler_for_test(1);
         std::this_thread::sleep_for(300ms);
         rc_after_pause = t.store.busy_handler_for_test(2);
     });
     paused.join();
-    CHECK(rc_after_pause == 0); // RED if the 300 ms pause restarted the clock: returned 1
+    // A thread starved past the 150 ms budget inside the first two calls gave up there and
+    // forgot the count, so count 2 would correctly restart: the property needs both to retry.
+    if (rc_first == 1 && rc_second == 1)
+        CHECK(rc_after_pause == 0); // RED if the 300 ms pause restarted the clock: returned 1
 }
 
 TEST_CASE("#5604 KvStore: a handler call that does not continue the previous count restarts the "
@@ -1159,8 +1277,8 @@ TEST_CASE("#5604 KvStore: a handler call that does not continue the previous cou
 
     // Counts 0 and 1, then a pause longer than the budget, then count 5. 5 is not the previous
     // count + 1, so it is a different wait: it must restart the clock and retry, not read the
-    // old start (200 ms ago, past the 150 ms budget) and give up at once. The pause is shorter
-    // than a time-gap heuristic would treat as a new wait, so only the count can tell.
+    // old start (200 ms ago, past the 150 ms budget) and give up at once. Elapsed time cannot
+    // tell this from a continuing wait, so only the count can.
     int rc_discontinuous = -1;
     double wait_ms = 0.0;
     std::thread waiter([&] {

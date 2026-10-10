@@ -1248,7 +1248,7 @@ flip, with a red-first test each:
     healthy one; logged, not counted), or the flush was skipped because it could not
     start within 18 s of the start of that stop after that stop had shown a slow store: an
     earlier shutdown step that ran slow, taking at least 750 ms (the 1 s stop busy budget
-    minus a 250 ms timer-rounding slack), or a persist pass whose failed write took that
+    minus a 250 ms measurement slack), or a persist pass whose failed write took that
     long and ended during that stop (a step that failed quickly is not such a sign, and a
     slow failure with an earlier start does not skip; logged, not counted), or an allocation
     or lock failure cut the flush, or the staging of captures the agent could not note,
@@ -2244,7 +2244,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   waiting write holds and does not shorten it). Its consequences:
   `kBaselineStopLatestStart` is now 18 s (grace less the Stop pass's 1 s wall and one 1 s
   busy budget; it has no slack, and the retry-sleep overshoot lands on top), and
-  `kBaselineStopTroubleThreshold` is 750 ms (the stop budget less a 250 ms timer slack).
+  `kBaselineStopTroubleThreshold` is 750 ms (the stop budget less a 250 ms measurement slack).
   The Stop pass is skipped only when it would start at or after 18 s AND this stop has shown
   a slow store: an earlier stage (the two journal flushes, the loss-ledger write; not the
   worker join, which is a thread join) that took at least the threshold, or a persist
@@ -2257,22 +2257,31 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   **Target (AC1)**: at most seven stop budgets (7 s): six enumerated waits plus one budget
   of allowance for sleep overshoot and a queued caller. The six are journal flush 1, the
   loss-ledger write, journal flush 2, the Stop pass (its wall is checked only from the
-  second tuple on, so it can make two 1 s writes) and an in-flight worker write. The
+  second tuple on, so it can make two writes, a slow success followed by a failing one,
+  because the stop budget allows one failure) and an in-flight worker write. The
   enumeration is not enforced by any code; the `static_assert` on seven stop budgets within
-  half the 20 s grace is the enforced margin. The largest figure measured is 6.04 s on
-  Linux (6.03 s on the real write row B with 5 staged, 6.04 s on the emulated row; one run
-  per point except rows B and E, which ran twice), inside the seven-budget target with a
-  0.96 s margin. On a Docker agent service (stopped at 10 s) a 6 s contended stop leaves
-  about 4 s for the DEX drain, the Spark consumer join, the updater and log teardown.
-  **Cost per queued writer**: every other KV writer queued on `KvStore::mu_` when `stop()`
-  runs adds about one budget, because each of `stop()`'s serial stages queues behind it.
-  Measured on Linux, one run per point, with a journal record pending and a non-baseline
-  worker write in flight: 9.0 s with 3 extra writers and 10.98 s with 5. Extrapolated, not
-  run: about 20 s, the watchdog, at about 14 queued writers. A writer that loops with no
-  pause can starve a `stop()` stage outright because `std::mutex` is not fair; no production
-  caller was found that does this. Both are properties of the store's single mutex that
-  predate #5604 and are not fixed here; to be tracked as a follow-up in the #5604 decision
-  comment.
+  half the 20 s grace is the enforced margin. The largest figure measured is 6.03 s on
+  Linux (the real-write row B at its slowest alignment and the emulated row E; see the
+  measured rows below), inside the seven-budget target with a 0.97 s margin. On a Docker
+  agent service (stopped at 10 s) a 6 s contended stop leaves about 4 s for the DEX drain,
+  the Spark consumer join, the updater and log teardown.
+  **Cost per queued writer**: every other single-shot KV writer queued on `KvStore::mu_`
+  when `stop()` runs adds about one budget, because each of `stop()`'s serial stages queues
+  behind it. Measured on Linux, one run per point, with a journal record pending and a
+  non-baseline worker write in flight: 9.0 s with 3 extra writers and 10.98 s with 5.
+  Extrapolated, not run: about 20 s, the watchdog, at about 14 queued writers. The
+  seven-budget target therefore holds with at most one other writer queued, and then with
+  little room: with one extra writer `stop()` took 7.01 to 7.02 s, about 20 ms of
+  retry-sleep overshoot above 7 s. The allowance budget is spent twice if a Worker pass in
+  flight makes two failed writes and a writer is also queued. A writer that loops costs
+  more than one budget: in a standalone `KvStore` run of six serial 1 s stage writes, K
+  other threads looping `set()` with a 50 ms pause took 8.8 s for K=1 and 17.8 s for K=3
+  against 6.0 s with none (one run per point), about 3 s per looping writer. A writer that
+  loops with no pause at all can starve a `stop()` stage outright because `std::mutex` is
+  not fair (with one such writer a stage was still unserved after more than 3 minutes, and
+  the run was killed); no production caller that does this was identified. All of this
+  predates #5604 and is not fixed here (a pre-existing residual of the store's single
+  mutex); to be tracked as a follow-up in the #5604 decision comment.
   **Trace decision (AC2)**: a watchdog-cut flush is accepted as untraceable at stop time
   (`hard_exit` forbids a log line, and a KV marker would fail on the same store); the
   evidence is exit code 4 plus the next boot's recapture lines. A recapture logs exactly
@@ -2281,25 +2290,29 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   sentinel is #5605's design.
   Measured under real SQLITE_BUSY (a second connection holding `BEGIN IMMEDIATE` through
   the whole stop), production values (5 s lowered to 1 s), Linux debug build, `stop()` entry
-  to exit, on the code with the lateness gate; one run per point, except rows
-  B and E, which were run twice and agreed within 8 ms: nothing pending, 3 or 5 staged
-  captures, 2.01 s; a journal record pending, 5.02 s with 3 staged and 6.03 s with 5 staged
-  (the same shape took 4.02 s with 3 staged and 4.03 s with 5 on the code before the gate,
-  re-run today, and 4.02 s and 5.03 s in a scratch build with only the gate removed: which
-  of the worker's writes line up with the stop decides how many of the
-  six waits occur); a worker baseline write in flight, 2.01 to 2.72 s across four
-  alignments (the 2.01 s points include the worker's retry write in flight); a worker
-  non-baseline write in flight (emulated by a KV write issued from the worker thread, 5
-  staged), 2.01 to 2.72 s; a journal record pending with that emulated write in flight,
-  5.33 to 6.04 s (the largest measured on an emulated row). Where the stall skipped the Stop
-  pass on the code before the gate, these rows were shorter: the journal row 4.02 s and
-  4.03 s; the baseline-write row 1.71, 1.01 and 1.01 s at its first three alignments (its
-  fourth, 2.01 s, and the non-baseline row did not change); the last row 5.03, 4.74 and
-  4.33 s. The gate costs one or two more stop budgets when the store is still locked.
-  Linux only; the emulated rows are not the real sent-marker write. Raw: `RESULTS.txt`
-  (before) and `RESULTS-fixround1.txt` (after), to be attached to the #5604 decision comment.
-  **Accepted trade-off**: an external process that holds the kv store locked for 1 to 5 s at
-  the shutdown instant now fails the stop-time writes that a 5 s budget would have survived.
+  to exit, with the busy handler of this change (count continuity, reset on entry to every
+  `KvStore` call) and the lateness gate; one run per point, except row B (eight runs for
+  each staged count) and row E (two runs): A, nothing pending, 3 or 5 staged captures,
+  2.01 s; B, a journal record pending and the worker idle, 4.02 to 6.03 s over 16 runs
+  (4.02 s seven times, 5.02 s six times, 6.03 s three times, with 3 and with 5 staged:
+  which of the worker's own writes line up with the stop decides how many of the six waits
+  occur, and the same spread appeared on the previous handler); C, a worker baseline write
+  in flight, 2.01 to 2.72 s across four alignments (the 2.01 s points include the worker's
+  retry write in flight); D, a worker non-baseline write in flight (emulated by a KV write
+  issued from the worker thread, 5 staged), 2.01 to 2.72 s; E, a journal record pending
+  with that emulated write in flight, 5.33 to 6.03 s (the two runs at each alignment
+  agreed within 3 ms). Rows A, C, D and E were first measured with an earlier handler (a
+  time-gap rule) and measured again at the final handler: unchanged within 11 ms. Where
+  the stall skipped the Stop pass on the code before the gate, rows C and E were shorter:
+  C 1.71, 1.01 and 1.01 s at its first three alignments (its fourth, 2.01 s, and row D did
+  not change), E 5.03, 4.74 and 4.33 s; row B took 4.02 s and 4.03 s there in one run each,
+  inside its spread above. The gate costs one or two more stop budgets when the store is
+  still locked (rows C and E). Linux only; the emulated rows are not the real sent-marker
+  write. Raw: the harness output for the code before the gate and for the final handler,
+  to be attached to the #5604 decision comment.
+  **Trade-off (journal-record loss is an F14 precondition, not yet accepted)**: an external
+  process that holds the kv store locked for 1 to 5 s at the shutdown instant now fails the
+  stop-time writes that a 5 s budget would have survived.
   The cost is one recapture of the affected baselines at the next boot (a file that drifted
   between a lost capture and that boot is accepted as the baseline), a stale (never
   corrupt) loss ledger, and, with `prefer_spark_` true, **lifecycle-journal audit records
@@ -2320,12 +2333,15 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   **Residual (stands; a flip-gate item, to be tracked in the #5604 decision comment and
   #3756)**: the busy handler only bounds lock waits. An fsync or
   other slow-I/O stall inside a write is not a lock event and no handler runs, so a stalled
-  disk still runs into the watchdog. On Windows SQLite's own file-I/O retries
-  (`winRetryIoerr`, about 1.45 s per failing file operation, derived from the SQLite source
-  and not measured here) and its WAL-index retry sleeps run outside the handler, so there the
-  bound is per busy wait, not per call (five stages at two failing operations per statement
-  would be about 19.6 s by that derivation). The DEX observer drain in `AgentImpl::stop()`
-  and plugin `shutdown()` under the second guard stay unbounded by this change. A stop
+  disk still runs into the watchdog. On every platform SQLite's WAL-index retry sleeps run
+  outside the handler, so the bound is per busy wait, not per call (measured on Linux with a
+  peer process holding the WAL index in recovery: a write under a 1000 ms budget returned
+  after 1.74 s and, in another phasing, 2.05 s; one run per phasing). On Windows SQLite's own
+  file-I/O retries (`winRetryIoerr`, about 1.45 s per failing file operation, derived from
+  the SQLite source and not measured here) add to that (five stages at two failing
+  operations per statement would be about 19.6 s by that derivation). The DEX observer
+  drain in `AgentImpl::stop()` and plugin `shutdown()` under the second guard stay
+  unbounded by this change. A stop
   queued behind an `apply_rules` is not cut by the lowering for a Forced drain (up to two
   failures of 1 s: its 2 s wall ends it) or a hung `watch()` (pre-existing). The stage
   evidence is still sampled.
@@ -2336,7 +2352,9 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   end-of-stop line reports per-stage timings. An operator therefore cannot see that the 1 s
   budget applied, how long each stage took, or a near miss (a stop that took 17 s). The
   per-write failure lines, the loss-ledger warning, the incomplete-flush line and the
-  pending-journal line are the available evidence. Deferred; related to #5605 and #3756.
+  pending-journal line are the available evidence; the pending-journal line carries the
+  count and the flush stage but no cause (a budget cut and any other write failure read
+  the same). Deferred; related to #5605 and #3756.
   Decision and implementation: #5604.
 - Owner: not assigned for any item above.
 - Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + three pre-PR-5 GATING items
@@ -2345,7 +2363,9 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   baseline-persist signal (F14 precondition, section 3a) and the missing
   remaining-deadline wall in `stop()`) - no issue numbers, tracked here; those two #4045 items
   are tracked in #5605 (fleet signal) and #5604 (the `stop()` deadline; the decision closes
-  with the stop busy budget, while the slow-I/O residual stays F14-gating, section 5). The pre-merge
+  with the stop busy budget, while the slow-I/O residual stays F14-gating, section 5, and
+  the lifecycle-journal records lost at stop are a further F14 precondition there: a fleet
+  signal or explicit risk acceptance by the F14 sign-off owner). The pre-merge
   real-File-mechanism run is DONE (2026-10-08, passed; section 3a).
 - Revisit trigger: before PR-5's sign-off, everything above re-checked; #4051 specifically
   re-checked before any production fleet (dedup races become far more frequent under

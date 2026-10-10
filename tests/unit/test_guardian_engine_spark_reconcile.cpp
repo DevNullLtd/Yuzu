@@ -9183,7 +9183,9 @@ TEST_CASE("#4045 E45: stop() marks its start BEFORE it waits for the engine mute
 
     f.engine->set_apply_post_drain_hook_for_test([&] { // runs inside apply_rules, mtx_ held
         in_apply.store(true);
-        (void)yuzu::test::spin_until([&] { return release.load(); });
+        // Bounded far above the main thread's 5 s wait below, so that wait is the one that times
+        // out first when stop() never marks, and the hook cannot release stop() by timing out.
+        (void)yuzu::test::spin_until([&] { return release.load(); }, std::chrono::seconds{30});
     });
     std::thread apply_thread([&] {
         apply_rc = f.dispatch_raw(make_service_rule("r1", /*enabled=*/false), false).exit_code;
@@ -9201,7 +9203,8 @@ TEST_CASE("#4045 E45: stop() marks its start BEFORE it waits for the engine mute
         in_write.store(true);
         // The failed write has run but has not ended: hold it here until stop() has taken its
         // mark, then make it slow AND leave the stop late.
-        (void)yuzu::test::spin_until([&] { return persister->stop_begun_for_test(); });
+        (void)yuzu::test::spin_until([&] { return persister->stop_begun_for_test(); },
+                                     std::chrono::seconds{30});
         clock.advance(yuzu::agent::kBaselineStopLatestStart.count());
     });
     GuardianBaselinePersister::Outcome forced;
@@ -9740,7 +9743,7 @@ TEST_CASE("#4045 E53: store trouble is a stage that took 750 ms or more, and onl
     FakeClock4045 clock{*persister};
     HookGuard4045 hooks{*f.engine};
 
-    SECTION("the threshold is the stop busy budget less a 250 ms timer slack") {
+    SECTION("the threshold is the stop busy budget less a 250 ms measurement slack") {
         using namespace std::chrono_literals;
         static_assert(yuzu::agent::kBaselineStopTroubleSlack == 250ms);
         CHECK(yuzu::agent::kBaselineStopTroubleThreshold == 750ms);

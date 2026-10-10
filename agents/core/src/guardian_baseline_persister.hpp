@@ -47,7 +47,7 @@
  * always runs, and one write against a BUSY store costs a busy budget (GuardianEngine::stop()
  * lowers it to kKvStoreStopBusyTimeout, #5604), which would end past the 20 s grace. The
  * evidence is either an earlier stage of this same stop() that ran SLOW, at least
- * kBaselineStopTroubleThreshold (750 ms: the stop busy budget less a timer slack;
+ * kBaselineStopTroubleThreshold (750 ms: the stop busy budget less a measurement slack;
  * note_stop_store_trouble()), or a persist pass of this persister (the worker's, typically)
  * whose failed write took that long and ENDED at or after begin_stop(): a BUSY store burns a
  * whole busy budget per write. A stall that ended before the mark spent none of this stop's
@@ -249,13 +249,14 @@ static_assert(kBaselineStopTroubleThreshold > std::chrono::milliseconds{0} &&
               "budget");
 // stop()'s serial KV waits are enumerated as six busy budgets: journal flush 1, the loss
 // ledger, journal flush 2, the Stop pass (its wall is checked only from the second tuple on, so
-// it can make two 1 s writes) and an in-flight worker write. That enumeration is NOT enforced
-// by any code. What is enforced is this margin: seven stop budgets, one more than the six, must
-// fit in half the grace, so the rest of AgentImpl::stop() (DEX observer, Spark engine,
-// updater) keeps the other half. It is a margin rule, not a derived bound: it counts neither
-// the retry-sleep overshoot (up to 10 ms per wait, about 16 ms where the timer tick is coarse)
-// nor callers queued on KvStore::mu_ that began waiting before the budget was lowered (each
-// adds about one budget, see GuardianEngine::stop()).
+// it can make two 1 s writes: a slow success then a failing one) and an in-flight worker write.
+// That enumeration is NOT enforced by any code. What is enforced is this margin: seven stop
+// budgets, one more than the six, must fit in half the grace, so the rest of
+// AgentImpl::stop() (DEX observer, Spark engine, updater) keeps the other half. It is a margin
+// rule, not a derived bound: it counts neither the retry-sleep overshoot (up to 10 ms per
+// wait, about 16 ms where the timer tick is coarse) nor callers queued on KvStore::mu_ that
+// began waiting before the budget was lowered (each single-shot one adds about one budget, a
+// looping one more, see GuardianEngine::stop()).
 static_assert(7 * kKvStoreStopBusyTimeout <= kBaselineShutdownGrace / 2,
               "stop()'s serial KV waits at the stop busy budget must fit in half the shutdown "
               "grace");
