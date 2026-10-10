@@ -3596,3 +3596,93 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamTlsHandshakeFailures", alertstate="firing"}'
         eval_time: 30m
         exp_samples: []
+
+  # CASE V -- a trusted proxy that keeps sending no usable address fires
+  # YuzuGatewayOriginUnusable after its 10m `for:`, labelled with instance, mode and
+  # reason (nothing else). The counters are pre-seeded to 0, so the series is present
+  # from the start (`0x5`) and then rises. g2 is flat: a healthy proxied listener
+  # stays quiet. RED if the reason matcher dropped bad_claim or no_claim, if the `for:`
+  # were dropped (it would fire at 10m), or if the aggregation lost a label.
+  - interval: 1m
+    name: gateway origin unusable - sustained no_claim and bad_claim fire after for
+    input_series:
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g1",mode="forwarded_for",reason="no_claim"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g3",mode="proxy_protocol",reason="bad_claim"}'
+        values: "0x5 1+1x30"
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g2",mode="forwarded_for",reason="no_claim"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing", instance="g1", mode="forwarded_for", reason="no_claim", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing", instance="g3", mode="proxy_protocol", reason="bad_claim", severity="warning"}'
+            value: 1
+
+  # CASE W -- untrusted_source does NOT fire YuzuGatewayOriginUnusable (a different
+  # condition with its own alert), and a single no_claim increment (t5 to t6, then
+  # flat) keeps the 10m increase above zero only until about t14, so the alert is pending
+  # from t6 and its expression is false again before the 10m `for:` elapses: it
+  # never fires. The 12m check is the one that would catch a dropped `for:` (the
+  # alert would be firing then); the 20m and 40m checks cannot, since by then the
+  # burst has aged out of the window either way (CASE V is the other `for:` guard).
+  # RED if the matcher became a regex that includes untrusted_source, or the `for:`
+  # were shortened below the burst length.
+  - interval: 1m
+    name: gateway origin unusable - untrusted_source and a short burst stay quiet
+    input_series:
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g1",mode="forwarded_for",reason="untrusted_source"}'
+        values: "0x5 1+1x40"
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g2",mode="proxy_protocol",reason="no_claim"}'
+        values: "0x5 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginUnusable", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples: []
+
+  # CASE X -- a steady untrusted_source rate fires YuzuGatewayOriginSourcesMismatch
+  # only after its 30m `for:` (still quiet at 20m), labelled with instance and mode
+  # (the reason is part of the matcher, not a label). A steady no_claim rate on
+  # another listener does not fire it. RED if the `for:` were shortened or the
+  # matcher widened.
+  - interval: 1m
+    name: gateway origin sources mismatch - sustained untrusted_source fires after for
+    input_series:
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g1",mode="forwarded_for",reason="untrusted_source"}'
+        values: "0x5 1+1x60"
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g2",mode="forwarded_for",reason="no_claim"}'
+        values: "0x5 1+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginSourcesMismatch", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginSourcesMismatch", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayOriginSourcesMismatch", alertstate="firing", instance="g1", mode="forwarded_for", severity="warning"}'
+            value: 1
+
+  # CASE Y -- a counter that stopped rising (a probe long ago, value 3 for the whole
+  # hour) is quiet. This guards the expression's use of increase(): comparing the
+  # raw counter to zero would fire here after the 30m `for:`. RED if increase() were
+  # dropped. It does not guard the matcher or the `for:` (CASE X does).
+  - interval: 1m
+    name: gateway origin sources mismatch - a counter that stopped rising stays quiet
+    input_series:
+      - series: 'yuzu_gw_grpc_origin_ignored_total{job="yuzu-gateway",instance="g1",mode="proxy_protocol",reason="untrusted_source"}'
+        values: "3x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayOriginSourcesMismatch", alertstate="firing"}'
+        eval_time: 60m
+        exp_samples: []

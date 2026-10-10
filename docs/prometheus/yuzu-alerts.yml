@@ -555,6 +555,74 @@ groups:
             rather than waiting for it to clear.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
 
+      # A listener configured as behind a proxy counts every call whose
+      # claimed client address was not used
+      # (yuzu_gw_grpc_origin_ignored_total{mode,reason}, pre-seeded to 0 for
+      # every pair at start, so increase() has a baseline and a first
+      # occurrence is visible). `no_claim` and `bad_claim` mean a TRUSTED proxy
+      # gave the gateway no usable address: the call is sent upstream with no
+      # observed address and the server audits origin_observed=false, so every
+      # such registration loses its source. The counters carry no listener label.
+      # `for: 10m` over a 10m window: a short restart of the proxy is a burst, a
+      # proxy missing `mode http` / `option forwardfor` (or an iRule sending no
+      # header) is steady. The origin is resolved per RPC STREAM, so only a
+      # connection that goes on to make a call is counted: an L4, TCP, TLS or
+      # PROXY LOCAL health check opens no stream and never is; only an HTTP/2
+      # health check that makes a call would be (a PROXY LOCAL one counts as
+      # no_claim). INITIAL threshold, to be tuned on a real deployment.
+      - alert: YuzuGatewayOriginUnusable
+        expr: |
+          sum by (instance, mode, reason) (increase(yuzu_gw_grpc_origin_ignored_total{reason=~"no_claim|bad_claim"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway {{ $labels.instance }}: trusted proxy gave no usable client address (mode={{ $labels.mode }}, reason={{ $labels.reason }})"
+          description: >-
+            Calls on {{ $labels.instance }}'s {{ $labels.mode }} listener came
+            from a configured proxy that sent no usable client address
+            (reason={{ $labels.reason }}) for at least 10 minutes. Those
+            registrations reach the server with no observed address, so the
+            audit log records the gateway node as source_ip with
+            origin_observed=false. Check that the proxy adds the address: HAProxy
+            needs `mode http` for `option forwardfor`; an OpenShift/OKD router
+            needs the IngressController forwardedHeaderPolicy at Append or
+            Replace; an F5 iRule must send a PROXY header on every backend
+            connection; `trusted_hops` must match the number of proxies that
+            append. The origin is resolved per RPC stream, so a health check that
+            only opens a TCP, TLS or PROXY connection is never counted; one that
+            makes an HTTP/2 call is. INITIAL threshold, not yet tuned against a
+            real deployment.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md#client-addresses-behind-a-proxy"
+
+      # `untrusted_source`: the TCP peer is not one of the listener's
+      # `sources`, so any claim was ignored and the call attributed to that
+      # peer. A steady rate on a proxied listener means either the proxy is
+      # connecting from an address `sources` does not list (the common case:
+      # a router with hostNetwork shows up as the node's address, not the
+      # router pod's) or something other than the proxy reaches the port.
+      - alert: YuzuGatewayOriginSourcesMismatch
+        expr: |
+          sum by (instance, mode) (increase(yuzu_gw_grpc_origin_ignored_total{reason="untrusted_source"}[10m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway {{ $labels.instance }}: connections to the {{ $labels.mode }} listener come from addresses outside sources"
+          description: >-
+            For at least 30 minutes, calls on {{ $labels.instance }}'s
+            {{ $labels.mode }} listener have come from a TCP peer that is not
+            one of its configured sources, so any client address the peer
+            claimed was ignored and the call was attributed to the peer itself.
+            Either `origin.sources` omits the address the gateway actually sees
+            for the proxy (read the connecting address from the proxy side, or
+            from the gateway's listener socket; an OpenShift/OKD router on
+            hostNetwork is the node's OVN management address), or something other
+            than the proxy can reach the listener: close that path with a
+            firewall rule or a NetworkPolicy. A few of these from a probe or a
+            scanner are expected; a steady rate is not.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md#client-addresses-behind-a-proxy"
+
   - name: yuzu-security
     rules:
       - alert: YuzuOnBehalfAssertionRejected

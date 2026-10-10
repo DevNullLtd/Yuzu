@@ -80,6 +80,7 @@ yuzu-agent --cert-store MY --cert-subject "agent-001"
 | 50051 | TCP | Inbound | Agent gRPC | Agent network |
 | 50052 | TCP | Inbound | Management gRPC | Admin network |
 | 50055 | TCP | Inbound | Gateway upstream (mutual TLS plus an SPKI public-key pin of the gateway's key, or an acknowledged-disabled plaintext rig) | Gateway hosts only |
+| 50063 | TCP | Inbound | Gateway management (server to gateway command fan-out; mutual TLS plus a peer pin) | Server hosts only; never publish it |
 | 9568 | TCP | Inbound | Gateway Prometheus | Monitoring network |
 
 **Recommendations:**
@@ -123,10 +124,12 @@ PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
   an L4 virtual IP or a TLS-passthrough proxy that keeps one TCP connection per agent
   end to end), with the gateway agent listener itself running the one-way TLS above.
   A reverse proxy or L7 load balancer that terminates TLS or HTTP/2 in front of
-  `:50051` is no longer a supported way to protect this edge: the gateway binds each
-  agent's heartbeats to the connection that opened its session, and such a proxy can
-  spread one agent's calls over several connections (see
-  [Heartbeat admission](gateway.md#heartbeat-admission)), **or**
+  `:50051` is a supported way to protect this edge only when it keeps each client
+  connection on its own backend connection for as long as the client connection lives
+  (see [Keeping each agent on one backend connection](gateway.md#keeping-each-agent-on-one-backend-connection)):
+  the gateway binds each agent's heartbeats to the connection that opened its session,
+  and a proxy that pools backend connections can spread one agent's calls over several
+  connections (see [Heartbeat admission](gateway.md#heartbeat-admission)), **or**
 - keep `:50051` on a **trusted network** (VPN / private subnet / a mesh policy that does not
   terminate HTTP/2; see [Heartbeat admission](gateway.md#heartbeat-admission)), never
   directly internet-exposed.
@@ -154,7 +157,8 @@ Requesting a client certificate on this edge is a configuration change that enfo
 nothing yet, and enforcing one needs a separate design (see
 [Moving the agent edge to mutual TLS](gateway.md#moving-the-agent-edge-to-mutual-tls)).
 The address the gateway reports for an agent is the TCP peer unless the listener is told
-which proxies to trust (see
+which proxies to trust, and it discards whatever the agent sent (a forged address passes
+through an older gateway that does not: upgrade every gateway; see
 [Client addresses behind a proxy](gateway.md#client-addresses-behind-a-proxy)).
 The gateway admits an agent `Heartbeat` only on the connection that opened the
 session's `Subscribe` stream, and only for a session that gateway node holds
@@ -175,6 +179,31 @@ network-reachable mgmt listener lacks this posture; never set
 `{allow_insecure_mgmt, true}` outside an isolated lab rig, and never publish
 `:50063` from a plaintext stack. See `docs/user-manual/gateway.md` "TLS posture"
 for pin configuration and rotation.
+
+**Firewall the management port (known, accepted limitation).** The management listener
+holds at most 256 connections (`limits.max_connections`), and that is a file-descriptor
+bound, not protection. Before the TLS handshake, anyone with layer-4 reach to the port can
+hold a slot for up to the 10 s handshake timeout; after the handshake, any holder of a
+certificate issued by the install CA (every enrolled agent has one) can hold it for as long
+as `PING`s keep the connection busy, because the SPKI peer pin runs later, per stream. About
+256 held connections would stop the server making **new** connections to the gateway;
+connections already established are unaffected. The gateway does not fix this; you must
+restrict `:50063` (and any alternative port set by `YUZU_GW_MGMT_PORT`) so that only the
+server replicas can reach it, set the management listener's `listen.ip` to the management
+interface's address so the port is not bound on the agent-facing interface, and where you can,
+multi-home the server so that the interface it uses for gateway management traffic is not
+the one that faces agents or the database. The shipped composes do not publish it, and the
+gateway cannot verify the firewall or the interface separation. To detect a flood, count
+`ss -Htn state established '( sport = :50063 )'` on the gateway host against the number of
+server replicas, and watch `yuzu_server_gateway_forward_total{status="unavailable"}` on the
+server (commands dropped after three attempts; an alert on its `increase` is recommended and
+none ships). To recover, block the source at the firewall; a process restart does not
+clear it. The agent listener has the matching
+residual risk: its 60000-connection ceiling bounds file descriptors, but a peer that
+completes the handshake and keeps sending can hold connections open and fill it, after which
+new connections wait in the kernel backlog (agents already connected are unaffected until
+they reconnect). Limit connections per source address at the L4 balancer or firewall; see
+[Connection ceilings and the unauthenticated ports](gateway.md#grpc-listeners).
 
 ## Secret Management
 

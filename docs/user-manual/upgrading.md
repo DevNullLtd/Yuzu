@@ -10,6 +10,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.5.x | 0.5.0 | 0.5.0 | Compiler hardening flags (`-fstack-protector-strong`, `_FORTIFY_SOURCE=2`, full RELRO), config file permission enforcement (`0600` on Unix), SRI integrity attributes on CDN scripts, configurable trigger limit (default 2000), git-derived version strings, chargen instruction definitions. |
 | 0.6.x – 0.9.x | same as 0.5.x | same as 0.5.x | No on-disk format changes from 0.5.x; upgrade directly to 0.10.x. |
 | 0.10.x | 0.10.0 | 0.10.0 | Server-side schema migration runner wired into every SQLite store. Upgrading from 0.9.x or earlier is data-preserving: the first 0.10.x startup stamps each database at schema v1 and runs a one-time legacy compatibility shim for stores that historically added columns via silent `ALTER TABLE` (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`). Failed migrations close the affected store's DB handle and are reported via `/readyz` with the failed store name — **check `/readyz`, not `/livez`, to confirm upgrade success**. |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway listeners move from `{grpcbox, [{servers, ...}]}` to `{yuzu_gw, [{grpc_listeners, ...}]}` (breaking for every gateway config).** The agent (`:50051`) and management (`:50063`) listeners are served by the gateway's own gRPC layer over Cowboy; a config that still has a `servers` block refuses to start, and an old gateway image given the new config starts, reports healthy and binds nothing, so the image and its `sys.config` are an atomic pair. The gateway now also decides the client address it reports to the server (`gateway_observed_peer`) and discards what the agent sent: upgrade every gateway before you rely on audit `source_ip`. No agent or server change. See "Gateway listeners move to `grpc_listeners`" below and [Client addresses behind a proxy](gateway.md#client-addresses-behind-a-proxy). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). **Inventory freshness gauge now server-clock-stamped (#1685).** `yuzu_inventory_stale_agents` keys on the server's receipt time, not the agent-supplied `collected_at`. A one-time migration (v3) at first 0.15.x startup clamps any `inventory_state` row whose `last_seen`/`first_seen` was stamped from a future-skewed agent clock back down to now. **Operator-visible:** if any agents had future-skewed clocks, the gauge may show a one-time *increase* post-upgrade as previously-hidden endpoints re-enter the staleness window with a fresh ~48h grace — genuinely active agents fall back out within two daily sync cycles; this is the intended security correction, not an incident. No operator action required (the `YuzuInventoryStaleAgents` alert ships disabled). **Rollback note:** downgrading the server below 0.15.x after v3 has run is data-safe (schema unchanged) but new inventory syncs revert to stamping `last_seen` from agent time, silently re-opening the clock-skew gap for those rows. **DEX application performance over time (opt-in).** New per-app, per-version CPU/working-set trend views (DEX → Performance → "Application performance over time"; REST `/api/v1/dex/perf/{apps,app,group}` + the `list_dex_perf_apps`/`get_dex_app_perf`/`get_dex_group_app_perf` MCP tools; per-device drill `GET /api/v1/dex/devices/{id}/app-perf`). **No action is required to upgrade, but the views are EMPTY until you opt in:** per-application sampling ships **off by default** (`procperf_enabled=false`) because it is usage-class telemetry (works-council-relevant). Enable `procperf_enabled=true` on the target devices via `tar.configure` (and leave the daily-sync master switch `--inventory-disable` unset). Data appears **after the first completed UTC midnight** on each opted-in device (the agent ships a daily summary, not immediately), and the trends lengthen as days accumulate (fleet ≤180 days, group ≤31 days). A freshly-enrolled or non-opted-in device shows an honest empty state ("no application performance history yet"), not a bug. The per-device drill is also reachable from a dashboard panel on the `/device` DEX lens ("Application performance over time" — same retained data, no live query, no `Execute` permission; no upgrade action needed). The per-device drill is behavioural PII — scoped + audited (`dex.device.app_perf.view`, fail-closed); the fleet and group aggregates suppress any app/version on fewer than 10 devices to a count only (no singling-out). **Response/execution reads fail closed on a corrupt RBAC store (#1634, partial).** The response readers (`query_responses` + `aggregate_responses` MCP tools, `GET /api/v1/executions/{id}/visualization`, `GET /api/responses/{id}` / `/aggregate` / `/export`) route through a per-agent management-group filter. **The only operator-visible change in this release** is fail-closed behavior under a **corrupt/load-failed `rbac.db`**: these surfaces now return zero rows (the legacy `/api/responses/{id}/aggregate` returns `503`) instead of exposing the whole fleet via the legacy read fallback. **Not yet changed:** under normal RBAC operation these reads are **not** management-group-scoped — a holder of global `Response:Read` still sees all agents' responses (the filter is inert under the current global gate; the gate change that makes scoping effective is tracked under #1634). RBAC explicitly disabled is unchanged. No operator action required. **MCP agentic write surface + A2 discovery + A4 error-shape (R2, #289 / #1794).** Five MCP write tools (`set_tag`/`delete_tag`/`approve_request`/`reject_request`/`quarantine_device`) ship with a ticket-then-recall approval flow, plus the `/api/v1/discover/*` discovery family. The approvals store gains additive `consumed_at` + `consumed_by` columns (auto-migrated at first startup; no operator action). **Breaking wire-shape change:** many `/api/v1` error bodies that were previously `{"error":"<string>"}` are now the nested A4 object `{"error":{"code","message","correlation_id",…}}` — a REST client that read `error` as a *string* must migrate to `error.code` / `error.message` (see `rest-api.md` §Error envelope). The MCP write surface is gated behind the existing tier model + a maker-checker approval workflow; audit `mcp.<tool>` covers every write. **NVD CVE-store schema migration (v1→v2) + full CPE version-range matching.** The server-side NVD store is reshaped on first startup (flat `cve` → normalized `cve` + `cve_match`); `/api/nvd/match` now evaluates real CPE version ranges. **Operator-visible on upgrade:** (a) the migration **drops and rebuilds the local CVE mirror** — vulnerability-matching coverage is reduced until the next NVD sync completes (rate-limited; up to a few hours without an API key), self-healing and logged with a warning at migration time; (b) `GET /api/nvd/status` `total_cves` now counts **distinct CVEs** (was one row per affected product) so it reads **lower** after upgrade even once fully synced, and near-zero during the rebuild window — **expected, not data loss**. Any SIEM/dashboard alerting on the `total_cves` magnitude should be re-baselined. No config change or action required. **NVD CVE sync now actually runs (was dormant).** A `rate_limit()` integer overflow meant the server-side NVD sync slept ~292 years before its first request, so it never populated on any prior deployment (`/api/nvd/status` `total_cves` stayed at the built-in seed). It now runs on startup. **Operator-visible:** (a) the server makes **new outbound HTTPS requests to `services.nvd.nist.gov`** — restricted-egress / air-gapped deployments that silently never reached it before may now log connection failures (set `--no-nvd-sync` to disable, or `--nvd-proxy`); (b) `total_cves` grows from the seed as the (keyword-scoped) sync populates. No config change required to benefit. **OIDC JWT signature verification now enforced on the Windows server (#1856/#1782, CRITICAL).** A Windows *server* build previously **skipped OIDC `id_token` signature verification entirely** — accepting forged RS256/384/512 tokens (session minting / account takeover). It now verifies on every platform via the same OpenSSL path. **Operator-visible only if you run a Windows server with OIDC SSO:** verification now genuinely depends on the IdP's JWKS being reachable, so a misconfigured or unreachable `jwks_uri` that the old Windows build *silently tolerated* (by accepting everything) will now cause **all OIDC logins to fail closed**. **Before upgrading a Windows + OIDC deployment**, confirm the server can reach the IdP `jwks_uri` and that system clock skew is within tolerance; if OIDC logins start failing fleet-wide post-upgrade, check JWKS reachability first. Local-password and API-token auth are unaffected; Linux/macOS servers already verified and are unchanged. **MCP `execute_instruction`'s zero-agents-reached response schema gained three new fields and a widened `status` enum (#3424/#3511).** The published `outputSchema`'s `oneOf` grew from 2 branches to 5: the success branch is unchanged, but the single `{status:"no_agents_reached", ...}` zero-reach branch is now four mutually-exclusive branches — `no_agents_reached` (same trigger condition, but now REQUIRES `retry_after_ms` where it was previously absent/unspecified), plus new `quarantined`, `containment_unreadable`, and `plugin_not_found` — each REQUIRING three new fields that were not previously present: `retry_after_ms` (a per-branch `const` — `5000` for the two retryable branches `containment_unreadable` and `no_agents_reached`, `null` for the two permanent branches `quarantined` and `plugin_not_found`), `agents_quarantined`, and `agents_unknown_plugin` (integer counts, present on every zero-reach branch regardless of which status matched). **Strict-validating consumers pinned to the old 2-branch `oneOf` or the old `no_agents_reached`-only zero-reach shape will reject a response using one of the three new statuses, or reject the new required fields on the shape they already recognized.** Relax any pinned `oneOf`/`const` validation to accept the widened schema (`GET /mcp/v1/` `tools/list` always reflects the current, authoritative shape) before upgrading an agentic client with strict response validation. A client that only branches on `status == "no_agents_reached"` string-equality (rather than treating an unrecognized status as "some non-retryable or retryable failure, check `message`") should add explicit handling for the three new values — see `docs/user-manual/mcp.md`'s `execute_instruction` row for the full semantics and retry guidance. **Alert-rule change (action may be required if you maintain a fork).** `YuzuDispatchTargetRejected`'s exclusion widens from `reason!="quarantined"` alone to `reason!~"quarantined\|unknown_plugin"` — same reasoning as the #881 exclusion above: a misconfigured automation retrying against an absent plugin is a caller mistake, not a fleet outage, and without the exclusion it clears the alert's `>3/15m` threshold on its own. If you maintain a fork of `docs/prometheus/yuzu-alerts.yml`, apply the same widened exclusion (`!~`, not `=~` — the fork's rule excludes both reasons, it does not match only them). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). **Inventory freshness gauge now server-clock-stamped (#1685).** `yuzu_inventory_stale_agents` keys on the server's receipt time, not the agent-supplied `collected_at`. A one-time migration (v3) at first 0.15.x startup clamps any `inventory_state` row whose `last_seen`/`first_seen` was stamped from a future-skewed agent clock back down to now. **Operator-visible:** if any agents had future-skewed clocks, the gauge may show a one-time *increase* post-upgrade as previously-hidden endpoints re-enter the staleness window with a fresh ~48h grace — genuinely active agents fall back out within two daily sync cycles; this is the intended security correction, not an incident. No operator action required (the `YuzuInventoryStaleAgents` alert ships disabled). **Rollback note:** downgrading the server below 0.15.x after v3 has run is data-safe (schema unchanged) but new inventory syncs revert to stamping `last_seen` from agent time, silently re-opening the clock-skew gap for those rows. **DEX application performance over time (opt-in).** New per-app, per-version CPU/working-set trend views (DEX → Performance → "Application performance over time"; REST `/api/v1/dex/perf/{apps,app,group}` + the `list_dex_perf_apps`/`get_dex_app_perf`/`get_dex_group_app_perf` MCP tools; per-device drill `GET /api/v1/dex/devices/{id}/app-perf`). **No action is required to upgrade, but the views are EMPTY until you opt in:** per-application sampling ships **off by default** (`procperf_enabled=false`) because it is usage-class telemetry (works-council-relevant). Enable `procperf_enabled=true` on the target devices via `tar.configure` (and leave the daily-sync master switch `--inventory-disable` unset). Data appears **after the first completed UTC midnight** on each opted-in device (the agent ships a daily summary, not immediately), and the trends lengthen as days accumulate (fleet ≤180 days, group ≤31 days). A freshly-enrolled or non-opted-in device shows an honest empty state ("no application performance history yet"), not a bug. The per-device drill is also reachable from a dashboard panel on the `/device` DEX lens ("Application performance over time" — same retained data, no live query, no `Execute` permission; no upgrade action needed). The per-device drill is behavioural PII — scoped + audited (`dex.device.app_perf.view`, fail-closed); the fleet and group aggregates suppress any app/version on fewer than 10 devices to a count only (no singling-out). **Response/execution reads fail closed on a corrupt RBAC store (#1634, partial).** The response readers (`query_responses` + `aggregate_responses` MCP tools, `GET /api/v1/executions/{id}/visualization`, `GET /api/responses/{id}` / `/aggregate` / `/export`) route through a per-agent management-group filter. **The only operator-visible change in this release** is fail-closed behavior under a **corrupt/load-failed `rbac.db`**: these surfaces now return zero rows (the legacy `/api/responses/{id}/aggregate` returns `503`) instead of exposing the whole fleet via the legacy read fallback. **Not yet changed:** under normal RBAC operation these reads are **not** management-group-scoped — a holder of global `Response:Read` still sees all agents' responses (the filter is inert under the current global gate; the gate change that makes scoping effective is tracked under #1634). RBAC explicitly disabled is unchanged. No operator action required. **MCP agentic write surface + A2 discovery + A4 error-shape (R2, #289 / #1794).** Five MCP write tools (`set_tag`/`delete_tag`/`approve_request`/`reject_request`/`quarantine_device`) ship with a ticket-then-recall approval flow, plus the `/api/v1/discover/*` discovery family. The approvals store gains additive `consumed_at` + `consumed_by` columns (auto-migrated at first startup; no operator action). **Breaking wire-shape change:** many `/api/v1` error bodies that were previously `{"error":"<string>"}` are now the nested A4 object `{"error":{"code","message","correlation_id",…}}` — a REST client that read `error` as a *string* must migrate to `error.code` / `error.message` (see `rest-api.md` §Error envelope). The MCP write surface is gated behind the existing tier model + a maker-checker approval workflow; audit `mcp.<tool>` covers every write. **NVD CVE-store schema migration (v1→v2) + full CPE version-range matching.** The server-side NVD store is reshaped on first startup (flat `cve` → normalized `cve` + `cve_match`); `/api/nvd/match` now evaluates real CPE version ranges. **Operator-visible on upgrade:** (a) the migration **drops and rebuilds the local CVE mirror** — vulnerability-matching coverage is reduced until the next NVD sync completes (rate-limited; up to a few hours without an API key), self-healing and logged with a warning at migration time; (b) `GET /api/nvd/status` `total_cves` now counts **distinct CVEs** (was one row per affected product) so it reads **lower** after upgrade even once fully synced, and near-zero during the rebuild window — **expected, not data loss**. Any SIEM/dashboard alerting on the `total_cves` magnitude should be re-baselined. No config change or action required. **NVD CVE sync now actually runs (was dormant).** A `rate_limit()` integer overflow meant the server-side NVD sync slept ~292 years before its first request, so it never populated on any prior deployment (`/api/nvd/status` `total_cves` stayed at the built-in seed). It now runs on startup. **Operator-visible:** (a) the server makes **new outbound HTTPS requests to `services.nvd.nist.gov`** — restricted-egress / air-gapped deployments that silently never reached it before may now log connection failures (set `--no-nvd-sync` to disable, or `--nvd-proxy`); (b) `total_cves` grows from the seed as the sync populates. No config change required to benefit. **NVD sync now builds the FULL CVE catalog (newest-first), not ~20 keywords.** The sync backfills every CVE published within a configurable window — `--nvd-backfill-years` / `YUZU_NVD_BACKFILL_YEARS` (default **8 years**; `0` = full history) — newest-first and **resumable across restarts**, then settles into a periodic last-modified freshness re-check. **Operator-visible:** the server makes sustained HTTPS requests to `services.nvd.nist.gov`, the local NVD DB grows into the hundreds of MB, and `/api/nvd/status` `total_cves` climbs continuously while `backfill_complete` stays `false` until the backfill floor is first reached — `last_sync_time` advances after every successful fetch window and is **not** a completion signal (use the new `backfill_complete` + `backfill_oldest_published` fields, and the `yuzu_nvd_total_cves` / `yuzu_nvd_backfill_complete` metrics, for progress). **`/api/nvd/status` `enabled` semantics corrected:** it now reflects whether sync is configured on, so under `--no-nvd-sync` it reports `enabled:false` (was `true`); a monitor keying on `enabled` to mean "mirror usable" should check `total_cves` instead. The initial backfill is NVD-rate-limited (hours without an `--nvd-api-key`, minutes with one) and resumes where it left off if interrupted. Set `--no-nvd-sync` to disable, `--nvd-proxy` for restricted egress. Product matching stays name-based (vendor-precise CPE identity pending ADR-0018). **Certificate inventory now reads System/SystemRoot keychains and Linux `/etc/ssl/certs` natively (no more `openssl`/`security` CLI shell-out for those stores).** The `certificates` plugin's `list`/`details`/`delete` actions are unchanged in output shape (same pipe-delimited columns, same field values) — this is a collection-mechanism change only, verified byte-parity against the prior CLI-based output. The macOS login keychain read has ALSO moved off its governed-shell path in this same release (#3406): it now runs as a pre-split argv through the bounded runner, with the console user's home directory resolved in-process instead of by the shell. Output shape is unchanged. **One operator-visible correction:** when the console user cannot be determined — most often a slow or unreachable directory service on a domain-joined Mac — `certificates.list`/`details` with `store=login` or `all` now return an explicit `not_available|<reason>` row and mark the result PARTIAL. Previously that case silently dropped the login keychain and the list read as complete, and `details` could answer a confident `not_found` for a certificate it had never looked for. Expect to SEE partial results where output previously looked clean on such hosts; that is the bug being fixed, not a regression. No operator action required; mixed old/new-agent fleets and rollback are safe (no server-side or schema change). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). **Inventory freshness gauge now server-clock-stamped (#1685).** `yuzu_inventory_stale_agents` keys on the server's receipt time, not the agent-supplied `collected_at`. A one-time migration (v3) at first 0.15.x startup clamps any `inventory_state` row whose `last_seen`/`first_seen` was stamped from a future-skewed agent clock back down to now. **Operator-visible:** if any agents had future-skewed clocks, the gauge may show a one-time *increase* post-upgrade as previously-hidden endpoints re-enter the staleness window with a fresh ~48h grace — genuinely active agents fall back out within two daily sync cycles; this is the intended security correction, not an incident. No operator action required (the `YuzuInventoryStaleAgents` alert ships disabled). **Rollback note:** downgrading the server below 0.15.x after v3 has run is data-safe (schema unchanged) but new inventory syncs revert to stamping `last_seen` from agent time, silently re-opening the clock-skew gap for those rows. **DEX application performance over time (opt-in).** New per-app, per-version CPU/working-set trend views (DEX → Performance → "Application performance over time"; REST `/api/v1/dex/perf/{apps,app,group}` + the `list_dex_perf_apps`/`get_dex_app_perf`/`get_dex_group_app_perf` MCP tools; per-device drill `GET /api/v1/dex/devices/{id}/app-perf`). **No action is required to upgrade, but the views are EMPTY until you opt in:** per-application sampling ships **off by default** (`procperf_enabled=false`) because it is usage-class telemetry (works-council-relevant). Enable `procperf_enabled=true` on the target devices via `tar.configure` (and leave the daily-sync master switch `--inventory-disable` unset). Data appears **after the first completed UTC midnight** on each opted-in device (the agent ships a daily summary, not immediately), and the trends lengthen as days accumulate (fleet ≤180 days, group ≤31 days). A freshly-enrolled or non-opted-in device shows an honest empty state ("no application performance history yet"), not a bug. The per-device drill is also reachable from a dashboard panel on the `/device` DEX lens ("Application performance over time" — same retained data, no live query, no `Execute` permission; no upgrade action needed). The per-device drill is behavioural PII — scoped + audited (`dex.device.app_perf.view`, fail-closed); the fleet and group aggregates suppress any app/version on fewer than 10 devices to a count only (no singling-out). **Response/execution reads fail closed on a corrupt RBAC store (#1634, partial).** The response readers (`query_responses` + `aggregate_responses` MCP tools, `GET /api/v1/executions/{id}/visualization`, `GET /api/responses/{id}` / `/aggregate` / `/export`) route through a per-agent management-group filter. **The only operator-visible change in this release** is fail-closed behavior under a **corrupt/load-failed `rbac.db`**: these surfaces now return zero rows (the legacy `/api/responses/{id}/aggregate` returns `503`) instead of exposing the whole fleet via the legacy read fallback. **Not yet changed:** under normal RBAC operation these reads are **not** management-group-scoped — a holder of global `Response:Read` still sees all agents' responses (the filter is inert under the current global gate; the gate change that makes scoping effective is tracked under #1634). RBAC explicitly disabled is unchanged. No operator action required. **MCP agentic write surface + A2 discovery + A4 error-shape (R2, #289 / #1794).** Five MCP write tools (`set_tag`/`delete_tag`/`approve_request`/`reject_request`/`quarantine_device`) ship with a ticket-then-recall approval flow, plus the `/api/v1/discover/*` discovery family. The approvals store gains additive `consumed_at` + `consumed_by` columns (auto-migrated at first startup; no operator action). **Breaking wire-shape change:** many `/api/v1` error bodies that were previously `{"error":"<string>"}` are now the nested A4 object `{"error":{"code","message","correlation_id",…}}` — a REST client that read `error` as a *string* must migrate to `error.code` / `error.message` (see `rest-api.md` §Error envelope). The MCP write surface is gated behind the existing tier model + a maker-checker approval workflow; audit `mcp.<tool>` covers every write. **NVD CVE-store schema migration (v1→v2) + full CPE version-range matching.** The server-side NVD store is reshaped on first startup (flat `cve` → normalized `cve` + `cve_match`); `/api/nvd/match` now evaluates real CPE version ranges. **Operator-visible on upgrade:** (a) the migration **drops and rebuilds the local CVE mirror** — vulnerability-matching coverage is reduced until the next NVD sync completes (rate-limited; up to a few hours without an API key), self-healing and logged with a warning at migration time; (b) `GET /api/nvd/status` `total_cves` now counts **distinct CVEs** (was one row per affected product) so it reads **lower** after upgrade even once fully synced, and near-zero during the rebuild window — **expected, not data loss**. Any SIEM/dashboard alerting on the `total_cves` magnitude should be re-baselined. No config change or action required. **NVD CVE sync now actually runs (was dormant).** A `rate_limit()` integer overflow meant the server-side NVD sync slept ~292 years before its first request, so it never populated on any prior deployment (`/api/nvd/status` `total_cves` stayed at the built-in seed). It now runs on startup. **Operator-visible:** (a) the server makes **new outbound HTTPS requests to `services.nvd.nist.gov`** — restricted-egress / air-gapped deployments that silently never reached it before may now log connection failures (set `--no-nvd-sync` to disable, or `--nvd-proxy`); (b) `total_cves` grows from the seed as the sync populates. No config change required to benefit. **NVD sync now builds the FULL CVE catalog (newest-first), not ~20 keywords.** The sync backfills every CVE published within a configurable window — `--nvd-backfill-years` / `YUZU_NVD_BACKFILL_YEARS` (default **8 years**; `0` = full history) — newest-first and **resumable across restarts**, then settles into a periodic last-modified freshness re-check. **Operator-visible:** the server makes sustained HTTPS requests to `services.nvd.nist.gov`, the local NVD DB grows into the hundreds of MB, and `/api/nvd/status` `total_cves` climbs continuously while `backfill_complete` stays `false` until the backfill floor is first reached — `last_sync_time` advances after every successful fetch window and is **not** a completion signal (use the new `backfill_complete` + `backfill_oldest_published` fields, and the `yuzu_nvd_total_cves` / `yuzu_nvd_backfill_complete` metrics, for progress). **`/api/nvd/status` `enabled` semantics corrected:** it now reflects whether sync is configured on, so under `--no-nvd-sync` it reports `enabled:false` (was `true`); a monitor keying on `enabled` to mean "mirror usable" should check `total_cves` instead. The initial backfill is NVD-rate-limited (hours without an `--nvd-api-key`, minutes with one) and resumes where it left off if interrupted. Set `--no-nvd-sync` to disable, `--nvd-proxy` for restricted egress. Product matching stays name-based (vendor-precise CPE identity pending ADR-0018). **Certificate inventory now reads System/SystemRoot keychains and Linux `/etc/ssl/certs` natively (no more `openssl`/`security` CLI shell-out for those stores).** The `certificates` plugin's `list`/`details`/`delete` actions are unchanged in output shape (same pipe-delimited columns, same field values) — this is a collection-mechanism change only, verified byte-parity against the prior CLI-based output. The macOS login keychain is unchanged (still reads via the existing governed-shell path, a deliberate exception — see `docs/agent-spawn-sink-manifest.md`). No operator action required; mixed old/new-agent fleets and rollback are safe (no server-side or schema change). |
@@ -837,9 +838,12 @@ not connect through the gateway are not affected by this requirement.
 The gateway now admits an agent `Heartbeat` only on the HTTP/2 connection that opened the session's
 `Subscribe` stream, and only for a session that gateway node holds. A heartbeat that arrives on any
 other connection is answered `NOT_FOUND` (`unknown session`), counted and not forwarded.
-HTTP/2-terminating proxies are unsupported: they may cause repeated heartbeat rejection or share
-gateway-side connections across agents, removing the per-agent connection separation this check
-requires. Observed in a test with nginx `grpc_pass` in front of two agents: every heartbeat was
+An HTTP/2-terminating proxy is supported only when it is configured for connection affinity (each
+client connection gets its own backend connection, kept for as long as the client connection lives;
+see [Keeping each agent on one backend connection](gateway.md#keeping-each-agent-on-one-backend-connection)).
+One that pools backend connections across clients is unsupported: it may cause repeated heartbeat
+rejection or share gateway-side connections across agents, removing the per-agent connection
+separation this check requires. Observed in a test with nginx `grpc_pass` in front of two agents: every heartbeat was
 rejected, agents still enrolled and received commands, no heartbeat reached the server and the
 server's online count flickered; an L4 TCP forwarder (nginx `stream`) caused no rejections. Each rejection raises
 `yuzu_gw_heartbeat_session_mismatch_total{event="security"}` or `yuzu_gw_heartbeat_rejected_total{reason}`
@@ -849,7 +853,10 @@ and that log line.
 
 **Check before upgrading.** Look for an HTTP/2-terminating hop between the agents and `:50051`
 (reverse proxy, L7 load balancer, mesh sidecar). If there is one, move agents to an L4 or
-TLS-passthrough path first, or exempt `:50051` from the proxy. Also check the agent versions of
+TLS-passthrough path first, exempt `:50051` from the proxy, or configure the proxy for connection
+affinity and run the check in [Client addresses behind a proxy](gateway.md#client-addresses-behind-a-proxy)
+(HAProxy 3.2.25 and the OKD 4.21 router were measured at 50 agents; nginx `grpc_pass` rejected
+every heartbeat in the one two-agent test). Also check the agent versions of
 your fleet (the Hardware list at `/hardware` shows each device's agent version) and upgrade every
 agent older than 0.13.0 that connects through the gateway before you deploy the new gateway, and
 plan to restart any released 0.13.0 or rc6 agent that stays rejected; see Older agents below.
@@ -4196,6 +4203,14 @@ Start-Service yuzu-server  # or start manually
 
 ## Upgrading the Gateway
 
+> **Breaking: the listener configuration moved.** The gateway's listeners are now configured
+> under `{yuzu_gw, [{grpc_listeners, [...]}]}`, and a gateway config that still has a
+> `{grpcbox, [{servers, ...}]}` block refuses to start. The gateway image and its `sys.config`
+> are an atomic pair: an old image with a new config starts, reports healthy and serves
+> nothing. Read "Gateway listeners move to `grpc_listeners`" under *Upgrade notes by release*
+> below (key mapping, pre-flight check, roll-forward and roll-back) before you replace the
+> image or the config.
+
 If the server was restarted while this gateway stayed connected, see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts) first. The server is upgraded first, so the server restart that ships this fix meets the OLD gateway, and agents behind it can read offline until the gateway is upgraded. Upgrade the gateway and restart it: this version's gateway then recovers a later server restart by itself. A gateway restart disconnects every agent that gateway holds, so it is a fleet-wide reconnect for it, and released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged after a graceful gateway restart in testing (v0.12.0 never re-registered; bug #2182, fixed by #5183, in no release tag yet): upgrade the agents to a build that includes #5183 first, or expect to restart the agent service on those agents (see "Agent dependency" in the section linked above). Whether restarting only the gateway recovers agents stranded by an earlier server restart was not tested.
 
 ### Linux (systemd)
@@ -4623,6 +4638,329 @@ The SLE detection source also collects a new, suppressible **per-user identifier
 pseudonym; see [Software licence detection](software-licensing.md) for the
 `--license-scan-user-ref` flag, the honest limits of that default, and the
 `--inventory-disable` source-level opt-out.
+
+### Gateway listeners move to `grpc_listeners` (the Cowboy edge) — **BREAKING**
+
+Affects every operator who runs the Erlang gateway, from the first release containing the
+`yuzu_gw` `grpc_listeners` shape. The gateway's two listeners (agent `:50051`, management
+`:50063`) are now served by the gateway's own gRPC layer over Cowboy and Ranch instead of
+grpcbox, and they are configured under `{yuzu_gw, [{grpc_listeners, [...]}]}` instead of
+`{grpcbox, [{servers, [...]}]}`. The wire protocol, the protobuf contracts and the
+management-plane peer pin are unchanged; the upstream channel to the server
+(`{grpcbox, [{client, ...}]}`) is unchanged. Every config and compose file shipped in this
+repository is converted. A config you wrote yourself is not: it has to be converted before
+the new gateway will start.
+
+**The gateway image and its `sys.config` are an atomic pair.** Never change one without the
+other:
+
+- New image + old config: the gateway refuses to start. It exits within seconds, logs
+  `Refusing to start: {grpcbox, servers} is set` (text below), systemd reports `failed` after
+  three tries in 60 s, Compose restart-loops it, and `YuzuGatewayDown` fires after two
+  minutes. No listener is left bound.
+- **Old image + new config: the gateway starts, reports healthy, and serves nothing.** The old
+  image ignores `grpc_listeners`, binds no listener and logs no warning; `/healthz` and
+  `/readyz` return 200, so a Compose or load-balancer health check stays green while ports
+  50051 and 50063 refuse connections and `yuzu_gw_agents_current` is 0. This pairing also
+  happens on a development checkout: `docker-compose.uat.yml`,
+  `deploy/docker/docker-compose.reference-gateway.yml`, `docker-compose.demo.yml` and
+  `scripts/start-demo.sh` mount new-shape configs and, left at their default
+  `${YUZU_VERSION:-0.14.1}`, pull an older gateway image. Pin a gateway image from the first
+  release containing the `grpc_listeners` shape (or build one from the tree) when you use them.
+
+**Key mapping.** One listener at a time:
+
+| Old key (inside `{grpcbox, [{servers, [...]}]}`) | New key (inside `{yuzu_gw, [{grpc_listeners, [...]}]}`) |
+|---|---|
+| `grpc_opts => #{service_protos, services, auth_fun}` | Dissolved: `service_protos`, `services` and `auth_fun` are keys of the listener entry itself. |
+| `listen_opts => #{port, ip}` | `listen => #{port, ip}` |
+| `transport_opts => #{ssl => true, certfile, keyfile, cacertfile, verify, fail_if_no_peer_cert}` | `tls => #{certfile, keyfile, cacertfile, verify, fail_if_no_peer_cert}`. `ssl => true` is gone: the `tls` map's presence turns TLS on. A leftover `transport_opts` refuses boot. |
+| `pool_opts => #{size => N}` | `acceptors => N` |
+| (none) | `name`: mandatory and unique. |
+| (none) | `origin`, `http2`, `limits`: new and optional. |
+| `{yuzu_gw, [{agent_listen_addr, _}, {agent_listen_port, _}, {mgmt_listen_addr, _}, {mgmt_listen_port, _}]}` | Dead keys that no code reads; remove them or leave them. The bind is `listen`. |
+
+`grpc_listeners` belongs in the `yuzu_gw` application block, not in `grpcbox`. A listener
+entry may carry only the keys the gateway reads (`name`, `service_protos`, `services`,
+`listen`, `tls`, `auth_fun`, `origin`, `acceptors`, `http2`, `limits`; `limits` takes `max_connections`, `max_message_bytes` and `send_timeout_ms`), and its `tls`,
+`listen`, `http2`, `limits` and `origin` maps only theirs: any other key, a legacy key above
+and a misspelled one alike, refuses boot and is named in the log. The legacy keys the gateway
+names are `transport_opts`, `listen_opts`, `grpc_opts`, `pool_opts` and `ssl`.
+
+**Not carried over.** The new maps are closed, and several things the old shape could carry
+have no equivalent. Check your old entries for them before you convert:
+
+- `grpc_opts` entries other than `service_protos`, `services` and `auth_fun`: not read.
+- `transport_opts` SSL extras beyond the six `tls` keys (`certfile`, `keyfile`, `cacertfile`,
+  `verify`, `fail_if_no_peer_cert`, `ciphers`): `versions`, `depth`, `crl_check`,
+  `partial_chain` and `password` are **not supported** and refuse boot. TLS is 1.2 only, and
+  an encrypted private key has to be decrypted first
+  (`openssl pkey -in encrypted.key -out gateway.key`; keep the file readable by the gateway
+  user only). Supporting them is a follow-up. **Decrypting removes the passphrase protection
+  the key had at rest**, so the answer to "are private keys encrypted at rest?" for this key
+  changes: protect the file with permissions and the secret store that mounts it.
+- `listen_opts` socket options: only `listen => #{port, ip, socket_opts}` remains, and
+  `socket_opts` may not carry `ip`, `ifaddr`, `fd`, `port` or `{local, _}`.
+- `pool_opts`: only the acceptor count survives, as `acceptors`.
+
+**Worked example.** Before, the agent listener with one-way TLS:
+
+```erlang
+{grpcbox, [
+    {servers, [
+        #{grpc_opts => #{service_protos => [agent_pb],
+                         services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service}},
+          listen_opts => #{port => 50051, ip => {0,0,0,0}},
+          transport_opts => #{ssl => true,
+                              certfile   => "/etc/yuzu/certs/default-gateway.pem",
+                              keyfile    => "/etc/yuzu/certs/default-gateway.key",
+                              cacertfile => "/etc/yuzu/certs/default-ca.pem",
+                              verify => verify_none,
+                              fail_if_no_peer_cert => false}}
+    ]}
+]}
+```
+
+After:
+
+```erlang
+{yuzu_gw, [
+    {grpc_listeners, [
+        #{name => agent,
+          service_protos => [agent_pb],
+          services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service},
+          listen => #{port => 50051, ip => {0,0,0,0}},
+          tls => #{certfile   => "/etc/yuzu/certs/default-gateway.pem",
+                   keyfile    => "/etc/yuzu/certs/default-gateway.key",
+                   cacertfile => "/etc/yuzu/certs/default-ca.pem",
+                   verify => verify_none,
+                   fail_if_no_peer_cert => false}}
+    ]}
+]}
+```
+
+with the `{servers, ...}` block deleted. The management listener keeps its
+`auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` and, in `{yuzu_gw, ...}`, its
+`mgmt_peer_pins`. **To keep strict mutual TLS on the management listener, omit `verify` and
+`fail_if_no_peer_cert` from its `tls` map**: the defaults are `verify_peer` and `true`, and
+copying the agent listener's `verify_none` onto it would leave the command plane without
+transport authentication (the boot guard refuses a network-reachable management listener
+that has it). `gateway/config/sys.config.prod` is the full reference.
+
+**The refusals.** With a `{servers, ...}` block still present the gateway logs, at critical
+level, and exits:
+
+```
+Refusing to start: {grpcbox, servers} is set. The gateway's listeners are configured in {yuzu_gw, grpc_listeners} (one entry per listener); a leftover grpcbox listener would serve the same RPCs without the management-plane peer pin. Move the listener settings into grpc_listeners and remove the {servers, ...} block (see config/sys.config.prod and docs/user-manual/gateway.md).
+```
+
+A grpcbox listener binds before this check runs, so for the moments before the refusal a
+config that still has the block is listening; every handler on it fails, because the
+registry, the router and their tables do not exist yet. The gateway also refuses to start,
+with a critical log line that names the defect, when: `grpc_listeners` is unset, empty or
+`[]` (the old advice to delete the `servers` block and add nothing leaves a gateway that is
+healthy and accepts nothing; `{yuzu_gw, [{allow_no_listeners, true}]}` is the lab
+acknowledgement); an entry has a legacy or unknown key; a `tls` map lacks `certfile`,
+`keyfile` or `cacertfile`; an `auth_fun` is set on a listener that serves the agent service (`agent_pb` in `service_protos`, or the AgentService itself in `services`); no entry routes the AgentService (an entry counts only if its `services` map has the key `'yuzu.agent.v1.AgentService'`; `service_protos => [agent_pb]` with an empty `services` does not); a
+listener has no `name` or reuses one, or reuses a fixed port; a proxy `origin` has no
+`sources`; or `socket_opts` tries to move the bind (`ip`, `ifaddr`, `fd`, `port`, `local`). An entry defect is
+printed as `{Name, Term}` (the entry's `name`, or `unknown` when it has none) inside the
+`Refusing to start: invalid {yuzu_gw, grpc_listeners} entry/entries` line (the
+`bad_grpc_listeners` refusal); `no_grpc_listeners` and `no_agent_listener` are plain sentences
+in the log. All three names are what the pre-flight below prints. The next table
+says what to change for each term.
+
+| Term in the log | Fix |
+|---|---|
+| `legacy_keys` | A key of the old shape (`transport_opts`, `listen_opts`, `grpc_opts`, `pool_opts`, `ssl`): move it as in the key mapping. The term is `{legacy_keys, Where, [{Key, Hint}]}`: it names the key and where it went. |
+| `unknown_keys` | A misspelled key, or one the gateway does not read: use only the keys listed in [gRPC listeners](gateway.md#grpc-listeners) (the term lists the allowed ones). |
+| `missing_keys` | The entry lacks `name`, `service_protos`, `services` or `listen`. |
+| `tls_incomplete` | A `tls` map needs `certfile`, `keyfile` and `cacertfile`; omit the map for plaintext. |
+| `bad_tls_values` | `verify` is not `verify_peer`/`verify_none`, `fail_if_no_peer_cert` is not a boolean, or `ciphers` is not a proper, non-empty list of strings or tuples. |
+| `auth_fun_on_agent_listener` | An `auth_fun` on a listener that serves the agent service (`agent_pb`, or the AgentService itself in `services`). Remove it: it would cut agent enrollment, and only the management listener authenticates its peer. |
+| `listen_socket_opts_set_the_bind` | `socket_opts` carries `ip`, `ifaddr`, `fd`, `port` or `{local, _}`; the bind is `listen` alone. |
+| `bad_listen_ip` | `listen.ip` is not an IP address tuple. |
+| `bad_acceptors` | `acceptors` is not a positive integer. |
+| `{unknown_keys, limits, [BadKey], {allowed, [...]}}` | A `limits` key the gateway does not read. Every `unknown_keys` term has this shape, with the map it was found in (`entry`, `tls`, `listen`, `http2` or `limits`; the `origin` map has `unknown_origin_options`) as the second element and the allowed keys last; for `limits` they are `max_connections`, `max_message_bytes` and `send_timeout_ms`. |
+| `bad_limits` | `limits` is not a map, or a key's value is not valid (`max_connections` and `send_timeout_ms` take a positive integer or `infinity`, `max_message_bytes` a positive integer); the line lists the keys with bad values. |
+| `duplicate_name` | Two entries share a `name`. |
+| `duplicate_port` | Two entries bind the same fixed port. |
+| `no_grpc_listeners` | `grpc_listeners` is unset or empty; add the listeners to the `yuzu_gw` block. |
+| `no_agent_listener` | No entry routes the AgentService: no entry's `services` map has the key `'yuzu.agent.v1.AgentService'`. `service_protos => [agent_pb]` with `services => #{}` does not count, because nothing would answer an agent. No agent could connect and `/readyz` would never be ready. Only the literal `{allow_no_listeners, true}` excuses it (a lab or test). |
+| `entry_not_a_map` | An element of `grpc_listeners` is not a map. |
+| `grpc_listeners_not_a_list` | `grpc_listeners` itself is not a list (the line prints it as `{unknown, grpc_listeners_not_a_list}`). |
+| `bad_service_protos`, `bad_services` | `service_protos` is not a list of proto module atoms (a list with an improper tail included), or `services` is not a map of service name to module. |
+| `bad_auth_fun` | `auth_fun` is set on a listener that does not serve the agent service but is not a one-argument fun. |
+| `bad_listen_socket_opts` | `listen.socket_opts` is not a list. |
+| `bad_routes` | The `services` map could not be turned into a route table: the line gives `{unknown_service, Name}` (a service name that none of the `service_protos` defines) or `{module_not_loaded, Module}` (the module is not in the release). |
+| `{listen_failed, Reason}` | Not a config-shape defect: the entry validated, but the listener could not start (the port is already bound, `eaddrinuse`; the address is not on this host; or a `tls` file is missing or unreadable by the gateway user). It appears in the crash report, not as a `Refusing to start` line, and the pre-flight does not detect it: check `ss -ltn` and the file permissions. |
+| `bad_routes` with `{service_without_routes, Name}` | A service in the `services` map whose module exports **none** of that service's methods (the arity-2, snake_case functions, `register/2`, `heartbeat/2`, and so on). This is nearly always a mistyped module name: the listener would start, `/readyz` would report ready, and every RPC of that service would answer `UNIMPLEMENTED`. A module that exports only some of the methods is accepted, and a request for one it lacks answers `UNIMPLEMENTED`. Name the module that implements the service (`yuzu_gw_agent_service` for the agent, `yuzu_gw_mgmt_service` for management). |
+| `origin_sources_required`, `bad_origin_sources` | A proxy `origin` (`proxy_protocol` or `forwarded_for`) needs a non-empty `sources` list; each element is an IP address or `{Ip, Prefix}` (a prefix of 0, or above the address width, is refused); a `sources` that is not a proper list reports `{bad_origin_sources, improper_list}`. |
+| `{ipv4_mapped_source_prefix_must_exceed_96, [...]}` | A `sources` element `{::ffff:a.b.c.d, P}` with `P` of 96 or less (counted over the 128-bit address); use a prefix of 97 to 128. |
+| `unknown_origin_mode`, `unknown_origin_options`, `origin_transport_takes_no_options`, `bad_origin` | `origin.mode` is not `transport`, `proxy_protocol` or `forwarded_for`; the `origin` map has a key its mode does not take; `transport` takes no other key; or `origin` is not a map with a `mode`. |
+| `bad_trusted_hops` | `origin.trusted_hops` is not an integer from 0 to 31. |
+| `auth_fun_without_tls` | An `auth_fun` needs a `tls` map; add it. |
+| `auth_fun_behind_terminating_proxy` | An `auth_fun` on a `forwarded_for` listener: the check would run on the proxy's certificate. Remove one of them. |
+| `bad_listen`, `bad_tls`, `bad_http2`, `reserved_http2_options` | A `listen` map without an integer `port` from 0 to 65535, a `tls` or `http2` value that is not a map, or an `http2` option the gateway owns. |
+| `bad_grpc_listeners` | The summary line for any of the entry defects above; the entries and their defects are printed with it. |
+
+**Environment variables.** `YUZU_GW_AGENT_PORT` and `YUZU_GW_MGMT_PORT` changed nothing about
+the listeners before; they now rewrite `listen.port` of the entry that serves `agent_pb`
+and of the entry that serves `management_pb`, and only when exactly one entry serves the
+proto (otherwise a warning is logged and the variable is ignored). **Check the value before
+you upgrade:** a gateway container or unit that has either variable set to a number other
+than its configured port (a host-port number copied from an `.env` file, for example) moves
+its listener on the first start of the new image. The server's settings page lists
+`YUZU_GW_MGMT_PORT` with default 50052; the management listener is on 50063.
+
+**Pre-flight (offline, before you touch production).** On the host, with the NEW release
+unpacked beside the old one and the production `YUZU_GW_*` environment set, this runs the
+gateway's own config checks without starting a listener. `application:load` is required:
+without it the application environment is not read and the check passes falsely, and the
+script exits 1 if either `application:load` fails (a `grpcbox` or `yuzu_gw` that is not on
+the `-pa` path makes the old check print `ok` for a config that would not start). It does not
+check the distribution cookie, the upstream TLS posture, that the certificate files exist, or
+that the ports can bind (a `{listen_failed, Reason}` in the crash report means one of those; see the table below). Proceed only on exit 0; a non-`ok` entry in the printed list is the refusal (`legacy_grpcbox_servers`, `no_grpc_listeners`, `no_agent_listener`, `bad_grpc_listeners`, or the management-posture defect), and the critical log line above it says why. On an image from before this change it fails
+with `undef` and exits 1, which tells you the image is old.
+
+```bash
+R=/opt/yuzu_gw; C=$R/releases/0.2.0/sys.config
+$R/erts-*/bin/erl -noshell -noinput -boot $R/releases/0.2.0/start_clean -config $C \
+  -pa $R/lib/*/ebin -eval '
+Load = [application:load(A) || A <- [grpcbox, yuzu_gw]], yuzu_gw_app:apply_env_overrides(),
+Results = Load ++ [yuzu_gw_app:check_legacy_grpcbox_servers(), yuzu_gw_app:check_grpc_listeners(),
+                   yuzu_gw_app:check_mgmt_listener_posture()],
+io:format("PREFLIGHT ~p~n", [Results]),
+halt(case lists:all(fun(X) -> X =:= ok end, Results) of true -> 0; false -> 1 end).'
+```
+
+**Pre-flight for container operators.** Run the same command in a throwaway container from the
+NEW image, with the candidate `sys.config` mounted and the production `YUZU_GW_*` variables
+passed with `-e`; bypass the entrypoint, which only prepares the node's address. In the image
+the release is unpacked at `/opt/yuzu_gw` and the release version directory is `releases/0.2.0`
+(`deploy/docker/Dockerfile.gateway` copies `_build/prod/rel/yuzu_gw/` there, and the reference
+compose mounts the config at `/opt/yuzu_gw/releases/0.2.0/sys.config`; adapt `R` and the version
+to your release root if yours differs). Save this as `preflight.sh`, which is the command
+above with the config taken from its first argument:
+
+```bash
+#!/bin/sh
+R=/opt/yuzu_gw; C=$1
+$R/erts-*/bin/erl -noshell -noinput -boot $R/releases/0.2.0/start_clean -config "$C" \
+  -pa $R/lib/*/ebin -eval '
+Load = [application:load(A) || A <- [grpcbox, yuzu_gw]], yuzu_gw_app:apply_env_overrides(),
+Results = Load ++ [yuzu_gw_app:check_legacy_grpcbox_servers(), yuzu_gw_app:check_grpc_listeners(),
+                   yuzu_gw_app:check_mgmt_listener_posture()],
+io:format("PREFLIGHT ~p~n", [Results]),
+halt(case lists:all(fun(X) -> X =:= ok end, Results) of true -> 0; false -> 1 end).'
+```
+
+then run it in the new image:
+
+```bash
+docker run --rm --entrypoint sh -e YUZU_GW_AGENT_PORT -e YUZU_GW_MGMT_PORT \
+  -v "$PWD/preflight.sh:/preflight.sh:ro" -v "$PWD/gateway-sys.config:/pf.config:ro" \
+  NEW_GATEWAY_IMAGE /preflight.sh /pf.config
+```
+
+The exit status of `docker run` is the script's. The `erl` command was run on a compiled tree
+(exit 0 on the shipped production and reference configs; exit 1 on an old-shape config and on a
+`-pa` path without `grpcbox`) and, in the release layout above (`erts-*/bin/erl`,
+`releases/0.2.0/start_clean`, `lib/*/ebin`), on a scratch production release (exit 0 on the
+shipped production config). The `docker run` wrapper (the entrypoint override, the mounts) was
+written from the Dockerfile and the compose files and has not been run.
+
+**Old and new gateways side by side is untested.** Rolling forward replaces one gateway at a time
+(below), so for a while the fleet runs both shapes. Nothing in the code ties the two together
+beyond the protocol, but a mixed fleet has not been run against a single server, which is one more
+reason to drain each gateway from the load balancer before you replace it.
+
+**Rolling forward.** Back up first: the tarball flow above (`rm -rf /opt/yuzu_gw`) deletes
+`releases/*/sys.config` with the old release, so copy the old `sys.config` out and keep both
+files. Convert and pre-flight the new config, then upgrade one gateway at a time: drain it
+from the load balancer, replace the image and the config together, and wait for
+`ss -ltn | grep -E ':50051|:50063'` to show both ports, `curl -s localhost:8081/readyz` to
+answer 200 (it now also requires each configured listener to be running) and
+`yuzu_gw_agents_current` to climb. A gateway restart disconnects every agent that gateway
+holds, and on agent builds that do not yet carry the #5183 reconnect fix (in no release
+yet) a released agent may stay wedged after it: restart the agent service on the agents that
+stay rejected only if they do. Then **upgrade every gateway before you rely on `source_ip`
+in the audit log**: an older gateway still forwards the `gateway_observed_peer` the agent
+sent, so a forged address passes through it.
+
+**Rolling back.** Restore the old image **and** the old config together, then verify as
+above. Restoring only the config is the old-image-plus-new-config pairing, which serves
+nothing and reports healthy.
+
+**Symptoms of a wrong pairing.**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Exit 1 within seconds, `Refusing to start: {grpcbox, servers} is set` | New image, old config | Convert the config (above), or restore the old image. |
+| Process up, `/readyz` 200, ports 50051 and 50063 refuse connections, `yuzu_gw_agents_current` 0, no listener log | Old image, new config | Restore the old config, or deploy the new image. |
+| Exit 1, `Refusing to start: {yuzu_gw, grpc_listeners} is unset or empty` | The `servers` block was deleted and nothing added, or `grpc_listeners` sits in the `grpcbox` block | Add the listeners to the `yuzu_gw` block. |
+| Listeners up, every TLS handshake fails with `no_suitable_ciphers` | `tls.ciphers` is set to a list with no suite for the certificate's key type (ECDSA suites with an RSA certificate, say) | Remove `ciphers` (the default follows the key type) or list suites that fit the key (below). |
+| Works, but the audit log shows many agents with one `source_ip` | A load balancer or router in front of the gateway and no `origin` configured | Configure `origin` (below). |
+| Exit 1, a critical line naming the management listener and a defect | The management listener lacks the required posture (`plaintext`, `missing_cert_material`, `verify_not_peer`, `peer_cert_not_required`, `missing_or_wrong_auth_fun`, `no_mgmt_peer_pins`, `proxied_origin`) | Fix the entry as in `sys.config.prod`; the lab-only override is `allow_insecure_mgmt`. |
+
+**Bring-your-own certificates.** The TLS cipher list is chosen by the certificate's key
+type unless `tls.ciphers` is set: the ECDHE-ECDSA AEAD suites for an EC key (the
+certificates the server generates), ECDHE-RSA AES-GCM suites for an RSA key. TLS 1.2 only,
+as before. This is narrower than the OTP default list the grpcbox listeners used; an agent
+that needs a suite outside the list needs `tls.ciphers`. FIPS mode is not claimed.
+
+**TLS behaviour changes.** The new listeners set `reuse_sessions => false` and
+`honor_cipher_order => true`; the grpcbox listeners took OTP's defaults for both. With session
+reuse off, every reconnect is a full TLS handshake, so a reconnect herd (every agent behind a
+proxy that cut its idle connections, a gateway restart) costs more CPU than it did. The
+gateway's own cipher order now decides the suite, not the client's. TLS stays 1.2 only.
+
+**Connection ceilings.** `sys.config.prod` and the reference configs now set
+`limits => #{max_connections => 60000, max_message_bytes => 4194304}` on the agent listener
+and `max_connections => 256` on the management listener (before, neither had a ceiling).
+`max_connections` bounds file descriptors and is **not** protection against a hostile peer:
+
+- Agent listener: a peer that completes the handshake and keeps sending (a `PING` resets
+  Cowboy's idle counter) can hold a connection indefinitely, so it can fill the 60000 ceiling;
+  new connections then wait in the kernel backlog while connected agents are unaffected until
+  they reconnect. This is an accepted residual risk of the unauthenticated agent port
+  (it predates the ceiling, which only changed what the same flood exhausts); limit connections
+  per source at the L4 balancer or firewall.
+- Management listener: about 256 held connections would stop the server making **new**
+  connections to the gateway (established ones are unaffected). Before the TLS handshake
+  anyone with layer-4 reach to the port can hold a slot (up to the 10 s handshake timeout);
+  after it, any holder of a certificate issued by the install CA (every enrolled agent has
+  one) can, because the SPKI pin runs later, per stream. This is a **known limitation that is
+  not being fixed in the gateway**: firewall the management port (`:50063` by default) so that
+  only the server replicas can reach it, set the listener's `listen.ip` to the management
+  interface's address, and, where you can, multi-home the server so that its management- and
+  gateway-facing interface is on a different network interface from its agent- and
+  database-facing ones. The shipped composes do not publish it, and the gateway cannot check
+  the firewall or the interface separation. Detection and recovery (the `ss` commands and
+  `yuzu_server_gateway_forward_total{status="unavailable"}`) are in
+  [Connection ceilings and the unauthenticated ports](gateway.md#grpc-listeners).
+
+Size `max_connections` under the gateway's file-descriptor limit (60000 assumes
+`LimitNOFILE=65536`). The compose files set no `ulimits`; add `ulimits: nofile: 131072` to the
+gateway service **and raise the agent listener's `limits.max_connections` with it** (keep about
+5500 descriptors below the limit): the 60000 ceiling assumes about 65536 descriptors, so a larger
+descriptor limit alone does not move it. Check the **hard** limit in `/proc/1/limits` (the BEAM
+raises its soft limit to it).
+
+**A proxy without `origin`.** A gateway behind a load balancer or router that has no
+`origin` configured attributes every agent to the proxy's address and nothing flags it: the
+audit `source_ip` is the proxy and there is no `origin_observed=false`. Before this change
+the agent's own (empty) value was forwarded, so the audit row carried `origin_observed=false`
+in the same situation. Configure `origin` for the proxy you run (see
+[Client addresses behind a proxy](gateway.md#client-addresses-behind-a-proxy)).
+
+**Verify after the upgrade.** `ss -ltn | grep -E ':50051|:50063'` shows both listeners;
+`curl -s localhost:8081/readyz` returns 200; `yuzu_gw_agents_current` climbs to the fleet
+size; behind a proxy, `yuzu_gw_grpc_origin_ignored_total{reason=~"no_claim|bad_claim"}` stays
+flat and the audit `source_ip` is each agent's own address. The server writes the gateway
+origin to the audit log only on `enrollment.token_consumed`, so read `source_ip` from that
+row, for an agent that enrolled with an enrollment token after the upgrade; a `Register`
+without a token leaves no row to read.
 
 ### Gateway distribution cookie now required (#659) — **BREAKING**
 
