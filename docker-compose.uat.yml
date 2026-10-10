@@ -13,6 +13,14 @@
 ## Connect an agent:
 ##   yuzu-agent --server localhost:50061 --no-tls
 ##   (approve the agent in Settings, then restart the agent)
+##
+## Gateway image: the gateway config below uses the {yuzu_gw, grpc_listeners}
+## shape, so the gateway image must be from the first release containing the
+## yuzu_gw grpc_listeners shape (or built from this checkout). An older image
+## ignores grpc_listeners, binds no listener and still answers /healthz and
+## /readyz with 200, so agents cannot connect while the stack looks healthy.
+## Image and config are an atomic pair; see the "Upgrading the Gateway" entry
+## in docs/user-manual/upgrading.md.
 
 configs:
   server-cfg:
@@ -22,10 +30,6 @@ configs:
     content: |
       [
           {yuzu_gw, [
-              {agent_listen_addr, "0.0.0.0"},
-              {agent_listen_port, 50051},
-              {mgmt_listen_addr, "0.0.0.0"},
-              {mgmt_listen_port, 50063},
               {upstream_addr, "server"},
               {upstream_port, 50055},
               {upstream_pool_size, 32},

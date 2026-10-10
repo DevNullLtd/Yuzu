@@ -7,7 +7,7 @@
 %%%   disconnected → cleanup, deregister, terminate
 %%%
 %%% The subscribe handler process (yuzu_gw_agent_service:stream_loop/3)
-%%% owns the grpcbox server stream and forwards data here as messages:
+%%% owns the gRPC server stream and forwards data here as messages:
 %%%   {stream_data, Frame}  — CommandResponse from agent
 %%%   stream_closed         — agent disconnected (stream ended)
 %%%   stream_error          — stream error (treated as disconnect)

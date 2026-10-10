@@ -4,11 +4,19 @@
 %%%
 %%% Listens on a configurable port (default 8081) and responds to:
 %%%   GET /healthz — liveness probe (200 if process is responding)
-%%%   GET /readyz  — readiness probe (200 if all core processes alive,
-%%%                  503 if any are down or circuit breaker is open)
+%%%   GET /readyz  — readiness probe (200 if all core processes alive and
+%%%                  every configured gRPC listener is running, 503 if any
+%%%                  is down or circuit breaker is open)
 %%%
 %%% Readiness also requires the registry's session index table: without it
-%%% every heartbeat is rejected.
+%%% every heartbeat is rejected. It requires every listener of
+%%% {yuzu_gw, grpc_listeners} to be running in Ranch (the gateway answers nothing
+%%% on a port whose listener is down, and /healthz alone would still say 200),
+%%% at least one of them routing the AgentService (a key of its `services', the
+%%% rule the boot guard applies), and is not ready when none is configured unless
+%%% {yuzu_gw, allow_no_listeners} is the literal `true' (which also excuses the
+%%% absence of an agent listener, as it does at boot). The check asks Ranch
+%%% for the listener's status; it does not connect to the port.
 %%%
 %%% Designed to coexist with the Prometheus /metrics endpoint (port 9568).
 %%% @end
@@ -131,6 +139,7 @@ readiness_check() ->
         check_process(<<"upstream">>, yuzu_gw_upstream),
         check_process(<<"agent_sup">>, yuzu_gw_agent_sup),
         check_process(<<"router">>, yuzu_gw_router),
+        check_listeners(),
         check_circuit_breaker()
     ],
     AllOk = lists:all(fun({_, V}) -> V end, Checks),
@@ -153,6 +162,29 @@ check_process(Name, RegisteredName) ->
 %% registry process is alive.
 check_session_index() ->
     {<<"sessions_index">>, yuzu_gw_registry:session_index_available()}.
+
+check_listeners() ->
+    {<<"listeners">>, listeners_ready(application:get_env(yuzu_gw, grpc_listeners, []))}.
+
+listeners_ready([]) ->
+    allow_no_listeners();
+listeners_ready([_ | _] = Listeners) ->
+    yuzu_grpc_listener:proper_list(Listeners)
+        andalso lists:all(fun listener_running/1, Listeners)
+        andalso (lists:any(fun yuzu_grpc_listener:routes_agent/1, Listeners)
+                 orelse allow_no_listeners());
+listeners_ready(_) ->
+    false.
+
+allow_no_listeners() ->
+    application:get_env(yuzu_gw, allow_no_listeners, false) =:= true.
+
+listener_running(#{name := Name}) ->
+    try ranch:get_status({yuzu_grpc, Name}) =:= running
+    catch _:_ -> false
+    end;
+listener_running(_) ->
+    false.
 
 check_circuit_breaker() ->
     try

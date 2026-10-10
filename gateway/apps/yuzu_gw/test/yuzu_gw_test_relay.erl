@@ -10,7 +10,7 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_test_relay).
 
--export([start/2, stop/1, proxy_header/2]).
+-export([start/2, stop/1, proxy_header/2, local_header/0]).
 
 -opaque relay() :: {pid(), port()}.
 -export_type([relay/0]).
@@ -42,6 +42,12 @@ proxy_header(Version, Src) ->
                                   transport_family => Family, transport_protocol => stream,
                                   src_address => Src, src_port => 41000,
                                   dest_address => Dest, dest_port => 50051})).
+
+%% @doc A PROXY protocol version 2 `LOCAL' header: the proxy's own connection (a
+%% health check), with no client behind it.
+-spec local_header() -> binary().
+local_header() ->
+    iolist_to_binary(ranch_proxy_header:header(#{version => 2, command => local})).
 
 accept_loop(Listen, UpstreamPort, Header) ->
     case gen_tcp:accept(Listen) of

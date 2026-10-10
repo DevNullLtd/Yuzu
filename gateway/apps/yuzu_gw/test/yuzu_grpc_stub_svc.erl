@@ -10,6 +10,10 @@
 %%%                             CommandRequest with the same command_id; a few
 %%%                             command_ids are commands themselves
 %%%
+%%% The same stub answers two ManagementService methods in the same spirit
+%%% (list_agents: unary, send_command: server stream) for the wire tests of a
+%%% listener that carries an auth_fun and so may not serve the AgentService.
+%%%
 %%% It counts invocations in an ETS table so a test can assert that a handler
 %%% ran exactly as many times as it should (never, for a refused call), and
 %%% records the pids of handlers that block, to assert they are dead after a
@@ -20,6 +24,8 @@
 -module(yuzu_grpc_stub_svc).
 
 -export([heartbeat/2, execute_command/2, subscribe/2]).
+%% ManagementService shapes, for the listeners that carry an auth_fun
+-export([list_agents/2, send_command/2]).
 -export([init_state/0, reset/0, notify/1, calls/0, sleepers/0, result/1]).
 
 -define(TAB, yuzu_grpc_stub_state).
@@ -130,9 +136,41 @@ heartbeat(<<"sleep">>, _Ctx, _Request) ->
 heartbeat(_Other, _Ctx, _Request) ->
     {grpc_error, {3, <<"unknown command">>}}.
 
+%% ManagementService.ListAgents: ListAgentsRequest.filter is the command.
+list_agents(Ctx, Request) ->
+    bump(),
+    list_agents_for(maps:get(filter, Request, <<>>), Ctx).
+
+list_agents_for(<<"ok">>, _Ctx) ->
+    {ok, #{agents => []}};
+%% whether a client certificate reached the handler, in the one agent's id
+list_agents_for(<<"ctx">>, Ctx) ->
+    {ok, #{agents => [#{agent_id => case yuzu_grpc:peer_cert(Ctx) of
+                                        undefined -> <<"no-cert">>;
+                                        _ -> <<"cert">>
+                                    end}]}};
+list_agents_for(_Other, _Ctx) ->
+    {grpc_error, {3, <<"unknown command">>}}.
+
 %%--------------------------------------------------------------------
 %% Server streaming
 %%--------------------------------------------------------------------
+
+%% ManagementService.SendCommand: command.action "count" sends command.command_id
+%% responses, numbered from 1.
+send_command(Request, Stream) ->
+    bump(),
+    Command = maps:get(command, Request, #{}),
+    send_command(maps:get(action, Command, <<>>), maps:get(command_id, Command, <<>>), Stream).
+
+send_command(<<"count">>, N, Stream) ->
+    lists:foreach(fun(I) ->
+                          ok = yuzu_grpc_stream:send(
+                                 Stream, #{agent_id => N, response => #{output => integer_to_binary(I)}})
+                  end, lists:seq(1, binary_to_integer(N))),
+    ok;
+send_command(_Other, _Arg, _Stream) ->
+    {grpc_error, {3, <<"unknown command">>}}.
 
 execute_command(Request, Stream) ->
     bump(),

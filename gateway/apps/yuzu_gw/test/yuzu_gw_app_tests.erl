@@ -13,6 +13,9 @@
 -module(yuzu_gw_app_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+%% logger handler callback (the log-capturing tests attach this module)
+-export([log/2]).
+
 %% A non-distributed node has no inter-node attack surface, so no cookie is
 %% ever rejected — this keeps eunit/CT (which run as nonode@nohost) unaffected.
 non_distributed_accepts_any_cookie_test() ->
@@ -93,6 +96,7 @@ override_allows_short_custom_cookie_test() ->
 %%%===================================================================
 
 -define(ENV_KEYS, [{yuzu_gw, grpc_listeners}, {yuzu_gw, allow_insecure_mgmt},
+                   {yuzu_gw, allow_no_listeners},
                    {yuzu_gw, mgmt_peer_pins}, {yuzu_gw, agent_listen_port},
                    {yuzu_gw, mgmt_listen_port}, {grpcbox, servers}]).
 -define(PORT_VARS, ["YUZU_GW_AGENT_PORT", "YUZU_GW_MGMT_PORT"]).
@@ -166,15 +170,45 @@ check_legacy_grpcbox_servers_test_() ->
                          yuzu_gw_app:check_legacy_grpcbox_servers())
         end}]).
 
-%% The guard over the configured entries: no entries is allowed (a gateway
-%% under test, or one that only routes), an invalid one is refused.
+%% The guard over the configured entries: no entries is refused unless the
+%% configuration says it is meant (a gateway under test, or one that only
+%% routes), an invalid one is refused.
 check_grpc_listeners_test_() ->
     env_case(
-      [{"no listeners configured is allowed",
+      [{"no listeners configured is refused",
         fun() ->
+            ?assertEqual({error, no_grpc_listeners}, yuzu_gw_app:check_grpc_listeners()),
+            application:set_env(yuzu_gw, grpc_listeners, []),
+            ?assertEqual({error, no_grpc_listeners}, yuzu_gw_app:check_grpc_listeners())
+        end},
+       {"{allow_no_listeners, true} accepts a gateway with none",
+        fun() ->
+            application:set_env(yuzu_gw, allow_no_listeners, true),
             ?assertEqual(ok, yuzu_gw_app:check_grpc_listeners()),
             application:set_env(yuzu_gw, grpc_listeners, []),
             ?assertEqual(ok, yuzu_gw_app:check_grpc_listeners())
+        end},
+       {"anything but the literal true is not the acknowledgement",
+        fun() ->
+            lists:foreach(
+              fun(Value) ->
+                  application:set_env(yuzu_gw, allow_no_listeners, Value),
+                  ?assertEqual({error, no_grpc_listeners},
+                               yuzu_gw_app:check_grpc_listeners(), Value)
+              end, [false, "true", <<"true">>, 1, yes])
+        end},
+       {"the acknowledgement does not excuse an invalid entry",
+        fun() ->
+            application:set_env(yuzu_gw, allow_no_listeners, true),
+            application:set_env(yuzu_gw, grpc_listeners, [(agent_entry())#{origins => #{}}]),
+            ?assertEqual({error, bad_grpc_listeners}, yuzu_gw_app:check_grpc_listeners())
+        end},
+       {"the refusal says what to do",
+        fun() ->
+            Text = lists:flatten(capture_logs(
+                     fun() -> {error, no_grpc_listeners} = yuzu_gw_app:check_grpc_listeners() end)),
+            {match, _} = re:run(Text, "Refusing to start: \\{yuzu_gw, grpc_listeners\\} is unset or empty", [unicode]),
+            {match, _} = re:run(Text, "allow_no_listeners", [unicode])
         end},
        {"the agent and management listeners of the shipped shape are accepted",
         fun() ->
@@ -191,6 +225,154 @@ check_grpc_listeners_test_() ->
         fun() ->
             application:set_env(yuzu_gw, grpc_listeners, #{agent => agent_entry()}),
             ?assertEqual({error, bad_grpc_listeners}, yuzu_gw_app:check_grpc_listeners())
+        end},
+       {"valid entries none of which serves the agent service are refused",
+        fun() ->
+            application:set_env(yuzu_gw, grpc_listeners, [mgmt_entry()]),
+            ?assertEqual({error, no_agent_listener}, yuzu_gw_app:check_grpc_listeners()),
+            application:set_env(yuzu_gw, allow_no_listeners, false),
+            ?assertEqual({error, no_agent_listener}, yuzu_gw_app:check_grpc_listeners())
+        end},
+       {"the refusal for a missing agent listener says what to do",
+        fun() ->
+            application:set_env(yuzu_gw, grpc_listeners, [mgmt_entry()]),
+            Text = lists:flatten(capture_logs(
+                     fun() -> {error, no_agent_listener} = yuzu_gw_app:check_grpc_listeners() end)),
+            {match, _} = re:run(Text, "Refusing to start: no \\{yuzu_gw, grpc_listeners\\} entry routes the AgentService", [unicode]),
+            {match, _} = re:run(Text, "readyz", [unicode]),
+            {match, _} = re:run(Text, "allow_no_listeners", [unicode])
+        end},
+       {"{allow_no_listeners, true} excuses a missing agent listener, with a warning",
+        fun() ->
+            application:set_env(yuzu_gw, grpc_listeners, [mgmt_entry()]),
+            application:set_env(yuzu_gw, allow_no_listeners, true),
+            Text = lists:flatten(capture_logs(
+                     fun() -> ok = yuzu_gw_app:check_grpc_listeners() end)),
+            {match, _} = re:run(Text, "routes the agent service and .*allow_no_listeners.* is true", [unicode])
+        end},
+       {"the acknowledgement does not excuse a missing agent listener when an entry is invalid",
+        fun() ->
+            application:set_env(yuzu_gw, allow_no_listeners, true),
+            application:set_env(yuzu_gw, grpc_listeners,
+                                [(mgmt_entry())#{tls := #{certfile => "gw.pem"}}]),
+            ?assertEqual({error, bad_grpc_listeners}, yuzu_gw_app:check_grpc_listeners())
+        end},
+       {"an entry that lists agent_pb but routes no AgentService is not an agent listener",
+        fun() ->
+            Unrouted = (agent_entry())#{services := #{}},
+            ?assertEqual(ok, yuzu_gw_app:evaluate_listeners([Unrouted])),
+            application:set_env(yuzu_gw, grpc_listeners, [Unrouted]),
+            ?assertEqual({error, no_agent_listener}, yuzu_gw_app:check_grpc_listeners()),
+            %% nor next to a management listener that is valid
+            application:set_env(yuzu_gw, grpc_listeners, [Unrouted, mgmt_entry()]),
+            ?assertEqual({error, no_agent_listener}, yuzu_gw_app:check_grpc_listeners())
+        end},
+       {"a combined agent and management entry that maps only the management service is not an agent listener",
+        fun() ->
+            Combined = (combined_entry())#{
+                         services := #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service}},
+            application:set_env(yuzu_gw, grpc_listeners, [Combined]),
+            ?assertEqual({error, no_agent_listener}, yuzu_gw_app:check_grpc_listeners())
+        end},
+       {"the refusal for an unrouted agent entry names the rule, not the protos",
+        fun() ->
+            application:set_env(yuzu_gw, grpc_listeners, [(agent_entry())#{services := #{}}]),
+            Text = lists:flatten(capture_logs(
+                     fun() -> {error, no_agent_listener} = yuzu_gw_app:check_grpc_listeners() end)),
+            {match, _} = re:run(Text, "no \\{yuzu_gw, grpc_listeners\\} entry routes the AgentService", [unicode]),
+            {match, _} = re:run(Text, "'yuzu.agent.v1.AgentService'", [unicode]),
+            {match, _} = re:run(Text, "services", [unicode])
+        end},
+       {"only the literal true excuses a missing agent listener",
+        fun() ->
+            application:set_env(yuzu_gw, grpc_listeners, [(agent_entry())#{services := #{}}]),
+            lists:foreach(
+              fun(Value) ->
+                  application:set_env(yuzu_gw, allow_no_listeners, Value),
+                  ?assertEqual({error, no_agent_listener},
+                               yuzu_gw_app:check_grpc_listeners(), Value)
+              end, [false, "true", <<"true">>, 1, yes]),
+            application:set_env(yuzu_gw, allow_no_listeners, true),
+            ?assertEqual(ok, yuzu_gw_app:check_grpc_listeners())
+        end},
+       {"a listeners value that is an improper list is refused, not a crash",
+        fun() ->
+            application:set_env(yuzu_gw, grpc_listeners, [agent_entry() | not_a_list]),
+            ?assertEqual({error, bad_grpc_listeners}, yuzu_gw_app:check_grpc_listeners()),
+            ?assertEqual({error, [{unknown, grpc_listeners_not_a_list}]},
+                         yuzu_gw_app:evaluate_listeners([agent_entry() | not_a_list])),
+            os:putenv("YUZU_GW_AGENT_PORT", "52001"),
+            ?assertEqual(ok, yuzu_gw_app:apply_listener_port_overrides()),
+            %% the management guard cannot show an improper list holds no
+            %% management listener, so it refuses (fail closed), escape hatch or not
+            ?assertEqual({error, insecure_mgmt_listener}, yuzu_gw_app:check_mgmt_listener_posture()),
+            ?assertEqual({error, {insecure_mgmt_listener, [{unknown, improper_list}]}},
+                         yuzu_gw_app:evaluate_mgmt_posture([agent_entry() | not_a_list], [], false)),
+            ?assertEqual({error, {insecure_mgmt_listener, [{unknown, improper_list}]}},
+                         yuzu_gw_app:evaluate_mgmt_posture([agent_entry() | not_a_list], [], true)),
+            ?assertEqual(false, yuzu_gw_app:listeners_have_tls([mgmt_entry() | not_a_list]))
+        end},
+       {"a management listener is exposed when its bind cannot be proven loopback",
+        fun() ->
+            Loop = (mgmt_entry())#{listen := #{port => 50063, ip => {127, 0, 0, 1}}},
+            Refused = fun(Entry) ->
+                          ?assertMatch({error, {insecure_mgmt_listener, [{_, _}]}},
+                                       yuzu_gw_app:evaluate_mgmt_posture([Entry], [], false))
+                      end,
+            %% the control: a loopback bind with proper socket_opts is not exposed
+            ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(
+                               [Loop#{listen := #{port => 50063, ip => {127, 0, 0, 1},
+                                                  socket_opts => [{nodelay, true}]}}], [], false)),
+            %% improper socket_opts, and a `listen' that is not a map, are exposed
+            Refused(Loop#{listen := #{port => 50063, ip => {127, 0, 0, 1},
+                                      socket_opts => [{nodelay, true} | x]}}),
+            Refused(Loop#{listen := not_a_map}),
+            ?assertEqual({error, {insecure_mgmt_listener, [{unknown, [plaintext, no_mgmt_peer_pins]}]}},
+                         yuzu_gw_app:evaluate_mgmt_posture(
+                           [(mgmt_entry())#{listen := not_a_map, tls := none}], [], false))
+        end},
+       {"a service module that exports none of its service's methods is refused",
+        fun() ->
+            Typo = (agent_entry())#{services := #{'yuzu.agent.v1.AgentService' => yuzu_gw_app}},
+            Expected = {agent, {bad_routes, {service_without_routes, 'yuzu.agent.v1.AgentService'}}},
+            ?assertEqual({error, [Expected]}, yuzu_gw_app:evaluate_listeners([Typo])),
+            ?assertEqual(ok, yuzu_grpc_listener:validate(Typo)),
+            application:set_env(yuzu_gw, grpc_listeners, [Typo]),
+            ?assertEqual({error, bad_grpc_listeners}, yuzu_gw_app:check_grpc_listeners())
+        end},
+       {"a service module that exports only some of its methods is accepted",
+        fun() ->
+            %% heartbeat/execute_command/subscribe only: the other agent RPCs are
+            %% absent from the route table and answer UNIMPLEMENTED
+            Partial = (agent_entry())#{services := #{'yuzu.agent.v1.AgentService' => yuzu_grpc_stub_svc}},
+            ?assertEqual(ok, yuzu_gw_app:evaluate_listeners([Partial])),
+            application:set_env(yuzu_gw, grpc_listeners, [Partial]),
+            ?assertEqual(ok, yuzu_gw_app:check_grpc_listeners())
+        end},
+       {"an entry whose service_protos is an improper list is refused, not a crash",
+        fun() ->
+            Improper = (agent_entry())#{service_protos := [agent_pb | management_pb]},
+            ?assertEqual({error, [{agent, bad_service_protos}]},
+                         yuzu_gw_app:evaluate_listeners([Improper])),
+            application:set_env(yuzu_gw, grpc_listeners, [Improper]),
+            ?assertEqual({error, bad_grpc_listeners}, yuzu_gw_app:check_grpc_listeners()),
+            %% the port override and the management guard read the same list
+            os:putenv("YUZU_GW_AGENT_PORT", "52001"),
+            os:putenv("YUZU_GW_MGMT_PORT", "52002"),
+            ?assertEqual(ok, yuzu_gw_app:apply_listener_port_overrides()),
+            ?assertEqual(ok, yuzu_gw_app:check_mgmt_listener_posture())
+        end},
+       {"an entry that serves the AgentService under another proto counts as an agent listener",
+        fun() ->
+            application:set_env(yuzu_gw, grpc_listeners,
+                                [(maps:remove(auth_fun, mgmt_entry()))#{
+                                   services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service}}]),
+            ?assertEqual(ok, yuzu_gw_app:check_grpc_listeners())
+        end},
+       {"a combined listener, and the agent and management pair, are agent listeners",
+        fun() ->
+            application:set_env(yuzu_gw, grpc_listeners, [combined_entry()]),
+            ?assertEqual(ok, yuzu_gw_app:check_grpc_listeners())
         end}]).
 
 %% The guard on the privileged command plane, over the configured entries and
@@ -231,6 +413,18 @@ check_mgmt_listener_posture_test_() ->
         fun() ->
             Set([PlainMgmt#{listen := #{port => 50063, ip => {127, 0, 0, 1}}}]),
             ?assertEqual(ok, yuzu_gw_app:check_mgmt_listener_posture())
+        end},
+       {"a socket option that rebinds a loopback listener is not loopback",
+        fun() ->
+            %% the entry guard refuses it outright (see the evaluate_listeners
+            %% tests); the posture decision does not trust it either
+            lists:foreach(
+              fun(Opts) ->
+                  Set([PlainMgmt#{listen := #{port => 50063, ip => {127, 0, 0, 1},
+                                              socket_opts => Opts}}]),
+                  ?assertEqual({error, insecure_mgmt_listener},
+                               yuzu_gw_app:check_mgmt_listener_posture(), Opts)
+              end, [[{ifaddr, {0, 0, 0, 0}}], [{ip, {0, 0, 0, 0}}], [{fd, 3}], [{local, "/x"}]])
         end},
        {"a proxied management listener is refused even with the full posture",
         fun() ->
@@ -300,8 +494,8 @@ evaluate_listeners_names_the_defect_of_each_invalid_entry_test_() ->
      {"a tls value that is not a map",
       ?_assertEqual([{mgmt, bad_tls}], Bad((mgmt_entry())#{tls := "gw.pem"}))},
      {"an auth_fun needs a tls map to authenticate",
-      ?_assertEqual([{agent, auth_fun_without_tls}],
-                    Bad((agent_entry())#{auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1}))},
+      ?_assertEqual([{mgmt, auth_fun_without_tls}],
+                    Bad(maps:remove(tls, mgmt_entry())))},
      {"a proxied origin must name the proxies it trusts",
       [?_assertEqual([{agent, origin_sources_required}],
                      Bad((agent_entry())#{origin => #{mode => proxy_protocol}})),
@@ -313,7 +507,70 @@ evaluate_listeners_names_the_defect_of_each_invalid_entry_test_() ->
                                                     sources => [{10, 0, 0, 5}]}}))},
      {"options the layer owns cannot be set through http2",
       ?_assertEqual([{agent, {reserved_http2_options, [proxy_header]}}],
-                    Bad((agent_entry())#{http2 => #{proxy_header => true}}))}].
+                    Bad((agent_entry())#{http2 => #{proxy_header => true}}))},
+     %% Closed key sets: an entry may carry only keys the layer reads. The first
+     %% two are the shape that would otherwise leave an encrypted-looking agent
+     %% edge serving plaintext.
+     {"the former transport_opts / listen_opts / grpc_opts / ssl keys are refused by name",
+      [?_assertMatch([{agent, {legacy_keys, entry, [{transport_opts, _}]}}],
+                     Bad((agent_entry())#{transport_opts => #{ssl => true, certfile => "gw.pem",
+                                                             keyfile => "gw.key",
+                                                             cacertfile => "ca.pem"}})),
+       ?_assertMatch([{agent, {legacy_keys, entry, [{listen_opts, _}]}}],
+                     Bad((agent_entry())#{listen_opts => #{port => 50051}})),
+       ?_assertMatch([{agent, {legacy_keys, entry, [{grpc_opts, _}]}}],
+                     Bad((agent_entry())#{grpc_opts => #{}})),
+       ?_assertMatch([{agent, {legacy_keys, entry, [{ssl, _}]}}],
+                     Bad((agent_entry())#{ssl => true}))]},
+     {"a mistyped key is refused, not ignored",
+      [?_assertMatch([{agent, {unknown_keys, entry, [origins], {allowed, _}}}],
+                     Bad((agent_entry())#{origins => #{mode => forwarded_for,
+                                                       sources => [{10, 0, 0, 5}]}})),
+       ?_assertMatch([{mgmt, {unknown_keys, tls, [certfil], {allowed, _}}}],
+                     Bad((mgmt_entry())#{tls := #{certfil => "gw.pem", keyfile => "gw.key",
+                                                  cacertfile => "ca.pem"}})),
+       ?_assertMatch([{agent, {unknown_keys, http2, [idle_timout], {allowed, _}}}],
+                     Bad((agent_entry())#{http2 => #{idle_timout => 1}})),
+       ?_assertMatch([{agent, {unknown_keys, listen, [host], {allowed, _}}}],
+                     Bad(with_listen(agent_entry(), #{port => 50051, host => "0.0.0.0"})))]},
+     {"acceptors and limits are checked for type",
+      [?_assertEqual([{agent, bad_acceptors}], Bad((agent_entry())#{acceptors => "32"})),
+       ?_assertEqual([{agent, bad_limits}], Bad((agent_entry())#{limits => garbage})),
+       ?_assertEqual([{agent, {bad_limits, [max_message_bytes]}}],
+                     Bad((agent_entry())#{limits => #{max_message_bytes => -1}}))]},
+     {"an auth_fun is refused on a listener that serves agent_pb",
+      [?_assertEqual([{agent, auth_fun_on_agent_listener}],
+                     Bad((agent_entry())#{tls => #{certfile => "gw.pem", keyfile => "gw.key",
+                                                   cacertfile => "ca.pem"},
+                                          auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1})),
+       ?_assertEqual([{combined, auth_fun_on_agent_listener}],
+                     Bad((combined_entry())#{tls => #{certfile => "gw.pem", keyfile => "gw.key",
+                                                      cacertfile => "ca.pem"},
+                                             auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1}))]},
+     {"a socket option cannot move the bind address or port",
+      [?_assertEqual([{mgmt, {listen_socket_opts_set_the_bind, [ifaddr]}}],
+                     Bad(with_listen(mgmt_entry(), #{port => 50063, ip => {127, 0, 0, 1},
+                                                     socket_opts => [{ifaddr, {0, 0, 0, 0}}]}))),
+       ?_assertEqual([{mgmt, {listen_socket_opts_set_the_bind, [port]}}],
+                     Bad(with_listen(mgmt_entry(), #{port => 50063, ip => {127, 0, 0, 1},
+                                                     socket_opts => [{port, 50052}]})))]}].
+
+%% The crafted entry: management_pb in service_protos, the AgentService served
+%% through `services', and an auth_fun. It reads as a management-only listener
+%% and serves the agent RPCs to peers an auth_fun would shut out.
+evaluate_listeners_refuses_an_auth_fun_on_a_listener_serving_the_agent_service_test() ->
+    Crafted = (mgmt_entry())#{
+                services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service,
+                              'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service}},
+    ?assertEqual({error, [{mgmt, auth_fun_on_agent_listener}]},
+                 yuzu_gw_app:evaluate_listeners([agent_entry(), Crafted])),
+    %% the legitimate management listener passes
+    ?assertEqual(ok, yuzu_gw_app:evaluate_listeners([agent_entry(), mgmt_entry()])).
+
+%% One listener for both services (the single-port rig) is a valid shape and
+%% carries no auth_fun.
+evaluate_listeners_accepts_a_combined_listener_without_an_auth_fun_test() ->
+    ?assertEqual(ok, yuzu_gw_app:evaluate_listeners([combined_entry()])).
 
 %% The route table is built here too, so a service the proto does not describe
 %% or a module that cannot be loaded refuses boot instead of failing when the
@@ -355,6 +612,48 @@ listeners_have_tls_test_() ->
 
 with_listen(Entry, Listen) ->
     Entry#{listen := Listen}.
+
+combined_entry() ->
+    #{name => combined,
+      service_protos => [agent_pb, management_pb],
+      services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service,
+                    'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},
+      listen => #{port => 50051, ip => {0, 0, 0, 0}}}.
+
+%% The log events of Fun, as text. The handler takes everything (no filters), so
+%% what is captured is what the code under test logged, at any level.
+capture_logs(Fun) ->
+    [Text || {_Level, Text} <- capture_events(Fun)].
+
+%% The same, with the level of each event: {Level, Text}.
+capture_events(Fun) ->
+    Id = yuzu_gw_app_tests_handler,
+    Primary = maps:get(level, logger:get_primary_config()),
+    ok = logger:set_primary_config(level, all),
+    ok = logger:add_handler(Id, ?MODULE, #{level => all, config => #{pid => self()}}),
+    try
+        Fun(),
+        drain_logs([])
+    after
+        ok = logger:remove_handler(Id),
+        ok = logger:set_primary_config(level, Primary)
+    end.
+
+drain_logs(Acc) ->
+    receive
+        {logged, #{level := Level, msg := {Fmt, Args}}} when is_list(Fmt), is_list(Args) ->
+            drain_logs([{Level, lists:flatten(io_lib:format(Fmt, Args))} | Acc]);
+        {logged, #{level := Level, msg := {string, Text}}} ->
+            drain_logs([{Level, lists:flatten(io_lib:format("~ts", [Text]))} | Acc]);
+        {logged, _} ->
+            drain_logs(Acc)
+    after 0 ->
+        lists:reverse(Acc)
+    end.
+
+log(Event, #{config := #{pid := Pid}}) ->
+    Pid ! {logged, Event},
+    ok.
 
 %% YUZU_GW_AGENT_PORT / YUZU_GW_MGMT_PORT rewrite the port of the entry that
 %% serves agent_pb / management_pb. They are read from the process environment:
@@ -400,6 +699,15 @@ apply_listener_port_overrides_test_() ->
             ok = yuzu_gw_app:apply_listener_port_overrides(),
             ?assertEqual([{agent, 0}], Ports())
         end},
+       {"an entry whose listen is not a map is left unchanged for validate to refuse",
+        fun() ->
+            Bad = (agent_entry())#{listen := not_a_map},
+            Set([Bad]),
+            os:putenv("YUZU_GW_AGENT_PORT", "52001"),
+            ?assertEqual(ok, yuzu_gw_app:apply_listener_port_overrides()),
+            ?assertEqual([Bad], application:get_env(yuzu_gw, grpc_listeners, [])),
+            ?assertEqual({error, [{agent, bad_listen}]}, yuzu_gw_app:evaluate_listeners([Bad]))
+        end},
        {"an invalid value is ignored",
         fun() ->
             Set([agent_entry(), mgmt_entry()]),
@@ -436,6 +744,59 @@ apply_listener_port_overrides_test_() ->
             ?assertMatch([not_a_map, #{name := agent, listen := #{port := 52001}}],
                          application:get_env(yuzu_gw, grpc_listeners, []))
         end},
+       {"with two agent listeners the variable is ignored, with a warning, and boot is not refused",
+        fun() ->
+            %% one listener for a load balancer, one for a router
+            Second = (agent_entry())#{name => agent_router, listen => #{port => 50052}},
+            Set([agent_entry(), Second, mgmt_entry()]),
+            os:putenv("YUZU_GW_AGENT_PORT", "52001"),
+            Text = lists:flatten(capture_logs(
+                     fun() -> ok = yuzu_gw_app:apply_listener_port_overrides() end)),
+            ?assertEqual([{agent, 50051}, {agent_router, 50052}, {mgmt, 50063}], Ports()),
+            {match, _} = re:run(Text, "YUZU_GW_AGENT_PORT is ignored", [unicode]),
+            ?assertEqual(ok, yuzu_gw_app:evaluate_listeners(
+                               application:get_env(yuzu_gw, grpc_listeners, [])))
+        end},
+       {"two management listeners are no different",
+        fun() ->
+            Second = (mgmt_entry())#{name => mgmt2, listen => #{port => 50064}},
+            Set([mgmt_entry(), Second]),
+            os:putenv("YUZU_GW_MGMT_PORT", "52002"),
+            ok = yuzu_gw_app:apply_listener_port_overrides(),
+            ?assertEqual([{mgmt, 50063}, {mgmt2, 50064}], Ports())
+        end},
+       {"a variable whose proto no listener serves is ignored, with a warning naming it",
+        fun() ->
+            Set([agent_entry()]),
+            os:putenv("YUZU_GW_MGMT_PORT", "52002"),
+            Text = lists:flatten(capture_logs(
+                     fun() -> ok = yuzu_gw_app:apply_listener_port_overrides() end)),
+            ?assertEqual([{agent, 50051}], Ports()),
+            {match, _} = re:run(Text, "YUZU_GW_MGMT_PORT is ignored", [unicode])
+        end},
+       {"a variable that is not set warns about nothing",
+        fun() ->
+            Set([agent_entry(), (agent_entry())#{name => agent2}]),
+            ?assertEqual([], capture_logs(
+                               fun() -> ok = yuzu_gw_app:apply_listener_port_overrides() end))
+        end},
+       {"a listener that serves both protos has one port: the agent variable sets it",
+        fun() ->
+            Set([combined_entry()]),
+            os:putenv("YUZU_GW_AGENT_PORT", "52001"),
+            os:putenv("YUZU_GW_MGMT_PORT", "52002"),
+            Text = lists:flatten(capture_logs(
+                     fun() -> ok = yuzu_gw_app:apply_listener_port_overrides() end)),
+            ?assertEqual([{combined, 52001}], Ports()),
+            {match, _} = re:run(Text, "YUZU_GW_MGMT_PORT is ignored", [unicode])
+        end},
+       {"the management variable alone does not move a listener that also serves agents",
+        fun() ->
+            Set([combined_entry()]),
+            os:putenv("YUZU_GW_MGMT_PORT", "52002"),
+            ok = yuzu_gw_app:apply_listener_port_overrides(),
+            ?assertEqual([{combined, 50051}], Ports())
+        end},
        {"with no listeners configured it sets nothing",
         fun() ->
             os:putenv("YUZU_GW_AGENT_PORT", "52001"),
@@ -464,6 +825,7 @@ apply_listener_port_overrides_test_() ->
                          || S <- [yuzu_gw_upstream, yuzu_gw_registry,
                                   yuzu_gw_agent_sup, yuzu_gw_router]]).
 -define(NODELAY_KEY, {?MODULE, nodelay_applied}).
+-define(THROTTLE_KEY, {yuzu_grpc_runner, warn_throttle}).
 
 %% yuzu_gw_app:start/2 must create the summary-log state before it starts the
 %% metrics listener and the supervision tree. Nothing else boots the app, so
@@ -536,6 +898,22 @@ boot_creates_safe_call_limits_before_sup_test_() ->
                        receive {sup_started, L} -> L after 0 -> missing end)
       end).
 
+%% The same for the runner's WARN limit (yuzu_grpc_runner): its state exists
+%% before the tree whose last children are the listeners serves a request.
+boot_creates_runner_throttle_before_sup_test_() ->
+    boot_case(
+      fun() ->
+          persistent_term:erase(?THROTTLE_KEY),
+          Self = self(),
+          meck:expect(yuzu_gw_sup, start_link,
+                      fun() ->
+                          Self ! {sup_started, persistent_term:get(?THROTTLE_KEY, undefined) =/= undefined},
+                          {ok, self()}
+                      end),
+          ?assertMatch({ok, _}, yuzu_gw_app:start(normal, [])),
+          ?assertEqual(true, receive {sup_started, T} -> T after 0 -> missing end)
+      end).
+
 %%%===================================================================
 %%% Boot wiring: TCP_NODELAY on the upstream channel
 %%%===================================================================
@@ -574,10 +952,142 @@ boot_refuses_a_leftover_grpcbox_servers_block_test_() ->
                  end,
                  legacy_grpcbox_servers).
 
+%% The refusal is the whole explanation: the listener summary printed before the
+%% guards reads "none configured" for an entry that was never read, which sends
+%% an operator looking for the wrong problem.
+boot_refusing_a_leftover_grpcbox_servers_block_logs_no_listener_summary_test_() ->
+    boot_case(
+      fun() ->
+          application:set_env(grpcbox, servers, [#{listen_opts => #{port => 50051}}]),
+          Text = lists:flatten(
+                   capture_logs(fun() ->
+                                    ?assertEqual({error, legacy_grpcbox_servers},
+                                                 yuzu_gw_app:start(normal, []))
+                                end)),
+          {match, _} = re:run(Text, "Refusing to start: \\{grpcbox, servers\\} is set", [unicode]),
+          ?assertEqual(nomatch, re:run(Text, "none configured", [unicode, {capture, none}])),
+          ?assertEqual(nomatch, re:run(Text, "transport TLS", [unicode, {capture, none}]))
+      end).
+
+%% An unset or empty grpc_listeners is the state the operator reaches by removing
+%% the refused {grpcbox, servers} block and adding nothing.
+boot_refuses_an_unset_or_empty_grpc_listeners_test_() ->
+    [boot_refusal(fun() -> application:unset_env(yuzu_gw, allow_no_listeners) end,
+                  no_grpc_listeners),
+     boot_refusal(fun() ->
+                      application:unset_env(yuzu_gw, allow_no_listeners),
+                      application:set_env(yuzu_gw, grpc_listeners, [])
+                  end,
+                  no_grpc_listeners),
+     boot_refusal(fun() ->
+                      application:set_env(yuzu_gw, allow_no_listeners, false)
+                  end,
+                  no_grpc_listeners)].
+
+%% What an operator reads at boot, through start/2 itself.
+boot_logs_an_unset_grpc_listeners_refusal_test_() ->
+    boot_case(
+      fun() ->
+          application:unset_env(yuzu_gw, allow_no_listeners),
+          Text = lists:flatten(
+                   capture_logs(fun() ->
+                                    ?assertEqual({error, no_grpc_listeners},
+                                                 yuzu_gw_app:start(normal, []))
+                                end)),
+          {match, _} = re:run(Text, "Refusing to start: \\{yuzu_gw, grpc_listeners\\} is unset or empty", [unicode]),
+          {match, _} = re:run(Text, "allow_no_listeners", [unicode])
+      end).
+
+%% The refusals are CRITICAL events: an operator's log shipper alerts on the
+%% level, and a refusal logged lower would be read as a clean start that stopped.
+boot_refusals_are_logged_at_critical_test_() ->
+    Levels = fun(Configure) ->
+                 fun() ->
+                     Configure(),
+                     Events = capture_events(fun() -> {error, _} = yuzu_gw_app:start(normal, []) end),
+                     [L || {L, Text} <- Events,
+                           re:run(Text, "Refusing to start", [unicode, {capture, none}]) =:= match]
+                 end
+             end,
+    [{"no listeners configured",
+      boot_case(fun() ->
+                    application:unset_env(yuzu_gw, allow_no_listeners),
+                    ?assertEqual([critical],
+                                 (Levels(fun() -> application:set_env(yuzu_gw, grpc_listeners, []) end))())
+                end)},
+     {"no listener routes the AgentService",
+      boot_case(fun() ->
+                    application:unset_env(yuzu_gw, allow_no_listeners),
+                    ?assertEqual([critical],
+                                 (Levels(fun() ->
+                                             application:set_env(yuzu_gw, grpc_listeners,
+                                                                 [(agent_entry())#{services := #{}}])
+                                         end))())
+                end)},
+     {"a leftover grpcbox servers block",
+      boot_case(fun() ->
+                    ?assertEqual([critical],
+                                 (Levels(fun() ->
+                                             application:set_env(grpcbox, servers,
+                                                                 [#{listen_opts => #{port => 50051}}])
+                                         end))())
+                end)}].
+
+%% An entry in the shape of the former grpcbox block (certificates in
+%% transport_opts) never starts as a plaintext listener: boot names the defect
+%% and where the key went.
+boot_logs_a_former_shape_entry_refusal_test_() ->
+    boot_case(
+      fun() ->
+          Former = maps:without([listen], agent_entry()),
+          application:set_env(yuzu_gw, grpc_listeners,
+                              [Former#{listen_opts => #{port => 50051},
+                                       transport_opts => #{ssl => true, certfile => "gw.pem",
+                                                           keyfile => "gw.key",
+                                                           cacertfile => "ca.pem"}}]),
+          Text = lists:flatten(
+                   capture_logs(fun() ->
+                                    ?assertEqual({error, bad_grpc_listeners},
+                                                 yuzu_gw_app:start(normal, []))
+                                end)),
+          {match, _} = re:run(Text, "Refusing to start: invalid \\{yuzu_gw, grpc_listeners\\} entry", [unicode]),
+          {match, _} = re:run(Text, "legacy_keys", [unicode]),
+          {match, _} = re:run(Text, "transport_opts", [unicode]),
+          {match, _} = re:run(Text, "listen_opts", [unicode]),
+          %% the hint says where the key went
+          {match, _} = re:run(Text, "renamed `tls'", [unicode]),
+          {match, _} = re:run(Text, "renamed `listen'", [unicode]),
+          ?assertEqual(0, meck:num_calls(yuzu_gw_sup, start_link, []))
+      end).
+
+boot_refuses_valid_entries_with_no_agent_listener_test_() ->
+    boot_refusal(fun() ->
+                     application:unset_env(yuzu_gw, allow_no_listeners),
+                     application:set_env(yuzu_gw, grpc_listeners, [mgmt_entry()])
+                 end,
+                 no_agent_listener).
+
+boot_accepts_no_listeners_when_the_configuration_says_so_test_() ->
+    boot_case(
+      fun() ->
+          application:set_env(yuzu_gw, allow_no_listeners, true),
+          ?assertMatch({ok, _}, yuzu_gw_app:start(normal, [])),
+          ?assertEqual(1, meck:num_calls(yuzu_gw_sup, start_link, []))
+      end).
+
 boot_refuses_an_invalid_listener_entry_test_() ->
     boot_refusal(fun() ->
                      application:set_env(yuzu_gw, grpc_listeners,
                                          [(mgmt_entry())#{tls := #{certfile => "gw.pem"}}])
+                 end,
+                 bad_grpc_listeners).
+
+%% The TLS summary printed before the guards walks the same value: an improper
+%% list is a refusal there too, not a crash of start/2.
+boot_refuses_a_listeners_value_that_is_an_improper_list_test_() ->
+    boot_refusal(fun() ->
+                     os:putenv("YUZU_GW_AGENT_PORT", "52001"),
+                     application:set_env(yuzu_gw, grpc_listeners, [agent_entry() | not_a_list])
                  end,
                  bad_grpc_listeners).
 
@@ -644,8 +1154,11 @@ boot_setup(Extra) ->
     %% The guards read the listener configuration, which an earlier module may
     %% have left set: boot runs against an empty one unless a test sets its own.
     PrevEnv = env_setup(),
+    %% ...and with no listeners at all, which boot refuses unless told it is meant
+    %% (the tests that are about that unset it again).
+    application:set_env(yuzu_gw, allow_no_listeners, true),
     PrevPrometheus = application:get_env(prometheus, prometheus_http),
-    AbsentKeys = [K || K <- [?SUMMARY_KEY | ?SAFE_CALL_KEYS],
+    AbsentKeys = [K || K <- [?SUMMARY_KEY, ?THROTTLE_KEY | ?SAFE_CALL_KEYS],
                        persistent_term:get(K, undefined) =:= undefined],
     %% yuzu_gw_app:stop/1 drains every member of the `all_agents' pg group and
     %% spends up to a second on each one that does not answer. A member left

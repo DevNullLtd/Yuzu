@@ -40,6 +40,9 @@
 -define(EXECUTE, <<"/yuzu.agent.v1.AgentService/ExecuteCommand">>).
 -define(SUBSCRIBE, <<"/yuzu.agent.v1.AgentService/Subscribe">>).
 -define(UPDATE, <<"/yuzu.agent.v1.AgentService/CheckForUpdate">>).
+-define(MGMT_SVC, 'yuzu.server.v1.ManagementService').
+-define(LIST_AGENTS, <<"/yuzu.server.v1.ManagementService/ListAgents">>).
+-define(SEND_COMMAND, <<"/yuzu.server.v1.ManagementService/SendCommand">>).
 -define(LOGS, yuzu_grpc_wire_logs).
 -define(MARKER, "SECRET-MARKER-9f3a7c").
 
@@ -96,6 +99,8 @@ plaintext_test_() ->
 
 plain_setup() ->
     start_apps(),
+    %% the logging cases read the runner's line for their own failure: no rate limit
+    application:set_env(yuzu_gw, grpc_runner_warn_interval_ms, 0),
     ensure_log_table(),
     yuzu_grpc_stub_svc:init_state(),
     {Port, Pid} = yuzu_gw_test_listener:start(#{name => wire_plain, service_protos => [agent_pb],
@@ -106,6 +111,7 @@ plain_setup() ->
     #{port => Port, listener => Pid, chans => Chans, chan => wire_plain_a, chan_b => wire_plain_b}.
 
 plain_cleanup(#{listener := Pid, chans := Chans}) ->
+    application:unset_env(yuzu_gw, grpc_runner_warn_interval_ms),
     _ = logger:remove_handler(?MODULE),
     [yuzu_gw_test_listener:stop_channel(C) || C <- Chans],
     yuzu_gw_test_listener:stop(Pid).
@@ -500,9 +506,16 @@ tls_setup() ->
             Tls = #{certfile => filename:join(Dir, "gw.pem"), keyfile => filename:join(Dir, "gw.key"),
                     cacertfile => Ca},
             Base = #{service_protos => [agent_pb], services => #{?SVC => yuzu_grpc_stub_svc}},
+            %% A listener that serves the AgentService may not carry an auth_fun
+            %% (yuzu_grpc_listener:validate/1), so the auth_fun legs run against a
+            %% management listener: the stub answers two ManagementService methods
+            %% (ListAgents, unary; SendCommand, server stream) and the AgentService
+            %% is not served on that port at all.
             {AuthPort, AuthPid} = yuzu_gw_test_listener:start(
-                                    Base#{name => wire_tls_auth, tls => Tls,
-                                          auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1}),
+                                    #{name => wire_tls_auth, tls => Tls,
+                                      service_protos => [management_pb],
+                                      services => #{?MGMT_SVC => yuzu_grpc_stub_svc},
+                                      auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1}),
             {OnePort, OnePid} = yuzu_gw_test_listener:start(
                                   Base#{name => wire_tls_oneway,
                                         tls => Tls#{verify => verify_none, fail_if_no_peer_cert => false}}),
@@ -538,29 +551,33 @@ client_chan(Name, Port, #{dir := Dir, ca := Ca}, Leaf) ->
 
 auth_admitted(#{chan_srv := Chan}) ->
     yuzu_grpc_stub_svc:reset(),
-    ?assertMatch({ok, #{acknowledged := true}, _}, heartbeat(Chan, <<"ok">>)),
+    ?assertMatch({ok, #{agents := []}, _}, list_agents(Chan, <<"ok">>)),
     ?assertEqual(1, yuzu_grpc_stub_svc:calls()).
 
 auth_admitted_stream(#{chan_srv := Chan}) ->
-    ?assertMatch({[_, _, _], <<"0">>, _}, collect(execute(Chan, <<"count">>, <<"3">>))).
+    ?assertMatch({[_, _, _], <<"0">>, _}, collect(send_command(Chan, <<"count">>, <<"3">>))).
 
 auth_sees_cert(#{chan_srv := Chan}) ->
-    {ok, #{pending_commands := [#{action := Cert}]}, _} = heartbeat(Chan, <<"ctx">>),
+    {ok, #{agents := [#{agent_id := Cert}]}, _} = list_agents(Chan, <<"ctx">>),
     ?assertEqual(<<"cert">>, Cert).
 
 auth_refused(#{chan_agent := Agent, chan_gw := Gw}) ->
     yuzu_grpc_stub_svc:reset(),
-    ?assertMatch({error, {<<"16">>, _}, _}, heartbeat(Agent, <<"ok">>)),
-    ?assertMatch({error, {<<"16">>, _}, _}, heartbeat(Gw, <<"ok">>)),
+    ?assertMatch({error, {<<"16">>, _}, _}, list_agents(Agent, <<"ok">>)),
+    ?assertMatch({error, {<<"16">>, _}, _}, list_agents(Gw, <<"ok">>)),
     ?assertEqual(0, yuzu_grpc_stub_svc:calls()).
 
 auth_refused_stream(#{chan_agent := Chan}) ->
     yuzu_grpc_stub_svc:reset(),
-    ?assertMatch({[], <<"16">>, _}, collect(execute(Chan, <<"count">>, <<"3">>))),
+    ?assertMatch({[], <<"16">>, _}, collect(send_command(Chan, <<"count">>, <<"3">>))),
     ?assertEqual(0, yuzu_grpc_stub_svc:calls()).
 
 %% A bidi handler would be started at once; frames already in flight behind the
-%% refusal must not start or feed anything.
+%% refusal must not start or feed anything. ManagementService has no bidi method,
+%% so the stream goes to the AgentService's Subscribe path, which this listener
+%% does not serve: the refusal comes before routing either way (see
+%% auth_refused_unknown_method), and what is tested is that the stream handler
+%% answers it without reading the frames behind it.
 auth_refused_bidi(#{chan_agent := Chan}) ->
     yuzu_grpc_stub_svc:reset(),
     {ok, S} = subscribe(Chan),
@@ -597,7 +614,7 @@ auth_no_pins(#{chan_srv := Chan}) ->
     Pins = application:get_env(yuzu_gw, mgmt_peer_pins, []),
     application:set_env(yuzu_gw, mgmt_peer_pins, []),
     try
-        ?assertMatch({error, {<<"16">>, _}, _}, heartbeat(Chan, <<"ok">>)),
+        ?assertMatch({error, {<<"16">>, _}, _}, list_agents(Chan, <<"ok">>)),
         ?assertEqual(0, yuzu_grpc_stub_svc:calls())
     after
         application:set_env(yuzu_gw, mgmt_peer_pins, Pins)
@@ -632,6 +649,16 @@ alpn_h2_only(#{oneway_port := Port, certs := #{ca := Ca}}) ->
 %%%-------------------------------------------------------------------
 %%% Client plumbing
 %%%-------------------------------------------------------------------
+
+list_agents(Chan, Command) ->
+    grpcbox_client:unary(ctx:new(), ?LIST_AGENTS, #{filter => Command},
+                         list_agents_def(), #{channel => Chan}).
+
+send_command(Chan, Action, Arg) ->
+    {ok, S} = grpcbox_client:stream(ctx:new(), ?SEND_COMMAND,
+                                    #{command => #{action => Action, command_id => Arg}},
+                                    send_command_def(), #{channel => Chan}),
+    S.
 
 heartbeat(Chan, Command) ->
     heartbeat(Chan, Command, #{}).
@@ -671,6 +698,16 @@ collect(S, Timeout, Acc) ->
         {error, {Status, Message}, _} -> {lists:reverse(Acc), Status, Message};
         Other -> {lists:reverse(Acc), {unexpected, Other}, undefined}
     end.
+
+list_agents_def() ->
+    #grpcbox_def{service = ?MGMT_SVC,
+                 marshal_fun = fun(M) -> management_pb:encode_msg(M, 'yuzu.server.v1.ListAgentsRequest') end,
+                 unmarshal_fun = fun(B) -> management_pb:decode_msg(B, 'yuzu.server.v1.ListAgentsResponse') end}.
+
+send_command_def() ->
+    #grpcbox_def{service = ?MGMT_SVC,
+                 marshal_fun = fun(M) -> management_pb:encode_msg(M, 'yuzu.server.v1.SendCommandRequest') end,
+                 unmarshal_fun = fun(B) -> management_pb:decode_msg(B, 'yuzu.server.v1.SendCommandResponse') end}.
 
 heartbeat_def() ->
     #grpcbox_def{service = ?SVC,

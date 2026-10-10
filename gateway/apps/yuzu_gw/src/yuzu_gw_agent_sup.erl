@@ -26,8 +26,8 @@ start_link() ->
 %%
 %% Args holds the RegisterRequest (enrollment_token, machine_certificate,
 %% csr_pem). A start_child that exits (this supervisor is not running) exits the
-%% CALLER, a grpcbox handler process, with a reason that embeds the call and so
-%% Args, and grpcbox logs it. The exit is turned into the fixed
+%% CALLER, a gRPC handler process, with a reason that embeds the call and so
+%% Args, which would be logged. The exit is turned into the fixed
 %% {error, agent_sup_unavailable}; neither the reason nor Args is logged (see
 %% yuzu_gw_safe_call).
 -spec start_agent(map()) -> {ok, pid()} | {error, term()}.

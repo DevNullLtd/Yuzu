@@ -12,7 +12,8 @@
 
 -export([setup/0, handle_event/4]).
 -export([mgmt_auth_reject_reasons/0, heartbeat_reject_reasons/0,
-         origin_ignored_labels/0, dropped_data_reasons/0]).
+         origin_ignored_labels/0, dropped_data_reasons/0,
+         upstream_dropped_rpcs/0]).
 
 %% All telemetry event names used by the gateway.
 -define(EVENTS, [
@@ -60,6 +61,10 @@
     %% request bytes it dropped because the call could not use them.
     [yuzu, gw, grpc, origin_ignored],
     [yuzu, gw, grpc, dropped_data],
+
+    %% A queued upstream proxy call skipped because its requesting gRPC call
+    %% had already ended (yuzu_gw_upstream).
+    [yuzu, gw, upstream, call_dropped],
 
     %% Mgmt-plane peer authorization (#1422)
     [yuzu, gw, mgmt_auth, rejected],
@@ -243,9 +248,11 @@ handle_event([yuzu, gw, heartbeat, rejected], #{count := N}, Meta, _Config) ->
 %% gRPC layer. `origin_ignored': a listener configured as sitting behind a proxy
 %% (yuzu_grpc_origin) did not use the address a claim carried -- the TCP peer is
 %% not one of its trusted proxies (untrusted_source), the trusted proxy sent
-%% nothing usable (no_claim: a PROXY health check, no header) or something that
-%% is not an address (bad_claim). Labelled by mode and reason only, both from
-%% closed sets of atoms emitted by that module, never by an address.
+%% no claim on a call (no_claim: a PROXY LOCAL header, no x-forwarded-for
+%% header) or one that is not usable (bad_claim). Origin is resolved per RPC
+%% stream, so a health check that opens no stream is never counted. Labelled by
+%% mode and reason only, both from closed sets of atoms emitted by that module,
+%% never by an address.
 %% `dropped_data': request bytes discarded in a state that must not run a
 %% handler (a second message of a unary call, DATA after a status).
 handle_event([yuzu, gw, grpc, origin_ignored], #{count := N}, Meta, _Config) ->
@@ -256,6 +263,17 @@ handle_event([yuzu, gw, grpc, origin_ignored], #{count := N}, Meta, _Config) ->
 handle_event([yuzu, gw, grpc, dropped_data], #{bytes := Bytes}, Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_grpc_dropped_data_bytes_total,
                            [atom_to_binary(maps:get(reason, Meta, unknown), utf8)], Bytes);
+
+handle_event([yuzu, gw, upstream, call_dropped], #{count := N}, Meta, _Config) ->
+    %% yuzu_gw_upstream names the call as a binary; an atom is tolerated and any
+    %% other term is counted as `unknown' (a series that is not pre-seeded), so the
+    %% handler cannot fail and be detached by telemetry.
+    Rpc = case maps:get(rpc_name, Meta, <<"unknown">>) of
+              A when is_atom(A) -> atom_to_binary(A, utf8);
+              B when is_binary(B) -> B;
+              _ -> <<"unknown">>
+          end,
+    prometheus_counter:inc(yuzu_gw_upstream_calls_dropped_total, [Rpc], N);
 
 handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
@@ -385,12 +403,22 @@ heartbeat_reject_reasons() ->
 
 %% The closed set of {mode, reason} labels on yuzu_gw_grpc_origin_ignored_total:
 %% what yuzu_grpc_origin:resolve/4 can report for each proxy mode (a mode that
-%% trusts nothing in particular, `transport', never ignores a claim).
+%% trusts nothing in particular, `transport', never ignores a claim). For a peer
+%% that is a trusted source of a proxy mode, no_claim and bad_claim mean NO
+%% OBSERVATION: the origin is undefined and gateway_observed_peer is empty. For
+%% a peer that is not a trusted source, untrusted_source, the TCP peer is the
+%% origin (as it is in `transport' mode).
 -spec origin_ignored_labels() -> [{proxy_protocol | forwarded_for,
                                    untrusted_source | no_claim | bad_claim}].
 origin_ignored_labels() ->
     [{Mode, Reason} || Mode <- [proxy_protocol, forwarded_for],
                        Reason <- [untrusted_source, no_claim, bad_claim]].
+
+%% The closed set of `rpc_name' values on yuzu_gw_upstream_calls_dropped_total:
+%% the queued upstream calls yuzu_gw_upstream may skip when the caller is gone.
+-spec upstream_dropped_rpcs() -> [register | inventory].
+upstream_dropped_rpcs() ->
+    [register, inventory].
 
 %% The closed set of `reason' values on yuzu_gw_grpc_dropped_data_bytes_total.
 -spec dropped_data_reasons() -> [extra_request_data | stream_ended].
@@ -549,9 +577,11 @@ declare_metrics() ->
                "(proxy_protocol, forwarded_for) and reason (untrusted_source = "
                "the TCP peer is not one of the listener's trusted proxies, so "
                "the claim was ignored and the call attributed to the peer; "
-               "no_claim = a trusted proxy sent no usable claim, such as a PROXY "
-               "health check; bad_claim = the claim is not an IP address or has "
-               "fewer entries than trusted_hops). Calls are served either way. "
+               "no_claim = a trusted proxy sent no claim on the call, such as a "
+               "PROXY LOCAL header or no x-forwarded-for header; bad_claim = the "
+               "claim is not a bare IP address, is over 64 bytes, or has fewer "
+               "than trusted_hops + 1 entries; for these two the call carries no "
+               "observed address). Calls are served either way. "
                "A steady untrusted_source rate means the listener is reachable "
                "without going through the proxy"}]),
     [prometheus_counter:inc(yuzu_gw_grpc_origin_ignored_total,
@@ -568,6 +598,16 @@ declare_metrics() ->
     [prometheus_counter:inc(yuzu_gw_grpc_dropped_data_bytes_total,
                             [atom_to_binary(R, utf8)], 0)
      || R <- dropped_data_reasons()],
+    prometheus_counter:declare([
+        {name, yuzu_gw_upstream_calls_dropped_total},
+        {labels, [rpc_name]},
+        {help, "Queued upstream proxy calls skipped because the requesting gRPC "
+               "call had already ended (the client reset the stream or its "
+               "deadline passed while the call waited behind the serial "
+               "upstream process), by rpc_name (register, inventory)"}]),
+    [prometheus_counter:inc(yuzu_gw_upstream_calls_dropped_total,
+                            [atom_to_binary(R, utf8)], 0)
+     || R <- upstream_dropped_rpcs()],
     prometheus_counter:declare([
         {name, yuzu_gw_registration_replay_triggered_total},
         {labels, [trigger]},

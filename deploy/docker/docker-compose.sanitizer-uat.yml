@@ -6,6 +6,13 @@
 # Usage (managed by scripts/sanitizer-uat.sh):
 #   SANITIZER=asan docker compose -f deploy/docker/docker-compose.sanitizer-uat.yml up
 #   SANITIZER=tsan docker compose -f deploy/docker/docker-compose.sanitizer-uat.yml up
+#
+# Gateway image: yuzu-gateway:latest must be built from this checkout (or be from
+# the first release containing the yuzu_gw grpc_listeners shape): the mounted
+# gateway-sys.config uses that shape. An older image ignores it, binds no listener
+# and still answers /healthz and /readyz with 200, so the stack looks up while no
+# agent can connect. Image and config are an atomic pair (see "Upgrading the
+# Gateway" in docs/user-manual/upgrading.md).
 
 services:
   server:

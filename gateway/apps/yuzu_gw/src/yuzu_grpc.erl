@@ -39,7 +39,10 @@ peer(Ctx) ->
 %% listener configured as proxied, a claim from one of its trusted proxy
 %% addresses (the PROXY protocol header, or x-forwarded-for) is used instead
 %% (`proxy_protocol' / `forwarded_for'); a claim from anyone else is ignored.
-%% See yuzu_grpc_origin. The address has no port.
+%% See yuzu_grpc_origin. The address has no port. `undefined' is NO OBSERVATION:
+%% the connection has no peer address, or the listener is proxied and its
+%% trusted proxy gave no usable address (the TCP peer is then the proxy, which
+%% is not the agent). A handler must not substitute the TCP peer for it.
 -spec origin(ctx:t()) ->
     {inet:ip_address(), transport | proxy_protocol | forwarded_for} | undefined.
 origin(Ctx) ->

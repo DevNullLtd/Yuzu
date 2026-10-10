@@ -517,17 +517,13 @@ fi
 # PHASE 2: Start the Erlang Gateway
 # ══════════════════════════════════════════════════════════════════════
 if ! $REUSE_STACK; then
-log "Starting Erlang gateway (agent=$GW_AGENT_PORT, mgmt=$GW_MGMT_PORT, upstream=$SERVER_AGENT_PORT)..."
+log "Starting Erlang gateway (agent+mgmt=$GW_AGENT_PORT, upstream=$SERVER_AGENT_PORT)..."
 
 # Write a test sys.config pointing upstream at the server
 GW_SYS_CONFIG="$WORK_DIR/gw_sys.config"
 cat > "$GW_SYS_CONFIG" << ERLCFG
 [
     {yuzu_gw, [
-        {agent_listen_addr, "0.0.0.0"},
-        {agent_listen_port, $GW_AGENT_PORT},
-        {mgmt_listen_addr, "0.0.0.0"},
-        {mgmt_listen_port, $GW_MGMT_PORT},
         {upstream_addr, "127.0.0.1"},
         {upstream_port, $SERVER_GW_PORT},
         {upstream_pool_size, 4},
@@ -539,7 +535,9 @@ cat > "$GW_SYS_CONFIG" << ERLCFG
         %% that posture without this explicit acknowledgement. Never copy into
         %% production - use deploy/docker/reference-gateway-sys.config.
         {allow_insecure_mgmt, true},
-        %% One plaintext listener serves both services on the agent port.
+        %% One plaintext listener serves both services, on the agent port: this
+        %% gateway has no separate management port (GW_MGMT_PORT names the
+        %% management port of a gateway started elsewhere, in reuse mode).
         {grpc_listeners, [
             #{name => gateway,
               service_protos => [agent_pb, management_pb],

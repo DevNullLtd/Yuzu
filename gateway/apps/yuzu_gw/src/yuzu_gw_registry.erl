@@ -579,9 +579,10 @@ list_agents(Limit, Cursor) ->
 %% consumed. A row with no connection key is stored as is: it is never counted.
 %%
 %% The table is owned by the registry process and written from the caller's own
-%% process (a grpcbox handler). With the registry down the table is gone and the
-%% insert raises badarg, whose stacktrace carries Info, which holds the
-%% RegisterRequest (enrollment token, certificate, CSR) and which grpcbox logs.
+%% process (a gRPC handler process, yuzu_grpc_runner). With the registry down
+%% the table is gone and the insert raises badarg, whose stacktrace carries
+%% Info, which holds the RegisterRequest (enrollment token, certificate, CSR) and
+%% would end up in a log or crash report.
 %% The error is caught here and the fixed {error, registry_unavailable} returned:
 %% no stacktrace, no arguments. The one call made to the registry process carries
 %% the session id, the connection key, the agent id and the reservation, never
@@ -781,8 +782,8 @@ warn_session_limit(Cap) ->
 %%
 %% Uses `ets:take/2' — a SINGLE atomic retrieve-and-delete BIF — NOT a
 %% lookup-then-delete pair. `?PENDING_TABLE' is `public', and this is called
-%% directly from `yuzu_gw_agent_service:subscribe/2', which grpcbox runs as an
-%% independent process per incoming stream, so two concurrent `Subscribe's
+%% directly from `yuzu_gw_agent_service:subscribe/2', which yuzu_grpc_runner runs
+%% as an independent process per incoming stream, so two concurrent `Subscribe's
 %% presenting the SAME session id race here with zero serialization. A
 %% lookup-then-delete let BOTH win — each spawning an agent process and each
 %% emitting its own `CONNECTED(S)', which is exactly the "more than one

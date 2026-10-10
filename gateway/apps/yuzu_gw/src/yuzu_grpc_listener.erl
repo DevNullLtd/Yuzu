@@ -17,30 +17,71 @@
 %%%                  and an incomplete map refuses to start. verify defaults to
 %%%                  verify_peer and fail_if_no_peer_cert to true for it (mutual
 %%%                  TLS); verify => verify_none gives one-way TLS and then
-%%%                  fail_if_no_peer_cert defaults to false. TLS 1.2 only.
+%%%                  fail_if_no_peer_cert defaults to false. TLS 1.2 only. `ciphers'
+%%%                  is optional; when it is unset the suites follow the key type
+%%%                  of certfile (see ssl_opts/1) and when it is set it is used
+%%%                  as given.
 %%%   auth_fun       optional fun(Der) -> {true, Id} | true | false, run on the
 %%%                  peer certificate before anything else happens to a stream
-%%%                  (yuzu_grpc_stream_h). Only on a listener with `tls'. NEVER
-%%%                  give one to the agent listener: a peer without a
-%%%                  certificate is refused whenever there is an auth_fun, and the
-%%%                  agent listener must admit the agents that have none yet.
+%%%                  (yuzu_grpc_stream_h). Only on a listener with `tls', and
+%%%                  never on a listener that serves the agent service (agent_pb
+%%%                  in service_protos, or the AgentService a key of services): a
+%%%                  peer without a certificate is refused whenever there is an
+%%%                  auth_fun, and the agent listener must admit the agents that
+%%%                  have none yet.
 %%%   origin         optional, how the address of the caller is decided; see
-%%                  yuzu_grpc_origin. Omitted: `#{mode => transport}', the TCP
-%%                  peer. A listener behind a load balancer or a router says so
-%%                  here, and names the proxies it trusts:
-%%                    #{mode => proxy_protocol, sources => [Ip | {Ip, Prefix}]}
-%%                    #{mode => forwarded_for, sources => [...], trusted_hops => 0}
-%%                  Both are refused to start without `sources'. proxy_protocol
-%%                  makes the listener require a PROXY header on every
-%%                  connection (one without is closed after a second), so it
-%%                  serves only the proxy; the header precedes the TLS
-%%                  handshake, so a client certificate still reaches the
-%%                  gateway. forwarded_for reads x-forwarded-for from a proxy
-%%                  that terminates TLS: the certificate the gateway sees is
-%%                  the proxy's, so it cannot be combined with an `auth_fun'.
-%%   http2          optional overrides of the Cowboy HTTP/2 options
-%%%   limits         optional #{max_message_bytes, send_timeout_ms}
+%%%                  yuzu_grpc_origin. Omitted: `#{mode => transport}', the TCP
+%%%                  peer. A listener behind a load balancer or a router says so
+%%%                  here, and names the proxies it trusts:
+%%%                    #{mode => proxy_protocol, sources => [Ip | {Ip, Prefix}]}
+%%%                    #{mode => forwarded_for, sources => [...], trusted_hops => 0}
+%%%                  Both are refused to start without `sources'. proxy_protocol
+%%%                  makes the listener require a PROXY header on every
+%%%                  connection (one without is closed after a second), so it
+%%%                  serves only the proxy; the header precedes the TLS
+%%%                  handshake, so a client certificate still reaches the
+%%%                  gateway. forwarded_for reads x-forwarded-for from a proxy
+%%%                  that terminates TLS: the certificate the gateway sees is
+%%%                  the proxy's, so it cannot be combined with an `auth_fun'.
+%%%   http2          optional overrides of the Cowboy HTTP/2 options
+%%%   limits         optional #{max_message_bytes, send_timeout_ms, max_connections}
+%%%                  max_connections is the most connections the listener holds
+%%%                  at once (default infinity). At the ceiling the listener stops
+%%%                  accepting until one closes; connections that are already
+%%%                  up are untouched. The ceiling is soft by the number of
+%%%                  acceptors less one (Ranch puts an acceptor to sleep only
+%%%                  after the connection that reached it). It bounds the file
+%%%                  descriptors a flood of connections can take. It does NOT
+%%%                  bound how long they are held, so it does not stop a flood
+%%%                  from filling it: a TLS handshake that never completes is
+%%%                  cut after 10 s and a PROXY header that never arrives after
+%%%                  1 s, but a connection past those is held until its HTTP/2
+%%%                  idle_timeout runs out, and cowboy_http2 resets that counter
+%%%                  on every byte it receives, so a peer that keeps sending
+%%%                  (a PING every few seconds) holds its slot indefinitely.
+%%%                  Once the ceiling is full new connections wait in the
+%%%                  kernel backlog; the connections already up are served
+%%%                  as before. On a listener whose peers are not authenticated
+%%%                  before the connection is held (the agent listener) only a
+%%%                  firewall or a per-source rate limit in front of it closes
+%%%                  that. Size it under the process's file descriptor limit
+%%%                  with headroom for the other listeners, the upstream channel
+%%%                  and the health port.
 %%%   acceptors      optional acceptor count (default 4)
+%%%
+%%% The key sets are closed: a key the layer does not read is refused rather
+%%% than ignored, so a typo or a key of the former grpcbox shape (transport_opts,
+%%% listen_opts, grpc_opts, pool_opts, ssl) never starts a listener that is not the one
+%%% configured. The `tls' map takes certfile, keyfile, cacertfile, verify,
+%%% fail_if_no_peer_cert and ciphers; `listen' takes port, ip and socket_opts
+%%% (which may not set the bind address or port).
+%%%
+%%% A listener that goes away is restarted by its supervisor, and a graceful stop
+%%% or a single death of the Ranch listener supervisor recovers that way. A brutal
+%%% exit(kill) of that supervisor, or of this process itself, can still take the
+%%% listeners down: two deaths of a listener supervisor inside the 5 s restart
+%%% period of ranch_sup take ranch_sup, and with it every listener of the node,
+%%% down. None of this is known to be network-triggerable.
 %%%
 %%% The defaults suit a low-volume control listener (idle timeout 10 minutes,
 %%% 1024 concurrent streams per connection, 4 acceptors). A listener that serves
@@ -51,8 +92,11 @@
 -module(yuzu_grpc_listener).
 -behaviour(gen_server).
 
+-include_lib("public_key/include/public_key.hrl").
+
 -export([start_link/1, start/1, stop/1, child_spec/1]).
 -export([port/1, validate/1, ssl_opts/1]).
+-export([serves_agent/1, routes_agent/1, serves_proto/2, proper_list/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([entry/0]).
@@ -62,11 +106,53 @@
 %% Options the layer owns; an entry may not override them.
 -define(RESERVED_HTTP2, [stream_handlers, env, protocols, alpn_default_protocol,
                          connection_type, middlewares, proxy_header]).
-%% ECDHE-ECDSA AEAD suites only, the list the gateway's upstream client uses
-%% (config/sys.config.prod): the gateway and server leaves are EC P-256.
--define(CIPHERS, ["ECDHE-ECDSA-AES256-GCM-SHA384",
-                  "ECDHE-ECDSA-AES128-GCM-SHA256",
-                  "ECDHE-ECDSA-CHACHA20-POLY1305"]).
+%% The suites when `tls.ciphers' is unset, by the key type of the certificate:
+%% AEAD suites with ephemeral ECDH only. For an EC certificate (the generated
+%% gateway leaf is EC P-256) the list the gateway's upstream client uses
+%% (config/sys.config.prod); for an RSA certificate, which cannot sign an ECDSA
+%% key exchange, the ECDHE-RSA AES-GCM pair.
+-define(CIPHERS_EC, ["ECDHE-ECDSA-AES256-GCM-SHA384",
+                     "ECDHE-ECDSA-AES128-GCM-SHA256",
+                     "ECDHE-ECDSA-CHACHA20-POLY1305"]).
+-define(CIPHERS_RSA, ["ECDHE-RSA-AES256-GCM-SHA384",
+                      "ECDHE-RSA-AES128-GCM-SHA256"]).
+
+%% The keys an entry, its `tls', `listen' and `limits' maps may carry. Any other
+%% key is refused. The former grpcbox keys are named, with where they went.
+-define(ENTRY_KEYS, [name, service_protos, services, listen, tls, auth_fun, origin,
+                     http2, limits, acceptors]).
+-define(TLS_KEYS, [certfile, keyfile, cacertfile, verify, fail_if_no_peer_cert, ciphers]).
+-define(LISTEN_KEYS, [port, ip, socket_opts]).
+-define(LIMIT_KEYS, [max_message_bytes, send_timeout_ms, max_connections]).
+-define(LEGACY_ENTRY_KEYS,
+        [{transport_opts, "renamed `tls' (a `tls' map is TLS and its absence is plaintext)"},
+         {listen_opts, "renamed `listen'"},
+         {grpc_opts, "dissolved: service_protos, services and auth_fun are keys of the entry itself"},
+         {pool_opts, "renamed `acceptors' (a count)"},
+         {ssl, "dropped: a `tls' map is TLS and its absence is plaintext"}]).
+-define(LEGACY_TLS_KEYS,
+        [{ssl, "dropped: a `tls' map is TLS and its absence is plaintext"}]).
+%% The Cowboy HTTP/2 options an entry may set (cowboy_http2:opts/0), without the
+%% ones the layer owns (?RESERVED_HTTP2) and the hooks that run caller code.
+-define(HTTP2_KEYS,
+        [active_n, compress_buffering, compress_threshold, connection_window_margin_size,
+         connection_window_update_threshold, dynamic_buffer, dynamic_buffer_initial_average,
+         dynamic_buffer_initial_size, enable_connect_protocol, goaway_initial_timeout,
+         goaway_complete_timeout, hibernate, idle_timeout, inactivity_timeout,
+         initial_connection_window_size, initial_stream_window_size, linger_timeout,
+         max_authority_length, max_cancel_stream_rate, max_concurrent_streams,
+         max_connection_buffer_size, max_connection_window_size, max_decode_table_size,
+         max_encode_table_size, max_fragmented_header_block_size, max_frame_size_received,
+         max_frame_size_sent, max_headers, max_received_frame_rate, max_reset_stream_rate,
+         max_stream_buffer_size, max_stream_window_size, preface_timeout,
+         reset_idle_timeout_on_send, sendfile, settings_timeout, shutdown_timeout,
+         stream_window_data_threshold, stream_window_margin_size,
+         stream_window_update_threshold]).
+%% The service the agents call; a listener that serves it takes no auth_fun.
+-define(AGENT_SERVICE, 'yuzu.agent.v1.AgentService').
+%% Socket options that would move the bind address or port, which `listen' alone
+%% decides (and the management-plane posture guard reads).
+-define(BIND_SOCKET_OPTS, [ip, ifaddr, fd, port, local]).
 
 %%--------------------------------------------------------------------
 %% API
@@ -106,16 +192,24 @@ port(Pid) ->
 %% that fails one never binds a port.
 -spec validate(entry()) -> ok | {error, term()}.
 validate(Entry) when is_map(Entry) ->
-    first_error([fun() -> check_required(Entry) end,
+    first_error([fun() -> check_keys(entry, Entry, ?ENTRY_KEYS, ?LEGACY_ENTRY_KEYS) end,
+                 fun() -> check_required(Entry) end,
+                 fun() -> check_services(Entry) end,
                  fun() -> check_listen(maps:get(listen, Entry, undefined)) end,
+                 fun() -> check_auth_fun(Entry) end,
                  fun() -> check_tls(Entry) end,
                  fun() -> check_origin(Entry) end,
-                 fun() -> check_http2(maps:get(http2, Entry, #{})) end]);
+                 fun() -> check_http2(maps:get(http2, Entry, #{})) end,
+                 fun() -> check_acceptors(maps:get(acceptors, Entry, undefined)) end,
+                 fun() -> check_limits(maps:get(limits, Entry, #{})) end]);
 validate(_) ->
     {error, entry_not_a_map}.
 
 %% @doc The TLS socket options of a `tls' map. Mutual TLS by default; TLS 1.2
-%% with ECDHE-ECDSA AEAD suites only.
+%% with ECDHE AEAD suites only, chosen by the key type of the certificate
+%% unless the map sets `ciphers': ECDSA suites for an EC certificate, RSA suites
+%% for an RSA one. A certificate that cannot be read here (it fails when the
+%% listener starts, with the reason) gets the EC list.
 -spec ssl_opts(map()) -> [ssl:tls_server_option()].
 ssl_opts(#{certfile := Cert, keyfile := Key, cacertfile := CaCert} = Tls) ->
     Verify = maps:get(verify, Tls, verify_peer),
@@ -123,10 +217,34 @@ ssl_opts(#{certfile := Cert, keyfile := Key, cacertfile := CaCert} = Tls) ->
      {verify, Verify},
      {fail_if_no_peer_cert, maps:get(fail_if_no_peer_cert, Tls, Verify =:= verify_peer)},
      {versions, ['tlsv1.2']},
-     {ciphers, maps:get(ciphers, Tls, ?CIPHERS)},
+     {ciphers, maps:get(ciphers, Tls, default_ciphers(Cert))},
      {alpn_preferred_protocols, [<<"h2">>]},
      {honor_cipher_order, true},
      {reuse_sessions, false}].
+
+%% The suites for the key of the first certificate in the file.
+default_ciphers(CertFile) ->
+    case cert_key_type(CertFile) of
+        rsa -> ?CIPHERS_RSA;
+        _ -> ?CIPHERS_EC
+    end.
+
+cert_key_type(CertFile) ->
+    try
+        {ok, Pem} = file:read_file(CertFile),
+        [Der | _] = [D || {'Certificate', D, not_encrypted} <- public_key:pem_decode(Pem)],
+        #'OTPCertificate'{tbsCertificate = Tbs} = public_key:pkix_decode_cert(Der, otp),
+        #'OTPSubjectPublicKeyInfo'{algorithm = #'PublicKeyAlgorithm'{algorithm = Oid}} =
+            Tbs#'OTPTBSCertificate'.subjectPublicKeyInfo,
+        key_type(Oid)
+    catch
+        _:_ -> unknown
+    end.
+
+key_type(?rsaEncryption) -> rsa;
+key_type(?'id-RSASSA-PSS') -> rsa;
+key_type(?'id-ecPublicKey') -> ec;
+key_type(_) -> unknown.
 
 %%--------------------------------------------------------------------
 %% gen_server
@@ -157,10 +275,14 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 %% The Ranch listener went away under us: stop, so the supervisor restarts the
-%% whole listener rather than leaving a port unserved.
+%% whole listener rather than leaving a port unserved. The Ref stays in the state
+%% on purpose: terminate/2 then stops the listener's entry in ranch_sup too.
+%% Ranch restarts a permanent listener supervisor of its own accord; left alone
+%% that restart would run beside ours and race it for the name, and the loser's
+%% failure can take ranch_sup, and with it every listener of the node, down.
 -spec handle_info(term(), map()) -> {noreply, map()} | {stop, listener_down, map()}.
 handle_info({'DOWN', Mon, process, _Pid, _Reason}, #{mon := Mon} = State) ->
-    {stop, listener_down, State#{ref := undefined}};
+    {stop, listener_down, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -187,10 +309,10 @@ listen(#{name := Name} = Entry, Routes) ->
     case Started of
         {ok, Sup} ->
             Mon = erlang:monitor(process, Sup),
-            logger:info("gateway grpc listener ~p up on port ~p (tls=~p, auth_fun=~p)",
+            logger:info("gateway grpc listener ~p up on port ~p (tls=~p, auth_fun=~p, origin=~p)",
                         [Name, ranch:get_port(Ref), Tls =/= undefined,
-                         maps:is_key(auth_fun, Entry)],
-                        #{domain => [yuzu_gw, grpc]}),
+                         maps:is_key(auth_fun, Entry),
+                         maps:get(mode, maps:get(origin, Entry, #{mode => transport}))]),
             {ok, #{ref => Ref, sup => Sup, mon => Mon}};
         {error, Reason} ->
             {stop, {listen_failed, Reason}}
@@ -206,8 +328,9 @@ transport_opts(Entry, Tls) ->
                _ -> ssl_opts(Tls)
            end,
     #{num_acceptors => maps:get(acceptors, Entry, 4),
-      %% Ranch's default of 1024 connections would cap the fleet.
-      max_connections => infinity,
+      %% Ranch's default of 1024 connections would cap the fleet, so the
+      %% default here is none; `limits.max_connections' sets a ceiling.
+      max_connections => maps:get(max_connections, maps:get(limits, Entry, #{}), infinity),
       handshake_timeout => 10000,
       socket_opts => SocketOpts}.
 
@@ -246,16 +369,120 @@ first_error([Check | Rest]) ->
         {error, _} = Error -> Error
     end.
 
+%% The keys of Map must be Allowed. A key of the former grpcbox shape is refused
+%% by name with where it went; any other unknown key is refused with the keys
+%% that are allowed.
+check_keys(Where, Map, Allowed, Legacy) ->
+    Extra = maps:keys(Map) -- Allowed,
+    case [{K, Hint} || K <- Extra, {LK, Hint} <- Legacy, K =:= LK] of
+        [_ | _] = Found ->
+            {error, {legacy_keys, Where, Found}};
+        [] when Extra =:= [] ->
+            ok;
+        [] ->
+            {error, {unknown_keys, Where, Extra, {allowed, Allowed}}}
+    end.
+
 check_required(Entry) ->
     case [Key || Key <- [name, service_protos, services, listen], not maps:is_key(Key, Entry)] of
         [] -> ok;
         Missing -> {error, {missing_keys, Missing}}
     end.
 
-check_listen(#{port := Port}) when is_integer(Port), Port >= 0, Port =< 65535 ->
-    ok;
+%% The route table is built from these two (yuzu_grpc_route:build/2 takes a list
+%% and a map); a wrong type is a refusal here, not a crash in the caller.
+check_services(#{service_protos := Protos, services := Services}) ->
+    case {proper_list(Protos) andalso lists:all(fun is_atom/1, Protos), is_map(Services)} of
+        {true, true} -> ok;
+        {false, _} -> {error, bad_service_protos};
+        {true, false} -> {error, bad_services}
+    end.
+
+check_listen(#{port := Port} = Listen) when is_integer(Port), Port >= 0, Port =< 65535 ->
+    first_error([fun() -> check_keys(listen, Listen, ?LISTEN_KEYS, []) end,
+                 fun() -> check_ip(maps:get(ip, Listen, {0, 0, 0, 0})) end,
+                 fun() -> check_socket_opts(maps:get(socket_opts, Listen, [])) end]);
 check_listen(_) ->
     {error, bad_listen}.
+
+check_ip(Ip) ->
+    case inet:is_ip_address(Ip) of
+        true -> ok;
+        false -> {error, bad_listen_ip}
+    end.
+
+%% `listen' decides the bind address and port, and the management-plane posture
+%% guard reads them there: a socket option that sets them again (the later one
+%% wins in the option list) would bind somewhere the guard did not look.
+check_socket_opts(Opts) ->
+    case proper_list(Opts) of
+        true ->
+            case [Name || Opt <- Opts, Name <- [socket_opt_name(Opt)],
+                          lists:member(Name, ?BIND_SOCKET_OPTS)] of
+                [] -> ok;
+                Refused -> {error, {listen_socket_opts_set_the_bind, lists:usort(Refused)}}
+            end;
+        false ->
+            {error, bad_listen_socket_opts}
+    end.
+
+socket_opt_name(Opt) when is_atom(Opt) -> Opt;
+socket_opt_name(Opt) when is_tuple(Opt), tuple_size(Opt) >= 1 -> element(1, Opt);
+socket_opt_name(_) -> undefined.
+
+%% The agent listener admits agents that have no certificate yet; an auth_fun
+%% refuses every peer without one (yuzu_grpc_stream_h), which would shut the
+%% fleet out. Only the management plane authenticates its peer.
+check_auth_fun(Entry) ->
+    case {maps:get(auth_fun, Entry, undefined), serves_agent(Entry)} of
+        {undefined, _} -> ok;
+        {_, true} -> {error, auth_fun_on_agent_listener};
+        {Fun, false} when is_function(Fun, 1) -> ok;
+        {_, false} -> {error, bad_auth_fun}
+    end.
+
+%% @doc Whether the entry serves the agent service, in the broad sense the
+%% auth_fun refusal needs: agent_pb is among its service_protos (as the
+%% management-plane guard identifies its own listener,
+%% yuzu_gw_app:is_mgmt_listener/1: never by port) or the AgentService itself is a
+%% key of `services'. The second test is not redundant: management_pb embeds the
+%% AgentService definition, so `service_protos => [management_pb]' with
+%% `services' naming AgentService serves the agent RPCs and would otherwise read
+%% as a management-only listener. Total on any term.
+-spec serves_agent(term()) -> boolean().
+serves_agent(Entry) ->
+    serves_proto(Entry, agent_pb) orelse routes_agent(Entry).
+
+%% @doc Whether the entry routes the AgentService: it is a key of `services'.
+%% The strict test, which the boot guard and /readyz ask: an entry that lists
+%% agent_pb in its service_protos and maps no service builds a route table that
+%% answers every agent RPC UNIMPLEMENTED, so no agent can use it. Total on any
+%% term.
+-spec routes_agent(term()) -> boolean().
+routes_agent(#{services := Services}) when is_map(Services) ->
+    maps:is_key(?AGENT_SERVICE, Services);
+routes_agent(_) ->
+    false.
+
+%% @doc Whether the entry lists the proto module among its service_protos. Total:
+%% an entry that is not a map, a list that is not one (or is improper) is false.
+-spec serves_proto(term(), atom()) -> boolean().
+serves_proto(#{service_protos := Protos}, Proto) ->
+    list_member(Proto, Protos);
+serves_proto(_, _) ->
+    false.
+
+list_member(Item, [Item | _]) -> true;
+list_member(Item, [_ | Rest]) -> list_member(Item, Rest);
+list_member(_, _) -> false.
+
+%% @doc True for a proper list (the end of an improper one, `[a | b]', is not
+%% `[]'). The checks that walk a list from configuration ask it first, so a
+%% malformed one is a refusal and not a crash.
+-spec proper_list(term()) -> boolean().
+proper_list([]) -> true;
+proper_list([_ | Rest]) -> proper_list(Rest);
+proper_list(_) -> false.
 
 check_tls(Entry) ->
     case maps:get(tls, Entry, undefined) of
@@ -265,13 +492,32 @@ check_tls(Entry) ->
                 false -> ok
             end;
         Tls when is_map(Tls) ->
-            case [Key || Key <- [certfile, keyfile, cacertfile], not has_path(Tls, Key)] of
-                [] -> ok;
-                Missing -> {error, {tls_incomplete, Missing}}
-            end;
+            first_error([fun() -> check_keys(tls, Tls, ?TLS_KEYS, ?LEGACY_TLS_KEYS) end,
+                         fun() -> check_tls_paths(Tls) end,
+                         fun() -> check_tls_values(Tls) end]);
         _ ->
             {error, bad_tls}
     end.
+
+check_tls_paths(Tls) ->
+    case [Key || Key <- [certfile, keyfile, cacertfile], not has_path(Tls, Key)] of
+        [] -> ok;
+        Missing -> {error, {tls_incomplete, Missing}}
+    end.
+
+check_tls_values(Tls) ->
+    case [Key || {Key, Valid} <- [{verify, fun(V) -> V =:= verify_peer orelse V =:= verify_none end},
+                                  {fail_if_no_peer_cert, fun is_boolean/1},
+                                  {ciphers, fun valid_ciphers/1}],
+                 maps:is_key(Key, Tls), not Valid(maps:get(Key, Tls))] of
+        [] -> ok;
+        Bad -> {error, {bad_tls_values, Bad}}
+    end.
+
+valid_ciphers([_ | _] = Ciphers) ->
+    proper_list(Ciphers) andalso lists:all(fun(C) -> is_list(C) orelse is_tuple(C) end, Ciphers);
+valid_ciphers(_) ->
+    false.
 
 has_path(Tls, Key) ->
     case maps:get(Key, Tls, undefined) of
@@ -280,16 +526,49 @@ has_path(Tls, Key) ->
         _ -> false
     end.
 
+check_acceptors(undefined) -> ok;
+check_acceptors(N) when is_integer(N), N > 0 -> ok;
+check_acceptors(_) -> {error, bad_acceptors}.
+
+check_limits(Limits) when is_map(Limits) ->
+    case check_keys(limits, Limits, ?LIMIT_KEYS, []) of
+        ok ->
+            case [Key || {Key, Value} <- maps:to_list(Limits), not valid_limit(Key, Value)] of
+                [] -> ok;
+                Bad -> {error, {bad_limits, Bad}}
+            end;
+        {error, _} = Error ->
+            Error
+    end;
+check_limits(_) ->
+    {error, bad_limits}.
+
+valid_limit(max_message_bytes, N) -> is_integer(N) andalso N > 0;
+valid_limit(send_timeout_ms, N) -> N =:= infinity orelse (is_integer(N) andalso N > 0);
+valid_limit(max_connections, N) -> N =:= infinity orelse (is_integer(N) andalso N > 0).
+
 check_origin(Entry) ->
     case maps:get(origin, Entry, undefined) of
         undefined ->
             ok;
         Origin ->
-            case yuzu_grpc_origin:validate(Origin) of
-                ok -> check_origin_auth(Origin, maps:is_key(auth_fun, Entry));
-                {error, _} = Error -> Error
+            case origin_sources_walkable(Origin) of
+                true ->
+                    case yuzu_grpc_origin:validate(Origin) of
+                        ok -> check_origin_auth(Origin, maps:is_key(auth_fun, Entry));
+                        {error, _} = Error -> Error
+                    end;
+                false ->
+                    {error, {bad_origin_sources, improper_list}}
             end
     end.
+
+%% yuzu_grpc_origin:validate/1 walks `sources' as a proper list; one that is not
+%% is refused here instead of crashing the check.
+origin_sources_walkable(#{sources := Sources}) when is_list(Sources) ->
+    proper_list(Sources);
+origin_sources_walkable(_) ->
+    true.
 
 %% An auth_fun authenticates the peer of the TLS connection. Behind a proxy that
 %% terminates TLS that peer is the proxy, so the check would pass on the
@@ -303,7 +582,7 @@ check_origin_auth(_, _) ->
 
 check_http2(Http2) when is_map(Http2) ->
     case [Key || Key <- ?RESERVED_HTTP2, maps:is_key(Key, Http2)] of
-        [] -> ok;
+        [] -> check_keys(http2, Http2, ?HTTP2_KEYS, []);
         Reserved -> {error, {reserved_http2_options, Reserved}}
     end;
 check_http2(_) ->

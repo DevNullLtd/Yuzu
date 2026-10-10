@@ -86,6 +86,9 @@ info(_StreamId, Msg, St) ->
         Class:_ -> failed(St, Class)
     end.
 
+%% The handler is stopped with `shutdown' whatever the reason (a reset stream, a
+%% deadline, a closed connection): it does not trap exits, so it ends at once
+%% wherever it is blocked and runs no cleanup of its own (see yuzu_grpc_runner).
 -spec terminate(cowboy_stream:streamid(), cowboy_stream:reason(), #st{}) -> ok.
 terminate(_StreamId, _Reason, #st{handler = Handler, timer = Timer}) ->
     cancel_timer(Timer),
@@ -197,9 +200,9 @@ call(StreamId, Req, Headers, Route, Timeout, Env, St0) ->
             reject(St1, ?GRPC_STATUS_INTERNAL, <<"missing request message">>)
     end.
 
-%% The address the call is attributed to (yuzu_grpc_origin). A claim that was
-%% ignored is counted by mode and reason only: the address is never logged or
-%% put in a metric label.
+%% The address the call is attributed to (yuzu_grpc_origin), or `undefined' when
+%% a trusted proxy gave none. A claim that was ignored is counted by mode and
+%% reason only: the address is never logged or put in a metric label.
 origin(_Env, undefined, _Req, _Headers) ->
     undefined;
 origin(Env, {PeerIp, _Port}, Req, Headers) ->

@@ -10,6 +10,13 @@
 #   Server --> ClickHouse(:8123)          (analytics)
 #   Prometheus --> Server(:8080) + Gateway(:9568)  (metrics)
 #   Grafana --> Prometheus + ClickHouse   (dashboards)
+#
+# Gateway image: yuzu-gateway:latest must be built from this checkout (or be from
+# the first release containing the yuzu_gw grpc_listeners shape): the mounted
+# gateway-sys.config uses that shape. An older image ignores it, binds no listener
+# and still answers /healthz and /readyz with 200, so the stack looks up while no
+# agent can connect. Image and config are an atomic pair (see "Upgrading the
+# Gateway" in docs/user-manual/upgrading.md).
 
 services:
   # ── Yuzu Server (gateway mode) ─────────────────────────────────────────

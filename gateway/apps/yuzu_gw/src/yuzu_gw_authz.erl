@@ -8,12 +8,13 @@
 %%% command the fleet, so this module pins the mgmt peer to the C++
 %%% server's KEY, not merely its issuer.
 %%%
-%%% Wired as the grpcbox `auth_fun` on the mgmt listener ONLY (never the
-%%% :50051 agent listener, which is verify_none — grpcbox rejects a
-%%% certless peer whenever an auth_fun is installed, so an auth_fun there
-%%% would kill every agent connection). grpcbox invokes it per-stream,
-%%% before the service handler, with the peer's DER certificate; any
-%%% non-{true,_} return ends the stream UNAUTHENTICATED.
+%%% Wired as the `auth_fun` of the mgmt listener ONLY (never the :50051
+%%% agent listener, which is verify_none — a listener with an auth_fun
+%%% rejects a certless peer, so an auth_fun there would kill every agent
+%%% connection; yuzu_grpc_listener:validate/1 refuses the combination).
+%%% yuzu_grpc_stream_h invokes it per stream, before the service handler,
+%%% with the peer's DER certificate; any non-{true,_} return ends the
+%%% stream UNAUTHENTICATED.
 %%%
 %%% Pin model: `{yuzu_gw, mgmt_peer_pins}` is a list of
 %%%   {cert_file, Path}       — pin to the SPKI of the FIRST certificate in
@@ -57,11 +58,11 @@
 -define(IDENTITY, <<"yuzu-server">>).
 
 %%--------------------------------------------------------------------
-%% grpcbox auth_fun entry point
+%% auth_fun entry point
 %%--------------------------------------------------------------------
 
-%% @doc grpcbox auth_fun for the mgmt listener. Total: any throw/error
-%% rejects rather than crashing the stream process.
+%% @doc The auth_fun of the mgmt listener. Total: any throw/error rejects
+%% rather than crashing the connection process.
 -spec check_mgmt_peer(public_key:der_encoded()) -> {true, binary()} | false.
 check_mgmt_peer(DerCert) ->
     try

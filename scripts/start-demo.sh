@@ -11,6 +11,12 @@
 # multi-arch + chiselled — see docs/demo-environment.md), use --build to build
 # them locally from the current tree and tag them as that version.
 #
+# Gateway image: the gateway config this mounts (demo-gateway-sys.config) uses the
+# {yuzu_gw, grpc_listeners} shape, so the pinned gateway image must be from the
+# first release containing the yuzu_gw grpc_listeners shape. An older image binds
+# no listener and still reports healthy; use --build until the pin is such a
+# release.
+#
 # Usage:
 #   bash scripts/start-demo.sh [start] [--build|--pull] [--agents N] [--version X.Y.Z] [--keep]
 #   bash scripts/start-demo.sh status

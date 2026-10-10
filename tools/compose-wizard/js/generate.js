@@ -359,10 +359,6 @@ ${c.tlsMode === 'plaintext'
     y += `    content: |\n`;
     y += `      [\n`;
     y += `          {yuzu_gw, [\n`;
-    y += `              {agent_listen_addr, "0.0.0.0"},\n`;
-    y += `              {agent_listen_port, 50051},\n`;
-    y += `              {mgmt_listen_addr, "0.0.0.0"},\n`;
-    y += `              {mgmt_listen_port, 50063},\n`;
     y += `              {upstream_addr, "server"},\n`;
     y += `              {upstream_port, ${c.gwUpstreamPort}},\n`;
     y += `              {upstream_pool_size, ${c.gwPoolSize}},\n`;
@@ -765,6 +761,11 @@ ${c.tlsMode === 'plaintext'
   // Gateway
   if (c.gateway) {
     y += `\n  # ── Yuzu Gateway (Erlang/OTP) ────────────────────────────────────────\n`;
+    y += `  # The gateway-sys-config above uses the {yuzu_gw, grpc_listeners} shape, so\n`;
+    y += `  # this image must be from the first release containing that shape. An older\n`;
+    y += `  # image ignores the config, binds no listener and still answers /healthz\n`;
+    y += `  # with 200: the stack looks up while no agent can connect. Image and config\n`;
+    y += `  # are an atomic pair (docs/user-manual/upgrading.md, "Upgrading the Gateway").\n`;
     y += `  gateway:\n`;
     y += `    image: ghcr.io/devnullltd/yuzu-gateway:\${YUZU_VERSION:-${c.version}}\n`;
     y += `    container_name: yuzu-gateway\n`;

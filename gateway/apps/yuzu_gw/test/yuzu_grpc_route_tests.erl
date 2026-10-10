@@ -82,10 +82,16 @@ unexported_function_is_absent_test() ->
                           <<"/yuzu.server.v1.ManagementService/GetAgent">>, Table)),
     ?assertEqual(2, map_size(Table)).
 
-%% A module that exports none of the handlers routes nothing.
-module_without_handlers_routes_nothing_test() ->
-    {ok, Table} = yuzu_grpc_route:build([management_pb], #{?MGMT => yuzu_gw_authz_tests}),
-    ?assertEqual(0, map_size(Table)).
+%% A module that exports none of a service's handlers is refused: a listener
+%% serving a service nothing answers is a mistyped module, not a partial one.
+module_without_handlers_is_refused_test() ->
+    ?assertEqual({error, {service_without_routes, ?MGMT}},
+                 yuzu_grpc_route:build([management_pb], #{?MGMT => yuzu_gw_authz_tests})),
+    %% the refusal is per service: one good service does not excuse another
+    ?assertEqual({error, {service_without_routes, ?AGENT}},
+                 yuzu_grpc_route:build([agent_pb, management_pb],
+                                       #{?AGENT => yuzu_gw_authz_tests,
+                                         ?MGMT => yuzu_gw_mgmt_service})).
 
 unknown_path_test() ->
     {ok, Table} = yuzu_grpc_route:build([agent_pb], #{?AGENT => yuzu_gw_agent_service}),
@@ -105,6 +111,13 @@ service_no_proto_describes_is_an_error_test() ->
 module_that_cannot_be_loaded_is_an_error_test() ->
     ?assertEqual({error, {module_not_loaded, no_such_module_for_yuzu_grpc}},
                  yuzu_grpc_route:build([agent_pb], #{?AGENT => no_such_module_for_yuzu_grpc})).
+
+%% A service module that is not an atom is a missing module, not a crash of
+%% code:ensure_loaded/1.
+service_module_that_is_not_an_atom_is_an_error_test_() ->
+    [?_assertEqual({error, {module_not_loaded, Bad}},
+                   yuzu_grpc_route:build([agent_pb], #{?AGENT => Bad})) ||
+        Bad <- ["yuzu_gw_agent_service", <<"yuzu_gw_agent_service">>, 42, {m, f}]].
 
 no_services_is_an_empty_table_test() ->
     ?assertEqual({ok, #{}}, yuzu_grpc_route:build([agent_pb], #{})).

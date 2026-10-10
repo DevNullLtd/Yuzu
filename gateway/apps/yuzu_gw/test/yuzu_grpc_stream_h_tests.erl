@@ -14,8 +14,11 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_grpc_stream_h_tests).
 -include_lib("eunit/include/eunit.hrl").
+-include("yuzu_grpc.hrl").
 
 -export([forward_dropped/4, forward_origin/4]).
+%% the failing handlers of the runner log cases, and the logger handler callback
+-export([crash/2, bad_return/2, log/2]).
 
 -define(SVC, 'yuzu.agent.v1.AgentService').
 -define(HEARTBEAT, <<"/yuzu.agent.v1.AgentService/Heartbeat">>).
@@ -177,13 +180,53 @@ origin_test_() ->
                  ?assertEqual({{127, 0, 0, 1}, transport}, yuzu_grpc:origin(Ctx)),
                  ?assertEqual({forwarded_for, untrusted_source}, origin_event())
              end)),
-     ?CASE("an unusable x-forwarded-for from a trusted proxy falls back to the peer and is counted",
+     ?CASE("an unusable x-forwarded-for from a trusted proxy is no observation (not the proxy) and is counted",
            with_origin_events(
              fun() ->
                  Ctx = unary_ctx(ViaLb(req(?HEARTBEAT, Xff(<<"not-an-address">>))),
                                  FwdEnv(Routes, [Lb])),
-                 ?assertEqual({Lb, transport}, yuzu_grpc:origin(Ctx)),
+                 ?assertEqual(undefined, yuzu_grpc:origin(Ctx)),
+                 %% the TCP peer is still known, and is still the proxy
+                 ?assertEqual({Lb, 40000}, yuzu_grpc:peer(Ctx)),
                  ?assertEqual({forwarded_for, bad_claim}, origin_event())
+             end)),
+     ?CASE("no x-forwarded-for from a trusted proxy is no observation and is counted",
+           with_origin_events(
+             fun() ->
+                 Ctx = unary_ctx(ViaLb(req(?HEARTBEAT)), FwdEnv(Routes, [Lb])),
+                 ?assertEqual(undefined, yuzu_grpc:origin(Ctx)),
+                 ?assertEqual({forwarded_for, no_claim}, origin_event())
+             end)),
+     ?CASE("fewer x-forwarded-for entries than trusted_hops is no observation and is counted",
+           with_origin_events(
+             fun() ->
+                 Env = env(Routes, #{origin => #{mode => forwarded_for, sources => [Lb],
+                                                 trusted_hops => 1}}),
+                 Ctx = unary_ctx(ViaLb(req(?HEARTBEAT, Xff(<<"203.0.113.9">>))), Env),
+                 ?assertEqual(undefined, yuzu_grpc:origin(Ctx)),
+                 ?assertEqual({forwarded_for, bad_claim}, origin_event())
+             end)),
+     ?CASE("an x-forwarded-for that is not UTF-8 is served: attributed by the rules, no error logged",
+           with_origin_events(
+             fun() ->
+                 Env = FwdEnv(Routes, [Lb]),
+                 %% bytes the client chose to the left of the proxy's entry
+                 Junk = <<255, 254, 253, ", ", 192, 128, ", 203.0.113.9">>,
+                 {[], St0} = init(ViaLb(req(?HEARTBEAT, Xff(Junk))), Env),
+                 {Commands, _} = yuzu_grpc_stream_h:data(1, fin, hb_frame(<<"x">>), St0),
+                 ?assertMatch([{spawn, _, _}, {flow, _}], Commands),
+                 {_, _, Ctx} = started(),
+                 ?assertEqual({Client, forwarded_for}, yuzu_grpc:origin(Ctx)),
+                 %% and as the selected entry: no observation, a bad claim, still served
+                 {InitCommands, St1} = init(ViaLb(req(?HEARTBEAT, Xff(<<"1.1.1.1, ", 255, 254>>))), Env),
+                 ?assertEqual([], InitCommands),
+                 ?assertEqual({forwarded_for, bad_claim}, origin_event()),
+                 {DataCommands, _} = yuzu_grpc_stream_h:data(1, fin, hb_frame(<<"x">>), St1),
+                 ?assertMatch([{spawn, _, _}, {flow, _}], DataCommands),
+                 {_, _, Ctx2} = started(),
+                 ?assertEqual(undefined, yuzu_grpc:origin(Ctx2)),
+                 %% neither call produced a log command (Cowboy would print it as an error)
+                 ?assertEqual([], [C || C = {log, _, _, _} <- InitCommands ++ DataCommands])
              end)),
      ?CASE("a PROXY header from a trusted proxy is the origin",
            begin
@@ -200,14 +243,41 @@ origin_test_() ->
                  ?assertEqual({{127, 0, 0, 1}, transport}, yuzu_grpc:origin(Ctx)),
                  ?assertEqual({proxy_protocol, untrusted_source}, origin_event())
              end)),
-     ?CASE("a PROXY LOCAL (the balancer's own health check) is the peer and is counted",
+     ?CASE("a PROXY LOCAL (the balancer's own health check) is no observation and is counted",
            with_origin_events(
              fun() ->
                  Req = (ViaLb(req(?HEARTBEAT)))#{proxy_header => #{version => 2, command => local}},
                  Ctx = unary_ctx(Req, ProxyEnv(Routes, [Lb])),
-                 ?assertEqual({Lb, transport}, yuzu_grpc:origin(Ctx)),
+                 ?assertEqual(undefined, yuzu_grpc:origin(Ctx)),
                  ?assertEqual({proxy_protocol, no_claim}, origin_event())
              end)),
+     ?CASE("a PROXY header with no address, or none at all, is no observation and is counted",
+           with_origin_events(
+             fun() ->
+                 Unspec = #{version => 2, command => proxy, transport_family => undefined},
+                 Ctx = unary_ctx((ViaLb(req(?HEARTBEAT)))#{proxy_header => Unspec},
+                                 ProxyEnv(Routes, [Lb])),
+                 ?assertEqual(undefined, yuzu_grpc:origin(Ctx)),
+                 ?assertEqual({proxy_protocol, bad_claim}, origin_event()),
+                 Ctx2 = unary_ctx(ViaLb(req(?HEARTBEAT)), ProxyEnv(Routes, [Lb])),
+                 ?assertEqual(undefined, yuzu_grpc:origin(Ctx2)),
+                 ?assertEqual({proxy_protocol, no_claim}, origin_event())
+             end)),
+     ?CASE("a peer that is not a trusted proxy keeps the TCP peer as the origin, in both proxy modes",
+           with_origin_events(
+             fun() ->
+                 Ctx = unary_ctx(req(?HEARTBEAT), FwdEnv(Routes, [Lb])),
+                 ?assertEqual({{127, 0, 0, 1}, transport}, yuzu_grpc:origin(Ctx)),
+                 ?assertEqual({forwarded_for, untrusted_source}, origin_event()),
+                 Ctx2 = unary_ctx(req(?HEARTBEAT), ProxyEnv(Routes, [Lb])),
+                 ?assertEqual({{127, 0, 0, 1}, transport}, yuzu_grpc:origin(Ctx2)),
+                 ?assertEqual({proxy_protocol, untrusted_source}, origin_event())
+             end)),
+     ?CASE("a transport listener never reports no observation for a known peer",
+           begin
+               Ctx = unary_ctx(ViaLb(req(?HEARTBEAT)), env(Routes)),
+               ?assertEqual({Lb, transport}, yuzu_grpc:origin(Ctx))
+           end),
      ?CASE("a streaming handler's ctx carries the origin too",
            begin
                Env = FwdEnv(Routes, [Lb]),
@@ -584,6 +654,245 @@ bidi_test_() ->
            end)].
 
 %%%-------------------------------------------------------------------
+%%% A failing handler is logged where an operator can see it
+%%%-------------------------------------------------------------------
+
+%% The gateway ships OTP's default handler filters: `filter_default => stop', and
+%% only events with no domain (or an OTP one) pass. An event the runner tagged
+%% with a domain of its own is dropped before it is printed, so the line exists
+%% only if it carries none.
+default_handler_filters() ->
+    [{remote_gl, {fun logger_filters:remote_gl/2, stop}},
+     {domain, {fun logger_filters:domain/2, {log, super, [otp, sasl]}}},
+     {no_domain, {fun logger_filters:domain/2, {log, undefined, []}}}].
+
+runner_log_test_() ->
+    [{"the filters are the default ones: a domain-tagged event is dropped, an untagged one is shown",
+      fun() -> with_default_handler(fun() ->
+          logger:warning("tagged", [], #{domain => [yuzu_gw, grpc]}),
+          logger:warning("untagged"),
+          %% custom handlers run in the logging process, so both were decided already
+          ?assertEqual(["untagged"], logged_texts(fun(T) -> lists:member(T, ["tagged", "untagged"]) end))
+      end) end},
+     {"a handler that raises is logged with its method, exception class and top frame, and answers INTERNAL",
+      fun() -> with_default_handler(fun() ->
+          {Status, Message} = run_failing(crash, #{token => <<"S3CR3T">>}),
+          ?assertEqual({?GRPC_STATUS_INTERNAL, <<"internal error">>}, {Status, Message}),
+          [Text] = runner_texts(),
+          ?assertNotEqual(nomatch, string:find(Text, "/yuzu.agent.v1.AgentService/Heartbeat")),
+          ?assertNotEqual(nomatch, string:find(Text, "class=error")),
+          ?assertNotEqual(nomatch, string:find(Text, "yuzu_grpc_stream_h_tests:crash/2")),
+          %% never the reason, the request or the arguments
+          ?assertEqual(nomatch, string:find(Text, "S3CR3T")),
+          ?assertEqual(nomatch, string:find(Text, "secret"))
+      end) end},
+     {"failure lines are limited to one per interval and the next line counts what it skipped",
+      fun() -> with_default_handler(fun() ->
+          application:unset_env(yuzu_gw, grpc_runner_warn_interval_ms),
+          yuzu_grpc_runner:reset_throttle(),
+          Warn = fun(Now) -> yuzu_grpc_runner:warn_throttled(Now, ?HEARTBEAT, error, "m:f/1") end,
+          [Warn(T) || T <- [0, 1, 500, 999]],
+          [First] = runner_texts(),
+          ?assertEqual(nomatch, string:find(First, "not logged")),
+          ?assertNotEqual(nomatch, string:find(First, "class=error at m:f/1")),
+          Warn(1000),
+          [Second] = runner_texts(),
+          ?assertNotEqual(nomatch, string:find(Second, "(3 similar failures not logged")),
+          %% the count restarts after a line: one skipped at 1500, then the line at 2000
+          Warn(1500),
+          ?assertEqual([], runner_texts()),
+          Warn(2000),
+          [Third] = runner_texts(),
+          ?assertNotEqual(nomatch, string:find(Third, "(1 similar failures not logged"))
+      end) end},
+     {"failures that arrive together write one line and are all counted",
+      fun() -> with_default_handler(fun() ->
+          application:unset_env(yuzu_gw, grpc_runner_warn_interval_ms),
+          yuzu_grpc_runner:reset_throttle(),
+          Pids = [spawn_monitor(fun() ->
+                                    yuzu_grpc_runner:warn_throttled(5, ?HEARTBEAT, error, "m:f/1")
+                                end) || _ <- lists:seq(1, 50)],
+          [receive {'DOWN', Ref, process, Pid, _} -> ok after 5000 -> error(no_down) end
+           || {Pid, Ref} <- Pids],
+          ?assertEqual(1, length(runner_texts())),
+          yuzu_grpc_runner:warn_throttled(1005, ?HEARTBEAT, error, "m:f/1"),
+          [Next] = runner_texts(),
+          ?assertNotEqual(nomatch, string:find(Next, "(49 similar failures not logged"))
+      end) end},
+     {"a burst of failing calls writes one line and each call still answers INTERNAL",
+      fun() -> with_default_handler(fun() ->
+          application:set_env(yuzu_gw, grpc_runner_warn_interval_ms, 3600000),
+          yuzu_grpc_runner:reset_throttle(),
+          Answers = [run_failing(crash, #{token => <<"S3CR3T">>}) || _ <- lists:seq(1, 5)],
+          ?assertEqual(lists:duplicate(5, {?GRPC_STATUS_INTERNAL, <<"internal error">>}), Answers),
+          [Text] = runner_texts(),
+          ?assertNotEqual(nomatch, string:find(Text, "class=error")),
+          ?assertEqual(nomatch, string:find(Text, "S3CR3T"))
+      end) end},
+     {"an interval that is not a non-negative integer reads as the default of one second",
+      fun() -> with_default_handler(fun() ->
+          lists:foreach(
+            fun(Bad) ->
+                application:set_env(yuzu_gw, grpc_runner_warn_interval_ms, Bad),
+                ?assertEqual(1000, yuzu_grpc_runner:warn_interval(), Bad),
+                yuzu_grpc_runner:reset_throttle(),
+                Warn = fun(Now) -> yuzu_grpc_runner:warn_throttled(Now, ?HEARTBEAT, error, "m:f/1") end,
+                Warn(0), Warn(999),
+                ?assertEqual(1, length(runner_texts()), Bad),
+                Warn(1000),
+                [Next] = runner_texts(),
+                ?assertNotEqual(nomatch, string:find(Next, "(1 similar failures not logged"), Bad)
+            end, [-1, 1.5, "100", <<"100">>, infinity, undefined, abc])
+      end) end},
+     {"an interval above an hour is an hour: a typo cannot silence the log",
+      fun() -> with_default_handler(fun() ->
+          Warn = fun(Now) -> yuzu_grpc_runner:warn_throttled(Now, ?HEARTBEAT, error, "m:f/1") end,
+          lists:foreach(
+            fun(Huge) ->
+                application:set_env(yuzu_gw, grpc_runner_warn_interval_ms, Huge),
+                ?assertEqual(3600000, yuzu_grpc_runner:warn_interval(), Huge),
+                yuzu_grpc_runner:reset_throttle(),
+                Warn(0), Warn(3599999),
+                ?assertEqual(1, length(runner_texts()), Huge),
+                Warn(3600000),
+                ?assertEqual(1, length(runner_texts()), Huge)
+            end, [3600001, 1000000000000, 1 bsl 80]),
+          %% an hour exactly, and 0 (every failure), are kept
+          application:set_env(yuzu_gw, grpc_runner_warn_interval_ms, 3600000),
+          ?assertEqual(3600000, yuzu_grpc_runner:warn_interval()),
+          application:set_env(yuzu_gw, grpc_runner_warn_interval_ms, 0),
+          ?assertEqual(0, yuzu_grpc_runner:warn_interval())
+      end) end},
+     {"init_throttle creates the limit's state once and resets it afterwards, without replacing it",
+      fun() ->
+          Key = {yuzu_grpc_runner, warn_throttle},
+          Prev = persistent_term:get(Key, undefined),
+          try
+              persistent_term:erase(Key),
+              ok = yuzu_grpc_runner:init_throttle(),
+              Made = persistent_term:get(Key),
+              %% a failure the limit swallowed is counted in slot 2; init forgets it
+              atomics:put(Made, 1, 5000),
+              atomics:put(Made, 2, 7),
+              ok = yuzu_grpc_runner:init_throttle(),
+              ?assertEqual(Made, persistent_term:get(Key)),
+              ?assertEqual(0, atomics:get(Made, 2)),
+              ?assert(atomics:get(Made, 1) < -1000000)
+          after
+              case Prev of
+                  undefined -> yuzu_grpc_runner:init_throttle();
+                  _ -> persistent_term:put(Key, Prev)
+              end
+          end
+      end},
+     {"a failure that finds no state makes it, takes no global lock, and is logged",
+      fun() -> with_default_handler(fun() ->
+          Key = {yuzu_grpc_runner, warn_throttle},
+          application:set_env(yuzu_gw, grpc_runner_warn_interval_ms, 1000),
+          persistent_term:erase(Key),
+          %% Another process holds the global lock the former implementation took
+          %% for this resource: a caller that asks for it cannot proceed.
+          Self = self(),
+          Holder = spawn_link(fun() ->
+                                  true = global:set_lock({Key, self()}, [node()], 1),
+                                  Self ! locked,
+                                  receive release -> ok end
+                              end),
+          receive locked -> ok after 5000 -> error(lock_not_taken) end,
+          {Pid, Ref} = spawn_monitor(fun() ->
+              yuzu_grpc_runner:warn_throttled(5, ?HEARTBEAT, error, "m:f/1")
+          end),
+          receive {'DOWN', Ref, process, Pid, normal} -> ok
+          after 3000 -> exit(Pid, kill), Holder ! release, error(blocked_on_a_lock)
+          end,
+          Holder ! release,
+          ?assertEqual(1, length(runner_texts())),
+          ?assertNotEqual(undefined, persistent_term:get(Key, undefined))
+      end) end},
+     {"a handler that returns something else is logged the same way",
+      fun() -> with_default_handler(fun() ->
+          ?assertEqual({?GRPC_STATUS_INTERNAL, <<"internal error">>},
+                       run_failing(bad_return, #{token => <<"S3CR3T">>})),
+          [Text] = runner_texts(),
+          ?assertNotEqual(nomatch, string:find(Text, "class=bad_return")),
+          ?assertEqual(nomatch, string:find(Text, "S3CR3T"))
+      end) end}].
+
+%% Run Fun with a handler installed with the default filters; it forwards every
+%% event it is given to this process.
+with_default_handler(Fun) ->
+    {ok, _} = application:ensure_all_started(telemetry),
+    %% a case that reads the runner's line for its own failure: no rate limit,
+    %% unless the case sets one (the rate limit cases below do)
+    application:set_env(yuzu_gw, grpc_runner_warn_interval_ms, 0),
+    yuzu_grpc_runner:reset_throttle(),
+    Id = yuzu_grpc_stream_h_tests_log,
+    catch logger:remove_handler(Id),
+    ok = logger:add_handler(Id, ?MODULE,
+                            #{level => all, filter_default => stop,
+                              filters => default_handler_filters(),
+                              config => #{pid => self()}}),
+    Level = maps:get(level, logger:get_primary_config()),
+    ok = logger:set_primary_config(level, all),
+    try
+        Fun()
+    after
+        application:unset_env(yuzu_gw, grpc_runner_warn_interval_ms),
+        yuzu_grpc_runner:reset_throttle(),
+        logger:remove_handler(Id),
+        logger:set_primary_config(level, Level),
+        flush()
+    end.
+
+%% Run the real runner on a handler of this module, as a stream handler would
+%% (a linked process); this process is the "connection" and gets the status.
+run_failing(Function, Request) ->
+    Stream = #yuzu_grpc_stream{conn = self(), stream_id = 1, ctx = ctx:new(),
+                               method = <<"/yuzu.agent.v1.AgentService/Heartbeat">>,
+                               pb = agent_pb, output = 'yuzu.agent.v1.HeartbeatResponse'},
+    OldTrap = process_flag(trap_exit, true),
+    try
+        Pid = proc_lib:spawn_link(yuzu_grpc_runner, run,
+                                  [#{kind => unary, module => ?MODULE, function => Function,
+                                     stream => Stream, request => Request}]),
+        Self = self(),
+        receive {{Self, 1}, {grpc_end, Pid, Status, Message}} -> {Status, Message}
+        after 5000 -> error(runner_sent_no_status)
+        end
+    after
+        process_flag(trap_exit, OldTrap),
+        receive {'EXIT', _, _} -> ok after 0 -> ok end
+    end.
+
+crash(_Ctx, #{token := Token}) ->
+    erlang:error({secret, Token}).
+
+bad_return(_Ctx, _Request) ->
+    {definitely, not_a_result}.
+
+%% The runner logs before it reports its status, from the same process, so the
+%% line is in the mailbox once the status has been received. Only the events that
+%% satisfy Keep are returned: the handler sees every event of the node, and a
+%% line of another process must not decide a case.
+logged_texts(Keep) ->
+    [T || T <- all_logged_texts(), Keep(T)].
+
+runner_texts() ->
+    logged_texts(fun(T) -> string:find(T, "gateway grpc handler") =/= nomatch end).
+
+all_logged_texts() ->
+    receive
+        {logged, Text} -> [Text | all_logged_texts()]
+    after 0 -> []
+    end.
+
+%% logger handler callback: runs in the logging process.
+log(Event, #{config := #{pid := Pid}}) ->
+    Pid ! {logged, lists:flatten(logger_formatter:format(Event, #{single_line => true,
+                                                                  template => [msg]}))},
+    ok.
+
+%%%-------------------------------------------------------------------
 %%% No callback raises
 %%%-------------------------------------------------------------------
 
@@ -715,12 +1024,10 @@ unary_ctx(Req, Env) ->
 
 %% Telemetry: capture the origin_ignored events for the duration of Fun.
 with_origin_events(Fun) ->
-    fun() ->
-        Id = {?MODULE, make_ref()},
-        ok = telemetry:attach(Id, [yuzu, gw, grpc, origin_ignored], fun ?MODULE:forward_origin/4,
-                              self()),
-        try Fun() after telemetry:detach(Id) end
-    end.
+    Id = {?MODULE, make_ref()},
+    ok = telemetry:attach(Id, [yuzu, gw, grpc, origin_ignored], fun ?MODULE:forward_origin/4,
+                          self()),
+    try Fun() after telemetry:detach(Id) end.
 
 forward_origin(_Event, #{count := 1}, #{mode := Mode, reason := Reason}, Pid) ->
     Pid ! {origin_ignored, Mode, Reason},

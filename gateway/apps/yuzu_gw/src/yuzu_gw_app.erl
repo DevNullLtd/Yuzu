@@ -36,6 +36,15 @@ do_start() ->
     %% Apply environment variable overrides (container deployment).
     apply_env_overrides(),
 
+    %% A leftover {grpcbox, servers} is refused before anything else is said about
+    %% the listeners: the summary below would read "none configured" for it, and
+    %% the refusal is the whole explanation.
+    case check_legacy_grpcbox_servers() of
+        ok -> do_start_guarded();
+        {error, _} = Error -> Error
+    end.
+
+do_start_guarded() ->
     %% Log the ACTUAL transport TLS posture: the {yuzu_gw, grpc_listeners} entries
     %% for the two listeners and grpcbox's {grpcbox, client} for the upstream hop;
     %% the yuzu_gw `tls`/`tls_enabled` env is advisory only (nothing wires it into
@@ -48,16 +57,17 @@ do_start() ->
     %%
     %% A leftover {grpcbox, servers} would make the grpcbox application bind an
     %% unguarded listener next to ours. grpcbox starts before this application
-    %% does, so that listener is already up when this refuses; refusing halts the
-    %% release moments after it bound, with nothing served from it.
+    %% does, so that listener is already up when check_legacy_grpcbox_servers/0
+    %% refuses. It binds for the moments before the release halts, and every
+    %% request it receives fails: the registry, the router and the ETS tables
+    %% its handlers use do not exist yet.
     %%
     %% #PR5: fail CLOSED on a misconfigured-but-encrypted upstream (https without
     %% verify_peer is MITM-able) -- same fail-closed philosophy as the distribution
     %% cookie guard, rather than booting with only a log warning. PLAINTEXT upstream
     %% is still allowed (the legitimate UAT/dev posture); only the "TLS but
     %% unauthenticated" footgun is refused.
-    run_guards([fun check_legacy_grpcbox_servers/0,
-                fun check_grpc_listeners/0,
+    run_guards([fun check_grpc_listeners/0,
                 fun check_upstream_tls_posture/0,
                 fun check_mgmt_listener_posture/0],
                fun do_start_services/0).
@@ -81,6 +91,9 @@ do_start_services() ->
     %% The same for the WARN limit of the calls that carry a registration
     %% request (yuzu_gw_safe_call): a burst of first failures shares one limit.
     ok = yuzu_gw_safe_call:init_limits(),
+    %% And for the runner's WARN limit (yuzu_grpc_runner): the same burst, the
+    %% same reason, and no lock to take when it comes.
+    ok = yuzu_grpc_runner:init_throttle(),
 
     %% TCP_NODELAY on the upstream channel, before the supervision tree below
     %% (the only caller of the channel) exists: grpcbox already started the
@@ -346,37 +359,77 @@ apply_env_overrides() ->
     apply_tls_overrides().
 
 %% @doc Apply YUZU_GW_AGENT_PORT / YUZU_GW_MGMT_PORT to the listener entries:
-%% the port of the entry that serves agent_pb (resp. management_pb). Read from
-%% the process environment, not from the {yuzu_gw, agent_listen_port} /
-%% {yuzu_gw, mgmt_listen_port} keys the deployed configs still carry: those
-%% were never consulted, and some say something other than the listener does.
+%% the port of the entry that serves agent_pb (resp. management_pb), and ONLY
+%% when exactly one entry serves that proto. With none, or with several (the
+%% two-agent-listener topology: one for a load balancer, one for a router), a
+%% single variable cannot say which entry it means and moving them all would
+%% put two on one port, so the variable is ignored with a warning. An entry that
+%% serves both protos has one port, which YUZU_GW_AGENT_PORT sets;
+%% YUZU_GW_MGMT_PORT is ignored for it. Read from the process environment, not
+%% from the {yuzu_gw, agent_listen_port} / {yuzu_gw, mgmt_listen_port} keys the
+%% deployed configs may still carry: nothing reads those.
 -spec apply_listener_port_overrides() -> ok.
 apply_listener_port_overrides() ->
     Overrides = [{agent_pb, "YUZU_GW_AGENT_PORT"}, {management_pb, "YUZU_GW_MGMT_PORT"}],
     case application:get_env(yuzu_gw, grpc_listeners, []) of
-        Listeners when is_list(Listeners), Listeners =/= [] ->
-            Updated = lists:map(fun(L) -> override_listener_port(L, Overrides) end, Listeners),
-            application:set_env(yuzu_gw, grpc_listeners, Updated);
+        [_ | _] = Listeners ->
+            case yuzu_grpc_listener:proper_list(Listeners) of
+                true ->
+                    Updated = lists:foldl(fun({Proto, Var}, Acc) ->
+                                              override_proto_port(Proto, Var, Acc)
+                                          end, Listeners, Overrides),
+                    application:set_env(yuzu_gw, grpc_listeners, Updated);
+                false ->
+                    ok  %% check_grpc_listeners/0 refuses it
+            end;
         _ ->
             ok
     end.
 
-override_listener_port(#{service_protos := Protos} = Listener, Overrides) when is_list(Protos) ->
-    case [Var || {Proto, Var} <- Overrides, lists:member(Proto, Protos)] of
-        [Var | _] -> with_port(Listener, os:getenv(Var), Var);
-        [] -> Listener
-    end;
-override_listener_port(Listener, _Overrides) ->
-    Listener.
+override_proto_port(Proto, Var, Listeners) ->
+    case os:getenv(Var) of
+        false ->
+            Listeners;
+        Value ->
+            case [L || L <- Listeners, serves_proto(L, Proto)] of
+                [Only] ->
+                    case Proto =:= management_pb andalso serves_proto(Only, agent_pb) of
+                        true ->
+                            logger:warning("ENV override: ~s is ignored: the one listener "
+                                           "that serves management_pb also serves agent_pb "
+                                           "and has one port, set by YUZU_GW_AGENT_PORT", [Var]),
+                            Listeners;
+                        false ->
+                            [case L of
+                                 Only -> with_port(L, Value, Var);
+                                 _ -> L
+                             end || L <- Listeners]
+                    end;
+                Serving ->
+                    logger:warning("ENV override: ~s is ignored: it applies only when exactly "
+                                   "one grpc_listeners entry serves ~s and ~b do",
+                                   [Var, Proto, length(Serving)]),
+                    Listeners
+            end
+    end.
 
-with_port(Listener, false, _Var) ->
-    Listener;
+serves_proto(Entry, Proto) ->
+    yuzu_grpc_listener:serves_proto(Entry, Proto).
+
 with_port(Listener, Value, Var) ->
     try list_to_integer(Value) of
         Port when Port >= 0, Port =< 65535 ->
-            logger:info("ENV override: ~s = ~p", [Var, Port]),
-            Listen = maps:get(listen, Listener, #{}),
-            Listener#{listen => Listen#{port => Port}};
+            case maps:get(listen, Listener, #{}) of
+                Listen when is_map(Listen) ->
+                    logger:info("ENV override: ~s = ~p", [Var, Port]),
+                    Listener#{listen => Listen#{port => Port}};
+                _ ->
+                    %% A `listen' that is not a map is left for validate/1 to
+                    %% refuse (bad_listen); no port is applied to it.
+                    logger:warning("ENV override: ~s is ignored: the entry's `listen' is not "
+                                   "a map", [Var]),
+                    Listener
+            end;
         _ ->
             logger:warning("ENV override: ~s has invalid value '~s', ignoring", [Var, Value]),
             Listener
@@ -467,8 +520,11 @@ log_tls_state() ->
 
 %% "agent: one-way TLS, mgmt: mutual TLS": one phrase per listener entry.
 -spec listeners_summary(term()) -> string().
-listeners_summary(Listeners) when is_list(Listeners), Listeners =/= [] ->
-    lists:flatten(lists:join(", ", [listener_summary(L) || L <- Listeners]));
+listeners_summary([_ | _] = Listeners) ->
+    case yuzu_grpc_listener:proper_list(Listeners) of
+        true -> lists:flatten(lists:join(", ", [listener_summary(L) || L <- Listeners]));
+        false -> "unrecognised entries"
+    end;
 listeners_summary(_) ->
     "none configured".
 
@@ -538,7 +594,9 @@ evaluate_upstream_posture(_Posture, _Allow)  -> ok.
 %% would make the grpcbox application bind a second, unguarded listener on the
 %% same ports (no mgmt peer pin, no origin handling) next to ours. grpcbox
 %% starts before this application, so that listener is already bound when this
-%% refuses; the release halts at once and nothing is served from it.
+%% refuses; the release halts at once, and in the meantime every request it
+%% receives fails, because the registry, router and ETS tables its handlers use
+%% are not started yet.
 -spec check_legacy_grpcbox_servers() -> ok | {error, legacy_grpcbox_servers}.
 check_legacy_grpcbox_servers() ->
     case application:get_env(grpcbox, servers, []) of
@@ -557,28 +615,80 @@ check_legacy_grpcbox_servers() ->
             {error, legacy_grpcbox_servers}
     end.
 
-%% @private Refuse to boot with a listener entry that cannot start. Everything
-%% checked here is checked before any child of the supervision tree starts:
-%% an entry that fails (an incomplete `tls', an origin mode with no sources, a
-%% service module that does not export what its proto declares) never binds a
-%% port. No entries is allowed -- a gateway under test, or one that only
-%% routes -- and is said so.
--spec check_grpc_listeners() -> ok | {error, bad_grpc_listeners}.
+%% @private Refuse to boot with a listener entry that cannot start, and with no
+%% entries at all. Everything checked here is checked before any child of the
+%% supervision tree starts: an entry that fails (an incomplete `tls', a key the
+%% layer does not read, an origin mode with no sources, a service module that
+%% exports none of its service's methods) never binds a port. A module that
+%% exports only SOME of them is accepted: the route table leaves the others out
+%% and a request for one answers UNIMPLEMENTED (yuzu_grpc_route). An unset or
+%% empty `grpc_listeners' is a gateway that accepts no agent and no command
+%% while /healthz answers -- what an operator gets by removing the refused
+%% {grpcbox, servers} block and adding nothing -- so it is refused unless
+%% {yuzu_gw, allow_no_listeners} is the literal `true' (a gateway under test, or
+%% one that only routes). The same holds for entries none of which routes the
+%% AgentService (check_agent_listener/1).
+-spec check_grpc_listeners() ->
+          ok | {error, bad_grpc_listeners | no_grpc_listeners | no_agent_listener}.
 check_grpc_listeners() ->
     case application:get_env(yuzu_gw, grpc_listeners, []) of
         [] ->
-            logger:warning("No gRPC listeners are configured ({yuzu_gw, grpc_listeners}): "
-                           "this gateway accepts no agent or management connection."),
-            ok;
+            case application:get_env(yuzu_gw, allow_no_listeners, false) of
+                true ->
+                    logger:warning("No gRPC listeners are configured ({yuzu_gw, grpc_listeners}) "
+                                   "and {yuzu_gw, allow_no_listeners} is true: this gateway "
+                                   "accepts no agent or management connection."),
+                    ok;
+                _ ->
+                    logger:critical(
+                        "Refusing to start: {yuzu_gw, grpc_listeners} is unset or empty, so this "
+                        "gateway would accept no agent and no management connection. Configure "
+                        "the listeners in the yuzu_gw block (one entry per listener; see "
+                        "config/sys.config.prod and docs/user-manual/gateway.md). A gateway that "
+                        "is meant to serve none (a test) sets {yuzu_gw, allow_no_listeners} to "
+                        "true."),
+                    {error, no_grpc_listeners}
+            end;
         Listeners ->
             case evaluate_listeners(Listeners) of
                 ok ->
-                    ok;
+                    check_agent_listener(Listeners);
                 {error, Defects} ->
                     logger:critical(
                         "Refusing to start: invalid {yuzu_gw, grpc_listeners} entry/entries ~p. "
                         "See docs/user-manual/gateway.md for the entry shape.", [Defects]),
                     {error, bad_grpc_listeners}
+            end
+    end.
+
+%% Entries that are all valid but none of which routes the agent service: no agent
+%% could ever connect, and /readyz (which requires one) would never answer ready,
+%% so a clear refusal is better than a gateway that boots and is never put in
+%% rotation. "Routes" is the strict test (yuzu_grpc_listener:routes_agent/1): the
+%% AgentService is a key of the entry's `services'. An entry that only lists
+%% agent_pb in its service_protos builds a route table without it and answers
+%% every agent RPC UNIMPLEMENTED. Excused by {yuzu_gw, allow_no_listeners} (the
+%% literal `true') like the empty list.
+check_agent_listener(Listeners) ->
+    case lists:any(fun yuzu_grpc_listener:routes_agent/1, Listeners) of
+        true ->
+            ok;
+        false ->
+            case application:get_env(yuzu_gw, allow_no_listeners, false) of
+                true ->
+                    logger:warning("No {yuzu_gw, grpc_listeners} entry routes the agent service "
+                                   "and {yuzu_gw, allow_no_listeners} is true: this gateway "
+                                   "accepts no agent connection."),
+                    ok;
+                _ ->
+                    logger:critical(
+                        "Refusing to start: no {yuzu_gw, grpc_listeners} entry routes the "
+                        "AgentService (its `services' map has no 'yuzu.agent.v1.AgentService' "
+                        "key), so no agent could connect and /readyz would never report "
+                        "ready. Add the agent listener (see config/sys.config.prod and "
+                        "docs/user-manual/gateway.md). A gateway that is meant to serve none "
+                        "(a test) sets {yuzu_gw, allow_no_listeners} to true."),
+                    {error, no_agent_listener}
             end
     end.
 
@@ -588,6 +698,14 @@ check_grpc_listeners() ->
 %% would build, a name used twice, or a fixed port used twice.
 -spec evaluate_listeners(term()) -> ok | {error, [{term(), term()}]}.
 evaluate_listeners(Listeners) when is_list(Listeners) ->
+    case yuzu_grpc_listener:proper_list(Listeners) of
+        true -> evaluate_entries(Listeners);
+        false -> {error, [{unknown, grpc_listeners_not_a_list}]}
+    end;
+evaluate_listeners(_) ->
+    {error, [{unknown, grpc_listeners_not_a_list}]}.
+
+evaluate_entries(Listeners) ->
     Names = [N || #{name := N} <- Listeners],
     Ports = [P || #{listen := #{port := P}} <- Listeners, is_integer(P), P > 0],
     Defects = lists:flatmap(fun listener_defects/1, Listeners)
@@ -596,9 +714,7 @@ evaluate_listeners(Listeners) when is_list(Listeners) ->
     case Defects of
         [] -> ok;
         _ -> {error, Defects}
-    end;
-evaluate_listeners(_) ->
-    {error, [{unknown, grpc_listeners_not_a_list}]}.
+    end.
 
 listener_defects(Entry) when is_map(Entry) ->
     Name = maps:get(name, Entry, unknown),
@@ -617,10 +733,11 @@ listener_defects(_) ->
 %% @doc True if any listener entry serves TLS (it has a `tls' map). Pure;
 %% exported for testing.
 -spec listeners_have_tls(term()) -> boolean().
-listeners_have_tls(Listeners) when is_list(Listeners) ->
-    lists:any(fun(#{tls := Tls}) when is_map(Tls) -> true;
-                 (_) -> false
-              end, Listeners);
+listeners_have_tls([_ | _] = Listeners) ->
+    yuzu_grpc_listener:proper_list(Listeners)
+        andalso lists:any(fun(#{tls := Tls}) when is_map(Tls) -> true;
+                             (_) -> false
+                          end, Listeners);
 listeners_have_tls(_) ->
     false.
 
@@ -676,7 +793,20 @@ check_mgmt_listener_posture() ->
 %% refusal into {ok_insecure, Details} (boot + warn), never a silent pass.
 -spec evaluate_mgmt_posture(term(), term(), boolean()) ->
           ok | {ok_insecure, [term()]} | {error, {insecure_mgmt_listener, [term()]}}.
-evaluate_mgmt_posture(Listeners, Pins, Allow) when is_list(Listeners) ->
+evaluate_mgmt_posture([_ | _] = Listeners, Pins, Allow) ->
+    case yuzu_grpc_listener:proper_list(Listeners) of
+        true -> mgmt_posture(Listeners, Pins, Allow);
+        %% An improper list cannot be walked, so no listener can be shown NOT to
+        %% be a management one: refused, whatever the escape hatch says.
+        false -> {error, {insecure_mgmt_listener, [{unknown, improper_list}]}}
+    end;
+evaluate_mgmt_posture(_Listeners, _Pins, _Allow) ->
+    %% No listeners, or an unrecognisable listeners config: nothing provably
+    %% exposes management_pb (evaluate_listeners/1 refuses an unusable one
+    %% separately).
+    ok.
+
+mgmt_posture(Listeners, Pins, Allow) ->
     Details = [{listener_port(S), D}
                || S <- Listeners, is_mgmt_listener(S),
                   not loopback_bound(S),
@@ -686,37 +816,40 @@ evaluate_mgmt_posture(Listeners, Pins, Allow) when is_list(Listeners) ->
         {[], _}     -> ok;
         {_, true}   -> {ok_insecure, Details};
         {_, false}  -> {error, {insecure_mgmt_listener, Details}}
-    end;
-evaluate_mgmt_posture(_Listeners, _Pins, _Allow) ->
-    %% Unrecognisable listeners config: nothing provably exposes management_pb
-    %% (evaluate_listeners/1 refuses an unusable one separately).
-    ok.
+    end.
 
 %% @private A listener serving the management proto. Identified by
 %% service_protos -- never by port or the advisory yuzu_gw env keys.
 -spec is_mgmt_listener(term()) -> boolean().
-is_mgmt_listener(S) when is_map(S) ->
-    Protos = maps:get(service_protos, S, undefined),
-    is_list(Protos) andalso lists:member(management_pb, Protos);
-is_mgmt_listener(_) ->
-    false.
+is_mgmt_listener(S) ->
+    yuzu_grpc_listener:serves_proto(S, management_pb).
 
 %% @private Loopback-only binds have no network attack surface. A missing or
 %% unrecognised ip is EXPOSED (the listener binds {0,0,0,0} by default). The
 %% `ip' of `listen' is authoritative ONLY when `socket_opts' cannot override the
 %% bind: an inherited `{fd, _}' descriptor makes the socket bind wherever the fd
-%% points (e.g. systemd socket activation), and an `{ip, _}' inside socket_opts
-%% is appended after the map ip in the inet option list, where the later
-%% occurrence wins. Either shape makes a nominal `ip => {127,0,0,1}' a dead
-%% letter, so both forfeit the exemption (PR #3905 review, Doomgoose blocking
-%% finding).
+%% points (e.g. systemd socket activation), and an `{ip, _}' or `{ifaddr, _}'
+%% inside socket_opts is appended after the map ip in the inet option list,
+%% where the later occurrence wins. Any of them makes a nominal
+%% `ip => {127,0,0,1}' a dead letter, so all forfeit the exemption (PR #3905
+%% review, Doomgoose blocking finding). yuzu_grpc_listener:validate/1 refuses
+%% these options outright on every listener; this stays the fail-safe for a
+%% caller that reaches the posture decision without it.
 -spec loopback_bound(map()) -> boolean().
 loopback_bound(S) ->
-    Listen = maps:get(listen, S, #{}),
+    case maps:get(listen, S, #{}) of
+        Listen when is_map(Listen) -> loopback_bound_listen(Listen);
+        _ -> false  % unrecognised shape: cannot prove the bind -- exposed
+    end.
+
+loopback_bound_listen(Listen) ->
     Overridable = case maps:get(socket_opts, Listen, undefined) of
         undefined -> false;
         L when is_list(L) ->
-            lists:keymember(fd, 1, L) orelse lists:keymember(ip, 1, L);
+            not yuzu_grpc_listener:proper_list(L)  % unrecognised shape: exposed
+                orelse lists:keymember(fd, 1, L) orelse lists:keymember(ip, 1, L)
+                orelse lists:keymember(ifaddr, 1, L) orelse lists:keymember(local, 1, L)
+                orelse lists:member(local, L);
         _ -> true  % unrecognised shape: cannot prove the bind -- exposed
     end,
     case {Overridable, maps:get(ip, Listen, undefined)} of

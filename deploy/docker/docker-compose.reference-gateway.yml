@@ -53,6 +53,13 @@
 ## listener is one-way TLS). Env-driven gateway TLS is
 ## tracked in #1291.
 ##
+## Gateway image: that config uses the grpc_listeners shape, so the gateway
+## image must be from the first release containing the yuzu_gw grpc_listeners
+## shape. An older image ignores grpc_listeners, binds no listener and still
+## answers /healthz and /readyz with 200 (the compose healthcheck stays green
+## while no agent can connect). Image and config are an atomic pair; see
+## "Upgrading the Gateway" in docs/user-manual/upgrading.md.
+##
 ## --cert-san: the default leaves are minted with SANs for the in-compose
 ## service names so SNI verification succeeds (agent→`gateway`, gateway→`server`).
 ##

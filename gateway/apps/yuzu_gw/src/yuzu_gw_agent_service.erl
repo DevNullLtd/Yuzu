@@ -30,6 +30,9 @@
          execute_command/2,
          report_inventory/2]).
 
+%% The reservation guard's process body (proc_lib entry point, see guard/1).
+-export([reservation_guard/2]).
+
 %%--------------------------------------------------------------------
 %% Register — proxy to C++ server
 %%--------------------------------------------------------------------
@@ -37,14 +40,14 @@
 register(Ctx, RegisterReq0) ->
     %% The address of the agent, as the gateway decided it (yuzu_grpc_origin):
     %% the TCP peer, or the address a TRUSTED proxy vouched for. It is put in
-    %% RegisterRequest.gateway_observed_peer, which is gateway-authoritative:
-    %% whatever the agent put there is overwritten, an empty value when the
-    %% address is unknown. The server records it as the agent's source_ip and
-    %% trusts it on this path, so passing the agent's own value through would let
-    %% an agent choose the address its registration is attributed to.
+    %% RegisterRequest.gateway_observed_peer, which is gateway-authoritative: the
+    %% field is set here whatever the agent put in it, to an empty value when the
+    %% gateway has no observation (a trusted proxy gave no usable address). The
+    %% server records it as the agent's source_ip and trusts it on this path, so
+    %% passing the agent's own value through would let an agent choose the
+    %% address its registration is attributed to.
     Origin = origin_text(Ctx),
-    RegisterReq = (maps:without([<<"gateway_observed_peer">>], RegisterReq0))
-                      #{gateway_observed_peer => Origin},
+    RegisterReq = RegisterReq0#{gateway_observed_peer => Origin},
     PeerAddr = case Origin of
         <<>> -> <<"unknown">>;
         _ -> Origin
@@ -54,16 +57,21 @@ register(Ctx, RegisterReq0) ->
     %% upstream: the check and the claim are one step in the registry, so
     %% concurrent Registers on one connection admit at most the quota and a
     %% refused one leaves nothing on the server. The reservation becomes the
-    %% pending row in store_pending/3 and is released here on every other way out
-    %% (a reservation of a crashed handler is swept after the pending TTL).
+    %% pending row in store_pending/3 and is released here on every other way out.
+    %% This process can be killed while it waits for the upstream (the stream was
+    %% reset, its deadline passed, the connection closed), and a kill skips the
+    %% `after' clause: a guard process watching this one releases the reservation
+    %% then, promptly (see guard/1).
     AgentInfo0 = maps:get(info, RegisterReq, maps:get(<<"info">>, RegisterReq, #{})),
     case yuzu_gw_registry:reserve_session(yuzu_gw_conn:key_from_ctx(Ctx),
                                           extract_agent_id(AgentInfo0)) of
         {ok, Reservation} ->
+            Guard = guard(Reservation),
             try
                 register_upstream(Ctx, RegisterReq, PeerAddr, Reservation)
             after
-                yuzu_gw_registry:release_session(Reservation)
+                yuzu_gw_registry:release_session(Reservation),
+                disarm(Guard)
             end;
         {error, session_limit} ->
             session_limit_error();
@@ -72,6 +80,33 @@ register(Ctx, RegisterReq0) ->
             logger:warning("Register failed: registry_unavailable"),
             {grpc_error, {?GRPC_STATUS_INTERNAL,
                           <<"Registration failed: registry unavailable">>}}
+    end.
+
+%% A process that releases Reservation when the calling process dies before it
+%% disarms the guard. Releasing is idempotent and keyed by the reservation's own
+%% reference, so a guard that fires after the reservation became a pending row
+%% (the reservation is gone by then) removes nothing. The guard is not linked:
+%% it must outlive the process it watches.
+guard(undefined) ->
+    undefined;
+guard(Reservation) ->
+    proc_lib:spawn(?MODULE, reservation_guard, [self(), Reservation]).
+
+disarm(undefined) ->
+    ok;
+disarm(Guard) ->
+    Guard ! {disarm, self()},
+    ok.
+
+%% @private
+reservation_guard(Watched, Reservation) ->
+    Mon = erlang:monitor(process, Watched),
+    receive
+        {disarm, Watched} ->
+            erlang:demonitor(Mon, [flush]),
+            ok;
+        {'DOWN', Mon, process, Watched, _Reason} ->
+            yuzu_gw_registry:release_session(Reservation)
     end.
 
 %% The origin address of a call as text (a bare IP), or <<>> when it has none.

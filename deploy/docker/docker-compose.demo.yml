@@ -22,6 +22,12 @@
 #   bash scripts/start-demo.sh status
 #   bash scripts/start-demo.sh stop
 #
+# Gateway image: the mounted demo-gateway-sys.config uses the
+# {yuzu_gw, grpc_listeners} shape, which needs a gateway image from the first
+# release containing the yuzu_gw grpc_listeners shape. An older ${YUZU_VERSION}
+# image ignores it, binds no listener and still answers /healthz with 200, so
+# the demo looks up while no agent can connect. Use --build, or bump the pin.
+#
 # Topology:
 #   Agent(s) --> Gateway(:50051) --> Server(:50055)   registration + heartbeats
 #   Server   --> Gateway(:50063) --> Agent            command fanout

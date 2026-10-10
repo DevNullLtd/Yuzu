@@ -9,7 +9,10 @@
 %%% named like the method in snake_case (ListAgents -> list_agents/2, the
 %%% convention grpcbox used). A method whose function the module does not
 %%% export is simply absent from the table, which a request reads as
-%%% UNIMPLEMENTED. A gpb module may describe services it does not own (the
+%%% UNIMPLEMENTED -- except that a service none of whose methods the module
+%% exports is refused (`{service_without_routes, Service}'), since a listener
+%% that serves a service nothing answers is a misconfiguration (a mistyped
+%% module), not a partial implementation. A gpb module may describe services it does not own (the
 %%% management proto imports the agent one), so only the services named in
 %%% `services' are routed.
 %%% @end
@@ -32,7 +35,7 @@
 
 %% @doc The table for a listener, or why it cannot be built: a service named in
 %% `Services' that no proto describes, or an implementing module that cannot be
-%% loaded.
+%% loaded, or a service for which the module exports none of its methods.
 -spec build([module()], #{atom() => module()}) -> {ok, table()} | {error, term()}.
 build(Protos, Services) when is_list(Protos), is_map(Services) ->
     try
@@ -63,9 +66,13 @@ snake_case(Name) ->
 service_routes(Protos, Service, Module, Table) ->
     Pb = proto_of(Protos, Service),
     Exports = exports_of(Module),
-    lists:foldl(fun(Rpc, Acc) ->
-                        method_route(Pb, Service, Module, Exports, Rpc, Acc)
-                end, Table, Pb:get_rpc_names(Service)).
+    Added = lists:foldl(fun(Rpc, Acc) ->
+                                method_route(Pb, Service, Module, Exports, Rpc, Acc)
+                        end, #{}, Pb:get_rpc_names(Service)),
+    case map_size(Added) of
+        0 -> throw({route_error, {service_without_routes, Service}});
+        _ -> maps:merge(Table, Added)
+    end.
 
 method_route(Pb, Service, Module, Exports, Rpc, Table) ->
     Function = snake_case(Rpc),
@@ -93,8 +100,10 @@ proto_of(Protos, Service) ->
         [] -> throw({route_error, {unknown_service, Service}})
     end.
 
-exports_of(Module) ->
+exports_of(Module) when is_atom(Module) ->
     case code:ensure_loaded(Module) of
         {module, Module} -> Module:module_info(exports);
         {error, _} -> throw({route_error, {module_not_loaded, Module}})
-    end.
+    end;
+exports_of(Module) ->
+    throw({route_error, {module_not_loaded, Module}}).

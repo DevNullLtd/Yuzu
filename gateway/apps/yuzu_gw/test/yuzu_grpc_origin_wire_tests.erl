@@ -7,18 +7,21 @@
 %%%
 %%%   - a PROXY header (version 1 and 2, IPv4 and IPv6) from a trusted source
 %%%     is the origin, and the TCP peer stays the proxy;
+%%%   - a trusted proxy that gave no usable address (a PROXY `LOCAL', no
+%%%     x-forwarded-for, one that is not an address) leaves the call with NO
+%%%     origin: the proxy's own address is never put in its place;
 %%%   - a claim from a peer that is not a trusted source is ignored and counted,
 %%%     and the call is still served (never refused);
 %%%   - a proxy-protocol listener closes a connection that sends no header;
 %%%   - x-forwarded-for: the entry `trusted_hops' places from the right, never
-%%%     a forged leading one, and nothing at all on a listener that has no
-%%%     forwarded_for origin;
+%%%     a forged leading one, however many or however long the entries to its
+%%%     left; and nothing at all on a listener that has no forwarded_for origin;
 %%%   - client certificates and the proxy: a certificate reaches the handler
 %%%     through a PROXY-protocol relay (TLS passes through it), a listener that
 %%%     requests but does not require a certificate serves both kinds of
-%%%     client, and an auth_fun still gates a proxy-protocol listener. These are
-%%%     the properties a move of the agent edge to mutual TLS behind an F5 rests
-%%%     on.
+%%%     client, and an auth_fun (which only a management listener carries) still
+%%%     gates a proxy-protocol listener. These are the properties a move of the
+%%%     agent edge to mutual TLS behind an F5 rests on.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_grpc_origin_wire_tests).
@@ -26,9 +29,13 @@
 -include_lib("grpcbox/include/grpcbox.hrl").
 
 -export([forward_origin/4]).
+%% the service of the plain listeners (see heartbeat/2)
+-export([heartbeat/2]).
 
 -define(SVC, 'yuzu.agent.v1.AgentService').
 -define(HEARTBEAT, <<"/yuzu.agent.v1.AgentService/Heartbeat">>).
+-define(MGMT_SVC, 'yuzu.server.v1.ManagementService').
+-define(LIST_AGENTS, <<"/yuzu.server.v1.ManagementService/ListAgents">>).
 -define(CLIENT, {203, 0, 113, 9}).
 -define(CLIENT_TEXT, <<"203.0.113.9">>).
 -define(LOOPBACK, <<"127.0.0.1">>).
@@ -57,10 +64,18 @@ origin_test_() ->
           fun() -> xff_forged_leading(State) end},
          {"x-forwarded-for with trusted_hops 1 skips the proxy in front",
           fun() -> xff_hops(State) end},
-         {"x-forwarded-for with fewer entries than trusted_hops is ignored and counted",
+         {"x-forwarded-for: 120 forged entries and a megabyte of text before the proxy's entry do not matter",
+          fun() -> xff_long_header(State) end},
+         {"x-forwarded-for with fewer entries than trusted_hops: no origin, counted",
           fun() -> xff_too_short(State) end},
-         {"x-forwarded-for that is not an address is ignored and counted",
+         {"x-forwarded-for that is not an address: no origin, counted",
           fun() -> xff_garbage(State) end},
+         {"x-forwarded-for with bytes that are not UTF-8 is served and attributed by the rules",
+          fun() -> xff_not_utf8(State) end},
+         {"no x-forwarded-for from a trusted proxy: no origin, counted",
+          fun() -> xff_absent(State) end},
+         {"a PROXY LOCAL header from a trusted source: no origin, counted",
+          fun() -> proxy_local(State) end},
          {"x-forwarded-for from a peer that is not a trusted proxy is ignored and counted",
           fun() -> xff_untrusted(State) end},
          {"a listener with no origin configured ignores x-forwarded-for and counts nothing",
@@ -70,7 +85,7 @@ origin_test_() ->
 plain_setup() ->
     start_apps(),
     yuzu_grpc_stub_svc:init_state(),
-    Base = #{service_protos => [agent_pb], services => #{?SVC => yuzu_grpc_stub_svc}},
+    Base = #{service_protos => [agent_pb], services => #{?SVC => ?MODULE}},
     Local = [{127, 0, 0, 1}],
     Elsewhere = [{10, 0, 0, 5}],
     Start = fun(Name, Origin) ->
@@ -90,13 +105,15 @@ plain_setup() ->
               {r_v6, yuzu_gw_test_relay:start(
                        PtPort, yuzu_gw_test_relay:proxy_header(2, {16#2001, 16#db8, 0, 0, 0, 0, 0, 7}))},
               {r_untrusted, yuzu_gw_test_relay:start(
-                              PuPort, yuzu_gw_test_relay:proxy_header(2, ?CLIENT))}],
+                              PuPort, yuzu_gw_test_relay:proxy_header(2, ?CLIENT))},
+              {r_local, yuzu_gw_test_relay:start(PtPort, yuzu_gw_test_relay:local_header())}],
     Channel = fun(Name, Port) -> yuzu_gw_test_listener:client_channel(Name, #{port => Port}) end,
     Chans = [{chan_v2, Channel(ow_v2, element(1, proplists:get_value(r_v2, Relays)))},
              {chan_v1, Channel(ow_v1, element(1, proplists:get_value(r_v1, Relays)))},
              {chan_v6, Channel(ow_v6, element(1, proplists:get_value(r_v6, Relays)))},
              {chan_untrusted, Channel(ow_untrusted,
                                       element(1, proplists:get_value(r_untrusted, Relays)))},
+             {chan_local, Channel(ow_local, element(1, proplists:get_value(r_local, Relays)))},
              {chan_fwd, Channel(ow_fwd, FtPort)},
              {chan_fwd_untrusted, Channel(ow_fwd_untrusted_chan, FuPort)},
              {chan_fwd_hops, Channel(ow_fwd_hops_chan, FhPort)},
@@ -114,7 +131,7 @@ plain_cleanup(#{listeners := Listeners, relays := Relays, telemetry := Id} = Sta
     telemetry:detach(Id),
     ets:delete(?EVENTS),
     [yuzu_gw_test_listener:stop_channel(maps:get(K, State))
-     || K <- [chan_v2, chan_v1, chan_v6, chan_untrusted, chan_fwd, chan_fwd_untrusted,
+     || K <- [chan_v2, chan_v1, chan_v6, chan_untrusted, chan_local, chan_fwd, chan_fwd_untrusted,
               chan_fwd_hops, chan_none]],
     [yuzu_gw_test_relay:stop(R) || R <- Relays],
     [yuzu_gw_test_listener:stop(P) || P <- Listeners],
@@ -144,7 +161,7 @@ proxy_header_missing(#{proxy_port := Port}) ->
     yuzu_grpc_stub_svc:reset(),
     {ok, Sock} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}]),
     ok = gen_tcp:send(Sock, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>),
-    ?assertMatch({error, _}, gen_tcp:recv(Sock, 0, 5000)),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 5000)),
     gen_tcp:close(Sock),
     ?assertEqual(0, yuzu_grpc_stub_svc:calls()).
 
@@ -162,17 +179,47 @@ xff_hops(#{chan_fwd_hops := Chan}) ->
     ?assertEqual({?CLIENT_TEXT, <<"forwarded_for">>, ?LOOPBACK, <<"no-cert">>},
                  origin_of(Chan, <<"203.0.113.9, 192.0.2.50">>)).
 
+xff_long_header(#{chan_fwd := Chan}) ->
+    flush_events(),
+    Forged = iolist_to_binary(lists:join(<<", ">>, lists:duplicate(120, <<"1.1.1.1">>) ++ [<<"203.0.113.9">>])),
+    ?assertEqual({?CLIENT_TEXT, <<"forwarded_for">>, ?LOOPBACK, <<"no-cert">>},
+                 origin_of(Chan, Forged)),
+    %% several KiB of text, in front of the proxy's entry
+    Padded = <<(binary:copy(<<"A">>, 3000))/binary, ", 203.0.113.9">>,
+    ?assertEqual({?CLIENT_TEXT, <<"forwarded_for">>, ?LOOPBACK, <<"no-cert">>},
+                 origin_of(Chan, Padded)),
+    ?assertEqual(none, origin_event()).
+
 xff_too_short(#{chan_fwd_hops := Chan}) ->
     flush_events(),
-    ?assertEqual({?LOOPBACK, <<"transport">>, ?LOOPBACK, <<"no-cert">>},
+    ?assertEqual({<<"none">>, <<"none">>, ?LOOPBACK, <<"no-cert">>},
                  origin_of(Chan, <<"203.0.113.9">>)),
     ?assertEqual({forwarded_for, bad_claim}, origin_event()).
 
 xff_garbage(#{chan_fwd := Chan}) ->
     flush_events(),
-    ?assertEqual({?LOOPBACK, <<"transport">>, ?LOOPBACK, <<"no-cert">>},
+    ?assertEqual({<<"none">>, <<"none">>, ?LOOPBACK, <<"no-cert">>},
                  origin_of(Chan, <<"not-an-address">>)),
     ?assertEqual({forwarded_for, bad_claim}, origin_event()).
+
+xff_not_utf8(#{chan_fwd := Chan}) ->
+    flush_events(),
+    ?assertEqual({?CLIENT_TEXT, <<"forwarded_for">>, ?LOOPBACK, <<"no-cert">>},
+                 origin_of(Chan, <<255, 254, 253, ", 203.0.113.9">>)),
+    ?assertEqual(none, origin_event()),
+    ?assertEqual({<<"none">>, <<"none">>, ?LOOPBACK, <<"no-cert">>},
+                 origin_of(Chan, <<"203.0.113.9, ", 255, 254>>)),
+    ?assertEqual({forwarded_for, bad_claim}, origin_event()).
+
+xff_absent(#{chan_fwd := Chan}) ->
+    flush_events(),
+    ?assertEqual({<<"none">>, <<"none">>, ?LOOPBACK, <<"no-cert">>}, origin_of(Chan)),
+    ?assertEqual({forwarded_for, no_claim}, origin_event()).
+
+proxy_local(#{chan_local := Chan}) ->
+    flush_events(),
+    ?assertEqual({<<"none">>, <<"none">>, ?LOOPBACK, <<"no-cert">>}, origin_of(Chan)),
+    ?assertEqual({proxy_protocol, no_claim}, origin_event()).
 
 xff_untrusted(#{chan_fwd_untrusted := Chan}) ->
     flush_events(),
@@ -205,8 +252,8 @@ tls_test_() ->
                   "together with the proxied origin", fun() -> proxy_keeps_cert(State) end},
                  {"...and a certless client behind the proxy is served",
                   fun() -> proxy_certless(State) end},
-                 {"an auth_fun still gates a proxy-protocol listener: the pinned leaf is admitted "
-                  "with its proxied origin", fun() -> proxy_auth_admitted(State) end},
+                 {"an auth_fun still gates a proxy-protocol management listener: the pinned leaf is admitted",
+                  fun() -> proxy_auth_admitted(State) end},
                  {"...and an unpinned leaf is refused before the handler runs",
                   fun() -> proxy_auth_refused(State) end}];
             {error, Why} ->
@@ -221,6 +268,7 @@ tls_setup() ->
         Certs = #{dir := Dir, ca := Ca, srv_pem := SrvPem} ->
             start_apps(),
             yuzu_grpc_stub_svc:init_state(),
+            yuzu_gw_authz_stub_svc:init_counters(),
             application:set_env(yuzu_gw, mgmt_peer_pins, [{cert_file, SrvPem}]),
             Tls = #{certfile => filename:join(Dir, "gw.pem"), keyfile => filename:join(Dir, "gw.key"),
                     cacertfile => Ca},
@@ -231,9 +279,12 @@ tls_setup() ->
                                Base#{name => ow_tls_opp, tls => Opportunistic}),
             {PxPort, Px} = yuzu_gw_test_listener:start(
                              Base#{name => ow_tls_proxy, tls => Opportunistic, origin => Proxied}),
+            %% The auth_fun is a management listener's: an agent listener refuses to carry one.
+            MgmtBase = #{service_protos => [management_pb],
+                         services => #{?MGMT_SVC => yuzu_gw_authz_stub_svc}},
             {AuPort, Au} = yuzu_gw_test_listener:start(
-                             Base#{name => ow_tls_proxy_auth, tls => Tls, origin => Proxied,
-                                   auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1}),
+                             MgmtBase#{name => ow_tls_proxy_auth, tls => Tls, origin => Proxied,
+                                       auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1}),
             Header = yuzu_gw_test_relay:proxy_header(2, ?CLIENT),
             {PxRelayPort, PxRelay} = yuzu_gw_test_relay:start(PxPort, Header),
             {AuRelayPort, AuRelay} = yuzu_gw_test_relay:start(AuPort, Header),
@@ -274,12 +325,36 @@ proxy_certless(#{chan_px_none := Chan}) ->
     ?assertEqual({?CLIENT_TEXT, <<"proxy_protocol">>, ?LOOPBACK, <<"no-cert">>}, origin_of(Chan)).
 
 proxy_auth_admitted(#{chan_au_srv := Chan}) ->
-    ?assertEqual({?CLIENT_TEXT, <<"proxy_protocol">>, ?LOOPBACK, <<"cert">>}, origin_of(Chan)).
+    yuzu_gw_authz_stub_svc:init_counters(),
+    ?assertMatch({ok, #{agents := []}, _}, list_agents(Chan)),
+    ?assertEqual(1, yuzu_gw_authz_stub_svc:invocations()).
 
 proxy_auth_refused(#{chan_au_agent := Chan}) ->
-    yuzu_grpc_stub_svc:reset(),
-    ?assertMatch({error, {<<"16">>, _}, _}, heartbeat(Chan, <<"origin">>, ctx:new())),
-    ?assertEqual(0, yuzu_grpc_stub_svc:calls()).
+    yuzu_gw_authz_stub_svc:init_counters(),
+    ?assertMatch({error, {<<"16">>, _}, _}, list_agents(Chan)),
+    ?assertEqual(0, yuzu_gw_authz_stub_svc:invocations()).
+
+%%%-------------------------------------------------------------------
+%%% The service of the plain listeners
+%%%-------------------------------------------------------------------
+
+%% The stub service, except that a call with no origin (which the stub does not
+%% model) answers "none" for the origin and how it was learned. It counts no
+%% call of its own: the stub counts the ones it serves.
+heartbeat(Ctx, #{session_id := <<"origin">>} = Request) ->
+    case yuzu_grpc:origin(Ctx) of
+        undefined ->
+            {PeerIp, _} = yuzu_grpc:peer(Ctx),
+            {ok, #{acknowledged => true,
+                   pending_commands =>
+                       [#{command_id => <<"none">>, plugin => <<"none">>,
+                          action => yuzu_grpc_origin:format(PeerIp),
+                          parameters => #{<<"cert">> => <<"no-cert">>}}]}};
+        _ ->
+            yuzu_grpc_stub_svc:heartbeat(Ctx, Request)
+    end;
+heartbeat(Ctx, Request) ->
+    yuzu_grpc_stub_svc:heartbeat(Ctx, Request).
 
 %%%-------------------------------------------------------------------
 %%% Helpers
@@ -308,6 +383,16 @@ origin_of(Chan, Forwarded) ->
 heartbeat(Chan, Command, Ctx) ->
     grpcbox_client:unary(Ctx, ?HEARTBEAT, #{session_id => Command}, heartbeat_def(),
                          #{channel => Chan}).
+
+list_agents(Chan) ->
+    Def = #grpcbox_def{service = ?MGMT_SVC,
+                       marshal_fun = fun(M) ->
+                           management_pb:encode_msg(M, 'yuzu.server.v1.ListAgentsRequest')
+                       end,
+                       unmarshal_fun = fun(B) ->
+                           management_pb:decode_msg(B, 'yuzu.server.v1.ListAgentsResponse')
+                       end},
+    grpcbox_client:unary(ctx:new(), ?LIST_AGENTS, #{limit => 10}, Def, #{channel => Chan}).
 
 heartbeat_def() ->
     #grpcbox_def{service = ?SVC,

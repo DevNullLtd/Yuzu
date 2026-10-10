@@ -258,27 +258,57 @@ init([]) ->
         cluster_id      = ClusterId
     }}.
 
+%% Every handle_call clause and what it does with a caller that has died:
+%%
+%%   circuit_state    a state read: answered whatever the caller is.
+%%   proxy_register   skipped when the caller is gone (see caller_gone/1).
+%%   proxy_inventory  skipped when the caller is gone.
+%%   anything else    answered with {error, unknown_call}.
+%%
+%% This process runs one RPC at a time, so a call queued behind a slow one waits
+%% in the mailbox. The caller of a proxy call is the process of one gRPC request
+%% (yuzu_grpc_runner); the stream handler stops it when the client resets the
+%% stream, the deadline passes or the connection closes, and by then the answer
+%% is wanted by nobody. Running the RPC anyway would register the agent with the
+%% server (a session nothing will ever use) or send an inventory nobody waits
+%% for, and a burst of abandoned requests would be worked off one after the
+%% other while live ones queue behind them. Only these two calls are skipped:
+%% each is a request whose whole purpose is its answer to the caller. Everything
+%% whose effect must happen whatever the sender does is a cast (stream status,
+%% Guardian forward, registration replay) and never reaches handle_call.
+%% A skipped call is not counted as a failure of the upstream (the breaker is
+%% not touched) and not answered: nobody is listening.
 handle_call(circuit_state, _From, #state{cb_state = CbState} = State) ->
     {reply, CbState, State};
 
-handle_call({proxy_register, RegisterReq}, _From, State) ->
-    case check_circuit(State) of
-        {reject, State1} ->
-            {reply, {error, circuit_open}, State1};
-        {allow, State1} ->
-            Result = do_rpc('ProxyRegister', RegisterReq, register),
-            State2 = record_result(Result, State1),
-            {reply, Result, State2}
+handle_call({proxy_register, RegisterReq}, From, State) ->
+    case caller_gone(From) of
+        true ->
+            {noreply, drop_call(register, State)};
+        false ->
+            case check_circuit(State) of
+                {reject, State1} ->
+                    {reply, {error, circuit_open}, State1};
+                {allow, State1} ->
+                    Result = do_rpc('ProxyRegister', RegisterReq, register),
+                    State2 = record_result(Result, State1),
+                    {reply, Result, State2}
+            end
     end;
 
-handle_call({proxy_inventory, InventoryReport}, _From, State) ->
-    case check_circuit(State) of
-        {reject, State1} ->
-            {reply, {error, circuit_open}, State1};
-        {allow, State1} ->
-            Result = do_rpc('ProxyInventory', InventoryReport, inventory),
-            State2 = record_result(Result, State1),
-            {reply, Result, State2}
+handle_call({proxy_inventory, InventoryReport}, From, State) ->
+    case caller_gone(From) of
+        true ->
+            {noreply, drop_call(inventory, State)};
+        false ->
+            case check_circuit(State) of
+                {reject, State1} ->
+                    {reply, {error, circuit_open}, State1};
+                {allow, State1} ->
+                    Result = do_rpc('ProxyInventory', InventoryReport, inventory),
+                    State2 = record_result(Result, State1),
+                    {reply, Result, State2}
+            end
     end;
 
 handle_call(_Request, _From, State) ->
@@ -768,6 +798,28 @@ redact_loc(_Other) ->
 %% entry carrying the count (an empty list if the value is not a list).
 redact_log(Log) when is_list(Log) -> [{log_entries_redacted, length(Log)}];
 redact_log(_Other)                 -> [].
+
+%%%===================================================================
+%%% Calls whose caller has died
+%%%===================================================================
+
+%% True when the process that made a call is a local process that has exited.
+%% From is {Pid, Tag}. A caller on another node, or any form this does not
+%% recognise, counts as alive: only a death that can be seen is acted on, and a
+%% call that is wrongly run costs what it always cost. A caller that is alive
+%% but stopped waiting (its call timed out) is not detected; its reply goes
+%% nowhere and the RPC runs.
+caller_gone({Pid, _Tag}) when is_pid(Pid), node(Pid) =:= node() ->
+    not is_process_alive(Pid);
+caller_gone(_From) ->
+    false.
+
+%% A queued proxy call whose caller is gone is dropped without an RPC. The
+%% event feeds yuzu_gw_upstream_calls_dropped_total{rpc_name} in yuzu_gw_telemetry.
+drop_call(Rpc, State) ->
+    telemetry:execute([yuzu, gw, upstream, call_dropped],
+                      #{count => 1}, #{rpc_name => atom_to_binary(Rpc, utf8)}),
+    State.
 
 %%%===================================================================
 %%% Circuit breaker logic

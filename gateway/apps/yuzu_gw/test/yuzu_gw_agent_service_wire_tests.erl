@@ -7,9 +7,12 @@
 %%%
 %%%   - Register overwrites RegisterRequest.gateway_observed_peer with the
 %%%     address the gateway decided: the TCP peer on a plain listener, the
-%%%     trusted `x-forwarded-for' entry on a forwarded_for listener, never what
-%%%     the agent put in the field, never `:authority', never a forged leading
-%%%     header entry. The stored peer_addr is that same text;
+%%%     trusted `x-forwarded-for' entry on a forwarded_for listener, the address
+%%%     in a PROXY header from a trusted source, never what the agent put in the
+%%%     field, never `:authority', never a forged leading header entry. When a
+%%%     trusted proxy gave no usable address the field is EMPTY (the server then
+%%%     records that the origin was not observed), never the proxy's own address.
+%%%     The stored peer_addr is that same text, or "unknown" for an empty one;
 %%%   - a refused Register is the intended status: the connection's session cap
 %%%     is 14, an unavailable registry or a failed upstream is 13;
 %%%   - ExecuteCommand is server-streaming and ends with status 12;
@@ -46,6 +49,18 @@ agent_service_wire_test_() ->
           fun() -> register_forwards_request(State) end},
          {"Register: a trusted x-forwarded-for entry is the observed peer, a forged leading one is not",
           fun() -> register_forwarded_for(State) end},
+         {"Register: a forged field and 120 forged leading x-forwarded-for entries still yield the proxy's entry",
+          fun() -> register_forwarded_for_long_header(State) end},
+         {"Register: a trusted proxy that sent no usable x-forwarded-for yields an empty observation, not the proxy",
+          fun() -> register_forwarded_for_unusable(State) end},
+         {"Register: a PROXY header from a trusted source is the observed peer",
+          fun() -> register_proxy_protocol(State) end},
+         {"Register: a PROXY LOCAL from a trusted source yields an empty observation, not the proxy",
+          fun() -> register_proxy_protocol_local(State) end},
+         {"Register: a PROXY header from a source that is not trusted keeps the TCP peer",
+          fun() -> register_proxy_protocol_untrusted(State) end},
+         {"Register: with no origin at all the observation is empty and the stored peer is unknown",
+          fun() -> register_without_origin(State) end},
          {"Register: x-forwarded-for from a peer that is not a trusted proxy is ignored",
           fun() -> register_forwarded_for_untrusted(State) end},
          {"Register: a listener with no forwarded_for origin ignores x-forwarded-for",
@@ -92,14 +107,33 @@ setup() ->
     {OtherPort, Other} = yuzu_gw_test_listener:start(
                            Base#{name => agent_wire_fwd_other,
                                  origin => #{mode => forwarded_for, sources => [{10, 0, 0, 5}]}}),
+    {PxPort, Px} = yuzu_gw_test_listener:start(
+                     Base#{name => agent_wire_proxy,
+                           origin => #{mode => proxy_protocol, sources => Local}}),
+    {PxUntrustedPort, PxUntrusted} = yuzu_gw_test_listener:start(
+                                       Base#{name => agent_wire_proxy_other,
+                                             origin => #{mode => proxy_protocol,
+                                                         sources => [{10, 0, 0, 5}]}}),
+    Header = yuzu_gw_test_relay:proxy_header(2, binary_to_ip(?CLIENT)),
+    {PxRelayPort, PxRelay} = yuzu_gw_test_relay:start(PxPort, Header),
+    {LocalRelayPort, LocalRelay} = yuzu_gw_test_relay:start(PxPort, yuzu_gw_test_relay:local_header()),
+    {UntrustedRelayPort, UntrustedRelay} = yuzu_gw_test_relay:start(PxUntrustedPort, Header),
     Chans = #{plain => yuzu_gw_test_listener:client_channel(agent_wire_plain_chan, #{port => PlainPort}),
               plain2 => yuzu_gw_test_listener:client_channel(agent_wire_plain_chan2, #{port => PlainPort}),
               fwd => yuzu_gw_test_listener:client_channel(agent_wire_fwd_chan, #{port => FwdPort}),
-              other => yuzu_gw_test_listener:client_channel(agent_wire_other_chan, #{port => OtherPort})},
-    maps:merge(#{listeners => [Plain, Fwd, Other]}, Chans).
+              other => yuzu_gw_test_listener:client_channel(agent_wire_other_chan, #{port => OtherPort}),
+              proxy => yuzu_gw_test_listener:client_channel(agent_wire_proxy_chan, #{port => PxRelayPort}),
+              proxy_local => yuzu_gw_test_listener:client_channel(agent_wire_proxy_local_chan,
+                                                                  #{port => LocalRelayPort}),
+              proxy_untrusted => yuzu_gw_test_listener:client_channel(agent_wire_proxy_untrusted_chan,
+                                                                      #{port => UntrustedRelayPort})},
+    maps:merge(#{listeners => [Plain, Fwd, Other, Px, PxUntrusted],
+                 relays => [PxRelay, LocalRelay, UntrustedRelay]}, Chans).
 
-cleanup(#{listeners := Listeners} = State) ->
-    [yuzu_gw_test_listener:stop_channel(maps:get(K, State)) || K <- [plain, plain2, fwd, other]],
+cleanup(#{listeners := Listeners, relays := Relays} = State) ->
+    [yuzu_gw_test_listener:stop_channel(maps:get(K, State))
+     || K <- [plain, plain2, fwd, other, proxy, proxy_local, proxy_untrusted]],
+    [yuzu_gw_test_relay:stop(R) || R <- Relays],
     [yuzu_gw_test_listener:stop(L) || L <- Listeners],
     [meck:unload(M) || M <- ?MOCKS],
     ok.
@@ -168,6 +202,63 @@ register_forwarded_for(#{fwd := Chan}) ->
     ?assertEqual(?CLIENT, proxied_peer()),
     {_, Info, _} = stored(),
     ?assertEqual(?CLIENT, maps:get(peer_addr, Info)).
+
+register_forwarded_for_long_header(#{fwd := Chan}) ->
+    reset(),
+    Forged = iolist_to_binary(lists:join(<<", ">>, lists:duplicate(120, <<"9.9.9.9">>) ++ [?CLIENT])),
+    {ok, _, _} = register(Chan, <<"agent-l">>, ?FORGED, Forged),
+    ?assertEqual(?CLIENT, proxied_peer()),
+    {_, Info, _} = stored(),
+    ?assertEqual(?CLIENT, maps:get(peer_addr, Info)).
+
+register_forwarded_for_unusable(#{fwd := Chan}) ->
+    reset(),
+    %% the agent's own claim in the field is not kept either
+    {ok, _, _} = register(Chan, <<"agent-x">>, ?FORGED, <<"not-an-address">>),
+    ?assertEqual(<<>>, proxied_peer()),
+    {_, Info, _} = stored(),
+    ?assertEqual(<<"unknown">>, maps:get(peer_addr, Info)),
+    ?assertEqual(<<>>, maps:get(gateway_observed_peer, maps:get(register_req, Info))),
+    %% and with no header at all
+    reset(),
+    {ok, _, _} = register(Chan, <<"agent-y">>, ?FORGED),
+    ?assertEqual(<<>>, proxied_peer()).
+
+register_proxy_protocol(#{proxy := Chan}) ->
+    reset(),
+    {ok, _, _} = register(Chan, <<"agent-p">>, ?FORGED),
+    ?assertEqual(?CLIENT, proxied_peer()),
+    {_, Info, _} = stored(),
+    ?assertEqual(?CLIENT, maps:get(peer_addr, Info)).
+
+register_proxy_protocol_local(#{proxy_local := Chan}) ->
+    reset(),
+    {ok, _, _} = register(Chan, <<"agent-pl">>, ?FORGED),
+    ?assertEqual(<<>>, proxied_peer()),
+    {_, Info, _} = stored(),
+    ?assertEqual(<<"unknown">>, maps:get(peer_addr, Info)).
+
+register_proxy_protocol_untrusted(#{proxy_untrusted := Chan}) ->
+    reset(),
+    {ok, _, _} = register(Chan, <<"agent-pu">>, ?FORGED),
+    ?assertEqual(?LOOPBACK, proxied_peer()),
+    {_, Info, _} = stored(),
+    ?assertEqual(?LOOPBACK, maps:get(peer_addr, Info)).
+
+%% No origin in the ctx (no peer address to start from): the gateway has nothing
+%% to vouch for. The server reads the empty field as "not observed"; a made-up
+%% address would be recorded as if it were one.
+register_without_origin(_State) ->
+    reset(),
+    Ctx = yuzu_grpc:new_ctx(#{}, self(), undefined, undefined, undefined),
+    Request = #{info => #{agent_id => <<"agent-o">>, hostname => <<"h">>},
+                gateway_observed_peer => ?FORGED},
+    ?assertMatch({ok, #{session_id := <<"sess-agent-o">>}, _},
+                 yuzu_gw_agent_service:register(Ctx, Request)),
+    ?assertEqual(<<>>, proxied_peer()),
+    {_, Info, _} = stored(),
+    ?assertEqual(<<"unknown">>, maps:get(peer_addr, Info)),
+    ?assertEqual(<<>>, maps:get(gateway_observed_peer, maps:get(register_req, Info))).
 
 register_forwarded_for_untrusted(#{other := Chan}) ->
     reset(),
@@ -284,6 +375,10 @@ register(Chan, AgentId, Forged, ForwardedFor) ->
                 enrollment_token => <<"enroll-secret">>,
                 gateway_observed_peer => Forged},
     grpcbox_client:unary(Ctx, ?REGISTER, Request, register_def(), #{channel => Chan}).
+
+binary_to_ip(Text) ->
+    {ok, Ip} = inet:parse_strict_address(binary_to_list(Text)),
+    Ip.
 
 %% The gateway_observed_peer of the RegisterRequest the upstream was given.
 proxied_peer() ->

@@ -130,7 +130,7 @@ get_agent(Ctx, Request) ->
             %% `exit({noproc, _})` (dead process) or `exit({nodedown, _})` /
             %% `exit({noconnection, _})` (node genuinely disconnected) instead
             %% of returning `{error, _}` — uncaught, that would crash this
-            %% grpcbox request handler instead of reaching either `case`
+            %% request handler instead of reaching either `case`
             %% branch below. The router's fire-and-forget dispatch path
             %% self-heals the same staleness via the 300s `fanout_timeout`;
             %% this synchronous RPC has no such fallback and must map it to

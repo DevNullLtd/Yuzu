@@ -166,8 +166,9 @@ incomplete_tls_map_is_refused_not_plaintext_test_() ->
                    Refused(?TLS#{certfile => undefined})),
      ?_assertEqual({error, {tls_incomplete, [certfile, keyfile]}},
                    Refused(?TLS#{certfile => "", keyfile => <<>>})),
-     %% inline DER is not the file path forms the listener takes
-     ?_assertEqual({error, {tls_incomplete, [certfile]}},
+     %% inline DER is not the file path forms the listener takes: a key it does
+     %% not read is refused, not ignored
+     ?_assertMatch({error, {unknown_keys, tls, [cert], {allowed, _}}},
                    Refused(maps:remove(certfile, ?TLS#{cert => <<"der">>}))),
      %% the wrong container (a proplist) is not a tls map
      ?_assertEqual({error, bad_tls}, Refused([{certfile, "gw.pem"}, {keyfile, "gw.key"}])),

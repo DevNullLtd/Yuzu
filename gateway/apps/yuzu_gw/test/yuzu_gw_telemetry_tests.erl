@@ -66,6 +66,84 @@ grpc_layer_metrics_test_() ->
        end}
      ]}.
 
+%% yuzu_gw_upstream_calls_dropped_total{rpc_name}: queued upstream calls skipped
+%% because the requesting call had ended. The series exist from boot (or the
+%% first drop is invisible to increase()), each event moves the series of its
+%% own name by its own count, and the label is called rpc_name on the wire.
+call_dropped_metric_test_() ->
+    Name = yuzu_gw_upstream_calls_dropped_total,
+    Value = fun(Rpc) -> prometheus_counter:value(Name, [Rpc]) end,
+    Drop = fun(N, Meta) -> telemetry:execute([yuzu, gw, upstream, call_dropped], #{count => N}, Meta) end,
+    {setup,
+     fun() ->
+        {ok, Started} = application:ensure_all_started(prometheus),
+        {ok, Started2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        %% Whatever an earlier module left in the series: the first case then
+        %% sees what setup() itself creates.
+        _ = prometheus_counter:deregister(Name),
+        ok = yuzu_gw_telemetry:setup(),
+        Started ++ Started2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"the series of both names exist straight after setup, and no other",
+       fun() ->
+           ?assertEqual([inventory, register], lists:sort(yuzu_gw_telemetry:upstream_dropped_rpcs())),
+           ?assertEqual(0, Value(<<"register">>)),
+           ?assertEqual(0, Value(<<"inventory">>)),
+           ?assertEqual(undefined, Value(<<"unknown">>))
+       end},
+      {"the scrape carries the metric, its HELP and the label name rpc_name",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           ?assertNotEqual(nomatch, binary:match(Out, <<"# HELP yuzu_gw_upstream_calls_dropped_total ">>)),
+           ?assertNotEqual(nomatch, binary:match(Out, <<"# TYPE yuzu_gw_upstream_calls_dropped_total counter">>)),
+           ?assertNotEqual(nomatch,
+                           binary:match(Out, <<"yuzu_gw_upstream_calls_dropped_total{rpc_name=\"register\"} ">>)),
+           ?assertNotEqual(nomatch,
+                           binary:match(Out, <<"yuzu_gw_upstream_calls_dropped_total{rpc_name=\"inventory\"} ">>))
+       end},
+      {"a dropped register call moves the register series only",
+       fun() ->
+           {R0, I0} = {Value(<<"register">>), Value(<<"inventory">>)},
+           Drop(1, #{rpc_name => <<"register">>}),
+           ?assertEqual({R0 + 1, I0}, {Value(<<"register">>), Value(<<"inventory">>)})
+       end},
+      {"a dropped inventory call moves the inventory series only, by the event's count",
+       fun() ->
+           {R0, I0} = {Value(<<"register">>), Value(<<"inventory">>)},
+           Drop(3, #{rpc_name => <<"inventory">>}),
+           ?assertEqual({R0, I0 + 3}, {Value(<<"register">>), Value(<<"inventory">>)})
+       end},
+      {"a name given as an atom is the same series as the binary",
+       fun() ->
+           {R0, I0} = {Value(<<"register">>), Value(<<"inventory">>)},
+           Drop(2, #{rpc_name => inventory}),
+           Drop(1, #{rpc_name => register}),
+           ?assertEqual({R0 + 1, I0 + 2}, {Value(<<"register">>), Value(<<"inventory">>)})
+       end},
+      {"any other kind of name is counted as unknown and the handler stays attached",
+       fun() ->
+           lists:foreach(
+             fun(Bad) ->
+                 U0 = case Value(<<"unknown">>) of undefined -> 0; V -> V end,
+                 Drop(1, #{rpc_name => Bad}),
+                 ?assertEqual(U0 + 1, Value(<<"unknown">>), Bad)
+             end, [42, "register", {register}, [register], 1.5]),
+           %% a missing name is the same
+           U1 = Value(<<"unknown">>),
+           Drop(1, #{}),
+           ?assertEqual(U1 + 1, Value(<<"unknown">>)),
+           %% and the handler still serves a real drop afterwards
+           R0 = Value(<<"register">>),
+           Drop(1, #{rpc_name => <<"register">>}),
+           ?assertEqual(R0 + 1, Value(<<"register">>)),
+           ?assert(lists:any(fun(#{id := Id}) -> Id =:= yuzu_gw_prometheus end,
+                             telemetry:list_handlers([yuzu, gw, upstream, call_dropped])))
+       end}
+     ]}.
+
 notify_dropped_test_() ->
     {setup,
      fun() ->

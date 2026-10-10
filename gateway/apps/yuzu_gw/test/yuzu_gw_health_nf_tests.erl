@@ -29,7 +29,7 @@ health_nf_test_() ->
     {setup,
      fun setup/0,
      fun cleanup/1,
-     fun({Port, _HealthPid, _UpPid, _MockPids}) ->
+     fun({Port, _HealthPid, _UpPid, _MockPids, _PrevEnv}) ->
         {timeout, 30,
          [
           {"readyz 503 when registry process is dead",
@@ -60,6 +60,13 @@ setup() ->
     %% class — the same fix yuzu_gw_health_tests already carries. Tests
     %% read the actual port back via health_port/0 (yuzu_gw_health:port/0).
     application:set_env(yuzu_gw, health_port, 0),
+
+    %% Readiness requires the configured gRPC listeners to be running; these
+    %% tests run with none, which readiness accepts only when told it is meant.
+    PrevListeners = application:get_env(yuzu_gw, grpc_listeners),
+    PrevAllow = application:get_env(yuzu_gw, allow_no_listeners),
+    application:unset_env(yuzu_gw, grpc_listeners),
+    application:set_env(yuzu_gw, allow_no_listeners, true),
 
     %% Trap exits for the group process. With {setup, ...}, the group
     %% process stays alive while tests run in sub-processes. The upstream
@@ -109,10 +116,12 @@ setup() ->
     {ok, HealthPid} = yuzu_gw_health:start_link(),
     timer:sleep(100),
     {ok, Port} = yuzu_gw_health:port(),
-    {Port, HealthPid, UpPid, MockPids}.
+    {Port, HealthPid, UpPid, MockPids, {PrevListeners, PrevAllow}}.
 
-cleanup({_Port, HealthPid, UpPid, MockPids}) ->
+cleanup({_Port, HealthPid, UpPid, MockPids, {PrevListeners, PrevAllow}}) ->
     process_flag(trap_exit, true),
+    restore_env(grpc_listeners, PrevListeners),
+    restore_env(allow_no_listeners, PrevAllow),
     %% Synchronous shutdown — wait for actual death via monitors.
     sync_stop(HealthPid),
     sync_stop(UpPid),
@@ -404,3 +413,6 @@ drain_exits() ->
     receive {'EXIT', _, _} -> drain_exits()
     after 0 -> ok
     end.
+
+restore_env(Key, {ok, Value}) -> application:set_env(yuzu_gw, Key, Value);
+restore_env(Key, undefined) -> application:unset_env(yuzu_gw, Key).

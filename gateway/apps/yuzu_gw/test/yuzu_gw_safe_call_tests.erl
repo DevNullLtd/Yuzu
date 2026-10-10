@@ -100,6 +100,8 @@ setup() ->
     logger:set_primary_config(level, all),
     yuzu_gw_safe_call:reset_limits(),
     application:set_env(yuzu_gw, ?TIMEOUT_KEY, 100),
+    %% each case reads the runner's line for its own failure: no rate limit
+    application:set_env(yuzu_gw, grpc_runner_warn_interval_ms, 0),
     Level.
 
 cleanup(Level) ->
@@ -107,6 +109,7 @@ cleanup(Level) ->
     ok = yuzu_gw_crash_redact:remove(),
     logger:set_primary_config(level, Level),
     application:unset_env(yuzu_gw, ?TIMEOUT_KEY),
+    application:unset_env(yuzu_gw, grpc_runner_warn_interval_ms),
     stop_named(yuzu_gw_upstream),
     stop_named(yuzu_gw_registry),
     yuzu_gw_safe_call:reset_limits(),
