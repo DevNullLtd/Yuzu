@@ -715,7 +715,7 @@ TEST_CASE("catalogue routes: a degraded store is 503 + retry_after_ms + failure 
 }
 
 TEST_CASE("catalogue routes: an unreadable refresh-metadata row degrades the unfiltered versions "
-          "read only, with the versions message and a failure audit",
+          "read only and with the versions message and a failure audit",
           "[pg][rest][software_catalogue][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -999,11 +999,28 @@ TEST_CASE("catalogue: a never-built rollup is a 503 'being built' on the CSV exp
     }
     SECTION("reads that do not depend on the rollup, and the JSON page, still answer") {
         CatHarness h{&store};
+        {
+            // reset_rollup_to_building only zeroes refreshed_at; the newest mark reads the rollup
+            // rows directly, so empty them to truly model a never-computed rollup.
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(yuzu::server::pg::exec_params(
+                        lease.get(), "DELETE FROM software_inventory_store.catalog_rollup",
+                        std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
         auto eco = h.sink.Get(ver_url + "&ecosystem=brew");
         REQUIRE(eco);
         CHECK(eco->status == 200);
         CHECK(data_of(eco).at("count") == 2);
         // Rows and counts do not depend on the rollup; the newest mark does and stays false.
+        // The rpm row is git 2.41 (the fleet newest): with a populated rollup it would be true.
+        auto rpm = h.sink.Get(ver_url + "&ecosystem=rpm");
+        REQUIRE(rpm);
+        REQUIRE(rpm->status == 200);
+        REQUIRE(data_of(rpm).at("count") == 1);
+        for (const auto& row : data_of(rpm).at("versions"))
+            CHECK(row.at("newest") == false);
         for (const auto& row : data_of(eco).at("versions"))
             CHECK(row.at("newest") == false);
         auto dev = h.sink.Get(ver_url + "&agent_id=d1");
