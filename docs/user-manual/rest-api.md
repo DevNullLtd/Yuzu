@@ -853,12 +853,13 @@ this route performs no mutation.
 An empty filter set (no recognised filter keys supplied) returns a genuine `0` — no scoped count
 to report, and no store read is made.
 
-A filter value longer than 2048 bytes, or containing a NUL byte, a line break or invalid UTF-8, is refused with
+A filter value longer than 2048 bytes, or containing a NUL byte, a line feed or invalid UTF-8, is refused with
 `400` (A4 envelope, `retry_after_ms: null`, not retryable) before any store read: the response
 store never indexes a facet value over that length, ingest replaces every NUL / invalid-UTF-8
-byte with U+FFFD, and ingest splits the output into lines on every line feed, so no stored value
-can equal such a filter and it could only ever answer a misleading `0` (a NUL would additionally
-match as a truncated prefix). The message names all the causes and does not echo the value. The check applies to every filter value before its key is
+byte with U+FFFD, and ingest splits the output into lines on every line feed, so the value as
+sent cannot be stored and the request would only answer a misleading `0` (a NUL would additionally
+match as a truncated prefix). The refusal says the exact-match filter is not supported and the
+request was not evaluated; it does not claim that no agent has the value, and the message names all the causes and does not echo the value. The check applies to every filter value before its key is
 matched to a column, so it also refuses such a value under an unrecognised key.
 
 **Response:**

@@ -613,7 +613,10 @@ TEST_CASE("create-group-form: a filter value with a NUL, line feed or invalid UT
         REQUIRE(res != nullptr);
         CHECK(res->status == 200);
         CHECK(contains(res->body, "data-filter-refused=\"true\""));
-        CHECK(contains(res->body, "NUL byte, a line break or invalid UTF-8"));
+        CHECK(contains(res->body, "NUL byte, a line feed or invalid UTF-8"));
+        CHECK(contains(res->body, "The filter you set is not supported"));
+        CHECK_FALSE(contains(res->body, "selected View"));
+        CHECK_FALSE(contains(res->body, "line break"));
         CHECK_FALSE(contains(res->body, "agents will be added"));
         CHECK_FALSE(contains(res->body, "agent will be added"));
         CHECK(res->get_header_value("Cache-Control") == "no-store, private");
@@ -648,7 +651,10 @@ TEST_CASE("group-from-results: a filter value with a line feed is refused and cr
                           "&plugin=" + kPlugin + "&f_category=cat-a&f_severity=" + value);
         CHECK(res->status == 400);
         CHECK(contains(res->body, "data-filter-refused=\"true\""));
-        CHECK(contains(res->body, "NUL byte, a line break or invalid UTF-8"));
+        CHECK(contains(res->body, "NUL byte, a line feed or invalid UTF-8"));
+        CHECK(contains(res->body, "The filter you set is not supported"));
+        CHECK_FALSE(contains(res->body, "selected View"));
+        CHECK_FALSE(contains(res->body, "line break"));
         CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
         CHECK_FALSE(h.mg.find_group_by_name("lf-group").has_value());
     }

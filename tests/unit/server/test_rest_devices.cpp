@@ -466,7 +466,7 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview: an over-bound valu
 // and be reported as an exact count. Refused like an over-bound value, before any store
 // access (the harness store is nullptr: 503 would mean it was reached).
 TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a filter value with a NUL / a "
-          "line break / invalid UTF-8 is refused (400), not matched as a prefix or answered "
+          "line feed / invalid UTF-8 is refused (400), not matched as a prefix or answered "
           "as 0",
           "[rest][devices]") {
     DeviceRestHarness h; // response_store stays nullptr
@@ -493,7 +493,7 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a filter value wit
         CHECK(body["error"]["code"].get<int>() == 400);
         CHECK(body["error"]["retry_after_ms"].is_null()); // non-retryable
         CHECK(body["error"]["message"].get<std::string>().find("NUL") != std::string::npos);
-        CHECK(body["error"]["message"].get<std::string>().find("line break") !=
+        CHECK(body["error"]["message"].get<std::string>().find("line feed") !=
               std::string::npos);
         CHECK(body["error"].contains("remediation"));
     }

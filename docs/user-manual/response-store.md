@@ -326,11 +326,16 @@ operator-visible notes:
   of its output as facets, which drive the facet filter, group-from-results and
   the agent-count preview. A value over 2048 bytes is excluded, never
   truncated, and a facet filter, group-from-results or agent-count preview on
-  a value over 2048 bytes, or one containing a NUL byte, a line break or invalid UTF-8
-  (ingest replaces those bytes with U+FFFD and splits the output on line feeds, so no stored
-  value has them), is
+  a value over 2048 bytes, or one containing a NUL byte, a line feed or invalid UTF-8
+  (ingest replaces those bytes with U+FFFD and splits the output on line feeds, so a stored
+  value never has them), is
   refused with an error (the dashboard shows a message, REST answers 400 and
-  MCP -32602) instead of reporting no match. At
+  MCP -32602) instead of reporting no match. The refusal means the filter is not
+  supported, not that no agent has the value: a stored value containing a carriage return
+  can reach the server with a line feed when it is picked from the dashboard, and is refused
+  although an agent has it. On the dashboard the message says whether the refused filter is
+  the one you set or the selected View's saved filter; a View's saved filter with an empty
+  value is refused as well, because no stored field is ever empty. At
   most 5,000 facets are kept per response, chosen by most lines first, then
   column, then value, so a rare value can be cut. The symptom is an agent
   missing from a facet filter or preview while its response still shows in

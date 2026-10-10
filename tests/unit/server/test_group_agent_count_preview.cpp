@@ -95,7 +95,7 @@ TEST_CASE("facet_filter_value_unmatchable: strictly over 2048 bytes", "[server][
 // the length ingest bounds is the SANITIZED length. A reader that measured the
 // raw bytes accepted a 683-byte all-NUL value (2049 bytes sanitized, so excluded at ingest) and
 // answered an exact 0; the libpq bind also C-string-truncates a NUL and matched the prefix.
-TEST_CASE("facet_filter_value_unmatchable: NUL / line break / invalid UTF-8 are unmatchable",
+TEST_CASE("facet_filter_value_unmatchable: NUL / line feed / invalid UTF-8 are unmatchable",
           "[server][devices]") {
     using namespace std::string_literals;
     // NUL in the middle, and NUL as the only content.
@@ -197,25 +197,42 @@ TEST_CASE("any_facet_filter_unmatchable: one over-bound value among valid ones r
 TEST_CASE("facet filter refusal text names every cause and takes no value", "[server][devices]") {
     CHECK(facet_filter_value_refusal_message().find("2048 bytes") != std::string::npos);
     CHECK(facet_filter_value_refusal_message().find("NUL") != std::string::npos);
-    CHECK(facet_filter_value_refusal_message().find("line break") != std::string::npos);
+    CHECK(facet_filter_value_refusal_message().find("line feed") != std::string::npos);
     CHECK(facet_filter_value_refusal_message().find("UTF-8") != std::string::npos);
     CHECK(facet_filter_value_refusal_remediation().find("2048 bytes") != std::string::npos);
     CHECK(facet_filter_value_refusal_remediation().find("NUL") != std::string::npos);
-    CHECK(facet_filter_value_refusal_remediation().find("line break") != std::string::npos);
+    CHECK(facet_filter_value_refusal_remediation().find("line feed") != std::string::npos);
 }
 
-// The dashboard shows "<message>. <remediation>." as visible text, so both halves must start
-// a sentence (upper case) and the remediation must cover a template-supplied default value.
-TEST_CASE("facet filter refusal text reads as sentences and covers a template default",
-          "[server][devices]") {
+// The predicate refuses LF only (a CR is accepted), and a stored value holding a CR picked
+// from the dashboard dropdown reaches the server with an LF: an agent HAS that value, so the
+// text must not claim otherwise, and must not say "line break" (CR is not refused).
+TEST_CASE("facet filter refusal text does not claim no agent has the value", "[server][devices]") {
+    for (const auto& text : {facet_filter_value_refusal_message(),
+                             facet_filter_value_refusal_remediation()}) {
+        INFO(text);
+        CHECK(text.find("line break") == std::string::npos);
+        CHECK(text.find("cannot be matched") == std::string::npos);
+        CHECK(text.find("can never") == std::string::npos);
+        CHECK(text.find("never match") == std::string::npos);
+        CHECK(text.find("no agent") == std::string::npos);
+        CHECK(text.find("response template") == std::string::npos);
+        CHECK(text.find("View") == std::string::npos); // REST/MCP text names no dashboard concept
+    }
+    CHECK(facet_filter_value_refusal_message().find("not supported") != std::string::npos);
+    CHECK(facet_filter_value_refusal_message().find("not evaluated") != std::string::npos);
+}
+
+// Both halves start a sentence (upper case): REST and MCP carry them in separate fields, and
+// the dashboard joins the message with its own provenance sentence.
+TEST_CASE("facet filter refusal text reads as sentences", "[server][devices]") {
     const auto message = facet_filter_value_refusal_message();
     const auto remediation = facet_filter_value_refusal_remediation();
     REQUIRE_FALSE(message.empty());
     REQUIRE_FALSE(remediation.empty());
     CHECK(std::isupper(static_cast<unsigned char>(message.front())));
     CHECK(std::isupper(static_cast<unsigned char>(remediation.front())));
-    CHECK(remediation.find("response template") != std::string::npos);
-    CHECK(facet_filter_value_refusal_text() == message + ". " + remediation + ".");
+    CHECK(message.back() != '.'); // the dashboard appends ". <provenance sentence>"
 }
 
 // The REST and MCP previews check the RAW values, before the resolver skips an unknown key:

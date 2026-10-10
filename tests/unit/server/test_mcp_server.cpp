@@ -20625,7 +20625,7 @@ TEST_CASE("MCP preview_management_group_agent_count: a filter value containing a
         CHECK_FALSE(envelope.contains("result"));
         CHECK(envelope["error"]["code"].get<int>() == -32602);
         CHECK(envelope["error"]["message"].get<std::string>().find("NUL") != std::string::npos);
-        CHECK(envelope["error"]["message"].get<std::string>().find("line break") !=
+        CHECK(envelope["error"]["message"].get<std::string>().find("line feed") !=
               std::string::npos);
         CHECK(envelope["error"]["data"]["retry_after_ms"].is_null()); // non-retryable
         CHECK_FALSE(envelope["error"]["data"]["remediation"].is_null());

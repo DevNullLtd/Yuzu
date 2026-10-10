@@ -800,12 +800,13 @@ static const ToolDef kTools[] = {
      "store read. Requires ManagementGroup:Write — approval-gated (supervised MCP "
      "tier maker-checker), matching every other ManagementGroup:Write surface, even "
      "though this tool itself performs no mutation. A filter value over 2048 bytes, or "
-     "containing a NUL byte, a line break or invalid UTF-8, is refused with -32602 (no "
-     "stored facet can equal such a value, so the filter could never match).",
+     "containing a NUL byte, a line feed or invalid UTF-8, is refused with -32602 (this "
+     "exact-match filter is not supported; the request is not evaluated, so a refusal "
+     "is never a count of 0).",
      R"j({"type":"object","properties":{)j"
      R"j("command_id":{"type":"string","minLength":1,"description":"The response set's instruction/command id to count against"},)j"
      R"j("plugin":{"type":"string","minLength":1,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
-     R"j("filters":{"type":"object","additionalProperties":{"type":"string","maxLength":2048},"description":"Mangled column key -> exact-match value of at most 2048 bytes of valid UTF-8 without NUL or line break (no stored facet can equal anything else, so such a filter is refused); empty/omitted means no filter (count is 0)"})j"
+     R"j("filters":{"type":"object","additionalProperties":{"type":"string","maxLength":2048},"description":"Mangled column key -> exact-match value of at most 2048 bytes of valid UTF-8 without NUL or line feed (any other filter is not supported and is refused, not evaluated); empty/omitted means no filter (count is 0)"})j"
      R"j(},"required":["command_id","plugin"]})j",
      R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"}},"required":["agent_count"]})j"},
 

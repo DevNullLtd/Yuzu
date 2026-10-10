@@ -457,7 +457,7 @@ TEST_CASE("/fragments/results: a filter value over the facet bound is refused, n
 // C-string-truncated by the libpq bind, which matched the prefix (`short%00zzz` showed the
 // rows of `short`). Refused like an over-bound value, before any store access (the store is
 // nullptr: "Response store not available" would mean it was reached).
-TEST_CASE("/fragments/results: a filter value with a NUL / a line break / invalid UTF-8 is "
+TEST_CASE("/fragments/results: a filter value with a NUL / a line feed / invalid UTF-8 is "
           "refused, not matched as a prefix or rendered as an empty result",
           "[server][dashboard][fragment]") {
     FragmentResultsHarness h(/*response_store=*/nullptr);
@@ -479,7 +479,11 @@ TEST_CASE("/fragments/results: a filter value with a NUL / a line break / invali
         REQUIRE(res);
         CHECK(res->status == 200);
         CHECK(contains(res->body, "data-filter-refused=\"true\""));
-        CHECK(contains(res->body, "NUL byte, a line break or invalid UTF-8"));
+        CHECK(contains(res->body, "NUL byte, a line feed or invalid UTF-8"));
+        CHECK(contains(res->body, "The filter you set is not supported"));
+        CHECK_FALSE(contains(res->body, "selected View"));
+        CHECK_FALSE(contains(res->body, "line break"));
+        CHECK_FALSE(contains(res->body, "no agent"));
         CHECK_FALSE(contains(res->body, "Response store not available"));
         check_results_chrome_cleared(res->body);
     }
@@ -589,6 +593,155 @@ TEST_CASE("/fragments/results: a response-template equals default over the facet
     CHECK(at->status == 200);
     CHECK_FALSE(contains(at->body, "data-filter-refused"));
     CHECK(contains(at->body, "Response store not available")); // reached render_results
+}
+
+// Provenance of a refused filter (#5623): the dashboard says WHICH source of the filter is at
+// fault. The operator's own f_* filter -> "the filter you set"; the selected View's saved
+// `equals` default -> "the selected View's saved filter on <column>" with the two real
+// remedies. The column name is template-author text, so it must appear html-escaped; the
+// value must never be echoed. The response store is nullptr, so "Response store not
+// available" proves a request reached render_results.
+namespace {
+constexpr const char* kProvenanceColumn = "A<b>&D"; // escapes to A&lt;b&gt;&amp;D
+
+std::string make_provenance_definition(InstructionStore& is, const std::string& name,
+                                       const nlohmann::json& equals_value) {
+    nlohmann::json tpl = {
+        {"id", "tplprov"},
+        {"name", "provenance"},
+        {"columns", nlohmann::json::array({"Name"})},
+        {"filters", nlohmann::json::array({{{"column", kProvenanceColumn},
+                                            {"op", "equals"},
+                                            {"value", equals_value}}})}};
+    InstructionDefinition def;
+    def.name = name;
+    def.version = "1.0.0";
+    def.plugin = "registry";
+    def.action = "list";
+    def.type = "question";
+    def.enabled = true;
+    def.result_schema = nlohmann::json::array({{{"name", "Name"}, {"type", "string"}},
+                                               {{"name", kProvenanceColumn}, {"type", "string"}}})
+                            .dump();
+    def.response_templates_spec = nlohmann::json::array({tpl}).dump();
+    auto created = is.create_definition(def);
+    REQUIRE(created.has_value());
+    return *created;
+}
+} // namespace
+
+TEST_CASE("/fragments/results: a refused filter says whether it is the operator's filter or "
+          "the selected View's saved filter",
+          "[pg][server][dashboard][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, fragment_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+    const std::string over_value(2049, 'v');
+    const auto over_id =
+        make_provenance_definition(is, "tpl-prov-over", nlohmann::json(over_value));
+    const auto nul_id =
+        make_provenance_definition(is, "tpl-prov-nul", nlohmann::json(std::string("a\0b", 3)));
+
+    FragmentResultsHarness h(/*response_store=*/nullptr, &is);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    const std::string base = "/fragments/results?command_id=cmd-prov-1&plugin=registry&";
+
+    // View variant: a template equals default (no f_* param) that is unsupported.
+    for (const auto& id : {over_id, nul_id}) {
+        auto res = h.get(base + "definition_id=" + id + "&template_id=tplprov");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "data-filter-refused=\"true\""));
+        CHECK(contains(res->body, "The selected View&#39;s saved filter on A&lt;b&gt;&amp;D"));
+        CHECK(contains(res->body, "is not supported"));
+        CHECK(contains(res->body, "choose another View"));
+        CHECK(contains(res->body, "bypasses the View"));
+        CHECK(contains(res->body, "should correct it"));
+        CHECK(contains(res->body, "a line feed"));
+        CHECK_FALSE(contains(res->body, "you set"));
+        CHECK_FALSE(contains(res->body, "A<b>&D")); // the column name is escaped
+        CHECK_FALSE(contains(res->body, over_value)); // the value is never echoed
+        CHECK_FALSE(contains(res->body, "Response store not available"));
+        check_results_chrome_cleared(res->body);
+    }
+
+    // Operator variant: an unsupported f_* filter. The View's default is bypassed (an
+    // explicit filter replaces it), so the message must blame the operator's filter even
+    // though the same View is selected.
+    auto op = h.get(base + "definition_id=" + over_id + "&template_id=tplprov&f_output=a%0Ab");
+    REQUIRE(op);
+    CHECK(op->status == 200);
+    CHECK(contains(op->body, "data-filter-refused=\"true\""));
+    CHECK(contains(op->body, "The filter you set is not supported"));
+    CHECK_FALSE(contains(op->body, "selected View"));
+    CHECK_FALSE(contains(op->body, "A&lt;b&gt;"));
+    CHECK_FALSE(contains(op->body, "Response store not available"));
+
+    // A supported operator filter bypasses the View's unsupported default: not refused.
+    auto bypass = h.get(base + "definition_id=" + over_id + "&template_id=tplprov&f_output=ok");
+    REQUIRE(bypass);
+    CHECK(bypass->status == 200);
+    CHECK_FALSE(contains(bypass->body, "data-filter-refused"));
+    CHECK(contains(bypass->body, "Response store not available"));
+}
+
+// A View `equals` default with an EMPTY value used to be pushed as a filter; ingest never
+// stores an empty field, so the table silently emptied. Dashboard-results only: an explicit
+// empty f_* value still means "All" (parse_filters drops it), and a non-empty equals at the
+// bound still renders.
+TEST_CASE("/fragments/results: a View equals default with an empty value is refused, an "
+          "explicit empty operator filter is not",
+          "[pg][server][dashboard][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, fragment_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+    const auto empty_id = make_provenance_definition(is, "tpl-prov-empty", nlohmann::json(""));
+    const auto at_id = make_provenance_definition(is, "tpl-prov-at", nlohmann::json(std::string(2048, 'v')));
+
+    FragmentResultsHarness h(/*response_store=*/nullptr, &is);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    const std::string base = "/fragments/results?command_id=cmd-prov-2&plugin=registry&";
+
+    auto empty = h.get(base + "definition_id=" + empty_id + "&template_id=tplprov");
+    REQUIRE(empty);
+    CHECK(empty->status == 200);
+    CHECK(contains(empty->body, "data-filter-refused=\"true\""));
+    CHECK(contains(empty->body, "The selected View&#39;s saved filter on A&lt;b&gt;&amp;D has no value"));
+    CHECK(contains(empty->body, "Choose another View"));
+    CHECK(contains(empty->body, "should correct it"));
+    CHECK_FALSE(contains(empty->body, "A<b>&D"));
+    CHECK_FALSE(contains(empty->body, "Response store not available"));
+    check_results_chrome_cleared(empty->body);
+
+    // A non-empty operator filter replaces the View's defaults, so the empty one is moot.
+    auto explicit_ok =
+        h.get(base + "definition_id=" + empty_id + "&template_id=tplprov&f_output=ok");
+    REQUIRE(explicit_ok);
+    CHECK_FALSE(contains(explicit_ok->body, "data-filter-refused"));
+    CHECK(contains(explicit_ok->body, "Response store not available"));
+
+    // No View at all: an explicit empty f_* value is "All", not a refusal.
+    auto all = h.get(base + "f_output=");
+    REQUIRE(all);
+    CHECK(all->status == 200);
+    CHECK_FALSE(contains(all->body, "data-filter-refused"));
+    CHECK(contains(all->body, "Response store not available"));
+
+    // A non-empty equals exactly at the bound still reaches render_results.
+    auto at = h.get(base + "definition_id=" + at_id + "&template_id=tplprov");
+    REQUIRE(at);
+    CHECK_FALSE(contains(at->body, "data-filter-refused"));
+    CHECK(contains(at->body, "Response store not available"));
 }
 
 // ── #4644 Gate 7 (row 6a): the unfiltered read is byte-bounded and a cut is visible ──

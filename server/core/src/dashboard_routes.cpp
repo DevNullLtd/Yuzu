@@ -104,6 +104,37 @@ static std::string results_refusal_html(const std::string& message) {
     return html;
 }
 
+// -- Helpers: dashboard refusal sentences with provenance (#5623) -------------
+// The shared sentence (facet_filter_value_refusal_message: causes, never the value) plus ONE
+// provenance sentence saying which source of the filter is at fault, so the operator knows
+// what to change. Plain text: callers html_escape it (results_refusal_html does). The
+// column name is template-author text, so it is escaped by that same call, never spliced raw.
+// The view sentences name no value. The saved-filter remedies are the two real ones: another
+// View, or any filter of the operator's own (a non-empty f_* param disables the View's
+// saved `equals` defaults, see the filters_explicit branch of /fragments/results).
+static std::string facet_refusal_text_operator() {
+    return facet_filter_value_refusal_message() +
+           ". The filter you set is not supported; change it or clear it.";
+}
+
+static std::string facet_refusal_text_view(const std::string& column) {
+    return facet_filter_value_refusal_message() + ". The selected View's saved filter on " +
+           column +
+           " is not supported; choose another View, or set any filter of your own (setting a "
+           "filter bypasses the View's saved filters). The author of the View's definition "
+           "should correct it.";
+}
+
+// A template `equals` filter whose value is EMPTY. Ingest never stores an empty field, so
+// applying it would silently empty the table; the REST/shared predicate is unchanged (REST
+// reads an empty value as "no filter"), this guard is dashboard-results only.
+static std::string facet_refusal_text_view_empty(const std::string& column) {
+    return "The selected View's saved filter on " + column +
+           " has no value, so it cannot be applied. The request was not evaluated. Choose "
+           "another View, or set any filter of your own (setting a filter bypasses the "
+           "View's saved filters). The author of the View's definition should correct it.";
+}
+
 // -- Helper: column index by name (case-insensitive, excl. Agent col) ---------
 static int col_index_for_name(const std::vector<std::string>& cols, const std::string& name) {
     // cols[0] is "Agent" — field indices are 0-based starting after Agent
@@ -311,6 +342,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                 auto filters = parse_filters(req, plugin);
                 bool filters_explicit = !filters.empty();
+                // Provenance of the filters the View's saved `equals` defaults add (#5623):
+                // view_filter_cols[i] names filters[i]'s column while !filters_explicit
+                // (then every filter came from the View); view_empty_col is the first View
+                // `equals` default whose value is empty.
+                std::vector<std::string> view_filter_cols;
+                std::optional<std::string> view_empty_col;
                 auto text_query = req.get_param_value("q");
 
                 // Issue #587: when the dispatcher knew the definition_id
@@ -378,10 +415,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                 if (tf.op != "equals") continue;
                                 int col_idx = col_index_for_name(render_cols, tf.column);
                                 if (col_idx < 0) continue;
+                                if (tf.value.empty()) {
+                                    // Ingest never stores an empty field, so this filter
+                                    // would silently empty the table: refuse below.
+                                    if (!view_empty_col) view_empty_col = tf.column;
+                                    continue;
+                                }
                                 FacetFilter f;
                                 f.col_idx = col_idx;
                                 f.value = tf.value;
                                 filters.push_back(std::move(f));
+                                view_filter_cols.push_back(tf.column);
                             }
                         }
                         visible_columns = resolved.columns;
@@ -391,13 +435,28 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // A filter value that can match no stored facet (over kMaxFacetValueBytes,
                 // or a NUL / line feed / invalid UTF-8: see facet_filter_value_unmatchable)
                 // is refused instead of rendering a plausible empty table (#5623). Covers
-                // the f_* params and a template `equals` filter alike. The refusal also
+                // the f_* params and a template `equals` filter alike, and says which of the
+                // two is at fault (the operator's own filter, or the selected View's saved
+                // filter). A View `equals` default with an EMPTY value is refused too (view
+                // provenance): ingest never stores an empty field. An explicit empty f_*
+                // value is not affected: parse_filters drops it ("All"). The refusal also
                 // clears the OOB chrome of the previous render (see results_refusal_html).
                 // Rendered at 200, not 400: the dashboard htmx config drops 4xx bodies
                 // (responseHandling swap:false), which would leave the old rows in place.
-                if (any_facet_filter_unmatchable(filters)) {
-                    res.set_content(results_refusal_html(facet_filter_value_refusal_text()),
-                                    "text/html; charset=utf-8");
+                if (view_empty_col) {
+                    res.set_content(
+                        results_refusal_html(facet_refusal_text_view_empty(*view_empty_col)),
+                        "text/html; charset=utf-8");
+                    return;
+                }
+                for (size_t fi = 0; fi < filters.size(); ++fi) {
+                    if (!facet_filter_value_unmatchable(filters[fi].value)) continue;
+                    const bool from_view = !filters_explicit && fi < view_filter_cols.size();
+                    res.set_content(
+                        results_refusal_html(
+                            from_view ? facet_refusal_text_view(view_filter_cols[fi])
+                                      : facet_refusal_text_operator()),
+                        "text/html; charset=utf-8");
                     return;
                 }
 
@@ -550,7 +609,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     res.set_header("Vary", "Cookie");
                     res.set_content(
                         "<span class=\"feedback-error\" data-filter-refused=\"true\">" +
-                            html_escape(facet_filter_value_refusal_text()) + "</span>",
+                            html_escape(facet_refusal_text_operator()) + "</span>",
                         "text/html; charset=utf-8");
                     return;
                 }
@@ -639,20 +698,30 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  // A filter value that matches no stored facet (over kMaxFacetValueBytes, or
                  // a NUL / line feed / invalid UTF-8) would build the group from an empty
-                 // set: refuse (#5623). The dashboard UI cannot produce this POST for an
-                 // over-bound, NUL or invalid-UTF-8 value: /fragments/create-group-form
-                 // refuses such a filter first and renders no form for it. A stored value
-                 // holding a mid-value CR is the exception: the browser normalises the
-                 // hidden-input CR to a line feed on submit, so the POST carries an LF and
-                 // is refused here (before #5623 it answered 422 "no agents match"; htmx
-                 // drops both bodies). 400 is the honest status for the direct/automation
-                 // caller (see NOTE above).
+                 // set: refuse (#5623). This site (and /fragments/create-group-form) only
+                 // ever sees the operator's own filters, so it uses the 'your filter'
+                 // wording. The dashboard UI cannot produce this POST for an over-bound, NUL
+                 // or invalid-UTF-8 value (/fragments/create-group-form refuses it first and
+                 // renders no form). A stored value holding a mid-value CR is the exception:
+                 // the CR is stored, but it can reach the server as an LF, so it is refused
+                 // although an agent has it. The
+                 // mechanism is newline normalisation, not the POST: the HTML parser turns a
+                 // raw CR in markup text (so in an option or hidden-input attribute value)
+                 // into LF at input-stream preprocessing, and form submission normalises
+                 // newlines in submitted values too. That affects the GET dropdown path
+                 // (option value, then /fragments/create-group-form's hidden input) as much
+                 // as this POST. Reasoned from the HTML parsing and form-submission steps of
+                 // the HTML spec; NOT verified in a real browser here (whether a CR survives
+                 // depends on how the markup was escaped and how htmx builds the request).
+                 // Before #5623 the POST answered 422 "no agents match" (htmx drops both
+                 // bodies). 400 is the honest status for the direct/automation caller (see
+                 // NOTE above).
                  if (any_facet_filter_unmatchable(filters)) {
                      res.status = 400;
                      res.set_header("HX-Retarget", "#group-form-slot");
                      res.set_content(
                          "<span class=\"feedback-error\" data-filter-refused=\"true\">" +
-                             html_escape(facet_filter_value_refusal_text()) + "</span>",
+                             html_escape(facet_refusal_text_operator()) + "</span>",
                          "text/html; charset=utf-8");
                      return;
                  }
