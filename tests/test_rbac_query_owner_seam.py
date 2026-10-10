@@ -70,11 +70,12 @@ AUTH_PREFIXES = ("server/core/src/auth_db", "server/core/include/yuzu/server/aut
 # Every spelling of "an active local admin" the column floor's population can be written as: the
 # canonical order, the reversed order, an aliased column (`u.role`, `u.is_active`), a redundant
 # `is_active = TRUE`, a one-element `role IN ('admin')`, the negated `role <> 'user'`, optional
-# parentheses around either operand, `lower(role)` and `role = ANY(...)`. ONE combined regex with
+# parentheses around either operand (which is also how `lower(role) = 'admin'` is matched: the
+# unanchored `(role)` after `lower`) and `role = ANY(...)`. ONE combined regex with
 # alternation, so a spelling that two alternatives could both match is counted once.
 _COL = r"(?:\w+\.)?"
 _ROLE = (
-    r"\(?\s*(?:lower\s*\(\s*)?" + _COL + r"role\s*\)?\s*"
+    r"\(?\s*" + _COL + r"role\s*\)?\s*"
     r"(?:=\s*'admin'|(?:<>|!=)\s*'user'|IN\s*\(\s*'admin'\s*\)|=\s*ANY\s*\([^)]*admin[^)]*\))"
     r"\s*\)?"
 )
