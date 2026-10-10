@@ -59,7 +59,11 @@
 ///     the loader, so a store that is failing slowly is probed about once per window instead
 ///     of by every admitted push (each probe can cost seconds). One failure slot is kept (a
 ///     failure for another generation replaces it), a success clears it, and `invalidate()`
-///     clears it (a load already in flight when `invalidate()` runs does not re-populate it).
+///     clears it. A load already in flight when `invalidate()` runs is DETACHED: its result
+///     still goes to the callers that were waiting on it, but it installs neither a bundle
+///     nor a remembered failure, and a `get()` made after the `invalidate()` starts its own
+///     load instead of joining the old one (a rule edit committed after that load read its
+///     rows must not be hidden by it).
 ///   - An expired bundle (older than `max_age`) is NEVER served when its reload fails: the
 ///     caller gets the error and aborts the reconcile. That is a deliberate trade, fail
 ///     closed over stale: serving rules that may be out of date by a failed bump would
@@ -246,7 +250,7 @@ public:
         }
 
         // The registered flight is completed (erased) unconditionally by the guard.
-        FlightGuard flight{*this, generation};
+        FlightGuard flight{*this, generation, epoch};
         Result r = run_loader(generation, loader);
         install(r, generation, started, epoch);
         flight.fulfil(*promise, r);
@@ -254,13 +258,14 @@ public:
     }
 
     /// Drop the held bundle and any remembered failure (called when the generation was just
-    /// bumped locally, and by tests). A load in flight still completes and installs its
-    /// bundle, stamped with its own generation; if it FAILS it does not repopulate the
-    /// remembered failure.
+    /// bumped locally, after a rule edit, and by tests). A load in flight is detached: its
+    /// own callers still receive its result, but it installs nothing (neither a bundle nor a
+    /// remembered failure), and the next get() starts a fresh load rather than joining it.
     void invalidate() {
         std::lock_guard lk(mu_);
         held_.reset();
         failed_.reset();
+        inflight_.clear();
         ++epoch_;
     }
 
@@ -298,11 +303,13 @@ private:
                  std::uint64_t epoch) noexcept {
         try {
             std::lock_guard lk(mu_);
+            if (epoch != epoch_)
+                return;  // invalidate() ran during the load: its rows may predate the edit
             if (r.has_value()) {
                 held_ = *r;
                 held_at_ = started;
                 failed_.reset();
-            } else if (epoch == epoch_ && cfg_.negative_ttl.count() > 0) {
+            } else if (cfg_.negative_ttl.count() > 0) {
                 // A failed load is never the held bundle; it is remembered only so the next
                 // calls in the window do not each re-run a slow, failing loader. Stamped with
                 // the time the load FINISHED, otherwise a load slower than the TTL would
@@ -339,6 +346,7 @@ private:
     struct FlightGuard {
         GuardianRuleBundleCache& c;
         std::uint64_t generation;
+        std::uint64_t epoch;  // the cache epoch at registration
         bool erased{false};
 
         ~FlightGuard() { clear(); }
@@ -348,7 +356,10 @@ private:
                 return;
             try {
                 std::lock_guard lk(c.mu_);
-                c.inflight_.erase(generation);
+                // invalidate() clears the whole map and bumps the epoch: after that, an
+                // entry for this generation belongs to a NEWER flight and is not ours.
+                if (epoch == c.epoch_)
+                    c.inflight_.erase(generation);
                 erased = true;
             } catch (...) {
                 // mu_ could not be taken: the destructor retries once more.

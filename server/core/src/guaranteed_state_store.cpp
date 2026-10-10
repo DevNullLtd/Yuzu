@@ -586,9 +586,9 @@ void GuaranteedStateStore::notify_rule_mutation() noexcept {
     try {
         on_rule_mutation_();
     } catch (const std::exception& e) {
-        spdlog::debug("GuaranteedStateStore: rule-mutation hook threw: {}", e.what());
+        spdlog::warn("GuaranteedStateStore: rule-mutation hook threw: {}", e.what());
     } catch (...) {
-        spdlog::debug("GuaranteedStateStore: rule-mutation hook threw a non-std exception");
+        spdlog::warn("GuaranteedStateStore: rule-mutation hook threw a non-std exception");
     }
 }
 

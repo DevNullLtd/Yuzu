@@ -316,6 +316,75 @@ TEST_CASE("GuardianRuleBundleCache: a load that fails after an invalidate does n
     CHECK(ok_calls.load() == 1);
 }
 
+TEST_CASE("GuardianRuleBundleCache: a load that SUCCEEDS after an invalidate installs nothing",
+          "[guardian][rule_bundle][epoch]") {
+    // A rule edit commits after this load read its rows, its generation bump fails, and the
+    // store hook calls invalidate(): the late result predates the edit, so it must reach its
+    // own caller but must not become the held bundle for the (unchanged) generation.
+    ManualClock clk;
+    GuardianRuleBundleCache cache({}, clk.fn());
+    Event entered, release;
+    std::atomic<int> calls{0};
+    const GuardianRuleBundleCache::LoaderFn slow = [&] {
+        calls.fetch_add(1);
+        entered.set();
+        release.wait();
+        return std::expected<Bundle, BundleLoadError>(
+            make_bundle({rule("pre-edit", "")}, {"pre-edit"}));
+    };
+    GuardianRuleBundleCache::Result late;
+    std::jthread t([&] { late = cache.get(5, slow); });
+    REQUIRE(entered.wait());
+    cache.invalidate();  // the hook fired while the old load was still running
+    release.set();
+    t.join();
+    REQUIRE(late.has_value());  // its own caller still gets it
+    CHECK((*late)->rules.size() == 1);
+    CHECK_FALSE(cache.held_generation().has_value());  // but it was not installed
+
+    std::atomic<int> fresh_calls{0};
+    auto r = cache.get(5, counting_loader(fresh_calls, "post-edit"));
+    REQUIRE(r.has_value());
+    CHECK(fresh_calls.load() == 1);  // reloaded, not served from the stale in-flight result
+    CHECK((*r)->rules[0].rule_id == "post-edit");
+}
+
+TEST_CASE("GuardianRuleBundleCache: a get after an invalidate does not join the detached load",
+          "[guardian][rule_bundle][epoch]") {
+    ManualClock clk;
+    GuardianRuleBundleCache cache({}, clk.fn());
+    Event entered, release;
+    std::atomic<int> old_calls{0};
+    const GuardianRuleBundleCache::LoaderFn old_loader = [&] {
+        old_calls.fetch_add(1);
+        entered.set();
+        release.wait();
+        return std::expected<Bundle, BundleLoadError>(
+            make_bundle({rule("old", "")}, {"old"}));
+    };
+    std::jthread t([&] { (void)cache.get(7, old_loader); });
+    REQUIRE(entered.wait());
+    cache.invalidate();
+
+    // A new request for the same generation must start its OWN load (not wait on the old
+    // one, whose rows predate the edit) and get the new rows while the old load still runs.
+    std::atomic<int> new_calls{0};
+    auto r = cache.get(7, counting_loader(new_calls, "new"));
+    REQUIRE(r.has_value());
+    CHECK((*r)->rules[0].rule_id == "new");
+    CHECK(new_calls.load() == 1);
+    CHECK(cache.held_generation() == std::optional<std::uint64_t>{7});
+
+    // The old load finishing afterwards neither replaces the new bundle nor erases anything
+    // that belongs to a newer flight.
+    release.set();
+    t.join();
+    auto again = cache.get(7, counting_loader(new_calls, "must-not-load"));
+    REQUIRE(again.has_value());
+    CHECK((*again)->rules[0].rule_id == "new");
+    CHECK(new_calls.load() == 1);
+}
+
 TEST_CASE("GuardianRuleBundleCache: a zero negative_ttl disables the negative cache",
           "[guardian][rule_bundle][negative]") {
     // The manual clock never advances, so only the `negative_ttl > 0` guard can make the second
