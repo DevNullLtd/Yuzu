@@ -11,7 +11,7 @@ against the code at the tip. Format follows
 
 Nothing in this change adds a file descriptor, HANDLE, SOCKET, `FILE*`, `sqlite3*` or
 `sqlite3_stmt*` (the persister writes through the engine's existing `KvStore`, and
-`sqlite3_busy_timeout` is now set from the shared `kKvStoreBusyTimeout` on the existing handle),
+the busy wait on the existing handle is now a `sqlite3_busy_handler` over a heap-owned atomic budget (#5604, last row below)),
 OpenSSL or BCrypt object, allocated C string, mapped library, temp path, subprocess or production
 thread. The persister runs on three existing threads: the engine's callers (`apply_rules`, `stop()`
 under `mtx_`) and the existing drain worker. A mechanical grep over the added production lines finds
@@ -57,11 +57,11 @@ members.
 | `snap` and `done` vectors, `std::span<const CapturedBaseline>` over `done` | Pass-local; the span is consumed synchronously by `erase_staged_baselines_if_unchanged` and never stored | `persist_staged` | Scope end | `done` is allocated before the first write, so nothing after a write can throw; a throw before the first write loses nothing and widens the worker backoff |
 | `should_stop` (`const std::function<bool()>&`) | Borrowed for one call, worker thread only | Call-expression temporary | End of the full-expression | n/a |
 | `clock_`, `post_snapshot_hook_`, `post_write_hook_` (`std::function`) | Persister members, TEST-ONLY; the setters take `persist_mu_`; `begin_stop()` and `stop_stage_begin()/end()` read `clock_` unlocked, which is safe only because tests set it before threads start | Test setters | Member | Restored by `HookGuard4045` / `FakeClock4045` on every exit |
-| `kKvStoreBusyTimeout`, `kBaselinePassBudget`, `kBaselineStopBudget`, `kBaselineShutdownGrace`, `kBaselineStopLatestStart`, `kBaselineStopTroubleSlack` (500 ms), `kBaselineStopTroubleThreshold` (busy timeout minus the slack, 4.5 s) | `inline constexpr` values (no resource) | Compile time | n/a | A `static_assert` in `agent.cpp` ties `kBaselineShutdownGrace` to `kShutdownDeadlineGrace`; E46, E51 and E53 pin the values; a `static_assert` keeps the threshold between 0 and the busy timeout |
+| `kKvStoreBusyTimeout`, `kBaselinePassBudget`, `kBaselineStopBudget`, `kBaselineShutdownGrace`, `kBaselineStopLatestStart`, `kBaselineStopTroubleSlack` (250 ms since #5604; 500 ms before), `kBaselineStopTroubleThreshold` (the stop busy budget minus the slack, 750 ms since #5604; 4.5 s before) | `inline constexpr` values (no resource) | Compile time | n/a | A `static_assert` in `agent.cpp` ties `kBaselineShutdownGrace` to `kShutdownDeadlineGrace`; E46, E51 and E53 pin the values; a `static_assert` keeps the threshold between 0 and the stop busy budget; `kBaselineStopLatestStart` is 18 s since #5604 (15 s before), pinned by a `static_assert` and E46 |
 | `baseline_stop_flush_done_` (`bool`) | Engine, guarded by `mtx_` (only `stop()` sets it) | First `at_stop` flush, set before the stage and the pass | Never | Set before the attempt, so the destructor's second `stop()` flushes and logs nothing |
 | `baseline_stop_incomplete_logs_`, `baseline_stop_unstaged_logs_`, `baseline_stop_flush_threw_logs_`, `baseline_stop_sweep_threw_logs_` (`atomic<uint64_t>`) | Engine, TEST-ONLY observation beside each ERROR call | `fetch_add` at the log site | Never | Each is inside its own try/catch(...) |
 | `stop_stage_hook_for_test_` (`std::function<void(const char*)>`) | Engine, guarded by `mtx_`; the setter takes `mtx_` | Test setter | Member; cleared by `HookGuard4045` | Called from `stop_stage_hook_locked` at the START of each stage, inside a try/catch(...) |
-| `stop_stage_begin_locked()` / `stop_stage_hook_locked()` / `stop_stage_end_locked()` / `stop_journal_flush_locked()` | Engine member functions, `mtx_` held, noexcept | `stop()` | n/a | No resource: read the persister's clock and report a stage that took at least `kBaselineStopTroubleThreshold` (4.5 s) |
+| `stop_stage_begin_locked()` / `stop_stage_hook_locked()` / `stop_stage_end_locked()` / `stop_journal_flush_locked()` | Engine member functions, `mtx_` held, noexcept | `stop()` | n/a | No resource: read the persister's clock and report a stage that took at least `kBaselineStopTroubleThreshold` (750 ms since #5604; 4.5 s before) |
 
 ## `agents/core/src/guardian_spark_runtime.{hpp,cpp}` (staging side)
 
@@ -81,7 +81,8 @@ members.
 | `maint_.baselines` (`shared_ptr<GuardianBaselinePersister>`) | The worker's maintenance struct | Copied in at construction | Worker destruction | Null means no baseline persistence runs |
 | `baseline_recheck_pending`, `logged_baseline_throw` | Locals of the worker loop | Per cycle | Loop exit | The latch is local so the engine's firewall cannot suppress the worker's only log line |
 | Worker baseline step | The existing joined worker thread (no new thread) | Each loop cycle, before the outbox drain | n/a | Own try/catch, counted on the persister; never takes `mtx_` |
-| `kKvStoreBusyTimeout` use in `KvStore::open` | Existing sqlite handle | `sqlite3_busy_timeout(raw_db, static_cast<int>(count()))` | Handle close | Value-preserving (5000) |
+| `kKvStoreBusyTimeout` use in `KvStore::open` (#5604) | Existing sqlite handle | `sqlite3_busy_handler(raw_db, &kv_busy_handler, busy.get())`, initial budget 5000 ms (value-preserving) | Handle close (`sqlite3_close` runs before the context is released) | A failed install closes the handle and fails `open()` |
+| `KvBusyState` (`std::atomic<int64_t>` budget) (#5604) | `KvStore`, `unique_ptr`, heap-owned so the pointer SQLite keeps survives the `KvStore` move | `KvStore::open` | `KvStore` destruction or move-assignment, after the connection is closed | `set_busy_timeout` is a lock-free atomic store, never under `mu_`; `stop()` lowers it once to `kKvStoreStopBusyTimeout` (1 s), terminal |
 | `kShutdownDeadlineGrace` mirror `static_assert` | `agent.cpp`, compile time | n/a | n/a | A drifting mirror is a build failure |
 
 ## Test seams (all `*_for_test`, no production caller)
