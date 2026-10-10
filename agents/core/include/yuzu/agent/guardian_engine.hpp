@@ -37,6 +37,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <yuzu/agent/kv_store.hpp> // kKvStoreStopBusyTimeout (#5604)
 #include <yuzu/agent/guard.hpp>  // IGuard, GuardDrift (guard abstraction)
 #include <yuzu/agent/spark.hpp> // SparkType (for the classify() capability set)
 
@@ -793,6 +794,13 @@ public:
         std::lock_guard lock(mtx_);
         stop_stage_hook_for_test_ = std::move(hook);
     }
+    /// TEST-ONLY (#5604): the busy budget stop() lowers the KvStore to (default
+    /// kKvStoreStopBusyTimeout, 1 s), so a test can inject a budget short enough to keep the
+    /// case under a second. Call before stop(); atomic, so it never races it. No production
+    /// caller.
+    void set_stop_busy_timeout_for_test(std::chrono::milliseconds budget) noexcept {
+        stop_busy_timeout_ms_.store(budget.count(), std::memory_order_relaxed);
+    }
     /// TEST-ONLY (#4045): forget the published persister pointer, as if stop() had read it just
     /// before wire_spark_engine published it. The heartbeat getters then read 0. No production
     /// caller.
@@ -1076,7 +1084,7 @@ private:
     /// default time_point when no persister is wired). The hook runs the test hook, right after
     /// begin and BEFORE the stage body, so a test can make the body look slow by advancing an
     /// injected clock there. end records store trouble when the stage took at least
-    /// kBaselineStopTroubleThreshold (4.5 s, the busy timeout less a timer-rounding slack); a
+    /// kBaselineStopTroubleThreshold (750 ms, the stop busy budget less a timer-rounding slack); a
     /// stage that failed fast is not trouble (see the persister).
     [[nodiscard]] std::chrono::steady_clock::time_point stop_stage_begin_locked() const noexcept;
     void stop_stage_hook_locked(const char* stage) noexcept;
@@ -1330,6 +1338,9 @@ private:
     /// mtx_-guarded; null = no-op.
     std::function<void()> apply_post_drain_hook_for_test_;
     std::function<void(const char*)> stop_stage_hook_for_test_;
+    /// #5604: the budget stop() lowers kv_ to. Atomic because the seam may be set from a test
+    /// thread while stop() reads it before taking mtx_. Production never writes it.
+    std::atomic<std::int64_t> stop_busy_timeout_ms_{kKvStoreStopBusyTimeout.count()};
     std::function<void(const std::string&)> seed_read_hook_for_test_;
     std::function<void(const std::string&)> post_attach_hook_for_test_;
     /// TEST-ONLY drain-worker timing overrides (see set_drain_worker_timing_for_test);

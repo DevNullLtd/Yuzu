@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -26,10 +27,20 @@ struct sqlite3; // Forward declaration — avoids exposing sqlite3.h in the head
 
 namespace yuzu::agent {
 
-/// How long one KV write waits on a locked database before it fails (SQLite busy timeout, set
-/// by open()). A write against a store another process holds locked therefore costs up to this
-/// long, which is the unit the shutdown-time budgets are counted in (GuardianEngine::stop()).
+struct KvBusyState; // the busy handler's context; defined in kv_store.cpp
+
+/// How long one KV call waits on a locked database before it fails (the busy budget open()
+/// installs; see KvStore::set_busy_timeout). A call against a store another process holds locked
+/// therefore costs up to this long in normal operation.
 inline constexpr std::chrono::milliseconds kKvStoreBusyTimeout{5000};
+
+/// The terminal, shorter budget GuardianEngine::stop() lowers the store to (#5604). stop() shares
+/// ONE 20 s shutdown deadline with later teardown and runs several serial KV stages, so at the
+/// normal 5 s budget a store held locked by another connection could push it past the deadline,
+/// where hard_exit(4) kills the process with no log line. This is the unit the shutdown-time
+/// budgets are counted in (guardian_baseline_persister.hpp). Plugin KV writes made from a
+/// plugin's shutdown() run at this budget too, because the store is shared.
+inline constexpr std::chrono::milliseconds kKvStoreStopBusyTimeout{1000};
 
 struct KvStoreError {
     std::string message;
@@ -111,7 +122,8 @@ class YUZU_EXPORT KvStore final : public IJournalStore {
 public:
     /**
      * Open (or create) the KV store database at the given path.
-     * Sets WAL mode and the busy timeout (kKvStoreBusyTimeout, 5 s).
+     * Sets WAL mode and installs the busy handler with its initial budget
+     * (kKvStoreBusyTimeout, 5 s). See set_busy_timeout().
      */
     static std::expected<KvStore, KvStoreError> open(const std::filesystem::path& db_path);
 
@@ -236,10 +248,31 @@ public:
      */
     void enable_extended_result_codes_for_test();
 
+    /**
+     * Lower (or set) how long ONE KV call waits on a locked database before it fails with
+     * SQLITE_BUSY (#5604). The budget lives in an atomic that the connection's busy handler
+     * (not sqlite3_busy_timeout) reads on every retry, so this is lock-free and also shortens a
+     * wait that is ALREADY in progress on another thread: sqlite3_busy_timeout() from a second
+     * thread would block behind the connection mutex that the waiting call holds, and would not
+     * shorten that wait. A call costs at most one budget plus up to one 10 ms retry sleep (about
+     * 16 ms more on Windows, where sleeps round up to the 15.6 ms tick) as long as it takes the
+     * write lock at most once, which every method here does. Production lowers it once
+     * (GuardianEngine::stop(), to kKvStoreStopBusyTimeout) and never raises it: the stop budget
+     * is terminal. Safe from any thread, noexcept, never blocks.
+     */
+    void set_busy_timeout(std::chrono::milliseconds budget) noexcept;
+
+    /// TEST-ONLY: the budget the busy handler is currently using.
+    [[nodiscard]] std::chrono::milliseconds busy_timeout_for_test() const noexcept;
+
 private:
-    explicit KvStore(sqlite3* db);
+    /// The busy handler's context (kv_store.cpp). Heap-owned: SQLite keeps this raw pointer for
+    /// the life of the connection and KvStore itself IS moved (open() returns by value, agent.cpp
+    /// moves it into place), so a context at a member address would dangle after the move.
+    KvStore(sqlite3* db, std::unique_ptr<KvBusyState> busy);
 
     sqlite3* db_{nullptr};
+    std::unique_ptr<KvBusyState> busy_;
     std::mutex mu_;
 };
 

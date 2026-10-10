@@ -19,9 +19,14 @@
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <format>
+#include <memory>
 #include <string>
+#include <thread>
+#include <utility>
 
 namespace yuzu::agent {
 
@@ -50,6 +55,12 @@ std::string escape_like_prefix(std::string_view prefix) {
     return escaped;
 }
 
+// How often the busy handler re-tries a locked database. SQLite's own sqlite3_busy_timeout()
+// handler sleeps in a similar ladder (1, 2, 5, 10, ... ms); a flat 10 ms keeps the overshoot of
+// a budget bounded by one sleep without busy-spinning. On Windows sleep_for rounds up to the
+// 15.6 ms timer tick, so a wait overshoots its budget by at most one tick and never undershoots.
+constexpr std::chrono::milliseconds kBusyRetrySleep{10};
+
 struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
 };
@@ -57,8 +68,37 @@ using StmtPtr = std::unique_ptr<sqlite3_stmt, StmtDeleter>;
 
 } // namespace
 
+// The busy handler's context (see KvBusyState's declaration in kv_store.hpp).
+struct KvBusyState {
+    std::atomic<std::int64_t> budget_ms{0};
+};
+
+namespace {
+
+// sqlite3_busy_handler callback (#5604). Runs on the waiting thread WITH the connection mutex
+// held, so it may ONLY read the atomic budget and sleep: no logging, no locks, no allocation.
+// `count` is 0 on the first retry of each distinct lock wait, which is where the wait's start
+// is captured (thread_local: the wait runs entirely on the calling thread). Returning 0 makes
+// the pending call fail with SQLITE_BUSY. The budget is re-read on every retry, so lowering it
+// from another thread cuts a wait that is already in progress, which sqlite3_busy_timeout()
+// cannot do (it would block behind the connection mutex this wait holds).
+int kv_busy_handler(void* ctx, int count) noexcept {
+    thread_local std::chrono::steady_clock::time_point wait_start;
+    const auto now = std::chrono::steady_clock::now();
+    if (count == 0)
+        wait_start = now;
+    const auto* busy = static_cast<const KvBusyState*>(ctx);
+    const auto limit = std::chrono::milliseconds{busy->budget_ms.load(std::memory_order_relaxed)};
+    if (now - wait_start >= limit)
+        return 0;
+    std::this_thread::sleep_for(kBusyRetrySleep);
+    return 1;
+}
+
+} // namespace
+
 // Private constructor
-KvStore::KvStore(sqlite3* db) : db_{db} {}
+KvStore::KvStore(sqlite3* db, std::unique_ptr<KvBusyState> busy) : db_{db}, busy_{std::move(busy)} {}
 
 KvStore::~KvStore() {
     if (db_) {
@@ -67,15 +107,18 @@ KvStore::~KvStore() {
     }
 }
 
-KvStore::KvStore(KvStore&& other) noexcept : db_{other.db_} {
+KvStore::KvStore(KvStore&& other) noexcept : db_{other.db_}, busy_{std::move(other.busy_)} {
     other.db_ = nullptr;
 }
 
 KvStore& KvStore::operator=(KvStore&& other) noexcept {
     if (this != &other) {
+        // Close the connection BEFORE releasing the context it points at: close can still run
+        // the busy handler (a checkpoint), which reads the context.
         if (db_)
             sqlite3_close(db_);
         db_ = other.db_;
+        busy_ = std::move(other.busy_);
         other.db_ = nullptr;
     }
     return *this;
@@ -113,8 +156,17 @@ std::expected<KvStore, KvStoreError> KvStore::open(const std::filesystem::path& 
         sqlite3_free(err_msg);
     }
 
-    // Busy timeout for concurrent access
-    sqlite3_busy_timeout(raw_db, static_cast<int>(kKvStoreBusyTimeout.count()));
+    // Busy handling for concurrent access (#5604): a handler reading an atomic budget instead of
+    // sqlite3_busy_timeout(), so GuardianEngine::stop() can lower the budget lock-free and cut a
+    // wait already in progress. Starts at kKvStoreBusyTimeout, the old behaviour.
+    auto busy = std::make_unique<KvBusyState>();
+    busy->budget_ms.store(kKvStoreBusyTimeout.count(), std::memory_order_relaxed);
+    rc = sqlite3_busy_handler(raw_db, &kv_busy_handler, busy.get());
+    if (rc != SQLITE_OK) {
+        sqlite3_close(raw_db);
+        return std::unexpected(
+            KvStoreError{std::format("failed to install the kv_store busy handler: rc={}", rc)});
+    }
 
     // Create table.
     //
@@ -146,7 +198,19 @@ std::expected<KvStore, KvStoreError> KvStore::open(const std::filesystem::path& 
     }
 
     spdlog::info("KvStore opened: {}", db_path.string());
-    return KvStore{raw_db};
+    return KvStore{raw_db, std::move(busy)};
+}
+
+void KvStore::set_busy_timeout(std::chrono::milliseconds budget) noexcept {
+    // Deliberately not under mu_: a call waiting on a locked database holds the connection
+    // mutex (and mu_) for its whole wait, and the point is to shorten that wait.
+    if (busy_)
+        busy_->budget_ms.store(budget.count(), std::memory_order_relaxed);
+}
+
+std::chrono::milliseconds KvStore::busy_timeout_for_test() const noexcept {
+    return busy_ ? std::chrono::milliseconds{busy_->budget_ms.load(std::memory_order_relaxed)}
+                 : std::chrono::milliseconds{0};
 }
 
 bool KvStore::set(std::string_view plugin, std::string_view key, std::string_view value) {

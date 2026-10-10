@@ -16,6 +16,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -863,4 +864,124 @@ TEST_CASE("KvStore fallible reads surface a REAL SQLite failure as an error, not
     // this. Both report the same thing for a dropped table as for an empty namespace.
     CHECK(t.store.list("p1", "lc:").empty());
     CHECK_FALSE(t.store.get("p1", "lc:a").has_value());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// #5604: the busy budget is an atomic read by a busy HANDLER, so lowering it from another
+// thread cuts a write that is already waiting on a locked database.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+/// A second raw connection holding the write lock (BEGIN IMMEDIATE) until released or destroyed.
+struct WriteLockHolder5604 {
+    sqlite3* raw{nullptr};
+    explicit WriteLockHolder5604(const fs::path& path) {
+        REQUIRE(sqlite3_open(path.string().c_str(), &raw) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(raw, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    void release() {
+        if (raw)
+            sqlite3_exec(raw, "ROLLBACK", nullptr, nullptr, nullptr);
+    }
+    ~WriteLockHolder5604() {
+        if (raw)
+            sqlite3_close(raw); // rolls back an open transaction
+    }
+    WriteLockHolder5604(const WriteLockHolder5604&) = delete;
+    WriteLockHolder5604& operator=(const WriteLockHolder5604&) = delete;
+};
+
+/// How long `fn` takes, in milliseconds.
+template <class Fn> double elapsed_ms_5604(Fn&& fn) {
+    const auto t0 = std::chrono::steady_clock::now();
+    fn();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+} // namespace
+
+TEST_CASE("#5604 KvStore: open installs the normal 5 s busy budget; set_busy_timeout is observable",
+          "[kv_store][busy]") {
+    auto t = make_test_store();
+    CHECK(t.store.busy_timeout_for_test() == kKvStoreBusyTimeout);
+    t.store.set_busy_timeout(kKvStoreStopBusyTimeout);
+    CHECK(t.store.busy_timeout_for_test() == kKvStoreStopBusyTimeout);
+}
+
+TEST_CASE("#5604 KvStore: lowering the budget from another thread cuts a write already waiting",
+          "[kv_store][busy]") {
+    using namespace std::chrono_literals;
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p", "seed", "v"));
+    WriteLockHolder5604 holder{t.path};
+
+    t.store.set_busy_timeout(2000ms);
+    // At ~100 ms the budget drops to 300 ms: the write already waiting must give up at ~300 ms,
+    // not run out the 2000 ms it started under. sqlite3_busy_timeout() from this thread would
+    // have blocked behind the waiting call's connection mutex and not shortened it.
+    std::thread lower([&] {
+        std::this_thread::sleep_for(100ms);
+        t.store.set_busy_timeout(300ms);
+    });
+    bool in_flight_ok = true;
+    const double in_flight = elapsed_ms_5604([&] { in_flight_ok = t.store.set("p", "k1", "v"); });
+    lower.join();
+    CHECK_FALSE(in_flight_ok);
+    CHECK(in_flight >= 300.0);
+    CHECK(in_flight < 1500.0); // RED if the 2000 ms it started under had run out
+
+    // A fresh write under the lowered budget costs it, and fails.
+    bool fresh_ok = true;
+    const double fresh = elapsed_ms_5604([&] { fresh_ok = t.store.set("p", "k2", "v"); });
+    CHECK_FALSE(fresh_ok);
+    CHECK(fresh >= 300.0);
+    CHECK(fresh < 1500.0);
+    CHECK(t.store.busy_timeout_for_test() == 300ms); // never raised
+
+    // Releasing the lock: the same store writes again at once (nothing latched).
+    holder.release();
+    CHECK(t.store.set("p", "k3", "v"));
+    CHECK(t.store.get("p", "k3").value_or("") == "v");
+    CHECK_FALSE(t.store.get("p", "k1").has_value());
+}
+
+TEST_CASE("#5604 KvStore: a MOVED store keeps a working busy handler (the context is heap-owned)",
+          "[kv_store][busy]") {
+    using namespace std::chrono_literals;
+    // The handler's context pointer is registered with SQLite at open() and outlives the
+    // KvStore object's address: moving the store must neither dangle it nor lose the budget.
+    auto t = make_test_store();
+    t.store.set_busy_timeout(200ms);
+    KvStore moved{std::move(t.store)};
+    CHECK(moved.busy_timeout_for_test() == 200ms);
+    CHECK(t.store.busy_timeout_for_test() == 0ms); // moved-from: no context, no budget
+    t.store.set_busy_timeout(5000ms);              // a no-op on a moved-from store, not a crash
+
+    {
+        WriteLockHolder5604 holder{t.path};
+        bool ok = true;
+        const double ms = elapsed_ms_5604([&] { ok = moved.set("p", "k", "v"); });
+        CHECK_FALSE(ok);
+        CHECK(ms >= 200.0);
+        CHECK(ms < 1500.0);
+    }
+
+    // Move ASSIGNMENT: the destination's old connection and context are released, the source's
+    // adopted.
+    yuzu::test::TempDbFile other_db{"yuzu_test_kv_5604_"};
+    auto other = KvStore::open(other_db.path);
+    REQUIRE(other.has_value());
+    other->set_busy_timeout(5000ms);
+    *other = std::move(moved);
+    CHECK(other->busy_timeout_for_test() == 200ms);
+    {
+        WriteLockHolder5604 holder{t.path};
+        bool ok = true;
+        const double ms = elapsed_ms_5604([&] { ok = other->set("p", "k2", "v"); });
+        CHECK_FALSE(ok);
+        CHECK(ms >= 200.0);
+        CHECK(ms < 1500.0);
+    }
+    CHECK(other->set("p", "k3", "v"));
 }

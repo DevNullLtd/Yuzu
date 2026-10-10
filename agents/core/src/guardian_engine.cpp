@@ -749,12 +749,12 @@ GuardianBaselinePersister::persist_staged(GuardianSparkRuntime& rt, Trigger trig
     if (trigger == Trigger::Stop && stop_state_.load(std::memory_order_acquire) == 2) {
         // Two reasons to leave the store alone, both about THIS stop's share of the shared
         // shutdown deadline (kBaselineShutdownGrace). (1) A write that failed SLOWLY (a BUSY
-        // store burns a busy timeout per write) ended at or after the begin_stop() mark: one
-        // more attempt would spend another busy timeout. A stall that ended before the mark
+        // store burns a busy budget per write) ended at or after the begin_stop() mark: one
+        // more attempt would spend another busy budget. A stall that ended before the mark
         // spent none of it, so it is not a reason to skip. (2) This pass could not start within
         // kBaselineStopLatestStart of the mark AND an earlier stage of this stop ran slow, at
-        // least kBaselineStopTroubleThreshold, 4.5 s (note_stop_store_trouble): its first write
-        // always runs and may cost a busy timeout, which would end past the grace. Neither
+        // least kBaselineStopTroubleThreshold, 750 ms (note_stop_store_trouble): its first write
+        // always runs and may cost a busy budget, which would end past the grace. Neither
         // elapsed time alone nor a FAST failure is evidence of a slow store (an apply_rules
         // can hold the engine mutex that long on a healthy one, and a store that fails fast
         // fails this pass fast too), so a late start with no slow stage runs.
@@ -865,7 +865,10 @@ GuardianBaselinePersister::persist_staged(GuardianSparkRuntime& rt, Trigger trig
         if (r == BaselinePersistOutcome::Failed) {
             ++out.failed;
             const auto write_ended = now();
-            if (write_ended - write_began >= stop_budget_.max_wall) {
+            // Compared against the trouble threshold, not the pass's 1 s wall: a BUSY write now
+            // costs exactly the 1 s stop busy budget, so an exact-equality test against the wall
+            // would be a coin flip on timer rounding (#5604).
+            if (write_ended - write_began >= kBaselineStopTroubleThreshold) {
                 slow_failure = true; // timed per failing write, whatever succeeded before it
                 slow_failure_at = write_ended.time_since_epoch().count();
             }
@@ -1243,6 +1246,17 @@ void GuardianEngine::stop() {
     // does not move the mark.
     if (auto* persister = baseline_persister_published_.load(std::memory_order_acquire))
         persister->begin_stop();
+    // #5604: lower the store's busy budget to the terminal stop budget BEFORE waiting for mtx_,
+    // for the same reason as the mark above. kv_ is the agent's one shared KvStore (agent.cpp
+    // hands the same object to plugin_ctx_.kv_store) and is never reassigned after
+    // construction, so reading it without mtx_ is safe; set_busy_timeout() is a lock-free
+    // atomic store that also cuts a write ALREADY waiting on a locked database, including the
+    // one an apply_rules holding mtx_ is blocked in, which is what stop() is queued behind.
+    // Terminal: nothing raises it again, so every later write by any caller of this store (the
+    // worker, plugins' shutdown()) runs at the stop budget.
+    if (kv_)
+        kv_->set_busy_timeout(
+            std::chrono::milliseconds{stop_busy_timeout_ms_.load(std::memory_order_relaxed)});
     std::lock_guard lock(mtx_);
     // A stop() that loaded the published pointer just BEFORE wire_spark_engine published it
     // (wire runs under mtx_, so it finished while this call waited for the lock) has no mark
@@ -1354,7 +1368,7 @@ void GuardianEngine::stop() {
     unsupported_rules_.clear();
     // Final flush: anything staged while the workers wound down, plus any records a prior
     // failed write left pending; there is no maintenance tick after stop(). Bounded +
-    // circuit-broken (worst case one KvStore 5 s busy-timeout). FIREWALLED: stop() is reached
+    // circuit-broken (worst case one KvStore stop busy budget, 1 s). FIREWALLED: stop() is reached
     // from the (implicitly noexcept) ~GuardianEngine destructor, so a throw here would
     // std::terminate (review B4a).
     stop_journal_flush_locked("journal_flush_2");
@@ -1369,17 +1383,17 @@ void GuardianEngine::stop() {
     // pass. The pass is SKIPPED, with its own logged line, when
     //  (1) a write that failed slowly ended at or after the begin_stop() mark taken at the top
     //      of this function (the stall already spent this stop's deadline), or
-    //  (2) it would start at or after kBaselineStopLatestStart (15 s) past that mark AND an
-    //      earlier stage of this same stop() ran SLOW, at least 4.5 s (the two journal
+    //  (2) it would start at or after kBaselineStopLatestStart (18 s) past that mark AND an
+    //      earlier stage of this same stop() ran SLOW, at least 750 ms (the two journal
     //      flushes, the worker join and the loss-ledger write feed note_stop_store_trouble()):
-    //      its first write always runs, and on a BUSY store one write costs a whole 5 s busy
-    //      timeout. A fast failure of a stage is not evidence (a BUSY store cannot fail fast).
-    //      A late start with no slow stage (an apply_rules that held mtx_ for 15 s on a healthy
-    //      store) runs: a healthy pass takes well under a millisecond per capture, but it may
-    //      use its whole 1 s wall plus one write, so a start in the last second of the grace
-    //      can run into the watchdog (a healthy 300-capture pass that started at 19 s ended at
-    //      20.035 s in a measurement with a slow-IO window). Accepted: the alternative is to
-    //      forfeit the captures of a healthy store.
+    //      its first write always runs, and on a BUSY store one write costs a whole 1 s stop
+    //      busy budget. A fast failure of a stage is not evidence (a BUSY store cannot fail
+    //      fast). A late start with no slow stage (an apply_rules that held mtx_ for 18 s on a
+    //      healthy store) runs: a healthy pass takes well under a millisecond per capture, but
+    //      it may use its whole 1 s wall plus one write, so a start in the last second of the
+    //      grace can run into the watchdog (before #5604, a healthy 300-capture pass that
+    //      started at 19 s ended at 20.035 s in a measurement with a slow-IO window).
+    //      Accepted: the alternative is to forfeit the captures of a healthy store.
     //
     // Ordering: this flush runs after the journal flush and the loss-ledger write, so it is the
     // one a stall skips; the integrity-relevant flusher yields to the audit-replay one only
@@ -1395,51 +1409,53 @@ void GuardianEngine::stop() {
     // Windows service is restarted by the SCM, and neither hard_exit nor ShutdownDeadlineGuard
     // writes any log line, so exit code 4 is the only evidence.
     //
-    // Measured with real SQLITE_BUSY (a second connection holding BEGIN IMMEDIATE), 5 s KvStore
-    // busy timeout, stop() entry to exit. On this exact code, with 3 staged captures: 10.008 s
-    // and 15.012 s (the implementer), then 10.01 s, 15.01 s, 7.51 to 9.71 s (worker write in
-    // flight, no journal), 24.72 s (in flight, journal pending) and 21.7 to 28.2 s (worker
-    // mid sent-marker write; 21.5 to 28.2 s with 5 staged) (the unhappy-path reviewer). The rest
-    // was measured on the previous revision (fbc816ac6) with 5 staged captures: 10.007 s,
-    // 15.011 to 15.013 s, 20.015 to 25.02 s (journal pending, baseline write in flight) and
-    // 28.82 to 29.04 s (one non-baseline worker write per run). That revision differs from this
-    // one in the evidence rule, two ERROR lines and where a test hook fires, none of which
-    // changes a BUSY timeline (a BUSY stage is slow under either rule). The 28.82 to 29.04 s
-    // row was not re-run on this exact code.
-    //   quiet worker, nothing else pending ......... ledger 5 + this pass 5 ........ 10.01 s
-    //                                                 (the pass runs and fails)
-    //   quiet worker, journal record pending ....... journal 5 + ledger 5 + journal 5
-    //                                                 = 15.01 s (15.011 to 15.013 s), this pass
-    //                                                 SKIPPED (it would start at 15 s; each BUSY
-    //                                                 stage is its 5 s sleep plus overhead, so
-    //                                                 the threshold is met with about 11 to 13 ms
-    //                                                 to spare)
-    //   worker baseline write in flight, journal ... 20 s to 25 s (20.015 to 25.02 s across
-    //     record pending                              alignments, 24.72 s on this code), this pass
-    //                                                 skipped by the stall: up to TWO busy
-    //                                                 timeouts are added, the in-flight write
-    //                                                 that holds KvStore::mu_ first, and a second
-    //                                                 baseline write when the worker's 5 s retry
-    //                                                 backoff expires just as journal flush 1 ends
-    //   worker baseline write in flight, no journal  at most 10.01 s (7.51 to 9.71 s when the
-    //                                                 write is already under way), this pass
-    //                                                 skipped by the stall
-    // The last two rows are on the watchdog when they pass 20 s. The worker's OTHER KV writes
-    // (journal sent-markers) take KvStore::mu_ too, so a worker mid non-baseline write puts its
-    // own busy timeout in front of every stage here: 21.5 s to 28.2 s in one harness (3 staged,
-    // the outbox send path driving the sent-marker write) and 28.82 s to 29.04 s in another (5
-    // staged, one non-baseline worker write in each of three runs), the pass skipped by the
-    // stall; the arithmetic bound is about 30 s (six busy timeouts). All past the 20 s grace.
-    // Without #4045 the same stops take 15 s (journal record pending) or 20 s and more (a worker
-    // sent-marker write in flight). What the shared deadline cannot bound: the journal and
-    // ledger stages above, the worker's non-baseline writes, and the worker's retry write. The
-    // evidence is SAMPLED by those stages: a store that turns BUSY only after them, or whose
-    // stages each stay under the 4.5 s threshold, with the stop already 15 s late, still lets
-    // the Stop pass run and the watchdog may cut it (a reviewer reproduced 21.0 s for the first
-    // shape and 20.11 s for the second, a 1.9 s hold plus three stages of 4.4 s plus a BUSY
-    // pass; the capture is lost either way and the loss has no log line). A
-    // Worker pass is deliberately NOT deferred once the mark is taken: a store that heals
-    // mid-stop gets its worker retry, and the Stop pass then runs instead of skipping.
+    // THE STOP BUSY BUDGET (#5604). Every KV write against a store another connection holds
+    // locked costs the whole busy budget, and this function has several serial KV stages, so
+    // at the normal 5 s budget the stages added up past the grace (21 to 29 s were measured on
+    // earlier revisions). The top of this function therefore lowers the shared KvStore's
+    // budget, once and terminally, to kKvStoreStopBusyTimeout (1 s); it is an atomic read by
+    // the store's busy handler, so the lowering is lock-free and also cuts a write that is
+    // already waiting. Accepted trade-off: an external process holding the store locked for
+    // 1 to 5 s at this instant now fails the writes here that 5 s would have survived (one
+    // recapture at the next boot, a stale but never corrupt loss ledger; both logged). The
+    // budget bounds lock waits only: an fsync stall is not a lock event, so a stalled disk
+    // can still reach the watchdog, and the DEX observer drain and plugin shutdown() under the
+    // second guard are not covered.
+    //
+    // Measured with real SQLITE_BUSY (a second connection holding BEGIN IMMEDIATE through the
+    // whole stop), production values (5 s lowered to 1 s), Linux debug build, one run per
+    // point, stop() entry to exit, 3 staged captures unless noted:
+    //   quiet worker (stopped), nothing pending .... ledger 1 + this pass 1 .......... 2.01 s
+    //                                                 (2.0134 s with 3 staged, 2.0139 s with 5;
+    //                                                 the pass runs and fails)
+    //   quiet worker, journal record pending ....... 4.03 s (4.0295 s with 3 staged, 4.0261 s
+    //                                                 with 5): four 1 s waits each time, but not
+    //                                                 the same four. With 3 staged: journal
+    //                                                 flush 1, the live worker's own baseline
+    //                                                 write during the worker join, the ledger,
+    //                                                 journal flush 2, then this pass skipped by
+    //                                                 the stall. With 5: journal flush 1, the
+    //                                                 ledger, journal flush 2, then this pass
+    //                                                 ran and failed
+    //   worker baseline write in flight ............ 1.71 s, 1.01 s, 1.01 s, 2.01 s for a stop
+    //                                                 called 0.3, 2.0, 4.5 and 5.3 s after the
+    //                                                 write began waiting (the last is the
+    //                                                 worker's retry write in flight)
+    //   worker NON-baseline write in flight ........ 2.72 s, 2.02 s, 2.02 s at 0.3, 2.0 and
+    //                                                 4.5 s (5 staged). EMULATED: a KV write
+    //                                                 issued from the worker thread through the
+    //                                                 persister's post-snapshot hook, not the
+    //                                                 real journal sent-marker write
+    //   journal record pending + that emulated
+    //     non-baseline worker write in flight ...... 5.03 s, 4.73 s, 4.33 s at 0, 0.3 and 0.7 s
+    //                                                 after it began (the largest measured)
+    // The sampled-evidence residual stands: a store that turns BUSY only after the evidence
+    // stages, or whose stages each stay under the 750 ms threshold, with the stop already 18 s
+    // late, still lets the Stop pass run and the watchdog may cut it (the capture is lost and
+    // the loss has no log line); this was reproduced at 21.0 s and 20.11 s on the earlier 15 s
+    // and 4.5 s constants and not re-run since. A Worker pass is deliberately NOT deferred once
+    // the mark is taken: a store that heals mid-stop gets its worker retry, and the Stop pass
+    // then runs instead of skipping.
     persist_staged_baselines_locked(/*at_stop=*/true);
     stopped_ = true;
     started_ = false;

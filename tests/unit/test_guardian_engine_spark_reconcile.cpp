@@ -9012,22 +9012,21 @@ TEST_CASE("#4045 E42: engine stop() marks its start before joining the worker, s
     REQUIRE(worker != nullptr);
     std::atomic<int> attempts{0};
     std::atomic<bool> in_hook{false};
+    // An injected clock makes the failed write count as slow (it must take at least
+    // kBaselineStopTroubleThreshold) without burning that long on the real clock. Only the
+    // worker's hook below advances it, so the live worker cannot race it.
+    FakeClock4045 clock{*persister};
     HookGuard4045 hooks{*f.engine};
-    // A stop wall budget of zero makes EVERY failed write count as slow (a failed write is slow
-    // when it took at least that long), so the test needs neither the real clock to burn a
-    // second nor an injected one the live worker could race.
-    persister->set_budgets_for_test(yuzu::agent::kBaselinePassBudget,
-                                    {(std::numeric_limits<std::size_t>::max)(), 1,
-                                     std::chrono::milliseconds{0}});
     fail_baseline_writes_4045(f.db_.path);
     // The worker's first write parks until stop() has been requested, which is after
-    // GuardianEngine::stop() marked its start. Installed BEFORE anything is staged, so whichever
-    // wake runs the first pass sees it.
+    // GuardianEngine::stop() marked its start, then "takes" the threshold on the injected
+    // clock. Installed BEFORE anything is staged, so whichever wake runs the first pass sees it.
     persister->set_post_write_hook_for_test([&] {
         if (++attempts != 1)
             return;
         in_hook.store(true);
         (void)yuzu::test::spin_until([&] { return worker->stop_requested_for_test(); });
+        clock.advance(yuzu::agent::kBaselineStopTroubleThreshold.count());
     });
     stage_n_4045(*rt, 3, "e42");
     worker->notify();
@@ -9220,25 +9219,25 @@ TEST_CASE("#4045 E46: a Stop pass that cannot start inside kBaselineStopLatestSt
     HookGuard4045 hooks{*f.engine};
 
     // The constants behind the rule: the grace stop() shares and the one write that must still
-    // fit inside it. A drift in either (agent.cpp's kShutdownDeadlineGrace, KvStore's busy
+    // fit inside it. A drift in either (agent.cpp's kShutdownDeadlineGrace, KvStore's stop busy
     // timeout) must be a conscious edit here.
     CHECK(yuzu::agent::kBaselineShutdownGrace == 20'000ms);
     CHECK(yuzu::agent::kKvStoreBusyTimeout == 5'000ms);
-    CHECK(yuzu::agent::kBaselineStopLatestStart == 15'000ms);
+    CHECK(yuzu::agent::kBaselineStopLatestStart == 18'000ms);
 
     stage_n_4045(*rt, 3, "e46");
     persister->begin_stop();
     persister->note_stop_store_trouble(); // the evidence rule is E53's; this case pins the bound
 
     SECTION("one millisecond before the latest start: the pass runs") {
-        clock.advance(14'999);
+        clock.advance(17'999);
         const auto out = persister->persist_staged(*rt, Trig::Stop);
         CHECK_FALSE(out.skipped_late_start);
         CHECK(out.written == 3);
         CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
     }
     SECTION("at the latest start: skipped, nothing attempted, nothing lost, logged once") {
-        clock.advance(15'000);
+        clock.advance(18'000);
         std::atomic<int> writes{0};
         persister->set_post_write_hook_for_test([&] { ++writes; });
         const auto out = persister->persist_staged(*rt, Trig::Stop);
@@ -9682,7 +9681,7 @@ TEST_CASE("#4045 E48b: metrics.md names the stop-time lines an operator is told 
     }
 }
 
-TEST_CASE("#4045 E53: store trouble is a stage that took 4.5 s or more, and only with it "
+TEST_CASE("#4045 E53: store trouble is a stage that took 750 ms or more, and only with it "
           "does a late start skip the Stop pass",
           "[spark][guardian][baseline][reconcile]") {
     using Trig = GuardianBaselinePersister::Trigger;
@@ -9696,32 +9695,32 @@ TEST_CASE("#4045 E53: store trouble is a stage that took 4.5 s or more, and only
     FakeClock4045 clock{*persister};
     HookGuard4045 hooks{*f.engine};
 
-    SECTION("the threshold is the busy timeout less a 500 ms timer slack") {
+    SECTION("the threshold is the stop busy budget less a 250 ms timer slack") {
         using namespace std::chrono_literals;
-        static_assert(yuzu::agent::kBaselineStopTroubleSlack == 500ms);
-        CHECK(yuzu::agent::kBaselineStopTroubleThreshold == 4'500ms);
+        static_assert(yuzu::agent::kBaselineStopTroubleSlack == 250ms);
+        CHECK(yuzu::agent::kBaselineStopTroubleThreshold == 750ms);
         CHECK(yuzu::agent::kBaselineStopTroubleThreshold ==
-              yuzu::agent::kKvStoreBusyTimeout - yuzu::agent::kBaselineStopTroubleSlack);
+              yuzu::agent::kKvStoreStopBusyTimeout - yuzu::agent::kBaselineStopTroubleSlack);
     }
     SECTION("stop_stage_end: a stage under the threshold is not trouble, one at it is") {
         auto began = persister->stop_stage_begin();
-        clock.advance(4'499);
+        clock.advance(749);
         persister->stop_stage_end(began);
         CHECK_FALSE(persister->stop_store_trouble_for_test());
         began = persister->stop_stage_begin();
-        clock.advance(4'500);
+        clock.advance(750);
         persister->stop_stage_end(began);
         CHECK(persister->stop_store_trouble_for_test());
     }
-    SECTION("a stage of a whole busy timeout (what a BUSY store costs) is trouble") {
+    SECTION("a stage of a whole stop busy budget (what a BUSY store costs) is trouble") {
         const auto began = persister->stop_stage_begin();
-        clock.advance(5'000);
+        clock.advance(1'000);
         persister->stop_stage_end(began);
         CHECK(persister->stop_store_trouble_for_test());
     }
     SECTION("a BUSY stage that a coarse timer measured short is still trouble") {
         const auto began = persister->stop_stage_begin();
-        clock.advance(4'985); // Sleep() granularity of about 15 ms, returned early
+        clock.advance(985); // Sleep() granularity of about 15 ms, returned early
         persister->stop_stage_end(began);
         CHECK(persister->stop_store_trouble_for_test());
     }
@@ -9732,7 +9731,7 @@ TEST_CASE("#4045 E53: store trouble is a stage that took 4.5 s or more, and only
     SECTION("a late start with NO trouble runs: a healthy pass is not cut for being late") {
         stage_n_4045(*rt, 3, "e53a");
         persister->begin_stop();
-        clock.advance(16'000);
+        clock.advance(19'000);
         const auto out = persister->persist_staged(*rt, Trig::Stop);
         CHECK_FALSE(out.skipped_late_start);
         CHECK(out.written == 3);
@@ -9742,7 +9741,7 @@ TEST_CASE("#4045 E53: store trouble is a stage that took 4.5 s or more, and only
         stage_n_4045(*rt, 3, "e53b");
         persister->begin_stop();
         persister->note_stop_store_trouble();
-        clock.advance(15'000);
+        clock.advance(18'000);
         const auto out = persister->persist_staged(*rt, Trig::Stop);
         CHECK(out.skipped_late_start);
         CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 1);
@@ -9751,14 +9750,14 @@ TEST_CASE("#4045 E53: store trouble is a stage that took 4.5 s or more, and only
         stage_n_4045(*rt, 3, "e53c");
         persister->begin_stop();
         persister->note_stop_store_trouble();
-        clock.advance(14'999);
+        clock.advance(17'999);
         CHECK(persister->persist_staged(*rt, Trig::Stop).written == 3);
     }
     SECTION("a stall that ended after the mark and a late start: the stall reason wins") {
         stage_n_4045(*rt, 2, "e53d");
         fail_baseline_writes_4045(f.db_.path);
         persister->begin_stop();
-        persister->set_post_write_hook_for_test([&] { clock.advance(16'000); });
+        persister->set_post_write_hook_for_test([&] { clock.advance(19'000); });
         CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 1);
         persister->set_post_write_hook_for_test(nullptr);
         const auto out = persister->persist_staged(*rt, Trig::Stop);
@@ -9767,7 +9766,7 @@ TEST_CASE("#4045 E53: store trouble is a stage that took 4.5 s or more, and only
         CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
     }
     SECTION("the late-start clock is read when the Stop pass HAS the lock, not at its entry") {
-        // A Stop pass queued behind a parked pass for 16 s of injected time is late once it
+        // A Stop pass queued behind a parked pass for 19 s of injected time is late once it
         // gets the lock.
         stage_n_4045(*rt, 2, "e53e");
         persister->begin_stop();
@@ -9787,7 +9786,7 @@ TEST_CASE("#4045 E53: store trouble is a stage that took 4.5 s or more, and only
         // join (destruction is in reverse order) and the parked pass can finish.
         yuzu::test::ScopeExit up{[&] { release.store(true); }};
         REQUIRE(yuzu::test::spin_until([&] { return persister->lock_waiters_for_test() == 1; }));
-        clock.advance(16'000);
+        clock.advance(19'000);
         release.store(true);
         a.join();
         t.join();
@@ -9796,7 +9795,7 @@ TEST_CASE("#4045 E53: store trouble is a stage that took 4.5 s or more, and only
 }
 
 TEST_CASE("#4045 E54: engine stop() on a HEALTHY store persists the captures although its mutex "
-          "wait ate 15 s, and skips only when one of its own store stages ran slow",
+          "wait ate 19 s, and skips only when one of its own store stages ran slow",
           "[spark][guardian][baseline][reconcile]") {
     using Skip = GuardianBaselinePersister::StopSkip;
     SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
@@ -9812,61 +9811,61 @@ TEST_CASE("#4045 E54: engine stop() on a HEALTHY store persists the captures alt
     // loss-ledger write really fails (fast, baseline writes stay healthy), and which stage the
     // hook makes slow by how much. The hook fires at the START of the stage, so the injected
     // time lands inside the stage's own measured span.
-    std::int64_t hold_ms = 16'000;
+    std::int64_t hold_ms = 19'000;
     bool fail_ledger = false;
     std::string slow_stage;
     std::int64_t slow_ms = 0;
     bool expect_skip = false;
 
-    SECTION("healthy store, apply_rules held the mutex for 16 s: the pass runs") {
+    SECTION("healthy store, apply_rules held the mutex for 19 s: the pass runs") {
         expect_skip = false;
     }
     SECTION("the loss-ledger write fails FAST (a non-BUSY error): not evidence, the pass runs") {
         fail_ledger = true;
         expect_skip = false; // RED if a failed stage counted as trouble whatever its duration
     }
-    SECTION("the loss-ledger write SUCCEEDS but takes a busy timeout (5 s): skipped") {
-        hold_ms = 10'000;
+    SECTION("the loss-ledger write SUCCEEDS but takes a stop busy budget (1 s): skipped") {
+        hold_ms = 17'000;
         slow_stage = "ledger";
-        slow_ms = 5'000;
+        slow_ms = 1'000;
         expect_skip = true;
     }
-    SECTION("the loss-ledger write fails AND takes a busy timeout (a BUSY store): skipped") {
+    SECTION("the loss-ledger write fails AND takes a stop busy budget (a BUSY store): skipped") {
         fail_ledger = true;
-        hold_ms = 10'000;
+        hold_ms = 17'000;
         slow_stage = "ledger";
-        slow_ms = 5'000;
+        slow_ms = 1'000;
         expect_skip = true;
     }
-    SECTION("the second journal flush takes a busy timeout (5 s): skipped") {
-        hold_ms = 10'000;
+    SECTION("the second journal flush takes a stop busy budget (1 s): skipped") {
+        hold_ms = 17'000;
         slow_stage = "journal_flush_2";
-        slow_ms = 5'000;
+        slow_ms = 1'000;
         expect_skip = true;
     }
-    SECTION("the second journal flush takes exactly the 4.5 s threshold: skipped") {
-        hold_ms = 10'500;
+    SECTION("the second journal flush takes exactly the 750 ms threshold: skipped") {
+        hold_ms = 17'250;
         slow_stage = "journal_flush_2";
-        slow_ms = 4'500;
+        slow_ms = 750;
         expect_skip = true;
     }
     SECTION("the second journal flush takes just under the threshold: not trouble, runs") {
-        // 10'501 + 4'499 = 15 s: the pass is late, so only the missing evidence lets it run.
-        hold_ms = 10'501;
+        // 17'251 + 749 = 18 s: the pass is late, so only the missing evidence lets it run.
+        hold_ms = 17'251;
         slow_stage = "journal_flush_2";
-        slow_ms = 4'499;
+        slow_ms = 749;
         expect_skip = false;
     }
-    SECTION("the first journal flush takes a busy timeout (5 s): skipped") {
-        hold_ms = 10'000;
+    SECTION("the first journal flush takes a stop busy budget (1 s): skipped") {
+        hold_ms = 17'000;
         slow_stage = "journal_flush_1";
-        slow_ms = 5'000;
+        slow_ms = 1'000;
         expect_skip = true;
     }
-    SECTION("the worker join takes a busy timeout (5 s): skipped") {
-        hold_ms = 10'000;
+    SECTION("the worker join takes a stop busy budget (1 s): skipped") {
+        hold_ms = 17'000;
         slow_stage = "worker_join";
-        slow_ms = 5'000;
+        slow_ms = 1'000;
         expect_skip = true;
     }
 
@@ -10039,7 +10038,7 @@ TEST_CASE("#4045 E57: a journal flush that fails FAST (the write ceiling) is no 
     Join4045 join_stop{stop_thread};
     yuzu::test::ScopeExit unpark_stop{[&] { release.store(true); }};
     REQUIRE(yuzu::test::spin_until([&] { return persister->stop_begun_for_test(); }));
-    clock.advance(16'000);
+    clock.advance(19'000);
     release.store(true);
     apply_thread.join();
     stop_thread.join();
@@ -10049,4 +10048,148 @@ TEST_CASE("#4045 E57: a journal flush that fails FAST (the write ceiling) is no 
     CHECK(rt->staged_baseline_count_for_test() == 0);
     for (const char* id : {"r0", "r1", "r2"})
         CHECK(baseline_record_4045(*f.kv, id).has_value());
+}
+
+// ---------------------------------------------------------------------------------------------
+// #5604: stop() runs its KV stages at a terminal, shorter busy budget
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("#5604 stop(): under real SQLITE_BUSY every KV stage is cut at the stop budget, and the "
+          "budget stays lowered afterwards",
+          "[spark][guardian][baseline][reconcile][busy]") {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    HookGuard4045 hooks{*f.engine};
+
+    // Production values are 5 s and 1 s; scaled to 400 ms and 100 ms so the case stays well
+    // under a second while keeping the ratio: a stage that ran at the NORMAL budget would take
+    // 400 ms, which the per-stage bound below rejects.
+    f.kv->set_busy_timeout(400ms);
+    f.engine->set_stop_busy_timeout_for_test(100ms);
+    stage_n_4045(*rt, 1, "5604");
+
+    std::vector<std::pair<std::string, Clock::time_point>> marks;
+    f.engine->set_stop_stage_hook_for_test(
+        [&](const char* stage) { marks.emplace_back(stage, Clock::now()); });
+
+    // A second connection holds the write lock for the whole stop(): every KV write inside
+    // stop() (the loss-ledger write and the Stop pass's baseline write) really waits on a
+    // locked database and fails with SQLITE_BUSY.
+    sqlite3* holder = nullptr;
+    REQUIRE(sqlite3_open(f.db_.path.string().c_str(), &holder) == SQLITE_OK);
+    yuzu::test::ScopeExit close_holder{[&] { sqlite3_close(holder); }};
+    REQUIRE(sqlite3_exec(holder, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    const auto t0 = Clock::now();
+    f.engine->stop();
+    const auto t1 = Clock::now();
+    sqlite3_exec(holder, "ROLLBACK", nullptr, nullptr, nullptr);
+
+    const auto ms = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    REQUIRE(marks.size() == 4);
+    CHECK(marks[0].first == "journal_flush_1");
+    CHECK(marks[1].first == "worker_join");
+    CHECK(marks[2].first == "ledger");
+    CHECK(marks[3].first == "journal_flush_2");
+    // Stages that write nothing are instant; the ledger stage is one BUSY write at the stop
+    // budget (100 ms), not the 400 ms the store started with.
+    CHECK(ms(marks[0].second, marks[1].second) < 150.0);
+    CHECK(ms(marks[1].second, marks[2].second) < 150.0);
+    const double ledger = ms(marks[2].second, marks[3].second);
+    CHECK(ledger >= 100.0);
+    CHECK(ledger < 150.0);
+    // The Stop pass: one baseline write, also BUSY at the stop budget.
+    const double stop_pass = ms(marks[3].second, t1);
+    CHECK(stop_pass >= 100.0);
+    CHECK(stop_pass < 150.0);
+    CHECK(ms(t0, t1) < 1000.0);
+
+    // The pass ran and failed (the wait was shorter than the trouble threshold, so it is not a
+    // stall), and the capture stays staged: a lost-to-this-process capture, recaptured next boot.
+    CHECK(persister->persist_failures() == 1);
+    CHECK(persister->stop_skip_logs_for_test(GuardianBaselinePersister::StopSkip::Stalled) == 0);
+    CHECK(persister->stop_skip_logs_for_test(GuardianBaselinePersister::StopSkip::LateStart) == 0);
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    // Terminal: stop() never raises the budget again.
+    CHECK(f.kv->busy_timeout_for_test() == 100ms);
+}
+
+TEST_CASE("#5604 stop(): the budget is lowered BEFORE stop() waits for the engine mutex, so a stop "
+          "queued behind apply_rules also cuts that holder's in-flight write",
+          "[spark][guardian][baseline][reconcile][busy]") {
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    REQUIRE(persister != nullptr);
+    HookGuard4045 hooks{*f.engine};
+    CHECK(f.kv->busy_timeout_for_test() == yuzu::agent::kKvStoreBusyTimeout);
+
+    std::atomic<bool> in_apply{false};
+    std::atomic<bool> release{false};
+    int apply_rc = -1;
+    f.engine->set_apply_post_drain_hook_for_test([&] {
+        in_apply.store(true);
+        (void)yuzu::test::spin_until([&] { return release.load(); });
+    });
+    std::thread apply_thread([&] {
+        apply_rc = f.dispatch_raw(make_service_rule("r1", /*enabled=*/false), false).exit_code;
+    });
+    Join4045 join_apply{apply_thread};
+    yuzu::test::ScopeExit unpark_apply{[&] { release.store(true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return in_apply.load(); }));
+    // apply_rules holds mtx_ and is parked. stop() queues behind it: it has begun and lowered
+    // the budget while apply_rules still holds the mutex.
+    std::thread stop_thread([&] { f.engine->stop(); });
+    Join4045 join_stop{stop_thread};
+    yuzu::test::ScopeExit unpark_stop{[&] { release.store(true); }};
+    REQUIRE(yuzu::test::spin_until([&] {
+        return f.kv->busy_timeout_for_test() == yuzu::agent::kKvStoreStopBusyTimeout;
+    }));
+    CHECK(in_apply.load()); // apply_rules is still parked inside the engine mutex
+    release.store(true);
+    apply_thread.join();
+    stop_thread.join();
+    CHECK(apply_rc == 0);
+}
+
+TEST_CASE("#5604 the Stop pass's stall rule compares a failed write against the trouble "
+          "threshold, not against the pass's own 1 s wall",
+          "[spark][guardian][baseline][reconcile][busy]") {
+    using Trig = GuardianBaselinePersister::Trigger;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    stage_n_4045(*rt, 2, "5604s");
+    fail_baseline_writes_4045(f.db_.path);
+    persister->begin_stop();
+    const auto threshold = yuzu::agent::kBaselineStopTroubleThreshold.count();
+
+    SECTION("a failed write one millisecond under the threshold is not a stall") {
+        persister->set_post_write_hook_for_test([&] { clock.advance(threshold - 1); });
+        CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 2);
+        persister->set_post_write_hook_for_test(nullptr);
+        CHECK_FALSE(persister->persist_staged(*rt, Trig::Stop).skipped_after_stall);
+    }
+    SECTION("a failed write that took the threshold is a stall, although it is under the 1 s "
+            "wall (a BUSY write at the stop busy budget measures a little short of it)") {
+        persister->set_post_write_hook_for_test([&] { clock.advance(threshold); });
+        CHECK(persister->persist_staged(*rt, Trig::Forced).failed == 2);
+        persister->set_post_write_hook_for_test(nullptr);
+        CHECK(persister->persist_staged(*rt, Trig::Stop).skipped_after_stall);
+        CHECK(threshold < yuzu::agent::kBaselineStopBudget.max_wall.count());
+    }
 }
