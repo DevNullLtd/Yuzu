@@ -26,10 +26,12 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::sanitize_utf8
 
 #include <algorithm>
 #include <format>
 #include <string>
+#include <span>
 #include <string_view>
 #include <tuple>
 #include <vector>
@@ -51,6 +53,7 @@
 
 #ifdef __APPLE__
 // #2273: native CFBundle/SecStaticCode per-app enrichment for list_inventory.
+#include "installed_apps_bundle_ids.hpp"
 #include "installed_apps_macos_enrich.hpp"
 // Round-3 sync-speed fix: in-process receipt-plist reads (replaces most
 // pkgutil --pkg-info spawns) + the system_profiler-output memoization cache.
@@ -82,6 +85,11 @@
 // would change output bytes for interior-NUL values. Both headers carry the
 // do-not-merge note.
 #include "installed_apps_registry_utf8.hpp"
+// The Uninstall-key walk with typed hive-read status (#4711); a header so a
+// unit test drives it against a scratch key.
+#include "installed_apps_registry_walk.hpp"
+
+#include <spdlog/spdlog.h>
 
 // Shared per-user profile/hive ladder (#2771) — the canonical implementation
 // this plugin's private copy was replaced by.
@@ -95,6 +103,10 @@ namespace {
 namespace parsers = yuzu::installed_apps::parsers;
 #ifdef __APPLE__
 namespace macos_receipts = yuzu::installed_apps::macos_receipts;
+namespace bundle_ids = yuzu::installed_apps::bundle_ids;
+// The agent-core CFString cap must equal the `list` field cap (bytes stay identical).
+static_assert(yuzu::agent::kMaxCFStringBytes == parsers::kMaxListFieldBytes,
+              "cfstring_to_utf8 cap must equal installed_apps kMaxListFieldBytes");
 #endif
 
 // ── subprocess helper (Linux / macOS) ──────────────────────────────────────
@@ -126,11 +138,11 @@ constexpr std::size_t kToolOutputCap = 8u * 1024u * 1024u;
 // KNOWN RESIDUAL, accepted deliberately: this is checked BETWEEN items, never
 // mid-item, so the true worst case is the budget plus one item -- a 20 s child
 // deadline, or one synchronous CFBundle/SecStaticCode call, which has no
-// cancellation or deadline facility at all. Bounding a native CF read would
-// mean moving enrichment onto its own cancellable thread, a structural change
-// well beyond this PR. The hours-scale exposure is closed; a single stalled
-// native read remains theoretically unbounded and is recorded here rather than
-// papered over.
+// cancellation or deadline facility at all. Bounding this path needs the
+// agent-core bounded-pass shape `list` now uses (bundle_id_read.hpp) plus a
+// bounded SecStaticCode leg; not done here. The hours-scale exposure is closed;
+// a single stalled native read remains theoretically unbounded and is recorded
+// here rather than papered over.
 constexpr std::chrono::seconds kCollectionBudget{120};
 
 // An operator reading a log cannot decode `reason=3`.
@@ -252,52 +264,6 @@ bool icontains(const std::string& haystack, const std::string& needle) {
     return it != haystack.end();
 }
 
-// Replace invalid UTF-8 bytes with '?' to avoid protobuf serialization errors.
-// Windows registry strings are now read via the *W APIs + WideCharToMultiByte(CP_UTF8)
-// and are already valid UTF-8, so this is defence-in-depth there (#1662); it remains
-// load-bearing for the Linux/macOS subprocess paths, whose output encoding is unknown.
-std::string sanitize_utf8(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    size_t i = 0;
-    while (i < s.size()) {
-        auto c = static_cast<unsigned char>(s[i]);
-        if (c < 0x80) {
-            // ASCII
-            out += s[i];
-            ++i;
-        } else if ((c >> 5) == 0x06 && i + 1 < s.size() &&
-                   (static_cast<unsigned char>(s[i + 1]) >> 6) == 0x02) {
-            // Valid 2-byte sequence
-            out += s[i];
-            out += s[i + 1];
-            i += 2;
-        } else if ((c >> 4) == 0x0E && i + 2 < s.size() &&
-                   (static_cast<unsigned char>(s[i + 1]) >> 6) == 0x02 &&
-                   (static_cast<unsigned char>(s[i + 2]) >> 6) == 0x02) {
-            // Valid 3-byte sequence
-            out += s[i];
-            out += s[i + 1];
-            out += s[i + 2];
-            i += 3;
-        } else if ((c >> 3) == 0x1E && i + 3 < s.size() &&
-                   (static_cast<unsigned char>(s[i + 1]) >> 6) == 0x02 &&
-                   (static_cast<unsigned char>(s[i + 2]) >> 6) == 0x02 &&
-                   (static_cast<unsigned char>(s[i + 3]) >> 6) == 0x02) {
-            // Valid 4-byte sequence
-            out += s[i];
-            out += s[i + 1];
-            out += s[i + 2];
-            out += s[i + 3];
-            i += 4;
-        } else {
-            out += '?';
-            ++i;
-        }
-    }
-    return out;
-}
-
 // ── Windows: read apps from a registry uninstall key ──────────────────────
 
 #ifdef _WIN32
@@ -308,92 +274,35 @@ std::string sanitize_utf8(const std::string& s) {
 // namespace so the existing unqualified call sites resolve unchanged.
 using namespace yuzu::installed_apps::reg_utf8;
 
-// RAII closer for an HKEY. Closing every handle into a RegLoadKeyW-mounted hive
-// BEFORE the unload is load-bearing: RegUnLoadKeyW fails (ERROR_ACCESS_DENIED)
-// while any subtree handle is open, so a leaked HKEY on a throw path would defeat
-// the unload guard. Destruction order guarantees these callee handles close as
-// the exception leaves enumerate_uninstall_key, before the caller's unload guard
-// runs (#1662 Gate-8). Since #2771 that guard is agents/shared/win_reg_handle.hpp's
-// ScopedUserHive (do_list_per_user's own HiveUnloadGuard was deleted, migrated
-// onto the shared ladder) -- this file's HKeyCloser itself is unchanged and still
-// used for every enumerate_uninstall_key call, hive-mounted or not.
-struct HKeyCloser {
-    HKEY h;
-    explicit HKeyCloser(HKEY k) : h(k) {}
-    ~HKeyCloser() {
-        if (h)
-            RegCloseKey(h);
-    }
-    HKeyCloser(const HKeyCloser&) = delete;
-    HKeyCloser& operator=(const HKeyCloser&) = delete;
-};
+namespace reg_walk = yuzu::installed_apps::reg_walk;
 
-void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
-                             std::vector<AppInfo>& apps) {
-    HKEY hkey{};
-    if (RegOpenKeyExW(root, to_wide(subkey).c_str(), 0,
-                      KEY_READ | KEY_ENUMERATE_SUB_KEYS | extra_sam, &hkey) != ERROR_SUCCESS) {
-        return;
-    }
-    HKeyCloser hkey_guard{hkey};
+const std::wstring kUninstallKey = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 
-    // RegEnumKeyExW's lpcchName is a WCHAR COUNT, not a byte size. Bind the array
-    // size and every reset to one constant so the byte-vs-count unit cannot skew —
-    // the #1662 A->W conversion missed one reset site (gov Gate 3/4 BLOCKING).
-    constexpr DWORD kNameBufLen = 256;
-    wchar_t name_buf[kNameBufLen]{};
-    DWORD idx = 0;
-    DWORD name_len = kNameBufLen;
+std::span<const reg_walk::UninstallRoot> windows_roots() {
+    static const reg_walk::UninstallRoot roots[] = {
+        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, false}, // 64-bit HKLM
+        // 32-bit HKLM (WoW6432Node): absent on a host without WoW64. A key that does not
+        // exist has no entries, so ERROR_FILE_NOT_FOUND cannot under-report (every other
+        // status still degrades). HKLM-64 stays strict: setup always creates it, so its
+        // absence is a broken hive.
+        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_32KEY, true},
+        {HKEY_CURRENT_USER, kUninstallKey, 0, true}, // current user
+    };
+    return roots;
+}
 
-    while (RegEnumKeyExW(hkey, idx++, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
-           ERROR_SUCCESS) {
-        HKEY app_key{};
-        if (RegOpenKeyExW(hkey, name_buf, 0, KEY_READ | extra_sam, &app_key) == ERROR_SUCCESS) {
-            HKeyCloser app_guard{app_key};
-            // Policy per value: see read_reg_string. Only InstallLocation accepts
-            // REG_EXPAND_SZ; the four hashed fields and SystemComponent stay REG_SZ-only.
-            auto read_str = [&](const char* value_name, bool accept_expand_sz) {
-                return read_reg_string(app_key, value_name, accept_expand_sz);
-            };
-
-            auto display_name = read_str("DisplayName", false);
-            if (!display_name.empty()) {
-                // Meant to skip system components, but SystemComponent is a
-                // REG_DWORD and read_reg_string accepts strings only, so this test
-                // never matches today (tracked separately).
-                auto sys_component = read_str("SystemComponent", false);
-                if (sys_component == "1") {
-                    name_len = kNameBufLen;
-                    continue; // app_guard closes app_key
-                }
-
-                AppInfo app;
-                app.name = std::move(display_name);
-                app.version = read_str("DisplayVersion", false);
-                app.publisher = read_str("Publisher", false);
-                app.install_date = read_str("InstallDate", false);
-                app.install_location = read_str("InstallLocation", /*accept_expand_sz=*/true);
-                apps.push_back(std::move(app));
-            }
-        }
-        name_len = kNameBufLen;
-    }
+void log_failed_root(std::size_t i) {
+    static constexpr const char* kRootNames[] = {"HKLM-64", "HKLM-32", "HKCU"};
+    spdlog::warn("installed_apps: Uninstall root {} could not be fully read -- the "
+                 "collection is degraded",
+                 kRootNames[i]);
 }
 
 AppCollection get_installed_apps_windows() {
-    std::vector<AppInfo> apps;
-    // Native registry reads: no subprocess outcome to propagate. See
-    // do_list_inventory for why that is NOT a claim this leg cannot
-    // under-report.
-    const bool degraded = false;
-    static const char* kUninstallKey = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
-
-    // 64-bit HKLM
-    enumerate_uninstall_key(HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, apps);
-    // 32-bit HKLM (WoW6432Node)
-    enumerate_uninstall_key(HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_32KEY, apps);
-    // Current user
-    enumerate_uninstall_key(HKEY_CURRENT_USER, kUninstallKey, 0, apps);
+    auto walk = reg_walk::collect_uninstall_apps(windows_roots());
+    for (const auto i : walk.failed_roots)
+        log_failed_root(i);
+    auto apps = std::move(walk.apps);
 
     // Sort, `list`-only location layer, unique(): one pure pass shared with the
     // tests (installed_apps_parsers.hpp). The comparator and survivor are the
@@ -402,7 +311,7 @@ AppCollection get_installed_apps_windows() {
     // lexicographically smallest populated one in its run).
     parsers::dedupe_uninstall_records(apps);
 
-    return AppCollection{std::move(apps), degraded};
+    return AppCollection{std::move(apps), walk.degraded};
 }
 #endif
 
@@ -505,27 +414,6 @@ AppCollection get_installed_apps_macos() {
 
 namespace inv = yuzu::installed_apps::inventory;
 
-#ifdef _WIN32
-InvCollection get_inventory_windows() {
-    std::vector<inv::InvRecord> recs;
-    auto win = get_installed_apps_windows();
-    for (auto& app : win.apps) {
-        inv::InvRecord r;
-        r.name = std::move(app.name);
-        r.version = std::move(app.version);
-        r.publisher = std::move(app.publisher);
-        r.install_date = std::move(app.install_date);
-        r.kind = "app";
-        r.ecosystem = "windows";
-        // epoch/release/signature honest-empty: the Uninstall hive stores no
-        // NEVRA and no signature. arch stays empty too — inferring x64/x86
-        // from which hive a key sat in would be synthesis, not storage.
-        recs.push_back(std::move(r));
-    }
-    return InvCollection{std::move(recs), false};
-}
-#endif
-
 #ifdef __linux__
 InvCollection get_inventory_linux() {
     bool degraded = false;
@@ -625,52 +513,39 @@ InvCollection get_inventory_linux() {
 // faster still, so 5000 of each stays well inside kCollectionBudget, which is
 // the bound that actually protects liveness. Reaching 5000 means something is
 // wrong, which is exactly when degrading is right.
-constexpr std::size_t kMaxEnrichApps = 5000;
+using bundle_ids::kMaxEnrichApps; // shared with the capped-warning text (installed_apps_bundle_ids.hpp)
 constexpr std::size_t kMaxPkgutilPackages = 5000;
 
-// Fills AppInfo::bundle_id (CFBundle only, no SecStaticCode) for the `list`
-// action. Called from do_list ONLY: do_query and do_list_per_user also use
-// get_installed_apps_macos() but never emit bundle_id, so filling it inside the
-// acquisition would waste up to kMaxEnrichApps CFBundleCreate calls there.
-// YUZU_HAVE_SECURITY_FRAMEWORK: meson.build resolves ['Security',
-// 'CoreFoundation'] as ONE dependency() call that never partially resolves, so
-// CFBundle is available exactly when the enrichment header's guard is.
-// Same kMaxEnrichApps / over_budget shape as get_inventory_macos_uncached, but
-// `list` is interactive and the column is informational: on exhaustion the
-// remaining rows keep an empty bundle_id (rendered "-") and the run is NOT
-// reported degraded -- unlike the daily-sync leg, where a silently hollowed-out
-// security-posture field must not publish as authoritative.
-// Budget semantics: kCollectionBudget is checked BETWEEN apps, so it bounds how
-// many CFBundle reads start, not how long one takes -- a single wedged read (a
-// stale network mount under a listed location) holds this dispatch worker until
-// it returns, the accepted residual recorded at kCollectionBudget's declaration.
-// A complete `list` (system_profiler + parse + this pass) measured 1.4-2.3 s wall
-// for 323 apps on the reference Mac (2026-09-21); the pass is inside the run-to-run noise
-// of the one system_profiler call, so the budget is a runaway guard, not the
-// expected cost.
-[[nodiscard]] std::vector<AppInfo> with_bundle_ids(std::vector<AppInfo> apps) {
-    const auto start = std::chrono::steady_clock::now();
-    const auto over_budget = [start]() {
-        return std::chrono::steady_clock::now() - start > kCollectionBudget;
-    };
-    std::size_t located = 0, filled = 0;
-    for (const auto& app : apps)
-        located += !app.install_location.empty();
-    for (auto& app : apps) {
-        if (app.install_location.empty())
-            continue;
-        if (filled >= kMaxEnrichApps || over_budget()) {
-            // The alphabetical tail loses bundle_id ("-", indistinguishable from
-            // a bundle without one); the log line is the only signal.
-            spdlog::warn("installed_apps: list bundle_id enrichment stopped after {} of {} "
-                         "located apps (cap {} apps / {} s); remaining rows carry '-'",
-                         filled, located, kMaxEnrichApps, kCollectionBudget.count());
-            break;
-        }
-        ++filled;
-        app.bundle_id = yuzu::installed_apps::macos_enrich::bundle_id_for(app.install_location);
-    }
-    return apps;
+// Fills AppInfo::bundle_id for the `list` action through ONE bounded, abandonable
+// pass in agent-core (yuzu::agent::read_bundle_ids_bounded, the CFBundle read
+// lives there so a detached worker never outlives a dlclose()d plugin image).
+// Called from do_list ONLY: do_query and do_list_per_user also use
+// get_installed_apps_macos() but never emit bundle_id.
+// The pass has its own deadline rather than kCollectionBudget: that budget is
+// checked BETWEEN apps and bounds a loop, whereas this one bounds a single
+// abandonable pass -- a wedged read (stale network mount) costs at most this long
+// and the worker is left behind (a later pass reports Busy, never stacks).
+// Absent-vs-not-read: the 7-field row is frozen, so a cut-short or capped pass is
+// reported by the leading `warning|bundle_id_*` row and a CONSTRAINED status
+// (installed_apps_bundle_ids.hpp), not by the rows themselves.
+inline constexpr std::chrono::milliseconds kBundleIdPassDeadline{30'000};
+
+[[nodiscard]] bundle_ids::BundleIdPassOutcome with_bundle_ids(std::vector<AppInfo>& apps) {
+    auto c = bundle_ids::collect_bundle_id_paths(apps);
+    auto outcome = c.outcome;
+    outcome.deadline = std::chrono::duration_cast<std::chrono::seconds>(kBundleIdPassDeadline);
+    if (c.paths.empty())
+        // Nothing to read: Completed, no bounded thread. This is the one dispatch shape
+        // that skips the reader; every list with >=1 located path makes exactly one call.
+        return outcome;
+
+    const auto r = yuzu::agent::read_bundle_ids_bounded(c.paths, kBundleIdPassDeadline);
+    outcome.status = r.status;
+    outcome.read_count = r.read_count;
+    bundle_ids::apply_bundle_ids(apps, r, c.index_map);
+    if (const auto row = bundle_ids::bundle_id_warning_row(outcome))
+        spdlog::warn("installed_apps: {}", *row);
+    return outcome;
 }
 
 InvCollection get_inventory_macos_uncached() {
@@ -1055,16 +930,14 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
     // already skips the whole cycle on a nonzero rc; this reports into that
     // existing contract rather than inventing a new signal.
 #ifdef _WIN32
-    // Windows acquires natively (registry), so there is no SUBPROCESS outcome to
-    // propagate and `degraded` stays false here. That is NOT a claim the Windows
-    // leg cannot under-report: enumerate_uninstall_key returns silently if
-    // RegOpenKeyExW fails and stops at the first non-ERROR_SUCCESS from
-    // RegEnumKeyExW, so a partial registry walk publishes as complete. That is
-    // pre-existing behaviour this PR does not touch or worsen, and closing it
-    // needs its own change plus Windows-side testing -- flagged in the gate
-    // report rather than silently implied to be covered here.
-    auto collected = get_inventory_windows();
-#elif defined(__linux__)
+    // Windows acquires natively (registry). A root that could not be opened or
+    // enumerated to the end, or an app key that was denied, marks the walk
+    // degraded: reg_walk::list_inventory then emits no rows, declares
+    // CONSTRAINED/PARTIAL and returns rc 1 -- the same contract as below.
+    return reg_walk::list_inventory(ctx, windows_roots(), reg_walk::RealRegOps{},
+                                    log_failed_root);
+#else
+#if defined(__linux__)
     auto collected = get_inventory_linux();
 #elif defined(__APPLE__)
     auto collected = get_inventory_macos();
@@ -1072,42 +945,34 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
     InvCollection collected;
 #endif
 
-#if defined(__linux__) || defined(__APPLE__)
-    if (collected.degraded) {
+    if (collected.degraded)
         spdlog::warn("installed_apps: list_inventory acquisition was degraded -- reporting "
                      "rc=1 so the daily sync skips this cycle instead of committing a "
                      "partial inventory as authoritative");
-        return 1;
-    }
-#endif
 
     // No sentinel row: an empty result is empty output + rc 0. The sync
     // source's empty-parse guard skips the cycle rather than wiping state.
-    for (const auto& r : collected.records) {
-        if (r.name.empty())
-            continue; // contract: row dropped if name is empty
-        ctx.write_output(sanitize_utf8(inv::format_inv_row(r)));
-    }
-    return 0;
+    return parsers::emit_inventory(ctx, collected.degraded, collected.records,
+                                   [](const inv::InvRecord& r) {
+                                       return yuzu::util::sanitize_utf8(inv::format_inv_row(r));
+                                   });
+#endif
 }
 
 // Emit an honest failure row for a degraded operator-facing action and tell
 // the caller to bail. Returns true when the collection is healthy and the
 // action should proceed. Kept as one helper so `list`, `query` and
 // `list_per_user` cannot drift apart on the wording or the rc.
-bool report_if_degraded([[maybe_unused]] yuzu::CommandContext& ctx, bool degraded,
-                        [[maybe_unused]] std::string_view action) {
-    if (!degraded)
-        return true;
-#if defined(__linux__) || defined(__APPLE__)
-    spdlog::warn("installed_apps: '{}' acquisition was degraded -- reporting an error rather "
-                 "than presenting a partial or empty list as authoritative",
-                 action);
+bool report_if_degraded(yuzu::CommandContext& ctx, bool degraded, std::string_view action) {
+    if (degraded)
+        spdlog::warn("installed_apps: '{}' acquisition was degraded -- reporting an error "
+                     "rather than presenting a partial or empty list as authoritative",
+                     action);
+#ifdef _WIN32
+    return parsers::report_degraded(ctx, degraded, parsers::kRegistryCauses);
+#else
+    return parsers::report_degraded(ctx, degraded);
 #endif
-    ctx.write_output("error|installed_apps: acquisition degraded (tool timed out, was killed, "
-                     "failed to start, exited nonzero, or its output was truncated) -- result "
-                     "withheld rather than reported as complete");
-    return false;
 }
 
 // ── list action ───────────────────────────────────────────────────────────
@@ -1132,8 +997,15 @@ int do_list(yuzu::CommandContext& ctx) {
         return 1;
 
 #if defined(__APPLE__)
-    // After the degraded guard: a withheld result must not pay the CFBundle pass.
-    apps.apps = with_bundle_ids(std::move(apps.apps));
+    // After the degraded guard: a withheld result must not pay the bundle-id pass.
+    const auto bundle_outcome = with_bundle_ids(apps.apps);
+    const auto bundle_status = bundle_ids::bundle_id_status(bundle_outcome);
+    ctx.set_result_status(bundle_status.status, bundle_status.completeness,
+                          bundle_status.provenance);
+    // Warning row BEFORE the app rows: a prefix, so a consumer reading sequentially
+    // sees the caveat first (list_per_user's warning rows are trailing, by contrast).
+    if (const auto row = bundle_ids::bundle_id_warning_row(bundle_outcome))
+        ctx.write_output(*row);
 #endif
 
     if (apps.apps.empty()) {
@@ -1142,7 +1014,7 @@ int do_list(yuzu::CommandContext& ctx) {
     }
 
     for (const auto& app : apps.apps)
-        ctx.write_output(sanitize_utf8(parsers::format_app_row(app)));
+        ctx.write_output(yuzu::util::sanitize_utf8(parsers::format_app_row(app)));
     return 0;
 }
 
@@ -1177,7 +1049,7 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
                 ctx.write_output("found|true");
                 found = true;
             }
-            ctx.write_output(sanitize_utf8(
+            ctx.write_output(yuzu::util::sanitize_utf8(
                 std::format("app|{}|{}|{}", app.name, app.version.empty() ? "-" : app.version,
                             app.publisher.empty() ? "-" : app.publisher)));
         }
@@ -1301,8 +1173,6 @@ private:
         // SeRestore, and fell back to the SID as a display name in violation
         // of ADR-0024 D11. It now rides the shared ladder in
         // agents/shared/win_profiles.hpp, which is the canonical one.
-        static const char* kUninstallKey =
-            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 
         bool profiles_ok = false;
         bool truncated = false;
@@ -1317,12 +1187,20 @@ private:
         const auto profiles = yuzu::profiles::build_profile_list(records, hku_subkeys);
 
         std::size_t privilege_missing = 0;
+        std::size_t hive_read_failed = 0;
         for (const auto& profile : profiles) {
             std::vector<AppInfo> user_apps;
             yuzu::win::HiveAccessReport report;
             const auto status = yuzu::win::with_user_hive(
                 profile.sid, profile.profile_path,
-                [&](HKEY root) { enumerate_uninstall_key(root, kUninstallKey, 0, user_apps); },
+                [&](HKEY root) {
+                    // A user hive often has no Uninstall key (absent_ok); anything
+                    // else (e.g. access denied) under-reports this profile.
+                    const reg_walk::UninstallRoot r{root, kUninstallKey, 0, true};
+                    if (reg_walk::enumerate_uninstall_key(r, user_apps) ==
+                        reg_walk::HiveRead::failed)
+                        ++hive_read_failed;
+                },
                 &report);
 
             // A leaked mount is the same system-wide fact wherever it happens,
@@ -1335,7 +1213,7 @@ private:
                 for (const auto& line : yuzu::profiles::render_hive_access_lines(
                          yuzu::profiles::HiveAccessStatus::ok, true, report.mount_name,
                          profile.sid))
-                    ctx.write_output(sanitize_utf8(line));
+                    ctx.write_output(yuzu::util::sanitize_utf8(line));
             }
             if (status == yuzu::win::HiveAccessStatus::privilege_missing)
                 ++privilege_missing;
@@ -1354,7 +1232,7 @@ private:
                 // splits these rows into (key, rest) — the opposite of the
                 // registry list_profiles case, where a leading tag caused the
                 // hp-B1 column shift. Do not strip it.
-                ctx.write_output(sanitize_utf8(
+                ctx.write_output(yuzu::util::sanitize_utf8(
                     std::format("user_app|{}|{}|{}|{}|{}", username,
                                 app.name, app.version.empty() ? "-" : app.version,
                                 app.publisher.empty() ? "-" : app.publisher,
@@ -1368,6 +1246,7 @@ private:
             ctx.write_output(yuzu::profiles::render_profile_list_truncated_warning(
                 yuzu::win::kMaxProfiles));
         }
+        parsers::report_hive_read_failed(ctx, hive_read_failed);
         if (privilege_missing > 0) {
             ctx.write_output(std::format(
                 "warning|privilege_missing: SeBackupPrivilege/SeRestorePrivilege could not be "
@@ -1383,7 +1262,7 @@ private:
         if (!report_if_degraded(ctx, apps.degraded, "list_per_user"))
             return 1;
         for (const auto& app : apps.apps) {
-            ctx.write_output(sanitize_utf8(
+            ctx.write_output(yuzu::util::sanitize_utf8(
                 std::format("user_app|system|{}|{}|{}|{}", app.name,
                             app.version.empty() ? "-" : app.version,
                             app.publisher.empty() ? "-" : app.publisher,
@@ -1398,7 +1277,7 @@ private:
         if (!report_if_degraded(ctx, apps.degraded, "list_per_user"))
             return 1;
         for (const auto& app : apps.apps) {
-            ctx.write_output(sanitize_utf8(
+            ctx.write_output(yuzu::util::sanitize_utf8(
                 std::format("user_app|system|{}|{}|{}|{}", app.name,
                             app.version.empty() ? "-" : app.version,
                             app.publisher.empty() ? "-" : app.publisher,
@@ -1415,7 +1294,7 @@ private:
                 return 1;
             auto brew_out = std::move(brew_res.output);
             for (auto& rec : parsers::parse_brew_list(brew_out)) {
-                ctx.write_output(sanitize_utf8(std::format(
+                ctx.write_output(yuzu::util::sanitize_utf8(std::format(
                     "user_app|brew|{}|{}|-|-", rec.name, rec.version.empty() ? "-" : rec.version)));
             }
         }

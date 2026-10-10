@@ -22,7 +22,9 @@
 #include <yuzu/agent/subprocess_runner.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -360,6 +362,48 @@ map_execution_result(const yuzu::agent::SubprocessResult& result) {
         output += "\n[output truncated at 16 MiB]";
     return ExecutionWireResult{result.exit_code == 0 ? "ok" : "error", result.exit_code,
                                std::move(output)};
+}
+
+/// Upper bound for cleanup's `hours`. Matches `maximum` in
+/// content/definitions/content_dist.yaml; keeps the cutoff arithmetic far
+/// below the point (1.3 million hours measured on Linux/libstdc++) where
+/// `now - hours(h)` wraps into the future and removes every staged file.
+inline constexpr int kMaxCleanupHours = 876000;
+
+/// Parse cleanup's `hours` text into [0, kMaxCleanupHours]. Follows std::stoi's
+/// prefix rules (leading whitespace, optional sign, digits, trailing text
+/// ignored) but never throws and never wraps: a number of any magnitude
+/// saturates at the maximum, zero and negative values (documented "remove
+/// every staged file") become 0, and text with no leading number (including
+/// empty) yields `fallback`.
+[[nodiscard]] constexpr int parse_cleanup_hours(std::string_view text, int fallback) noexcept {
+    std::size_t i = 0;
+    while (i < text.size() && (text[i] == ' ' || (text[i] >= '\t' && text[i] <= '\r')))
+        ++i;
+    bool negative = false;
+    if (i < text.size() && (text[i] == '+' || text[i] == '-'))
+        negative = text[i++] == '-';
+    if (i >= text.size() || text[i] < '0' || text[i] > '9')
+        return fallback;
+    long long value = 0;
+    for (; i < text.size() && text[i] >= '0' && text[i] <= '9'; ++i) {
+        // Stop growing once the value is far above the maximum: the digit
+        // loop must not overflow on an arbitrarily long number.
+        if (value < 1'000'000'000LL)
+            value = value * 10 + (text[i] - '0');
+    }
+    if (negative)
+        return 0;
+    return value > kMaxCleanupHours ? kMaxCleanupHours : static_cast<int>(value);
+}
+
+/// Whether cleanup removes a file: only when its age was actually read and is older than
+/// `cutoff`. last_write_time(ec) returns file_time_type::min() on error, which compares as
+/// older than any cutoff, so a read failure must never count as "old".
+[[nodiscard]] inline bool cleanup_is_stale(const std::error_code& mtime_ec,
+                                           std::filesystem::file_time_type mtime,
+                                           std::filesystem::file_time_type cutoff) noexcept {
+    return !mtime_ec && mtime < cutoff;
 }
 
 } // namespace yuzu::content_dist::exec

@@ -15,8 +15,8 @@
 ///
 /// Failure posture (ADR-0041), the load-bearing invariant:
 ///  - **Authz reads FAIL CLOSED.** `check_permission` /
-///    `check_scoped_permission` / `holds_permission_via_any_group` /
-///    `check_role_has_permission` keep their `bool`/DENY-on-error contract: a
+///    `check_scoped_permission` / `holds_permission_via_any_group` keep their
+///    `bool`/DENY-on-error contract: a
 ///    store-not-open, pool-acquire timeout, or query error returns `false`
 ///    (deny), NEVER `true`. The list/scope reads return the empty /
 ///    most-restrictive result on degrade. Callers that must distinguish
@@ -64,6 +64,16 @@ class PgPool;
 namespace yuzu::server {
 
 class ManagementGroupStore; // forward declaration
+
+/// Error strings the `RbacStore` read accessors return in `std::unexpected` when the read
+/// cannot be answered. They are a CONTRACT with `authz::ceiling_degrade_reason`
+/// (authz_gates.cpp), which maps a failed ceiling read to a `yuzu_server_rbac_read_degrade_total`
+/// reason label by matching these prefixes: every producer and that mapping use these
+/// constants, never a re-typed literal. A failed query is `"query failed: "` followed by the
+/// libpq message and has no constant (it is the label mapping's fallthrough).
+inline constexpr std::string_view kRbacErrStoreNotOpen = "rbac store not open";
+inline constexpr std::string_view kRbacErrPoolAcquireTimeout = "pool acquire timeout";
+inline constexpr std::string_view kRbacErrCircuitBreakerOpen = "circuit breaker open";
 
 struct RbacRole {
     std::string name;
@@ -570,10 +580,21 @@ public:
                                   const std::string& operation,
                                   const ManagementGroupStore* mgmt_store) const;
 
-    /// Check if a specific role grants a permission (for service-scoped token
-    /// validation). FAIL-CLOSED: false on any store error.
-    bool check_role_has_permission(const std::string& role_name, const std::string& securable_type,
-                                   const std::string& operation) const;
+    /// The ONE read deciding whether a role grants a (securable, operation) pair (extend,
+    /// never fork). It reads the single `role_permissions` row for the pair (the table's
+    /// primary key is `(role_name, securable_type, operation)`, so there is at most one):
+    /// `allow` => true; `deny`, any other effect text, or an absent pair => false; a failed
+    /// read => `unexpected(msg)` (never a false allow). `authz::service_ceiling_check`
+    /// delegates here.
+    /// The read goes through the same breaker and short acquire budget as the hot authz
+    /// reads, so a degraded store fails fast instead of pinning a worker: the error is then
+    /// `kRbacErrCircuitBreakerOpen` or `kRbacErrPoolAcquireTimeout` (both map to the
+    /// `pool_acquire_timeout` degrade label in `authz::ceiling_degrade_reason`), or
+    /// `"query failed: ..."`.
+    [[nodiscard]] std::expected<bool, std::string>
+    role_permission_allowed_checked(const std::string& role_name,
+                                    const std::string& securable_type,
+                                    const std::string& operation) const;
 
     /// All effective permissions for a user (for UI display).
     std::vector<Permission> get_effective_permissions(const std::string& username) const;
@@ -583,6 +604,17 @@ public:
     std::vector<std::string> list_operations() const;
 
 private:
+    /// Breaker-gated, `kAuthzAcquireTimeout` read of the one `role_permissions` row for a
+    /// (role, securable, operation) triple, for request-path callers
+    /// (`role_permission_allowed_checked`): the effect text, or `nullopt` when the role has no
+    /// row for the pair. Admin reads keep the wider `get_role_permissions_checked` budget.
+    /// Errors: `kRbacErrStoreNotOpen`, `kRbacErrCircuitBreakerOpen`,
+    /// `kRbacErrPoolAcquireTimeout`, `"query failed: ..."`.
+    std::expected<std::optional<std::string>, std::string>
+    role_permission_effect_authz_checked(const std::string& role_name,
+                                         const std::string& securable_type,
+                                         const std::string& operation) const;
+
     // #2703 Gate 7 item 3 — same shape as PreflightRoutesTestAccess /
     // DashboardResultsColumnsTestAccess: user_rbac_group_names/role_effects_for
     // are legitimately private (internal helpers `resolve_perm_groups` shares),

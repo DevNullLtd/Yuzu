@@ -63,6 +63,12 @@ Deps make_deps(UploadGrantStore& store, const std::filesystem::path& blob_root,
     deps.list_read_fn = [](const std::string&) {
         return UploadGrantListAuthorization{UploadGrantListDecision::kAdmitAll, {}};
     };
+    // Required at registration. These cases build their sessions without a service scope, so
+    // the closure is never reached; the real deny is exercised in
+    // test_upload_grants_service_scope.cpp.
+    deps.deny_service_scoped_fn = [](const httplib::Request&, httplib::Response&,
+                                     const std::string&, const std::string&, const std::string&,
+                                     const std::string&) { return false; };
     deps.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
                        const std::string&, const std::string&, const std::string&) { return true; };
     deps.store = &store;

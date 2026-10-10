@@ -930,11 +930,12 @@ Reversing the order strands the fleet until every agent is re-pointed.
 **Compromised-gateway caveat:** one-way TLS authenticates the **gateway to the
 agent**, not the agent to the gateway. It closes the on-path eavesdrop/inject of
 the plaintext edge, but a *compromised gateway itself* can still inject commands
-to the fleet — the compensating controls are app-layer: the server's
-gateway-authoritative `gateway_observed_peer` attribution and the enrollment
-approval workflow. Full cryptographic agent-to-gateway identity (so the gateway
-can't forge an agent) arrives with the through-gateway attestation work gated on
-PR5d / the QUIC migration (#376).
+to the fleet — the compensating control is app-layer: the enrollment approval
+workflow. (The server also accepts gateway-authoritative `gateway_observed_peer`
+attribution, but the gateway does not populate that field yet — see #1172 below.)
+Full cryptographic agent-to-gateway identity (so the gateway can't forge an
+agent) is tracked in the through-gateway attestation work (#1292, design in
+#5578); no release is committed.
 
 #### End-to-end enablement runbook (manual / interim)
 
@@ -1049,8 +1050,8 @@ yuzu-server --gateway-upstream "0.0.0.0:50055"
 > `RegisterRequest.gateway_observed_peer` field that carries the agent origin
 > (recording `source_ip`=agent origin and `gateway_ip`=transport peer when
 > present), but the gateway does not yet populate it — today's grpcbox transport
-> cannot observe the direct agent peer, and the durable source arrives with the
-> QUIC transport migration (#376). Until then, SIEM/audit consumers correlating
+> does not expose the direct agent peer to the gateway's handlers; the fix is
+> tracked in #1172. Until then, SIEM/audit consumers correlating
 > `source_ip` with network logs on this path will see the gateway's address.
 
 ### What happens when the server restarts

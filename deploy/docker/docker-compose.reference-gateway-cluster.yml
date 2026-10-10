@@ -32,7 +32,7 @@
 ## configuration needed for the cluster to form.
 services:
   gateway:
-    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.14.0}
+    image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.14.1}
     # NO container_name: (Compose refuses to scale a named service) and NO
     # host-published ports (they would collide across replicas — nothing
     # outside this Compose network needs to reach a specific replica by

@@ -172,7 +172,12 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # with a deliberate, reviewed "no MCP twin" reason). They are genuinely new
 # routes, never expected to flip to "twinned", so the count rises 203 -> 205
 # by design rather than regressing.
-BASELINE_UNTWINNED = 205
+#
+# 2026-10-06 (legacy /inventory fragment removal): the four dead
+# /fragments/inventory/{devices,device,find,find/results} rows are deleted along
+# with their routes (two `planned:#2146`, two `composed-of:`), so the count
+# falls 205 -> 201 -- the value the checker itself reported after the deletion.
+BASELINE_UNTWINNED = 201
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

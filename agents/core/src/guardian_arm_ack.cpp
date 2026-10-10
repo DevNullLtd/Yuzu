@@ -128,33 +128,23 @@ GuardianArmAckLedger::~GuardianArmAckLedger() = default;
 
 void GuardianArmAckLedger::begin_application(std::uint64_t generation, std::string content_id,
                                              bool full_sync, std::size_t applied) {
-    // rung 9c PR-5e (#4221, K-bound closeout, decision 1): decide the incoming
-    // application's reapply_count BEFORE current_ is touched - an exact identity
-    // match against the OUTGOING application (same comparison decide_retry() already
-    // uses: both digests real SHA-256, not a sentinel) inherits its saturated count;
-    // anything else - a distinct generation/content_id/full_sync, an invalid digest
-    // on either side, or no prior application at all - starts fresh at 0. Read-only
-    // string/int comparisons only, nothing here can throw.
-    std::size_t reapply_count = 0;
-    if (current_ && current_->generation == generation && current_->full_sync == full_sync &&
-        is_sha256_hex(current_->content_id) && is_sha256_hex(content_id) &&
-        current_->content_id == content_id) {
-        reapply_count = std::min(current_->reapply_count + 1, kReapplyWaiverThreshold);
-    }
     // Unconditionally replaces whatever was open - Astra opine review: "New
     // application: stale receipts cannot acknowledge it." The old Application's
     // pending map (if any) is simply destroyed here; its receipts' claims stay
     // owned by the runtime's own claims_ registry regardless (ArmReceipt is an
     // observation handle - see the header). Built LOCALLY and published only at the
     // end (rung 9c PR-5e, governance finding UP-1's own precedent applied here too):
-    // a make_unique/allocation throw here leaves current_ - and its reapply_count -
-    // completely untouched, matching apply_rules()'s own firewall around this call.
+    // a make_unique/allocation throw here leaves current_ completely untouched,
+    // matching apply_rules()'s own firewall around this call. A fresh Application also
+    // starts wedge_suppress_count at 0 (#5459): the safety valve's budget is reset ONLY
+    // here and in retire(). Replacing the open application wholesale also drops the
+    // retry obligation of any rule a partial (delta) push omits: a known limit, see the
+    // design doc R5.3 known limits and flip-gate AC-11.
     auto next = std::make_unique<Application>();
     next->generation = generation;
     next->content_id = std::move(content_id);
     next->full_sync = full_sync;
     next->applied = applied;
-    next->reapply_count = reapply_count;
     current_ = std::move(next);
 }
 
@@ -201,7 +191,7 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
     // small, rare population compared to a full ruleset - a bounded pass with a
     // resume cursor would be over-built for that shape here.
     //
-    // rung 9c PR-5e (#4221, K-bound closeout - adversarial review finding, Kimi K3 +
+    // rung 9c PR-5e (#4221 - adversarial review finding, Kimi K3 +
     // Codex Sol independently converging): this MUST be the combined
     // receipt_recovery_status() accessor, one registry_mu_ acquisition per entry -
     // NOT two sequential calls to receipt_recovered() then receipt_wedge_k_eligible()
@@ -227,31 +217,31 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             it = current_->failed_receipts.erase(it);
             break;
         case GuardianSparkRuntime::RecoveryStatus::WedgeEligible:
+        case GuardianSparkRuntime::RecoveryStatus::CompensationPending:
+            // #5459 (option D): both are OUTSTANDING wedges and both stay retained, so
+            // decide_retry() keeps a handle on them. CompensationPending (#4472: the
+            // late result has returned and its compensating teardown is outstanding)
+            // used to be erased here as Blocking, which destroyed the only handle the
+            // ledger had and made every held push pay a full teardown. Retaining it
+            // never acknowledges anything: resolved_failed stays counted, so
+            // can_advance() stays false until the teardown pops the claim.
             ++it;
             break;
         case GuardianSparkRuntime::RecoveryStatus::Blocking:
-            // rung 9c PR-5e (#4221, K-bound closeout): this entry's K-eligibility has
-            // settled to false since it was retained - a Dispatching-window race
-            // corrected to a genuine Failed/Stopped/AdmissionRejected outcome, or the
-            // claim was popped from its key's FIFO by a real completion (the
-            // "still-claimed" requirement; see receipt_wedge_k_eligible()'s own doc
-            // comment). It is now an ORDINARY blocking failure - never K-waivable -
-            // so it is dropped from the waiver-eligible set here, but resolved_failed
-            // is deliberately left UNTOUCHED: this is still a genuine, counted
-            // failure, only its membership in the Wedged-only carve-out changes. This
-            // is what keeps can_advance()'s `resolved_failed == failed_receipts.size()`
-            // check a SAFE predicate rather than a stale one.
-            //
-            // #4472: this is also where a wedge whose late result has returned and
-            // whose compensating teardown is outstanding settles (compensation_finished is
-            // false, so it is not K-eligible). Erasing it from failed_receipts while
-            // resolved_failed stays counted is conservative: the generation stays HELD until
-            // a later application, so the server keeps re-pushing. That conservatism, and any
-            // future recovery owner for the unarmed-after-K class (#5459), depends on ONE
-            // runtime invariant: compensation_finished=true is always written in the same
+            // This entry has settled to a genuine, non-outstanding failure since it
+            // was retained - a Dispatching-window race corrected to a genuine
+            // Failed/Stopped/AdmissionRejected outcome, or the claim was popped from
+            // its key's FIFO by a real completion nobody adopted (a late failure, or a
+            // compensating teardown that finished). It is an ORDINARY failure now, so
+            // it is dropped from the outstanding-wedge set, but resolved_failed is
+            // deliberately left UNTOUCHED: it is still a genuine, counted failure.
+            // That makes `resolved_failed != failed_receipts.size()`, which is exactly
+            // what forces decide_retry() to Reapply (the rule must be re-armed), and
+            // keeps can_advance() false. The runtime invariant this depends on
+            // (#4472): compensation_finished=true is always written in the same
             // critical section as the pop of the claim (or the dispatch -> Queued
-            // double-fault hand-back), so a Blocking reading never races a claim that is
-            // finished but still the Dispatched head.
+            // double-fault hand-back), so a Blocking reading never races a claim that
+            // is finished but still the Dispatched head.
             it = current_->failed_receipts.erase(it);
             break;
         }
@@ -260,7 +250,7 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
     std::size_t resolved = 0;
     for (auto it = current_->pending.begin();
         it != current_->pending.end() && resolved < max_per_tick;) {
-        // rung 9c PR-5e (#4221, K-bound closeout - cpp-safety governance finding):
+        // rung 9c PR-5e (#4221 - cpp-safety governance finding):
         // MUST be the combined receipt_status_wedge_aware() atomic read, one
         // registry_mu_ acquisition - NOT receipt_status() followed by a separate
         // receipt_wedge_k_eligible() call on the Wedged case (an earlier version
@@ -270,8 +260,9 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
         // popped the claim - the receipt would be counted as an ordinary failure
         // below (the fallthrough is unconditional on `status` alone) while never
         // being retained in failed_receipts, permanently desyncing
-        // resolved_failed from failed_receipts.size() for this application (self-
-        // heals only on the next identical retry). Same TOCTOU class the
+        // resolved_failed from failed_receipts.size() for this application (which
+        // decide_retry() reads as a non-wedge failure and answers with a Reapply, so it
+        // self-heals on the next identical retry). Same TOCTOU class the
         // adversarial review already found and fixed in the recovery-scan loop
         // above (receipt_recovery_status()'s own doc comment), reachable here too
         // until this single-read fix.
@@ -285,13 +276,13 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
         //
         // rung 9c PR-5c (#4221): CongestionExpired and Wedged both fold into
         // resolved_failed exactly like the pre-split Expired did - neither
-        // represents a committed arm. This PR adds classification only, not the
-        // later K-bound acknowledgement policy (5e): a Wedged receipt still
-        // counts as an ordinary resolved failure on every drain, and a repeated
+        // represents a committed arm. A Wedged receipt counts as an ordinary
+        // resolved failure on every drain, and a repeated
         // application can still count the same wedge again - nothing about up-2's
         // re-observation changes that (re-observation exists so a TYPED Wedged
         // status reaches this ledger at all, not to change what it means once it
-        // arrives).
+        // arrives). #5459 (option D) removed the K-bound acknowledgment entirely: a
+        // counted wedge holds the generation until recovered or replaced.
         using S = GuardianSparkRuntime::ReceiptStatus;
         switch (status) {
         case S::Pending:
@@ -310,9 +301,10 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             // explicit here avoids coupling this case's own lifetime to the
             // shared fallthrough body's unrelated edits.
             //
-            // rung 9c PR-5e (#4221, K-bound closeout): retain it into the
-            // K-eligible set ONLY if `wedge_aware.wedge_eligible` ALSO read true
-            // in the SAME atomic read that produced `status == Wedged` above -
+            // rung 9c PR-5e (#4221), reshaped by #5459 (option D): retain it into the
+            // outstanding-wedge set ONLY if `wedge_aware.wedge_eligible ||
+            // wedge_aware.compensation_pending` ALSO read true in the SAME atomic
+            // read that produced `status == Wedged` above -
             // NOT unconditionally on every Wedged status, and NOT via a second,
             // separately-locked call (see this loop's own comment above the
             // switch for why a second call would reintroduce a TOCTOU).
@@ -325,8 +317,10 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             // scan loop above only re-validates EXISTING entries from a PRIOR
             // drain, so the gap would stand open for one full tick. resolved_failed
             // still increments below regardless (it is still counted as an
-            // ordinary failure - only its K-eligible-set MEMBERSHIP is gated).
-            if (wedge_aware.wedge_eligible)
+            // ordinary failure - only its outstanding-wedge-set MEMBERSHIP is gated).
+            // A compensation-pending wedge is retained too (BOTH drain loops, #5459),
+            // so held pushes during a compensating teardown stay suppressed.
+            if (wedge_aware.wedge_eligible || wedge_aware.compensation_pending)
                 current_->failed_receipts.insert_or_assign(it->first, it->second);
             [[fallthrough]];
         case S::Failed:
@@ -367,23 +361,15 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
 }
 
 bool GuardianArmAckLedger::can_advance() const {
-    if (!current_)
-        return false; // nothing to advance FOR - not the same question as "may advance"
-    if (!current_->pending.empty() || current_->latched_failure)
-        return false;
-    if (current_->resolved_failed == 0)
-        return true;
-    // rung 9c PR-5e (#4221, K-bound closeout, decision 1): every remaining resolved
-    // failure is a currently-eligible Wedged entry - failed_receipts is kept pruned
-    // to exactly that set every drain_locked() tick (see its own recovery-loop
-    // comment), so this equality is a safe predicate, not a stale snapshot - AND this
-    // application-sequence has been identically re-applied at least
-    // kReapplyWaiverThreshold times. A non-Wedged failure, or a Wedged entry whose
-    // eligibility has since settled to false, is never part of failed_receipts, so it
-    // always breaks this equality and blocks the waiver, no matter how high
-    // reapply_count climbs.
-    return current_->resolved_failed == current_->failed_receipts.size() &&
-          current_->reapply_count >= kReapplyWaiverThreshold;
+    // #5459 (option D): the conservative branch ONLY. There is no wedge escape: an
+    // outstanding wedge, a compensation-pending wedge, and every ordinary failure keep
+    // resolved_failed > 0, which holds the generation until a genuine recovery
+    // (drain_locked() decrements it for an adopted late success) or a fresh successful
+    // application replaces this one. Holding the generation is what keeps the server's
+    // full_sync re-push alive; decide_retry() is what stops each held re-push from
+    // costing a teardown.
+    return current_ && current_->pending.empty() && !current_->latched_failure &&
+           current_->resolved_failed == 0;
 }
 
 std::size_t GuardianArmAckLedger::applied_count() const {
@@ -396,10 +382,6 @@ std::size_t GuardianArmAckLedger::pending_count_for_test() const {
 
 std::size_t GuardianArmAckLedger::failed_receipt_count_for_test() const {
     return current_ ? current_->failed_receipts.size() : 0;
-}
-
-std::size_t GuardianArmAckLedger::reapply_count_for_test() const {
-    return current_ ? current_->reapply_count : 0;
 }
 
 std::vector<GuardianSparkRuntime::ReceiptStatus>
@@ -428,33 +410,15 @@ std::uint64_t GuardianArmAckLedger::pending_generation() const {
 
 GuardianArmAckLedger::RetryDecision GuardianArmAckLedger::decide_retry(
     std::uint64_t generation, const std::string& content_id, bool full_sync,
-    const GuardianSparkRuntime& runtime) const {
+    const GuardianSparkRuntime& runtime) {
+    using S = GuardianSparkRuntime::ReceiptStatus;
     if (!current_)
         return RetryDecision::Reapply; // nothing open to suppress against
-    // Governance finding sec-1/arch-1 (Gates 2-4, 5x independently confirmed - the
-    // production-live wedge): the WHOLE reason this dedup exists is to protect a
-    // claim that is genuinely still in flight from a spurious re-teardown+re-arm on
-    // an identical retry (see this file's header). With nothing pending there is
-    // NOTHING to protect - either no rule was ever Accepted this application (the
-    // ordinary case at prefer_spark_=false, where Accepted never occurs at all) or
-    // everything already resolved - so Suppressing here served no purpose except to
-    // ALSO swallow the one thing apply_rules()'s own tail gate still needed to do on
-    // a repeat push: retry a policy-generation persist that failed last time. Before
-    // this fix, an empty `pending` map fell all the way through to a vacuous
-    // Suppress, and the retry that would have re-attempted the failed persist never
-    // ran - silently and permanently wedging the reported generation below the
-    // server's value until restart. Reapply here restores exact pre-PR behavior for
-    // this case: a full re-run, matching what a retry always did before this ledger
-    // existed - NOT free (governance finding, Gate 8: consistency-auditor, happy-
-    // path and security-guardian each independently caught an earlier draft of this
-    // comment overclaiming "costs nothing"). A full_sync retry still pays the same
-    // real teardown+re-arm cycle (attach_core() rebuilds eval state from scratch on
-    // every push, identical re-push included - there is no diff-skip) it always
-    // paid pre-ledger; what this fix restores is that the retry runs AT ALL, not
-    // that it becomes cheap.
-    if (current_->pending.empty())
-        return RetryDecision::Reapply;
-    if (current_->generation != generation)
+    auto& app = *current_;
+    // Identity checks come FIRST (#5459: they used to sit behind an early empty-pending
+    // Reapply, which an outstanding wedge in an application with nothing left pending
+    // could never get past).
+    if (app.generation != generation)
         return RetryDecision::Reapply; // a different generation is not a retry at all
     // Governance finding UP-2/SHOULD-2 (Gate 4, converged independently from two
     // reviewers): a content_id that is not an actual SHA-256 digest is a SENTINEL,
@@ -465,24 +429,93 @@ GuardianArmAckLedger::RetryDecision GuardianArmAckLedger::decide_retry(
     // opened) must never be read as "identical content" merely because their
     // sentinels happen to be byte-identical to each other - that comparison was
     // never meaningful in the first place.
-    if (!is_sha256_hex(current_->content_id) || !is_sha256_hex(content_id))
+    if (!is_sha256_hex(app.content_id) || !is_sha256_hex(content_id))
         return RetryDecision::Reapply;
-    if (current_->content_id != content_id || current_->full_sync != full_sync)
+    if (app.content_id != content_id || app.full_sync != full_sync)
         return RetryDecision::Reapply; // same generation number, changed content underneath it
-    if (current_->latched_failure || current_->resolved_failed > 0)
-        return RetryDecision::Reapply; // something already failed - a real re-apply is owed
-    // drain_locked() is BOUNDED - a receipt past one tick's cap can still sit in
-    // `pending` long after it actually resolved. Suppress means every pending
-    // receipt is STILL genuinely Pending, not merely "not yet drained" - so consult
-    // the runtime directly rather than trust resolved_failed alone (which only
-    // counts what drain_locked has actually retired so far).
-    for (const auto& entry : current_->pending) {
-        const auto status = runtime.receipt_status(entry.second);
-        if (status != GuardianSparkRuntime::ReceiptStatus::Pending &&
-            status != GuardianSparkRuntime::ReceiptStatus::Committed)
-            return RetryDecision::Reapply;
+    if (app.latched_failure)
+        return RetryDecision::Reapply; // an apply_rules() generation-hold failure - a real re-apply is owed
+    // Every COUNTED failure must have a retained outstanding-wedge candidate (see
+    // Application::failed_receipts). A count with no retained receipt is a genuine
+    // non-wedge failure (an ordinary Failed/Congestion/Withdrawn/Stopped, or a wedge
+    // whose claim has since popped) - the rule must be re-armed. Necessary, not
+    // sufficient: each retained candidate is re-read LIVE below, never trusted from
+    // the map (it can be stale between drains).
+    if (app.resolved_failed != app.failed_receipts.size())
+        return RetryDecision::Reapply;
+
+    bool outstanding_wedge = false;
+    for (const auto& entry : app.failed_receipts) {
+        // ONE combined accessor, one registry_mu_ acquisition per entry (the same TOCTOU
+        // reasoning as drain_locked()'s recovery scan: never assemble this from
+        // receipt_status_wedge_aware() plus a second call).
+        switch (runtime.receipt_recovery_status(entry.second)) {
+        case GuardianSparkRuntime::RecoveryStatus::WedgeEligible:
+        case GuardianSparkRuntime::RecoveryStatus::CompensationPending:
+            outstanding_wedge = true;
+            break;
+        case GuardianSparkRuntime::RecoveryStatus::Recovered:
+            // #5459 (Fable review finding): a retained wedge whose late success was ADOPTED
+            // since the last drain reads sticky Wedged but is no longer the FIFO front
+            // (adoption and the pop are ONE registry_mu_ critical section), so the old
+            // "still Wedged and eligible/compensating" test called it a settled failure
+            // and answered Reapply - a teardown of the rule that had JUST armed. It is
+            // OUTSTANDING WORK instead: it never acknowledges (resolved_failed is still
+            // counted until the next tick's recovery scan decrements it, after which
+            // can_advance() acks), and this push is suppressed until then. It counts toward
+            // the safety valve like any other Suppress below (deliberate: the window is one
+            // heartbeat tick, so the valve is usually not the binding bound for it; if the
+            // budget is already spent, a forced Reapply re-arms the just-recovered rule
+            // (safe direction: one wasted teardown, never an acknowledgment); an uncounted
+            // Suppress would be a second unbounded path).
+            outstanding_wedge = true;
+            break;
+        case GuardianSparkRuntime::RecoveryStatus::Blocking:
+            return RetryDecision::Reapply; // popped / settled since the last drain: a real failure now
+        }
     }
-    return RetryDecision::Suppress; // identical content, nothing failed yet, rest still pending
+    // drain_locked() is BOUNDED - a receipt past one tick's cap can still sit in
+    // `pending` long after it actually resolved. Suppress means every pending receipt is
+    // STILL genuinely Pending (or Committed), or a live outstanding wedge the bounded
+    // drain has not reached yet (otherwise the bound alone would cause avoidable
+    // Reapplies) - so consult the runtime directly rather than trust resolved_failed
+    // alone (which only counts what drain_locked has actually retired so far).
+    for (const auto& entry : app.pending) {
+        const auto s = runtime.receipt_status_wedge_aware(entry.second);
+        if (s.status == S::Pending || s.status == S::Committed)
+            continue;
+        if (s.status == S::Wedged && (s.wedge_eligible || s.compensation_pending)) {
+            outstanding_wedge = true;
+            continue;
+        }
+        return RetryDecision::Reapply;
+    }
+
+    if (!outstanding_wedge) {
+        // Governance finding sec-1/arch-1 (Gates 2-4, 5x independently confirmed - the
+        // production-live wedge): the whole reason this dedup exists is to protect a
+        // claim that is genuinely still in flight from a spurious re-teardown+re-arm on
+        // an identical retry. With nothing pending and no outstanding wedge there is
+        // NOTHING to protect, and Suppressing here would swallow the one thing
+        // apply_rules()'s own tail gate still needs to do on a repeat push: retry a
+        // policy-generation persist that failed last time (an empty `pending` used to
+        // fall through to a vacuous Suppress and silently, permanently wedge the
+        // reported generation below the server's value until restart). Reapply restores
+        // a full re-run - NOT free: a full_sync retry still pays the real teardown +
+        // re-arm cycle (attach_core() rebuilds eval state on every push, identical
+        // re-push included - there is no diff-skip); what this restores is that the
+        // retry runs AT ALL, not that it becomes cheap. With pending non-empty and
+        // every receipt Pending/Committed, an identical retry is a pure Suppress.
+        return app.pending.empty() ? RetryDecision::Reapply : RetryDecision::Suppress;
+    }
+
+    // Safety valve (#5459): a decision-count bound on wedge/compensation suppression.
+    // See kWedgeSuppressMaxDecisions for what it does and does not buy. The counter is
+    // incremented ONLY here, and reset only by begin_application()/retire().
+    if (app.wedge_suppress_count >= kWedgeSuppressMaxDecisions)
+        return RetryDecision::Reapply;
+    ++app.wedge_suppress_count;
+    return RetryDecision::Suppress;
 }
 
 void GuardianArmAckLedger::retire() {

@@ -2615,10 +2615,173 @@ Guardian ladder must check these.
   being absent from a full_sync. `guardian_persist_baseline` additionally
   refuses to overwrite a well-formed, same-fingerprint record (a write reaching
   that state can only mean a failed seed lookup — adversarial-review K1/C2-1).
-  Spark's own first-ever baseline capture is NOT yet wired to this store
-  (tracked as #4045) — under `prefer_spark_=true` (not the shipping default), a
-  rule never armed via legacy still relaunders on full_sync/restart exactly as
-  before this fix.
+  Spark's own first-ever baseline capture reaches this store through a staging
+  seam (#4045): `GuardianSparkRuntime` is the detach-survival object and NEVER
+  touches a `KvStore`, so it only STAGES the capture edge (rule_id, path, hash;
+  first capture wins, one entry per rule_id, no cap) and the engine-owned
+  `GuardianBaselinePersister` writes it through `guardian_persist_baseline`'s
+  overwrite guard by snapshot and erase-by-identity: a pass copies staging, writes
+  in rotation order under a budget (at most 64 tuples, 3 failed writes and 2 s of
+  wall between tuples; stop() has no tuple cap, 1 failure and 1 s), and erases only the
+  entries whose write returned Written or Refused and that are still identical, so
+  nothing is ever "out" of staging and a throw cannot lose a capture. The rotation
+  cursor (the last attempted rule_id) makes the next pass start after it, so a
+  tuple that fails every time cannot starve the ones sorted behind it; a pass that
+  ran out of tuples or wall with no failure is not a failure (no backoff) and
+  re-runs the worker at once, and a pass that attempted nothing changes no
+  bookkeeping (cursor, backoff, stall). A Worker pass also YIELDS: it defers while
+  an `apply_rules` is in flight (`ApplyScope`) and stops after its current tuple
+  when a seed-fence taker or a Forced/Stop pass is waiting for `persist_mu_`, and
+  the worker re-checks within 200 ms (a wait clamp, not a wake). Invariants:
+  (1) the persister drains from exactly three places: `apply_rules` BEFORE any
+  teardown or re-arm (so the common case is already durable when the seed is
+  read), `stop()` after the worker join, and the outbox drain worker's loop; and
+  NEVER from a drain that runs only on a live connection
+  (`journal_maintenance_tick`), or a boot re-arm that captures before the network
+  is up loses its capture on a crash. The drain does NOT by itself order an
+  in-flight evaluation of the OLD generation against the replacement's seed (an
+  evaluation can stage its first capture after any drain), so persist-before-seed
+  rests on two further pieces. (a) `GuardianSparkRuntime::attach_core` reads the
+  staged capture under the SAME `registry_mu_` hold that detaches the prior
+  generation (an old evaluation stages only under `registry_mu_` after rechecking
+  its generation, so it either staged before that hold, and is seen, or is
+  dropped after it) and seeds the replacement from it when the path matches; a
+  prior generation whose capture could not be staged (an allocation failure,
+  `RuleGeneration::baseline_unstaged`) has its committed hash staged first, on the
+  same path, so the lookup finds it; and every withdrawal (`detach_rule`, and
+  `detach_all`, which a full_sync push runs before it re-arms anything, leaving
+  attach_core no prior generation to read) stages it before the generation is
+  dropped (`salvage_unstaged_baseline_locked`).
+  (b) `reconcile_rule_locked` holds the persister's `persist_mu_`
+  (`hold_seed_fence()`) from a baseline-on-arm rule's seed read to the end of the
+  attach. The fence is REQUIRED: an entry leaves staging after its write, so
+  without it a worker pass could write and erase a capture between the engine's
+  KV seed read (empty, before the write) and attach_core's staged read (empty,
+  after the erase), and neither read would see it. Do not replace either piece
+  with a bare earlier drain. Lock order `mtx_` -> `persist_mu_` -> `registry_mu_`;
+  the worker takes `persist_mu_` -> `registry_mu_` and never `mtx_`. Because every
+  pass is budgeted, a Worker pass yields, and the worker backs off after a failed
+  pass (5 s doubling to 60 s; `apply_rules` and `stop()` ignore the backoff), a
+  seed fence waits for ONE in-flight write behind a Worker pass and for at most
+  the wall budget plus one write behind a Forced one (one KV busy timeout per
+  write when the store is BUSY), not one per staged capture. `stop()` first stages any
+  capture the runtime committed but could not stage (`stage_unstaged_baselines`: a stop
+  withdraws no rule, so no withdrawal staging would run), then runs its pass LAST, after
+  the journal flush and the loss-ledger write, under the stop budget (no tuple cap, 1
+  failure, 1 s of wall between tuples). The pass is skipped in two cases: a write that
+  failed slowly (took at least the stop wall budget) ended at or after the `begin_stop()`
+  mark, taken at the very top of `stop()` before it waits for `mtx_` (and again once it
+  holds `mtx_`, first call wins, for a stop that read the persister pointer just before the
+  wire published it; a stall that ends while `stop()` is queued behind an `apply_rules`
+  counts as this stop's); or the pass would start `kBaselineStopLatestStart` (15 s, the
+  20 s grace minus one 5 s KV busy timeout) or more after the mark AND an earlier stage of
+  this same `stop()` (the two journal flushes, the worker join, the loss-ledger write) ran
+  SLOW, at least `kBaselineStopTroubleThreshold` (4.5 s: the 5 s busy timeout minus a 0.5 s
+  timer-rounding slack, because Windows `Sleep()` can return early; `note_stop_store_trouble`).
+  A stage that failed FAST is not
+  evidence: a BUSY store costs a whole busy timeout per write, so it cannot hide behind a
+  fast stage, and a store that fails fast fails the Stop pass fast too. A late start with no
+  slow stage runs, so an `apply_rules` that held `mtx_` for 15 s does not cost the staged
+  captures; but a late HEALTHY pass can use its whole 1 s wall plus one write, so a pass that
+  starts in the last second of the grace can run into the watchdog (measured once: a stop
+  that waited 19 s with 300 staged captures ended at 20.035 s with the pass budget-exhausted
+  during a slow-IO window). A stall that ended before the mark does
+  not skip it. The 20 s `ShutdownDeadlineGuard` (`kShutdownDeadlineGrace`) is armed at
+  `AgentImpl::stop()` entry, so it also covers the DEX, Spark engine and updater stops after
+  `guardian_->stop()`; `run()`'s exit teardown (plugin shutdown, `thread_pool_.reset()`) is
+  under a second, independent 20 s guard. When a guard fires, `hard_exit(4)` cuts the rest
+  of the shutdown (a Windows service is restarted by the SCM) and writes no log line.
+  Measured with every KV write truly BUSY (5 s busy timeout), `stop()` entry to exit. On
+  this exact code, with 3 staged captures: 10.008 s and 15.012 s (the implementer), then
+  10.01 s, 15.01 s, 7.51 to 9.71 s (worker baseline write in flight, no journal record),
+  24.72 s (in flight, journal record pending) and 21.7 to 28.2 s (worker mid sent-marker
+  write, driving the outbox send path; 21.5 to 28.2 s with 5 staged) (an independent
+  reviewer). The rest was measured by another reviewer on the previous revision
+  (`fbc816ac6`) with 5 staged captures: 10.007 s, 15.011 to 15.013 s, 20.015 to 25.02 s
+  and 28.82 to 29.04 s. That revision differs from this one in the evidence rule, two ERROR
+  lines and where a test hook fires, none of which changes a BUSY timeline (a BUSY stage is
+  slow under either rule). The rows: quiet worker, no journal record pending 10.01 s (loss
+  ledger 5 + this pass 5, the pass runs and fails); quiet worker, a journal record pending
+  15.01 s (journal 5 + ledger 5 + journal 5, this pass skipped because it would start at
+  15 s; the 15 s threshold was met with 11 to 13 ms to spare on the previous revision,
+  because each BUSY stage is its 5 s sleep plus overhead); worker baseline write in flight,
+  no journal record at most 10.01 s (7.51 to 9.71 s when the write is already under way; this
+  pass skipped by the stall); worker baseline write in flight with a journal record pending
+  20 to 25 s (20.015 to 25.02 s across alignments; this pass skipped by the stall): up to TWO
+  busy timeouts are added, the in-flight write that holds `KvStore::mu_` first, and a second
+  baseline write when the worker's 5 s retry backoff expires just as journal flush 1 ends;
+  worker mid-write on its other KV traffic (journal sent-markers, which also take
+  `KvStore::mu_`) 21.5 to 28.2 s (3 staged) and 28.82 to 29.04 s (5 staged, one non-baseline
+  worker write per run, three runs), arithmetic bound about 30 s (six busy timeouts), past
+  the grace. The 28.82 to 29.04 s row was not re-run on this exact code. Without #4045
+  the same stops take 15 s (journal record pending), or 20 s and more with a worker
+  sent-marker write in flight. The earlier stages, the worker's other writes and the
+  worker's retry write are outside its control. The
+  evidence is sampled, not continuous: a store that turns BUSY only after the evidence
+  stages, or whose stages each stay under the 4.5 s threshold, with the stop already 15 s
+  late, still lets the Stop pass run, and the watchdog may cut it (a reviewer reproduced
+  21.0 s for the first shape and 20.11 s for the second); the capture is lost either way
+  and that loss has no log line. A slow SUCCESSFUL baseline write is not a failure and is
+  not counted;
+  (2) a failed write is a
+  deliberate fail-open (the rule keeps its in-memory baseline): the capture stays
+  staged and is retried, counted, error-logged, and exported on the sparse
+  heartbeat tag `yuzu.guardian_baseline_persist_failures` (Spark path only,
+  cumulative, readable from the per-agent heartbeat only: no server gauge exists,
+  so the agent error log is the primary signal), never silent. The tag counts
+  failed persist passes, firewalled throws, each failed ATTEMPT to stage a capture
+  (an allocation failure) or capture displaced from staging (a retarget over a
+  still-unpersisted capture) and a capture staged with no KV store (logged once,
+  kept). Stop-time losses that are NOT counted: a stop flush that ran out of its wall
+  budget with captures left, and one skipped (after a slow failure during that stop, or
+  because it could not start within 15 s after an earlier stop stage ran slow), each logged
+  with its own line (the skips by the persister, the others by the engine). Stop-time losses
+  whose count dies with the process, so the log line is the evidence: a capture that could
+  not be staged again at stop (each failed attempt is counted like any staging failure), a
+  Stop pass or staging sweep cut short by a firewalled allocation or lock failure (counted
+  in the persister's firewalled-exception count), and a failed write (counted as a failed
+  pass). The shutdown watchdog leaves neither a count nor a
+  line (exit code 4). A staging failure
+  keeps the baseline committed (a later change is still drift against the original
+  capture) and marks the generation
+  `baseline_unstaged` (runtime-owned, `registry_mu_`-guarded, never in the shared
+  evaluator state); every later commit retries staging the committed hash, as do a
+  re-push, a withdrawal and `stop()`, and each failed retry is counted. This
+  accessor takes no lock (atomics only), so reading this tag cannot wait behind
+  `apply_rules`; the same heartbeat tick's other getters (`policy_generation()`,
+  `journal_stats()`) do take `mtx_`, so the tick as a whole can still wait. A
+  write the overwrite guard refuses is counted apart (`baseline_persist_refusals`,
+  a diagnostic accessor with no tag and no other consumer; it can also count a
+  benign duplicate after a throwing erase) and is not a failure; (3) the known
+  residuals, eight: the crash window between a capture and its persist (wider than
+  legacy's synchronous write and wake-driven rather than clocked), including
+  captures an `apply_rules` pass left for the worker; a stop that loses waiting
+  captures (its single allowed write failing, its 1 s wall budget running out, on a
+  slow store or on a healthy one holding more than roughly 2,000 to 3,000 captures,
+  its flush skipped after a slow failure during that stop or because it could not
+  start within 15 s after an earlier stop stage ran slow, an allocation or lock failure
+  cutting the flush or the shutdown staging short (logged), or the 20 s shutdown watchdog
+  ending the process mid-stop);
+  an allocation failure while staging, which keeps the baseline live and is retried
+  (evaluation, re-push, withdrawal, stop), so it is a window only until a retry
+  succeeds (the crash window, a stop-time retry that also fails (logged), or a re-push
+  whose retries all fail: a delta push retries twice, a full_sync once, and then the new
+  arm captures afresh; the same when a retry succeeds but copying the staged hash back
+  fails, where the saved record keeps the original hash while the live arm is judged
+  against the fresh capture until its next re-arm); a path
+  re-authored while the first capture was unwritten (counted), and A to B to A
+  re-baselines A even with a healthy store, as legacy does, since there is one
+  record per rule; the `guardian_persist_baseline` write-anyway on a failed
+  re-check read, which two failed reads (a transient read fault, not only a
+  sustained outage) can turn into an overwrite of a good record; the refused window
+  (a failed arm-time seed read with a valid record on disk: the rule is judged
+  against freshly captured content until its next re-arm or restart, the record is
+  kept, and the refusal is counted by the diagnostic accessor only); a record found
+  malformed (bad JSON, an unknown schema number, an invalid hash) is discarded at
+  arm and overwritten at persist, which predates #4045 (#4021) and applies to both
+  paths; and a record persisted for a removed rule stays dormant. All of it is inert
+  while `prefer_spark_` is false (the shipping default) and becomes live at the
+  Spark flip.
 - **A guard whose own detection has permanently degraded must never publish
   itself compliant (PR #4748, CT-4).** `FileGuard`'s parent-directory
   (rename-detection) watch permanently disables after repeated teardown

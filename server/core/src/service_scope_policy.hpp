@@ -28,7 +28,7 @@
 namespace yuzu::server::authz {
 
 /// A (securable_type, operation) key — the same pair shape
-/// `RbacStore::check_role_has_permission` and `mcp::tier_allows` key on.
+/// `RbacStore::role_permission_allowed_checked` and `mcp::tier_allows` key on.
 struct PermPair {
     std::string_view securable_type;
     std::string_view operation;

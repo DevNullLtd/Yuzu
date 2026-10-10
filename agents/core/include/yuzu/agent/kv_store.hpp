@@ -12,6 +12,7 @@
 
 #include <yuzu/plugin.h>
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -24,6 +25,11 @@
 struct sqlite3; // Forward declaration — avoids exposing sqlite3.h in the header
 
 namespace yuzu::agent {
+
+/// How long one KV write waits on a locked database before it fails (SQLite busy timeout, set
+/// by open()). A write against a store another process holds locked therefore costs up to this
+/// long, which is the unit the shutdown-time budgets are counted in (GuardianEngine::stop()).
+inline constexpr std::chrono::milliseconds kKvStoreBusyTimeout{5000};
 
 struct KvStoreError {
     std::string message;
@@ -105,7 +111,7 @@ class YUZU_EXPORT KvStore final : public IJournalStore {
 public:
     /**
      * Open (or create) the KV store database at the given path.
-     * Sets WAL mode and busy_timeout=5000.
+     * Sets WAL mode and the busy timeout (kKvStoreBusyTimeout, 5 s).
      */
     static std::expected<KvStore, KvStoreError> open(const std::filesystem::path& db_path);
 

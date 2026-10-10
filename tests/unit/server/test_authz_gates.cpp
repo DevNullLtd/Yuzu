@@ -1,15 +1,12 @@
 /**
- * test_authz_gates.cpp — Unit tests for the service-scope-confinement Phase 0
- * primitives: `AuthRoutes::require_fleet_read` / `confine_agent_target`
- * (authz_gates.hpp/.cpp).
+ * test_authz_gates.cpp -- Unit tests for the service-scope-confinement primitives
+ * `AuthRoutes::require_fleet_read` / `confine_agent_target` (authz_gates.hpp/.cpp), including
+ * the ITServiceOwner authority ceiling (`authz::service_ceiling_check`) and how it behaves
+ * when the RBAC store is degraded.
  *
- * PR 2 of the durable service-scope-confinement fix
- * (.claude/plans/service-scope-confinement-review-2026-08-16.md,
- * .claude/plans/handover-written-to-claude-plans-guardia-piped-owl.md §2c/§2d):
- * these gates are wired here but called by NO route yet — zero behavior
- * change. This file is the net-new coverage implementation-plan §2d calls
- * out: no existing test drove a service-scoped token through the AuthRoutes
- * gates with RBAC enabled AND a real tag store.
+ * They drive a service-scoped token through the real AuthRoutes gates with RBAC enabled and a
+ * real tag store, which no other test file does at the chokepoint level. `require_fleet_read`
+ * is called by production routes; `confine_agent_target` has no production caller.
  */
 
 #include "audit_store.hpp"
@@ -28,6 +25,7 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
 
@@ -39,11 +37,16 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -526,6 +529,486 @@ TEST_CASE("require_fleet_read: genuinely empty service set ⇒ admitted-empty wi
     CHECK_FALSE(result->in_scope("a_s"));
 }
 
+// ITServiceOwner AUTHORITY CEILING on the service axis (parity with require_permission's
+// service branch). The minter holds a GLOBAL grant and the tag meet would admit, so only the
+// ceiling can produce the 403. `remove_permission` is the operator revoke (it records the
+// `revoked_seed_defaults` marker so a reboot does not re-seed the pair).
+TEST_CASE("require_fleet_read: service token - ITServiceOwner lacks the pair => Forbidden even "
+          "when the minter holds it and the tag meet would admit",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value()); // GLOBAL allow
+    const auto svc = r.mint("printers");
+    const auto plain = r.mint();
+
+    // Ceiling PRESENT (seeded ITServiceOwner Response CRUD): admitted, narrowed to the tag set.
+    {
+        auto req = bearer_request(svc);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+        REQUIRE(result.has_value());
+        CHECK_FALSE(result->unfiltered());
+        CHECK(result->in_scope("a_p"));
+        CHECK_FALSE(result->in_scope("a_c2"));
+    }
+
+    // Operator revokes the pair from ITServiceOwner only.
+    REQUIRE(r.rbac.remove_permission("ITServiceOwner", "Response", "Read").has_value());
+
+    {
+        auto req = bearer_request(svc);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error() == authz::GateFailure::Forbidden);
+        CHECK(res.status == 403);
+        CHECK(res.body.find("service-scoped token does not grant Response:Read") !=
+              std::string::npos);
+        // Clause 5: a grant to the minter would not admit this caller, so no `.permission`.
+        CHECK(res.body.find("\"permission\"") == std::string::npos);
+        auto rows = r.audit_store.query({});
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK((*rows)[0].action == "auth.fleet_read_required");
+        CHECK((*rows)[0].result == "denied");
+        CHECK((*rows)[0].detail.find("lacks ITServiceOwner permission Response:Read") !=
+              std::string::npos);
+    }
+    // The same minter's NON-service token is unaffected (the ceiling is service-axis only).
+    {
+        auto req = bearer_request(plain);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+        REQUIRE(result.has_value());
+        CHECK(result->unfiltered());
+    }
+    // The revoke is pair-specific: another pair ITServiceOwner still holds is admitted.
+    REQUIRE(r.rbac.create_role({"ExecReaderGate", "", false, 0}).has_value());
+    REQUIRE(r.rbac.set_permission({"ExecReaderGate", "Execution", "Read", "allow"}).has_value());
+    REQUIRE(r.rbac.assign_role({"user", "minter", "ExecReaderGate"}).has_value());
+    {
+        auto req = bearer_request(svc);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Execution", "Read");
+        REQUIRE(result.has_value());
+        CHECK_FALSE(result->unfiltered());
+    }
+}
+
+// What a gate that can succeed on retry (require_fleet_read, require_scoped_permission) must
+// answer for a Degraded ceiling read: 503, a machine retry hint, no `.permission` (an outage
+// is not cured by a grant) and none of the definitive-deny wording.
+namespace {
+void check_ceiling_degraded_503(const httplib::Response& res) {
+    CHECK(res.status == 503);
+    const auto j = nlohmann::json::parse(res.body, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(j.is_discarded());
+    REQUIRE(j.contains("error"));
+    REQUIRE(j.at("error").contains("retry_after_ms"));
+    CHECK(j.at("error").at("retry_after_ms").get<std::int64_t>() == 5000);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    CHECK(res.body.find("does not grant") == std::string::npos);
+}
+
+// What require_permission answers for a Degraded ceiling read: the SAME definitive
+// default-deny 403 a healthy read gets (the empty allow-list refuses the pair whatever the
+// ceiling read returns), so no retry hint, no `.permission`, no degraded wording.
+void check_default_deny_403(const httplib::Response& res) {
+    CHECK(res.status == 403);
+    const auto j = nlohmann::json::parse(res.body, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(j.is_discarded());
+    REQUIRE(j.contains("error"));
+    CHECK(j.at("error").value("retry_after_ms", nlohmann::json{}).is_null());
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    CHECK(res.body.find("not on the service-scope global-safe allow-list") !=
+          std::string::npos);
+    CHECK(res.body.find("degraded") == std::string::npos);
+}
+} // namespace
+
+TEST_CASE("require_fleet_read: service token - degraded ITServiceOwner permission read => "
+          "503 retryable with the degrade metric (fail closed and never an admit); "
+          "require_scoped_permission answers the same 503, require_permission answers the "
+          "definitive default-deny 403 with no retry hint and no degrade count",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the rig: auth_mgr keeps a raw pointer to it
+    GatesRig r{rbac_db_.dsn()};
+    r.auth_mgr.set_metrics_registry(&metrics);
+    r.rbac.set_metrics(&metrics); // publishes the breaker gauge
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
+    const auto svc = r.mint("printers");
+
+    // Drop the permission table out from under the live store so the ceiling read fails.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(rbac_db_.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.role_permissions CASCADE")};
+        REQUIRE(d.ok());
+    }
+    const auto degrade = [&](const char* reason) {
+        return metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}})
+            .value();
+    };
+
+    auto req = bearer_request(svc);
+    httplib::Response res;
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Degraded);
+    CHECK(res.status == 503);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == 5000);
+    // One failed ceiling read is one step short of the breaker threshold.
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+    // An outage is not a missing grant: no `.permission` (clause 5) and no "does not grant".
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    CHECK(res.body.find("does not grant") == std::string::npos);
+    CHECK(degrade("query_error") == 1.0);
+    CHECK(degrade("pool_acquire_timeout") == 0.0);
+
+    // require_permission: a failed ceiling read does NOT become a 503. The service-scope
+    // allow-list is empty, so the request is answered by the same default-deny 403 as a
+    // healthy read, counted under the default-deny metric, and the degrade counter does not
+    // move. The failed read still feeds the breaker (this is the second failure after the
+    // gate call above, so the breaker opens here).
+    {
+        auto req2 = bearer_request(svc);
+        httplib::Response res2;
+        CHECK_FALSE(r.ar->require_permission(req2, res2, "Response", "Read"));
+        check_default_deny_403(res2);
+    }
+    CHECK(degrade("query_error") == 1.0);
+    CHECK(degrade("pool_acquire_timeout") == 0.0);
+    CHECK(metrics
+              .counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "Response:Read"}, {"path_class", "default"}})
+              .value() == 1.0);
+    // Parity pin: require_scoped_permission answers the failed read with the same 503 + retry
+    // hint and the same counter as the fleet-read gate. It runs AFTER the calls above, so the
+    // breaker is open and the label is pool_acquire_timeout; the gate's own query_error label
+    // is only reachable while the breaker is closed.
+    {
+        auto req2 = bearer_request(svc);
+        httplib::Response res2;
+        CHECK_FALSE(r.ar->require_scoped_permission(req2, res2, "Response", "Read", "a_p"));
+        check_ceiling_degraded_503(res2);
+    }
+    CHECK(degrade("query_error") == 1.0);
+    CHECK(degrade("pool_acquire_timeout") == 1.0);
+    // The failed ceiling reads of the other gates feed the same breaker: it is open now.
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+
+    // The fleet-read and scoped-permission rows say the read degraded, never that the role
+    // lacks the permission; the require_permission row is the default-deny row.
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    const auto find_row = [&](const std::string& action) -> const AuditEvent* {
+        const AuditEvent* found = nullptr;
+        for (const auto& row : *rows) {
+            if (row.action != action)
+                continue;
+            CHECK(found == nullptr); // exactly one row per gate call
+            found = &row;
+        }
+        return found;
+    };
+    const auto* fleet_row = find_row("auth.fleet_read_required");
+    REQUIRE(fleet_row != nullptr);
+    CHECK(fleet_row->result == "denied");
+    CHECK(fleet_row->detail == "fleet read blocked: RBAC read degraded resolving the "
+                               "ITServiceOwner ceiling for Response:Read");
+    CHECK(fleet_row->detail.find("lacks ITServiceOwner") == std::string::npos);
+    const auto* perm_row = find_row("auth.permission_required");
+    REQUIRE(perm_row != nullptr);
+    CHECK(perm_row->result == "denied");
+    // The default-deny row of a failed ceiling read ends with a marker that a healthy
+    // default-deny row lacks (pinned in the next test case); the text before it is identical.
+    CHECK(perm_row->detail == "service-scoped token blocked: default-deny (Response:Read not on "
+                              "the service-scope global-safe allow-list); ceiling read degraded");
+    const auto* scoped_row = find_row("auth.scoped_permission_required");
+    REQUIRE(scoped_row != nullptr);
+    CHECK(scoped_row->result == "denied");
+    CHECK(scoped_row->detail == "service-scoped token blocked: RBAC read degraded resolving the "
+                                "ITServiceOwner ceiling");
+}
+
+// The healthy counterpart of the degraded default-deny audit row above: a ceiling read that
+// succeeds (ITServiceOwner holds the pair) and is then refused by the allow-list records the
+// default-deny detail WITHOUT the degraded marker, so the marker discriminates an outage.
+TEST_CASE("require_permission: a healthy default-deny audit row carries no degraded marker",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the rig: auth_mgr keeps a raw pointer to it
+    GatesRig r{rbac_db_.dsn()};
+    r.auth_mgr.set_metrics_registry(&metrics);
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
+    const auto svc = r.mint("printers");
+
+    auto req = bearer_request(svc);
+    httplib::Response res;
+    CHECK_FALSE(r.ar->require_permission(req, res, "Response", "Read"));
+    check_default_deny_403(res);
+    CHECK(metrics
+              .counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "Response:Read"}, {"path_class", "default"}})
+              .value() == 1.0);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 0.0);
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].action == "auth.permission_required");
+    CHECK((*rows)[0].result == "denied");
+    CHECK((*rows)[0].detail == "service-scoped token blocked: default-deny (Response:Read not on "
+                               "the service-scope global-safe allow-list)");
+}
+
+// require_permission falls through a Degraded ceiling read to its service-scope allow-list,
+// which is empty in production, so no production input reaches the guard where the allow-list
+// would admit. The allow-list's existing test override (set_service_scope_global_safe_override_
+// for_test, the same seam test_auth_routes.cpp uses for the admit path) lets this pin the guard:
+// a populated allow-list must never admit on a failed ceiling read.
+TEST_CASE("require_permission: a degraded ceiling read is never admitted even when the "
+          "allow-list would admit the pair (503 with retry_after_ms and the degrade metric)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the rig: auth_mgr keeps a raw pointer to it
+    GatesRig r{rbac_db_.dsn()};
+    r.auth_mgr.set_metrics_registry(&metrics);
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
+    const auto svc = r.mint("printers");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(rbac_db_.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.role_permissions CASCADE")};
+        REQUIRE(d.ok());
+    }
+    r.ar->set_service_scope_global_safe_override_for_test(
+        std::vector<authz::PermPair>{{"Response", "Read"}});
+
+    auto req = bearer_request(svc);
+    httplib::Response res;
+    CHECK_FALSE(r.ar->require_permission(req, res, "Response", "Read"));
+    check_ceiling_degraded_503(res);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 1.0);
+    // The allow-list admitted the pair, so the default-deny counter did not move.
+    CHECK(metrics
+              .counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "Response:Read"}, {"path_class", "default"}})
+              .value() == 0.0);
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].action == "auth.permission_required");
+    CHECK((*rows)[0].result == "denied");
+    CHECK((*rows)[0].detail == "service-scoped token blocked: RBAC read degraded resolving the "
+                               "ITServiceOwner ceiling");
+}
+
+TEST_CASE("require_fleet_read: explicit DENY row for ITServiceOwner on the pair => 403 - not an "
+          "admit and not a degrade",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the rig: auth_mgr keeps a raw pointer to it
+    GatesRig r{rbac_db_.dsn()};
+    r.auth_mgr.set_metrics_registry(&metrics);
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
+    const auto svc = r.mint("printers");
+    REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Response", "Read", "deny"}).has_value());
+
+    auto req = bearer_request(svc);
+    httplib::Response res;
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("service-scoped token does not grant Response:Read") !=
+          std::string::npos);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 0.0);
+
+    // The audit row: exact verb, result and detail (and NOT the degrade wording).
+    {
+        auto rows = r.audit_store.query({});
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        const auto& row = (*rows)[0];
+        CHECK(row.action == "auth.fleet_read_required");
+        CHECK(row.result == "denied");
+        CHECK(row.detail == "fleet read blocked: service-scoped token lacks ITServiceOwner "
+                            "permission Response:Read");
+        CHECK(row.detail.find("degraded") == std::string::npos);
+    }
+
+    // Same verdict through both sibling gates (one helper, one answer): a definitive deny
+    // stays a 403 with the "does not grant" text and the "lacks ITServiceOwner" audit detail,
+    // with no retry hint, and it is never counted as a degraded read.
+    {
+        auto req2 = bearer_request(svc);
+        httplib::Response res2;
+        CHECK_FALSE(r.ar->require_permission(req2, res2, "Response", "Read"));
+        CHECK(res2.status == 403);
+        CHECK(res2.body.find("service-scoped token does not grant Response:Read (requires "
+                             "ITServiceOwner AND an explicit service-scope allow-list entry)") !=
+              std::string::npos);
+        CHECK(nlohmann::json::parse(res2.body)["error"]["retry_after_ms"].is_null());
+        CHECK(res2.body.find("\"permission\"") == std::string::npos);
+    }
+    {
+        auto req2 = bearer_request(svc);
+        httplib::Response res2;
+        CHECK_FALSE(r.ar->require_scoped_permission(req2, res2, "Response", "Read", "a_p"));
+        CHECK(res2.status == 403);
+        CHECK(res2.body.find("service-scoped token does not grant Response:Read (requires "
+                             "ITServiceOwner AND the target agent's service tag to match the "
+                             "token's scope)") != std::string::npos);
+        CHECK(nlohmann::json::parse(res2.body)["error"]["retry_after_ms"].is_null());
+        CHECK(res2.body.find("\"permission\"") == std::string::npos);
+    }
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", "query_error"}})
+              .value() == 0.0);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "pool_acquire_timeout"}})
+              .value() == 0.0);
+    {
+        auto rows = r.audit_store.query({});
+        REQUIRE(rows.has_value());
+        int perm_rows = 0;
+        int scoped_rows = 0;
+        for (const auto& row : *rows) {
+            if (row.action == "auth.permission_required") {
+                ++perm_rows;
+                CHECK(row.detail == "service-scoped token blocked: lacks ITServiceOwner "
+                                    "permission");
+            } else if (row.action == "auth.scoped_permission_required") {
+                ++scoped_rows;
+                CHECK(row.detail == "service-scoped token blocked: lacks ITServiceOwner "
+                                    "permission");
+            }
+        }
+        CHECK(perm_rows == 1);
+        CHECK(scoped_rows == 1);
+    }
+}
+
+TEST_CASE("require_fleet_read: service token through an MCP tier is not admitted by the "
+          "ceiling path on its own (branch order: the tier falls through and the ceiling "
+          "still decides)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
+    auto raw = r.api_tokens->create_token("gates-test-svc-tier", "minter", now_epoch() + 3600,
+                                          /*scope_service=*/"printers", /*mcp_tier=*/"readonly");
+    REQUIRE(raw.has_value());
+
+    // Ceiling present: the tier allows Read, so the request falls through and is NARROWED to
+    // the service set (it is never promoted to unfiltered by the tier).
+    {
+        auto req = bearer_request(*raw);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+        REQUIRE(result.has_value());
+        CHECK_FALSE(result->unfiltered());
+        CHECK(result->in_scope("a_p"));
+        CHECK_FALSE(result->in_scope("a_c2"));
+    }
+    // Ceiling revoked: the allowed tier admits nothing by itself.
+    REQUIRE(r.rbac.remove_permission("ITServiceOwner", "Response", "Read").has_value());
+    {
+        auto req = bearer_request(*raw);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error() == authz::GateFailure::Forbidden);
+        CHECK(res.status == 403);
+        CHECK(res.body.find("service-scoped token does not grant Response:Read") !=
+              std::string::npos);
+    }
+}
+
+// Pins the documented Breaking change: ITServiceOwner is not seeded Enrollment:Read, so a
+// service-scoped token is refused on GET /api/v1/enrollment/pending-agents (the gate's pair)
+// even when its minter is an Administrator. A non-service Administrator is unaffected.
+TEST_CASE("require_fleet_read: Enrollment:Read under seeded defaults => 403 for a service "
+          "token with the ceiling body - an Administrator non-service token is unaffected",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "minter", "Administrator"}).has_value());
+    const auto svc = r.mint("printers");
+    const auto plain = r.mint();
+    {
+        auto req = bearer_request(svc);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Enrollment", "Read");
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error() == authz::GateFailure::Forbidden);
+        CHECK(res.status == 403);
+        CHECK(res.body.find("service-scoped token does not grant Enrollment:Read") !=
+              std::string::npos);
+        CHECK(res.body.find("\"permission\"") == std::string::npos);
+    }
+    {
+        auto req = bearer_request(plain);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, "Enrollment", "Read");
+        REQUIRE(result.has_value());
+        CHECK(result->unfiltered());
+    }
+}
+
+// The eight literal securables fleet-read callers use (all Read). Seeded ITServiceOwner holds
+// seven; Enrollment is the documented exception. Revoking one pair refuses only that pair.
+TEST_CASE("require_fleet_read: ceiling over the eight fleet-read securables - seeded and after "
+          "a single-pair revoke",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "minter", "Administrator"}).has_value());
+    const auto svc = r.mint("printers");
+    const std::vector<std::string> securables = {"Execution", "Infrastructure", "Response",
+                                                 "Inventory", "Policy",         "GuaranteedState",
+                                                 "Workflow",  "Enrollment"};
+    const auto admitted = [&](const std::string& securable) {
+        auto req = bearer_request(svc);
+        httplib::Response res;
+        auto result = r.ar->require_fleet_read(req, res, securable, "Read");
+        if (result.has_value())
+            return true;
+        CHECK(result.error() == authz::GateFailure::Forbidden);
+        CHECK(res.status == 403);
+        return false;
+    };
+
+    int admits = 0;
+    for (const auto& s : securables) {
+        INFO("seeded: " << s);
+        if (s == "Enrollment") {
+            CHECK_FALSE(admitted(s));
+        } else {
+            CHECK(admitted(s));
+            ++admits;
+        }
+    }
+    CHECK(admits == 7);
+
+    REQUIRE(r.rbac.remove_permission("ITServiceOwner", "Policy", "Read").has_value());
+    for (const auto& s : securables) {
+        INFO("after revoking Policy:Read: " << s);
+        if (s == "Policy" || s == "Enrollment")
+            CHECK_FALSE(admitted(s));
+        else
+            CHECK(admitted(s));
+    }
+}
+
 TEST_CASE("require_fleet_read: null rbac store ⇒ Degraded (not a crash)",
           "[pg][auth_routes][authz_gates][service_scope]") {
     Config cfg{};
@@ -572,6 +1055,28 @@ TEST_CASE("require_fleet_read: service-scoped token, RBAC genuinely disabled "
     CHECK(result.error() == authz::GateFailure::Forbidden);
     CHECK(res.status == 403);
     CHECK(res.body.find("require RBAC to be enabled") != std::string::npos);
+}
+
+TEST_CASE("require_fleet_read: service token - RBAC disabled AND the pair revoked from "
+          "ITServiceOwner => the RBAC-must-be-enabled text - not the ceiling text (branch order)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.remove_permission("ITServiceOwner", "Response", "Read").has_value());
+    r.rbac.set_rbac_enabled(false);
+    auto token = r.mint("printers");
+    auto req = bearer_request(token);
+    httplib::Response res;
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("require RBAC to be enabled") != std::string::npos);
+    CHECK(res.body.find("ITServiceOwner") == std::string::npos);
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].detail.find("requires RBAC to be enabled") != std::string::npos);
 }
 
 TEST_CASE("require_fleet_read: non-service token, RBAC genuinely disabled ⇒ "
@@ -792,4 +1297,285 @@ TEST_CASE("service_scope_policy: service_scope_global_safe denies everything whi
     CHECK_FALSE(service_scope_global_safe("Response", "Read"));
     CHECK_FALSE(service_scope_global_safe("Execution", "Execute"));
     CHECK_FALSE(service_scope_global_safe("", ""));
+}
+
+// The closed reason-label mapping for yuzu_server_rbac_read_degrade_total on a failed
+// ITServiceOwner ceiling read. A pool-acquire timeout cannot be provoked on demand, so the
+// pure mapping function is pinned directly (the Degraded => 503 path itself is covered by
+// the degraded-read test above).
+TEST_CASE("authz::ceiling_degrade_reason: pool acquire timeout prefix maps to "
+          "pool_acquire_timeout - anything else to query_error",
+          "[authz_gates][authz]") {
+    using yuzu::server::authz::ceiling_degrade_reason;
+    CHECK(std::string_view{ceiling_degrade_reason("pool acquire timeout")} ==
+          "pool_acquire_timeout");
+    CHECK(std::string_view{ceiling_degrade_reason("pool acquire timeout after 5000ms")} ==
+          "pool_acquire_timeout");
+    CHECK(std::string_view{ceiling_degrade_reason("ERROR: relation does not exist")} ==
+          "query_error");
+    CHECK(std::string_view{ceiling_degrade_reason("")} == "query_error");
+    // The breaker-gated read reports an open breaker under the pool label, matching the
+    // label the hot authz path uses for the same condition.
+    CHECK(std::string_view{ceiling_degrade_reason("circuit breaker open")} ==
+          "pool_acquire_timeout");
+    CHECK(std::string_view{ceiling_degrade_reason("rbac store not open")} == "query_error");
+    // The prefix is anchored: the phrase later in the message is not a pool timeout.
+    CHECK(std::string_view{ceiling_degrade_reason("query failed: pool acquire timeout")} ==
+          "query_error");
+    // Case-sensitive on purpose: the producer's message is a fixed string.
+    CHECK(std::string_view{ceiling_degrade_reason("Pool acquire timeout")} == "query_error");
+}
+
+// The ceiling read has the same availability contract as the hot authz reads: a short acquire
+// budget plus the fail-fast breaker, so a degraded store cannot pin request workers. The pool
+// is starved by holding every lease. PgPool then waits out the caller's budget, clamped to
+// its 500 ms saturated-pool limit (the ceiling read's 250 ms budget is the smaller of the two),
+// and gives up, so every acquire fails. This test therefore does not distinguish the 250 ms
+// authz budget from the 2 s admin budget; the budget test further down does.
+// Evidence is the breaker gauge and the error strings; only the third call is expected to be
+// answered by an open breaker (it follows the second within the 1 s probe cooldown).
+TEST_CASE("ceiling read: a starved pool trips the authz breaker and every degraded answer "
+          "is 503 with the pool_acquire_timeout label through the real gate",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics;
+    GatesRig r{rbac_db_.dsn()};
+    r.auth_mgr.set_metrics_registry(&metrics);
+    r.rbac.set_metrics(&metrics);
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
+    const auto svc = r.mint("printers");
+    const auto degrade = [&](const char* reason) {
+        return metrics.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}})
+            .value();
+    };
+
+    // Healthy first: the ceiling admits through the same accessor (a real allow).
+    {
+        auto ok = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+        REQUIRE(ok.has_value());
+        CHECK(*ok);
+        // A non-Degraded verdict carries no reason label.
+        const auto admit = authz::service_ceiling_check(r.rbac, "Response", "Read");
+        CHECK(admit.verdict == authz::CeilingVerdict::Admit);
+        CHECK(admit.degrade_reason == nullptr);
+        const auto deny = authz::service_ceiling_check(r.rbac, "NoSuchSecurable", "Read");
+        CHECK(deny.verdict == authz::CeilingVerdict::Deny);
+        CHECK(deny.degrade_reason == nullptr);
+    }
+
+    // Starve the 4-connection pool.
+    std::vector<decltype(r.pool.acquire())> held;
+    for (int i = 0; i < 4; ++i) {
+        held.push_back(r.pool.acquire());
+        REQUIRE(held.back());
+    }
+
+    // Two failed acquires (streak 1 then 2) trip the breaker.
+    auto e1 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e1.has_value());
+    CHECK(e1.error() == "pool acquire timeout");
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+    auto e2 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e2.has_value());
+    CHECK(e2.error() == "pool acquire timeout");
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+
+    // Open: answered without a pool touch. This string check assumes the read runs within the
+    // 1 s probe cooldown of the second failing read's admit (about 750 ms of margin after that
+    // read's 250 ms acquire wait); a read delayed past it would be the half-open probe and fail
+    // with "pool acquire timeout" instead. The gauge assertions above do not depend on it.
+    auto e3 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e3.has_value());
+    CHECK(e3.error() == "circuit breaker open");
+
+    // The helper returns the reason together with the verdict (a helper that dropped it, or
+    // hard-coded "query_error", would fail here).
+    {
+        const auto ceiling = authz::service_ceiling_check(r.rbac, "Response", "Read");
+        CHECK(ceiling.verdict == authz::CeilingVerdict::Degraded);
+        REQUIRE(ceiling.degrade_reason != nullptr);
+        CHECK(std::string_view{ceiling.degrade_reason} == "pool_acquire_timeout");
+    }
+
+    // The real gate: 503 retryable, no `.permission`, counted under the pool label only.
+    auto req = bearer_request(svc);
+    httplib::Response res;
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Degraded);
+    CHECK(res.status == 503);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == 5000);
+    CHECK(res.body.find("\"permission\"") == std::string::npos);
+    CHECK(degrade("pool_acquire_timeout") == 1.0);
+    CHECK(degrade("query_error") == 0.0);
+
+    // require_scoped_permission answers the same failed read with the same 503 + retry hint and
+    // counts it under the same label (the breaker is open, so the label is
+    // pool_acquire_timeout).
+    {
+        auto req2 = bearer_request(svc);
+        httplib::Response res2;
+        CHECK_FALSE(r.ar->require_scoped_permission(req2, res2, "Response", "Read", "a_p"));
+        check_ceiling_degraded_503(res2);
+    }
+    CHECK(degrade("pool_acquire_timeout") == 2.0);
+    CHECK(degrade("query_error") == 0.0);
+    // require_permission does not: the same failed read is the definitive default-deny 403
+    // and moves neither degrade label.
+    {
+        auto req3 = bearer_request(svc);
+        httplib::Response res3;
+        CHECK_FALSE(r.ar->require_permission(req3, res3, "Response", "Read"));
+        check_default_deny_403(res3);
+    }
+    CHECK(degrade("pool_acquire_timeout") == 2.0);
+    CHECK(degrade("query_error") == 0.0);
+}
+
+// The streak is reset by a successful ceiling read: one failed acquire, then a read that gets
+// through, then another failed acquire leaves the breaker closed (streak 1, not 2). Without
+// the success note after the SELECT the first failure would still be counted and the second
+// would open the breaker.
+TEST_CASE("ceiling read: a successful read resets the failure streak so a later single "
+          "failure leaves the breaker closed",
+          "[pg][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics;
+    GatesRig r{rbac_db_.dsn()};
+    r.rbac.set_metrics(&metrics);
+    const auto breaker_open = [&] {
+        return metrics.gauge("yuzu_server_rbac_breaker_open").value();
+    };
+
+    std::vector<decltype(r.pool.acquire())> held;
+    const auto starve = [&] {
+        for (int i = 0; i < 4; ++i) {
+            held.push_back(r.pool.acquire());
+            REQUIRE(held.back());
+        }
+    };
+
+    starve();
+    auto e1 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e1.has_value());
+    CHECK(e1.error() == "pool acquire timeout");
+    CHECK(breaker_open() == 0.0);
+
+    held.clear(); // return every lease
+    auto ok = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE(ok.has_value());
+    CHECK(*ok);
+
+    starve();
+    auto e2 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e2.has_value());
+    CHECK(e2.error() == "pool acquire timeout");
+    CHECK(breaker_open() == 0.0);
+}
+
+// A failed SELECT on an acquired lease counts toward the breaker exactly like a failed acquire:
+// two consecutive query failures open it. Without the failure note after the SELECT the
+// gauge would stay 0 however many reads fail.
+TEST_CASE("ceiling read: two consecutive query failures open the authz breaker",
+          "[pg][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    yuzu::MetricsRegistry metrics;
+    GatesRig r{rbac_db_.dsn()};
+    r.rbac.set_metrics(&metrics);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(rbac_db_.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.role_permissions CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto e1 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e1.has_value());
+    CHECK(e1.error().rfind("query failed:", 0) == 0);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+    auto e2 = r.rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    REQUIRE_FALSE(e2.has_value());
+    CHECK(e2.error().rfind("query failed:", 0) == 0);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+}
+
+namespace {
+// Lets a helper thread learn that the reader has finished, on every path out of a test
+// (including a failed REQUIRE): the guard's destructor fires it.
+struct ReaderDone {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::atomic<bool> flag{false};
+    void fire() {
+        {
+            std::lock_guard lk(mu);
+            flag.store(true);
+        }
+        cv.notify_all();
+    }
+};
+struct FireOnExit {
+    ReaderDone& d;
+    ~FireOnExit() { d.fire(); }
+};
+} // namespace
+
+// The ceiling read waits for a free connection for the 250 ms authz budget, not the 2 s admin
+// budget. Both leases of a 2-connection pool are held, so the reader blocks inside the pool. A
+// helper thread frees one lease once the reader has finished, or after 750 ms if it has not.
+// What this pins is that the reader gives up well before the helper's 750 ms timer releases a
+// lease: a read that used the 2 s budget would still be waiting at 750 ms, get the released
+// connection and succeed. It does not pin the budget at exactly 250 ms; any budget comfortably
+// below 750 ms passes. The pool's own saturated-pool clamp is raised to 5 s so that only the
+// caller's budget bounds the wait. The passing path takes about 250 ms and the helper's timer
+// is only reached on a regression.
+//
+// A plain std::thread with an explicit join guard, not std::jthread: Apple Clang's libc++ has
+// no std::jthread, and a bare std::thread left joinable by a failed REQUIRE would call
+// std::terminate. The guards are declared after the thread so that on any unwind the reader-done
+// flag is set first and the join follows, before the lease objects, the pool and `done` die.
+TEST_CASE("ceiling read: the acquire budget is the 250 ms authz budget and not the 2 s admin "
+          "budget",
+          "[pg][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    PgPool pool{{.conninfo = rbac_db_.dsn(),
+                 .size = 2,
+                 .saturated_fast_fail = std::chrono::milliseconds{5000}}};
+    RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+
+    auto lease_a = pool.acquire();
+    auto lease_b = pool.acquire();
+    REQUIRE(lease_a);
+    REQUIRE(lease_b);
+
+    ReaderDone done;
+    std::thread releaser{[&pool, &done, lease = std::move(lease_b)]() mutable {
+        // Wait until the reader is parked inside the pool's bounded acquire.
+        while (pool.waiters() == 0 && !done.flag.load())
+            std::this_thread::yield();
+        {
+            std::unique_lock lk(done.mu);
+            done.cv.wait_for(lk, std::chrono::milliseconds{750},
+                             [&done] { return done.flag.load(); });
+        }
+        lease.reset();
+    }};
+    // Destroyed in reverse order: FireOnExit sets the flag (waking the helper), then JoinGuard
+    // joins the helper.
+    struct JoinGuard {
+        std::thread& t;
+        ~JoinGuard() {
+            if (t.joinable())
+                t.join();
+        }
+    } join_guard{releaser};
+    FireOnExit guard{done};
+
+    auto result = rbac.role_permission_allowed_checked("ITServiceOwner", "Response", "Read");
+    done.fire();
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == "pool acquire timeout");
 }

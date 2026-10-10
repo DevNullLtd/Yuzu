@@ -106,39 +106,26 @@ TEST_CASE("macOS enrich: an unsigned bundle is reported unsigned, never signed",
 #endif
 }
 
-// bundle_id_for(): the single CFBundle read behind the `list` action's
-// bundle_id column (ADR-0028 binding condition). Same cost class as the case
-// above: one temp dir, two small files, no subprocess.
-TEST_CASE("macOS enrich: bundle_id_for reads CFBundleIdentifier, empty for a non-bundle path",
+// enrich_app()'s bundle_id read (the `list` action itself reads through the bounded
+// agent-core pass). Same cost class as the case above: one temp dir, two small
+// files, no subprocess.
+TEST_CASE("macOS enrich: bundle_id is empty for a non-bundle path or a bundle with no identifier",
           "[installed_apps][macos]") {
     yuzu::test::TempDir dir("yuzu_test_bundle_id_");
     std::filesystem::create_directories(dir.path);
 
-    const auto app = make_unsigned_bundle(dir.path);
     const auto missing = (dir.path / "DoesNotExist.app").string();
-
-#ifdef YUZU_HAVE_SECURITY_FRAMEWORK
-    using yuzu::installed_apps::macos_enrich::bundle_id_for;
-    CHECK(bundle_id_for(app.string()) == "com.yuzu.test.unsigned");
-    // Non-existent path: honest-empty, never a fabricated id.
-    CHECK(bundle_id_for(missing).empty());
-    CHECK(bundle_id_for("").empty());
-
+    std::filesystem::create_directories(dir.path / "anon");
     // A bundle with no CFBundleIdentifier: honest-empty, never fabricated
     // (mutation: returning a placeholder from bundle_id_for_url on a null
     // identifier fails here).
-    std::filesystem::create_directories(dir.path / "anon");
     const auto anon = make_unsigned_bundle(dir.path / "anon", /*with_identifier=*/false);
-    CHECK(bundle_id_for(anon.string()).empty());
 
-    // enrich_app shares the same bundle-id read.
-    CHECK(yuzu::installed_apps::macos_enrich::enrich_app(app.string()).bundle_id ==
-          bundle_id_for(app.string()));
-#else
-    // No Security framework at build time: the honest no-op.
-    CHECK(yuzu::installed_apps::macos_enrich::bundle_id_for(app.string()).empty());
-    CHECK(yuzu::installed_apps::macos_enrich::bundle_id_for(missing).empty());
-#endif
+    using yuzu::installed_apps::macos_enrich::enrich_app;
+    CHECK(enrich_app(anon.string()).bundle_id.empty());
+    // Non-existent path: honest-empty, never a fabricated id.
+    CHECK(enrich_app(missing).bundle_id.empty());
+    CHECK(enrich_app("").bundle_id.empty());
 }
 
 #endif // __APPLE__
