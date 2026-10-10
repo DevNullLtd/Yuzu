@@ -20,25 +20,39 @@
 /// key/schema as test_response_store.cpp — the registry replay-verifies the
 /// resulting schema, not the setup lambda's literal text).
 
+#include "response_export_metrics.hpp"
+#include "response_query_params.hpp"
 #include "response_routes.hpp"
+#include "test_export_cap_guard.hpp"
 #include "test_route_sink.hpp"
 
+#include "audit_store.hpp"
+#include "auth_routes.hpp"
+#include "oidc_provider.hpp"
 #include "authz_model.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
+
+#include <yuzu/server/auth.hpp>
+#include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 using namespace yuzu::server;
 using json = nlohmann::json;
@@ -224,6 +238,13 @@ struct PgHarness {
     authz::VisibleSet fleet_scope; // nullopt = unconfined
 
     std::vector<AuditRow> audits;
+    bool audit_succeeds{true}; // audit_fn's persist outcome (false = row not durably written)
+    bool audit_throws{false};  // audit_fn throws (emission pipeline fault)
+    // When set, audit_succeeds/audit_throws apply only to calls AFTER this many rows have been
+    // recorded (0 = fail from the first call, 1 = let the first row persist, fail the second).
+    std::optional<std::size_t> audit_fail_after;
+
+    yuzu::MetricsRegistry metrics; // #4644/#4703 counters; outlives the sink's handlers
 
     yuzu::server::test::TestRouteSink sink; // LAST — see file header.
 
@@ -240,6 +261,8 @@ struct PgHarness {
 
         response::Deps deps;
         deps.store = store.get();
+        deps.metrics = &metrics;
+        yuzu::server::seed_response_metrics(metrics);
         deps.fleet_read_fn = [this](const httplib::Request&, httplib::Response&,
                                     const std::string&, const std::string&) -> authz::FleetReadGate {
             authz::FleetReadGate g;
@@ -251,7 +274,10 @@ struct PgHarness {
                                const std::string& tt, const std::string& ti,
                                const std::string& d) -> bool {
             audits.push_back({a, r, tt, ti, d});
-            return true;
+            const bool failing = !audit_fail_after || audits.size() > *audit_fail_after;
+            if (failing && audit_throws)
+                throw std::runtime_error("audit pipeline fault");
+            return failing ? audit_succeeds : true;
         };
         response::register_response_routes(sink, deps);
     }
@@ -266,6 +292,34 @@ struct PgHarness {
     }
 };
 
+} // namespace
+
+namespace {
+constexpr const char* kCsvTrailerPrefix = "# result_truncated_by_cap";
+
+// The in-band truncation record of a CUT CSV export, or "" when the body has none. It is
+// the last CRLF-terminated record.
+std::string csv_trailer(const std::string& body) {
+    if (body.size() < 2 || body.compare(body.size() - 2, 2, "\r\n") != 0)
+        return {};
+    const auto start = body.rfind("\r\n", body.size() - 3);
+    const std::size_t from = start == std::string::npos ? 0 : start + 2;
+    const std::string last = body.substr(from, body.size() - 2 - from);
+    return last.rfind(kCsvTrailerPrefix, 0) == 0 ? last : std::string{};
+}
+
+// Data rows in a CSV export body: every record ends CRLF, the header is one of them and a
+// cut export's trailer is another, neither counted. The seeded payloads contain no CR/LF,
+// so a line count is a row count plus the header (plus the trailer when present).
+std::size_t csv_data_rows(const std::string& body) {
+    std::size_t lines = 0;
+    for (std::size_t pos = body.find("\r\n"); pos != std::string::npos;
+         pos = body.find("\r\n", pos + 2))
+        ++lines;
+    if (!csv_trailer(body).empty() && lines > 0)
+        --lines;
+    return lines == 0 ? 0 : lines - 1;
+}
 } // namespace
 
 TEST_CASE("GET /api/responses/:id/aggregate: happy path returns its own shape, not the "
@@ -351,20 +405,695 @@ TEST_CASE("GET /api/responses/:id (catch-all): an engaged scope that drops a res
     REQUIRE(body["responses"].size() == 1);
     CHECK(body["responses"][0]["agent_id"] == "in-scope-agent");
 
-    REQUIRE(h.audits.size() == 1);
+    // Denied scope-drop row, THEN the fail-closed success row (#4644 Gate 7). This used to
+    // be the only row (size 1); the success row is new.
+    REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].action == "response.read");
     CHECK(h.audits[0].result == "denied");
     CHECK(h.audits[0].detail.find("surface=get") != std::string::npos);
+    CHECK(h.audits[1].result == "success");
 }
 
 TEST_CASE("GET /api/responses/:id (catch-all): an unconfined caller's genuinely-empty "
-          "result is NOT audited (no scope engaged, nothing dropped)",
+          "result writes no denied row (nothing dropped) but IS audited once as a success read",
           "[server][routes][response_routes][rest][pg]") {
     PgHarness h; // fleet_scope stays nullopt -- unconfined
     auto res = h.sink.Get("/api/responses/instr-nonexistent");
     REQUIRE(res);
     CHECK(res->status == 200);
-    CHECK(h.audits.empty());
+    // Was `audits.empty()` before #4644 Gate 7 made the legacy get fail-closed-audited: an
+    // admitted read of an empty result is still an access, exactly as on the v1 twin.
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].target_id == "instr-nonexistent");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4644 / #4703: strict numeric parameters, export limit ceiling, export byte cap
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+// The contract is the TEXT: asserted as a literal on purpose, never via a shared constant, so
+// a drifted string fails here.
+constexpr const char* kNumericParamMessage = "invalid numeric query parameter";
+
+// A 400 whose body is the A4 error envelope carrying exactly the numeric-param message.
+void check_numeric_400(const std::unique_ptr<httplib::Response>& res) {
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto body = json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"].is_object());
+    CHECK(body["error"]["code"] == 400);
+    CHECK(body["error"]["message"] == kNumericParamMessage);
+    REQUIRE(body.contains("meta"));
+    CHECK(body["meta"]["api_version"] == "v1");
+}
+} // namespace
+
+TEST_CASE("legacy response routes: a malformed numeric query parameter is a 400 not a "
+          "different valid-looking filter (#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-strict", "agent-1", 1);
+
+    const std::string route = GENERATE(as<std::string>{}, "", "/aggregate", "/export");
+    const std::string query = GENERATE(as<std::string>{}, "status=0x1", "status=1e0",
+                                       "status=-5", "status=", "since=1e9", "since=100abc",
+                                       "until=0x10", "status=99999999999");
+    INFO("route=" << route << " query=" << query);
+    auto res = h.sink.Get("/api/responses/instr-strict" + route + "?" + query);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto body = json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["message"] == "invalid numeric query parameter");
+}
+
+TEST_CASE("legacy response routes: limit and offset reject trailing garbage where accepted (#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-strict-lim", "agent-1", 1);
+
+    // Explicit (route, query) pairs rather than a cross product: /export reads limit but
+    // has no offset parameter, so offset garbage there is not a pair worth asserting.
+    const auto [route, query] = GENERATE(
+        std::pair<std::string, std::string>{"", "limit=100abc"},
+        std::pair<std::string, std::string>{"", "limit=1e3"},
+        std::pair<std::string, std::string>{"", "limit=0x10"},
+        std::pair<std::string, std::string>{"", "limit="},
+        std::pair<std::string, std::string>{"", "offset=1e1"},
+        std::pair<std::string, std::string>{"", "offset=2abc"},
+        std::pair<std::string, std::string>{"/export", "limit=100abc"},
+        std::pair<std::string, std::string>{"/export", "limit=1e3"},
+        std::pair<std::string, std::string>{"/export", "limit=0x10"},
+        std::pair<std::string, std::string>{"/export", "limit="});
+    INFO("route=" << route << " query=" << query);
+    auto res = h.sink.Get("/api/responses/instr-strict-lim" + route + "?" + query);
+    check_numeric_400(res);
+}
+
+TEST_CASE("legacy response routes: only the FIRST of a repeated numeric query parameter is "
+          "validated (current contract, #4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-repeat", "agent-1", 1);
+
+    // httplib keeps repeated keys in query order and get_param_value() returns the first, so a
+    // malformed SECOND value is ignored and a malformed FIRST one is the 400. Pinned as the
+    // present behaviour, not as an endorsement: a caller cannot rely on the second value.
+    const std::string route = GENERATE(as<std::string>{}, "", "/export");
+    INFO("route=" << route);
+    auto later_bad = h.sink.Get("/api/responses/instr-repeat" + route + "?limit=5&limit=abc");
+    REQUIRE(later_bad);
+    CHECK(later_bad->status == 200);
+    check_numeric_400(h.sink.Get("/api/responses/instr-repeat" + route + "?limit=abc&limit=5"));
+}
+
+TEST_CASE("legacy response routes: a 100-digit number is an out-of-range 400 for limit, since "
+          "and until (#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-longdigits", "agent-1", 1);
+
+    const std::string huge(100, '9');
+    for (const char* route : {"", "/export"}) {
+        for (const char* key : {"limit", "since", "until"}) {
+            INFO("route=" << route << " key=" << key);
+            check_numeric_400(h.sink.Get(std::string("/api/responses/instr-longdigits") + route +
+                                         "?" + key + "=" + huge));
+        }
+    }
+}
+
+TEST_CASE("legacy response routes: a percent-encoded plus (%2B1) is rejected as a literal sign, "
+          "and a bare '+1' is rejected as whitespace-led (#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-plus", "agent-1", 1);
+
+    // httplib decodes a bare '+' in a query to a space, so `+1` reaches the parser as " 1"
+    // (leading whitespace). `%2B1` is the only way to deliver a literal leading '+', which
+    // std::from_chars does not accept either. Both are 400.
+    for (const char* q : {"status=+1", "status=%2B1", "limit=%2B5", "since=%2B5", "until=%2B5"}) {
+        INFO(q);
+        check_numeric_400(h.sink.Get(std::string("/api/responses/instr-plus?") + q));
+    }
+}
+
+// One drift tripwire for the REST 400 text: every legacy response route that parses numeric
+// query parameters must answer a malformed one with this exact message in the A4 envelope.
+// (The string is copy-pasted per handler, so a single edited copy would otherwise go unseen.)
+TEST_CASE("legacy response routes: every route answers a malformed numeric parameter with the "
+          "same status, message and envelope (#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-parity", "agent-1", 1);
+
+    // The aggregate route takes no `limit`, so its malformed numeric is `status`.
+    const auto [route, query] = GENERATE(
+        std::pair<std::string, std::string>{"", "limit=abc"},
+        std::pair<std::string, std::string>{"/aggregate", "status=abc"},
+        std::pair<std::string, std::string>{"/export", "limit=abc"});
+    INFO("route=" << route << " query=" << query);
+    check_numeric_400(h.sink.Get("/api/responses/instr-parity" + route + "?" + query));
+}
+
+TEST_CASE("legacy response catch-all: a valid offset still paginates (#4644 must not break it)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-offset", "agent-1", 1);
+    h.seed("instr-offset", "agent-2", 1);
+    h.seed("instr-offset", "agent-3", 1);
+
+    auto count_for = [&](const std::string& query) {
+        auto res = h.sink.Get("/api/responses/instr-offset" + query);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        return json::parse(res->body)["responses"].size();
+    };
+    // offset skips rows (3 stored): a regression that rejects or ignores a valid offset
+    // changes one of these counts.
+    CHECK(count_for("") == 3);
+    CHECK(count_for("?offset=1") == 2);
+    CHECK(count_for("?offset=2") == 1);
+    CHECK(count_for("?offset=3") == 0);
+}
+
+TEST_CASE("export limit normalisation: the ceiling is exactly 10000 the floor 1 omitted = ceiling",
+          "[server][routes][response_routes]") {
+    using yuzu::server::kExportRowLimitCap;
+    using yuzu::server::normalize_export_limit;
+    CHECK(kExportRowLimitCap == 10000);
+    CHECK(normalize_export_limit(true, 999999999) == 10000);
+    CHECK(normalize_export_limit(true, 10001) == 10000);
+    CHECK(normalize_export_limit(true, 10000) == 10000);
+    CHECK(normalize_export_limit(true, 9999) == 9999);
+    CHECK(normalize_export_limit(true, 1) == 1);
+    CHECK(normalize_export_limit(true, 0) == 1);
+    CHECK(normalize_export_limit(true, -5) == 1);
+    CHECK(normalize_export_limit(false, 12345) == 10000);
+
+    // The plain-list ceiling (legacy GET /api/responses/{id}): exactly 1000, and a
+    // non-positive value is left alone on purpose (the store maps it to its default).
+    using yuzu::server::cap_query_limit;
+    using yuzu::server::kQueryRowLimitCap;
+    CHECK(kQueryRowLimitCap == 1000);
+    CHECK(cap_query_limit(2147483647) == 1000);
+    CHECK(cap_query_limit(1001) == 1000);
+    CHECK(cap_query_limit(1000) == 1000);
+    CHECK(cap_query_limit(999) == 999);
+    CHECK(cap_query_limit(0) == 0);
+    CHECK(cap_query_limit(-5) == -5);
+}
+
+TEST_CASE("legacy response routes: well-formed numerics still pass incl. zero-padding and "
+          "the -1 'any' sentinel (#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-strict-ok", "agent-1", 1);
+
+    const std::string route = GENERATE(as<std::string>{}, "", "/aggregate", "/export");
+    const std::string query = GENERATE(as<std::string>{}, "status=007", "status=-1", "status=1",
+                                       "since=0", "until=1");
+    INFO("route=" << route << " query=" << query);
+    auto res = h.sink.Get("/api/responses/instr-strict-ok" + route + "?" + query);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+TEST_CASE("GET /api/responses/:id/export: a caller-supplied limit is clamped to 1 to 10000 "
+          "like the v1 twin (#4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    h.seed("instr-exp-lim", "agent-1", 1);
+    h.seed("instr-exp-lim", "agent-2", 1);
+
+    // 999999999 used to reach ResponseStore::query as-is; now it is pinned to the route's
+    // own ceiling and still serves the two rows.
+    auto big = h.sink.Get("/api/responses/instr-exp-lim/export?limit=999999999");
+    REQUIRE(big);
+    CHECK(big->status == 200);
+    CHECK(json::parse(big->body)["responses"].size() == 2);
+
+    // A non-positive limit is raised to 1 (never the store's "unbounded" reading).
+    auto neg = h.sink.Get("/api/responses/instr-exp-lim/export?limit=-5");
+    REQUIRE(neg);
+    CHECK(neg->status == 200);
+    auto neg_body = json::parse(neg->body);
+    CHECK(neg_body["responses"].size() == 1);
+    // limit=1 against two rows is a row-cap truncation, signalled like the byte cap.
+    CHECK(neg_body.value("result_truncated_by_cap", false) == true);
+
+    auto all = h.sink.Get("/api/responses/instr-exp-lim/export");
+    REQUIRE(all);
+    CHECK_FALSE(json::parse(all->body).contains("result_truncated_by_cap"));
+}
+
+TEST_CASE("GET /api/responses/:id/export: the total-byte cap truncates JSON and CSV and "
+          "signals it (#4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    for (int i = 0; i < 5; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-bytecap";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 0;
+        r.output = std::string(400, 'x');
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+
+    {
+        yuzu::test::ExportByteCapGuard cap(600);
+        auto res_json = h.sink.Get("/api/responses/instr-bytecap/export");
+        REQUIRE(res_json);
+        REQUIRE(res_json->status == 200);
+        auto body = json::parse(res_json->body);
+        CHECK(body["responses"].size() >= 1);
+        CHECK(body["responses"].size() < 5);
+        CHECK(body["count"] == body["responses"].size()); // count reports what was served
+        CHECK(body.value("result_truncated_by_cap", false) == true);
+        // Second out-of-body signal: a renamed download (kept by `curl -OJ` and a browser,
+        // not by a plain `curl -o`; the CSV body carries its own trailer record instead).
+        CHECK(res_json->get_header_value("Content-Disposition") ==
+              "attachment; filename=\"responses-instr-bytecap-truncated.json\"");
+
+        auto res_csv = h.sink.Get("/api/responses/instr-bytecap/export?format=csv");
+        REQUIRE(res_csv);
+        CHECK(res_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+        // In-band signal: the cut CSV ends with one 7-field trailer record naming the cause.
+        CHECK(csv_trailer(res_csv->body) == "# result_truncated_by_cap cause=byte_cap,,,,,,");
+        CHECK(res_csv->get_header_value("Content-Disposition") ==
+              "attachment; filename=\"responses-instr-bytecap-truncated.csv\"");
+    }
+    auto res_full = h.sink.Get("/api/responses/instr-bytecap/export");
+    REQUIRE(res_full);
+    auto full = json::parse(res_full->body);
+    CHECK(full["responses"].size() == 5);
+    CHECK_FALSE(full.contains("result_truncated_by_cap"));
+    CHECK(res_full->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-bytecap.json\"");
+
+    auto res_full_csv = h.sink.Get("/api/responses/instr-bytecap/export?format=csv");
+    REQUIRE(res_full_csv);
+    CHECK(res_full_csv->get_header_value("X-Result-Truncated-By-Cap").empty());
+    CHECK(csv_trailer(res_full_csv->body).empty());
+    CHECK(res_full_csv->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-bytecap.csv\"");
+}
+
+TEST_CASE("GET /api/responses/:id/export: the SERIALIZATION backstop alone flags a byte-cap cut "
+          "when the SQL cut kept every row (#4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    // Quote-heavy payload: 100 raw bytes per row, but CSV doubles each quote and JSON
+    // escapes each one, so the serialized row is about twice its raw payload.
+    for (int i = 0; i < 2; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-backstop";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 1;
+        r.output = std::string(100, '"');
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+
+    // Cap 150 sits between the raw payload of one row (100) and its serialized size (>150).
+    // Precondition, so this test can only pass through the backstop: the SQL cut keeps both
+    // rows (the rows BEFORE the second total 100 < 150) and reports no cut of its own.
+    {
+        ResponseQuery q;
+        q.limit = 10000;
+        auto sql_only = h.store->query_bounded("instr-backstop", q, std::nullopt, 150);
+        REQUIRE(sql_only.has_value());
+        REQUIRE(sql_only->rows.size() == 2);
+        REQUIRE_FALSE(sql_only->byte_cap_hit);
+        REQUIRE_FALSE(sql_only->row_cap_hit);
+    }
+
+    yuzu::test::ExportByteCapGuard cap(150);
+
+    auto res_json = h.sink.Get("/api/responses/instr-backstop/export");
+    REQUIRE(res_json);
+    REQUIRE(res_json->status == 200);
+    auto body = json::parse(res_json->body);
+    CHECK(body["responses"].size() == 1); // the backstop stopped before the second row
+    CHECK(body["count"] == 1);
+    CHECK(body.value("result_truncated_by_cap", false) == true);
+    CHECK(res_json->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-backstop-truncated.json\"");
+
+    auto res_csv = h.sink.Get("/api/responses/instr-backstop/export?format=csv");
+    REQUIRE(res_csv);
+    REQUIRE(res_csv->status == 200);
+    CHECK(res_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+    CHECK(csv_trailer(res_csv->body) == "# result_truncated_by_cap cause=byte_cap,,,,,,");
+    CHECK(csv_data_rows(res_csv->body) == 1);
+    CHECK(res_csv->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-backstop-truncated.csv\"");
+}
+
+TEST_CASE("GET /api/responses/:id/export: a ROW-cap cut renames the download and an exactly-full "
+          "export does not (#4703 UP-3)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    for (int i = 0; i < 3; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-rowcut";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 0;
+        r.output = "o";
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+    for (const char* fmt : {"json", "csv"}) {
+        const std::string f = fmt;
+        // limit=2 of 3 rows: cut by row count.
+        auto cut = h.sink.Get("/api/responses/instr-rowcut/export?limit=2&format=" + f);
+        REQUIRE(cut);
+        CHECK(cut->get_header_value("Content-Disposition") ==
+              "attachment; filename=\"responses-instr-rowcut-truncated." + f + "\"");
+        if (f == "csv") {
+            CHECK(csv_trailer(cut->body) == "# result_truncated_by_cap cause=row_cap,,,,,,");
+            CHECK(csv_data_rows(cut->body) == 2); // the trailer is not a data row
+        }
+        // limit == row count: exact crossing, nothing dropped, so nothing is flagged.
+        auto exact = h.sink.Get("/api/responses/instr-rowcut/export?limit=3&format=" + f);
+        REQUIRE(exact);
+        CHECK(exact->get_header_value("Content-Disposition") ==
+              "attachment; filename=\"responses-instr-rowcut." + f + "\"");
+        CHECK(exact->get_header_value("X-Result-Truncated-By-Cap").empty());
+        if (f == "csv") {
+            CHECK(csv_trailer(exact->body).empty());
+            CHECK(csv_data_rows(exact->body) == 3);
+        }
+    }
+}
+
+TEST_CASE("GET /api/responses/:id/export: no limit serves every row up to the ceiling and "
+          "limit 0 serves exactly one (#4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    // 101 rows: more than the plain-list default of 100, so a handler that fell back to
+    // the store default instead of the export ceiling would serve 100 and fail here.
+    for (int i = 0; i < 101; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-default";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 0;
+        r.output = "o";
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+    auto all_json = h.sink.Get("/api/responses/instr-default/export");
+    REQUIRE(all_json);
+    auto body = json::parse(all_json->body);
+    CHECK(body["responses"].size() == 101);
+    CHECK(body["count"] == 101);
+    CHECK_FALSE(body.contains("result_truncated_by_cap"));
+    auto all_csv = h.sink.Get("/api/responses/instr-default/export?format=csv");
+    REQUIRE(all_csv);
+    CHECK(csv_data_rows(all_csv->body) == 101);
+
+    // limit=0 is clamped UP to one row (never "no rows") and, with 100 more matching,
+    // is a row-cap cut.
+    auto zero = h.sink.Get("/api/responses/instr-default/export?limit=0");
+    REQUIRE(zero);
+    auto zero_body = json::parse(zero->body);
+    CHECK(zero_body["responses"].size() == 1);
+    CHECK(zero_body.value("result_truncated_by_cap", false) == true);
+}
+
+TEST_CASE("GET /api/responses/:id/export: the byte cap always serves one row and never flags "
+          "a last row that merely crosses it (#4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    {
+        StoredResponse r;
+        r.instruction_id = "instr-lastcross";
+        r.agent_id = "agent-0";
+        r.status = 0;
+        r.output = std::string(400, 'y');
+        r.timestamp = 100;
+        h.store->store(r);
+    }
+    for (int i = 0; i < 3; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-progress";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 0;
+        r.output = std::string(400, 'z');
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+    yuzu::test::ExportByteCapGuard cap(1); // every row alone exceeds this
+
+    // One row, and it crosses the cap: nothing was dropped, so nothing is flagged.
+    auto one_json = h.sink.Get("/api/responses/instr-lastcross/export");
+    REQUIRE(one_json);
+    auto one = json::parse(one_json->body);
+    CHECK(one["responses"].size() == 1);
+    CHECK_FALSE(one.contains("result_truncated_by_cap"));
+    CHECK(one_json->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-lastcross.json\"");
+    auto one_csv = h.sink.Get("/api/responses/instr-lastcross/export?format=csv");
+    REQUIRE(one_csv);
+    CHECK(csv_data_rows(one_csv->body) == 1);
+    CHECK(one_csv->get_header_value("X-Result-Truncated-By-Cap").empty());
+    CHECK(csv_trailer(one_csv->body).empty());
+    CHECK(one_csv->get_header_value("Content-Disposition") ==
+          "attachment; filename=\"responses-instr-lastcross.csv\"");
+
+    // Three rows: progress is guaranteed (exactly one served) and the cut is flagged.
+    auto many_json = h.sink.Get("/api/responses/instr-progress/export");
+    REQUIRE(many_json);
+    auto many = json::parse(many_json->body);
+    CHECK(many["responses"].size() == 1);
+    CHECK(many.value("result_truncated_by_cap", false) == true);
+    auto many_csv = h.sink.Get("/api/responses/instr-progress/export?format=csv");
+    REQUIRE(many_csv);
+    CHECK(csv_data_rows(many_csv->body) == 1);
+    CHECK(many_csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+    CHECK(csv_trailer(many_csv->body) == "# result_truncated_by_cap cause=byte_cap,,,,,,");
+}
+
+TEST_CASE("legacy response routes: until of zero is a 400 since of zero is the same as omitting "
+          "it and a negative bound is a 400 (#4644)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    for (int i = 0; i < 3; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-window";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 0;
+        r.output = "o";
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+    const auto export_rows = [&h](const std::string& q) -> std::size_t {
+        auto res = h.sink.Get("/api/responses/instr-window/export" + (q.empty() ? "" : "?" + q));
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        return json::parse(res->body)["responses"].size();
+    };
+    // ABSENT is unbounded; `since=0` is a literal lower bound at the epoch that matches exactly
+    // what absent matches (every stored timestamp is positive), including its zero-padded form.
+    CHECK(export_rows("") == 3);
+    for (const char* q : {"since=0", "since=000"})
+        CHECK(export_rows(q) == 3);
+    // A positive window is unchanged: both bounds inclusive.
+    CHECK(export_rows("since=101") == 2);
+    CHECK(export_rows("until=101") == 2);
+    CHECK(export_rows("since=101&until=101") == 1);
+    CHECK(export_rows("since=0&until=101") == 2);
+    // `until=0` is not a way to say unbounded: it is a 400 on every route sharing the parser
+    // (a computed window that collapsed to 0 used to return the whole table). A negative
+    // epoch on either side is no timestamp and is a 400 too.
+    for (const char* route : {"/api/responses/instr-window", "/api/responses/instr-window/export",
+                              "/api/responses/instr-window/aggregate"}) {
+        for (const char* q : {"until=0", "until=000", "since=0&until=0", "since=5&until=0",
+                              "since=-5", "until=-5", "since=-1&until=0", "since=0&until=-9"}) {
+            INFO(route << "?" << q);
+            auto res = h.sink.Get(std::string(route) + "?" + q);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(json::parse(res->body)["error"]["message"] == "invalid numeric query parameter");
+        }
+        INFO(route << "?since=0");
+        auto ok = h.sink.Get(std::string(route) + "?since=0");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
+}
+
+TEST_CASE("legacy response routes count rejected numeric params and cut exports by surface "
+          "(#4644 #4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    for (int i = 0; i < 3; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-metric";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 0;
+        r.output = std::string(400, 'x');
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+    using yuzu::server::kResponseExportTruncatedMetric;
+    using yuzu::server::kResponseParamRejectedMetric;
+    auto rejected = [&](const char* surface) {
+        return h.metrics.counter(kResponseParamRejectedMetric, {{"surface", surface}}).value();
+    };
+    auto cut = [&](const char* surface, const char* cause) {
+        return h.metrics
+            .counter(kResponseExportTruncatedMetric, {{"surface", surface}, {"cause", cause}})
+            .value();
+    };
+
+    // One rejection per legacy handler (list, aggregate, export): three increments.
+    CHECK(h.sink.Get("/api/responses/instr-metric?limit=100abc")->status == 400);
+    CHECK(h.sink.Get("/api/responses/instr-metric/aggregate?since=1e9")->status == 400);
+    CHECK(h.sink.Get("/api/responses/instr-metric/export?status=0x1")->status == 400);
+    CHECK(rejected("rest") == 3.0);
+    CHECK(rejected("rest_v1") == 0.0);
+    CHECK(rejected("mcp") == 0.0);
+    // A valid request does not count.
+    CHECK(h.sink.Get("/api/responses/instr-metric?limit=2")->status == 200);
+    CHECK(rejected("rest") == 3.0);
+
+    // Row-cap cut (limit 2 of 3), then a complete export, then a byte-cap cut.
+    CHECK(h.sink.Get("/api/responses/instr-metric/export?limit=2")->status == 200);
+    CHECK(cut("rest", "row_cap") == 1.0);
+    CHECK(h.sink.Get("/api/responses/instr-metric/export")->status == 200);
+    CHECK(cut("rest", "row_cap") == 1.0);
+    CHECK(cut("rest", "byte_cap") == 0.0);
+    {
+        yuzu::test::ExportByteCapGuard cap(500);
+        CHECK(h.sink.Get("/api/responses/instr-metric/export?format=csv")->status == 200);
+    }
+    CHECK(cut("rest", "byte_cap") == 1.0);
+    CHECK(cut("rest_v1", "byte_cap") == 0.0);
+}
+
+TEST_CASE("GET /api/responses/:id/export: an UNCUT CSV is byte-identical to the plain header + "
+          "rows body and has no trailer record (#4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    for (int i = 0; i < 2; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-ident";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 1;
+        r.output = "out," + std::to_string(i); // forces CSV quoting
+        r.error_detail = "";
+        r.timestamp = 100 + i;
+        h.store->store(r);
+    }
+    // The ids are store-assigned, so read them back through the JSON export.
+    auto js = json::parse(h.sink.Get("/api/responses/instr-ident/export")->body);
+    REQUIRE(js["responses"].size() == 2);
+    std::string expected = "id,instruction_id,agent_id,timestamp,status,output,error_detail\r\n";
+    for (const auto& row : js["responses"])
+        expected += std::to_string(row["id"].get<long long>()) + ",instr-ident," +
+                    row["agent_id"].get<std::string>() + "," +
+                    std::to_string(row["timestamp"].get<long long>()) + ",1,\"" +
+                    row["output"].get<std::string>() + "\",\r\n";
+    auto csv = h.sink.Get("/api/responses/instr-ident/export?format=csv");
+    REQUIRE(csv);
+    CHECK(csv->body == expected);
+    CHECK(csv_trailer(csv->body).empty());
+}
+
+TEST_CASE("GET /api/responses/:id (catch-all): a limit above the 1000 ceiling is clamped AND "
+          "signalled; a request that never exceeded it gets a byte-identical body (#4703)",
+          "[server][routes][response_routes][rest][pg]") {
+    PgHarness h;
+    // 1001 rows: one more than the ceiling, so a clamped page is genuinely incomplete.
+    for (int i = 0; i < 1001; ++i) {
+        StoredResponse r;
+        r.instruction_id = "instr-ceiling";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 1;
+        r.output = "o";
+        r.timestamp = 1000 + i;
+        h.store->store(r);
+    }
+    {
+        auto over = h.sink.Get("/api/responses/instr-ceiling?limit=999999999");
+        REQUIRE(over);
+        REQUIRE(over->status == 200);
+        auto body = json::parse(over->body);
+        CHECK(body["responses"].size() == 1000);
+        CHECK(body["count"] == 1000);
+        CHECK(body.value("result_truncated_by_cap", false) == true);
+    }
+    {
+        // At the ceiling exactly: the caller asked for what it got, nothing was clamped.
+        auto at = h.sink.Get("/api/responses/instr-ceiling?limit=1000");
+        REQUIRE(at);
+        auto body = json::parse(at->body);
+        CHECK(body["responses"].size() == 1000);
+        CHECK_FALSE(body.contains("result_truncated_by_cap"));
+    }
+    {
+        // No limit: the store default, never flagged (the route has always paged by offset).
+        auto dflt = h.sink.Get("/api/responses/instr-ceiling");
+        REQUIRE(dflt);
+        auto body = json::parse(dflt->body);
+        CHECK(body["responses"].size() == 100);
+        CHECK_FALSE(body.contains("result_truncated_by_cap"));
+    }
+    // Clamped request, short result: the page did not come back full, so no flag.
+    h.seed("instr-few", "agent-1", 1);
+    h.seed("instr-few", "agent-2", 1);
+    auto few = h.sink.Get("/api/responses/instr-few?limit=999999999");
+    REQUIRE(few);
+    auto few_body = json::parse(few->body);
+    CHECK(few_body["responses"].size() == 2);
+    CHECK_FALSE(few_body.contains("result_truncated_by_cap"));
+}
+
+TEST_CASE("export helpers: filename sanitisation and trailer record shape and cut cause "
+          "precedence (#4703)",
+          "[server][routes][response_routes]") {
+    using yuzu::server::ExportCut;
+    using yuzu::server::export_csv_truncation_row;
+    using yuzu::server::export_filename;
+
+    // Characters outside [A-Za-z0-9._-] cannot reach the quoted header value.
+    CHECK(export_filename("a\"b\r\n/../\xC3\xA9", "csv", true) ==
+          "responses-a_b___..___-truncated.csv");
+    CHECK(export_filename("instr-1.v2_x", "json", false) == "responses-instr-1.v2_x.json");
+
+    // The trailer is one record with `columns` fields: columns-1 commas, CRLF-terminated.
+    CHECK(export_csv_truncation_row(ExportCut{true, false}, 7) ==
+          "# result_truncated_by_cap cause=row_cap,,,,,,\r\n");
+    CHECK(export_csv_truncation_row(ExportCut{false, true}, 10) ==
+          "# result_truncated_by_cap cause=byte_cap,,,,,,,,,\r\n");
+
+    // byte_cap names the tighter bound when both fired; none fired = not a cut.
+    CHECK(ExportCut{true, true}.cause() == std::string("byte_cap"));
+    CHECK(ExportCut{true, false}.cause() == std::string("row_cap"));
+    CHECK(ExportCut{false, true}.cause() == std::string("byte_cap"));
+    CHECK_FALSE(ExportCut{false, false}.any());
+    CHECK(ExportCut{true, true}.any());
+}
+
+TEST_CASE("seed_response_metrics pre-seeds every closed series at zero (#4644 #4703)",
+          "[server][routes][response_routes]") {
+    yuzu::MetricsRegistry m;
+    yuzu::server::seed_response_metrics(m);
+    const auto text = m.serialize();
+    for (const char* s : {"rest", "rest_v1", "mcp"})
+        CHECK(text.find(std::string("yuzu_server_response_param_rejected_total{surface=\"") + s +
+                        "\"} 0") != std::string::npos);
+    for (const char* s : {"rest", "rest_v1"})
+        for (const char* c : {"row_cap", "byte_cap"})
+            CHECK(text.find(std::string("yuzu_server_response_export_truncated_total{surface=\"") +
+                            s + "\",cause=\"" + c + "\"} 0") != std::string::npos);
+    CHECK(text.find("# HELP yuzu_server_response_export_truncated_total") != std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -385,4 +1114,350 @@ TEST_CASE("response_routes: wiring -- server.cpp still calls register_response_r
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_response_routes(") != std::string::npos);
+}
+
+// ── #4644 Gate 7: the legacy export writes a fail-closed success audit row ───
+
+TEST_CASE("GET /api/responses/:id/export: every served export writes ONE response.read success "
+          "row CSV and JSON before any body",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-audited", "agent-a");
+    h.seed("instr-audited", "agent-b");
+
+    for (const char* format : {"json", "csv"}) {
+        INFO(format);
+        h.audits.clear();
+        auto res = h.sink.Get(std::string("/api/responses/instr-audited/export?format=") + format);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "response.read");
+        CHECK(h.audits[0].result == "success");
+        CHECK(h.audits[0].target_type == "Execution");
+        CHECK(h.audits[0].target_id == "instr-audited");
+        CHECK(h.audits[0].detail.rfind("legacy response export cid=", 0) == 0);
+        // The cid in the row is the one the response carries.
+        CHECK(h.audits[0].detail ==
+              "legacy response export cid=" + res->get_header_value("X-Correlation-Id"));
+        CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    }
+}
+
+// The scope-drop `denied` row on this route is fail-closed too (it used to be set-and-proceed):
+// an export whose drop evidence cannot be persisted must serve nothing, whichever of the two
+// rows fails and however it fails.
+TEST_CASE("GET /api/responses/:id/export: a scope drop with a failing audit is a 503 with no data "
+          "for either row a false return or a throw CSV and JSON",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-drop-fail", "in-scope-agent");
+    h.seed("instr-drop-fail", "out-of-scope-agent");
+    h.fleet_scope = authz::VisibleSet{std::unordered_set<std::string>{"in-scope-agent"}};
+
+    // fail_after 0: the DENIED row fails first. fail_after 1: the denied row persists and the
+    // SUCCESS row fails.
+    for (const std::size_t fail_after : {std::size_t{0}, std::size_t{1}}) {
+        for (const bool throws : {false, true}) {
+            for (const char* format : {"json", "csv"}) {
+                INFO("fail_after=" << fail_after << (throws ? " throws " : " returns false ")
+                                   << format);
+                h.audits.clear();
+                h.audit_fail_after = fail_after;
+                h.audit_succeeds = false;
+                h.audit_throws = throws;
+                auto res = h.sink.Get(std::string("/api/responses/instr-drop-fail/export?format=") +
+                                      format);
+                REQUIRE(res);
+                CHECK(res->status == 503);
+                CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+                // No export data and no download name: nothing was served, and the
+                // out-of-scope agent is not named anywhere.
+                CHECK(res->body.find("in-scope-agent") == std::string::npos);
+                CHECK(res->body.find("out-of-scope-agent") == std::string::npos);
+                CHECK(res->get_header_value("Content-Disposition").empty());
+                // REQUIRE, not CHECK: a missing row must fail cleanly rather than make the
+                // index below undefined behaviour.
+                REQUIRE(h.audits.size() == fail_after + 1); // the failing row ends the request
+                CHECK(h.audits[0].result == "denied");
+            }
+        }
+    }
+}
+
+// A cut export whose audit row fails must not be counted as a cut export that was served.
+TEST_CASE("GET /api/responses/:id/export: a cut export whose audit fails is a 503 and the cut "
+          "counter does not move",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-cut-audit-fail", "agent-a");
+    h.seed("instr-cut-audit-fail", "agent-b");
+    h.audit_succeeds = false;
+
+    auto res = h.sink.Get("/api/responses/instr-cut-audit-fail/export?limit=1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("agent-") == std::string::npos);
+    const auto text = h.metrics.serialize();
+    for (const char* c : {"row_cap", "byte_cap"})
+        CHECK(text.find(std::string("yuzu_server_response_export_truncated_total{surface=\"rest\","
+                                    "cause=\"") + c + "\"} 0") != std::string::npos);
+    // Control: with a healthy audit the same cut IS counted.
+    h.audit_succeeds = true;
+    auto ok = h.sink.Get("/api/responses/instr-cut-audit-fail/export?limit=1");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    const auto after = h.metrics.serialize();
+    CHECK(after.find("yuzu_server_response_export_truncated_total{surface=\"rest\","
+                     "cause=\"row_cap\"} 1") != std::string::npos);
+}
+
+TEST_CASE("GET /api/responses/:id/export: a scope drop writes the denied row THEN the success "
+          "row once each",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-audited-scope", "in-scope-agent");
+    h.seed("instr-audited-scope", "out-of-scope-agent");
+    h.fleet_scope = authz::VisibleSet{std::unordered_set<std::string>{"in-scope-agent"}};
+
+    auto res = h.sink.Get("/api/responses/instr-audited-scope/export");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "denied");
+    CHECK(h.audits[0].detail == "scope_dropped=1 surface=export");
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].detail.rfind("legacy response export cid=", 0) == 0);
+}
+
+TEST_CASE("GET /api/responses/:id/export: an audit row that does not persist or an audit "
+          "pipeline that throws is a 503 with no data",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-audit-fail", "agent-a");
+
+    for (const bool throws : {false, true}) {
+        for (const char* format : {"json", "csv"}) {
+            INFO((throws ? "throws " : "returns false ") << format);
+            h.audits.clear();
+            h.audit_succeeds = false;
+            h.audit_throws = throws;
+            auto res =
+                h.sink.Get(std::string("/api/responses/instr-audit-fail/export?format=") + format);
+            REQUIRE(res);
+            CHECK(res->status == 503);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            auto body = json::parse(res->body, nullptr, false);
+            REQUIRE_FALSE(body.is_discarded());
+            CHECK(body["error"]["code"] == 503);
+            CHECK(body["error"]["retry_after_ms"] == 5000);
+            CHECK(body["error"]["message"].get<std::string>().find("audit subsystem unavailable") !=
+                  std::string::npos);
+            // No export data and no download name: nothing was served.
+            CHECK(res->body.find("agent-a") == std::string::npos);
+            CHECK(res->get_header_value("Content-Disposition").empty());
+            REQUIRE(h.audits.size() == 1); // the one attempted row, not retried
+        }
+    }
+}
+
+// ── #4644 Gate 7: the legacy get and aggregate write fail-closed audit rows ──
+//
+// The legacy export got the same treatment first (above). These cases run the two remaining
+// legacy reads through one table so a route cannot drift from its sibling.
+
+namespace {
+struct LegacyReadRoute {
+    const char* path_suffix; // after /api/responses/<id>
+    const char* detail_prefix;
+    const char* surface;
+};
+constexpr LegacyReadRoute kLegacyGet{"", "legacy response query cid=", "surface=get"};
+constexpr LegacyReadRoute kLegacyAggregate{"/aggregate", "legacy response aggregate cid=",
+                                           "surface=aggregate"};
+} // namespace
+
+TEST_CASE("legacy get and aggregate: an unconfined caller writes exactly one response.read "
+          "success row carrying the response correlation id",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-la", "agent-a");
+    h.seed("instr-la", "agent-b");
+
+    for (const auto& route : {kLegacyGet, kLegacyAggregate}) {
+        INFO(route.path_suffix);
+        h.audits.clear();
+        auto res = h.sink.Get(std::string("/api/responses/instr-la") + route.path_suffix);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "response.read");
+        CHECK(h.audits[0].result == "success");
+        CHECK(h.audits[0].target_type == "Execution");
+        CHECK(h.audits[0].target_id == "instr-la");
+        CHECK(h.audits[0].detail ==
+              std::string(route.detail_prefix) + res->get_header_value("X-Correlation-Id"));
+        CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    }
+}
+
+TEST_CASE("legacy get and aggregate: a scope drop writes the denied row THEN the success row",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-la-scope", "in-scope-agent");
+    h.seed("instr-la-scope", "out-of-scope-agent");
+    h.fleet_scope = authz::VisibleSet{std::unordered_set<std::string>{"in-scope-agent"}};
+
+    for (const auto& route : {kLegacyGet, kLegacyAggregate}) {
+        INFO(route.path_suffix);
+        h.audits.clear();
+        auto res = h.sink.Get(std::string("/api/responses/instr-la-scope") + route.path_suffix);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].detail == std::string("scope_dropped=1 ") + route.surface);
+        CHECK(h.audits[1].result == "success");
+        CHECK(h.audits[1].detail.rfind(route.detail_prefix, 0) == 0);
+    }
+}
+
+TEST_CASE("legacy get and aggregate: an audit row that does not persist or an audit pipeline "
+          "that throws is a 503 with no data and one attempted row",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-la-fail", "agent-a");
+
+    for (const auto& route : {kLegacyGet, kLegacyAggregate}) {
+        for (const bool throws : {false, true}) {
+            INFO(route.path_suffix << (throws ? " throws" : " returns false"));
+            h.audits.clear();
+            h.audit_succeeds = false;
+            h.audit_throws = throws;
+            auto res = h.sink.Get(std::string("/api/responses/instr-la-fail") + route.path_suffix);
+            REQUIRE(res);
+            CHECK(res->status == 503);
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            auto body = json::parse(res->body, nullptr, false);
+            REQUIRE_FALSE(body.is_discarded());
+            CHECK(body["error"]["code"] == 503);
+            CHECK(body["error"]["retry_after_ms"] == 5000);
+            CHECK(body["error"]["message"].get<std::string>().find("audit subsystem unavailable") !=
+                  std::string::npos);
+            // Nothing the route would have served is in the body.
+            CHECK(res->body.find("agent-a") == std::string::npos);
+            CHECK_FALSE(body.contains("responses"));
+            CHECK_FALSE(body.contains("groups"));
+            REQUIRE(h.audits.size() == 1); // the one attempted row, not retried
+        }
+    }
+}
+
+// The scope-drop `denied` row is fail-closed too (it used to be set-and-proceed on these two
+// routes): whichever of the two rows fails, nothing is served and no further row is attempted.
+TEST_CASE("legacy get and aggregate: a scope drop with a failing audit is a 503 with no data "
+          "for either row a false return or a throw",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-la-drop-fail", "in-scope-agent");
+    h.seed("instr-la-drop-fail", "out-of-scope-agent");
+    h.fleet_scope = authz::VisibleSet{std::unordered_set<std::string>{"in-scope-agent"}};
+
+    // fail_after 0: the DENIED row fails first. fail_after 1: the denied row persists and the
+    // SUCCESS row fails.
+    for (const auto& route : {kLegacyGet, kLegacyAggregate}) {
+        for (const std::size_t fail_after : {std::size_t{0}, std::size_t{1}}) {
+            for (const bool throws : {false, true}) {
+                INFO(route.path_suffix << " fail_after=" << fail_after
+                                       << (throws ? " throws" : " returns false"));
+                h.audits.clear();
+                h.audit_fail_after = fail_after;
+                h.audit_succeeds = false;
+                h.audit_throws = throws;
+                auto res = h.sink.Get(std::string("/api/responses/instr-la-drop-fail") +
+                                      route.path_suffix);
+                REQUIRE(res);
+                CHECK(res->status == 503);
+                CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+                CHECK(res->body.find("in-scope-agent") == std::string::npos);
+                CHECK(res->body.find("out-of-scope-agent") == std::string::npos);
+                auto body = json::parse(res->body, nullptr, false);
+                REQUIRE_FALSE(body.is_discarded());
+                CHECK_FALSE(body.contains("responses"));
+                CHECK_FALSE(body.contains("groups"));
+                REQUIRE(h.audits.size() == fail_after + 1); // the failing row ends the request
+                CHECK(h.audits[0].result == "denied");
+            }
+        }
+    }
+}
+
+// A request rejected before the store read is not a read: no row of either kind.
+TEST_CASE("legacy get and aggregate: a rejected request parameter is a 400 and writes no "
+          "audit row",
+          "[server][routes][response_routes][rest][pg][audit]") {
+    PgHarness h;
+    h.seed("instr-la-400", "agent-a");
+    h.fleet_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-a"}};
+
+    for (const char* url : {"/api/responses/instr-la-400?limit=abc",
+                            "/api/responses/instr-la-400?status=abc",
+                            "/api/responses/instr-la-400/aggregate?status=abc",
+                            "/api/responses/instr-la-400/aggregate?group_by=bogus",
+                            "/api/responses/instr-la-400/aggregate?op_column=bogus"}) {
+        INFO(url);
+        h.audits.clear();
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.audits.empty());
+    }
+}
+
+// CWE-117: the legacy catch-all `/api/responses/(.+)` takes an UNRESTRICTED instruction id and
+// PR1 now sends it as the audit target_id on every served read. When the audit row cannot be
+// persisted, AuthRoutes::audit_log warns with that id; a CR/LF in it must not forge a log
+// line, nor a space / '=' forge a key=value token (v1 restricts ids to [A-Za-z0-9_-]{1,128}).
+// No Postgres needed: an unroutable pool makes AuditStore::log fail.
+TEST_CASE("AuthRoutes::audit_log: a hostile target_id is neutralised in the persist-failure "
+          "warning",
+          "[server][routes][response_routes][audit]") {
+    yuzu::server::pg::PgPool bad{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    AuditStore audit_store(bad);
+    REQUIRE_FALSE(audit_store.is_open());
+
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    AuthRoutes routes(cfg, auth_mgr, /*rbac_store=*/nullptr, /*api_token_store=*/nullptr,
+                      &audit_store, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                      /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+
+    const std::string hostile = "evil\r\n[2099-01-01] [critical] forged target_id='x' y=z";
+    httplib::Request req;
+    bool persisted = true;
+    std::string logs;
+    {
+        yuzu::test::LogCapture capture(spdlog::level::warn);
+        persisted = routes.audit_log(req, "response.read", "success", "Execution", hostile,
+                                     "legacy response query cid=abc");
+        capture.stop();
+        logs = capture.text();
+    }
+    CHECK_FALSE(persisted);
+    // The warning was actually captured (guards against a vacuous negative below).
+    REQUIRE(logs.find("audit_log: AuditStore::log failed") != std::string::npos);
+    CHECK(logs.find("evil__[2099-01-01]_[critical]_forged_target_id_'x'_y_z") !=
+          std::string::npos);
+    // Exactly one physical line. spdlog's own terminator is the only line ending ("\n", or
+    // "\r\n" on Windows), so strip ONE trailing terminator and require no CR or LF in the rest.
+    std::string body = logs;
+    if (body.size() >= 2 && body.compare(body.size() - 2, 2, "\r\n") == 0)
+        body.resize(body.size() - 2);
+    else if (!body.empty() && body.back() == '\n')
+        body.pop_back();
+    CHECK(body.find('\r') == std::string::npos);
+    CHECK(body.find('\n') == std::string::npos);
+    CHECK(logs.find("evil\r") == std::string::npos);
 }

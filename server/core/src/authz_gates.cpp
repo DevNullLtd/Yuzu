@@ -4,14 +4,77 @@
 #include "authz_model.hpp"
 #include "authz_topology_floor.hpp" // #4031: topology_floor_applies — see this gate's floor-check block
 #include "mcp_policy.hpp" // mcp::tier_allows — #3290 Phase 2 caller-class parity with require_permission/require_list_read
+#include "rbac_store.hpp" // kRbacErr*: the store error strings ceiling_degrade_reason matches
 #include "rest_a4_envelope_http.hpp"
 #include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 
 #include <yuzu/metrics.hpp> // MetricsRegistry — #4031 topology-floor-denied counter
 
+#include <cassert>
+#include <expected>
+#include <string>
+#include <string_view>
 #include <unordered_set>
 
 namespace yuzu::server {
+
+const char* authz::ceiling_degrade_reason(std::string_view read_error) noexcept {
+    // Closed label set of yuzu_server_rbac_read_degrade_total for the ceiling read:
+    // {pool_acquire_timeout, query_error}. The read is breaker-gated, so an open breaker
+    // (kRbacErrCircuitBreakerOpen) is reported under the same label the hot authz path uses
+    // for it (pool_acquire_timeout), as is a pool acquire that timed out
+    // (kRbacErrPoolAcquireTimeout). Everything else, including kRbacErrStoreNotOpen and a
+    // "query failed: ..." message, is a query error. The constants are the producers' own
+    // (rbac_store.hpp); never re-type their text here.
+    return (read_error.starts_with(kRbacErrPoolAcquireTimeout) ||
+            read_error.starts_with(kRbacErrCircuitBreakerOpen))
+               ? "pool_acquire_timeout"
+               : "query_error";
+}
+
+authz::CeilingResult authz::service_ceiling_check(const RbacStore& store,
+                                                  const std::string& securable_type,
+                                                  const std::string& operation) {
+    // The read lives in ONE place, RbacStore::role_permission_allowed_checked (the pair's one
+    // row: `allow` admits, `deny`, another effect text or an absent pair refuses). Only a
+    // failed read is mapped differently here: reported as Degraded, not folded into a deny.
+    auto allowed = store.role_permission_allowed_checked("ITServiceOwner", securable_type,
+                                                         operation);
+    if (!allowed)
+        return CeilingResult{CeilingVerdict::Degraded, ceiling_degrade_reason(allowed.error())};
+    return CeilingResult{*allowed ? CeilingVerdict::Admit : CeilingVerdict::Deny, nullptr};
+}
+
+void AuthRoutes::respond_ceiling_degraded(const httplib::Request& req, httplib::Response& res,
+                                          const std::string& audit_action,
+                                          const std::string& audit_detail,
+                                          const authz::CeilingResult& ceiling) {
+    // The ONE emission for a Degraded ITServiceOwner ceiling read, shared by
+    // require_fleet_read and require_scoped_permission (and require_permission's dormant
+    // guard where its allow-list would admit): an outage is not a missing grant, so it is a
+    // retryable 503 (never the 403 of a definitive deny), counted under the closed
+    // yuzu_server_rbac_read_degrade_total label, with an audit detail the caller words
+    // truthfully. The caller still refuses the request (fail CLOSED); this only writes the
+    // response. No `.permission`: an outage is not cured by any grant (routed-concern
+    // clause 5).
+    // Precondition: every caller passes a Degraded verdict. A misuse is a programming error
+    // caught in debug builds; in release the response below is still a refusal (fail CLOSED,
+    // never an admit), with the counter label falling back to query_error.
+    assert(ceiling.verdict == authz::CeilingVerdict::Degraded &&
+           "respond_ceiling_degraded: caller must pass a Degraded ceiling verdict");
+    if (auto* m = auth_mgr_.metrics_registry()) {
+        m->counter("yuzu_server_rbac_read_degrade_total",
+                   {{"reason", ceiling.degrade_reason ? ceiling.degrade_reason : "query_error"}})
+            .increment();
+    }
+    audit_log(req, audit_action, "denied", "", "", audit_detail);
+    res.status = 503;
+    res.set_content(detail::a4_denial(res, 503,
+                                      "authorization store degraded, cannot verify the "
+                                      "service-token ceiling",
+                                      detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                    "application/json");
+}
 
 std::expected<authz::ListAuthority, authz::GateFailure>
 AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& res,
@@ -165,6 +228,59 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
                                           "service-scoped tokens require RBAC to be enabled"),
                         "application/json");
         return std::unexpected(authz::GateFailure::Forbidden);
+    }
+
+    // ITServiceOwner AUTHORITY CEILING (the same `authz::service_ceiling_check` that
+    // require_permission and require_scoped_permission call): a service-scoped token can never
+    // exceed what that role grants, regardless of what its minter holds. Without it this gate
+    // admitted a service token on the minter's grant plus the tag meet alone, so a pair absent
+    // from ITServiceOwner (never seeded, or removed through RbacStore::remove_permission, which
+    // records it in `revoked_seed_defaults` so the next boot does not re-seed it) still saw
+    // service tokens served on every fleet-read route.
+    // Same answer as those two gates: a definitive deny (explicit deny row or an absent or
+    // revoked pair) is a 403, and a FAILED ceiling read is a retryable 503 (bumping
+    // yuzu_server_rbac_read_degrade_total) through the one shared respond_ceiling_degraded,
+    // because an outage is not a missing grant and the caller can retry. Still fail CLOSED:
+    // never an admit.
+    // Deliberately NOT the second half of require_permission's service branch
+    // (`service_scope_admits` / `kServiceScopeGlobalSafe`): that allow-list guards routes that
+    // return fleet-wide data UNCONFINED, whereas this gate's service axis below always narrows
+    // to the tagged set, so the allow-list is neither applied nor widened here.
+    // Service axis only (non-service callers never reach it), after the elevated -> engine ->
+    // mcp_tier branches and before the RBAC axis (branch order unchanged). No `.permission`
+    // on the 403 (routed-concern clause 5): granting `perm` to the minter does not admit this
+    // caller; only an ITServiceOwner grant does.
+    if (!session->token_scope_service.empty()) {
+        const auto ceiling = authz::service_ceiling_check(*rbac_store_, securable_type, operation);
+        const auto verdict = ceiling.verdict;
+        if (verdict == authz::CeilingVerdict::Degraded) {
+            // The audit text deliberately does NOT say the role lacks the permission:
+            // the read failed, the role's grants are unknown.
+            respond_ceiling_degraded(req, res, "auth.fleet_read_required",
+                                     "fleet read blocked: RBAC read degraded resolving the "
+                                     "ITServiceOwner ceiling for " +
+                                         perm,
+                                     ceiling);
+            return std::unexpected(authz::GateFailure::Degraded);
+        }
+        // Everything that is not an explicit Admit is refused: a Deny verdict, and any
+        // out-of-range value, which must never fall through to the admit below.
+        // This is an if chain, not a switch over CeilingVerdict, so -Wswitch will not flag a
+        // new enumerator here: it would be refused with the 403 below. A new enumerator that
+        // needs its own answer (as Degraded has) must be handled above this branch.
+        if (verdict != authz::CeilingVerdict::Admit) {
+            audit_log(req, "auth.fleet_read_required", "denied", "", "",
+                      "fleet read blocked: service-scoped token lacks ITServiceOwner "
+                      "permission " +
+                          perm);
+            res.status = 403;
+            res.set_content(detail::a4_denial(res, 403,
+                                              "service-scoped token does not grant " + perm +
+                                                  " (the ITServiceOwner role does not hold "
+                                                  "it)"),
+                            "application/json");
+            return std::unexpected(authz::GateFailure::Forbidden);
+        }
     }
 
     // #4031 topology floor (authz_topology_floor.hpp): RbacStore::authorize_

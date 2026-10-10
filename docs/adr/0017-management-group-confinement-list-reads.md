@@ -262,6 +262,23 @@ gate.
     group-write + confined response-read) can use the unscoped facet query to discover and enroll
     out-of-scope agents. Tracked as a follow-up, not fixed by #1712 — see #3489
     (canonical; #3525 tracked the same finding and was closed as its duplicate).
+- **Executions list fragment and MCP `summarize_working_set` (#3526, #4753)**: `GET /fragments/executions`
+  and `summarize_working_set` `kind=execution` migrated onto `require_fleet_read`/`fleet_read_fn_` as
+  the sole gate on `(Execution, Read)` (hardening plus an admission change; an author-run reachability
+  probe, not independently adjudicated, found no leak through the old gate; see
+  `docs/auth-architecture.md`'s "Sixth migration"). With RBAC off both surfaces are unconfined for every
+  authenticated non-service, non-engine caller whose tier allows it (an engine principal is refused
+  with 403 with RBAC off). When the gate refuses the fragment it still audits, but the response is
+  replaced with an HTTP 200 note (`data-denied="true"` for a 403, `data-degraded="gate"` for a 503;
+  a 401 passes through), because the dashboard drops 4xx/5xx bodies; the REST and MCP twins keep the
+  real 403/503. The fragment suppresses the owner disjunct for service-scoped sessions
+  (a service-scoped token's session username is its minter); the other execution read surfaces still show
+  a minter's executions to a service-scoped token (#5557). The fragment pushes the scope into SQL
+  before its LIMIT and bounds the agent-status read to the visible agents; MCP's first gate stays a
+  plain `Infrastructure:Read`. **NOT covered, disclosed:** `summarize_working_set` `kind=fleet` and
+  `kind=result_set` return the whole-registry agent count from `agents_fn()` (#4753, checklist still
+  open), as does `kind=execution`/`kind=agent` with an empty id; REST
+  `GET /api/v1/execution-statistics/agents` (#3526).
 - **Executions (legacy pre-v1 routes)** — `GET /api/executions` (list), `/{id}` (detail),
   `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, `POST /{id}/cancel`
   (`execution_routes.cpp` as of #2542 PR-7, extracted from `server.cpp`) — absent from every prior version of this coverage map; found during #1634's own

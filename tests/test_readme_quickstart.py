@@ -313,6 +313,16 @@ def at_tag(tag, rel):
     return out.stdout if out.returncode == 0 else None
 
 
+def meson_version():
+    """Return the `version:` of meson.build's project(), or None if it cannot be read."""
+    try:
+        text = (ROOT / "meson.build").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = re.search(r"^\s*version:\s*'([^']+)'", text, re.M)
+    return m.group(1) if m else None
+
+
 def live_inputs():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     region = quickstart_region(readme)
@@ -347,6 +357,11 @@ class ReadmeQuickstart(unittest.TestCase):
                             f"refs/tags/v{tag}:refs/tags/v{tag}"], check=False,
                            capture_output=True, timeout=120)
             tagged = at_tag(tag, rel)
+            if tagged is None and tag == meson_version():
+                # The release-prep commit pins the README to the version it is
+                # about to be tagged as, so that tag cannot exist yet.
+                self.skipTest(f"tag v{tag} is the release being prepared (meson.build "
+                              f"version {tag}); it does not exist until this commit is tagged")
             self.assertIsNotNone(tagged, f"could not fetch tag v{tag} in CI (#5419)")
         if tagged is None:
             self.skipTest(f"tag v{tag} is not in this clone")
@@ -424,7 +439,7 @@ class ReadmeQuickstart(unittest.TestCase):
             "sha1": (r.replace('pbkdf2_hmac("sha256"', 'pbkdf2_hmac("sha1"'), compose, rel),
             "short pw": (r.replace("len(p) < 12", "len(p) < 8"), compose, rel),
             "one pg password": (r.replace("p2=$(openssl rand -hex 24)", "p2=$p1"), compose, rel),
-            "no version": (r.replace("YUZU_VERSION=0.14.0\\n", ""), compose, rel),
+            "no version": (r.replace(f"YUZU_VERSION={tag}\\n", ""), compose, rel),
             "san after up": (r.replace("YUZU_CERT_SAN", "CERT_NAMES"), compose, rel),
             "no --wait": (r.replace("up -d --wait &&", "up -d &&"), compose, rel),
             "no readyz": (r.replace("8443/readyz", "8443/"), compose, rel),

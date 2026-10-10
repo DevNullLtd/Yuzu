@@ -1055,7 +1055,7 @@
       },
       "default": 3,
       "definition_id": "device.filesystem.find_by_hash",
-      "description": "Maximum directory recursion depth. Default: 3, max: 10.\n",
+      "description": "Maximum directory recursion depth. Default: 3, max: 10. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.\n",
       "name": "max_depth",
       "required": false,
       "type": "int32"
@@ -1177,7 +1177,7 @@
       },
       "default": 100,
       "definition_id": "device.filesystem.read",
-      "description": "Maximum number of lines to return. Default: 100, max: 10000.\n",
+      "description": "Maximum number of lines to return. Default: 100, max: 10000. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.\n",
       "name": "limit",
       "required": false,
       "type": "int32"
@@ -1345,7 +1345,7 @@
       },
       "default": 100,
       "definition_id": "device.filesystem.search",
-      "description": "Maximum number of matching lines to return. Default: 100, max: 10000.\n",
+      "description": "Maximum number of matching lines to return. Default: 100, max: 10000. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.\n",
       "name": "max_matches",
       "required": false,
       "type": "int32"
@@ -1419,7 +1419,7 @@
       },
       "default": 5,
       "definition_id": "device.filesystem.search_dir",
-      "description": "Maximum directory recursion depth. Default: 5, max: 20.\n",
+      "description": "Maximum directory recursion depth. Default: 5, max: 20. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.\n",
       "name": "max_depth",
       "required": false,
       "type": "int32"
@@ -1431,7 +1431,7 @@
       },
       "default": 100,
       "definition_id": "device.filesystem.search_dir",
-      "description": "Maximum number of matching entries to return. Default: 100, max: 1000.\n",
+      "description": "Maximum number of matching entries to return. Default: 100, max: 1000. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.\n",
       "name": "max_results",
       "required": false,
       "type": "int32"
@@ -1513,7 +1513,7 @@
       "default": null,
       "definition_id": "workflow.config_search_and_replace",
       "description": "Full path to the configuration file to update. Example: \"/etc/myapp/config.ini\" or \"C:\\ProgramData\\MyApp\\config.ini\"\n",
-      "name": "config_path",
+      "name": "path",
       "required": true,
       "type": "string"
     },
@@ -1523,8 +1523,8 @@
       },
       "default": null,
       "definition_id": "workflow.config_search_and_replace",
-      "description": "The current configuration value to search for. Matched literally (not regex) unless search_regex=true.\n",
-      "name": "old_value",
+      "description": "The current configuration value to search for. Matched literally (not regex) unless regex=true.\n",
+      "name": "search",
       "required": true,
       "type": "string"
     },
@@ -1533,7 +1533,7 @@
       "default": null,
       "definition_id": "workflow.config_search_and_replace",
       "description": "The new configuration value to replace matches with.\n",
-      "name": "new_value",
+      "name": "replacement",
       "required": true,
       "type": "string"
     },
@@ -1546,10 +1546,49 @@
       },
       "default": "false",
       "definition_id": "workflow.config_search_and_replace",
-      "description": "If \"true\", interpret old_value as a regex pattern. Default: \"false\".\n",
-      "name": "search_regex",
+      "description": "If \"true\", interpret search as a regex pattern. Default: \"false\".\n",
+      "name": "regex",
       "required": false,
       "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "true",
+      "definition_id": "workflow.config_search_and_replace",
+      "description": "If \"true\" (default), match is case-sensitive.\n",
+      "name": "case_sensitive",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "enum": [
+          "true",
+          "false"
+        ]
+      },
+      "default": "false",
+      "definition_id": "workflow.config_search_and_replace",
+      "description": "If \"true\", count replacements without modifying the file. Default: \"false\".\n",
+      "name": "dry_run",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "constraints": {
+        "minimum": 0
+      },
+      "default": 0,
+      "definition_id": "workflow.config_search_and_replace",
+      "description": "Maximum number of replacements to perform. 0 = unlimited. Default: 0.\n",
+      "name": "max_replacements",
+      "required": false,
+      "type": "int32"
     },
     {
       "constraints": {
@@ -1569,7 +1608,7 @@
       "default": null,
       "definition_id": "workflow.version_compliance_check",
       "description": "Full path to the Windows executable to check. Example: \"C:\\Program Files\\MyApp\\myapp.exe\"\n",
-      "name": "executable_path",
+      "name": "path",
       "required": true,
       "type": "string"
     },

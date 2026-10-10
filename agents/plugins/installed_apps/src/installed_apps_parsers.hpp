@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <format>
 #include <initializer_list>
 #include <sstream>
 #include <string>
@@ -391,7 +392,31 @@ constexpr unsigned long kRegExpandSz = 2;
     return type == kRegSz || (accept_expand_sz && type == kRegExpandSz);
 }
 
-// ── Degraded-acquisition contract (every OS; wired on Linux/macOS here) ─────
+// ── Windows: registry-walk status classification ────────────────────────────
+// Outcome of reading one Uninstall root: ok, absent (a missing key that the
+// root declares normal, e.g. a user hive with no Uninstall key), or failed
+// (anything else -- the walk under-reports and the collection is degraded).
+enum class HiveRead { ok, absent, failed };
+
+// winnt.h LSTATUS literals so the decision is testable on every host
+// (installed_apps_registry_walk.hpp static_asserts them on Windows).
+constexpr long kErrorFileNotFound = 2;
+constexpr long kErrorAccessDenied = 5;
+constexpr long kErrorMoreData = 234;
+constexpr long kErrorNoMoreItems = 259;
+
+// Classify one Reg* status. ERROR_FILE_NOT_FOUND is absent only when the root
+// allows it; ERROR_NO_MORE_ITEMS is the normal end of an enumeration; every
+// other status (ERROR_ACCESS_DENIED, ERROR_MORE_DATA, ...) is a failure.
+[[nodiscard]] constexpr HiveRead classify_reg_status(long status, bool absent_ok) noexcept {
+    if (status == 0 || status == kErrorNoMoreItems)
+        return HiveRead::ok;
+    if (status == kErrorFileNotFound && absent_ok)
+        return HiveRead::absent;
+    return HiveRead::failed;
+}
+
+// ── Degraded-acquisition contract (every OS) ────────────────────────────────
 // ONE place declares what a degraded acquisition looks like to the caller, so
 // list / query / list_per_user / list_inventory cannot drift. Templated on the
 // context so a unit test drives it with a recording fake instead of a plugin
@@ -406,8 +431,7 @@ template <class Ctx> void declare_acquisition_degraded(Ctx& ctx) {
 // What a degraded Linux/macOS acquisition means (the wording in docs/samples).
 inline constexpr std::string_view kSubprocessCauses =
     "tool timed out, was killed, failed to start, exited nonzero, or its output was truncated";
-// The Windows registry-walk equivalent (Uninstall root/app key unreadable); declared
-// for the Windows leg, not wired on this branch.
+// The Windows registry-walk equivalent (Uninstall root/app key unreadable).
 inline constexpr std::string_view kRegistryCauses =
     "an Uninstall registry key could not be fully read";
 
@@ -423,6 +447,19 @@ bool report_degraded(Ctx& ctx, bool degraded, std::string_view causes = kSubproc
     row += ") -- result withheld rather than reported as complete";
     ctx.write_output(row);
     return false;
+}
+
+// list_per_user (Windows): profiles whose Uninstall key could not be read are
+// reported as a trailing warning row plus the typed status; rows already read stay
+// and rc stays 0 -- a per-profile partial, unlike list/query's whole-collection
+// withhold. No-op at 0.
+template <class Ctx> void report_hive_read_failed(Ctx& ctx, std::size_t failed_profiles) {
+    if (failed_profiles == 0)
+        return;
+    declare_acquisition_degraded(ctx);
+    ctx.write_output(std::format("warning|hive_read_failed: {} profile(s) had an unreadable "
+                                 "Uninstall key; their per-user apps may be under-listed",
+                                 failed_profiles));
 }
 
 // list_inventory: a degraded collection emits NO rows and returns rc 1 (the
@@ -486,16 +523,31 @@ inline void dedupe_uninstall_records(std::vector<Rec>& apps) {
                apps.end());
 }
 
-// Per-field bound for `list` rows. Above every legitimate source: the Windows
-// reader's 512-WCHAR buffer bounds a registry value at 1,536 UTF-8 bytes at most
-// (512 WCHAR x 3), a macOS path at PATH_MAX (1,024); the longest field in the
-// three reference captures is 135 bytes. It exists because CoreFoundation returns
-// a hostile multi-MiB CFBundleIdentifier in full and one such row would exceed the
-// 4 MiB gRPC receive default and tear the agent stream. The raw value is cut here,
-// before escaping, so an emitted field can reach 8 KiB (every byte a `|`).
+// Per-field bound for every row an action emits. Above every legitimate source: a
+// macOS path is at most PATH_MAX (1,024); the longest field in the three reference
+// captures is 135 bytes. It exists because a hostile registry string (the Windows
+// reader admits values up to 64 KiB) or a multi-MiB CFBundleIdentifier would
+// otherwise exceed the 4 MiB gRPC receive default in one row and tear the agent
+// stream. The bound is applied at FORMAT time by detail::list_field and at READ time
+// by the Windows registry reader (installed_apps_registry_utf8.hpp reg_sz_to_utf8)
+// and the CoreFoundation reader (agents/core cf_bundle_id.hpp kMaxCFStringBytes), so
+// `query`/`list_per_user` rows, the `inv|` rows and the in-memory AppInfo vectors are
+// bounded too. The raw value is cut before escaping, so an emitted `list` field can
+// reach 8 KiB (every byte a `|`).
 constexpr std::size_t kMaxListFieldBytes = 4096;
 
 namespace detail {
+// `v` cut to at most `max_bytes` bytes, backing up so a UTF-8 sequence is never split.
+// Pure; the one boundary cut shared by list_field and the Windows registry reader.
+inline std::string_view cut_utf8(std::string_view v, std::size_t max_bytes) {
+    if (v.size() <= max_bytes)
+        return v;
+    std::size_t cut = max_bytes;
+    while (cut > 0 && (static_cast<unsigned char>(v[cut]) & 0xC0) == 0x80)
+        --cut;
+    return v.substr(0, cut);
+}
+
 // One `list` field on the wire: cut at the first NUL (write_output hands the row
 // to a C string, so an interior NUL would otherwise truncate the whole ROW and
 // strand the later columns), bound the length at a UTF-8 sequence boundary,
@@ -503,13 +555,7 @@ namespace detail {
 // The NUL cut and the bound MUST precede the escape: escaping first can cut
 // between a '\' and its '|', and the stranded '\' then swallows the delimiter.
 inline std::string list_field(std::string_view v) {
-    v = v.substr(0, v.find('\0'));
-    if (v.size() > kMaxListFieldBytes) {
-        std::size_t cut = kMaxListFieldBytes;
-        while (cut > 0 && (static_cast<unsigned char>(v[cut]) & 0xC0) == 0x80)
-            --cut;
-        v = v.substr(0, cut);
-    }
+    v = cut_utf8(v.substr(0, v.find('\0')), kMaxListFieldBytes);
     return v.empty() ? std::string("-") : yuzu::util::safe_output_field(v);
 }
 } // namespace detail

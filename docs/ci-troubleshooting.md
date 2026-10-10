@@ -514,8 +514,7 @@ OR the hand-rolled `find_library()` wiring re-introduces the failure.
 
 **Full history** including every failed approach
 (per-build-type triplets → explicit `CMAKE_BUILD_TYPE` → drop static
-override → option H hybrid) and the strategic escape path (#376 QUIC
-migration if option D ever rots) lives in
+override → option H hybrid) lives in
 `.claude/agents/build-ci.md` under **"Windows MSVC static-link history
 and #375"**. **Read that file before touching the Windows build wiring.**
 

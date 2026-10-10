@@ -95,7 +95,7 @@ Subprocesses: `shasum` (macOS) / `sha256sum`, `sha1sum` (Linux) for `file_hash`/
 | `device.filesystem.file_hash` | `base_dir` | string | no | - | maxLength 4096 | Optional. Restricts access to files within this directory. |
 | `device.filesystem.find_by_hash` | `directory` | string | yes | - | maxLength 4096 | The root directory to search. |
 | `device.filesystem.find_by_hash` | `sha256` | string | yes | - | minLength 64 · maxLength 64 | The SHA256 hex digest to search for (case-insensitive). |
-| `device.filesystem.find_by_hash` | `max_depth` | int32 | no | 3 | minimum 1 · maximum 10 | Maximum directory recursion depth. Default: 3, max: 10. |
+| `device.filesystem.find_by_hash` | `max_depth` | int32 | no | 3 | minimum 1 · maximum 10 | Maximum directory recursion depth. Default: 3, max: 10. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute. |
 | `device.filesystem.get_acl` | `path` | string | yes | - | maxLength 4096 | The file or directory to inspect. |
 | `device.filesystem.get_acl` | `base_dir` | string | no | - | maxLength 4096 | Optional. Restricts access to paths within this directory. |
 | `device.filesystem.get_signature` | `path` | string | yes | - | maxLength 4096 | The executable, DLL, or app bundle to verify. |
@@ -106,7 +106,7 @@ Subprocesses: `shasum` (macOS) / `sha256sum`, `sha1sum` (Linux) for `file_hash`/
 | `device.filesystem.list_dir` | `base_dir` | string | no | - | maxLength 4096 | Optional. Restricts access to paths within this directory. |
 | `device.filesystem.read` | `path` | string | yes | - | maxLength 4096 | The text file to read. |
 | `device.filesystem.read` | `offset` | int32 | no | 1 | minimum 1 | 1-based line number to start reading from. Default: 1. |
-| `device.filesystem.read` | `limit` | int32 | no | 100 | minimum 1 · maximum 10000 | Maximum number of lines to return. Default: 100, max: 10000. |
+| `device.filesystem.read` | `limit` | int32 | no | 100 | minimum 1 · maximum 10000 | Maximum number of lines to return. Default: 100, max: 10000. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute. |
 | `device.filesystem.read` | `base_dir` | string | no | - | maxLength 4096 | Optional. Restricts access to files within this directory. |
 | `device.filesystem.replace` | `path` | string | yes | - | maxLength 4096 | The file to perform find/replace on. |
 | `device.filesystem.replace` | `search` | string | yes | - | maxLength 256 | The literal string or regex to search for. |
@@ -120,26 +120,29 @@ Subprocesses: `shasum` (macOS) / `sha256sum`, `sha1sum` (Linux) for `file_hash`/
 | `device.filesystem.search` | `pattern` | string | yes | - | maxLength 256 | The literal string or regex to search for in each line. |
 | `device.filesystem.search` | `regex` | string | no | false | enum: true, false | If "true", interpret the pattern as an ECMAScript regex. Patterns with nested quantifiers are rejected to prevent catastrophic backtracking. Default: "false". |
 | `device.filesystem.search` | `case_sensitive` | string | no | true | enum: true, false | If "true" (default), match is case-sensitive. If "false", performs case-insensitive matching. |
-| `device.filesystem.search` | `max_matches` | int32 | no | 100 | minimum 1 · maximum 10000 | Maximum number of matching lines to return. Default: 100, max: 10000. |
+| `device.filesystem.search` | `max_matches` | int32 | no | 100 | minimum 1 · maximum 10000 | Maximum number of matching lines to return. Default: 100, max: 10000. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute. |
 | `device.filesystem.search` | `base_dir` | string | no | - | maxLength 4096 | Optional. Restricts access to files within this directory. |
 | `device.filesystem.search_dir` | `root` | string | yes | - | maxLength 4096 | The root directory to search from. |
 | `device.filesystem.search_dir` | `pattern` | string | yes | - | maxLength 256 | Glob pattern (default) or regex to match against entry names. Examples: "*.log", "config*", "^backup-\d+$" (with regex=true). |
 | `device.filesystem.search_dir` | `regex` | string | no | false | enum: true, false | If "true", interpret the pattern as an ECMAScript regex instead of a glob. Default: "false". |
 | `device.filesystem.search_dir` | `match_type` | string | no | directories | enum: directories, files, both | What to match: "directories" (default), "files", or "both". |
-| `device.filesystem.search_dir` | `max_depth` | int32 | no | 5 | minimum 1 · maximum 20 | Maximum directory recursion depth. Default: 5, max: 20. |
-| `device.filesystem.search_dir` | `max_results` | int32 | no | 100 | minimum 1 · maximum 1000 | Maximum number of matching entries to return. Default: 100, max: 1000. |
+| `device.filesystem.search_dir` | `max_depth` | int32 | no | 5 | minimum 1 · maximum 20 | Maximum directory recursion depth. Default: 5, max: 20. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute. |
+| `device.filesystem.search_dir` | `max_results` | int32 | no | 100 | minimum 1 · maximum 1000 | Maximum number of matching entries to return. Default: 100, max: 1000. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute. |
 | `device.filesystem.search_dir` | `base_dir` | string | no | - | maxLength 4096 | Optional. Restricts the search root to paths within this directory. |
 | `device.filesystem.write_content` | `path` | string | yes | - | maxLength 4096 | The file path to write to. If the file does not exist, it will be created if create=true. |
 | `device.filesystem.write_content` | `content` | string | no | - | - | The text content to write to the file. |
 | `device.filesystem.write_content` | `create` | string | no | false | enum: true, false | If "true", create the file if it does not exist. Default: "false". |
 | `device.filesystem.write_content` | `overwrite` | string | no | false | enum: true, false | If "true", overwrite an existing file. Default: "false". |
 | `device.filesystem.write_content` | `base_dir` | string | no | - | maxLength 4096 | Optional. Restricts access to files within this directory. |
-| `workflow.config_search_and_replace` | `config_path` | string | yes | - | maxLength 4096 | Full path to the configuration file to update. Example: "/etc/myapp/config.ini" or "C:\ProgramData\MyApp\config.ini" |
-| `workflow.config_search_and_replace` | `old_value` | string | yes | - | maxLength 256 | The current configuration value to search for. Matched literally (not regex) unless search_regex=true. |
-| `workflow.config_search_and_replace` | `new_value` | string | yes | - | - | The new configuration value to replace matches with. |
-| `workflow.config_search_and_replace` | `search_regex` | string | no | false | enum: true, false | If "true", interpret old_value as a regex pattern. Default: "false". |
+| `workflow.config_search_and_replace` | `path` | string | yes | - | maxLength 4096 | Full path to the configuration file to update. Example: "/etc/myapp/config.ini" or "C:\ProgramData\MyApp\config.ini" |
+| `workflow.config_search_and_replace` | `search` | string | yes | - | maxLength 256 | The current configuration value to search for. Matched literally (not regex) unless regex=true. |
+| `workflow.config_search_and_replace` | `replacement` | string | yes | - | - | The new configuration value to replace matches with. |
+| `workflow.config_search_and_replace` | `regex` | string | no | false | enum: true, false | If "true", interpret search as a regex pattern. Default: "false". |
+| `workflow.config_search_and_replace` | `case_sensitive` | string | no | true | enum: true, false | If "true" (default), match is case-sensitive. |
+| `workflow.config_search_and_replace` | `dry_run` | string | no | false | enum: true, false | If "true", count replacements without modifying the file. Default: "false". |
+| `workflow.config_search_and_replace` | `max_replacements` | int32 | no | 0 | minimum 0 | Maximum number of replacements to perform. 0 = unlimited. Default: 0. |
 | `workflow.config_search_and_replace` | `base_dir` | string | no | - | maxLength 4096 | Optional. Restricts access to files within this directory. |
-| `workflow.version_compliance_check` | `executable_path` | string | yes | - | maxLength 4096 | Full path to the Windows executable to check. Example: "C:\Program Files\MyApp\myapp.exe" |
+| `workflow.version_compliance_check` | `path` | string | yes | - | maxLength 4096 | Full path to the Windows executable to check. Example: "C:\Program Files\MyApp\myapp.exe" |
 | `workflow.version_compliance_check` | `minimum_version` | string | no | - | maxLength 64 | The minimum acceptable product version string (e.g. "2.5.0.0"). Used by downstream PolicyFragment conditions for compliance evaluation. The check itself returns the raw version; the comparison happens in the policy layer using version_gte. |
 | `workflow.version_compliance_check` | `base_dir` | string | no | - | maxLength 4096 | Optional. Restricts access to files within this directory. |
 <!-- END GENERATED -->
