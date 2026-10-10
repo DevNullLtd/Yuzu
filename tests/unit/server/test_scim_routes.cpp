@@ -23,6 +23,7 @@
  * broken (test_helpers.hpp skip-vs-fail contract, via yuzu::test::AuthDbPg).
  */
 
+#include "rbac_store.hpp"
 #include "scim_routes.hpp"
 
 #include "analytics_event.hpp"
@@ -78,6 +79,9 @@ namespace {
 /// FAILs when set but broken (via yuzu::test::AuthDbPg).
 struct Fixture {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: the last-Administrator guard AuthManager::remove_user/update_role now require (fail
+    // closed without it), built on the same pool: the production composition.
+    std::unique_ptr<yuzu::server::RbacStore> rbac_guard;
     auth::AuthManager auth_mgr;
     std::unique_ptr<ScimStore> scim_store;
     // ADR-2001 §§1,3: shares auth_db's PgPool, same "one PgPool, independent
@@ -114,6 +118,12 @@ struct Fixture {
     /// promotes to admin.
     explicit Fixture(bool broken_audit = false, std::string scim_admin_group = {}) {
         auth_mgr.set_auth_db(auth_db.get());
+        rbac_guard = std::make_unique<yuzu::server::RbacStore>(auth_db.pool());
+        REQUIRE(rbac_guard->is_open());
+        auth_mgr.set_rbac_store(rbac_guard.get());
+        // A second active admin: cases that demote/remove an admin test the write path, not the
+        // last-Administrator refusal (that has its own cases).
+        REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", auth::Role::admin).has_value());
         auth_mgr.set_metrics_registry(&metrics);
 
         scim_store = std::make_unique<ScimStore>(auth_db.pool());
@@ -1113,6 +1123,7 @@ TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a C
     // too, with no further change needed here.)
     auth::AuthManager cold_auth_mgr;
     cold_auth_mgr.set_auth_db(f.auth_db.get());
+    cold_auth_mgr.set_rbac_store(f.rbac_guard.get());
 
     // Prime the cache for "dana" only, via `reactivate_user` — a legitimate,
     // idempotent AuthDB write (harmless on an already-active row; clears
@@ -2586,6 +2597,9 @@ struct ScimIntegrationServer {
     // into this struct's own member-init (rather than deferring it inside
     // start(), as the old SQLite AuthDB did) changes nothing observable.
     yuzu::test::AuthDbPg auth_db;
+    // #4966: the last-Administrator guard AuthManager::remove_user/update_role now require (fail
+    // closed without it), built on the same pool: the production composition.
+    std::unique_ptr<yuzu::server::RbacStore> rbac_guard;
     auth::AuthManager auth_mgr;
     std::unique_ptr<ScimStore> scim_store;
     // ADR-2001 §§1,3: shares auth_db's PgPool, same "one PgPool" pattern as
@@ -2612,6 +2626,12 @@ struct ScimIntegrationServer {
 
     void start() {
         auth_mgr.set_auth_db(auth_db.get());
+        rbac_guard = std::make_unique<yuzu::server::RbacStore>(auth_db.pool());
+        REQUIRE(rbac_guard->is_open());
+        auth_mgr.set_rbac_store(rbac_guard.get());
+        // A second active admin: cases that demote/remove an admin test the write path, not the
+        // last-Administrator refusal (that has its own cases).
+        REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", auth::Role::admin).has_value());
 
         scim_store = std::make_unique<ScimStore>(auth_db.pool());
         REQUIRE(scim_store->is_open());

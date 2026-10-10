@@ -27,6 +27,7 @@
  * deterministically under TSan with no TSan report (#438).
  */
 
+#include "rbac_store.hpp"
 #include "settings_routes.hpp"
 
 #include "api_token_store.hpp"
@@ -260,6 +261,9 @@ namespace {
 /// deliberately fails closed on delete). Local to these ADR-2001 cases only.
 struct SettingsAdr2001Harness {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: the last-Administrator guard AuthManager::remove_user/update_role now require (fail
+    // closed without it), built on the same pool: the production composition.
+    std::unique_ptr<yuzu::server::RbacStore> rbac_guard;
     Config cfg{};
     auth::AuthManager auth_mgr{};
     auth::AutoApproveEngine auto_approve{};
@@ -276,6 +280,9 @@ struct SettingsAdr2001Harness {
 
     SettingsAdr2001Harness() {
         auth_mgr.set_auth_db(auth_db.get());
+        rbac_guard = std::make_unique<yuzu::server::RbacStore>(auth_db.pool());
+        REQUIRE(rbac_guard->is_open());
+        auth_mgr.set_rbac_store(rbac_guard.get());
         REQUIRE(auth_mgr.upsert_user("admin", "adminpassword1", auth::Role::admin));
         REQUIRE(auth_mgr.upsert_user("bob", "bobpassword12", auth::Role::user));
 

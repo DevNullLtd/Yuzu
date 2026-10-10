@@ -1,7 +1,8 @@
 /**
  * test_rbac_account_lifecycle_guard.cpp -- the last-Administrator guard for ACCOUNT lifecycle
  * (#4966): RbacAdminAuthorityOwner::deactivate_account / set_local_role /
- * would_strand_last_administrator, reached through RbacStore.
+ * would_strand_last_administrator, reached through RbacStore, and the AuthManager entry points
+ * remove_user_checked / update_role_checked that are the production way in.
  *
  * Two floors, stated once so each case below can name the one it exercises:
  *   - COLUMN floor, BOTH regimes: the active local `role='admin'` population.
@@ -25,6 +26,8 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "rbac_store.hpp"
+#include "session_store.hpp"
+#include <yuzu/server/auth.hpp>
 
 #include "test_auth_db_pg_helper.hpp"
 #include "../test_helpers.hpp"
@@ -734,4 +737,236 @@ TEST_CASE("lifecycle guard: would_strand_last_administrator takes no lock, whate
     CHECK_FALSE(b.would_strand);
     REQUIRE(unknown.ok);
     CHECK_FALSE(unknown.would_strand);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// AuthManager: remove_user_checked / update_role_checked (the production entry to the guard)
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+using yuzu::server::auth::AuthManager;
+using yuzu::server::auth::RemoveUserOutcome;
+using yuzu::server::auth::UpdateRoleOutcome;
+
+// The production composition: AuthDB + RbacStore + SessionStore on ONE pool, wired into an
+// AuthManager. `wire_rbac = false` reproduces a server that forgot the injection.
+struct ManagerFx {
+    yuzu::test::AuthDbPg db;
+    RbacStore rbac{db.pool()};
+    yuzu::server::SessionStore sessions{db.pool()};
+    AuthManager mgr;
+
+    explicit ManagerFx(bool wire_rbac = true) {
+        REQUIRE(rbac.is_open());
+        REQUIRE(sessions.is_open());
+        mgr.set_auth_db(db.get());
+        mgr.set_session_store(&sessions);
+        if (wire_rbac)
+            mgr.set_rbac_store(&rbac);
+    }
+    ~ManagerFx() {
+        mgr.set_rbac_store(nullptr);
+        mgr.set_session_store(nullptr);
+        mgr.set_auth_db(nullptr);
+    }
+    ManagerFx(const ManagerFx&) = delete;
+    ManagerFx& operator=(const ManagerFx&) = delete;
+
+    int durable_sessions_of(const std::string& user) {
+        return static_cast<int>(
+            query_col(db.pool(),
+                      ("SELECT 1 FROM session_store.sessions WHERE username = '" + user + "'").c_str())
+                .size());
+    }
+    // A REAL fault in the throwaway database: the durable session table is moved aside, so the
+    // post-commit wipe's DELETE genuinely fails while the guarded account write is unaffected.
+    void break_session_wipe() { exec_raw(db.pool(), "ALTER TABLE session_store.sessions RENAME TO sessions_gone"); }
+    void repair_session_wipe() { exec_raw(db.pool(), "ALTER TABLE session_store.sessions_gone RENAME TO sessions"); }
+};
+
+} // namespace
+
+TEST_CASE("AuthManager lifecycle guard: the unwired decision is exactly 'AuthDB set, RbacStore not'",
+          "[lifecycle_guard][auth]") {
+    // The ONE decision shared by the runtime fail-closed arms and the boot self-check.
+    CHECK(AuthManager::lifecycle_guard_unwired(true, false));
+    CHECK_FALSE(AuthManager::lifecycle_guard_unwired(true, true));
+    CHECK_FALSE(AuthManager::lifecycle_guard_unwired(false, false)); // config-file-only mode
+    CHECK_FALSE(AuthManager::lifecycle_guard_unwired(false, true));
+}
+
+TEST_CASE("AuthManager lifecycle guard: config-file mode (no AuthDB) keeps the in-memory path "
+          "and needs no guard",
+          "[lifecycle_guard][auth]") {
+    AuthManager mgr; // no AuthDB, no RbacStore: nothing to dereference
+    REQUIRE_FALSE(mgr.has_rbac_store());
+    REQUIRE(mgr.upsert_user("cfguser", "a-sufficiently-long-password-1", Role::user));
+    REQUIRE(mgr.upsert_user("cfgadmin", "a-sufficiently-long-password-2", Role::admin));
+
+    CHECK(mgr.update_role_checked("cfguser", Role::admin) == UpdateRoleOutcome::Updated);
+    CHECK(mgr.get_user_role("cfguser") == Role::admin);
+    CHECK(mgr.update_role_checked("nobody", Role::admin) == UpdateRoleOutcome::NotFound);
+    CHECK_FALSE(mgr.update_role("nobody", Role::admin));
+
+    // No last-Administrator floor in config-file mode: there is no DB population to protect and
+    // the in-memory behaviour is unchanged.
+    CHECK(mgr.remove_user_checked("cfgadmin") == RemoveUserOutcome::Removed);
+    CHECK(mgr.remove_user_checked("cfgadmin") == RemoveUserOutcome::NotFound);
+    CHECK_FALSE(mgr.remove_user("cfgadmin"));
+    CHECK(mgr.remove_user("cfguser"));
+}
+
+TEST_CASE("AuthManager lifecycle guard: with an AuthDB and NO RbacStore both writes fail CLOSED, "
+          "never the unguarded AuthDB path",
+          "[pg][auth_db][lifecycle_guard]") {
+    ManagerFx f(/*wire_rbac=*/false);
+    seed(f.db, "fc_admin", Role::admin);
+    seed(f.db, "fc_user", Role::user);
+    REQUIRE_FALSE(f.mgr.has_rbac_store());
+
+    CHECK(f.mgr.remove_user_checked("fc_user") == RemoveUserOutcome::StoreFailure);
+    CHECK_FALSE(f.mgr.remove_user("fc_user"));
+    CHECK(account_active(f.db.pool(), "fc_user")); // the unguarded soft delete did not run
+    CHECK(f.mgr.update_role_checked("fc_user", Role::admin) == UpdateRoleOutcome::StoreFailure);
+    CHECK_FALSE(f.mgr.update_role("fc_user", Role::admin));
+    CHECK(role_column(f.db.pool(), "fc_user") == "user"); // nor the unguarded role write
+    CHECK(active_column_admins(f.db.pool()) == std::vector<std::string>{"fc_admin"});
+}
+
+TEST_CASE("AuthManager lifecycle guard: remove_user_checked outcomes (Removed, NotFound, refused)",
+          "[pg][auth_db][lifecycle_guard]") {
+    ManagerFx f;
+    seed(f.db, "ou_admin", Role::admin);
+    seed(f.db, "ou_user", Role::user);
+    const auto user_session = f.mgr.create_local_session_for_test("ou_user", Role::user, false);
+    const auto admin_session = f.mgr.create_local_session_for_test("ou_admin", Role::admin, false);
+    REQUIRE_FALSE(user_session.empty());
+    REQUIRE_FALSE(admin_session.empty());
+    REQUIRE(f.durable_sessions_of("ou_user") == 1);
+
+    // Refused: the sole active column admin. NOTHING changes, in particular its session lives on.
+    CHECK(f.mgr.remove_user_checked("ou_admin") == RemoveUserOutcome::LastAdministratorRefused);
+    CHECK_FALSE(f.mgr.remove_user("ou_admin"));
+    CHECK(account_active(f.db.pool(), "ou_admin"));
+    CHECK(f.mgr.validate_session(admin_session).has_value());
+    CHECK(f.durable_sessions_of("ou_admin") == 1);
+
+    // Removed: committed first, then caches and BOTH session copies are gone.
+    CHECK(f.mgr.remove_user_checked("ou_user") == RemoveUserOutcome::Removed);
+    CHECK_FALSE(account_active(f.db.pool(), "ou_user"));
+    CHECK_FALSE(f.mgr.validate_session(user_session).has_value());
+    CHECK(f.durable_sessions_of("ou_user") == 0);
+
+    // Idempotent: the row is already inactive, and an unknown name is the same answer.
+    CHECK(f.mgr.remove_user_checked("ou_user") == RemoveUserOutcome::NotFound);
+    CHECK(f.mgr.remove_user_checked("ou_nobody") == RemoveUserOutcome::NotFound);
+    CHECK_FALSE(f.mgr.remove_user("ou_nobody"));
+}
+
+TEST_CASE("AuthManager lifecycle guard: RemovedSessionWipeFailed says the row IS deactivated, and "
+          "a retry converges",
+          "[pg][auth_db][lifecycle_guard]") {
+    ManagerFx f;
+    seed(f.db, "wf_admin", Role::admin);
+    seed(f.db, "wf_user", Role::user);
+    const auto token = f.mgr.create_local_session_for_test("wf_user", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE(f.durable_sessions_of("wf_user") == 1);
+
+    f.break_session_wipe();
+    // The guarded write committed; only the durable wipe failed. NOT StoreFailure: that would
+    // lie that the row is untouched.
+    CHECK(f.mgr.remove_user_checked("wf_user") == RemoveUserOutcome::RemovedSessionWipeFailed);
+    CHECK_FALSE(account_active(f.db.pool(), "wf_user"));
+    // The bool wrapper stays false (the pre-existing fail-closed return).
+    // A retry with the store still broken: the row is already inactive, nothing was removed BY
+    // THIS CALL, and the wipe failed again.
+    CHECK(f.mgr.remove_user_checked("wf_user") == RemoveUserOutcome::StoreFailure);
+
+    f.repair_session_wipe();
+    // Converges: the wipe now succeeds on the already-inactive row, and the durable row is gone.
+    CHECK(f.mgr.remove_user_checked("wf_user") == RemoveUserOutcome::NotFound);
+    CHECK(f.durable_sessions_of("wf_user") == 0);
+    CHECK_FALSE(f.mgr.validate_session(token).has_value());
+}
+
+TEST_CASE("AuthManager lifecycle guard: a store failure inside the guard is StoreFailure, and "
+          "AuthManager::mu_ is NOT held across the owner call",
+          "[pg][auth_db][lifecycle_guard]") {
+    ManagerFx f;
+    seed(f.db, "mu_a", Role::admin);
+    seed(f.db, "mu_b", Role::admin);
+
+    HeldLocks hold(f.db.pool());
+    hold.lock_rbac_enabled();
+    RemoveUserOutcome removed = RemoveUserOutcome::Removed;
+    UpdateRoleOutcome updated = UpdateRoleOutcome::Updated;
+    Workers workers([&] { hold.rollback(); });
+    workers.add([&] { removed = f.mgr.remove_user_checked("mu_a"); });
+    workers.add([&] { updated = f.mgr.update_role_checked("mu_b", Role::user); });
+    REQUIRE(wait_for_blocked_backends(f.db.dsn(), hold.pid(), 2).size() >= 2);
+
+    // Both workers are INSIDE the owner call right now. An AuthManager accessor that takes
+    // mu_ must still answer at once; had remove_user_checked held mu_ across the call (the
+    // deadlock shape with recheck_role_after_credential_check), these would wait out the 2 s
+    // lock_timeout, and a login-path reader would be stalled behind an admin's lock wait.
+    const auto t0 = std::chrono::steady_clock::now();
+    (void)f.mgr.has_users(); // takes mu_ shared; a held unique mu_ would block it here
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(1000));
+
+    workers.join_all(); // both wait out the transaction-local lock_timeout together
+    CHECK(removed == RemoveUserOutcome::StoreFailure);
+    CHECK(updated == UpdateRoleOutcome::StoreFailure);
+    CHECK(account_active(f.db.pool(), "mu_a"));
+    CHECK(role_column(f.db.pool(), "mu_b") == "admin");
+}
+
+TEST_CASE("AuthManager lifecycle guard: update_role_checked outcomes",
+          "[pg][auth_db][lifecycle_guard]") {
+    ManagerFx f;
+    seed(f.db, "ur_admin", Role::admin);
+    seed(f.db, "ur_user", Role::user);
+    seed(f.db, "ur_gone", Role::user);
+    REQUIRE(f.db->remove_user("ur_gone").has_value());
+    const auto token = f.mgr.create_local_session_for_test("ur_user", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+
+    CHECK(f.mgr.update_role_checked("ur_nobody", Role::admin) == UpdateRoleOutcome::NotFound);
+    CHECK_FALSE(f.mgr.update_role("ur_nobody", Role::admin));
+    // Never re-arm an inactive account.
+    CHECK(f.mgr.update_role_checked("ur_gone", Role::admin) == UpdateRoleOutcome::InactivePromotionRefused);
+    CHECK(role_column(f.db.pool(), "ur_gone") == "user");
+    // The sole active column admin cannot be demoted; nothing changes.
+    CHECK(f.mgr.update_role_checked("ur_admin", Role::user) == UpdateRoleOutcome::LastAdministratorRefused);
+    CHECK(role_column(f.db.pool(), "ur_admin") == "admin");
+
+    // A real change wipes the user's sessions so they pick up the new role.
+    CHECK(f.mgr.update_role_checked("ur_user", Role::admin) == UpdateRoleOutcome::Updated);
+    CHECK(role_column(f.db.pool(), "ur_user") == "admin");
+    CHECK_FALSE(f.mgr.validate_session(token).has_value());
+    // With two admins the first can now be demoted; the bool wrapper agrees.
+    CHECK(f.mgr.update_role("ur_admin", Role::user));
+    CHECK(active_column_admins(f.db.pool()) == std::vector<std::string>{"ur_user"});
+}
+
+TEST_CASE("AuthManager lifecycle guard: UpdatedSessionWipeFailed says the role IS changed, and a "
+          "retry converges (the row already holds the role)",
+          "[pg][auth_db][lifecycle_guard]") {
+    ManagerFx f;
+    seed(f.db, "uw_admin", Role::admin);
+    seed(f.db, "uw_user", Role::user);
+    const auto token = f.mgr.create_local_session_for_test("uw_user", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+
+    f.break_session_wipe();
+    CHECK(f.mgr.update_role_checked("uw_user", Role::admin) == UpdateRoleOutcome::UpdatedSessionWipeFailed);
+    CHECK(role_column(f.db.pool(), "uw_user") == "admin"); // committed
+    CHECK_FALSE(f.mgr.update_role("uw_user", Role::admin)); // wrapper: not a clean success
+
+    f.repair_session_wipe();
+    // The retry finds the role already set (Unchanged inside), still wipes, and succeeds.
+    CHECK(f.mgr.update_role_checked("uw_user", Role::admin) == UpdateRoleOutcome::Updated);
+    CHECK(f.durable_sessions_of("uw_user") == 0);
+    CHECK_FALSE(f.mgr.validate_session(token).has_value());
 }
