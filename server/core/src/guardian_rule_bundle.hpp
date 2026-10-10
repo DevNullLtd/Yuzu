@@ -35,9 +35,17 @@
 /// generation is then lower than the rules, the agent reports lower than current on its
 /// next heartbeat and is reconciled again) but never older. What ordering cannot cover is a
 /// bump that FAILED after its mutation committed: the generation stays `g` while the rules
-/// are newer, and a bundle held for `g` would be served forever. `max_age` is the backstop:
-/// a held bundle older than it is a miss and is reloaded, so such a divergence heals within
-/// `max_age` instead of persisting until the next unrelated bump.
+/// are newer, and a bundle held for `g` would be served until `max_age`. Two backstops, with
+/// different reach. (1) On the replica that took a rule create/update/delete, the store's
+/// post-mutation hook (`GuaranteedStateStore::set_on_rule_mutation`, wired in `server.cpp`)
+/// calls `invalidate()` after the bump attempt whether or not the bump succeeded, so the
+/// next reconcile reloads at once. (2) `max_age` bounds everything the hook cannot see:
+/// another replica's edit, or a double fault. A held bundle older than it is a miss and is
+/// reloaded. NOTE what `max_age` heals and what it does not: it heals the MEMO. An agent that
+/// was already reconciled from a stale bundle was labelled with the current generation and
+/// stays Converged until the next bump (or its own regression); the reload does not re-push
+/// to it. So on a missed bump the memo recovers within `max_age`, but the already-served
+/// agents recover only at the next bump.
 ///
 /// SHAPE.
 ///   - ONE bundle is held (the most recently loaded). A request for a different

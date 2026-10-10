@@ -219,7 +219,7 @@ TEST_CASE("GuardianReconcileBudget: thread-safety smoke", "[guardian][reconcile_
     constexpr int kIters = 2000;
     std::atomic<std::uint64_t> admitted_seen{0};
     std::atomic<std::uint64_t> shed_seen{0};
-    std::vector<std::thread> ts;
+    std::vector<std::jthread> ts;
     for (int t = 0; t < kThreads; ++t) {
         ts.emplace_back([&] {
             for (int i = 0; i < kIters; ++i) {

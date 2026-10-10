@@ -418,7 +418,7 @@ TEST_CASE("GuardianReconcileGate: decide() is atomic across threads (one Admit p
     std::condition_variable cv;
     bool go = false;
     std::atomic<std::uint64_t> admits{0}, limited{0};
-    std::vector<std::thread> threads;
+    std::vector<std::jthread> threads;
     for (int t = 0; t < kThreads; ++t)
         threads.emplace_back([&] {
             {
@@ -595,7 +595,7 @@ TEST_CASE("GuardianReconcileGate: thread-safety smoke", "[guardian][reconcile_ga
         }
     };
 
-    std::vector<std::thread> threads;
+    std::vector<std::jthread> threads;
     for (int t = 0; t < kThreads; ++t)
         threads.emplace_back(worker, t);
     for (auto& th : threads)

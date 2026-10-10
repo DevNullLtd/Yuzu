@@ -1352,7 +1352,7 @@ private:
 // -- Scope kind discovery catalog ---------------------------------------------
 //
 // One row per scope-expression ATTRIBUTE kind the `evaluate_scope` resolver
-// (agent_registry.cpp, the `resolver` lambda inside the `agents_` loop) knows
+// (agent_registry.cpp, `resolve_scope_attribute`) knows
 // how to answer. Deliberately colocated with `evaluate_scope` rather than in
 // the discovery module (`discover_routes.cpp`) so a reviewer touching the
 // resolver sees this list in the same diff hunk / file.
@@ -1365,7 +1365,7 @@ private:
 // discovery route.
 //
 // DRIFT CONTRACT: any NEW `if (key == ...)` / `key.starts_with(...)` branch
-// added to the resolver lambda MUST get a matching entry here. The
+// added to `resolve_scope_attribute` MUST get a matching entry here. The
 // `test_discovery_routes.cpp` CROSS-CHECK test exercises `evaluate_scope` for
 // every entry below (proving the enumerator is a SUBSET of what the resolver
 // honors) and confirms a made-up kind resolves to no match (proving the

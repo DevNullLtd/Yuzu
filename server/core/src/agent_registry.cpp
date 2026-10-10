@@ -27,6 +27,8 @@
 #include "tag_store.hpp"
 #include "web_utils.hpp"
 
+#include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
+
 namespace yuzu::server::detail {
 
 // Bring html_escape into scope for the HTML rendering methods.
@@ -2101,7 +2103,7 @@ AgentRegistry::evaluate_scope_for_agent(const std::string& agent_id,
     // any store read (defence in depth). Same predicate as TagStore / CustomPropertiesStore
     // (empty, > 256 bytes, or an embedded NUL); the stores guard themselves too, this keeps
     // the evaluator from even taking the session lookup for such an id.
-    if (agent_id.empty() || agent_id.size() > 256 ||
+    if (agent_id.empty() || agent_id.size() > auth::kMaxAgentIdLength ||
         agent_id.find('\0') != std::string::npos)
         return false;
 

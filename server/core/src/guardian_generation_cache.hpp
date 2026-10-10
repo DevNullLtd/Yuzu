@@ -40,7 +40,8 @@
 ///   - A lower fetched value REPLACES a higher cached one. That is a store reset and is
 ///     not hidden: `regressions()` counts it. Nothing here pins the generation upward.
 ///   - `invalidate()` drops the cached outcome (called when the generation was just bumped
-///     locally, and by tests). A fetch already in flight when `invalidate()` runs still
+///     locally, by the store's post-mutation rule hook after every rule create/update/delete
+///     on this replica even when the bump failed, and by tests). A fetch already in flight when `invalidate()` runs still
 ///     returns its result to its own callers but does NOT repopulate the cache, so an
 ///     invalidation can never be undone by an older read. It also ends single-flight
 ///     for that fetch: the next `get()` starts its own fetch rather than waiting on the

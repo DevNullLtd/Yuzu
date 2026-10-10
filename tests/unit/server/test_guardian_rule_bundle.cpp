@@ -303,7 +303,7 @@ TEST_CASE("GuardianRuleBundleCache: a load that fails after an invalidate does n
         return std::expected<Bundle, BundleLoadError>(
             std::unexpected(BundleLoadError{BundleLoadError::Source::rules, "late failure"}));
     };
-    std::thread t([&] { (void)cache.get(8, slow_failing); });
+    std::jthread t([&] { (void)cache.get(8, slow_failing); });
     REQUIRE(entered.wait());
     cache.invalidate();  // the bump landed while the old load was still running
     release.set();
@@ -400,7 +400,7 @@ TEST_CASE("GuardianRuleBundleCache: concurrent callers for one generation share 
     };
 
     std::vector<std::shared_ptr<const Bundle>> got(8);
-    std::vector<std::thread> ts;
+    std::vector<std::jthread> ts;
     ts.emplace_back([&] { got[0] = cache.get(4, slow).value(); });
     REQUIRE(entered.wait());  // the flight is registered before the loader body runs
     for (std::size_t i = 1; i < got.size(); ++i)
@@ -427,7 +427,7 @@ TEST_CASE("GuardianRuleBundleCache: a request for another generation does not wa
         return std::expected<Bundle, BundleLoadError>(make_bundle({rule("slow", "")}, {"slow"}));
     };
     std::shared_ptr<const Bundle> slow_result;
-    std::thread t([&] { slow_result = cache.get(1, slow).value(); });
+    std::jthread t([&] { slow_result = cache.get(1, slow).value(); });
     REQUIRE(entered.wait());
 
     std::atomic<int> calls{0};
@@ -558,7 +558,7 @@ TEST_CASE("GuardianRuleBundleCache: a waiter gives up after max_wait while the l
         return std::expected<Bundle, BundleLoadError>(make_bundle({rule("x", "")}, {"x"}));
     };
     std::shared_ptr<const Bundle> loaded;
-    std::thread t([&] { loaded = cache.get(4, slow).value(); });
+    std::jthread t([&] { loaded = cache.get(4, slow).value(); });
     REQUIRE(entered.wait());
 
     auto waiter = cache.get(4, slow);
@@ -600,11 +600,11 @@ TEST_CASE("GuardianRuleBundleCache: waited reports the time a blocked waiter spe
     };
 
     std::chrono::nanoseconds owner_waited{-1};
-    std::thread owner([&] { (void)cache.get(4, slow, &owner_waited); });
+    std::jthread owner([&] { (void)cache.get(4, slow, &owner_waited); });
     REQUIRE(entered.wait());  // the flight is registered; the owner has read the clock once
 
     std::chrono::nanoseconds waiter_waited{-1};
-    std::thread waiter([&] { (void)cache.get(4, slow, &waiter_waited); });
+    std::jthread waiter([&] { (void)cache.get(4, slow, &waiter_waited); });
     // Under the lock (read 2) and just before blocking (read 3): the waiter is about to block.
     REQUIRE(clk.wait_for_calls(3));
     clk.base.advance(3s);  // 3 s pass while the waiter is blocked
