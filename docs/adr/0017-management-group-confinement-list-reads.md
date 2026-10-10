@@ -279,7 +279,8 @@ gate.
   `kind=result_set` return the whole-registry agent count from `agents_fn()` (#4753, checklist still
   open), as does `kind=execution`/`kind=agent` with an empty id. (REST
   `GET /api/v1/execution-statistics/agents` and MCP `get_execution_statistics_by_agent`, formerly
-  listed here under #3526, are now confined on the same chokepoint: see the Execution-statistics
+  listed here under #3526, are now confined on the same chokepoint, effective only with RBAC
+  enforcement on: see the Execution-statistics
   per-agent rollup paragraph in `docs/auth-architecture.md`.)
 - **Executions (legacy pre-v1 routes)** — `GET /api/executions` (list), `/{id}` (detail),
   `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, `POST /{id}/cancel`

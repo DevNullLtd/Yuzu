@@ -125,14 +125,10 @@ too large for its type were already `400`.
   `now - n` that went past the epoch silently returned the whole result. Omit the parameter for
   "no bound on that side". `since=0` stays valid and matches exactly what omitting `since`
   matches; no script that sends `since=0` changes behaviour.
-- Scripts that send a **negative** `since` to `GET /api/v1/execution-statistics/agents` or `/definitions` or their MCP twins, a
-  negative `since` or `until`, or `until=0`, to the legacy `GET /api/audit` or MCP `query_audit_log` (`-32602`), `to=0` to
-  `GET /api/v1/audit/auth-sample`, or `until` of `0` or below (or a non-integer bound) in the body of `POST /api/v1/inventory/query` or
-  `POST /api/inventory/query`: it is `400` now. It used to be read as "unbounded", so a window
-  computed as `now - n` that went past the epoch silently returned the whole result. Omit the
-  parameter for "no bound on that side". `since=0` (`from=0`) stays valid and matches exactly what
-  omitting it matches. A non-integer `since`/`until` in an inventory query body made the body read throw
-  (nlohmann's `value()` throws on a type mismatch) and is a clean `400` now.
+- Scripts that send a **negative** `since` or `until`, or `until=0`, to other epoch-bounded reads
+  (the execution-statistics, legacy audit, auth-sample and inventory-query routes): it is `400`
+  now too, with the same fix (omit the parameter for no bound). The list is under
+  [Behaviour change: numeric query parameters on other routes](#behaviour-change-numeric-query-parameters-on-other-routes-are-parsed-strictly-too-4644).
 - MCP clients that send `"limit": null` or `"status": null`, or a float or string for either: omit
   the key to get the default. A `status` above `2147483647` and an unsigned value above
   `9223372036854775807` are `-32602` too (the latter used to wrap to `-1`, "any status"; the same
@@ -190,24 +186,41 @@ integer or does not fit a signed 64-bit value (a string used to mean `0`, unboun
 where a saturated value would be harmful and the argument is strict and bounded instead (`-32602`
 otherwise): `create_offload_target` `batch_size` must be 1 to 10000 (the declared schema range, now
 enforced), `mint_upload_grant` `declared_max_size` must be a JSON integer that fits a signed 64-bit
-value, and `create_guardian_rule` `version` must be 1 to 2147483647. The same two bounds now hold
+value, and `create_guardian_rule` `version` must be 1 to 2147483647. `mint_engine_credential`
+`ttl_days` of the wrong JSON type is `-32602` too (nothing is minted; it used to fall back to the
+90-day maximum). The two bounds now hold
 at the REST twins and in the stores, so no writer bypasses them: `POST /api/v1/offload-targets`
-answers `400` for a `batch_size` above 10000, `POST /api/v1/guaranteed-state/rules` answers `400`
+reads `batch_size` as a 64-bit value and answers `400` outside 1 to 10000 (an oversized number is
+rejected, not wrapped) and for a float, string, boolean or `null` (a float such as `5.5` used to be
+truncated), `POST /api/v1/guaranteed-state/rules` answers `400`
 for a `version` outside 1 to 2147483647, and `PUT /api/v1/guaranteed-state/rules/{id}` and MCP
-`update_guardian_rule` refuse a rule whose stored version is already at 2147483647 (`409` on REST,
-`-32602` on MCP) instead of overflowing the version bump.
+`update_guardian_rule` refuse a rule whose stored version is already at 2147483647 or above (`409` on REST,
+`-32602` on MCP) instead of overflowing the version bump. The store enforces the range only when a
+write changes the version, so a rule that already holds an out-of-range stored version can still be
+enabled or disabled from the dashboard. The MCP tools `get_execution_statistics_by_agent` and
+`get_execution_statistics_by_definition` answer `-32602` for a `limit` below 1 (the schema minimum;
+it used to be replaced by the default 50); their REST twins still map `0` or a negative `limit` to 50.
 
-A negative `since`, and an `until` of `0` or below, are refused as well (`400`, `-32602` on MCP) on
-the legacy `GET /api/audit` and MCP `query_audit_log` (`until` of `0` is new there; a negative
-`since` or `until` was refused already), and a negative `since` on
-`GET /api/v1/execution-statistics/definitions`/`agents` and their MCP twins. The bounds are
-presence-tracked now: `-3600` and `until=0` used to mean no bound and returned the whole log or
-statistics set. Omit the parameter for no bound; `since=0` is accepted and matches the same rows as
-omitting it. `GET /api/v1/audit` takes no `since`/`until` and is unchanged.
+A negative `since` is refused (`400`, `-32602` on MCP) on the legacy `GET /api/audit` and MCP
+`query_audit_log`, and so is an `until` of `0` or below (a negative `since` or `until`, and an `until`
+of `0`, each used to mean no bound and are new `400`s here). The same holds for a negative `since` on
+`GET /api/v1/execution-statistics/definitions`/`agents` and their MCP twins, for `to=0` on
+`GET /api/v1/audit/auth-sample`, and for an `until` of `0` or below (or a non-integer bound) in the
+body of `POST /api/v1/inventory/query` and `POST /api/inventory/query`; a non-integer `since` or
+`until` in an inventory query body made the body read throw and is a clean `400` now. The bounds are
+presence-tracked now: `-3600` and `until=0` used to mean no bound and returned the whole log,
+statistics set or inventory. Omit the parameter for no bound; `since=0` (`from=0` on the auth sample)
+is accepted and matches the same rows as omitting it. On the auth-sample export a present but empty
+`from` or `to` is accepted as unbounded on that side. `GET /api/v1/audit` takes no `since`/`until`
+and is unchanged.
 
 The same strictness now covers the dashboard fragments' `page`/`per_page`, the software
 inventory, DEX perf, network quality, hardware and CA-issued lists, the notification, webhook and
-offload delivery lists, the pre-flight run list `limit`, the hardware sync poll's `await_since`
+offload delivery lists, the DEX, network and result-set `limit` and the Guaranteed State events `limit`/`offset` (trailing characters are `400`; an integer outside the result-set page range still uses the default page size),
+the pre-flight run list `limit`, the pre-flight run form's `min_gib` and `window` (a malformed value
+or a negative `min_gib` is `400`; an empty field keeps its default; a `window` of zero or below uses 30
+minutes and a larger value is clamped to 1 to 2880 as a 64-bit value, so one beyond a signed 64-bit
+integer is `400`; see [Pre-flight](preflight.md)), the hardware sync poll's `await_since`
 (a malformed freshness bound used to read as "no bound"), the TAR process-tree `node` and the
 `GET /api/v1/events` `?since` cursor (the workflow stream has the header only). A malformed
 `Last-Event-ID` header is served live only (nothing replayed, never the whole buffer) rather than
@@ -225,12 +238,22 @@ empty field, or a value that parses to a literal `0` (`0`, `-0`, `00`), means un
 expiry now, and a negative `ttl_hours` is refused (it would have computed `0`). The API-token form
 refuses with its usual `200` feedback span and mints nothing; the other forms answer `400` plus an
 error toast. On the batch route an empty `max_uses` defaults to `1`. A malformed `rollout_pct` on an OTA
-package upload or rollout change is a `400` instead of silently becoming `100`.
+package upload or rollout change is a `400` instead of silently becoming `100`. **Behaviour change on
+the rollout change route only:** an empty `rollout_pct` and a value above `100` are now `400` as well
+(an empty value used to mean `100` and a larger one was clamped to `100`); a negative value still
+clamps to `0`, and the upload route is unchanged. A negative `limit` or `offset` on `GET /api/notifications`, and a negative `limit` on the patch lists
+(`GET /api/patches`, `GET /api/patches/deployments`), is `400` too (the store answered an empty `200`),
+and so is a negative `limit` on the legacy `GET /api/policy-fragments` and `GET /api/policies` (it
+reached Postgres as `LIMIT -1` and answered `503`; the `/api/v1/` policy routes clamp it as before).
+A malformed or out-of-range enrollment-token number now also writes an `enrollment.token_create` or
+`enrollment.bulk_token_create` row with `result=denied` and `detail=invalid_numeric_parameter` (see
+[Audit Log](audit-log.md)).
 
-Still lenient, and not an exhaustive list: the live-snapshot `n` attempt counters
-(`deployment_routes.cpp`, `device_routes.cpp`, `hardware_routes.cpp`, `dex_routes.cpp`,
-`preflight_routes.cpp`, `tar_tree_routes.cpp`), and values parsed from stored rows, agent output
-or server configuration rather than from a request. Numeric path segments matched by a `(\d+)`
+Still lenient, and not an exhaustive list: the `n` retry-attempt counter on the live-snapshot poll
+fragments (the deployment, device, hardware, DEX, pre-flight and TAR process-tree polls), which is
+clamped to a fixed range per poll (1 to 100000 on the deployment and pre-flight polls, at most 50 on
+the others), and values parsed from stored rows, agent output or server configuration rather than
+from a request. Numeric path segments matched by a `(\d+)`
 pattern (notification read/dismiss, the webhook routes, the auto-approve rule index) now answer
 `404` for an id that does not fit a signed 64-bit integer; they used to fail with `500`.
 
@@ -245,7 +268,8 @@ four MCP statistics tools used to answer a store failure (execution store not op
 failed query) with `200` and an empty list or an all-zero summary, which reads as "no
 executions". They now answer `503` with `retry_after_ms: 2000` on REST and a retryable error with
 `retry_after_ms` on MCP. A filter or confined scope that genuinely matches nothing is still `200`
-with an empty `data` array.
+with an empty `data` array. Each degraded read also logs a warning on the server
+(`ExecutionTracker::try_get_<reader> degraded: tracker not open`, `pool exhausted` or `query failed`).
 
 **What to do.** Treat a `503` from these routes as retryable. A dashboard or script that read
 `data: []` as "nothing to report" during an outage will now see the error instead.
@@ -259,29 +283,35 @@ response cap reached"**, stays Incomplete (never in Deploy's go cohort) and the 
 re-dispatching that run; the run still completes at its deadline. Re-run against a smaller group
 to resolve those devices.
 
-## Breaking: per-agent execution statistics are confined to the caller's scope (#3526)
+## Behaviour change: per-agent execution statistics are confined to the caller's scope (#3526)
 
 `GET /api/v1/execution-statistics/agents` and the MCP tool `get_execution_statistics_by_agent` used
-to gate on a bare `Execution:Read` check and return one row per agent across every execution of every
-operator, so a management-group-confined operator saw agents outside its groups. They now go through
-the same admit-then-filter fleet-read gate as `GET /api/v1/executions` (ADR-0017): a confined caller
-sees only the rows of the agents it can see, applied in the query before the row limit, and a caller
-with unrestricted read sees what it saw before.
+to gate on a bare `Execution:Read` check. That check admits only a holder of a global grant, and it
+returned one row per agent across every execution of every operator with no per-agent filter. A
+management-group-scoped-only operator (no global grant) was refused with `403`. Both now go through
+the same admit-then-filter fleet-read gate as `GET /api/v1/executions` (ADR-0017): the visible-agent
+set is applied in the query before the grouping and the row limit, and an empty visible set returns
+no rows, never the fleet. This widens who is admitted and narrows what a confined caller sees:
+nothing a caller could read before is now refused.
 
-- **Fewer rows for a confined operator** is the intended effect; a script that totalled the fleet
-  from this route as a confined user will now get its own scope's total.
-- **A service-scoped API token on the REST route** used to be refused (`403`) by the bare gate. It is
-  now admitted as a confined view (only the agents tagged for its service), the same as the other
-  fleet-read routes, provided RBAC enforcement is on and the minting principal holds `Execution:Read`;
-  a degraded tag store answers `503`. The MCP tool still denies service-scoped tokens. Widening that
-  is a separate decision, not made here.
+- **A group-scoped-only operator** goes from `403` to a `200` that carries only the rows of the
+  agents it can see. A holder of a global grant sees the same rows as before.
+- **A service-scoped API token on the REST route** used to be refused (`403`) by the bare gate. With
+  RBAC enforcement on it is now admitted as a confined view: the token must clear the
+  `ITServiceOwner` authority ceiling (the seeded role holds `Execution:Read`), and the rows are then
+  intersected with the agents tagged for its service. A degraded tag store answers `503`. The MCP
+  tool still denies service-scoped tokens, and widening that is a separate decision, not made here.
+- **Confinement is effective only with RBAC enforcement on.** With RBAC off (the shipped default)
+  the rollup is unfiltered for every authenticated caller other than a service-scoped token or an
+  engine principal (a service-scoped token is refused `403` with RBAC off). Treat the confined view
+  as available once you enable RBAC enforcement, not before.
 - `GET /api/v1/execution-statistics/definitions` and the fleet summary carry no agent identity and
   keep the plain `Execution:Read` gate (the summary's `active_agents` is a fleet-wide count).
   `GET /fragments/executions` is not changed by this entry.
 - A negative `since` on `/agents` and `/definitions` is `400` (see the previous section).
 
-During a rolling upgrade, replicas on the old and the new build return different row sets to a
-confined caller.
+During a rolling upgrade, replicas on the old and the new build admit and return different row sets to
+a confined caller.
 
 ## Behaviour change: a cut visualization, results fragment or TAR scan is reported (#4644)
 
@@ -692,7 +722,7 @@ plus one new prerequisite.**
   `get_fleet_posture_fast`, stays open; the executions-list move covers only `kind=execution`). The same
   whole-registry branch is also reached by `kind=execution` or `kind=agent` with an EMPTY id, or
   when the execution tracker is unavailable (not separately tracked). (`GET
-  /api/v1/execution-statistics/agents` was listed here and is now confined; see "Breaking:
+  /api/v1/execution-statistics/agents` was listed here and is now confined; see "Behaviour change:
   per-agent execution statistics are confined to the caller's scope (#3526)".)
 
 **Rollback.** Redeploy the previous binary. The plain `Execution:Read` gate returns, so

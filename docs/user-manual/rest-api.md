@@ -58,6 +58,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
 - [Authentication](#authentication)
 - [JSON Envelope](#json-envelope)
 - [Pre-Auth Request Body Caps](#pre-auth-request-body-caps-2407)
+- [Numeric Query Parameters](#numeric-query-parameters-4644)
 - [REST API v1 Endpoints](#rest-api-v1-endpoints)
   - [Current User](#current-user)
   - [Devices](#devices)
@@ -243,8 +244,8 @@ A numeric query parameter must be **one complete base-10 integer**, on the route
 this way, or the route answers `400` with the A4 message `invalid numeric query parameter` (the
 message names the parameter on several routes, for example `window`, the `software` inventory
 `limit`, the event stream's `since` and the delivery-list `limit`; the wording otherwise varies by
-route family). They were read by `std::stoi`/`std::stoll`, which
-stop at the first non-digit, so `?limit=100abc` was read as `100`, `?since=1e9` as `1` and
+route family). They were read leniently, stopping at the first
+non-digit, so `?limit=100abc` was read as `100`, `?since=1e9` as `1` and
 `?since=junk` was swallowed into the default ("from the beginning"): a malformed filter silently
 answered a different question than the one asked. Rejected now: trailing characters, hex and
 exponent forms, decimals, whitespace, a leading `+` and a value too large for its type (an
@@ -263,26 +264,26 @@ Routes that parse strictly (the response routes are listed in
 
 | Family | Routes and parameters |
 |---|---|
-| Execution statistics | `GET /api/v1/execution-statistics/agents` and `/definitions`: `since`, `limit` |
+| Execution statistics | `GET /api/v1/execution-statistics/agents` and `/definitions`: `since`, `limit` (a negative `since` is `400` too; a `limit` of `0` or below uses the default 50, whereas the MCP twins reject it with `-32602`) |
 | Executions | `GET /api/executions`, `GET /api/v1/executions`: `limit`; `GET /api/v1/executions/{id}/visualization`: `index` |
 | Audit | `GET /api/v1/audit`: `limit`; `GET /api/audit`: `since`, `until`, `limit`, `offset`; `GET /api/analytics/recent`: `limit` (a malformed value used to be ignored) |
 | Instructions, product packs, workflows | `GET /api/instructions`, `GET /api/v1/instructions`, `GET /api/v1/product-packs`, `GET /api/product-packs`, `GET /api/workflows`, `GET /api/v1/workflows`: `limit` |
-| Compliance | `GET /api/policy-fragments`, `GET /api/policies`, `GET /api/v1/policy-fragments`, `GET /api/v1/policies`: `limit` |
-| Patches | `GET /api/patches`, `GET /api/patches/deployments`: `limit` (a malformed value used to be ignored) |
+| Compliance | `GET /api/policy-fragments`, `GET /api/policies`, `GET /api/v1/policy-fragments`, `GET /api/v1/policies`: `limit`. On the two legacy routes (`/api/policy-fragments`, `/api/policies`) a negative `limit` is `400` too: it used to reach Postgres as `LIMIT -1`, fail, and answer `503`. The `/api/v1/` routes clamp `limit` to 1..1000 as before |
+| Patches | `GET /api/patches`, `GET /api/patches/deployments`: `limit` (a malformed value used to be ignored; a negative `limit` is `400` too, where the store answered an empty `200`) |
 | Inventory | `GET /api/v1/inventory/software`: `limit` (trailing characters were read as their numeric prefix) |
 | Fleet visualization | `GET /api/v1/viz/fleet/topology`: `machines_max` |
-| Verification | the app-performance compare route: `window` (a malformed value used to fall back to 7 days). This dashboard fragment keeps its own rejection style: an honest `200` note ("The window must be a whole number of days."), because the dashboard's htmx config drops `4xx` bodies; nothing is computed or audited. The other dashboard fragments in this table (results, inventory, hardware, DEX perf, network quality) still answer a JSON `400` that an operator in the dashboard never sees: that is a known UX gap and a follow-up (not yet filed), not a deliberate inconsistency |
+| Verification | the app-performance compare route: `window` (a malformed value used to fall back to 7 days). This dashboard fragment keeps its own rejection style: an honest `200` note ("The window must be a whole number of days."), because the dashboard's htmx config drops `4xx` bodies; nothing is computed or audited. The other dashboard fragments in this table (results, inventory, hardware, DEX perf, network quality) still answer a JSON `400` that an operator in the dashboard never sees: that is a known UX gap that a follow-up tracks, not a deliberate inconsistency |
 | Dashboard fragments | `GET /fragments/results`: `page`, `per_page`; the software inventory fragments (`/fragments/inventory/software`, `/software/devices`): `limit`; the DEX perf devices fragment and the network quality devices fragment: `limit`; the hardware list fragment and `GET /api/v1/hardware`: `offset`, `limit` (a negative value is refused too, it used to be clamped to `0`); the hardware sync poll: `await_since` (a malformed freshness bound used to read as "no bound", so a stale snapshot could be served as fresh); `GET /fragments/tar/process-tree/detail`: `node` (`stoul` read `-1` as the largest node id and `5x` as `5`) |
-| Delivery and list routes | `GET /api/notifications`: `limit`, `offset`; `GET /api/webhooks/{id}/deliveries` and `GET /api/v1/offload-targets/{id}/deliveries`: `limit`; `GET /api/v1/ca/issued`: `limit`, `offset`; `GET /api/v1/preflight/runs`: `limit` |
+| Delivery and list routes | `GET /api/notifications`: `limit`, `offset` (a negative value is `400` too, where the store answered an empty `200`); `GET /api/webhooks/{id}/deliveries` and `GET /api/v1/offload-targets/{id}/deliveries`: `limit`; `GET /api/v1/ca/issued`: `limit`, `offset`; `GET /api/v1/preflight/runs`: `limit`; the pre-flight run form: `min_gib` and `window` (a malformed value is `400`; a negative `min_gib` is `400` too; see [Pre-flight readiness checks](preflight.md)); `GET /api/v1/result-sets` and `GET /api/v1/result-sets/{id}/members`: `limit` (trailing characters are `400`, not their numeric prefix; an integer outside the route's page range still uses the default page size); `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices` and `GET /api/v1/network/devices`: `limit`; `GET /api/v1/guaranteed-state/events`: `limit` and `offset` (a negative value is `400` too; both are parsed before the `dex.device.view` audit row is written, so a `400` leaves no access row) |
 | Event streams | `GET /api/v1/events`: `since` (a non-negative integer; a malformed value is `400`, answered before the stream budget is touched). A malformed `Last-Event-ID` **header** on `GET /api/v1/events` or the workflow execution stream is served **live only**: nothing buffered is replayed (never the whole ring buffer) and it is not a `400`, because the header is browser-supplied inference and a `400` would fail a reconnect. The cursor is parsed strictly, so `-1` and `5abc` are never accepted as a position (`5abc` used to replay from position 5; `-1` wrapped past every event and also replayed nothing, so that input's outcome is unchanged); valid ids replay exactly as before. A rejected `?since` leaves no success audit row, because it is parsed before the audit write |
-| Settings forms | `POST /api/settings/dex-alerts/blast` (`min_devices`, `window_seconds`, `cooldown_seconds`): a malformed value is `400` and nothing is saved (it used to persist the clamped minimum); `POST /api/settings/enrollment-tokens` and `/batch` (`max_uses`, `ttl_hours`, `count`): `0x5` used to read as `0`, and `max_uses` `0` means unlimited, so a mistyped limit minted an unlimited token (only an **empty** field, or a value that parses to a literal `0` such as `0`, `-0` or `00`, means unlimited or no expiry now; on `/batch` an empty `max_uses` defaults to `1`, not unlimited; a **negative** `ttl_hours` is refused with `400` because it would compute `0`, a token that never expires); the API-token create form `ttl_hours` (the same `0x5` read as a token that never expires; it is refused with the form's usual `200` feedback span, `Invalid TTL value.`, a negative value too, and nothing is minted); the OTA package `rollout_pct` on upload and on the rollout route (one shared parser; an out-of-range integer is clamped to 0..100 as before): a malformed value used to become `100`, a full-fleet rollout. Each enrollment and OTA `400` also sets an error toast (`HX-Trigger`), because the dashboard drops `4xx` bodies |
+| Settings forms | `POST /api/settings/dex-alerts/blast` (`min_devices`, `window_seconds`, `cooldown_seconds`): a malformed value is `400` and nothing is saved (it used to persist the clamped minimum); `POST /api/settings/enrollment-tokens` and `/batch` (`max_uses`, `ttl_hours`, `count`): `0x5` used to read as `0`, and `max_uses` `0` means unlimited, so a mistyped limit minted an unlimited token (only an **empty** field, or a value that parses to a literal `0` such as `0`, `-0` or `00`, means unlimited or no expiry now; on `/batch` an empty `max_uses` defaults to `1`, not unlimited; a **negative** `ttl_hours` is refused with `400` because it would compute `0`, a token that never expires); the API-token create form `ttl_hours` (the same `0x5` read as a token that never expires; it is refused with the form's usual `200` feedback span, `Invalid TTL value.`, a negative value too, and nothing is minted); the OTA package `rollout_pct` on upload and on the rollout route (an out-of-range integer on upload is clamped to 0..100 as before): a malformed value used to become `100`, a full-fleet rollout. **Behaviour change on the rollout change route only:** an empty `rollout_pct` and a value above `100` are also `400` there (an empty value used to mean `100` and a larger one was clamped to `100`), while a negative value still clamps to `0` (the least exposure); the upload route is unchanged. Each enrollment and OTA `400` also sets an error toast (`HX-Trigger`), because the dashboard drops `4xx` bodies |
 
-On the query-parameter routes in the table above, a parameter that is **present but empty** (`?limit=`) is malformed, not absent (`GET /api/v1/audit` `limit` included). The admin forms are different: an EMPTY form field means that field's default.
+On the query-parameter routes in the table above, a parameter that is **present but empty** (`?limit=`) is malformed, not absent (`GET /api/v1/audit` `limit` included). The auth-sample export is the exception: a present but empty `from` or `to` on `GET /api/v1/audit/auth-sample` is accepted as unbounded on that side. The admin forms are different: an EMPTY form field means that field's default.
 
-Not covered by this change, and still lenient (the list is not exhaustive): the live-snapshot
-`n` attempt counters (`deployment_routes.cpp`, `device_routes.cpp`, `hardware_routes.cpp`,
-`dex_routes.cpp`, `preflight_routes.cpp`, `tar_tree_routes.cpp`), which are polling counters
-clamped to a small range; and values that are parsed from stored rows, agent output or server
+Not covered by this change, and still lenient (the list is not exhaustive): the `n` retry-attempt
+counter on the live-snapshot poll fragments (the deployment, device, hardware, DEX, pre-flight and
+TAR process-tree polls), which is clamped to a fixed range per poll (`1` to `100000` on the
+deployment and pre-flight polls, at most `50` on the others); and values that are parsed from stored rows, agent output or server
 configuration rather than from a request. Numeric path segments matched by a `(\d+)` pattern
 (`/api/notifications/{id}/read`, `/dismiss`, the webhook routes and the auto-approve rule index)
 answer `404` for an id that does not fit a signed 64-bit integer; they used to throw and answer
@@ -5477,7 +5478,7 @@ Create a new offload target. Returns 201 + `{id, status}` on success, 400 when v
 | `auth_type` | string | No (`none`) | One of `none`, `bearer`, `basic`, `hmac`. |
 | `auth_credential` | string | No | Bearer token (Bearer), `user:pass` (Basic), shared secret (Hmac). Never returned by any endpoint. |
 | `event_types` | string | No (`*`) | Comma-separated list of event types or `*` for all. Same semantics as webhooks. |
-| `batch_size` | int | No (1) | Accumulate up to N events into a single POST body. `1` = no batching. Must be `1`..`10000`; the per-target buffer flushes only at this size and has no other cap, so the store refuses a larger value (the same range MCP `create_offload_target` enforces). |
+| `batch_size` | int | No (1) | Accumulate up to N events into a single POST body. `1` = no batching. Must be `1`..`10000` (read as a 64-bit value, so an oversized number is rejected rather than wrapped; a float such as `5.5`, a string, a boolean or `null` is `400` `invalid_field_type`, where a float used to be truncated); the per-target buffer flushes only at this size and has no other cap, so the store refuses a larger value (the same range MCP `create_offload_target` enforces). |
 | `enabled` | bool | No (true) | When false, no events are dispatched until re-enabled. |
 
 **Auth headers (set per `auth_type`):**
@@ -6971,7 +6972,7 @@ List the caller's owned result sets, most recently used first (`last_used_at` th
 | Param | Type | Description |
 |---|---|---|
 | `cursor` | string | Opaque pagination cursor from a previous response |
-| `limit` | integer | Max results (default 50, max 500) |
+| `limit` | integer | Max results (default 50, max 500). A value that is not one base-10 integer (`10abc`, empty, too large for `int`) is `400`; an integer outside `1`..`500` uses the default of 50 |
 
 **Response:**
 
@@ -6986,6 +6987,7 @@ List the caller's owned result sets, most recently used first (`last_used_at` th
 
 | Status | Reason |
 |---|---|
+| 400 | `limit` is not one base-10 integer |
 | 403 | Service-scoped API token — result-set listing cannot be confined to the token's service |
 | 503 | `RESULT_SET_STORE_UNAVAILABLE` — a store-level read failure while listing |
 
@@ -7072,7 +7074,7 @@ Page through a result set's member device ids.
 | Param | Type | Description |
 |---|---|---|
 | `cursor` | string | Opaque pagination cursor |
-| `limit` | integer | Max results (default 1000, max 10000) |
+| `limit` | integer | Max results (default 1000, max 10000). A value that is not one base-10 integer is `400`; an integer outside `1`..`10000` uses the default of 1000 |
 
 **Response:** `{"data": {"device_ids": [...], "next_cursor": ""}, "meta": {"api_version": "v1"}}`
 
@@ -7080,6 +7082,7 @@ Page through a result set's member device ids.
 
 | Status | Reason |
 |---|---|
+| 400 | `limit` is not one base-10 integer |
 | 403 | Service-scoped API token |
 | 404 | No such set, or not owned by the caller |
 | 503 | Result-set store unavailable |
@@ -7270,7 +7273,7 @@ genuinely matches nothing is still `200` with an empty `data` array.
     "total_executions": 15420,
     "executions_today": 230,
     "active_agents": 142,
-    "overall_success_rate": 0.973,
+    "overall_success_rate": 97.3,
     "avg_duration_seconds": 4.2
   },
   "meta": { "api_version": "v1" }
@@ -7281,7 +7284,7 @@ genuinely matches nothing is still `200` with an empty `data` array.
 
 Get per-agent execution statistics.
 
-**Permission:** `Execution:Read`, through the fleet-read chokepoint (ADR-0017 admit-then-filter, #3526): a management-group-confined caller is admitted and sees only the rows of the agents it can see (filtered in SQL before the `limit`), while a global grant sees every agent. The sibling `/definitions` route and the fleet summary carry no agent identity and keep the plain `Execution:Read` gate. A malformed `since` or `limit` is `400`, and so is a negative `since`.
+**Permission:** `Execution:Read`, through the fleet-read chokepoint (ADR-0017 admit-then-filter, #3526): a management-group-confined caller is admitted and sees only the rows of the agents it can see (filtered in SQL before the `limit`), while a global grant sees every agent. A caller holding only a management-group-scoped grant, refused with `403` before, is admitted as a confined view. A service-scoped API token, also refused before, is admitted as a confined view only when RBAC enforcement is on (it must clear the `ITServiceOwner` authority ceiling, which holds `Execution:Read`, and the rows are then intersected with the token's service tag scope); with RBAC off it is refused with `403`. With RBAC off (the shipped default) the rollup is unfiltered for every authenticated non-service, non-engine caller. The sibling `/definitions` route and the fleet summary carry no agent identity and keep the plain `Execution:Read` gate. A malformed `since` or `limit` is `400`, and so is a negative `since`.
 
 **Query parameters:**
 
@@ -7289,7 +7292,7 @@ Get per-agent execution statistics.
 |---|---|---|
 | `agent_id` | string | Filter to a single agent |
 | `since` | integer | Unix timestamp, inclusive lower bound on dispatch time. Omit for no bound; `0` is accepted and matches the same rows as omitting it; a negative value is `400` (it used to read as no bound) |
-| `limit` | integer | Max results (default 50, max 1000) |
+| `limit` | integer | Max results (default 50, max 1000). `0` or a negative value uses the default of 50; the MCP twin instead rejects a `limit` below 1 with `-32602` |
 
 **Response:**
 
@@ -7322,7 +7325,7 @@ Get per-definition execution statistics.
 |---|---|---|
 | `definition_id` | string | Filter to a single definition |
 | `since` | integer | Unix timestamp, inclusive lower bound on dispatch time. Omit for no bound; `0` is accepted and matches the same rows as omitting it; a negative value is `400` (it used to read as no bound) |
-| `limit` | integer | Max results (default 50, max 1000) |
+| `limit` | integer | Max results (default 50, max 1000). `0` or a negative value uses the default of 50; the MCP twin instead rejects a `limit` below 1 with `-32602` |
 
 **Response:**
 
@@ -8323,7 +8326,7 @@ Get an aggregated view of fleet execution statistics.
     "executions": {
       "total": 15420,
       "today": 230,
-      "success_rate": 0.973,
+      "success_rate": 97.3,
       "avg_duration_seconds": 4.2
     },
     "active_agents": 142
@@ -8545,7 +8548,7 @@ Query Guaranteed State events (rule violations, remediations, agent sync events)
 - **Permission:** two gated shapes behind one route. A query with a non-empty `agent_id` (max 256 chars, no control characters) requires per-device-scoped `GuaranteedState:Read` — management-group aware, and a service-scoped API token is confined to its own service's agents. A query with no `agent_id` (fleet-wide) requires global `GuaranteedState:Read` **and** denies a service-scoped token outright (`403`): the fleet fan-out returns every reporting agent's `agent_id` + `detail_json`, which the bare service-token role check alone would not confine.
 - **Query parameters:** `rule_id`, `agent_id`, `severity`, `limit` (default 100, capped at 1000), `offset` (default 0).
 - **Response:** `data[]` of event objects. Each object: `event_id`, `rule_id`, `agent_id`, `event_type`, `severity`, `guard_type`, `guard_category`, `detected_value`, `expected_value`, **`detail_json`**, `remediation_action`, `remediation_success`, `detection_latency_us`, `remediation_latency_us`, `timestamp`. `detail_json` is a structured JSON string: for DEX observations it carries the uniform keys `subject`/`reason`/`symbolic`/`component`/`metric`/`platform` (plus, for `process.crashed`, the legacy `process`/`exception_code`/`faulting_module`); empty string for plain drift events. Per-signal shapes are documented in [`docs/dex-signal-catalog.md`](../dex-signal-catalog.md).
-- **4xx:** `400` on non-integer or negative `limit` / `offset`, or on an `agent_id` over 256 characters / containing a control character. `403` if a service-scoped token queries the fleet-wide shape, or names a device outside its own service's scope.
+- **4xx:** `400` on non-integer or negative `limit` / `offset` (both are parsed before the `dex.device.view` audit row is written, so a `400` here leaves no access row), or on an `agent_id` over 256 characters / containing a control character. `403` if a service-scoped token queries the fleet-wide shape, or names a device outside its own service's scope.
 - **Ruleless DEX signal observations share this endpoint.** Filter `rule_id=__observation__` to retrieve `event_type=<obs_type>` rows (`process.crashed`, `process.hung`, `service.crashed`, `os.boot`, … — fleet-wide signals recorded independent of any rule; `severity` is a fixed `info`; `expected_value` empty). See [DEX signal observations](guaranteed-state.md#dex-signal-observations) and the [DEX dashboard](dex.md).
 - **Audit (behavioral PII):** BOTH shapes emit a **`dex.device.view`** audit row on every read — the per-device shape returns that device's signal history (`detail_json` reveals which apps a person runs) and audits `target_type=Agent`, `target_id=<agent_id>` (the same verb as the dashboard per-device drill-down); the fleet-wide shape returns every reporting agent's rows and audits `target_type=GuaranteedState`, `target_id=` (empty — no single agent). **Fail-closed on both shapes:** the audit fires before the data is serialized; if the audit row cannot persist, the endpoint returns `503` + `Sec-Audit-Failed: true` and serves no data (parity with `GET /api/v1/dex/devices/{id}`). A service-scoped token denied the fleet-wide shape also gets a `dex.device.view` `denied` audit row, so a rejected probe still leaves a trace.
 - **MCP twin:** `list_guardian_events` (#4037) — same dual gate shape, same query params. `audit_persisted:false` posture instead of REST's fail-closed (JSON-RPC has no `Sec-Audit-Failed` header channel). The fleet-wide branch's confinement gap (#3238) is **not** closed by this twin — it deliberately keeps the same bare-`perm_fn` posture REST has today rather than inventing a different MCP-only gate.

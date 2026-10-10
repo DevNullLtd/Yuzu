@@ -43,6 +43,18 @@ a device that never answers stays **Incomplete**. The page itself pauses polling
 after a few minutes, but the run continues server-side for the whole window —
 reopen it from **Recent runs** to refresh.
 
+## Numeric thresholds are validated
+
+The run form reads **minimum free GiB** (`min_gib`) and the **window** (`window`, in minutes)
+strictly. Each must be empty or one whole base-10 number. Anything else (`10abc`, `0x10`, `1.5`,
+a leading `+`, whitespace, or a value too large for a signed 64-bit integer) is answered with
+`400`, an error toast ("Pre-flight thresholds must be whole numbers") and an A4 error body; no run
+is created and nothing is dispatched. A negative `min_gib` is refused the same way. An empty field
+keeps its default: a minimum of 0 GiB free, and a 30-minute window. A `window` of zero or below
+also uses the 30-minute default, and a larger value is clamped to 1 to 2880 minutes, clamped as a
+64-bit value so a huge number cannot wrap into a different window. Before this check a malformed
+`min_gib` read as 0, which let every device pass the free-disk check.
+
 ## Persistence and retention
 
 Runs are **saved** and listed in the **Recent runs** rail; reopen one to revisit
@@ -88,7 +100,7 @@ evicts the **oldest** rows first, which are the **earliest** answerers. On a lar
 with a long window (up to 2,880 minutes) and a cohort near its 20,000-device cap, devices that
 passed early can therefore flip to "inconclusive" before the deadline. To resolve those
 devices, re-run the pre-flight against a smaller group. Changing the re-dispatch rule, and
-per-device paging of the response read, are known follow-ups (not yet filed).
+per-device paging of the response read, are known limitations that follow-ups track.
 
 ## Verify — before / after performance
 
