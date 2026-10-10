@@ -224,6 +224,12 @@ inline std::vector<std::string> pam_logical_lines(std::string_view text) {
 
 /// Skips comments, blanks and `@include`. A line that is not `type control module`
 /// is dropped (PAM itself would reject it) -- pam.d holds no other policy.
+///
+/// Normalised the way Linux-PAM reads a line, so a configured module is never missed: the
+/// type is matched case-insensitively (`AUTH`, `Auth`) and reported lower-case, and a module
+/// given with a directory path (`/usr/lib64/security/pam_faillock.so`) is reported by its file
+/// name only; the directory is not kept. The module's own name stays case-sensitive (it is a
+/// file name).
 inline std::vector<PamLine> parse_pam_lines(std::string_view text) {
     std::vector<PamLine> out;
     for (const auto& line : pam_logical_lines(text)) {
@@ -240,6 +246,9 @@ inline std::vector<PamLine> parse_pam_lines(std::string_view text) {
         auto t = word();
         if (!t.empty() && t.front() == '-') t.remove_prefix(1);
         p.type = std::string{t};
+        std::transform(p.type.begin(), p.type.end(), p.type.begin(), [](unsigned char c) {
+            return static_cast<char>(c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c);
+        });
         s = trim_ws(s);
         if (!s.empty() && s.front() == '[') {
             const auto close = s.find(']');
@@ -249,7 +258,10 @@ inline std::vector<PamLine> parse_pam_lines(std::string_view text) {
         } else {
             p.control = std::string{word()};
         }
-        p.module = std::string{word()};
+        auto mod = word();
+        if (const auto slash = mod.rfind('/'); slash != std::string_view::npos)
+            mod.remove_prefix(slash + 1);
+        p.module = std::string{mod};
         p.args = std::string{trim_ws(s)};
         if (p.type.empty() || p.control.empty() || p.module.empty()) continue;
         out.push_back(std::move(p));
@@ -261,9 +273,12 @@ inline constexpr std::string_view kPamPasswordModules[] = {"pam_pwquality.so", "
                                                             "pam_cracklib.so", "pam_unix.so"};
 inline constexpr std::string_view kPamLockoutModules[] = {"pam_faillock.so", "pam_tally2.so",
                                                            "pam_tally.so"};
-/// The `source` field of the `lockout_keys|not_found` row: the files the Linux lockout read covers.
+/// The `source` field of the `lockout_keys|not_found` row: the files the Linux lockout read
+/// covers -- the four named PAM alternatives (not the whole of /etc/pam.d), of which only those
+/// that exist are read.
 inline constexpr std::string_view kLockoutSearched =
-    "/etc/login.defs,/etc/security/faillock.conf,/etc/pam.d";
+    "/etc/login.defs,/etc/security/faillock.conf,/etc/pam.d/common-auth,/etc/pam.d/common-account,"
+    "/etc/pam.d/system-auth,/etc/pam.d/password-auth";
 
 // ---- auditd rules -----------------------------------------------------------------
 
@@ -1207,11 +1222,15 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
                                               "password-auth"};
         constexpr std::string_view types[] = {"auth", "account"};
         detail::pam_sources(rd, t, prefix, files, types, kPamLockoutModules);
-        // Every source read and none set a lockout key (a stock RHEL 9 host without the faillock
-        // feature): say so, rather than hand back an OK result with no rows that reads like a
-        // dead agent. An absent or failed source already produced its own row above, so an empty
-        // row set here means the reads succeeded. The wording is about what was READ -- faillock.conf
-        // drop-ins and PAM include/substack targets are not followed -- never "no lockout enforced".
+        // Every source that exists was read and none set a lockout key (a stock RHEL 9 host
+        // without the faillock feature): say so, rather than hand back an OK result with no
+        // rows that reads like a dead agent. An absent (login.defs, faillock.conf, or every PAM
+        // file) or failed source already produced its own row above, and a single absent PAM
+        // alternative beside a readable sibling is silent by design, so an empty row set here
+        // means the sources that exist were read and set nothing; `readable > 0` is defensive.
+        // The wording is about what was READ: faillock.conf drop-ins, PAM include/substack
+        // targets and PAM services other than the four named files are not followed, so it is
+        // never "no lockout enforced".
         if (t.rows.empty() && t.readable > 0)
             t.row(format_kv_row(prefix, "lockout_keys", "not_found", kLockoutSearched));
         break;
