@@ -381,10 +381,18 @@ the account's linked credentials (API tokens and sessions, including linked
 OIDC/SAML identities) were **revoked before the refusal** and that the account
 **remains active**, because revocation comes first (see above). Two things for
 your connector: a `409` does not prove an IdP will stop retrying, so expect the
-same request again on the next sync (every attempt is audited and counted; the
-server log line is limited to one warning per username per minute); and
-resolving it is an operator action, not an IdP one: grant the `Administrator`
-role to another account first. When a Group change would demote the last active
+same request again on the next sync (every attempt is audited and counted and
+raises a critical analytics event; the server log line is limited to one
+warning per username per minute); and resolving it is an operator action, not
+an IdP one: grant the `Administrator` role to another account first. Until then
+the person the IdP terminated is still active here: after an early refusal
+their API tokens and sessions are live as well, and after a late one they can
+sign in again through SSO, so revoke them by hand if that matters. If the
+guarded write times out or the store is unavailable the answer is **`503`** with
+`Retry-After: 2` (the linked credentials were already revoked, and the retry
+finishes the job); a `500` after a failed session wipe means the account IS
+deactivated, and a retry of that request is not promised to repeat the wipe
+([#5214](https://github.com/Tr3kkR/Yuzu/issues/5214)). When a Group change would demote the last active
 local admin account, the Group request still succeeds, the account keeps its
 role, and the refusal is audited the same way. See
 [`rbac.md`](rbac.md#last-administrator-guard-for-account-deactivation-and-demotion).
@@ -392,7 +400,12 @@ role, and the refusal is audited the same way. See
 `POST /scim/v2/Users` also refuses (`404`, nothing created or reactivated) a
 `userName` that already holds an `Administrator` grant, or whose deactivated
 record still has a role other than `user`: a SCIM account must never become a
-counted administrator.
+counted administrator. A `PATCH`/`PUT` with `active:true` applies the same two
+checks before reactivating. The `404` tells the holder of the SCIM bearer, with
+no side effect, that the name holds a grant or an elevated deactivated record.
+These checks read the RBAC store, so SCIM provisioning needs it even when RBAC
+enforcement is off; if the grant read is unavailable the answer is `503` with
+`Retry-After: 2` and nothing is created.
 
 If the person is later re-added in the IdP, the same SCIM resource is
 reactivated (`active: true`): the account comes back, any lockout state is

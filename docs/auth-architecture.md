@@ -2002,7 +2002,9 @@ that triggers a `500`).
 | `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write could not persist |
 | `scim.user.reactivated` | `success` / `failure` | `PATCH` or `PUT` sets `active:true`; `failure` (set-and-proceed) on an audit-write error |
 | `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed) |
-| `scim.user.provenance_denied` | `denied` | A deactivate/reactivate/delete/update targets an account whose `provisioning_source != "scim"`, **or** whose current `role != "user"` |
+| `scim.user.provenance_denied` | `denied` | A deactivate/reactivate/delete/update targets an account whose `provisioning_source != "scim"`, **or** whose current `role != "user"`; **or** (#4966) a `POST /Users` or an `active:true` reactivation names a username that already holds an `Administrator` grant or a deactivated record whose role is not `user`. Counted on `yuzu_scim_provenance_denied_total` for the same causes (including the group-recompute provenance skip, which writes no audit row) |
+| `scim.user.last_administrator_refused` | `denied` | (#4966) The last-Administrator guard refused a deactivation, delete, `POST` with `active:false` or group-derived demotion (`409` `mutability`). A refused deprovision also raises a critical analytics event. Counted on `yuzu_server_rbac_last_admin_guard_refused_total{transport="scim"}` |
+| `scim.user.compensation_failed` | `failure` | (#4966) The guarded undo of a half-finished create/revive was refused or failed (`outcome` = `guard_refused_last_administrator` / `deactivated_but_session_wipe_failed` / `store_failure`). Written with a critical analytics event and `yuzu_scim_compensation_failed_total{outcome}`; the account is left active only for the guard refusal |
 | `scim.auth.denied` | `denied` | Bearer-auth validation fails (missing/malformed/wrong token) on any `/scim/v2/*` route, including discovery |
 | `scim.group.created` | `success` / `denied` / `failure` | `POST /scim/v2/Groups` succeeds / rejected `409` — `displayName` collision against an existing group / rolls back `500` |
 | `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` — rename onto an existing `displayName` / fails `500` |
@@ -2120,6 +2122,25 @@ which carries unrelated `caller=self|admin` metric semantics) and
 `oidc_principal.hpp` (the single `oidc_principal_id(iss, sub)` builder every
 call site uses — a hand-built format would silently miss every token for a
 principal built the "wrong" way).
+
+**The last-Administrator guard sits after the revoke (#4966).** The account
+removal itself is `AuthManager::remove_user_checked`, which runs the guarded
+soft delete (`RbacStore::deactivate_account`) AFTER the credentials-first
+revoke above. A best-effort, lock-free **early check**
+(`would_strand_last_administrator`) runs BEFORE the revoke and, when it already
+shows the account is the last member of a protected administrator population,
+refuses with nothing revoked. When that check passes (or cannot answer) and the
+guard then refuses, the outcome is a **late refusal**: the credentials were
+revoked, the account stays active, the response and audit row say so (SCIM
+`409` `mutability`, dashboard `409` and a `partial` audit result). In both
+forms the person the identity provider terminated is not terminated here: after
+an early refusal their API tokens and sessions are still live, after a late one
+the account is active and they can sign in again through SSO. A refused SCIM
+deprovision therefore raises a `Severity::kCritical` analytics event and the
+operator revokes manually or lets the identity provider retry once another
+administrator exists; see `docs/user-manual/rbac.md`, "Last-Administrator guard
+for account deactivation and demotion". The guard stays a recovery rule, not a
+proof that anyone can sign in.
 
 **The ~60s residual, stated honestly.** A previously-issued API/MCP token
 may keep *validating* for up to `ApiTokenStore`'s validate-cache

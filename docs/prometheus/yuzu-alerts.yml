@@ -1133,7 +1133,10 @@ groups:
             create/PATCH/PUT targeted an account the SCIM provenance check
             refused to mutate — either the account was never provisioned by
             SCIM, or it was elevated/promoted outside SCIM's ownership
-            boundary (#2021). A single event is usually a misconfigured IdP
+            boundary (#2021), or (#4966) a SCIM POST or active:true
+            reactivation named a username that already holds an Administrator
+            grant or whose deactivated record carries a non-user role. A
+            single event is usually a misconfigured IdP
             attribute mapping; a sustained rate is worth treating as a
             possibly compromised or misbehaving IdP. Correlate via the
             scim provenance-denial audit row for the calling IdP/client.
