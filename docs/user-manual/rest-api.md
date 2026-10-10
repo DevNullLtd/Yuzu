@@ -3575,8 +3575,8 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `api_token.create` | API token created |
 | `api_token.revoke` | API token revoked. Can carry `result=success` (token was revoked) or `result=denied` (a non-owner without the admin role attempted a cross-user revoke). Denied events include `detail=owner=<real owner>` so forensics can tell a legitimate self-revoke from an enumeration probe. |
 | `user.create` | Local account created. `result` ∈ {`success`, `denied`}. Denied detail values: `duplicate_username` (409 — attempted create on an existing name), `weak_password` (400 — fewer than 12 bytes), `too_long` (400 — more than 1024 bytes, #5342). The `role` field is ignored on create — new users always land as `user`. To change role, use the dedicated `POST /api/settings/users/{username}/role` endpoint (audit action `user.role_change`). |
-| `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`success`, `denied`, `no_op`}. Denied detail values: `self_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `db_failure` (500). `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role — recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
-| `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404). |
+| `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`success`, `denied`, `no_op`}. Denied detail values: `self_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `last_administrator_blocked` (409), `inactive_promotion_refused` (409). `result=failure` with detail `store_failure` (503) when the guarded write did not complete (this replaces the former `denied` / `db_failure` 500), and `result=partial` with detail `role_changed session_wipe_failed=true` (503) when the role changed but session cleanup failed. `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role - recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
+| `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`, `failure`, `partial`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404), `owns_active_engine_principal` (409), `last_administrator_blocked` (409; the late form continues `credentials_revoked_before_refusal=true account_remains_active=true` followed by the revoke summary). `failure` detail `store_failure ...` (503), or `identity_link_resolution_failed` / `api_token_store_unavailable`; `partial` detail `account_deactivated session_wipe_failed=true ...` (503) or the revoke summary with `api_tokens_db_error=true` (500). |
 | `user.password_change` | Local account changed its own password via `POST /api/v1/users/me/password` (#5342). `target_type=User`, `target_id=<caller>`; the principal is the caller on every row, including those written after its own session was revoked. `result` ∈ {`ok`, `denied`, `error`}. Success detail `self_service sessions_revoked=<N> provisional_mfa_cleared=<true\|false>`, written in the same transaction as the change (no separate `session.revoke_all` row). Denied/error detail tokens: `token_session`, `not_local`, `csrf`, `wrong_current`, `account_locked`, `sso_only_local_disabled`, `verify_transient`, `not_found`, `conflict`, `store_unavailable`, `audit_unavailable`. A malformed body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. Never carries the password or its length. |
 | `user.password_reset` | Admin reset another local account's password via `POST /api/v1/users/{name}/password` (#5342). `target_type=User`, `target_id=<target>`, principal = the caller. `result` ∈ {`ok`, `denied`, `error`}. Success detail `admin_reset target_role=<admin\|user> sessions_revoked=<N> provisional_mfa_cleared=<true\|false>` (no separate `session.revoke_all` row), plus — only when a lockout existed — an `auth.lockout.cleared` row (`result=ok`, `detail=password_reset`), both in the same transaction as the reset. Denied/error detail tokens: `token_session`, `csrf`, `durable_admin_required`, `admin_gate_unavailable`, `self_target`, `break_glass_target`, `not_found`, `not_local`, `store_unavailable`, `audit_unavailable`. A malformed username or body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. |
 | `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. |
@@ -9226,7 +9226,11 @@ The `role` field must be exactly `admin` or `user`.
 
 - **Response (404):** `:username` does not match any persisted user. Audit `user.role_change / denied / user_not_found`.
 
-- **Response (500):** AuthDB write failed. Audit `user.role_change / denied / db_failure`.
+- **Response (409):** The guarded write refused the change (nothing changed, the sessions of the target are untouched):
+  - `last_administrator_blocked` - demoting `:username` would leave no active local `admin` account (the last-Administrator guard, see `docs/user-manual/rbac.md` "Last-Administrator guard for account deactivation and demotion"). `HX-Trigger: {"showToast":{"message":"Cannot demote: this account is the fleet's last administrator","level":"error"}}` and an A4 error body with the same message. Audit `user.role_change / denied / last_administrator_blocked`. Counted on `yuzu_server_rbac_last_admin_guard_refused_total{transport="dashboard"}`.
+  - `inactive_promotion_refused` - `:username` is an inactive account and `admin` was requested ("Cannot promote an inactive account"). Audit `user.role_change / denied / inactive_promotion_refused`.
+
+- **Response (503):** The guarded role write did not complete (store fault, or the last-Administrator guard is not wired, which fails closed instead of writing unguarded). `Retry-After: 2` and an A4 body with `retry_after_ms: 2000`. Audit `user.role_change / failure / store_failure`. A `503` with the message "Role updated, but session cleanup failed" means the role **is** changed but a session at the old role may survive: revoke the user's sessions (`DELETE /api/v1/sessions?username=<name>`); audit `user.role_change / partial`.
 
 **Example — promote `bob` to admin:**
 
@@ -9253,6 +9257,10 @@ Delete the named account.
 
   Audit event recorded as `user.delete / denied / self_delete_blocked`. The rejected attempt is logged at warn level on the server. To delete the account you are signed in as, create a second admin, sign out, sign in as the second admin, then delete the original.
 
+- **Response (409) last administrator:** `:name` is the last member of a protected administrator population (the last-Administrator guard, see `docs/user-manual/rbac.md` "Last-Administrator guard for account deactivation and demotion"). Counted on `yuzu_server_rbac_last_admin_guard_refused_total{transport="dashboard"}`. There are two forms, and they differ in what already happened:
+  - **Early refusal** - a read-only check, made before anything is revoked, showed the account is the last one. Nothing was changed or revoked. `HX-Trigger: {"showToast":{"message":"Cannot delete: this account is the fleet's last administrator","level":"error"}}`, an A4 error body with the same message, audit `user.delete / denied / last_administrator_blocked`.
+  - **Late refusal** - the early check passed (or could not answer) and the guard refused afterwards. The account's linked credentials (API tokens and sessions, including those of linked SSO identities) were **already revoked** and the account **remains active**. The toast and the A4 message read "Cannot delete: this account is the fleet's last administrator. Its credentials were revoked before the refusal; the account remains active", and the audit detail is `last_administrator_blocked credentials_revoked_before_refusal=true account_remains_active=true` followed by the revoke summary.
+- **Response (503):** The guarded delete did not complete. `Retry-After: 2` and an A4 body with `retry_after_ms: 2000`. Audit `user.delete / failure / store_failure ...` (the linked credentials were already revoked; the account may or may not be deactivated, and repeating the delete converges). The message "User deactivated, but session cleanup failed" means the account **is** deactivated but a session may survive: repeat the delete (it answers `404` once the session cleanup completes) or revoke the user's sessions with `DELETE /api/v1/sessions?username=<name>`; audit `user.delete / partial`.
 - **Response (401):** Defensive — admin gate passed but session not re-resolvable.
 - **Response (500):** Defensive — session resolved with empty username.
 
@@ -9261,6 +9269,8 @@ Delete the named account.
 | 200 | Account deleted successfully |
 | 400 | Username failed the allowlist regex |
 | 404 | No persisted user matched `:name` |
+| 409 | `:name` is the last member of a protected administrator population (early or late form above) |
+| 503 | The guarded delete did not complete, or the account is deactivated but its session cleanup failed |
 | 403 | Target equals the caller's own username (self-delete guard) |
 | 403 | Caller is not an admin (rejected by admin gate before handler) |
 | 401 | Defensive — admin gate / session callbacks disagree |
@@ -11428,6 +11438,7 @@ connectors issue `PUT` rather than `PATCH` for lifecycle changes.
 | `200` | Replaced — SCIM User representation |
 | `400` (`scim_type=mutability`) | Body includes a `userName` change — rename is out of scope this slice |
 | `404` | Unknown `id`, or the provenance/role guard rejects the target (see below) |
+| `409` (`scim_type=mutability`) | `active:false` would remove the fleet's last protected administrator (see "Last-administrator refusal" below) |
 
 #### `PATCH /scim/v2/Users/{id}`
 
@@ -11443,11 +11454,42 @@ and explicit `{"path":"active","value":false}` PatchOp forms are accepted.
 |---|---|
 | `200` | Applied — SCIM User representation |
 | `404` | Unknown `id`, or the provenance/role guard rejects the target (see below) |
+| `409` (`scim_type=mutability`) | `active:false` would remove the fleet's last protected administrator (see "Last-administrator refusal" below) |
 
 #### `DELETE /scim/v2/Users/{id}`
 
 Deprovision (equivalent to `PATCH`/`PUT active:false` for IdPs that issue a
-hard delete). `204` on success; `404` if unknown or guard-rejected.
+hard delete). `204` on success; `404` if unknown or guard-rejected; `409`
+(`scim_type=mutability`) under the last-administrator refusal below.
+
+#### Last-administrator refusal
+
+`PUT`/`PATCH` `active:false`, `DELETE`, and `POST` with `active:false` answer
+`409` with `scim_type=mutability` when the deprovision would remove the last
+member of a protected administrator population (the last-Administrator
+guard; see `docs/user-manual/rbac.md` "Last-Administrator guard for account
+deactivation and demotion"). Because the provenance/role guard above already
+`404`s any account whose role is not `user`, a SCIM request reaches this
+refusal only for a `role=user` account that holds the fleet's sole
+`Administrator` grant, under RBAC enforcement on. Two forms:
+
+- **Early:** the `detail` is "cannot deactivate: this account is the fleet's
+  last administrator". Nothing was revoked or changed.
+- **Late:** the `detail` adds that the account's linked credentials (API
+  tokens and sessions, including linked OIDC/SAML identities) were revoked
+  before the refusal and that the account remains active. The credentials-first
+  order is deliberate (ADR-2001).
+
+Each refusal is audited as `scim.user.last_administrator_refused` and counted
+on `yuzu_server_rbac_last_admin_guard_refused_total{transport="scim"}`. A `409`
+does not prove that an IdP stops retrying: expect the same request again on
+the next sync cycle. The audit row and counter are written every time; the
+server log line is limited to one warning per username per minute. A
+group-derived **demotion** that the guard refuses does not fail the Group
+request; the account keeps its role and the same audit action is recorded.
+On `POST /scim/v2/Users`, a username whose deactivated record carries a role
+other than `user`, or that already holds an `Administrator` grant, is refused
+`404` before anything is created or reactivated.
 
 #### Provenance guard
 
@@ -11532,7 +11574,9 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 | `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write itself could not persist |
 | `scim.user.reactivated` | `success` / `failure` | `PATCH`/`PUT` sets `active:true`; `failure` on an audit-write error (set-and-proceed) |
 | `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed) |
-| `scim.user.provenance_denied` | `denied` | A mutating call targets an account failing the provenance or role guard |
+| `scim.user.provenance_denied` | `denied` | A mutating call targets an account failing the provenance or role guard, or a `POST` names a tombstone whose role is not `user` / a username that already holds an `Administrator` grant |
+| `scim.user.last_administrator_refused` | `failure` | The last-Administrator guard refused a deactivation, delete or group-derived demotion (`409` `mutability` on the Users routes). On the Users routes `detail` carries `attempted_action=...`, `early_refusal=true\|false`, `credentials_revoked_before_refusal=true\|false` and `account_remains_active=true`; for a refused group-derived demotion it carries `attempted_action=scim.user.role_changed` and `role_unchanged=true` |
+| `scim.user.compensation_failed` | `failure` | The guarded undo of a half-finished create/revive was refused or failed; the account is left active and the request answered `500`. A critical analytics event is emitted with it |
 | `scim.auth.denied` | `denied` | Bearer-auth validation fails on any `/scim/v2/*` route, including discovery |
 | `scim.group.created` | `success` / `denied` / `failure` | `POST /scim/v2/Groups` succeeds / rejected `409` — `displayName` collision / rolls back `500` |
 | `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` — rename onto an existing `displayName` / fails `500` |

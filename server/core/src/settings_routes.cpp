@@ -5136,7 +5136,7 @@ void SettingsRoutes::register_routes(
                 return;
             }
         }
-        // #4966 — BEST-EFFORT early refusal, BEFORE any credential is revoked: if removing this
+        // #4966 - BEST-EFFORT early refusal, BEFORE any credential is revoked: if removing this
         // account would exhaust a protected administrator population right now, answer 409 with
         // nothing changed. This is advisory, not the authority: the read takes no lock, so a
         // concurrent grant removal or demotion can invalidate either answer, and the guard inside
@@ -5478,7 +5478,8 @@ void SettingsRoutes::register_routes(
             audit_fn_(req, "user.role_change", "partial", "User", target_username,
                       "role_changed session_wipe_failed=true");
             respond_lifecycle_store_unavailable(
-                res, "Role updated, but session cleanup failed. Repeat the change to finish");
+                res,
+                "Role updated, but session cleanup failed. Revoke the user's sessions to finish");
             return;
         case auth::UpdateRoleOutcome::StoreFailure:
             spdlog::error("Failed to update role for '{}'", target_username);

@@ -369,6 +369,31 @@ see [Manual role changes to a SCIM account are not durable](#manual-role-changes
 above — a manual promotion is not otherwise durable, but demotion is still
 a required, explicit step before SCIM can deprovision the account.
 
+**The fleet's last administrator is protected: a `409`.** When RBAC enforcement
+is on, a deprovision (or a `POST` with `active:false`) of the account that
+holds the fleet's only `Administrator` grant is refused with **`409`** and
+`scimType: "mutability"`, audited as `scim.user.last_administrator_refused` and
+counted on `yuzu_server_rbac_last_admin_guard_refused_total{transport="scim"}`.
+(`role=admin` accounts never get this far; they are the `404` above.) Yuzu
+checks first, before revoking anything, and answers `409` with nothing changed.
+If that early check passed and the guard refuses afterwards, the response says
+the account's linked credentials (API tokens and sessions, including linked
+OIDC/SAML identities) were **revoked before the refusal** and that the account
+**remains active**, because revocation comes first (see above). Two things for
+your connector: a `409` does not prove an IdP will stop retrying, so expect the
+same request again on the next sync (every attempt is audited and counted; the
+server log line is limited to one warning per username per minute); and
+resolving it is an operator action, not an IdP one: grant the `Administrator`
+role to another account first. When a Group change would demote the last active
+local admin account, the Group request still succeeds, the account keeps its
+role, and the refusal is audited the same way. See
+[`rbac.md`](rbac.md#last-administrator-guard-for-account-deactivation-and-demotion).
+
+`POST /scim/v2/Users` also refuses (`404`, nothing created or reactivated) a
+`userName` that already holds an `Administrator` grant, or whose deactivated
+record still has a role other than `user`: a SCIM account must never become a
+counted administrator.
+
 If the person is later re-added in the IdP, the same SCIM resource is
 reactivated (`active: true`): the account comes back, any lockout state is
 cleared, but **MFA is not restored** — they will re-enroll TOTP the next
