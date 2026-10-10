@@ -21,6 +21,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "acquire_retry.hpp"
+#include "auth_db_sql_helpers.hpp" // one copy of the soft-delete / role-write statements (#4966)
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
@@ -969,30 +970,22 @@ std::expected<bool, AuthDBError> AuthDB::remove_user(const std::string& username
     // side effect here — AuthDB carries no session surface at all (see the
     // .hpp header note); AuthManager wipes its own in-memory map.
     bool removed = false;
+    std::string sql_err;
     const bool ok = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        // AND is_active = TRUE: re-removing an already-inactive row must be a
-        // no-op (matches zero rows -> removed=false), never a spurious
-        // "re-removal" success — the test/caller contract is idempotent-false,
-        // not idempotent-true, on an already-soft-deleted user.
-        pg::PgResult upd = pg::exec_params(
-            conn,
-            "UPDATE auth.users SET is_active = FALSE, mfa_totp_secret = NULL, mfa_enrolled_at = NULL, "
-            "mfa_disabled_at = now(), mfa_last_counter = 0, updated_at = now() "
-            "WHERE username = $1 AND is_active = TRUE RETURNING id",
-            std::vector<std::string>{username});
-        if (upd.status() != PGRES_TUPLES_OK)
+        // The soft-delete statement pair lives ONCE in auth_db_sql_helpers.hpp, shared with the
+        // last-Administrator-guarded owner path (#4966); see there for the idempotent-false
+        // contract on an already-inactive user.
+        const auto soft_deleted = auth_sql::soft_delete_user_in_txn(conn, username, sql_err);
+        if (!soft_deleted)
             return false;
-        if (PQntuples(upd.get()) == 0) {
-            removed = false;
-            return true; // commit a no-op — user not found is not a write failure
-        }
-        removed = true;
-        pg::PgResult del = pg::exec_params(conn, "DELETE FROM auth.mfa_recovery_codes WHERE username = $1",
-                                           std::vector<std::string>{username});
-        return del.status() == PGRES_COMMAND_OK;
+        removed = *soft_deleted; // false: user not found is not a write failure, commit a no-op
+        return true;
     });
-    if (!ok)
+    if (!ok) {
+        if (!sql_err.empty())
+            spdlog::error("AuthDB::remove_user failed for '{}': {}", username, sql_err);
         return std::unexpected(AuthDBError::WriteFailed);
+    }
 
     if (removed) {
         spdlog::info("User removed (MFA state cleared): {}", username);
@@ -1031,14 +1024,14 @@ std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username
     auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected(AuthDBError::WriteFailed);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE auth.users SET role = $1, updated_at = now() WHERE username = $2 AND is_active = TRUE "
-        "RETURNING id",
-        std::vector<std::string>{role_str, username});
-    if (res.status() != PGRES_TUPLES_OK)
+    std::string sql_err;
+    const auto written = auth_sql::set_role_in_txn(lease.get(), username, role_str,
+                                                   /*match_inactive=*/false, sql_err);
+    if (!written) {
+        spdlog::error("AuthDB::update_role failed for '{}': {}", username, sql_err);
         return std::unexpected(AuthDBError::WriteFailed);
-    if (PQntuples(res.get()) == 0) {
+    }
+    if (!*written) {
         spdlog::warn("update_role: user not found or inactive: '{}'", username);
         return std::unexpected(AuthDBError::UserNotFound);
     }

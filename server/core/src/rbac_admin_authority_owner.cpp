@@ -2,6 +2,7 @@
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "auth_db_sql_helpers.hpp" // kActiveLocalAdminPredicate: ONE copy of the column floor's population
 #include "pg/pg_raii.hpp"
 #include "rbac_store_sql_helpers.hpp"
 
@@ -43,14 +44,21 @@ constexpr std::string_view kAuthenticatableAdminGrantsFrom =
     "WHERE pr.role_name = 'Administrator' AND pr.principal_type = 'user' "
     "AND u.is_active";
 
-// "SELECT pr.principal_id " + kAuthenticatableAdminGrantsFrom + " FOR UPDATE OF pr"
+// "SELECT pr.principal_id " + kAuthenticatableAdminGrantsFrom +
+// " ORDER BY pr.principal_id FOR UPDATE OF pr"
 // Returns the principal_ids of the rows ACTUALLY LOCKED (nullopt on query error,
 // with `err` set from the connection). The unassign guard uses the result as the
 // membership test for "was the row being deleted itself one of the counted rows".
+// The ORDER BY makes every locker of this set (`unassign_role`, `deactivate_account`,
+// and `set_enforcement`'s enable direction) take the row locks in the same
+// deterministic order, so two of them cannot wait on each other in a cycle through
+// THIS set. It is appended AFTER the shared fragment, which stays byte-identical, so
+// the lock and count sets still share one definition.
 std::optional<std::vector<std::string>> lock_authenticatable_admin_grants(PGconn* c,
                                                                           std::string& err) {
     const std::string sql = std::string("SELECT pr.principal_id ") +
-                            std::string(kAuthenticatableAdminGrantsFrom) + " FOR UPDATE OF pr";
+                            std::string(kAuthenticatableAdminGrantsFrom) +
+                            " ORDER BY pr.principal_id FOR UPDATE OF pr";
     pg::PgResult r = pg::exec_params(c, sql.c_str(), std::vector<std::string>{});
     if (r.status() != PGRES_TUPLES_OK) {
         err = PQerrorMessage(c);
@@ -108,15 +116,17 @@ std::optional<std::vector<std::string>> list_authenticatable_admin_grants(PGconn
 }
 
 // Disable direction (auth.users only; `role` stores the literal
-// 'admin'/'user', auth_db.cpp). ONE statement, same reason as above:
+// 'admin'/'user', auth_db.cpp). The population is `auth_sql::kActiveLocalAdminPredicate`,
+// the one copy shared with `auth_sql::count_active_local_admin_accounts`. ONE statement, same reason as above:
 // membership and count from one snapshot, never two queries that can
 // observe two account states. Deliberately NO FOR SHARE / FOR UPDATE (A2
 // parity — see set_enforcement's own doc comment on why no auth.users row
 // lock is taken).
 std::optional<std::vector<std::string>> list_active_local_admin_accounts(PGconn* c,
                                                                          std::string& err) {
-    pg::PgResult r = pg::exec_params(c, "SELECT username FROM auth.users WHERE role = 'admin' AND is_active",
-                                     std::vector<std::string>{});
+    const std::string sql = "SELECT username FROM auth.users WHERE " +
+                            std::string(auth_sql::kActiveLocalAdminPredicate);
+    pg::PgResult r = pg::exec_params(c, sql.c_str(), std::vector<std::string>{});
     if (r.status() != PGRES_TUPLES_OK) {
         err = PQerrorMessage(c);
         return std::nullopt;
@@ -382,12 +392,15 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
 // locked), and a grant that IS in the set is held FOR UPDATE, so a
 // concurrent unassign_role of it blocks behind this transaction's lock and
 // re-evaluates its own count against this transaction's committed outcome
-// (and vice versa). This does NOT claim PG-level deadlock freedom for two
-// transactions locking the same multi-row set without an ORDER BY (neither
-// query carries one, because the JOIN must stay byte-identical to
-// unassign_role's original literal) — if PG's detector fires, or
-// `lock_timeout` expires, ONE side's transaction aborts and surfaces here
-// as a store failure (never a hang, never a half-applied write).
+// (and vice versa). Every locker of this set (this method's enable
+// direction, `unassign_role`, `deactivate_account`) takes the rows in the
+// same `ORDER BY pr.principal_id` order, appended after the shared fragment
+// (which stays byte-identical), so two of them cannot wait on each other in
+// a cycle through THIS set. That is not a claim of PG-level deadlock
+// freedom in general (a lock outside this set can still participate in a
+// cycle). If PG's detector fires, or `lock_timeout` expires, ONE side's
+// transaction aborts and surfaces here as a store failure (never a hang,
+// never a half-applied write).
 //
 // The guarantee is honestly point-in-time, not enduring: the caller was
 // eligible under the destination regime AS OBSERVED INSIDE this transaction,

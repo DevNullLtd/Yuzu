@@ -1601,7 +1601,7 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
                             "JOIN auth.users u ON u.username = pr.principal_id "
                             "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
                             "'user' AND u.is_active "
-                            "FOR UPDATE OF pr",
+                            "ORDER BY pr.principal_id FOR UPDATE OF pr",
                             std::vector<std::string>{})
                 .ok());
 
@@ -1693,7 +1693,7 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard rolls back "
                             "JOIN auth.users u ON u.username = pr.principal_id "
                             "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
                             "'user' AND u.is_active "
-                            "FOR UPDATE OF pr",
+                            "ORDER BY pr.principal_id FOR UPDATE OF pr",
                             std::vector<std::string>{})
                 .ok());
 
@@ -3906,7 +3906,7 @@ TEST_CASE("RbacStore A1(6a): sole authenticatable Administrator — unassign_rol
                                 "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
                                 "JOIN auth.users u ON u.username = pr.principal_id "
                                 "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
-                                "'user' AND u.is_active FOR UPDATE OF pr",
+                                "'user' AND u.is_active ORDER BY pr.principal_id FOR UPDATE OF pr",
                                 std::vector<std::string>{})
                     .ok());
 
@@ -3957,7 +3957,7 @@ TEST_CASE("RbacStore A1(6a): sole authenticatable Administrator — unassign_rol
                                 "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
                                 "JOIN auth.users u ON u.username = pr.principal_id "
                                 "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
-                                "'user' AND u.is_active FOR UPDATE OF pr",
+                                "'user' AND u.is_active ORDER BY pr.principal_id FOR UPDATE OF pr",
                                 std::vector<std::string>{})
                     .ok());
 
@@ -4026,7 +4026,7 @@ TEST_CASE("RbacStore A1(6b): a second authenticatable Administrator survives —
                                 "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
                                 "JOIN auth.users u ON u.username = pr.principal_id "
                                 "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
-                                "'user' AND u.is_active FOR UPDATE OF pr",
+                                "'user' AND u.is_active ORDER BY pr.principal_id FOR UPDATE OF pr",
                                 std::vector<std::string>{})
                     .ok());
 
@@ -4076,7 +4076,7 @@ TEST_CASE("RbacStore A1(6b): a second authenticatable Administrator survives —
                                 "SELECT pr.principal_id FROM rbac_store.principal_roles pr "
                                 "JOIN auth.users u ON u.username = pr.principal_id "
                                 "WHERE pr.role_name = 'Administrator' AND pr.principal_type = "
-                                "'user' AND u.is_active FOR UPDATE OF pr",
+                                "'user' AND u.is_active ORDER BY pr.principal_id FOR UPDATE OF pr",
                                 std::vector<std::string>{})
                     .ok());
 

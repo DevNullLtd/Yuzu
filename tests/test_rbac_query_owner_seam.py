@@ -9,9 +9,20 @@ if either half of that seam regresses:
 
   1. `server/core/src/rbac_store.cpp` contains an `auth.`-schema reference inside a string
      literal (SQL). Comments are ignored, so prose that names `auth.users` is fine.
-  2. `kAuthenticatableAdminGrantsFrom`, the one SQL fragment that defines "an authenticatable
+  2. Symmetrically, an `auth_db*` file (server/core/src/auth_db.cpp, auth_db_sql_helpers.hpp,
+     the public server/core/include/yuzu/server/auth_db.hpp) contains an `rbac_store.`-schema
+     reference inside a string literal. `AuthDB` and the statements it shares with the owner
+     (`auth_sql::`, #4966) are own-schema `auth.*` SQL only; the cross-schema half lives in the
+     owner.
+  3. `kAuthenticatableAdminGrantsFrom`, the one SQL fragment that defines "an authenticatable
      Administrator grant", is not defined exactly once under server/core/src, in the owner's
      translation unit. A second copy is the drift the fragment exists to remove.
+  4. The active-local-admin predicate (`role = 'admin' AND is_active`, the column floor's
+     population, #4966) is not exactly ONE string literal under server/, in
+     `auth_db_sql_helpers.hpp` (`kActiveLocalAdminPredicate`). The count helper, the owner's
+     survivor list and the owner's per-target membership read all embed it by name; a second
+     literal is a drift the floor cannot tolerate. A copy that aliases the table
+     (`u.is_active`) or splits the predicate across statements is NOT seen by this textual scan.
 
 It scans string literals only (a small tokenizer skips `//` and `/* */` comments), so a doc
 comment cannot trip it. Wired into tests/meson.build (suite 'docs') and docs-lint.yml.
@@ -36,6 +47,10 @@ CHAR_LIT = re.compile(
     r"'(?:\\(?:x[0-9A-Fa-f]+|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|[0-7]{1,3}|.)|[^\\'\n])'"
 )
 STORE_PREFIX = "server/core/src/rbac_store"
+FOREIGN_RBAC = re.compile(r"\brbac_store\.[A-Za-z_]+", re.IGNORECASE)
+AUTH_PREFIXES = ("server/core/src/auth_db", "server/core/include/yuzu/server/auth_db")
+ADMIN_PREDICATE = re.compile(r"role\s*=\s*'admin'\s+AND\s+is_active\b", re.IGNORECASE)
+ADMIN_PREDICATE_FILE = "server/core/src/auth_db_sql_helpers.hpp"
 
 
 def tokenize(src: str):
@@ -104,13 +119,13 @@ def literals(src: str):
     return out
 
 
-def foreign_match(lit: str):
-    """First auth-schema reference in a literal, also seen through escaped quotes/whitespace."""
-    m = FOREIGN.search(lit)
+def foreign_match(lit: str, pattern=FOREIGN):
+    """First `pattern` schema reference in a literal, also seen through escaped quotes/whitespace."""
+    m = pattern.search(lit)
     if m:
         return m.group(0)
     tidy = re.sub(r"\s*\.\s*", ".", re.sub(r'[\\"]', "", lit))
-    m = FOREIGN.search(tidy)
+    m = pattern.search(tidy)
     return m.group(0) if m else None
 
 
@@ -155,6 +170,23 @@ def _selfcheck() -> None:
     for text in ('const char* a = "docs are fine";\n// "auth.users" in a comment\n',):
         if any(foreign_match(l) for l in literals(text)):
             raise SystemExit("selfcheck: a comment or clean literal was reported")
+    # The symmetric (rbac_store.) pattern: found in a literal, ignored in a comment, and seen
+    # through the same escaping/adjacent-literal tricks as the auth. scan.
+    rbac_sample = (
+        '// rbac_store.principal_roles in a comment\n'
+        'const char* a = "SELECT 1 FROM rbac_store.principal_roles";\n'
+        'const char* b = "FROM rbac" "_store.roles";\n'
+        'const char* c = "FROM \\"rbac_store\\".roles";\n'
+        'const char* d = "plain auth.users text";\n'
+    )
+    rbac_hits = [l for l in literals(rbac_sample) if foreign_match(l, FOREIGN_RBAC)]
+    if len(rbac_hits) != 3:
+        raise SystemExit(f"selfcheck: expected 3 rbac_store. literals, got {rbac_hits!r}")
+    if foreign_match('docs only, no schema', FOREIGN_RBAC):
+        raise SystemExit("selfcheck: a clean literal was reported by the rbac_store. scan")
+    pred = 'const char* p = "x WHERE role = \'admin\' AND is_active";\n// role = \'admin\' AND is_active\n'
+    if sum(len(ADMIN_PREDICATE.findall(l)) for l in literals(pred)) != 1:
+        raise SystemExit("selfcheck: the admin-predicate scan must count literals only")
     for text in ("#define " + FRAGMENT + " \"FROM x\"\n",
                  "static const char* " + FRAGMENT + " = \"FROM x\";\n"):
         if not DEFINITION.search(code(text)):
@@ -189,6 +221,42 @@ def main() -> int:
                     f"{rel}: string literal references the auth schema ({hit!r}); "
                     f"cross-schema SQL belongs in {OWNER} (ADR-0012 s3)"
                 )
+    # Rule 2: the mirror of rule 1. Also scans the public header, which lives outside src/.
+    auth_files = [
+        f for f in subprocess.run(
+            ["git", "ls-files", "--", "server/core/src", "server/core/include"],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+        if f.startswith(AUTH_PREFIXES) and f.endswith((".cpp", ".hpp"))
+    ]
+    if "server/core/src/auth_db.cpp" not in auth_files:
+        failures.append("server/core/src/auth_db.cpp is not tracked; the seam scan has nothing to check")
+    for rel in auth_files:
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
+        for lit in literals(text):
+            hit = foreign_match(lit, FOREIGN_RBAC)
+            if hit:
+                failures.append(
+                    f"{rel}: string literal references the rbac_store schema ({hit!r}); "
+                    f"cross-schema SQL belongs in {OWNER} (ADR-0012 s3)"
+                )
+    # Rule 4: ONE active-local-admin predicate literal under server/.
+    pred_sites = []
+    for rel in subprocess.run(
+        ["git", "ls-files", "--", "server"],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    ).stdout.splitlines():
+        if not rel.endswith((".cpp", ".hpp", ".h", ".cc")):
+            continue
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
+        for lit in literals(text):
+            pred_sites.extend([rel] * len(ADMIN_PREDICATE.findall(lit)))
+    if pred_sites != [ADMIN_PREDICATE_FILE]:
+        failures.append(
+            "the active-local-admin predicate (role = 'admin' AND is_active) must be exactly one "
+            f"string literal under server/, in {ADMIN_PREDICATE_FILE} (kActiveLocalAdminPredicate); "
+            f"found {pred_sites!r}"
+        )
     defs = []
     for rel in files:
         if not rel.endswith((".cpp", ".hpp", ".h", ".cc")):
@@ -205,8 +273,9 @@ def main() -> int:
         print("FAIL: the RBAC cross-schema query-owner seam regressed (ADR-0012 s3):")
         print("\n".join("  " + f for f in failures))
         return 1
-    print(f"OK: no auth. SQL in {len(store_files)} rbac_store* file(s); "
-          f"{FRAGMENT} defined once, in {OWNER}")
+    print(f"OK: no auth. SQL in {len(store_files)} rbac_store* file(s); no rbac_store. SQL in "
+          f"{len(auth_files)} auth_db* file(s); {FRAGMENT} defined once, in {OWNER}; "
+          f"active-admin predicate defined once, in {ADMIN_PREDICATE_FILE}")
     return 0
 
 
