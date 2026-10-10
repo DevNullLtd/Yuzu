@@ -20,10 +20,11 @@ rule). Loaded by `security-guardian` + `docs-writer` during governance.
 of the REST endpoints below, wired via `McpServer::set_viz_deps()` (passes the
 SAME `fleet_topology_store_`/`viz_disabled_` instances and the same
 `OfflineEndpointStore` (via an `OfflineRosterFn` closure) REST's `VizRoutes`
-registration uses, so the two surfaces cannot disagree about cache state). Every invariant in this doc (kill-switch
-ordering, the DoS cap, the offline-merge rule) applies identically to both
-surfaces - a change to one that doesn't preserve parity with the other is a
-regression, not a stylistic difference. That equal treatment does not extend
+registration uses, so the two surfaces cannot disagree about cache state).
+Every invariant in this doc (kill-switch ordering, the DoS cap, the
+offline-merge rule) applies identically to both surfaces - a change to one
+that doesn't preserve parity with the other is a regression, not a stylistic
+difference. That equal treatment does not extend
 to confinement: **neither surface confines results to the caller's
 management-group scope** - a caller with `Response:Read` sees every connected
 agent's process/connection/listener data fleet-wide on both REST and MCP

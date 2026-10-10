@@ -102,6 +102,9 @@ struct PresenceIdentity {
 /// genuine DB error guards against).
 enum class PresenceReadError { StoreUnavailable, DbError, Truncated };
 
+/// One offline-roster read, as `OfflineEndpointStore::query_stale_within` returns it (#5531).
+using OfflineRosterRead = std::expected<std::vector<OfflineEndpoint>, PresenceReadError>;
+
 class OfflineEndpointStore {
 public:
     /// Hard cap on rows materialised by `query_stale_within`/`query_live_ids`
@@ -167,8 +170,7 @@ public:
     /// (`op=query_stale_within`) and logged at warn once per failed call (a
     /// store that never opened — boot-time migration failure — answers
     /// `StoreUnavailable` without a count or warn, as `query_live_ids` does).
-    [[nodiscard]] std::expected<std::vector<OfflineEndpoint>, PresenceReadError>
-    query_stale_within(std::chrono::seconds window);
+    [[nodiscard]] OfflineRosterRead query_stale_within(std::chrono::seconds window);
 
     /// HA WS-5: every agent whose `last_seen_at` is within `ttl` of the
     /// DATABASE clock (`now()` in-SQL, never the replica's own
@@ -217,7 +219,6 @@ private:
 /// Injected roster read (#5531): lets VizRoutes / McpServer take the typed
 /// `query_stale_within` as a boundary without holding the store. An empty
 /// function means "no durable roster wired" (live-only, legacy behaviour).
-using OfflineRosterFn = std::function<std::expected<std::vector<OfflineEndpoint>, PresenceReadError>(
-    std::chrono::seconds)>;
+using OfflineRosterFn = std::function<OfflineRosterRead(std::chrono::seconds)>;
 
 } // namespace yuzu::server

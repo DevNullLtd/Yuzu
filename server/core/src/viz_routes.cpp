@@ -261,8 +261,8 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     // (fleet_topology_store.{hpp,cpp}) is the SHARED pure transform the MCP
     // get_fleet_topology tool also calls (api-twin-recipe.md Rule 1) — the
     // copy-on-write / online-set-dedup rule cannot drift between the two
-    // surfaces. Null store (tests, or a legacy binary) = exactly the prior
-    // behavior (no query, snap unchanged). Done BEFORE the DoS gate so the
+    // surfaces. An empty roster closure (tests, or a legacy binary) = exactly
+    // the prior behavior (no query, snap unchanged). Done BEFORE the DoS gate so the
     // machines_max cap counts the merged total.
     // #5531: a FAILED read renders live-only (never hard-fails the request) and
     // is flagged `offline_roster_degraded` in the envelope + audit detail.

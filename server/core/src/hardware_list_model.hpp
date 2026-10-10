@@ -156,12 +156,9 @@ inline constexpr std::array<int, 3> kSyncNowMinAgentVersion{0, 13, 1};
 
 // ── #5531: the store-to-bit mappings, pure so a revert is visible to a unit test ──
 
-/// One offline-roster read, as `OfflineEndpointStore::query_stale_within` returns it.
-using OfflineRosterRead = std::expected<std::vector<OfflineEndpoint>, PresenceReadError>;
-
 /// Failed read -> `roster_degraded` + `ci_degraded` + `tags_degraded` (no enrichment of an
 /// unknown roster) and returns false; a healthy read touches nothing and returns true.
-bool apply_roster_read(InventoryDevicesResult& result, const OfflineRosterRead& eps);
+[[nodiscard]] bool apply_roster_read(InventoryDevicesResult& result, const OfflineRosterRead& eps);
 
 /// One device's identity from an offline-roster read: the error is propagated (a failed read
 /// is never "not in the roster"); a healthy read yields the matching row (online=false, stale

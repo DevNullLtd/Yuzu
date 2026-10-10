@@ -26,6 +26,8 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cstdint>
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -46,6 +48,17 @@ InventoryDeviceRow make_row(std::string agent_id) {
     r.last_seen_ms = 1000;
     return r;
 }
+
+OfflineEndpoint make_offline_ep(const std::string& id, std::int64_t hb_ms) {
+    OfflineEndpoint e;
+    e.agent_id = id;
+    e.hostname = "host-" + id;
+    e.os = "linux";
+    e.last_heartbeat_ms = hb_ms;
+    return e;
+}
+std::string fake_age(std::int64_t) { return std::string("aged"); }
+constexpr std::int64_t kDayMs = 24LL * 60 * 60 * 1000;
 
 } // namespace
 
@@ -535,6 +548,17 @@ TEST_CASE("hardware_ci_json: absent identity renders null identity fields, onlin
     CHECK(j["identity_state"] == "absent");
 }
 
+// A set identity is a found identity: identity_degraded only describes an unanswered read.
+TEST_CASE("hardware_ci_json: identity outranks identity_degraded in identity_state",
+          "[hardware][model][json]") {
+    HardwareCiDetail d;
+    InventoryDeviceRow row;
+    row.agent_id = "a1";
+    d.identity = row;
+    d.identity_degraded = true;
+    CHECK(hardware_ci_json(d, 0)["identity_state"] == "found");
+}
+
 TEST_CASE("hardware_ci_json: ci_state discriminates degraded/absent/found", "[hardware][model][json]") {
     HardwareCiDetail degraded_detail;
     degraded_detail.ci = std::unexpected(CiReadError::kDegraded);
@@ -607,4 +631,71 @@ TEST_CASE("hardware_ci_json: software_last_seen distinguishes nullopt (degraded)
 
     d.software_last_seen = 1234567;
     CHECK(hardware_ci_json(d, 0)["software_last_seen"] == 1234567);
+}
+
+// ── #5531: the pure store-to-bit mappings server.cpp's closures delegate to ───
+
+// Kills: apply_roster_read treating a failed read as healthy (returns true / leaves a degraded
+// bit unset), and a healthy read being flagged degraded.
+TEST_CASE("apply_roster_read: failed read sets every degraded bit; healthy read touches nothing",
+          "[hardware][model]") {
+    InventoryDevicesResult failed;
+    CHECK_FALSE(apply_roster_read(failed, OfflineRosterRead{std::unexpected(PresenceReadError::DbError)}));
+    CHECK(failed.roster_degraded);
+    CHECK(failed.ci_degraded);
+    CHECK(failed.tags_degraded);
+
+    InventoryDevicesResult healthy;
+    CHECK(apply_roster_read(healthy, OfflineRosterRead{std::vector<OfflineEndpoint>{}}));
+    CHECK_FALSE(healthy.roster_degraded);
+    CHECK_FALSE(healthy.ci_degraded);
+    CHECK_FALSE(healthy.tags_degraded);
+}
+
+// Kills: offline_identity_row swallowing the read error into an empty optional ("not found").
+TEST_CASE("offline_identity_row: error propagates; hit is offline; miss is nullopt",
+          "[hardware][model]") {
+    const auto err = offline_identity_row(
+        OfflineRosterRead{std::unexpected(PresenceReadError::StoreUnavailable)}, "a1", 10 * kDayMs, fake_age);
+    REQUIRE_FALSE(err.has_value());
+    CHECK(err.error() == PresenceReadError::StoreUnavailable);
+
+    const OfflineRosterRead roster{std::vector<OfflineEndpoint>{make_offline_ep("a1", 9 * kDayMs)}};
+    const auto hit = offline_identity_row(roster, "a1", 10 * kDayMs, fake_age);
+    REQUIRE(hit.has_value());
+    REQUIRE(hit->has_value());
+    CHECK((*hit)->hostname == "host-a1");
+    CHECK_FALSE((*hit)->online);
+    CHECK_FALSE((*hit)->stale); // 1 day old
+    CHECK((*hit)->last_seen == "aged");
+
+    const auto old = offline_identity_row(
+        OfflineRosterRead{std::vector<OfflineEndpoint>{make_offline_ep("a1", 0)}}, "a1", 10 * kDayMs, fake_age);
+    REQUIRE(old.has_value());
+    CHECK((*old)->stale);
+
+    const auto miss = offline_identity_row(roster, "zzz", 10 * kDayMs, fake_age);
+    REQUIRE(miss.has_value());
+    CHECK_FALSE(miss->has_value());
+}
+
+// Kills: apply_identity_read never setting identity_degraded, or setting it on a clean miss.
+TEST_CASE("apply_identity_read: error degrades; nullopt is absent; row is identity", "[hardware][model]") {
+    HardwareCiDetail d;
+    apply_identity_read(d, std::unexpected(PresenceReadError::DbError));
+    CHECK(d.identity_degraded);
+    CHECK_FALSE(d.identity.has_value());
+
+    HardwareCiDetail absent;
+    apply_identity_read(absent, std::optional<InventoryDeviceRow>{});
+    CHECK_FALSE(absent.identity_degraded);
+    CHECK_FALSE(absent.identity.has_value());
+
+    HardwareCiDetail found;
+    InventoryDeviceRow row;
+    row.agent_id = "a1";
+    apply_identity_read(found, std::optional<InventoryDeviceRow>{row});
+    CHECK_FALSE(found.identity_degraded);
+    REQUIRE(found.identity.has_value());
+    CHECK(found.identity->agent_id == "a1");
 }
