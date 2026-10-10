@@ -418,3 +418,39 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview — a real filter a
     REQUIRE(res != nullptr);
     CHECK(res->status == 503);
 }
+
+// #5623: a facet value over kMaxFacetValueBytes (2048) is never stored, so a filter on it
+// matches no agent. The preview must refuse it (400, non-retryable) rather than answer an
+// exact 0. The harness's response_store is nullptr, so reaching the store would be the 503
+// above: a 400 proves the refusal came before any store access. Literal sizes pin the bound.
+TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a filter value over the facet "
+          "bound is refused (400), not answered as 0",
+          "[rest][devices]") {
+    DeviceRestHarness h;
+    const std::string over(2049, 'a');
+    auto res = h.sink.Get("/api/v1/management-groups/agent-count-preview"
+                          "?command_id=cmd-1&plugin=procfetch&name=" +
+                          over);
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 400);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"].get<int>() == 400);
+    CHECK(body["error"]["retry_after_ms"].is_null()); // non-retryable
+    const auto message = body["error"]["message"].get<std::string>();
+    CHECK(message.find("2048 bytes") != std::string::npos);
+    CHECK(message.find(over) == std::string::npos); // the value is never echoed
+    CHECK(body["error"].contains("remediation"));
+    CHECK(res->body.find(over) == std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a filter value exactly at the "
+          "facet bound is accepted (reaches the store, 503 when unwired)",
+          "[rest][devices]") {
+    DeviceRestHarness h; // response_store stays nullptr
+    const std::string at(2048, 'a');
+    auto res = h.sink.Get("/api/v1/management-groups/agent-count-preview"
+                          "?command_id=cmd-1&plugin=procfetch&name=" +
+                          at);
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 503);
+}

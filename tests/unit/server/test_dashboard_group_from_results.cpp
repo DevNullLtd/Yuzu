@@ -564,3 +564,86 @@ TEST_CASE("group-from-results: a configured trusted origin is accepted "
     CHECK(res->status == 200);
     CHECK(h.mg.find_group_by_name("csrf-trusted-group").has_value());
 }
+
+// -- #5623: a facet filter value over kMaxFacetValueBytes is refused ---------
+// Such a value is never stored (response_store.hpp), so a filter on it matches no agent.
+// Both surfaces must refuse it visibly instead of previewing "0 agents" or building a group
+// from an empty set. Literal sizes pin the shipped bound. visible_set_fn_calls == 0 shows
+// the refusal ran before any store read or scope resolution.
+
+TEST_CASE("create-group-form: a filter value over the facet bound is refused, not previewed "
+          "as 0 agents",
+          "[pg][server][dashboard][group_from_results]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    const std::string over(2049, 't');
+    auto res = h.sink.Get(std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                          "&plugin=" + kPlugin + "&f_title=" + over);
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200); // 4xx bodies are dropped by the dashboard htmx config
+    CHECK(contains(res->body, "data-filter-refused=\"true\""));
+    CHECK(contains(res->body, "2048 bytes"));
+    CHECK_FALSE(contains(res->body, "agents will be added"));
+    CHECK_FALSE(contains(res->body, over)); // the value is never echoed
+    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(h.visible_set_fn_calls == 0);
+}
+
+TEST_CASE("create-group-form: a filter value exactly at the facet bound is previewed",
+          "[pg][server][dashboard][group_from_results]") {
+    GroupFromResultsHarness h;
+    const std::string at(2048, 't');
+    StoredResponse r;
+    r.instruction_id = kCommandId;
+    r.agent_id = "agent-A";
+    r.status = 1;
+    r.plugin = kPlugin;
+    r.output = "high|cat-a|" + at + "|detail\n";
+    h.rs().store(r);
+
+    auto res = h.sink.Get(std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                          "&plugin=" + kPlugin + "&f_title=" + at);
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    CHECK_FALSE(contains(res->body, "data-filter-refused"));
+    CHECK(contains(res->body, "1 agent will be added"));
+}
+
+TEST_CASE("group-from-results: a filter value over the facet bound is refused and creates "
+          "no group",
+          "[pg][server][dashboard][group_from_results]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+    const std::string over(2049, 't');
+    // The matching f_category filter is present too: dropping the over-long one would
+    // still match both agents, so a group appearing here means the filter was dropped.
+    auto res = h.post("group_name=over-bound-group&command_id=" + std::string{kCommandId} +
+                      "&plugin=" + kPlugin + "&f_category=cat-a&f_title=" + over);
+    CHECK(res->status == 400);
+    CHECK(contains(res->body, "data-filter-refused=\"true\""));
+    CHECK(contains(res->body, "2048 bytes"));
+    CHECK_FALSE(contains(res->body, over)); // the value is never echoed
+    CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
+    CHECK_FALSE(h.mg.find_group_by_name("over-bound-group").has_value());
+    CHECK(h.visible_set_fn_calls == 0);
+}
+
+TEST_CASE("group-from-results: a filter value exactly at the facet bound builds the group",
+          "[pg][server][dashboard][group_from_results]") {
+    GroupFromResultsHarness h;
+    const std::string at(2048, 't');
+    StoredResponse r;
+    r.instruction_id = kCommandId;
+    r.agent_id = "agent-A";
+    r.status = 1;
+    r.plugin = kPlugin;
+    r.output = "high|cat-a|" + at + "|detail\n";
+    h.rs().store(r);
+
+    auto res = h.post("group_name=at-bound-group&command_id=" + std::string{kCommandId} +
+                      "&plugin=" + kPlugin + "&f_title=" + at);
+    CHECK(res->status == 200);
+    auto group = h.mg.find_group_by_name("at-bound-group");
+    REQUIRE(group.has_value());
+    CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
+}

@@ -402,6 +402,63 @@ TEST_CASE("/fragments/results: Create Group button still renders for an "
     CHECK(contains(res->body, "Create Group from 1 Agent"));
 }
 
+// #5623: a facet value over kMaxFacetValueBytes (2048) is never stored, so a filter on it
+// matches no agent. The fragment must say so instead of rendering a plausible empty table.
+// The response store is nullptr here: reaching render_results would answer "Response store
+// not available", so the refusal text proves the check ran before any store access.
+// Literal sizes pin the shipped bound.
+TEST_CASE("/fragments/results: a filter value over the facet bound is refused, not rendered "
+          "as an empty result",
+          "[server][dashboard][fragment]") {
+    FragmentResultsHarness h(/*response_store=*/nullptr);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+          const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    const std::string over(2049, 'v');
+    auto res = h.get("/fragments/results?command_id=cmd-bound-1&plugin=registry&f_output=" + over);
+    REQUIRE(res);
+    // 200, not 4xx: the dashboard htmx config drops 4xx bodies, which would leave stale rows.
+    CHECK(res->status == 200);
+    CHECK(contains(res->body, "data-filter-refused=\"true\""));
+    CHECK(contains(res->body, "2048 bytes"));
+    CHECK_FALSE(contains(res->body, "Response store not available"));
+    CHECK_FALSE(contains(res->body, over)); // the value is never echoed
+}
+
+TEST_CASE("/fragments/results: a filter value exactly at the facet bound still matches its "
+          "stored facet",
+          "[pg][server][dashboard][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-at-bound-1";
+    const std::string at(2048, 'v');
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = "agent-a";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.output = at;
+    r.plugin = "registry";
+    rs.store(r);
+
+    FragmentResultsHarness h(&rs);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+          const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    auto res = h.get("/fragments/results?command_id=" + command_id +
+                      "&plugin=registry&f_output=" + at);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(contains(res->body, "data-filter-refused"));
+    CHECK(contains(res->body, "class=\"result-row\""));
+}
+
 // ── #4644 Gate 7 (row 6a): the unfiltered read is byte-bounded and a cut is visible ──
 
 TEST_CASE("/fragments/results: an unfiltered read cut by the payload cap shows a truncation "

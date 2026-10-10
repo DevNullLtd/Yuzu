@@ -851,6 +851,11 @@ this route performs no mutation.
 An empty filter set (no recognised filter keys supplied) returns a genuine `0` — no scoped count
 to report, and no store read is made.
 
+A filter value longer than 2,048 bytes is refused with `400` (A4 envelope, `retry_after_ms: null`,
+not retryable) before any store read: the response store never indexes a facet value over that
+length, so such a filter could only ever answer a misleading `0`. The message names the bound and
+does not echo the value.
+
 **Response:**
 
 ```json

@@ -325,10 +325,13 @@ operator-visible notes:
 - **Facets are bounded.** Each response keeps the distinct (column, value) pairs
   of its output as facets, which drive the facet filter, group-from-results and
   the agent-count preview. A value over 2,048 bytes is excluded, never
-  truncated. At most 5,000 facets are kept per response, chosen by most lines
-  first, then column, then value, so a rare value can be cut. The symptom is an
-  agent missing from a facet filter or preview while its response still shows
-  in the results. See `yuzu_server_response_facets_dropped_total` in
+  truncated, and a facet filter, group-from-results or agent-count preview on
+  a value over 2,048 bytes is refused with an error (the dashboard shows a
+  message, REST answers 400 and MCP -32602) instead of reporting no match. At
+  most 5,000 facets are kept per response, chosen by most lines first, then
+  column, then value, so a rare value can be cut. The symptom is an agent
+  missing from a facet filter or preview while its response still shows in
+  the results. See `yuzu_server_response_facets_dropped_total` in
   [metrics.md](metrics.md).
 
 ## Retention and cleanup

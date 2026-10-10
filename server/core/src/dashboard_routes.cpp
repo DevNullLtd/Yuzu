@@ -370,6 +370,22 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     }
                 }
 
+                // A filter value over kMaxFacetValueBytes was never indexed, so it can
+                // match no agent: refuse instead of rendering a plausible empty table
+                // (#5623). Covers the f_* params and a template `equals` filter alike.
+                // Rendered at 200, not 400: the dashboard htmx config drops 4xx bodies
+                // (responseHandling swap:false), which would leave the old rows in place.
+                if (any_facet_filter_exceeds_bound(filters)) {
+                    res.set_content(
+                        "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\" "
+                        "data-filter-refused=\"true\">" +
+                            html_escape(facet_filter_value_bound_message()) + ". " +
+                            html_escape(facet_filter_value_bound_remediation()) +
+                            ".</td></tr></tbody>",
+                        "text/html; charset=utf-8");
+                    return;
+                }
+
                 auto html = render_results(command_id, plugin, sort_col, sort_dir,
                                            page, per_page, filters, text_query,
                                            definition_id, template_id,
@@ -511,6 +527,19 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 auto command_id = req.get_param_value("command_id");
                 auto plugin = req.get_param_value("plugin");
                 auto filters = parse_filters(req, plugin);
+                // Refuse a filter value no stored facet can equal (#5623) rather than
+                // preview an exact "0 agents". 200 for the same reason as /fragments/results.
+                if (any_facet_filter_exceeds_bound(filters)) {
+                    res.set_header("Cache-Control", "no-store, private");
+                    res.set_header("Vary", "Cookie");
+                    res.set_content(
+                        "<span class=\"feedback-error\" data-filter-refused=\"true\">" +
+                            html_escape(facet_filter_value_bound_message()) + ". " +
+                            html_escape(facet_filter_value_bound_remediation()) +
+                            ".</span>",
+                        "text/html; charset=utf-8");
+                    return;
+                }
                 // JIT-elevated: full-fleet view, not a username-derived RBAC
                 // re-check that can't see the session's live elevation (see
                 // render_filter_bar's identical comment).
@@ -586,6 +615,20 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  // Reconstruct filters from form
                  auto filters = parse_filters(req, plugin);
+
+                 // A filter value over kMaxFacetValueBytes matches no stored facet, so
+                 // the group would be built from an empty set: refuse (#5623).
+                 if (any_facet_filter_exceeds_bound(filters)) {
+                     res.status = 400;
+                     res.set_header("HX-Retarget", "#group-form-slot");
+                     res.set_content(
+                         "<span class=\"feedback-error\" data-filter-refused=\"true\">" +
+                             html_escape(facet_filter_value_bound_message()) + ". " +
+                             html_escape(facet_filter_value_bound_remediation()) +
+                             ".</span>",
+                         "text/html; charset=utf-8");
+                     return;
+                 }
 
                  if (!response_store_ || !mgmt_group_store_) {
                      res.status = 500;

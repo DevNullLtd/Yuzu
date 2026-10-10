@@ -20545,6 +20545,70 @@ TEST_CASE("MCP preview_management_group_agent_count: an array-shaped filters is 
     CHECK_FALSE(envelope.contains("result"));
 }
 
+// #5623: a facet value over kMaxFacetValueBytes (2048) is never stored, so a filter on it
+// matches no agent. The tool must refuse it (-32602, non-retryable) rather than answer an
+// exact 0. response_store_for_test stays nullptr, so reaching the store would be the
+// degrade above (-32603): -32602 proves the refusal came before any store access.
+TEST_CASE("MCP preview_management_group_agent_count: a filter value over the facet bound is "
+          "refused with -32602, not answered as 0",
+          "[mcp][devices][security]") {
+    McpTestServer ts;
+    ts.start();
+    const std::string over(2049, 'a');
+    const std::string body =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":96,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":{"name":")" +
+        over + R"("}}}})";
+    auto res = ts.call(body);
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK_FALSE(envelope.contains("result"));
+    CHECK(envelope["error"]["code"].get<int>() == -32602);
+    CHECK(envelope["error"]["message"].get<std::string>().find("2048 bytes") !=
+          std::string::npos);
+    CHECK(envelope["error"]["data"]["retry_after_ms"].is_null()); // non-retryable
+    CHECK_FALSE(envelope["error"]["data"]["remediation"].is_null());
+    CHECK(res->body.find(over) == std::string::npos); // the value is never echoed
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: a filter value exactly at the facet bound "
+          "is accepted (reaches the store, degrades when unwired)",
+          "[mcp][devices]") {
+    McpTestServer ts;
+    ts.start();
+    const std::string at(2048, 'a');
+    const std::string body =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":97,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":{"name":")" +
+        at + R"("}}}})";
+    auto res = ts.call(body);
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK(envelope["error"]["code"].get<int>() == -32603); // store degrade, not a refusal
+}
+
+// The served schema's per-value maxLength is the same contract as kMaxFacetValueBytes,
+// expressed twice in a raw literal; this binds them (the C8 approval path rejects on the
+// schema, the handler above on the bytes).
+TEST_CASE("MCP preview_management_group_agent_count: the served filters maxLength equals "
+          "kMaxFacetValueBytes",
+          "[mcp][devices]") {
+    bool found = false;
+    for (const auto& row : input_schemas_for_test()) {
+        if (row.name != "preview_management_group_agent_count")
+            continue;
+        found = true;
+        const auto schema = nlohmann::json::parse(row.schema_json);
+        CHECK(schema["properties"]["filters"]["additionalProperties"]["maxLength"]
+                  .get<std::size_t>() == yuzu::server::kMaxFacetValueBytes);
+    }
+    CHECK(found);
+}
+
 TEST_CASE("MCP preview_management_group_agent_count: readonly tier is denied "
           "(ManagementGroup:Write, not Read)",
           "[mcp][devices]") {

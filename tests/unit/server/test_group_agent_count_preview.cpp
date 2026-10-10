@@ -16,6 +16,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <string>
+#include <vector>
+
 using namespace yuzu::server;
 
 TEST_CASE("mangle_column_key: lowercase, space/dash -> underscore", "[server][devices]") {
@@ -68,4 +71,32 @@ TEST_CASE("group_agent_count_preview: non-empty filters against an unconfigured 
     std::vector<FacetFilter> filters{{0, "1234"}};
     auto count = group_agent_count_preview(nullptr, "cmd-1", filters, std::nullopt);
     CHECK_FALSE(count.has_value()); // nullopt — never a false 0
+}
+
+// #5623: the reader-side twin of the ingest exclusion (response_store.hpp). The literal
+// 2048 pins the shipped bound; the helpers must agree with the constant itself.
+TEST_CASE("facet_value_exceeds_bound: strictly over 2048 bytes", "[server][devices]") {
+    static_assert(kMaxFacetValueBytes == 2048);
+    CHECK_FALSE(facet_value_exceeds_bound(""));
+    CHECK_FALSE(facet_value_exceeds_bound(std::string(2048, 'a')));
+    CHECK(facet_value_exceeds_bound(std::string(2049, 'a')));
+    // Bytes, not characters: 1025 two-byte code points is 2050 bytes.
+    std::string wide;
+    for (int i = 0; i < 1025; ++i)
+        wide += "\xC3\xA9";
+    CHECK(facet_value_exceeds_bound(wide));
+}
+
+TEST_CASE("any_facet_filter_exceeds_bound: one over-bound value among valid ones refuses",
+          "[server][devices]") {
+    std::vector<FacetFilter> ok{{0, "1234"}, {1, std::string(2048, 'a')}};
+    CHECK_FALSE(any_facet_filter_exceeds_bound(ok));
+    CHECK_FALSE(any_facet_filter_exceeds_bound({}));
+    std::vector<FacetFilter> bad{{0, "1234"}, {1, std::string(2049, 'a')}};
+    CHECK(any_facet_filter_exceeds_bound(bad));
+}
+
+TEST_CASE("facet filter refusal text names the bound and takes no value", "[server][devices]") {
+    CHECK(facet_filter_value_bound_message().find("2048 bytes") != std::string::npos);
+    CHECK(facet_filter_value_bound_remediation().find("2048 bytes") != std::string::npos);
 }

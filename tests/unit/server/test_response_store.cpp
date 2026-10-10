@@ -1968,6 +1968,16 @@ TEST_CASE("ResponseStore: an over-long facet value is excluded, the other facets
     // col 3 (detail): the huge value is absent.
     CHECK(facet_set(3) == std::vector<std::string>{"detail-a", "detail-b"});
 
+    // The reader side: a filter on the at-bound title finds the agent, so the readers
+    // (which refuse a value over the bound) lose nothing a stored facet could match.
+    auto at_bound_agents = store.facet_agent_ids("cmd-facet-toolong", {FacetFilter{2, at_bound}});
+    REQUIRE(at_bound_agents.has_value());
+    CHECK(*at_bound_agents == std::vector<std::string>{"agent-1"});
+    auto at_bound_count = store.facet_agent_count("cmd-facet-toolong",
+                                                  {FacetFilter{2, at_bound}}, std::nullopt);
+    REQUIRE(at_bound_count.has_value());
+    CHECK(*at_bound_count == 1);
+
     // 2 distinct values excluded (over_bound, huge); nothing else dropped.
     CHECK(dropped_count(metrics, "value_too_long") == 2.0);
     CHECK(dropped_count(metrics, "cap") == 0.0);

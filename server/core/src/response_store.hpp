@@ -43,9 +43,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu {
@@ -75,6 +77,30 @@ namespace yuzu::server {
 /// echoes; the longest the server mints is about 60 bytes); a longer id still fails the
 /// facet batch, which is counted as `batch_failed`.
 inline constexpr std::size_t kMaxFacetValueBytes = 2048;
+
+/// Reader-side twin of the ingest exclusion above. A facet filter on a value over
+/// `kMaxFacetValueBytes` can match no agent (such a value is never stored), so a reader
+/// that ran it would report an exact "0 agents" for a filter it cannot evaluate. Every
+/// reader that builds a `FacetFilter` from caller input refuses the request when this is
+/// true, and never drops the filter (dropping it would widen the match). Decidable from
+/// the input alone, so no store access is involved.
+[[nodiscard]] inline bool facet_value_exceeds_bound(std::string_view v) noexcept {
+    return v.size() > kMaxFacetValueBytes;
+}
+
+/// Caller-facing text for the refusal above. Names the bound, never echoes the value.
+[[nodiscard]] inline std::string facet_filter_value_bound_message() {
+    return std::format("a filter value is longer than {} bytes; facet values over that "
+                       "length are not indexed, so no agent can match such a filter",
+                       kMaxFacetValueBytes);
+}
+
+/// Remediation paired with `facet_filter_value_bound_message()`.
+[[nodiscard]] inline std::string facet_filter_value_bound_remediation() {
+    return std::format("remove that filter or use a value of at most {} bytes; the "
+                       "request was not evaluated",
+                       kMaxFacetValueBytes);
+}
 
 /// `yuzu_server_response_facets_dropped_total{reason}`: facet rows (distinct
 /// (column, value) pairs) of a response that did not persist, by reason. Counted only
@@ -141,6 +167,16 @@ struct FacetFilter {
     int col_idx{-1};   // column index (0-based, excl. Agent column)
     std::string value; // exact match
 };
+
+/// True when any filter value is over `kMaxFacetValueBytes` (see
+/// `facet_value_exceeds_bound`): the request must be refused, not evaluated.
+[[nodiscard]] inline bool any_facet_filter_exceeds_bound(
+    const std::vector<FacetFilter>& filters) noexcept {
+    for (const auto& f : filters)
+        if (facet_value_exceeds_bound(f.value))
+            return true;
+    return false;
+}
 
 struct ResponseQuery {
     std::string agent_id;

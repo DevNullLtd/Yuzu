@@ -798,11 +798,12 @@ static const ToolDef kTools[] = {
      "an empty filters map returns a genuine 0 (no scoped count to report), never a "
      "store read. Requires ManagementGroup:Write — approval-gated (supervised MCP "
      "tier maker-checker), matching every other ManagementGroup:Write surface, even "
-     "though this tool itself performs no mutation.",
+     "though this tool itself performs no mutation. A filter value over 2048 bytes is "
+     "refused with -32602 (such values are not indexed, so the filter could never match).",
      R"j({"type":"object","properties":{)j"
      R"j("command_id":{"type":"string","minLength":1,"description":"The response set's instruction/command id to count against"},)j"
      R"j("plugin":{"type":"string","minLength":1,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
-     R"j("filters":{"type":"object","additionalProperties":{"type":"string"},"description":"Mangled column key -> exact-match value; empty/omitted means no filter (count is 0)"})j"
+     R"j("filters":{"type":"object","additionalProperties":{"type":"string","maxLength":2048},"description":"Mangled column key -> exact-match value of at most 2048 bytes (longer facet values are not indexed, so such a filter is refused); empty/omitted means no filter (count is 0)"})j"
      R"j(},"required":["command_id","plugin"]})j",
      R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"}},"required":["agent_count"]})j"},
 
@@ -10018,6 +10019,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                 }
                 auto filters = resolve_group_preview_filters(plugin, raw_fields);
+
+                // A value over kMaxFacetValueBytes was never indexed and matches no agent:
+                // refuse (non-retryable) rather than answer an exact 0 (#5623). Same
+                // check, bound and text as the REST twin; the value is never echoed.
+                if (any_facet_filter_exceeds_bound(filters)) {
+                    res.set_content(a4_error(kInvalidParams, facet_filter_value_bound_message(),
+                                             facet_filter_value_bound_remediation()),
+                                    "application/json");
+                    return;
+                }
 
                 // Elevated -> nullopt (JIT full-fleet view), else the D3
                 // resolver — mirrors DashboardRoutes::resolve_visible_scope
