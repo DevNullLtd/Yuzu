@@ -46,7 +46,9 @@ void NotificationRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Pe
                     if (!req.has_param(name))
                         continue;
                     const auto v = yuzu::server::parse_query_int<int>(raw);
-                    if (!v) {
+                    // A negative page size/offset is malformed too: it reaches `LIMIT $1::bigint`,
+                    // PG rejects it, and the store answers an empty list as a valid-looking 200.
+                    if (!v || *v < 0) {
                         res.status = 400;
                         res.set_content(
                             R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",

@@ -501,7 +501,7 @@ TEST_CASE("AuditStore: time range filter", "[pg][audit_store]") {
     REQUIRE(r->size() == 3);
 }
 
-TEST_CASE("AuditStore: AuditQuery since and until are presence-tracked, a literal 0 is not the "
+TEST_CASE("AuditStore: AuditQuery since and until are presence-tracked and a literal 0 is not the "
           "unbounded sentinel (#4644)",
           "[pg][audit_store][since_until]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);

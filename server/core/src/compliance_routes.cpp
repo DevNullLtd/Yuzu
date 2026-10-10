@@ -472,8 +472,12 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             if (req.has_param("name"))
                 q.name_filter = req.get_param_value("name");
             try {
-                if (req.has_param("limit"))
+                if (req.has_param("limit")) {
                     q.limit = strict_stoi(req.get_param_value("limit"));
+                    // Negative: PG rejects `LIMIT -1` (store degrade, a 503 for a client error).
+                    if (q.limit < 0)
+                        throw std::invalid_argument("negative limit");
+                }
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
@@ -522,8 +526,12 @@ void ComplianceRoutes::register_routes(HttpRouteSink& sink,
             if (req.has_param("enabled_only"))
                 q.enabled_only = true;
             try {
-                if (req.has_param("limit"))
+                if (req.has_param("limit")) {
                     q.limit = strict_stoi(req.get_param_value("limit"));
+                    // Negative: PG rejects `LIMIT -1` (store degrade, a 503 for a client error).
+                    if (q.limit < 0)
+                        throw std::invalid_argument("negative limit");
+                }
             } catch (const std::exception&) {
                 res.status = 400;
                 res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");

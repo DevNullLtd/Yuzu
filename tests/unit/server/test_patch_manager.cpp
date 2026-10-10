@@ -458,7 +458,9 @@ TEST_CASE("DiscoveryRoutes: GET /api/patches and /api/patches/deployments reject
 
     for (const char* route : {"/api/patches", "/api/patches/deployments"}) {
         for (const char* bad : {"limit=abc", "limit=50x", "limit=1e3", "limit=0x10",
-                                "limit=4294967296", "limit="}) {
+                                "limit=4294967296", "limit=",
+                                // PG rejects a negative LIMIT; the store answered an empty 200.
+                                "limit=-1"}) {
             INFO(route << "?" << bad);
             auto res = sink.Get(std::string(route) + "?" + bad);
             REQUIRE(res);

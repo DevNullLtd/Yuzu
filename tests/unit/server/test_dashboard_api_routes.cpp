@@ -634,7 +634,7 @@ TEST_CASE("dashboard_api_routes: /api/audit rejects a malformed since/until/limi
 }
 
 TEST_CASE("dashboard_api_routes: /api/audit rejects a negative since and until of zero or below "
-          "with 400, since of zero is accepted",
+          "with 400 while since of zero is accepted",
           "[pg][server][routes][dashboard_api_routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dashapi_audit_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};

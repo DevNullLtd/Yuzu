@@ -3841,6 +3841,31 @@ TEST_CASE("GET /api/v1/result-sets: a degraded read refuses (503), never a 200 w
             PGRES_COMMAND_OK);
 }
 
+// from_chars without an end-pointer check read `10abc` as 10 (and `abc` as "default"): a
+// malformed page size silently became a different, valid-looking one (#4644).
+TEST_CASE("GET /api/v1/result-sets and /{id}/members: a malformed limit is a 400 not its prefix",
+          "[pg][result_set][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    const auto id = h.seed_materialized("page-me", {"a", "b"});
+
+    for (const std::string base : {std::string("/api/v1/result-sets"),
+                                   "/api/v1/result-sets/" + id + "/members"}) {
+        for (const char* bad : {"limit=10abc", "limit=1e1", "limit=0x10", "limit=",
+                                "limit=99999999999999999999"}) {
+            INFO(base << "?" << bad);
+            auto res = h.sink.Get(base + "?" + bad);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+        auto ok = h.sink.Get(base + "?limit=10");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
+}
+
 TEST_CASE("GET /api/v1/result-sets/{id}/members: a degraded members-table read refuses "
           "(503), never a 200 with an empty array (#4306 finding 3 / #4307 finding 2)",
           "[pg][result_set][security][4306]") {

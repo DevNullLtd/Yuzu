@@ -6568,8 +6568,10 @@ void SettingsRoutes::register_routes(
                   auto version = req.matches[3].str();
                   auto pct_s = extract_form_value(req.body, "rollout_pct");
 
-                  // Malformed => 400, never the 100% default (shared with the upload route).
-                  const auto pct_parsed = yuzu::server::parse_rollout_pct(pct_s);
+                  // Malformed, EMPTY or above 100 => 400, never the 100% default or a clamp to
+                  // it: on an EXISTING package either would silently make it a full-fleet
+                  // rollout. (The upload route keeps its lenient default; it creates the row.)
+                  const auto pct_parsed = yuzu::server::parse_rollout_pct_strict(pct_s);
                   if (!pct_parsed) {
                       yuzu::server::reject_bad_rollout_pct(
                           res, yuzu::server::RolloutRejectEffect::kChanged);

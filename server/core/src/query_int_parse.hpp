@@ -89,6 +89,21 @@ struct SseReplayCursor {
     return *v < 0 ? 0 : (*v > 100 ? 100 : *v);
 }
 
+/// The CHANGE-rollout variant of `parse_rollout_pct` (the route that edits an EXISTING package's
+/// percentage; the upload route keeps the lenient one above). There a missing value must not
+/// default to 100 and an over-range value must not clamp to 100: both would flip an existing
+/// package to a FULL-FLEET rollout on a blank or typo'd field, so each is rejected (nullopt, the
+/// caller answers 400 and changes nothing). A negative value keeps its documented clamp to 0 (the
+/// least exposure, never a full-fleet value).
+[[nodiscard]] inline std::optional<int> parse_rollout_pct_strict(std::string_view s) {
+    if (s.empty())
+        return std::nullopt;
+    const auto v = parse_query_int<int>(s);
+    if (!v || *v > 100)
+        return std::nullopt;
+    return *v < 0 ? 0 : *v;
+}
+
 /// Read the OPTIONAL `since`/`until` epoch-second bounds from a JSON request body into
 /// presence-tracked optionals (#4644). `Json` is nlohmann's type, taken as a template parameter
 /// so this header never includes it. A key that is ABSENT leaves its side unset (unbounded). A

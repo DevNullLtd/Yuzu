@@ -309,7 +309,7 @@ TEST_CASE("ExecutionStatistics: agent stats with since filter",
     CHECK(stats[0].total_executions == 1); // only the recent one
 }
 
-TEST_CASE("ExecutionStatistics: since and until are presence-tracked, a literal 0 is not the "
+TEST_CASE("ExecutionStatistics: since and until are presence-tracked and a literal 0 is not the "
           "unbounded sentinel (#4644)",
           "[pg][execution_statistics][since_until]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;

@@ -247,7 +247,7 @@ TEST_CASE("POST /api/inventory/query: happy path filters by agent_id",
     CHECK(body["results_excluded_by_poison"] == 0);
 }
 
-TEST_CASE("POST /api/inventory/query: since and until are presence-tracked, until of zero and "
+TEST_CASE("POST /api/inventory/query: since and until are presence-tracked and until of zero and "
           "malformed bounds are a 400 (#4644)",
           "[server][routes][data_inventory_routes][rest][pg]") {
     PgHarness h;

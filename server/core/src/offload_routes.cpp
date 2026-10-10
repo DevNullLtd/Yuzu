@@ -8,6 +8,8 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace yuzu::server {
@@ -89,7 +91,10 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       return;
                   }
                   std::string name, url, auth_type_str, auth_credential, event_types;
-                  int batch_size = 1;
+                  // Read WIDE and range-check before narrowing: `body.value("batch_size", 1)`
+                  // as int wrapped 4294967297 to 1 and 4294977296 to 10000 (#4644).
+                  std::int64_t batch_size_wide = 1;
+                  bool batch_size_is_integer = true;
                   bool enabled = true;
                   try {
                       name = body.value("name", std::string{});
@@ -97,12 +102,30 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       auth_type_str = body.value("auth_type", std::string{"none"});
                       auth_credential = body.value("auth_credential", std::string{});
                       event_types = body.value("event_types", std::string{"*"});
-                      batch_size = body.value("batch_size", 1);
+                      if (const auto it = body.find("batch_size"); it != body.end()) {
+                          if (!it->is_number_integer())
+                              batch_size_is_integer = false;
+                          else if (it->is_number_unsigned() &&
+                                   it->get<std::uint64_t>() >
+                                       static_cast<std::uint64_t>(
+                                           std::numeric_limits<std::int64_t>::max()))
+                              batch_size_wide = std::numeric_limits<std::int64_t>::max();
+                          else
+                              batch_size_wide = it->get<std::int64_t>();
+                      }
                       enabled = body.value("enabled", true);
                   } catch (const nlohmann::json::exception&) {
                       // A present-but-wrong-typed field (e.g. batch_size as a
                       // string) throws type_error out of body.value() — that's
                       // still a caller mistake, not a server fault (#3097).
+                      audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                               "invalid_field_type");
+                      send_bad_json(res);
+                      return;
+                  }
+                  if (!batch_size_is_integer) {
+                      // A float/bool/null/string batch_size: same caller mistake as a
+                      // wrong-typed field above (a float used to truncate silently).
                       audit_fn(req, "offload_target.create", "denied", "offload_target", name,
                                "invalid_field_type");
                       send_bad_json(res);
@@ -114,6 +137,17 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                                       "application/json");
                       return;
                   }
+                  if (batch_size_wide < 1 || batch_size_wide > kMaxOffloadBatchSize) {
+                      audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                               "validation_failed");
+                      res.status = 400;
+                      res.set_content(
+                          detail::a4_error(res, "batch_size must be an integer from 1 to " +
+                                                    std::to_string(kMaxOffloadBatchSize)),
+                          "application/json");
+                      return;
+                  }
+                  const int batch_size = static_cast<int>(batch_size_wide);
                   auto auth_type = offload_auth_type_from_string(auth_type_str);
                   if (offload_auth_type_to_string(auth_type) != auth_type_str) {
                       // offload_auth_type_from_string() folds any unrecognized

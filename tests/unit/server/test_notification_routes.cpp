@@ -368,7 +368,10 @@ TEST_CASE("GET /api/notifications: a malformed limit or offset is a 400 and vali
     REQUIRE(w.store.create("info", "t", "m") > 0);
 
     for (const char* q : {"limit=10abc", "limit=0x10", "limit=1e1", "limit=", "offset=5x",
-                          "offset=-", "limit=99999999999999999999"}) {
+                          "offset=-", "limit=99999999999999999999",
+                          // Negative page size/offset: PG rejects a negative LIMIT/OFFSET and
+                          // the store answered an empty list as a valid-looking 200.
+                          "limit=-1", "offset=-1"}) {
         INFO(q);
         auto res = h.sink.Get(std::string("/api/notifications?") + q);
         REQUIRE(res);

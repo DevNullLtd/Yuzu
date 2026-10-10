@@ -936,7 +936,7 @@ TEST_CASE("ca_routes: dashboard revoke proceeds for a same-origin POST + re-rend
 
 // The panel's paging hint must not be copy-pasteable as a present-but-empty `offset=` (a 400 since
 // #4644). The 500-row cap that triggers it is too costly to seed, so the wording is a free function.
-TEST_CASE("ca_issued_paging_hint shows an escaped placeholder, never a bare offset=",
+TEST_CASE("ca_issued_paging_hint shows an escaped placeholder and never a bare offset=",
           "[ca_routes][pki][numeric_params]") {
     const auto hint = yuzu::server::ca_issued_paging_hint(500);
     CHECK(hint.find("Showing the first 500 certificates") != std::string::npos);

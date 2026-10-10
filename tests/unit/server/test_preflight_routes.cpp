@@ -307,6 +307,67 @@ TEST_CASE("preflight routes: /fragments/auto/run reaches resolve_targets + "
     CHECK(saw_success);
 }
 
+// `preflight::parse_i64` read junk as 0, so a typo in the disk threshold became "no minimum free
+// disk" and passed every device, and a junk window became the default one. Both are now strict:
+// a malformed (or, for the threshold, negative) number is a 400 and NOTHING is dispatched.
+TEST_CASE("preflight routes: /fragments/auto/run 400s on a malformed min_gib or window and "
+          "dispatches nothing",
+          "[pg][preflight][routes][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PreflightRunStore run_store{pool};
+    REQUIRE(run_store.is_open());
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto devices = [](const std::string&) {
+        DeviceRow d;
+        d.agent_id = "WS-1";
+        d.hostname = "WS-1-host";
+        d.os = "windows";
+        return std::vector<DeviceRow>{d};
+    };
+    int dispatched = 0;
+    auto dispatch = [&dispatched](const std::string&, const std::string&,
+                                  const std::vector<std::string>&, const std::string&,
+                                  const std::unordered_map<std::string, std::string>&,
+                                  const std::string&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatched;
+        return {.sent = 1, .command_id = "cmd-1"};
+    };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) -> bool {
+        return true;
+    };
+
+    PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, devices, /*groups_fn=*/{},
+                           /*group_members_fn=*/{}, dispatch, /*collect_fn=*/{}, audit, &run_store);
+
+    for (const char* bad : {"min_gib=junk", "min_gib=20abc", "min_gib=-1", "min_gib=1e1",
+                            "min_gib=0x10", "min_gib=99999999999999999999", "window=abc",
+                            "window=30min", "window=1e2", "window=99999999999999999999"}) {
+        INFO(bad);
+        auto res = sink.Post("/fragments/auto/run", bad, "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    CHECK(dispatched == 0);
+
+    // The shapes the form really sends still work: plain integers, and a cleared number input.
+    for (const char* ok : {"min_gib=20&window=30", "min_gib=&window=", "min_gib=0&window=1"}) {
+        INFO(ok);
+        auto res = sink.Post("/fragments/auto/run", ok, "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    CHECK(dispatched >= 3);
+}
+
 // SEC-2/SEC-3 confinement-gap class (Gate 4 unhappy-path review, UP-1):
 // /fragments/auto (rail), /fragments/auto/result, and /fragments/auto/delete
 // all scope by session->username alone — but ApiToken::principal_id ("the

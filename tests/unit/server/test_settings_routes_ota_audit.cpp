@@ -208,20 +208,31 @@ TEST_CASE("OTA rollout on a package that does not exist records not_found, not s
     CHECK(pkgs.front().rollout_pct == 50);
 }
 
-TEST_CASE("OTA rollout percentage is clamped, and the row reports the CLAMPED value",
-          "[ota][audit][settings_routes][pg]") {
-    // The handler clamps to 0..100. The audit row must report what was actually
-    // stored, not what was requested, or the evidence disagrees with the state.
+TEST_CASE("OTA rollout change refuses an empty or above-100 percentage and changes nothing",
+          "[ota][audit][settings_routes][pg][numeric_params]") {
+    // Both used to become 100 (the empty default, and the clamp), i.e. a blank or typo'd
+    // field flipped an existing package to a FULL-FLEET rollout. Now a 400 with the stored
+    // percentage untouched; 0, 50 and 100 are still accepted.
     YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
     OtaAuditHarness h{db.dsn()};
     h.seed(/*rollout_pct=*/10, /*mandatory=*/false);
 
-    h.post_rollout("1.2.3", "500");
+    for (const char* bad : {"", "101", "500", "%205"}) {
+        INFO("rollout_pct='" << bad << "'");
+        auto res = h.post_rollout("1.2.3", bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.registry->list_packages().front().rollout_pct == 10);
+    }
+    CHECK(h.audited.empty());
 
-    REQUIRE(h.audited.size() == 1);
-    CHECK(h.audited.front().detail.find("from=10%") != std::string::npos);
-    CHECK(h.audited.front().detail.find("to=100%") != std::string::npos);
-    CHECK(h.registry->list_packages().front().rollout_pct == 100);
+    for (const int ok : {0, 50, 100}) {
+        INFO("rollout_pct=" << ok);
+        auto res = h.post_rollout("1.2.3", std::to_string(ok));
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.registry->list_packages().front().rollout_pct == ok);
+    }
 }
 
 TEST_CASE("a rollout whose registry write does not commit is audited as failure, not success",

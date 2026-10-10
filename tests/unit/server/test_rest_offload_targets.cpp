@@ -135,6 +135,35 @@ TEST_CASE("REST offload-targets: create rejects a batch_size above the ceiling w
     CHECK(res->status == 201);
 }
 
+TEST_CASE("REST offload-targets: create refuses a batch_size that wraps or is not a plain integer",
+          "[rest][offload][pg][numeric_params]") {
+    OffloadHarness h;
+    // 4294967297 wrapped to 1 and 4294977296 to 10000 when narrowed to int; UINT64_MAX is above
+    // INT64_MAX. Each must be a 400 and create NOTHING.
+    for (const char* bad : {"4294967297", "4294977296", "18446744073709551615", "0", "-1", "10001",
+                            "\"5\"", "5.5", "true", "null"}) {
+        INFO("batch_size=" << bad);
+        const std::string body = std::string(R"({"name":"wrap-x","url":"https://siem.example.com/i","batch_size":)") +
+                                 bad + "}";
+        auto res = h.sink.Post("/api/v1/offload-targets", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    auto list = h.sink.Get("/api/v1/offload-targets");
+    REQUIRE(list);
+    CHECK(nlohmann::json::parse(list->body)["offload_targets"].empty());
+
+    for (const int ok_size : {1, 10000}) {
+        INFO("batch_size=" << ok_size);
+        nlohmann::json ok = {{"name", "ok-" + std::to_string(ok_size)},
+                             {"url", "https://siem.example.com/ingest"},
+                             {"batch_size", ok_size}};
+        auto res = h.sink.Post("/api/v1/offload-targets", ok.dump());
+        REQUIRE(res);
+        CHECK(res->status == 201);
+    }
+}
+
 TEST_CASE("REST offload-targets: create returns 201 and id", "[rest][offload][pg]") {
     OffloadHarness h;
     nlohmann::json body = {{"name", "siem-primary"},

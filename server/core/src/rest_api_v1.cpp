@@ -1223,7 +1223,13 @@ const std::string& openapi_spec() {
     },
     "/guaranteed-state/alerts": {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
-    },
+    },)json"
+        // Split here (MSVC C2026 ~16,380-byte per-literal cap): the segment
+        // opening at /guaranteed-state/device-compliance reached 16,402 bytes
+        // (#4644 PR2 governance, policy floor). Adjacent string literals are
+        // concatenated at compile time, so the emitted OpenAPI JSON is
+        // byte-identical to the unsplit form.
+        R"json(
     "/events": {
       "get": {"summary": "Subscribe to per-execution live events (JSON SSE)", "tags": ["Events"], "description": "Authenticated agentic-first JSON Server-Sent Events channel (sprint W5.1). Gated by the ADR-0017 admit-then-filter fleet-read primitive (Execution:Read) — an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined subscriber's agent-transition events are filtered to their in-scope agents, execution-progress is withheld, and execution-completed carries only the real terminal status (no fleet-wide counts). Reuses the per-execution ExecutionEventBus that backs the dashboard /sse/executions/{id} route. Each SSE frame carries an `id:`, `event:` (one of `agent-transition`, `execution-progress`, `execution-completed`, plus the synthetic `replay-gap` / `events-dropped` / `heartbeat`), and a JSON `data:` payload conforming to ExecutionSseEvent. Reconnect via `Last-Event-ID` request header OR `?since=<event_id>` query (query wins). A `?since` that is not one non-negative base-10 integer is a 400 (answered before the stream budget is touched and before the success audit row); a malformed `Last-Event-ID` header is served live only (nothing replayed). On reconnect after the per-execution ring buffer has evicted older events (FIFO, ~1000 events / ~30s window), a synthetic `replay-gap` frame is emitted as the first event so the worker knows state may be inconsistent. A slow consumer that lets the per-connection queue fill receives a synthetic `events-dropped` envelope summarising the drop count rather than silent OOM growth. Errors use the A4 envelope (ErrorEnvelope schema). Response headers always include X-Correlation-Id; Sec-Audit-Failed: true is set when audit persistence fails (CC6.6 contract).", "parameters": [{"name": "execution_id", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "Execution to subscribe to. Unfiltered subscription is reserved for sprint W5.2."}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Replay events with id > since. Overrides Last-Event-ID header. A value that is not one non-negative base-10 integer is a 400."}, {"name": "Last-Event-ID", "in": "header", "schema": {"type": "string"}, "description": "Browser EventSource auto-reconnect header. Ignored when `since` is set."}], "responses": {"200": {"description": "SSE stream. Content-Type: text/event-stream. Each `data:` line is an ExecutionSseEvent.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when audit row persistence failed; subscription still proceeds (CC6.6 evidence chain)."}}, "content": {"text/event-stream": {"schema": {"$ref": "#/components/schemas/ExecutionSseEvent"}}}}, "400": {"description": "Missing or malformed execution_id, or a malformed since", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "410": {"description": "Execution already terminal — subscribe-time stream is no longer available", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Tracker or event bus not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
@@ -11947,11 +11953,15 @@ void RestApiV1::register_routes(
             std::string cursor = req.has_param("cursor") ? req.get_param_value("cursor") : "";
             int limit = 50;
             if (req.has_param("limit")) {
-                const auto lv = req.get_param_value("limit");
-                int v = 0;
-                std::from_chars(lv.data(), lv.data() + lv.size(), v);
-                if (v > 0 && v <= 500)
-                    limit = v;
+                // Not ONE base-10 integer (`10abc`, empty, overflow) is a 400, not its numeric prefix
+                // (#4644); an in-grammar value outside 1..500 keeps the default page size.
+                const auto v = parse_query_int<int>(req.get_param_value("limit"));
+                if (!v) {
+                    rs_err(res, 400, "invalid limit (expected integer)");
+                    return;
+                }
+                if (*v > 0 && *v <= 500)
+                    limit = *v;
             }
             // #4306/#4307 finding 2: a degraded page must never silently
             // read as "empty fleet" — refuse rather than answer 200 with an
@@ -13269,11 +13279,15 @@ void RestApiV1::register_routes(
                          req.has_param("cursor") ? req.get_param_value("cursor") : "";
                      int limit = 1000;
                      if (req.has_param("limit")) {
-                         const auto lv = req.get_param_value("limit");
-                         int v = 0;
-                         std::from_chars(lv.data(), lv.data() + lv.size(), v);
-                         if (v > 0 && v <= 10000)
-                             limit = v;
+                         // Not ONE base-10 integer (`10abc`, empty, overflow) is a 400, not its numeric prefix
+                         // (#4644); an in-grammar value outside 1..10000 keeps the default page size.
+                         const auto v = parse_query_int<int>(req.get_param_value("limit"));
+                         if (!v) {
+                             rs_err(res, 400, "invalid limit (expected integer)");
+                             return;
+                         }
+                         if (*v > 0 && *v <= 10000)
+                             limit = *v;
                      }
                      // #4306 finding 3 / #4307 finding 2: never a 200 with an
                      // empty array on a degraded read — indistinguishable
@@ -14552,7 +14566,7 @@ void RestApiV1::register_routes(
             res.set_content(detail::error_json_a4(400, "version must be an integer from 1 to 2147483647",
                                                   cid, "omit version (it defaults to 1) or send 1..2147483647"),
                             "application/json");
-            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", audit_token(row.rule_id),
                      "version out of range");
             return;
         }
@@ -14573,7 +14587,7 @@ void RestApiV1::register_routes(
                             "application/json");
             // Audit the reject (sibling-parity with the update handler + the
             // invalid-JSON branch — leave a SIEM trail for a malformed/probe body).
-            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", audit_token(row.rule_id),
                      "invalid enforcement_mode");
             return;
         }
@@ -14591,7 +14605,7 @@ void RestApiV1::register_routes(
             res.set_content(
                 detail::error_json_a4(400, spec.error->message, cid, spec.error->remediation),
                 "application/json");
-            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", audit_token(row.rule_id),
                      spec.error->message);
             return;
         }
@@ -14616,7 +14630,7 @@ void RestApiV1::register_routes(
                          "spark+assertion (or yaml_source)"),
                 "application/json");
             audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState",
-                     row.rule_id, "invalid rule_id, missing name, or missing yaml_source");
+                     audit_token(row.rule_id), "invalid rule_id, missing name, or missing yaml_source");
             return;
         }
         row.created_by = session->username;
@@ -15259,6 +15273,30 @@ void RestApiV1::register_routes(
             return;
         }
 
+        // Validate the paging parameters BEFORE the behavioural-PII access audit below: a request
+        // rejected with a 400 serves no device data, so it must not leave a `success` access row
+        // (#4644: the strict parse introduced a 400 path that used to be unreachable).
+        if (req.has_param("limit")) {
+            // Strict full-consumption parse: `10abc` is a 400, not 10 (#4644).
+            const auto parsed = parse_query_int<int>(req.get_param_value("limit"));
+            if (!parsed || *parsed < 0) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
+                return;
+            }
+            q.limit = std::min(*parsed, 1000);
+        }
+        if (req.has_param("offset")) {
+            // Strict full-consumption parse: `10abc` is a 400, not 10 (#4644).
+            const auto parsed = parse_query_int<int>(req.get_param_value("offset"));
+            if (!parsed || *parsed < 0) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid offset"), "application/json");
+                return;
+            }
+            q.offset = *parsed;
+        }
+
         // Behavioral-PII access audit (governance compliance-F1), unconditional on
         // BOTH branches now: the fleet branch's per-row projection carries agent_id +
         // detail_json for every reporting agent, which IS individual-identifying —
@@ -15294,28 +15332,6 @@ void RestApiV1::register_routes(
             spdlog::warn("dex.device.view (events) audit fail-closed (503) agent_id={} cid={}",
                          q.agent_id, cid);
             return;
-        }
-        if (req.has_param("limit")) {
-            int v = 0;
-            auto s = req.get_param_value("limit");
-            [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-            if (ec != std::errc{} || v < 0) {
-                res.status = 400;
-                res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
-                return;
-            }
-            q.limit = std::min(v, 1000);
-        }
-        if (req.has_param("offset")) {
-            int v = 0;
-            auto s = req.get_param_value("offset");
-            [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-            if (ec != std::errc{} || v < 0) {
-                res.status = 400;
-                res.set_content(detail::a4_error(res, "invalid offset"), "application/json");
-                return;
-            }
-            q.offset = v;
         }
         // ADR-0031 WS-A4 (ninth family): GuardianApi::list_events — same
         // plain-vector, empty-on-degrade contract as the wrapped store call
@@ -15841,16 +15857,14 @@ void RestApiV1::register_routes(
                      req.has_param("window") ? req.get_param_value("window") : "7d";
                  int limit = 50;
                  if (req.has_param("limit")) {
-                     int v = 0;
-                     auto s = req.get_param_value("limit");
-                     [[maybe_unused]] auto [_, ec] =
-                         std::from_chars(s.data(), s.data() + s.size(), v);
-                     if (ec != std::errc{} || v < 0) {
+                     // Strict full-consumption parse: `10abc` is a 400, not 10 (#4644).
+                     const auto parsed = parse_query_int<int>(req.get_param_value("limit"));
+                     if (!parsed || *parsed < 0) {
                          res.status = 400;
                          res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
                          return;
                      }
-                     limit = std::min(v, 500);
+                     limit = std::min(*parsed, 500);
                  }
                  // A1 parity: `os=windows|linux|macos` scopes the drilldown detail
                  // lists to one OS (anything else = all-OS), matching the dashboard
@@ -16210,17 +16224,15 @@ void RestApiV1::register_routes(
                      cohort_filter = req.get_param_value("cohort_value");
                  int limit = 50;
                  if (req.has_param("limit")) {
-                     int v = 0;
-                     auto s = req.get_param_value("limit");
-                     [[maybe_unused]] auto [_, ec] =
-                         std::from_chars(s.data(), s.data() + s.size(), v);
-                     if (ec != std::errc{} || v <= 0) {
+                     // Strict full-consumption parse: `10abc` is a 400, not 10 (#4644).
+                     const auto parsed = parse_query_int<int>(req.get_param_value("limit"));
+                     if (!parsed || *parsed <= 0) {
                          res.status = 400;
                          res.set_content(detail::error_json_a4(400, "invalid limit", cid),
                                          "application/json");
                          return;
                      }
-                     limit = std::min(v, 500);
+                     limit = std::min(*parsed, 500);
                  }
                  // Behavioral-PII access audit: each row below names an agent_id +
                  // its perf metrics, individual-identifying, fleet-wide. FAIL-CLOSED
@@ -17548,16 +17560,14 @@ void RestApiV1::register_routes(
                      cohort_filter = req.get_param_value("cohort_value");
                  int limit = 50;
                  if (req.has_param("limit")) {
-                     int v = 0;
-                     auto s = req.get_param_value("limit");
-                     [[maybe_unused]] auto [_, ec] =
-                         std::from_chars(s.data(), s.data() + s.size(), v);
-                     if (ec != std::errc{} || v <= 0) {
+                     // Strict full-consumption parse: `10abc` is a 400, not 10 (#4644).
+                     const auto parsed = parse_query_int<int>(req.get_param_value("limit"));
+                     if (!parsed || *parsed <= 0) {
                          res.status = 400;
                          res.set_content(detail::a4_error(res, "invalid limit"), "application/json");
                          return;
                      }
-                     limit = std::min(v, 500);
+                     limit = std::min(*parsed, 500);
                  }
                  // Behavioral-PII access audit: each row below names an agent_id +
                  // its network perf/correlation facts, individual-identifying,

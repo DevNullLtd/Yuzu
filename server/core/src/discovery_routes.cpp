@@ -314,8 +314,13 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                 q.severity = req.get_param_value("severity");
                 q.status = req.get_param_value("status");
                 try {
-                    if (req.has_param("limit"))
+                    if (req.has_param("limit")) {
                         q.limit = strict_stoi(req.get_param_value("limit"));
+                        // A negative LIMIT is rejected by PG and the store answers an empty
+                        // list: a valid-looking 200 for a malformed request.
+                        if (q.limit < 0)
+                            throw std::invalid_argument("negative limit");
+                    }
                 } catch (const std::exception&) {
                     res.status = 400;
                     res.set_content(
@@ -515,8 +520,12 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                 int limit = 50;
                 try {
-                    if (req.has_param("limit"))
+                    if (req.has_param("limit")) {
                         limit = strict_stoi(req.get_param_value("limit"));
+                        // Negative: PG rejects `LIMIT -1`; the store would answer an empty 200.
+                        if (limit < 0)
+                            throw std::invalid_argument("negative limit");
+                    }
                 } catch (const std::exception&) {
                     res.status = 400;
                     res.set_content(

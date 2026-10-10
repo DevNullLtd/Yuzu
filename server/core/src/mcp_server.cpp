@@ -1349,7 +1349,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("rule_id":{"type":"string","minLength":1,"maxLength":256,"pattern":"^[A-Za-z0-9._-]+$","description":"Unique Guard identifier"},)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique human-authored Guard name"},)j"
-     R"j("version":{"type":"integer","minimum":1,"default":1},)j"
+     R"j("version":{"type":"integer","minimum":1,"maximum":2147483647,"default":1},)j"
      R"j("enabled":{"type":"boolean","default":true},)j"
      R"j("enforcement_mode":{"type":"string","enum":["enforce","audit"],"default":"enforce"},)j"
      R"j("severity":{"type":"string","enum":["critical","high","medium","low"],"default":"medium"},)j"
@@ -21297,6 +21297,14 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                if (*limit_opt < 1) {
+                    // retry-hint-exempt: the schema declares minimum:1; a non-positive limit
+                    // used to be silently replaced by the default 50 (malformed client input,
+                    // resending the same value fails identically).
+                    res.set_content(a4_error(kInvalidParams, "limit must be at least 1"),
+                                    "application/json");
+                    return;
+                }
                 q.limit = saturate_to_int(*limit_opt);
                 if (q.limit > 1000)
                     q.limit = 1000;
@@ -21389,6 +21397,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     // type), not a store/query fault -- resending the same value
                     // fails identically.
                     res.set_content(a4_error(kInvalidParams, "limit must be a JSON integer"),
+                                    "application/json");
+                    return;
+                }
+                if (*limit_opt < 1) {
+                    // retry-hint-exempt: the schema declares minimum:1; a non-positive limit
+                    // used to be silently replaced by the default 50 (malformed client input,
+                    // resending the same value fails identically).
+                    res.set_content(a4_error(kInvalidParams, "limit must be at least 1"),
                                     "application/json");
                     return;
                 }
@@ -24033,20 +24049,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::string cred_name = param_str(args, "name", "engine credential");
-                int64_t ttl_days = param_int(args, "ttl_days", 90);
+                // A wrong-typed ttl_days (string, float, bool, null, above INT64_MAX) is
+                // -32602, not the lenient `param_int` default of 90: that default is the
+                // MAXIMUM lifetime, so a typo'd short lifetime silently minted the longest one.
+                const auto ttl_days_opt = param_int_strict(args, "ttl_days", 90);
                 // §7 / REST parity: reject an out-of-range ttl_days outright —
                 // never silently truncate it — mirroring POST
                 // /api/v1/engine-principals/{id}/credentials's "ttl_days must
                 // be between 1 and 90" 400 (rest_api_v1.cpp). Checked before
                 // the multiply below so a valid (in-range) value can't
                 // overflow `now_epoch() + ttl_days * 86400`.
-                if (ttl_days < 1 || ttl_days > 90) {
+                if (!ttl_days_opt || *ttl_days_opt < 1 || *ttl_days_opt > 90) {
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        "ttl_days out of range: must be between 1 and 90"),
                         "application/json");
                     return;
                 }
+                const int64_t ttl_days = *ttl_days_opt;
                 const int64_t expires_at = now_epoch() + ttl_days * 86400;
                 // Docs promise "a second mint errors" — a principal with an
                 // active credential must use rotate_engine_credential, not a

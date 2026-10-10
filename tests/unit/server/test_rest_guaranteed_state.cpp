@@ -970,6 +970,31 @@ TEST_CASE("REST gs.rules: create bounds version to 1..2147483647 with a denied a
     CHECK(res->status == 201);
 }
 
+// The denied rows are written BEFORE is_valid_rule_id runs, so a hostile rule_id (CR/LF, space)
+// must be neutralised by audit_token before it becomes the audit target (CWE-117 log forging).
+TEST_CASE("REST gs.rules: create denied audit rows neutralise a hostile rule_id",
+          "[pg][rest][guaranteed_state][create][audit]") {
+    RestGsHarness h;
+    const std::string hostile = "evil\r\nforged=1 x";
+    for (const char* mode : {"version", "enforcement_mode"}) {
+        INFO(mode);
+        auto body = nlohmann::json::parse(RestGsHarness::make_rule_body("r-h", "name-h"));
+        body["rule_id"] = hostile;
+        if (std::string(mode) == "version")
+            body["version"] = 0;
+        else
+            body["enforcement_mode"] = "bogus";
+        auto res = h.sink.Post("/api/v1/guaranteed-state/rules", body.dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE_FALSE(h.audit_log.empty());
+        const auto& row = h.audit_log.back();
+        CHECK(row.result == "denied");
+        CHECK(row.target_id == "evil__forged_1_x");
+        CHECK(row.target_id.find_first_of("\r\n =") == std::string::npos);
+    }
+}
+
 // An update bumps the version by one. A row at (or past) the bound could only be stored
 // before the bound existed, so the test writes it directly and expects a clean 409 instead
 // of the signed-overflow increment.
@@ -1216,6 +1241,21 @@ TEST_CASE("REST gs.events: invalid limit → 400", "[pg][rest][guaranteed_state]
     auto res = h.sink.Get("/api/v1/guaranteed-state/events?limit=-7");
     REQUIRE(res);
     CHECK(res->status == 400);
+}
+
+// from_chars alone accepted `10abc` as 10 (the handler checked `ec` but never the end pointer).
+TEST_CASE("REST gs.events: a trailing-garbage limit or offset is a 400 not its prefix (#4644)",
+          "[pg][rest][guaranteed_state][events][validation][numeric_params]") {
+    RestGsHarness h;
+    for (const char* q : {"limit=10abc", "limit=1e1", "limit=0x10", "limit=", "offset=5x",
+                          "offset=", "offset=1.5"}) {
+        INFO(q);
+        auto res = h.sink.Get(std::string("/api/v1/guaranteed-state/events?") + q);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    // A rejected request serves no device data, so it must leave no dex.device.view access row.
+    CHECK(h.audit_log.empty());
 }
 
 // ── SEC-3 regression coverage: agent_id present → scoped_perm_fn, agent_id
@@ -4149,6 +4189,19 @@ TEST_CASE("REST dex.signals/{type}: invalid limit → 400", "[pg][rest][dex][sig
                           h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 400);
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex.signals/{type}: a trailing-garbage limit is a 400 not its prefix (#4644)",
+          "[pg][rest][dex][signals][numeric_params]") {
+    RestGsHarness h;
+    for (const char* q : {"limit=10abc", "limit=1e1", "limit=0x10", "limit="}) {
+        INFO(q);
+        auto res = h.sink.Get(std::string("/api/v1/dex/signals/process.crashed?") + q,
+                              h.status_route_headers());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
     CHECK(h.audit_log.empty());
 }
 

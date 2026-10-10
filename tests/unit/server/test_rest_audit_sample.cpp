@@ -227,7 +227,7 @@ TEST_CASE("auth-sample: malformed from/to → 400", "[pg][auth-sample][rest]") {
     CHECK(res2->status == 400);
 }
 
-TEST_CASE("auth-sample: to of zero is a 400, from of zero matches what omitting it matches (#4644)",
+TEST_CASE("auth-sample: to of zero is a 400 and from of zero matches what omitting it matches (#4644)",
           "[pg][auth-sample][rest]") {
     AuthSampleHarness h;
     for (const char* q : {"to=0", "to=000", "from=5&to=0", "from=0&to=0"}) {

@@ -643,6 +643,18 @@ TEST_CASE("REST /network/devices: sort, filters, validation", "[network][rest]")
         REQUIRE(bad);
         CHECK(bad->status == 400);
     }
+    SECTION("a trailing-garbage limit is a 400, not its numeric prefix (#4644)") {
+        // from_chars alone accepted `2abc` as 2 (it only checked ec, not the end pointer).
+        for (const char* q : {"limit=2abc", "limit=1e1", "limit=0x2", "limit=", "limit=2.5"}) {
+            INFO(q);
+            auto bad = h.sink.Get(std::string("/api/v1/network/devices?") + q);
+            REQUIRE(bad);
+            CHECK(bad->status == 400);
+        }
+        auto ok = h.sink.Get("/api/v1/network/devices?limit=2");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
     SECTION("perm denied → 403") {
         h.grant_perms = false;
         auto denied = h.sink.Get("/api/v1/network/fleet");

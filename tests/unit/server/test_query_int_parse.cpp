@@ -117,6 +117,22 @@ TEST_CASE("parse_rollout_pct: malformed is rejected; empty is the default; valid
     CHECK(yuzu::server::parse_rollout_pct("2147483647") == 100);
 }
 
+// The CHANGE-rollout route must never turn a blank or over-range value into a full-fleet rollout.
+TEST_CASE("parse_rollout_pct_strict: empty and above 100 are refused rather than defaulted or "
+          "clamped to a full-fleet value",
+          "[query_int_parse][numeric_params]") {
+    for (const char* bad : {"", "101", "500", "2147483647", "0x5", "5abc", "1e1", "+5", " 5", "5 ",
+                            "-", "99999999999999999999"}) {
+        INFO("value='" << bad << "'");
+        CHECK_FALSE(yuzu::server::parse_rollout_pct_strict(bad).has_value());
+    }
+    CHECK(yuzu::server::parse_rollout_pct_strict("0") == 0);
+    CHECK(yuzu::server::parse_rollout_pct_strict("50") == 50);
+    CHECK(yuzu::server::parse_rollout_pct_strict("100") == 100);
+    CHECK(yuzu::server::parse_rollout_pct_strict("007") == 7);
+    CHECK(yuzu::server::parse_rollout_pct_strict("-5") == 0); // clamped: the least exposure
+}
+
 TEST_CASE("sse_cursor_from_header: the cursor is one non-negative integer or live only",
           "[query_int_parse][numeric_params]") {
     CHECK(yuzu::server::sse_cursor_from_header("0").since_id == 0);
@@ -155,7 +171,7 @@ TEST_CASE("reject_bad_rollout_pct answers 400 with a constant toast and an A4 bo
 
 // The JSON-body twin of `apply_response_numeric_params`' since/until rule, shared by the legacy and
 // v1 inventory query routes (#4644): omitted is unbounded, `since` is `>= 0`, `until` is `>= 1`.
-TEST_CASE("read_json_epoch_window: presence-tracked bounds, until of zero refused",
+TEST_CASE("read_json_epoch_window: presence-tracked bounds and until of zero refused",
           "[query_int_parse][numeric_params]") {
     using yuzu::server::read_json_epoch_window;
     const auto run = [](const char* body, std::optional<std::int64_t>& since,

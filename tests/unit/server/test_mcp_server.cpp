@@ -2450,6 +2450,38 @@ TEST_CASE("MCP #3937: mint_engine_credential fails CLOSED and withholds the secr
     CHECK(store.list_active_for_principal(principal).size() == 1);
 }
 
+// A wrong-typed `ttl_days` used to fall to `param_int`'s default of 90, i.e. the MAXIMUM lifetime:
+// a typo'd short lifetime silently minted the longest credential the tool allows (#4644).
+TEST_CASE("MCP mint_engine_credential: a wrong-typed ttl_days is -32602 and mints nothing",
+          "[mcp][pg][engine_principal][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const std::string principal = "engine:mcp-mint-ttl-type";
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+
+    for (const char* bad : {"\"7\"", "7.5", "true", "null", "18446744073709551615"}) {
+        INFO("ttl_days=" << bad);
+        auto r = ts.call(
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+                        R"("params":{"name":"mint_engine_credential","arguments":)"
+                        R"({"principal_id":"engine:mcp-mint-ttl-type","ttl_days":)") +
+            bad + "}}}");
+        REQUIRE(r->status == 200);
+        auto body = nlohmann::json::parse(r->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    CHECK(store.list_active_for_principal(principal).empty());
+}
+
 // #3937 adversarial-review CDX-001/K6: a THROWING audit sink (bad_alloc-class) must
 // fail closed identically to a false-returning one — the domain audit now routes
 // through try_persist_audit, so the throw is caught -> false -> the 503 fires and
@@ -28025,8 +28057,41 @@ TEST_CASE("MCP get_execution_statistics_by_agent: an invalid limit answers kInva
     CHECK(body["error"]["code"] == mcp::kInvalidParams);
 }
 
-TEST_CASE("MCP execution statistics tools: since is presence-tracked, since of zero matches what "
-          "omitting it matches, a negative or non-integer since is kInvalidParams (#4644)",
+// The schema declares limit minimum:1, so a non-positive limit is -32602 rather than the old
+// silent substitution of the default 50 (which made the declared schema untrue).
+TEST_CASE("MCP execution statistics by-agent and by-definition tools: a limit below 1 is "
+          "kInvalidParams matching the declared schema",
+          "[pg][mcp][integration][operator_surface][numeric_params]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+
+    int next_id = 200;
+    for (const char* tool :
+         {"get_execution_statistics_by_agent", "get_execution_statistics_by_definition"}) {
+        for (const char* limit : {"0", "-1", "-9223372036854775807"}) {
+            INFO(tool << " limit=" << limit);
+            auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                               std::to_string(next_id++) + R"(,"params":{"name":")" + tool +
+                               R"(","arguments":{"limit":)" + limit + "}}}");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == mcp::kInvalidParams);
+        }
+        auto ok = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                          std::to_string(next_id++) + R"(,"params":{"name":")" + tool +
+                          R"(","arguments":{"limit":1}}})");
+        REQUIRE(ok);
+        CHECK_FALSE(nlohmann::json::parse(ok->body).contains("error"));
+    }
+}
+
+TEST_CASE("MCP execution statistics tools: since is presence-tracked and since of zero matches what "
+          "omitting it matches while a negative or non-integer since is kInvalidParams (#4644)",
           "[pg][mcp][integration][operator_surface]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
     ExecutionTracker& tracker = *tracker_bundle;

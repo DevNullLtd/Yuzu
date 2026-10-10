@@ -66,7 +66,8 @@ struct GuaranteedStateRuleRow {
 /// Largest accepted Guard rule `version`. An update bumps the stored version by one and
 /// the agent push casts it to uint64, so a caller-chosen value near INT64_MAX would
 /// overflow the signed increment (UB) and wrap on the wire. Enforced at every writer:
-/// `GuaranteedStateStore::create_rule` / `update_rule`, the REST create + update handlers
+/// `GuaranteedStateStore::create_rule` / `update_rule` (the latter on a version CHANGE only, so a
+/// legacy out-of-range row can still be disabled), the REST create + update handlers
 /// and the MCP create + update tools, all against these two helpers.
 inline constexpr int64_t kMaxRuleVersion = std::numeric_limits<int>::max();
 inline constexpr bool rule_version_in_range(int64_t v) noexcept {
