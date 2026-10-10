@@ -234,7 +234,7 @@ public:
                 note("audit");
                 audits.push_back(ev);
             },
-            .random_suffix = [this] { return "sfx" + std::to_string(++suffix_calls); },
+            .random_suffix = [this] { return "sfx" + std::to_string(suffix_base + ++suffix_calls); },
             .now = shed_clock.fn()};
     }
 
@@ -310,6 +310,7 @@ public:
     int deployed_calls{0};
     int eval_calls{0};
     int suffix_calls{0};
+    int suffix_base{0};  // a second rig (a restarted replica) uses a disjoint range
 
     std::unique_ptr<GuardianReconcileFlow> flow;
     std::optional<GuardianReconcileGate::Scoped> held;  // destroyed before the gate
@@ -482,17 +483,17 @@ TEST_CASE("GuardianReconcileFlow: the shed log is throttled to one line a minute
         rig.run("agent-b");
         rig.run("agent-b");
         REQUIRE(rig.count("shed") == 3.0);
-        CHECK(log.count("replica admission budget exhausted") == 1);
+        CHECK(log.count("admission budget or per-second ceiling exhausted") == 1);
         CHECK(log.count("in-flight reconcile cap reached") == 0);
         CHECK(log.count("1 shed so far") == 1);
 
         rig.shed_clock.advance(59s);
         rig.run("agent-b");
-        CHECK(log.count("replica admission budget exhausted") == 1);  // still inside the minute
+        CHECK(log.count("admission budget or per-second ceiling exhausted") == 1);  // still inside the minute
 
         rig.shed_clock.advance(1s);  // 60 s since the last line
         rig.run("agent-b");
-        CHECK(log.count("replica admission budget exhausted") == 2);
+        CHECK(log.count("admission budget or per-second ceiling exhausted") == 2);
         CHECK(log.count("5 shed so far") == 1);
         CHECK(rig.count("shed") == 5.0);  // the counter is not throttled
     }
@@ -505,7 +506,7 @@ TEST_CASE("GuardianReconcileFlow: the shed log is throttled to one line a minute
         rig.run();
         rig.run();
         CHECK(log.count("in-flight reconcile cap reached") == 1);
-        CHECK(log.count("replica admission budget exhausted") == 0);
+        CHECK(log.count("admission budget or per-second ceiling exhausted") == 0);
         CHECK(rig.count("shed") == 2.0);
     }
 }
@@ -714,7 +715,14 @@ TEST_CASE("GuardianReconcileFlow: a successful reconcile pushes exactly the appl
         return n == 1 ? 7 : fresh;
     };
 
+    const auto wall_secs = [] {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    };
+    const auto ts_before = wall_secs();
     rig.run("agent-1", 3);
+    const auto ts_after = wall_secs();
 
     REQUIRE(rig.sent.size() == 1);
     const auto& sp = rig.sent[0];
@@ -738,6 +746,10 @@ TEST_CASE("GuardianReconcileFlow: a successful reconcile pushes exactly the appl
     CHECK(ev.action == "guaranteed_state.reconcile");
     CHECK(ev.target_type == "GuaranteedState");
     CHECK(ev.target_id == "agent-1");
+    // A plausible wall-clock stamp, like the abort row's: inside the window the call ran in.
+    CHECK(ev.timestamp >= ts_before);
+    CHECK(ev.timestamp <= ts_after);
+    CHECK(ev.timestamp > 0);
     CHECK(rig.gate.in_flight() == 0);
     CHECK(rig.duration_count() == 1);
 }
@@ -796,6 +808,137 @@ TEST_CASE("GuardianReconcileFlow: after a scope store degrades no later scoped r
     // One probe found the store down; probing it again for every remaining rule would multiply
     // the load on a store that has just failed.
     CHECK(rig.eval_calls == 1);
+}
+
+TEST_CASE("GuardianReconcileFlow: an unparseable scope expression is not a member and is never evaluated",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    // "== == ==" does not parse, so the bundle holds no expression for it. A null scope read as
+    // "member" would arm a rule whose targeting nobody could read.
+    rig.set_rules({rule("open"), rule("broken", "", "== == =="), rule("scoped-in", "", "tag:grp == beta")});
+    rig.scope_outcomes["beta"] = ScopeOutcome::Member;
+    rig.run();
+    REQUIRE(rig.sent.size() == 1);
+    CHECK(rule_ids(parse_push(rig.sent[0].bytes)) == std::vector<std::string>{"open", "scoped-in"});
+    CHECK(rig.eval_calls == 1);  // only the parseable expression reached the evaluator
+    CHECK(rig.count("sent") == 1.0);
+    CHECK(rig.count("degraded") == 0.0);
+}
+
+TEST_CASE("GuardianReconcileFlow: a NOT-member verdict is cached across rules sharing the expression",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    rig.set_rules({rule("open"), rule("a", "", "tag:grp == nobody"), rule("b", "", "tag:grp == nobody"),
+                   rule("c", "", "tag:grp == nobody")});
+    rig.scope_outcomes["nobody"] = ScopeOutcome::NotMember;
+    rig.run();
+    REQUIRE(rig.sent.size() == 1);
+    CHECK(rule_ids(parse_push(rig.sent[0].bytes)) == std::vector<std::string>{"open"});
+    // The false verdict is memoised too, not only a true one: three rules, one evaluation.
+    CHECK(rig.eval_calls == 1);
+}
+
+// ---------------------------------------------------------------------------------------
+// Chaos scenarios (#5513 Gate 8): C7 (a rule edit whose generation bump failed), C2 (a bump
+// during a tag-store outage) and C5 (a replica restart).
+// ---------------------------------------------------------------------------------------
+
+TEST_CASE("GuardianReconcileFlow: C7, a rule edit whose bump failed is served from the reloaded rules once both caches are invalidated",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    rig.run("agent-1", 0);  // loads and holds the bundle for generation 7
+    REQUIRE(rig.sent.size() == 1);
+    CHECK(rule_ids(parse_push(rig.sent[0].bytes)) == std::vector<std::string>{"r1"});
+    REQUIRE(rig.list_calls == 1);
+
+    // An operator adds r2 on this replica; the row commits, but the generation bump fails, so
+    // the stored generation is still 7 and nothing keyed by it can notice.
+    rig.set_rules({rule("r1"), rule("r2")});
+    rig.clock.advance(1s);
+
+    // WITHOUT the invalidation a brand-new agent (generation 0) is answered from the held
+    // pre-edit bundle, labelled with the current generation, and is then converged for good.
+    rig.run("agent-2", 0);
+    REQUIRE(rig.sent.size() == 2);
+    CHECK(rule_ids(parse_push(rig.sent[1].bytes)) == std::vector<std::string>{"r1"});
+    CHECK(rig.list_calls == 1);
+
+    // What GuaranteedStateStore::set_on_rule_mutation is wired to do (server.cpp; pinned by the
+    // lexical gate): drop the cached generation and the held bundle.
+    rig.gen_cache.invalidate();
+    rig.bundle_cache.invalidate();
+
+    rig.run("agent-3", 0);
+    REQUIRE(rig.sent.size() == 3);
+    CHECK(rule_ids(parse_push(rig.sent[2].bytes)) == std::vector<std::string>{"r1", "r2"});
+    CHECK(parse_push(rig.sent[2].bytes).policy_generation() == 7);
+    CHECK(rig.list_calls == 2);  // the invalidation forced exactly one reload
+}
+
+TEST_CASE("GuardianReconcileFlow: C2, a policy bump during a tag-store outage aborts each agent once and recovers",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    rig.set_rules({rule("open"), rule("scoped", "", "tag:grp == alpha")});
+    rig.scope_outcomes["alpha"] = ScopeOutcome::StoreDegraded;
+
+    // The bump lands (generation 7) while the tag store is down: every admitted agent aborts
+    // degraded, writes ONE audit row and keeps its claim.
+    for (const char* agent : {"a1", "a2", "a3"})
+        rig.run(agent, 3);
+    CHECK(rig.count("degraded") == 3.0);
+    CHECK(rig.audits.size() == 3);
+    for (const auto& ev : rig.audits)
+        CHECK(ev.result == "degraded");
+    CHECK(rig.sent.empty());
+    CHECK(rig.gate.claims_size() == 3);
+
+    rig.clock.advance(10s);
+    rig.run("a1", 3);
+    CHECK(rig.count("rate_limited") == 1.0);  // the kept claim limits the retry
+    CHECK(rig.audits.size() == 3);             // and no new audit row
+
+    // Recovery: the tag store is back. A brand-new agent (never admitted before) is pushed.
+    rig.scope_outcomes["alpha"] = ScopeOutcome::Member;
+    rig.run("a4", 0);
+    REQUIRE(rig.sent.size() == 1);
+    CHECK(rule_ids(parse_push(rig.sent[0].bytes)) == std::vector<std::string>{"open", "scoped"});
+    CHECK(parse_push(rig.sent[0].bytes).policy_generation() == 7);
+
+    // A second bump: the push path invalidates the cached generation, and the next admitted push
+    // is labelled with the fresh one. a1's claim is now 25 s old, so it is admitted again.
+    rig.store_generation = 8;
+    rig.gen_cache.invalidate();
+    rig.clock.advance(15s);
+    rig.run("a1", 3);
+    REQUIRE(rig.sent.size() == 2);
+    CHECK(rig.sent[1].agent_id == "a1");
+    CHECK(parse_push(rig.sent[1].bytes).policy_generation() == 8);
+    CHECK(rig.generation_gauge() == 8.0);
+}
+
+TEST_CASE("GuardianReconcileFlow: C5, a replica restart loses the claims, and the duplicate is bounded by the budget",
+          "[guardian][reconcile_flow]") {
+    // The old replica pushes two agents. A restart builds a fresh gate and fresh caches for the
+    // same agents. In-memory claims are per replica by design (ADR-2002), so the new replica
+    // admits the same agents again inside 25 s, under a DIFFERENT command id, and only the
+    // per-second ceiling stops the duplicate burst.
+    Rig before;
+    before.run("a1", 3);
+    before.run("a2", 3);
+    REQUIRE(before.sent.size() == 2);
+
+    RigOptions o;
+    o.budget = {.budget_ms_per_s = 1000.0, .burst_ms = 100'000.0, .max_per_s = 1};
+    Rig after(o);
+    after.suffix_base = 100;
+    after.run("a1", 3);  // a duplicate full_sync inside 25 s of the first
+    REQUIRE(after.sent.size() == 1);
+    CHECK(after.sent[0].command_id != before.sent[0].command_id);
+    CHECK(after.sent[0].agent_id == before.sent[0].agent_id);
+    after.run("a2", 3);  // the second duplicate is shed: the ceiling is the bound
+    CHECK(after.sent.size() == 1);
+    CHECK(after.count("shed") == 1.0);
+    CHECK(after.count("rate_limited") == 0.0);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1060,6 +1203,7 @@ TEST_CASE("GuardianReconcileFlow: construction rejects every empty required depe
         std::function<void(Deps&)> empty_it;
     };
     const Case cases[] = {
+        {"duration", [](Deps& d) { d.duration = nullptr; }},
         {"store_wired", [](Deps& d) { d.store_wired = nullptr; }},
         {"list_rules", [](Deps& d) { d.list_rules = nullptr; }},
         {"deployed_ids", [](Deps& d) { d.deployed_ids = nullptr; }},

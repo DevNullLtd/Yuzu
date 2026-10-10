@@ -16,7 +16,8 @@ guard and this gate is the cheap tripwire that stays beside it):
   removed, string-literal contents reduced to [A-Za-z0-9_], whitespace collapsed): invariants
   a-h, j-o, r, s below.
   WIRING = server.cpp: the `set_guardian_reconcile_fn(` call, the `GuardianReconcileFlowDeps`
-  construction feeding it, and the maintenance tick: invariants i, o (second half), p, q, t, u.
+  construction feeding it, the maintenance tick, and the store's rule-mutation hook: invariants
+  i, o (second half), p, q, t, u, v.
 
 Invariants over the FLOW:
 
@@ -90,8 +91,11 @@ Invariants over the WIRING (server.cpp):
      for or while may sit between publish_cohort_perf_gauges(); and the gauge try or between the
      gauge try and the sweep. The sweep sits in a try with both catch arms; what else the sweep try
      contains (consuming the result, further statements) is not pinned. Accepted limit: a
-     construct that keeps all of the above yet stops the block running (a macro, a throwing
-     statement the lexer does not recognise) is review-only.
+     construct that keeps all of the above yet stops the block running is review-only; the
+     shapes named here are known not to be caught: a dead `if (false)` wrapping the whole gauge
+     span, a preprocessor `#if` around it, a lambda that is defined but never invoked, a `throw`
+     inside a catch arm, a constant-folded `.set(0 ? x : 0.0)`, a macro, and a throwing statement
+     the lexer does not recognise.
   t. `set_guardian_reconcile_fn(` is called exactly once, its lambda does nothing but call
      `reconcile_flow->run(agent_id_sv, agent_gen)` (no inline `decide(`: a second, unreviewed copy
      of the control flow would be the drift this extraction removed), and the lambda captures the
@@ -111,7 +115,26 @@ Invariants over the WIRING (server.cpp):
      and returns `sess->os`; `random_suffix` is `bytes_to_hex(random_bytes(8))`; `eval_scope`
      passes its own `agent_id` and `expr` and the real `tag_store_.get()` /
      `custom_properties_store_.get()`; `send_push` builds the command from its own `command_id`
-     and `push_bytes` and sends to its own `agent_id`.
+     and `push_bytes` and sends to its own `agent_id`. `audit` is exactly
+     `if (audit_store_ && audit_store_->is_open()) (void)audit_store_->log(ev);` (a `log(` of
+     anything but its own parameter, or an `is_open() || true`, is red), and `send_push`'s result
+     arms are pinned whole: `return true;` only inside the `forward_gateway_pending()` success
+     branch, a final `return false;`, and `classified && send_system_reserved(...)` (not `||`).
+     (u) pins SPELLING, not only values: it is a lexical match against the reviewed text, so a
+     semantically equivalent rewrite in a form the patterns do not list (for example a
+     `std::optional` unwrapped through `value_or`) is red until the gate is updated. It
+     tolerates the spellings that do not change meaning: a `this->` member prefix,
+     `!= nullptr` against an implicit bool test, `const auto` against `auto`, optional braces
+     around a single statement, and any names for the callable's own parameters (the pins follow
+     the names the lambda declares).
+  v. `GuaranteedStateStore::set_on_rule_mutation(` is called with a lambda whose body invalidates
+     BOTH reconcile caches (`guardian_generation_cache_` and `guardian_rule_bundle_cache_`) and
+     does nothing else: a rule create/update/delete whose best-effort generation bump failed
+     leaves the generation unchanged, so without this hook a held rule bundle is served to a new
+     agent for up to its max_age (chaos-F1). The store-side half (the hook fires after the commit
+     and after the bump attempt on all three mutation paths, never throws, holds no lease) is
+     pinned by the [rule_hook] cases in tests/unit/server/test_guaranteed_state_store.cpp, which
+     need a Postgres.
 
 LEXICAL ONLY. It cannot see a relocation that keeps the tokens but changes control flow (that
 stays review-enforced), and the behavioural guarantees are the building blocks' own unit tests.
@@ -464,6 +487,9 @@ def problems(src):
         if c is None:
             out.append("the GuardianReconcileFlowDeps{...} initializer is unbalanced (t)")
     if c is not None:
+        # A `this->` member prefix is spelling, not meaning: drop it so every pin below sees the
+        # bare member name.
+        c = re.sub(r"(?<![\w:])this ?-> ?", "", c)
         for field, member in ((".gate", "guardian_reconcile_gate_"), (".generation_cache", "guardian_generation_cache_"),
                               (".rule_bundle_cache", "guardian_rule_bundle_cache_"),
                               (".budget", "guardian_reconcile_budget_"), (".metrics", "metrics_"),
@@ -483,7 +509,7 @@ def problems(src):
                 ("deployed_ids", (r"\bdeployed_member_rule_ids\(\)",)),
                 ("session_os", (r"registry_ ?\. ?get_session\(", r"->os\b")),
                 ("random_suffix", (r"AuthManager::bytes_to_hex\( ?(?:auth::)?AuthManager::random_bytes\(8\) ?\)",)),
-                ("audit", (r"\baudit_store_ ?&& ?audit_store_ ?-> ?is_open\(\)", r"\baudit_store_ ?-> ?log\(")),
+                ("audit", (r"\baudit_store_(?: ?!= ?nullptr)? ?&& ?audit_store_ ?-> ?is_open\(\)", r"\baudit_store_ ?-> ?log\(")),
                 ("send_push", (r"yuzu::server::DispatchCaller ?\{ ?\.system = true ?\}", r'"__guard__"', r'"push_rules"',
                                r"SystemReservedPush::guardian_push_rules"))):
             blk = field_block(name)
@@ -497,34 +523,67 @@ def problems(src):
         # runs of whitespace collapsed). A callable that keeps the right TOKENS but feeds them the
         # wrong values (a constant command id, an empty push, another agent's id, null stores) is
         # exactly the wiring defect the flow's unit tests cannot see, because they stub these.
-        for name, pat in (
-                ("store_wired", r"^\{ ?return static_cast<bool>\( ?guaranteed_state_store_ ?\) ?; ?\}$"),
-                ("list_rules", r"^\{ ?return guaranteed_state_store_ ?-> ?list_rules\( ?\) ?; ?\}$"),
-                ("deployed_ids", r"^\{ ?return deployed_member_rule_ids\( ?\) ?; ?\}$"),
-                ("random_suffix", r"^\{ ?return (?:auth::)?AuthManager::bytes_to_hex\( ?(?:auth::)?AuthManager::"
-                                  r"random_bytes\(8\) ?\) ?; ?\}$"),
-                ("session_os", r"^\{ ?auto sess = registry_ ?\. ?get_session\( ?agent_id ?\) ?; ?"
-                               r"if ?\( ?! ?sess ?\) ?(?:\{ ?)?return std::nullopt ?; ?(?:\} ?)?"
-                               r"return sess ?-> ?os ?; ?\}$"),
-                ("eval_scope", r"^\{ ?return registry_ ?\. ?evaluate_scope_for_agent\( ?agent_id, ?expr, ?"
-                               r"tag_store_ ?\. ?get\( ?\), ?custom_properties_store_ ?\. ?get\( ?\) ?\) ?; ?\}$")):
+        def params(name):
+            """The names the lambda declares for its own parameters, in order. The pins below are
+            about STRUCTURE (which parameter feeds which call), not about what it is called."""
+            m = re.search(r"\." + name + r" ?= ?\[[^\]]*\] ?\(([^()]*)\)", c)
+            if not m or not m.group(1).strip():
+                return []
+            return [re.findall(r"\w+", part)[-1] for part in m.group(1).split(",")]
+
+        def esc(ident):
+            return re.escape(ident)
+
+        store = r"guaranteed_state_store_"
+        sess_p = params("session_os")
+        eval_p = params("eval_scope")
+        audit_p = params("audit")
+        send_p = params("send_push")
+        exact = [
+            ("store_wired", r"^\{ ?return (?:static_cast<bool>\( ?" + store + r" ?\)|" + store +
+             r" ?!= ?nullptr|nullptr ?!= ?" + store + r") ?; ?\}$"),
+            ("list_rules", r"^\{ ?return " + store + r" ?-> ?list_rules\( ?\) ?; ?\}$"),
+            ("deployed_ids", r"^\{ ?return deployed_member_rule_ids\( ?\) ?; ?\}$"),
+            ("random_suffix", r"^\{ ?return (?:auth::)?AuthManager::bytes_to_hex\( ?(?:auth::)?AuthManager::"
+                              r"random_bytes\(8\) ?\) ?; ?\}$"),
+        ]
+        if len(sess_p) == 1:
+            sp_ = esc(sess_p[0])
+            exact.append(("session_os", r"^\{ ?(?:const )?auto (?P<s>\w+) ?= ?registry_ ?\. ?get_session\( ?" + sp_ +
+                          r" ?\) ?; ?if ?\( ?! ?(?P=s) ?\) ?(?:\{ ?)?return std::nullopt ?; ?(?:\} ?)?"
+                          r"return (?P=s) ?-> ?os ?; ?\}$"))
+        else:
+            out.append("could not read the .session_os lambda's parameter (u)")
+        if len(eval_p) == 2:
+            exact.append(("eval_scope", r"^\{ ?return registry_ ?\. ?evaluate_scope_for_agent\( ?" + esc(eval_p[0]) +
+                          r", ?" + esc(eval_p[1]) + r", ?tag_store_ ?\. ?get\( ?\), ?custom_properties_store_ ?\. ?"
+                          r"get\( ?\) ?\) ?; ?\}$"))
+        else:
+            out.append("could not read the .eval_scope lambda's parameters (u)")
+        if len(audit_p) == 1:
+            exact.append(("audit", r"^\{ ?if ?\( ?audit_store_(?: ?!= ?nullptr)? ?&& ?audit_store_ ?-> ?is_open\( ?\) ?\) ?"
+                          r"(?:\{ ?)?\(void\) ?audit_store_ ?-> ?log\( ?" + esc(audit_p[0]) + r" ?\) ?; ?(?:\} ?)?\}$"))
+        else:
+            out.append("could not read the .audit lambda's parameter (u)")
+        if len(send_p) == 3:
+            agent_p, cmd_p, bytes_p = (esc(x) for x in send_p)
+            exact.append(("send_push",
+                          r"^\{ ?(?:const )?auto classified = build_classified_command\( ?yuzu::server::DispatchCaller ?\{ ?"
+                          r"\.system = true ?\} ?, ?\"__guard__\", ?\"push_rules\", ?" + cmd_p + r", ?\{ ?\} ?, ?" + bytes_p +
+                          r" ?\) ?; ?if ?\( ?(?:classified|classified ?\. ?has_value\( ?\)|classified ?!= ?std::nullopt) ?&& ?"
+                          r"send_system_reserved\( ?" + agent_p + r", ?\* ?classified, ?"
+                          r"yuzu::server::SystemReservedPush::guardian_push_rules ?\) ?\) ?\{ ?forward_gateway_pending\( ?\) ?; ?"
+                          r"return true ?; ?\} ?return false ?; ?\}$"))
+        else:
+            out.append("could not read the .send_push lambda's parameters (u)")
+        for name, pat in exact:
             blk = field_block(name)
             if blk is not None and not re.search(pat, blk.strip()):
                 out.append(f"the .{name} dependency body is no longer exactly its reviewed form `{pat}` (u)")
         sp = field_block("send_push")
         if sp is not None:
-            # The command id and the push bytes are the lambda's OWN parameters, and the target is
-            # its agent_id: never a constant, an empty string or another variable.
-            if not re.search(r"\bbuild_classified_command\( ?yuzu::server::DispatchCaller ?\{ ?\.system = true ?\} ?, ?"
-                             r'"__guard__", ?"push_rules", ?command_id, ?\{ ?\} ?, ?push_bytes ?\)', sp):
-                out.append("the .send_push dependency no longer builds the command as "
-                           "build_classified_command(DispatchCaller{.system = true}, \"__guard__\", "
-                           "\"push_rules\", command_id, {}, push_bytes) with its own parameters (u)")
-            if not re.search(r"\bsend_system_reserved\( ?agent_id, ?\*classified, ?"
-                             r"yuzu::server::SystemReservedPush::guardian_push_rules ?\)", sp):
-                out.append("the .send_push dependency no longer sends with "
-                           "send_system_reserved(agent_id, *classified, guardian_push_rules) to its own "
-                           "agent_id (u)")
+            # (The command id, the push bytes and the target being the lambda's OWN parameters is
+            # pinned by the whole-body match above, under whatever names the lambda declares.)
             if len(re.findall(r"\bforward_gateway_pending\(\)", sp)) != 1 or not re.search(
                     r"\bsend_system_reserved\([^{}]*?\) ?\) ?\{ ?forward_gateway_pending\(\) ?; ?return true ?;", sp):
                 out.append("the .send_push dependency must call forward_gateway_pending() exactly once, and only "
@@ -554,6 +613,21 @@ def problems(src):
         for cache in ("guardian_generation_cache_", "guardian_rule_bundle_cache_"):
             if not re.search(cache + r"\.invalidate\(\)", push_body):
                 out.append(f"guardian_push_fn_ no longer calls {cache}.invalidate() (p)")
+
+    # (v) a rule create/update/delete on this replica drops both reconcile caches (chaos-F1).
+    hooks = [m.end() - 1 for m in re.finditer(r"\bset_on_rule_mutation\((?= ?\[)", t)]
+    if len(hooks) != 1:
+        out.append("server.cpp no longer wires exactly one GuaranteedStateStore::set_on_rule_mutation( lambda (v)")
+    else:
+        end = match_close(t, hooks[0], "(", ")")
+        arg = "" if end < 0 else t[hooks[0] + 1:end]
+        body = block_after(arg, "]") or ""
+        inv = r"(?:this ?-> ?)?%s ?\. ?invalidate\( ?\) ?;"
+        gen, bun = inv % "guardian_generation_cache_", inv % "guardian_rule_bundle_cache_"
+        if not (re.search(r"^\{ ?" + gen + " ?" + bun + r" ?\}$", body.strip()) or
+                re.search(r"^\{ ?" + bun + " ?" + gen + r" ?\}$", body.strip())):
+            out.append("the set_on_rule_mutation lambda no longer does exactly "
+                       "{ guardian_generation_cache_.invalidate(); guardian_rule_bundle_cache_.invalidate(); } (v)")
 
     # (q) the saturation gauges and the claim sweep (see q_problems).
     out.extend(q_problems(t))
@@ -864,11 +938,11 @@ MUTATIONS += [
     ("filter and std::move combined in one statement",
      (lambda s: s + "\nauto b = guardian::make_bundle(guardian::filter_deployed_members(r, d), std::move(*deployed_result));\n"), "(o)"),
     ("bump fan-out stops dropping the generation cache",
-     _sub("guardian_generation_cache_.invalidate();", "(void)0;"), "(p)"),
+     _after("guardian_push_fn_ = [this]", "guardian_generation_cache_.invalidate();", "(void)0;"), "(p)"),
     ("bump fan-out stops dropping the bundle cache",
-     _sub("guardian_rule_bundle_cache_.invalidate();", "(void)0;"), "(p)"),
+     _after("guardian_push_fn_ = [this]", "guardian_rule_bundle_cache_.invalidate();", "(void)0;"), "(p)"),
     ("invalidate moved out of the push fn into unrelated code",
-     lambda s: _sub("guardian_generation_cache_.invalidate();", "(void)0;")(s)
+     lambda s: _after("guardian_push_fn_ = [this]", "guardian_generation_cache_.invalidate();", "(void)0;")(s)
      + "\nvoid elsewhere() { guardian_generation_cache_.invalidate(); }\n", "(p)"),
     ("in-flight gauge no longer published in the gauge block",
      _resub(r'metrics_\s*\.gauge\("yuzu_server_guardian_reconcile_in_flight"\)\s*\.set\(static_cast<double>\(guardian_reconcile_gate_\.in_flight\(\)\)\);',
@@ -1005,6 +1079,33 @@ SERVER_MUTATIONS = [m for m in MUTATIONS if m[2] in SERVER_LETTERS] + [
              "return std::string(auth::AuthManager::random_bytes(8).begin(), auth::AuthManager::random_bytes(8).end());"), "(u)"),
     ("filter and std::move combined in one statement (server.cpp)",
      (lambda s: s + "\nauto b = guardian::make_bundle(guardian::filter_deployed_members(r, d), std::move(*deployed_result));\n"), "(o)"),
+    # (u) the audit callable and the send_push result arms, pinned whole.
+    ("audit dependency logs an empty event instead of its parameter",
+     _after(FLOW_CTOR, "(void)audit_store_->log(ev);", "(void)audit_store_->log(AuditEvent{});"), "(u)"),
+    ("audit dependency's is_open check is made vacuous",
+     _after(FLOW_CTOR, "if (audit_store_ && audit_store_->is_open())",
+            "if (audit_store_ && (audit_store_->is_open() || true))"), "(u)"),
+    ("audit dependency logs unconditionally",
+     _after(FLOW_CTOR, "if (audit_store_ && audit_store_->is_open())\n", "if (true)\n"), "(u)"),
+    ("push dependency admits an unclassified command (classified ||)",
+     _wafter(FLOW_CTOR, "if (classified &&", "if (classified ||"), "(u)"),
+    ("push dependency reports success on its final fall-through",
+     _after(FLOW_CTOR, "return false;", "return true;"), "(u)"),
+    ("push dependency reports success without waiting for the send",
+     _wafter(FLOW_CTOR, "forward_gateway_pending(); return true; } return false;",
+             "forward_gateway_pending(); } return true;"), "(u)"),
+    # (v) the rule-mutation hook.
+    ("rule-mutation hook is never wired",
+     _wafter("set_on_rule_mutation([this] {",
+             "guardian_generation_cache_.invalidate(); guardian_rule_bundle_cache_.invalidate(); });",
+             "});"), "(v)"),
+    ("rule-mutation hook forgets the rule bundle cache",
+     _wafter("set_on_rule_mutation([this] {", "guardian_rule_bundle_cache_.invalidate();", "(void)0;"), "(v)"),
+    ("rule-mutation hook forgets the generation cache",
+     _wafter("set_on_rule_mutation([this] {", "guardian_generation_cache_.invalidate();", "(void)0;"), "(v)"),
+    ("rule-mutation hook invalidates only when something else holds",
+     _wafter("set_on_rule_mutation([this] {", "guardian_generation_cache_.invalidate();",
+             "if (cfg_.guardian_reconcile_max_per_s > 0) guardian_generation_cache_.invalidate();"), "(v)"),
 ]
 
 # Mutations over guardian_push_builder.cpp (the bundle loader's evaluation order).
@@ -1042,6 +1143,27 @@ BENIGN_SERVER = [
     ("store_wired body split across lines with a comment",
      _wafter(FLOW_CTOR, "[this] { return static_cast<bool>(guaranteed_state_store_); }",
              "[this] {\n // the store pointer is reset by stop()\n return static_cast<bool>(guaranteed_state_store_);\n }")),
+    # (u) tolerated spellings: they do not change what the callable does.
+    ("this-> member prefixes on the dependency bodies",
+     _wafter(FLOW_CTOR, "return registry_.evaluate_scope_for_agent(agent_id, expr, tag_store_.get(), custom_properties_store_.get());",
+             "return this->registry_.evaluate_scope_for_agent(agent_id, expr, this->tag_store_.get(), this->custom_properties_store_.get());")),
+    ("store_wired compared against nullptr",
+     _wafter(FLOW_CTOR, "return static_cast<bool>(guaranteed_state_store_);", "return guaranteed_state_store_ != nullptr;")),
+    ("audit store tested against nullptr, with braces and a this-> prefix",
+     _wafter(FLOW_CTOR, "if (audit_store_ && audit_store_->is_open()) (void)audit_store_->log(ev);",
+             "if (this->audit_store_ != nullptr && this->audit_store_->is_open()) { (void)this->audit_store_->log(ev); }")),
+    ("const auto for the session local",
+     _wafter(FLOW_CTOR, "auto sess = registry_.get_session(agent_id);", "const auto sess = registry_.get_session(agent_id);")),
+    ("lambda parameters renamed",
+     _wafter(FLOW_CTOR, "[this](const AuditEvent& ev) { if (audit_store_ && audit_store_->is_open()) (void)audit_store_->log(ev); }",
+             "[this](const AuditEvent& event) { if (audit_store_ && audit_store_->is_open()) (void)audit_store_->log(event); }")),
+    ("send_push parameters renamed",
+     _wafter(FLOW_CTOR, "[this](const std::string& agent_id, const std::string& command_id, const std::string& push_bytes) -> bool { auto classified = build_classified_command( yuzu::server::DispatchCaller{.system = true}, \"__guard__\", \"push_rules\", command_id, /*parameters=*/{}, push_bytes); if (classified && send_system_reserved( agent_id, *classified,",
+             "[this](const std::string& target, const std::string& cid, const std::string& bytes) -> bool { auto classified = build_classified_command( yuzu::server::DispatchCaller{.system = true}, \"__guard__\", \"push_rules\", cid, /*parameters=*/{}, bytes); if (classified && send_system_reserved( target, *classified,")),
+    ("rule-mutation hook with the invalidations in the other order and a this-> prefix",
+     _wafter("set_on_rule_mutation([this] {",
+             "guardian_generation_cache_.invalidate(); guardian_rule_bundle_cache_.invalidate();",
+             "this->guardian_rule_bundle_cache_.invalidate(); this->guardian_generation_cache_.invalidate();")),
     ("session lookup with braces around the early return",
      _wafter(FLOW_CTOR, "if (!sess) return std::nullopt;", "if (!sess) { return std::nullopt; }")),
     # (q) must accept restructurings that keep the invariant: the gate is about order and

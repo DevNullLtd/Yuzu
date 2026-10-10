@@ -5880,9 +5880,9 @@ public:
             // audit row (the counter and a once-a-minute log line are its whole signal).
             metrics_.describe("yuzu_server_guardian_reconciles_total",
                               "Guardian heartbeat reconcile outcomes by result: sent (re-push "
-                              "dispatched), rate_limited (per-agent 25 s slot), shed (replica "
-                              "admission budget exhausted or in-flight cap reached, nothing sent, "
-                              "no audit row), degraded "
+                              "dispatched), rate_limited (per-agent 25 s slot), shed (admission "
+                              "budget or per-second ceiling exhausted, or in-flight cap reached, "
+                              "nothing sent, no audit row), degraded "
                               "(a store read failed, re-push aborted), no_session",
                               "counter");
             for (auto result : {"sent", "rate_limited", "shed", "degraded", "no_session"})
@@ -6893,6 +6893,18 @@ public:
             if (guaranteed_state_store_ && guaranteed_state_store_->is_open() &&
                 !startup_failed_) {
                 guaranteed_state_store_->set_metrics(&metrics_);
+                // #5513 chaos-F1: a rule create/update/delete on THIS replica drops the
+                // heartbeat reconcile's cached generation and held bundle immediately,
+                // even when the best-effort generation bump failed (an unchanged
+                // generation would otherwise keep serving the pre-mutation bundle to a
+                // new agent for up to max_age). Both caches are members declared AFTER
+                // guaranteed_state_store_, so they are destroyed first; the hook only
+                // fires from a mutation, and stop() clears it (after the HTTP/MCP surfaces
+                // are quiesced) before it resets the store.
+                guaranteed_state_store_->set_on_rule_mutation([this] {
+                    guardian_generation_cache_.invalidate();
+                    guardian_rule_bundle_cache_.invalidate();
+                });
                 spdlog::info("GuaranteedStateStore initialized (schema guaranteed_state_store; "
                              "retention={}d)",
                              cfg_.guardian_event_retention_days);
@@ -10602,6 +10614,8 @@ public:
         agent_service_.set_guaranteed_state_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_guaranteed_state_store(nullptr);
+        if (guaranteed_state_store_)
+            guaranteed_state_store_->set_on_rule_mutation({}); // hook captures `this` (#5513)
         guaranteed_state_store_.reset();
         // RbacStore (authorization substrate, ADR-0041) borrows pg_pool_ — drop
         // before the pool. Every HTTP/gRPC/MCP handler holding the raw pointer is
@@ -19612,8 +19626,11 @@ private:
                     return 0;
                 // Callers reach here right after a local policy-generation bump (baseline
                 // deploy, delete of a DEPLOYED baseline) or an explicit push (REST, MCP). Drop
-                // the heartbeat reconcile's cached generation (<= 2 s stale) and held bundle
+                // the heartbeat reconcile's cached generation (about 2 s stale) and held bundle
                 // so the next heartbeat decides from the post-bump state instead of waiting out the TTL.
+                // Rule create/update/delete on this replica reach the same two invalidations
+                // through GuaranteedStateStore::set_on_rule_mutation (wired where the store is
+                // constructed), because they do not pass through here.
                 guardian_generation_cache_.invalidate();
                 guardian_rule_bundle_cache_.invalidate();
                 const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(

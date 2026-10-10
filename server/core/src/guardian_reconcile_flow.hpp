@@ -12,8 +12,11 @@
 /// (`guardian_reconcile_gate_`, `guardian_generation_cache_`, `guardian_rule_bundle_cache_`,
 /// `guardian_reconcile_budget_`, `metrics_`) so the moved lines read identically and
 /// `git diff --color-moved` shows the move. Only the dependencies that are NOT header-only
-/// value collaborators are injected as callables: the session lookup, the scope evaluation,
-/// the push send, the audit sink, the command-id suffix and two clocks.
+/// value collaborators are injected, as nine callables (`store_wired`, `list_rules`,
+/// `deployed_ids`, `session_os`, `eval_scope`, `send_push`, `audit`, `random_suffix`, `now`)
+/// plus the `duration` histogram pointer. `now` is the one injected clock, and it drives the
+/// shed-log throttle only: the `DurationObserver` reads `steady_clock::now()` directly (and
+/// observes into `duration`), and the audit timestamps read `system_clock::now()` directly.
 ///
 /// WHAT STAYS IN server.cpp (deliberately, because it is security-relevant wiring and not
 /// control flow): the `DispatchCaller{.system = true}` construction and the
@@ -60,8 +63,8 @@ namespace yuzu::server {
 /// Everything the flow reads that is not constructed by it. The references are the
 /// header-only collaborators (concrete, so a test drives the real gate, caches and budget with
 /// manual clocks); the callables are the pieces that stay in `ServerImpl`. Every callable except
-/// `audit` and `now` is required: the constructor throws `std::invalid_argument` naming an
-/// empty one.
+/// `audit` and `now` is required, and so is `duration`: the constructor throws
+/// `std::invalid_argument` naming an empty (or null) one.
 struct GuardianReconcileFlowDeps {
     GuardianReconcileGate& gate;
     GuardianGenerationCache& generation_cache;
@@ -116,6 +119,7 @@ public:
         // An empty std::function would otherwise surface as std::bad_function_call on the
         // first heartbeat that reaches it, thrown from a heartbeat thread. Fail at
         // construction, naming the dependency. (`audit` and `now` keep their defaults.)
+        require(reconcile_duration_, "duration");
         require(store_wired_, "store_wired");
         require(list_rules_, "list_rules");
         require(deployed_ids_, "deployed_ids");
@@ -148,7 +152,7 @@ public:
     // convergence, and the maintenance sweep bounds the rest. Nothing releases a claim
     // early: an agent whose push ends without sending (no session, or a failed send)
     // is admitted at most once per interval, however often it heartbeats. The cached
-    // generation (<= 2 s old) only drives that decision; an ADMITTED push re-reads the
+    // generation (about 2 s old, the cache TTL plus the fetch time) only drives that decision; an ADMITTED push re-reads the
     // generation fresh and labels the push with it.
     void run(std::string_view agent_id_sv, std::uint64_t agent_gen) {
         if (!store_wired_())
@@ -212,9 +216,11 @@ public:
             if ((last_rep == kGuardianShedLogNever || now_rep - last_rep >= interval_rep) &&
                 guardian_shed_log_last_.compare_exchange_strong(
                     last_rep, now_rep, std::memory_order_relaxed)) {
-                // Worded by cause: the two have different remedies (a budget shed
-                // means raise the budget or look at slow pushes; a cap shed means
-                // pushes are stuck inside a store call).
+                // Worded by cause: the two have different remedies (a budget or
+                // per-second-ceiling shed means raise the budget or the ceiling, or
+                // look at slow pushes; a cap shed means pushes are stuck inside a
+                // store call). try_admit() classifies BOTH the leaky-bucket budget
+                // and the per-second COUNT ceiling as ShedCause::Budget.
                 const auto shed_so_far =
                     guardian_reconcile_budget_.shed_total() +
                     guardian_reconcile_gate_.in_flight_shed_total();
@@ -225,10 +231,10 @@ public:
                                  "logged at most once a minute)",
                                  shed_so_far);
                 else
-                    spdlog::warn("Guardian heartbeat reconcile: replica admission "
-                                 "budget exhausted, shedding re-pushes (agents retry "
-                                 "on their next heartbeat; {} shed so far; this line "
-                                 "is logged at most once a minute)",
+                    spdlog::warn("Guardian heartbeat reconcile: admission budget or "
+                                 "per-second ceiling exhausted, shedding re-pushes "
+                                 "(agents retry on their next heartbeat; {} shed so "
+                                 "far; this line is logged at most once a minute)",
                                  shed_so_far);
             }
             return;
