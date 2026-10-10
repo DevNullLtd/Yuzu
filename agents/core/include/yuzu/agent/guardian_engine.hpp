@@ -321,8 +321,8 @@ public:
     /// attempt) or displaced a capture (a retarget that replaced a still-unpersisted capture;
     /// GuardianSparkRuntime::staged_baseline_drops), and passes that found a capture staged
     /// with no KV store to write it to. A stop-time loss that is not a failed write (the stop
-    /// flush ran out of wall budget, or was skipped after a slow failure or a late start that
-    /// followed a slow stop stage) is logged, NOT counted here. A capture that could not be
+    /// flush ran out of wall budget, or was skipped because it started late AND this stop had
+    /// shown a slow store) is logged, NOT counted here. A capture that could not be
     /// staged again at stop IS counted (per failed attempt, like any staging failure) and
     /// logged, but the count dies with the exiting process, so the log line is the evidence;
     /// the same holds for a flush cut short by a firewalled throw (counted in the persister's
@@ -367,8 +367,9 @@ public:
     [[nodiscard]] std::uint64_t baseline_stop_sweep_threw_logs_for_test() const noexcept {
         return baseline_stop_sweep_threw_logs_.load(std::memory_order_relaxed);
     }
-    /// TEST-ONLY: how many times stop() logged that lifecycle-journal records were still unpersisted
-    /// after its final journal flush (0 or 1). No production caller.
+    /// How many times stop() logged that lifecycle-journal records were still unpersisted after
+    /// its final journal flush (0 or 1). stop() reads it as the once-only latch for that line;
+    /// tests read it to count the line. No other production caller.
     [[nodiscard]] std::uint64_t journal_stop_pending_logs_for_test() const noexcept {
         return journal_stop_pending_logs_.load(std::memory_order_relaxed);
     }
@@ -796,11 +797,12 @@ public:
         apply_post_drain_hook_for_test_ = std::move(hook);
     }
 
-    /// TEST-ONLY (#4045): fires inside stop(), mtx_ HELD, at the START of each store stage that
-    /// feeds the late-start skip's evidence ("journal_flush_1", "worker_join", "ledger",
-    /// "journal_flush_2"), after the stage's start is read from the persister's clock and
-    /// before its body runs: a test advances an injected clock here to make that stage look
-    /// slow. Same CONTRACT as set_apply_post_drain_hook_for_test. No production caller.
+    /// TEST-ONLY (#4045): fires inside stop(), mtx_ HELD, at the START of each stop() stage
+    /// ("journal_flush_1", "worker_join", "ledger", "journal_flush_2"), after the stage's start
+    /// is read from the persister's clock and before its body runs: a test advances an injected
+    /// clock here to make that stage look slow. The three store stages feed the late-start
+    /// skip's evidence; "worker_join" is a thread join and does not. Same CONTRACT as
+    /// set_apply_post_drain_hook_for_test. No production caller.
     void set_stop_stage_hook_for_test(std::function<void(const char* stage)> hook) {
         std::lock_guard lock(mtx_);
         stop_stage_hook_for_test_ = std::move(hook);
@@ -1109,10 +1111,10 @@ private:
     /// destructor calls; a throw is counted by the persister (note_firewalled_exception).
     /// Called ONLY from apply_rules (before any teardown/re-arm, so the new generation's seed
     /// read observes the prior capture; `at_stop` false, Trigger::Forced) and stop() (after the
-    /// worker join; `at_stop` true, Trigger::Stop: tighter budget, skipped after a slow failed
-    /// pass); the third persister caller is the drain worker (Trigger::Worker). NOT from
-    /// journal_maintenance_tick: it runs only on a live connection and could not cover a
-    /// pre-network boot re-arm.
+    /// worker join; `at_stop` true, Trigger::Stop: tighter budget, skipped only when it starts
+    /// late AND this stop has shown a slow store); the third persister caller is the drain
+    /// worker (Trigger::Worker). NOT from journal_maintenance_tick: it runs only on a live
+    /// connection and could not cover a pre-network boot re-arm.
     void persist_staged_baselines_locked(bool at_stop) noexcept;
 
     /// Step 4: arm (or re-arm) the on-box guard for a rule. Reads the rule's
@@ -1447,8 +1449,9 @@ private:
     /// baseline_stop_flush_threw_logs_for_test() / baseline_stop_sweep_threw_logs_for_test().
     std::atomic<std::uint64_t> baseline_stop_flush_threw_logs_{0};
     std::atomic<std::uint64_t> baseline_stop_sweep_threw_logs_{0};
-    /// TEST-ONLY: the "journal records pending after the stop flush" ERROR line, see
-    /// journal_stop_pending_logs_for_test(). At most one per engine (mtx_-guarded).
+    /// The "journal records pending after the stop flush" ERROR line, see
+    /// journal_stop_pending_logs_for_test(). At most one per engine (mtx_-guarded); stop()
+    /// checks it before logging, so a second stop() (the destructor's) stays silent.
     std::atomic<std::uint64_t> journal_stop_pending_logs_{0};
     std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
     std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;

@@ -2677,7 +2677,8 @@ Guardian ladder must check these.
   the wire published it). Slow-store evidence is either (a) an earlier stage of this `stop()`
   (the two journal flushes and the loss-ledger write) that ran at least
   `kBaselineStopTroubleThreshold` (750 ms: the 1 s stop busy budget minus a 250 ms
-  timer-rounding slack, because Windows `Sleep()` can return early;
+  timer-rounding slack: a BUSY stage is timed by a different clock reading than the
+  handler's own deadline check, so it can measure a little under the budget;
   `note_stop_store_trouble`), or (b) a persist pass (typically the worker's) whose failed write
   took at least that long and ended at or after the mark (a stall that ends while `stop()` is
   queued behind an `apply_rules` counts as this stop's). The worker join is NOT a stage in
@@ -2711,31 +2712,48 @@ Guardian ladder must check these.
   second thread calling `sqlite3_busy_timeout` could not do this, since it blocks behind the
   connection mutex that the waiting write holds. `KvStore` is moved after `open()`, so the
   handler context is heap-owned. The handler sleeps 1, 2, 5, then 10 ms between retries by
-  SQLite's retry count (the platform timer rounds a sleep up, never down: about 15.6 ms on
-  Windows, about 15 ms on macOS as measured in a review), so a lock held for a few milliseconds costs
-  milliseconds. Every user of the shared store runs at the stop budget once `stop()` has
+  SQLite's retry count. The wait itself never undershoots its budget (the handler compares
+  `steady_clock` readings); the sleeps round up on a platform with a coarse timer. Measured
+  on macOS, one run of 200 sleeps per request: medians 1.52, 3.03, 7.53 and 15.03 ms for 1, 2,
+  5 and 10 ms, so only the 10 ms tail rounds to about 15 ms there. Windows rounds sleeps to
+  its timer tick, about 15.6 ms (derived, not measured here). On Linux a lock held for a few
+  milliseconds costs milliseconds; a hold of 29 to 33 ms or 49 to 53 ms can cost up to about
+  5 ms more than SQLite's own ladder (its grid differs), and shorter holds are faster.
+  Every user of the shared store runs at the stop budget once `stop()` has
   lowered it: plugin actions and a plugin's `shutdown()` writes, the sync scheduler's and the
-  license scan's writes. TARGET: the serial KV waits take at most six stop budgets (6 s plus
-  retry sleeps): an in-flight worker write, journal flush 1, a write inside the worker join,
-  the loss ledger, journal flush 2 and the Stop pass; a `static_assert` keeps seven stop
-  budgets within half the 20 s grace (a margin rule, not a derived bound: it ignores callers
-  queued on `KvStore::mu_` behind the lowering). Measured with every KV write truly BUSY (a
+  license scan's writes. TARGET: at most seven stop budgets (7 s): six enumerated waits plus
+  one budget of allowance for sleep overshoot and a queued caller. The six are journal flush
+  1, the loss ledger, journal flush 2, the Stop pass (its wall is checked only from the
+  second tuple on, so it can make two 1 s writes) and an in-flight worker write; the
+  enumeration is not enforced by code. A `static_assert` keeps seven stop budgets within
+  half the 20 s grace; that margin rule is the enforced part. The largest measured is 6.04 s
+  (6.03 s on the real write row B with 5 staged, 6.04 s on the emulated row E). COST PER
+  QUEUED WRITER: every other KV writer queued on `KvStore::mu_` when `stop()` runs adds
+  about one budget, because each serial stage queues behind it (measured on Linux, one run
+  per point, with a journal record pending and a non-baseline worker write in flight: 9.0 s
+  with 3 extra writers and 10.98 s with 5; extrapolated, not run: about 20 s, the watchdog,
+  at about 14 queued writers). A writer that loops with no pause can starve a stage because
+  `std::mutex` is not fair; no production caller does so. Both predate #5604 and are not
+  fixed here. Measured with every KV write truly BUSY (a
   second connection holding `BEGIN IMMEDIATE` through the stop), production values (5 s
   lowered to 1 s), Linux debug build, `stop()` entry to exit, on the code with the lateness
-  gate (fix round 1); one run per point, except rows B and E, which were run twice and agreed
-  within 3 ms: A, quiet worker with nothing pending, 2.01 s with 3 and with 5 staged captures
+  gate; one run per point, except rows B and E, which were run twice and agreed
+  within 8 ms: A, quiet worker with nothing pending, 2.01 s with 3 and with 5 staged captures
   (loss ledger 1 s + this pass 1 s); B, a journal record pending and the worker idle, 5.02 s
-  with 3 staged and 6.03 s with 5 staged (the same shape took 4.02 s with 3 and with 5 staged on the earlier code, re-run today, and
-  4.02 s and 5.03 s in a scratch build with only the gate removed: which of the worker's writes line up with the
-  stop decides how many of the six waits occur); C, a worker baseline write in flight, 3
+  with 3 staged and 6.03 s with 5 staged (the same shape took 4.02 s with 3 staged and 4.03 s
+  with 5 on the earlier code, re-run today, and 4.02 s and 5.03 s in a scratch build with only
+  the gate removed: which of the worker's writes line up with the stop decides how many of
+  the six waits occur); C, a worker baseline write in flight, 3
   staged, stop called 0.3, 2.0, 4.5 and 5.3 s after it began waiting: 2.72, 2.01, 2.02 and
   2.01 s; D, a worker non-baseline write in flight, EMULATED by a KV write issued from the
   worker thread (not the real sent-marker write), 5 staged, first three alignments: 2.72,
   2.01 and 2.02 s; E, a journal record pending with that emulated write in flight, 3 staged,
-  stop called 0, 0.3 and 0.7 s after: 6.04, 5.74 and 5.33 s (the largest figure measured,
-  and the top row is emulated). On the code before the lateness gate rows C and E were 1 s
-  shorter (the stall skipped the Stop pass; E 5.03, 4.73, 4.33 s); the gate costs one more
-  stop budget on a store that is still locked and saves the capture of a store that healed.
+  stop called 0, 0.3 and 0.7 s after: 6.04, 5.74 and 5.33 s (the largest figure measured on
+  an emulated row; the real row B reached 6.03 s). On the code before the lateness gate the
+  stall skipped the Stop pass and these rows were shorter: B 4.02 and 4.03 s; C 1.71, 1.01
+  and 1.01 s at its first three alignments (its fourth, 2.01 s, and row D did not change);
+  E 5.03, 4.74 and 4.33 s. The gate costs one or two more stop budgets on a store that is
+  still locked and saves the capture of a store that healed.
   Before #5604 the same scenarios reached 21 to 29 s on earlier revisions (not re-run on this
   code). ACCEPTED TRADE-OFF: an external process holding the store locked for 1 to 5 s at the
   shutdown instant now fails the stop-time writes that a 5 s budget would have survived: one
@@ -2749,11 +2767,12 @@ Guardian ladder must check these.
   not measured here) and its WAL-index retry sleeps run outside the handler, so there the
   bound is per busy wait, not per call; the DEX observer drain and plugin `shutdown()` under
   the second guard stay unbounded; a stop queued behind an `apply_rules` is not cut by the
-  lowering for a Forced drain (three failures of 1 s) or a hung `watch()` (pre-existing); and
+  lowering for a Forced drain (up to two failures of 1 s: its 2 s wall ends it) or a hung
+  `watch()` (pre-existing); and
   the evidence is sampled, not continuous: a store that turns BUSY only after the evidence
   stages, or whose stages each stay under the 750 ms threshold, with the stop already 18 s
   late, still lets the Stop pass run, and the watchdog may cut it (the capture is lost and
-  that loss has no log line; before #5604 a reviewer reproduced 21.0 s and 20.11 s for these
+  that loss has no log line; before #5604, 21.0 s and 20.11 s were reproduced for these
   two shapes on the earlier 15 s / 4.5 s constants). A supervisor's own stop timeout is
   implicit and may be shorter than the 20 s (Docker agent services stop at 10 s, so exit code
   4 never appears there). A slow SUCCESSFUL baseline write is not a failure and is
@@ -2768,8 +2787,9 @@ Guardian ladder must check these.
   (an allocation failure) or capture displaced from staging (a retarget over a
   still-unpersisted capture) and a capture staged with no KV store (logged once,
   kept). Stop-time losses that are NOT counted: a stop flush that ran out of its wall
-  budget with captures left, and one skipped (it could not start within 18 s after a slow
-  failure during that stop or an earlier stop stage that ran slow), each logged with its own
+  budget with captures left, and one skipped (it started 18 s or more after the mark and this
+  stop had shown a slow store: a slow failed write or a stage that ran slow), each logged with
+  its own
   line (the skips by the persister, the others by the engine), and lifecycle-journal records
   still pending after the last stop-time flush (one engine ERROR line with the count;
   the records are destroyed with the process). Stop-time losses

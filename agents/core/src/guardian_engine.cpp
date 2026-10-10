@@ -1429,29 +1429,43 @@ void GuardianEngine::stop() {
     // THE STOP BUSY BUDGET (#5604). Every KV write against a store another connection holds
     // locked costs the whole busy budget, and this function has several serial KV stages, so
     // at the normal 5 s budget the stages added up past the grace (21 to 29 s were measured on
-    // earlier revisions). The top of this function therefore lowers the shared KvStore's
-    // budget, once and terminally, to kKvStoreStopBusyTimeout (1 s); it is an atomic read by
-    // the store's busy handler, so the lowering is lock-free and also cuts a write that is
-    // already waiting. Target: the serial KV waits take at most six stop budgets (6 s plus
-    // retry sleeps): an in-flight worker write, journal flush 1, the worker's own sent-marker
-    // write, the loss ledger, journal flush 2 and the Stop pass; guardian_baseline_persister.hpp
-    // asserts that seven stop budgets fit in half the grace. That assertion is a margin rule:
-    // it does not count a caller queued on KvStore::mu_ behind the lowering, and the 18 s latest
-    // start leaves no slack for the retry-sleep overshoot. Accepted trade-off: an external
-    // process holding the store locked for 1 to 5 s at this instant now fails the writes here
-    // that 5 s would have survived (a capture lost to this process and recaptured at the next
-    // boot, a stale but never corrupt loss ledger; both logged, as is a lifecycle-journal record
-    // left pending; a drift between the lost capture and the next boot is accepted as the
-    // baseline). The budget bounds lock waits only: an fsync stall is not a lock event, so a
-    // stalled disk can still reach the watchdog, and the DEX observer drain and plugin
-    // shutdown() under the second guard are not covered. A stop queued behind an apply_rules
-    // is cut only for the writes the budget governs: a Forced drain (three failures of 1 s) or
-    // a hung watch() keeps the engine mutex past it (pre-existing).
+    // earlier revisions of this code and not re-run on the final code). The top of this
+    // function therefore lowers the shared KvStore's budget, once and terminally, to
+    // kKvStoreStopBusyTimeout (1 s); it is an atomic read by the store's busy handler, so the
+    // lowering is lock-free and also cuts a write that is already waiting. Target, not an
+    // enforced bound: at most seven stop budgets (7 s), which is six enumerated waits plus one
+    // budget of allowance for sleep overshoot and a queued caller. The six are journal flush 1,
+    // the loss ledger, journal flush 2, the Stop pass (its wall is checked only from the
+    // second tuple on, so it can make two 1 s writes: a slow success then a failing one) and
+    // an in-flight worker write. guardian_baseline_persister.hpp
+    // asserts that seven stop budgets fit in half the grace; that assertion, not the
+    // enumeration, is the enforced margin. A Worker baseline pass in flight when stop() begins
+    // can itself make two failed 1 s writes (its 2 s wall is checked from the second tuple on),
+    // so seven serial waits is reachable by interleaving; that was not run, and it uses the
+    // whole margin. The largest measured is 6.04 s. The 18 s latest start leaves no slack for
+    // the retry-sleep overshoot.
+    // COST PER QUEUED WRITER: every other KV writer queued on KvStore::mu_ when stop() runs
+    // adds about one budget, because each of stop()'s serial stages queues behind it (measured
+    // on Linux, one run per point, with a journal record pending and a non-baseline worker
+    // write in flight: 9.0 s at 3 extra writers and 10.98 s at 5; extrapolated, not run: about
+    // 20 s, the watchdog, at about 14). A writer that loops with no pause can starve a stop
+    // stage outright, because std::mutex is not fair; no production caller does that. Both are
+    // pre-existing properties of the store's one mutex, not fixed here. Accepted trade-off: an
+    // external process holding the store locked for 1 to 5 s at this instant now fails the
+    // writes here that 5 s would have survived (a capture lost to this process and recaptured
+    // at the next boot, a stale but never corrupt loss ledger; both logged, as is a
+    // lifecycle-journal record left pending; a drift between the lost capture and the next
+    // boot is accepted as the baseline). The budget bounds lock waits only: an fsync stall is
+    // not a lock event, so a stalled disk can still reach the watchdog, and the DEX observer
+    // drain and plugin shutdown() under the second guard are not covered. A stop queued behind
+    // an apply_rules is cut only for the writes the budget governs: a Forced drain (up to two
+    // failures of 1 s: its 2 s wall ends it) or a hung watch() keeps the engine mutex past it
+    // (pre-existing).
     //
     // Measured with real SQLITE_BUSY (a second connection holding BEGIN IMMEDIATE through the
     // whole stop), production values (5 s lowered to 1 s), Linux debug build, stop() entry to
     // exit, 3 staged captures unless noted, on the code WITH the lateness gate above. One run
-    // per point, except the two journal rows, which were run twice and agreed within 3 ms:
+    // per point, except the two journal rows, which were run twice and agreed within 8 ms:
     //   worker stopped, nothing pending ............ ledger 1 + this pass 1 .......... 2.01 s
     //                                                 (2.0083 s with 3 staged, 2.0093 s with 5;
     //                                                 the pass runs and fails)
@@ -1462,8 +1476,8 @@ void GuardianEngine::stop() {
     //                                                 live worker's own baseline writes add one
     //                                                 or two, depending on how its pass lines
     //                                                 up with the stop (the same shape took
-    //                                                 4.02 s with 3 and with 5 staged on the
-    //                                                 code before the gate)
+    //                                                 4.02 s with 3 staged and 4.03 s with 5
+    //                                                 on the code before the gate)
     //   worker baseline write in flight ............ 2.72 s, 2.01 s, 2.02 s, 2.01 s for a stop
     //                                                 called 0.3, 2.0, 4.5 and 5.3 s after the
     //                                                 write began waiting
@@ -1474,11 +1488,14 @@ void GuardianEngine::stop() {
     //                                                 real journal sent-marker write
     //   journal record pending + that emulated
     //     non-baseline worker write in flight ...... 6.04 s, 5.74 s, 5.33 s at 0, 0.3 and 0.7 s
-    //                                                 after it began (the largest measured, and
-    //                                                 an emulated row)
-    // Before the gate the worker rows were 1 s shorter where the stall skipped the pass (5.03,
-    // 4.73 and 4.33 s for the last row); the gate costs one more stop budget on a store that is
-    // still locked and keeps the capture of one that healed.
+    //                                                 after it began (the largest measured on
+    //                                                 an emulated row; the real-write row above
+    //                                                 reached 6.03 s)
+    // Before the gate, where the stall skipped the pass, these rows were shorter: the journal
+    // row above 4.02 s (3 staged) and 4.03 s (5 staged); the baseline-write row 1.71, 1.01 and
+    // 1.01 s at its first three points (the fourth, 2.01 s, and the NON-baseline row did not
+    // change); the last row 5.03, 4.74 and 4.33 s. The gate costs one or two more stop budgets
+    // on a store that is still locked and keeps the capture of one that healed.
     // The sampled-evidence residual stands: a store that turns BUSY only after the evidence
     // stages, or whose stages each stay under the 750 ms threshold, with the stop already 18 s
     // late, still lets the Stop pass run and the watchdog may cut it (the capture is lost and

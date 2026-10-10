@@ -267,13 +267,15 @@ public:
      * a larger value is the maximum.
      *
      * Cost of a call: one budget plus up to one retry sleep per lock wait (the sleep is 1 to
-     * 10 ms and the platform rounds it up: about 15.6 ms on Windows, about 15 ms on macOS as
-     * a review measured it). In WAL mode, which open() sets, every method takes the write lock at most once, so
-     * that is at most one budget per call. The rollback-journal fallback (WAL could not be
-     * enabled) lets del_keys() wait twice, so it can cost two. The bound is per BUSY WAIT, not
-     * per call, on Windows: SQLite's own file-I/O retries (winRetryIoerr, about 1.4 to 1.5 s per
-     * failing I/O, derived from the SQLite source, not measured here) and its WAL-index retry
-     * sleeps happen outside the busy handler and are not counted against the budget.
+     * 10 ms and a platform with a coarse timer rounds it up: the 10 ms sleep measured about
+     * 15 ms on macOS, one run; Windows rounds it to its tick, about 15.6 ms, derived not
+     * measured).
+     * In WAL mode, which open() sets, every method takes the write lock at most once, so that is
+     * at most one budget per call. The rollback-journal fallback (WAL could not be enabled) lets
+     * del_keys() wait twice, so it can cost two. The bound is per BUSY WAIT, not per call, on
+     * Windows: SQLite's own file-I/O retries (winRetryIoerr, about 1.4 to 1.5 s per failing I/O,
+     * derived from the SQLite source, not measured here) and its WAL-index retry sleeps happen
+     * outside the busy handler, which cannot cut them short.
      *
      * Production lowers it once (GuardianEngine::stop(), to kKvStoreStopBusyTimeout) and never
      * raises it: the stop budget is terminal. noexcept and never blocks. Thread-safety

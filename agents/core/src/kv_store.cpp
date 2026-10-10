@@ -23,9 +23,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <format>
-#include <cstddef>
 #include <memory>
 #include <string>
 #include <thread>
@@ -63,11 +63,17 @@ std::string escape_like_prefix(std::string_view prefix) {
 // SQLite's own sqlite3_busy_timeout() handler sleeps in a similar ladder (1, 2, 5, 10, 15, 20, 25,
 // 25, 25, 50, 50, 100 ms); the short head means a lock another process holds for a few
 // milliseconds costs milliseconds, not a whole 10 ms sleep, and the 10 ms tail keeps a long wait
-// from busy-spinning. A sleep never undershoots, but the platform timer rounds it UP: about
-// 15.6 ms on Windows (the default timer tick) and about 15 ms on macOS (a review measured
-// 15.03 ms, one run, median), so each of the first retries can cost up to one tick there and a budget is overshot by up to
-// one tick. The head of the ladder is therefore a Linux latency gain; elsewhere it is bounded by
-// the tick.
+// from busy-spinning. A hold of 29 to 33 ms or 49 to 53 ms can cost up to about 5 ms MORE than
+// SQLite's own ladder (the grids differ); shorter holds are faster (measured on Linux, SQLite
+// 3.52, medians of 5: a 5 ms hold returned in 8.2 ms against 9.3 ms, a 52 ms hold in 58.6 ms
+// against 54.7 ms).
+// The wait itself never undershoots its budget: the handler compares steady_clock readings
+// and gives up only once the budget has elapsed. The sleeps do round UP on a platform with a
+// coarse timer. Measured on macOS, one run of 200 sleeps per request: medians of 1.52, 3.03,
+// 7.53 and 15.03 ms for 1, 2, 5 and 10 ms, so there the head of the ladder still helps and only
+// the 10 ms tail rounds to about 15 ms. Windows rounds sleeps to its timer tick (about 15.6 ms
+// by default; derived from the Sleep documentation, not measured here), so a wait can overshoot
+// its budget by up to one tick there.
 constexpr std::array<std::chrono::milliseconds, 4> kBusyRetryLadder{
     std::chrono::milliseconds{1}, std::chrono::milliseconds{2}, std::chrono::milliseconds{5},
     std::chrono::milliseconds{10}};
@@ -78,13 +84,6 @@ std::chrono::milliseconds busy_retry_sleep(int count) noexcept {
                                             kBusyRetryLadder.size() - 1);
     return kBusyRetryLadder[idx];
 }
-
-// A handler call more than this long after the previous call on the same thread cannot be a
-// continuation of one wait: a continuing wait calls the handler again after one retry sleep (at
-// most about 10 ms, about 16 ms on a coarse-timer platform, plus scheduler delay), so a gap this
-// wide means the previous wait ended (its call returned BUSY, or the statement completed) and
-// this is a different one whose `count == 0` call this thread never saw.
-constexpr std::chrono::milliseconds kBusyWaitRestartGap{250};
 
 struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
@@ -102,37 +101,41 @@ namespace {
 
 // sqlite3_busy_handler callback (#5604). Runs on the waiting thread WITH the connection mutex
 // held, so it may ONLY read the atomic budget and sleep: no logging, no locks, no allocation.
-// `count` is the number of earlier retries within ONE lock wait, so 0 is that wait's first
-// retry and the wait's start is captured there (thread_local: the wait runs entirely on the
-// calling thread). SQLite resets `count` to 0 at the start of every statement step, prepare
-// and checkpoint that has to wait, not once per KV method: a method that takes the lock twice
-// (del_keys' rollback-journal fallback) starts two waits. Because the start is only captured on
-// `count == 0`, a call with `count > 0` on a thread that never saw the matching `count == 0`
-// (a wait begun by a code path this handler did not observe) would read a stale or empty start
-// and fail at once. Defence: the start is also re-captured when this thread has no previous
-// call, or when the previous call was more than kBusyWaitRestartGap ago (see there); no such
-// path has been constructed (the review that raised it could not). Returning 0 makes the pending call fail with SQLITE_BUSY. The budget is re-read on
-// every retry, so lowering it from another thread cuts a wait that is already in progress,
-// which sqlite3_busy_timeout() cannot do (it would block behind the connection mutex this wait
-// holds). A thread descheduled for more than the gap in the middle of a wait restarts that
-// wait's clock, so its budget can then be exceeded by up to that gap; the budgets here are
-// seconds, not a hard real-time bound.
+//
+// `count` is the number of retries SQLite has already made in ONE lock wait. SQLite calls the
+// handler with consecutive counts 0, 1, 2, ... while a wait continues, and resets the count to 0
+// for every statement step, prepare and checkpoint that has to wait (not once per KV method: a
+// method that takes the lock twice, del_keys' rollback-journal fallback, starts two waits). The
+// wait's clock is a thread_local (the wait runs entirely on the calling thread) and restarts
+// whenever this call does not continue the previous one on this thread: count == 0, or a count
+// other than the previous count + 1. That covers a call with count > 0 on a thread that never
+// saw the matching count == 0 (a fresh thread, another store, a prepare-time wait that follows a
+// statement that waited). Continuity is judged by the count, not by elapsed time, so a
+// scheduler stall or one of SQLite's own sleeps inside a wait (its WAL read retries sleep
+// outside this handler) does not renew the budget. A coincidental continuation, a new wait whose
+// first observed count happens to equal the previous count + 1, is not known to occur in SQLite
+// and would at worst carry an older start. When the handler gives up it forgets the count, so
+// the next wait always restarts.
+//
+// Returning 0 makes the pending call fail with SQLITE_BUSY. The budget is re-read on every retry,
+// so lowering it from another thread cuts a wait that is already in progress, which
+// sqlite3_busy_timeout() cannot do (it would block behind the connection mutex this wait holds).
 int kv_busy_handler(void* ctx, int count) noexcept {
     struct WaitClock {
         std::chrono::steady_clock::time_point start{};
-        std::chrono::steady_clock::time_point last{};
-        bool seen{false};
+        int last_count{-2}; // never a count SQLite passes, so the first call always restarts
     };
     thread_local WaitClock wait;
     const auto now = std::chrono::steady_clock::now();
-    if (count == 0 || !wait.seen || now - wait.last > kBusyWaitRestartGap)
+    if (count <= 0 || count != wait.last_count + 1)
         wait.start = now;
-    wait.seen = true;
-    wait.last = now;
+    wait.last_count = count;
     const auto* busy = static_cast<const KvBusyState*>(ctx);
     const auto limit = std::chrono::milliseconds{busy->budget_ms.load(std::memory_order_relaxed)};
-    if (now - wait.start >= limit)
+    if (now - wait.start >= limit) {
+        wait.last_count = -2;
         return 0;
+    }
     std::this_thread::sleep_for(busy_retry_sleep(count));
     return 1;
 }
@@ -140,7 +143,8 @@ int kv_busy_handler(void* ctx, int count) noexcept {
 } // namespace
 
 // Private constructor
-KvStore::KvStore(sqlite3* db, std::unique_ptr<KvBusyState> busy) : db_{db}, busy_{std::move(busy)} {}
+KvStore::KvStore(sqlite3* db, std::unique_ptr<KvBusyState> busy)
+    : db_{db}, busy_{std::move(busy)} {}
 
 KvStore::~KvStore() {
     if (db_) {
@@ -157,8 +161,8 @@ KvStore& KvStore::operator=(KvStore&& other) noexcept {
     if (this != &other) {
         // Close the connection BEFORE releasing the context it points at. Defensive ordering,
         // not a measured need: closing a connection does not run the busy handler (SQLite's
-        // close-time checkpoint passes no handler; a review measured 0 handler calls), but nothing here
-        // should rely on that staying true across SQLite versions.
+        // close-time checkpoint passes no handler; 0 handler calls measured on Linux, SQLite
+        // 3.52), but nothing here should rely on that staying true across SQLite versions.
         if (db_)
             sqlite3_close(db_);
         db_ = other.db_;

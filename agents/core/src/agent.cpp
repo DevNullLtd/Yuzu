@@ -118,14 +118,12 @@ constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 // GuardianEngine::stop() carry that budget, the timelines measured against a BUSY store and
 // what it does not bound (slow I/O, the DEX observer, plugin shutdown()); numbers are not
 // repeated here so they cannot drift from it. dex_observer_'s
-// drain wait and stop_all_guards_locked()'s per-guard stops have NO named bound at all - so
-// this sits AT the named floor, not comfortably above it (corrected per external review, PR
-// #3737 - the earlier wording overstated the margin), without claiming to be a derived
-// guarantee (matching spark_file.cpp's arm_ancestor deadline comment: state plainly that it's
-// not a wall-clock bound where it isn't one). Also constrained from above: service_win.cpp
-// reports a 30s STOP_PENDING hint to the Windows SCM, so a SINGLE watchdog must stay under
-// that - 20s leaves only a 10s margin, not a comfortable one (matching service_win.cpp's own
-// wording on the same relationship, not "well under").
+// drain wait and stop_all_guards_locked()'s per-guard stops have NO named bound at all, so this
+// is not a derived guarantee (matching spark_file.cpp's arm_ancestor deadline comment: state
+// plainly that it's not a wall-clock bound where it isn't one). Also constrained from above:
+// service_win.cpp reports a 30s STOP_PENDING hint to the Windows SCM, so a SINGLE watchdog must
+// stay under that - 20s leaves only a 10s margin, not a comfortable one (matching
+// service_win.cpp's own wording on the same relationship, not "well under").
 //
 // TWO watchdogs on the external-trigger path, and their budgets are independent, not
 // shared: run()'s ScopeExit re-calls guardian_->stop() on EVERY exit (comment below),

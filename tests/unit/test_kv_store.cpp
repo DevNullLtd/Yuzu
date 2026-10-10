@@ -1021,7 +1021,8 @@ TEST_CASE("#5604 KvStore: set_busy_timeout clamps to [0, 1 h]; zero and negative
     CHECK(t.store.busy_timeout_for_test() == kKvStoreMaxBusyTimeout);
     t.store.set_busy_timeout(kKvStoreMaxBusyTimeout + 1ms);
     CHECK(t.store.busy_timeout_for_test() == kKvStoreMaxBusyTimeout);
-    // The value that overflowed the handler's millisecond-to-nanosecond arithmetic before the clamp.
+    // The value that overflowed the handler's millisecond-to-nanosecond arithmetic before the
+    // clamp.
     t.store.set_busy_timeout((std::chrono::milliseconds::max)());
     CHECK(t.store.busy_timeout_for_test() == kKvStoreMaxBusyTimeout);
     // With the huge value in place the handler still behaves (no overflow): it retries.
@@ -1066,15 +1067,24 @@ TEST_CASE("#5604 KvStore: a handler call with count > 0 on a thread that never s
 
     // A fresh thread has no wait clock. count == 3 is a call SQLite could make for a wait this
     // thread's handler never began (a reset count after a prepare or checkpoint wait): reading
-    // an empty start would see "elapsed since the epoch" and give up immediately.
+    // an empty start would see "elapsed since the epoch" and give up immediately. The call
+    // restarts the clock instead, and the wait then ends at about the budget from THAT call.
     int rc_fresh = -1;
     double fresh_ms = 0.0;
+    double fresh_wait_ms = 0.0;
     std::thread fresh([&] {
-        fresh_ms = elapsed_ms_5604([&] { rc_fresh = t.store.busy_handler_for_test(3); });
+        fresh_wait_ms = elapsed_ms_5604([&] {
+            fresh_ms = elapsed_ms_5604([&] { rc_fresh = t.store.busy_handler_for_test(3); });
+            int rc = rc_fresh;
+            for (int count = 4; rc == 1 && count < 10'000; ++count)
+                rc = t.store.busy_handler_for_test(count);
+        });
     });
     fresh.join();
-    CHECK(rc_fresh == 1);        // RED before the guard: returned 0 at once
-    CHECK(fresh_ms >= 10.0);     // it slept the ladder's tail (a sleep never undershoots)
+    CHECK(rc_fresh == 1);   // RED without the restart: returned 0 at once
+    CHECK(fresh_ms >= 5.0); // it slept the ladder's tail (10 ms; a coarse timer may return early)
+    CHECK(fresh_wait_ms >= 150.0);
+    CHECK(fresh_wait_ms < 1500.0);
 
     // A normal wait: count 0, 1, 2, ... until the handler gives up. It must give up, and only
     // once the budget is spent.
@@ -1089,21 +1099,127 @@ TEST_CASE("#5604 KvStore: a handler call with count > 0 on a thread that never s
     CHECK(wait_ms >= 150.0);
     CHECK(wait_ms < 1500.0);
 
-    // A call long after the previous one is a different wait: its clock restarts instead of
-    // reading the old start. (Budget 150 ms; the gap below is longer than the restart gap.)
-    int rc_after_gap = -1;
-    std::thread gap([&] {
-        (void)t.store.busy_handler_for_test(0);
-        std::this_thread::sleep_for(300ms); // more than the 250 ms restart gap
-        rc_after_gap = t.store.busy_handler_for_test(5);
-    });
-    gap.join();
-    CHECK(rc_after_gap == 1);
-
-    // Count 0 always starts a wait: with a zero budget it gives up at once, with a budget it retries.
+    // Count 0 always starts a wait: with a zero budget it gives up at once.
     t.store.set_busy_timeout(0ms);
     int rc_zero = -1;
     std::thread zero([&] { rc_zero = t.store.busy_handler_for_test(0); });
     zero.join();
     CHECK(rc_zero == 0);
+}
+
+TEST_CASE("#5604 KvStore: a pause inside a continuing wait does not renew its budget",
+          "[kv_store][busy]") {
+    using namespace std::chrono_literals;
+    auto t = make_test_store();
+    t.store.set_busy_timeout(400ms);
+
+    // SQLite calls the handler with consecutive counts while one wait continues. A scheduler
+    // stall, or one of SQLite's own sleeps outside the handler, between two such calls is part of
+    // the same wait: the 300 ms pause between count 1 and count 2 below must not grant a fresh
+    // 400 ms. The wait ends at the budget from the FIRST call (plus one ladder sleep), not at the
+    // budget plus the pause (about 700 ms when the pause renews it).
+    int last_rc = 1;
+    double total_ms = 0.0;
+    std::thread waiter([&] {
+        total_ms = elapsed_ms_5604([&] {
+            (void)t.store.busy_handler_for_test(0);
+            (void)t.store.busy_handler_for_test(1);
+            std::this_thread::sleep_for(300ms);
+            int count = 2;
+            while (last_rc == 1 && count < 10'000)
+                last_rc = t.store.busy_handler_for_test(count++);
+        });
+    });
+    waiter.join();
+    CHECK(last_rc == 0);
+    CHECK(total_ms >= 400.0);
+    CHECK(total_ms < 650.0); // RED if the pause renewed the budget: about 700 ms or more
+
+    // The same property without an upper timing bound: a pause longer than the whole budget
+    // between two consecutive counts leaves the wait over budget, so the next call gives up. A
+    // slow scheduler can only lengthen the pause, so it cannot flip this result.
+    t.store.set_busy_timeout(150ms);
+    int rc_after_pause = -1;
+    std::thread paused([&] {
+        (void)t.store.busy_handler_for_test(0);
+        (void)t.store.busy_handler_for_test(1);
+        std::this_thread::sleep_for(300ms);
+        rc_after_pause = t.store.busy_handler_for_test(2);
+    });
+    paused.join();
+    CHECK(rc_after_pause == 0); // RED if the 300 ms pause restarted the clock: returned 1
+}
+
+TEST_CASE("#5604 KvStore: a handler call that does not continue the previous count restarts the "
+          "wait's clock",
+          "[kv_store][busy]") {
+    using namespace std::chrono_literals;
+    auto t = make_test_store();
+    t.store.set_busy_timeout(150ms);
+
+    // Counts 0 and 1, then a pause longer than the budget, then count 5. 5 is not the previous
+    // count + 1, so it is a different wait: it must restart the clock and retry, not read the
+    // old start (200 ms ago, past the 150 ms budget) and give up at once. The pause is shorter
+    // than a time-gap heuristic would treat as a new wait, so only the count can tell.
+    int rc_discontinuous = -1;
+    double wait_ms = 0.0;
+    std::thread waiter([&] {
+        (void)t.store.busy_handler_for_test(0);
+        (void)t.store.busy_handler_for_test(1);
+        std::this_thread::sleep_for(200ms);
+        wait_ms = elapsed_ms_5604([&] {
+            rc_discontinuous = t.store.busy_handler_for_test(5);
+            int rc = rc_discontinuous;
+            for (int count = 6; rc == 1 && count < 10'000; ++count)
+                rc = t.store.busy_handler_for_test(count);
+        });
+    });
+    waiter.join();
+    CHECK(rc_discontinuous == 1);
+    CHECK(wait_ms >= 150.0); // the restarted wait runs its whole budget
+    CHECK(wait_ms < 1500.0);
+
+    // After the handler gives up, the next wait restarts even with a count that would otherwise
+    // continue the last one (the give-up forgets the count).
+    int rc_after_give_up = -1;
+    std::thread after([&] {
+        int rc = 1;
+        int count = 0;
+        for (; rc == 1 && count < 10'000; ++count)
+            rc = t.store.busy_handler_for_test(count);
+        // `count` is now the previous call's count + 1: a call that would continue the wait the
+        // handler just gave up on if the give-up had not forgotten it.
+        rc_after_give_up = t.store.busy_handler_for_test(count);
+    });
+    after.join();
+    CHECK(rc_after_give_up == 1);
+}
+
+TEST_CASE("#5604 KvStore: two stores waited on in turn by one thread are each cut at their own "
+          "budget",
+          "[kv_store][busy]") {
+    using namespace std::chrono_literals;
+    // Through real SQLite: the busy handler's wait clock is per thread, shared by every store
+    // that thread waits on. Each wait starts at count 0, so a wait on one store never reads the
+    // start another store's wait left behind.
+    auto a = make_test_store();
+    auto b = make_test_store();
+    a.store.set_busy_timeout(80ms);
+    b.store.set_busy_timeout(160ms);
+    WriteLockHolder5604 hold_a{a.path};
+    WriteLockHolder5604 hold_b{b.path};
+    REQUIRE(hold_a.locked);
+    REQUIRE(hold_b.locked);
+    for (int round = 0; round < 2; ++round) {
+        bool ok_a = true;
+        bool ok_b = true;
+        const double ms_a = elapsed_ms_5604([&] { ok_a = a.store.set("p", "k", "v"); });
+        const double ms_b = elapsed_ms_5604([&] { ok_b = b.store.set("p", "k", "v"); });
+        CHECK_FALSE(ok_a);
+        CHECK_FALSE(ok_b);
+        CHECK(ms_a >= 80.0);
+        CHECK(ms_a < 1000.0);
+        CHECK(ms_b >= 160.0);
+        CHECK(ms_b < 1000.0);
+    }
 }

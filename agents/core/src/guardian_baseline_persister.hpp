@@ -174,9 +174,12 @@ struct GuardianBaselinePassBudget {
 ///  - 64 tuples: a healthy write is on the order of a millisecond (WAL, synchronous=FULL), so a
 ///    full pass holds persist_mu_ for well under a second; a larger rule set simply drains over
 ///    several back-to-back passes.
-///  - 3 failures: tolerates a couple of per-key faults at the head of the order. A BUSY store
-///    ends a pass after one write, because its 5 s busy timeout alone exceeds the wall budget;
-///    a fast global fault (full disk, read-only file) ends it after three cheap failures.
+///  - 3 failures: tolerates a couple of per-key faults at the head of the order. At the normal
+///    5 s busy budget a BUSY store ends a pass after one write, because that budget alone
+///    exceeds the wall budget. At the 1 s stop budget (GuardianEngine::stop() lowers it) a pass
+///    already in flight can make two failed writes: the wall is checked only from the second
+///    tuple on, and 1 s is under 2 s. A fast global fault (full disk, read-only file) ends it
+///    after three cheap failures.
 ///  - 2000 ms: apply_rules already pays one synchronous KV write per rule under mtx_
 ///    (put_rule_locked), so a pass capped at 2 s of wall adds a stall of the same order, not an
 ///    unbounded one.
@@ -190,8 +193,9 @@ inline constexpr GuardianBaselinePassBudget kBaselinePassBudget{64, 3,
 /// between tuples, and is skipped only when it could not start in time AND this stop has shown
 /// the store to be slow (see BOUNDED PASSES and kBaselineStopLatestStart). It has NO tuple cap:
 /// a healthy store persists a staged capture in well under a millisecond, and a cap would
-/// abandon the rest at a few dozen captures. The 1 s wall is the limit instead: above roughly 2,000 to 3,000 staged captures the pass ends on it with
-/// the remainder lost to this process (logged as incomplete), even on a healthy store.
+/// abandon the rest at a few dozen captures. The 1 s wall is the limit instead: above roughly
+/// 2,000 to 3,000 staged captures the pass ends on it with the remainder lost to this process
+/// (logged as incomplete), even on a healthy store.
 inline constexpr GuardianBaselinePassBudget kBaselineStopBudget{
     (std::numeric_limits<std::size_t>::max)(), 1, std::chrono::milliseconds{1000}};
 
@@ -226,15 +230,16 @@ inline constexpr std::chrono::milliseconds kBaselineStopLatestStart =
 /// How long a stop() stage (or a failed persist-pass write) must take to count as store
 /// trouble (GuardianEngine::stop()'s two journal flushes and loss-ledger write feed it through
 /// stop_stage_end(); the worker join does not, it is a thread join and not a store stage). A
-/// BUSY stage lasts the whole kKvStoreStopBusyTimeout. The handler's sleep never undershoots,
-/// but the stage is timed by a different clock reading than the handler's, so the measured
-/// duration of a BUSY stage can still land a little under the budget (a clock read, scheduler
-/// delay, the handler's own last check): testing for exactly the busy budget would let such a
-/// stage slip under the test, and with the fast-failure evidence gone that would be the only
-/// gate. The slack covers that with a wide margin; a healthy stage that takes 750 ms or more
-/// is itself a slow store and equally merits skipping a late pass. The persist pass's stall
-/// test compares against this same threshold: with the busy budget equal to the pass wall
-/// (both 1 s), an exact-equality test against the wall would be a coin flip.
+/// BUSY stage lasts the whole kKvStoreStopBusyTimeout. The handler's wait never undershoots its
+/// budget (it compares steady_clock readings), but the stage is timed by a different clock
+/// reading than the handler's, so the measured duration of a BUSY stage can still land a
+/// little under the budget (a clock read, scheduler delay, the handler's own last check):
+/// testing for exactly the busy budget would let such a stage slip under the test, and with
+/// the fast-failure evidence gone that would be the only gate. The slack covers that with a
+/// wide margin; a healthy stage that takes 750 ms or more is itself a slow store and equally
+/// merits skipping a late pass. The persist pass's stall test compares against this same
+/// threshold: with the busy budget equal to the pass wall (both 1 s), an exact-equality test
+/// against the wall would be a coin flip.
 inline constexpr std::chrono::milliseconds kBaselineStopTroubleSlack{250};
 inline constexpr std::chrono::milliseconds kBaselineStopTroubleThreshold =
     kKvStoreStopBusyTimeout - kBaselineStopTroubleSlack;
@@ -242,13 +247,15 @@ static_assert(kBaselineStopTroubleThreshold > std::chrono::milliseconds{0} &&
                   kBaselineStopTroubleThreshold < kKvStoreStopBusyTimeout,
               "the stage-trouble threshold must lie strictly between zero and the stop busy "
               "budget");
-// The arithmetic bound on stop()'s serial KV waits is six busy budgets: an in-flight worker
-// write, journal flush 1, a write inside the worker join, the loss ledger, journal flush 2 and
-// the Stop pass. Seven stop budgets, one more than that, must fit in half the grace, so the
-// rest of AgentImpl::stop() (DEX observer, Spark engine, updater) keeps the other half. This is
-// a margin rule, not a derived bound: it counts neither the retry-sleep overshoot (up to 10 ms
-// per wait, about 16 ms where the timer tick is coarse) nor callers queued on KvStore::mu_
-// that began waiting before the budget was lowered (each pays its own wait first).
+// stop()'s serial KV waits are enumerated as six busy budgets: journal flush 1, the loss
+// ledger, journal flush 2, the Stop pass (its wall is checked only from the second tuple on, so
+// it can make two 1 s writes) and an in-flight worker write. That enumeration is NOT enforced
+// by any code. What is enforced is this margin: seven stop budgets, one more than the six, must
+// fit in half the grace, so the rest of AgentImpl::stop() (DEX observer, Spark engine,
+// updater) keeps the other half. It is a margin rule, not a derived bound: it counts neither
+// the retry-sleep overshoot (up to 10 ms per wait, about 16 ms where the timer tick is coarse)
+// nor callers queued on KvStore::mu_ that began waiting before the budget was lowered (each
+// adds about one budget, see GuardianEngine::stop()).
 static_assert(7 * kKvStoreStopBusyTimeout <= kBaselineShutdownGrace / 2,
               "stop()'s serial KV waits at the stop busy budget must fit in half the shutdown "
               "grace");

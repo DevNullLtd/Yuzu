@@ -317,8 +317,10 @@ YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* 
 
 /* ── KV Storage (ABI v2) — persistent SQLite-backed storage per plugin ─────── */
 /* A storage call can fail when another process holds the store locked: the agent waits
- * up to 5 s in normal operation and only 1 s while it is shutting down (#5604), so a call
- * made from shutdown() can fail where an earlier one would have succeeded. */
+ * up to 5 s in normal operation and 1 s once the agent has begun shutting down (#5604). That
+ * change can race a plugin's shutdown(), so a write made there waits 5 s or 1 s and can fail
+ * where an earlier one would have succeeded. The C++ SDK's get, delete and list wrappers show
+ * a failed call as an empty result. */
 
 /**
  * Store a key-value pair in the plugin's persistent namespace.

@@ -1239,7 +1239,8 @@ JournalPageStats GuardianLifecycleJournal::page_into_window(GuardianSparkRuntime
     // re-offered. That is the case the DEFERRED server ack closes properly; until it lands this
     // is the honest boundary of at-least-once here.
     // Shutdown before the label scan. This is a full namespace scan able to block on the KvStore
-    // busy budget (GuardianEngine::stop() lowers it, see its comment), on the thread GuardianEngine::stop() joins while holding mtx_ - the one
+    // busy budget (GuardianEngine::stop() lowers it, see its comment), on the thread
+    // GuardianEngine::stop() joins while holding mtx_ - the one
     // heavy KvStore call on this path that the candidate-build loop's gate does not cover,
     // because that gate is INSIDE the loop above. Prune states the rule for its identical
     // call: the stopping_ gates must PRECEDE the heavy calls, not merely straddle them
