@@ -571,8 +571,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        read ... has no REST/MCP twin"); PR-2b is the closing change.
        **Revisit by 2026-11-07**; until the MCP tools merge, the parity
        ledger rows for these routes read `twinned` with `mcp_twin: null`.
-     - **The exception relaxes no control.** Both routes are gated on a
-       global `Inventory:Read`, deny service-scoped tokens, audit every
+     - **The exception relaxes no control.** The fleet view is gated on a
+       global `Inventory:Read` (the per-device view is admitted in scope), deny service-scoped tokens, audit every
        served page or file, and answer a degraded read with `503`, never an
        empty `200`; wire reference: `docs/user-manual/rest-api.md`.
 

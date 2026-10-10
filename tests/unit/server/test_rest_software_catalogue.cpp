@@ -235,6 +235,8 @@ TEST_CASE("catalogue routes: unwired fleet_read_fn fails closed with 503",
         CHECK(r->status == 503);
         // The unwired arm, not the null-store one that would also be a 503 here.
         CHECK(err_of(r).at("message") == "service unavailable");
+        // A4 bodies always carry the key; null = no retry hint (nothing to retry against).
+        CHECK(err_of(r).at("retry_after_ms").is_null());
         CHECK_FALSE(nlohmann::json::parse(r->body).contains("data"));
     }
 }
@@ -262,6 +264,7 @@ TEST_CASE("catalogue routes: null store is 503 'not available' with no audit row
         REQUIRE(r);
         CHECK(r->status == 503);
         CHECK(err_of(r).at("message") == "software inventory store not available");
+        CHECK(err_of(r).at("retry_after_ms").is_null());
         CHECK_FALSE(r->get_header_value("X-Correlation-Id").empty());
         CHECK(err_of(r).at("correlation_id").get<std::string>() == r->get_header_value("X-Correlation-Id"));
     }
@@ -696,16 +699,58 @@ TEST_CASE("catalogue routes: a degraded store is 503 + retry_after_ms + failure 
 
     auto held = pool.acquire(); // starve the pool: every read times out → nullopt
     CatHarness h{&store};
-    for (const char* path : {kCat, kVer}) {
+    for (const auto& [path, what] : {std::pair<const char*, const char*>{kCat, "catalogue read"},
+                                     std::pair<const char*, const char*>{kVer, "versions read"}}) {
         auto r = h.sink.Get(std::string(path) + "?name=git");
         REQUIRE(r);
         CHECK(r->status == 503);
+        CHECK(err_of(r).at("message") ==
+              std::string("software inventory store degraded — ") + what + " failed");
         CHECK(err_of(r).at("retry_after_ms") == 5000);
         CHECK_FALSE(nlohmann::json::parse(r->body).contains("data"));
     }
-    CHECK(h.audits("inventory.software.catalog", "failure") == 1);
-    CHECK(h.audits("inventory.software.versions", "failure") == 1);
+    CHECK(h.audits("inventory.software.catalog", "failure", "catalogue read degraded") == 1);
+    CHECK(h.audits("inventory.software.versions", "failure", "versions read degraded") == 1);
     CHECK(h.audits("inventory.software.catalog", "success") == 0);
+}
+
+TEST_CASE("catalogue routes: an unreadable refresh-metadata row degrades the unfiltered versions "
+          "read only, with the versions message and a failure audit",
+          "[pg][rest][software_catalogue][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_fixture(store);
+    {
+        // The meta read is a direct statement, so renaming the table in the disposable clone
+        // fails it while version_rollup and installed_software stay readable: the pre-check's
+        // nullopt arm is then the only thing that can produce the 503.
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    lease.get(),
+                    "ALTER TABLE software_inventory_store.catalog_rollup_meta RENAME TO "
+                    "catalog_rollup_meta_renamed",
+                    std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    CatHarness h{&store};
+    auto r = h.sink.Get(std::string(kVer) + "?name=git");
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    CHECK(err_of(r).at("message") ==
+          "software inventory store degraded — versions read failed");
+    CHECK(err_of(r).at("retry_after_ms") == 5000);
+    CHECK_FALSE(nlohmann::json::parse(r->body).contains("data"));
+    CHECK(h.audits("inventory.software.versions", "failure", "versions read degraded") == 1);
+    CHECK(h.audits("inventory.software.versions", "success") == 0);
+
+    // A filtered read never touches the meta row, so it still serves.
+    auto filtered = h.sink.Get(std::string(kVer) + "?name=git&ecosystem=brew");
+    REQUIRE(filtered);
+    CHECK(filtered->status == 200);
 }
 
 TEST_CASE("catalogue routes: a throwing or failing audit sink serves 200 with audit_persisted:false",
@@ -854,7 +899,7 @@ TEST_CASE("catalogue: a degraded store on the titles CSV is 503 + retry_after_ms
     CHECK(h.audits("inventory.software.export", "success") == 0);
 }
 
-TEST_CASE("catalogue: titles CSV posture: confined fleet deny, in-scope host blanking, denied-row "
+TEST_CASE("catalogue: titles CSV posture / confined fleet deny / in-scope host blanking / denied-row "
           "carry-over",
           "[pg][rest][software_catalogue][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
@@ -912,8 +957,8 @@ TEST_CASE("catalogue: titles CSV posture: confined fleet deny, in-scope host bla
     }
 }
 
-TEST_CASE("catalogue: a never-built rollup is a 503 'being built' on the CSV export and the "
-          "unfiltered versions read, never an empty 200",
+TEST_CASE("catalogue: a never-built rollup is a 503 'being built' on the CSV export / the "
+          "unfiltered versions read / never an empty 200",
           "[pg][rest][software_catalogue][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -958,6 +1003,9 @@ TEST_CASE("catalogue: a never-built rollup is a 503 'being built' on the CSV exp
         REQUIRE(eco);
         CHECK(eco->status == 200);
         CHECK(data_of(eco).at("count") == 2);
+        // Rows and counts do not depend on the rollup; the newest mark does and stays false.
+        for (const auto& row : data_of(eco).at("versions"))
+            CHECK(row.at("newest") == false);
         auto dev = h.sink.Get(ver_url + "&agent_id=d1");
         REQUIRE(dev);
         CHECK(dev->status == 200);

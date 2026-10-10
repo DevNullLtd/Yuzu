@@ -434,7 +434,7 @@ fleet with filtered `totals`, first-page KPIs, a keyset `next_cursor` and a `for
 export; `GET /api/v1/inventory/software/catalogue/versions` returns installs per version
 of one title. Unlike the raw route above, a management-group-confined caller gets `403` on
 the fleet view (pass `agent_id` for an in-scope device) and service-scoped tokens are
-denied. A degraded read is `503`, never an empty `200`; the export and the unfiltered
+denied. A degraded read is `503`, never an empty `200`; the fleet export and the unfiltered
 versions read are also `503` until the first catalogue refresh has landed. Parameters,
 responses and audit behaviour: [REST API](rest-api.md#get-apiv1inventorysoftwarecatalogue).
 
