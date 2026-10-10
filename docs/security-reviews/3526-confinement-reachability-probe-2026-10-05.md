@@ -78,4 +78,4 @@ comparison oracle.
    `response.read` / `denied` row (`scope_dropped=1`), where the v1 twin also writes `response.read` / `success`; a
    global principal produces no audit row at all on the legacy route, even for a whole-fleet read; and when audit
    persistence fails the legacy route stays `200` with the data (fail-open) while the v1 twin returns `503`. The
-   probe did not drive `/api/responses/{id}/export`. Tracked in #5556.
+   probe did not drive `/api/responses/{id}/export`. Tracked in #5556; addressed for all three legacy routes in the response-routes hardening change (#4644).
