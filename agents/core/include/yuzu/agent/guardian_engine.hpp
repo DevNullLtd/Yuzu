@@ -367,6 +367,17 @@ public:
     [[nodiscard]] std::uint64_t baseline_stop_sweep_threw_logs_for_test() const noexcept {
         return baseline_stop_sweep_threw_logs_.load(std::memory_order_relaxed);
     }
+    /// TEST-ONLY: how many times stop() logged that lifecycle-journal records were still unpersisted
+    /// after its final journal flush (0 or 1). No production caller.
+    [[nodiscard]] std::uint64_t journal_stop_pending_logs_for_test() const noexcept {
+        return journal_stop_pending_logs_.load(std::memory_order_relaxed);
+    }
+    /// The exact ERROR line stop() logs when `pending` lifecycle-journal records remain unpersisted
+    /// after the stop-time flush `stage`. They are audit evidence held only in memory, so they
+    /// are lost with the process. Count and stage only: no rule id, path or record content. Pure
+    /// and static so a test can pin the text without capturing spdlog.
+    [[nodiscard]] static std::string stop_journal_pending_log_line(std::size_t pending,
+                                                                   const char* stage);
 
     /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was
     /// edge-suppressed (M1). Surfaced sparsely on the heartbeat as
@@ -1078,8 +1089,9 @@ private:
     void persist_lifecycle_journal_locked(std::size_t max_batches, std::size_t max_records);
     /// stop() only (mtx_ held, noexcept): one unbounded journal flush, timed and reported to the
     /// baseline persister as store-trouble evidence for the late-start skip (stage name `stage`
-    /// is for the test hook).
-    void stop_journal_flush_locked(const char* stage) noexcept;
+    /// is for the test hook). `final_flush` marks the last one: if records are still pending
+    /// after it, ONE ERROR line names their count (they are lost with the process).
+    void stop_journal_flush_locked(const char* stage, bool final_flush) noexcept;
     /// stop() only: bracket one store stage. begin returns the persister clock's reading (a
     /// default time_point when no persister is wired). The hook runs the test hook, right after
     /// begin and BEFORE the stage body, so a test can make the body look slow by advancing an
@@ -1435,6 +1447,9 @@ private:
     /// baseline_stop_flush_threw_logs_for_test() / baseline_stop_sweep_threw_logs_for_test().
     std::atomic<std::uint64_t> baseline_stop_flush_threw_logs_{0};
     std::atomic<std::uint64_t> baseline_stop_sweep_threw_logs_{0};
+    /// TEST-ONLY: the "journal records pending after the stop flush" ERROR line, see
+    /// journal_stop_pending_logs_for_test(). At most one per engine (mtx_-guarded).
+    std::atomic<std::uint64_t> journal_stop_pending_logs_{0};
     std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
     std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
 };

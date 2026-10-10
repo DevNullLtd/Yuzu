@@ -10,9 +10,10 @@ against the code at the tip. Format follows
 `docs/resource-ledgers/spark-criterion10-timing-instrumentation.md`.
 
 Nothing in this change adds a file descriptor, HANDLE, SOCKET, `FILE*`, `sqlite3*` or
-`sqlite3_stmt*` (the persister writes through the engine's existing `KvStore`, and
-the busy wait on the existing handle is now a `sqlite3_busy_handler` over a heap-owned atomic budget (#5604, last row below)),
-OpenSSL or BCrypt object, allocated C string, mapped library, temp path, subprocess or production
+`sqlite3_stmt*` (the persister writes through the engine's existing `KvStore`, and the busy
+wait on the existing handle is now a `sqlite3_busy_handler` over a heap-owned atomic budget,
+#5604, see the #5604 rows of the last table), OpenSSL or BCrypt object, allocated C string,
+mapped library, temp path, subprocess or production
 thread. The persister runs on three existing threads: the engine's callers (`apply_rules`, `stop()`
 under `mtx_`) and the existing drain worker. A mechanical grep over the added production lines finds
 no such expression in code (`new` or `delete` expressions, `malloc`, `free`, `reinterpret_cast`,
@@ -49,7 +50,7 @@ members.
 | `ApplyScope` over `apply_active_` | Persister nested class, non-copyable, null-safe | `apply_rules` baseline section (`mtx_` held) | `apply_rules` exit on every path | Destructor on unwind; a Worker pass defers while any scope is alive |
 | `stop_state_` (`atomic<uint8_t>` 0/1/2) and `stop_began_rep_` (`atomic<Clock::rep>`) | Persister, lock-free | `begin_stop()`: CAS 0 -> 1 (acq_rel), relaxed store of the mark, release store of 2 | Never reset; dies with the persister | A second concurrent caller returns at once; a reader trusts only state 2 (acquire), then reads the rep. A clock that reads 0 cannot disable the mark |
 | `stop_store_trouble_` (`atomic<bool>`) | Persister, lock-free | `note_stop_store_trouble()` (release), called from `GuardianEngine::stop()` only, through `stop_stage_end()`, and only for a stage that took at least `kBaselineStopTroubleThreshold` (a fast failure is not evidence) | Never reset: `stop()` is terminal, so the flag can only describe the one stop that raised it | noexcept; read with acquire by the Stop pass under `persist_mu_`. Without it a late start never skips |
-| `stalled_` and `stalled_at_`, `cursor_`, `backoff_`, `backoff_initial_`, `backoff_max_`, `pass_budget_`, `stop_budget_` | Persister members, guarded by `persist_mu_`; the TEST-ONLY setters take `persist_mu_` | Per attempting pass | n/a | `cursor_` assignment is inside a try/catch; a pass that attempted nothing changes none of them |
+| `stalled_` and `stalled_at_` (read by a LATE Stop pass as slow-store evidence, #5604), `cursor_`, `backoff_`, `backoff_initial_`, `backoff_max_`, `pass_budget_`, `stop_budget_` | Persister members, guarded by `persist_mu_`; the TEST-ONLY setters take `persist_mu_` | Per attempting pass | n/a | `cursor_` assignment is inside a try/catch; a pass that attempted nothing changes none of them |
 | `next_attempt_rep_` (`atomic<Clock::rep>`) | Persister; read lock-free by the Worker retry floor, written under `persist_mu_` | After a failed pass | Reset by a pass with no failure | n/a |
 | `persist_failures_`, `no_store_pending_`, `persist_refusals_`, `firewalled_exceptions_` (`atomic<uint64_t>`) | Persister | `fetch_add` at the event | Never | Relaxed counters; `failure_signals()` sums them with the runtime's drop counter, lock-free |
 | `staging_drops_` (`shared_ptr<const atomic<uint64_t>>`) | Persister member, never reseated | Constructor, copied from `staged_baseline_drops_source()` | Last holder | Outlives runtime teardown |
@@ -81,7 +82,11 @@ members.
 | `maint_.baselines` (`shared_ptr<GuardianBaselinePersister>`) | The worker's maintenance struct | Copied in at construction | Worker destruction | Null means no baseline persistence runs |
 | `baseline_recheck_pending`, `logged_baseline_throw` | Locals of the worker loop | Per cycle | Loop exit | The latch is local so the engine's firewall cannot suppress the worker's only log line |
 | Worker baseline step | The existing joined worker thread (no new thread) | Each loop cycle, before the outbox drain | n/a | Own try/catch, counted on the persister; never takes `mtx_` |
-| `kKvStoreBusyTimeout` use in `KvStore::open` (#5604) | Existing sqlite handle | `sqlite3_busy_handler(raw_db, &kv_busy_handler, busy.get())`, initial budget 5000 ms (value-preserving) | Handle close (`sqlite3_close` runs before the context is released) | A failed install closes the handle and fails `open()` |
+| `kKvStoreBusyTimeout` use in `KvStore::open` (#5604) | Existing sqlite handle | `sqlite3_busy_handler(raw_db, &kv_busy_handler, busy.get())`, initial budget 5000 ms (value-preserving) | Handle close (`sqlite3_close` runs before the context is released; defensive ordering, closing runs no handler) | The install cannot fail on an open handle; a non-OK result is logged and tolerated (a locked write then fails at once), with no hand cleanup. The context is allocated BEFORE `sqlite3_open_v2`, so a `bad_alloc` has no handle to leak |
+| `sqlite3*` connection (`db_`) (#5604: no new one) | `KvStore`; closed in the destructor and move-assignment | `KvStore::open` (existing) | `sqlite3_close` | Pre-existing early returns in `open()` close it by hand; #5604 adds none |
+| `stop_busy_timeout_ms_` (`atomic<int64_t>`) (#5604) | `GuardianEngine` member, default `kKvStoreStopBusyTimeout`; only a test setter writes it | Constructor | Dies with the engine | Read once, relaxed, by `stop()` before `mtx_`; `KvStore::set_busy_timeout` clamps it to 0 to 1 h |
+| `thread_local` wait clock in `kv_busy_handler` (start, last-call time, seen flag) (#5604) | The calling thread, function-local `thread_local` | First handler call on the thread | Thread exit | No allocation or destructor. A start is re-captured when `count == 0`, when this thread has made no previous call, or when the previous call was over 250 ms ago, so a stale start cannot fail a wait at once |
+| `journal_stop_pending_logs_` (`atomic<uint64_t>`) (#5604) | `GuardianEngine`, TEST-ONLY observation beside the ERROR call in `stop_journal_flush_locked` | `fetch_add` after the log | Never | Inside try/catch(...); at most one line per engine; the gate is `prefer_spark_ && spark_runtime_ && lifecycle_journal_`, same as the persist |
 | `KvBusyState` (`std::atomic<int64_t>` budget) (#5604) | `KvStore`, `unique_ptr`, heap-owned so the pointer SQLite keeps survives the `KvStore` move | `KvStore::open` | `KvStore` destruction or move-assignment, after the connection is closed | `set_busy_timeout` is a lock-free atomic store, never under `mu_`; `stop()` lowers it once to `kKvStoreStopBusyTimeout` (1 s), terminal |
 | `kShutdownDeadlineGrace` mirror `static_assert` | `agent.cpp`, compile time | n/a | n/a | A drifting mirror is a build failure |
 
@@ -98,10 +103,13 @@ Engine: `baseline_persister_for_test`, `baseline_stop_incomplete_logs_for_test`,
 `set_seed_read_hook_for_test`, `set_post_attach_hook_for_test`, `set_stop_stage_hook_for_test`,
 `unpublish_baseline_persister_for_test`. Runtime: `stage_baseline_for_test`,
 `staged_baseline_count_for_test`, `fail_next_stage_baseline_for_test`,
-`fail_next_snapshot_for_test`, `fail_next_unstaged_sweep_for_test`, `fail_next_inherit_copy_for_test`,
-`unstaged_sweep_stopping_for_test`. Drain worker: `stop_requested_for_test`. Test threads (E45,
-E50, E52, E53, E54, E57) are `std::thread`s under `Join4045` plus `ScopeExit` unpark guards declared
-after the join guards, so a failing `REQUIRE` releases a parked hook before the join.
+`fail_next_snapshot_for_test`, `fail_next_unstaged_sweep_for_test`,
+`fail_next_inherit_copy_for_test`, `unstaged_sweep_stopping_for_test`. Drain worker:
+`stop_requested_for_test`. KvStore (#5604): `busy_timeout_for_test`, `busy_handler_for_test`,
+`busy_retry_sleep_for_test`. Engine (#5604): `set_stop_busy_timeout_for_test`,
+`journal_stop_pending_logs_for_test`. Test threads (E45, E50, E52, E53, E54, E57, `#5604 A1`)
+are `std::thread`s under `Join4045` plus `ScopeExit` unpark guards declared after the join
+guards, so a failing `REQUIRE` releases a parked hook before the join.
 
 Sanitizer coverage: ThreadSanitizer and AddressSanitizer plus UBSan runs of the `#4045*` and
 `[spark][guardian]` suites were run by the governance reviewers at the end of each fix round (the

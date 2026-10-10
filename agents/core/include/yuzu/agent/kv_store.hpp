@@ -38,9 +38,15 @@ inline constexpr std::chrono::milliseconds kKvStoreBusyTimeout{5000};
 /// ONE 20 s shutdown deadline with later teardown and runs several serial KV stages, so at the
 /// normal 5 s budget a store held locked by another connection could push it past the deadline,
 /// where hard_exit(4) kills the process with no log line. This is the unit the shutdown-time
-/// budgets are counted in (guardian_baseline_persister.hpp). Plugin KV writes made from a
-/// plugin's shutdown() run at this budget too, because the store is shared.
+/// budgets are counted in (guardian_baseline_persister.hpp). Every other user of the shared
+/// store runs at this budget too once stop() has lowered it: plugin actions and a plugin's
+/// shutdown() writes, the sync scheduler's and the license scan's writes.
 inline constexpr std::chrono::milliseconds kKvStoreStopBusyTimeout{1000};
+
+/// The range set_busy_timeout() clamps a requested budget to: no negative wait, and no budget
+/// large enough to overflow the handler's millisecond-to-nanosecond clock arithmetic.
+inline constexpr std::chrono::milliseconds kKvStoreMinBusyTimeout{0};
+inline constexpr std::chrono::milliseconds kKvStoreMaxBusyTimeout{3'600'000}; // 1 h
 
 struct KvStoreError {
     std::string message;
@@ -249,21 +255,44 @@ public:
     void enable_extended_result_codes_for_test();
 
     /**
-     * Lower (or set) how long ONE KV call waits on a locked database before it fails with
-     * SQLITE_BUSY (#5604). The budget lives in an atomic that the connection's busy handler
-     * (not sqlite3_busy_timeout) reads on every retry, so this is lock-free and also shortens a
-     * wait that is ALREADY in progress on another thread: sqlite3_busy_timeout() from a second
-     * thread would block behind the connection mutex that the waiting call holds, and would not
-     * shorten that wait. A call costs at most one budget plus up to one 10 ms retry sleep (about
-     * 16 ms more on Windows, where sleeps round up to the 15.6 ms tick) as long as it takes the
-     * write lock at most once, which every method here does. Production lowers it once
-     * (GuardianEngine::stop(), to kKvStoreStopBusyTimeout) and never raises it: the stop budget
-     * is terminal. Safe from any thread, noexcept, never blocks.
+     * Lower (or set) the busy budget: how long ONE lock wait of a KV call waits on a locked
+     * database before it fails with SQLITE_BUSY (#5604). The budget lives in an atomic that the
+     * connection's busy handler (not sqlite3_busy_timeout) reads on every retry, so this is
+     * lock-free and also shortens a wait that is ALREADY in progress on another thread:
+     * sqlite3_busy_timeout() from a second thread would block behind the connection mutex that
+     * the waiting call holds, and would not shorten that wait.
+     *
+     * The value is clamped to [kKvStoreMinBusyTimeout, kKvStoreMaxBusyTimeout] (0 to 1 h): zero
+     * and any negative value mean "do not wait" (a locked database fails the call at once), and
+     * a larger value is the maximum.
+     *
+     * Cost of a call: one budget plus up to one retry sleep per lock wait (the sleep is 1 to
+     * 10 ms and the platform rounds it up: about 15.6 ms on Windows, about 15 ms on macOS as
+     * a review measured it). In WAL mode, which open() sets, every method takes the write lock at most once, so
+     * that is at most one budget per call. The rollback-journal fallback (WAL could not be
+     * enabled) lets del_keys() wait twice, so it can cost two. The bound is per BUSY WAIT, not
+     * per call, on Windows: SQLite's own file-I/O retries (winRetryIoerr, about 1.4 to 1.5 s per
+     * failing I/O, derived from the SQLite source, not measured here) and its WAL-index retry
+     * sleeps happen outside the busy handler and are not counted against the budget.
+     *
+     * Production lowers it once (GuardianEngine::stop(), to kKvStoreStopBusyTimeout) and never
+     * raises it: the stop budget is terminal. noexcept and never blocks. Thread-safety
+     * PRECONDITION: the call must not race a concurrent move or destruction of this same
+     * KvStore (the context it writes through moves with the store); concurrent set_busy_timeout()
+     * calls and concurrent KV calls are fine.
      */
     void set_busy_timeout(std::chrono::milliseconds budget) noexcept;
 
     /// TEST-ONLY: the budget the busy handler is currently using.
     [[nodiscard]] std::chrono::milliseconds busy_timeout_for_test() const noexcept;
+
+    /// TEST-ONLY: invoke the busy handler directly with SQLite's `count` (retries already made in
+    /// this wait). Returns what SQLite would see: 1 after sleeping (retry), 0 (give up). Lets a
+    /// test drive the handler's per-thread wait clock without a contended database.
+    [[nodiscard]] int busy_handler_for_test(int count) noexcept;
+
+    /// TEST-ONLY: the retry sleep the handler uses for SQLite's `count` (1, 2, 5, then 10 ms).
+    [[nodiscard]] static std::chrono::milliseconds busy_retry_sleep_for_test(int count) noexcept;
 
 private:
     /// The busy handler's context (kv_store.cpp). Heap-owned: SQLite keeps this raw pointer for

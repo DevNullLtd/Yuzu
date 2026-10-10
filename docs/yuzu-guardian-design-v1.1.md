@@ -2669,25 +2669,34 @@ Guardian ladder must check these.
   (below), then stages any capture the runtime committed but could not stage (`stage_unstaged_baselines`: a stop
   withdraws no rule, so no withdrawal staging would run), then runs its pass LAST, after
   the journal flush and the loss-ledger write, under the stop budget (no tuple cap, 1
-  failure, 1 s of wall between tuples). The pass is skipped in two cases: a write that
-  failed slowly (took at least `kBaselineStopTroubleThreshold`, 750 ms) ended at or after
-  the `begin_stop()` mark, taken at the very top of `stop()` before it waits for `mtx_` (and
-  again once it holds `mtx_`, first call wins, for a stop that read the persister pointer
-  just before the wire published it; a stall that ends while `stop()` is queued behind an
-  `apply_rules` counts as this stop's); or the pass would start `kBaselineStopLatestStart`
-  (18 s: the 20 s grace minus the pass's 1 s wall and one 1 s stop busy budget) or more
-  after the mark AND an earlier stage of this same `stop()` (the two journal flushes, the
-  worker join, the loss-ledger write) ran SLOW, at least `kBaselineStopTroubleThreshold`
-  (750 ms: the 1 s stop busy budget minus a 250 ms timer-rounding slack, because Windows
-  `Sleep()` can return early; `note_stop_store_trouble`). A stage that failed FAST is not
-  evidence: a BUSY store costs a whole busy budget per write, so it cannot hide behind a
-  fast stage, and a store that fails fast fails the Stop pass fast too. A late start with no
-  slow stage runs, so an `apply_rules` that held `mtx_` for 18 s does not cost the staged
-  captures; but a late HEALTHY pass can use its whole 1 s wall plus one write, so a pass that
-  starts in the last second of the grace can run into the watchdog (measured once, before
-  #5604: a stop that waited 19 s with 300 staged captures ended at 20.035 s with the pass
-  budget-exhausted during a slow-IO window). A stall that ended before the mark does
-  not skip it. The 20 s `ShutdownDeadlineGuard` (`kShutdownDeadlineGrace`) is armed at
+  failure, 1 s of wall between tuples). The pass is skipped in ONE case: it would start
+  `kBaselineStopLatestStart` (18 s: the 20 s grace minus the pass's 1 s wall and one 1 s stop
+  busy budget) or more after the `begin_stop()` mark AND this same stop has shown the store to
+  be slow. The mark is taken at the very top of `stop()` before it waits for `mtx_` (and again
+  once it holds `mtx_`, first call wins, for a stop that read the persister pointer just before
+  the wire published it). Slow-store evidence is either (a) an earlier stage of this `stop()`
+  (the two journal flushes and the loss-ledger write) that ran at least
+  `kBaselineStopTroubleThreshold` (750 ms: the 1 s stop busy budget minus a 250 ms
+  timer-rounding slack, because Windows `Sleep()` can return early;
+  `note_stop_store_trouble`), or (b) a persist pass (typically the worker's) whose failed write
+  took at least that long and ended at or after the mark (a stall that ends while `stop()` is
+  queued behind an `apply_rules` counts as this stop's). The worker join is NOT a stage in
+  this sense: it is a thread join, not a store call, so a slow join is no evidence. A stage
+  that failed FAST is not evidence: a BUSY store costs a whole busy budget per write, so it
+  cannot hide behind a fast stage, and a store that fails fast fails the Stop pass fast too.
+  A slow failure alone does NOT skip a pass that starts early (before #5604's lateness gate it
+  did, which discarded the capture of a store that had healed in the meantime: a worker write
+  cut at the lowered budget, the lock holder releasing right after, and the Stop pass skipped
+  although the store was writable; the regression test is `#5604 A1`). A Stop pass costs at
+  most its 1 s wall plus one write, which fits the grace from any start before 18 s. A late
+  start with no slow evidence runs, so an `apply_rules` that held `mtx_` for 18 s does not
+  cost the staged captures; but a late HEALTHY pass can use its whole 1 s wall plus one write,
+  so a pass that starts in the last second of the grace can run into the watchdog (measured
+  once, before #5604: a stop that waited 19 s with 300 staged captures ended at 20.035 s with
+  the pass budget-exhausted during a slow-IO window). A stall that ended before the mark is not
+  evidence. The 18 s figure has zero slack: a pass that starts exactly then and spends its wall
+  and one full budget ends at the grace, and every retry-sleep overshoot lands on top.
+  The 20 s `ShutdownDeadlineGuard` (`kShutdownDeadlineGrace`) is armed at
   `AgentImpl::stop()` entry, so it also covers the DEX, Spark engine and updater stops after
   `guardian_->stop()`; `run()`'s exit teardown (plugin shutdown, `thread_pool_.reset()`) is
   under a second, independent 20 s guard. When a guard fires, `hard_exit(4)` cuts the rest
@@ -2701,31 +2710,53 @@ Guardian ladder must check these.
   an `apply_rules` holding `mtx_` is blocked in, which a queued `stop()` waits behind); a
   second thread calling `sqlite3_busy_timeout` could not do this, since it blocks behind the
   connection mutex that the waiting write holds. `KvStore` is moved after `open()`, so the
-  handler context is heap-owned. Plugin KV writes made from a plugin's `shutdown()` run at
-  the stop budget too (one shared store). Measured with every KV write truly BUSY (a second
-  connection holding `BEGIN IMMEDIATE` through the stop), production values (5 s lowered to
-  1 s), Linux debug build, one run per point, `stop()` entry to exit: quiet worker with
-  nothing pending 2.01 s (loss ledger 1 + this pass 1; 3 and 5 staged captures); a journal
-  record pending 4.03 s with 3 staged and 4.03 s with 5 (the Stop pass was skipped by the
-  stall in the first run and ran and failed in the second); a worker baseline write in flight, 3
-  staged, stop called 0.3, 2.0, 4.5 and 5.3 s after it started waiting: 1.71, 1.01, 1.01 and
-  2.01 s (the last is the worker's retry write in flight); a worker non-baseline write in
-  flight, emulated by a KV write issued from the worker thread, 5 staged, same first three
-  alignments: 2.72, 2.02 and 2.02 s; a journal record pending with that non-baseline worker
-  write in flight, 3 staged, stop called 0, 0.3 and 0.7 s after: 5.03, 4.73 and 4.33 s (the
-  largest measured). Before #5604 the same scenarios reached 21 to 29 s on earlier revisions
-  (not re-run on this code). The static asserts require seven stop budgets to fit in half the
-  grace. ACCEPTED TRADE-OFF: an external process holding the store locked for 1 to 5 s at the
-  shutdown instant now fails the stop-time writes that a 5 s budget would have survived (one
-  recapture of the affected baselines at the next boot, a stale but never corrupt loss
-  ledger; both logged). What the budget cannot bound: an fsync or other slow-I/O stall is
-  not a lock event, so no busy handler runs; the DEX observer drain and plugin `shutdown()`
-  under the second guard stay unbounded; and the evidence is sampled, not continuous: a
-  store that turns BUSY only after the evidence stages, or whose stages each stay under the
-  750 ms threshold, with the stop already 18 s late, still lets the Stop pass run, and the
-  watchdog may cut it (the capture is lost and that loss has no log line; before #5604 a
-  reviewer reproduced 21.0 s and 20.11 s for these two shapes on the earlier 15 s /
-  4.5 s constants). A slow SUCCESSFUL baseline write is not a failure and is
+  handler context is heap-owned. The handler sleeps 1, 2, 5, then 10 ms between retries by
+  SQLite's retry count (the platform timer rounds a sleep up, never down: about 15.6 ms on
+  Windows, about 15 ms on macOS as measured in a review), so a lock held for a few milliseconds costs
+  milliseconds. Every user of the shared store runs at the stop budget once `stop()` has
+  lowered it: plugin actions and a plugin's `shutdown()` writes, the sync scheduler's and the
+  license scan's writes. TARGET: the serial KV waits take at most six stop budgets (6 s plus
+  retry sleeps): an in-flight worker write, journal flush 1, a write inside the worker join,
+  the loss ledger, journal flush 2 and the Stop pass; a `static_assert` keeps seven stop
+  budgets within half the 20 s grace (a margin rule, not a derived bound: it ignores callers
+  queued on `KvStore::mu_` behind the lowering). Measured with every KV write truly BUSY (a
+  second connection holding `BEGIN IMMEDIATE` through the stop), production values (5 s
+  lowered to 1 s), Linux debug build, `stop()` entry to exit, on the code with the lateness
+  gate (fix round 1); one run per point, except rows B and E, which were run twice and agreed
+  within 3 ms: A, quiet worker with nothing pending, 2.01 s with 3 and with 5 staged captures
+  (loss ledger 1 s + this pass 1 s); B, a journal record pending and the worker idle, 5.02 s
+  with 3 staged and 6.03 s with 5 staged (the same shape took 4.02 s with 3 and with 5 staged on the earlier code, re-run today, and
+  4.02 s and 5.03 s in a scratch build with only the gate removed: which of the worker's writes line up with the
+  stop decides how many of the six waits occur); C, a worker baseline write in flight, 3
+  staged, stop called 0.3, 2.0, 4.5 and 5.3 s after it began waiting: 2.72, 2.01, 2.02 and
+  2.01 s; D, a worker non-baseline write in flight, EMULATED by a KV write issued from the
+  worker thread (not the real sent-marker write), 5 staged, first three alignments: 2.72,
+  2.01 and 2.02 s; E, a journal record pending with that emulated write in flight, 3 staged,
+  stop called 0, 0.3 and 0.7 s after: 6.04, 5.74 and 5.33 s (the largest figure measured,
+  and the top row is emulated). On the code before the lateness gate rows C and E were 1 s
+  shorter (the stall skipped the Stop pass; E 5.03, 4.73, 4.33 s); the gate costs one more
+  stop budget on a store that is still locked and saves the capture of a store that healed.
+  Before #5604 the same scenarios reached 21 to 29 s on earlier revisions (not re-run on this
+  code). ACCEPTED TRADE-OFF: an external process holding the store locked for 1 to 5 s at the
+  shutdown instant now fails the stop-time writes that a 5 s budget would have survived: one
+  recapture of the affected baselines at the next boot (any drift between a lost capture and
+  that boot is accepted as the baseline), a stale but never corrupt loss ledger, and lifecycle-
+  journal records still pending when the last stop-time flush fails are destroyed with the
+  process (a count only; with `prefer_spark_` true these are audit evidence); the capture, the
+  ledger and the journal each log a line. What the budget cannot bound: an fsync or other
+  slow-I/O stall is not a lock event, so no busy handler runs; on Windows SQLite's own file-
+  I/O retries (about 1.45 s per failing file operation, derived from the SQLite source and
+  not measured here) and its WAL-index retry sleeps run outside the handler, so there the
+  bound is per busy wait, not per call; the DEX observer drain and plugin `shutdown()` under
+  the second guard stay unbounded; a stop queued behind an `apply_rules` is not cut by the
+  lowering for a Forced drain (three failures of 1 s) or a hung `watch()` (pre-existing); and
+  the evidence is sampled, not continuous: a store that turns BUSY only after the evidence
+  stages, or whose stages each stay under the 750 ms threshold, with the stop already 18 s
+  late, still lets the Stop pass run, and the watchdog may cut it (the capture is lost and
+  that loss has no log line; before #5604 a reviewer reproduced 21.0 s and 20.11 s for these
+  two shapes on the earlier 15 s / 4.5 s constants). A supervisor's own stop timeout is
+  implicit and may be shorter than the 20 s (Docker agent services stop at 10 s, so exit code
+  4 never appears there). A slow SUCCESSFUL baseline write is not a failure and is
   not counted;
   (2) a failed write is a
   deliberate fail-open (the rule keeps its in-memory baseline): the capture stays
@@ -2737,9 +2768,11 @@ Guardian ladder must check these.
   (an allocation failure) or capture displaced from staging (a retarget over a
   still-unpersisted capture) and a capture staged with no KV store (logged once,
   kept). Stop-time losses that are NOT counted: a stop flush that ran out of its wall
-  budget with captures left, and one skipped (after a slow failure during that stop, or
-  because it could not start within 18 s after an earlier stop stage ran slow), each logged
-  with its own line (the skips by the persister, the others by the engine). Stop-time losses
+  budget with captures left, and one skipped (it could not start within 18 s after a slow
+  failure during that stop or an earlier stop stage that ran slow), each logged with its own
+  line (the skips by the persister, the others by the engine), and lifecycle-journal records
+  still pending after the last stop-time flush (one engine ERROR line with the count;
+  the records are destroyed with the process). Stop-time losses
   whose count dies with the process, so the log line is the evidence: a capture that could
   not be staged again at stop (each failed attempt is counted like any staging failure), a
   Stop pass or staging sweep cut short by a firewalled allocation or lock failure (counted
@@ -2762,8 +2795,8 @@ Guardian ladder must check these.
   captures an `apply_rules` pass left for the worker; a stop that loses waiting
   captures (its single allowed write failing, its 1 s wall budget running out, on a
   slow store or on a healthy one holding more than roughly 2,000 to 3,000 captures,
-  its flush skipped after a slow failure during that stop or because it could not
-  start within 18 s after an earlier stop stage ran slow, an allocation or lock failure
+  its flush skipped because it could not start within 18 s after a slow failure during that
+  stop or an earlier stop stage that ran slow, an allocation or lock failure
   cutting the flush or the shutdown staging short (logged), or the 20 s shutdown watchdog
   ending the process mid-stop);
   an allocation failure while staging, which keeps the baseline live and is retried
@@ -2783,9 +2816,11 @@ Guardian ladder must check these.
   kept, and the refusal is counted by the diagnostic accessor only); a record found
   malformed (bad JSON, an unknown schema number, an invalid hash) is discarded at
   arm and overwritten at persist, which predates #4045 (#4021) and applies to both
-  paths; and a record persisted for a removed rule stays dormant. All of it is inert
-  while `prefer_spark_` is false (the shipping default) and becomes live at the
-  Spark flip.
+  paths; and a record persisted for a removed rule stays dormant. The baseline persistence
+  and the lifecycle-journal persistence are inert while `prefer_spark_` is false (the shipping
+  default) and become live at the Spark flip. The #5604 KvStore busy handler, the 1 s stop
+  budget, the stop-time loss-ledger write and the sync scheduler's, license scan's and
+  plugins' shutdown-time writes at that budget are LIVE in every released agent.
 - **A guard whose own detection has permanently degraded must never publish
   itself compliant (PR #4748, CT-4).** `FileGuard`'s parent-directory
   (rename-detection) watch permanently disables after repeated teardown

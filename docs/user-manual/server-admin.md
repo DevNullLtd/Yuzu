@@ -5375,7 +5375,11 @@ automatically: `AgentImpl::stop()` and the agent's own `run()`-exit teardown
 each arm a 20-second internal watchdog, and self hard-exit (**code 4** — new,
 distinct from this section's exit 1 and the crash-loop-backstop's exit 3
 below) if guardian/spark/DEX teardown or any other blocking step hasn't
-returned within it. Separately again (#4666 PR-2), once the rest of shutdown
+returned within it. After an exit 4, treat a `file-hash-equals` Guardian rule
+that has no authored `expected_hash` as possibly re-baselined (a baseline capture
+that was waiting to be written is lost and the next start captures the file's
+current content, logging it exactly like a first capture), and check the disk
+and any other process holding `kv_store.db` locked. Separately again (#4666 PR-2), once the rest of shutdown
 has already finished (after both watchdogs above have been cancelled and
 after the F3 orphan-exit check below has run), the agent tears down its own
 async log hand-off logger before the process exits: **code 5** (distinct from

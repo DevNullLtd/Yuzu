@@ -4022,6 +4022,12 @@ Before upgrading any component:
   configuration (#1822) auto-restarts on a watchdog fire similarly to the
   Linux `Restart=always` unit, but the exit shows up as a generic unexpected
   termination rather than one of the SCM's own "specific error" buckets.
+  During shutdown the agent now waits at most 1 second (normally 5) for a
+  `kv_store.db` that another process holds locked, so the shutdown does not run
+  into this deadline for that reason (#5604); a shutdown-time write to that store
+  can fail where the longer wait would have succeeded, which can cost one Guardian
+  baseline recapture at the next start (see the baseline note in
+  [Guaranteed State](guaranteed-state.md)).
   `AgentImpl::stop()` and the run()-exit teardown each arm this deadline
   separately, and in the worst case the two can compose sequentially to as
   much as ~40s before either one fires, past the 30s SCM hint — but that

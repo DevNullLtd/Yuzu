@@ -111,13 +111,13 @@ namespace gpb = ::yuzu::guardian::v1;
 constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 
 // #2233 item 3 ("S+"): ShutdownDeadlineGuard's grace period for both AgentImpl::stop()
-// and run()'s teardown ScopeExit. NOT a measured value - the named sub-budgets listed here
-// are only PART of the blocking chain, and they sum to roughly 15-20s (GuardianEngine's two
-// persist_lifecycle_journal_locked calls, each documented as "worst case one KvStore 5s busy
-// timeout"; SparkEngine's kConsumerJoinBudgetMs = 2'000), and the loss-ledger write adds
-// another. #4045 adds the final baseline flush (up to one more busy timeout), and
-// GuardianEngine::stop()'s own comment lists the stop() timelines measured against a BUSY
-// store: 10s to 25s and more with a worker write in flight. dex_observer_'s
+// and run()'s teardown ScopeExit. NOT a measured value - the named sub-budgets are only PART
+// of the blocking chain: SparkEngine's kConsumerJoinBudgetMs = 2'000, and GuardianEngine::stop()'s
+// serial KvStore waits, which stop() bounds by lowering the store's busy budget to
+// kKvStoreStopBusyTimeout for the rest of the process (#5604). The comments in
+// GuardianEngine::stop() carry that budget, the timelines measured against a BUSY store and
+// what it does not bound (slow I/O, the DEX observer, plugin shutdown()); numbers are not
+// repeated here so they cannot drift from it. dex_observer_'s
 // drain wait and stop_all_guards_locked()'s per-guard stops have NO named bound at all - so
 // this sits AT the named floor, not comfortably above it (corrected per external review, PR
 // #3737 - the earlier wording overstated the margin), without claiming to be a derived

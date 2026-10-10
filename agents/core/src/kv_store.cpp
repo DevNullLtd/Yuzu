@@ -19,10 +19,13 @@
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <format>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <thread>
@@ -55,11 +58,33 @@ std::string escape_like_prefix(std::string_view prefix) {
     return escaped;
 }
 
-// How often the busy handler re-tries a locked database. SQLite's own sqlite3_busy_timeout()
-// handler sleeps in a similar ladder (1, 2, 5, 10, ... ms); a flat 10 ms keeps the overshoot of
-// a budget bounded by one sleep without busy-spinning. On Windows sleep_for rounds up to the
-// 15.6 ms timer tick, so a wait overshoots its budget by at most one tick and never undershoots.
-constexpr std::chrono::milliseconds kBusyRetrySleep{10};
+// How long the busy handler sleeps between retries of a locked database, by `count` (the number
+// of retries SQLite has already made in this wait): 1, 2, 5, then 10 ms from the fourth retry on.
+// SQLite's own sqlite3_busy_timeout() handler sleeps in a similar ladder (1, 2, 5, 10, 15, 20, 25,
+// 25, 25, 50, 50, 100 ms); the short head means a lock another process holds for a few
+// milliseconds costs milliseconds, not a whole 10 ms sleep, and the 10 ms tail keeps a long wait
+// from busy-spinning. A sleep never undershoots, but the platform timer rounds it UP: about
+// 15.6 ms on Windows (the default timer tick) and about 15 ms on macOS (a review measured
+// 15.03 ms, one run, median), so each of the first retries can cost up to one tick there and a budget is overshot by up to
+// one tick. The head of the ladder is therefore a Linux latency gain; elsewhere it is bounded by
+// the tick.
+constexpr std::array<std::chrono::milliseconds, 4> kBusyRetryLadder{
+    std::chrono::milliseconds{1}, std::chrono::milliseconds{2}, std::chrono::milliseconds{5},
+    std::chrono::milliseconds{10}};
+
+std::chrono::milliseconds busy_retry_sleep(int count) noexcept {
+    const auto idx = count < 0 ? std::size_t{0}
+                               : (std::min)(static_cast<std::size_t>(count),
+                                            kBusyRetryLadder.size() - 1);
+    return kBusyRetryLadder[idx];
+}
+
+// A handler call more than this long after the previous call on the same thread cannot be a
+// continuation of one wait: a continuing wait calls the handler again after one retry sleep (at
+// most about 10 ms, about 16 ms on a coarse-timer platform, plus scheduler delay), so a gap this
+// wide means the previous wait ended (its call returned BUSY, or the statement completed) and
+// this is a different one whose `count == 0` call this thread never saw.
+constexpr std::chrono::milliseconds kBusyWaitRestartGap{250};
 
 struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
@@ -77,21 +102,38 @@ namespace {
 
 // sqlite3_busy_handler callback (#5604). Runs on the waiting thread WITH the connection mutex
 // held, so it may ONLY read the atomic budget and sleep: no logging, no locks, no allocation.
-// `count` is 0 on the first retry of each distinct lock wait, which is where the wait's start
-// is captured (thread_local: the wait runs entirely on the calling thread). Returning 0 makes
-// the pending call fail with SQLITE_BUSY. The budget is re-read on every retry, so lowering it
-// from another thread cuts a wait that is already in progress, which sqlite3_busy_timeout()
-// cannot do (it would block behind the connection mutex this wait holds).
+// `count` is the number of earlier retries within ONE lock wait, so 0 is that wait's first
+// retry and the wait's start is captured there (thread_local: the wait runs entirely on the
+// calling thread). SQLite resets `count` to 0 at the start of every statement step, prepare
+// and checkpoint that has to wait, not once per KV method: a method that takes the lock twice
+// (del_keys' rollback-journal fallback) starts two waits. Because the start is only captured on
+// `count == 0`, a call with `count > 0` on a thread that never saw the matching `count == 0`
+// (a wait begun by a code path this handler did not observe) would read a stale or empty start
+// and fail at once. Defence: the start is also re-captured when this thread has no previous
+// call, or when the previous call was more than kBusyWaitRestartGap ago (see there); no such
+// path has been constructed (the review that raised it could not). Returning 0 makes the pending call fail with SQLITE_BUSY. The budget is re-read on
+// every retry, so lowering it from another thread cuts a wait that is already in progress,
+// which sqlite3_busy_timeout() cannot do (it would block behind the connection mutex this wait
+// holds). A thread descheduled for more than the gap in the middle of a wait restarts that
+// wait's clock, so its budget can then be exceeded by up to that gap; the budgets here are
+// seconds, not a hard real-time bound.
 int kv_busy_handler(void* ctx, int count) noexcept {
-    thread_local std::chrono::steady_clock::time_point wait_start;
+    struct WaitClock {
+        std::chrono::steady_clock::time_point start{};
+        std::chrono::steady_clock::time_point last{};
+        bool seen{false};
+    };
+    thread_local WaitClock wait;
     const auto now = std::chrono::steady_clock::now();
-    if (count == 0)
-        wait_start = now;
+    if (count == 0 || !wait.seen || now - wait.last > kBusyWaitRestartGap)
+        wait.start = now;
+    wait.seen = true;
+    wait.last = now;
     const auto* busy = static_cast<const KvBusyState*>(ctx);
     const auto limit = std::chrono::milliseconds{busy->budget_ms.load(std::memory_order_relaxed)};
-    if (now - wait_start >= limit)
+    if (now - wait.start >= limit)
         return 0;
-    std::this_thread::sleep_for(kBusyRetrySleep);
+    std::this_thread::sleep_for(busy_retry_sleep(count));
     return 1;
 }
 
@@ -113,8 +155,10 @@ KvStore::KvStore(KvStore&& other) noexcept : db_{other.db_}, busy_{std::move(oth
 
 KvStore& KvStore::operator=(KvStore&& other) noexcept {
     if (this != &other) {
-        // Close the connection BEFORE releasing the context it points at: close can still run
-        // the busy handler (a checkpoint), which reads the context.
+        // Close the connection BEFORE releasing the context it points at. Defensive ordering,
+        // not a measured need: closing a connection does not run the busy handler (SQLite's
+        // close-time checkpoint passes no handler; a review measured 0 handler calls), but nothing here
+        // should rely on that staying true across SQLite versions.
         if (db_)
             sqlite3_close(db_);
         db_ = other.db_;
@@ -135,6 +179,12 @@ std::expected<KvStore, KvStoreError> KvStore::open(const std::filesystem::path& 
                 std::format("failed to create directory {}: {}", parent.string(), ec.message())});
         }
     }
+
+    // The busy handler's context is allocated BEFORE the connection exists, so a failed
+    // allocation (bad_alloc) has no sqlite3* to leak, and every later early return frees it
+    // through the unique_ptr (#5604).
+    auto busy = std::make_unique<KvBusyState>();
+    busy->budget_ms.store(kKvStoreBusyTimeout.count(), std::memory_order_relaxed);
 
     sqlite3* raw_db = nullptr;
     int rc = sqlite3_open_v2(db_path.string().c_str(), &raw_db,
@@ -158,15 +208,16 @@ std::expected<KvStore, KvStoreError> KvStore::open(const std::filesystem::path& 
 
     // Busy handling for concurrent access (#5604): a handler reading an atomic budget instead of
     // sqlite3_busy_timeout(), so GuardianEngine::stop() can lower the budget lock-free and cut a
-    // wait already in progress. Starts at kKvStoreBusyTimeout, the old behaviour.
-    auto busy = std::make_unique<KvBusyState>();
-    busy->budget_ms.store(kKvStoreBusyTimeout.count(), std::memory_order_relaxed);
+    // wait already in progress. Starts at kKvStoreBusyTimeout, the old behaviour. Installing a
+    // handler on an open connection cannot fail (SQLite returns SQLITE_OK; SQLITE_MISUSE is only
+    // reachable for a closed or invalid handle), so a non-OK result is unreachable here. It is
+    // logged and tolerated rather than cleaned up by hand: the store then fails a locked write at
+    // once instead of waiting, and set_busy_timeout() has nothing to lower.
     rc = sqlite3_busy_handler(raw_db, &kv_busy_handler, busy.get());
-    if (rc != SQLITE_OK) {
-        sqlite3_close(raw_db);
-        return std::unexpected(
-            KvStoreError{std::format("failed to install the kv_store busy handler: rc={}", rc)});
-    }
+    if (rc != SQLITE_OK)
+        spdlog::error("KvStore: installing the busy handler failed (rc={}); a locked database "
+                      "will fail writes at once",
+                      rc);
 
     // Create table.
     //
@@ -204,8 +255,21 @@ std::expected<KvStore, KvStoreError> KvStore::open(const std::filesystem::path& 
 void KvStore::set_busy_timeout(std::chrono::milliseconds budget) noexcept {
     // Deliberately not under mu_: a call waiting on a locked database holds the connection
     // mutex (and mu_) for its whole wait, and the point is to shorten that wait.
-    if (busy_)
-        busy_->budget_ms.store(budget.count(), std::memory_order_relaxed);
+    if (busy_) {
+        // Clamped so a caller's value can never overflow the handler's millisecond-to-clock
+        // conversion (a budget beyond about 9.2e12 ms overflows int64 nanoseconds, which is
+        // undefined behaviour): negative and zero both mean "do not wait".
+        const auto clamped = (std::clamp)(budget, kKvStoreMinBusyTimeout, kKvStoreMaxBusyTimeout);
+        busy_->budget_ms.store(clamped.count(), std::memory_order_relaxed);
+    }
+}
+
+int KvStore::busy_handler_for_test(int count) noexcept {
+    return busy_ ? kv_busy_handler(busy_.get(), count) : 0;
+}
+
+std::chrono::milliseconds KvStore::busy_retry_sleep_for_test(int count) noexcept {
+    return busy_retry_sleep(count);
 }
 
 std::chrono::milliseconds KvStore::busy_timeout_for_test() const noexcept {

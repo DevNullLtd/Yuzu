@@ -19,6 +19,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -874,19 +876,25 @@ TEST_CASE("KvStore fallible reads surface a REAL SQLite failure as an error, not
 namespace {
 
 /// A second raw connection holding the write lock (BEGIN IMMEDIATE) until released or destroyed.
+/// The connection is owned by an RAII member from the moment it is opened, and the constructor
+/// asserts nothing (a REQUIRE that threw from here would skip the destructor and leak the
+/// handle): a caller checks `locked` with REQUIRE after construction.
 struct WriteLockHolder5604 {
-    sqlite3* raw{nullptr};
+    struct Closer {
+        void operator()(sqlite3* db) const { sqlite3_close(db); } // rolls back an open transaction
+    };
+    std::unique_ptr<sqlite3, Closer> raw;
+    bool locked{false};
     explicit WriteLockHolder5604(const fs::path& path) {
-        REQUIRE(sqlite3_open(path.string().c_str(), &raw) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(raw, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3* db = nullptr;
+        const int rc = sqlite3_open(path.string().c_str(), &db);
+        raw.reset(db);
+        locked = rc == SQLITE_OK &&
+                 sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) == SQLITE_OK;
     }
     void release() {
         if (raw)
-            sqlite3_exec(raw, "ROLLBACK", nullptr, nullptr, nullptr);
-    }
-    ~WriteLockHolder5604() {
-        if (raw)
-            sqlite3_close(raw); // rolls back an open transaction
+            sqlite3_exec(raw.get(), "ROLLBACK", nullptr, nullptr, nullptr);
     }
     WriteLockHolder5604(const WriteLockHolder5604&) = delete;
     WriteLockHolder5604& operator=(const WriteLockHolder5604&) = delete;
@@ -915,29 +923,38 @@ TEST_CASE("#5604 KvStore: lowering the budget from another thread cuts a write a
     auto t = make_test_store();
     REQUIRE(t.store.set("p", "seed", "v"));
     WriteLockHolder5604 holder{t.path};
+    REQUIRE(holder.locked);
 
     t.store.set_busy_timeout(2000ms);
-    // At ~100 ms the budget drops to 300 ms: the write already waiting must give up at ~300 ms,
-    // not run out the 2000 ms it started under. sqlite3_busy_timeout() from this thread would
-    // have blocked behind the waiting call's connection mutex and not shortened it.
-    std::thread lower([&] {
-        std::this_thread::sleep_for(100ms);
-        t.store.set_busy_timeout(300ms);
-    });
+    // The writer raises a flag right before its set(); this thread waits for the flag, gives the
+    // write a moment to reach the busy handler, then drops the budget to 200 ms. The write
+    // already waiting must give up at ~200 ms from its start, not run out the 2000 ms it started
+    // under. sqlite3_busy_timeout() from this thread would have blocked behind the waiting
+    // call's connection mutex and not shortened it.
+    std::atomic<bool> about_to_write{false};
     bool in_flight_ok = true;
-    const double in_flight = elapsed_ms_5604([&] { in_flight_ok = t.store.set("p", "k1", "v"); });
-    lower.join();
+    double in_flight = 0.0;
+    std::thread writer([&] {
+        in_flight = elapsed_ms_5604([&] {
+            about_to_write.store(true);
+            in_flight_ok = t.store.set("p", "k1", "v");
+        });
+    });
+    REQUIRE(yuzu::test::spin_until([&] { return about_to_write.load(); }));
+    std::this_thread::sleep_for(50ms);
+    t.store.set_busy_timeout(200ms);
+    writer.join();
     CHECK_FALSE(in_flight_ok);
-    CHECK(in_flight >= 300.0);
-    CHECK(in_flight < 1500.0); // RED if the 2000 ms it started under had run out
+    CHECK(in_flight >= 200.0);
+    CHECK(in_flight < 1000.0); // RED if the 2000 ms it started under had run out
 
     // A fresh write under the lowered budget costs it, and fails.
     bool fresh_ok = true;
     const double fresh = elapsed_ms_5604([&] { fresh_ok = t.store.set("p", "k2", "v"); });
     CHECK_FALSE(fresh_ok);
-    CHECK(fresh >= 300.0);
-    CHECK(fresh < 1500.0);
-    CHECK(t.store.busy_timeout_for_test() == 300ms); // never raised
+    CHECK(fresh >= 200.0);
+    CHECK(fresh < 1000.0);
+    CHECK(t.store.busy_timeout_for_test() == 200ms); // never raised
 
     // Releasing the lock: the same store writes again at once (nothing latched).
     holder.release();
@@ -952,18 +969,19 @@ TEST_CASE("#5604 KvStore: a MOVED store keeps a working busy handler (the contex
     // The handler's context pointer is registered with SQLite at open() and outlives the
     // KvStore object's address: moving the store must neither dangle it nor lose the budget.
     auto t = make_test_store();
-    t.store.set_busy_timeout(200ms);
+    t.store.set_busy_timeout(100ms);
     KvStore moved{std::move(t.store)};
-    CHECK(moved.busy_timeout_for_test() == 200ms);
+    CHECK(moved.busy_timeout_for_test() == 100ms);
     CHECK(t.store.busy_timeout_for_test() == 0ms); // moved-from: no context, no budget
     t.store.set_busy_timeout(5000ms);              // a no-op on a moved-from store, not a crash
 
     {
         WriteLockHolder5604 holder{t.path};
+        REQUIRE(holder.locked);
         bool ok = true;
         const double ms = elapsed_ms_5604([&] { ok = moved.set("p", "k", "v"); });
         CHECK_FALSE(ok);
-        CHECK(ms >= 200.0);
+        CHECK(ms >= 100.0);
         CHECK(ms < 1500.0);
     }
 
@@ -974,14 +992,118 @@ TEST_CASE("#5604 KvStore: a MOVED store keeps a working busy handler (the contex
     REQUIRE(other.has_value());
     other->set_busy_timeout(5000ms);
     *other = std::move(moved);
-    CHECK(other->busy_timeout_for_test() == 200ms);
+    CHECK(other->busy_timeout_for_test() == 100ms);
     {
         WriteLockHolder5604 holder{t.path};
+        REQUIRE(holder.locked);
         bool ok = true;
         const double ms = elapsed_ms_5604([&] { ok = other->set("p", "k2", "v"); });
         CHECK_FALSE(ok);
-        CHECK(ms >= 200.0);
+        CHECK(ms >= 100.0);
         CHECK(ms < 1500.0);
     }
     CHECK(other->set("p", "k3", "v"));
+}
+
+TEST_CASE("#5604 KvStore: set_busy_timeout clamps to [0, 1 h]; zero and negative mean do not wait",
+          "[kv_store][busy]") {
+    using namespace std::chrono_literals;
+    auto t = make_test_store();
+    t.store.set_busy_timeout(1234ms);
+    CHECK(t.store.busy_timeout_for_test() == 1234ms);
+    t.store.set_busy_timeout(0ms);
+    CHECK(t.store.busy_timeout_for_test() == 0ms);
+    t.store.set_busy_timeout(-5ms);
+    CHECK(t.store.busy_timeout_for_test() == kKvStoreMinBusyTimeout);
+    t.store.set_busy_timeout((std::chrono::milliseconds::min)());
+    CHECK(t.store.busy_timeout_for_test() == kKvStoreMinBusyTimeout);
+    t.store.set_busy_timeout(kKvStoreMaxBusyTimeout);
+    CHECK(t.store.busy_timeout_for_test() == kKvStoreMaxBusyTimeout);
+    t.store.set_busy_timeout(kKvStoreMaxBusyTimeout + 1ms);
+    CHECK(t.store.busy_timeout_for_test() == kKvStoreMaxBusyTimeout);
+    // The value that overflowed the handler's millisecond-to-nanosecond arithmetic before the clamp.
+    t.store.set_busy_timeout((std::chrono::milliseconds::max)());
+    CHECK(t.store.busy_timeout_for_test() == kKvStoreMaxBusyTimeout);
+    // With the huge value in place the handler still behaves (no overflow): it retries.
+    CHECK(t.store.busy_handler_for_test(0) == 1);
+
+    // Zero (and a negative, clamped to zero) means a locked database fails the call at once.
+    WriteLockHolder5604 holder{t.path};
+    REQUIRE(holder.locked);
+    for (const auto budget : {0ms, -5ms}) {
+        t.store.set_busy_timeout(budget);
+        bool ok = true;
+        const double ms = elapsed_ms_5604([&] { ok = t.store.set("p", "k", "v"); });
+        CHECK_FALSE(ok);
+        CHECK(ms < 1000.0); // the budget is zero: nothing waits
+    }
+}
+
+TEST_CASE("#5604 KvStore: the busy handler's retry sleep is a short ladder (1, 2, 5, then 10 ms)",
+          "[kv_store][busy]") {
+    using namespace std::chrono_literals;
+    CHECK(KvStore::busy_retry_sleep_for_test(0) == 1ms);
+    CHECK(KvStore::busy_retry_sleep_for_test(1) == 2ms);
+    CHECK(KvStore::busy_retry_sleep_for_test(2) == 5ms);
+    CHECK(KvStore::busy_retry_sleep_for_test(3) == 10ms);
+    CHECK(KvStore::busy_retry_sleep_for_test(4) == 10ms);
+    CHECK(KvStore::busy_retry_sleep_for_test(1'000'000) == 10ms);
+    CHECK(KvStore::busy_retry_sleep_for_test((std::numeric_limits<int>::max)()) == 10ms);
+    CHECK(KvStore::busy_retry_sleep_for_test(-1) == 1ms); // never indexes out of range
+    // The point of the ladder: a lock held for a few milliseconds is retried well before a
+    // flat 10 ms would have retried it.
+    CHECK(KvStore::busy_retry_sleep_for_test(0) < 10ms);
+    CHECK(KvStore::busy_retry_sleep_for_test(1) < 10ms);
+    CHECK(KvStore::busy_retry_sleep_for_test(2) < 10ms);
+}
+
+TEST_CASE("#5604 KvStore: a handler call with count > 0 on a thread that never saw count == 0 "
+          "does not fail at once, and a continuing wait is still cut at the budget",
+          "[kv_store][busy]") {
+    using namespace std::chrono_literals;
+    auto t = make_test_store();
+    t.store.set_busy_timeout(150ms);
+
+    // A fresh thread has no wait clock. count == 3 is a call SQLite could make for a wait this
+    // thread's handler never began (a reset count after a prepare or checkpoint wait): reading
+    // an empty start would see "elapsed since the epoch" and give up immediately.
+    int rc_fresh = -1;
+    double fresh_ms = 0.0;
+    std::thread fresh([&] {
+        fresh_ms = elapsed_ms_5604([&] { rc_fresh = t.store.busy_handler_for_test(3); });
+    });
+    fresh.join();
+    CHECK(rc_fresh == 1);        // RED before the guard: returned 0 at once
+    CHECK(fresh_ms >= 10.0);     // it slept the ladder's tail (a sleep never undershoots)
+
+    // A normal wait: count 0, 1, 2, ... until the handler gives up. It must give up, and only
+    // once the budget is spent.
+    int calls = 0;
+    int rc = 1;
+    const double wait_ms = elapsed_ms_5604([&] {
+        for (int count = 0; rc == 1 && count < 10'000; ++count, ++calls)
+            rc = t.store.busy_handler_for_test(count);
+    });
+    CHECK(rc == 0);
+    CHECK(calls > 3);
+    CHECK(wait_ms >= 150.0);
+    CHECK(wait_ms < 1500.0);
+
+    // A call long after the previous one is a different wait: its clock restarts instead of
+    // reading the old start. (Budget 150 ms; the gap below is longer than the restart gap.)
+    int rc_after_gap = -1;
+    std::thread gap([&] {
+        (void)t.store.busy_handler_for_test(0);
+        std::this_thread::sleep_for(300ms); // more than the 250 ms restart gap
+        rc_after_gap = t.store.busy_handler_for_test(5);
+    });
+    gap.join();
+    CHECK(rc_after_gap == 1);
+
+    // Count 0 always starts a wait: with a zero budget it gives up at once, with a budget it retries.
+    t.store.set_busy_timeout(0ms);
+    int rc_zero = -1;
+    std::thread zero([&] { rc_zero = t.store.busy_handler_for_test(0); });
+    zero.join();
+    CHECK(rc_zero == 0);
 }
