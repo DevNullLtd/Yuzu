@@ -46,24 +46,23 @@ configs:
               %% ships the guard). Safe only while :50063 stays unpublished
               %% on this compose network. Standing exception, revisit when
               %% the rig TLS flip lands (#1422 follow-up).
-              {allow_insecure_mgmt, true}
+              {allow_insecure_mgmt, true},
+              %% gRPC listeners (plaintext: no tls key). The rig is isolated.
+              {grpc_listeners, [
+                  #{name => agent,
+                    service_protos => [agent_pb],
+                    services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service},
+                    listen => #{port => 50051, ip => {0,0,0,0}}},
+                  #{name => mgmt,
+                    service_protos => [management_pb],
+                    services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},
+                    listen => #{port => 50063, ip => {0,0,0,0}}}
+              ]}
           ]},
           {grpcbox, [
               {client, #{channels => [
                   {default_channel, [{http, "server", 50055, []}], #{}}
-              ]}},
-              {servers, [
-                  #{grpc_opts => #{
-                      service_protos => [agent_pb],
-                      services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service}
-                  },
-                  listen_opts => #{port => 50051, ip => {0,0,0,0}}},
-                  #{grpc_opts => #{
-                      service_protos => [management_pb],
-                      services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service}
-                  },
-                  listen_opts => #{port => 50063, ip => {0,0,0,0}}}
-              ]}
+              ]}}
           ]},
           {kernel, [
               {connect_all, false},

@@ -58,4 +58,4 @@ The dispatch flow in `agent_registry.cpp` `send_to()`:
 - Agent has a `gateway_node` but no local stream → queue to `gw_pending_` for gateway forwarding
 - `forward_gateway_pending()` drains the queue via `gw_mgmt_stub_->SendCommand()`
 
-The gateway uses port range 5006x (vs server's 5005x); `gateway/config/sys.config` and `grpcbox` `listen_opts` are configured independently and must match. UAT credentials: fresh `yuzu-server.cfg` with PBKDF2-SHA256 hashed `admin` / `adminpassword1` per run; state lives under `/tmp/yuzu-uat/` and is wiped on each start.
+The gateway uses port range 5006x (vs server's 5005x); `gateway/config/sys.config` and the gateway's `grpc_listeners` `listen` ports (`YUZU_GW_AGENT_PORT` / `YUZU_GW_MGMT_PORT` override them) are configured independently of the server's and must match. UAT credentials: fresh `yuzu-server.cfg` with PBKDF2-SHA256 hashed `admin` / `adminpassword1` per run; state lives under `/tmp/yuzu-uat/` and is wiped on each start.

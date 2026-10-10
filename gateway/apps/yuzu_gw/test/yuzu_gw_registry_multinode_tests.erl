@@ -158,7 +158,7 @@ remote_session_not_admitted_test_() ->
             %% lookup would find it; admission must still refuse.
             ?assertEqual({ok, PeerAgentPid}, await_lookup(AgentId, PeerAgentPid, 100)),
             ?assertEqual(error, yuzu_gw_registry:lookup_session(SessionId)),
-            ?assertEqual({grpc_error, {<<"5">>, <<"unknown session">>}},
+            ?assertEqual({grpc_error, {5, <<"unknown session">>}},
                          yuzu_gw_agent_service:heartbeat(ctx:background(),
                                                          #{session_id => SessionId})),
             ?assertEqual(0, meck:num_calls(yuzu_gw_heartbeat_buffer, queue_heartbeat, '_'))

@@ -32,6 +32,8 @@
 
 %% logger handler and telemetry handler callbacks
 -export([log/2, forward_dropped/4]).
+%% shared with yuzu_grpc_origin_wire_tests
+-export([client_chan/4]).
 
 -define(SVC, 'yuzu.agent.v1.AgentService').
 -define(HEARTBEAT, <<"/yuzu.agent.v1.AgentService/Heartbeat">>).

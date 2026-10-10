@@ -9,14 +9,14 @@
 %%% counted and is never queued.
 %%%
 %%% The connection key is injected by mocking `yuzu_gw_conn:key_from_ctx/1'
-%%% (the real accessor needs a live grpcbox stream; that part is covered
+%%% (the real accessor needs a live gRPC stream; that part is covered
 %%% end to end by `yuzu_gw_heartbeat_conn_rpc_tests'). The registry is the
 %%% real one; the heartbeat buffer and the upstream client are mocks.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_heartbeat_binding_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
+-include_lib("yuzu_gw/src/yuzu_grpc.hrl").
 
 %% logger handler callback (log capture)
 -export([log/2]).

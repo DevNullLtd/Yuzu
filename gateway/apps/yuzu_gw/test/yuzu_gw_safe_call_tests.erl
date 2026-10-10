@@ -4,26 +4,30 @@
 %%% yuzu_gw_registry:register_agent/7 and the yuzu_gw_agent that makes it.
 %%%
 %%% The defect: the exit of a gen_server:call embeds the call, and so the
-%%% request. The caller is a grpcbox handler process; grpcbox logs the
-%%% exception of a handler that crashes, and a crash report names the exit
-%%% reason, neither of which the crash report filter can tell is ours. Here
-%%% every caller runs the call UNCAUGHT in a plain proc_lib process (as a
-%%% handler would), or under the same catch-and-log grpcbox_stream uses, with
-%%% the crash report filter installed and a capturing handler that sees every
-%%% event after the primary filters. Each is rendered with the default
-%%% formatter and with ~p, and none may contain a credential marker. The
-%%% server is absent (noproc), never answers (a fake, with a few
-%%% milliseconds of call timeout) or dies serving the call.
+%%% request. The caller is a gRPC handler process; a crash report names the
+%%% exit reason, and a handler wrapper that logged the exception would too,
+%%% neither of which the crash report filter can tell is ours. Here every
+%%% caller runs the call UNCAUGHT in a plain proc_lib process (as a handler
+%%% would), with the crash report filter installed and a capturing handler
+%%% that sees every event after the primary filters. The service handlers are
+%%% run through yuzu_grpc_runner, the wrapper a real handler runs in, whose own
+%%% rule is that a crash logs the method, the exception class and the top
+%%% frame and nothing else. Each event is rendered with the default formatter
+%%% and with ~p, and none may contain a credential marker. The server is
+%%% absent (noproc), never answers (a fake, with a few milliseconds of call
+%%% timeout) or dies serving the call.
 %%%
-%%% A positive control makes the same raw gen_server:call and requires the
-%%% markers to show, so a clean result cannot be an artefact of the harness.
+%%% Positive controls make the same raw gen_server:call (and a handler wrapper
+%%% that logs the exception) and require the markers to show, so a clean result
+%%% cannot be an artefact of the harness.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_safe_call_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
+-include("yuzu_grpc.hrl").
 
 -export([log/2]).  %% logger handler
+-export([run_fun/2]).  %% a unary handler for yuzu_grpc_runner: runs the fun it is given
 
 -define(HANDLER, yuzu_safe_call_test_log).
 -define(M_TOKEN, <<"MARKER-enrollment-token-1c9e">>).
@@ -40,8 +44,8 @@ safe_call_test_() ->
      [
       {"register: upstream not running answers upstream_unavailable, nothing leaks",
        fun register_noproc/0},
-      {"register: the grpcbox catch-and-log sees no exception",
-       fun register_noproc_grpcbox_style/0},
+      {"runner: a crashing handler logs the method, the class and the top frame, nothing else",
+       fun runner_crash_logs_no_request_no_reason/0},
       {"register: an upstream that never answers times out without leaking",
        fun register_timeout/0},
       {"register: an upstream that dies serving the call does not leak",
@@ -82,10 +86,10 @@ safe_call_test_() ->
        fun start_agent_guard/0},
       {"router send_command with the router not running answers an error, nothing leaks",
        fun router_send_command_router_down/0},
-      {"mgmt SendCommand with the router not running answers UNAVAILABLE (14) and logs one WARN",
+      {"mgmt SendCommand through the runner with the router not running answers UNAVAILABLE (14) and logs one WARN",
        fun mgmt_send_command_router_down/0},
-      {"control: a raw ets:insert into the missing pending table does leak",
-       fun control_raw_ets_insert_leaks/0}
+      {"control: a handler wrapper that logs the exception does leak",
+       fun control_logging_wrapper_leaks/0}
      ]}.
 
 setup() ->
@@ -119,19 +123,33 @@ register_noproc() ->
     ?assertEqual({returned, {error, upstream_unavailable}}, Result),
     assert_no_markers(Events).
 
-%% grpcbox_stream catches `C:E:S' of the handler and logs
-%% "crash: class=~p exception=~p stacktrace=~p" at INFO; that is what exposed
-%% the request. Nothing is thrown now, so nothing is logged.
-register_noproc_grpcbox_style() ->
-    {Result, Events} = run_caller(fun() ->
-        try yuzu_gw_upstream:proxy_register(req())
-        catch C:E:S ->
-            logger:info("crash: class=~p exception=~p stacktrace=~p", [C, E, S]),
-            grpcbox_would_answer_unknown
-        end
-    end),
-    ?assertEqual({returned, {error, upstream_unavailable}}, Result),
-    assert_no_markers(Events).
+%% The runner is what a handler runs in. Whatever escapes a handler, the call
+%% ends INTERNAL with a fixed message and the log carries the method, the
+%% exception class and the top frame's M:F/Arity: never the exit reason (which
+%% embeds the call), the stacktrace arguments (the frame of a badarg or a
+%% function_clause carries them), the thrown term or the returned one.
+runner_crash_logs_no_request_no_reason() ->
+    start_fake(yuzu_gw_upstream, hang),
+    Cases =
+        [{"exit of a raw gen_server:call (the reason embeds the request)", <<"class=exit">>,
+          fun(_Ctx) -> gen_server:call(yuzu_gw_upstream, {proxy_register, req()}, 50) end},
+         {"badarg whose stacktrace arguments are the request", <<"ets:insert/2">>,
+          fun(_Ctx) -> ets:insert(yuzu_gw_pending_missing_table, {<<"s">>, req()}) end},
+         {"throw of the request", <<"class=throw">>,
+          fun(_Ctx) -> throw(req()) end},
+         {"a return that is no result", <<"class=bad_return">>,
+          fun(_Ctx) -> req() end}],
+    lists:foreach(
+      fun({What, Needle, Fun}) ->
+          {Result, Events} = run_caller(fun() ->
+              via_runner(unary, ?MODULE, run_fun, #{request => #{call => Fun}})
+          end),
+          ?assertEqual({returned, {?GRPC_STATUS_INTERNAL, <<"internal error">>}}, Result, What),
+          assert_no_markers(Events),
+          Warns = [W || W <- warnings(Events), contains(W, <<"/test.Service/Method">>)],
+          ?assertMatch([_], Warns, What),
+          ?assert(contains(hd(Warns), Needle), What)
+      end, Cases).
 
 register_timeout() ->
     start_fake(yuzu_gw_upstream, hang),
@@ -306,7 +324,8 @@ control_raw_call_leaks() ->
 
 %% The Register handler stores the request in the pending table from its own
 %% process. The registry owns the table, so with the registry down the insert
-%% raised badarg with the request in the stacktrace, which grpcbox logs.
+%% raised badarg with the request in the stacktrace; the call now answers a
+%% fixed error, through the runner, and logs a fixed line.
 register_handler_registry_down() ->
     stop_named(yuzu_gw_registry),
     ok = meck:new(yuzu_gw_upstream, [passthrough, no_link]),
@@ -314,12 +333,11 @@ register_handler_registry_down() ->
         ok = meck:expect(yuzu_gw_upstream, proxy_register,
                          fun(_) -> {ok, #{session_id => <<"s-1">>}} end),
         {Result, Events} = run_caller(fun() ->
-            grpcbox_style(fun() ->
-                yuzu_gw_agent_service:register(ctx:background(),
-                    maps:merge(req(), #{info => #{agent_id => <<"a-1">>}}))
-            end)
+            via_runner(unary, yuzu_gw_agent_service, register,
+                       #{request => maps:merge(req(), #{info => #{agent_id => <<"a-1">>}})})
         end),
-        ?assertMatch({returned, {grpc_error, {?GRPC_STATUS_INTERNAL, _}}}, Result),
+        ?assertEqual({returned, {?GRPC_STATUS_INTERNAL,
+                                 <<"Registration failed: registry unavailable">>}}, Result),
         assert_no_markers(Events),
         %% The handler says what happened, in a fixed line.
         ?assert(lists:any(fun(W) -> contains(W, <<"registry_unavailable">>) end,
@@ -331,7 +349,7 @@ register_handler_registry_down() ->
 subscribe_handler_registry_down() ->
     stop_named(yuzu_gw_registry),
     {Result, Events} = run_subscribe(<<"s-sub-1">>),
-    ?assertMatch({returned, {caught, throw, {grpc_error, {?GRPC_STATUS_INTERNAL, _}}}}, Result),
+    ?assertEqual({returned, {?GRPC_STATUS_INTERNAL, <<"Internal: registry unavailable">>}}, Result),
     assert_no_markers(Events).
 
 subscribe_handler_agent_sup_down() ->
@@ -345,8 +363,8 @@ subscribe_handler_agent_sup_down() ->
                 #{agent_id => <<"a-2">>, agent_info => #{}, peer_addr => <<"p">>,
                   register_req => req(), conn_key => undefined}),
         {Result, Events} = run_subscribe(S),
-        ?assertMatch({returned, {caught, throw,
-                                 {grpc_error, {?GRPC_STATUS_INTERNAL, _}}}}, Result),
+        ?assertEqual({returned, {?GRPC_STATUS_INTERNAL,
+                                 <<"Internal: agent process start failed">>}}, Result),
         assert_no_markers(Events),
         %% Positive control: the pending row was consumed, so the handler got
         %% as far as the supervisor.
@@ -374,7 +392,7 @@ pending_calls_without_registry() ->
 start_agent_guard() ->
     stop_named(yuzu_gw_agent_sup),
     {Result, Events} = run_caller(fun() ->
-        grpcbox_style(fun() -> yuzu_gw_agent_sup:start_agent(#{register_req => req()}) end)
+        yuzu_gw_agent_sup:start_agent(#{register_req => req()})
     end),
     ?assertEqual({returned, {error, agent_sup_unavailable}}, Result),
     assert_no_markers(Events),
@@ -390,16 +408,14 @@ start_agent_guard() ->
 router_send_command_router_down() ->
     stop_named(yuzu_gw_router),
     {Result, Events} = run_caller(fun() ->
-        grpcbox_style(fun() ->
-            yuzu_gw_router:send_command([<<"a-1">>],
-                #{plugin => <<"p">>, parameters => #{<<"password">> => ?M_TOKEN}}, #{})
-        end)
+        yuzu_gw_router:send_command([<<"a-1">>],
+            #{plugin => <<"p">>, parameters => #{<<"password">> => ?M_TOKEN}}, #{})
     end),
     ?assertEqual({returned, {error, router_unavailable}}, Result),
     assert_no_markers(Events),
     ?assert(has_warning(Events, <<"noproc">>)).
 
-%% The operator-facing handler: a router that is down is a transient condition
+%% The operator-facing handler, run through the runner: a router that is down is a transient condition
 %% (UNAVAILABLE, 14), not INTERNAL (13); one WARN names only the class, however
 %% many commands fail inside the limiter's second, and the request is not logged.
 mgmt_send_command_router_down() ->
@@ -407,21 +423,24 @@ mgmt_send_command_router_down() ->
     Request = #{agent_ids => [<<"a-1">>],
                 command => #{plugin => <<"p">>, parameters => #{<<"password">> => ?M_TOKEN}}},
     {Result, Events} = run_caller(fun() ->
-        [yuzu_gw_mgmt_service:send_command(Request, no_stream) || _ <- lists:seq(1, 5)]
+        [via_runner(server_stream, yuzu_gw_mgmt_service, send_command, #{request => Request})
+         || _ <- lists:seq(1, 5)]
     end),
     {returned, Replies} = Result,
     ?assertEqual(5, length(Replies)),
-    [?assertEqual({error, #{status => 14, message => <<"Command router unavailable">>}}, R)
+    [?assertEqual({?GRPC_STATUS_UNAVAILABLE, <<"Command router unavailable">>}, R)
      || R <- Replies],
     assert_no_markers(Events),
     ?assert(has_warning(Events, <<"noproc">>)),
     ?assertEqual(1, length([W || W <- warnings(Events),
                                  contains(W, <<"Call to yuzu_gw_router failed">>)])).
 
-%% The harness sees the leak when there is one: the same insert, made raw.
-control_raw_ets_insert_leaks() ->
+%% The harness sees the leak when there is one: the same insert, made raw,
+%% under a wrapper that logs the exception the way a careless handler wrapper
+%% would (the runner does not).
+control_logging_wrapper_leaks() ->
     {Result, Events} = run_caller(fun() ->
-        grpcbox_style(fun() ->
+        logging_wrapper(fun() ->
             ets:insert(yuzu_gw_pending_missing_table, {<<"s">>, #{register_req => req()}, 1})
         end)
     end),
@@ -433,33 +452,48 @@ control_raw_ets_insert_leaks() ->
 %%% Scenario helpers
 %%%===================================================================
 
-%% Fun under the catch-and-log grpcbox_stream wraps a handler in, answering what
-%% it returned or {caught, Class, Exception}.
-grpcbox_style(Fun) ->
+%% The unary handler of the tests that need an arbitrary function: calls the
+%% fun in the request with the ctx.
+run_fun(Ctx, #{call := Fun}) ->
+    Fun(Ctx).
+
+%% Service function Module:Function run the way the stream handler runs it
+%% (yuzu_grpc_runner:run/1), in the calling process, and the {Status, Message}
+%% the runner ended the call with. Extra is the `request' (unary, server_stream)
+%% or `ref' (bidi). The stream's connection is the calling process, which is
+%% also the connection key of the ctx, and its ctx carries Headers. Only for
+%% calls that end in a status without sending a response.
+via_runner(Kind, Module, Function, Extra) ->
+    via_runner(Kind, Module, Function, Extra, #{}).
+
+via_runner(Kind, Module, Function, Extra, Headers) ->
+    Conn = self(),
+    Ctx = yuzu_grpc:new_ctx(Headers, Conn, undefined, undefined, undefined),
+    Stream = #yuzu_grpc_stream{conn = Conn, stream_id = 1, ctx = Ctx,
+                               method = <<"/test.Service/Method">>,
+                               pb = agent_pb, output = 'yuzu.agent.v1.RegisterResponse'},
+    ok = yuzu_grpc_runner:run(Extra#{kind => Kind, module => Module, function => Function,
+                                     stream => Stream}),
+    receive {{Conn, 1}, {grpc_end, _Runner, Status, Message}} -> {Status, Message}
+    after 0 -> no_status
+    end.
+
+%% A handler wrapper that catches everything and logs the exception: the
+%% careless version of the runner, for the positive control.
+logging_wrapper(Fun) ->
     try Fun()
     catch C:E:S ->
         logger:info("crash: class=~p exception=~p stacktrace=~p", [C, E, S]),
         {caught, C, E}
     end.
 
-%% yuzu_gw_agent_service:subscribe/2 for session S, with the stream's ctx
-%% mocked to carry the session id header.
+%% yuzu_gw_agent_service:subscribe/2 for session S, through the runner, with
+%% the session id header on the call.
 run_subscribe(S) ->
-    ok = meck:new(grpcbox_stream, [non_strict, no_link]),
-    try
-        ok = meck:expect(grpcbox_stream, ctx,
-                         fun(_State) ->
-                             ctx:set(ctx:background(), md_incoming_key,
-                                     #{<<"x-yuzu-session-id">> => S})
-                         end),
-        run_caller(fun() ->
-            grpcbox_style(fun() ->
-                yuzu_gw_agent_service:subscribe(make_ref(), not_a_stream_state)
-            end)
-        end)
-    after
-        meck:unload(grpcbox_stream)
-    end.
+    run_caller(fun() ->
+        via_runner(bidi, yuzu_gw_agent_service, subscribe, #{ref => make_ref()},
+                   #{<<"x-yuzu-session-id">> => S})
+    end).
 
 req() ->
     #{enrollment_token => ?M_TOKEN, machine_certificate => ?M_CERT, csr_pem => ?M_CSR}.
@@ -468,7 +502,7 @@ register_agent() ->
     yuzu_gw_registry:register_agent(<<"a-1">>, self(), <<"s-1">>, [], <<"h">>, req(),
                                     undefined).
 
-%% Run Fun, uncaught, in a plain proc_lib process (as a grpcbox handler is),
+%% Run Fun, uncaught, in a plain proc_lib process (as a gRPC handler is),
 %% and return {{returned, Result} | no_result, EventsItLogged}. The capture
 %% handler runs in the logging process, so every event of the caller is in this
 %% process's mailbox before the 'DOWN' that follows its exit.

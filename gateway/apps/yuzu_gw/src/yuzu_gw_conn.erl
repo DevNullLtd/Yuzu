@@ -7,11 +7,10 @@
 %%% same channel) reports the same key; calls on different connections
 %%% report different keys. Heartbeat admission compares these keys.
 %%%
-%%% The pid comes from the vendored grpcbox accessors
-%%% `grpcbox_stream:connection_pid/1' and
-%%% `grpcbox_stream:connection_pid_from_ctx/1' (see
-%%% gateway/_checkouts/grpcbox/YUZU_PATCH.md). This module is the only place
-%%% the agent-facing handlers obtain a key, so tests can replace it.
+%%% The pid is the Cowboy connection process, read from the call's ctx
+%%% (`yuzu_grpc:conn_pid/1') or stream (`yuzu_grpc_stream:conn_pid/1'). This
+%%% module is the only place the agent-facing handlers obtain a key, so tests can
+%%% replace it.
 %%%
 %%% `undefined' means "no key available" (for example a ctx that does not
 %%% come from a live stream). It is never a usable key: a session bound to
@@ -28,13 +27,13 @@
 %% @doc Connection key for the ctx a unary handler receives.
 -spec key_from_ctx(ctx:t()) -> key().
 key_from_ctx(Ctx) ->
-    try grpcbox_stream:connection_pid_from_ctx(Ctx)
+    try yuzu_grpc:conn_pid(Ctx)
     catch _:_ -> undefined
     end.
 
 %% @doc Connection key for the stream state a bidi handler receives.
--spec key_from_stream(grpcbox_stream:t()) -> key().
+-spec key_from_stream(yuzu_grpc_stream:stream()) -> key().
 key_from_stream(Stream) ->
-    try grpcbox_stream:connection_pid(Stream)
+    try yuzu_grpc_stream:conn_pid(Stream)
     catch _:_ -> undefined
     end.

@@ -11,16 +11,19 @@
 %%% - ReportInventory: proxied upstream
 %%% - ExecuteCommand: not used (Subscribe is the primary channel)
 %%%
-%%% grpcbox calling conventions (v0.17.1):
-%%%   Unary:   Module:Fun(Ctx, Request)   -> {ok, Response, Ctx} | {grpc_error, {Status, Msg}}
-%%%   Bidi:    Module:Fun(Ref, State)     -> any()  (loops until stream ends)
+%%% Calling conventions (yuzu_grpc_runner):
+%%%   Unary:         Module:Fun(Ctx, Request) -> {ok, Response, Ctx} | {grpc_error, {Status, Msg}}
+%%%   Server stream: Module:Fun(Request, Stream) -> ok | {grpc_error, {Status, Msg}}
+%%%   Bidi:          Module:Fun(Ref, Stream)  -> ok | {grpc_error, {Status, Msg}}
+%%%                  (loops until the stream ends)
+%%% A handler may also throw({grpc_error, {Status, Msg}}) from anywhere.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_agent_service).
 
--include_lib("grpcbox/include/grpcbox.hrl").
+-include("yuzu_grpc.hrl").
 
-%% grpcbox service callbacks
+%% service callbacks (yuzu_grpc_runner)
 -export([register/2,
          subscribe/2,
          heartbeat/2,
@@ -31,10 +34,21 @@
 %% Register — proxy to C++ server
 %%--------------------------------------------------------------------
 
-register(Ctx, RegisterReq) ->
-    Headers = grpcbox_metadata:from_incoming_ctx(Ctx),
-    PeerAddr = maps:get(<<":authority">>, Headers,
-                        maps:get(<<"x-forwarded-for">>, Headers, <<"unknown">>)),
+register(Ctx, RegisterReq0) ->
+    %% The address of the agent, as the gateway decided it (yuzu_grpc_origin):
+    %% the TCP peer, or the address a TRUSTED proxy vouched for. It is put in
+    %% RegisterRequest.gateway_observed_peer, which is gateway-authoritative:
+    %% whatever the agent put there is overwritten, an empty value when the
+    %% address is unknown. The server records it as the agent's source_ip and
+    %% trusts it on this path, so passing the agent's own value through would let
+    %% an agent choose the address its registration is attributed to.
+    Origin = origin_text(Ctx),
+    RegisterReq = (maps:without([<<"gateway_observed_peer">>], RegisterReq0))
+                      #{gateway_observed_peer => Origin},
+    PeerAddr = case Origin of
+        <<>> -> <<"unknown">>;
+        _ -> Origin
+    end,
 
     %% A slot on the connection is RESERVED before the registration goes
     %% upstream: the check and the claim are one step in the registry, so
@@ -58,6 +72,13 @@ register(Ctx, RegisterReq) ->
             logger:warning("Register failed: registry_unavailable"),
             {grpc_error, {?GRPC_STATUS_INTERNAL,
                           <<"Registration failed: registry unavailable">>}}
+    end.
+
+%% The origin address of a call as text (a bare IP), or <<>> when it has none.
+origin_text(Ctx) ->
+    case yuzu_grpc:origin(Ctx) of
+        {Ip, _How} -> yuzu_grpc_origin:format(Ip);
+        undefined -> <<>>
     end.
 
 register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
@@ -124,18 +145,18 @@ register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
 %%--------------------------------------------------------------------
 %% Subscribe — terminate bidi stream locally
 %%
-%% grpcbox calls this as subscribe(Ref, State) where:
-%%   Ref   = make_ref() used as the mailbox key for incoming agent data
-%%   State = grpcbox_stream:state() (opaque record; use grpcbox_stream API)
+%% Called as subscribe(Ref, Stream) in its own process, where:
+%%   Ref    = make_ref() used as the mailbox key for incoming agent data
+%%   Stream = the stream handle (opaque; use the yuzu_grpc_stream API)
 %%
 %% Incoming data (agent -> gateway) arrives as {Ref, DecodedMap} messages.
-%% To send data (gateway -> agent) use grpcbox_stream:send(Msg, State).
+%% To send data (gateway -> agent) use yuzu_grpc_stream:send(Stream, Msg).
 %% Stream end is signalled as {Ref, eos}.
 %%--------------------------------------------------------------------
 
 subscribe(Ref, State) ->
-    Ctx = grpcbox_stream:ctx(State),
-    Headers = grpcbox_metadata:from_incoming_ctx(Ctx),
+    Ctx = yuzu_grpc_stream:ctx(State),
+    Headers = yuzu_grpc:headers(Ctx),
     SessionId = maps:get(<<"x-yuzu-session-id">>, Headers, undefined),
 
     case SessionId of
@@ -206,7 +227,7 @@ subscribe(Ref, State) ->
             end
     end.
 
-%% Subscribe stream loop: relay messages between grpcbox and the agent process.
+%% Subscribe stream loop: relay messages between the stream and the agent process.
 %%
 %% Backpressure: before writing a command to the HTTP/2 stream, we check
 %% our own message queue length. If it exceeds the threshold (configurable
@@ -230,7 +251,7 @@ stream_loop(Ref, State, AgentPid) ->
             %% Check backpressure before writing to stream.
             case check_backpressure() of
                 ok ->
-                    grpcbox_stream:send(Cmd, State),
+                    yuzu_grpc_stream:send(State, Cmd),
                     stream_loop(Ref, State, AgentPid);
                 {backpressure, QueueLen} ->
                     %% H13: Log and count dropped commands instead of dropping silently.
@@ -295,7 +316,7 @@ heartbeat(Ctx, HeartbeatReq) ->
 %% ExecuteCommand — not used (Subscribe is the primary channel)
 %%--------------------------------------------------------------------
 
-execute_command(_Ctx, _CommandReq) ->
+execute_command(_CommandReq, _Stream) ->
     {grpc_error, {?GRPC_STATUS_UNIMPLEMENTED,
                   <<"Use Subscribe for command delivery">>}}.
 

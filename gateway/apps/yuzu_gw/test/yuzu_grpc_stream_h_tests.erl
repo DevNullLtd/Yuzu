@@ -15,7 +15,7 @@
 -module(yuzu_grpc_stream_h_tests).
 -include_lib("eunit/include/eunit.hrl").
 
--export([forward_dropped/4]).
+-export([forward_dropped/4, forward_origin/4]).
 
 -define(SVC, 'yuzu.agent.v1.AgentService').
 -define(HEARTBEAT, <<"/yuzu.agent.v1.AgentService/Heartbeat">>).
@@ -137,6 +137,89 @@ auth_test_() ->
                Frame = hb_frame(<<"x">>),
                ?assertMatch({[{flow, _}], _}, yuzu_grpc_stream_h:data(1, fin, Frame, St)),
                receive {probe_started, _, _, _} -> error(handler_started) after 0 -> ok end
+           end)].
+
+%%%-------------------------------------------------------------------
+%%% The address a call is attributed to (yuzu_grpc_origin)
+%%%-------------------------------------------------------------------
+
+origin_test_() ->
+    Lb = {10, 0, 0, 5},
+    Client = {203, 0, 113, 9},
+    ViaLb = fun(Req) -> Req#{peer => {Lb, 40000}} end,
+    Xff = fun(Value) -> #{<<"x-forwarded-for">> => Value} end,
+    FwdEnv = fun(Routes, Sources) ->
+                 env(Routes, #{origin => #{mode => forwarded_for, sources => Sources}})
+             end,
+    ProxyEnv = fun(Routes, Sources) ->
+                   env(Routes, #{origin => #{mode => proxy_protocol, sources => Sources}})
+               end,
+    ProxyInfo = #{version => 2, command => proxy, transport_family => ipv4,
+                  transport_protocol => stream, src_address => Client, src_port => 41000,
+                  dest_address => {10, 0, 0, 9}, dest_port => 50051},
+    [?CASE("with no origin configured the TCP peer is the origin and a forwarded-for header is ignored",
+           begin
+               Ctx = unary_ctx(req(?HEARTBEAT, Xff(<<"192.0.2.1">>)), env(Routes)),
+               ?assertEqual({{127, 0, 0, 1}, transport}, yuzu_grpc:origin(Ctx)),
+               ?assertEqual({{127, 0, 0, 1}, 40000}, yuzu_grpc:peer(Ctx))
+           end),
+     ?CASE("a trusted proxy's x-forwarded-for entry is the origin; the peer is still the proxy",
+           begin
+               Req = ViaLb(req(?HEARTBEAT, Xff(<<"198.51.100.7, 203.0.113.9">>))),
+               Ctx = unary_ctx(Req, FwdEnv(Routes, [Lb])),
+               ?assertEqual({Client, forwarded_for}, yuzu_grpc:origin(Ctx)),
+               ?assertEqual({Lb, 40000}, yuzu_grpc:peer(Ctx))
+           end),
+     ?CASE("x-forwarded-for from a peer that is not a trusted proxy is ignored and counted",
+           with_origin_events(
+             fun() ->
+                 Ctx = unary_ctx(req(?HEARTBEAT, Xff(<<"192.0.2.1">>)), FwdEnv(Routes, [Lb])),
+                 ?assertEqual({{127, 0, 0, 1}, transport}, yuzu_grpc:origin(Ctx)),
+                 ?assertEqual({forwarded_for, untrusted_source}, origin_event())
+             end)),
+     ?CASE("an unusable x-forwarded-for from a trusted proxy falls back to the peer and is counted",
+           with_origin_events(
+             fun() ->
+                 Ctx = unary_ctx(ViaLb(req(?HEARTBEAT, Xff(<<"not-an-address">>))),
+                                 FwdEnv(Routes, [Lb])),
+                 ?assertEqual({Lb, transport}, yuzu_grpc:origin(Ctx)),
+                 ?assertEqual({forwarded_for, bad_claim}, origin_event())
+             end)),
+     ?CASE("a PROXY header from a trusted proxy is the origin",
+           begin
+               Req = (ViaLb(req(?HEARTBEAT)))#{proxy_header => ProxyInfo},
+               Ctx = unary_ctx(Req, ProxyEnv(Routes, [Lb])),
+               ?assertEqual({Client, proxy_protocol}, yuzu_grpc:origin(Ctx)),
+               ?assertEqual({Lb, 40000}, yuzu_grpc:peer(Ctx))
+           end),
+     ?CASE("a PROXY header from a peer that is not a trusted proxy is ignored and counted",
+           with_origin_events(
+             fun() ->
+                 Req = (req(?HEARTBEAT))#{proxy_header => ProxyInfo},
+                 Ctx = unary_ctx(Req, ProxyEnv(Routes, [Lb])),
+                 ?assertEqual({{127, 0, 0, 1}, transport}, yuzu_grpc:origin(Ctx)),
+                 ?assertEqual({proxy_protocol, untrusted_source}, origin_event())
+             end)),
+     ?CASE("a PROXY LOCAL (the balancer's own health check) is the peer and is counted",
+           with_origin_events(
+             fun() ->
+                 Req = (ViaLb(req(?HEARTBEAT)))#{proxy_header => #{version => 2, command => local}},
+                 Ctx = unary_ctx(Req, ProxyEnv(Routes, [Lb])),
+                 ?assertEqual({Lb, transport}, yuzu_grpc:origin(Ctx)),
+                 ?assertEqual({proxy_protocol, no_claim}, origin_event())
+             end)),
+     ?CASE("a streaming handler's ctx carries the origin too",
+           begin
+               Env = FwdEnv(Routes, [Lb]),
+               {[{spawn, _, _}], _} = init(ViaLb(req(?SUBSCRIBE, Xff(<<"203.0.113.9">>))), Env),
+               {_Handler, _Ref, Stream} = started(),
+               ?assertEqual({Client, forwarded_for},
+                            yuzu_grpc:origin(yuzu_grpc_stream:ctx(Stream)))
+           end),
+     ?CASE("a call served with no usable origin reports nothing rather than guessing",
+           begin
+               Ctx = unary_ctx((req(?HEARTBEAT))#{peer => undefined}, env(Routes)),
+               ?assertEqual(undefined, yuzu_grpc:origin(Ctx))
            end)].
 
 %%%-------------------------------------------------------------------
@@ -622,6 +705,30 @@ assert_refused(Status, {Commands, _State}) ->
     ?assertMatch([{response, 200, #{<<"grpc-status">> := Expected,
                                     <<"content-type">> := <<"application/grpc">>}, <<>>}, stop],
                  Commands).
+
+%% The ctx a unary handler is handed for a request.
+unary_ctx(Req, Env) ->
+    {[], St0} = init(Req, Env),
+    {[{spawn, _, _}, {flow, _}], _} = yuzu_grpc_stream_h:data(1, fin, hb_frame(<<"x">>), St0),
+    {_Handler, _Request, Ctx} = started(),
+    Ctx.
+
+%% Telemetry: capture the origin_ignored events for the duration of Fun.
+with_origin_events(Fun) ->
+    fun() ->
+        Id = {?MODULE, make_ref()},
+        ok = telemetry:attach(Id, [yuzu, gw, grpc, origin_ignored], fun ?MODULE:forward_origin/4,
+                              self()),
+        try Fun() after telemetry:detach(Id) end
+    end.
+
+forward_origin(_Event, #{count := 1}, #{mode := Mode, reason := Reason}, Pid) ->
+    Pid ! {origin_ignored, Mode, Reason},
+    ok.
+
+origin_event() ->
+    receive {origin_ignored, Mode, Reason} -> {Mode, Reason}
+    after 5000 -> error(no_origin_event) end.
 
 %% Telemetry: capture the dropped_data events for the duration of Fun.
 with_dropped_events(Fun) ->

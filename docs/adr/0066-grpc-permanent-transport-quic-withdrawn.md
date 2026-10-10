@@ -61,3 +61,7 @@ Constraints on the #5578 design:
 - ECDSA P-256/P-384 for the internal CA (`x509_ca.hpp`) stays. It was chosen with QUIC in mind, but it is equally the right choice for gRPC over TLS 1.2 and 1.3.
 - The account-lockout follow-up UP-2, also parked on "QUIC-era auth work", is re-homed to #5579.
 - A proposal to rewrite the gateway transport (for example Cowboy + gun) is a separate decision. This ADR does not adopt one. The default path is the grpcbox fix backlog (#1172, #1293, #635, #3913, #5175) and grpcbox upgrades.
+
+## Amendment — 2026-10-10: the gateway's two listeners move off grpcbox
+
+The Decision is unchanged: gRPC stays Yuzu's permanent transport, on the wire and in the protobuf contracts. What changes is the Erlang *server* implementation behind the gateway's two listeners (agent `:50051`, management `:50063`). They are now served by a thin gRPC layer over Cowboy/Ranch that this repository owns (`gateway/apps/yuzu_gw/src/yuzu_grpc*.erl`), configured under `{yuzu_gw, grpc_listeners}`. grpcbox remains in use as the gateway's upstream *client* (the channel to the C++ server) for now. The constraints above carry over to the new layer unchanged: no `auth_fun` on the agent listener, and the layer exposes the peer certificate to handlers (`yuzu_grpc:peer_cert/1`) so the accessor the #5578 design needs does not require patching a dependency. The `Consequences` bullet on the grpcbox fix backlog describes the position when this ADR was written; the listener-side items of that backlog are now handled in the owned layer.

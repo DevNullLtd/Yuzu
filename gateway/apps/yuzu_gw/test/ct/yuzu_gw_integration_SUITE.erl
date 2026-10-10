@@ -502,7 +502,7 @@ mgmt_list_agents(_Config) ->
         io_lib:format("list-agent-~b", [I]))) || I <- lists:seq(1, 10)],
 
     Request = #{limit => 5, cursor => undefined},
-    {ok, Response, _} = yuzu_gw_mgmt_service:list_agents(Request, #{}),
+    {ok, Response, _} = yuzu_gw_mgmt_service:list_agents(ctx:background(), Request),
 
     AgentList = maps:get(agents, Response),
     ?assertEqual(5, length(AgentList)),
@@ -510,7 +510,7 @@ mgmt_list_agents(_Config) ->
 
     %% Second page.
     Request2 = #{limit => 10, cursor => maps:get(next_cursor, Response)},
-    {ok, Response2, _} = yuzu_gw_mgmt_service:list_agents(Request2, #{}),
+    {ok, Response2, _} = yuzu_gw_mgmt_service:list_agents(ctx:background(), Request2),
     AgentList2 = maps:get(agents, Response2),
     ?assert(length(AgentList2) >= 5),
 
@@ -521,7 +521,7 @@ mgmt_get_agent(_Config) ->
     {AgentPid, _} = start_silent_agent(AgentId),
 
     Request = #{agent_id => AgentId},
-    {ok, Response, _} = yuzu_gw_mgmt_service:get_agent(Request, #{}),
+    {ok, Response, _} = yuzu_gw_mgmt_service:get_agent(ctx:background(), Request),
 
     Summary = maps:get(summary, Response),
     ?assertEqual(AgentId, maps:get(agent_id, Summary)),
@@ -540,7 +540,7 @@ upstream_register_error_handling(Config) ->
     %% (non-transport) gRPC status reaches yuzu_gw_upstream:do_rpc/4 in
     %% grpcbox_client:unary/5's REAL shape -- `{error, {Status, Message},
     %% Trailers}`, Status being the raw `grpc-status` trailer as a binary
-    %% digit string (grpcbox_stream:grpc_error_response()) -- and do_rpc
+    %% digit string -- and do_rpc
     %% surfaces it UNWRAPPED as `{error, {Status, Message}}`, which is what
     %% callers such as do_replay_one/6's FAILED_PRECONDITION branch match
     %% on. `{error, {internal, Bin}}` is reserved for transport-level

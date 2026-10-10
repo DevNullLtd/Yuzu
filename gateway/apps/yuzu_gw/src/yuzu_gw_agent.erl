@@ -14,7 +14,7 @@
 %%%
 %%% To send a command to the agent, we send {send_command, Cmd} to the
 %%% stream_pid (the subscribe handler process), which calls
-%%% grpcbox_stream:send(Cmd, State) to write it to the HTTP/2 stream.
+%%% yuzu_grpc_stream:send(State, Cmd) to write it to the HTTP/2 stream.
 %%%
 %%% The agent process monitors stream_pid so that if the stream handler
 %%% crashes without sending stream_closed, we still transition to

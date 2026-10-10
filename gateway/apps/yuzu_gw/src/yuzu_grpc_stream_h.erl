@@ -112,7 +112,7 @@ start(StreamId, Req, Env) ->
         false ->
             reject(St0, ?GRPC_STATUS_UNAUTHENTICATED, <<"unauthenticated">>);
         true ->
-            admitted(StreamId, Req, Env, Limits, St0)
+            admitted(StreamId, Req, Env, St0)
     end.
 
 %% The authentication is the first thing that happens to a stream, ahead of
@@ -132,7 +132,7 @@ authenticate(AuthFun, Cert) ->
         _:_ -> false
     end.
 
-admitted(StreamId, Req, Env, Limits, St0) ->
+admitted(StreamId, Req, Env, St0) ->
     Headers = maps:get(headers, Req),
     case check_request(Req, Headers, maps:get(grpc, Env, #{})) of
         {error, Status, Message} ->
@@ -142,7 +142,7 @@ admitted(StreamId, Req, Env, Limits, St0) ->
                 {error, invalid} ->
                     reject(St0, ?GRPC_STATUS_INVALID_ARGUMENT, <<"invalid grpc-timeout">>);
                 Timeout ->
-                    call(StreamId, Req, Headers, Route, Timeout, Limits, St0)
+                    call(StreamId, Req, Headers, Route, Timeout, Env, St0)
             end
     end.
 
@@ -166,10 +166,12 @@ check_request(Req, Headers, Routes) ->
             {error, ?GRPC_STATUS_INVALID_ARGUMENT, <<"method must be POST">>}
     end.
 
-call(StreamId, Req, Headers, Route, Timeout, Limits, St0) ->
+call(StreamId, Req, Headers, Route, Timeout, Env, St0) ->
     #{path := Path, pb := Pb, output := Output, kind := Kind} = Route,
+    Limits = maps:get(limits, Env, #{}),
     Conn = self(),
-    Ctx = yuzu_grpc:new_ctx(Headers, Conn, maps:get(peer, Req, undefined),
+    Peer = maps:get(peer, Req, undefined),
+    Ctx = yuzu_grpc:new_ctx(Headers, Conn, Peer, origin(Env, Peer, Req, Headers),
                             maps:get(cert, Req, undefined)),
     Stream = #yuzu_grpc_stream{conn = Conn, stream_id = StreamId, ctx = Ctx,
                                method = Path, pb = Pb, output = Output,
@@ -194,6 +196,22 @@ call(StreamId, Req, Headers, Route, Timeout, Limits, St0) ->
         {_, false} ->
             reject(St1, ?GRPC_STATUS_INTERNAL, <<"missing request message">>)
     end.
+
+%% The address the call is attributed to (yuzu_grpc_origin). A claim that was
+%% ignored is counted by mode and reason only: the address is never logged or
+%% put in a metric label.
+origin(_Env, undefined, _Req, _Headers) ->
+    undefined;
+origin(Env, {PeerIp, _Port}, Req, Headers) ->
+    Config = maps:get(origin, Env, #{mode => transport}),
+    {Origin, Note} = yuzu_grpc_origin:resolve(Config, PeerIp, maps:get(proxy_header, Req, undefined),
+                                              Headers),
+    case Note of
+        ok -> ok;
+        _ -> telemetry:execute([yuzu, gw, grpc, origin_ignored], #{count => 1},
+                               #{mode => maps:get(mode, Config), reason => Note})
+    end,
+    Origin.
 
 arm_deadline(_StreamId, infinity) ->
     undefined;

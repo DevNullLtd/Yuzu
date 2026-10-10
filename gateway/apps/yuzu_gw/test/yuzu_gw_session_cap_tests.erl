@@ -25,7 +25,7 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_session_cap_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
+-include("yuzu_grpc.hrl").
 
 -export([handle_event/4, log/2]).
 
@@ -422,24 +422,19 @@ subscribe_handler_refuses_before_start() ->
     S = session(9),
     true = ets:insert(yuzu_gw_pending, {S, info(agent(9), conn_a),
                                         erlang:monotonic_time(millisecond)}),
-    ok = meck:new(grpcbox_stream, [non_strict, no_link]),
-    try
-        ok = meck:expect(grpcbox_stream, ctx,
-                         fun(_State) ->
-                             ctx:set(ctx:background(), md_incoming_key,
-                                     #{<<"x-yuzu-session-id">> => S})
-                         end),
-        Result = try yuzu_gw_agent_service:subscribe(make_ref(), not_a_stream_state)
-                 catch throw:T -> {thrown, T}
-                 end,
-        ?assertMatch({thrown, {grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}}}, Result),
-        ?assertEqual(1, refused()),
-        %% No error-level report (a crash of a started agent process would be one).
-        ?assertEqual([], [T || {_, log, T} <- ets:tab2list(?EVENTS_TAB),
-                               binary:match(T, <<"crasher">>) =/= nomatch])
-    after
-        meck:unload(grpcbox_stream)
-    end.
+    Stream = #yuzu_grpc_stream{conn = self(), stream_id = 1,
+                               ctx = yuzu_grpc:new_ctx(#{<<"x-yuzu-session-id">> => S},
+                                                       self(), undefined, undefined, undefined),
+                               method = <<"/yuzu.agent.v1.AgentService/Subscribe">>,
+                               pb = agent_pb, output = 'yuzu.agent.v1.CommandRequest'},
+    Result = try yuzu_gw_agent_service:subscribe(make_ref(), Stream)
+             catch throw:T -> {thrown, T}
+             end,
+    ?assertMatch({thrown, {grpc_error, {?GRPC_STATUS_UNAVAILABLE, _}}}, Result),
+    ?assertEqual(1, refused()),
+    %% No error-level report (a crash of a started agent process would be one).
+    ?assertEqual([], [T || {_, log, T} <- ets:tab2list(?EVENTS_TAB),
+                           binary:match(T, <<"crasher">>) =/= nomatch]).
 
 agent_process_refused() ->
     mock_handler_deps(),

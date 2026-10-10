@@ -20,6 +20,52 @@
 -module(yuzu_gw_telemetry_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+%% The gRPC layer's events reach the counters (same blind spot as above: the
+%% producer's own tests only see that the event was emitted).
+grpc_layer_metrics_test_() ->
+    {setup,
+     fun() ->
+        {ok, Started} = application:ensure_all_started(prometheus),
+        {ok, Started2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        ok = yuzu_gw_telemetry:setup(),
+        Started ++ Started2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"an ignored origin claim reaches the counter, labelled by mode and reason",
+       fun() ->
+           Labels = [<<"proxy_protocol">>, <<"untrusted_source">>],
+           Before = counter_val(yuzu_gw_grpc_origin_ignored_total, Labels),
+           telemetry:execute([yuzu, gw, grpc, origin_ignored], #{count => 1},
+                             #{mode => proxy_protocol, reason => untrusted_source}),
+           ?assertEqual(Before + 1, counter_val(yuzu_gw_grpc_origin_ignored_total, Labels))
+       end},
+      {"every {mode, reason} the origin module can report has a series at 0 from boot",
+       fun() ->
+           [?assert(is_integer(counter_val(yuzu_gw_grpc_origin_ignored_total,
+                                           [atom_to_binary(M, utf8), atom_to_binary(R, utf8)])))
+            || {M, R} <- yuzu_gw_telemetry:origin_ignored_labels()]
+       end},
+      {"dropped request bytes reach the counter by reason",
+       fun() ->
+           Labels = [<<"extra_request_data">>],
+           Before = counter_val(yuzu_gw_grpc_dropped_data_bytes_total, Labels),
+           telemetry:execute([yuzu, gw, grpc, dropped_data], #{bytes => 123},
+                             #{reason => extra_request_data, method => <<"/x/Y">>}),
+           ?assertEqual(Before + 123, counter_val(yuzu_gw_grpc_dropped_data_bytes_total, Labels))
+       end},
+      {"the labels on both counters are exactly the atoms the layer emits",
+       fun() ->
+           %% yuzu_grpc_origin reports no other note for a proxy mode; a new one
+           %% needs a series here, or its first occurrence is invisible to increase().
+           ?assertEqual(lists:sort([untrusted_source, no_claim, bad_claim]),
+                        lists:usort([R || {_, R} <- yuzu_gw_telemetry:origin_ignored_labels()])),
+           ?assertEqual([extra_request_data, stream_ended],
+                        lists:sort(yuzu_gw_telemetry:dropped_data_reasons()))
+       end}
+     ]}.
+
 notify_dropped_test_() ->
     {setup,
      fun() ->

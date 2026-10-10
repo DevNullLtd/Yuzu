@@ -1,8 +1,8 @@
 %%%-------------------------------------------------------------------
 %%% @doc RPC-level tests for the mgmt-plane SPKI peer pin (#1422).
 %%%
-%%% Starts a REAL grpcbox TLS listener shaped like the :50063 mgmt
-%%% listener (strict mTLS + auth_fun => yuzu_gw_authz:check_mgmt_peer/1)
+%%% Starts a REAL yuzu_grpc_listener TLS listener shaped like the :50063
+%%% mgmt listener (strict mTLS + auth_fun => yuzu_gw_authz:check_mgmt_peer/1)
 %%% plus a second listener shaped like the :50051 agent listener
 %%% (verify_none, no auth_fun), then drives them with real grpcbox client
 %%% channels holding different leaf certs. Proves, at gRPC-status level
@@ -16,8 +16,8 @@
 %%%   - a certless peer still completes RPCs against the agent-listener
 %%%     posture — the auth_fun must never leak onto :50051.
 %%%
-%%% Listener ports are OS-assigned-then-probed with retry (two runner
-%%% agents share each CI box; fixed ports collide across jobs).
+%%% Listeners and channels come from yuzu_gw_test_listener (OS-assigned
+%%% ports; two runner agents share each CI box).
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_authz_rpc_tests).
@@ -162,27 +162,26 @@ setup() ->
         {error, _} = E ->
             E;
         Certs = #{dir := Dir, ca := Ca, srv_pem := SrvPem} ->
-            {ok, _} = application:ensure_all_started(grpcbox),
             {ok, _} = application:ensure_all_started(telemetry),
             yuzu_gw_authz_stub_svc:init_counters(),
             application:set_env(yuzu_gw, mgmt_peer_pins, [{cert_file, SrvPem}]),
-            GwPem = filename:join(Dir, "gw.pem"),
-            GwKey = filename:join(Dir, "gw.key"),
+            Tls = #{certfile => filename:join(Dir, "gw.pem"),
+                    keyfile => filename:join(Dir, "gw.key"),
+                    cacertfile => Ca},
+            Base = #{service_protos => [management_pb],
+                     services => #{?SVC => yuzu_gw_authz_stub_svc}},
             %% Mgmt-shaped listener: strict mTLS + the pin auth_fun.
-            {MgmtPort, MgmtSrv} = start_listener(
-                #{ssl => true, certfile => GwPem, keyfile => GwKey,
-                  cacertfile => Ca},
-                #{auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1}),
+            {MgmtPort, MgmtSrv} = yuzu_gw_test_listener:start(
+                Base#{name => authz_rpc_mgmt, tls => Tls,
+                      auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1}),
             %% Agent-shaped listener: one-way TLS, NO auth_fun.
-            {AgentPort, AgentSrv} = start_listener(
-                #{ssl => true, certfile => GwPem, keyfile => GwKey,
-                  cacertfile => Ca, verify => verify_none,
-                  fail_if_no_peer_cert => false},
-                #{}),
-            ChanSrv = start_chan(chan_srv, MgmtPort, Ca, Dir, "srv"),
-            ChanAgent = start_chan(chan_agent, MgmtPort, Ca, Dir, "agent"),
-            ChanGw = start_chan(chan_gw, MgmtPort, Ca, Dir, "gw"),
-            ChanAgentless = start_chan(chan_agentless, AgentPort, Ca, undefined, undefined),
+            {AgentPort, AgentSrv} = yuzu_gw_test_listener:start(
+                Base#{name => authz_rpc_agent,
+                      tls => Tls#{verify => verify_none, fail_if_no_peer_cert => false}}),
+            ChanSrv = yuzu_grpc_wire_tests:client_chan(chan_srv, MgmtPort, Certs, "srv"),
+            ChanAgent = yuzu_grpc_wire_tests:client_chan(chan_agent, MgmtPort, Certs, "agent"),
+            ChanGw = yuzu_grpc_wire_tests:client_chan(chan_gw, MgmtPort, Certs, "gw"),
+            ChanAgentless = yuzu_grpc_wire_tests:client_chan(chan_agentless, AgentPort, Certs, undefined),
             #{certs => Certs,
               mgmt_port => MgmtPort, agent_port => AgentPort,
               servers => [MgmtSrv, AgentSrv],
@@ -193,60 +192,9 @@ setup() ->
 cleanup({error, _}) ->
     ok;
 cleanup(#{certs := Certs, servers := Servers} = State) ->
-    [catch grpcbox_channel:stop(C) || C <- [maps:get(chan_srv, State),
-                                            maps:get(chan_agent, State),
-                                            maps:get(chan_gw, State),
-                                            maps:get(chan_agentless, State)]],
-    [catch supervisor:terminate_child(grpcbox_services_simple_sup, P)
-     || P <- Servers],
+    [yuzu_gw_test_listener:stop_channel(maps:get(K, State))
+     || K <- [chan_srv, chan_agent, chan_gw, chan_agentless]],
+    [yuzu_gw_test_listener:stop(P) || P <- Servers],
     application:unset_env(yuzu_gw, mgmt_peer_pins),
     yuzu_gw_authz_tests:cleanup_certs(Certs),
     ok.
-
-%% Start a grpcbox listener on an OS-probed free port; retry on the
-%% probe→bind race (shared CI boxes run multiple jobs).
-start_listener(TransportOpts, ExtraGrpcOpts) ->
-    start_listener(TransportOpts, ExtraGrpcOpts, 5).
-
-start_listener(_TransportOpts, _ExtraGrpcOpts, 0) ->
-    error(no_free_port);
-start_listener(TransportOpts, ExtraGrpcOpts, Retries) ->
-    Port = probe_free_port(),
-    GrpcOpts = maps:merge(
-        #{service_protos => [management_pb],
-          services => #{?SVC => yuzu_gw_authz_stub_svc}},
-        ExtraGrpcOpts),
-    case grpcbox:start_server(#{grpc_opts => GrpcOpts,
-                                listen_opts => #{port => Port, ip => {127, 0, 0, 1}},
-                                transport_opts => TransportOpts}) of
-        {ok, Pid} -> {Port, Pid};
-        {error, _} -> start_listener(TransportOpts, ExtraGrpcOpts, Retries - 1)
-    end.
-
-probe_free_port() ->
-    {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}]),
-    {ok, Port} = inet:port(L),
-    ok = gen_tcp:close(L),
-    Port.
-
-%% Client channel; Leaf =:= undefined means no client cert (certless).
-start_chan(Name, Port, Ca, Dir, Leaf) ->
-    Base = [{cacertfile, Ca}, {verify, verify_peer},
-            {versions, ['tlsv1.2']},
-            {server_name_indication, "localhost"}],
-    SslOpts = case Leaf of
-        undefined -> Base;
-        _ -> Base ++ [{certfile, filename:join(Dir, Leaf ++ ".pem")},
-                      {keyfile, filename:join(Dir, Leaf ++ ".key")}]
-    end,
-    %% sync_start: register the endpoint in gproc_pool before start_child
-    %% returns. Without it, init/1 replies while still `idle` and queues
-    %% the internal `connect` event that calls start_workers/4 -- the very
-    %% next RPC in this suite can race that event and see {error,
-    %% no_endpoints} from grpcbox_channel:pick/2 (CI flake, shared runner
-    %% box widens the window). This is a genuine cross-process race, not
-    %% just an in-order queue: pick/2 reads gproc_pool directly, bypassing
-    %% the channel gen_statem entirely.
-    {ok, _} = grpcbox_channel_sup:start_child(
-                Name, [{https, "localhost", Port, SslOpts}], #{sync_start => true}),
-    Name.

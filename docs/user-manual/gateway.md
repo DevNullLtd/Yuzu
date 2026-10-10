@@ -111,9 +111,13 @@ The gateway source lives in `gateway/apps/yuzu_gw/src/`:
 | `yuzu_gw_router` | Command fanout coordinator |
 | `yuzu_gw_upstream` | gRPC client to the C++ server: one channel, one HTTP/2 connection, one call at a time (see "Registration rate per gateway" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
 | `yuzu_gw_agent_service` | Agent-facing gRPC server (AgentService proxy) |
-| `yuzu_gw_conn` | Connection key (the HTTP/2 connection pid) of an agent-facing gRPC call, read through the vendored grpcbox accessors |
+| `yuzu_gw_conn` | Connection key (the HTTP/2 connection pid) of an agent-facing gRPC call, read from the call's context or stream |
 | `yuzu_gw_heartbeat_admission` | Admission decision for agent `Heartbeat` calls (session held by this node and call on the connection that opened it), rejection counters and the rate-limited summary log line |
 | `yuzu_gw_mgmt_service` | Operator-facing gRPC server (ManagementService proxy) |
+| `yuzu_grpc_listener` | One gRPC listener per `grpc_listeners` entry: a Ranch listener running Cowboy's HTTP/2 connection with `yuzu_grpc_stream_h` as its only stream handler; a `gen_server` the supervisor starts as one of its last children |
+| `yuzu_grpc_stream_h` | Cowboy stream handler: runs the listener's `auth_fun` on the peer certificate, resolves the caller's address (`yuzu_grpc_origin`), routes the call and spawns the handler |
+| `yuzu_grpc_origin` | Which address a call is attributed to (transport peer, PROXY protocol header, `x-forwarded-for`); pure |
+| `yuzu_grpc`, `yuzu_grpc_stream`, `yuzu_grpc_route`, `yuzu_grpc_runner`, `yuzu_grpc_frame` | The rest of the gRPC layer: context accessors (`peer/1`, `origin/1`, `peer_cert/1`), the stream API handlers use (`send/2`), route table built from the proto modules, handler runner (unary, server-streaming, bidi), and gRPC message framing |
 | `yuzu_gw_telemetry` | Telemetry event definitions and handlers |
 | `yuzu_gw_gauge` | Periodic gauge emission for Prometheus |
 | `yuzu_gw_proto` | Protobuf encode/decode wrappers |
@@ -312,11 +316,16 @@ node failover that leaves the session not held by the surviving node is expected
 behave the same way (inferred, not tested).
 
 **Supported topologies.** Agents connect to the gateway agent listener (`:50051`)
-directly, or through an L4 / TLS-passthrough path that keeps one TCP connection per
-agent end to end (a plain TCP load balancer, an L4 virtual IP, a TLS-passthrough
-proxy). An HTTP/2-terminating or HTTP/2-multiplexing proxy between agents and the
-gateway (including a service-mesh sidecar that terminates HTTP/2) is **not
-supported** for this check: it may cause repeated heartbeat rejection or share
+directly, or through a path that keeps **one gateway-side connection per agent for the
+whole life of its session**: an L4 / TLS-passthrough path (a plain TCP load balancer, an L4
+virtual IP, a TLS-passthrough proxy), or a proxy that terminates HTTP/2 **and is
+configured for connection affinity**, meaning each client connection gets its own
+backend connection, kept for as long as the client connection lives (see
+[Keeping each agent on one backend connection](#keeping-each-agent-on-one-backend-connection)).
+An HTTP/2-terminating proxy that pools backend connections across clients, or that
+sends one agent's calls over several of them (HAProxy's default `http-reuse safe`, a
+service-mesh sidecar that terminates HTTP/2), is **not supported**: it
+may cause repeated heartbeat rejection or share
 gateway-side connections across agents, removing the per-agent connection separation
 this check requires. It can spread one agent's calls over several
 connections, which shows up as connection mismatches (the `connection_mismatch=`
@@ -384,9 +393,8 @@ It carries reason names and counts only, never a session id. The line is written
 when a rejection arrives, so counts that trail the last line wait for the next
 rejection and the line can lag the counters; the counters are authoritative. The rate
 limit is one state shared by all concurrent rejections (it is created at gateway
-start, after telemetry setup and before the gateway supervision tree starts; the agent
-listener belongs to the grpcbox dependency application, which can start first, so a
-heartbeat in that window is rejected and the state is then created lazily), so in initialized operation a burst of simultaneous first rejections produces one line; a heartbeat before the state exists can race with other lazy initializations and may produce an extra line. At startup the
+start, after telemetry setup and before the gateway supervision tree starts; the
+listeners are that tree's last children, so they start after it), so in initialized operation a burst of simultaneous first rejections produces one line; a heartbeat before the state exists can race with other lazy initializations and may produce an extra line. At startup the
 gateway logs `Heartbeat admission is connection-bound: a heartbeat is admitted only on the connection that opened its session`. No alert rule ships for these series. The
 rejected heartbeat has no resolved principal, so there is no audit row, only the
 counters and the summary line.
@@ -421,8 +429,8 @@ counters and the summary line.
 - `yuzu_gw_heartbeat_rejected_total{reason="no_connection"}` rises when the call, or
   the session it names, has no connection key to compare. Not observed in testing. Its
   possible causes are a registration path that carries no connection key, or a
-  regression in the connection accessor (`yuzu_gw_conn` returns `undefined` when the
-  vendored grpcbox accessor fails, see `gateway/_checkouts/grpcbox/YUZU_PATCH.md`). The
+  regression in the connection accessor (`yuzu_gw_conn:key_from_ctx/1` and
+  `key_from_stream/1` return `undefined` when the call carries no connection). The
   decision is in `gateway/apps/yuzu_gw/src/yuzu_gw_heartbeat_admission.erl`.
 - `yuzu_gw_heartbeat_rejected_total{reason="registry_unavailable"}` stays at 0 on a
   gateway that was restarted to deploy this change. A non-zero value means the session
@@ -617,13 +625,10 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 
 ```erlang
 {yuzu_gw, [
-    %% Agent-facing gRPC (agents connect here)
-    {agent_listen_addr, "0.0.0.0"},
-    {agent_listen_port, 50051},
-
-    %% Operator-facing gRPC (dashboard/CLI)
-    {mgmt_listen_addr, "0.0.0.0"},
-    {mgmt_listen_port, 50052},
+    %% The agent-facing (:50051) and operator-facing (:50063) gRPC listeners
+    %% are the {grpc_listeners, [...]} entries described under "gRPC listeners"
+    %% below. The agent_listen_* / mgmt_listen_* keys that older configs carry
+    %% are read by nothing and have no effect.
 
     %% Upstream C++ server (GatewayUpstream service)
     {upstream_addr, "127.0.0.1"},
@@ -677,8 +682,80 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
     %% addresses forever. No env override; edit sys.config directly if a
     %% real deployment's lifetime address churn needs a higher ceiling.
     {cluster_max_lifetime_addrs, 1024}
+    %% ... plus {grpc_listeners, [...]}, below
 ]}
 ```
+
+### gRPC listeners
+
+The gateway's two listeners are served by its own gRPC layer over Cowboy/Ranch
+(`yuzu_grpc_listener`). They are configured as a list of maps under
+`{yuzu_gw, grpc_listeners}`, one map per listener, and are the last children of the
+supervision tree. Every entry is validated before anything is bound: an entry that
+cannot start (an incomplete `tls` map, an `origin` mode with no `sources`, a service
+module that lacks what its proto declares, a name or a fixed port used twice) refuses
+boot with a critical log line. With no entries the gateway starts, logs a warning and
+accepts no connection. This is the production shape, from `gateway/config/sys.config.prod`
+(comments shortened):
+
+```erlang
+{yuzu_gw, [
+    {grpc_listeners, [
+        %% Agent listener: one-way (server-authenticated) TLS. NEVER give this
+        %% listener an auth_fun (see "Moving the agent edge to mutual TLS").
+        #{name => agent,
+          service_protos => [agent_pb],
+          services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service},
+          listen => #{port => 50051, ip => {0,0,0,0}},
+          tls => #{certfile   => "/etc/yuzu/certs/default-gateway.pem",
+                   keyfile    => "/etc/yuzu/certs/default-gateway.key",
+                   cacertfile => "/etc/yuzu/certs/default-ca.pem",
+                   verify => verify_none,
+                   fail_if_no_peer_cert => false},
+          acceptors => 32,
+          http2 => #{idle_timeout => 180000, max_concurrent_streams => 32}},
+
+        %% Mgmt listener: strict mTLS (the defaults) + the SPKI peer pin.
+        #{name => mgmt,
+          service_protos => [management_pb],
+          services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},
+          listen => #{port => 50063, ip => {0,0,0,0}},
+          tls => #{certfile   => "/etc/yuzu/certs/default-gateway.pem",
+                   keyfile    => "/etc/yuzu/certs/default-gateway.key",
+                   cacertfile => "/etc/yuzu/certs/default-ca.pem"},
+          auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1,
+          acceptors => 4,
+          http2 => #{idle_timeout => 600000, max_concurrent_streams => 1024}}
+    ]}
+]}
+```
+
+| Key | Meaning |
+|---|---|
+| `name` | Any term; names the listener. Must be unique. |
+| `service_protos` | The proto modules (`agent_pb`, `management_pb`) that describe the services the listener serves. |
+| `services` | `#{ServiceName => Module}`: the module that serves each service. |
+| `listen` | `#{port, ip}`. `ip` defaults to `0.0.0.0`. `port => 0` binds any free port (tests). An optional `socket_opts` list is appended to the socket options. |
+| `tls` | Omit for plaintext HTTP/2. When present, `certfile`, `keyfile` **and** `cacertfile` are all required; an incomplete map refuses boot, so "certificates configured but plaintext" cannot happen. `verify` defaults to `verify_peer` and `fail_if_no_peer_cert` to `true` (mutual TLS); `verify => verify_none` is one-way TLS and then `fail_if_no_peer_cert` defaults to `false`. TLS 1.2 only; ECDHE-ECDSA AEAD cipher suites unless `ciphers` is set. |
+| `auth_fun` | Management listener only: `fun(Der) -> {true, Id} \| true \| false`, run by the stream handler on the peer certificate before a handler exists. Needs `tls`. **Never on the agent listener.** |
+| `origin` | How the caller's address is decided; default `#{mode => transport}`. See [Client addresses behind a proxy](#client-addresses-behind-a-proxy). |
+| `acceptors` | Acceptor processes (default 4). The agent listener uses 32 for reconnect storms. |
+| `http2` | Overrides of the Cowboy HTTP/2 options. Defaults: `idle_timeout` 600000 ms, `max_concurrent_streams` 1024, `max_frame_size_received` 16384, `linger_timeout` 1000. The agent listener sets `idle_timeout` to 180000 because agents ping every 60 s (the 60 s default would race the ping) and a few streams per connection. The management client does not ping, so it keeps ten minutes. |
+| `limits` | `#{max_message_bytes, send_timeout_ms}`; defaults 4194304 bytes and 30000 ms. |
+
+A leftover `{grpcbox, [{servers, ...}]}` block **refuses boot**: it would start a second
+listener, with no peer pin and no origin handling, next to these. Only
+`{grpcbox, [{client, ...}]}` (the upstream channel to the C++ server) remains in
+`{grpcbox, ...}`.
+
+**Environment overrides for the listeners.** `YUZU_GW_AGENT_PORT` rewrites
+`listen.port` of the entry whose `service_protos` contains `agent_pb`, and
+`YUZU_GW_MGMT_PORT` that of the entry serving `management_pb` (applied at start by
+`yuzu_gw_app:apply_listener_port_overrides/0`). A value that is not an integer from 0 to
+65535 is logged and ignored. The `agent_listen_port` / `mgmt_listen_port` keys that the
+deployed configs still carry are dead and are left alone. The `YUZU_GW_TLS_*` variables
+still do not drive the listeners' certificates (#1291): certificate paths are in the
+`tls` map.
 
 **Registration replay tuning** (application env keys read by the upstream
 client at start, except `upstream_call_timeout_ms`, which is read on every call; set them in the `yuzu_gw` section of `sys.config`. No
@@ -878,11 +955,12 @@ See `deploy/docker/gateway-entrypoint.sh` for the exact logic.
 > the CA to agents. **Until your deployment turns it on (only the reference gateway compose
 > ships it; the cluster, demo and UAT composes are plaintext, see the table
 > below), a gateway exposed to an untrusted network MUST**
-> either (a) front the gateway at L4 or with TLS passthrough only (one TCP
+> either (a) front the gateway at L4 or with TLS passthrough (one TCP
 > connection per agent end to end, with the gateway's own agent-listener TLS
-> enabled; an HTTP/2-terminating reverse proxy, including a service-mesh sidecar
-> that terminates HTTP/2, is not supported for heartbeat admission, see
-> [Heartbeat admission](#heartbeat-admission)), or (b) keep
+> enabled), or with an HTTP/2-terminating proxy configured for connection affinity
+> (re-encrypting to the gateway; see
+> [Keeping each agent on one backend connection](#keeping-each-agent-on-one-backend-connection)),
+> never one that pools backend connections across clients, or (b) keep
 > `:50051` on a trusted network (VPN / private subnet / a mesh policy that does not
 > terminate HTTP/2; see [Heartbeat admission](#heartbeat-admission)). Direct
 > agent→server connections use TLS; this gap is specific to the gateway edge.
@@ -890,21 +968,20 @@ See `deploy/docker/gateway-entrypoint.sh` for the exact logic.
 | Hop | State | Notes |
 |---|---|---|
 | gateway → server upstream (`:50055`) | **mutual TLS** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. |
-| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `transport_opts => #{ssl => true, certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` (needs the vendored `_checkouts/grpcbox`). Of the shipped composes, only `docker-compose.reference-gateway.yml` enables it (#1314, mounting `reference-gateway-sys.config`). The cluster, demo, full-UAT, viz-UAT and sanitizer-UAT composes, and the repo-root `docker-compose.uat.yml`, run plaintext on the shipped default or a UAT/demo `sys.config` (inline in `docker-compose.uat.yml`, mounted as a file by the others); the remaining composes do not run the gateway. Heartbeats are bound to the connection that opened the session's `Subscribe` stream (see [Heartbeat admission](#heartbeat-admission)); the agent listener itself still does not authenticate agents. |
-| server → gateway mgmt (`:50063`) | **strict mTLS + SPKI peer pin (#1422)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert`) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_pins}` pinning the server's cert — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs: point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one. |
+| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `tls => #{certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` in its `grpc_listeners` entry. Of the shipped composes, only `docker-compose.reference-gateway.yml` enables it (#1314, mounting `reference-gateway-sys.config`). The cluster, demo, full-UAT, viz-UAT and sanitizer-UAT composes, and the repo-root `docker-compose.uat.yml`, run plaintext on the shipped default or a UAT/demo `sys.config` (inline in `docker-compose.uat.yml`, mounted as a file by the others); the remaining composes do not run the gateway. Heartbeats are bound to the connection that opened the session's `Subscribe` stream (see [Heartbeat admission](#heartbeat-admission)); the agent listener itself still does not authenticate agents. |
+| server → gateway mgmt (`:50063`) | **strict mTLS + SPKI peer pin (#1422)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert` from the `tls` map) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_pins}` pinning the server's cert — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs: point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one. |
 
-TLS is configured **entirely in the `grpcbox` block** (grpcbox reads its own
-config at boot — the old `{tls, [...]}` advisory key under `yuzu_gw` was removed
-in PKI PR5 and does **nothing**). To enable upstream mutual TLS, copy the
-`{grpcbox, [{client, ...}]}` `{https,...}` channel from
-`gateway/config/sys.config.prod`.
+TLS is configured in two places: the `tls` map of each `grpc_listeners` entry (the
+two listeners) and the `{grpcbox, [{client, ...}]}` block (the upstream channel). The
+old `{tls, [...]}` advisory key under `yuzu_gw` was removed in PKI PR5 and does
+**nothing**. To enable upstream mutual TLS, copy the `{grpcbox, [{client, ...}]}`
+`{https,...}` channel from `gateway/config/sys.config.prod`. A listener without a `tls`
+map is plaintext, and a `tls` map must carry all three of `certfile`, `keyfile` and
+`cacertfile` or the gateway refuses to boot.
 
-To enable mTLS on the agent listener for a deployment where **every agent already
-holds a CA-issued client cert** (not the normal enrollment path), add a
-`transport_opts` map to each server entry — see the commented block in
-`sys.config.prod`. **`ssl => true` is mandatory**; omit it and grpcbox silently
-runs plaintext regardless of the other options. Full detail:
-`docs/pki-architecture.md` "Gateway TLS".
+Do not turn on client-certificate enforcement on the agent listener by adding an
+`auth_fun`: see [Moving the agent edge to mutual TLS](#moving-the-agent-edge-to-mutual-tls)
+for what exists and what does not. Full detail: `docs/pki-architecture.md` "Gateway TLS".
 
 #### Enabling agent-listener TLS — order of operations + caveats (#1244)
 
@@ -923,7 +1000,7 @@ at once — there is no dual-listen transition):**
 1. **Distribute the CA** (`default-gateway`'s issuing CA, i.e. the install root)
    to every agent's `--ca-cert` / cert dir.
 2. **Reconfigure agents** to dial the gateway over TLS and verify that CA.
-3. **Only then flip the listener** to `ssl => true` in `sys.config.prod`.
+3. **Only then flip the listener** to TLS by adding the `tls` map to its entry (as in `sys.config.prod`).
 
 Reversing the order strands the fleet until every agent is re-pointed.
 
@@ -932,7 +1009,8 @@ agent**, not the agent to the gateway. It closes the on-path eavesdrop/inject of
 the plaintext edge, but a *compromised gateway itself* can still inject commands
 to the fleet — the compensating control is app-layer: the enrollment approval
 workflow. (The server also accepts gateway-authoritative `gateway_observed_peer`
-attribution, but the gateway does not populate that field yet — see #1172 below.)
+attribution, which the gateway now sets itself for every registration; see
+[Client addresses behind a proxy](#client-addresses-behind-a-proxy).)
 Full cryptographic agent-to-gateway identity (so the gateway can't forge an
 agent) is tracked in the through-gateway attestation work (#1292, design in
 #5578); no release is committed.
@@ -959,9 +1037,8 @@ cp /etc/yuzu/certs/default-ca.pem ./install-ca.pem   # or GET /api/v1/ca/root
 # 1. Point the gateway's upstream at the server over mutual TLS (PR5) and turn on
 #    the agent-listener one-way TLS (PR5c) — both live in sys.config.prod:
 #      {grpcbox,[{client,...,{https,...,[{ssl_options,...}]}}]}   % upstream mTLS
-#      listener transport_opts => #{ssl=>true, certfile, keyfile, cacertfile,
+#      grpc_listeners agent entry: tls => #{certfile, keyfile, cacertfile,
 #                                   verify=>verify_none, fail_if_no_peer_cert=>false}
-#    (needs the vendored _checkouts/grpcbox — the image build asserts it.)
 
 # 2. Distribute install-ca.pem to every agent and have them dial the gateway over
 #    TLS, verifying that CA:
@@ -976,6 +1053,178 @@ Verify: the gateway boot log shows `tls` posture (not `plaintext`); an agent
 connects and enrolls; `openssl s_client -connect gateway:50051` presents the
 `default-gateway` leaf. Direct agent→server connections (no gateway) use TLS and
 need none of this.
+
+### Client addresses behind a proxy
+
+The server records the address of the agent that registered (`source_ip` in audit rows,
+`gateway_observed_peer` on the wire). The gateway decides that address itself, per call,
+from the listener's `origin` option. Whatever an agent puts in
+`RegisterRequest.gateway_observed_peer` is discarded and replaced.
+
+A gateway behind a load balancer or a router sees the balancer as its TCP peer. The
+address of the agent behind it arrives as a claim: a PROXY protocol header, or an
+`x-forwarded-for` header. A claim is believable only when the proxy made it, so the
+decision is made by **who connected, never by whether the claim matches** the connection:
+
+| `origin` | The address is | Use when |
+|---|---|---|
+| `#{mode => transport}` (default) | The TCP peer. A PROXY header or `x-forwarded-for` a client sends is ignored. | Agents connect to the gateway directly. |
+| `#{mode => proxy_protocol, sources => [...]}` | The address in the PROXY protocol header, if the TCP peer is one of `sources`. | An F5 (iRule) or HAProxy (`send-proxy-v2`) passes the TCP stream through. |
+| `#{mode => forwarded_for, sources => [...], trusted_hops => N}` | The `x-forwarded-for` entry `trusted_hops` places from the right (0 = the last entry, the one the nearest proxy appended), if the TCP peer is one of `sources`. Entries further left are never used. | A router terminates TLS and forwards HTTP/2 to the gateway. |
+
+`sources` are the proxies as the gateway's socket sees them: an IP tuple such as
+`{10,0,0,5}`, or `{Ip, PrefixLen}` for a network such as `{{10,1,0,0}, 24}`. A proxy mode
+with no sources refuses boot, as does an unknown mode or option. A claim from a TCP peer
+that is **not** a source is **ignored, not refused**: the call is served and attributed to
+that peer. Behind NAT, an F5 or a router the claim and the connection legitimately
+differ, so refusing a mismatch would turn a configuration slip into an outage; ignoring
+it is safe because the answer is then the TCP peer, which is what a client that sent the
+claim directly really is. Addresses are attributed without a port, and IPv4-mapped IPv6
+addresses are folded to IPv4.
+
+```erlang
+%% F5 iRule or HAProxy `send-proxy-v2`; v1 and v2 headers are both read.
+origin => #{mode => proxy_protocol, sources => [{10,0,0,5}, {{10,1,0,0}, 24}]}
+
+%% A router that terminates TLS and appends the client it saw to x-forwarded-for.
+origin => #{mode => forwarded_for, sources => [{10,0,0,5}], trusted_hops => 0}
+```
+
+**`proxy_protocol`.** The header precedes the TLS handshake, so a TLS-passthrough
+balancer keeps the TLS session end to end and the **client certificate still reaches the
+gateway**. Every connection on the listener must carry the header or it is closed (after a
+second), so such a listener serves only the proxy. An F5 health monitor aimed at that port
+will fail unless it sends the header: monitor another port (for example the gateway's
+health port). A PROXY `LOCAL` command (a health check by the proxy itself) carries no
+client and is attributed to the proxy.
+
+**`forwarded_for`.** The router terminates TLS, so the certificate the gateway sees is the
+router's, not the agent's, and the option **cannot be combined with an `auth_fun`**
+(boot refuses it: the check would pass on the router's certificate and say nothing about the
+agent). The entry `trusted_hops` places from the right is used; a header with fewer entries
+than that, longer than 1024 bytes, or with more than 32 entries, or an entry that is not an
+IP address, is ignored. With an OpenShift/OKD router, also set the ingress controller's
+forwarded-header policy so that a client-supplied `x-forwarded-for` is not trusted
+(`spec.httpHeaders.forwardedHeaderPolicy` on the IngressController). That cluster-side
+detail is stated from memory and must be confirmed against your cluster version. A router
+that terminates HTTP/2 must also keep each agent on one backend connection, because
+[Heartbeat admission](#heartbeat-admission) binds heartbeats to the connection that opened
+the session: see the next section.
+
+#### Keeping each agent on one backend connection
+
+Behind a router that terminates TLS the gateway's "connection" is the router's
+connection to the gateway, not the agent's to the router. Heartbeat admission compares the
+connection of an agent's `Heartbeat` calls with the one that opened its `Subscribe`
+stream, so the router must give **each client connection its own backend connection and
+keep it for as long as the client connection lives**. Then all of an agent's calls arrive
+on one backend connection (and, with several gateway replicas, on the one replica that
+backend connection is to, which the node-local admission state also needs). A router that
+pools backend connections across clients (HAProxy's default `http-reuse safe` lets every
+request after a session's first travel on any idle backend connection, `aggressive` and
+`always` more so) breaks this in both directions: one agent's calls spread over several
+connections are rejected as `connection_mismatch`, and calls of different agents share one,
+which weakens the separation the check provides.
+
+HAProxy as the terminating proxy, re-encrypting to the gateway over HTTP/2:
+
+```
+frontend yuzu_agents
+    bind :443 ssl crt /etc/haproxy/agents.pem alpn h2
+    http-request del-header X-Forwarded-For   # drop anything the client sent
+    option forwardfor                         # add the address HAProxy saw
+    default_backend yuzu_gateway
+
+backend yuzu_gateway
+    http-reuse never                          # a backend connection belongs to ONE client connection
+    balance leastconn                         # chooses the replica when the client connects
+    timeout server 300s                       # longer than the agent's 60 s keepalive
+    server gw1 10.0.1.11:50051 ssl verify required ca-file /etc/haproxy/yuzu-ca.pem alpn h2
+```
+
+`http-reuse never` is HAProxy's setting for connection-bound protocols: the server
+connection a session opened stays attached to that session instead of returning to a
+pool other sessions draw from. `option forwardfor` adds the client address as its own
+`X-Forwarded-For` line after any the client sent; the gateway joins the lines in order and
+reads the one `trusted_hops` places from the right, so the client's own claim is never the
+one used (deleting it first keeps the header short). Keep the router's idle timeouts above
+the agent's 60 s keepalive; the agent listener itself closes a connection that has carried
+no bytes for 180 s.
+
+**OpenShift / OKD router.** The OpenShift router is HAProxy, and its connection-reuse
+setting for a route backend is whatever its template sets: this manual does not state it
+and you must not assume it. Establish it on your cluster before sending agents through the
+router, with the check below. If the router does not pin connections, use a TLS
+**passthrough** route (the gateway then sees the agent's own TCP connection, and
+`proxy_protocol` or the transport peer give the address), or put an HAProxy configured as
+above between the router and the gateway.
+
+**Check it.** Run agents through the proxy for at least ten minutes. In the gateway's
+`/metrics`, `yuzu_gw_heartbeat_session_mismatch_total` and
+`yuzu_gw_heartbeat_rejected_total{reason="no_connection"}` must not rise, and the summary
+log line must not report `connection_mismatch=`. A router that is not pinning shows as a
+steady rise of the first, and as agents that re-register every few minutes. Repeat after
+any change to the router's configuration or version.
+
+| Topology | Gateway listener `origin` |
+|---|---|
+| Agents reach the gateway directly | `transport` (default) |
+| F5 only, TLS passthrough | `proxy_protocol`, `sources` = the F5's self IPs |
+| Router or HAProxy only, terminating TLS | `forwarded_for`, `trusted_hops => 0`, `sources` = the router |
+| F5 in front of a router (the gateway sits behind the router) | `forwarded_for`, `sources` = the router. `trusted_hops => 0` if the F5 hands the client address to the router by PROXY protocol; `1` if the F5 inserts `X-Forwarded-For` itself and the router appends the F5's address |
+| Both an F5 path and a router path reach the gateway | Two listeners on two ports, one entry per path, each with its own mode and `sources` |
+
+**The listener must also be reachable only from the proxy** (a firewall rule, a Kubernetes
+NetworkPolicy). `sources` is defence in depth, not a substitute: the trust decision is
+made on the TCP peer, so the strength of the attribution is the strength of who can reach
+that port. The management listener is never proxied: the boot guard refuses a
+network-reachable management listener whose `origin` is not `transport`.
+
+**Metrics.** `yuzu_gw_grpc_origin_ignored_total{mode,reason}` counts calls on a proxied
+listener whose claim was not used. Both labels come from closed sets, and an address is
+never a label or a log field. Reasons: `untrusted_source` (the TCP peer is not one of the
+`sources`, so the claim was ignored and the call attributed to the peer), `no_claim` (a
+trusted proxy sent nothing usable, for example a PROXY `LOCAL` health check or no
+`x-forwarded-for`), `bad_claim` (the claim is not an IP address, or the header has fewer
+entries than `trusted_hops` places). A steady `untrusted_source` rate means something
+other than the proxy is reaching the listener (or `sources` is wrong): fix the network
+rule, not the counter. `yuzu_gw_grpc_dropped_data_bytes_total{reason}` is the request
+bytes the layer discarded in a state that must not run a handler (`extra_request_data`,
+`stream_ended`).
+
+### Moving the agent edge to mutual TLS
+
+Agent identity at the gateway is application-layer: the agent listener is **one-way
+TLS**, encrypting the hop and authenticating the gateway to the agent, and a client
+certificate is neither requested nor checked. The move to client certificates has three
+stages. Only the first two exist in code today, and the second enforces nothing.
+
+1. **One-way TLS (today, shipped).** `tls => #{..., verify => verify_none,
+   fail_if_no_peer_cert => false}`. This is the shape in `sys.config.prod`.
+2. **Request a certificate, enforce nothing (available now, configuration only).**
+   `tls => #{..., verify => verify_peer, fail_if_no_peer_cert => false}` asks every client
+   for a certificate and still serves agents that have none (an agent that has not
+   enrolled yet has none). A handler can see the certificate the client presented
+   (`yuzu_grpc:peer_cert/1` returns its DER, or `undefined`); no shipped handler reads it
+   and nothing refuses a call because of it. A certificate that is presented but invalid
+   (expired, wrong CA) still aborts the handshake under `verify_peer`, whatever
+   `fail_if_no_peer_cert` says, so an agent with a stale leaf would be locked out: check
+   that before using this stage on a fleet.
+3. **Enforcement (not built; needs a design and its own ADR).** An `auth_fun` refuses
+   every peer without a certificate, and the agents that have not enrolled have none, so
+   enforcing certificates needs more than configuration: enrollment has to be separated
+   from the enforced surface (a listener that serves only `Register`, and a per-listener
+   method allow-list, which the layer does not have yet). The cryptographic agent
+   identity work is tracked in #1292 and the design in #5578.
+
+**Never put an `auth_fun` on the agent listener as it stands today.** It would refuse
+every agent without a certificate and cut agent bootstrap fleet-wide.
+
+How this interacts with a proxy: behind `proxy_protocol` the certificate still reaches
+the gateway (TLS passes through the balancer), so stages 2 and 3 are possible. Behind
+`forwarded_for` the router terminates TLS, so the certificate the gateway sees is the
+router's and cannot identify an agent; the layer refuses `forwarded_for` together with
+an `auth_fun` for that reason.
 
 ### Distribution Cookie (Required in Production)
 
@@ -1044,15 +1293,15 @@ the address and port for the GatewayUpstream service. This port must match
 yuzu-server --gateway-upstream "0.0.0.0:50055"
 ```
 
-> **Known limitation — gateway origin-IP attribution (#1064).** On the gateway
-> `ProxyRegister` path, audit rows currently record the **gateway node's** IP as
-> `source_ip`, not the originating agent's IP. The server already consumes the
-> `RegisterRequest.gateway_observed_peer` field that carries the agent origin
-> (recording `source_ip`=agent origin and `gateway_ip`=transport peer when
-> present), but the gateway does not yet populate it — today's grpcbox transport
-> does not expose the direct agent peer to the gateway's handlers; the fix is
-> tracked in #1172. Until then, SIEM/audit consumers correlating
-> `source_ip` with network logs on this path will see the gateway's address.
+> **Gateway origin-IP attribution (#1064, #1172).** On the gateway `ProxyRegister`
+> path the server's transport peer is the gateway. The gateway therefore sets
+> `RegisterRequest.gateway_observed_peer` itself on every registration, to the
+> address it decided for the caller (the TCP peer, or the address a trusted proxy
+> vouched for, see [Client addresses behind a proxy](#client-addresses-behind-a-proxy)),
+> and discards whatever the agent put in that field. The server records
+> `source_ip`=that address and `gateway_ip`=transport peer. Behind a load
+> balancer or router with no `origin` configured, the address is the balancer's:
+> configure `origin` to get the agent's.
 
 ### What happens when the server restarts
 
@@ -1985,30 +2234,16 @@ env keys with defaults, which a reverted build ignores.
   that the server's `online` count and its route rows disagree after a large cold
   start. It is covered by the planned follow-up (i) below, a bounded pending queue
   for dropped notifications, and by #4632 (the in-flight notification limit).
-- **A refused `Subscribe` reaches the client as status 2 (`process exited without
-  reason`), not as `NOT_FOUND`, and logs an error report.** OBSERVED in rig pass 6
-  (run K5) with an Erlang probe client, not with a real agent: for a `Subscribe`
-  with no pending registration the gateway logged the WARN `Subscribe: no pending
-  registration for session` and then an `[error] crasher` report from
-  `grpcbox_stream:handle_streams/2` carrying `throw: {grpc_error, {<<"5">>,
-  <<"No pending registration for session">>}}`, and the probe's stream ended with
-  status 2 instead of 5. INFERRED from the code: `yuzu_gw_agent_service:subscribe/2`
-  signals its refusals with `throw({grpc_error, ...})`, which crashes the stream
-  process of a bidirectional streaming call. The same throw pattern exists on
-  `origin/dev` (`subscribe/2` there throws at its argument, pending-registration
-  and internal-error refusals; checked with `git show` and `grep -n throw`), so
-  this is not introduced by this change. No functional effect was seen in pass 6,
-  but no real agent was refused: from `agents/core/src/agent.cpp` (not run) a
-  non-OK `Register` goes back to the retry loop and an ended `Subscribe` stream
-  goes through the reconnect loop, whichever status the stream ended with, so the
-  agent re-registers either way. Expect one error report per refused `Subscribe`
-  (for example after the dead connection grace has passed). A `Subscribe` refused
-  by the per-connection session cap is raised by the same throw pattern
-  (`session_limit_error()` in `subscribe/2`), so it is expected to end the same
-  way (INFERRED from the code, not run); a refused `Register` is returned and
-  reaches the client as `UNAVAILABLE` (14). Follow-up, no issue
-  number yet: answer these refusals with a status returned from the handler rather
-  than a throw.
+- **A refused `Subscribe` ends with its own status.** The handler returns or throws
+  `{grpc_error, {Status, Message}}` and the gRPC layer sends that status as the stream's
+  trailers: `INVALID_ARGUMENT` (3) when `x-yuzu-session-id` is missing, `NOT_FOUND` (5)
+  for a session with no pending registration, `UNAVAILABLE` (14) when the
+  per-connection session cap refuses it. Any other return, throw or crash of a
+  handler is `INTERNAL` (13) with one log line naming only the method, the exception
+  class and the top frame; the request, the context and the exit term are never
+  logged. (Rig pass 6 observed the previous transport ending such a stream with
+  status 2 and an error report; that no longer applies.) From `agents/core/src/agent.cpp` (read, not run) the
+  agent re-registers on any non-OK status either way.
 - Related tracked items: #5244 (an idempotent adopt: a re-adopt of a session the
   server already holds wipes placement), #4632 (the in-flight notification limit
   on the convergence path), #5278 (verdict follow-ups: the desync log seam and a
@@ -2088,7 +2323,8 @@ This starts the gateway with all applications loaded, useful for debugging.
 
 | Dependency | Version | Purpose |
 |---|---|---|
-| grpcbox | 0.17.1 | gRPC server and client (HTTP/2, protobuf) |
+| grpcbox | 0.17.1 | gRPC client for the upstream channel (the listeners are the gateway's own `yuzu_grpc*` layer) |
+| cowboy / ranch | 2.19.0 / 2.3.0 | HTTP/2 server and listener behind the gRPC layer |
 | gpb | 4.21.7 | Protobuf compiler and runtime |
 | telemetry | 1.3.0 | Metrics event API |
 | prometheus | 4.11.0 | Prometheus exposition |
@@ -2220,6 +2456,8 @@ that are actually emitted are listed.
 | `yuzu_gw_cluster_address_cap_exceeded_total` | counter | Total times the lifetime distinct-address cap (`cluster_max_lifetime_addrs`) refused a never-before-seen address (`#4555` review round 2). Any non-zero value should be investigated immediately — it means the seed DNS name is returning an unexpectedly large or rotating/hostile answer set. |
 | `yuzu_gw_heartbeat_rejected_total` | counter | Agent `Heartbeat` calls rejected before buffering because no usable session binding exists (label `reason`, closed set: `unknown_session` = the session is not held by this node, `no_connection` = no connection key to compare, `registry_unavailable` = the session index does not exist). Every reason is created at 0 at start. The agent re-registers on the `NOT_FOUND` answer when its build includes the reconnect fix (see the gateway manual); older agents only log it. A held session whose heartbeat arrived on a different connection is counted in the next row instead. See [Heartbeat admission](#heartbeat-admission). |
 | `yuzu_gw_heartbeat_session_mismatch_total` | counter | Agent `Heartbeat` calls rejected because the session is held by this node but the call arrived on a different connection than the one that opened it (label `event`, always `security`, for SIEM routing; created at 0 at start). Also rises when an HTTP/2 proxy between agents and the gateway spreads one agent's calls over several connections. A rise of one per affected agent is expected when an agent's connection is replaced while its session is still held (observed with an injected GOAWAY, a test-only trigger; not observed with an abrupt close or a gateway restart). There is no audit row (the sender of a rejected heartbeat is not a resolved principal): the counter and a rate-limited summary log line are the signal. |
+| `yuzu_gw_grpc_origin_ignored_total` | counter | gRPC calls on a listener configured as behind a proxy whose claimed client address was not used (labels `mode` = `proxy_protocol` or `forwarded_for`, `reason` = `untrusted_source`, `no_claim` or `bad_claim`). The call is served either way. Created at 0 for every pair at start. See [Client addresses behind a proxy](#client-addresses-behind-a-proxy) |
+| `yuzu_gw_grpc_dropped_data_bytes_total` | counter | Request bytes the gRPC layer discarded in a state that must not run a handler (label `reason`, closed set: `extra_request_data` = a second message on a unary call, `stream_ended` = data after the stream's status). |
 | `yuzu_gw_session_limit_rejected_total` | counter | Registrations refused because one connection already holds the configured number of agent sessions, pending plus live (`max_sessions_per_connection`, default 8). Unlabelled, created at 0 at start. A `Register` over the cap is answered `UNAVAILABLE` (14); a `Subscribe` over the cap ends its stream (status 2 today, see Known limits) and is counted the same. A stock agent holds one session per connection (INFERRED), so a rise points to an L4 balancer, forwarder or client that carries several agents on one connection; see "Per-connection session cap" under Configuration. |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and

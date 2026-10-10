@@ -11,7 +11,8 @@
 -module(yuzu_gw_telemetry).
 
 -export([setup/0, handle_event/4]).
--export([mgmt_auth_reject_reasons/0, heartbeat_reject_reasons/0]).
+-export([mgmt_auth_reject_reasons/0, heartbeat_reject_reasons/0,
+         origin_ignored_labels/0, dropped_data_reasons/0]).
 
 %% All telemetry event names used by the gateway.
 -define(EVENTS, [
@@ -54,6 +55,11 @@
 
     %% Registrations refused by the per-connection session quota
     [yuzu, gw, session, limit_rejected],
+
+    %% The gRPC layer (yuzu_grpc_stream_h): an origin claim it ignored, and
+    %% request bytes it dropped because the call could not use them.
+    [yuzu, gw, grpc, origin_ignored],
+    [yuzu, gw, grpc, dropped_data],
 
     %% Mgmt-plane peer authorization (#1422)
     [yuzu, gw, mgmt_auth, rejected],
@@ -234,6 +240,23 @@ handle_event([yuzu, gw, heartbeat, rejected], #{count := N}, Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_heartbeat_rejected_total,
                            [atom_to_binary(Reason, utf8)], N);
 
+%% gRPC layer. `origin_ignored': a listener configured as sitting behind a proxy
+%% (yuzu_grpc_origin) did not use the address a claim carried -- the TCP peer is
+%% not one of its trusted proxies (untrusted_source), the trusted proxy sent
+%% nothing usable (no_claim: a PROXY health check, no header) or something that
+%% is not an address (bad_claim). Labelled by mode and reason only, both from
+%% closed sets of atoms emitted by that module, never by an address.
+%% `dropped_data': request bytes discarded in a state that must not run a
+%% handler (a second message of a unary call, DATA after a status).
+handle_event([yuzu, gw, grpc, origin_ignored], #{count := N}, Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_grpc_origin_ignored_total,
+                           [atom_to_binary(maps:get(mode, Meta, unknown), utf8),
+                            atom_to_binary(maps:get(reason, Meta, unknown), utf8)], N);
+
+handle_event([yuzu, gw, grpc, dropped_data], #{bytes := Bytes}, Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_grpc_dropped_data_bytes_total,
+                           [atom_to_binary(maps:get(reason, Meta, unknown), utf8)], Bytes);
+
 handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
                            [<<"security">>], N);
@@ -359,6 +382,20 @@ mgmt_auth_reject_reasons() ->
 -spec heartbeat_reject_reasons() -> [atom()].
 heartbeat_reject_reasons() ->
     [unknown_session, no_connection, registry_unavailable].
+
+%% The closed set of {mode, reason} labels on yuzu_gw_grpc_origin_ignored_total:
+%% what yuzu_grpc_origin:resolve/4 can report for each proxy mode (a mode that
+%% trusts nothing in particular, `transport', never ignores a claim).
+-spec origin_ignored_labels() -> [{proxy_protocol | forwarded_for,
+                                   untrusted_source | no_claim | bad_claim}].
+origin_ignored_labels() ->
+    [{Mode, Reason} || Mode <- [proxy_protocol, forwarded_for],
+                       Reason <- [untrusted_source, no_claim, bad_claim]].
+
+%% The closed set of `reason' values on yuzu_gw_grpc_dropped_data_bytes_total.
+-spec dropped_data_reasons() -> [extra_request_data | stream_ended].
+dropped_data_reasons() ->
+    [extra_request_data, stream_ended].
 
 %% Every `{help, ...}` string below MUST be plain ASCII (#4707, #5177). This
 %% source file is UTF-8, so a literal em dash or smart quote becomes a charlist
@@ -504,6 +541,33 @@ declare_metrics() ->
      || R <- heartbeat_reject_reasons()],
     prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
                            [<<"security">>], 0),
+    prometheus_counter:declare([
+        {name, yuzu_gw_grpc_origin_ignored_total},
+        {labels, [mode, reason]},
+        {help, "gRPC calls on a listener configured as behind a proxy whose "
+               "claimed client address was not used, by origin mode "
+               "(proxy_protocol, forwarded_for) and reason (untrusted_source = "
+               "the TCP peer is not one of the listener's trusted proxies, so "
+               "the claim was ignored and the call attributed to the peer; "
+               "no_claim = a trusted proxy sent no usable claim, such as a PROXY "
+               "health check; bad_claim = the claim is not an IP address or has "
+               "fewer entries than trusted_hops). Calls are served either way. "
+               "A steady untrusted_source rate means the listener is reachable "
+               "without going through the proxy"}]),
+    [prometheus_counter:inc(yuzu_gw_grpc_origin_ignored_total,
+                            [atom_to_binary(M, utf8), atom_to_binary(R, utf8)], 0)
+     || {M, R} <- origin_ignored_labels()],
+    prometheus_counter:declare([
+        {name, yuzu_gw_grpc_dropped_data_bytes_total},
+        {labels, [reason]},
+        {help, "Request bytes the gRPC layer discarded because the call could "
+               "not use them, by reason (extra_request_data = a second message "
+               "on a unary or server-streaming call, stream_ended = DATA that "
+               "arrived after a status was sent, including on a refused call). "
+               "The handler is never run for these bytes"}]),
+    [prometheus_counter:inc(yuzu_gw_grpc_dropped_data_bytes_total,
+                            [atom_to_binary(R, utf8)], 0)
+     || R <- dropped_data_reasons()],
     prometheus_counter:declare([
         {name, yuzu_gw_registration_replay_triggered_total},
         {labels, [trigger]},

@@ -538,22 +538,22 @@ cat > "$GW_SYS_CONFIG" << ERLCFG
         %% serves management_pb in plaintext, and the gateway refuses to boot
         %% that posture without this explicit acknowledgement. Never copy into
         %% production - use deploy/docker/reference-gateway-sys.config.
-        {allow_insecure_mgmt, true}
+        {allow_insecure_mgmt, true},
+        %% One plaintext listener serves both services on the agent port.
+        {grpc_listeners, [
+            #{name => gateway,
+              service_protos => [agent_pb, management_pb],
+              services => #{
+                  'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service,
+                  'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service
+              },
+              listen => #{port => $GW_AGENT_PORT, ip => {0,0,0,0}}}
+        ]}
     ]},
     {grpcbox, [
         {client, #{channels => [
             {default_channel, [{http, "127.0.0.1", $SERVER_GW_PORT, []}], #{}}
-        ]}},
-        {servers, [
-            #{grpc_opts => #{
-                service_protos => [agent_pb, management_pb],
-                services => #{
-                    'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service,
-                    'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service
-                }
-            },
-            listen_opts => #{port => $GW_AGENT_PORT, ip => {0,0,0,0}}}
-        ]}
+        ]}}
     ]},
     {kernel, [
         {logger_level, info},
@@ -613,7 +613,7 @@ GATEWAY_PID=$!
 cd "$PROJECT_ROOT"
 log "  Gateway PID: $GATEWAY_PID"
 
-# Poll the gateway's agent-facing gRPC port until it's bound. grpcbox
+# Poll the gateway's agent-facing gRPC port until it's bound. Gateway
 # startup is usually 1-2s but can be slower on cold BEAM VM — the old
 # `sleep 3` was both too short (flaked on cold runs) and too long (paid
 # full budget on warm runs). wait_for_port returns as soon as the port

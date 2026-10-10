@@ -24,7 +24,21 @@
 %%%                  give one to the agent listener: a peer without a
 %%%                  certificate is refused whenever there is an auth_fun, and the
 %%%                  agent listener must admit the agents that have none yet.
-%%%   http2          optional overrides of the Cowboy HTTP/2 options
+%%%   origin         optional, how the address of the caller is decided; see
+%%                  yuzu_grpc_origin. Omitted: `#{mode => transport}', the TCP
+%%                  peer. A listener behind a load balancer or a router says so
+%%                  here, and names the proxies it trusts:
+%%                    #{mode => proxy_protocol, sources => [Ip | {Ip, Prefix}]}
+%%                    #{mode => forwarded_for, sources => [...], trusted_hops => 0}
+%%                  Both are refused to start without `sources'. proxy_protocol
+%%                  makes the listener require a PROXY header on every
+%%                  connection (one without is closed after a second), so it
+%%                  serves only the proxy; the header precedes the TLS
+%%                  handshake, so a client certificate still reaches the
+%%                  gateway. forwarded_for reads x-forwarded-for from a proxy
+%%                  that terminates TLS: the certificate the gateway sees is
+%%                  the proxy's, so it cannot be combined with an `auth_fun'.
+%%   http2          optional overrides of the Cowboy HTTP/2 options
 %%%   limits         optional #{max_message_bytes, send_timeout_ms}
 %%%   acceptors      optional acceptor count (default 4)
 %%%
@@ -47,7 +61,7 @@
 
 %% Options the layer owns; an entry may not override them.
 -define(RESERVED_HTTP2, [stream_handlers, env, protocols, alpn_default_protocol,
-                         connection_type, middlewares]).
+                         connection_type, middlewares, proxy_header]).
 %% ECDHE-ECDSA AEAD suites only, the list the gateway's upstream client uses
 %% (config/sys.config.prod): the gateway and server leaves are EC P-256.
 -define(CIPHERS, ["ECDHE-ECDSA-AES256-GCM-SHA384",
@@ -95,6 +109,7 @@ validate(Entry) when is_map(Entry) ->
     first_error([fun() -> check_required(Entry) end,
                  fun() -> check_listen(maps:get(listen, Entry, undefined)) end,
                  fun() -> check_tls(Entry) end,
+                 fun() -> check_origin(Entry) end,
                  fun() -> check_http2(maps:get(http2, Entry, #{})) end]);
 validate(_) ->
     {error, entry_not_a_map}.
@@ -202,11 +217,16 @@ protocol_opts(Entry, Routes) ->
                  max_concurrent_streams => 1024,
                  max_frame_size_received => 16384,
                  linger_timeout => 1000},
+    Origin = maps:get(origin, Entry, #{mode => transport}),
     maps:merge(maps:merge(Defaults, maps:get(http2, Entry, #{})),
                #{stream_handlers => [yuzu_grpc_stream_h],
                  env => #{grpc => Routes,
                           auth_fun => maps:get(auth_fun, Entry, undefined),
+                          origin => Origin,
                           limits => Limits},
+                 %% Cowboy reads the PROXY header itself, before the TLS
+                 %% handshake; the stream handler decides whether to believe it.
+                 proxy_header => maps:get(mode, Origin) =:= proxy_protocol,
                  %% HTTP/2 only: prior knowledge in cleartext. On TLS ALPN
                  %% settles on h2 (a client offering only http/1.1 or another
                  %% protocol is refused with a no_application_protocol alert);
@@ -259,6 +279,27 @@ has_path(Tls, Key) ->
         Path when is_binary(Path), Path =/= <<>> -> true;
         _ -> false
     end.
+
+check_origin(Entry) ->
+    case maps:get(origin, Entry, undefined) of
+        undefined ->
+            ok;
+        Origin ->
+            case yuzu_grpc_origin:validate(Origin) of
+                ok -> check_origin_auth(Origin, maps:is_key(auth_fun, Entry));
+                {error, _} = Error -> Error
+            end
+    end.
+
+%% An auth_fun authenticates the peer of the TLS connection. Behind a proxy that
+%% terminates TLS that peer is the proxy, so the check would pass on the
+%% proxy's certificate and say nothing about the agent: refuse the combination
+%% rather than let it read as agent authentication. (PROXY protocol does not
+%% terminate TLS and does not have the problem.)
+check_origin_auth(#{mode := forwarded_for}, true) ->
+    {error, auth_fun_behind_terminating_proxy};
+check_origin_auth(_, _) ->
+    ok.
 
 check_http2(Http2) when is_map(Http2) ->
     case [Key || Key <- ?RESERVED_HTTP2, maps:is_key(Key, Http2)] of

@@ -11,12 +11,13 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_grpc).
 
--export([headers/1, peer/1, peer_cert/1, conn_pid/1]).
--export([new_ctx/4]).
+-export([headers/1, peer/1, origin/1, peer_cert/1, conn_pid/1]).
+-export([new_ctx/5]).
 
 -define(HEADERS, yuzu_grpc_headers).
 -define(CONN, yuzu_grpc_conn).
 -define(PEER, yuzu_grpc_peer).
+-define(ORIGIN, yuzu_grpc_origin).
 -define(CERT, yuzu_grpc_cert).
 
 %% @doc The request headers, names lowercased. A header sent more than once is
@@ -27,10 +28,22 @@ headers(Ctx) ->
     ctx:get(Ctx, ?HEADERS, #{}).
 
 %% @doc The address of the TCP peer of the connection, or `undefined'. Behind a
-%% proxy this is the proxy.
+%% proxy this is the proxy. It is what the socket says and is never altered by
+%% anything the client sent; use origin/1 for the address of the agent.
 -spec peer(ctx:t()) -> {inet:ip_address(), inet:port_number()} | undefined.
 peer(Ctx) ->
     ctx:get(Ctx, ?PEER, undefined).
+
+%% @doc The address the call is attributed to, and where it came from. On a
+%% listener that is not behind a proxy this is the TCP peer (`transport'). On a
+%% listener configured as proxied, a claim from one of its trusted proxy
+%% addresses (the PROXY protocol header, or x-forwarded-for) is used instead
+%% (`proxy_protocol' / `forwarded_for'); a claim from anyone else is ignored.
+%% See yuzu_grpc_origin. The address has no port.
+-spec origin(ctx:t()) ->
+    {inet:ip_address(), transport | proxy_protocol | forwarded_for} | undefined.
+origin(Ctx) ->
+    ctx:get(Ctx, ?ORIGIN, undefined).
 
 %% @doc The DER certificate the peer presented in the TLS handshake, or
 %% `undefined' (plaintext, or a peer that sent none).
@@ -48,7 +61,8 @@ conn_pid(Ctx) ->
 %% @doc The ctx of a new call (for yuzu_grpc_stream_h).
 -spec new_ctx(#{binary() => binary()}, pid(),
               {inet:ip_address(), inet:port_number()} | undefined,
+              yuzu_grpc_origin:origin() | undefined,
               binary() | undefined) -> ctx:t().
-new_ctx(Headers, ConnPid, Peer, Cert) ->
+new_ctx(Headers, ConnPid, Peer, Origin, Cert) ->
     ctx:with_values(#{?HEADERS => Headers, ?CONN => ConnPid,
-                      ?PEER => Peer, ?CERT => Cert}).
+                      ?PEER => Peer, ?ORIGIN => Origin, ?CERT => Cert}).

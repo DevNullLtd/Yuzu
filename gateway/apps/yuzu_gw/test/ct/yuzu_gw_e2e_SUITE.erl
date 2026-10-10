@@ -1,14 +1,15 @@
 %%%-------------------------------------------------------------------
 %%% @doc End-to-end Common Test suite for the Yuzu gateway.
 %%%
-%%% This suite tests the full gRPC flow using actual grpcbox client
-%%% calls to simulate agent behavior. It requires:
-%%%   - The gateway to be fully started (grpcbox servers running)
+%%% This suite drives the agent service handlers in-process, the way a
+%%% connected agent would, with the gateway's own processes running. It
+%%% requires:
+%%%   - The gateway processes (registry, router, heartbeat buffer) started
 %%%   - Mock upstream handlers for the C++ server
 %%%
 %%% Test scenarios:
 %%%   1. Full agent lifecycle: Register → Subscribe → Heartbeat → Disconnect
-%%%   2. Command fanout through actual gRPC channels
+%%%   2. Command fanout through the router to the agent processes
 %%%   3. Error handling and recovery
 %%%   4. Concurrent agent connections
 %%% @end
@@ -31,9 +32,6 @@
     agent_reconnection/1,
     command_fanout_e2e/1
 ]).
-
--define(AGENT_PORT, 50151).  %% Test port for agent service
--define(MGMT_PORT, 50152).   %% Test port for management service
 
 %% These cases call the agent service handlers in-process (no real
 %% connection), so the connection key heartbeat admission compares is
@@ -62,8 +60,6 @@ init_per_suite(Config) ->
     application:ensure_all_started(gpb),
 
     %% Configure gateway for testing.
-    application:set_env(yuzu_gw, agent_listen_port, ?AGENT_PORT),
-    application:set_env(yuzu_gw, mgmt_listen_port, ?MGMT_PORT),
     application:set_env(yuzu_gw, upstream_addr, "127.0.0.1"),
     application:set_env(yuzu_gw, upstream_port, 59999),  %% unused port
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 500),

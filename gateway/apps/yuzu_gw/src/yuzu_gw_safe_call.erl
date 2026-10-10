@@ -4,11 +4,14 @@
 %%% A call that exits (the server is not running, is stalled past the timeout,
 %%% or died while serving it) exits the CALLER with a reason that embeds the
 %%% whole call: {Why, {gen_server, call, [Server, Request, Timeout]}}. The
-%%% caller here is a grpcbox handler process, and grpcbox logs the exception of
-%%% a handler that crashes (grpcbox_stream, INFO `exception=~p'). The crash
-%%% report filter (yuzu_gw_crash_redact) never sees that line, so a
+%%% caller that lets the exit propagate puts that request in the reason of a
+%%% dying process, where a crash report, a monitor or a trace shows it, so a
 %%% RegisterRequest in the call (enrollment_token, machine_certificate,
-%%% csr_pem) would reach the default log.
+%%% csr_pem) could reach the default log. A gRPC handler is not the only caller
+%%% (the agent processes and the registry call here too), and yuzu_grpc_runner,
+%%% which logs only the method, the exception class and the top frame of a
+%%% handler that crashes, is not what keeps the request out of a log: this
+%%% module is.
 %%%
 %%% call/4 (and guard/3, for a supervisor:start_child) turns every such exit into `{error, Error}' (Error is a fixed atom
 %%% chosen by the caller) and logs one WARN naming only the class of the exit:

@@ -93,6 +93,21 @@ heartbeat(<<"ctx">>, Ctx, _Request) ->
                                                 undefined -> <<"no-cert">>;
                                                 _ -> <<"cert">>
                                             end}]}};
+%% Where the call is attributed and what it reached the handler over: the
+%% origin address and how it was learned, the TCP peer, and whether a client
+%% certificate arrived (in `parameters').
+heartbeat(<<"origin">>, Ctx, _Request) ->
+    {Origin, Source} = yuzu_grpc:origin(Ctx),
+    {PeerIp, _} = yuzu_grpc:peer(Ctx),
+    {ok, #{acknowledged => true,
+           pending_commands =>
+               [#{command_id => yuzu_grpc_origin:format(Origin),
+                  plugin => atom_to_binary(Source, utf8),
+                  action => yuzu_grpc_origin:format(PeerIp),
+                  parameters => #{<<"cert">> => case yuzu_grpc:peer_cert(Ctx) of
+                                                    undefined -> <<"no-cert">>;
+                                                    _ -> <<"cert">>
+                                                end}}]}};
 heartbeat(<<"err5">>, _Ctx, _Request) ->
     {grpc_error, {5, <<"nope">>}};
 heartbeat(<<"err_bin">>, _Ctx, _Request) ->

@@ -3878,11 +3878,15 @@ gateway IP (`origin_observed=false`) when absent. The *direct* Register path
 ignores the field, so a *direct* agent cannot forge a source IP. It is **not** a
 defence against a compromised gateway (which is inside the trust boundary and
 can set any value) — both `source_ip` and the gateway's `gateway_ip` are
-recorded so an auditor can cross-check. **Server-side consumption ships now; the
-gateway-side population is a follow-up** — today's grpcbox transport can only
-source it from `x-forwarded-for` (proxied deployments); grpcbox does not yet
-expose the transport peer to the gateway's handlers, and the vendored accessor
-that will is #1172.
+recorded so an auditor can cross-check. **The gateway sets the field itself and
+discards whatever the agent sent** (`yuzu_gw_agent_service:register/2`): the value
+is the call's origin address as the gateway's own gRPC layer decides it — the
+transport peer by default, or the address a trusted proxy vouched for when the
+listener is configured with an `origin` mode (`proxy_protocol` or `forwarded_for`,
+judged by who connected, never by whether the claim matches; a claim from a peer
+that is not a configured proxy is ignored) — as a bare IP text, empty when the
+address is unknown. See `docs/user-manual/gateway.md`, "Client addresses behind a
+proxy".
 
 ## HTTPS and bind defaults (hard invariants)
 

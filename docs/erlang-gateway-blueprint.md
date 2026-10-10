@@ -113,7 +113,7 @@ yuzu_gateway/
 ```erlang
 %% rebar.config
 {deps, [
-    {grpcbox,   "0.17.1"},     % gRPC server + client (HTTP/2, protobuf)
+    {grpcbox,   "0.17.1"},     % gRPC client (upstream channel); the listeners are the yuzu_grpc* layer over cowboy
     {gpb,       "4.21.7"},     % Protobuf compiler/runtime (grpcbox dep)
     {telemetry,  "1.3.0"},     % Metrics event API
     {prometheus, "4.11.0"},    % Prometheus exposition (telemetry handler)
@@ -263,8 +263,9 @@ yuzu_gw_sup (one_for_one)
   ├── yuzu_gw_upstream          (gen_server — gRPC client pool to C++ server)
   ├── yuzu_gw_router            (gen_server — fanout coordinator)
   ├── yuzu_gw_agent_sup         (simple_one_for_one — agent processes)
-  ├── yuzu_gw_mgmt_service      (grpcbox service — operator-facing)
-  └── yuzu_gw_agent_service     (grpcbox service — agent-facing proxy)
+  └── yuzu_grpc_listener        (one per {yuzu_gw, grpc_listeners} entry, last children:
+                                 mgmt -> yuzu_gw_mgmt_service, operator-facing;
+                                 agent -> yuzu_gw_agent_service, agent-facing proxy)
 ```
 
 ---
@@ -703,7 +704,7 @@ LB/DNS ────────├─── gw3 (1M agents) ───├──�
    list and updates `last_seen` in bulk.
 
 3. **Add the Erlang OTP project** under `gateway/` (or a separate repo).
-   Wire up `grpcbox` with the proto files using `gpb` for code generation.
+   Wire up the gateway's gRPC layer (`yuzu_grpc*` over Cowboy; `grpcbox` for the upstream client) with the proto files using `gpb` for code generation.
 
 ### Phase 1: Shadow Mode (read-only gateway, agents still connect to C++)
 

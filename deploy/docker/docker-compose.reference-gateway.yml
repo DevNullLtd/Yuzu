@@ -47,9 +47,10 @@
 ## explicit pin, so the server pins its own default-gateway.pem automatically
 ## and no extra server flag is needed here.
 ##
-## Gateway TLS config: the gateway's grpcbox reads its OWN config, not the
-## YUZU_GW_* env vars, so we MOUNT reference-gateway-sys.config (upstream points
-## at the `server` service, listener is one-way TLS). Env-driven gateway TLS is
+## Gateway TLS config: the gateway's listeners are configured in its sys.config
+## ({yuzu_gw, grpc_listeners}), not by the YUZU_GW_* env vars, so we MOUNT
+## reference-gateway-sys.config (upstream points at the `server` service, agent
+## listener is one-way TLS). Env-driven gateway TLS is
 ## tracked in #1291.
 ##
 ## --cert-san: the default leaves are minted with SANs for the in-compose
@@ -142,7 +143,7 @@ services:
       # production gateway; set a strong YUZU_GW_COOKIE instead.
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     volumes:
-      # grpcbox reads its own config — mount the TLS sys.config (#1291 follow-up).
+      # The listeners come from sys.config, not env — mount the TLS sys.config (#1291 follow-up).
       - ./reference-gateway-sys.config:/opt/yuzu_gw/releases/0.2.0/sys.config:ro
       - certs:/etc/yuzu/certs:ro      # reads default-ca/-gateway via the yuzu-pki group
     depends_on:

@@ -380,7 +380,18 @@ ${c.tlsMode === 'plaintext'
     y += `              %% plaintext on 0.0.0.0 and the gateway otherwise refuses to\n`;
     y += `              %% boot. Safe only while :50063 stays unpublished on this\n`;
     y += `              %% compose network. Never copy into production.\n`;
-    y += `              {allow_insecure_mgmt, true}\n`;
+    y += `              {allow_insecure_mgmt, true},\n`;
+    y += `              %% gRPC listeners (plaintext: no tls key).\n`;
+    y += `              {grpc_listeners, [\n`;
+    y += `                  #{name => agent,\n`;
+    y += `                    service_protos => [agent_pb],\n`;
+    y += `                    services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service},\n`;
+    y += `                    listen => #{port => 50051, ip => {0,0,0,0}}},\n`;
+    y += `                  #{name => mgmt,\n`;
+    y += `                    service_protos => [management_pb],\n`;
+    y += `                    services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},\n`;
+    y += `                    listen => #{port => 50063, ip => {0,0,0,0}}}\n`;
+    y += `              ]}\n`;
     y += `          ]},\n`;
     // Plaintext gateway: gateway + TLS isn't generated yet (see the C1/N2 guard),
     // so this path is only reached in plaintext mode — the gateway dials the server
@@ -389,19 +400,7 @@ ${c.tlsMode === 'plaintext'
     y += `          {grpcbox, [\n`;
     y += `              {client, #{channels => [\n`;
     y += `                  {default_channel, [{http, "server", ${c.gwUpstreamPort}, []}], #{}}\n`;
-    y += `              ]}},\n`;
-    y += `              {servers, [\n`;
-    y += `                  #{grpc_opts => #{\n`;
-    y += `                      service_protos => [agent_pb],\n`;
-    y += `                      services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service}\n`;
-    y += `                  },\n`;
-    y += `                  listen_opts => #{port => 50051, ip => {0,0,0,0}}},\n`;
-    y += `                  #{grpc_opts => #{\n`;
-    y += `                      service_protos => [management_pb],\n`;
-    y += `                      services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service}\n`;
-    y += `                  },\n`;
-    y += `                  listen_opts => #{port => 50063, ip => {0,0,0,0}}}\n`;
-    y += `              ]}\n`;
+    y += `              ]}}\n`;
     y += `          ]},\n`;
     y += `          {kernel, [\n`;
     y += `              {connect_all, false},\n`;

@@ -24,6 +24,23 @@ bash scripts/check-proto-codegen.sh          # F-3 (#1243): committed *_pb.erl i
 
 **`rebar3 eunit --module X` does NOT give you test isolation.** It runs the full `--dir` phase first, then the module filter, **in the same BEAM VM**. The second run inherits polluted state — meck mocks, registered names, leaked processes, send_after timers — from the first, so a passing filtered run does not prove the test is order-independent, and a failing filtered run may be failing because of pollution rather than the test itself. For real isolation, `rm -rf gateway/_build/test` between runs (forces a fresh BEAM) or drop into `erl -pa _build/test/lib/yuzu_gw/ebin -pa _build/test/lib/*/ebin` and call test functions directly. This gotcha wasted meaningful debugging time on #336.
 
+## The gRPC layer and how listeners are started
+
+The gateway's two listeners (agent, management) are not served by a dependency: they are the gateway's own thin gRPC layer over Cowboy/Ranch, in `gateway/apps/yuzu_gw/src/`:
+
+| Module | Role |
+|---|---|
+| `yuzu_grpc_listener` | One Ranch listener per `{yuzu_gw, grpc_listeners}` entry; a `gen_server` a supervisor starts. Its header documents every entry key. |
+| `yuzu_grpc_stream_h` | The only Cowboy stream handler: runs the `auth_fun`, resolves the caller's address, routes the call, spawns the runner. |
+| `yuzu_grpc_origin` | Which address a call is attributed to (`transport` / `proxy_protocol` / `forwarded_for`); pure. |
+| `yuzu_grpc_route`, `yuzu_grpc_runner`, `yuzu_grpc_stream`, `yuzu_grpc_frame`, `yuzu_grpc` | Route table from the proto modules, handler runner (unary, server-streaming, bidi; any non-gRPC-error failure is `INTERNAL`), the stream API (`yuzu_grpc_stream:send(Stream, Message)`, stream first), message framing, and the ctx accessors (`peer/1`, `origin/1`, `peer_cert/1`, `conn_pid/1`). |
+
+Listeners are the **last children** of `yuzu_gw_sup`, one `yuzu_grpc_listener` child spec per entry, so nothing is served before the registry, router and agent supervisor exist and a listener that cannot bind stops the tree. `yuzu_gw_app` validates every entry (and refuses a leftover `{grpcbox, [{servers, ...}]}` block) before the supervisor starts. `YUZU_GW_AGENT_PORT` / `YUZU_GW_MGMT_PORT` rewrite the matching entry's port. The operator-facing description is in `docs/user-manual/gateway.md`, "gRPC listeners".
+
+grpcbox is still the gateway's upstream **client** (the channel to the C++ server) and the test clients are `grpcbox_client` channels. **Pending, not done:** `gateway/_checkouts/grpcbox` (the vendored, patched grpcbox) is still present, and the image builds still assert it, until PR 3 of the Cowboy-edge work removes it.
+
+**Test helpers** (in `apps/yuzu_gw/test/`). Tests start listeners through `yuzu_gw_test_listener:start/1` (a `grpc_listeners` entry on a probed free loopback port, returns `{Port, Pid}`) and talk to them through `yuzu_gw_test_listener:client_channel/2` or `yuzu_grpc_wire_tests:client_chan/4`; do not write another `start_listener`/`probe_free_port`. `yuzu_gw_test_relay` is a plain TCP splice that writes a fixed header first (a PROXY protocol header, as an F5 iRule or HAProxy `send-proxy-v2` would) and then copies bytes both ways, so TLS and the client certificate pass through it untouched; use it for the `proxy_protocol` origin tests. A wire test never waits on a sleep: it waits on a message, a monitor, a telemetry event or a stub counter.
+
 ## Toolchain activation (Erlang on PATH)
 
 `rebar3` and the meson custom_target that wraps it both need `erl` on PATH. Forgetting to activate is the usual cause of phantom `.gateway_built` failures while the C++ targets succeed. Source the cross-platform helper before any gateway work and verify:

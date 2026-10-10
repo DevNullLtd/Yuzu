@@ -10,6 +10,11 @@
 %%%   6. yuzu_gw_cluster_discovery — cluster-formation redial loop (#4555)
 %%%   7. yuzu_gw_health            — HTTP health/readiness endpoint
 %%%   8. yuzu_gw_agent_sup         — simple_one_for_one for agent processes
+%%%   9. one yuzu_grpc_listener per {yuzu_gw, grpc_listeners} entry — LAST, so
+%%%      nothing is served before the registry, router and agent supervisor a
+%%%      handler calls exist, and a listener that cannot bind stops the tree
+%%%      rather than leaving a gateway that looks up and serves nothing. The
+%%%      entries were validated by yuzu_gw_app before this supervisor started.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_sup).
@@ -116,6 +121,16 @@ init([]) ->
           restart  => permanent,
           shutdown => infinity,
           type     => supervisor}
-    ],
+    ] ++ listener_children(),
 
     {ok, {SupFlags, Children}}.
+
+%% One child per configured listener entry; none when the key is unset (a
+%% gateway under test, which starts its own listeners).
+listener_children() ->
+    case application:get_env(yuzu_gw, grpc_listeners, []) of
+        Listeners when is_list(Listeners) ->
+            [yuzu_grpc_listener:child_spec(Entry) || Entry <- Listeners];
+        _ ->
+            []
+    end.

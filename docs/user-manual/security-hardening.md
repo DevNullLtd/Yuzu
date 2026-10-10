@@ -111,8 +111,9 @@ Run each component under its own system user:
 > The gateway is the command fan-out plane — a plaintext, untrusted-network-reachable
 > agent listener lets an on-path attacker inject commands (fleet RCE).
 > **One-way (server-authenticated) TLS now exists for it (PKI PR5c)** — enable it on
-> the agent listener (`transport_opts` with `verify => verify_none`,
-> `fail_if_no_peer_cert => false`; see `gateway/config/sys.config.prod`) and ship the
+> the agent listener (a `tls` map in its `{yuzu_gw, grpc_listeners}` entry with
+> `verify => verify_none`, `fail_if_no_peer_cert => false`; see
+> `gateway/config/sys.config.prod`) and ship the
 > CA to your agents. `docker-compose.reference-gateway.yml` ships it (#1314); the
 > cluster compose boots the image default `sys.config` and the demo and UAT composes use their own UAT/demo `sys.config`; all of those listen in plaintext.
 
@@ -149,6 +150,12 @@ Direct agent→server connections (no gateway) use TLS. Full detail + the deploy
 "TLS posture" and `docs/pki-architecture.md` "Gateway TLS".
 
 The agent listener authenticates the gateway to agents, not agents to the gateway.
+Requesting a client certificate on this edge is a configuration change that enforces
+nothing yet, and enforcing one needs a separate design (see
+[Moving the agent edge to mutual TLS](gateway.md#moving-the-agent-edge-to-mutual-tls)).
+The address the gateway reports for an agent is the TCP peer unless the listener is told
+which proxies to trust (see
+[Client addresses behind a proxy](gateway.md#client-addresses-behind-a-proxy)).
 The gateway admits an agent `Heartbeat` only on the connection that opened the
 session's `Subscribe` stream, and only for a session that gateway node holds
 (a rejected heartbeat is answered `NOT_FOUND`, counted, and not forwarded).
@@ -160,7 +167,7 @@ disclosure of session ids in logs; some log lines still include session ids.
 The gateway **management plane** (`:50063`) — the port the server's command
 forwarding dials — is the highest-value gateway surface: whoever it admits can
 run commands on every connected agent. Its secure shape is strict mTLS **plus a
-peer pin** (#1422): the listener's `auth_fun` accepts only a client cert whose
+peer pin** (#1422): the listener's `auth_fun` (run by the gateway's gRPC layer before any handler exists) accepts only a client cert whose
 key matches `{yuzu_gw, mgmt_peer_pins}` (your server's cert) AND carries the
 `serverAuth` EKU — a CA-issued cert alone (any agent's leaf, the gateway's own
 leaf) is rejected with `UNAUTHENTICATED`. The gateway **refuses to boot** when a
