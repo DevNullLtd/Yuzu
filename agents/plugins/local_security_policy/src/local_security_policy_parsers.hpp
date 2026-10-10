@@ -1128,15 +1128,18 @@ std::optional<std::string> read_source(const FileReader& rd, Tally& t, const std
     return std::nullopt;
 }
 
+/// `counts_as_key` false: the rows are still reported, but they are not evidence of a lockout
+/// setting (the login.defs login-prompt/faillog keys), so they do not stop `not_found`.
 inline void kv_source(const FileReader& rd, Tally& t, std::string_view action, const std::string& path,
-                      std::string_view seps, std::span<const std::string_view> allow) {
+                      std::string_view seps, std::span<const std::string_view> allow,
+                      bool counts_as_key = true) {
     auto text = read_source(rd, t, path, [&](const auto& st) {
         t.row(format_kv_row(action, "source_state", kv_state_text(st), path));
     });
     if (!text) return;
     for (const auto& [k, v] : parse_kv_lines(*text, seps))
         if (allow.empty() || std::find(allow.begin(), allow.end(), k) != allow.end()) {
-            ++t.key_rows;
+            if (counts_as_key) ++t.key_rows;
             t.row(format_kv_row(action, k, v, path));
         }
 }
@@ -1226,14 +1229,17 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
         break;
     }
     case LocalPolicyAction::Lockout: {
-        detail::kv_source(rd, t, prefix, "/etc/login.defs", " \t", kLoginDefsLockoutKeys);
+        // LOGIN_RETRIES, LOGIN_TIMEOUT, FAILLOG_ENAB and FAIL_DELAY are login(1) prompt and faillog
+        // settings, not account-lockout counters: reported, but not evidence that lockout is set.
+        detail::kv_source(rd, t, prefix, "/etc/login.defs", " \t", kLoginDefsLockoutKeys, false);
         detail::kv_source(rd, t, prefix, "/etc/security/faillock.conf", " \t=", {});
         constexpr std::string_view files[] = {"common-auth", "common-account", "system-auth",
                                               "password-auth"};
         constexpr std::string_view types[] = {"auth", "account"};
         detail::pam_sources(rd, t, prefix, files, types, kPamLockoutModules);
         // The DEFAULT "no lockout key found" answer (#5620): at least one source was read and
-        // NO key row (a login.defs / faillock.conf key, a pam.<type>.<module> line) was produced.
+        // NO key row (a faillock.conf key, a pam.<type>.<module> line) was produced; the login.defs rows
+        // are reported but do not count (login-prompt and faillog settings, not lockout).
         // An absent or unreadable sibling keeps its own `source_state` row and does not suppress
         // this one -- a host with no faillock.conf and no PAM lockout line gets BOTH facts. Any
         // key row at all (say faillock.conf absent but system-auth configures pam_faillock) means

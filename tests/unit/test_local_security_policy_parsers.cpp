@@ -438,13 +438,46 @@ TEST_CASE("local_security_policy collect_file_policy: not_found names the files 
 TEST_CASE("local_security_policy collect_file_policy: lockout_policy not_found row is the default "
           "only while no key row exists",
           "[local_security_policy][parsers]") {
-    SECTION("a login.defs key suppresses it") {
+    // The four login.defs keys are login(1) prompt and faillog settings, not account-lockout counters
+    // (some distros may ship them uncommented). They are REPORTED, in file order and before the
+    // not_found row, but they are not evidence of a lockout setting, so they never stop not_found.
+    SECTION("the login.defs keys are reported but do not suppress it") {
+        for (const char* key : {"LOGIN_RETRIES", "LOGIN_TIMEOUT", "FAILLOG_ENAB", "FAIL_DELAY"}) {
+            INFO(key);
+            auto files = no_lockout_files();
+            files["/etc/login.defs"] = std::string{key} + " 5\n";
+            const auto c = collect_lockout(files);
+            CHECK(c.status == PolicyStatus::Ok);
+            CHECK(c.rows == std::vector<std::string>{
+                                "lockout_policy|" + std::string{key} + "|5|/etc/login.defs",
+                                std::string{kNotFoundRow}});
+        }
+    }
+    SECTION("all four login.defs keys at once still leave not_found") {
+        auto files = no_lockout_files();
+        files["/etc/login.defs"] = "LOGIN_RETRIES 5\nLOGIN_TIMEOUT 60\nFAILLOG_ENAB yes\nFAIL_DELAY 3\n";
+        const auto c = collect_lockout(files);
+        CHECK(c.rows == std::vector<std::string>{"lockout_policy|LOGIN_RETRIES|5|/etc/login.defs",
+                                                 "lockout_policy|LOGIN_TIMEOUT|60|/etc/login.defs",
+                                                 "lockout_policy|FAILLOG_ENAB|yes|/etc/login.defs",
+                                                 "lockout_policy|FAIL_DELAY|3|/etc/login.defs",
+                                                 std::string{kNotFoundRow}});
+    }
+    SECTION("a login.defs key beside a real lockout key: the real key still suppresses it") {
         auto files = no_lockout_files();
         files["/etc/login.defs"] = "LOGIN_RETRIES 5\n";
-        const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout,
-                                           reader_from(files), empty_dir());
+        files["/etc/security/faillock.conf"] = "deny = 4\n";
+        const auto c = collect_lockout(files);
         CHECK_FALSE(has_prefix_row(c, "lockout_policy|lockout_keys|"));
         CHECK(count_row(c, "lockout_policy|LOGIN_RETRIES|5|/etc/login.defs") == 1);
+        CHECK(count_row(c, "lockout_policy|deny|4|/etc/security/faillock.conf") == 1);
+    }
+    SECTION("password_policy is untouched: its login.defs keys are still reported") {
+        const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Password,
+                                           reader_from({{"/etc/login.defs", "PASS_MAX_DAYS 90\n"}}),
+                                           empty_dir());
+        CHECK(count_row(c, "password_policy|PASS_MAX_DAYS|90|/etc/login.defs") == 1);
+        CHECK_FALSE(has_prefix_row(c, "password_policy|lockout_keys|"));
     }
     SECTION("a faillock.conf key suppresses it") {
         auto files = no_lockout_files();

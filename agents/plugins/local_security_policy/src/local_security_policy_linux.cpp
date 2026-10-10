@@ -16,8 +16,8 @@
  *    `type control module` is dropped without a row.
  *  - A file read successfully that sets none of the reported keys contributes no row
  *    (e.g. Debian's all-commented faillock.conf), EXCEPT that a lockout_policy read in
- *    which at least one source was read and NO key row (a login.defs / faillock.conf key,
- *    a pam.<type>.<module> line) resulted writes one
+ *    which at least one source was read and NO key row (a faillock.conf key,
+ *    a pam.<type>.<module> line; login.defs rows are reported but do not count) resulted writes one
  *    `lockout_policy|lockout_keys|not_found|<files>` row (#5620), the default "no lockout
  *    key found" answer. An absent or unreadable sibling keeps its own `source_state` row
  *    and does not suppress it; any key row does. `<files>` names exactly the files read
