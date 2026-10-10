@@ -451,6 +451,8 @@ TEST_CASE("dashboard stylesheet: the facet refusal cell is allowed to wrap and u
     CHECK(contains(body, "white-space: normal"));
     CHECK(contains(body, "overflow: visible"));
     CHECK(contains(body, "max-width: none"));
+    // A refusal is read, not skimmed: it must not inherit .empty-state's low-contrast colour.
+    CHECK(contains(body, "color: var(--yellow"));
     // And the generic clip it overrides still exists, so the override is what makes it readable.
     CHECK(contains(css, "tbody td {"));
 }

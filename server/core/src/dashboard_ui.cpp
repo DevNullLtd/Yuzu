@@ -269,6 +269,9 @@ extern const char* const kDashboardIndexHtml =
     td.filter-refused {
       white-space: normal; overflow: visible; text-overflow: clip; max-width: none;
       text-align: left;
+      /* .empty-state's colour is 2.4:1 on the canvas (below WCAG AA); a refusal must be
+         read, so use the warning tone (about 11.5:1). */
+      color: var(--yellow, #ffcc00);
     }
     /* #2691 finding 7: an honest "store degraded, not zero matches" banner —
        distinct from .empty-state so it doesn't visually read as "nothing here".
