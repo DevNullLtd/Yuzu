@@ -1135,7 +1135,11 @@ groups:
             SCIM, or it was elevated/promoted outside SCIM's ownership
             boundary (#2021), or (#4966) a SCIM POST or active:true
             reactivation named a username that already holds an Administrator
-            grant or whose deactivated record carries a non-user role. A
+            grant or whose deactivated record carries a non-user role. That
+            #4966 case also fires for a benign re-enable of an account an
+            operator elevated or granted outside SCIM, on every IdP retry:
+            clear the role or grant (rbac.md, SCIM specifics) rather than
+            investigating the IdP. A
             single event is usually a misconfigured IdP
             attribute mapping; a sustained rate is worth treating as a
             possibly compromised or misbehaving IdP. Correlate via the

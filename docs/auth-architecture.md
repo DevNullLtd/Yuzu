@@ -1999,16 +1999,17 @@ that triggers a `500`).
 | `scim.user.provisioned` | `denied` | `POST` rejected `409` — `userName` collision against a currently-active account |
 | `scim.user.provisioned` | `failure` | `POST` rolls back after a `500` (e.g. the account-creation transaction fails) |
 | `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500` |
-| `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write could not persist |
-| `scim.user.reactivated` | `success` / `failure` | `PATCH` or `PUT` sets `active:true`; `failure` (set-and-proceed) on an audit-write error |
-| `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed) |
+| `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write could not persist. (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`) |
+| `scim.user.reactivated` | `success` / `failure` | `PATCH` or `PUT` sets `active:true`. `failure` causes (#4966): the tombstone's role could not be read (`500`, `tombstone role unreadable before reactivation`), the Administrator-grant read was unavailable (`503`, `administrator grant check unavailable`), or the account or mirror write failed (`500`). An elevated tombstone or a name holding an Administrator grant is a `scim.user.provenance_denied` (`404`), not a `reactivated` row |
+| `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed). (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`) |
 | `scim.user.provenance_denied` | `denied` | A deactivate/reactivate/delete/update targets an account whose `provisioning_source != "scim"`, **or** whose current `role != "user"`; **or** (#4966) a `POST /Users` or an `active:true` reactivation names a username that already holds an `Administrator` grant or a deactivated record whose role is not `user`. Counted on `yuzu_scim_provenance_denied_total` for the same causes (including the group-recompute provenance skip, which writes no audit row) |
-| `scim.user.last_administrator_refused` | `denied` | (#4966) The last-Administrator guard refused a deactivation, delete, `POST` with `active:false` or group-derived demotion (`409` `mutability`). A refused deprovision also raises a critical analytics event. Counted on `yuzu_server_rbac_last_admin_guard_refused_total{transport="scim"}` |
+| `scim.user.last_administrator_refused` | `denied` / `partial` | (#4966) The last-Administrator guard refused a deactivation, delete, `POST` with `active:false` or group-derived demotion (`409` `mutability`). `partial` for a LATE refusal (the linked credentials were revoked before the guard refused); `denied` for an early refusal and for a refused demotion. Every refusal also raises a critical analytics event. Counted on `yuzu_server_rbac_last_admin_guard_refused_total{transport="scim"}` |
 | `scim.user.compensation_failed` | `failure` | (#4966) The guarded undo of a half-finished create/revive was refused or failed (`outcome` = `guard_refused_last_administrator` / `deactivated_but_session_wipe_failed` / `store_failure`). Written with a critical analytics event and `yuzu_scim_compensation_failed_total{outcome}`; the account is left active only for the guard refusal |
 | `scim.auth.denied` | `denied` | Bearer-auth validation fails (missing/malformed/wrong token) on any `/scim/v2/*` route, including discovery |
 | `scim.group.created` | `success` / `denied` / `failure` | `POST /scim/v2/Groups` succeeds / rejected `409` — `displayName` collision against an existing group / rolls back `500` |
 | `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` — rename onto an existing `displayName` / fails `500` |
 | `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed) |
+| `scim.group.recompute_incomplete` | `partial` | (#4966, target type `Group`) A Group request's role recompute hit a store failure and skipped the remaining PROMOTIONS (demotions are never skipped): the count and up to 20 usernames. Counted on `yuzu_scim_group_recompute_skipped_total{direction}` |
 | `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value (user create, or a Group create/replace/patch/delete affecting admin-group membership); records `old_role`→`new_role`, `reason=group` |
 
 All rows carry `principal = "scim-service"`, `principal_role = "scim-service"`.
@@ -2026,6 +2027,7 @@ Prometheus counters (all in the `yuzu_scim_*` namespace):
 | `yuzu_scim_audit_write_failures_total` | — | An audit-log write itself failed. All lifecycle actions (provision, update, deactivate, reactivate, delete, group create/update/delete, role change) are set-and-proceed on this failure mode — the SCIM call still succeeded and the bump is the only record that the evidence row is missing; alert on this counter rather than expecting a `500` (see "All lifecycle audit writes are set-and-proceed" above). |
 | `yuzu_scim_provenance_denied_total` | — | Provenance- or role-guard refusals; pairs with `scim.user.provenance_denied` audit rows. |
 | `yuzu_scim_role_changes_total` | — | A user's role was recomputed to a new value via Groups → role mapping; pairs with `scim.user.role_changed` audit rows (`success`). |
+| `yuzu_scim_group_recompute_skipped_total` | `direction` | (#4966) Group role-recompute members NOT attempted after the first store failure of a request. Only `promotion` is ever skipped (demotions are always attempted, so `demotion` stays 0); pairs with one `scim.group.recompute_incomplete` audit row per request. |
 | `yuzu_scim_role_change_failures_total` | — | `recompute_scim_user_role`'s `AuthManager::update_role` call reported a genuine AuthDB write failure — a role change that was decided but did **not** durably apply; pairs with `scim.user.role_changed` audit rows (`failure`). A sustained non-zero rate means role changes are silently not taking effect — alert on it distinctly from `yuzu_scim_audit_write_failures_total` (that counter covers a lost *evidence row* for an otherwise-successful mutation; this one covers the mutation itself failing). |
 
 ### Storage
@@ -2135,7 +2137,8 @@ revoked, the account stays active, the response and audit row say so (SCIM
 `409` `mutability`, dashboard `409` and a `partial` audit result). In both
 forms the person the identity provider terminated is not terminated here: after
 an early refusal their API tokens and sessions are still live, after a late one
-the account is active and they can sign in again through SSO. A refused SCIM
+the account remains active in Yuzu, so any credential the identity provider
+still accepts for it works. A refused SCIM
 deprovision therefore raises a `Severity::kCritical` analytics event and the
 operator revokes manually or lets the identity provider retry once another
 administrator exists; see `docs/user-manual/rbac.md`, "Last-Administrator guard
@@ -2314,7 +2317,14 @@ above) now also carry `api_tokens_revoked=N sessions_revoked=N
 principals=N` in `detail` on success, and `partial` is now a possible
 `result` for those two actions specifically (a non-persisted credential
 revoke — see "Deprovision-time revoke" above), in addition to the existing
-`success`/`failure`.
+`success`/`failure`. When the detail lists the revoked principals
+(`revoked_principals=a,b,c`), each principal string is tokenised before it is
+written (#4966, CWE-117): `,`, space, `=`, control bytes and every byte
+>= 0x80 become `_`, and a string over 256 bytes is shortened. The tokenisation
+is **lossy**: two distinct principals (for example two OIDC subjects differing
+only in a non-ASCII character) can collapse into one token, so a SIEM rule
+must not treat the list as an identity key; the exact identities are in the
+`identity_links` rows.
 
 ### New metrics (ADR-2001)
 

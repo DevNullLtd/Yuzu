@@ -47,7 +47,16 @@ and the new counters are listed in the changelog entry and in `docs/user-manual/
 - SCIM connectors: expect `409` on a deprovision of the fleet's last administrator and `503` with
   `Retry-After: 2` when the guarded write times out. A refused deprovision leaves the person's account
   active until an operator acts, and raises a critical analytics event. SCIM provisioning now reads the
-  RBAC store even when enforcement is off.
+  RBAC store even when enforcement is off. **Behaviour change: `active:true` on a tombstone.** A SCIM
+  `PATCH`/`PUT` with `active:true` on a deactivated resource whose role is not `user`, or whose username
+  holds an `Administrator` grant, now answers `404` (audited `scim.user.provenance_denied`, counted on
+  `yuzu_scim_provenance_denied_total`) instead of reactivating the account. SCIM can deactivate the holder
+  of an `Administrator` grant but cannot reactivate it until the grant is removed (MCP
+  `unassign_rbac_role`); an elevated tombstone has its role cleared with
+  `UPDATE auth.users SET role = 'user' WHERE username = '<name>' AND NOT is_active;` (see `rbac.md`).
+  The `503` for a store failure no longer carries a `retry_after_ms` body member (the `Retry-After`
+  header stays), and a Group request that hits a store failure now skips the remaining promotions and
+  records one `scim.group.recompute_incomplete` audit row.
 
 ## Behaviour change: `POST /api/instructions/{id}/execute` now validates `params` against the stored schema
 

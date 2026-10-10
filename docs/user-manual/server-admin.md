@@ -3256,7 +3256,7 @@ The server emits an audit event on every branch:
 | User not found | `denied` | `user_not_found` |
 | Would leave no active local admin (last administrator) | `denied` | `last_administrator_blocked` (HTTP 409) |
 | Account deactivated between the route's lookup and the write, `admin` requested | `denied` | `inactive_promotion_refused` (HTTP 409; an account already inactive when the request arrives is `user_not_found`, HTTP 404) |
-| Role store unavailable, or the guard is not wired | `failure` | `store_failure` (HTTP 503, `Retry-After: 2`; the write may not have completed) |
+| Role store unavailable, or the guard is not wired | `failure` | `store_failure` (HTTP 503, no retry hint: the change may or may not have been applied, so check the user's role and revoke the user's sessions) |
 | Role changed but session cleanup failed | `partial` | `role_changed session_wipe_failed=true old_role=<r> new_role=<r>` (HTTP 503, no retry hint: revoke the user's sessions) |
 
 > **You cannot change your own role.** The endpoint rejects self-target
@@ -3309,14 +3309,20 @@ The server emits an audit event on every branch:
 > `user.delete` / `partial` (credentials were revoked), and both are counted on
 > `yuzu_server_rbac_last_admin_guard_refused_total{transport="dashboard"}`.
 > If the delete cannot complete because the store is unavailable, the answer
-> is HTTP 503 with `Retry-After: 2`; repeating the delete is safe.
+> is HTTP 503 with `Retry-After: 2`; repeating the delete converges (a repeat
+> on an already-deactivated account answers 404 and re-runs the durable
+> session wipe).
 >
 > **Operator notes.** Every guarded delete and role change takes the same
 > database row lock, waiting at most 2000 ms, so a burst of SCIM
 > deprovisions queues on it and some requests can time out (dashboard `503`
-> and SCIM `503`, both with `Retry-After: 2`) with the account itself
-> unchanged (its credentials were already revoked, see above); retries are
-> safe. Each request keeps a pooled PostgreSQL connection while it waits
+> with `Retry-After: 2`, SCIM `503` with `Retry-After: 2`; the dashboard role
+> change answers `503` with no retry hint) with the account itself unchanged
+> after a lock timeout (its credentials were already revoked, see above). A
+> SCIM retry finishes the job only after a lock timeout in which nothing
+> committed; it does not converge after a lost commit acknowledgement, a
+> failed session wipe, or a `POST` with `active:false`
+> ([#5214](https://github.com/Tr3kkR/Yuzu/issues/5214)). Each request keeps a pooled PostgreSQL connection while it waits
 > (default pool 16, `--postgres-pool-size`; a deactivation can wait up to four
 > times 2000 ms), so watch `yuzu_pg_pool_waiters`,
 > `yuzu_pg_acquire_wait_seconds` and

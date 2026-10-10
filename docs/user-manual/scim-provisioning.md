@@ -386,22 +386,56 @@ raises a critical analytics event; the server log line is limited to one
 warning per username per minute); and resolving it is an operator action, not
 an IdP one: grant the `Administrator` role to another account first. Until then
 the person the IdP terminated is still active here: after an early refusal
-their API tokens and sessions are live as well, and after a late one they can
-sign in again through SSO, so revoke them by hand if that matters. If the
+their API tokens and sessions are live as well, and after a late one the
+account remains active in Yuzu, so any credential the IdP still accepts for it
+works; revoke them by hand if that matters. If the
 guarded write times out or the store is unavailable the answer is **`503`** with
-`Retry-After: 2` (the linked credentials were already revoked, and the retry
-finishes the job); a `500` after a failed session wipe means the account IS
+`Retry-After: 2` (header only; the body is the plain SCIM error, with no
+`retry_after_ms` member) and a detail saying the account state may be
+indeterminate. The linked credentials were already revoked. A retry finishes the
+job only when the cause was a lock timeout and nothing committed (`PATCH`, `PUT`,
+`DELETE`); it does not converge after a lost commit acknowledgement (the retry
+meets the `404` role guard on the now-deactivated account), and not for a `POST`
+with `active:false` (the account stays active and mapped, and the retry gets the
+`userName` `409`). A `500` after a failed session wipe means the account IS
 deactivated, and a retry of that request is not promised to repeat the wipe
 ([#5214](https://github.com/Tr3kkR/Yuzu/issues/5214)). When a Group change would demote the last active
 local admin account, the Group request still succeeds, the account keeps its
-role, and the refusal is audited the same way. See
+role, the refusal is audited the same way and raises a critical analytics
+event (the IdP removed the person from the admin group and they keep admin: an
+operator has to act). A late refusal is audited with `result=partial` (the
+credentials were revoked); an early refusal and a refused demotion are
+`denied`.
+
+**Group role recompute after a store failure.** After a Group create, replace,
+patch or delete commits, Yuzu recomputes the role of each affected member. If one
+member's guarded role write hits a store failure (a lock wait that expired, an
+unavailable store), the remaining **demotions** are still attempted (skipping one
+would leave an IdP-removed administrator holding the role), and the remaining
+**promotions** are skipped. Skipped promotions are recorded as ONE
+`scim.group.recompute_incomplete` audit row (`result=partial`, the skipped count
+and up to 20 usernames) and counted on
+`yuzu_scim_group_recompute_skipped_total{direction="promotion"}`. A failed
+demotion writes a `scim.user.role_changed` failure row, increments
+`yuzu_scim_role_change_failures_total`, raises the critical analytics event
+`scim.user.role_demotion_incomplete` and a critical log line: demote the account
+and revoke its sessions by hand. The Group request keeps its status (its
+membership write committed). A skipped promotion is repaired by the next
+create/replace/patch of the same Group, by its delete (for former members), or by
+a `POST /Users` re-provision of that user; it is not repaired for a member already
+removed from a surviving group, or on a timer, so use the audit row to find them.
+See
 [`rbac.md`](rbac.md#last-administrator-guard-for-account-deactivation-and-demotion).
 
 `POST /scim/v2/Users` also refuses (`404`, nothing created or reactivated) a
 `userName` that already holds an `Administrator` grant, or whose deactivated
 record still has a role other than `user`: a SCIM account must never become a
 counted administrator. A `PATCH`/`PUT` with `active:true` applies the same two
-checks before reactivating. The `404` tells the holder of the SCIM bearer, with
+checks before reactivating (behaviour change: such a request used to reactivate
+the account). Every such `404` increments `yuzu_scim_provenance_denied_total`,
+the compromised-IdP signal, so this benign case also fires it. An elevated
+tombstone cannot be re-enabled through SCIM or the dashboard until its role is
+cleared (see [`rbac.md`](rbac.md#last-administrator-guard-for-account-deactivation-and-demotion)). The `404` tells the holder of the SCIM bearer, with
 no side effect, that the name holds a grant or an elevated deactivated record.
 These checks read the RBAC store, so SCIM provisioning needs it even when RBAC
 enforcement is off; if the grant read is unavailable the answer is `503` with
