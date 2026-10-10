@@ -14,6 +14,7 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -137,6 +138,90 @@ std::optional<std::vector<std::string>> list_active_local_admin_accounts(PGconn*
         names.push_back(text_col(r.get(), i, 0));
     return names;
 }
+
+// Bound on EVERY lock wait inside `deactivate_account` and `set_local_role` (the `rbac_enabled`
+// row, the counted grant set, the target's grant row, the target's `auth.users` row), installed as
+// the FIRST statement of each transaction. PR #4966 installs 2000 ms. `rbac_sql::kWriteTimeout`
+// (4000 ms) bounds only the pool ACQUIRE and the pool's own `lock_timeout` defaults to 10000 ms
+// (and is not injected at all when the DSN or `PGOPTIONS` carries its own), so without this a
+// stuck lock holder could pin a pooled connection for 10 s per lock or unbounded. There is no
+// ordering constraint on the value against `AuthDB::recheck_role_locked` (2000 ms) or
+// `CredentialChangeOwner` (1500 ms): those wait on the `auth.users` row this owner takes LAST
+// and holds only across lock-free recounts and the COMMIT, and this owner never waits on a lock
+// either of them holds while holding the `auth.users` row, so no chain of waits forms.
+constexpr std::chrono::milliseconds kLifecycleLockTimeout{2000};
+
+// "SELECT set_config('lock_timeout', $1, true)": transaction-local (never leaks to the pooled
+// connection), bound parameter, the same shape `AuthDB`'s own transaction-scoped bound uses.
+bool set_txn_lock_timeout(PGconn* c, std::string& err) {
+    pg::PgResult r = pg::exec_params(
+        c, "SELECT set_config('lock_timeout', $1, true)",
+        std::vector<std::string>{std::to_string(kLifecycleLockTimeout.count()) + "ms"});
+    if (r.status() != PGRES_TUPLES_OK) {
+        err = PQerrorMessage(c);
+        return false;
+    }
+    return true;
+}
+
+// "SELECT 1 FROM rbac_store.principal_roles WHERE ... FOR UPDATE" for ONE principal's own
+// fleet-wide Administrator grant row. Returns whether the row exists (and is now locked),
+// nullopt on a query error. Takes the lock whether or not the principal's account is active:
+// `deactivate_account` needs to know about a grant the counted-set lock query could not have
+// seen (an INSERT committed after that query's snapshot, or a grant whose account was inactive
+// at that time).
+std::optional<bool> lock_target_administrator_grant(PGconn* c, const std::string& username,
+                                                    std::string& err) {
+    pg::PgResult r = pg::exec_params(
+        c,
+        "SELECT 1 FROM rbac_store.principal_roles WHERE principal_type = 'user' "
+        "AND principal_id = $1 AND role_name = 'Administrator' FOR UPDATE",
+        std::vector<std::string>{username});
+    if (r.status() != PGRES_TUPLES_OK) {
+        err = PQerrorMessage(c);
+        return std::nullopt;
+    }
+    return PQntuples(r.get()) > 0;
+}
+
+// A TARGET's membership in the column floor's population, taking that one `auth.users` row's
+// lock when it is a member: is `username` an ACTIVE local `role = 'admin'` account
+// (`auth_sql::kActiveLocalAdminPredicate`, the one copy). A non-member is left unlocked here (a
+// role write needs the `rbac_enabled` lock this transaction already holds, so it cannot become
+// a member mid-transaction; the soft delete that follows locks the row anyway). nullopt on a
+// query error.
+std::optional<bool> lock_target_if_active_local_admin(PGconn* c, const std::string& username,
+                                                      std::string& err) {
+    const std::string sql = "SELECT 1 FROM auth.users WHERE username = $1 AND " +
+                            std::string(auth_sql::kActiveLocalAdminPredicate) + " FOR UPDATE";
+    pg::PgResult r = pg::exec_params(c, sql.c_str(), std::vector<std::string>{username});
+    if (r.status() != PGRES_TUPLES_OK) {
+        err = PQerrorMessage(c);
+        return std::nullopt;
+    }
+    return PQntuples(r.get()) > 0;
+}
+
+// True iff `members` is exactly {username}: the sole-member test the advisory check uses on a
+// list read that already holds only active, counted members (a member list holds a username at
+// most once: principal_roles' PRIMARY KEY and auth.users.username's UNIQUE).
+bool is_sole_member(const std::vector<std::string>& members, const std::string& username) {
+    return members.size() == 1 && members.front() == username;
+}
+
+// The text a failed lifecycle transaction reports: the lambda's own `err` when it set one, else
+// the pool's best-effort last error, else a symptom-only fallback. `err` is empty when
+// `with_txn_for` returns false without the lambda having set it, which covers a PRE-lambda
+// failure (acquire timeout, connect backoff, BEGIN failure) AND a POST-lambda one the lambda
+// never observes (the abort guard, or a failed COMMIT: the mutation may then already be durable
+// server-side, ack loss), so the fallback names the symptom, not a cause.
+std::string lifecycle_failure_text(pg::PgPool& pool, const std::string& err, std::string_view what) {
+    if (!err.empty())
+        return err;
+    const std::string pool_err = pool.last_error();
+    return std::string(what) + " failed: " +
+           (pool_err.empty() ? "transaction did not complete (no further detail)" : pool_err);
+}
 } // namespace
 
 RbacAdminAuthorityOwner::UnassignOutcome
@@ -218,7 +303,8 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
         // under READ COMMITTED an account can become active between the lock and
         // the count and then be counted without having been locked (which only
         // ever raises the count). A deactivation that commits before the count is
-        // seen by it; one that commits after the count is the residual listed below.
+        // seen by it; one that commits after the count is residual (2) below (closed for
+        // `deactivate_account`).
         // Doomgoose external review, PR #4985 (governance ledger a2-p7-doomgoose-1):
         // the lock query's own result set is the ONLY correct membership test
         // for "was the row being deleted itself one of the counted rows" — a
@@ -315,16 +401,22 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
         //      by an `AuthDB` writer such as `upsert_user`, `upsert_sso_identity` or
         //      the first-admin seed (`is_active` defaults TRUE) can commit after this
         //      SELECT returns zero rows;
-        //  (2) deactivation of a SURVIVING counted Administrator between the
-        //      recount below and this transaction's COMMIT (#4966: `remove_user`
-        //      has no last-Administrator guard).
+        //  (2) (closed by #4966 for every deactivation that goes through
+        //      `deactivate_account`, the sole production path via
+        //      `AuthManager::remove_user_checked`) deactivation of a SURVIVING counted
+        //      Administrator between the recount below and this transaction's COMMIT:
+        //      `deactivate_account` locks the same counted grant set FOR UPDATE, in the same
+        //      `ORDER BY`, before writing, so it waits behind this transaction and then
+        //      re-counts against its outcome. Still outside it: direct SQL against
+        //      `auth.users`, which is break-glass.
         // Lock order in this transaction: `principal_roles` rows, then this one
         // `auth.users` row, then the `rbac_meta` `write_generation` row (taken by
         // `bump_generation_in_txn` at the end). A path that holds an `auth.users`
         // row lock and then waits on `principal_roles` or `rbac_meta` would deadlock
-        // against it. auth_db.cpp has no `principal_roles` or `rbac_store` SQL, and
-        // #4966's fix must honour this order (or use one shared
-        // transaction-scoped advisory lock) rather than invert it. A lock
+        // against it. auth_db.cpp has no `principal_roles` or `rbac_store` SQL (the
+        // `auth_db*` seam rule in tests/test_rbac_query_owner_seam.py pins that), and
+        // `deactivate_account` / `set_local_role` (#4966) honour this order rather than
+        // invert it. A lock
         // wait here is bounded by the pool's `lock_timeout` (10 s by default; the
         // pool does not inject it when the DSN sets its own `options` or `PGOPTIONS` is
         // set, and the wait is then bounded only if that setting, or the server or role
@@ -680,6 +772,221 @@ RbacAdminAuthorityOwner::provision_first_admin(const std::string& username,
     result.new_gen = new_gen;
     result.err = err;
     return result;
+}
+
+// See the header's doc comment for the contract, the two floors and why each applies where it
+// does. Steps are numbered as there. Every recount (6, 7) is a SEPARATE statement issued after
+// the write: a fresh READ COMMITTED snapshot that also sees this transaction's own uncommitted
+// UPDATE. A recount folded into the write's statement (or issued before it) would count the
+// target itself.
+AccountDeactivationResult
+RbacAdminAuthorityOwner::deactivate_account(const std::string& username) const {
+    bool refused = false;
+    bool removed = false;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        // 0.
+        if (!set_txn_lock_timeout(c, err))
+            return false;
+
+        // 1.
+        const auto rbac_enabled = read_rbac_enabled_for_update(c, err);
+        if (!rbac_enabled)
+            return false;
+
+        // 2. Locked in BOTH regimes: a concurrent unassign_role of any counted grant must wait
+        // and re-count (its residual (2) comment relies on this). Under OFF the lock decides
+        // nothing here, but dropping it would let this deactivation commit AFTER an
+        // unassign_role recount that did not see it.
+        const auto locked = lock_authenticatable_admin_grants(c, err);
+        if (!locked)
+            return false;
+        const bool in_counted_grants =
+            std::find(locked->begin(), locked->end(), username) != locked->end();
+
+        // 3.
+        const auto target_has_grant = lock_target_administrator_grant(c, username, err);
+        if (!target_has_grant)
+            return false;
+
+        // 4. Both regimes: the column floor protects its population whatever `rbac_enabled` says.
+        const auto in_local_admins = lock_target_if_active_local_admin(c, username, err);
+        if (!in_local_admins)
+            return false;
+
+        // 5.
+        const auto soft_deleted = auth_sql::soft_delete_user_in_txn(c, username, err);
+        if (!soft_deleted)
+            return false;
+        if (!*soft_deleted)
+            return true; // unknown or already inactive: nothing changed, nothing to guard
+
+        // 6. GRANT floor, RBAC ON only. Fires only when the target was itself a counted grant
+        // (step 2) or held a grant at all (step 3, catches one the step-2 snapshot missed): a
+        // target outside the population is never refused on its account, and an already-empty
+        // population never blocks.
+        if (*rbac_enabled && (in_counted_grants || *target_has_grant)) {
+            const auto remaining = count_authenticatable_admin_grants(c, err);
+            if (!remaining)
+                return false;
+            if (*remaining == 0) {
+                refused = true;
+                return false; // aborts the transaction: the soft delete rolls back
+            }
+        }
+
+        // 7. COLUMN floor, BOTH regimes. Independent of step 6 (a refusal from either aborts).
+        // Takes no new lock: the recount is a plain SELECT and every decreaser of this
+        // population holds the `rbac_enabled` lock taken at step 1.
+        if (*in_local_admins) {
+            const auto remaining = auth_sql::count_active_local_admin_accounts(c, err);
+            if (!remaining)
+                return false;
+            if (*remaining == 0) {
+                refused = true;
+                return false;
+            }
+        }
+        removed = true;
+        return true;
+    });
+
+    AccountDeactivationResult out;
+    if (refused) {
+        out.kind = AccountDeactivationResult::Kind::kLastAdministratorRefused;
+    } else if (!ok) {
+        out.kind = AccountDeactivationResult::Kind::kStoreFailure;
+        out.err = lifecycle_failure_text(pool_, err, "deactivate_account");
+    } else {
+        out.kind = removed ? AccountDeactivationResult::Kind::kDeactivated
+                           : AccountDeactivationResult::Kind::kNotFound;
+    }
+    return out;
+}
+
+// See the header's doc comment. The role literals are the column's own ('admin' / 'user').
+LocalRoleChangeResult RbacAdminAuthorityOwner::set_local_role(const std::string& username,
+                                                              auth::Role role) const {
+    using Kind = LocalRoleChangeResult::Kind;
+    const bool make_admin = (role == auth::Role::admin);
+    Kind kind = Kind::kStoreFailure;
+    bool refused = false;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        // 0.
+        if (!set_txn_lock_timeout(c, err))
+            return false;
+
+        // 1. The regime value is not used; the row LOCK is the point (see the header banner).
+        if (!read_rbac_enabled_for_update(c, err))
+            return false;
+
+        // 2. The one `auth.users` row lock, the last lock this method takes.
+        pg::PgResult row = pg::exec_params(
+            c, "SELECT role, is_active FROM auth.users WHERE username = $1 FOR UPDATE",
+            std::vector<std::string>{username});
+        if (row.status() != PGRES_TUPLES_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        if (PQntuples(row.get()) == 0) {
+            kind = Kind::kNotFound;
+            return true;
+        }
+        const bool previous_admin = text_col(row.get(), 0, 0) == "admin";
+        const bool was_active = to_bool(PQgetvalue(row.get(), 0, 1));
+
+        // 3. Classify before writing.
+        if (previous_admin == make_admin) {
+            kind = Kind::kUnchanged; // nothing written, even for an inactive row
+            return true;
+        }
+        if (make_admin && !was_active) {
+            kind = Kind::kInactivePromotionRefused; // never re-arm an inactive account
+            return true;
+        }
+
+        // 4. `match_inactive` only when demoting, so an inactive elevated account can be
+        // demoted (recovery) but never promoted.
+        const auto written = auth_sql::set_role_in_txn(c, username, make_admin ? "admin" : "user",
+                                                       /*match_inactive=*/!make_admin, err);
+        if (!written)
+            return false;
+        if (!*written) {
+            // The row was read and locked above, so a write that matches nothing is an anomaly.
+            err = "set_local_role: the locked row matched no write (anomaly)";
+            return false;
+        }
+
+        // 5. COLUMN floor, both regimes: ONLY when the demotion actually removed a member of the
+        // population (an ACTIVE admin became non-admin). A SEPARATE statement after the write.
+        // An inactive admin's demotion is never refused: it was not counted.
+        if (previous_admin && was_active && !make_admin) {
+            const auto remaining = auth_sql::count_active_local_admin_accounts(c, err);
+            if (!remaining)
+                return false;
+            if (*remaining == 0) {
+                refused = true;
+                return false; // aborts the transaction: the role write rolls back
+            }
+        }
+        kind = Kind::kChanged;
+        return true;
+    });
+
+    LocalRoleChangeResult out;
+    if (refused) {
+        out.kind = Kind::kLastAdministratorRefused;
+    } else if (!ok) {
+        out.kind = Kind::kStoreFailure;
+        out.err = lifecycle_failure_text(pool_, err, "set_local_role");
+    } else {
+        out.kind = kind;
+    }
+    return out;
+}
+
+// See the header's doc comment. Membership in a counted/active set already implies "active"
+// (both statements filter `is_active`), so an unknown or already-inactive username falls out as
+// "in neither set" without a separate existence read. Every read reuses a helper the guard or
+// `regime_authority` already runs: the ONE `kAuthenticatableAdminGrantsFrom` fragment (via
+// list_authenticatable_admin_grants), the lock-free regime read and the active-local-admin list.
+WouldStrandResult
+RbacAdminAuthorityOwner::would_strand_last_administrator(const std::string& username) const {
+    WouldStrandResult out;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        const std::string pool_err = pool_.last_error();
+        out.err = "would_strand_last_administrator failed: " +
+                  (pool_err.empty() ? std::string("could not acquire a connection") : pool_err);
+        return out;
+    }
+    std::string err;
+    const auto fail = [&]() {
+        out.err = "would_strand_last_administrator failed: " +
+                  (err.empty() ? std::string("query did not complete (no further detail)") : err);
+        return out;
+    };
+    const auto rbac_enabled = read_rbac_enabled_lockfree(lease.get(), err);
+    if (!rbac_enabled)
+        return fail();
+
+    // Step 6's twin, the GRANT floor: RBAC ON only.
+    bool grant_floor = false;
+    if (*rbac_enabled) {
+        const auto grants = list_authenticatable_admin_grants(lease.get(), err);
+        if (!grants)
+            return fail();
+        grant_floor = is_sole_member(*grants, username);
+    }
+    // Step 7's twin, the COLUMN floor: both regimes. Read even when the grant floor already says
+    // strand, so a store fault is never half-reported as a verdict.
+    const auto local_admins = list_active_local_admin_accounts(lease.get(), err);
+    if (!local_admins)
+        return fail();
+    out.ok = true;
+    out.would_strand = grant_floor || is_sole_member(*local_admins, username);
+    return out;
 }
 
 } // namespace yuzu::server

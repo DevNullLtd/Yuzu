@@ -2279,6 +2279,30 @@ std::expected<bool, std::string> RbacStore::provision_first_admin(const std::str
     return true;
 }
 
+// ── Account-lifecycle guard (#4966) ────────────────────────────────────────
+//
+// Thin delegations to `RbacAdminAuthorityOwner` (rbac_admin_authority_owner.cpp), the ADR-0012
+// §3 cross-schema query owner, constructed per call exactly as `unassign_role` does. None of
+// them changes a `principal_roles` / `rbac_meta` row, so none applies a local cache generation.
+
+AccountDeactivationResult RbacStore::deactivate_account(const std::string& username) {
+    if (!open_)
+        return {AccountDeactivationResult::Kind::kStoreFailure, std::string(kRbacErrStoreNotOpen)};
+    return RbacAdminAuthorityOwner{pool_}.deactivate_account(username);
+}
+
+LocalRoleChangeResult RbacStore::set_local_role(const std::string& username, auth::Role role) {
+    if (!open_)
+        return {LocalRoleChangeResult::Kind::kStoreFailure, std::string(kRbacErrStoreNotOpen)};
+    return RbacAdminAuthorityOwner{pool_}.set_local_role(username, role);
+}
+
+WouldStrandResult RbacStore::would_strand_last_administrator(const std::string& username) const {
+    if (!open_)
+        return {false, false, std::string(kRbacErrStoreNotOpen)};
+    return RbacAdminAuthorityOwner{pool_}.would_strand_last_administrator(username);
+}
+
 // ── Groups CRUD ──────────────────────────────────────────────────────────────
 
 std::vector<RbacGroup> RbacStore::list_groups() const {

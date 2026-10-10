@@ -272,13 +272,14 @@ const std::vector<pg::PgMigration>& migrations() {
     // UPDATE that just blocks on this lock) cannot commit between that read and the
     // guard's own COMMIT. The lock order is documented in
     // rbac_admin_authority_owner.hpp: `principal_roles` rows, then one `auth.users`
-    // row, then `rbac_meta`. A change here (e.g. a last-Administrator guard on
-    // `remove_user`, #4966) that holds an `auth.users` row lock and then touches
-    // `principal_roles` or `rbac_meta` would invert it and can deadlock. Honour that
-    // order, or have EVERY participant, the unassign guard as well as a `remove_user`
-    // guard, take one shared transaction-scoped advisory lock as the first statement of
-    // its own transaction; an advisory lock taken by only some of them removes no
-    // inversion.
+    // row, then `rbac_meta`. A change here that holds an `auth.users` row lock and then
+    // touches `principal_roles` or `rbac_meta` would invert it and can deadlock. The
+    // last-Administrator guard for account lifecycle (#4966) honours that order: it lives
+    // in the owner (`RbacAdminAuthorityOwner::deactivate_account` / `set_local_role`),
+    // which takes `rbac_enabled` and the counted `principal_roles` rows BEFORE its one
+    // `auth.users` row, and calls this file's `auth_sql::` statements (auth_db_sql_helpers.hpp)
+    // so the soft delete and the role write exist once. Keep this file free of
+    // `rbac_store` SQL (tests/test_rbac_query_owner_seam.py pins it).
     //
     // A1's `RbacAdminAuthorityOwner::set_enforcement` (`RbacStore::set_rbac_enforcement`
     // delegates to it, same as `unassign_role` above) is the SECOND external
@@ -1115,10 +1116,10 @@ AuthDB::recheck_role_locked(
         }
         if (PQntuples(sel.get()) == 0) {
             // No active row - either never existed, or a concurrent
-            // remove_user() already committed its soft-delete UPDATE (which
-            // took this SAME row lock for its own transaction, so this
-            // SELECT either saw it directly or waited for it) before this
-            // SELECT ran.
+            // soft delete (the owner's `deactivate_account`, #4966) already
+            // committed (its UPDATE took this SAME row lock for its own
+            // transaction, so this SELECT either saw it directly or waited
+            // for it) before this SELECT ran.
             err = AuthDBError::UserNotFound;
             return false;
         }
