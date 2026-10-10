@@ -904,6 +904,10 @@ inline constexpr int kReadSymlink = -4;
 /// check (sudo allows a group-writable file owned by the sudoers group), and the same direction:
 /// content sudo would refuse is never reported as policy.
 inline constexpr int kReadInsecure = -5;
+/// open() returned ENOENT or ENOTDIR, but the path itself is a symlink: its target is missing or
+/// unreachable (an authselect link mid-apply, a removed target, a target path through a regular file). That is not "this file is not here" -- a link was put there
+/// on purpose -- so it is a failed read, never the silent absent a missing alternative gets.
+inline constexpr int kReadDanglingSymlink = -6;
 
 /// The owner a sudoers source must have in production: root. Named so the default cannot drift
 /// (the reader takes the owner as a parameter only so tests can run as any user).
@@ -935,6 +939,7 @@ inline ReadOutcome classify_read_errno(int err) {
     case kReadEmbeddedNul: return {ReadClass::Failed, "embedded_nul"};
     case kReadSymlink: return {ReadClass::Failed, "symlink_refused"};
     case kReadInsecure: return {ReadClass::Failed, "insecure_owner_or_mode"};
+    case kReadDanglingSymlink: return {ReadClass::Failed, "dangling_symlink"};
     default: return {ReadClass::Failed, "errno_" + std::to_string(err)};
     }
 }

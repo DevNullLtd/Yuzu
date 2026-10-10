@@ -297,6 +297,9 @@ TEST_CASE("local_security_policy errno classification: absent vs denied vs faile
         CHECK(o.token == "permission_denied");
     }
     CHECK(classify_read_errno(ELOOP).token == "symlink_loop");
+    const auto dangling = classify_read_errno(kReadDanglingSymlink);
+    CHECK(dangling.cls == ReadClass::Failed); // a link with no target is a failed read, never absent
+    CHECK(dangling.token == "dangling_symlink");
     CHECK(classify_read_errno(EIO).token == "io_error");
     CHECK(classify_read_errno(kReadOversized).token == "oversized");
     CHECK(classify_read_errno(kReadNotRegular).token == "not_regular");
@@ -1524,6 +1527,35 @@ TEST_CASE("local_security_policy sudoers: a refused source is an unreadable row,
     CHECK(loose_row);
 }
 
+// A dangling PAM link (an authselect target mid-apply) is a failed read: its own `unreadable` row, a
+// CONSTRAINED status, and it is not named in `source`. Before this it read as an absent alternative
+// -- silent -- and not_found was asserted over the remaining files with nothing to say one was dropped.
+TEST_CASE("local_security_policy collect_file_policy: a dangling symlink is an unreadable source",
+          "[local_security_policy][parsers]") {
+    auto files = no_lockout_files();
+    files.erase("/etc/pam.d/system-auth");
+    files["/etc/pam.d/password-auth"] = "auth required pam_unix.so\n";
+    const auto c = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout,
+                                       reader_failing(files, "/etc/pam.d/system-auth", kReadDanglingSymlink),
+                                       empty_dir());
+    CHECK(c.status == PolicyStatus::Constrained);
+    CHECK(c.reason.find("/etc/pam.d/system-auth:dangling_symlink") != std::string::npos);
+    CHECK(c.rows == std::vector<std::string>{
+                        "lockout_policy|source_state|unreadable:dangling_symlink|/etc/pam.d/system-auth",
+                        "lockout_policy|lockout_keys|not_found|/etc/login.defs,/etc/security/faillock.conf,"
+                        "/etc/pam.d/password-auth"});
+
+    // The same link as the ONLY pam source still counts as existing: no `absent /etc/pam.d` row.
+    auto only = no_lockout_files();
+    only.erase("/etc/pam.d/system-auth");
+    const auto d = collect_file_policy(FileFlavor::Linux, LocalPolicyAction::Lockout,
+                                       reader_failing(only, "/etc/pam.d/system-auth", kReadDanglingSymlink),
+                                       empty_dir());
+    CHECK(d.status == PolicyStatus::Constrained);
+    CHECK_FALSE(has_prefix_row(d, "lockout_policy|source_state|absent|/etc/pam.d"));
+    CHECK(count_row(d, "lockout_policy|source_state|unreadable:dangling_symlink|/etc/pam.d/system-auth") == 1);
+}
+
 #if !defined(_WIN32)
 // The real reader, on a real filesystem: the planted-link case that motivated the strict rule.
 TEST_CASE("local_security_policy posix reader: strict refuses a link, a loose and a foreign-owned "
@@ -1612,6 +1644,40 @@ TEST_CASE("local_security_policy make_posix_reader: sudoers sources are strict, 
     const auto pam = rd("/etc/pam.d/system-auth");          // PAM: symlinks are real, followed
     CHECK(pam.err == 0);
     CHECK(pam.data == "SECRET\n");
+}
+
+// The real reader on a real filesystem: only a LINK with no target is a dangling symlink. A path that is
+// simply not there stays ENOENT (and so stays an absent alternative), and a live link is still followed.
+TEST_CASE("local_security_policy posix reader: a symlink with a missing target is dangling, not absent",
+          "[local_security_policy][parsers]") {
+    yuzu::test::TempDir root{"yuzu_test_lsp_"};
+    namespace fsp = std::filesystem;
+    fsp::create_directories(root.path / "etc" / "pam.d");
+    fsp::create_directories(root.path / "etc" / "sudoers.d");
+    fsp::create_symlink(root.path / "no-such-target", root.path / "etc" / "pam.d" / "system-auth");
+    fsp::create_symlink(root.path / "etc" / "pam.d" / "loop-b", root.path / "etc" / "pam.d" / "loop-a");
+    fsp::create_symlink(root.path / "etc" / "pam.d" / "loop-a", root.path / "etc" / "pam.d" / "loop-b");
+    fsp::create_symlink(root.path / "no-such-target", root.path / "etc" / "sudoers.d" / "stale");
+    {
+        std::ofstream(root.path / "real") << "auth required pam_unix.so\n";
+    }
+    fsp::create_symlink(root.path / "real", root.path / "etc" / "pam.d" / "password-auth");
+
+    const auto rd = make_posix_reader(root.path.string(), ::geteuid());
+    const auto dangling = rd("/etc/pam.d/system-auth");
+    CHECK(dangling.err == kReadDanglingSymlink);
+    CHECK(dangling.data.empty());
+    CHECK(rd("/etc/pam.d/common-auth").err == ENOENT);   // never created: still an absent alternative
+    // A target path that runs THROUGH a regular file is ENOTDIR from open(); behind a link it is dangling
+    // too, but a plain path whose parent is a file stays absent (lstat of it fails the same way).
+    fsp::create_symlink(root.path / "real" / "below", root.path / "etc" / "pam.d" / "password-auth-ac");
+    CHECK(rd("/etc/pam.d/password-auth-ac").err == kReadDanglingSymlink);
+    CHECK(rd("/real/below").err == ENOTDIR);
+    CHECK(rd("/etc/pam.d/password-auth").err == 0);      // a live link is followed
+    CHECK(rd("/etc/pam.d/loop-a").err == ELOOP);         // unchanged: a link loop is not ENOENT
+    // Sudoers sources open O_NOFOLLOW, so a stale link there is the existing symlink_refused, not this.
+    CHECK(rd("/etc/sudoers.d/stale").err == kReadSymlink);
+    CHECK(classify_read_errno(dangling.err).token == "dangling_symlink");
 }
 #endif // !_WIN32
 
