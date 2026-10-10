@@ -1489,6 +1489,7 @@ TEST_CASE("AuthRoutes::audit_log: a hostile target_id is neutralised in the pers
     CHECK(body.find('\r') == std::string::npos);
     CHECK(body.find('\n') == std::string::npos);
     CHECK(logs.find("evil\r") == std::string::npos);
+}
 
 // ── #4644 Gate 7: the shared strict integer primitive (query_int_parse.hpp) ──
 
