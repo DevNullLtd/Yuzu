@@ -714,7 +714,7 @@ rule in the push but does NOT unstick the wedged claim (an identical re-observat
 returns the existing claim); it bounds the dependence on the suppress classification
 and is not a recovery guarantee against a classifier that misidentifies a dead claim.
 Two side effects are accepted and recorded in the flip gate (AC-10, AC-16): re-arming
-every rule can recapture unpersisted Spark-first `FileHashEquals` baselines (#4045), and
+every rule can recapture a Spark-first `FileHashEquals` baseline that was lost, never written or overwritten (#4045), and
 while a same-type mechanism call is hung, the Disarm of a healthy same-type rule queues
 behind it on `SparkEngine`'s per-type mechanism lock, so that rule is logically
 withdrawn at once and its re-arm may expire as `CongestionExpired`; the same collateral
@@ -802,8 +802,10 @@ heartbeat at the default (the push interval is `ceil(25 s / heartbeat) x heartbe
 re-arm about every 330 s from the safety valve (for a pure retained-wedge hold; with a
 healthy same-type sibling in the push, every push after the first forced one is a full
 teardown and re-arm, AC-16) (re-arm recaptures only
-Spark-first-captured, unpersisted `FileHashEquals` baselines, #4045: persisted
-baselines are re-seeded on every arm); (3) an operator delta push (`full_sync=false`)
+a Spark-first-captured `FileHashEquals` baseline that was lost, never written or overwritten, #4045: the
+remaining cases are enumerated in the flip gate's AC-10; `apply_rules` persists staged
+captures within its pass budget first (the remainder is handed to the new arm from memory)
+and persisted baselines are re-seeded on every arm); (3) an operator delta push (`full_sync=false`)
 during a hold flips the push identity twice and resets the suppression budget;
 (4) recovery needs a live connection (the maintenance tick runs on the per-connection
 heartbeat thread). Known limits NOT fixed here: a delta push (`full_sync=false`) that
@@ -819,8 +821,11 @@ handler in `rest_api_v1.cpp`, the MCP `push_guardian_rules` tool in `mcp_server.
 `guardian_push_fn_` fan-out in `server.cpp`; so the default flag is not itself the hazard,
 a push that omits a still-desired rule is; follow-up FU-12 in the flip gate, #5547); an
 agent restart gap (the boot
-Application opens at the loaded acknowledged generation with an empty `content_id`,
-and a failed boot re-arm is never retried, #5513); a content-identity gap (an
+Application opens at the loaded acknowledged generation with an empty `content_id`;
+a failed boot re-arm, formerly never retried, is resolved by #5513: the agent reports
+generation 0 (intermittently, with an agent-side back-off between failed catch-ups) with the
+`yuzu.guardian_boot_rearm_unresolved` tag until a push applies cleanly; a legacy guard that returns false at arm is the boot-path analogue of #2797's
+`apply_rules` defect and stays uncovered); a content-identity gap (an
 identical re-observation matches `rule_id` and spec only, #5512); a wedge that is adopted or
 settles before the agent has retained it costs one avoidable Reapply on the next identical
 push: one minted in the Dispatching window is counted in `resolved_failed` but never retained
@@ -1006,8 +1011,8 @@ together in prose but which do not share one signal in code:
   `rules_` currently carry this EXACT (rule_id, generation) incarnation, not
   merely SOME generation of the rule) and, on a match, decrements
   `resolved_failed` and drops the entry - clearing `can_advance()`'s block for
-  that application without ever decrementing the cumulative, fleet-visible
-  `arm_failures_` counter (`failed_out` is untouched on recovery; that counter
+  that application without ever decrementing the cumulative `arm_failures_` counter (read
+  only by tests today, `arm_failure_count()` has no production caller, #4062) (`failed_out` is untouched on recovery; that counter
   answers "how many arm failures have ever happened", a different question
   from "does the current application still have one outstanding").
 
@@ -1163,7 +1168,12 @@ design is mentioned it is named as the earlier design.
   `failed_receipts` would remove the cost and is not done here.
 - **Known limits #5459 does NOT fix (record, do not widen scope).** Agent restart gap:
   the boot Application opens at the loaded acknowledged generation with an empty
-  `content_id`, and a failed boot re-arm is never retried (#5513); an acknowledgment
+  `content_id`. A failed boot re-arm, formerly never retried, is resolved by #5513 (the
+  agent reports generation 0, intermittently with an agent-side back-off between failed
+  catch-ups, with the `yuzu.guardian_boot_rearm_unresolved` tag until a
+  push applies cleanly; a legacy guard that returns false at arm is the boot-path analogue
+  of #2797's `apply_rules` defect and stays uncovered, and a server at generation 0 does
+  not push); an acknowledgment
   persisted by the old waiver is not revoked. A never-returning arm holds the
   generation forever (intended). A push whose unresolved set mixes a wedge with a
   congestion or ordinary failure forces a Reapply every time. A delta push
@@ -1182,8 +1192,15 @@ design is mentioned it is named as the earlier design.
   (`can_advance()` ignores content) and the server stops re-pushing, so the stale content
   stays until the next generation. #4045: a forced Reapply re-arms the whole
   push, but persisted baselines are re-seeded on every arm
-  (`guardian_engine.cpp`), so only Spark-first-captured, unpersisted `FileHashEquals`
-  baselines are exposed to a baseline recapture.
+  (`guardian_engine.cpp`), `apply_rules` persists staged captures within its pass budget first
+  (a leftover is handed to the new arm from memory), and a capture an
+  in-flight evaluation stages after that drain is seeded from the runtime's staging at attach
+  (`attach_core`, under the same `registry_mu_` hold as the detach, with the persister's
+  seed fence ordering a worker write against the engine's KV seed read), so a baseline
+  recapture is exposed only for a Spark-first-captured `FileHashEquals` baseline that was
+  lost, never written or overwritten, and a rule whose arm-time seed read failed while a valid record
+  existed is judged against re-captured content until its next re-arm (the "refused
+  window"; the record is kept). The known cases (eight) are the flip gate's AC-10.
 
 **Known accepted residual (governance Gate 4/8, rung 9c PR-5d /governance run,
 independently traced and REFUTED as permanent):** a withdraw immediately
@@ -1394,11 +1411,12 @@ the OS call does. `GuardianEngine::stop()` also retires the ack ledger (Unit 6,
 tick()` already no-ops after `stopped_`, but it also stops watching receipts whose
 claims `begin_stop()` is tearing down; `start_local()` opens a defensive application
 at the already-loaded `policy_generation_` before its own boot re-arm walk, so a
-receipt accepted during that walk is tracked too - not exercised by
-`SparkReconcileFixture` (`test_guardian_engine_spark_reconcile.cpp`), which wires
-`start_local()` BEFORE `wire_spark_engine()` (the reverse of production's
-`agent.cpp` order), so `spark_availability_` is still `Unwired` during its boot
-walk and the walk never reaches the spark path at all in that fixture.
+receipt accepted during that walk is tracked too. `SparkReconcileFixture`
+(`test_guardian_engine_spark_reconcile.cpp`) wires `start_local()` BEFORE
+`wire_spark_engine()` by default (the reverse of production's `agent.cpp` order), so
+`spark_availability_` is still `Unwired` during its boot walk and the walk never reaches
+the spark path in that default; its `wire_first` flag (#5513) and `BootRig5513` select the
+production order, and are the path that exercises a Spark boot arm.
 
 **R5.5 as implemented (rung 9c PR-4; existing mechanics from PR-1/PR-2).**
 `GuardianEngine::reconcile_rule_locked()` selects `GuardianSparkRuntime::attach_rule

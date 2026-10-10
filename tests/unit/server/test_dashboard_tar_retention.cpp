@@ -26,6 +26,7 @@
  */
 
 #include "dashboard_routes.hpp"
+#include "test_export_cap_guard.hpp"
 #include "management_group_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
@@ -35,6 +36,8 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <nlohmann/json.hpp>
 
 #include <initializer_list>
 #include <stdexcept>
@@ -64,6 +67,7 @@ struct DashboardTarRetentionTestAccess {
         routes.response_store_ = rs;
         routes.mgmt_group_store_ = mg;
     }
+    void set_metrics(yuzu::MetricsRegistry* m) { routes.metrics_ = m; }
     void set_scan(const std::string& user, const std::string& cmd_id, int count, int64_t at) {
         routes.tar_scans_by_user_[user] = DashboardRoutes::TarScanState{cmd_id, count, at};
     }
@@ -438,6 +442,163 @@ TEST_CASE("render_tar_retention_paused: a degraded store read renders the "
     CHECK(contains(html, "Retention state unavailable"));
     CHECK_FALSE(contains(html, "No paused sources detected"));
     CHECK_FALSE(contains(html, "still in progress"));
+}
+
+// ── #4644 Gate 7 (row 6a): the scan read is byte-bounded and a cut is reported ───
+
+TEST_CASE("gather_tar_retention_paused: a read cut by the payload cap sets "
+          "result_truncated_by_cap renders a partial-result banner and serialises the flag",
+          "[pg][server][tar][retention-render][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-A", "agent-B", "agent-C"});
+    for (const char* agent : {"agent-A", "agent-B", "agent-C"})
+        rs.store(mk_resp(agent, 10,
+                         "config|process_enabled|false\nconfig|process_paused_at|1710000000\n"));
+
+    DashboardTarRetentionTestAccess acc;
+    acc.set_stores(&rs, &mg);
+    acc.set_scan(kUser, kScan, 3, 1);
+
+    // Uncut: every response read, no flag, no banner, the JSON carries an explicit false.
+    {
+        const auto scan = acc.routes.gather_tar_retention_paused(kUser);
+        CHECK_FALSE(scan.result_truncated_by_cap);
+        CHECK(scan.agents_responded == 3);
+        CHECK_FALSE(contains(acc.render(kUser), "Partial result"));
+        CHECK(nlohmann::json::parse(tar_retention_paused_json(scan))["result_truncated_by_cap"] ==
+              false);
+    }
+
+    // Each response is ~70 bytes; a 100-byte cap keeps two and drops the third.
+    yuzu::test::ExportByteCapGuard guard(100);
+    const auto scan = acc.routes.gather_tar_retention_paused(kUser);
+    CHECK(scan.result_truncated_by_cap);
+    CHECK(scan.agents_responded == 2); // the dropped response reads as an agent that never answered
+    CHECK_FALSE(scan.store_degraded);  // a cut is not a failed read
+    const auto html = acc.render(kUser);
+    CHECK(contains(html, "data-result-truncated=\"true\""));
+    CHECK(contains(html, "Partial result"));
+    CHECK(nlohmann::json::parse(tar_retention_paused_json(scan))["result_truncated_by_cap"] ==
+          true);
+    // The JSON also sets store_degraded for a cut scan so a client that predates
+    // result_truncated_by_cap still sees an incomplete result; the dashboard page keeps the
+    // two apart (scan.store_degraded above stays false, no "Postgres degraded" banner).
+    CHECK(nlohmann::json::parse(tar_retention_paused_json(scan))["store_degraded"] == true);
+    CHECK_FALSE(contains(html, "Retention state unavailable"));
+}
+
+TEST_CASE("tar_retention_paused_json: store_degraded is false for an uncut healthy scan",
+          "[pg][server][tar][retention-render][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-A"});
+    rs.store(mk_resp("agent-A", 10, "config|process_enabled|true\n"));
+    DashboardTarRetentionTestAccess acc;
+    acc.set_stores(&rs, &mg);
+    acc.set_scan(kUser, kScan, 1, 1);
+    const auto scan = acc.routes.gather_tar_retention_paused(kUser);
+    const auto j = nlohmann::json::parse(tar_retention_paused_json(scan));
+    CHECK(j["store_degraded"] == false);
+    CHECK(j["result_truncated_by_cap"] == false);
+}
+
+// A cut read with NO paused rows must not fall into either empty-state that claims a
+// resolved answer: "still in progress, click Refresh" never resolves (the cut repeats), and
+// "all agents responded and every collector is running normally" is false.
+TEST_CASE("retention-paused page: a cut read with no rows says the page cannot tell",
+          "[pg][server][tar][retention-render][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-A", "agent-B", "agent-C"});
+    for (const char* agent : {"agent-A", "agent-B", "agent-C"})
+        rs.store(mk_resp(agent, 10, "config|process_enabled|true\nconfig|tcp_enabled|true\n"));
+
+    yuzu::test::ExportByteCapGuard guard(60);  // keeps one or two of three responses
+    // agents_responded < scan_count (the dropped agents never "answered") and, with
+    // scan_count == agents_responded after the cut, the "all clear" branch would fire.
+    // The surviving response count is the one scan_count the other two cannot reach: with
+    // agents_responded == scan_count the page would otherwise be eligible for the "all agents
+    // responded, every collector is running normally" text even though a response was dropped.
+    // Measure it rather than hard-code it (how many responses fit under the cap depends on the
+    // row sizes), then run it as the third case.
+    int surviving = 0;
+    {
+        DashboardTarRetentionTestAccess probe;
+        probe.set_stores(&rs, &mg);
+        probe.set_scan(kUser, kScan, 5, 1);
+        const auto first = probe.routes.gather_tar_retention_paused(kUser);
+        REQUIRE(first.result_truncated_by_cap);
+        surviving = first.agents_responded;
+        REQUIRE(surviving >= 1);
+        REQUIRE(surviving < 3); // at least one of the three responses was dropped
+    }
+    for (const int scan_count : {5, 3, surviving}) {
+        DashboardTarRetentionTestAccess acc;
+        acc.set_stores(&rs, &mg);
+        acc.set_scan(kUser, kScan, scan_count, 1);
+        const auto scan = acc.routes.gather_tar_retention_paused(kUser);
+        REQUIRE(scan.result_truncated_by_cap);
+        REQUIRE(scan.rows.empty());
+        if (scan_count == surviving)
+            REQUIRE(scan.agents_responded == scan_count); // the all-clear-eligible case
+        const auto html = acc.render(kUser);
+        INFO("scan_count=" << scan_count);
+        CHECK(contains(html, "No paused sources in the partial result"));
+        CHECK(contains(html, "Refresh</strong> in a moment") == false);
+        CHECK_FALSE(contains(html, "agents in your scope responded and every collector"));  // all-clear
+        CHECK_FALSE(contains(html, "Retention state unavailable"));
+        CHECK(contains(html, "partial result, see below"));      // header counts qualified
+        CHECK(contains(html, "data-result-truncated=\"true\"")); // one banner, not two
+    }
+}
+
+// The yuzu_tar_retention_paused_devices gauge is set from the page's own scan read, so a scan
+// cut by the response-read cap UNDER-counts (it can read 0 with paused sources present on the
+// dropped agents). A cut scan must leave the last good value in place, not overwrite it.
+TEST_CASE("retention-paused page: a scan cut by the payload cap does not overwrite the "
+          "paused-devices gauge",
+          "[pg][server][tar][retention-render][cap][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-A", "agent-B", "agent-C"});
+    for (const char* agent : {"agent-A", "agent-B", "agent-C"})
+        rs.store(mk_resp(agent, 10,
+                         "config|process_enabled|false\nconfig|process_paused_at|1710000000\n"));
+
+    yuzu::MetricsRegistry metrics;
+    DashboardTarRetentionTestAccess acc;
+    acc.set_stores(&rs, &mg);
+    acc.set_metrics(&metrics);
+    acc.set_scan(kUser, kScan, 3, 1);
+    auto& process_gauge = metrics.gauge("yuzu_tar_retention_paused_devices", {{"source", "process"}});
+
+    // Positive control: an uncut scan DOES publish (all three agents have a paused process source).
+    (void)acc.render(kUser);
+    REQUIRE(process_gauge.value() == 3.0);
+
+    // A sentinel standing in for "the last good value"; the cut scan below would write 2.
+    process_gauge.set(7.0);
+    {
+        yuzu::test::ExportByteCapGuard guard(100);
+        const auto scan = acc.routes.gather_tar_retention_paused(kUser);
+        REQUIRE(scan.result_truncated_by_cap);
+        REQUIRE(scan.rows.size() < 3); // the row set under-counts
+        (void)acc.render(kUser);
+    }
+    CHECK(process_gauge.value() == 7.0);
 }
 
 } // namespace yuzu::server

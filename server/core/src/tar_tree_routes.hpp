@@ -133,6 +133,11 @@ struct TarRetentionPausedScan {
     int agents_with_no_paused_sources = 0;
     int agents_filtered_out_of_scope = 0;
     bool store_degraded = false;
+    /// #4644 Gate 7 (row 6a): the scan's response read hit the 10,000-row or the 50 MiB payload
+    /// cap, so `rows` and the counters above are PARTIAL (dropped responses read as agents that
+    /// never answered). Distinct from `store_degraded`, which means the read failed outright
+    /// (the REST/MCP JSON sets its `store_degraded` for a cut scan too, for older clients).
+    bool result_truncated_by_cap = false;
     std::vector<TarPausedSourceRow> rows;
 };
 
