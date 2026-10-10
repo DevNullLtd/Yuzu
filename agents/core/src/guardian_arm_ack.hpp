@@ -91,8 +91,9 @@ inline constexpr std::size_t kAckDrainMaxPerTick = 1024;
 /// returns Reapply. A DECISION-count bound, not wall-clock: decide_retry() has one
 /// production caller (apply_rules(), driven by the server's push cadence), so at the
 /// 30 s heartbeat this is about 330 s (275 s at 25 s spacing). A forced Reapply
-/// re-arms every rule in the push (and so reintroduces the #4045 baseline-recapture
-/// exposure for Spark-captured, unpersisted baselines) but does NOT unstick the wedged
+/// re-arms every rule in the push (apply_rules persists staged Spark baseline captures
+/// first, #4045, so only a capture that was lost or never written is exposed to a
+/// recapture; the flip gate's AC-10 lists the cases) but does NOT unstick the wedged
 /// claim - an identical re-observation returns the existing claim. It bounds the
 /// dependence on the suppress classification; it is NOT a recovery guarantee against
 /// a classifier that misidentifies a dead claim. Reset only by begin_application()
@@ -169,7 +170,10 @@ public:
     /// these are orthogonal to any single rule's own arm outcome, so they
     /// cannot be expressed as a receipt. A no-op if there is no current
     /// application.
-    void latch_failure();
+    /// Also called by the boot caller, GuardianEngine::note_boot_rearm_failure_locked() (#5513).
+    /// noexcept: that caller is itself noexcept, so this must never throw (the body is a
+    /// pointer test and a bool store).
+    void latch_failure() noexcept;
 
     /// Expected to be called with the caller's own engine lock held, matching
     /// journal_maintenance_tick()'s own posture - this call does not take any
@@ -196,8 +200,9 @@ public:
     /// receipts THIS call resolved to non-Committed - governance finding UP-3
     /// (Gate 4, unhappy-path): an async arm failure used to update only this
     /// ledger's own internal `resolved_failed` and a local log line, never the
-    /// durable fleet-visible `arm_failures_` counter a synchronous refusal
-    /// already did. The caller (GuardianEngine::journal_maintenance_tick()) folds
+    /// cumulative `arm_failures_` counter a synchronous refusal already did
+    /// (that counter has no production reader today, so it is not fleet-visible;
+    /// tracked by #4062). The caller (GuardianEngine::journal_maintenance_tick()) folds
     /// this into `arm_failures_` itself - the ledger has no engine pointer of its
     /// own and must not gain one.
     std::size_t drain_locked(GuardianSparkRuntime& runtime, std::size_t max_per_tick,

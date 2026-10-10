@@ -74,7 +74,23 @@ inline constexpr std::size_t kMaxSchemaPatternProgramSize = 65536;
 inline constexpr std::size_t kMaxPatternMatchedStringBytes = 64 * 1024;
 inline constexpr std::uint64_t kMaxPatternMatchWork = 16ULL * 1024 * 1024;
 inline constexpr std::int64_t kIntegerBoundLimit = 9007199254740992;  // 2^53
-inline constexpr std::size_t kParamValidatorCacheEntries = 128;
+// Cache bounds. The byte budget bounds the RETAINED total; the entry ceiling only caps the
+// per-entry bookkeeping (key, list node, map node) for validators that weigh almost nothing.
+// The budget is twice what a 128-pattern schema is estimated at (128 x mcp::kPatternMaxMem is
+// 64 MiB), and a test pins the shipped catalogue's total estimate at or below half of it.
+inline constexpr std::size_t kParamValidatorCacheEntries = 4096;
+inline constexpr std::size_t kParamValidatorCacheMaxBytes = 128ULL * 1024 * 1024;
+// No single entry heavier than this is retained, so one hostile schema (a 128-pattern schema is
+// estimated at 64 MiB, inside the budget) cannot evict the rest of the cache in one insert; it is
+// instead rebuilt on every call. A test pins every bundled schema under it.
+inline constexpr std::size_t kParamValidatorCacheMaxEntryBytes = 32ULL * 1024 * 1024;
+// Weight terms of ParamValidator::estimated_retained_bytes(), besides the schema text length
+// and one mcp::kPatternMaxMem per compiled pattern: a fixed cost per validator, a cost per
+// declared property, and a cost per enum member (the compiled schema keeps each member as a
+// JSON value, which for a short member costs far more than its text).
+inline constexpr std::size_t kParamValidatorFixedBytes = 4096;
+inline constexpr std::size_t kParamValidatorPerPropertyBytes = 1024;
+inline constexpr std::size_t kParamValidatorPerEnumMemberBytes = 128;
 
 // Immutable, move-only; check() is const and thread-safe. A moved-from validator is
 // neither absent nor usable: check() on it returns a violation, never a pass.
@@ -88,6 +104,13 @@ class ParamValidator {
 
     // True when the stored schema declared nothing (see PRESENCE).
     [[nodiscard]] bool absent() const noexcept;
+
+    // A conservative upper bound, in bytes, of what this validator keeps alive: the fixed,
+    // per-property and per-enum-member allowances above, the schema text length, and
+    // mcp::kPatternMaxMem for EACH compiled RE2 pattern (RE2 caps one pattern's memory there,
+    // including its lazily grown DFA). It is an estimate for cache accounting, not a
+    // measurement. Computed once at prepare time. 0 for an absent or moved-from validator.
+    [[nodiscard]] std::size_t estimated_retained_bytes() const noexcept;
 
     // First violation, or nullopt if `params` conforms. `params` is the caller's value:
     // an object, or null (omitted), read as an empty object; any other JSON type is a
@@ -111,38 +134,77 @@ class ParamValidator {
 [[nodiscard]] std::expected<ParamValidator, std::vector<std::string>>
 prepare_param_validator(std::string_view stored_schema_json);
 
+// The canonical JSON-Schema form of a stored `parameter_schema`: the exact object
+// prepare_param_validator() compiles (DSL types and `validation{}` rewritten, the root closed with
+// `additionalProperties: false`), for discovery to publish. nullopt means "no schema stored" (see
+// PRESENCE); an error list means the text could not be canonicalised (same messages and the same
+// size, depth and shape limits as prepare_param_validator, which calls the same code).
+// NO RE2 pattern is compiled, so this does not pay the RE2 compile cost. That also means a
+// non-null result can still be refused at execute time: prepare_param_validator() rejects, and
+// this does not check, a pattern that does not compile or exceeds the RE2 program budget, a
+// `default` that violates its own parameter's constraints, and anything else the shared schema
+// compiler (mcp::compile_input_schema) refuses, for example non-numeric bounds, inverted bounds
+// or a keyword on the wrong type. The write gate keeps such schemas out of the store; a legacy
+// row can still carry one.
+[[nodiscard]] std::expected<std::optional<nlohmann::json>, std::vector<std::string>>
+canonicalise_param_schema(std::string_view stored_schema_json);
+
 // Bounded LRU of prepared validators so the execute route does not re-compile a
 // definition's schema on every call. Keyed by (definition id, schema length, SHA-256 of
 // the schema text): an edited definition has a new key, and the old entry ages out.
 // Compilation runs OUTSIDE the lock, so concurrent first calls for one schema may each
-// compile it (accepted: there is no single-flight). Failures and absent validators are
-// never cached. If the digest cannot be computed the call compiles without caching.
-// The cache is capped by ENTRY count, not bytes. What it can hold is entries x the patterns in
-// a schema (at most one per property, a string's own `pattern` or an array's `items` pattern,
-// so at most kMaxSchemaProperties) x what one compiled pattern retains, and
-// mcp::kPatternMaxMem bounds only that last factor.
+// compile it (accepted: there is no single-flight). Failures, absent validators and oversized
+// validators (see below) are never cached. If the digest cannot be computed the call compiles
+// without caching.
+//
+// The cache is bounded by BYTES. Each entry is weighed by ParamValidator::
+// estimated_retained_bytes() and least-recently-used entries are evicted until the retained
+// total is at most the byte budget; the entry ceiling is only a safety net on bookkeeping. An
+// entry is retained only if its weight is at most BOTH the byte budget and the per-entry cap
+// (max_entry_bytes); an oversized validator is returned to the caller but never retained, so it
+// evicts nothing. The most a schema can weigh is about kMaxSchemaProperties x
+// mcp::kPatternMaxMem; an entry that is admitted can still displace older entries, but the
+// RETAINED total never exceeds the budget. Peak memory is the retained total plus the validators
+// in flight: one per concurrent request, since there is no single-flight and concurrent first
+// calls for one schema each build their own. An entry over the cap or the budget is rebuilt on
+// every call, a deliberate trade of repeated CPU for a bounded cache. The CPU cost depends on
+// the patterns: from sub-millisecond for trivial ones to milliseconds for classes like
+// `[a-zA-Z0-9_.-]{1,64}`. The weights are upper-bound estimates, so the budget bounds the
+// estimate, not a measured resident size.
 class ParamValidatorCache {
   public:
     using Result =
         std::expected<std::shared_ptr<const ParamValidator>, std::vector<std::string>>;
 
-    explicit ParamValidatorCache(std::size_t max_entries = kParamValidatorCacheEntries);
+    // max_entries < 1 is read as 1. max_bytes == 0 retains nothing. max_entry_bytes is the
+    // heaviest single entry retained: a validator weighing more than it (or than max_bytes) is
+    // returned but never cached.
+    explicit ParamValidatorCache(std::size_t max_entries = kParamValidatorCacheEntries,
+                                 std::size_t max_bytes = kParamValidatorCacheMaxBytes,
+                                 std::size_t max_entry_bytes = kParamValidatorCacheMaxEntryBytes);
 
     [[nodiscard]] Result get(const std::string& definition_id, const std::string& stored_schema);
 
     // Entries currently held (for tests).
     [[nodiscard]] std::size_t size() const;
 
+    // Sum of the weights of the entries currently held (for tests).
+    [[nodiscard]] std::size_t bytes() const;
+
   private:
     struct Entry {
         std::string key;
         std::shared_ptr<const ParamValidator> validator;
+        std::size_t weight = 0;
     };
 
     const std::size_t max_entries_;
+    const std::size_t max_bytes_;
+    const std::size_t max_entry_bytes_;
     mutable std::mutex mu_;
     std::list<Entry> lru_;  // front = most recently used
     std::unordered_map<std::string, std::list<Entry>::iterator> index_;
+    std::size_t total_bytes_ = 0;  // sum of lru_ weights; guarded by mu_
 };
 
 }  // namespace yuzu::server::instr

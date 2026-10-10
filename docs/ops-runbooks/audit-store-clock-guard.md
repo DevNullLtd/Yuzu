@@ -62,6 +62,9 @@ Not a retention problem, and much louder than one:
 PostgreSQL (schema `audit_store`) at all. Behavioural-PII REST routes
 are fail-closed, so they are returning `503` while this persists, and the
 evidence for whatever is happening right now is not being recorded.
+The response reads (`response.read`, on `/api/responses/*` and `/api/v1/responses/*`) are among them,
+and every served read there adds one audit INSERT, so a polling script on those routes raises audit
+volume; the audit reaper's retention cap is the only backpressure.
 
 Check, in order: `/healthz` `stores.audit` (a failed migration or an
 unreachable `--postgres-dsn` closes the store — the log says so explicitly);

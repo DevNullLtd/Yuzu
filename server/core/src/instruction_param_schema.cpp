@@ -176,6 +176,9 @@ std::size_t fixed_pattern_program(Subtype t) {
 struct PatternBudget {
     std::size_t user_program = 0;  // sum of user pattern program sizes
     bool exhausted = false;        // a budget failure was reported: stop compiling
+    // false: canonicalise only (canonicalise_param_schema). No pattern is compiled or sized;
+    // the shape, size and depth limits still apply.
+    bool compile = true;
 };
 
 // Pre-compile one USER pattern under the shared RE2 budget. Returns its program size, or
@@ -186,6 +189,8 @@ std::optional<std::size_t> vet_pattern(const std::string& pattern, const std::st
                                        std::vector<std::string>& errors) {
     if (budget.exhausted)
         return std::nullopt;
+    if (!budget.compile)
+        return std::size_t{0};
     const RE2 re(pattern, pattern_options());
     if (!re.ok()) {
         if (re.error_code() == RE2::ErrorPatternTooLarge) {
@@ -385,7 +390,7 @@ PropResult canonicalise_property(const std::string& name, const json& spec, Patt
         r.canonical["pattern"] = std::string(ti->subtype == Subtype::kDatetime ? kDatetimePattern
                                                                                : kGuidPattern);
         r.info.has_pattern = true;
-        r.info.pattern_prog = fixed_pattern_program(ti->subtype);
+        r.info.pattern_prog = budget.compile ? fixed_pattern_program(ti->subtype) : 0;
     } else if (ti->subtype == Subtype::kInt32) {
         tighten_bound(r.canonical, "minimum", kInt32Min, /*is_min=*/true);
         tighten_bound(r.canonical, "maximum", kInt32Max, /*is_min=*/false);
@@ -579,6 +584,7 @@ struct ParamValidator::Impl {
     // nullopt = ABSENT (nothing declared).
     std::optional<mcp::CompiledInputSchema> schema;
     std::vector<PropInfo> props;
+    std::size_t retained_bytes = 0;  // see estimated_retained_bytes(); 0 when absent
 };
 
 ParamValidator::ParamValidator(std::unique_ptr<const Impl> impl) : impl_(std::move(impl)) {}
@@ -588,6 +594,10 @@ ParamValidator::~ParamValidator() = default;
 
 bool ParamValidator::absent() const noexcept {
     return impl_ && !impl_->schema;
+}
+
+std::size_t ParamValidator::estimated_retained_bytes() const noexcept {
+    return impl_ ? impl_->retained_bytes : 0;
 }
 
 std::optional<mcp::SchemaViolation> ParamValidator::check(const json& params) const {
@@ -622,10 +632,16 @@ std::optional<mcp::SchemaViolation> ParamValidator::check(const json& params) co
     return impl_->schema->validate(subset);
 }
 
-std::expected<ParamValidator, std::vector<std::string>>
-prepare_param_validator(std::string_view stored_schema_json) {
+namespace {
+
+// Everything prepare_param_validator() does before it compiles the schema: the size, depth,
+// parse and shape limits, then canonicalise_root(). nullopt = nothing stored (empty text or
+// `{}`). `props` receives the per-property facts check() needs; `budget.compile` says whether
+// user patterns are compiled and sized (enforcement) or left alone (canonicalise_param_schema).
+std::expected<std::optional<json>, std::vector<std::string>>
+canonicalise_stored(std::string_view stored_schema_json, PatternBudget& budget,
+                    std::vector<PropInfo>& props) {
     std::vector<std::string> errors;
-    auto impl = std::make_unique<ParamValidator::Impl>();
 
     // Size first, on the RAW text, before any trim/scan/parse.
     if (stored_schema_json.size() > kMaxParameterSchemaBytes) {
@@ -636,7 +652,7 @@ prepare_param_validator(std::string_view stored_schema_json) {
 
     const auto text = trim(stored_schema_json);
     if (text.empty())
-        return ParamValidator(std::move(impl));  // absent
+        return std::nullopt;  // absent
 
     if (mcp::json_exceeds_depth(text, kMaxStoredSchemaDepth)) {
         errors.emplace_back("stored parameter schema nests deeper than " +
@@ -653,15 +669,39 @@ prepare_param_validator(std::string_view stored_schema_json) {
         return std::unexpected(std::move(errors));
     }
     if (parsed.empty())
-        return ParamValidator(std::move(impl));  // `{}`: absent
+        return std::nullopt;  // `{}`: absent
     // Any other object is canonicalised; one without a root `type` is an error there (a
     // truncated schema must not silently skip validation).
 
     json canonical;
-    PatternBudget budget;
-    canonicalise_root(parsed, canonical, impl->props, budget, errors);
+    canonicalise_root(parsed, canonical, props, budget, errors);
     if (!errors.empty())
         return std::unexpected(std::move(errors));
+    return std::optional<json>(std::move(canonical));
+}
+
+}  // namespace
+
+std::expected<std::optional<json>, std::vector<std::string>>
+canonicalise_param_schema(std::string_view stored_schema_json) {
+    PatternBudget budget;
+    budget.compile = false;
+    std::vector<PropInfo> props;
+    return canonicalise_stored(stored_schema_json, budget, props);
+}
+
+std::expected<ParamValidator, std::vector<std::string>>
+prepare_param_validator(std::string_view stored_schema_json) {
+    std::vector<std::string> errors;
+    auto impl = std::make_unique<ParamValidator::Impl>();
+
+    PatternBudget budget;
+    auto stored = canonicalise_stored(stored_schema_json, budget, impl->props);
+    if (!stored)
+        return std::unexpected(std::move(stored.error()));
+    if (!*stored)
+        return ParamValidator(std::move(impl));  // absent
+    json canonical = std::move(**stored);
 
     auto compiled = mcp::compile_input_schema(canonical.dump());
     if (!compiled)
@@ -701,16 +741,39 @@ prepare_param_validator(std::string_view stored_schema_json) {
     if (!errors.empty())
         return std::unexpected(std::move(errors));
 
+    // Every pattern in `props` (a user pattern, or the fixed datetime/guid one) is written into
+    // the canonical schema and compiled by compile_input_schema, one RE2 per pattern; every
+    // enum member is copied into the compiled schema as a JSON value.
+    std::size_t patterns = 0;
+    std::size_t enum_members = 0;
+    for (const auto& p : impl->props) {
+        patterns += static_cast<std::size_t>(p.has_pattern) +
+                    static_cast<std::size_t>(p.items_has_pattern);
+        enum_members += p.enum_members + p.items_enum_members;
+    }
+    impl->retained_bytes = kParamValidatorFixedBytes +
+                           impl->props.size() * kParamValidatorPerPropertyBytes +
+                           enum_members * kParamValidatorPerEnumMemberBytes +
+                           trim(stored_schema_json).size() +
+                           patterns * static_cast<std::size_t>(mcp::kPatternMaxMem);
+
     impl->schema.emplace(std::move(*compiled));
     return ParamValidator(std::move(impl));
 }
 
-ParamValidatorCache::ParamValidatorCache(std::size_t max_entries)
-    : max_entries_(max_entries == 0 ? 1 : max_entries) {}
+ParamValidatorCache::ParamValidatorCache(std::size_t max_entries, std::size_t max_bytes,
+                                         std::size_t max_entry_bytes)
+    : max_entries_(max_entries == 0 ? 1 : max_entries), max_bytes_(max_bytes),
+      max_entry_bytes_(max_entry_bytes) {}
 
 std::size_t ParamValidatorCache::size() const {
     std::lock_guard lk(mu_);
     return lru_.size();
+}
+
+std::size_t ParamValidatorCache::bytes() const {
+    std::lock_guard lk(mu_);
+    return total_bytes_;
 }
 
 ParamValidatorCache::Result ParamValidatorCache::get(const std::string& definition_id,
@@ -745,23 +808,31 @@ ParamValidatorCache::Result ParamValidatorCache::get(const std::string& definiti
     Result result = build();  // outside the lock
     if (!result || (*result)->absent())
         return result;
+    // An entry heavier than the whole budget, or than the per-entry cap, is handed back but
+    // never retained: admitting it would evict most of the other entries in one insert.
+    const std::size_t weight = (*result)->estimated_retained_bytes();
+    if (weight > max_bytes_ || weight > max_entry_bytes_)
+        return result;
     try {
         std::lock_guard lk(mu_);
         if (!index_.contains(key)) {  // another thread may have inserted it meanwhile
-            lru_.push_front(Entry{key, *result});
+            lru_.push_front(Entry{key, *result, weight});
             try {
                 index_.emplace(key, lru_.begin());
             } catch (...) {
                 lru_.pop_front();
                 throw;
             }
-            while (lru_.size() > max_entries_) {
+            total_bytes_ += weight;
+            // The new entry is at the front and fits alone, so this loop ends before it.
+            while (lru_.size() > max_entries_ || total_bytes_ > max_bytes_) {
+                total_bytes_ -= lru_.back().weight;
                 index_.erase(lru_.back().key);
                 lru_.pop_back();
             }
         }
     } catch (...) {
-        // Caching is an optimisation: an allocation failure leaves the cache usable.
+        // Caching is an optimisation: an allocation or lock failure leaves the cache usable.
     }
     return result;
 }

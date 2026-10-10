@@ -305,15 +305,16 @@ Example startup:
 ### OIDC Login Flow
 
 1. User clicks "Sign in with SSO" on the login page.
-2. Browser is redirected to `GET /auth/oidc/start`, which generates a PKCE challenge and redirects to the IdP's authorization endpoint.
+2. Browser is redirected to `GET /auth/oidc/start`, which generates a PKCE challenge, sets the browser-binding cookie, and redirects to the IdP's authorization endpoint.
 3. User authenticates at the IdP.
-4. IdP redirects back to `GET /auth/callback` with an authorization code.
-5. Server exchanges the code for tokens, validates the ID token, extracts claims, and creates a local session.
+4. IdP redirects back to `GET /auth/callback` with an authorization code. The browser presents the binding cookie.
+5. Server checks the binding cookie, exchanges the code for tokens, validates the ID token, extracts claims, and creates a local session.
 
 ```
 Browser           Yuzu Server               IdP (Entra ID)
   |                    |                          |
   |-- GET /auth/oidc/start -->                    |
+  |<-- 302 + Set-Cookie (binding) --|             |
   |                    |-- 302 authorize?... ---->|
   |                    |                          |
   |                    |          (user authenticates)
@@ -321,6 +322,17 @@ Browser           Yuzu Server               IdP (Entra ID)
   |                    |<--- 302 /auth/callback --|
   |<-- Set-Cookie -----|                          |
 ```
+
+### Browser binding
+
+The sign-in is bound to the browser that started it. `GET /auth/oidc/start` sets a short-lived (10 minute) `HttpOnly` cookie holding a random secret, and the server keeps only a SHA-256 digest of that secret beside the pending flow. `GET /auth/callback` refuses a request that does not present the matching cookie, so a callback URL only completes in the browser that began the flow. A refused callback does not consume the pending flow, so the original browser can still finish within the 10 minute window; the cookie is cleared once the flow it proved has been used.
+
+- **Cookie name.** `__Host-yuzu_oidc_bind` (`Secure`, `Path=/`) when the server's own listener runs with HTTPS, and `yuzu_oidc_bind` on plain HTTP, the same rule the session cookie follows. A server behind a TLS-terminating proxy that itself listens on plain HTTP therefore uses the unprefixed, non-`Secure` name, the same posture as its session cookie and weaker than SAML's HTTPS-only stance.
+- **Same host name.** The cookie is bound to the host name it was set on, so the sign-in must be started on the same host name as the configured `--oidc-redirect-uri`. A sign-in started on a different host name (an IP address, a short name) is refused with `sso_failed` until it is restarted on the configured host.
+- **`SameSite=Lax`.** The identity provider returns by a top-level GET, which a `Lax` cookie accompanies (SAML needs `None` because its assertion arrives as a POST). This relies on the default `query` response mode, which is what Yuzu requests; it does not request `form_post`.
+- **Multiple replicas.** The pending flow and its digest are held in server memory, so the callback must reach the replica that handled `GET /auth/oidc/start`. Configure session affinity on `GET /auth/oidc/start` and `GET /auth/callback`, as for SAML (see [SAML HA](../auth-architecture.md#ha--multi-replica)).
+- **Restarts and upgrades.** A sign-in started before a server upgrade or restart cannot be completed afterwards; the user restarts it from the login page. Starting a second SSO sign-in in the same browser replaces the cookie, so the earlier unfinished sign-in in that browser must be restarted.
+- **Audit.** Refusals are audited as `auth.oidc_login_failed` with `reason=browser_binding_missing` (no cookie), `reason=browser_binding_mismatch` (a cookie that does not match the flow) or `reason=browser_binding_unavailable` (the server could not compute the digest; the flow stays pending). The browser sees the usual generic `sso_failed` error in every case.
 
 ### Group-to-Role Mapping
 
@@ -1212,7 +1224,7 @@ The following audit actions are emitted for authentication and authorization eve
 | `auth.login_failed` | `failure` | Failed login attempt |
 | `auth.logout` | `success` | User-initiated logout |
 | `auth.oidc_login` | `success` | Successful OIDC SSO login |
-| `auth.oidc_login_failed` | `failure` | Failed OIDC login attempt |
+| `auth.oidc_login_failed` | `failure` | Failed OIDC login attempt; a refused browser-binding check carries `reason=browser_binding_missing`, `browser_binding_mismatch` or `browser_binding_unavailable` |
 | `auth.saml_login` | `ok` | Successful SAML 2.0 SSO login |
 | `auth.saml_login_failed` | `error` | Failed SAML login attempt (missing binding cookie, oversize body, missing SAMLResponse, or signature/audience/expiry/replay validation failure) |
 
@@ -1249,7 +1261,7 @@ HTTP status codes:
 |---|---|---|---|
 | `POST` | `/login` | No | Authenticate with username/password; returns JSON `{"status":"ok"}` + session cookie |
 | `POST` | `/logout` | Session | Invalidate current session; returns JSON `{"status":"ok"}` |
-| `GET` | `/auth/oidc/start` | No | Begin OIDC PKCE login flow (302 redirect to IdP) |
+| `GET` | `/auth/oidc/start` | No | Begin OIDC PKCE login flow (302 redirect to IdP); sets the browser-binding cookie that `/auth/callback` requires (refusals: `browser_binding_missing` / `_mismatch` / `_unavailable`) |
 | `GET` | `/auth/callback` | No | OIDC callback (IdP redirects here; creates session, 302 to `/`) |
 | `GET` | `/auth/saml/start` | No | Begin SAML 2.0 SP-initiated login flow (302 redirect to IdP via HTTP-Redirect binding); Linux/macOS only |
 | `POST` | `/saml/acs` | No | SAML Assertion Consumer Service — IdP POSTs the response here; validates and creates session; Linux/macOS only |

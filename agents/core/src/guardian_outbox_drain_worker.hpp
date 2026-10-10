@@ -65,6 +65,22 @@
  * thread; here the same work is already-async and co-located with the KvStore I/O
  * the drain path does anyway (mark_batch_sent per sent batch).
  *
+ * BASELINE PERSISTENCE (#4045): the worker is also the always-on, connection-independent
+ * caller of the engine-owned GuardianBaselinePersister (guardian_baseline_persister.hpp), which
+ * writes Spark's staged baseline-on-arm captures into the #4021 KV record. One firewalled step
+ * per cycle, ahead of the outbox drain: a capture's compliant-edge enqueue normally wakes this
+ * loop, so the record is usually durable within milliseconds of the capture (see the persister's
+ * LATENCY note for the honest bound), with no new waker and no dependence on server
+ * connectivity (a boot re-arm happens before the network is up; the heartbeat-thread tick
+ * cannot cover it). After a failed pass the step backs off (5 s doubling to 60 s), and every
+ * pass runs under a budget (tuples, failures, wall; see the persister's BOUNDED PASSES), so it
+ * stalls the drain for at most the wall budget plus one in-flight KV write. A pass that ran
+ * out of budget with captures still staged (no failure) makes the loop run again at once
+ * instead of waiting. The pass also polls this worker's stop flag between tuples, so a pass in
+ * flight when stop() joins it ends after at most one more write. Another KvStore caller on this
+ * existing joined thread, alongside the journal; it takes only the persister's leaf
+ * persist_mu_, never mtx_.
+ *
  * THE CENTRAL CONSTRAINT: maintenance must NEVER take the GuardianEngine mtx_.
  * GuardianEngine::stop() holds mtx_ across its whole body AND joins this worker
  * inside it, so an mtx_ acquisition on this thread is a lock-vs-join deadlock.
@@ -77,6 +93,7 @@
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
+#include "guardian_baseline_persister.hpp"  // GuardianBaselinePersister (#4045)
 #include "guardian_outbox.hpp"              // OutboxEntry, SendResult
 #include "guardian_outbox_send_executor.hpp" // GuardianOutboxSendExecutor
 #include "guardian_spark_runtime.hpp"        // GuardianSparkRuntime
@@ -177,6 +194,11 @@ struct GuardianMaintenanceConfig {
     /// unenforceable ordering nothing would have caught if reordered (#2298 governance A4).
     /// One allocation, and the whole class of failure goes away.
     std::shared_ptr<GuardianLifecycleJournal> journal{};
+    /// SHARED, may be null (no baseline persistence runs). The engine-owned persister of
+    /// Spark's staged baseline-on-arm captures (#4045), expressed as a typed shared_ptr for the
+    /// same reason as `journal`. The worker is one of its THREE callers; see
+    /// guardian_baseline_persister.hpp. Defaulted, so designated-init users are unaffected.
+    std::shared_ptr<GuardianBaselinePersister> baselines{};
     std::chrono::milliseconds page_interval{kGuardianJournalPageInterval};
     std::chrono::milliseconds prune_interval{kGuardianJournalPruneInterval};
     std::size_t drain_budget{kGuardianDrainBudget};
@@ -290,6 +312,21 @@ public:
     /// throw, but a bad_alloc on the bare worker thread never terminates the agent).
     void drain_once();
 
+    /// Persist Spark's staged baseline captures (#4045), once, via maint_.baselines (a no-op
+    /// when unset), as a Trigger::Worker pass: it honours the persister's retry backoff,
+    /// polls this worker's stop flag between tuples and yields to a fence / apply_rules waiter.
+    /// Returns the pass outcome (a default Outcome when unset): `budget_exhausted` means it
+    /// ran out of budget with captures still staged and no failure (the loop then runs again
+    /// at once), `yielded` that it deferred (the loop re-checks within
+    /// kGuardianSendRecheckInterval, with no wake needed). loop() runs this every cycle before
+    /// the outbox drain; it is public so a test can drive it synchronously. NOT firewalled
+    /// here (loop() firewalls it and counts into the persister's firewalled_exceptions()).
+    /// Takes the persister's leaf persist_mu_ and never GuardianEngine::mtx_.
+    GuardianBaselinePersister::Outcome persist_staged_baselines_once();
+
+    /// TEST-ONLY: true once stop() has been requested (the flag the baseline pass polls).
+    [[nodiscard]] bool stop_requested_for_test() const noexcept { return stop_requested(); }
+
     /// TEST-ONLY: pin the jitter source so offsets are reproducible. Intended before
     /// start(), but it takes sig_->mu regardless: the RNG is worker-thread state guarded by
     /// that mutex, and a doc comment is not a synchronization primitive - a later caller
@@ -343,7 +380,6 @@ public:
     [[nodiscard]] std::uint64_t journal_maint_exception_count() const noexcept {
         return journal_maint_exceptions_.load(std::memory_order_relaxed);
     }
-
     /// steady_clock ms of the last PAGE maintenance pass that made REPLAY PROGRESS or positively
     /// established there was none, seeded non-zero at start() (flip item 6 / item 14). 0 means
     /// start() has not run - the reader treats that as "no worker", not as an age. The cadence
