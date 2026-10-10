@@ -106,8 +106,14 @@ struct FacetFilter {
 struct ResponseQuery {
     std::string agent_id;
     int status{-1};   // -1 = any
-    int64_t since{0}; // epoch seconds, 0 = no lower bound
-    int64_t until{0}; // epoch seconds, 0 = no upper bound
+    /// Epoch-second bounds, PRESENCE-tracked (#4644): an unset optional is "no bound on that
+    /// side"; a set value is a literal bound (`timestamp >= *since`, `timestamp <= *until`).
+    /// A literal 0 is NOT a sentinel -- the old `int64_t{0}` default made an omitted bound and a
+    /// computed window that collapsed to 0 indistinguishable, so the latter silently returned
+    /// the whole table. The REST/MCP edge rejects `until <= 0`; `since == 0` is a harmless
+    /// literal bound (every stored timestamp is positive).
+    std::optional<int64_t> since;
+    std::optional<int64_t> until;
     int limit{100};
     int offset{0};
 };
@@ -134,6 +140,26 @@ struct ResponseQuery {
 ///                           never a silent unfiltered read (also the fail-closed
 ///                           sink for a corrupt RBAC store / a store-read error).
 using AggregateScope = std::optional<std::vector<std::string>>;
+
+/// Result of `ResponseStore::query_bounded()`: the kept rows plus WHY any rows were
+/// left out. Both flags can be true at once (a byte cut inside a result that also
+/// exceeded the row limit); a caller that needs one cause reports `byte_cap_hit`
+/// first (the tighter, payload-driven bound).
+struct BoundedResponses {
+    std::vector<StoredResponse> rows;
+    /// More matching rows existed beyond `limit` (precise: the store fetched limit+1
+    /// candidate rows to know, so exactly `limit` matching rows is NOT flagged).
+    bool row_cap_hit{false};
+    /// At least one row within `limit` was left out because the cumulative
+    /// `octet_length(output) + octet_length(error_detail)` had already reached the
+    /// payload cap.
+    bool byte_cap_hit{false};
+    /// `PQresultMemorySize()` of the libpq result the query materialised, i.e. what the
+    /// fetch actually held (kept rows' columns plus per-row/field overhead and the two
+    /// `meta` columns). Observability and a test seam for the byte bound; not a request
+    /// limit. 0 when the query returned no rows.
+    std::size_t result_bytes{0};
+};
 
 enum class AggregateOp { Count, Sum, Avg, Min, Max };
 
@@ -246,6 +272,29 @@ public:
     [[nodiscard]] std::optional<std::vector<StoredResponse>>
     query(const std::string& instruction_id, const ResponseQuery& q = {},
          const AggregateScope& scope = std::nullopt) const;
+    /// Byte-aware variant of `query()` for the two EXPORT routes (#4703). Same
+    /// predicates, same resolve-then-scope push-down (ADR-0017 INV-3: the scope clause is
+    /// in the WHERE before any cut), but the cut is made IN SQL so neither libpq's
+    /// PGresult nor the parsed vector ever holds more than roughly `max_payload_bytes` of
+    /// `output`+`error_detail` (plus one final row of up to about 4 MiB for text output, about 12 MiB for
+    /// output dense in invalid bytes or NULs: each field is cut to 2 MiB at ingest before invalid bytes
+    /// and NULs become 3-byte U+FFFD; that includes the `error_detail` that
+    /// `finalize_terminal_status` writes for a terminal frame):
+    ///   1. a sizing pass over the (at most limit+1) candidate rows reads only
+    ///      `octet_length(output)+octet_length(error_detail)` -- Postgres answers that
+    ///      from the TOAST pointer without detoasting (measured: 0.05 ms vs 207 ms for
+    ///      `length()` over 400 x 512 KiB rows) -- and a running SUM in export order;
+    ///   2. only rows whose PRECEDING cumulative size is still below the cap are joined
+    ///      back to fetch the full columns (the first row is always kept, so a single row
+    ///      larger than the cap still makes progress).
+    /// Export order is `timestamp DESC, id DESC` (the id tiebreak makes the cut
+    /// deterministic; `query()` orders by timestamp alone, so rows with equal timestamps can come
+    /// back in a different order from the list routes). `q.offset` is ignored. A
+    /// concurrent delete between the two steps is one statement, so the snapshot is
+    /// consistent. Returns nullopt on store-degraded, exactly like `query()`.
+    [[nodiscard]] std::optional<BoundedResponses>
+    query_bounded(const std::string& instruction_id, const ResponseQuery& q,
+                  const AggregateScope& scope, std::size_t max_payload_bytes) const;
     /// Exact-correlation lookup keyed on `execution_id` (PR 2). Empty
     /// `execution_id` is rejected (returns an engaged empty vector, NOT
     /// nullopt) — that sentinel is the legacy path; callers must fall back

@@ -1376,6 +1376,7 @@ if build_server
       'unit/server/test_dispatch_target_shape.cpp',
       'unit/server/test_instruction_param_schema.cpp',
       'unit/server/test_instruction_param_golden.cpp', # golden accept/reject table over the shipped definitions
+      'unit/server/test_instruction_canonical_schema.cpp', # canonicalise_param_schema: the discovery input_schema source
       'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',
@@ -1540,6 +1541,7 @@ if build_server
       'unit/server/test_dex_app_perf_model.cpp',
       'unit/server/test_app_perf_compare.cpp',
       'unit/server/test_dex_app_perf_ui.cpp',
+      'unit/server/test_dex_stats.cpp', # pure known-answer statistics (dex_stats.hpp): no store, no I/O, no [pg]
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
       'unit/server/test_verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
@@ -2843,6 +2845,17 @@ test('instructions risk table',
   args: [files('test_instructions_risk_table.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Description-quality ratchet over the shipped definitions (content/definitions and content/packs;
+# scripts/ci/check-definition-descriptions.py): the self-test with seeded defects, plus the real
+# script over the real tree against scripts/ci/definition-descriptions-baseline.json. Hermetic;
+# needs PyYAML.
+test('definition descriptions',
+  _python3_test,
+  args: [files('test_definition_descriptions.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # firmware_posture's definition-column contract (content/definitions/firmware_posture.yaml):
