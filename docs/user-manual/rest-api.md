@@ -11316,11 +11316,11 @@ Destroy the current session. Clears the `yuzu_session` cookie.
 
 #### `GET /auth/oidc/start`
 
-Begin the OIDC SSO login flow. Redirects to the configured identity provider.
+Begin the OIDC SSO login flow. Sets the short-lived browser-binding cookie (`__Host-yuzu_oidc_bind`, or `yuzu_oidc_bind` on plain HTTP) and redirects to the configured identity provider. Answers `500` with no cookie and no redirect if the server cannot start the flow.
 
 #### `GET /auth/callback`
 
-OIDC callback endpoint. The identity provider redirects here after authentication. Exchanges the authorization code for tokens and creates a local session.
+OIDC callback endpoint. The identity provider redirects here after authentication. Requires the browser-binding cookie set by `GET /auth/oidc/start`; a request without the matching cookie is refused with the generic `/login?error=sso_failed` redirect. Otherwise exchanges the authorization code for tokens and creates a local session. See [OIDC Login Flow](authentication.md#oidc-login-flow).
 
 #### `GET /auth/saml/start`
 
