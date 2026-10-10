@@ -111,7 +111,10 @@ metadata:
     in /etc/pam.d/common-auth, common-account, system-auth and password-auth
     (in a container these are the image's files, not the host's); macOS
     reads the authentication policies from `pwpolicy -getaccountpolicies` (no
-    authentication policy reports `policies|none`, the default); Windows
+    authentication policy reports `policies|none`, the default); Linux
+    reports `lockout_keys|not_found` when at least one source was read and no
+    lockout key was found, a statement about the files read and not a verdict
+    that lockout is off; Windows
     reads LockoutBadCount, ResetLockoutCount and LockoutDuration from one
     `secedit /export` staged under agent.data_dir and removed on return. It
     reports configuration, not live lockout counters; on Windows that is the
@@ -149,7 +152,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: value
         type: string
-        description: 'The setting value; present when a key has no value; absent for a Windows key the export does not carry; for a pam.<type>.<module> row, the control followed by the module arguments; for unmodelled_parameter (macOS), <name>=<value>. For lockout_keys, not_found -- the default answer when sources were read and no lockout key was found; a statement about the files read, not that no lockout is enforced (faillock.conf drop-ins, PAM include/substack targets, PAM services other than the four named files, IdM/SSSD and fail2ban are not read). An absent or unreadable sibling source keeps its own source_state row and does not suppress it; any key row does. For source_state, absent or unreadable:<reason> (a macOS pwpolicy defect is unreadable:malformed_category, malformed_policy, malformed_identifier, malformed_content, malformed_parameters, malformed_parameter_value, non_string_key, unconvertible_key or missing_content; a file holding a NUL byte is unreadable:embedded_nul; the row-cap marker is unreadable:row_cap). For status, constrained -- the only state any leg reaches today.'
+        description: 'The setting value; present when a key has no value; absent for a Windows key the export does not carry; for a pam.<type>.<module> row, the control followed by the module arguments; for unmodelled_parameter (macOS), <name>=<value>. For lockout_keys, not_found -- the default answer when sources were read and no lockout key was found; a statement about the files read, not that no lockout is enforced (faillock.conf drop-ins, PAM include/substack targets, PAM services other than the four named files, IdM/SSSD and fail2ban are not read). An absent login.defs or faillock.conf, an all-absent PAM directory or an unreadable file keeps its own source_state row and does not suppress it; any key row does (every faillock.conf key counts, and so do the login.defs keys LOGIN_RETRIES, LOGIN_TIMEOUT, FAILLOG_ENAB and FAIL_DELAY, which are login-prompt and faillog settings, not account-lockout counters). An older agent never writes this row: it returns an empty result unless login.defs or faillock.conf is absent, every PAM file is absent or a file is unreadable, and then only the source_state rows for those, so an empty result from an older agent means not known. For source_state, absent or unreadable:<reason> (a macOS pwpolicy defect is unreadable:malformed_category, malformed_policy, malformed_identifier, malformed_content, malformed_parameters, malformed_parameter_value, non_string_key, unconvertible_key or missing_content; a file holding a NUL byte is unreadable:embedded_nul; the row-cap marker is unreadable:row_cap). For status, constrained -- the only state any leg reaches today.'
         example: "5"
         platforms: [windows, linux, darwin]
       - name: source

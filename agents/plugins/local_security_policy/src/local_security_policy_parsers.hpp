@@ -1240,9 +1240,9 @@ inline Collected collect_file_policy(FileFlavor flavor, LocalPolicyAction action
         // include/substack targets, PAM services other than the four named files, IdM/SSSD and
         // fail2ban are not read, so it is never "no lockout enforced".
         if (t.key_rows == 0 && t.readable > 0) {
-            std::string files;
-            for (const auto& f : t.read_paths) files += (files.empty() ? "" : ",") + f;
-            t.row(format_kv_row(prefix, "lockout_keys", "not_found", files));
+            std::string joined;
+            for (const auto& f : t.read_paths) joined += (joined.empty() ? "" : ",") + f;
+            t.row(format_kv_row(prefix, "lockout_keys", "not_found", joined));
         }
         break;
     }
