@@ -589,6 +589,50 @@ TEST_CASE("create-group-form: a filter value over the facet bound is refused, no
     CHECK(h.visible_set_fn_calls == 0);
 }
 
+// A NUL / invalid UTF-8 filter value can never equal a stored value (ingest rewrites each to
+// U+FFFD) and a NUL is truncated by the libpq bind, so `high%00ignored-suffix` used to show the
+// count of `high`. Refused like an over-bound value; visible_set_fn_calls == 0 shows no store
+// read or scope resolution happened. The matching `high` rows ARE seeded, so a dropped or
+// truncated filter would surface as "agents will be added".
+TEST_CASE("create-group-form: a filter value with a NUL or invalid UTF-8 is refused, not "
+          "previewed as the count of its prefix",
+          "[pg][server][dashboard][group_from_results]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+    std::string nuls;
+    for (int i = 0; i < 683; ++i)
+        nuls += "%00";
+    for (const std::string& value :
+         {std::string("high%00x"), std::string("high%00ignored-suffix"), std::string("%00"), nuls,
+          std::string("%FF"), std::string("%C0%80"), std::string("%ED%A0%80"),
+          std::string("high%C3")}) {
+        INFO(value.substr(0, 40));
+        auto res = h.sink.Get(std::string{"/fragments/create-group-form?command_id="} +
+                              kCommandId + "&plugin=" + kPlugin + "&f_severity=" + value);
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "data-filter-refused=\"true\""));
+        CHECK(contains(res->body, "NUL byte or invalid UTF-8"));
+        CHECK_FALSE(contains(res->body, "agents will be added"));
+        CHECK_FALSE(contains(res->body, "agent will be added"));
+        CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    }
+    CHECK(h.visible_set_fn_calls == 0);
+}
+
+TEST_CASE("group-from-results: a filter value with a NUL is refused and creates no group",
+          "[pg][server][dashboard][group_from_results]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+    auto res = h.post("group_name=nul-group&command_id=" + std::string{kCommandId} +
+                      "&plugin=" + kPlugin + "&f_category=cat-a&f_severity=high%00x");
+    CHECK(res->status == 400);
+    CHECK(contains(res->body, "data-filter-refused=\"true\""));
+    CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
+    CHECK_FALSE(h.mg.find_group_by_name("nul-group").has_value());
+    CHECK(h.visible_set_fn_calls == 0);
+}
+
 TEST_CASE("create-group-form: a filter value exactly at the facet bound is previewed",
           "[pg][server][dashboard][group_from_results]") {
     GroupFromResultsHarness h;

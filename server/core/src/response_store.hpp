@@ -50,6 +50,8 @@
 #include <string_view>
 #include <vector>
 
+#include "utf8_sanitize.hpp"
+
 namespace yuzu {
 class MetricsRegistry;
 }
@@ -78,40 +80,57 @@ namespace yuzu::server {
 /// facet batch, which is counted as `batch_failed`.
 inline constexpr std::size_t kMaxFacetValueBytes = 2048;
 
-/// Reader-side twin of the ingest exclusion above. A facet filter on a value over
-/// `kMaxFacetValueBytes` can match no agent (such a value is never stored), so a reader
-/// that ran it would report an exact "0 agents" for a filter it cannot evaluate. Every
-/// reader that builds a `FacetFilter` from caller input refuses the request when this is
-/// true, and never drops the filter (dropping it would widen the match). Decidable from
-/// the input alone, so no store access is involved.
-[[nodiscard]] inline bool facet_value_exceeds_bound(std::string_view v) noexcept {
-    return v.size() > kMaxFacetValueBytes;
+/// Reader-side twin of the ingest exclusion above. A facet filter value that can never
+/// equal a stored facet value matches no agent, so a reader that ran it would report an
+/// exact "0 agents" (or, for a NUL, a silent PREFIX match) for a filter it cannot
+/// evaluate. Such a value is one that is:
+///   - over `kMaxFacetValueBytes` (never stored: see above); or
+///   - containing a NUL byte, or not valid UTF-8 (ingest runs the text through
+///     `sanitize_pg_text`, which rewrites each such byte to the 3-byte U+FFFD, so a stored
+///     value never contains one; the libpq bind would also C-string-truncate a NUL and
+///     match the prefix as if it were the whole value).
+/// The length is compared to the same bound ingest applies (to the sanitized form, which
+/// for a value passing the other two tests is the raw form). Every reader that builds a
+/// `FacetFilter` from caller input refuses the request when this is true, and never drops
+/// the filter (dropping it would widen the match). Decidable from the input alone, so no
+/// store access is involved. UTF-8 validity is `sanitize_utf8_strict`'s definition (what
+/// PostgreSQL's UTF8 encoding accepts), not a second validator.
+[[nodiscard]] inline bool facet_filter_value_unmatchable(std::string_view v) {
+    if (v.size() > kMaxFacetValueBytes)
+        return true;
+    if (v.find('\0') != std::string_view::npos)
+        return true;
+    // A rewritten byte grows 1 -> 3, so the scrubbed copy has the same size iff the input
+    // was already valid.
+    return sanitize_utf8_strict(v).size() != v.size();
 }
 
-/// Caller-facing text for the refusal above. Names the bound, never echoes the value.
+/// Caller-facing text for the refusal above. Names both causes, never echoes the value.
 /// Sentence case, so the dashboard can join message + ". " + remediation + "." and read
 /// correctly; the REST and MCP envelopes carry the same two strings in their own fields.
-[[nodiscard]] inline std::string facet_filter_value_bound_message() {
-    return std::format("A filter value is longer than {} bytes; facet values over that "
-                       "length are not indexed, so no agent can match such a filter",
+[[nodiscard]] inline std::string facet_filter_value_refusal_message() {
+    return std::format("A filter value cannot be matched: it is longer than {} bytes (longer "
+                       "facet values are not indexed), or it contains a NUL byte or invalid "
+                       "UTF-8 (ingest replaces those bytes, so stored text never has them); "
+                       "no agent can match such a filter",
                        kMaxFacetValueBytes);
 }
 
-/// Remediation paired with `facet_filter_value_bound_message()`. The value may come from
+/// Remediation paired with `facet_filter_value_refusal_message()`. The value may come from
 /// the caller's own filter or from a response template's default `equals` filter (the
 /// dashboard applies one when the operator supplies no filter), hence both are named.
-[[nodiscard]] inline std::string facet_filter_value_bound_remediation() {
+[[nodiscard]] inline std::string facet_filter_value_refusal_remediation() {
     return std::format("Remove or change that filter (or the response template's default "
-                       "filter value), or use a value of at most {} bytes; the request was "
-                       "not evaluated",
+                       "filter value), or use a valid UTF-8 value of at most {} bytes with no "
+                       "NUL byte; the request was not evaluated",
                        kMaxFacetValueBytes);
 }
 
 /// The two strings above as one sentence pair for the dashboard fragments, which have no
 /// separate remediation field: "<message>. <remediation>." The single source for all three
 /// dashboard refusal sites.
-[[nodiscard]] inline std::string facet_filter_value_bound_text() {
-    return facet_filter_value_bound_message() + ". " + facet_filter_value_bound_remediation() +
+[[nodiscard]] inline std::string facet_filter_value_refusal_text() {
+    return facet_filter_value_refusal_message() + ". " + facet_filter_value_refusal_remediation() +
            ".";
 }
 
@@ -181,12 +200,12 @@ struct FacetFilter {
     std::string value; // exact match
 };
 
-/// True when any filter value is over `kMaxFacetValueBytes` (see
-/// `facet_value_exceeds_bound`): the request must be refused, not evaluated.
-[[nodiscard]] inline bool any_facet_filter_exceeds_bound(
-    const std::vector<FacetFilter>& filters) noexcept {
+/// True when any filter value is unmatchable (see `facet_filter_value_unmatchable`: over
+/// `kMaxFacetValueBytes`, or a NUL / invalid UTF-8): the request must be refused, not
+/// evaluated.
+[[nodiscard]] inline bool any_facet_filter_unmatchable(const std::vector<FacetFilter>& filters) {
     for (const auto& f : filters)
-        if (facet_value_exceeds_bound(f.value))
+        if (facet_filter_value_unmatchable(f.value))
             return true;
     return false;
 }

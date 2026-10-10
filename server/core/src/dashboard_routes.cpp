@@ -87,6 +87,23 @@ static int param_int(const httplib::Request& req, const char* name, int def) {
 }
 
 // -- Helper: column index by name (case-insensitive, excl. Agent col) ---------
+// /fragments/results refusal body (#5623): the empty-state row for the swap target plus the
+// same four OOB replacements render_results emits (thead, pagination, summary, chart deck),
+// each emptied. Without them the previous render's sort headers, "Showing a-b of n", result
+// count / "Create Group" button and chart deck would stay on screen beside the refusal. The
+// ids and swap attributes mirror render_results' own OOB elements (an empty chart-deck-host
+// is what it already emits to clear a prior deck).
+static std::string results_refusal_html(const std::string& message) {
+    std::string html = "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\" "
+                       "data-filter-refused=\"true\">" +
+                       html_escape(message) + "</td></tr></tbody>";
+    html += "<thead id=\"results-thead\" hx-swap-oob=\"true\"><tr></tr></thead>";
+    html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>";
+    html += "<div id=\"result-summary\" hx-swap-oob=\"true\"></div>";
+    html += R"(<div id="chart-deck-host" hx-swap-oob="innerHTML"></div>)";
+    return html;
+}
+
 static int col_index_for_name(const std::vector<std::string>& cols, const std::string& name) {
     // cols[0] is "Agent" — field indices are 0-based starting after Agent
     for (size_t i = 1; i < cols.size(); ++i) {
@@ -370,18 +387,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     }
                 }
 
-                // A filter value over kMaxFacetValueBytes was never indexed, so it can
-                // match no agent: refuse instead of rendering a plausible empty table
-                // (#5623). Covers the f_* params and a template `equals` filter alike.
+                // A filter value that can match no stored facet (over kMaxFacetValueBytes,
+                // or a NUL / invalid UTF-8: see facet_filter_value_unmatchable) is refused
+                // instead of rendering a plausible empty table (#5623). Covers the f_*
+                // params and a template `equals` filter alike. The refusal also clears the
+                // OOB chrome of the previous render (see results_refusal_html).
                 // Rendered at 200, not 400: the dashboard htmx config drops 4xx bodies
                 // (responseHandling swap:false), which would leave the old rows in place.
-                if (any_facet_filter_exceeds_bound(filters)) {
-                    res.set_content(
-                        "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\" "
-                        "data-filter-refused=\"true\">" +
-                            html_escape(facet_filter_value_bound_text()) +
-                            "</td></tr></tbody>",
-                        "text/html; charset=utf-8");
+                if (any_facet_filter_unmatchable(filters)) {
+                    res.set_content(results_refusal_html(facet_filter_value_refusal_text()),
+                                    "text/html; charset=utf-8");
                     return;
                 }
 
@@ -526,14 +541,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 auto command_id = req.get_param_value("command_id");
                 auto plugin = req.get_param_value("plugin");
                 auto filters = parse_filters(req, plugin);
-                // Refuse a filter value no stored facet can equal (#5623) rather than
-                // preview an exact "0 agents". 200 for the same reason as /fragments/results.
-                if (any_facet_filter_exceeds_bound(filters)) {
+                // Refuse a filter value no stored facet can equal (#5623: over the bound,
+                // or a NUL / invalid UTF-8) rather than preview an exact "0 agents". 200 for the same reason as /fragments/results.
+                if (any_facet_filter_unmatchable(filters)) {
                     res.set_header("Cache-Control", "no-store, private");
                     res.set_header("Vary", "Cookie");
                     res.set_content(
                         "<span class=\"feedback-error\" data-filter-refused=\"true\">" +
-                            html_escape(facet_filter_value_bound_text()) + "</span>",
+                            html_escape(facet_filter_value_refusal_text()) + "</span>",
                         "text/html; charset=utf-8");
                     return;
                 }
@@ -619,17 +634,18 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // Reconstruct filters from form
                  auto filters = parse_filters(req, plugin);
 
-                 // A filter value over kMaxFacetValueBytes matches no stored facet, so
-                 // the group would be built from an empty set: refuse (#5623). The
+                 // A filter value that matches no stored facet (over kMaxFacetValueBytes, or
+                 // a NUL / invalid UTF-8) would build the group from an empty set: refuse
+                 // (#5623). The
                  // dashboard UI cannot produce this POST: /fragments/create-group-form
                  // refuses such a filter first and renders no form for it. 400 therefore
                  // is the honest status for the direct/automation caller (see NOTE above).
-                 if (any_facet_filter_exceeds_bound(filters)) {
+                 if (any_facet_filter_unmatchable(filters)) {
                      res.status = 400;
                      res.set_header("HX-Retarget", "#group-form-slot");
                      res.set_content(
                          "<span class=\"feedback-error\" data-filter-refused=\"true\">" +
-                             html_escape(facet_filter_value_bound_text()) + "</span>",
+                             html_escape(facet_filter_value_refusal_text()) + "</span>",
                          "text/html; charset=utf-8");
                      return;
                  }

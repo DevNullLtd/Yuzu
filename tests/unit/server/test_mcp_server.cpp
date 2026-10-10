@@ -20593,6 +20593,40 @@ TEST_CASE("MCP preview_management_group_agent_count: an over-bound value under a
     CHECK(res->body.find(over) == std::string::npos);
 }
 
+// JSON can carry a NUL (U+0000 escape) but not invalid UTF-8 (the request body fails to parse before
+// the handler), so the MCP leg of the unmatchable-value refusal is the NUL case. Like the
+// REST twin it is refused before any store access: -32602, not the unwired-store -32603.
+TEST_CASE("MCP preview_management_group_agent_count: a filter value containing a NUL is "
+          "refused with -32602, not matched as a prefix",
+          "[mcp][devices][security]") {
+    McpTestServer ts;
+    ts.start();
+    const auto call_with = [&](const std::string& filters_json, int id) {
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(id) +
+            R"(,"params":{"name":"preview_management_group_agent_count",)"
+            R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":)" +
+            filters_json + "}}}";
+        return ts.call(body);
+    };
+    for (const std::string& filters_json : {
+             std::string(R"({"name":"short\u0000zzz"})"), // NUL in the middle
+             std::string(R"({"name":"\u0000"})"),         // NUL as the only content
+             std::string(R"({"no_such_column":"a\u0000b"})"), // under an unrecognised key
+         }) {
+        INFO(filters_json);
+        auto res = call_with(filters_json, 99);
+        REQUIRE(res->status == 200);
+        auto envelope = nlohmann::json::parse(res->body);
+        REQUIRE(envelope.contains("error"));
+        CHECK_FALSE(envelope.contains("result"));
+        CHECK(envelope["error"]["code"].get<int>() == -32602);
+        CHECK(envelope["error"]["message"].get<std::string>().find("NUL") != std::string::npos);
+        CHECK(envelope["error"]["data"]["retry_after_ms"].is_null()); // non-retryable
+        CHECK_FALSE(envelope["error"]["data"]["remediation"].is_null());
+    }
+}
+
 TEST_CASE("MCP preview_management_group_agent_count: a filter value exactly at the facet bound "
           "is accepted (reaches the store, degrades when unwired)",
           "[mcp][devices]") {

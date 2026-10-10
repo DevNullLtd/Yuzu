@@ -833,8 +833,8 @@ twin of `/fragments/create-group-form`'s own live count. This route and its MCP 
 shared builder (`group_agent_count_preview.hpp`), so those two cannot drift from each other; the
 dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation
 (`DashboardRoutes::parse_filters`) — the number it shows and this route's `agent_count` are
-expected to agree today, but are not structurally guaranteed to. The fragment also refuses a
-filter value over 2048 bytes, but answers HTTP 200 with a `data-filter-refused` marker in the
+expected to agree today, but are not structurally guaranteed to. The fragment also refuses an
+unmatchable filter value (see below), but answers HTTP 200 with a `data-filter-refused` marker in the
 returned HTML (htmx drops 4xx swaps), where this route answers `400` and the MCP twin `-32602`.
 MCP twin: `preview_management_group_agent_count`.
 
@@ -848,16 +848,18 @@ this route performs no mutation.
 |---|---|
 | `command_id` | The response set's instruction/command id to count against. |
 | `plugin` | Plugin name whose response columns the filter keys are matched against. |
-| `<filter keys>` | Any other query param is treated as a filter, keyed by the SAME mangling the dashboard fragment's `f_<column>` params apply to a column name — lowercase, spaces/dashes replaced with underscores (e.g. `Local Addr` → `local_addr`). Unlike the fragment, this route's keys carry **no** `f_` prefix — supply `local_addr`, not `f_local_addr`. An unrecognised key is silently ignored (its value is still checked against the 2048-byte filter bound below). |
+| `<filter keys>` | Any other query param is treated as a filter, keyed by the SAME mangling the dashboard fragment's `f_<column>` params apply to a column name — lowercase, spaces/dashes replaced with underscores (e.g. `Local Addr` → `local_addr`). Unlike the fragment, this route's keys carry **no** `f_` prefix — supply `local_addr`, not `f_local_addr`. An unrecognised key is silently ignored (its value is still checked against the filter-value refusal below). |
 
 An empty filter set (no recognised filter keys supplied) returns a genuine `0` — no scoped count
 to report, and no store read is made.
 
-A filter value longer than 2048 bytes is refused with `400` (A4 envelope, `retry_after_ms: null`,
-not retryable) before any store read: the response store never indexes a facet value over that
-length, so such a filter could only ever answer a misleading `0`. The message names the bound and
-does not echo the value. The check applies to every filter value before its key is matched to a
-column, so it also refuses an over-long value under an unrecognised key.
+A filter value longer than 2048 bytes, or containing a NUL byte or invalid UTF-8, is refused with
+`400` (A4 envelope, `retry_after_ms: null`, not retryable) before any store read: the response
+store never indexes a facet value over that length, and ingest replaces every NUL / invalid-UTF-8
+byte with U+FFFD, so no stored value can equal such a filter and it could only ever answer a
+misleading `0` (a NUL would additionally match as a truncated prefix). The message names both
+causes and does not echo the value. The check applies to every filter value before its key is
+matched to a column, so it also refuses such a value under an unrecognised key.
 
 **Response:**
 

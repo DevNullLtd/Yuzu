@@ -460,6 +460,61 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview: an over-bound valu
     CHECK(res->body.find(over) == std::string::npos);
 }
 
+// A NUL or invalid UTF-8 byte in a filter can never equal a stored value (ingest rewrites each
+// to U+FFFD), and a NUL is C-string-truncated by the libpq bind, so `short%00zzz` used to
+// match the rows of `short` and be reported as an exact count. Refused like an over-bound
+// value, before any store access (the harness store is nullptr: 503 would mean it was reached).
+TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a NUL or invalid UTF-8 filter "
+          "value is refused (400), not matched as a prefix or answered as 0",
+          "[rest][devices]") {
+    DeviceRestHarness h; // response_store stays nullptr
+    const std::string base = "/api/v1/management-groups/agent-count-preview"
+                             "?command_id=cmd-1&plugin=procfetch&";
+    const std::vector<std::string> bad_queries = {
+        "name=short%00zzz",                // NUL in the middle: a prefix match presented as exact
+        "name=%00",                        // NUL as the only content
+        "name=%FF",                        // invalid lead byte
+        "name=%C0%80",                     // overlong NUL
+        "name=%ED%A0%80",                  // surrogate U+D800
+        "name=ok%C3",                      // truncated multibyte at the end
+        "no_such_column=short%00zzz",      // under an unrecognised key too
+    };
+    for (const auto& q : bad_queries) {
+        INFO(q);
+        auto res = h.sink.Get(base + q);
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 400);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"]["code"].get<int>() == 400);
+        CHECK(body["error"]["retry_after_ms"].is_null()); // non-retryable
+        CHECK(body["error"]["message"].get<std::string>().find("NUL") != std::string::npos);
+        CHECK(body["error"].contains("remediation"));
+    }
+    // 683 NULs (percent-encoded): under the raw bound, 2049 bytes once ingest widens them.
+    std::string nuls;
+    for (int i = 0; i < 683; ++i)
+        nuls += "%00";
+    auto res = h.sink.Get(base + "name=" + nuls);
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 400);
+}
+
+// Positive control: a valid multibyte value at exactly 2048 bytes is not refused (it reaches
+// the unwired store: 503).
+TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a valid multibyte filter value "
+          "of exactly 2048 bytes is accepted",
+          "[rest][devices]") {
+    DeviceRestHarness h; // response_store stays nullptr
+    std::string enc;
+    for (int i = 0; i < 1024; ++i)
+        enc += "%C3%A9"; // U+00E9, 2 bytes each => 2048 bytes
+    auto res = h.sink.Get("/api/v1/management-groups/agent-count-preview"
+                          "?command_id=cmd-1&plugin=procfetch&name=" +
+                          enc);
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 503);
+}
+
 TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a filter value exactly at the "
           "facet bound is accepted (reaches the store, 503 when unwired)",
           "[rest][devices]") {

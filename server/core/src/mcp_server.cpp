@@ -777,8 +777,8 @@ static const ToolDef kTools[] = {
     // agent-count-preview is the REST twin; group_agent_count_preview.hpp
     // is the shared builder this tool and that REST route both call — the
     // dashboard fragment itself keeps its own separate, behaviourally-
-    // equivalent inline implementation; it now also refuses an over-bound filter value,
-    // see #5623). Gated
+    // equivalent inline implementation; it also refuses an unmatchable filter value
+    // (over-bound, NUL or invalid UTF-8), see #5623). Gated
     // ManagementGroup:Write matching the fragment EXACTLY (only an operator
     // who could create the group may preview it) — NOT ManagementGroup:Read,
     // even though the tool performs no mutation. Consequence: approval-gated
@@ -799,12 +799,13 @@ static const ToolDef kTools[] = {
      "an empty filters map returns a genuine 0 (no scoped count to report), never a "
      "store read. Requires ManagementGroup:Write — approval-gated (supervised MCP "
      "tier maker-checker), matching every other ManagementGroup:Write surface, even "
-     "though this tool itself performs no mutation. A filter value over 2048 bytes is "
-     "refused with -32602 (such values are not indexed, so the filter could never match).",
+     "though this tool itself performs no mutation. A filter value over 2048 bytes, or "
+     "containing a NUL byte or invalid UTF-8, is refused with -32602 (no stored facet can "
+     "equal such a value, so the filter could never match).",
      R"j({"type":"object","properties":{)j"
      R"j("command_id":{"type":"string","minLength":1,"description":"The response set's instruction/command id to count against"},)j"
      R"j("plugin":{"type":"string","minLength":1,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
-     R"j("filters":{"type":"object","additionalProperties":{"type":"string","maxLength":2048},"description":"Mangled column key -> exact-match value of at most 2048 bytes (longer facet values are not indexed, so such a filter is refused); empty/omitted means no filter (count is 0)"})j"
+     R"j("filters":{"type":"object","additionalProperties":{"type":"string","maxLength":2048},"description":"Mangled column key -> exact-match value of at most 2048 bytes of valid UTF-8 without NUL (no stored facet can equal anything else, so such a filter is refused); empty/omitted means no filter (count is 0)"})j"
      R"j(},"required":["command_id","plugin"]})j",
      R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"}},"required":["agent_count"]})j"},
 
@@ -9969,8 +9970,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // and that REST route call the SAME shared builder
             // (group_agent_count_preview.hpp), so those two cannot drift
             // from each other; the fragment keeps its own separate,
-            // behaviourally-equivalent inline implementation, unchanged by
-            // this PR. Gated ManagementGroup:Write matching the fragment exactly (see
+            // behaviourally-equivalent inline implementation; it also refuses an
+            // unmatchable filter value (over-bound, NUL or invalid UTF-8), see
+            // #5623. Gated ManagementGroup:Write matching the fragment exactly (see
             // kTools[]'s comment on this tool) — NOT migrated onto
             // fleet_read_fn_ (that chokepoint is for per-agent LIST reads;
             // this route's scope is the D3 Response:Read-visible set, a
@@ -10020,14 +10022,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                 }
 
-                // A value over kMaxFacetValueBytes was never indexed and matches no agent:
-                // refuse (non-retryable) rather than answer an exact 0 (#5623). Same
-                // check, bound and text as the REST twin, on the RAW values before key
+                // A value that can match no agent (over kMaxFacetValueBytes, or a NUL /
+                // invalid UTF-8) is refused (non-retryable) rather than answered as an
+                // exact 0 (#5623). Same check, bound and text as the REST twin, on the RAW values before key
                 // resolution (an unknown key is skipped by the resolver); the value is
                 // never echoed.
-                if (any_raw_filter_value_exceeds_bound(raw_fields)) {
-                    res.set_content(a4_error(kInvalidParams, facet_filter_value_bound_message(),
-                                             facet_filter_value_bound_remediation()),
+                if (any_raw_filter_value_unmatchable(raw_fields)) {
+                    res.set_content(a4_error(kInvalidParams, facet_filter_value_refusal_message(),
+                                             facet_filter_value_refusal_remediation()),
                                     "application/json");
                     return;
                 }

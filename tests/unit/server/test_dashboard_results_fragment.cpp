@@ -413,6 +413,19 @@ TEST_CASE("/fragments/results: Create Group button still renders for an "
     CHECK(contains(res->body, "Create Group from 1 Agent"));
 }
 
+// The refusal replaces only #results-tbody, so it must also emit the OOB clears for the rest of
+// the previous render's chrome (sort headers, pagination, result count + "Create Group" button,
+// chart deck); otherwise they stay on screen beside the refusal. render_results emits the same
+// four ids on every normal render (zero-match included), so these asserts are the same contract.
+static void check_results_chrome_cleared(const std::string& body) {
+    CHECK(contains(body, "<tbody id=\"results-tbody\""));
+    CHECK(contains(body, "<thead id=\"results-thead\" hx-swap-oob=\"true\">"));
+    CHECK(contains(body, "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>"));
+    CHECK(contains(body, "<div id=\"result-summary\" hx-swap-oob=\"true\"></div>"));
+    CHECK(contains(body, "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>"));
+    CHECK_FALSE(contains(body, "btn-create-group"));
+}
+
 // #5623: a facet value over kMaxFacetValueBytes (2048) is never stored, so a filter on it
 // matches no agent. The fragment must say so instead of rendering a plausible empty table.
 // The response store is nullptr here: reaching render_results would answer "Response store
@@ -436,6 +449,38 @@ TEST_CASE("/fragments/results: a filter value over the facet bound is refused, n
     CHECK(contains(res->body, "2048 bytes"));
     CHECK_FALSE(contains(res->body, "Response store not available"));
     CHECK_FALSE(contains(res->body, over)); // the value is never echoed
+    check_results_chrome_cleared(res->body);
+}
+
+// A NUL or invalid UTF-8 byte in a filter value can never equal a stored value (ingest rewrites
+// each to U+FFFD), and a NUL is C-string-truncated by the libpq bind, which matched the prefix
+// (`short%00zzz` showed the rows of `short`). Refused like an over-bound value, before any
+// store access (the store is nullptr: "Response store not available" would mean it was reached).
+TEST_CASE("/fragments/results: a filter value with a NUL or invalid UTF-8 is refused, not "
+          "matched as a prefix or rendered as an empty result",
+          "[server][dashboard][fragment]") {
+    FragmentResultsHarness h(/*response_store=*/nullptr);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+          const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    std::string nuls; // 683 NULs: 2049 bytes once ingest widens each to U+FFFD
+    for (int i = 0; i < 683; ++i)
+        nuls += "%00";
+    for (const std::string& value : {std::string("short%00zzz"), std::string("%00"), nuls,
+                                    std::string("%FF"), std::string("%C0%80"),
+                                    std::string("%ED%A0%80"), std::string("ok%C3")}) {
+        INFO(value.substr(0, 40));
+        auto res = h.get("/fragments/results?command_id=cmd-nul-1&plugin=registry&f_output=" +
+                          value);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "data-filter-refused=\"true\""));
+        CHECK(contains(res->body, "NUL byte or invalid UTF-8"));
+        CHECK_FALSE(contains(res->body, "Response store not available"));
+        check_results_chrome_cleared(res->body);
+    }
 }
 
 TEST_CASE("/fragments/results: a filter value exactly at the facet bound still matches its "
@@ -468,6 +513,19 @@ TEST_CASE("/fragments/results: a filter value exactly at the facet bound still m
     CHECK(res->status == 200);
     CHECK_FALSE(contains(res->body, "data-filter-refused"));
     CHECK(contains(res->body, "class=\"result-row\""));
+
+    // A normal zero-match render (no refusal) emits the same OOB ids the refusal path now
+    // mirrors, so the two cannot drift apart unnoticed.
+    auto none = h.get("/fragments/results?command_id=" + command_id +
+                       "&plugin=registry&f_output=no-such-value");
+    REQUIRE(none);
+    CHECK(none->status == 200);
+    CHECK_FALSE(contains(none->body, "data-filter-refused"));
+    CHECK_FALSE(contains(none->body, "class=\"result-row\""));
+    CHECK(contains(none->body, "<thead id=\"results-thead\" hx-swap-oob=\"true\">"));
+    CHECK(contains(none->body, "<nav id=\"result-pagination\" hx-swap-oob=\"true\">"));
+    CHECK(contains(none->body, "<div id=\"result-summary\" hx-swap-oob=\"true\">"));
+    CHECK(contains(none->body, "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\">"));
 }
 
 // The template `equals` default is a second route into the same filter vector (no f_* params

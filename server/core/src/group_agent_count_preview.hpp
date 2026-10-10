@@ -51,15 +51,16 @@ std::string mangle_column_key(std::string_view column_name);
 std::vector<FacetFilter> resolve_group_preview_filters(
     const std::string& plugin, const std::vector<std::pair<std::string, std::string>>& fields);
 
-/// True when any RAW (pre-resolution) filter value is over `kMaxFacetValueBytes`. The REST
-/// and MCP previews check this BEFORE `resolve_group_preview_filters`: that resolver
-/// silently skips a key matching no column, so a check on its output would let an over-bound
-/// value under a misspelled key resolve to an empty filter set and answer an exact 0 (#5623).
-/// Checking the raw values makes the refusal independent of whether the key resolves.
-[[nodiscard]] inline bool any_raw_filter_value_exceeds_bound(
-    const std::vector<std::pair<std::string, std::string>>& fields) noexcept {
+/// True when any RAW (pre-resolution) filter value is unmatchable (`facet_filter_value_unmatchable`:
+/// over `kMaxFacetValueBytes`, or a NUL / invalid UTF-8). The REST and MCP previews check this
+/// BEFORE `resolve_group_preview_filters`: that resolver silently skips a key matching no
+/// column, so a check on its output would let such a value under a misspelled key resolve to
+/// an empty filter set and answer an exact 0 (#5623). Checking the raw values makes the
+/// refusal independent of whether the key resolves.
+[[nodiscard]] inline bool any_raw_filter_value_unmatchable(
+    const std::vector<std::pair<std::string, std::string>>& fields) {
     for (const auto& kv : fields)
-        if (facet_value_exceeds_bound(kv.second))
+        if (facet_filter_value_unmatchable(kv.second))
             return true;
     return false;
 }
