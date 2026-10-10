@@ -10100,16 +10100,19 @@ TEST_CASE("#5604 stop(): under real SQLITE_BUSY every KV stage is cut at the sto
     CHECK(marks[2].first == "ledger");
     CHECK(marks[3].first == "journal_flush_2");
     // Stages that write nothing are instant; the ledger stage is one BUSY write at the stop
-    // budget (100 ms), not the 400 ms the store started with.
-    CHECK(ms(marks[0].second, marks[1].second) < 150.0);
-    CHECK(ms(marks[1].second, marks[2].second) < 150.0);
+    // budget (100 ms), not the 400 ms the store started with. The lower bound is the assertion
+    // that the budget really cuts the wait; the upper bound only has to stay clear of the 400 ms
+    // starting budget, with room for scheduler delay on a loaded shared runner (Windows rounds
+    // the handler's 10 ms sleeps up to its ~15.6 ms tick: 7 sleeps, about 110 ms, idle).
+    CHECK(ms(marks[0].second, marks[1].second) < 300.0);
+    CHECK(ms(marks[1].second, marks[2].second) < 300.0);
     const double ledger = ms(marks[2].second, marks[3].second);
     CHECK(ledger >= 100.0);
-    CHECK(ledger < 150.0);
+    CHECK(ledger < 300.0);
     // The Stop pass: one baseline write, also BUSY at the stop budget.
     const double stop_pass = ms(marks[3].second, t1);
     CHECK(stop_pass >= 100.0);
-    CHECK(stop_pass < 150.0);
+    CHECK(stop_pass < 300.0);
     CHECK(ms(t0, t1) < 1000.0);
 
     // The pass ran and failed (the wait was shorter than the trouble threshold, so it is not a
