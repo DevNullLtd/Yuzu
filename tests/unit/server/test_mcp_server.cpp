@@ -20469,7 +20469,7 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
 // follow-up): an earlier version of this comment claimed
 // /fragments/create-group-form's own live count shares it too (a third
 // "all three" surface) — false; the fragment keeps its own separate inline
-// implementation (dashboard_routes.cpp), unchanged by this PR. No Postgres
+// implementation (dashboard_routes.cpp; it also refuses an over-bound value, #5623). No Postgres
 // substrate needed here: response_store_for_test stays nullptr, which exercises the
 // "empty filters -> genuine 0, no store call" branch and the "non-empty
 // filters against an unconfigured store -> degrade" branch, both entirely

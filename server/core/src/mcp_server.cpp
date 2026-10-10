@@ -777,7 +777,8 @@ static const ToolDef kTools[] = {
     // agent-count-preview is the REST twin; group_agent_count_preview.hpp
     // is the shared builder this tool and that REST route both call — the
     // dashboard fragment itself keeps its own separate, behaviourally-
-    // equivalent inline implementation, unchanged by this PR). Gated
+    // equivalent inline implementation; it now also refuses an over-bound filter value,
+    // see #5623). Gated
     // ManagementGroup:Write matching the fragment EXACTLY (only an operator
     // who could create the group may preview it) — NOT ManagementGroup:Read,
     // even though the tool performs no mutation. Consequence: approval-gated

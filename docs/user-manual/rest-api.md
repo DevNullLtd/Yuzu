@@ -848,7 +848,7 @@ this route performs no mutation.
 |---|---|
 | `command_id` | The response set's instruction/command id to count against. |
 | `plugin` | Plugin name whose response columns the filter keys are matched against. |
-| `<filter keys>` | Any other query param is treated as a filter, keyed by the SAME mangling the dashboard fragment's `f_<column>` params apply to a column name — lowercase, spaces/dashes replaced with underscores (e.g. `Local Addr` → `local_addr`). Unlike the fragment, this route's keys carry **no** `f_` prefix — supply `local_addr`, not `f_local_addr`. An unrecognised key is silently ignored. |
+| `<filter keys>` | Any other query param is treated as a filter, keyed by the SAME mangling the dashboard fragment's `f_<column>` params apply to a column name — lowercase, spaces/dashes replaced with underscores (e.g. `Local Addr` → `local_addr`). Unlike the fragment, this route's keys carry **no** `f_` prefix — supply `local_addr`, not `f_local_addr`. An unrecognised key is silently ignored (its value is still checked against the 2048-byte filter bound below). |
 
 An empty filter set (no recognised filter keys supplied) returns a genuine `0` — no scoped count
 to report, and no store read is made.

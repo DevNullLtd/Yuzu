@@ -6,7 +6,7 @@
 // (#4033 follow-up): an earlier version of this comment claimed the
 // /fragments/create-group-form dashboard fragment shares it too — false; the
 // fragment keeps its own separate, behaviourally-equivalent inline
-// implementation (dashboard_routes.cpp), unchanged by this PR.
+// implementation (dashboard_routes.cpp); it also refuses an over-bound filter value (#5623).
 //
 // No httplib, no MCP, no Postgres: these are direct calls against the pure
 // functions. The real facet_agent_count store-backed count is
