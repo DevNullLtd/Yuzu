@@ -83,7 +83,11 @@ inline constexpr std::size_t kMaxFacetValueBytes = 2048;
 /// Reader-side twin of the ingest exclusion above. A facet filter value that can never
 /// equal a stored facet value matches no agent, so a reader that ran it would report an
 /// exact "0 agents" (or, for a NUL, a silent PREFIX match) for a filter it cannot
-/// evaluate. Such a value is one that is:
+/// evaluate. The causes below are the set this predicate REFUSES, not everything that can
+/// never match: a value with a LF, or a trailing CR, can never be stored either (ingest
+/// splits the output on '\n' and drops a trailing '\r' from each line) and is deliberately
+/// NOT refused, because the reader's exact 0 for it is a true zero (nothing stored can
+/// match), not a filter it failed to evaluate. A refused value is one that is:
 ///   - over `kMaxFacetValueBytes` (never stored: see above); or
 ///   - containing a NUL byte, or not valid UTF-8 (ingest runs the text through
 ///     `sanitize_pg_text`, which rewrites each such byte to the 3-byte U+FFFD, so a stored

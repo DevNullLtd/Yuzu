@@ -86,7 +86,7 @@ static int param_int(const httplib::Request& req, const char* name, int def) {
     catch (...) { return def; }
 }
 
-// -- Helper: column index by name (case-insensitive, excl. Agent col) ---------
+// -- Helper: /fragments/results refusal body ---------------------------------
 // /fragments/results refusal body (#5623): the empty-state row for the swap target plus the
 // same four OOB replacements render_results emits (thead, pagination, summary, chart deck),
 // each emptied. Without them the previous render's sort headers, "Showing a-b of n", result
@@ -104,6 +104,7 @@ static std::string results_refusal_html(const std::string& message) {
     return html;
 }
 
+// -- Helper: column index by name (case-insensitive, excl. Agent col) ---------
 static int col_index_for_name(const std::vector<std::string>& cols, const std::string& name) {
     // cols[0] is "Agent" — field indices are 0-based starting after Agent
     for (size_t i = 1; i < cols.size(); ++i) {
@@ -616,7 +617,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto command_id = extract_form_value(req.body, "command_id");
                  auto plugin = extract_form_value(req.body, "plugin");
 
-                 // NOTE on every 4xx in this handler (and the over-bound refusal below):
+                 // NOTE on every 4xx in this handler (and the unmatchable-value refusal
+                 // below: over-bound, NUL or invalid UTF-8):
                  // htmx 2.0.4's default responseHandling drops 4xx/5xx bodies (`[45]..`,
                  // swap:false; static_js_bundle.cpp) and nothing in the dashboard overrides
                  // it, so a browser shows none of these bodies or HX-Retarget feedback.
@@ -636,8 +638,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  // A filter value that matches no stored facet (over kMaxFacetValueBytes, or
                  // a NUL / invalid UTF-8) would build the group from an empty set: refuse
-                 // (#5623). The
-                 // dashboard UI cannot produce this POST: /fragments/create-group-form
+                 // (#5623). The dashboard UI cannot produce this POST: /fragments/create-group-form
                  // refuses such a filter first and renders no form for it. 400 therefore
                  // is the honest status for the direct/automation caller (see NOTE above).
                  if (any_facet_filter_unmatchable(filters)) {

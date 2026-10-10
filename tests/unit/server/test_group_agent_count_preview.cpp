@@ -132,6 +132,25 @@ TEST_CASE("facet_filter_value_unmatchable: valid UTF-8 (incl. multibyte) is matc
     CHECK_FALSE(facet_filter_value_unmatchable("\xF0\x9F\x98\x80"));  // U+1F600
     CHECK_FALSE(facet_filter_value_unmatchable("\xEF\xBF\xBD"));       // U+FFFD itself
     CHECK_FALSE(facet_filter_value_unmatchable("\xF4\x8F\xBF\xBF"));  // U+10FFFF
+    // Accept-side edges (pinned to ingest by the store roundtrip in test_response_store.cpp).
+    // The noncharacters and the BOM are valid UTF-8 and PostgreSQL stores them as is, so
+    // ingest keeps them and a filter on one is matchable.
+    CHECK_FALSE(facet_filter_value_unmatchable("\xEF\xBF\xBE"));   // U+FFFE
+    CHECK_FALSE(facet_filter_value_unmatchable("\xEF\xBF\xBF"));   // U+FFFF
+    CHECK_FALSE(facet_filter_value_unmatchable("\xEF\xBB\xBF"));   // BOM, U+FEFF
+    CHECK_FALSE(facet_filter_value_unmatchable("a\tb"));            // TAB
+    // Smallest and largest values at the boundaries of the multibyte ranges.
+    CHECK_FALSE(facet_filter_value_unmatchable("\xE0\xA0\x80"));   // U+0800
+    CHECK_FALSE(facet_filter_value_unmatchable("\xED\x9F\xBF"));   // U+D7FF
+    CHECK_FALSE(facet_filter_value_unmatchable("\xF0\x90\x80\x80")); // U+10000
+    // CR and LF are ACCEPTED even though a stored value can never contain either: ingest
+    // splits the output on '\n' and drops a trailing '\r' from each line, so no facet value
+    // has a LF or a trailing CR. The predicate lists only the causes it refuses; a filter on
+    // such a value is evaluated and its exact 0 is a true zero (nothing stored can match).
+    CHECK_FALSE(facet_filter_value_unmatchable("a\rb"));
+    CHECK_FALSE(facet_filter_value_unmatchable("a\r"));
+    CHECK_FALSE(facet_filter_value_unmatchable("a\nb"));
+    CHECK_FALSE(facet_filter_value_unmatchable("\n"));
     // A valid multibyte value of EXACTLY 2048 bytes is accepted: 1024 x U+00E9 (2 bytes
     // each), and 682 x U+20AC (3 bytes) + 2 ASCII = 2048.
     std::string two_byte;

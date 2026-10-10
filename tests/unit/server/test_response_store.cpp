@@ -31,6 +31,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -2178,6 +2179,139 @@ TEST_CASE("ResponseStore: facet_agent_count and facet_line_count distinguish deg
     REQUIRE_FALSE(bad_store.is_open());
     CHECK_FALSE(bad_store.facet_agent_count("cmd-facetcount", {match}).has_value());
     CHECK_FALSE(bad_store.facet_line_count("cmd-facetcount", {match}).has_value());
+}
+
+// #5623: the facet filter refusal predicate (facet_filter_value_unmatchable, response_store.hpp)
+// must agree with what ingest stores, and ingest's sanitize_pg_text is not reachable from a test
+// (anonymous namespace). So this pins them through the store instead: for each candidate value,
+// ingest it as a vuln_scan category (col_idx 1) and read it back through the real readers.
+//   - A value the predicate ACCEPTS must be stored byte-for-byte, and the readers called with
+//     exactly that value must find the agent. This is the claim that a value a reader accepts
+//     equals its sanitized form, so the reader compares what ingest stored.
+//   - A value the predicate REFUSES must not be stored as itself (ingest rewrote it, or never
+//     stored it), which is the mismatch the refusal exists to prevent.
+// LF and a trailing CR are deliberately NOT refused by the predicate: ingest splits the output
+// on '\n' and drops a trailing '\r' from each line, so a stored value can never contain either
+// and the readers' exact 0 for such a filter is a true zero. The last section asserts that.
+TEST_CASE("ResponseStore: the facet filter predicate agrees with what ingest stores",
+          "[pg][response_store][facets]") {
+    using namespace std::string_literals;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    std::string multibyte_2048;
+    for (int i = 0; i < 682; ++i)
+        multibyte_2048 += "\xE2\x82\xAC"; // U+20AC, 3 bytes
+    multibyte_2048 += "ab";
+    REQUIRE(multibyte_2048.size() == 2048);
+
+    // Values ingest keeps as is, so the predicate must accept them. None contains '|' (the
+    // vuln_scan delimiter), a backslash-pipe, LF or a trailing CR.
+    const std::vector<std::pair<std::string, std::string>> accepted{
+        {"U+FFFE", "\xEF\xBF\xBE"s},
+        {"U+FFFF", "\xEF\xBF\xBF"s},
+        {"BOM", "\xEF\xBB\xBF"s},
+        {"tab inside", "a\tb"s},
+        {"CR inside", "a\rb"s},
+        {"U+1F600", "\xF0\x9F\x98\x80"s},
+        {"U+10FFFF", "\xF4\x8F\xBF\xBF"s},
+        {"U+0800", "\xE0\xA0\x80"s},
+        {"U+D7FF", "\xED\x9F\xBF"s},
+        {"U+10000", "\xF0\x90\x80\x80"s},
+        {"2048 bytes multibyte", multibyte_2048},
+        {"contains U+FFFD itself", "x\xEF\xBF\xBD" "y"s},
+        {"control 0x01", "a\x01" "b"s},
+    };
+    // Values ingest rewrites (NUL, invalid UTF-8) or never stores (over the bound).
+    const std::vector<std::pair<std::string, std::string>> refused{
+        {"NUL", "a\0b"s},
+        {"0xFF", "a\xFF" "b"s},
+        {"overlong NUL C0 80", "\xC0\x80"s},
+        {"surrogate ED A0 80", "\xED\xA0\x80"s},
+        {"2049 bytes", std::string(2049, 'a')},
+    };
+
+    int n = 0;
+    auto ingest = [&](const std::string& v) {
+        StoredResponse resp;
+        resp.instruction_id = "cmd-facet-rt-" + std::to_string(n);
+        resp.agent_id = "agent-rt-" + std::to_string(n);
+        resp.status = 1;
+        resp.plugin = "vuln_scan";
+        resp.output = "high|" + v + "|title|detail";
+        store.store(resp);
+        ++n;
+        return resp;
+    };
+    auto stored_col1 = [&](const StoredResponse& resp) {
+        std::vector<std::string> out;
+        auto f = store.facet_values(resp.instruction_id, 1);
+        REQUIRE(f.has_value());
+        for (const auto& fv : *f)
+            out.push_back(fv.value);
+        return out;
+    };
+
+    for (const auto& [name, v] : accepted) {
+        INFO(name);
+        REQUIRE_FALSE(facet_filter_value_unmatchable(v));
+        const auto resp = ingest(v);
+        CHECK(stored_col1(resp) == std::vector<std::string>{v}); // stored exactly as sent
+        const std::vector<FacetFilter> filter{FacetFilter{1, v}};
+        auto count = store.facet_agent_count(resp.instruction_id, filter);
+        REQUIRE(count.has_value());
+        CHECK(*count == 1); // the reader, called with exactly v, finds the agent
+        auto ids = store.facet_agent_ids(resp.instruction_id, filter);
+        REQUIRE(ids.has_value());
+        CHECK(*ids == std::vector<std::string>{resp.agent_id});
+    }
+
+    for (const auto& [name, v] : refused) {
+        INFO(name << ": ingest does not store this value as sent, so the predicate must refuse it");
+        const auto resp = ingest(v);
+        // Whatever was stored is not v: a reader that ran this filter could never match it.
+        const auto stored = stored_col1(resp);
+        CHECK(std::find(stored.begin(), stored.end(), v) == stored.end());
+        CHECK(facet_filter_value_unmatchable(v));
+    }
+    // Spot-check that the refused NUL really was stored in its rewritten form (not dropped).
+    {
+        StoredResponse probe;
+        probe.instruction_id = "cmd-facet-rt-nul";
+        probe.agent_id = "agent-rt-nul";
+        probe.status = 1;
+        probe.plugin = "vuln_scan";
+        probe.output = "high|a"s + '\0' + "b|title|detail"s;
+        store.store(probe);
+        CHECK(stored_col1(probe) == std::vector<std::string>{"a\xEF\xBF\xBD" "b"});
+    }
+
+    // LF and a trailing CR: accepted by the predicate, never stored, true zero.
+    CHECK_FALSE(facet_filter_value_unmatchable("a\nb"));
+    CHECK_FALSE(facet_filter_value_unmatchable("d\r"));
+    StoredResponse lines;
+    lines.instruction_id = "cmd-facet-rt-lf";
+    lines.agent_id = "agent-rt-lf";
+    lines.status = 1;
+    lines.plugin = "vuln_scan";
+    // The LF splits one intended value into two lines; the CR ends the last field (detail).
+    lines.output = "high|a\nb|title|d\r\n";
+    store.store(lines);
+    for (int col = 0; col < 4; ++col) {
+        auto f = store.facet_values(lines.instruction_id, col);
+        REQUIRE(f.has_value());
+        for (const auto& fv : *f) {
+            CHECK(fv.value.find('\n') == std::string::npos);
+            CHECK(fv.value.find('\r') == std::string::npos);
+        }
+    }
+    auto lf_count = store.facet_agent_count(lines.instruction_id, {FacetFilter{1, "a\nb"}});
+    REQUIRE(lf_count.has_value());
+    CHECK(*lf_count == 0);
+    auto cr_count = store.facet_agent_count(lines.instruction_id, {FacetFilter{3, "d\r"}});
+    REQUIRE(cr_count.has_value());
+    CHECK(*cr_count == 0);
 }
 
 // ── CC-07 typed plugin result status (PR1.1 finding F11) ───────────────────

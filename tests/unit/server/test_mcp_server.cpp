@@ -20627,6 +20627,38 @@ TEST_CASE("MCP preview_management_group_agent_count: a filter value containing a
     }
 }
 
+// The comment above claims invalid UTF-8 cannot reach the handler; this proves it. A raw 0xFF
+// byte inside a string, and a lone-surrogate escape (\ud800, which has no UTF-8 encoding), both
+// fail the JSON parse in parse_request (nlohmann rejects them) before any tool dispatch, so the
+// outcome is the JSON-RPC parse error -32700 with a null id, never the -32602 value refusal and
+// never an answer. This is why the MCP leg of the refusal needs no invalid-UTF-8 branch of its own.
+TEST_CASE("MCP preview_management_group_agent_count: invalid UTF-8 in a filter value fails the "
+          "JSON parse (-32700) before the handler",
+          "[mcp][devices][security]") {
+    McpTestServer ts;
+    ts.start();
+    const std::string head =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":100,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":{"name":")";
+    const std::string tail = R"("}}})" "}";
+    for (const std::string& value : {
+             std::string("a\xFF" "z"),                // raw 0xFF byte in the body
+             std::string("\xC0\x80"),                 // overlong NUL, raw
+             std::string("\xED\xA0\x80"),            // surrogate U+D800 encoded raw
+             std::string(R"(\ud800)"),                // lone high surrogate escape
+             std::string(R"(\udc00)"),                // lone low surrogate escape
+         }) {
+        auto res = ts.call(head + value + tail);
+        REQUIRE(res->status == 200);
+        auto envelope = nlohmann::json::parse(res->body);
+        REQUIRE(envelope.contains("error"));
+        CHECK_FALSE(envelope.contains("result"));
+        CHECK(envelope["error"]["code"].get<int>() == -32700);
+        CHECK(envelope["id"].is_null());
+    }
+}
+
 TEST_CASE("MCP preview_management_group_agent_count: a filter value exactly at the facet bound "
           "is accepted (reaches the store, degrades when unwired)",
           "[mcp][devices]") {
