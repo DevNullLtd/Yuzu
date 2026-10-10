@@ -576,9 +576,12 @@ void ResponseStore::store(const StoredResponse& resp) {
                         flat.emplace_back(col_idx, value, count);
                 }
             if (excluded_too_long > 0) {
-                spdlog::warn("ResponseStore: response_id={} excluded {} facet value(s) longer "
-                             "than {} bytes; the response and its other facets persist",
-                             response_id, excluded_too_long, kMaxFacetValueBytes);
+                // debug, not warn: this fires per ingested response and a fleet-wide
+                // command with a long field would log once per agent; the counter
+                // below carries the signal.
+                spdlog::debug("ResponseStore: response_id={} excluded {} facet value(s) longer "
+                              "than {} bytes; the response and its other facets persist",
+                              response_id, excluded_too_long, kMaxFacetValueBytes);
                 note_facets_dropped(metrics_, kFacetDropValueTooLong, excluded_too_long);
             }
 
@@ -590,11 +593,16 @@ void ResponseStore::store(const StoredResponse& resp) {
             // same facets every time, rather than jittering which columns
             // the dashboard's facet filter can see. `flat` is built from
             // unordered_maps, so its order is hash order and means nothing:
-            // the survivors are chosen by a total order, the most frequent
-            // facets first (a value on more lines is the more useful filter
-            // entry), then column index, then value bytes. partial_sort keeps
-            // the cost at O(n log cap) for n distinct facets, and n is bounded
-            // only by the ingest byte cap.
+            // the survivors are chosen by a total order: higher line_count
+            // first, then column index, then value bytes. The order exists to
+            // be stable, not because frequent values matter more: a rare value
+            // (one line, such as a single vulnerable package) sorts late and is
+            // the first to be cut, so a filter on a cut value finds no agent
+            // for it. Nothing marks the response as capped to its readers
+            // today (the `cap` counter and the warning are the only signals);
+            // making consumers aware of a capped facet index is tracked
+            // separately. partial_sort keeps the cost at O(n log cap) for n
+            // distinct facets, and n is bounded only by the ingest byte cap.
             if (flat.size() > kMaxFacetsPerResponse) {
                 spdlog::warn("ResponseStore: response_id={} facet count ({}) exceeds the "
                             "per-response cap ({}); only the {} most frequent persist",

@@ -20,7 +20,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <map>
 
@@ -1975,6 +1977,13 @@ TEST_CASE("ResponseStore: an over-long facet value is excluded, the other facets
 // The survivors are now chosen by a total order: higher line_count first, then
 // col_idx, then value bytes. Two responses with the same output in a different line
 // order must therefore keep the identical set, and it must be the documented one.
+//
+// The input is built so that the boundary is known by construction. Facets of FOUR
+// different columns share line_count 2 and straddle the cap: columns 0 and 1 survive
+// whole, column 2 survives in part (its lowest values), column 3 is cut whole. The
+// value prefixes sort in the OPPOSITE direction to the columns (column 3 values sort
+// first), so dropping the col_idx tie-break, or reversing it, keeps a visibly
+// different set.
 TEST_CASE("ResponseStore: the facet cap keeps the most frequent facets, deterministically",
           "[pg][response_store][facets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -1984,35 +1993,55 @@ TEST_CASE("ResponseStore: the facet cap keeps the most frequent facets, determin
     seed_response_facet_metrics(metrics);
     store.set_metrics(&metrics);
 
-    // vuln_scan: severity|category|title|detail. 6001 distinct categories, category i
-    // appearing 1 + (i % 3) times, plus one value each in columns 0, 2 and 3 on every
-    // line: 6004 distinct facets against the cap of 5000.
-    constexpr int kCategories = 6001;
+    // vuln_scan: severity|category|title|detail. Every line carries ONE value (the
+    // other fields stay empty and are never faceted), so each facet's line_count is
+    // exactly the number of times the generator emits it.
     constexpr std::size_t kCap = 5000;
-    std::vector<std::string> lines;
-    std::map<std::tuple<int, std::string>, int> expected_counts; // (col, value) -> count
-    for (int i = 0; i < kCategories; ++i) {
-        const std::string cat = "category-" + std::to_string(i);
-        for (int rep = 0; rep < 1 + (i % 3); ++rep) {
-            lines.push_back("high|" + cat + "|title|detail");
-            ++expected_counts[{0, "high"}];
-            ++expected_counts[{1, cat}];
-            ++expected_counts[{2, "title"}];
-            ++expected_counts[{3, "detail"}];
-        }
-    }
-    REQUIRE(expected_counts.size() == 6004);
+    constexpr int kHigh1 = 1000, kHigh2 = 500, kHigh3 = 500; // count 3: columns 1, 2, 3
+    constexpr int kTie = 1125;     // count 2: kTie values in each of the four columns
+    constexpr int kTieKept2 = 750; // slots left for column 2 after columns 0 and 1
+    constexpr int kLow0 = 500;     // count 1, column 0: all cut
+    // Higher tiers first: 2000 + 2 * 1125 + 750 = exactly the cap.
+    static_assert(kHigh1 + kHigh2 + kHigh3 + 2 * kTie + kTieKept2 == kCap);
+    // Value prefixes sort opposite to the column order: col 3 < col 2 < col 1 < col 0.
+    const std::array<std::string, 4> prefix{"d-", "c-", "b-", "a-"};
+    auto value_for = [&](int col, const char* tier, int i) {
+        char num[8];
+        std::snprintf(num, sizeof num, "%04d", i);
+        return prefix[static_cast<std::size_t>(col)] + tier + num;
+    };
+    auto field_line = [](int col, const std::string& value) {
+        std::string line;
+        for (int c = 0; c < col; ++c)
+            line += '|';
+        return line + value + std::string(static_cast<std::size_t>(3 - col), '|');
+    };
 
-    // The documented order, computed independently of the store.
-    std::vector<std::tuple<int, int, std::string>> ranked; // (-count, col, value)
-    for (const auto& [key, count] : expected_counts)
-        ranked.emplace_back(-count, std::get<0>(key), std::get<1>(key));
-    std::sort(ranked.begin(), ranked.end());
-    ranked.resize(kCap);
-    std::map<std::tuple<int, std::string>, int> expected_kept;
-    for (const auto& [neg, col, value] : ranked)
-        expected_kept[{col, value}] = -neg;
+    std::vector<std::string> lines;
+    std::map<std::tuple<int, std::string>, int> expected_kept; // (col, value) -> line_count
+    std::size_t distinct = 0;
+    auto emit = [&](int col, const std::string& value, int count, bool kept) {
+        ++distinct;
+        if (kept)
+            expected_kept[{col, value}] = count;
+        for (int r = 0; r < count; ++r)
+            lines.push_back(field_line(col, value));
+    };
+    for (int i = 0; i < kHigh1; ++i)
+        emit(1, value_for(1, "h", i), 3, true);
+    for (int i = 0; i < kHigh2; ++i)
+        emit(2, value_for(2, "h", i), 3, true);
+    for (int i = 0; i < kHigh3; ++i)
+        emit(3, value_for(3, "h", i), 3, true);
+    for (int col = 0; col < 4; ++col)
+        for (int i = 0; i < kTie; ++i) {
+            const bool kept = col < 2 || (col == 2 && i < kTieKept2);
+            emit(col, value_for(col, "t", i), 2, kept);
+        }
+    for (int i = 0; i < kLow0; ++i)
+        emit(0, value_for(0, "l", i), 1, false);
     REQUIRE(expected_kept.size() == kCap);
+    REQUIRE(distinct == 7000);
 
     auto join = [](const std::vector<std::string>& v) {
         std::string out;
@@ -2050,8 +2079,8 @@ TEST_CASE("ResponseStore: the facet cap keeps the most frequent facets, determin
     CHECK(forward.size() == kCap);
     CHECK(forward == backward);      // same output, different order: same facets
     CHECK(forward == expected_kept); // and they are the documented ones
-    // 6004 distinct, 5000 kept, 1004 counted once per response stored.
-    CHECK(dropped_count(metrics, "cap") == 2.0 * (expected_counts.size() - kCap));
+    // 7000 distinct, 5000 kept, 2000 counted once per response stored.
+    CHECK(dropped_count(metrics, "cap") == 2.0 * (distinct - kCap));
     CHECK(dropped_count(metrics, "value_too_long") == 0.0);
     CHECK(dropped_count(metrics, "batch_failed") == 0.0);
 }
