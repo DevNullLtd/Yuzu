@@ -71,11 +71,14 @@ client has been told the call failed. Do not narrow the guard to the auth path.
 Two other early ends are **not** covered. A `grpc-timeout` deadline
 (DEADLINE_EXCEEDED) and a spawned handler process exiting both end the stream
 from `handle_info`, which discards `end_stream`'s returned state, so
-`trailers_sent` stays false. For a server-streaming method, later DATA then runs
-the handler again; for client-streaming or bidi, it goes to the dead handler
-process and runs nothing. Only an admitted peer can be affected: a rejected
-stream already has `trailers_sent` set, so the guard drops its data even if the
-deadline fires. This patch does not change that stock behaviour. Upstream,
+`trailers_sent` stays false. After a deadline, late DATA runs a unary or
+server-streaming handler. For client-streaming or bidi, the timeout does not
+stop the spawned handler, so late DATA can still be processed by it. After a
+spawned handler exits, late DATA runs a server-streaming handler again; for
+client-streaming or bidi, it goes to the dead process and runs nothing. Only an
+admitted peer can be affected: a rejected stream already has
+`trailers_sent` set, so the guard drops its data even if the deadline fires.
+This patch does not change that stock behaviour. Upstream,
 tsloughter/grpcbox#123 also fixes this, by having those `handle_info` clauses keep
 `end_stream`'s state. Tracked in #5591 (late DATA after a deadline) and #5590
 (core's `SendCommand` deadline equals the gateway fan-out timeout).
@@ -152,11 +155,13 @@ merged upstream code, not just the PR number, and keep `yuzu_gw_authz_rpc_tests`
 either way.
 
 Any re-sync to grpcbox v0.18.0 or later (chatterbox 0.16) must also handle the
-chatterbox module rename: `h2_*` becomes `chatterbox_h2_*`. Three places use the
-old names: patch 3's `connection_pid/1` call, the dialyzer comment
-on `h2_stream_set:stream_set()` in `gateway/rebar.config`, and
+chatterbox module rename: `h2_*` becomes `chatterbox_h2_*`. Three sites need
+the rename: patch 3's `connection_pid/1` call, the dialyzer comment on
+`h2_stream_set:stream_set()` in `gateway/rebar.config`, and
 `apps/yuzu_gw/test/yuzu_gw_heartbeat_conn_drain_tests.erl`, which calls
-`h2_stream_set:connection/1` and `h2_connection:send_frame/2` directly. A missed
+`h2_stream_set:connection/1` and `h2_connection:send_frame/2` directly. The
+comment and synthetic error tuple in `yuzu_gw_heartbeat_buffer_bound_tests.erl`
+also name `h2_connection`; update them to reflect the new module name. A missed
 rename in patch 3 does not crash: `yuzu_gw_conn` catches the `undef` and returns
 `undefined`. A session bound to `undefined` admits nothing, so every agent's
 heartbeat is refused fleet-wide, while Register and Subscribe still succeed and
