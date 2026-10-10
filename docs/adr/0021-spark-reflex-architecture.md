@@ -10,6 +10,15 @@ scope: platform — agent detection layer, Reflex response capability, event spi
 
 Supersedes the previously-considered incremental-migration posture (converge detection mechanisms opportunistically, one subsystem at a time) in favor of the full-convergence rebuild recorded here. Also supersedes §11.1 of `docs/yuzu-guardian-design-v1.1.md` as the authoritative approval-workflow design (see Decision 9).
 
+> **Amendment pending: ADR-3006 (capability enablement, proposed 2026-10-06).** ADR-3006 sets
+> the direction that `--spark-disable` stops being the only rollback lever for the Spark
+> engine: it becomes a one-time starting-state input that the server adopts as a visible
+> off-rule, and the engine becomes a unit that is switched off at runtime. Off means the engine
+> is not used and the existing detection path carries on, never that detection stops; the
+> engine's sticky stop is not the way to do it, and each rule stays armed in at most one path
+> throughout. Nothing has changed in the product yet: until the work that follows ADR-3006
+> lands, this ADR and its rollback ruling describe what ships.
+
 ## Amendments
 
 Recorded after acceptance; each supersedes the named clause of the original decision below, and the original text is retained for decision history.

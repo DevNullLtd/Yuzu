@@ -11,6 +11,14 @@ context-refs: ["#2568", "#2580", "docs/postgres-store-playbook.md"]
 
 # 3005 — Plugin config/secret plane + per-action kill switch
 
+> **Amendment pending: ADR-3006 (capability enablement, proposed 2026-10-06).** ADR-3006 sets
+> the direction that the kill switch described here becomes one layer of a wider enablement
+> model: enforced on the endpoint as well as at dispatch, targetable beyond operating system,
+> no longer seeded off for any plugin on new installations, and changed under a permission of
+> its own, which would supersede "REST authorization — existing operations only" for it.
+> Nothing has changed in the product yet: until the work that follows ADR-3006 lands, this ADR
+> describes what ships, and it remains the record of the store and its fail-closed evaluation.
+
 > **Implementation status (2026-09-07 ADR reconciliation):** Shipped — `PluginConfigStore::get_kill_switch`/`set_kill_switch` (`server/core/src/plugin_config_store.hpp:29,188,192`) and `plugin_config_routes.{hpp,cpp}` exist and are wired. Shipped: PR #3134 ("feat(server): plugin config/secret/kill-switch plane + typed schedule params (PR1.5a/b)"), merged 2026-08-15. Per-OS kill-switch rows (schema v2): see "Update (2026-10-03, #5294)".
 
 ## Context
