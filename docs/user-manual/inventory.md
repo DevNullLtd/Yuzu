@@ -544,9 +544,11 @@ read — a *whole-store* degrade there is now its own explicit "CI columns unava
 yet synced"); a FAILED roster read (not only an unwired provider) shows a dedicated
 "roster unavailable" banner rather than an empty table, makes `GET /api/v1/hardware`
 answer `503` with `retry_after_ms`, and audits `result=failure`. The CI record
-distinguishes "not found" (`404`) from "roster unreadable" (`503`, nothing else
-readable) from a record served with a degraded identity (note / `identity_state:
-degraded`). The **per-device CI record's Overview
+distinguishes "not found" (`404`) from "roster unreadable" (`503`, the device was not
+otherwise found: CI record readable-and-absent, no software, no tags) from a record
+served with a degraded identity (note / `identity_state: degraded`). A degraded CI store
+alongside a degraded roster is a `200` carrying both `identity_state` and `ci_state` as
+`degraded`. The **per-device CI record's Overview
 lens**, by contrast, has always been an authoritative three-state read: found /
 genuinely-not-yet-synced ("no CI record synced yet") / degraded (an explicit "CI record
 unavailable" banner) are never conflated.

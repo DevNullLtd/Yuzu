@@ -208,8 +208,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (all.roster_degraded) {
             // 200, not 5xx: htmx does not swap a failed response, so the banner
             // would never render. Mirrors the unwired arm above.
-            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.devices", "failure",
-                                            "Inventory", "fleet", "hardware roster read failed");
+            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.devices", "failure",
+                                                "Inventory", "fleet", "hardware roster read failed");
             HardwareListPage degraded;
             degraded.query = *normalised;
             send_html(res, render_hardware_list_fragment(degraded, false, /*roster_unavailable=*/true, results_only));
@@ -485,8 +485,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         if (all.roster_degraded) {
-            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.devices", "failure",
-                                            "Inventory", "fleet", "hardware roster read failed");
+            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.devices", "failure",
+                                                "Inventory", "fleet", "hardware roster read failed");
             res.status = 503;
             res.set_content(detail::a4_error(res, "hardware roster unavailable",
                                              {.retry_after_ms = 5000}),
@@ -557,9 +557,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                   (!detail.tags || detail.tags->empty());
         if (truly_absent && detail.identity_degraded) {
             // A failed roster read is never a 404 (#5531).
-            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.device.ci", "failure",
-                                            "Agent", agent_id,
-                                            "hardware CI record (REST) state=roster unreadable");
+            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.device.ci", "failure",
+                                                "Agent", agent_id,
+                                                "hardware CI record (REST) state=roster unreadable");
             res.status = 503;
             res.set_content(detail::a4_error(res, "hardware roster unavailable",
                                              {.retry_after_ms = 5000}),

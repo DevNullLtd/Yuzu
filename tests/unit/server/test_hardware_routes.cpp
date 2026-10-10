@@ -698,6 +698,26 @@ TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with nothing e
     }
 }
 
+// Pins the documented dual-degraded shape: a degraded CI store alongside a degraded roster
+// defeats truly_absent, so the record is served (200), not 503.
+TEST_CASE("route: GET /api/v1/hardware/{id} — degraded roster AND degraded CI store is 200 with both "
+          "states degraded",
+          "[hardware][route][rest]") {
+    HwHarness h;
+    h.ci_detail = degraded_identity_detail(false);
+    h.ci_detail.ci = std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+        std::unexpected(CiReadError::kDegraded));
+    auto res = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"]["identity_state"].get<std::string>() == "degraded");
+    REQUIRE(body["data"]["ci_state"].get<std::string>() == "degraded");
+    REQUIRE_FALSE(h.audits.empty());
+    REQUIRE(h.audits.back() == "inventory.device.ci|failure");
+    REQUIRE(contains(h.audit_details.back(), "state=store degraded identity=roster unreadable"));
+}
+
 // Kills: dropping identity_state from hardware_ci_json / the failure audit on a served degraded record.
 TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with a readable CI record is 200 "
           "with identity_state=degraded",

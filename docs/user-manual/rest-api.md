@@ -7975,7 +7975,7 @@ Returns the full topology as JSON.
 ```json
 {
   "schema": "fleet_topology.v1",
-  "schema_minor": 3,
+  "schema_minor": 4,
   "generated_at": 1715299200,
   "include_vuln": false,
   "machines": [
@@ -8007,6 +8007,8 @@ Returns the full topology as JSON.
 ```
 
 `schema_minor` is bumped (not `schema`) on additive evolution; renderers MUST ignore unknown keys.
+
+Optional top-level key `offline_roster_degraded: true` is present only when the durable offline-host read failed; `machines` is then live-only. It is a request-time, envelope-level annotation like `audit_persisted` (set per request, outside the cached snapshot document), not a `schema_minor` change.
 
 **`schema_minor` history:**
 
