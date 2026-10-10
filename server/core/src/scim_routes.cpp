@@ -2642,7 +2642,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         if (scim_store->get_group_by_display_name(input.display_name).has_value()) {
             send_scim_error(res, 409, "displayName already exists", "uniqueness");
             audit(auth_mgr, audit_store, req, "scim.group.created", "denied", "",
-                 "displayName already exists: " + input.display_name, "Group");
+                 "displayName already exists: " + neutral_free_text(input.display_name), "Group");
             record_request(auth_mgr, "group_create", 409);
             return;
         }
@@ -2651,7 +2651,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         if (!group) {
             send_scim_error(res, 500, "failed to create the SCIM group");
             audit(auth_mgr, audit_store, req, "scim.group.created", "failure", "",
-                 input.display_name, "Group");
+                 neutral_free_text(input.display_name), "Group");
             record_request(auth_mgr, "group_create", 500);
             return;
         }
