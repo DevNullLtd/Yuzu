@@ -2037,6 +2037,18 @@ RemoveUserOutcome AuthManager::remove_user_checked(const std::string& username) 
     return erased ? RemoveUserOutcome::Removed : RemoveUserOutcome::NotFound;
 }
 
+std::optional<bool> AuthManager::would_strand_last_administrator(const std::string& username) const {
+    if (!auth_db_ || !rbac_store_)
+        return std::nullopt;
+    const auto r = rbac_store_->would_strand_last_administrator(username);
+    if (!r.ok) {
+        spdlog::warn("AuthManager::would_strand_last_administrator('{}'): advisory read failed: {}",
+                     username, r.err);
+        return std::nullopt;
+    }
+    return r.would_strand;
+}
+
 bool AuthManager::remove_user(const std::string& username) {
     return remove_user_checked(username) == RemoveUserOutcome::Removed;
 }

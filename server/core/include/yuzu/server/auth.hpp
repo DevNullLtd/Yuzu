@@ -935,6 +935,14 @@ public:
     /// failed wipe. Config-file mode (no AuthDB) keeps the in-memory path unchanged.
     [[nodiscard]] RemoveUserOutcome remove_user_checked(const std::string& username);
 
+    /// #4966 best-effort EARLY refusal for a deactivation: true iff removing `username` would
+    /// exhaust a protected administrator population right now, so a caller can decline BEFORE it
+    /// revokes linked credentials. Read-only, takes no lock, and is NOT the authority: a
+    /// concurrent change can invalidate either answer, and `remove_user_checked` still decides.
+    /// `nullopt` = could not be answered (no AuthDB or no RbacStore wired, or a store fault):
+    /// the caller proceeds and lets the guard decide.
+    [[nodiscard]] std::optional<bool> would_strand_last_administrator(const std::string& username) const;
+
     /// Bool wrapper over `remove_user_checked`: true iff `Removed`. Every refusal, absence and
     /// failure (including `RemovedSessionWipeFailed`, which was `false` before this wrapper
     /// existed) is false; a caller that must tell them apart uses the checked form.

@@ -38,9 +38,11 @@
 #include "runtime_config_store.hpp"
 #include "tag_store.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "test_principal_lock_gate.hpp"
 #include "test_route_sink.hpp"
 #include "update_registry.hpp"
 #include "../test_helpers.hpp"
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/auto_approve.hpp>
@@ -50,11 +52,13 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -273,6 +277,8 @@ struct SettingsAdr2001Harness {
     std::unique_ptr<ApiTokenStore> token_store;
     SettingsRoutes routes;
     yuzu::server::test::TestRouteSink sink;
+    // #4966: wired so the last-Administrator refusal counter is observable.
+    yuzu::MetricsRegistry metrics;
 
     std::string session_user{"admin"};
     auth::Role session_role{auth::Role::admin};
@@ -327,11 +333,30 @@ struct SettingsAdr2001Harness {
                                /*runtime_config_store=*/nullptr,
                                /*audit_store=*/nullptr,
                                /*gateway_enabled=*/false, gateway_count_fn, agents_json_fn,
-                               oidc_mu, oidc_provider);
+                               oidc_mu, oidc_provider, &metrics);
     }
 
     auto delete_user(const std::string& username) {
         return sink.Delete("/api/settings/users/" + username);
+    }
+    auto set_role(const std::string& username, const std::string& role) {
+        return sink.Post("/api/settings/users/" + username + "/role",
+                         R"({"role":")" + role + R"("})", "application/json");
+    }
+    double refused_dashboard() {
+        return metrics
+            .counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                     {{"transport", "dashboard"}})
+            .value();
+    }
+
+    /// The detail of the (single) audit call matching action+result for `target`, or "<none>".
+    std::string audit_detail(std::string_view action, std::string_view result,
+                             std::string_view target) const {
+        for (const auto& a : audit_calls)
+            if (a.action == action && a.result == result && a.target_id == target)
+                return a.detail;
+        return "<none>";
     }
 
     /// True if any captured audit call matches all four fields — mirrors
@@ -1073,4 +1098,182 @@ TEST_CASE("SettingsRoutes GET /fragments/settings/users: no password controls on
         CHECK(count_of(body, "data-pw-action=") == 2);
         CHECK(body.find("hx-on") == std::string::npos);
     }
+}
+
+// ── #4966: the last-Administrator guard on the dashboard delete and role routes ──────────────
+//
+// The harness seeds exactly one active admin ("admin") and one user ("bob"). The caller is the
+// mock session "ops" (admin_fn only looks at the mock role, never at the user table), so the
+// self-target guards never fire and the only thing standing in the way is the account-lifecycle
+// guard. RBAC is OFF in these cases, so the column floor (the active `role='admin'` population)
+// is the one that applies.
+
+namespace {
+
+constexpr std::string_view kEarlyDeleteMsg =
+    "Cannot delete: this account is the fleet's last administrator";
+constexpr std::string_view kLateDeleteMsg =
+    "Cannot delete: this account is the fleet's last administrator. Its credentials were "
+    "revoked before the refusal; the account remains active";
+constexpr std::string_view kDemoteMsg =
+    "Cannot demote: this account is the fleet's last administrator";
+
+std::string toast_for(std::string_view message) {
+    return R"({"showToast":{"message":")" + std::string(message) + R"(","level":"error"}})";
+}
+
+} // namespace
+
+TEST_CASE("SettingsRoutes DELETE: the last administrator is refused EARLY with 409, nothing "
+          "revoked, counted and audited (#4966)",
+          "[pg][settings][users][lifecycle_guard][lastadmin]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    auto token = h.token_store->create_token("t-admin", "admin");
+    REQUIRE(token.has_value());
+
+    auto res = h.delete_user("admin");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("HX-Trigger") == toast_for(kEarlyDeleteMsg));
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 409);
+    CHECK(body["error"]["message"] == std::string(kEarlyDeleteMsg));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(body["error"]["retry_after_ms"].is_null()); // a business refusal is not retryable
+
+    CHECK(h.has_audit("user.delete", "denied", "User", "admin"));
+    CHECK(h.audit_detail("user.delete", "denied", "admin") == "last_administrator_blocked");
+    CHECK(h.refused_dashboard() == 1.0);
+    // The early refusal's whole point: NOTHING was revoked and the account is untouched.
+    CHECK(h.auth_mgr.get_user_role("admin").has_value());
+    CHECK(h.token_store->validate_token(*token).has_value());
+}
+
+TEST_CASE("SettingsRoutes DELETE: a LATE refusal (state changed after the early check) says "
+          "the credentials were revoked and the account remains active (#4966)",
+          "[pg][settings][users][lifecycle_guard][lastadmin][late]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    // Two admins: the early check passes. The revoke is parked on the principal advisory lock,
+    // the OTHER admin is demoted (allowed: "admin" survives), then the revoke resumes and the
+    // guard finds "admin" is now the last one.
+    REQUIRE(h.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::admin));
+    auto token = h.token_store->create_token("t-admin", "admin");
+    REQUIRE(token.has_value());
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        yuzu::test::PrincipalLockGate gate(h.auth_db.pool(), "admin");
+        std::thread request([&] { res = h.delete_user("admin"); });
+        REQUIRE(gate.wait_until_contended());
+        REQUIRE(h.auth_mgr.update_role_checked("carol", auth::Role::user) ==
+                auth::UpdateRoleOutcome::Updated);
+        gate.release();
+        request.join();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("HX-Trigger") == toast_for(kLateDeleteMsg));
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == std::string(kLateDeleteMsg));
+
+    const auto detail = h.audit_detail("user.delete", "denied", "admin");
+    CHECK(detail.starts_with("last_administrator_blocked "));
+    CHECK(detail.find("credentials_revoked_before_refusal=true") != std::string::npos);
+    CHECK(detail.find("account_remains_active=true") != std::string::npos);
+    CHECK(detail.find("api_tokens_revoked=1") != std::string::npos);
+    CHECK(h.refused_dashboard() == 1.0);
+    // The recorded state matches the sentence: credentials gone, account still active.
+    CHECK_FALSE(h.token_store->validate_token(*token).has_value());
+    CHECK(h.auth_mgr.get_user_role("admin").has_value());
+}
+
+TEST_CASE("SettingsRoutes DELETE: with a spare administrator the delete still succeeds and "
+          "nothing is counted (#4966)",
+          "[pg][settings][users][lifecycle_guard][lastadmin]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    REQUIRE(h.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::admin));
+
+    auto res = h.delete_user("admin");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(h.auth_mgr.get_user_role("admin").has_value());
+    CHECK(h.has_audit("user.delete", "success", "User", "admin"));
+    CHECK(h.refused_dashboard() == 0.0);
+}
+
+TEST_CASE("SettingsRoutes DELETE: an unwired guard answers the retryable 503 shape, never a "
+          "bare delete (#4966)",
+          "[pg][settings][users][lifecycle_guard][storefailure]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    h.auth_mgr.set_rbac_store(nullptr); // fail-closed arm: AuthDB set, guard not wired
+
+    auto res = h.delete_user("bob");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK_FALSE(res->get_header_value("HX-Trigger").empty());
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 503);
+    CHECK(body["error"]["retry_after_ms"] == 2000);
+    CHECK(h.has_audit("user.delete", "failure", "User", "bob"));
+    CHECK(h.audit_detail("user.delete", "failure", "bob").starts_with("store_failure"));
+    // Nothing was removed: the unguarded AuthDB path is never reached.
+    h.auth_mgr.set_rbac_store(h.rbac_guard.get());
+    CHECK(h.auth_mgr.get_user_role("bob").has_value());
+    CHECK(h.refused_dashboard() == 0.0);
+}
+
+TEST_CASE("SettingsRoutes POST role: demoting the last administrator is refused with 409, "
+          "toast, audit and counter (#4966)",
+          "[pg][settings][users][lifecycle_guard][lastadmin][role]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+
+    auto res = h.set_role("admin", "user");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("HX-Trigger") == toast_for(kDemoteMsg));
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 409);
+    CHECK(body["error"]["message"] == std::string(kDemoteMsg));
+    CHECK(h.has_audit("user.role_change", "denied", "User", "admin"));
+    CHECK(h.audit_detail("user.role_change", "denied", "admin") == "last_administrator_blocked");
+    CHECK(h.refused_dashboard() == 1.0);
+    CHECK(h.auth_mgr.get_user_role("admin").value() == auth::Role::admin);
+}
+
+TEST_CASE("SettingsRoutes POST role: with a spare administrator the demotion succeeds "
+          "unchanged (#4966)",
+          "[pg][settings][users][lifecycle_guard][role]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    REQUIRE(h.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::admin));
+
+    auto res = h.set_role("admin", "user");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.auth_mgr.get_user_role("admin").value() == auth::Role::user);
+    CHECK(h.audit_detail("user.role_change", "success", "admin") ==
+          "old_role=admin,new_role=user");
+    CHECK(h.refused_dashboard() == 0.0);
+}
+
+TEST_CASE("SettingsRoutes POST role: an unwired guard answers the retryable 503 shape (#4966)",
+          "[pg][settings][users][lifecycle_guard][storefailure][role]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    REQUIRE(h.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::admin));
+    h.auth_mgr.set_rbac_store(nullptr);
+
+    auto res = h.set_role("carol", "user");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"] == 2000);
+    CHECK(h.has_audit("user.role_change", "failure", "User", "carol"));
+    h.auth_mgr.set_rbac_store(h.rbac_guard.get());
+    CHECK(h.auth_mgr.get_user_role("carol").value() == auth::Role::admin);
 }
