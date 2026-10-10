@@ -57,6 +57,22 @@
  * very end of evaluate_key() (after eval_lk and registry_mu_ have both already released)
  * and in last_eval_timings_for_test(); never held while taking any lock above.
  *
+ * snapshot_staged_baselines()/erase_staged_baselines_if_unchanged() (#4045) take registry_mu_
+ * STANDALONE: their callers (the engine's GuardianBaselinePersister, under its own leaf
+ * persist_mu_) hold no runtime lock, and they never touch outbox_mu_. evaluate_key's
+ * capture-edge staging runs inside the commit section it already holds registry_mu_ for.
+ * attach_core reads staged_baselines_ under the registry_mu_ hold it already has for the prior
+ * generation's detach (an old evaluation either staged before that hold or is rejected by
+ * evaluate_key's generation recheck after it). A staged entry leaves staging only AFTER its
+ * KV write has returned, so nothing is ever "out" of staging; the engine's persister seed
+ * fence (guardian_baseline_persister.hpp) additionally orders a worker pass against a
+ * baseline-on-arm rule's KV seed read. A capture that could not be staged (bad_alloc) stays
+ * committed in its generation's eval state, flagged RuleGeneration::baseline_unstaged; the
+ * flag is read and written only under registry_mu_ (evaluate_key's commit retries staging;
+ * attach_core and every withdrawal stage the generation's committed hash before it is replaced
+ * or dropped, attach_core reads staging again after the withdrawal, and
+ * stage_unstaged_baselines() stages what is left once more when the engine stops).
+ *
  * Rung 3 builds this against FAKE seams (IStateReader, ISparkBackend). The real
  * platform readers are rung 5; the convergence scheduler that also drives
  * evaluate_key is rung 4; the unified reconcile op (merge / full-sync / kill-
@@ -88,6 +104,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -505,6 +522,11 @@ public:
     // drives these via the narrow API below. The runtime NEVER touches a KvStore:
     // it is the detach-survival object and must OWN everything it touches (file
     // header), so the durable seam stays in the engine.
+    //
+    // The same rule governs Spark's baseline-on-arm capture (#4045, further below):
+    // evaluate_key STAGES the capture edge here (a bounded map insert, no I/O) and the
+    // engine-owned GuardianBaselinePersister persists it to the #4021 baseline record;
+    // the runtime never sees the KvStore.
 
     /// A FIFO copy of the currently-staged (built + validated, not-yet-persisted)
     /// records. Immutable view; the caller serialises + writes them, then calls
@@ -583,6 +605,98 @@ public:
     }
     [[nodiscard]] std::uint64_t journal_clock_rejected() const noexcept {
         return journal_clock_rejected_.load(std::memory_order_relaxed);
+    }
+
+    // --- #4045: staged baseline captures (Spark's side of the #4021 baseline store) ----------
+    /// One file-hash-equals baseline-on-arm capture, staged for the engine-owned persister.
+    /// `path` is the RAW spark path (the same string the engine's arm-time seed fingerprints,
+    /// so the persisted fingerprint and the seed lookup cannot disagree).
+    struct CapturedBaseline {
+        std::string rule_id;
+        std::string path;
+        std::string hash;
+    };
+    /// A COPY of every staged capture (registry_mu_ standalone, strong guarantee: a throw leaves
+    /// staging untouched, because nothing is moved or erased). Deliberately NOT gated on
+    /// stopping_: the engine's stop() flush runs AFTER begin_stop(), and a stopping_
+    /// early-return would silently empty it. The caller persists the copies and then calls
+    /// erase_staged_baselines_if_unchanged() for the ones that reached the KV record.
+    [[nodiscard]] std::vector<CapturedBaseline> snapshot_staged_baselines() const;
+    /// Erase each entry of `done` from staging iff (rule_id, path, hash) are STILL identical
+    /// (registry_mu_ standalone; the erases themselves cannot throw). A newer capture or a
+    /// retarget for the same rule_id stays staged. Call ONLY for captures whose persist
+    /// returned Written or Refused: a Failed one stays staged, so a failure never loses it.
+    /// Fires NO waker (a failing KV must not spin the drain worker).
+    void erase_staged_baselines_if_unchanged(std::span<const CapturedBaseline> done);
+    /// Stage the committed hash of every generation whose capture is committed but could not be
+    /// staged (RuleGeneration::baseline_unstaged: an allocation failure), under registry_mu_.
+    /// GuardianEngine::stop() calls it after the drain worker has joined and before its final
+    /// persist pass: a stop withdraws no rule, so the withdrawal staging would never run and the
+    /// capture would die with the process. Not gated on stopping_ (like snapshot_staged_baselines);
+    /// an entry that cannot be staged again is counted by stage_baseline_locked and the capture is
+    /// then lost to this process. Idempotent: a staged generation's flag is cleared, and a
+    /// failed one stays flagged, so a repeated call retries it. Returns how many captures are
+    /// STILL unstaged afterwards (the engine logs a non-zero count: the drop counter dies with
+    /// the process). May throw only from the lock itself; the engine firewalls it.
+    [[nodiscard]] std::size_t stage_unstaged_baselines();
+    /// TEST-ONLY: whether stopping_ was already set when the last stage_unstaged_baselines() ran
+    /// (1 yes, 0 no, -1 it has not run). Pins the sweep AFTER the runtime's begin_stop(): moved
+    /// earlier, a commit could still stage between the sweep and the Stop pass. No production
+    /// caller.
+    [[nodiscard]] int unstaged_sweep_stopping_for_test() const noexcept {
+        return unstaged_sweep_stopping_for_test_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t staged_baseline_count_for_test() const;
+    /// TEST-ONLY: stage `rule_id`'s capture through the production staging rule (first capture
+    /// wins on one path; a different path replaces and is counted). No production caller.
+    void stage_baseline_for_test(const std::string& rule_id, const std::string& path,
+                                 const std::string& hash);
+    /// TEST-ONLY: make the next `n` stage_baseline_locked calls take the allocation-failure
+    /// path (nothing is staged, each failure is counted, and the generation keeps its baseline
+    /// but remembers it is unstaged). No production caller.
+    void fail_next_stage_baseline_for_test(int n = 1) noexcept {
+        fail_next_stage_baseline_.store(n, std::memory_order_relaxed);
+    }
+    /// TEST-ONLY: make the next snapshot_staged_baselines() throw bad_alloc before it touches
+    /// staging (a throw must leave staging untouched). No production caller.
+    void fail_next_snapshot_for_test() noexcept {
+        fail_next_snapshot_.store(true, std::memory_order_relaxed);
+    }
+    /// TEST-ONLY: make the next stage_unstaged_baselines() throw bad_alloc before it takes its
+    /// lock (as if the lock failed). Consumed once. No production caller.
+    void fail_next_unstaged_sweep_for_test() noexcept {
+        fail_next_unstaged_sweep_.store(true, std::memory_order_relaxed);
+    }
+    /// TEST-ONLY: make the next attach_core inherit-the-staged-hash copy throw bad_alloc (the
+    /// copy happens BEFORE the prior generation is detached, so the prior arm must survive).
+    /// No production caller.
+    void fail_next_inherit_copy_for_test() noexcept {
+        fail_next_inherit_copy_.store(true, std::memory_order_relaxed);
+    }
+    /// True iff at least one capture is staged (registry_mu_ standalone). The persister's
+    /// no-store branch uses it to count a capture that has nowhere to go.
+    [[nodiscard]] bool has_staged_baselines() const;
+    /// Staging attempts that failed or displaced a capture: an allocation failure while staging
+    /// (one per failed ATTEMPT: the baseline stays committed and staging is retried at every
+    /// later evaluation of the generation, each failed retry counted again, so a capture that
+    /// eventually stages still leaves its failed attempts here), or a retarget that replaced a
+    /// still-unpersisted capture of another path (that capture is gone; legacy loses it on any
+    /// failed write too, with no retry). It also counts the one failure that is not a staging
+    /// attempt: attach_core's read-back of a capture that staged successfully, when the copy
+    /// of its hash throws (the staged original stays, the live arm captures afresh; no separate
+    /// counter, the effect is the same one the tag already reports). GuardianBaselinePersister
+    /// reads this through staged_baseline_drops_source() so the heartbeat getter needs no
+    /// runtime lock.
+    /// A retarget landing in the instant between a capture's write and its erase also counts:
+    /// the count is an upper bound on lost captures, never an under-count.
+    [[nodiscard]] std::uint64_t staged_baseline_drops() const noexcept {
+        return staged_baseline_drops_->load(std::memory_order_relaxed);
+    }
+    /// The drop counter itself, shared so a reader outlives this object safely (the persister
+    /// keeps it for the lock-free heartbeat getter). Set once at construction, never reseated.
+    [[nodiscard]] std::shared_ptr<const std::atomic<std::uint64_t>> staged_baseline_drops_source()
+        const noexcept {
+        return staged_baseline_drops_;
     }
     /// Repeat Unknown evaluations whose guard.unhealthy was edge-suppressed (M1): a rule
     /// stuck errored is re-evaluated every convergence tick to catch recovery, but only the
@@ -1085,7 +1199,19 @@ private:
         bool active{true};            ///< registry_mu_-guarded; uncommitted wedge desire or committed rule state
         bool emit_compliant_edge{true};
         RuleAssertion assertion;
-        RuleEvalState eval;           ///< mutated only under the key's eval_mu (single serialisation domain)
+        /// Mutated only under the key's eval_mu (single serialisation domain); evaluate_key's
+        /// COMMIT also holds registry_mu_, so a reader holding registry_mu_ alone (attach_core, a
+        /// withdrawal) never sees it torn.
+        RuleEvalState eval;
+        /// #4045: this generation's baseline-on-arm capture is committed in `eval` but could NOT
+        /// be staged (an allocation failure, counted). registry_mu_-guarded, like staging itself.
+        /// Runtime-owned on purpose: RuleEvalState is shared evaluator code and must not learn
+        /// about persistence. While set, evaluate_key retries staging the COMMITTED hash on
+        /// every commit, attach_core stages it before a same-path replacement reads staging (and
+        /// reads staging again after the withdrawal, which retries it once more), a withdrawal
+        /// stages it, and the engine's stop() sweeps what is left; the baseline keeps detecting
+        /// drift meanwhile instead of being re-captured.
+        bool baseline_unstaged{false};
     };
 
     /// M1 item (b) bookkeeping for one rule_id still awaiting its first Known eval.
@@ -2487,6 +2613,46 @@ private:
     /// Called outside BOTH locks after any outbox_/lifecycle_log_ mutation.
     std::function<void()> outbox_enqueue_waker_;
     std::function<std::string()> agent_id_fn_;    ///< registry_mu_-guarded; wired by GuardianEngine::wire_spark_engine (#2237)
+    /// #4045: baseline-on-arm captures awaiting the engine-owned persister, keyed by rule_id
+    /// (registry_mu_-guarded). Bounded by the number of distinct rule_ids with a capture not
+    /// yet durable (one entry per rule_id), NOT by a cap: a cap would have to DROP a capture,
+    /// and a dropped capture is re-baselined from drifted content at the next re-arm. Staged by
+    /// evaluate_key's commit section, COPIED by snapshot_staged_baselines(), erased only after
+    /// its KV write by erase_staged_baselines_if_unchanged(), and READ (not drained) by
+    /// attach_core under the same registry_mu_ hold as the prior generation's detach, to seed a
+    /// replacement baseline-on-arm generation from a capture not yet durable. See
+    /// stage_baseline_locked().
+    std::map<std::string, CapturedBaseline> staged_baselines_;
+    /// Allocation-failure and replaced-unpersisted-capture drops. A shared_ptr set at
+    /// construction (never reseated) so GuardianBaselinePersister can read it without any lock.
+    std::shared_ptr<std::atomic<std::uint64_t>> staged_baseline_drops_ =
+        std::make_shared<std::atomic<std::uint64_t>>(0);
+    std::atomic<int> fail_next_stage_baseline_{0}; ///< TEST-ONLY allocation-failure seam (count)
+    mutable std::atomic<bool> fail_next_snapshot_{false}; ///< TEST-ONLY snapshot-throw seam
+    std::atomic<bool> fail_next_unstaged_sweep_{false}; ///< TEST-ONLY sweep-throw seam
+    std::atomic<bool> fail_next_inherit_copy_{false};     ///< TEST-ONLY attach_core copy seam
+    /// TEST-ONLY: see unstaged_sweep_stopping_for_test().
+    std::atomic<int> unstaged_sweep_stopping_for_test_{-1};
+    /// registry_mu_ held. First capture wins on one path; a different path (a retarget)
+    /// replaces the unpersisted capture and counts a drop. Never throws, so a throw cannot split
+    /// evaluate_key's enqueue from its commit. Returns false iff the capture could NOT be staged
+    /// (an allocation failure, counted as a drop). The caller must then NOT forget the capture
+    /// and must not discard the baseline it established (that would let the next evaluation
+    /// re-baseline drifted content): it sets RuleGeneration::baseline_unstaged so the staging is
+    /// retried with the same, committed hash.
+    [[nodiscard]] bool stage_baseline_locked(const std::string& rule_id, const std::string& path,
+                                             const std::string& hash) noexcept;
+    /// registry_mu_ held. A generation about to be dropped (withdrawn by detach_rule, or by
+    /// detach_all as a full_sync does before it re-arms) whose capture is committed but unstaged
+    /// (RuleGeneration::baseline_unstaged) stages its committed hash first, on the path of its
+    /// key's spec, so the replacement generation's staged read still inherits it. Never throws;
+    /// a second staging failure is counted by stage_baseline_locked, and the capture is then
+    /// lost to the replacement unless a later retry (attach_core's own, or its read-back after
+    /// the withdrawal) stages it.
+    /// Returns true iff the hash is now staged.
+    [[nodiscard]] bool salvage_unstaged_baseline_locked(
+        const std::string& rule_id, const RuleGeneration& rg,
+        const std::optional<std::string>& key) noexcept;
     std::unique_ptr<SparkKeyRuleIndex> index_;                          // key <-> rule fan-out + refcount
     std::unordered_map<std::string, std::shared_ptr<RuleGeneration>> rules_; // rule_id -> generation
     std::unordered_map<std::string, std::shared_ptr<PerKey>> keys_;          // spark_key -> per-key

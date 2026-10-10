@@ -321,6 +321,30 @@ must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. Both scripts carry a fixture self-test that the `docs`
 suite also runs (the touch-rule one off Windows only, #5428).
 
+### Definition-description ratchet (`definition-descriptions` job + `docs` suite)
+
+`scripts/ci/check-definition-descriptions.py` lints the description text of every shipped
+`InstructionDefinition` (the text an agentic worker reads through `discover_instructions`): the
+definition description, each parameter description, each result-column description, and
+non-empty tags. It walks the files `server/core/scripts/embed_content.py` ships (every `*.yaml`
+under `content/definitions` and `content/packs`, recursively) and lints only documents whose
+`kind` is `InstructionDefinition`. It is a ratchet over
+`scripts/ci/definition-descriptions-baseline.json`: a failure absent from the baseline is `NEW`
+and fails the run, and a baselined failure that no longer fails is `STALE` and also fails it, so
+the baseline only shrinks (delete the entry in the change that fixes it). `--update-baseline`
+rewrites it from the tree; run it deliberately, never to hide a new failure, and never in CI.
+
+Two places run the same test, `tests/test_definition_descriptions.py`. The `definition-descriptions`
+job in `docs-lint.yml` (check name "Definition descriptions") is **advisory**: the workflow's own
+header names only "CHANGELOG order" as its required check. It installs PyYAML from
+`requirements-ci.txt` with `--require-hashes` (a `--user` install, skipped when PyYAML is already
+importable), so it reaches PyPI and is its own job so that an outage reds only this check. The
+same test is registered as the `definition descriptions` test in `tests/meson.build` (suite
+`docs`), and the `linux` and `windows` jobs of `ci.yml` list `--suite docs`, so the ratchet is
+enforced on the required `Linux gcc-15 debug` and `Windows MSVC debug` legs without depending on
+the advisory job. A PR that changes only `docs/**` or root `*.md` builds nothing (see "Docs-only changes"),
+but it cannot touch `content/` or the baseline, which are classified as code.
+
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
 
 PR-scoped libFuzzer fuzzing of the untrusted-input parsers (target
