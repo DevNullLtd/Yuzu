@@ -2049,6 +2049,18 @@ std::optional<bool> AuthManager::would_strand_last_administrator(const std::stri
     return r.would_strand;
 }
 
+std::optional<bool> AuthManager::holds_administrator_grant(const std::string& username) const {
+    if (!rbac_store_)
+        return std::nullopt;
+    const auto roles = rbac_store_->get_principal_roles_checked("user", username);
+    if (!roles) {
+        spdlog::warn("AuthManager::holds_administrator_grant('{}'): grant read failed: {}",
+                     username, roles.error());
+        return std::nullopt;
+    }
+    return std::ranges::any_of(*roles, [](const auto& pr) { return pr.role_name == "Administrator"; });
+}
+
 bool AuthManager::remove_user(const std::string& username) {
     return remove_user_checked(username) == RemoveUserOutcome::Removed;
 }

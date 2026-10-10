@@ -475,6 +475,13 @@ public:
     std::expected<std::string, AuthDBError>
     get_provisioning_source(const std::string& username);
 
+    /// Read a user's role column REGARDLESS of `is_active` (soft-deleted rows included). SCIM's
+    /// revive path (#4966) reads the tombstone's role BEFORE `reactivate_user`, so an
+    /// out-of-band-elevated account is refused without ever being made active again. UserNotFound
+    /// only when no row (active or not) matched; InvalidUsername for malformed input; QueryFailed
+    /// on a lease/query failure (callers fail closed).
+    std::expected<auth::Role, AuthDBError> get_role_including_inactive(const std::string& username);
+
     /// Set the `identity_source` marker (auth.db migration v6, carried
     /// unchanged into `auth.users`) directly — distinct from
     /// `set_provisioning_source` (WHO manages the account's lifecycle) —

@@ -943,6 +943,12 @@ public:
     /// the caller proceeds and lets the guard decide.
     [[nodiscard]] std::optional<bool> would_strand_last_administrator(const std::string& username) const;
 
+    /// #4966 pre-create check for SCIM: does the local account name `username` already hold an
+    /// `Administrator` role grant (RBAC `principal_roles`, principal type "user")? A SCIM slug may
+    /// never become a counted administrator, so provisioning refuses a name that already holds one.
+    /// `nullopt` = could not be answered (RbacStore not wired or a store fault): callers refuse.
+    [[nodiscard]] std::optional<bool> holds_administrator_grant(const std::string& username) const;
+
     /// Bool wrapper over `remove_user_checked`: true iff `Removed`. Every refusal, absence and
     /// failure (including `RemovedSessionWipeFailed`, which was `false` before this wrapper
     /// existed) is false; a caller that must tell them apart uses the checked form.

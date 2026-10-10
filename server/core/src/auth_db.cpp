@@ -1213,6 +1213,25 @@ AuthDB::get_provisioning_source(const std::string& username) {
     return col_str(res.get(), 0, 0);
 }
 
+std::expected<auth::Role, AuthDBError>
+AuthDB::get_role_including_inactive(const std::string& username) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    // Deliberately NO `is_active = TRUE` filter: see the .hpp doc comment.
+    auto lease = impl_->pool.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::QueryFailed);
+    pg::PgResult res = pg::exec_params(lease.get(),
+                                       "SELECT role FROM auth.users WHERE username = $1",
+                                       std::vector<std::string>{username});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(AuthDBError::QueryFailed);
+    if (PQntuples(res.get()) == 0)
+        return std::unexpected(AuthDBError::UserNotFound);
+    return auth::string_to_role(col_str(res.get(), 0, 0));
+}
+
 std::expected<void, AuthDBError> AuthDB::set_identity_source(const std::string& username,
                                                               const std::string& source) {
     if (!is_valid_username(username)) {

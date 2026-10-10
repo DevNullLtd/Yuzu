@@ -34,6 +34,18 @@
 /// confirm the local account's existence to the IdP) and audited at
 /// `scim.user.provenance_denied`.
 ///
+/// LAST-ADMINISTRATOR GUARD (#4966): every site that deactivates or demotes an account goes
+/// through `AuthManager::remove_user_checked` / `update_role_checked` (the guard in
+/// `RbacAdminAuthorityOwner`). A refusal is a 409 with scimType `mutability`, audited as
+/// `scim.user.last_administrator_refused` and counted on
+/// `yuzu_server_rbac_last_admin_guard_refused_total{transport="scim"}`. A best-effort early
+/// refusal runs BEFORE the linked credentials are revoked; when the guard refuses LATE, the
+/// credentials were already revoked (ADR-2001 credentials-first) and the response and the audit
+/// row say so. Provisioning pre-checks refuse an elevated tombstone and a username that already
+/// holds an Administrator grant before anything is created or revived; the same-request undo of
+/// a half-finished create stays GUARDED and escalates (500, `scim.user.compensation_failed`, a
+/// critical event) when it cannot complete, leaving the account active.
+///
 /// Follows the CaRoutes pattern: a production overload wraps httplib::Server
 /// in an HttplibRouteSink; a test-only overload registers directly against
 /// an HttpRouteSink so tests can dispatch in-process (no socket, TSan-safe,
