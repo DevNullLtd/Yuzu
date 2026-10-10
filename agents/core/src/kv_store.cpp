@@ -114,7 +114,7 @@ std::expected<KvStore, KvStoreError> KvStore::open(const std::filesystem::path& 
     }
 
     // Busy timeout for concurrent access
-    sqlite3_busy_timeout(raw_db, 5000);
+    sqlite3_busy_timeout(raw_db, static_cast<int>(kKvStoreBusyTimeout.count()));
 
     // Create table.
     //
