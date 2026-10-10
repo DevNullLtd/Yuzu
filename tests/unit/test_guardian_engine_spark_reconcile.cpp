@@ -38,9 +38,11 @@
 #include <algorithm>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -583,10 +585,14 @@ struct SparkReconcileFixture {
     /// make_service_rule(); FakeServiceMechanism is entirely type-agnostic (its
     /// watch()/unwatch() do not look at which SparkType it is registered under), so
     /// this changes only what the fixture registers it AS, nothing else.
+    /// `wire_first` (#5513) selects the PRODUCTION boot order, wire_spark_engine() BEFORE
+    /// start_local() (agent.cpp), so spark is Available while the boot re-arm walk runs.
+    /// Default false keeps the historical order (start_local() first, so the walk never
+    /// reaches spark) that every pre-existing fixture user was written against.
     explicit SparkReconcileFixture(std::uint64_t periodic_bound_ms = 0,
                                    std::optional<std::chrono::milliseconds> backend_op_deadline = std::nullopt,
                                    SparkType mechanism_type = SparkType::Service,
-                                   bool with_registry_sibling = false) {
+                                   bool with_registry_sibling = false, bool wire_first = false) {
         auto opened = KvStore::open(db_.path);
         REQUIRE(opened.has_value());
         kv = std::make_unique<KvStore>(std::move(*opened));
@@ -603,17 +609,25 @@ struct SparkReconcileFixture {
         spark_engine.start();
 
         engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test", /*prefer_spark=*/true);
+        // The two timing seams must precede wire_spark_engine() (it constructs the worker and
+        // the runtime), and are harmless before start_local(), so one lambda serves both orders.
+        const auto configure_and_wire = [&] {
+            if (periodic_bound_ms > 0)
+                engine->set_drain_worker_timing_for_test(periodic_bound_ms);
+            if (backend_op_deadline)
+                engine->set_spark_backend_op_deadline_for_test(*backend_op_deadline);
+            engine->wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                                      [this](const OutboxEntry& e) {
+                                          std::lock_guard<std::mutex> lk{sent_mu};
+                                          sent.push_back(e);
+                                          return SendResult::Sent;
+                                      });
+        };
+        if (wire_first)
+            configure_and_wire();
         REQUIRE(engine->start_local().has_value());
-        if (periodic_bound_ms > 0)
-            engine->set_drain_worker_timing_for_test(periodic_bound_ms);
-        if (backend_op_deadline)
-            engine->set_spark_backend_op_deadline_for_test(*backend_op_deadline);
-        engine->wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
-                                  [this](const OutboxEntry& e) {
-                                      std::lock_guard<std::mutex> lk{sent_mu};
-                                      sent.push_back(e);
-                                      return SendResult::Sent;
-                                  });
+        if (!wire_first)
+            configure_and_wire();
         REQUIRE(engine->spark_availability() == GuardianEngine::SparkAvailability::Available);
     }
 
@@ -983,7 +997,7 @@ TEST_CASE("start_local degrades per-rule when a re-arm throws: the other cached 
           "[spark][guardian][reconcile][boot]") {
     // #2238 item 1 (fixes BLOCKING-2a): guardian_engine.cpp's start_local() catches a
     // std::system_error thrown while re-arming a single cached rule (modelling a legacy
-    // guard's std::thread ctor throwing under thread/handle exhaustion) and continues to
+    // guard's std::thread ctor throwing under thread-creation failure) and continues to
     // the next rule instead of letting the throw escape and terminate the agent. Nothing
     // in production can force that throw deterministically (see the handover's survey of
     // guard_systemd.cpp / guard_file.cpp / guard_registry.cpp), so this drives it via
@@ -1080,6 +1094,1089 @@ TEST_CASE("start_local degrades per-rule when a re-arm throws: the other cached 
     engine.set_rearm_fault_hook_for_test(nullptr);
     engine.stop();
     spark_engine.stop();
+}
+
+// ---------------------------------------------------------------------------
+// #5513 boot re-arm catch-up
+//
+// A boot re-arm that failed at an already-acknowledged generation used to leave the agent
+// reporting that generation, so the server's heartbeat reconcile (which only pushes while the
+// reported value is BEHIND its current) never re-sent the rule. The engine now reports 0 while a
+// boot re-arm is unresolved (GuardianEngine::boot_rearm_unresolved()) and clears that on the first
+// clean application, so the server's catch-up push re-arms the rule.
+//
+// LIVE vs DORMANT. Production runs prefer_spark=false, where journal_maintenance_tick() returns at
+// its `!prefer_spark_` guard: only the synchronous set (the start_local() walk) and the
+// apply_rules() tail clear are reachable there. Every case below whose name says "dormant" needs
+// prefer_spark=true (the tick-side set from a drained boot receipt, the tick-side clear, and the
+// ledger latch) and is dormant code today; it is here so the flip PR knows what it turns on.
+//
+// Every Spark BOOT case runs in PRODUCTION ORDER (wire_spark_engine() before start_local()) over a
+// RESTARTED engine on the same on-disk KV (the one post-boot case uses the fixture's wire_first
+// flag instead), and forces its interleaving with the fake mechanism's
+// gates rather than assuming what attach_rule() returns. hang_next_watch()/release_hang() is the
+// FIRST park only: release_hang() latches open for the life of the mechanism, so any SECOND park
+// in a case uses set_park_all_watches()/release_park_all(). set_late_watch_outcome() is consumed
+// after both gates. A "flag HOLDS" assertion is only made after draining to quiescence (pending 0
+// and no live backend worker), never while an arm may still be in flight.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr std::uint64_t kGen5513 = 7; // the persisted, already-acknowledged generation
+
+std::string push_bytes_5513(const std::vector<gpb::GuaranteedStateRule>& rules,
+                            std::uint64_t generation, bool full_sync = true) {
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(full_sync);
+    p.set_policy_generation(generation);
+    for (const auto& r : rules)
+        *p.add_rules() = r;
+    return p.SerializeAsString();
+}
+
+/// The same injected thread-creation-failure throw the "start_local degrades per-rule" test uses,
+/// aimed at exactly one rule by id.
+std::function<void(const std::string&)> rearm_throw_hook_5513(std::string target) {
+    return [target = std::move(target)](const std::string& rule_id) {
+        if (rule_id == target)
+            throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                    "injected thread exhaustion");
+    };
+}
+
+/// A restartable engine over ONE on-disk KV. SparkReconcileFixture cannot be used for the boot
+/// cases because they need a SECOND engine incarnation reading what the first one persisted
+/// (the fixture's KV, SparkEngine and mechanism live exactly as long as its one engine). Every
+/// incarnation gets a fresh KvStore, SparkEngine and mechanism(s), the shape the "start_local
+/// degrades per-rule" test already uses for its two phases. The backend-op deadline is widened
+/// so no real clock can expire a parked claim: a case that needs a wedge expires the claim
+/// itself with the runtime's synthetic clock.
+struct BootRig5513 {
+    yuzu::test::TempDbFile db_{unique_kv_path()}; // declared first: destroyed last
+    std::unique_ptr<KvStore> kv;
+    std::unique_ptr<SparkEngine> spark_engine; // null when built without spark
+    FakeServiceMechanism* mechanism{nullptr};  // borrowed; owned by spark_engine
+    FakeServiceMechanism* sibling_mechanism{nullptr}; // Registry type, only with_registry_sibling
+    std::unique_ptr<GuardianEngine> engine;
+
+    BootRig5513() = default;
+    BootRig5513(const BootRig5513&) = delete;
+    BootRig5513& operator=(const BootRig5513&) = delete;
+    ~BootRig5513() { shutdown(); }
+
+    void construct(bool prefer_spark, bool with_spark, bool with_registry_sibling = false) {
+        auto opened = KvStore::open(db_.path);
+        REQUIRE(opened.has_value());
+        kv = std::make_unique<KvStore>(std::move(*opened));
+        if (with_spark) {
+            spark_engine = std::make_unique<SparkEngine>();
+            auto mech = std::make_unique<FakeServiceMechanism>();
+            mechanism = mech.get();
+            REQUIRE(spark_engine->register_mechanism(SparkType::Service, std::move(mech))
+                        .has_value());
+            if (with_registry_sibling) {
+                auto sib = std::make_unique<FakeServiceMechanism>();
+                sibling_mechanism = sib.get();
+                REQUIRE(spark_engine->register_mechanism(SparkType::Registry, std::move(sib))
+                            .has_value());
+            }
+            spark_engine->start();
+        }
+        engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test", prefer_spark);
+        if (with_spark)
+            engine->set_spark_backend_op_deadline_for_test(std::chrono::milliseconds{60'000});
+    }
+
+    /// Spark wiring; a caller wanting production order calls this BEFORE start_local().
+    void wire() {
+        REQUIRE(spark_engine != nullptr);
+        engine->wire_spark_engine(spark_engine.get(), /*spark_disabled_by_config=*/false,
+                                  [](const OutboxEntry&) { return SendResult::Sent; });
+        REQUIRE(engine->spark_availability() == GuardianEngine::SparkAvailability::Available);
+    }
+
+    void release_gates() {
+        for (FakeServiceMechanism* m : {mechanism, sibling_mechanism}) {
+            if (!m)
+                continue;
+            m->release_hang();
+            m->release_park_all();
+            m->release_isolated_unwatch_hang();
+        }
+    }
+
+    /// Releases every gate FIRST (a parked worker would otherwise outlive the engine that owns
+    /// its claim), waits (bounded) for the released worker to finish, then tears down in the
+    /// fixture's order: engine, then SparkEngine, then KV. The wait is an event-driven poll with
+    /// no REQUIRE/CHECK (REQUIRE throws, and shutdown() also runs from the destructor, possibly
+    /// during unwind); a timeout is reported on stderr, then teardown proceeds.
+    void shutdown() {
+        release_gates();
+        if (engine &&
+            !yuzu::test::spin_until([&] { return engine->active_io_workers() == 0; },
+                                    std::chrono::seconds{10})) {
+            std::fprintf(stderr,
+                         "BootRig5513::shutdown: workers still alive after the bounded wait; "
+                         "proceeding with teardown anyway\n");
+        }
+        engine.reset();
+        if (spark_engine)
+            spark_engine->stop();
+        spark_engine.reset();
+        mechanism = nullptr;
+        sibling_mechanism = nullptr;
+        kv.reset();
+    }
+
+    yuzu::agent::GuardianDispatchResult push(const std::vector<gpb::GuaranteedStateRule>& rules,
+                                             std::uint64_t generation, bool full_sync = true) {
+        return yuzu::agent::guardian_dispatch_push_bytes_for_test(
+            *engine, push_bytes_5513(rules, generation, full_sync));
+    }
+    void push_ok(const std::vector<gpb::GuaranteedStateRule>& rules, std::uint64_t generation,
+                 bool full_sync = true) {
+        REQUIRE(push(rules, generation, full_sync).exit_code == 0);
+    }
+
+    /// Drives the heartbeat tick until `pred` holds or the (sanitizer-scaled) bound elapses.
+    template <typename Pred>
+    [[nodiscard]] bool tick_until(Pred pred,
+                                  std::chrono::milliseconds timeout = std::chrono::seconds{10}) {
+        return yuzu::test::spin_until(
+            [&] {
+                engine->journal_maintenance_tick();
+                return pred();
+            },
+            timeout);
+    }
+    void tick_n(int n) {
+        for (int i = 0; i < n; ++i)
+            engine->journal_maintenance_tick();
+    }
+
+    /// QUIESCENT: nothing pending in the ack ledger and no backend arm/disarm still running (the
+    /// shape this file's set_fail_next_watch loop uses), then a bounded COUNT of extra ticks so a
+    /// tick that observed the quiescent state has certainly run. Never call while a gate is held.
+    void quiesce() {
+        REQUIRE(tick_until([&] {
+            return engine->ack_pending_count_for_test() == 0 && engine->active_io_workers() == 0;
+        }));
+        tick_n(3);
+    }
+
+    /// Phase 1: a throwaway incarnation that persists `rules` at `generation`, settles, and shuts
+    /// down. Leaves the KV holding the rules and the acknowledged generation.
+    void seed(bool prefer_spark, bool with_spark,
+              const std::vector<gpb::GuaranteedStateRule>& rules, std::uint64_t generation,
+              bool with_registry_sibling = false) {
+        construct(prefer_spark, with_spark, with_registry_sibling);
+        if (with_spark)
+            wire();
+        REQUIRE(engine->start_local().has_value());
+        push_ok(rules, generation);
+        if (prefer_spark && with_spark) {
+            REQUIRE(tick_until([&] { return engine->spark_armed_rule_count() == rules.size(); }));
+        }
+        quiesce();
+        REQUIRE(engine->policy_generation() == generation);
+        REQUIRE_FALSE(engine->boot_rearm_unresolved());
+        shutdown();
+    }
+};
+
+} // namespace
+
+TEST_CASE("#5513 live (prefer_spark=false, spark wired, production order): a boot re-arm throw "
+          "reports generation 0, and the same-generation catch-up push clears it",
+          "[spark][guardian][reconcile][boot][5513]") {
+    // The production configuration: prefer_spark is const false, spark_runtime_ is wired before
+    // start_local() (so decide_retry() runs on the catch-up with a non-null runtime), and the
+    // heartbeat tick returns at its prefer_spark guard, so the apply_rules() tail is the ONLY
+    // clearer. Mutation: deleting the tail clear leaves the agent reporting 0 forever; deleting
+    // the synchronous set leaves it reporting kGen5513 after the failed boot.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/true, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, true);
+    r.wire();
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    const auto failures_before = r.engine->arm_failure_count();
+    REQUIRE(r.engine->start_local().has_value()); // degrade contract: the throw does not escape
+
+    CHECK(r.engine->policy_generation() == 0); // reported, not the persisted kGen5513
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->arm_failure_count() == failures_before + 1);
+    CHECK(r.engine->ack_pending_count_for_test() == 0);
+    const auto report = r.engine->generation_report();
+    CHECK(report.reported == 0);
+    CHECK(report.boot_rearm_unresolved);
+
+    // The tick is not a clearer at prefer_spark=false: it returns before the ack drain.
+    r.tick_n(3);
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+
+    // The server's reconcile push at its current generation (the agent's reported 0 is behind).
+    r.push_ok({make_file_rule("r1")}, kGen5513);
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->ack_pending_count_for_test() == 0);
+    const auto cleared = r.engine->generation_report();
+    CHECK(cleared.reported == kGen5513);
+    CHECK_FALSE(cleared.boot_rearm_unresolved);
+}
+
+TEST_CASE("#5513 live (prefer_spark=false): a healthy boot re-arm never holds the reported "
+          "generation",
+          "[spark][guardian][reconcile][boot][5513]") {
+    // Control for the legacy path: no throw, so the reported generation is the persisted one and
+    // the flag never rises. Mutation: a set keyed on anything but a failed re-arm reports 0 here.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, false);
+    const auto failures_before = r.engine->arm_failure_count();
+    REQUIRE(r.engine->start_local().has_value());
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->arm_failure_count() == failures_before);
+    r.tick_n(3);
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+}
+
+TEST_CASE("#5513 live (prefer_spark=false): a catch-up push the KV refuses leaves the flag set and "
+          "the reported generation 0, until a push applies",
+          "[spark][guardian][reconcile][boot][5513]") {
+    // The persistent-failure shape on the production (legacy) path. A legacy re-arm failure at
+    // APPLY time has no deterministic seam (reconcile_rule_locked's legacy branch never returns
+    // Failed; the fault hook fires only in start_local()), so the catch-up is made to fail by a
+    // real KV write failure instead: the rule persist is refused, apply_rules() returns the
+    // error, and the flag must stay set on every refused attempt. Mutation: clearing the flag
+    // before the persist reports kGen5513 here.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == 0);
+
+    drop_kv_store_table_for_test(r.db_.path);
+    for (int i = 0; i < 2; ++i) {
+        const auto refused = r.push({make_file_rule("r1")}, kGen5513);
+        CHECK(refused.exit_code != 0);
+        CHECK(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->policy_generation() == 0);
+    }
+
+    recreate_kv_store_table_for_test(r.db_.path);
+    r.push_ok({make_file_rule("r1")}, kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513);
+}
+
+TEST_CASE("#5513 live (prefer_spark=false): a catch-up whose generation persist fails clears the "
+          "flag but reports the HELD generation, never a newer one",
+          "[spark][guardian][reconcile][boot][5513]") {
+    // The flag clears on a clean APPLICATION; advancing the internal generation is a separate step
+    // that needs the generation write to succeed. An empty delta push writes no rule, so the only
+    // KV write is that generation persist: dropping the table makes exactly it fail. The agent
+    // then reports the generation it really holds (kGen5513), which is BEHIND the pushed
+    // kGen5513 + 1, so the server's reconcile keeps pushing; reporting the pushed value here
+    // would be a false acknowledgment. Once the store is back, the same push persists and
+    // advances, and a restart reads it from disk.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+
+    drop_kv_store_table_for_test(r.db_.path);
+    r.push_ok({}, kGen5513 + 1, /*full_sync=*/false);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513); // held, below the server's current
+
+    recreate_kv_store_table_for_test(r.db_.path);
+    r.push_ok({}, kGen5513 + 1, /*full_sync=*/false);
+    CHECK(r.engine->policy_generation() == kGen5513 + 1);
+
+    r.shutdown();
+    r.construct(false, false);
+    REQUIRE(r.engine->start_local().has_value());
+    CHECK(r.engine->policy_generation() == kGen5513 + 1); // durable
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a boot arm that drains as a failure reports 0, and "
+          "only the tick clears it once the catch-up arm commits",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Boot arm parked in watch() (Accepted, pending), then released with a late refusal: the drain
+    // folds it as a failure on the BOOT application, which sets the flag (the tick-side set). The
+    // catch-up push re-arms through apply_rules() but its arm is parked too, so the tail cannot
+    // clear (pending), and the tick must not clear while the receipt is Pending; the clear comes
+    // from the tick once the arm commits. Mutations: deleting the tick-side set never reaches 0;
+    // deleting the tick-side clear (or leaving only the tail clear) never returns to kGen5513.
+    using namespace std::chrono_literals;
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire(); // production order
+    r.mechanism->hang_next_watch();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s)); // the boot arm is IN watch()
+
+    // Accepted alone never holds: the receipt is pending, not failed.
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->ack_pending_count_for_test() == 1);
+
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    CHECK(r.engine->policy_generation() == 0);
+
+    // The catch-up arm is held in watch() by the park-all gate (the hang gate is latched open).
+    r.mechanism->set_park_all_watches();
+    const auto pending_reply = r.push({make_service_rule("r1")}, kGen5513);
+    REQUIRE(pending_reply.exit_code == 0);
+    // The push_rules reply text reads the REPORTED generation, so while the flag is set it says 0
+    // (not the persisted kGen5513) even though the push itself was accepted.
+    CHECK(pending_reply.output.find(" generation=0 ") != std::string::npos);
+    REQUIRE(yuzu::test::spin_until([&] { return r.mechanism->parked_watch_count() == 1; }));
+    CHECK(r.engine->policy_generation() == 0); // the tail cannot clear: the receipt is pending
+    CHECK(r.engine->boot_rearm_unresolved());
+    for (int i = 0; i < 3; ++i) {
+        r.engine->journal_maintenance_tick(); // a pending receipt must not clear it either
+        CHECK(r.engine->policy_generation() == 0);
+        CHECK(r.engine->boot_rearm_unresolved());
+    }
+
+    r.mechanism->release_park_all();
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+}
+
+namespace {
+
+/// T4 body. `singleton` seeds only the throwing rule (an empty ledger after boot: nothing for any
+/// sibling receipt to drain); otherwise two siblings arm and commit beside it.
+void run_boot_throw_drained_before_push_5513(bool singleton) {
+    constexpr std::uint64_t kGen = 9;
+    BootRig5513 r;
+    const std::vector<gpb::GuaranteedStateRule> all =
+        singleton ? std::vector<gpb::GuaranteedStateRule>{make_service_rule("r2", true, "SvcB")}
+                  : std::vector<gpb::GuaranteedStateRule>{make_service_rule("r1", true, "SvcA"),
+                                                         make_service_rule("r2", true, "SvcB"),
+                                                         make_service_rule("r3", true, "SvcC")};
+    r.seed(true, true, all, kGen);
+
+    r.construct(true, true);
+    r.wire(); // production order
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r2"));
+    const auto failures_before = r.engine->arm_failure_count();
+    REQUIRE(r.engine->start_local().has_value());
+
+    // Set synchronously by the walk's catch, before any tick has run.
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == 0);
+    const auto report = r.engine->generation_report();
+    CHECK(report.reported == 0);
+    CHECK(report.boot_rearm_unresolved);
+
+    if (!singleton)
+        REQUIRE(r.tick_until([&] { return r.engine->spark_armed_rule_count() == 2; }));
+    // Drain to QUIESCENT before asserting the flag HOLDS: the sibling receipts have committed and
+    // the boot application has nothing pending and no counted failure, so the tick's can_advance()
+    // is true. Only the failure latch keeps it false.
+    r.quiesce();
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->arm_failure_count() == failures_before + 1);
+    CHECK(r.engine->spark_armed_rule_count() == (singleton ? 0u : 2u));
+
+    // The catch-up push at the server's generation arms the rule and the tick clears the flag.
+    r.push_ok(all, kGen);
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->spark_armed_rule_count() == all.size());
+}
+
+} // namespace
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a boot throw beside committed siblings stays "
+          "unresolved after the tick drains to quiescence (the ledger latch)",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // The tripwire for the tick-side clear. The two sibling arms commit and drain clean, so the
+    // boot application has pending 0, no counted failure and (without the latch) can_advance() is
+    // TRUE: the first maintenance tick would erase the flag before the first heartbeat ever read
+    // it. Mutation: delete the latch_failure() in the synchronous set helper and the
+    // post-quiescence CHECKs fail (flag false, reported kGen).
+    run_boot_throw_drained_before_push_5513(/*singleton=*/false);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a boot throw as the ONLY cached rule stays "
+          "unresolved across ticks (empty ledger, the ledger latch)",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Singleton variant of the case above: no sibling receipt at all, so can_advance() is true on
+    // the very first tick unless the latch holds it. Same mutation, red on the first tick.
+    run_boot_throw_drained_before_push_5513(/*singleton=*/true);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a boot arm the runtime refuses SYNCHRONOUSLY "
+          "(ReconcileOutcome::Failed) reports 0, holds across ticks and refused pushes, and a "
+          "clean catch-up clears it",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // The only test that reaches start_local()'s `case ReconcileOutcome::Failed:` arm (every
+    // sibling goes through the throw catches or the async drain). The refusal is REAL and needs
+    // no timing: GuardianSparkRuntime::begin_stop() before start_local() makes attach_core()
+    // return Failed("stopping") at its first locked check, which attach_rule() returns as
+    // unexpected and reconcile_rule_locked() maps to Failed with no receipt registered.
+    // (apply_rules() can never observe this under mtx_, because stop() holds it across
+    // begin_stop(); calling it directly on the runtime ahead of the boot walk is the test-only
+    // reach.) Because the runtime stays stopped, a push of the same rule is refused too, so the
+    // clearing push is the operator removing the rule: an application with nothing to arm is
+    // clean. Mutation: deleting note_boot_rearm_failure_locked() from the Failed arm reports
+    // kGen5513 and no unresolved flag right after start_local().
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire(); // production order
+    auto* rt = r.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    rt->begin_stop();
+    const auto failures_before = r.engine->arm_failure_count();
+    REQUIRE(r.engine->start_local().has_value());
+
+    // Set synchronously by the walk, before any tick has run.
+    CHECK(r.engine->policy_generation() == 0); // reported, not the persisted kGen5513
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->arm_failure_count() == failures_before + 1);
+    CHECK(r.engine->ack_pending_count_for_test() == 0); // a refusal registers no receipt
+    CHECK(r.engine->spark_armed_rule_count() == 0);
+    const auto report = r.engine->generation_report();
+    CHECK(report.reported == 0);
+    CHECK(report.boot_rearm_unresolved);
+
+    // Nothing is pending, so only the failure latch keeps the tick from clearing it.
+    r.tick_n(3);
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+
+    // The catch-up push at the server's generation re-attempts the arm and is refused again.
+    r.push_ok({make_service_rule("r1")}, kGen5513);
+    r.tick_n(3);
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->arm_failure_count() == failures_before + 2);
+
+    // A clean catch-up: the server's rule set no longer carries the refused rule.
+    r.push_ok({}, kGen5513);
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->arm_failure_count() == failures_before + 2);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a healthy but SLOW boot arm never holds the "
+          "reported generation at any step",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // The boot arm is parked in watch() (Accepted, pending) while ticks run, then released and
+    // committed. Mutations: a set on Accepted alone, or one keyed on !can_advance(), reports 0 at
+    // the first or the mid-hang check.
+    using namespace std::chrono_literals;
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire();
+    r.mechanism->hang_next_watch();
+    const auto failures_before = r.engine->arm_failure_count();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s));
+
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->ack_pending_count_for_test() == 1);
+    for (int i = 0; i < 3; ++i) {
+        r.engine->journal_maintenance_tick(); // drains: the receipt is still Pending
+        CHECK(r.engine->policy_generation() == kGen5513);
+        CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    }
+
+    r.mechanism->release_hang(); // the late outcome is the default: the arm succeeds
+    REQUIRE(r.tick_until([&] { return r.engine->spark_armed_rule_count() == 1; }));
+    r.quiesce();
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->arm_failure_count() == failures_before);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a persistently failing rule holds the reported "
+          "generation at 0 across every catch-up, and the first clean push clears it",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Boot failure as in the drained-failure case above, then three catch-up pushes each preceded
+    // by a single-shot set_fail_next_watch(). A refusal may resolve synchronously (Failed) or
+    // asynchronously (drained), and BOTH hold, so the case never depends on which. Each iteration
+    // drains to quiescence BEFORE re-arming the single-shot (an arm still in flight would consume
+    // it, the flake the boot_inert refusal loop in this file documents). Mutation: a clear fired
+    // by begin_application or by a Reapply flips the reported value to kGen5513 mid-loop.
+    using namespace std::chrono_literals;
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire();
+    r.mechanism->hang_next_watch();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s));
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    r.quiesce();
+    REQUIRE(r.engine->policy_generation() == 0);
+
+    auto last_failures = r.engine->arm_failure_count();
+    for (int i = 0; i < 3; ++i) {
+        r.mechanism->set_fail_next_watch();
+        r.push_ok({make_service_rule("r1")}, kGen5513);
+        CHECK(r.engine->policy_generation() == 0); // right after the push, before any drain
+        CHECK(r.engine->boot_rearm_unresolved());
+        r.quiesce();
+        CHECK(r.engine->policy_generation() == 0);
+        CHECK(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->spark_armed_rule_count() == 0);
+        const auto failures = r.engine->arm_failure_count();
+        CHECK(failures > last_failures); // each refused attempt is counted
+        last_failures = failures;
+    }
+
+    r.push_ok({make_service_rule("r1")}, kGen5513); // no injected fault: the arm commits
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->spark_armed_rule_count() == 1);
+}
+
+namespace {
+
+/// #5513 back-off rig: the boot arm is refused SYNCHRONOUSLY (the runtime is stopped before the
+/// boot walk, exactly as the "refuses SYNCHRONOUSLY" case above), and it stays stopped, so every
+/// later push of the rule is refused too and reaches apply_rules()' tail with the flag still set.
+/// That is the only deterministic way to produce several FAILED catch-ups in a row, hence
+/// [dormant] (prefer_spark=true).
+void stage_refused_boot_5513(BootRig5513& r) {
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+    r.construct(true, true);
+    r.wire(); // production order
+    auto* rt = r.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    rt->begin_stop();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+}
+
+/// Consumes exactly `real` heartbeat reports and asserts each is the REAL persisted generation
+/// with the companion still set, then ONE more asserting the holdoff is spent (reported 0,
+/// companion set). Calls generation_report() exactly real + 1 times.
+void expect_backoff_reports_5513(GuardianEngine& e, std::uint32_t real) {
+    for (std::uint32_t i = 0; i < real; ++i) {
+        const auto rep = e.generation_report();
+        CHECK(rep.reported == kGen5513);
+        CHECK(rep.boot_rearm_unresolved);
+    }
+    const auto spent = e.generation_report();
+    CHECK(spent.reported == 0);
+    CHECK(spent.boot_rearm_unresolved);
+    CHECK(e.boot_report_holdoff_for_test() == 0);
+}
+
+} // namespace
+
+TEST_CASE("#5513 back-off dormant (prefer_spark=true): each failed catch-up earns the next "
+          "heartbeats' real report, escalating 1, 2, 4, 8, 10, 10, and a re-push replaces it",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Reported-value sequence asserted (R = the real persisted kGen5513 with the companion set,
+    // Z = 0 with the companion set): after the boot failure alone Z (no failed catch-up yet);
+    // after catch-up #1: R Z; #2: R R Z; #3 (only ONE of its 4 consumed, so a re-push replaces
+    // the remainder): R; #4: exactly 8 R then Z; #5 and #6: 10 R then Z each. policy_generation()
+    // (the const accessor __guard__ replies use) is 0 throughout, and the internal generation is
+    // never touched. Mutations: dropping the holdoff set leaves Z at #1; dropping the cap
+    // reports 16 R at #5/#6; `holdoff +=` instead of `=` reports 11 R at #4; consuming nothing
+    // in generation_report() never reaches Z.
+    BootRig5513 r;
+    stage_refused_boot_5513(r);
+
+    // The boot failure alone is not a failed catch-up: no holdoff, so the report is 0 and it
+    // does not decay across repeated reads.
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+    for (int i = 0; i < 3; ++i) {
+        const auto rep = r.engine->generation_report();
+        CHECK(rep.reported == 0);
+        CHECK(rep.boot_rearm_unresolved);
+    }
+
+    const std::uint32_t expected[] = {1, 2, 4, 8, 10, 10};
+    for (std::uint32_t i = 0; i < 6; ++i) {
+        r.push_ok({make_service_rule("r1")}, kGen5513); // refused again: the tail sees !clean
+        CHECK(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->policy_generation() == 0);
+        CHECK(r.engine->boot_catchup_failures_for_test() == i + 1);
+        CHECK(r.engine->boot_report_holdoff_for_test() == expected[i]);
+        if (i == 2) {
+            // Consume ONE of the 4: the next push must REPLACE the remaining 3, not add to it.
+            const auto rep = r.engine->generation_report();
+            CHECK(rep.reported == kGen5513);
+            CHECK(rep.boot_rearm_unresolved);
+            CHECK(r.engine->boot_report_holdoff_for_test() == 3);
+            continue;
+        }
+        expect_backoff_reports_5513(*r.engine, expected[i]);
+        CHECK(r.engine->policy_generation() == 0); // reads never leak the holdoff
+    }
+    // The internal value is untouched by any of it: a clean push at the same generation clears
+    // the flag and the reported value returns to it.
+    r.push_ok({}, kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513);
+}
+
+TEST_CASE("#5513 back-off dormant (prefer_spark=true): the failure counter saturates, the holdoff "
+          "holds at the cap, and a clean push clears the back-off",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // 40 failed catch-ups: past the counter's 16 cap and past 32, where an uncapped counter
+    // would shift by >= 32 (undefined; on x86 it wraps and the holdoff collapses to 1). The
+    // holdoff must still be exactly the 10-heartbeat ceiling. Then a clean push with holdoff
+    // still unspent: the flag clears, the back-off state is reset, and the report is the real
+    // value with no companion. Mutations: no counter cap (holdoff 1 or UBSan at failure 33);
+    // no reset of the two members on the tail clear (accessors stay 16 / 10 after the clear).
+    BootRig5513 r;
+    stage_refused_boot_5513(r);
+
+    for (std::uint32_t i = 1; i <= 40; ++i) {
+        r.push_ok({make_service_rule("r1")}, kGen5513);
+        REQUIRE(r.engine->boot_catchup_failures_for_test() == std::min<std::uint32_t>(i, 16));
+        if (i >= 5)
+            REQUIRE(r.engine->boot_report_holdoff_for_test() ==
+                    GuardianEngine::kBootReportBackoffMaxHeartbeats);
+    }
+    CHECK(r.engine->boot_report_holdoff_for_test() == 10);
+    CHECK(r.engine->policy_generation() == 0);
+
+    r.push_ok({}, kGen5513); // clean: the operator removed the refused rule
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+    for (int i = 0; i < 3; ++i) {
+        const auto rep = r.engine->generation_report();
+        CHECK(rep.reported == kGen5513);
+        CHECK_FALSE(rep.boot_rearm_unresolved);
+    }
+    CHECK(r.engine->policy_generation() == kGen5513);
+}
+
+TEST_CASE("#5513 back-off dormant (prefer_spark=true): a failed push with NO unresolved boot "
+          "re-arm neither counts nor holds off, and a healthy boot always reports the real "
+          "generation",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Healthy boot (flag never set), then a later push of the rule is refused once: that is an
+    // ordinary held push, not a boot catch-up. Mutations: dropping the
+    // `boot_unresolved_` term of the tail's else-if counts it (accessors 1 / 1); applying or
+    // consuming holdoff without the flag would show here only through those accessors, since
+    // the report would read {G, false} either way.
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+    r.construct(true, true);
+    r.wire();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.tick_until([&] { return r.engine->spark_armed_rule_count() == 1; }));
+    r.quiesce();
+    for (int i = 0; i < 3; ++i) {
+        const auto rep = r.engine->generation_report();
+        CHECK(rep.reported == kGen5513);
+        CHECK_FALSE(rep.boot_rearm_unresolved);
+    }
+
+    // A single-shot refusal (resolved synchronously or drained, the case does not depend on
+    // which): the push reaches the tail !clean, but the flag was never set.
+    const auto failures_before = r.engine->arm_failure_count();
+    r.mechanism->set_fail_next_watch();
+    r.push_ok({make_service_rule("r1")}, kGen5513);
+    r.quiesce();
+    CHECK(r.engine->arm_failure_count() > failures_before); // the push did fail to arm
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+    const auto rep = r.engine->generation_report();
+    CHECK(rep.reported == kGen5513);
+    CHECK_FALSE(rep.boot_rearm_unresolved);
+}
+
+TEST_CASE("#5513 back-off live (prefer_spark=false): pushes that return before the tail (invalid "
+          "rule id, KV refusal) are not failed catch-ups and earn no holdoff",
+          "[spark][guardian][reconcile][boot][5513]") {
+    // The #4665 reject and the put_rule early return both leave the boot application's flag
+    // owned by it and must not count. Mutation: moving the count to the top of apply_rules (or
+    // counting any non-ok return) reports the real generation after the first refused push.
+    BootRig5513 r;
+    r.seed(/*prefer_spark=*/false, /*with_spark=*/false, {make_file_rule("r1")}, kGen5513);
+
+    r.construct(false, false);
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r1"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+
+    CHECK(r.push({make_file_rule("")}, kGen5513).exit_code != 0); // invalid rule_id: rejected
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+
+    drop_kv_store_table_for_test(r.db_.path);
+    for (int i = 0; i < 2; ++i) {
+        CHECK(r.push({make_file_rule("r1")}, kGen5513).exit_code != 0); // put_rule refused
+        CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+        CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+        const auto rep = r.engine->generation_report();
+        CHECK(rep.reported == 0);
+        CHECK(rep.boot_rearm_unresolved);
+    }
+
+    recreate_kv_store_table_for_test(r.db_.path);
+    r.push_ok({make_file_rule("r1")}, kGen5513);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    const auto cleared = r.engine->generation_report();
+    CHECK(cleared.reported == kGen5513);
+    CHECK_FALSE(cleared.boot_rearm_unresolved);
+}
+
+TEST_CASE("#5513 back-off dormant (prefer_spark=true): the tick's can_advance() clear resets the "
+          "back-off",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Boot arm drained as a failure (flag set by the tick), then a catch-up whose arm is parked
+    // (Accepted, pending): the tail sees !clean and starts the back-off (failure 1, holdoff 1);
+    // ticks while it is pending neither clear nor consume it. Releasing the arm lets the TICK
+    // clear the flag, and that clear (not the tail's) must reset both members. Mutation:
+    // deleting the two resets from the tick's clear leaves 1 / 1 after the flag is gone.
+    using namespace std::chrono_literals;
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire();
+    r.mechanism->hang_next_watch();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s));
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0); // the boot failure is not a catch-up
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+
+    r.mechanism->set_park_all_watches();
+    REQUIRE(r.push({make_service_rule("r1")}, kGen5513).exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return r.mechanism->parked_watch_count() == 1; }));
+    CHECK(r.engine->boot_catchup_failures_for_test() == 1);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 1);
+    for (int i = 0; i < 3; ++i) {
+        r.engine->journal_maintenance_tick();
+        CHECK(r.engine->boot_catchup_failures_for_test() == 1);
+        CHECK(r.engine->boot_report_holdoff_for_test() == 1);
+    }
+
+    r.mechanism->release_park_all();
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->boot_catchup_failures_for_test() == 0);
+    CHECK(r.engine->boot_report_holdoff_for_test() == 0);
+    const auto rep = r.engine->generation_report();
+    CHECK(rep.reported == kGen5513);
+    CHECK_FALSE(rep.boot_rearm_unresolved);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): one rule fixed and one still failing keeps the "
+          "reported generation at 0 until a fully clean application",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // r1 (Registry, its own mechanism) arms cleanly every time; r2 (Service) fails at boot (late
+    // refusal) and on the first catch-up (single-shot refusal on the Service mechanism only). After
+    // the first catch-up a rule IS armed, yet the application is not clean. Mutation: a clear keyed
+    // on "any rule armed" instead of "every rule clean" reports kGen5513 after the first catch-up.
+    using namespace std::chrono_literals;
+    const std::vector<gpb::GuaranteedStateRule> rules = {make_registry_rule("r1"),
+                                                         make_service_rule("r2", true, "SvcB")};
+    BootRig5513 r;
+    r.seed(true, true, rules, kGen5513, /*with_registry_sibling=*/true);
+
+    r.construct(true, true, /*with_registry_sibling=*/true);
+    r.wire();
+    r.mechanism->hang_next_watch(); // only r2 uses the Service mechanism
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s));
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    r.quiesce();
+    REQUIRE(r.engine->policy_generation() == 0);
+    REQUIRE(r.engine->spark_armed_rule_count() == 1); // r1 armed at boot, r2 did not
+
+    r.mechanism->set_fail_next_watch(); // Service mechanism only
+    r.push_ok(rules, kGen5513);
+    r.quiesce();
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->spark_armed_rule_count() == 1); // r1 re-armed, r2 still not
+
+    r.push_ok(rules, kGen5513); // clean
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->spark_armed_rule_count() == 2);
+}
+
+namespace {
+
+enum class LateOutcome5513 { RefuseAfterPushes, SuccessAfterPushes, SuccessNoPush };
+
+/// T11 body: a boot arm wedged by a (synthetic) expired claim, so the drain retains it.
+void run_wedged_boot_arm_5513(LateOutcome5513 outcome) {
+    using namespace std::chrono_literals;
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire();
+    r.mechanism->hang_next_watch();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s));
+    const std::string key = r.mechanism->first_watch_key();
+    REQUIRE_FALSE(key.empty());
+    auto* rt = r.engine->spark_runtime_for_test();
+    REQUIRE(rt != nullptr);
+    REQUIRE(yuzu::test::spin_until([&] { return rt->active_backend_op_workers() == 1; }, 10s));
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+
+    const auto await_late_result_landed = [&] {
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                return rt->active_backend_op_workers() == 0 &&
+                       rt->claim_queue_depth_for_test(key) == 0;
+            },
+            10s));
+    };
+
+    // Expire the claim with the runtime's synthetic clock (never a sleep): the drain reads the
+    // receipt as an outstanding Wedged one, which sets the flag AND is retained in the ledger.
+    REQUIRE(rt->expire_overdue_claims_at_for_test(std::chrono::steady_clock::now() + 600s) == 1);
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    CHECK(r.engine->policy_generation() == 0);
+    // Retained BEFORE any late outcome is released. Releasing first turns the retained wedge into
+    // an ordinary failure and the identical retry below into an avoidable Reapply.
+    CHECK(r.engine->ack_failed_receipt_count_for_test() == 1);
+
+    if (outcome == LateOutcome5513::SuccessNoPush) {
+        // No push at all: the late success is adopted while the BOOT application is current. The
+        // recovery scan retires the counted failure, can_advance() turns true, and the tick clears
+        // the flag. A tick clear guarded on "the boot application is not open" would never fire.
+        r.mechanism->release_hang(); // late outcome None: success
+        await_late_result_landed();
+        REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+        CHECK_FALSE(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->spark_armed_rule_count() == 1);
+        CHECK(r.mechanism->watch_call_count() == 1); // recovered, never re-armed
+        return;
+    }
+
+    // First same-generation push: a Reapply (the boot application's content id is a sentinel).
+    // The attach re-observes the retained claim and constructs no new one, so no new watch().
+    r.push_ok({make_service_rule("r1")}, kGen5513);
+    CHECK(r.mechanism->watch_call_count() == 1);
+    CHECK(r.engine->policy_generation() == 0); // the tail cannot clear: the receipt is pending
+    CHECK(r.engine->boot_rearm_unresolved());
+    REQUIRE(r.tick_until([&] {
+        return r.engine->ack_failed_receipt_count_for_test() == 1 &&
+               r.engine->ack_pending_count_for_test() == 0;
+    }));
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+
+    // Second identical push: SUPPRESSED while the retained wedge is outstanding (the open
+    // application survives: pending 0, failed 1; nothing reaches the mechanism).
+    r.push_ok({make_service_rule("r1")}, kGen5513);
+    {
+        const auto s = r.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 0);
+        CHECK(s->failed == 1);
+    }
+    CHECK(r.mechanism->watch_call_count() == 1);
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+
+    if (outcome == LateOutcome5513::RefuseAfterPushes) {
+        // The late refusal pops the claim; the retained entry reads Blocking, so the next push is
+        // a real Reapply with ONE fresh watch(), and the clean application clears the flag.
+        r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+        r.mechanism->release_hang();
+        await_late_result_landed();
+        r.push_ok({make_service_rule("r1")}, kGen5513);
+        REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+        CHECK_FALSE(r.engine->boot_rearm_unresolved());
+        CHECK(r.mechanism->watch_call_count() == 2);
+        CHECK(r.engine->spark_armed_rule_count() == 1);
+    } else {
+        // The late success is ADOPTED: the recovery scan on the post-push application retires the
+        // counted failure with NO further push, and the tick clears the flag.
+        r.mechanism->release_hang(); // late outcome None: success
+        await_late_result_landed();
+        REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+        CHECK_FALSE(r.engine->boot_rearm_unresolved());
+        CHECK(r.engine->spark_armed_rule_count() == 1);
+        CHECK(r.mechanism->watch_call_count() == 1);
+    }
+}
+
+} // namespace
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a wedged boot arm is retained, held through "
+          "suppressed retries, and a late REFUSAL is repaired by one Reapply",
+          "[spark][guardian][reconcile][boot][5513][dormant][liveness]") {
+    // Mutations: no set on a drained Wedged receipt (never reaches 0); releasing the late outcome
+    // before the retain step; a clear that fires on the Reapply or the Suppress.
+    run_wedged_boot_arm_5513(LateOutcome5513::RefuseAfterPushes);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a wedged boot arm whose late SUCCESS is adopted "
+          "after the retries clears with no further push",
+          "[spark][guardian][reconcile][boot][5513][dormant][liveness]") {
+    // Mutation: a missing tick-side clear never reaches kGen5513 once the recovery scan has
+    // retired the counted failure.
+    run_wedged_boot_arm_5513(LateOutcome5513::SuccessAfterPushes);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a wedged boot arm whose late SUCCESS lands while "
+          "the BOOT application is still current clears with no push at all",
+          "[spark][guardian][reconcile][boot][5513][dormant][liveness]") {
+    // Mutation: a tick clear guarded by "the boot application is not open" never fires here, and
+    // a missing tick clear is red as above.
+    run_wedged_boot_arm_5513(LateOutcome5513::SuccessNoPush);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a rejected push leaves a set flag and the boot "
+          "application untouched, and the next clean push clears it",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Flag already set by the synchronous boot throw. The #4665 reject returns before
+    // begin_application(), so nothing about the boot state may change. Mutation: clearing the
+    // flag (or the boot application's ledger state) on a rejected push.
+    BootRig5513 r;
+    const std::vector<gpb::GuaranteedStateRule> rules = {make_service_rule("r2", true, "SvcB")};
+    r.seed(true, true, rules, kGen5513);
+
+    r.construct(true, true);
+    r.wire();
+    r.engine->set_rearm_fault_hook_for_test(rearm_throw_hook_5513("r2"));
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == 0);
+    const auto pending_before = r.engine->ack_pending_count_for_test();
+
+    // An empty rule_id is rejected for the WHOLE push before any state is touched.
+    const auto rejected = r.push({make_service_rule("r2", true, "SvcB"), make_service_rule("")},
+                                 kGen5513 + 1);
+    CHECK(rejected.exit_code != 0);
+    CHECK(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == 0);
+    CHECK(r.engine->ack_pending_count_for_test() == pending_before);
+
+    r.push_ok(rules, kGen5513);
+    REQUIRE(r.tick_until([&] { return r.engine->policy_generation() == kGen5513; }));
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->spark_armed_rule_count() == 1);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a rejected push does not close the boot "
+          "application, so a later drained boot failure still sets the flag",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Flag NOT yet set: the boot arm is parked (Accepted). The rejected push must leave the boot
+    // application current, which is observable only afterwards: the late refusal is drained against
+    // the boot application and must still set the flag. Mutation: clearing the "boot application
+    // open" marker at the top of apply_rules() (before the reject) leaves the flag false forever.
+    using namespace std::chrono_literals;
+    BootRig5513 r;
+    r.seed(true, true, {make_service_rule("r1")}, kGen5513);
+
+    r.construct(true, true);
+    r.wire();
+    r.mechanism->hang_next_watch();
+    REQUIRE(r.engine->start_local().has_value());
+    REQUIRE(r.mechanism->wait_entered_hang(30s));
+    const auto pending_before = r.engine->ack_pending_count_for_test();
+    REQUIRE(pending_before == 1);
+
+    const auto rejected = r.push({make_service_rule("")}, kGen5513 + 1);
+    CHECK(rejected.exit_code != 0);
+    CHECK_FALSE(r.engine->boot_rearm_unresolved());
+    CHECK(r.engine->policy_generation() == kGen5513);
+    CHECK(r.engine->ack_pending_count_for_test() == pending_before);
+
+    r.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    r.mechanism->release_hang();
+    REQUIRE(r.tick_until([&] { return r.engine->boot_rearm_unresolved(); }));
+    CHECK(r.engine->policy_generation() == 0);
+}
+
+TEST_CASE("#5513 dormant (prefer_spark=true): a post-boot held push never reports generation 0 "
+          "or raises the boot flag",
+          "[spark][guardian][reconcile][boot][5513][dormant]") {
+    // Healthy boot (flag false), one clean push to kGen5513, then a push at the next generation
+    // whose arm is parked and then refused: the drained failure belongs to an ordinary
+    // application, not the boot one, so the reported value is HELD at kGen5513 (never 0) and the
+    // flag stays false. Mutation: a tick-side set not guarded by "the boot application is open"
+    // reports 0 on an ordinary held push.
+    using namespace std::chrono_literals;
+    SparkReconcileFixture f{/*periodic_bound_ms=*/0,
+                            /*backend_op_deadline=*/std::chrono::milliseconds{60'000},
+                            SparkType::Service, /*with_registry_sibling=*/false,
+                            /*wire_first=*/true};
+    // Release the park gate on EVERY exit path, before the fixture tears down the engine.
+    struct ReleaseOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseOnExit() {
+            fx.mechanism->release_park_all();
+            fx.mechanism->release_hang();
+        }
+    } release_parked{f};
+    const std::vector<gpb::GuaranteedStateRule> rules = {make_service_rule("r1")};
+    const auto dispatch = [&](std::uint64_t generation) {
+        return yuzu::agent::guardian_dispatch_push_bytes_for_test(
+            *f.engine, push_bytes_5513(rules, generation));
+    };
+
+    CHECK_FALSE(f.engine->boot_rearm_unresolved());
+    REQUIRE(dispatch(kGen5513).exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] {
+        f.engine->journal_maintenance_tick();
+        return f.engine->policy_generation() == kGen5513;
+    }));
+    CHECK_FALSE(f.engine->boot_rearm_unresolved());
+
+    f.mechanism->set_park_all_watches();
+    REQUIRE(dispatch(kGen5513 + 1).exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return f.mechanism->parked_watch_count() == 1; }));
+    // held: the next generation is not acknowledged
+    CHECK(f.engine->policy_generation() == kGen5513);
+    f.mechanism->set_late_watch_outcome(FakeServiceMechanism::LateWatchOutcome::Refuse);
+    f.mechanism->release_park_all();
+    REQUIRE(yuzu::test::spin_until([&] {
+        f.engine->journal_maintenance_tick();
+        return f.engine->ack_pending_count_for_test() == 0 && f.engine->active_io_workers() == 0;
+    }));
+    for (int i = 0; i < 3; ++i)
+        f.engine->journal_maintenance_tick();
+
+    CHECK(f.engine->arm_failure_count() >= 1); // the refusal was drained and counted
+    CHECK(f.engine->policy_generation() == kGen5513); // held, not 0
+    CHECK_FALSE(f.engine->boot_rearm_unresolved());
 }
 
 TEST_CASE("prefer_spark=false never populates unsupported_rules_, even for a type "

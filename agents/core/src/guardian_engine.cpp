@@ -1005,17 +1005,34 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     // `gen > policy_generation_` check can never advance anything from it; boot
     // re-arm's Accepted receipts are still drained and their failures still logged
     // (ack_ledger_'s drain, not reconcile_rule_locked's now-synchronous-only warn),
-    // they just never move the generation. No content_id: nothing here is compared
-    // against a later push (decide_retry() is apply_rules()-only), so the field is
-    // unused for this application - left empty rather than computed for nothing.
+    // they just never move the generation. No content_id: the empty string is a sentinel
+    // decide_retry() never reads as a real content identity (it is not a SHA-256 digest), so a
+    // same-generation catch-up push against this application always Reapplies; computing a
+    // hash for it would buy nothing.
     //
-    // Defensive, not exercised by SparkReconcileFixture (test_guardian_engine_spark_
-    // reconcile.cpp): that fixture calls start_local() BEFORE wire_spark_engine(), so
-    // spark_availability_ is still Unwired here and reconcile_rule_locked's Arm branch
-    // never reaches spark_runtime_->attach_rule() during ITS boot walk - nothing this
-    // application could ever hold pending. Production wires first (agent.cpp calls
-    // wire_spark_engine() before start_local()), so a real boot CAN re-arm via spark
-    // here; this call exists for that ordering, not the test fixture's.
+    // #5513: this application is also the carrier of the boot re-arm's unresolved state.
+    // boot_app_open_ marks it as still current: it is set right after begin_application()
+    // succeeds below and cleared only when apply_rules' own begin_application() succeeds
+    // (which supersedes it; a rejected or Suppressed push leaves it current) or in stop().
+    // While it is open, the maintenance tick sets boot_unresolved_ when one of ITS receipts
+    // drains as a failure (the late variant: a Spark arm accepted at boot that later
+    // resolves to a non-Committed outcome), and never for any other application. The
+    // synchronous variants (a returned Failed or a throw in the walk below) go through
+    // note_boot_rearm_failure_locked(), which also latches this application, so the tick's
+    // can_advance() clear cannot erase them before the server has been told (a latched
+    // application's effect is can_advance() == false: decide_retry() also reads the latch, but
+    // the boot application's empty content_id sentinel returns Reapply before that check).
+    // Contract: if this begin_application() throws there is no boot application, so the late
+    // variant is invisible (late receipts are dropped by add_pending) and the latch is a
+    // no-op; the synchronous variants are still covered.
+    //
+    // Production order, and what the test fixture now covers: agent.cpp calls
+    // wire_spark_engine() BEFORE start_local(), so a real boot CAN re-arm via Spark here and
+    // leave Accepted receipts on this application. SparkReconcileFixture (test_guardian_
+    // engine_spark_reconcile.cpp) historically called start_local() first, so its boot walk
+    // never reached spark_runtime_->attach_rule(); its `wire_first` flag
+    // (SparkReconcileFixture's constructor) selects the production order, and the #5513
+    // cases that need a Spark boot arm use it.
     // Governance finding UP-1 (Gate 4, folded): same unguarded-allocation class as
     // apply_rules()'s own begin_application() call, fixed alongside it. Non-fatal
     // here - a failure to open the boot bookkeeping application must not block
@@ -1024,6 +1041,7 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     try {
         ack_ledger_->begin_application(policy_generation_, "", /*full_sync=*/false,
                                        /*applied=*/0);
+        boot_app_open_ = true;
     } catch (const std::exception& e) {
         spdlog::warn("Guardian: failed to begin boot ack application: {}", e.what());
     } catch (...) {
@@ -1090,6 +1108,7 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     };
 
     std::size_t rearmed = 0;
+    std::size_t boot_rearm_failed = 0; // #5513: synchronous failures only (Failed or a throw)
     for (const auto& key : kv_->list(kKvNamespace, kRulePrefix)) {
         auto raw = kv_->get(kKvNamespace, key);
         if (!raw)
@@ -1104,8 +1123,10 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         }
         if (!rule.enabled())
             continue;
-        // Arming a legacy guard spawns a std::thread (guard_{file,registry,systemd}.cpp);
-        // under thread-or-handle exhaustion that ctor throws std::system_error. This
+        // Arming a legacy guard spawns a std::thread (guard_{file,registry,service,systemd}.cpp);
+        // on thread-creation failure that ctor throws std::system_error (each guard opens its
+        // handle/bus BEFORE the thread, and a handle/fd failure there returns false, which
+        // is Inert, #2797). This
         // loop runs OUTSIDE the json try above, and start_local()'s caller does not
         // catch, so an uncaught throw here escapes run() and terminates the agent. Since
         // rung 7.7a re-armed cached guards AFTER the SparkEngine's own boot threads, an
@@ -1115,9 +1136,25 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         try {
             if (rearm_fault_hook_for_test_)
                 rearm_fault_hook_for_test_(rule.rule_id());
-            if (reconcile_rule_locked(rule) == ReconcileOutcome::Armed) // either backend
+            // #5513: a returned Failed (a Spark synchronous refusal; the legacy path's
+            // returned-false stays Inert, #2797) or a throw below marks the boot re-arm
+            // unresolved; Accepted alone does not (the late variant is handled in the
+            // maintenance tick).
+            switch (reconcile_rule_locked(rule)) { // either backend
+            case ReconcileOutcome::Armed:
                 ++rearmed;
+                break;
+            case ReconcileOutcome::Failed:
+                note_boot_rearm_failure_locked();
+                ++boot_rearm_failed;
+                break;
+            case ReconcileOutcome::Accepted:
+            case ReconcileOutcome::Inert:
+                break;
+            }
         } catch (const std::exception& e) {
+            note_boot_rearm_failure_locked(); // #5513 (noexcept, allocates nothing)
+            ++boot_rearm_failed;
             // Build once, log, and record for last_rearm_degrade_message_for_test - a single
             // source of truth rather than a second copy of this text. spdlog::error("{}", msg),
             // a literal one-placeholder format string with msg as the substituted argument,
@@ -1130,7 +1167,7 @@ std::expected<void, std::string> GuardianEngine::start_local() {
             // its OWN allocation internally (SPDLOG_TRY/SPDLOG_LOGGER_CATCH - never rethrows),
             // but the raw string concatenation building degrade_msg runs OUTSIDE that firewall,
             // in a catch block whose entire purpose is to survive exactly the resource-exhaustion
-            // class (thread/handle exhaustion often correlates with memory pressure) that could
+            // class (thread-creation failure often correlates with memory pressure) that could
             // also make this concatenation throw bad_alloc. An uncaught throw here would escape
             // start_local() and terminate the agent - precisely the failure this outer catch
             // exists to prevent. Degrade further on a secondary failure rather than risk that.
@@ -1146,11 +1183,36 @@ std::expected<void, std::string> GuardianEngine::start_local() {
                               "could not be built (secondary allocation failure) - NOT enforcing "
                               "this rule; agent continues with the remaining rules");
             }
+        } catch (...) {
+            // #5513: a non-std::exception throw out of the arm path used to escape start_local()
+            // (and run()), terminating the agent; degrade per-rule exactly like the arm above.
+            // The failure is recorded first (noexcept). The message names the rule like the
+            // sibling arm does; log_id_token() allocates, so it is built in its own nested
+            // try/catch and falls back to a fixed literal if that throws.
+            note_boot_rearm_failure_locked();
+            ++boot_rearm_failed;
+            try {
+                const std::string degrade_msg =
+                    "Guardian: rule '" + log_id_token(rule.rule_id()) +
+                    "' failed to re-arm (non-standard exception) - NOT enforcing this rule; "
+                    "agent continues with the remaining rules";
+                spdlog::error("{}", degrade_msg);
+                last_rearm_degrade_message_for_test_ = degrade_msg;
+            } catch (...) {
+                spdlog::error("Guardian: a rule failed to re-arm (non-standard exception) - NOT "
+                              "enforcing this rule; agent continues with the remaining rules");
+            }
         }
     }
 
-    spdlog::info("Guardian engine started (cached_rules={}, re-armed={}, policy_generation={})",
-                 rule_count_, rearmed, policy_generation_);
+    spdlog::info("Guardian engine started (cached_rules={}, re-armed={}, boot_rearm_failed={}, "
+                 "policy_generation={})",
+                 rule_count_, rearmed, boot_rearm_failed, policy_generation_);
+    if (boot_rearm_failed > 0)
+        spdlog::warn("Guardian: {} cached rule(s) failed to re-arm at boot - reporting "
+                     "policy_generation=0 (persisted={}) until the server's catch-up push applies "
+                     "cleanly",
+                     boot_rearm_failed, policy_generation_);
     if (rearmed > 0)
         spdlog::warn("Guardian: {} guard(s) re-armed pre-network — drift remediated before the "
                      "server connection is enforced but NOT reported until reconnect (durable "
@@ -1165,8 +1227,9 @@ void GuardianEngine::sync_with_server() {
         spdlog::warn("Guardian: sync_with_server called before start_local — ignoring");
         return;
     }
-    spdlog::info("Guardian engine network-connected (policy_generation={}, rules={})",
-                 policy_generation_, rule_count_);
+    spdlog::info("Guardian engine network-connected (policy_generation={}, rules={}, "
+                 "boot_rearm_unresolved={})",
+                 policy_generation_, rule_count_, boot_unresolved_);
 }
 
 void GuardianEngine::stop() {
@@ -1219,6 +1282,7 @@ void GuardianEngine::stop() {
     // raced this call and read stopped_ as still false, plus it stops watching
     // receipts whose claims begin_stop() just started tearing down.
     ack_ledger_->retire();
+    boot_app_open_ = false; // #5513: no application is current after retire()
     if (spark_scheduler_)
         spark_scheduler_->stop();
     if (spark_drain_worker_) {
@@ -1571,8 +1635,9 @@ void GuardianEngine::journal_maintenance_tick() {
     // second heartbeat call site, since both are "periodic maintenance under mtx_,
     // prefer_spark_-gated, firewalled" already. Runs AFTER the journal persist above (an
     // arbitrary but harmless ordering choice: neither reads the other's result) and BEFORE
-    // agent.cpp reads policy_generation() for the heartbeat's own guardian_generation tag,
-    // so an acknowledgment this tick produces is visible on the SAME heartbeat, not one late.
+    // agent.cpp reads generation_report() for the heartbeat's own guardian_generation tag (and
+    // its #5513 boot-re-arm companion), so an acknowledgment or clear this tick produces is
+    // visible on the SAME heartbeat, not one late.
     std::lock_guard lock(mtx_);
     if (stopped_ || !prefer_spark_)
         return;
@@ -1597,16 +1662,42 @@ void GuardianEngine::journal_maintenance_tick() {
     // above (already done) from having happened, and must not escape onto the bare
     // heartbeat thread either.
     try {
-        // UP-3 (Gate 4, folded): drain_locked()'s failed_out feeds the durable
-        // fleet-visible arm_failures_ counter - an async-resolved arm failure used
-        // to update only this ledger's own internal bookkeeping and a local log
-        // line, never the counter a synchronous refusal already bumps.
+        // UP-3 (Gate 4, folded): drain_locked()'s failed_out feeds the cumulative
+        // arm_failures_ counter - an async-resolved arm failure used to update only this
+        // ledger's own internal bookkeeping and a local log line, never the counter a
+        // synchronous refusal already bumps. That counter is read only by tests today (no
+        // heartbeat tag or metric, #4062), so this does not make the failure fleet-visible.
         std::size_t ack_arm_failures_this_tick = 0;
         ack_ledger_->drain_locked(*spark_runtime_, kAckDrainMaxPerTick,
                                   &ack_arm_failures_this_tick);
-        if (ack_arm_failures_this_tick > 0)
+        if (ack_arm_failures_this_tick > 0) {
             arm_failures_.fetch_add(ack_arm_failures_this_tick, std::memory_order_relaxed);
+            // #5513 (the late variant, dormant until prefer_spark_ flips): a receipt of the
+            // still-open BOOT application drained as a failure, so the boot re-arm did not
+            // complete. Guarded by boot_app_open_: a failure on any later application is an
+            // ordinary held push and must never report 0. NOT latched here (unlike the
+            // synchronous variants): a drained wedge stays retained and recoverable, and a
+            // late success adopted by the drain's recovery scan clears resolved_failed and
+            // lets the clear below fire with no push at all.
+            if (boot_app_open_)
+                boot_unresolved_ = true;
+        }
         if (ack_ledger_->can_advance()) {
+            // #5513: any application that can advance is a clean one, the boot application
+            // included (a latched or failed one cannot reach here), so the boot re-arm is
+            // resolved. Deliberately NOT guarded by !boot_app_open_ (a late success adopted on
+            // the boot application must clear it) and BEFORE the `gen > policy_generation_`
+            // check below: that gate never opens for the boot application (its generation IS
+            // policy_generation_), so a clear nested inside it would never fire.
+            if (boot_unresolved_) {
+                boot_unresolved_ = false;
+                boot_catchup_failures_ = 0; // see apply_rules' identical clear
+                boot_report_holdoff_ = 0;
+                spdlog::info("Guardian: boot re-arm flag cleared (the ack-drain tick saw no arm "
+                             "failure; a legacy arm that returned false is not detected, #2797), "
+                             "reporting policy_generation={} again",
+                             policy_generation_);
+            }
             const auto gen = ack_ledger_->pending_generation();
             // Persist BEFORE publishing, and check the result: a false return or a
             // throw (kv_->set() is not noexcept) must leave policy_generation_
@@ -1751,6 +1842,21 @@ std::optional<GuardianJournalAgeStats> GuardianEngine::journal_age_stats() const
 std::size_t GuardianEngine::ack_pending_count_for_test() const {
     std::lock_guard lock(mtx_);
     return ack_ledger_->pending_count_for_test();
+}
+
+std::size_t GuardianEngine::ack_failed_receipt_count_for_test() const {
+    std::lock_guard lock(mtx_);
+    return ack_ledger_->failed_receipt_count_for_test();
+}
+
+std::uint32_t GuardianEngine::boot_catchup_failures_for_test() const {
+    std::lock_guard lock(mtx_);
+    return boot_catchup_failures_;
+}
+
+std::uint32_t GuardianEngine::boot_report_holdoff_for_test() const {
+    std::lock_guard lock(mtx_);
+    return boot_report_holdoff_;
 }
 
 std::optional<GuardianArmStats> GuardianEngine::arm_stats() const {
@@ -1948,6 +2054,12 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
         return std::unexpected("failed to begin ack application: unknown exception");
     }
+    // #5513: only now has this push superseded the boot application. The #4665 reject above and
+    // the Suppress return above both leave the boot application current (and its unresolved
+    // flag owned by it), so this is NOT cleared at the top of the function. A throw out of
+    // begin_application() above returns before this line, so the boot application stays open
+    // and the next push retries.
+    boot_app_open_ = false;
 
     // Flush staged lifecycle records to the durable journal on EVERY exit - the normal
     // return, the put_rule early return below, and any un-firewalled throw. GuardianRollback
@@ -2236,7 +2348,8 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // Guaranteed-State product. Holding the generation keeps the 25s heartbeat retry
     // live so a transient OOM/thread-exhaustion self-heals. (Sol B1 / Fable.) A later
     // successful push can still advance past a persistently-failing rule; arm_failures_
-    // (surfaced via the heartbeat, item 9) is the durable fleet-visible signal for that.
+    // counts those attempts, but it is read only by tests today (no heartbeat tag or
+    // metric, #4062), so it is not a fleet-visible signal for that gap.
     // rung 9c PR-2 Unit 6: ack_ledger_->can_advance() replaces the old pending_arms == 0
     // check - true for the ordinary case (nothing Accepted this push, matching today's
     // behavior exactly) and false whenever an accepted arm is still genuinely pending
@@ -2267,8 +2380,46 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // today's production default - a repeat PUSH is the only live recovery lane
     // at prefer_spark_=false, not a heartbeat tick. Do not conflate the two in a
     // future edit here or in the log line below.
-    if (reconcile_failures == 0 && ack_ledger_->can_advance() &&
-        push.policy_generation() > policy_generation_) {
+    //
+    // #5513: a clean application also resolves an unresolved BOOT re-arm. The clear sits
+    // BESIDE the `push.policy_generation() > policy_generation_` gate, never inside it:
+    // the server's catch-up push for a boot failure carries the generation the agent
+    // already holds, so the `>` term is false for exactly the push this clear exists for. It
+    // is also tied to a clean application (no failure this call, nothing pending, nothing
+    // latched), not to the failed rule re-arming: a catch-up that disables or omits the rule
+    // is clean too. When an Accepted arm is still pending here (the Spark path), this does
+    // not fire and journal_maintenance_tick()'s can_advance() block clears it once the arm
+    // commits (that clear is in the tick, and is not behind its own `>` gate either). The
+    // internal policy_generation_ is never altered by the clear; only the REPORTED value
+    // (policy_generation(), which reads 0 while boot_unresolved_) changes.
+    const bool clean = reconcile_failures == 0 && ack_ledger_->can_advance();
+    if (clean && boot_unresolved_) {
+        boot_unresolved_ = false;
+        boot_catchup_failures_ = 0; // the back-off belongs to the unresolved episode
+        boot_report_holdoff_ = 0;
+        spdlog::info("Guardian: boot re-arm flag cleared (this push applied without an arm "
+                     "failure; a legacy arm that returned false is not detected, #2797), "
+                     "reporting policy_generation={} again",
+                     policy_generation_);
+    } else if (!clean && boot_unresolved_) {
+        // #5513 back-off (governance finding P-1): this catch-up did not resolve the boot
+        // re-arm, and reporting 0 on every heartbeat would make the server re-push a full sync
+        // about every heartbeat for as long as the rule keeps failing. Only an application that
+        // reached this tail counts: the #4665 reject, the Suppress return, the begin_application
+        // and put_rule early returns above all leave the counters alone. A pending Spark arm
+        // also lands here (!can_advance()); the tick clears the flag, and the counters, once it
+        // commits, so at worst the real generation is reported for a few heartbeats first. The
+        // internal generation is untouched; only the next generation_report() calls change.
+        if (boot_catchup_failures_ < kBootCatchupFailuresCap)
+            ++boot_catchup_failures_;
+        boot_report_holdoff_ = std::min<std::uint32_t>(1u << (boot_catchup_failures_ - 1),
+                                                       kBootReportBackoffMaxHeartbeats);
+        spdlog::info("Guardian: boot re-arm still unresolved after catch-up push #{} - reporting "
+                     "the real policy_generation={} for the next {} heartbeat(s) before asking "
+                     "the server again",
+                     boot_catchup_failures_, policy_generation_, boot_report_holdoff_);
+    }
+    if (clean && push.policy_generation() > policy_generation_) {
         if (persist_generation_locked(push.policy_generation()))
             policy_generation_ = push.policy_generation();
         else
@@ -2293,6 +2444,8 @@ gpb::GuaranteedStateStatus GuardianEngine::get_status() const {
     std::lock_guard lock(mtx_);
     gpb::GuaranteedStateStatus status;
     status.set_agent_id(agent_id_);
+    // The INTERNAL (persisted) generation, deliberately not policy_generation()'s reported
+    // value: this is the census view and no server consumer reads its generation (#5513).
     status.set_policy_generation(policy_generation_);
     status.set_total_rules(static_cast<std::uint32_t>(rule_count_));
 
@@ -2375,6 +2528,11 @@ GuardianDispatchResult GuardianEngine::dispatch(const apb::CommandRequest& cmd) 
         }
         res.exit_code = 0;
         res.content_type = "text";
+        // The REPORTED generation (what the next heartbeat will say). On a Spark Accepted
+        // catch-up for an unresolved boot re-arm (dormant: prefer_spark_ is false in
+        // production) this still reads 0 until the arm commits; harmless, since the server's
+        // direct Subscribe loop drops solicited __guard__ replies (agent_service_impl.cpp) and
+        // reconciles from the heartbeat tag.
         res.output = "applied=" + std::to_string(*applied) +
                      " generation=" + std::to_string(policy_generation()) +
                      " total=" + std::to_string(rule_count());
@@ -2432,7 +2590,38 @@ bool GuardianEngine::last_file_on_baseline_wired_for_test() const {
 
 std::uint64_t GuardianEngine::policy_generation() const {
     std::lock_guard lock(mtx_);
-    return policy_generation_;
+    return boot_unresolved_ ? 0 : policy_generation_;
+}
+
+GuardianEngine::GenerationReport GuardianEngine::generation_report() {
+    std::lock_guard lock(mtx_);
+    // #5513 back-off: one call is one heartbeat's report. While the boot re-arm is unresolved
+    // and a failed catch-up left holdoff, report the real persisted generation (the server then
+    // stops re-pushing for that heartbeat) but keep the companion flag set, so the pair still
+    // says "unresolved". Holdoff is never consumed or applied when the flag is not set.
+    if (boot_unresolved_ && boot_report_holdoff_ > 0) {
+        --boot_report_holdoff_;
+        return GenerationReport{.reported = policy_generation_, .boot_rearm_unresolved = true};
+    }
+    return GenerationReport{.reported = boot_unresolved_ ? 0 : policy_generation_,
+                            .boot_rearm_unresolved = boot_unresolved_};
+}
+
+bool GuardianEngine::boot_rearm_unresolved() const {
+    std::lock_guard lock(mtx_);
+    return boot_unresolved_;
+}
+
+void GuardianEngine::note_boot_rearm_failure_locked() noexcept {
+    boot_unresolved_ = true;
+    arm_failures_.fetch_add(1, std::memory_order_relaxed);
+    // For the boot application the latch's effect is can_advance() == false, the predicate the
+    // tick's clear reads (see start_local()'s boot-application comment). decide_retry() also
+    // reads latched_failure, but the boot application's empty content_id sentinel returns
+    // Reapply before that check is reached. Calls GuardianArmAckLedger::latch_failure(), which
+    // is noexcept: this function is noexcept and runs inside the exhaustion catch.
+    // A no-op when begin_application() failed (no current application).
+    ack_ledger_->latch_failure();
 }
 
 bool GuardianEngine::put_rule_locked(const gpb::GuaranteedStateRule& rule) {

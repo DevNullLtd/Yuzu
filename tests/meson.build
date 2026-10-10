@@ -3199,6 +3199,21 @@ test('gateway-upstream guard registration lexical gate',
   timeout: 30,
 )
 
+# #5513: static lexical gate pinning that agent.cpp's heartbeat still calls
+# guardian_->generation_report() and feeds BOTH fields to emit_guardian_generation_heartbeat_tags()
+# (the boot re-arm companion tag) inside a contained try, after journal_maintenance_tick(), and
+# that the emitter inserts the companion before yuzu.guardian_generation. AgentImpl::run's
+# heartbeat loop has no unit-drivable seam (#1492), so deleting that call site would leave every
+# other test green while restoring the never-retry bug. Carries its own in-memory mutation
+# self-test. No build required. Python, not bash, for the same reason as the OTA gate above
+# (#5428). Never raise the budget -- port, split or host-gate instead.
+test('guardian heartbeat generation wiring lexical gate (#5513)',
+  _python3_test,
+  args: [files('test_guardian_heartbeat_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # #4666 PR-2 W3a MI-2: report-only symbol-binding probe over the built exe/core-lib/
 # agent_actions plugin (see the script's own header for what it does and does not prove).
 # Gated on build_agent the same way the capability matrix gate above is -- nothing to
