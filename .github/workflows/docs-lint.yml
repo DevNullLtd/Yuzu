@@ -7,10 +7,11 @@ name: Docs Lint
 # check and got wedged forever on a status that never arrived (the
 # path-filtered-required-check trap). The changelog jobs are fast and
 # dependency-light — no build, no vcpkg, no caches — so running them
-# unconditionally is cheap. `prometheus-rules` below is the one exception: it
-# reaches TWO registries — a digest-pinned Prometheus image from Docker Hub and
-# a hash-pinned PyYAML from PyPI — which is why it is a separate job, so an
-# outage at either reds only that check.
+# unconditionally is cheap. Two jobs are the exception, and each is a separate
+# job for the same reason: an outage must red only the check named for it, never
+# the dependency-free changelog jobs. `prometheus-rules` reaches TWO registries:
+# a digest-pinned Prometheus image from Docker Hub and a hash-pinned PyYAML from
+# PyPI. `definition-descriptions` reaches one, a hash-pinned PyYAML from PyPI.
 on:
   # No paths filter: the required CHANGELOG-order status must report on every
   # PR. push fires only on mainline branches so a feature/fix branch with an
@@ -274,6 +275,34 @@ jobs:
         run: |
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           python3 scripts/assemble-changelog.py --guard "$BASE_SHA"
+
+  # Definition-description lint: shipped definitions (content/definitions and
+  # content/packs, as embed_content.py walks them) must carry
+  # descriptions an agentic worker can act on (definition, parameters, result
+  # columns), ratcheted against scripts/ci/definition-descriptions-baseline.json.
+  # Needs PyYAML (the content definitions are YAML), installed hash-pinned from
+  # requirements-ci.txt exactly like the prometheus-rules job below. ITS OWN JOB,
+  # deliberately: the install reaches PyPI, and a PyPI outage must red THIS check
+  # under a name that says what broke, not the required "CHANGELOG order" check.
+  # The test is not run with `python3 -I`: the pinned install is `--user`, which
+  # isolated mode ignores.
+  definition-descriptions:
+    name: Definition descriptions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install PyYAML (hash-pinned)
+        run: |
+          python3 -c "import yaml" 2>/dev/null || \
+            python3 -m pip install --user --break-system-packages \
+              --disable-pip-version-check --require-hashes -r requirements-ci.txt
+
+      - name: Definition description lint (ratchet)
+        run: python3 tests/test_definition_descriptions.py
 
   # Prometheus alert rules are code that runs in production and never compiles,
   # so nothing caught a rule that parses perfectly and can still never fire for

@@ -29,6 +29,7 @@
 #include "saml_principal.hpp"  // saml_principal_id / is_valid_saml_component — ADR-2001 PR4a
 #include "saml_scim_link.hpp"  // link_saml_login_to_scim — ADR-2001 PR4a login-site orchestration
 #include "service_scope_policy.hpp" // authz::service_scope_global_safe — #2298 PR 3 default-deny table
+#include "web_utils.hpp" // audit_token — CWE-117 neutralisation for the audit-failure warn
 
 #include <ctime>
 
@@ -1477,9 +1478,12 @@ bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& actio
         // returns false so the caller can decide whether to abort the
         // surrounding operation; most call sites legitimately fire-and-
         // forget the return value (matches the historical contract).
+        // CWE-117: target_id is caller-controlled on the legacy `/api/responses/(.+)`
+        // route (an unrestricted instruction id), so every field is neutralised
+        // exactly as `try_persist_audit` does; the raw value stays in the audit row.
         spdlog::warn("audit_log: AuditStore::log failed for action='{}' target_type='{}' "
                      "target_id='{}'",
-                     action, target_type, target_id);
+                     audit_token(action), audit_token(target_type), audit_token(target_id));
     }
     return ok;
 }

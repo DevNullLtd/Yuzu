@@ -19,6 +19,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <limits>
 
 #include <libpq-fe.h>
 
@@ -482,6 +483,106 @@ TEST_CASE("ResponseStore: finalize_terminal_status sanitizes error_detail (inval
     CHECK((*results)[0].error_detail.find('\xff') == std::string::npos);
 }
 
+// The same ingest cap store() applies to error_detail must bound the terminal
+// frame's message too (ledger row error-detail-not-truncated-at-finalize-
+// terminal-status): a terminal frame's error message cannot exceed the
+// documented per-row worst case (2 MiB plus the truncation marker).
+TEST_CASE("ResponseStore: finalize_terminal_status truncates an over-cap error_detail",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    constexpr std::size_t kCap = 2ull * 1024 * 1024; // kMaxIngestBytes
+    const std::string marker = "\n...[truncated by server ingest cap]";
+
+    auto make_running = [&](const std::string& id) {
+        StoredResponse running;
+        running.instruction_id = id;
+        running.agent_id = "agent-1";
+        running.execution_id = "exec-1";
+        running.status = 0;
+        store.store(running);
+    };
+
+    // Structural UTF-8 validity (lead/continuation byte shape), enough to
+    // prove the cut multibyte character did not reach PG or the row raw.
+    auto valid_utf8 = [](const std::string& s) {
+        std::size_t i = 0;
+        while (i < s.size()) {
+            const auto c = static_cast<unsigned char>(s[i]);
+            std::size_t n = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3
+                          : (c >> 3) == 0x1E ? 4 : 0;
+            if (n == 0 || i + n > s.size())
+                return false;
+            for (std::size_t k = 1; k < n; ++k)
+                if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80)
+                    return false;
+            i += n;
+        }
+        return true;
+    };
+
+    SECTION("over-cap message with a multibyte char straddling the cut") {
+        make_running("cmd-final-overcap");
+        // U+20AC (E2 82 AC) begins one byte before the cap, so the raw-byte
+        // cut lands inside it and leaves a dangling lead byte.
+        const std::string big = std::string(kCap - 1, 'x') + "\xE2\x82\xAC" + std::string(500, 'y');
+        auto fr = store.finalize_terminal_status("cmd-final-overcap", "agent-1", /*status=*/2,
+                                                 big, "exec-1", /*plugin_result_status=*/0);
+        CHECK(fr == ResponseStore::FinalizeResult::Updated);
+
+        auto results = store.get_by_instruction("cmd-final-overcap");
+        REQUIRE(results.has_value());
+        REQUIRE(results->size() == 1);
+        const std::string& stored = (*results)[0].error_detail;
+        CHECK((*results)[0].status == 2);
+        CHECK(stored.size() < big.size()); // genuinely truncated
+        // Bounded: the cap plus the marker, plus at most a few bytes of
+        // U+FFFD expansion for the severed lead byte.
+        CHECK(stored.size() <= kCap + marker.size() + 6);
+        CHECK(stored.find("truncated by server ingest cap") != std::string::npos);
+        CHECK(stored.find(std::string(500, 'y')) == std::string::npos); // tail dropped
+        CHECK(stored.compare(0, kCap - 1, std::string(kCap - 1, 'x')) == 0);
+        CHECK(valid_utf8(stored));
+    }
+
+    SECTION("a message of exactly the cap is stored whole and one byte over is cut") {
+        make_running("cmd-final-exact");
+        const std::string exact(kCap, 'x');
+        REQUIRE(store.finalize_terminal_status("cmd-final-exact", "agent-1", /*status=*/2, exact,
+                                               "exec-1", /*plugin_result_status=*/0) ==
+                ResponseStore::FinalizeResult::Updated);
+        auto at_cap = store.get_by_instruction("cmd-final-exact");
+        REQUIRE(at_cap.has_value());
+        REQUIRE(at_cap->size() == 1);
+        CHECK((*at_cap)[0].error_detail == exact); // <= cap: no marker, no cut
+
+        make_running("cmd-final-over");
+        const std::string over(kCap + 1, 'x');
+        REQUIRE(store.finalize_terminal_status("cmd-final-over", "agent-1", /*status=*/2, over,
+                                               "exec-1", /*plugin_result_status=*/0) ==
+                ResponseStore::FinalizeResult::Updated);
+        auto above = store.get_by_instruction("cmd-final-over");
+        REQUIRE(above.has_value());
+        REQUIRE(above->size() == 1);
+        const auto& e = (*above)[0].error_detail;
+        CHECK(e == std::string(kCap, 'x') + marker); // cap bytes kept, then the marker
+    }
+
+    SECTION("short message is stored verbatim") {
+        make_running("cmd-final-short");
+        const std::string msg = "boom: caf\xC3\xA9 failed";
+        auto fr = store.finalize_terminal_status("cmd-final-short", "agent-1", /*status=*/2, msg,
+                                                 "exec-1", /*plugin_result_status=*/0);
+        CHECK(fr == ResponseStore::FinalizeResult::Updated);
+        auto results = store.get_by_instruction("cmd-final-short");
+        REQUIRE(results.has_value());
+        REQUIRE(results->size() == 1);
+        CHECK((*results)[0].error_detail == msg);
+    }
+}
+
 TEST_CASE("ResponseStore: timestamp ordering", "[pg][response_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -526,6 +627,73 @@ TEST_CASE("ResponseStore: query with time range", "[pg][response_store]") {
     auto results = store.query("cmd-range", q);
     REQUIRE(results.has_value());
     CHECK(results->size() == 3);
+}
+
+TEST_CASE("ResponseStore: ResponseQuery since and until are presence-tracked so a literal 0 is "
+          "not the unbounded sentinel (#4644)",
+          "[pg][response_store][since_until]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    for (int64_t ts : {100, 200, 300}) {
+        StoredResponse r;
+        r.instruction_id = "cmd-presence";
+        r.agent_id = "agent-1";
+        r.status = 1;
+        r.output = "t" + std::to_string(ts);
+        r.timestamp = ts;
+        r.execution_id = "exec-presence";
+        store.store(r);
+    }
+
+    // Defaults are unset: no bound on either side.
+    ResponseQuery none;
+    CHECK_FALSE(none.since.has_value());
+    CHECK_FALSE(none.until.has_value());
+
+    ResponseQuery since_zero;
+    since_zero.since = 0; // literal bound at the epoch: matches every stored row, like unset
+    ResponseQuery until_set;
+    until_set.until = 200; // bounded subset: inclusive upper bound
+    ResponseQuery both;
+    both.since = 0;
+    both.until = 200;
+    ResponseQuery window;
+    window.since = 200;
+    window.until = 200;
+
+    const auto rows_via = [&](const ResponseQuery& q) {
+        auto a = store.query("cmd-presence", q);
+        auto b = store.query_by_execution("exec-presence", q);
+        auto c = store.query_bounded("cmd-presence", q, std::nullopt, 1u << 20);
+        REQUIRE(a.has_value());
+        REQUIRE(b.has_value());
+        REQUIRE(c.has_value());
+        AggregationQuery aq;
+        aq.group_by = "status";
+        aq.op = AggregateOp::Count;
+        auto d = store.aggregate("cmd-presence", aq, q);
+        REQUIRE(d.has_value());
+        int64_t agg_total = 0;
+        for (const auto& g : *d)
+            agg_total += g.count;
+        REQUIRE(static_cast<int64_t>(a->size()) == agg_total);
+        REQUIRE(a->size() == b->size());
+        REQUIRE(a->size() == c->rows.size());
+        return a->size();
+    };
+    CHECK(rows_via(none) == 3);
+    CHECK(rows_via(since_zero) == 3);
+    CHECK(rows_via(until_set) == 2);
+    CHECK(rows_via(both) == 2);
+    CHECK(rows_via(window) == 1);
+
+    // Presence, not a sentinel: a literal `until = 0` is an upper bound at the epoch that
+    // matches nothing. The REST edge rejects it before it can get here; the store must not
+    // quietly turn it back into "unbounded".
+    ResponseQuery until_zero;
+    until_zero.until = 0;
+    CHECK(rows_via(until_zero) == 0);
 }
 
 TEST_CASE("ResponseStore: multiple instructions", "[pg][response_store]") {
@@ -2027,4 +2195,226 @@ TEST_CASE("ResponseStore: scoped facet_values/facet_agent_count apply the WHOLE 
     auto count = store.facet_agent_count("cmd-facet-scope-cap", {net_filter}, big_scope);
     REQUIRE(count.has_value());
     CHECK(*count == 1);
+}
+
+// ── query_bounded (#4703): the byte-aware export fetch ────────────────────────────────
+namespace {
+
+void put_response(ResponseStore& store, const std::string& instruction, const std::string& agent,
+                  std::int64_t ts, std::size_t payload_bytes, const std::string& error = {}) {
+    StoredResponse r;
+    r.instruction_id = instruction;
+    r.agent_id = agent;
+    r.timestamp = ts;
+    r.status = 1;
+    r.output = std::string(payload_bytes, 'x');
+    r.error_detail = error;
+    store.store(r);
+}
+
+} // namespace
+
+TEST_CASE("ResponseStore query_bounded keeps only the rows under the payload cap",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    // 40 rows x 64 KiB (2.5 MiB). A 200 KiB cap keeps rows whose PRECEDING cumulative size
+    // is still under it: 0, 64, 128, 192 KiB -> 4 rows. The vector holds exactly the rows
+    // the final statement returned (no C++-side filtering), so rows.size() IS what libpq
+    // buffered: it is 4, not 40, because the cut happens in SQL before the full columns
+    // are fetched.
+    for (int i = 0; i < 40; ++i)
+        put_response(store, "cmd-bounded", "agent-1", 1000 + i, 64 * 1024);
+
+    ResponseQuery q;
+    q.limit = 100;
+    auto r = store.query_bounded("cmd-bounded", q, std::nullopt, 200 * 1024);
+    REQUIRE(r.has_value());
+    CHECK(r->rows.size() == 4);
+    CHECK(r->byte_cap_hit);
+    CHECK_FALSE(r->row_cap_hit);
+    // Newest first, and the kept rows are the NEWEST four.
+    CHECK(r->rows.front().timestamp == 1039);
+    CHECK(r->rows.back().timestamp == 1036);
+    // What libpq actually held: the four kept rows' payload (4 x 64 KiB) plus overhead, far
+    // below the 40 rows (2.5 MiB) query() materialises. This is the observable form of "the
+    // cut happens before the full columns are fetched".
+    CHECK(r->result_bytes >= 4u * 64u * 1024u);
+    CHECK(r->result_bytes < 1024u * 1024u);
+
+    // The plain query() fetches all 40, which is exactly what the bound avoids.
+    auto all = store.query("cmd-bounded", q);
+    REQUIRE(all.has_value());
+    CHECK(all->size() == 40);
+}
+
+TEST_CASE("ResponseStore query_bounded payload cap boundary is strict and exact",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // Three rows of exactly 10 payload bytes (output 6 + error_detail 4).
+    for (int i = 0; i < 3; ++i)
+        put_response(store, "cmd-edge", "agent-1", 100 + i, 6, "eeee");
+
+    ResponseQuery q;
+    q.limit = 100;
+    // Row 3's PRECEDING cumulative size is 20. Under a cap of 20 it is NOT strictly
+    // below, so it is dropped (2 rows, cut); under 21 it is kept (3 rows, no cut).
+    auto cut = store.query_bounded("cmd-edge", q, std::nullopt, 20);
+    REQUIRE(cut.has_value());
+    CHECK(cut->rows.size() == 2);
+    CHECK(cut->byte_cap_hit);
+    auto fit = store.query_bounded("cmd-edge", q, std::nullopt, 21);
+    REQUIRE(fit.has_value());
+    CHECK(fit->rows.size() == 3);
+    CHECK_FALSE(fit->byte_cap_hit);
+
+    // A cap of 0 still serves the first row (progress) and flags the cut.
+    auto zero = store.query_bounded("cmd-edge", q, std::nullopt, 0);
+    REQUIRE(zero.has_value());
+    CHECK(zero->rows.size() == 1);
+    CHECK(zero->byte_cap_hit);
+}
+
+TEST_CASE("ResponseStore query_bounded row_cap_hit is exact not size equals limit",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    for (int i = 0; i < 5; ++i)
+        put_response(store, "cmd-rowcap", "agent-1", 500 + i, 4);
+
+    ResponseQuery q;
+    q.limit = 5; // exactly as many rows as exist: NOT a cut
+    auto exact = store.query_bounded("cmd-rowcap", q, std::nullopt, 1 << 20);
+    REQUIRE(exact.has_value());
+    CHECK(exact->rows.size() == 5);
+    CHECK_FALSE(exact->row_cap_hit);
+    CHECK_FALSE(exact->byte_cap_hit);
+
+    q.limit = 4; // one more row exists beyond the limit: a cut
+    auto cut = store.query_bounded("cmd-rowcap", q, std::nullopt, 1 << 20);
+    REQUIRE(cut.has_value());
+    CHECK(cut->rows.size() == 4);
+    CHECK(cut->row_cap_hit);
+    CHECK_FALSE(cut->byte_cap_hit);
+}
+
+TEST_CASE("ResponseStore query_bounded counts a byte cut only among rows within the limit",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // Four rows of exactly 10 payload bytes. The statement fetches limit + 1 candidates, so
+    // the extra candidate must never be mistaken for a byte-cap casualty.
+    for (int i = 0; i < 4; ++i)
+        put_response(store, "cmd-within", "agent-1", 100 + i, 6, "eeee");
+
+    ResponseQuery q;
+    // limit 2, cap 20: row 2's preceding size is 10 (< 20), kept; the third candidate is past
+    // the limit. Only the row cap fired; an `rn <= limit` guard missing from the cut count
+    // would also report a byte cut here (candidate 3's preceding size is exactly 20).
+    q.limit = 2;
+    auto row_only = store.query_bounded("cmd-within", q, std::nullopt, 20);
+    REQUIRE(row_only.has_value());
+    CHECK(row_only->rows.size() == 2);
+    CHECK(row_only->row_cap_hit);
+    CHECK_FALSE(row_only->byte_cap_hit);
+
+    // limit 3, cap 20: candidate 3 is within the limit but its preceding size (20) is not
+    // below the cap -> dropped (byte cut), and a fourth candidate exists (row cut): both fire.
+    q.limit = 3;
+    auto both = store.query_bounded("cmd-within", q, std::nullopt, 20);
+    REQUIRE(both.has_value());
+    CHECK(both->rows.size() == 2);
+    CHECK(both->row_cap_hit);
+    CHECK(both->byte_cap_hit);
+}
+
+TEST_CASE("ResponseStore query_bounded survives a limit of INT_MAX (limit + 1 does not overflow)",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    for (int i = 0; i < 3; ++i)
+        put_response(store, "cmd-intmax", "agent-1", 100 + i, 4);
+
+    ResponseQuery q;
+    q.limit = std::numeric_limits<int>::max();
+    auto r = store.query_bounded("cmd-intmax", q, std::nullopt, 1 << 20);
+    // nullopt here would be the "integer out of range" degrade the bigint placeholder fixes.
+    REQUIRE(r.has_value());
+    CHECK(r->rows.size() == 3);
+    CHECK_FALSE(r->row_cap_hit);
+    CHECK_FALSE(r->byte_cap_hit);
+}
+
+TEST_CASE("ResponseStore query_bounded reports result_bytes 0 for a zero-row result",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // A different instruction has rows, so a zero here is the "no rows matched" path and
+    // not an empty store.
+    put_response(store, "cmd-other", "agent-1", 100, 16);
+
+    ResponseQuery q;
+    q.limit = 10;
+    auto none = store.query_bounded("cmd-no-rows", q, std::nullopt, 1 << 20);
+    REQUIRE(none.has_value());
+    CHECK(none->rows.empty());
+    CHECK_FALSE(none->row_cap_hit);
+    CHECK_FALSE(none->byte_cap_hit);
+    // A zero-row libpq result still carries its column descriptors; the field is documented
+    // as 0 when no rows came back, so that is what it must report.
+    CHECK(none->result_bytes == 0);
+
+    // The same call with a matching row reports a non-zero size (the field is live).
+    auto one = store.query_bounded("cmd-other", q, std::nullopt, 1 << 20);
+    REQUIRE(one.has_value());
+    CHECK(one->rows.size() == 1);
+    CHECK(one->result_bytes > 0);
+}
+
+TEST_CASE("ResponseStore query_bounded applies scope before the cut and breaks ties by id",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // Interleaved agents, SAME timestamp (the id tiebreak makes the order deterministic).
+    for (int i = 0; i < 6; ++i)
+        put_response(store, "cmd-scope", i % 2 == 0 ? "agent-a" : "agent-b", 777, 100);
+
+    ResponseQuery q;
+    q.limit = 100;
+    // Whole set = 600 bytes, cap 250 would cut it; agent-a's 3 rows (300 bytes) with a
+    // cap of 301 all fit ONLY if the scope is applied before the cut.
+    AggregateScope only_a = std::vector<std::string>{"agent-a"};
+    auto scoped = store.query_bounded("cmd-scope", q, only_a, 301);
+    REQUIRE(scoped.has_value());
+    CHECK(scoped->rows.size() == 3);
+    CHECK_FALSE(scoped->byte_cap_hit);
+    for (const auto& row : scoped->rows)
+        CHECK(row.agent_id == "agent-a");
+    // Same timestamp: strictly decreasing ids.
+    CHECK(scoped->rows[0].id > scoped->rows[1].id);
+    CHECK(scoped->rows[1].id > scoped->rows[2].id);
+
+    // An engaged EMPTY scope is fail-closed: zero rows, never an unfiltered read.
+    AggregateScope none = std::vector<std::string>{};
+    auto empty = store.query_bounded("cmd-scope", q, none, 1 << 20);
+    REQUIRE(empty.has_value());
+    CHECK(empty->rows.empty());
+    CHECK_FALSE(empty->byte_cap_hit);
+    CHECK_FALSE(empty->row_cap_hit);
 }

@@ -241,6 +241,13 @@ void GuardianOutboxDrainWorker::notify() {
 
 void GuardianOutboxDrainWorker::drain_once() { rt_.drain(send_); }
 
+GuardianBaselinePersister::Outcome GuardianOutboxDrainWorker::persist_staged_baselines_once() {
+    if (!maint_.baselines)
+        return {};
+    return maint_.baselines->persist_staged(rt_, GuardianBaselinePersister::Trigger::Worker,
+                                            [this] { return stop_requested(); });
+}
+
 GuardianSparkRuntime::DrainOutcome GuardianOutboxDrainWorker::drain_bounded() {
     GuardianSparkRuntime::DrainLimits limits;
     limits.max_entries = maint_.drain_budget;
@@ -313,12 +320,17 @@ void GuardianOutboxDrainWorker::loop() {
     // it. Nothing here takes the engine mtx_, so running concurrently with the remainder of
     // wire_spark_engine is safe.
     bool skip_wait = true;
+    bool logged_baseline_throw = false; // #4045: log-once latch for the baseline persist firewall
     // #3953 item 3: a LOCAL, not a member (same convention as the timers above) - set
     // after each drain pass, consumed by the wait computation below. Lets loop() poll a
     // stalled-past-kGuardianSendOfferWait send sooner than the full periodic bound,
     // without becoming a wake SOURCE itself (no sig_->gen bump, no notify_all) - see the
     // wait computation's own comment for why that distinction is what keeps R4 sound.
     bool send_in_flight_pending = false;
+    // #4045: the baseline pass yielded to an apply_rules or a fence waiter (or deferred while an
+    // apply_rules was in flight). Nothing wakes the worker when that apply finishes, so the wait
+    // is clamped like send_in_flight_pending (a WAIT clamp, not a wake source).
+    bool baseline_recheck_pending = false;
     // Concurrent arm/disarm traffic can refill the window between the end-of-cycle headroom
     // check and the next page pass, so the immediate re-arm could chain indefinitely - each
     // link a full journal scan. The token bucket does NOT bound that: take() is charged only
@@ -392,7 +404,7 @@ void GuardianOutboxDrainWorker::loop() {
             // loop's own cv.wait_for blocks before re-evaluating its own predicate, so R4
             // (whose sink is fully synchronous - offer() never returns nullopt there, so
             // send_in_flight_pending is always false in that test) is untouched.
-            if (send_in_flight_pending)
+            if (send_in_flight_pending || baseline_recheck_pending)
                 wait_ms = (std::min)(wait_ms, kGuardianSendRecheckInterval);
             sig_->cv.wait_for(lk, wait_ms, [this, seen] {
                 return sig_->stopping.load(std::memory_order_acquire) || sig_->gen != seen;
@@ -520,7 +532,49 @@ void GuardianOutboxDrainWorker::loop() {
 
         if (stop_requested())
             break;
+        // #4045: persist Spark's staged baseline captures ahead of the drain. Its own firewall
+        // and counter (the persister's, not firewalled_drain/journal_maint_exceptions_): a
+        // baseline write failing must neither skip this cycle's outbox drain nor blur the
+        // journal and delivery counters. Cheap when nothing is staged (one registry_mu_ take, no
+        // allocation) and a no-op while the retry backoff after a failed pass has not elapsed:
+        // it is wake-driven, so enqueue churn cannot drive a retry storm. A pass is budgeted
+        // (tuples, failures, wall), so it stalls the outbox drain for at most its wall budget
+        // plus one in-flight KV write. A pass that ran out of budget with captures still staged
+        // and no failure sets `baselines_more`: the loop then runs again without waiting
+        // (below, after the drain, which would otherwise overwrite skip_wait), so a backlog
+        // larger than one budget drains back to back instead of one pass per wake. A pass that
+        // yielded (to an apply_rules or a fence waiter) sets `baseline_recheck_pending`, which
+        // only clamps the next wait to kGuardianSendRecheckInterval (nothing wakes this thread
+        // when the apply finishes, and a clamp is not a wake source). A
+        // capture's compliant-edge enqueue normally wakes this very cycle, so the record
+        // usually lands within milliseconds; see guardian_baseline_persister.hpp LATENCY for
+        // the honest bound.
+        bool baselines_more = false;
+        baseline_recheck_pending = false;
+        try {
+            const auto baseline_pass = persist_staged_baselines_once();
+            baselines_more = baseline_pass.budget_exhausted;
+            baseline_recheck_pending = baseline_pass.yielded;
+        } catch (...) {
+            // Nothing is lost (staging is untouched by a throw); count it on the persister's
+            // aggregate and log only the first THIS WORKER sees: the latch is local, because the
+            // engine's own firewall shares the counter and must not be able to suppress the
+            // worker's only log line.
+            if (maint_.baselines)
+                maint_.baselines->note_firewalled_exception();
+            if (!logged_baseline_throw) {
+                logged_baseline_throw = true;
+                try {
+                    spdlog::error("Guardian drain worker: baseline persist step threw "
+                                  "(firewalled; agent survives, staged captures are retried). "
+                                  "Further occurrences counted only.");
+                } catch (...) {
+                }
+            }
+        }
         const auto drained = firewalled_drain();
+        if (baselines_more && !stop_requested())
+            skip_wait = true; // staged captures remain and nothing failed: go again now
 
         // #3953 item 3: firewalled like every other read in this bare-thread tail (the
         // item-13 seam below models exactly this class of exposure) - a std::system_error

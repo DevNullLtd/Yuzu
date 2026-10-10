@@ -428,7 +428,7 @@ InstructionStore::query_definitions(const InstructionQuery& q) const {
     if (limit <= 0)
         limit = kDefaultListLimit;
     limit = std::min(limit, kMaxListLimit);
-    sql += " ORDER BY name ASC LIMIT $" + std::to_string(++n);
+    sql += " ORDER BY name ASC, id ASC LIMIT $" + std::to_string(++n);
     binds.push_back(std::to_string(limit));
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), binds);
