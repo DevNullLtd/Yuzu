@@ -465,7 +465,12 @@ std::string namespaced_group_name(const std::string& source, const std::string& 
 // ── Construction / teardown ──────────────────────────────────────────────────
 
 RbacStore::RbacStore(pg::PgPool& pool, std::chrono::milliseconds lifecycle_lock_timeout)
-    : pool_(pool), lifecycle_lock_timeout_(lifecycle_lock_timeout) {
+    // Clamped to at least 1 ms: Postgres reads `lock_timeout = 0` as "no bound" (a stuck lock
+    // holder would then pin a pooled connection until the pool's own, much longer, timeout) and a
+    // negative value is a statement error that would fail every guarded write. Production passes
+    // the 2000 ms default; only a test shortens it.
+    : pool_(pool),
+      lifecycle_lock_timeout_(std::max(lifecycle_lock_timeout, std::chrono::milliseconds{1})) {
     auto lease = pool_.acquire();
     if (!lease) {
         spdlog::error("RbacStore: no database connection at construction ({}) — authorization "

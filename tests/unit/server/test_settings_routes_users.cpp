@@ -1287,21 +1287,99 @@ TEST_CASE("SettingsRoutes POST role: with a spare administrator the demotion suc
     CHECK(h.refused_dashboard() == 0.0);
 }
 
-TEST_CASE("SettingsRoutes POST role: an unwired guard answers the retryable 503 shape (#4966)",
+TEST_CASE("SettingsRoutes POST role: a store failure answers a 503 with NO retry hint and says to "
+          "check the role and revoke the sessions (#4966)",
           "[pg][settings][users][lifecycle_guard][storefailure][role]") {
     SettingsAdr2001Harness h;
     h.session_user = "ops";
     REQUIRE(h.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::admin));
-    h.auth_mgr.set_rbac_store(nullptr);
+    h.auth_mgr.set_rbac_store(nullptr); // the fail-closed arm: a StoreFailure with nothing attempted
 
     auto res = h.set_role("carol", "user");
     REQUIRE(res);
     CHECK(res->status == 503);
-    CHECK(res->get_header_value("Retry-After") == "2");
-    CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"] == 2000);
+    // The route cannot tell "nothing committed" from "committed, acknowledgement lost, and the
+    // failure path's durable session wipe failed too", and a repeat in the second case is a 200
+    // no-op that never redoes the wipe: so there is no Retry-After and no retry_after_ms.
+    CHECK(res->get_header_value("Retry-After").empty());
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"].is_null());
+    const auto msg = body["error"]["message"].get<std::string>();
+    CHECK(msg.find("may or may not have been applied") != std::string::npos);
+    CHECK(msg.find("Check the user's role") != std::string::npos);
+    CHECK(msg.find("revoke the user's sessions") != std::string::npos);
+    CHECK(msg.find("Try again") == std::string::npos);
     CHECK(h.has_audit("user.role_change", "failure", "User", "carol"));
     h.auth_mgr.set_rbac_store(h.rbac_guard.get());
     CHECK(h.auth_mgr.get_user_role("carol").value() == auth::Role::admin);
+}
+
+TEST_CASE("SettingsRoutes POST role: a lock-timeout store failure whose durable session wipe also "
+          "fails leaves the durable session, and a repeat after a commit is a no-op (#4966)",
+          "[pg][settings][users][lifecycle_guard][storefailure][role][wipefailed]") {
+    SettingsAdr2001Harness h;
+    h.session_user = "ops";
+    h.use_session_store();
+    // A short lock bound so the guarded write fails after 300 ms instead of 2 s.
+    yuzu::server::RbacStore fast{h.auth_db.pool(), std::chrono::milliseconds(300)};
+    REQUIRE(fast.is_open());
+    struct Restore {
+        SettingsAdr2001Harness& h;
+        ~Restore() { h.auth_mgr.set_rbac_store(h.rbac_guard.get()); }
+    } restore{h};
+    h.auth_mgr.set_rbac_store(&fast);
+    const auto token = h.auth_mgr.create_local_session_for_test("bob", auth::Role::user, false);
+    REQUIRE_FALSE(token.empty());
+
+    const auto durable_sessions_of_bob = [&] {
+        auto lease = h.auth_db.pool().acquire();
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+            lease.get(), "SELECT 1 FROM session_store.sessions WHERE username = 'bob'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return PQntuples(r.get());
+    };
+    REQUIRE(durable_sessions_of_bob() == 1);
+
+    std::unique_ptr<httplib::Response> res;
+    {
+        yuzu::test::HeldLocks hold(h.auth_db.pool());
+        hold.lock_rbac_enabled(); // every guarded lifecycle write queues behind this row
+        h.wipe_fault.arm();       // ... and the failure path's durable wipe cannot succeed either
+        yuzu::test::Workers workers([&] { hold.rollback(); });
+        workers.add([&] { res = h.set_role("bob", "admin"); });
+        workers.join_all();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After").empty());
+    CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"].is_null());
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"].get<std::string>().find(
+              "revoke the user's sessions") != std::string::npos);
+    // What actually holds: nothing committed (a lock timeout), and the DURABLE session SURVIVED
+    // because its wipe failed. The response told the operator to revoke the user's sessions; it
+    // does not claim a retry converges.
+    h.wipe_fault.repair();
+    CHECK(durable_sessions_of_bob() == 1);
+    CHECK(h.auth_mgr.get_user_role("bob").value() == auth::Role::user);
+
+    // The case the no-retry shape exists for: had the change COMMITTED (simulated here by writing
+    // the role directly), the repeat is the 200 "Role unchanged" no-op and does NOT redo the wipe.
+    {
+        auto lease = h.auth_db.pool().acquire();
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+            lease.get(), "UPDATE auth.users SET role = 'admin' WHERE username = 'bob'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    h.auth_mgr.set_rbac_store(h.rbac_guard.get());
+    auto again = h.set_role("bob", "admin");
+    REQUIRE(again);
+    CHECK(again->status == 200);
+    CHECK(h.has_audit("user.role_change", "no_op", "User", "bob"));
+    CHECK(durable_sessions_of_bob() == 1); // still there: the repeat is not a convergence path
 }
 
 TEST_CASE("SettingsRoutes DELETE: a failed durable session wipe after the deactivation is a "
@@ -1310,6 +1388,18 @@ TEST_CASE("SettingsRoutes DELETE: a failed durable session wipe after the deacti
     SettingsAdr2001Harness h;
     h.session_user = "ops";
     h.use_session_store();
+    const auto token = h.auth_mgr.create_local_session_for_test("bob", auth::Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    const auto durable_sessions_of_bob = [&] {
+        auto lease = h.auth_db.pool().acquire();
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+            lease.get(), "SELECT 1 FROM session_store.sessions WHERE username = 'bob'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return PQntuples(r.get());
+    };
+    REQUIRE(durable_sessions_of_bob() == 1);
     h.wipe_fault.arm();
 
     auto res = h.delete_user("bob");
@@ -1326,9 +1416,13 @@ TEST_CASE("SettingsRoutes DELETE: a failed durable session wipe after the deacti
               .starts_with("account_deactivated session_wipe_failed=true"));
     // A repeat once the store is healthy finishes the job and answers 404 (already inactive).
     h.wipe_fault.repair();
+    CHECK(durable_sessions_of_bob() == 1); // the wipe failed: the durable session survived
     auto again = h.delete_user("bob");
     REQUIRE(again);
     CHECK(again->status == 404);
+    // ... and it genuinely finished the job: the durable session is gone now.
+    CHECK(durable_sessions_of_bob() == 0);
+    CHECK_FALSE(h.auth_mgr.validate_session(token).has_value());
 }
 
 TEST_CASE("SettingsRoutes POST role: a failed durable session wipe after the role change is a "

@@ -22,19 +22,25 @@ if either half of that seam regresses:
      `auth_db_sql_helpers.hpp` (`kActiveLocalAdminPredicate`). The count helper, the owner's
      survivor list and the owner's per-target membership read all embed it by name; a second
      literal is a drift the floor cannot tolerate. Also counted: the reversed order
-     (`is_active AND role = 'admin'`), an aliased copy (`u.role = 'admin' AND u.is_active`) and
-     `role IN ('admin')`. A copy that splits the predicate across statements is NOT seen by this
-     textual scan.
+     (`is_active AND role = 'admin'`), an aliased copy (`u.role = 'admin' AND u.is_active`),
+     `role IN ('admin')`, `role <> 'user'` / `role != 'user'`, a parenthesised operand,
+     `lower(role) = 'admin'` and `role = ANY(...admin...)`. A copy that splits the predicate across
+     statements is NOT seen by this textual scan.
   5. An unguarded fixture primitive is called from production code. `AuthDB::remove_user` and
      `AuthDB::update_role` write the soft delete / role column WITHOUT the last-Administrator
      guard (they exist for fixtures; production goes through `AuthManager::remove_user_checked` /
-     `update_role_checked`). No file under server/core/src other than `auth_db.cpp` may call
-     either through a `db` / `auth_db` / `auth_db_` / `auth_db_ptr()` receiver.
+     `update_role_checked`). No file under server/core/src or server/core/include other than
+     `auth_db.cpp` may call either through a receiver whose identifier CONTAINS `db`
+     (`db`, `auth_db_`, `auth_db_ptr()`, `get_db()`, `mydb`, ...) or a parenthesised dereference
+     `(*expr)`. This scans for those receiver SPELLINGS: a call through an alias that does not
+     contain `db` (a reference named `store`, a lambda capture, a function pointer) is not seen.
   6. A statement that decreases the guarded populations is written outside the shared helpers:
-     `UPDATE auth.users SET is_active = FALSE` and `UPDATE auth.users SET role = ...` may appear
-     only in `auth_db_sql_helpers.hpp` (the soft delete and the role write the owner and `AuthDB`
-     share). `SET is_active = TRUE` (reactivation) is deliberately not in scope: it can only
-     GROW the population.
+     an `UPDATE [auth.]users [[AS] alias] SET ...` whose SET list (any column position)
+     assigns `role` or assigns `is_active` to FALSE, 0 or a bound `$n`, and any
+     `DELETE FROM [auth.]users`, may appear only in `auth_db_sql_helpers.hpp` (the soft delete and
+     the role write the owner and `AuthDB` share). `SET is_active = TRUE` (reactivation) is
+     deliberately not in scope: it can only GROW the population. This scans for these statement
+     shapes; SQL assembled from fragments at runtime, or a stored procedure, is not seen.
 
 It scans string literals only (a small tokenizer skips `//` and `/* */` comments), so a doc
 comment cannot trip it. Wired into tests/meson.build (suite 'docs') and docs-lint.yml.
@@ -63,13 +69,22 @@ FOREIGN_RBAC = re.compile(r"\brbac_store\.[A-Za-z_]+", re.IGNORECASE)
 AUTH_PREFIXES = ("server/core/src/auth_db", "server/core/include/yuzu/server/auth_db")
 # Every spelling of "an active local admin" the column floor's population can be written as: the
 # canonical order, the reversed order, an aliased column (`u.role`, `u.is_active`), a redundant
-# `is_active = TRUE`, and a one-element `role IN ('admin')`.
+# `is_active = TRUE`, a one-element `role IN ('admin')`, the negated `role <> 'user'`, optional
+# parentheses around either operand, `lower(role)` and `role = ANY(...)`. ONE combined regex with
+# alternation, so a spelling that two alternatives could both match is counted once.
 _COL = r"(?:\w+\.)?"
+_ROLE = (
+    r"\(?\s*(?:lower\s*\(\s*)?" + _COL + r"role\s*\)?\s*"
+    r"(?:=\s*'admin'|(?:<>|!=)\s*'user'|IN\s*\(\s*'admin'\s*\)|=\s*ANY\s*\([^)]*admin[^)]*\))"
+    r"\s*\)?"
+)
+_ACTIVE = r"\(?\s*" + _COL + r"is_active\b(?:\s*=\s*(?:TRUE|1))?\s*\)?"
 ADMIN_PREDICATES = (
-    re.compile(_COL + r"role\s*=\s*'admin'\s+AND\s+" + _COL + r"is_active\b", re.IGNORECASE),
-    re.compile(_COL + r"is_active\b(?:\s*=\s*(?:TRUE|1))?\s+AND\s+" + _COL + r"role\s*=\s*'admin'",
-               re.IGNORECASE),
-    re.compile(_COL + r"role\s+IN\s*\(\s*'admin'\s*\)", re.IGNORECASE),
+    re.compile(
+        "(?:" + _ROLE + r"\s+AND\s+" + _ACTIVE + "|" + _ACTIVE + r"\s+AND\s+" + _ROLE +
+        r"|" + _COL + r"role\s+IN\s*\(\s*'admin'\s*\))",
+        re.IGNORECASE,
+    ),
 )
 ADMIN_PREDICATE_FILE = "server/core/src/auth_db_sql_helpers.hpp"
 
@@ -78,15 +93,39 @@ def admin_predicate_count(lit: str) -> int:
     return sum(len(p.findall(lit)) for p in ADMIN_PREDICATES)
 
 
-# Rule 5: a production call of an unguarded fixture primitive.
+# Rule 5: a production call of an unguarded fixture primitive. The receiver is any identifier
+# containing `db` (optionally called, `get_db()`), or a parenthesised dereference `(*expr)`.
 UNGUARDED_CALL = re.compile(
-    r"\b(?:auth_db_?|auth_db_ptr\s*\(\s*\)|db)\s*(?:->|\.)\s*(?:remove_user|update_role)\s*\("
+    r"(?:\b\w*db\w*(?:\s*\(\s*\))?|\(\s*\*(?:[^()]|\([^()]*\))*\))\s*(?:->|\.)\s*"
+    r"(?:remove_user|update_role)\s*\(",
+    re.IGNORECASE,
 )
 UNGUARDED_CALL_ALLOWED = ("server/core/src/auth_db.cpp",)
-# Rule 6: a statement that can SHRINK the guarded populations.
-POPULATION_WRITE = re.compile(
-    r"UPDATE\s+auth\.users\s+SET\s+(?:is_active\s*=\s*(?:FALSE|0)\b|role\s*=)", re.IGNORECASE
+UNGUARDED_CALL_ROOTS = ("server/core/src/", "server/core/include/")
+# Rule 6: a statement that can SHRINK the guarded populations. An UPDATE of the users table
+# (qualified or not, with an optional alias) whose SET list assigns `role` or sets `is_active` to
+# FALSE / 0 / a bound parameter, in ANY column position; and any DELETE FROM the users table.
+_UPDATE_USERS = re.compile(
+    r"UPDATE\s+(?:auth\.)?users\b(?:\s+(?:AS\s+)?(?!SET\b)\w+)?\s+SET\s+(?P<set>[^;]*)",
+    re.IGNORECASE,
 )
+_SET_LIST_END = re.compile(r"\b(?:WHERE|FROM|RETURNING)\b", re.IGNORECASE)
+_SHRINKING_ASSIGN = re.compile(
+    r"\b(?:\w+\.)?(?:role\s*=(?!=)|is_active\s*=\s*(?:FALSE\b|0\b|\$\d+))",
+    re.IGNORECASE,
+)
+_DELETE_USERS = re.compile(r"DELETE\s+FROM\s+(?:auth\.)?users\b", re.IGNORECASE)
+
+
+def population_write_count(lit: str) -> int:
+    n = len(_DELETE_USERS.findall(lit))
+    for m in _UPDATE_USERS.finditer(lit):
+        set_list = _SET_LIST_END.split(m.group("set"), maxsplit=1)[0]
+        if _SHRINKING_ASSIGN.search(set_list):
+            n += 1
+    return n
+
+
 POPULATION_WRITE_FILE = "server/core/src/auth_db_sql_helpers.hpp"
 
 
@@ -232,32 +271,67 @@ def _selfcheck() -> None:
         "aliased reversed order": "x WHERE u.is_active AND u.role = 'admin'",
         "one-element IN": "x WHERE role IN ('admin')",
         "aliased one-element IN": "x WHERE u.role IN ( 'admin' )",
+        "negated role": "x WHERE role <> 'user' AND is_active",
+        "negated role (!=) reversed": "x WHERE is_active AND role != 'user'",
+        "parenthesised operands": "x WHERE (role = 'admin') AND (is_active)",
+        "lower(role)": "x WHERE lower(role) = 'admin' AND is_active",
+        "ANY array": "x WHERE role = ANY(ARRAY['admin']) AND is_active",
+        "ANY text array": "x WHERE is_active AND role = ANY('{admin}')",
+        "aliased negated": "x WHERE u.role <> 'user' AND u.is_active",
     }.items():
         if admin_predicate_count(text) != 1:
             raise SystemExit(f"selfcheck: the admin-predicate scan missed: {name}")
     # ... and an unrelated literal is not.
     for text in ("x WHERE role = 'user' AND is_active", "x WHERE role = $1 AND is_active",
-                 "x WHERE is_active AND role = $1", "role IN ('admin', 'user')"):
+                 "x WHERE is_active AND role = $1", "role IN ('admin', 'user')",
+                 "x WHERE role <> 'admin' AND is_active", "x WHERE role <> 'user'"):
         if admin_predicate_count(text) != 0:
             raise SystemExit(f"selfcheck: the admin-predicate scan over-matched: {text!r}")
-    # Rule 5: the unguarded-primitive call scan finds the receivers it names and ignores the
-    # guarded API, comments and fixtures spelled through AuthManager.
+    # Rule 5: the unguarded-primitive call scan finds every receiver spelling it names (any
+    # identifier containing `db`, optionally called; a parenthesised dereference) and ignores the
+    # guarded API, comments and receivers that do not contain `db`.
     for text in ("db->remove_user(u);", "auth_db_->update_role(u, r);", "auth_db.remove_user(u);",
-                 "auth_db_ptr()->update_role(u, r);", "x = db ->  remove_user (u);"):
+                 "auth_db_ptr()->update_role(u, r);", "x = db ->  remove_user (u);",
+                 "mydb->remove_user(u);", "get_db()->update_role(u, r);",
+                 "AuthDB_ref.remove_user(u);", "(*db).remove_user(u);",
+                 "(*mgr->auth_db_ptr()).update_role(u, r);", "(* ptr ).remove_user(u);",
+                 "this->db_handle_.update_role(u, r);", "auth_mgr_->auth_db_ptr()->remove_user(u);"):
         if not UNGUARDED_CALL.search(code(text + "\n")):
             raise SystemExit(f"selfcheck: the unguarded-call scan missed: {text!r}")
     for text in ("auth_mgr_->remove_user_checked(u);", "auth_mgr.update_role_checked(u, r);",
-                 "auth_mgr_->remove_user(u);", "// db->remove_user(u);", "mydb->remove_user(u);"):
+                 "auth_mgr_->remove_user(u);", "// db->remove_user(u);", "store->remove_user(u);",
+                 "db->remove_user_checked(u);", "db->user_exists(u);"):
         if UNGUARDED_CALL.search(code(text + "\n")):
             raise SystemExit(f"selfcheck: the unguarded-call scan over-matched: {text!r}")
-    # Rule 6: a shrinking write is found in a literal, a growing one and a comment are not.
-    if sum(len(POPULATION_WRITE.findall(l)) for l in literals(
-            'a = "UPDATE auth.users SET is_active = FALSE WHERE x"; b = "UPDATE auth.users SET role = $1";\n')) != 2:
-        raise SystemExit("selfcheck: the population-write scan missed a shrinking write")
+    # Rule 6: every shrinking write shape is found in a literal; a growing write, an unrelated
+    # column and a comment are not.
+    shrinking = {
+        "is_active = FALSE": "UPDATE auth.users SET is_active = FALSE WHERE x",
+        "role =": "UPDATE auth.users SET role = $1",
+        "multi-column, role second": "UPDATE auth.users SET last_login_at = now(), role = $2 WHERE x",
+        "multi-column, is_active last": "UPDATE auth.users SET a = 1, is_active = FALSE",
+        "alias with AS": "UPDATE auth.users AS u SET is_active = FALSE WHERE u.username = $1",
+        "alias without AS": "UPDATE auth.users u SET u.role = 'user'",
+        "unqualified users": "UPDATE users SET role = 'user'",
+        "bound is_active": "UPDATE auth.users SET is_active = $2 WHERE username = $1",
+        "is_active = 0": "UPDATE auth.users SET is_active = 0",
+        "DELETE": "DELETE FROM auth.users WHERE username = $1",
+        "unqualified DELETE": "delete from users",
+    }
+    for name, text in shrinking.items():
+        if population_write_count(text) != 1:
+            raise SystemExit(f"selfcheck: the population-write scan missed: {name}")
+    if sum(population_write_count(l) for l in literals(
+            'a = "UPDATE auth.users SET is_active = " "FALSE WHERE x"; b = "UPDATE auth.users SET role = $1";\n')) != 2:
+        raise SystemExit("selfcheck: the population-write scan must see adjacent literals")
     for text in ('a = "UPDATE auth.users SET is_active = TRUE WHERE x";\n',
                  'a = "UPDATE auth.users SET last_login_at = now()";\n',
+                 'a = "UPDATE auth.users SET last_role = $1 WHERE x";\n',
+                 'a = "UPDATE auth.users SET a = 1 WHERE role = \'admin\'";\n',
+                 'a = "UPDATE auth.users SET is_active = TRUE WHERE is_active = FALSE";\n',
+                 'a = "UPDATE auth.user_prefs SET role = $1";\n',
                  '// "UPDATE auth.users SET role = $1"\n'):
-        if any(POPULATION_WRITE.search(l) for l in literals(text)):
+        if any(population_write_count(l) for l in literals(text)):
             raise SystemExit(f"selfcheck: the population-write scan over-matched: {text!r}")
     for text in ("#define " + FRAGMENT + " \"FROM x\"\n",
                  "static const char* " + FRAGMENT + " = \"FROM x\";\n"):
@@ -325,12 +399,11 @@ def main() -> int:
         text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
         for lit in literals(text):
             pred_sites.extend([rel] * admin_predicate_count(lit))
-        if rel.startswith("server/core/src/") and rel not in UNGUARDED_CALL_ALLOWED:
+        if rel.startswith(UNGUARDED_CALL_ROOTS) and rel not in UNGUARDED_CALL_ALLOWED:
             for _ in UNGUARDED_CALL.findall(code(text)):
                 unguarded_calls.append(rel)
         for lit in literals(text):
-            for _ in POPULATION_WRITE.findall(lit):
-                population_writes.append(rel)
+            population_writes.extend([rel] * population_write_count(lit))
     if pred_sites != [ADMIN_PREDICATE_FILE]:
         failures.append(
             "the active-local-admin predicate (role = 'admin' AND is_active) must be exactly one "
@@ -340,12 +413,14 @@ def main() -> int:
     if unguarded_calls:
         failures.append(
             "AuthDB::remove_user / update_role are UNGUARDED fixture primitives; production must "
-            "use AuthManager::remove_user_checked / update_role_checked (#4966). Called from: "
+            "use AuthManager::remove_user_checked / update_role_checked (#4966). Called (through a "
+            "receiver containing `db`, or a `(*...)` dereference) from: "
             f"{sorted(set(unguarded_calls))!r}"
         )
     if population_writes != [POPULATION_WRITE_FILE] * len(population_writes) or not population_writes:
         failures.append(
-            "`UPDATE auth.users SET is_active = FALSE` / `SET role =` may appear only in "
+            "a users-table UPDATE that assigns role / sets is_active to FALSE, 0 or a bound parameter, "
+            "and any DELETE FROM users, may appear only in "
             f"{POPULATION_WRITE_FILE} (the soft delete and role write the owner and AuthDB share); "
             f"found {sorted(set(population_writes))!r} ({len(population_writes)} site(s))"
         )

@@ -230,7 +230,9 @@ public:
     /// (fail-closed, every authz read then DENIES, the right posture for the
     /// authorization substrate). `lifecycle_lock_timeout` bounds the lock waits of the
     /// account-lifecycle guard (#4966); the default is the production value and is a constructor
-    /// parameter, never a mutable member, so it is fixed for the store's lifetime.
+    /// parameter, never a mutable member, so it is fixed for the store's lifetime. A value below
+    /// 1 ms is clamped to 1 ms (0 would disable the bound in Postgres; a negative value is an
+    /// error).
     explicit RbacStore(pg::PgPool& pool, std::chrono::milliseconds lifecycle_lock_timeout =
                                              kDefaultLifecycleLockTimeout);
     ~RbacStore();

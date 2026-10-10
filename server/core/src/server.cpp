@@ -1997,7 +1997,10 @@ public:
                           "administrator, not a store fault - compare against "
                           "yuzu_server_rbac_read_degrade_total to rule that out. A SCIM "
                           "compensation undo the guard refused is NOT counted here (it is not "
-                          "an IdP removal attempt); see yuzu_scim_compensation_failed_total.",
+                          "an IdP removal attempt); see yuzu_scim_compensation_failed_total. "
+                          "Every refusal is counted, including repeats; a Severity::kCritical "
+                          "analytics event accompanies each SCIM refusal (a no-op under "
+                          "--no-analytics; the audit row and this counter still fire).",
                           "counter");
         for (const auto transport : {"rest", "mcp", "dashboard", "scim"})
             metrics_.counter("yuzu_server_rbac_last_admin_guard_refused_total",
@@ -2010,8 +2013,11 @@ public:
         metrics_.describe("yuzu_server_rbac_lifecycle_store_failure_total",
                           "Store faults inside the account-lifecycle last-Administrator guard, "
                           "by operation (deactivate: account removal; set_role: role write; "
-                          "would_strand: the advisory pre-check; grant_read: the SCIM "
-                          "pre-provisioning Administrator-grant read). A sustained non-zero "
+                          "would_strand: the advisory pre-check, after which the request still "
+                          "proceeds to the guarded write; grant_read: the SCIM "
+                          "pre-provisioning Administrator-grant read). The unwired fail-closed "
+                          "arm also counts, for deactivate and set_role only. A sustained "
+                          "non-zero "
                           "rate means deprovisioning or role changes are being answered with a "
                           "retryable error rather than judged: look at yuzu_pg_pool_waiters and "
                           "yuzu_pg_acquire_wait_seconds, and for a stuck rbac_enabled row lock "
@@ -2027,13 +2033,28 @@ public:
                           "created or revived earlier in the same request) that did not "
                           "complete, by outcome (guard_refused_last_administrator: the account "
                           "is left active; deactivated_but_session_wipe_failed: deactivated, a "
-                          "session may survive; store_failure: state indeterminate; other). "
-                          "Every increment needs operator attention: check the account.",
+                          "session may survive; store_failure: state indeterminate). Every "
+                          "increment needs operator attention: check the account. The "
+                          "Severity::kCritical analytics event that accompanies it is a no-op "
+                          "under --no-analytics; the audit row and this counter still fire.",
                           "counter");
         for (const auto outcome : {"guard_refused_last_administrator",
-                                   "deactivated_but_session_wipe_failed", "store_failure",
-                                   "other"})
+                                   "deactivated_but_session_wipe_failed", "store_failure"})
             metrics_.counter("yuzu_scim_compensation_failed_total", {{"outcome", outcome}});
+        // #4966: SCIM Group role-recompute members that were NOT attempted after a store failure
+        // earlier in the same request. Only promotions are ever skipped (the fail-safe direction):
+        // the demotion series exists so its zero is visible and stays seeded as evidence.
+        metrics_.describe("yuzu_scim_group_recompute_skipped_total",
+                          "SCIM Group role-recompute members skipped after the first store "
+                          "failure of a request, by direction. Only promotions are skipped; "
+                          "demotions are always attempted, so direction=demotion should stay 0. "
+                          "Each increment is recorded by one scim.group.recompute_incomplete "
+                          "audit row listing the skipped users; they are repaired by the next "
+                          "Group operation that names them or a User re-provision.",
+                          "counter");
+        for (const auto direction : {"promotion", "demotion"})
+            metrics_.counter("yuzu_scim_group_recompute_skipped_total",
+                             {{"direction", direction}});
         // #2703 Gate 7 merge-slice item 1 commit C. Neither metric duplicates the
         // existing shared-pool signals (yuzu_pg_acquire_wait_seconds,
         // yuzu_pg_pool_in_use — both already cover every RbacStore acquire, since

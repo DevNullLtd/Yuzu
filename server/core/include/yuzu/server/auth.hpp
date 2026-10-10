@@ -571,7 +571,11 @@ enum class UpdateRoleOutcome : std::uint8_t {
     InactivePromotionRefused, ///< an inactive account cannot be made an admin; NOTHING changed
     StoreFailure,             ///< as `RemoveUserOutcome::StoreFailure`
     UpdatedSessionWipeFailed, ///< the role IS changed (committed) but the durable session wipe
-                              ///< failed, so a session at the old role may survive: retry
+                              ///< failed, so a session at the old role may survive. A repeated
+                              ///< `update_role_checked` re-runs the wipe, but the dashboard role
+                              ///< route answers an unchanged role with a 200 no-op BEFORE calling
+                              ///< it, so that route offers no retry: the operator revokes the
+                              ///< sessions
 };
 
 class AuthManager {
@@ -979,7 +983,10 @@ public:
     /// Change a user's role. Uses AuthDB if available (through the #4966 guarded owner write,
     /// same ordering and `mu_` rule as `remove_user_checked`), otherwise updates in-memory +
     /// config. The cache entry and sessions are refreshed after the commit, also when the row
-    /// already held the requested role, so a retry converges after a failed wipe.
+    /// already held the requested role, so a repeated CALL of this function re-runs a failed
+    /// wipe. That does not make a route-level retry safe: the dashboard role route returns a
+    /// 200 no-op for an unchanged role before it reaches here, and a retry after a lost COMMIT
+    /// acknowledgement is not promised to converge.
     [[nodiscard]] UpdateRoleOutcome update_role_checked(const std::string& username, Role new_role);
 
     /// Bool wrapper over `update_role_checked` (GUARDED: it delegates). It has no production

@@ -151,8 +151,9 @@ void respond_lifecycle_store_unavailable(httplib::Response& res, std::string_vie
                     "application/json");
 }
 
-// #4966: the answer for "the change COMMITTED but the durable session wipe failed" on the role
-// route. A plain 503 with NO retry hint (no `Retry-After`, no `retry_after_ms`): a repeat of the
+// #4966: the answer for "the change COMMITTED but the durable session wipe failed" AND for the
+// role route's indeterminate StoreFailure (the commit may have been acknowledged-lost and the
+// failure path's wipe may have failed). A plain 503 with NO retry hint (no `Retry-After`, no `retry_after_ms`): a repeat of the
 // role POST finds the role already set and answers 200 "Role unchanged" WITHOUT redoing the wipe,
 // so telling a client to retry would promise a convergence the route does not provide. The
 // operator finishes it by revoking the user's sessions.
@@ -5503,8 +5504,15 @@ void SettingsRoutes::register_routes(
             spdlog::error("Failed to update role for '{}'", target_username);
             audit_fn_(req, "user.role_change", "failure", "User", target_username,
                       "store_failure");
-            respond_lifecycle_store_unavailable(
-                res, "Role store unavailable; the change may not have completed. Try again");
+            // The owner outcome does not distinguish "nothing committed" from "committed but the
+            // commit acknowledgement was lost", and the failure path's durable session wipe may
+            // itself have failed. A repeat of this POST would then find the role already set and
+            // answer 200 "Role unchanged" WITHOUT redoing the wipe, so no retry is promised:
+            // the operator checks the role and revokes the sessions.
+            respond_committed_no_retry(
+                res,
+                "Role store unavailable; the change may or may not have been applied. Check the "
+                "user's role and revoke the user's sessions");
             return;
         }
 

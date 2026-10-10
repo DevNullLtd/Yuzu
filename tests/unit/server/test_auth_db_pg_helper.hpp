@@ -169,7 +169,7 @@ public:
     /// the fixture clones. A fixture that ALSO constructs an `RbacStore` on the same pool passes
     /// `&auth_db_rbac_pg_template` (test_auth_db_rbac_pg_template.hpp) so the clone already carries
     /// the migrated, seeded `rbac_store` schema instead of re-running its four migrations and
-    /// default seeding per test (#4966, measured in the fix-round report).
+    /// default seeding per test (#4966).
     explicit AuthDbPg(int cleanup_interval_secs = 0, bool inject_encrypt_faults = false,
                       PgTestTemplate* tpl = nullptr)
         : cleanup_interval_secs_(cleanup_interval_secs) {

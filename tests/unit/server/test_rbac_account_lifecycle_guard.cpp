@@ -541,6 +541,41 @@ TEST_CASE("lifecycle guard: a lock wait that expires is reported as a store fail
     CHECK(store.deactivate_account("to_a").kind == DKind::kDeactivated);
 }
 
+TEST_CASE("lifecycle guard: a lifecycle lock timeout below 1 ms is clamped to 1 ms, so zero does "
+          "not disable the bound and a negative value does not fail every write",
+          "[pg][auth_db][lifecycle_guard]") {
+    LIFECYCLE_FIXTURE(seeding_store, auth_db);
+    build_world(auth_db, seeding_store, /*rbac_on=*/false,
+                {{"cl_a", Role::admin}, {"cl_b", Role::admin}, {"cl_c", Role::admin}});
+
+    SECTION("zero: a held lock fails fast instead of waiting on the pool's own, longer, bound") {
+        RbacStore store{auth_db.pool(), std::chrono::milliseconds(0)};
+        REQUIRE(store.is_open());
+        HeldLocks hold(auth_db.pool());
+        hold.lock_rbac_enabled();
+        AccountDeactivationResult dres;
+        std::chrono::milliseconds elapsed{0};
+        Workers workers([&] { hold.rollback(); });
+        workers.add([&] {
+            const auto t0 = std::chrono::steady_clock::now();
+            dres = store.deactivate_account("cl_a");
+            elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0);
+        });
+        workers.join_all();
+        CHECK(dres.kind == DKind::kStoreFailure);
+        // Unclamped, lock_timeout=0 waits for the pool's 10 s statement bound; clamped, it is 1 ms.
+        CHECK(elapsed < std::chrono::milliseconds(3000));
+        CHECK(account_active(auth_db.pool(), "cl_a"));
+    }
+    SECTION("negative: the write still works (an unclamped negative value is a statement error)") {
+        RbacStore store{auth_db.pool(), std::chrono::milliseconds(-5)};
+        REQUIRE(store.is_open());
+        CHECK(store.deactivate_account("cl_b").kind == DKind::kDeactivated);
+        CHECK_FALSE(account_active(auth_db.pool(), "cl_b"));
+    }
+}
+
 TEST_CASE("lifecycle guard: a connection lost mid-transaction rolls back cleanly as a store failure",
           "[pg][auth_db][lifecycle_guard]") {
     LIFECYCLE_FIXTURE(store, auth_db);
