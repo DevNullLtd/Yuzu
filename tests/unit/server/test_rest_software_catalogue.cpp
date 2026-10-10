@@ -1029,6 +1029,12 @@ TEST_CASE("catalogue: a never-built rollup is a 503 'being built' on the CSV exp
         auto host = h.sink.Get(csv_url + "&agent_id=d1");
         REQUIRE(host);
         CHECK(host->status == 200);
+        // The per-device export's newest_version cell reads the rollup: blank until first refresh.
+        const auto row_start = host->body.find('\n');
+        REQUIRE(row_start != std::string::npos);
+        const auto row_end = host->body.find('\n', row_start + 1);
+        REQUIRE(row_end != std::string::npos);
+        CHECK(host->body[row_end - 1] == ',');
         auto page = h.sink.Get(kCat);
         REQUIRE(page);
         CHECK(page->status == 200);

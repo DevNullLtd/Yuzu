@@ -558,7 +558,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
    - **2026-10-07 — software title catalogue REST routes
      (`GET /api/v1/inventory/software/catalogue`,
      `GET /api/v1/inventory/software/catalogue/versions`, M.9 PR-2a).**
-     REST-only for now, no MCP twin yet - a "no" on Decision 1/4's
+     REST-only for now, no MCP twin yet — a "no" on Decision 1/4's
      both-surfaces requirement. Recorded rather than fixed pre-merge because:
      - **A build-order gap, not a boundary.** The catalogue read surface
        (shared pure model, totals, cursors, CSV export) lands first so the
@@ -568,12 +568,15 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        export is REST-only by design (a download, not a structured tool
        result).
      - **Tracked by the open P1 issue #3988** ("Inventory catalogue-grain
-       read ... has no REST/MCP twin"); PR-2b is the closing change.
+       read ... has no REST/MCP twin"); PR-2b closes the MCP-twin half only;
+       #3988's confinement criterion is superseded by the refuse-to-confined
+       ruling, so the issue's disposition is a decision, not this PR's merge.
        **Revisit by 2026-11-07**; until the MCP tools merge, the parity
        ledger rows for these routes read `twinned` with `mcp_twin: null`.
      - **The exception relaxes no control.** The fleet view is gated on a
-       global `Inventory:Read` (the per-device view is admitted in scope), deny service-scoped tokens, audit every
-       served page or file, and answer a degraded read with `503`, never an
+       global `Inventory:Read` (the per-device view is admitted in scope),
+       denies service-scoped tokens, audits every
+       served page or file, and answers a degraded read with `503`, never an
        empty `200`; wire reference: `docs/user-manual/rest-api.md`.
 
 ## Interim rules (until the named follow-ups ship)
