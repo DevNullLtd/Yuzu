@@ -460,8 +460,8 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview: an over-bound valu
     CHECK(res->body.find(over) == std::string::npos);
 }
 
-// A NUL or invalid UTF-8 byte in a filter can never equal a stored value (ingest rewrites each
-// to U+FFFD), and a NUL is C-string-truncated by the libpq bind, so `short%00zzz` used to
+// A NUL, line feed or invalid UTF-8 byte in a filter can never equal a stored value (ingest
+// rewrites each NUL / bad byte to U+FFFD and splits on every LF), and a NUL is C-string-truncated by the libpq bind, so `short%00zzz` used to
 // match the rows of `short` and be reported as an exact count. Refused like an over-bound
 // value, before any store access (the harness store is nullptr: 503 would mean it was reached).
 TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a NUL or invalid UTF-8 filter "
@@ -478,6 +478,9 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a NUL or invalid U
         "name=%ED%A0%80",                  // surrogate U+D800
         "name=ok%C3",                      // truncated multibyte at the end
         "no_such_column=short%00zzz",      // under an unrecognised key too
+        "name=a%0Ab",                      // line feed: ingest splits on it, never stored
+        "name=%0A",                        // line feed as the only content
+        "no_such_column=a%0Ab",            // line feed under an unrecognised key too
     };
     for (const auto& q : bad_queries) {
         INFO(q);
@@ -488,6 +491,8 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a NUL or invalid U
         CHECK(body["error"]["code"].get<int>() == 400);
         CHECK(body["error"]["retry_after_ms"].is_null()); // non-retryable
         CHECK(body["error"]["message"].get<std::string>().find("NUL") != std::string::npos);
+        CHECK(body["error"]["message"].get<std::string>().find("line break") !=
+              std::string::npos);
         CHECK(body["error"].contains("remediation"));
     }
     // 683 NULs (percent-encoded): under the raw bound, 2049 bytes once ingest widens them.

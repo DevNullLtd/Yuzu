@@ -452,8 +452,8 @@ TEST_CASE("/fragments/results: a filter value over the facet bound is refused, n
     check_results_chrome_cleared(res->body);
 }
 
-// A NUL or invalid UTF-8 byte in a filter value can never equal a stored value (ingest rewrites
-// each to U+FFFD), and a NUL is C-string-truncated by the libpq bind, which matched the prefix
+// A NUL, line feed or invalid UTF-8 byte in a filter value can never equal a stored value
+// (ingest rewrites each NUL / bad byte to U+FFFD and splits on every LF), and a NUL is C-string-truncated by the libpq bind, which matched the prefix
 // (`short%00zzz` showed the rows of `short`). Refused like an over-bound value, before any
 // store access (the store is nullptr: "Response store not available" would mean it was reached).
 TEST_CASE("/fragments/results: a filter value with a NUL or invalid UTF-8 is refused, not "
@@ -470,14 +470,15 @@ TEST_CASE("/fragments/results: a filter value with a NUL or invalid UTF-8 is ref
         nuls += "%00";
     for (const std::string& value : {std::string("short%00zzz"), std::string("%00"), nuls,
                                     std::string("%FF"), std::string("%C0%80"),
-                                    std::string("%ED%A0%80"), std::string("ok%C3")}) {
+                                    std::string("%ED%A0%80"), std::string("ok%C3"),
+                                    std::string("a%0Ab")}) {
         INFO(value.substr(0, 40));
         auto res = h.get("/fragments/results?command_id=cmd-nul-1&plugin=registry&f_output=" +
                           value);
         REQUIRE(res);
         CHECK(res->status == 200);
         CHECK(contains(res->body, "data-filter-refused=\"true\""));
-        CHECK(contains(res->body, "NUL byte or invalid UTF-8"));
+        CHECK(contains(res->body, "NUL byte, a line break or invalid UTF-8"));
         CHECK_FALSE(contains(res->body, "Response store not available"));
         check_results_chrome_cleared(res->body);
     }

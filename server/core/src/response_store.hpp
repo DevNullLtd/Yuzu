@@ -83,16 +83,17 @@ inline constexpr std::size_t kMaxFacetValueBytes = 2048;
 /// Reader-side twin of the ingest exclusion above. A facet filter value that can never
 /// equal a stored facet value matches no agent, so a reader that ran it would report an
 /// exact "0 agents" (or, for a NUL, a silent PREFIX match) for a filter it cannot
-/// evaluate. The causes below are the set this predicate REFUSES, not everything that can
-/// never match: a value with a LF, or a trailing CR, can never be stored either (ingest
-/// splits the output on '\n' and drops a trailing '\r' from each line) and is deliberately
-/// NOT refused, because the reader's exact 0 for it is a true zero (nothing stored can
-/// match), not a filter it failed to evaluate. A refused value is one that is:
+/// evaluate. A refused value is one that is:
 ///   - over `kMaxFacetValueBytes` (never stored: see above); or
 ///   - containing a NUL byte, or not valid UTF-8 (ingest runs the text through
 ///     `sanitize_pg_text`, which rewrites each such byte to the 3-byte U+FFFD, so a stored
 ///     value never contains one; the libpq bind would also C-string-truncate a NUL and
-///     match the prefix as if it were the whole value).
+///     match the prefix as if it were the whole value); or
+///   - containing a line feed ('\n'): ingest splits the output on '\n' (`split_output_lines`,
+///     result_parsing.hpp) before any value is taken, so no stored value can contain one.
+/// A CR is deliberately NOT refused: a CR inside a value IS storable (only a trailing CR
+/// of a line's LAST column is stripped), and this predicate judges one value at a time, so
+/// it cannot know the value's column position.
 /// The length is compared to the same bound ingest applies (to the sanitized form, which
 /// for a value passing the other two tests is the raw form). Every reader that builds a
 /// `FacetFilter` from caller input refuses the request when this is true, and never drops
@@ -104,19 +105,22 @@ inline constexpr std::size_t kMaxFacetValueBytes = 2048;
         return true;
     if (v.find('\0') != std::string_view::npos)
         return true;
+    // A LF can never be stored: ingest splits the output on '\n' before taking any value.
+    if (v.find('\n') != std::string_view::npos)
+        return true;
     // A rewritten byte grows 1 -> 3, so the scrubbed copy has the same size iff the input
     // was already valid.
     return sanitize_utf8_strict(v).size() != v.size();
 }
 
-/// Caller-facing text for the refusal above. Names both causes, never echoes the value.
+/// Caller-facing text for the refusal above. Names all the causes, never echoes the value.
 /// Sentence case, so the dashboard can join message + ". " + remediation + "." and read
 /// correctly; the REST and MCP envelopes carry the same two strings in their own fields.
 [[nodiscard]] inline std::string facet_filter_value_refusal_message() {
     return std::format("A filter value cannot be matched: it is longer than {} bytes (longer "
-                       "facet values are not indexed), or it contains a NUL byte or invalid "
-                       "UTF-8 (ingest replaces those bytes, so stored text never has them); "
-                       "no agent can match such a filter",
+                       "facet values are not indexed), or it contains a NUL byte, a line break "
+                       "or invalid UTF-8 (ingest replaces or splits on those, so stored text "
+                       "never has them); no agent can match such a filter",
                        kMaxFacetValueBytes);
 }
 
@@ -126,7 +130,7 @@ inline constexpr std::size_t kMaxFacetValueBytes = 2048;
 [[nodiscard]] inline std::string facet_filter_value_refusal_remediation() {
     return std::format("Remove or change that filter (or the response template's default "
                        "filter value), or use a valid UTF-8 value of at most {} bytes with no "
-                       "NUL byte; the request was not evaluated",
+                       "NUL byte and no line break; the request was not evaluated",
                        kMaxFacetValueBytes);
 }
 
@@ -205,7 +209,7 @@ struct FacetFilter {
 };
 
 /// True when any filter value is unmatchable (see `facet_filter_value_unmatchable`: over
-/// `kMaxFacetValueBytes`, or a NUL / invalid UTF-8): the request must be refused, not
+/// `kMaxFacetValueBytes`, or a NUL / line feed / invalid UTF-8): the request must be refused, not
 /// evaluated.
 [[nodiscard]] inline bool any_facet_filter_unmatchable(const std::vector<FacetFilter>& filters) {
     for (const auto& f : filters)

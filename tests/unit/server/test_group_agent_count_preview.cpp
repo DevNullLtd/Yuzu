@@ -143,14 +143,15 @@ TEST_CASE("facet_filter_value_unmatchable: valid UTF-8 (incl. multibyte) is matc
     CHECK_FALSE(facet_filter_value_unmatchable("\xE0\xA0\x80"));   // U+0800
     CHECK_FALSE(facet_filter_value_unmatchable("\xED\x9F\xBF"));   // U+D7FF
     CHECK_FALSE(facet_filter_value_unmatchable("\xF0\x90\x80\x80")); // U+10000
-    // CR and LF are ACCEPTED even though a stored value can never contain either: ingest
-    // splits the output on '\n' and drops a trailing '\r' from each line, so no facet value
-    // has a LF or a trailing CR. The predicate lists only the causes it refuses; a filter on
-    // such a value is evaluated and its exact 0 is a true zero (nothing stored can match).
+    // CR is ACCEPTED: a CR inside a value IS storable (only a trailing CR of a line's last
+    // column is stripped, and the predicate judges one value without its column position).
     CHECK_FALSE(facet_filter_value_unmatchable("a\rb"));
     CHECK_FALSE(facet_filter_value_unmatchable("a\r"));
-    CHECK_FALSE(facet_filter_value_unmatchable("a\nb"));
-    CHECK_FALSE(facet_filter_value_unmatchable("\n"));
+    // LF is REFUSED: ingest splits the output on '\n' before taking any value, so no stored
+    // value can contain one (see the store roundtrip in test_response_store.cpp).
+    CHECK(facet_filter_value_unmatchable("a\nb"));
+    CHECK(facet_filter_value_unmatchable("\n"));
+    CHECK(facet_filter_value_unmatchable("tail\n"));
     // A valid multibyte value of EXACTLY 2048 bytes is accepted: 1024 x U+00E9 (2 bytes
     // each), and 682 x U+20AC (3 bytes) + 2 ASCII = 2048.
     std::string two_byte;
@@ -189,14 +190,17 @@ TEST_CASE("any_facet_filter_unmatchable: one over-bound value among valid ones r
     // A NUL / invalid UTF-8 value refuses just like an over-bound one, in any position.
     CHECK(any_facet_filter_unmatchable({{0, "x"}, {1, std::string("a\0b", 3)}}));
     CHECK(any_facet_filter_unmatchable({{0, "\xFF"}, {1, "y"}}));
+    CHECK(any_facet_filter_unmatchable({{0, "x"}, {1, "a\nb"}}));
 }
 
-TEST_CASE("facet filter refusal text names both causes and takes no value", "[server][devices]") {
+TEST_CASE("facet filter refusal text names every cause and takes no value", "[server][devices]") {
     CHECK(facet_filter_value_refusal_message().find("2048 bytes") != std::string::npos);
     CHECK(facet_filter_value_refusal_message().find("NUL") != std::string::npos);
+    CHECK(facet_filter_value_refusal_message().find("line break") != std::string::npos);
     CHECK(facet_filter_value_refusal_message().find("UTF-8") != std::string::npos);
     CHECK(facet_filter_value_refusal_remediation().find("2048 bytes") != std::string::npos);
     CHECK(facet_filter_value_refusal_remediation().find("NUL") != std::string::npos);
+    CHECK(facet_filter_value_refusal_remediation().find("line break") != std::string::npos);
 }
 
 // The dashboard shows "<message>. <remediation>." as visible text, so both halves must start

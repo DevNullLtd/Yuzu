@@ -2190,9 +2190,11 @@ TEST_CASE("ResponseStore: facet_agent_count and facet_line_count distinguish deg
 //     equals its sanitized form, so the reader compares what ingest stored.
 //   - A value the predicate REFUSES must not be stored as itself (ingest rewrote it, or never
 //     stored it), which is the mismatch the refusal exists to prevent.
-// LF and a trailing CR are deliberately NOT refused by the predicate: ingest splits the output
-// on '\n' and drops a trailing '\r' from each line, so a stored value can never contain either
-// and the readers' exact 0 for such a filter is a true zero. The last section asserts that.
+// A LF is REFUSED by the predicate: ingest splits the output on '\n' before taking any value,
+// so a stored value can never contain one. A CR is deliberately NOT refused (a CR inside a value
+// is storable, and a trailing CR of the last column is stripped, a per-column fact the
+// per-value predicate cannot see); the readers' exact 0 for a trailing-CR filter is a true
+// zero. The last section asserts both.
 TEST_CASE("ResponseStore: the facet filter predicate agrees with what ingest stores",
           "[pg][response_store][facets]") {
     using namespace std::string_literals;
@@ -2287,8 +2289,9 @@ TEST_CASE("ResponseStore: the facet filter predicate agrees with what ingest sto
         CHECK(stored_col1(probe) == std::vector<std::string>{"a\xEF\xBF\xBD" "b"});
     }
 
-    // LF and a trailing CR: accepted by the predicate, never stored, true zero.
-    CHECK_FALSE(facet_filter_value_unmatchable("a\nb"));
+    // LF: refused by the predicate (never stored). Trailing CR: accepted, never stored, true
+    // zero.
+    CHECK(facet_filter_value_unmatchable("a\nb"));
     CHECK_FALSE(facet_filter_value_unmatchable("d\r"));
     StoredResponse lines;
     lines.instruction_id = "cmd-facet-rt-lf";
@@ -2306,9 +2309,6 @@ TEST_CASE("ResponseStore: the facet filter predicate agrees with what ingest sto
             CHECK(fv.value.find('\r') == std::string::npos);
         }
     }
-    auto lf_count = store.facet_agent_count(lines.instruction_id, {FacetFilter{1, "a\nb"}});
-    REQUIRE(lf_count.has_value());
-    CHECK(*lf_count == 0);
     auto cr_count = store.facet_agent_count(lines.instruction_id, {FacetFilter{3, "d\r"}});
     REQUIRE(cr_count.has_value());
     CHECK(*cr_count == 0);
