@@ -595,6 +595,7 @@ TEST_CASE("route: list fragment — roster read failure renders the roster-unava
     REQUIRE_FALSE(h.audits.empty());
     REQUIRE(h.audits.back() == "inventory.devices|failure");
     REQUIRE(contains(h.audit_details.back(), "roster read failed"));
+    REQUIRE_FALSE(res->has_header("Sec-Audit-Failed")); // control: audit persisted
 
     auto ro = h.sink.Get("/fragments/hardware/list?results_only=1&q=abc");
     REQUIRE(ro);
@@ -606,6 +607,21 @@ TEST_CASE("route: list fragment — roster read failure renders the roster-unava
     auto bad = h.sink.Get("/fragments/hardware/list?sort=bogus");
     REQUIRE(bad);
     REQUIRE(bad->status == 400);
+}
+
+// Kills: reverting the list fragment's roster-failure audit to try_persist_audit (drops the
+// Sec-Audit-Failed signal when the audit store is also degraded).
+TEST_CASE("route: list fragment — roster failure with a degraded audit store keeps the banner and "
+          "sets Sec-Audit-Failed",
+          "[hardware][route][security]") {
+    HwHarness h;
+    h.roster_degraded = true;
+    h.audit_should_fail = true;
+    auto res = h.sink.Get("/fragments/hardware/list?q=abc");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(contains(res->body, "Hardware roster unavailable"));
+    REQUIRE(res->get_header_value("Sec-Audit-Failed") == "true");
 }
 
 // Kills: dropping the roster_degraded guard in the REST list (200 with an empty data page).
@@ -623,6 +639,21 @@ TEST_CASE("route: GET /api/v1/hardware — roster read failure is 503 with retry
         REQUIRE_FALSE(body.contains("data"));
         REQUIRE_FALSE(h.audits.empty());
         REQUIRE(h.audits.back() == "inventory.devices|failure");
+        REQUIRE_FALSE(res->has_header("Sec-Audit-Failed")); // control: audit persisted
+    }
+    {
+        // Kills: reverting the swap to try_persist_audit — a degraded audit store must still
+        // surface Sec-Audit-Failed on top of the unchanged 503.
+        HwHarness h;
+        h.roster_degraded = true;
+        h.audit_should_fail = true;
+        auto res = h.sink.Get("/api/v1/hardware");
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body["error"]["retry_after_ms"].get<int>() == 5000);
+        REQUIRE(res->get_header_value("Sec-Audit-Failed") == "true");
     }
     {
         // Empty is not failed.
@@ -687,6 +718,18 @@ TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with nothing e
         REQUIRE(body["error"]["retry_after_ms"].get<int>() == 5000);
         REQUIRE_FALSE(h.audits.empty());
         REQUIRE(h.audits.back() == "inventory.device.ci|failure");
+        REQUIRE_FALSE(res->has_header("Sec-Audit-Failed")); // control: audit persisted
+    }
+    {
+        // Kills: reverting the swap to try_persist_audit — a degraded audit store must still
+        // surface Sec-Audit-Failed on top of the unchanged 503.
+        HwHarness h;
+        h.ci_detail = degraded_identity_detail(false);
+        h.audit_should_fail = true;
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+        REQUIRE(res->get_header_value("Sec-Audit-Failed") == "true");
     }
     {
         HwHarness h;
