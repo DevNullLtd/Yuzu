@@ -10018,17 +10018,19 @@ McpServer::HandlerFn McpServer::build_handler(
                         raw_fields.emplace_back(key, value.get<std::string>());
                     }
                 }
-                auto filters = resolve_group_preview_filters(plugin, raw_fields);
 
                 // A value over kMaxFacetValueBytes was never indexed and matches no agent:
                 // refuse (non-retryable) rather than answer an exact 0 (#5623). Same
-                // check, bound and text as the REST twin; the value is never echoed.
-                if (any_facet_filter_exceeds_bound(filters)) {
+                // check, bound and text as the REST twin, on the RAW values before key
+                // resolution (an unknown key is skipped by the resolver); the value is
+                // never echoed.
+                if (any_raw_filter_value_exceeds_bound(raw_fields)) {
                     res.set_content(a4_error(kInvalidParams, facet_filter_value_bound_message(),
                                              facet_filter_value_bound_remediation()),
                                     "application/json");
                     return;
                 }
+                auto filters = resolve_group_preview_filters(plugin, raw_fields);
 
                 // Elevated -> nullopt (JIT full-fleet view), else the D3
                 // resolver — mirrors DashboardRoutes::resolve_visible_scope

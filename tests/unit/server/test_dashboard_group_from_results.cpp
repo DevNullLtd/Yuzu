@@ -607,6 +607,9 @@ TEST_CASE("create-group-form: a filter value exactly at the facet bound is previ
     CHECK(res->status == 200);
     CHECK_FALSE(contains(res->body, "data-filter-refused"));
     CHECK(contains(res->body, "1 agent will be added"));
+    // Positive control for the == 0 assertions above: the counter does move on an accepted
+    // request, so a dead counter cannot make those pass.
+    CHECK(h.visible_set_fn_calls > 0);
 }
 
 TEST_CASE("group-from-results: a filter value over the facet bound is refused and creates "
@@ -646,4 +649,5 @@ TEST_CASE("group-from-results: a filter value exactly at the facet bound builds 
     auto group = h.mg.find_group_by_name("at-bound-group");
     REQUIRE(group.has_value());
     CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
+    CHECK(h.visible_set_fn_calls > 0); // positive control for the == 0 refusal case above
 }

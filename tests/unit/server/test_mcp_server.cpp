@@ -20573,6 +20573,26 @@ TEST_CASE("MCP preview_management_group_agent_count: a filter value over the fac
     CHECK(res->body.find(over) == std::string::npos); // the value is never echoed
 }
 
+TEST_CASE("MCP preview_management_group_agent_count: an over-bound value under an unrecognised "
+          "key is refused with -32602, not answered as 0",
+          "[mcp][devices][security]") {
+    McpTestServer ts;
+    ts.start();
+    const std::string over(2049, 'a');
+    const std::string body =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":98,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch",)"
+        R"("filters":{"no_such_column":")" +
+        over + R"("}}}})";
+    auto res = ts.call(body);
+    REQUIRE(res->status == 200);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK(envelope["error"]["code"].get<int>() == -32602);
+    CHECK(res->body.find(over) == std::string::npos);
+}
+
 TEST_CASE("MCP preview_management_group_agent_count: a filter value exactly at the facet bound "
           "is accepted (reaches the store, degrades when unwired)",
           "[mcp][devices]") {

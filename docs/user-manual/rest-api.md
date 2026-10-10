@@ -832,9 +832,11 @@ filter criteria, before creating it (#4033, #2146 API-parity Batch A). REST/MCP/
 twin of `/fragments/create-group-form`'s own live count. This route and its MCP twin call the same
 shared builder (`group_agent_count_preview.hpp`), so those two cannot drift from each other; the
 dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation
-(`DashboardRoutes::parse_filters`), unchanged by this PR — the number it shows and this route's
-`agent_count` are expected to agree today, but are not structurally guaranteed to. MCP twin:
-`preview_management_group_agent_count`.
+(`DashboardRoutes::parse_filters`) — the number it shows and this route's `agent_count` are
+expected to agree today, but are not structurally guaranteed to. The fragment also refuses a
+filter value over 2048 bytes, but answers HTTP 200 with a `data-filter-refused` marker in the
+returned HTML (htmx drops 4xx swaps), where this route answers `400` and the MCP twin `-32602`.
+MCP twin: `preview_management_group_agent_count`.
 
 **Permission:** `ManagementGroup:Write` — matching the fragment's own gate exactly (only an
 operator who could create the group may preview it), **not** `ManagementGroup:Read`, even though
@@ -851,10 +853,11 @@ this route performs no mutation.
 An empty filter set (no recognised filter keys supplied) returns a genuine `0` — no scoped count
 to report, and no store read is made.
 
-A filter value longer than 2,048 bytes is refused with `400` (A4 envelope, `retry_after_ms: null`,
+A filter value longer than 2048 bytes is refused with `400` (A4 envelope, `retry_after_ms: null`,
 not retryable) before any store read: the response store never indexes a facet value over that
 length, so such a filter could only ever answer a misleading `0`. The message names the bound and
-does not echo the value.
+does not echo the value. The check applies to every filter value before its key is matched to a
+column, so it also refuses an over-long value under an unrecognised key.
 
 **Response:**
 

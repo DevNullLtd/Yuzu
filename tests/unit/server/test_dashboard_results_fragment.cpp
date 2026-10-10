@@ -38,6 +38,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <string>
 #include <unordered_set>
 
@@ -56,6 +58,14 @@ yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::stri
         throw std::runtime_error("responsestore template: store failed to migrate");
 }};
 
+// InstructionStore is a migrated Postgres store (ADR-0058).
+yuzu::test::PgTestTemplate fragment_instr_tpl{"fragresinstr", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    InstructionStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("fragment_instr template: store failed to migrate");
+}};
+
 bool contains(const std::string& hay, std::string_view needle) {
     return hay.find(needle) != std::string::npos;
 }
@@ -68,7 +78,8 @@ struct FragmentResultsHarness {
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
-    explicit FragmentResultsHarness(ResponseStore* response_store) {
+    explicit FragmentResultsHarness(ResponseStore* response_store,
+                                    InstructionStore* instruction_store = nullptr) {
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -99,7 +110,7 @@ struct FragmentResultsHarness {
             /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
             /*caller_fn=*/DashboardRoutes::CallerFn{},
             /*resolve_fn=*/[](const std::string&) { return std::pair<std::string, std::string>{}; },
-            &metrics, /*instruction_store=*/nullptr);
+            &metrics, instruction_store);
     }
 
     std::unique_ptr<httplib::Response> get(const std::string& path) { return sink.Get(path); }
@@ -457,6 +468,67 @@ TEST_CASE("/fragments/results: a filter value exactly at the facet bound still m
     CHECK(res->status == 200);
     CHECK_FALSE(contains(res->body, "data-filter-refused"));
     CHECK(contains(res->body, "class=\"result-row\""));
+}
+
+// The template `equals` default is a second route into the same filter vector (no f_* params
+// at all), resolved from the stored definition's response template. The refusal must cover
+// it: the operator typed nothing over-bound, so the bound is hit only after the template
+// resolves. The response store is nullptr, so "Response store not available" is the proof the
+// at-bound request reached render_results while the over-bound one did not.
+TEST_CASE("/fragments/results: a response-template equals default over the facet bound is "
+          "refused, and one at the bound is not",
+          "[pg][server][dashboard][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, fragment_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+
+    const auto make_definition = [&](const std::string& name, std::size_t equals_bytes) {
+        nlohmann::json tpl = {
+            {"id", "tplbound"},
+            {"name", "bounded"},
+            {"columns", nlohmann::json::array({"Name"})},
+            {"filters", nlohmann::json::array({{{"column", "Name"},
+                                                {"op", "equals"},
+                                                {"value", std::string(equals_bytes, 'v')}}})}};
+        InstructionDefinition def;
+        def.name = name;
+        def.version = "1.0.0";
+        def.plugin = "registry";
+        def.action = "list";
+        def.type = "question";
+        def.enabled = true;
+        def.result_schema = R"([{"name":"Name","type":"string"}])";
+        def.response_templates_spec = nlohmann::json::array({tpl}).dump();
+        auto created = is.create_definition(def);
+        REQUIRE(created.has_value());
+        return *created;
+    };
+    const auto over_id = make_definition("tpl-equals-over", 2049);
+    const auto at_id = make_definition("tpl-equals-at", 2048);
+
+    FragmentResultsHarness h(/*response_store=*/nullptr, &is);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+          const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+
+    auto over = h.get("/fragments/results?command_id=cmd-tpl-1&plugin=registry&definition_id=" +
+                      over_id + "&template_id=tplbound");
+    REQUIRE(over);
+    CHECK(over->status == 200);
+    CHECK(contains(over->body, "data-filter-refused=\"true\""));
+    CHECK(contains(over->body, "2048 bytes"));
+    CHECK_FALSE(contains(over->body, "Response store not available"));
+    CHECK_FALSE(contains(over->body, std::string(2049, 'v'))); // the value is never echoed
+
+    auto at = h.get("/fragments/results?command_id=cmd-tpl-1&plugin=registry&definition_id=" +
+                    at_id + "&template_id=tplbound");
+    REQUIRE(at);
+    CHECK(at->status == 200);
+    CHECK_FALSE(contains(at->body, "data-filter-refused"));
+    CHECK(contains(at->body, "Response store not available")); // reached render_results
 }
 
 // ── #4644 Gate 7 (row 6a): the unfiltered read is byte-bounded and a cut is visible ──

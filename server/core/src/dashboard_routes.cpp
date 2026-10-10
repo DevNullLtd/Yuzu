@@ -379,9 +379,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     res.set_content(
                         "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\" "
                         "data-filter-refused=\"true\">" +
-                            html_escape(facet_filter_value_bound_message()) + ". " +
-                            html_escape(facet_filter_value_bound_remediation()) +
-                            ".</td></tr></tbody>",
+                            html_escape(facet_filter_value_bound_text()) +
+                            "</td></tr></tbody>",
                         "text/html; charset=utf-8");
                     return;
                 }
@@ -534,9 +533,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                     res.set_header("Vary", "Cookie");
                     res.set_content(
                         "<span class=\"feedback-error\" data-filter-refused=\"true\">" +
-                            html_escape(facet_filter_value_bound_message()) + ". " +
-                            html_escape(facet_filter_value_bound_remediation()) +
-                            ".</span>",
+                            html_escape(facet_filter_value_bound_text()) + "</span>",
                         "text/html; charset=utf-8");
                     return;
                 }
@@ -604,6 +601,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto command_id = extract_form_value(req.body, "command_id");
                  auto plugin = extract_form_value(req.body, "plugin");
 
+                 // NOTE on every 4xx in this handler (and the over-bound refusal below):
+                 // htmx 2.0.4's default responseHandling drops 4xx/5xx bodies (`[45]..`,
+                 // swap:false; static_js_bundle.cpp) and nothing in the dashboard overrides
+                 // it, so a browser shows none of these bodies or HX-Retarget feedback.
+                 // They serve non-htmx/automation callers. This was not exercised in a
+                 // browser here; it is read from the bundled config.
                  if (group_name.empty()) {
                      res.status = 400;
                      res.set_header("HX-Retarget", "#group-form-slot");
@@ -617,15 +620,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto filters = parse_filters(req, plugin);
 
                  // A filter value over kMaxFacetValueBytes matches no stored facet, so
-                 // the group would be built from an empty set: refuse (#5623).
+                 // the group would be built from an empty set: refuse (#5623). The
+                 // dashboard UI cannot produce this POST: /fragments/create-group-form
+                 // refuses such a filter first and renders no form for it. 400 therefore
+                 // is the honest status for the direct/automation caller (see NOTE above).
                  if (any_facet_filter_exceeds_bound(filters)) {
                      res.status = 400;
                      res.set_header("HX-Retarget", "#group-form-slot");
                      res.set_content(
                          "<span class=\"feedback-error\" data-filter-refused=\"true\">" +
-                             html_escape(facet_filter_value_bound_message()) + ". " +
-                             html_escape(facet_filter_value_bound_remediation()) +
-                             ".</span>",
+                             html_escape(facet_filter_value_bound_text()) + "</span>",
                          "text/html; charset=utf-8");
                      return;
                  }

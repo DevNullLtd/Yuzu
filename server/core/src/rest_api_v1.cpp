@@ -910,7 +910,7 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Unassign a role from a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}}}
     },
     "/management-groups/agent-count-preview": {
-      "get": {"summary": "Preview the agent count a would-be management group would match (#4033, #2146 Batch A)", "tags": ["Management Groups"], "description": "MCP twin: preview_management_group_agent_count. REST/MCP/dashboard-fragment twin of /fragments/create-group-form's own live scoped count — this route and the MCP twin call the same shared builder (group_agent_count_preview.hpp) so those two cannot drift from each other; the dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation, unchanged by this PR. Used before POST /api/v1/management-groups to preview how many currently-visible agents would match. Requires ManagementGroup:Write, matching the fragment's gate exactly (only an operator who could create the group may preview it) — not ManagementGroup:Read, even though this route performs no mutation. filters are supplied as repeated query params using the SAME mangling the fragment applies to a column name (lowercase, spaces/dashes -> underscore, e.g. Local Addr -> local_addr) but WITHOUT the fragment's f_ key prefix (supply local_addr, not f_local_addr); an empty filter set returns a genuine 0 (no scoped count to report), never a store read. A filter value over 2048 bytes is refused with 400 (such values are not indexed, so the filter could never match). Scope is the D3 Response:Read-visible agent set, with an elevated session getting the JIT full-fleet view.", "parameters": [{"name": "command_id", "in": "query", "schema": {"type": "string"}, "description": "The response set's instruction/command id to count against"}, {"name": "plugin", "in": "query", "schema": {"type": "string"}, "description": "Plugin name whose response columns the filter keys are matched against"}], "responses": {"200": {"description": "{data: {agent_count}, meta}"}, "400": {"description": "A filter value is longer than 2048 bytes; such facet values are not indexed, so the filter could never match (A4 envelope, not retryable)"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks ManagementGroup:Write"}, "503": {"description": "Response store degraded — preview unavailable"}}}
+      "get": {"summary": "Preview the agent count a would-be management group would match (#4033, #2146 Batch A)", "tags": ["Management Groups"], "description": "MCP twin: preview_management_group_agent_count. REST/MCP/dashboard-fragment twin of /fragments/create-group-form's own live scoped count — this route and the MCP twin call the same shared builder (group_agent_count_preview.hpp) so those two cannot drift from each other; the dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation. The fragment also refuses a filter value over 2048 bytes, but with HTTP 200 plus a data-filter-refused marker in the returned HTML (htmx drops 4xx swaps), where this route returns 400 and the MCP twin -32602. Used before POST /api/v1/management-groups to preview how many currently-visible agents would match. Requires ManagementGroup:Write, matching the fragment's gate exactly (only an operator who could create the group may preview it) — not ManagementGroup:Read, even though this route performs no mutation. filters are supplied as repeated query params using the SAME mangling the fragment applies to a column name (lowercase, spaces/dashes -> underscore, e.g. Local Addr -> local_addr) but WITHOUT the fragment's f_ key prefix (supply local_addr, not f_local_addr); an empty filter set returns a genuine 0 (no scoped count to report), never a store read. A filter value over 2048 bytes is refused with 400 (such values are not indexed, so the filter could never match). Scope is the D3 Response:Read-visible agent set, with an elevated session getting the JIT full-fleet view.", "parameters": [{"name": "command_id", "in": "query", "schema": {"type": "string"}, "description": "The response set's instruction/command id to count against"}, {"name": "plugin", "in": "query", "schema": {"type": "string"}, "description": "Plugin name whose response columns the filter keys are matched against"}], "responses": {"200": {"description": "{data: {agent_count}, meta}"}, "400": {"description": "A filter value is longer than 2048 bytes; such facet values are not indexed, so the filter could never match (A4 envelope, not retryable)"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks ManagementGroup:Write"}, "503": {"description": "Response store degraded — preview unavailable"}}}
     },
     "/engine-principals/{id}/roles": {
       "get": {"summary": "List fleet-wide RBAC roles assigned to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "responses": {"200": {"description": "List of role assignments"}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "RBAC store unavailable"}}},
@@ -3736,12 +3736,13 @@ void RestApiV1::register_routes(
                          continue;
                      raw_fields.emplace_back(key, value);
                  }
-                 auto filters = resolve_group_preview_filters(plugin, raw_fields);
 
                  // A value over kMaxFacetValueBytes was never indexed and matches no agent:
-                 // refuse (non-retryable) rather than answer an exact 0 (#5623). Checked
-                 // before any store access; the value is never echoed.
-                 if (any_facet_filter_exceeds_bound(filters)) {
+                 // refuse (non-retryable) rather than answer an exact 0 (#5623). Checked on
+                 // the RAW values, before key resolution (which skips an unknown key and
+                 // would otherwise turn a misspelled key into an empty filter set and an
+                 // exact 0), and before any store access; the value is never echoed.
+                 if (any_raw_filter_value_exceeds_bound(raw_fields)) {
                      res.status = 400;
                      res.set_content(detail::error_json_a4(400, facet_filter_value_bound_message(),
                                                            cid,
@@ -3749,6 +3750,7 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
+                 auto filters = resolve_group_preview_filters(plugin, raw_fields);
 
                  // Elevated -> nullopt (JIT full-fleet view), else the D3
                  // resolver — mirrors DashboardRoutes::resolve_visible_scope

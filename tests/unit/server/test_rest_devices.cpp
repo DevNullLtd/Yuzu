@@ -443,6 +443,23 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a filter value ove
     CHECK(res->body.find(over) == std::string::npos);
 }
 
+// A misspelled key is skipped by the filter resolver, which used to leave an empty filter set
+// and an exact 0. The bound is checked on the raw value, so the key does not matter.
+TEST_CASE("GET /api/v1/management-groups/agent-count-preview: an over-bound value under an "
+          "unrecognised key is refused (400), not answered as 0",
+          "[rest][devices]") {
+    DeviceRestHarness h;
+    const std::string over(2049, 'a');
+    auto res = h.sink.Get("/api/v1/management-groups/agent-count-preview"
+                          "?command_id=cmd-1&plugin=procfetch&no_such_column=" +
+                          over);
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 400);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["message"].get<std::string>().find("2048 bytes") != std::string::npos);
+    CHECK(res->body.find(over) == std::string::npos);
+}
+
 TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a filter value exactly at the "
           "facet bound is accepted (reaches the store, 503 when unwired)",
           "[rest][devices]") {

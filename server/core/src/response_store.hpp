@@ -89,17 +89,30 @@ inline constexpr std::size_t kMaxFacetValueBytes = 2048;
 }
 
 /// Caller-facing text for the refusal above. Names the bound, never echoes the value.
+/// Sentence case, so the dashboard can join message + ". " + remediation + "." and read
+/// correctly; the REST and MCP envelopes carry the same two strings in their own fields.
 [[nodiscard]] inline std::string facet_filter_value_bound_message() {
-    return std::format("a filter value is longer than {} bytes; facet values over that "
+    return std::format("A filter value is longer than {} bytes; facet values over that "
                        "length are not indexed, so no agent can match such a filter",
                        kMaxFacetValueBytes);
 }
 
-/// Remediation paired with `facet_filter_value_bound_message()`.
+/// Remediation paired with `facet_filter_value_bound_message()`. The value may come from
+/// the caller's own filter or from a response template's default `equals` filter (the
+/// dashboard applies one when the operator supplies no filter), hence both are named.
 [[nodiscard]] inline std::string facet_filter_value_bound_remediation() {
-    return std::format("remove that filter or use a value of at most {} bytes; the "
-                       "request was not evaluated",
+    return std::format("Remove or change that filter (or the response template's default "
+                       "filter value), or use a value of at most {} bytes; the request was "
+                       "not evaluated",
                        kMaxFacetValueBytes);
+}
+
+/// The two strings above as one sentence pair for the dashboard fragments, which have no
+/// separate remediation field: "<message>. <remediation>." The single source for all three
+/// dashboard refusal sites.
+[[nodiscard]] inline std::string facet_filter_value_bound_text() {
+    return facet_filter_value_bound_message() + ". " + facet_filter_value_bound_remediation() +
+           ".";
 }
 
 /// `yuzu_server_response_facets_dropped_total{reason}`: facet rows (distinct
