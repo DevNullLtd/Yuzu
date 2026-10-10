@@ -442,9 +442,11 @@ void seed_response_facet_metrics(yuzu::MetricsRegistry& m) {
                "Response facet rows that did not persist, by reason (value_too_long = longer "
                "than the facet value bound and excluded; cap = past the per-response facet "
                "cardinality cap; batch_failed = the facet insert failed and none of the "
-               "response's facets persisted) - the response row and its output are stored in "
-               "every case, but a dropped facet is missing from the dashboard facet filter, "
-               "group-from-results and the agent-count preview",
+               "response's facets persisted) - counted only for responses that were stored, "
+               "whose row and output persist in every counted case, but a dropped facet is "
+               "missing from the dashboard facet filter, group-from-results and the "
+               "agent-count preview; a failure of the SAVEPOINT machinery itself aborts the "
+               "whole response and is counted by ingest_dropped_total{reason=query_error} only",
                "counter");
     for (const auto* reason : {kFacetDropValueTooLong, kFacetDropCap, kFacetDropBatchFailed})
         m.counter(kResponseFacetsDroppedMetric, {{"reason", reason}});
@@ -515,6 +517,14 @@ void ResponseStore::store(const StoredResponse& resp) {
     // from "began, but something inside failed" (kReasonQueryError) — the
     // pool/BEGIN failure classes with_txn_for's own bool return collapses.
     bool reached_txn = false;
+    // Facet-drop deltas are accumulated here and published only once the response
+    // transaction has committed: a facet counter counts facets of a STORED response.
+    // If the SAVEPOINT machinery itself fails, the transaction is aborted and the
+    // whole response is dropped (counted by ingest_dropped alone), so publishing
+    // from inside the callback would count facets of a response that never persisted.
+    std::size_t facets_too_long = 0;
+    std::size_t facets_capped = 0;
+    std::size_t facets_batch_failed = 0;
     const bool ok = pool_.with_txn_for(kIngestTimeout, [&](PGconn* conn) -> bool {
         reached_txn = true;
         pg::PgResult ins = pg::exec_params(
@@ -582,7 +592,7 @@ void ResponseStore::store(const StoredResponse& resp) {
                 spdlog::debug("ResponseStore: response_id={} excluded {} facet value(s) longer "
                               "than {} bytes; the response and its other facets persist",
                               response_id, excluded_too_long, kMaxFacetValueBytes);
-                note_facets_dropped(metrics_, kFacetDropValueTooLong, excluded_too_long);
+                facets_too_long = excluded_too_long;
             }
 
             // Bound facet cardinality independently of output size (#2691,
@@ -618,7 +628,7 @@ void ResponseStore::store(const StoredResponse& resp) {
                                           return std::get<0>(a) < std::get<0>(b);
                                       return std::get<1>(a) < std::get<1>(b);
                                   });
-                note_facets_dropped(metrics_, kFacetDropCap, flat.size() - kMaxFacetsPerResponse);
+                facets_capped = flat.size() - kMaxFacetsPerResponse;
                 flat.resize(kMaxFacetsPerResponse);
             }
 
@@ -628,7 +638,7 @@ void ResponseStore::store(const StoredResponse& resp) {
                 if (sp.status() != PGRES_COMMAND_OK) {
                     spdlog::warn("ResponseStore: facet SAVEPOINT failed for response_id={}: {}",
                                  response_id, PQerrorMessage(conn));
-                    note_facets_dropped(metrics_, kFacetDropBatchFailed, flat.size());
+                    facets_batch_failed = flat.size();
                 } else {
                     bool facets_ok = true;
                     // Chunk so `3 + 3*chunk` stays well under libpq's
@@ -664,7 +674,7 @@ void ResponseStore::store(const StoredResponse& resp) {
                                         "response_id={}: {}",
                                         response_id, PQerrorMessage(conn));
                             facets_ok = false;
-                            note_facets_dropped(metrics_, kFacetDropBatchFailed, flat.size());
+                            facets_batch_failed = flat.size();
                         }
                     }
                     const char* fin_sql = facets_ok ? "RELEASE SAVEPOINT facet_batch"
@@ -684,7 +694,11 @@ void ResponseStore::store(const StoredResponse& resp) {
         spdlog::warn("ResponseStore: store failed for instruction={} agent={}: {}",
                      resp.instruction_id, resp.agent_id, pool_.last_error());
         note_ingest_dropped(metrics_, reached_txn ? kReasonQueryError : kReasonPoolTimeout);
+        return;
     }
+    note_facets_dropped(metrics_, kFacetDropValueTooLong, facets_too_long);
+    note_facets_dropped(metrics_, kFacetDropCap, facets_capped);
+    note_facets_dropped(metrics_, kFacetDropBatchFailed, facets_batch_failed);
 }
 
 ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(

@@ -76,16 +76,20 @@ namespace yuzu::server {
 inline constexpr std::size_t kMaxFacetValueBytes = 1024;
 
 /// `yuzu_server_response_facets_dropped_total{reason}`: facet rows (distinct
-/// (column, value) pairs) of a response that did not persist, by reason. The response
-/// row itself is stored in every case.
+/// (column, value) pairs) of a response that did not persist, by reason. Counted only
+/// once the response has been stored, and the response row itself is stored in every
+/// counted case. If the SAVEPOINT machinery itself fails (SAVEPOINT creation, or the
+/// ROLLBACK TO after a failed batch), the transaction is aborted and the whole response
+/// is dropped: that is counted by `yuzu_server_response_ingest_dropped_total{query_error}`
+/// only, and no facet counter moves.
 inline constexpr const char* kResponseFacetsDroppedMetric =
     "yuzu_server_response_facets_dropped_total";
 /// `value_too_long`: excluded because longer than `kMaxFacetValueBytes`.
 inline constexpr const char* kFacetDropValueTooLong = "value_too_long";
 /// `cap`: distinct facets past the per-response cardinality cap.
 inline constexpr const char* kFacetDropCap = "cap";
-/// `batch_failed`: the facet INSERT batch (or its SAVEPOINT) failed, so the whole
-/// batch was rolled back and none of the response's facets persisted.
+/// `batch_failed`: the facet INSERT batch failed and was rolled back to its savepoint,
+/// so none of the response's facets persisted (the response itself committed).
 inline constexpr const char* kFacetDropBatchFailed = "batch_failed";
 
 /// Describe and pre-seed every reason of the facets-dropped counter at zero, so an
