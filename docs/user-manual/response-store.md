@@ -307,7 +307,7 @@ curl -s -b cookies.txt \
 ## Storage substrate (PostgreSQL, ADR-0039)
 
 Since the Postgres migration (ADR-0006/0039), responses live in the server's
-PostgreSQL database (schema `response_store`), not a local `responses.db`. Two
+PostgreSQL database (schema `response_store`), not a local `responses.db`. Three
 operator-visible notes:
 
 - **History reset on cutover.** The legacy SQLite `responses.db` is **not**
@@ -322,6 +322,14 @@ operator-visible notes:
   are replaced with the Unicode replacement character (U+FFFD) at ingest. The
   response row is still stored and still renders (defanged) — it is not
   dropped or turned into a 500.
+- **Facets are bounded.** Each response keeps the distinct (column, value) pairs
+  of its output as facets, which drive the facet filter, group-from-results and
+  the agent-count preview. A value over 2,048 bytes is excluded, never
+  truncated. At most 5,000 facets are kept per response, chosen by most lines
+  first, then column, then value, so a rare value can be cut. The symptom is an
+  agent missing from a facet filter or preview while its response still shows
+  in the results. See `yuzu_server_response_facets_dropped_total` in
+  [metrics.md](metrics.md).
 
 ## Retention and cleanup
 

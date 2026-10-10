@@ -1907,8 +1907,8 @@ double dropped_count(yuzu::MetricsRegistry& m, const char* reason) {
 } // namespace
 
 // #5623: one facet value the btree cannot index used to fail the whole multi-row
-// INSERT and lose EVERY facet of the response. A value over kMaxFacetValueBytes is now
-// excluded (not truncated) and the rest persist.
+// INSERT and lose EVERY facet of the response. A value over kMaxFacetValueBytes (2048)
+// is now excluded (not truncated) and the rest persist.
 TEST_CASE("ResponseStore: an over-long facet value is excluded, the other facets persist",
           "[pg][response_store][facets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -1926,10 +1926,12 @@ TEST_CASE("ResponseStore: an over-long facet value is excluded, the other facets
     CHECK(text.find(std::string("# HELP ") + kResponseFacetsDroppedMetric) != std::string::npos);
 
     // vuln_scan schema: severity|category|title|detail. Line 1 carries a title of
-    // EXACTLY the bound (kept) and line 2 one byte over (excluded); line 3 carries a
-    // 20000 byte incompressible detail (excluded, well past the btree limit).
-    const std::string at_bound = incompressible_text(kMaxFacetValueBytes, 1);
-    const std::string over_bound = incompressible_text(kMaxFacetValueBytes + 1, 2);
+    // EXACTLY 2048 bytes (kept, and it must insert under both indexes with a short id)
+    // and line 2 one byte over (excluded); line 3 carries a 20000 byte incompressible
+    // detail (excluded, well past the btree limit).
+    // Literal sizes, not kMaxFacetValueBytes: the test pins the shipped bound itself.
+    const std::string at_bound = incompressible_text(2048, 1);
+    const std::string over_bound = incompressible_text(2049, 2);
     const std::string huge = incompressible_text(20000, 3);
     const std::string output = "high|cat-a|" + at_bound + "|detail-a\n" + "low|cat-b|" +
                                over_bound + "|detail-b\n" + "low|cat-c|title-c|" + huge + "\n";

@@ -63,17 +63,18 @@ namespace yuzu::server {
 /// the wrong filter values and make group-from-results build a wrong group); the
 /// response row, its output and every other facet still persist.
 ///
-/// Why 1024: `response_facets.value` is in the primary key (response_id, col_idx,
+/// Why 2048: `response_facets.value` is in the primary key (response_id, col_idx,
 /// value) and in `idx_facets_query (instruction_id, col_idx, value)`. A btree tuple
 /// over 2704 bytes is refused (PostgreSQL 18.4, 8 KB pages), and one refused row fails
 /// the whole multi-row INSERT. Measured against a copy of both indexes with
 /// incompressible values: the largest value that inserts is about 2680 minus
 /// len(instruction_id) bytes (2644 at a 40 byte id, 2620 at 64, 2484 at 200). Only a
 /// value that compresses well gets past that, up to the 8191 byte "index row requires"
-/// error, so the byte length alone decides here. 1024 leaves about 1600 bytes for the
+/// error, so the byte length alone decides here. 2048 leaves about 630 bytes for the
 /// instruction_id, whose length the ingest path does not bound (it is the id the agent
-/// echoes); a longer id still fails the facet batch, which is counted as `batch_failed`.
-inline constexpr std::size_t kMaxFacetValueBytes = 1024;
+/// echoes; the longest the server mints is about 60 bytes); a longer id still fails the
+/// facet batch, which is counted as `batch_failed`.
+inline constexpr std::size_t kMaxFacetValueBytes = 2048;
 
 /// `yuzu_server_response_facets_dropped_total{reason}`: facet rows (distinct
 /// (column, value) pairs) of a response that did not persist, by reason. Counted only
