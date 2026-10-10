@@ -43,6 +43,7 @@
 ///    real rows are found, never blocks boot.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <mutex>
@@ -215,14 +216,23 @@ struct RbacEnforcementError {
     std::string message; ///< human-readable; no caller-supplied text is ever embedded
 };
 
+/// Production bound on every lock wait inside the #4966 account-lifecycle transactions
+/// (`deactivate_account` / `set_local_role`), installed as a transaction-local `lock_timeout`.
+/// `RbacStore`'s constructor takes it as a parameter so a test can shorten it; nothing in
+/// production passes anything but this default.
+inline constexpr std::chrono::milliseconds kDefaultLifecycleLockTimeout{2000};
+
 class RbacStore {
 public:
     /// Borrows the shared pool and runs the `rbac_store` schema migration on a
     /// pinned lease, then seeds defaults + loads the durable enabled flag.
     /// `is_open()` is false if the lease was empty or the migration failed
-    /// (fail-closed — every authz read then DENIES, the right posture for the
-    /// authorization substrate).
-    explicit RbacStore(pg::PgPool& pool);
+    /// (fail-closed, every authz read then DENIES, the right posture for the
+    /// authorization substrate). `lifecycle_lock_timeout` bounds the lock waits of the
+    /// account-lifecycle guard (#4966); the default is the production value and is a constructor
+    /// parameter, never a mutable member, so it is fixed for the store's lifetime.
+    explicit RbacStore(pg::PgPool& pool, std::chrono::milliseconds lifecycle_lock_timeout =
+                                             kDefaultLifecycleLockTimeout);
     ~RbacStore();
 
     RbacStore(const RbacStore&) = delete;
@@ -691,6 +701,7 @@ private:
     friend struct RbacStoreTestAccess;
 
     pg::PgPool& pool_;
+    const std::chrono::milliseconds lifecycle_lock_timeout_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
     // Cached by set_metrics() — see that method's doc comment. Null whenever

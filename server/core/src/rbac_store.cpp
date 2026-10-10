@@ -464,7 +464,8 @@ std::string namespaced_group_name(const std::string& source, const std::string& 
 
 // ── Construction / teardown ──────────────────────────────────────────────────
 
-RbacStore::RbacStore(pg::PgPool& pool) : pool_(pool) {
+RbacStore::RbacStore(pg::PgPool& pool, std::chrono::milliseconds lifecycle_lock_timeout)
+    : pool_(pool), lifecycle_lock_timeout_(lifecycle_lock_timeout) {
     auto lease = pool_.acquire();
     if (!lease) {
         spdlog::error("RbacStore: no database connection at construction ({}) — authorization "
@@ -2288,19 +2289,19 @@ std::expected<bool, std::string> RbacStore::provision_first_admin(const std::str
 AccountDeactivationResult RbacStore::deactivate_account(const std::string& username) {
     if (!open_)
         return {AccountDeactivationResult::Kind::kStoreFailure, std::string(kRbacErrStoreNotOpen)};
-    return RbacAdminAuthorityOwner{pool_}.deactivate_account(username);
+    return RbacAdminAuthorityOwner{pool_, lifecycle_lock_timeout_}.deactivate_account(username);
 }
 
 LocalRoleChangeResult RbacStore::set_local_role(const std::string& username, auth::Role role) {
     if (!open_)
         return {LocalRoleChangeResult::Kind::kStoreFailure, std::string(kRbacErrStoreNotOpen)};
-    return RbacAdminAuthorityOwner{pool_}.set_local_role(username, role);
+    return RbacAdminAuthorityOwner{pool_, lifecycle_lock_timeout_}.set_local_role(username, role);
 }
 
 WouldStrandResult RbacStore::would_strand_last_administrator(const std::string& username) const {
     if (!open_)
         return {false, false, std::string(kRbacErrStoreNotOpen)};
-    return RbacAdminAuthorityOwner{pool_}.would_strand_last_administrator(username);
+    return RbacAdminAuthorityOwner{pool_, lifecycle_lock_timeout_}.would_strand_last_administrator(username);
 }
 
 // ── Groups CRUD ──────────────────────────────────────────────────────────────

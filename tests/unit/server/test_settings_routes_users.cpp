@@ -1165,12 +1165,14 @@ TEST_CASE("SettingsRoutes DELETE: a LATE refusal (state changed after the early 
     std::unique_ptr<httplib::Response> res;
     {
         yuzu::test::PrincipalLockGate gate(h.auth_db.pool(), "admin");
-        std::thread request([&] { res = h.delete_user("admin"); });
+        // Declared AFTER the gate: destroyed first, releases the gate, then joins (RAII).
+        yuzu::test::Workers workers([&] { gate.release(); });
+        workers.add([&] { res = h.delete_user("admin"); });
         REQUIRE(gate.wait_until_contended());
         REQUIRE(h.auth_mgr.update_role_checked("carol", auth::Role::user) ==
                 auth::UpdateRoleOutcome::Updated);
         gate.release();
-        request.join();
+        workers.join_all();
     }
     REQUIRE(res);
     CHECK(res->status == 409);

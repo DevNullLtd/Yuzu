@@ -180,7 +180,7 @@ public:
 
     /// #4966: the guarded soft delete behind `AuthManager::remove_user_checked`. ONE
     /// transaction, in order:
-    ///   0. a transaction-local `lock_timeout` (`kLifecycleLockTimeout`, see the .cpp), as the FIRST
+    ///   0. a transaction-local `lock_timeout` (`kDefaultLifecycleLockTimeout`, 2000 ms, see rbac_store.hpp), as the FIRST
     ///      statement, so every lock wait below is bounded;
     ///   1. `rbac_enabled` FOR UPDATE (fixes the regime for this transaction and serialises every
     ///      guarded lifecycle write and the enforcement toggle);
@@ -243,9 +243,15 @@ public:
 
 private:
     friend class RbacStore;
-    explicit RbacAdminAuthorityOwner(pg::PgPool& pool) : pool_(pool) {}
+    explicit RbacAdminAuthorityOwner(
+        pg::PgPool& pool,
+        std::chrono::milliseconds lifecycle_lock_timeout = kDefaultLifecycleLockTimeout)
+        : pool_(pool), lifecycle_lock_timeout_(lifecycle_lock_timeout) {}
 
     pg::PgPool& pool_;
+    /// The transaction-local `lock_timeout` `deactivate_account` / `set_local_role` install as
+    /// their first statement. Set by `RbacStore` from its own constructor parameter.
+    std::chrono::milliseconds lifecycle_lock_timeout_;
 };
 
 } // namespace yuzu::server

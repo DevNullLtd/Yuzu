@@ -141,7 +141,9 @@ std::optional<std::vector<std::string>> list_active_local_admin_accounts(PGconn*
 
 // Bound on EVERY lock wait inside `deactivate_account` and `set_local_role` (the `rbac_enabled`
 // row, the counted grant set, the target's grant row, the target's `auth.users` row), installed as
-// the FIRST statement of each transaction. PR #4966 installs 2000 ms. `rbac_sql::kWriteTimeout`
+// the FIRST statement of each transaction. #4966 installs 2000 ms (`kDefaultLifecycleLockTimeout`
+// in rbac_store.hpp; `RbacStore`'s constructor parameter lets a test shorten it, production never
+// does). `rbac_sql::kWriteTimeout`
 // (4000 ms) bounds only the pool ACQUIRE and the pool's own `lock_timeout` defaults to 10000 ms
 // (and is not injected at all when the DSN or `PGOPTIONS` carries its own), so without this a
 // stuck lock holder could pin a pooled connection for 10 s per lock or unbounded. There is no
@@ -149,14 +151,13 @@ std::optional<std::vector<std::string>> list_active_local_admin_accounts(PGconn*
 // `CredentialChangeOwner` (1500 ms): those wait on the `auth.users` row this owner takes LAST
 // and holds only across lock-free recounts and the COMMIT, and this owner never waits on a lock
 // either of them holds while holding the `auth.users` row, so no chain of waits forms.
-constexpr std::chrono::milliseconds kLifecycleLockTimeout{2000};
 
 // "SELECT set_config('lock_timeout', $1, true)": transaction-local (never leaks to the pooled
 // connection), bound parameter, the same shape `AuthDB`'s own transaction-scoped bound uses.
-bool set_txn_lock_timeout(PGconn* c, std::string& err) {
+bool set_txn_lock_timeout(PGconn* c, std::chrono::milliseconds timeout, std::string& err) {
     pg::PgResult r = pg::exec_params(
         c, "SELECT set_config('lock_timeout', $1, true)",
-        std::vector<std::string>{std::to_string(kLifecycleLockTimeout.count()) + "ms"});
+        std::vector<std::string>{std::to_string(timeout.count()) + "ms"});
     if (r.status() != PGRES_TUPLES_OK) {
         err = PQerrorMessage(c);
         return false;
@@ -786,7 +787,7 @@ RbacAdminAuthorityOwner::deactivate_account(const std::string& username) const {
     std::string err;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         // 0.
-        if (!set_txn_lock_timeout(c, err))
+        if (!set_txn_lock_timeout(c, lifecycle_lock_timeout_, err))
             return false;
 
         // 1.
@@ -874,7 +875,7 @@ LocalRoleChangeResult RbacAdminAuthorityOwner::set_local_role(const std::string&
     std::string err;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         // 0.
-        if (!set_txn_lock_timeout(c, err))
+        if (!set_txn_lock_timeout(c, lifecycle_lock_timeout_, err))
             return false;
 
         // 1. The regime value is not used; the row LOCK is the point (see the header banner).

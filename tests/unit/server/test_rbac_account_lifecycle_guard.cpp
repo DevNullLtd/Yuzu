@@ -30,6 +30,7 @@
 #include <yuzu/server/auth.hpp>
 
 #include "test_auth_db_pg_helper.hpp"
+#include "test_principal_lock_gate.hpp" // Workers, SessionWipeFault, kLockWait*
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -145,14 +146,16 @@ std::vector<int> blocked_backend_pids(const std::string& dsn, int own_pid) {
 }
 
 // Event-driven wait (poll, no fixed sleep-and-assume) until >= n backends are lock-blocked.
-// Bounded: ~10 s, then returns whatever it saw so the REQUIRE reports the shortfall.
+// Bounded by the shared `kLockWaitDeadline`, then returns whatever it saw so the REQUIRE reports
+// the shortfall.
 std::vector<int> wait_for_blocked_backends(const std::string& dsn, int own_pid, std::size_t n) {
     std::vector<int> pids;
-    for (int i = 0; i < 400; ++i) {
+    const auto end = std::chrono::steady_clock::now() + yuzu::test::kLockWaitDeadline;
+    while (std::chrono::steady_clock::now() < end) {
         pids = blocked_backend_pids(dsn, own_pid);
         if (pids.size() >= n)
             return pids;
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        std::this_thread::sleep_for(yuzu::test::kLockWaitPoll);
     }
     return pids;
 }
@@ -203,30 +206,8 @@ private:
     int pid_{0};
 };
 
-// Joins every worker on scope exit AFTER running `before_join` (release the held locks), so a
-// failing REQUIRE can neither leave a joinable std::thread behind nor wait out a lock_timeout.
-class Workers {
-public:
-    explicit Workers(std::function<void()> before_join) : before_join_(std::move(before_join)) {}
-    ~Workers() {
-        if (before_join_)
-            before_join_();
-        join_all();
-    }
-    Workers(const Workers&) = delete;
-    Workers& operator=(const Workers&) = delete;
-    void add(std::function<void()> fn) { threads_.emplace_back(std::move(fn)); }
-    // Joins only; a test releases its held locks first when it wants the workers to proceed.
-    void join_all() {
-        for (auto& t : threads_)
-            if (t.joinable())
-                t.join();
-    }
-
-private:
-    std::function<void()> before_join_;
-    std::vector<std::thread> threads_;
-};
+using yuzu::test::SessionWipeFault;
+using yuzu::test::Workers;
 
 struct Acct {
     std::string name;
@@ -753,11 +734,16 @@ using yuzu::server::auth::UpdateRoleOutcome;
 // AuthManager. `wire_rbac = false` reproduces a server that forgot the injection.
 struct ManagerFx {
     yuzu::test::AuthDbPg db;
-    RbacStore rbac{db.pool()};
+    RbacStore rbac;
     yuzu::server::SessionStore sessions{db.pool()};
+    SessionWipeFault wipe_fault{db.pool()}; // RAII: repaired even when a REQUIRE unwinds
     AuthManager mgr;
 
-    explicit ManagerFx(bool wire_rbac = true) {
+    // `lock_timeout` is the lifecycle guard's lock bound: the production 2000 ms by default, a
+    // short value for a case that only needs a lock wait to EXPIRE (not the 2000 ms itself).
+    explicit ManagerFx(bool wire_rbac = true,
+                       std::chrono::milliseconds lock_timeout = kDefaultLifecycleLockTimeout)
+        : rbac(db.pool(), lock_timeout) {
         REQUIRE(rbac.is_open());
         REQUIRE(sessions.is_open());
         mgr.set_auth_db(db.get());
@@ -781,8 +767,9 @@ struct ManagerFx {
     }
     // A REAL fault in the throwaway database: the durable session table is moved aside, so the
     // post-commit wipe's DELETE genuinely fails while the guarded account write is unaffected.
-    void break_session_wipe() { exec_raw(db.pool(), "ALTER TABLE session_store.sessions RENAME TO sessions_gone"); }
-    void repair_session_wipe() { exec_raw(db.pool(), "ALTER TABLE session_store.sessions_gone RENAME TO sessions"); }
+    // RAII-scoped through `wipe_fault` (idempotent repair, noexcept destructor).
+    void break_session_wipe() { wipe_fault.arm(); }
+    void repair_session_wipe() { wipe_fault.repair(); }
 };
 
 } // namespace
@@ -894,7 +881,10 @@ TEST_CASE("AuthManager lifecycle guard: RemovedSessionWipeFailed says the row IS
 TEST_CASE("AuthManager lifecycle guard: a store failure inside the guard is StoreFailure, and "
           "AuthManager::mu_ is NOT held across the owner call",
           "[pg][auth_db][lifecycle_guard]") {
-    ManagerFx f;
+    // A shortened lock bound: this case needs the waits to EXPIRE, not the 2000 ms value (the
+    // lock-timeout case above pins that). 800 ms still leaves the probe ample time to see both
+    // workers blocked together.
+    ManagerFx f(/*wire_rbac=*/true, std::chrono::milliseconds(800));
     seed(f.db, "mu_a", Role::admin);
     seed(f.db, "mu_b", Role::admin);
 
@@ -909,13 +899,14 @@ TEST_CASE("AuthManager lifecycle guard: a store failure inside the guard is Stor
 
     // Both workers are INSIDE the owner call right now. An AuthManager accessor that takes
     // mu_ must still answer at once; had remove_user_checked held mu_ across the call (the
-    // deadlock shape with recheck_role_after_credential_check), these would wait out the 2 s
-    // lock_timeout, and a login-path reader would be stalled behind an admin's lock wait.
+    // deadlock shape with recheck_role_after_credential_check), these would wait out the
+    // lock_timeout (800 ms here), and a login-path reader would be stalled behind an admin's lock
+    // wait.
     const auto t0 = std::chrono::steady_clock::now();
     (void)f.mgr.has_users(); // takes mu_ shared; a held unique mu_ would block it here
-    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(1000));
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(400));
 
-    workers.join_all(); // both wait out the transaction-local lock_timeout together
+    workers.join_all(); // both wait out the (shortened) transaction-local lock_timeout together
     CHECK(removed == RemoveUserOutcome::StoreFailure);
     CHECK(updated == UpdateRoleOutcome::StoreFailure);
     CHECK(account_active(f.db.pool(), "mu_a"));

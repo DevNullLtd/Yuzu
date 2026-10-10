@@ -4631,20 +4631,21 @@ TEST_CASE("ScimRoutes: a LATE refusal (state changed after the early check) says
     std::string audit_action;
     {
         yuzu::test::PrincipalLockGate gate(f.auth_db.pool(), "dara");
-        std::thread request;
+        // Declared AFTER the gate: destroyed first, releases the gate, then joins (RAII).
+        yuzu::test::Workers workers([&] { gate.release(); });
         SECTION("PATCH active:false") {
             audit_action = "scim.user.deactivated";
-            request = std::thread([&] { res = f.patch("/scim/v2/Users/" + id, deactivate_ops()); });
+            workers.add([&] { res = f.patch("/scim/v2/Users/" + id, deactivate_ops()); });
         }
         SECTION("DELETE") {
             audit_action = "scim.user.deleted";
-            request = std::thread([&] { res = f.del("/scim/v2/Users/" + id); });
+            workers.add([&] { res = f.del("/scim/v2/Users/" + id); });
         }
         REQUIRE(gate.wait_until_contended());
         // The other holder loses the grant (allowed: dara remains), so dara is now the last.
         REQUIRE(f.rbac_guard->unassign_role("user", "carol", "Administrator").has_value());
         gate.release();
-        request.join();
+        workers.join_all();
     }
     REQUIRE(res);
     CHECK(res->status == 409);
@@ -4685,14 +4686,15 @@ TEST_CASE("ScimRoutes: POST active:false is a REQUESTED deactivation, guarded an
         // fleet's only Administrator (carol loses hers), so the guard refuses what the early
         // check let through.
         yuzu::test::PrincipalLockGate gate(f.auth_db.pool(), "pia");
-        std::thread request([&] {
+        yuzu::test::Workers workers([&] { gate.release(); });
+        workers.add([&] {
             res = f.post("/scim/v2/Users", {{"userName", "pia"}, {"active", false}});
         });
         REQUIRE(gate.wait_until_contended());
         REQUIRE(f.rbac_guard->assign_role({"user", "pia", "Administrator"}).has_value());
         REQUIRE(f.rbac_guard->unassign_role("user", "carol", "Administrator").has_value());
         gate.release();
-        request.join();
+        workers.join_all();
     }
     REQUIRE(res);
     CHECK(res->status == 409);
@@ -4805,14 +4807,16 @@ TEST_CASE("ScimRoutes: a compensation the guard refuses is a 500 that leaves the
         // created account is granted the fleet's only Administrator, so when the collision then
         // fails the write the undo of the account creation is refused by the guard.
         yuzu::test::UncommittedScimRowGate gate(f.auth_db.pool(), "ext-collide");
-        std::thread request([&] {
+        // Unwinding rolls the gate back (the request's insert then succeeds) before joining.
+        yuzu::test::Workers workers([&] { gate.rollback(); });
+        workers.add([&] {
             res = f.post("/scim/v2/Users", {{"userName", "jo"}, {"externalId", "ext-collide"}});
         });
         REQUIRE(gate.wait_until_contended());
         REQUIRE(f.rbac_guard->assign_role({"user", "jo", "Administrator"}).has_value());
         REQUIRE(f.rbac_guard->unassign_role("user", "carol", "Administrator").has_value());
         gate.commit();
-        request.join();
+        workers.join_all();
     }
     REQUIRE(res);
     // Not the 409 uniqueness the IdP could act on: the undo did not happen, so a retryable 500.
