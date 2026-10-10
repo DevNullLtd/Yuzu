@@ -6902,6 +6902,13 @@ TEST_CASE("MCP Integration: discover_instructions wired vs unwired",
         nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
     CHECK(got == expected);
     REQUIRE_FALSE(got["instructions"].empty());
+    // The additive canonical schema rides on the same builder: this definition declares none.
+    for (const auto& entry : got["instructions"]) {
+        REQUIRE(entry.contains("input_schema"));
+        REQUIRE(entry.contains("input_schema_error"));
+        CHECK(entry["input_schema"].is_null());
+        CHECK(entry["input_schema_error"].is_null());
+    }
 
     // Unwired — JSON-RPC tool error (InstructionStore left null).
     McpTestServer ts_unwired;
@@ -6911,6 +6918,52 @@ TEST_CASE("MCP Integration: discover_instructions wired vs unwired",
     REQUIRE(res2);
     auto body2 = nlohmann::json::parse(res2->body);
     CHECK(body2.contains("error"));
+}
+
+// A5 for the discovery tool itself: the description says what it returns, how to chain into
+// execute_instruction, and where stored-schema validation does and does not apply; the typed
+// output schema carries the canonical input_schema and is read-only truthful.
+TEST_CASE("MCP: discover_instructions advertises input_schema and chaining guidance",
+          "[mcp][integration][discovery]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":30})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "discover_instructions")
+            tool = &t;
+    REQUIRE(tool != nullptr);
+
+    const auto desc = (*tool)["description"].get<std::string>();
+    for (const char* needle :
+         {"canonical JSON Schema the server enforces", "CHAIN:", "plugin and action",
+          "string-valued", "enforced only by POST /api/instructions/{id}/execute",
+          "no filter arguments", "count 0", "InstructionDefinition:Read",
+          "input_schema_budget_exceeded", "can still be refused at execute", "at 5000 entries"})
+        CHECK(desc.find(needle) != std::string::npos);
+    // The execute route is POST /api/instructions/{id}/execute; there is no /api/v1 execute path,
+    // and the description makes no cost claim it has not measured.
+    for (const char* banned : {"/api/v1/instructions/execute", "cheap", "hit its schema budget"})
+        CHECK(desc.find(banned) == std::string::npos);
+
+    const auto& item = (*tool)["outputSchema"]["properties"]["instructions"]["items"];
+    CHECK(item["properties"].contains("input_schema"));
+    CHECK(item["properties"].contains("input_schema_error"));
+    CHECK(item["properties"]["input_schema"]["type"] == nlohmann::json::array({"object", "null"}));
+    CHECK(item["properties"]["input_schema_error"]["type"] ==
+          nlohmann::json::array({"string", "null"}));
+    // The closed token set (null = no error) is part of the typed contract, not prose.
+    CHECK(item["properties"]["input_schema_error"]["enum"] ==
+          nlohmann::json::array({nullptr, "parameter_schema_not_canonicalisable",
+                                 "input_schema_budget_exceeded"}));
+    const auto required = item["required"];
+    CHECK(std::find(required.begin(), required.end(), "input_schema") != required.end());
+    CHECK(std::find(required.begin(), required.end(), "input_schema_error") != required.end());
+
+    CHECK((*tool)["annotations"]["readOnlyHint"] == true);
+    CHECK((*tool)["annotations"]["destructiveHint"] == false);
 }
 
 TEST_CASE("MCP Integration: discover_plugins wired vs unwired", "[mcp][integration][discovery]") {

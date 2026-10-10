@@ -6352,7 +6352,7 @@ Without `UserManagement:Read` the `roles` key is replaced by:
 
 #### `GET /api/v1/discover/instructions`
 
-Published (`enabled_only=true`) `InstructionDefinition` catalog — the commands an agentic worker may dispatch via `execute_instruction` (MCP) or `POST /api/v1/instructions/execute` (REST). A disabled definition is excluded; there is no flag distinguishing "excluded because disabled" from "never existed."
+Published (`enabled_only=true`) `InstructionDefinition` catalog, the commands an agentic worker may dispatch via `execute_instruction` (MCP) or `POST /api/instructions/{id}/execute` (REST). A disabled definition is excluded; there is no flag distinguishing "excluded because disabled" from "never existed."
 
 **Permission:** `InstructionDefinition:Read`
 
@@ -6371,6 +6371,8 @@ Published (`enabled_only=true`) `InstructionDefinition` catalog — the commands
       "action": "query",
       "description": "...",
       "parameter_schema": {"type": "object", "properties": {}},
+      "input_schema": {"type": "object", "properties": {}, "additionalProperties": false},
+      "input_schema_error": null,
       "platforms": "windows,linux,darwin",
       "approval_mode": "auto"
     }
@@ -6378,7 +6380,16 @@ Published (`enabled_only=true`) `InstructionDefinition` catalog — the commands
 }
 ```
 
-`parameter_schema` is a nested JSON Schema **object** (not a string) when the stored value parses as JSON *and* is itself a JSON object; `null` when the stored value fails to parse (the authoring path always stores at least `{}`, so this case needs a non-standard write to reach), or when it parses to something other than an object, e.g. an array or string (only a legacy or non-standard write can store one: the store refuses a non-object schema, and the only REST route that can supply a `parameter_schema` at all is `POST /api/instructions/import`). Same rule `GET /api/v1/discover/plugins` already follows for its inline `parameter_schema`.
+`input_schema` is the **canonical JSON Schema** the server enforces on `POST /api/instructions/{id}/execute`: build `params` from it. It is produced by the same canonicaliser as that route's validator (DSL types such as `int32` become `integer` with the int32 range, `displayName` and other DSL-only keys are dropped, an inline `required` is hoisted to the root, and the root carries `additionalProperties: false`, so an undeclared parameter is refused). It is `null` in three cases that `input_schema_error` tells apart: `input_schema_error` is `null` when the definition declares no parameter schema (stored empty or `{}`: nothing is enforced); the fixed token `parameter_schema_not_canonicalisable` when a stored schema cannot be canonicalised (the execute route refuses such a definition with a `500`); and the fixed token `input_schema_budget_exceeded` when canonicalising THIS schema would have taken the request past 4 MiB (`kDiscoveryCanonicalBudgetBytes`) of stored schema text in total. The test is per definition: definitions are visited in name order (ties broken by id), one that does not fit is skipped, and a smaller later one can still get its `input_schema`. Which definitions are affected depends on the catalogue order and the schema sizes; for an unchanged catalogue the outcome is the same on every request, so retrying does not change it. The raw `parameter_schema` is still published, and the shipped catalogue uses about 2% of the budget. Canonical schemas are not cached; the budget bounds canonicalisation work only. Each request still parses and depth-scans every stored `parameter_schema` (at most 5000 definitions, and the store's write gate caps a new schema at 256 KiB, though a legacy row can be larger), and the response size grows with the catalogue. This route is served with `Cache-Control: public, max-age=300`, so a client can hold an `input_schema` up to five minutes older than an edit to the definition: after editing one, re-fetch with a conditional request (`If-None-Match` carrying the last `ETag`). The canonicaliser does not compile regular-expression patterns, so `input_schema` can be non-null while the execute route still refuses the stored schema, for any reason `prepare_param_validator` rejects that canonicalisation does not check: a pattern that does not compile or exceeds the RE2 program budget, a `default` that violates its own constraints, and any rejection by the shared schema compiler (for example non-numeric bounds, inverted bounds, or a keyword on the wrong type). The store's write gate blocks new rows like that; only a legacy row can carry one. `parameter_schema` is unchanged and kept for existing readers; prefer `input_schema`.
+
+How a client should read `input_schema`:
+
+- **Dialect.** It is a JSON Schema subset, but the server (not the client) is the validator. `minLength` and `maxLength` count UTF-8 bytes. `pattern` uses RE2 syntax, so a generic JSON Schema validator in JavaScript may disagree with the server: `(?P<name>...)` named groups are valid RE2 but rejected by JavaScript, and `\A` / `\z` anchors are valid RE2 but JavaScript accepts them as a literal `A` / `z`. An `integer` property accepts a decimal digit string (`"24"`) or a JSON integer; the execute route refuses a non-integral number such as `24.5` and also an integral float such as `24.0`.
+- **Defaults.** `default` is published as documentation only. The server never injects it, and a parameter that has a default is not listed in `required`, so the client must still send it unless the target plugin applies its own default (some plugins reject an omitted defaulted parameter: `crossplatform.tar.recent_processes` declares a default `sql`, and the `tar` plugin's `sql` action answers `missing required 'sql' parameter` without it). See [docs/yaml-dsl-spec.md](../yaml-dsl-spec.md) for the DSL side of the same rule.
+- **MCP.** The MCP `execute_instruction` tool takes string-valued `params`, so send an `integer` or `boolean` property in its string form (`"24"`, `"true"`).
+- **Plugins catalogue.** `GET /api/v1/discover/plugins` still carries each action's inline `parameter_schema` in the raw stored DSL form (`int32`, `displayName`); the canonical form is `input_schema` here, for published definitions.
+
+`parameter_schema` is the stored definition schema as a nested **object** (not a string; the raw DSL form, not a standard JSON Schema: `int32`, `displayName`) when the stored value parses as JSON *and* is itself a JSON object; `null` when the stored value fails to parse (the authoring path always stores at least `{}`, so this case needs a non-standard write to reach), or when it parses to something other than an object, e.g. an array or string (only a legacy or non-standard write can store one: the store refuses a non-object schema, and the only REST route that can supply a `parameter_schema` at all is `POST /api/instructions/import`). Same rule `GET /api/v1/discover/plugins` already follows for its inline `parameter_schema`.
 
 #### `GET /api/v1/discover/routes`
 
@@ -6454,7 +6465,7 @@ Plugin/action catalog observed across currently-connected agents (deduplicated b
 }
 ```
 
-An action carries an inline `parameter_schema` **only** when it has a published `InstructionDefinition` (matched on plugin + action) **and** the caller holds `InstructionDefinition:Read`; a caller with only `Infrastructure:Read` gets each action's `name` + `description` and no schema. The top-level `actions_enriched_with_schema` counts how many actions were enriched. For the complete schema-bearing catalog, use [`GET /api/v1/discover/instructions`](#get-apiv1discoverinstructions).
+An action carries an inline `parameter_schema` **only** when it has a published `InstructionDefinition` (matched on plugin + action) **and** the caller holds `InstructionDefinition:Read`; a caller with only `Infrastructure:Read` gets each action's `name` + `description` and no schema. The top-level `actions_enriched_with_schema` counts how many actions were enriched. The inline `parameter_schema` here is the raw stored DSL form (`int32`, `displayName`), not a canonical JSON Schema; the canonical form is `input_schema` in [`GET /api/v1/discover/instructions`](#get-apiv1discoverinstructions), which is the complete schema-bearing catalog.
 
 > **Consumer note:** this catalog is now `"version": 3` (was `1`; v2 added the inline `parameter_schema` and top-level `actions_enriched_with_schema` fields). The revision is additive; treat `version` as a **minimum** (`>= 1`), not `== 1`, so future additive revisions do not break your client.
 

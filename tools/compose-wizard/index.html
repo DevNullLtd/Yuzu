@@ -143,33 +143,37 @@
 
           <div class="callout warning">
             <strong>Mount your PEM material into the container.</strong> The paths below
-            are <em>container</em> paths; the wizard bind-mounts a host <code>./certs</code>
-            directory read-only at <code>/etc/yuzu/certs</code>. Put your files there, or
-            edit the mount in the generated compose.
+            are <em>container</em> paths. Put your <code>server.pem</code>,
+            <code>server.key</code> and <code>ca.pem</code> in <code>./certs</code> on the
+            host (next to the generated compose); the wizard bind-mounts that directory
+            <strong>read-only</strong> at <code>/etc/yuzu/tls</code>, so every path must be
+            under <code>/etc/yuzu/tls/</code>. The files must be readable by the container's
+            <code>yuzu</code> user (uid 999 in the Debian <code>yuzu-server</code> image), and the
+            server refuses a private key with any group or other permission bit set, so give the key to
+            that user with mode 0600:
+            <code>sudo chown 999:999 ./certs/server.key &amp;&amp; sudo chmod 600 ./certs/server.key</code>.
           </div>
 
-          <div class="callout warning">
-            <strong>Known issue (#5420): this mode does not start as generated.</strong> The server
-            also writes its secrets KEK into <code>/etc/yuzu/certs</code>. Because the wizard mounts
-            <code>./certs</code> read-only, the server cannot write the KEK and stops at its first boot
-            with <code>provider_failure</code>, before it has encrypted anything. Until #5420 is fixed,
-            use <strong>Default certs</strong>, or edit the generated mount to drop <code>:ro</code> and
-            make <code>./certs</code> writable by the server's <code>yuzu</code> user (uid 999 in the
-            Debian <code>yuzu-server</code> image). Back up <code>./certs</code> with your database
-            from then on, because it holds the KEK.
+          <div class="callout info">
+            <strong><code>/etc/yuzu/certs</code> is not for your files.</strong> It is the
+            server's own <em>writable</em> directory: it holds the internal CA and the secrets
+            KEK registered in Postgres, so the wizard gives it the same persistent volume as
+            the other modes (<code>server-certs</code> when named volumes are on or Postgres is
+            external). Do not replace it with your own or a read-only mount: the server could
+            not write its KEK and would stop at first boot (#5420). Back it up with your database.
           </div>
 
           <div class="field">
             <label for="tls-cert">Certificate Path</label>
-            <input type="text" id="tls-cert" value="/etc/yuzu/certs/server.pem" placeholder="/etc/yuzu/certs/server.pem">
+            <input type="text" id="tls-cert" value="/etc/yuzu/tls/server.pem" placeholder="/etc/yuzu/tls/server.pem">
           </div>
           <div class="field">
             <label for="tls-key">Key Path</label>
-            <input type="text" id="tls-key" value="/etc/yuzu/certs/server.key" placeholder="/etc/yuzu/certs/server.key">
+            <input type="text" id="tls-key" value="/etc/yuzu/tls/server.key" placeholder="/etc/yuzu/tls/server.key">
           </div>
           <div class="field">
             <label for="tls-ca-cert">CA Certificate Path (<strong>required</strong> — verifies agent/gateway client certs)</label>
-            <input type="text" id="tls-ca-cert" value="/etc/yuzu/certs/ca.pem" placeholder="/etc/yuzu/certs/ca.pem">
+            <input type="text" id="tls-ca-cert" value="/etc/yuzu/tls/ca.pem" placeholder="/etc/yuzu/tls/ca.pem">
             <small>The server <strong>refuses to start</strong> with operator certs and no CA (mTLS client verification is mandatory). To deliberately disable client-cert verification you must run the server with <code>--insecure-skip-client-verify</code> + <code>YUZU_ALLOW_INSECURE_TLS=1</code> yourself.</small>
           </div>
         </fieldset>

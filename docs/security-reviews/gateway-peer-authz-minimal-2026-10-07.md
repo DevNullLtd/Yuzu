@@ -18,8 +18,12 @@ mistaken for oversights. It is a decision record, not a design proposal.
 What this record claims, and what it does not.
 
 - **Review.** The design and code were reviewed by the Yuzu governance pipeline: review agents
-  run from the authoring session. That is **not independent review**. No external review has occurred, and no
-  external reviewer has adjudicated the TLS session-resumption question below.
+  run from the authoring session. That is **not independent review**. After that run, a scoped
+  adversarial review of the built code was run by two external models (Kimi K3 and Codex Sol, two
+  phases each). Both returned a pass with no critical or high finding; their one confirmed finding is
+  the Windows pin-file reader described under the limits below (#5563), and one further claim was
+  refuted. Those reviewers are models, not human reviewers, and neither adjudicated the TLS
+  session-resumption question below: it remains open.
 - **Design consults before implementation.** Read-only analyses of source, run before the code
   was written: two consults on the minimal design, a plan review, and a security consult on an
   earlier, larger design that was withdrawn as too complex to review (its relation to this one is
@@ -348,8 +352,14 @@ immutable pin set that cannot be empty by construction, and boot refuses an empt
   writable by group or others or owned by an unexpected user: it reads the file once, bounded, and
   the operator guide tells the administrator to protect it. Whoever can write the file at boot
   decides which gateway key is admitted.
-- **TLS session resumption.** See the next section: the question is open and unadjudicated, and no
-  external review has occurred.
+- **The Windows pin-file reader is not a single handle.** On POSIX the reader opens the file once
+  and checks and reads through that one descriptor. On Windows it checks the type and size by path
+  and then opens by path, so a path replaced between those steps can bypass the regular-file and size
+  checks or stall the open before any listener binds. The read itself stays capped at the maximum
+  size plus one byte. It needs write authority over the pin file's location, which already overlaps
+  the authority to choose the pin content. Tracked as #5563.
+- **TLS session resumption.** See the next section: the question is open and unadjudicated. The
+  external models that reviewed the built code only spot-checked the accuracy of the disclosure.
 - **Acknowledged mode is a deliberate off switch.** It disables the guard on every port and is
   detectable (error line, audit row, gauge, alert on TLS servers with a client CA) but not preventable.
 - **Anonymous refusals have no audit row.** They are counter and log only; the rate-limited warning
@@ -396,7 +406,8 @@ core tree supplies one, and this server configures none, so ticket keys are the 
 for each server context, per process. The only pin-withdrawal path in this design is a restart, which
 therefore invalidates every ticket issued before it. This is read from source, not tested here.
 
-Status: open, unadjudicated; no external review has occurred. The conclusion reached inside the
+Status: open, unadjudicated. The external models that reviewed the built code only spot-checked the
+accuracy of this disclosure and did not adjudicate it. The conclusion reached inside the
 governance pipeline is that this is acceptable: reuse requires the pinned peer's own session state,
 tickets are keyed per process (so a restart invalidates them), and no network caller who merely
 reaches the port holds either. The question a reviewer should answer is whether admission may be
@@ -408,10 +419,13 @@ ticket issuance on the gateway-upstream listener.
 ## Follow-up work and scenarios not run
 
 Everything in this section is a proposal, not a commitment, and none of it is a prerequisite for the
-control. The section exists so that this record carries the open items itself: no tracker issue
-stands behind most of them, and one should be filed only when someone decides to take an item on.
+control. The section exists so that this record carries the open items itself. Some now have a
+tracker issue: the connection-lifetime group is #5568, the operator-visible posture and tooling
+group is #5569, the reserved gateway documentation list is a comment on #4632
+(issuecomment-6060710606), and the Windows pin-file reader is #5563. The rest have no issue, and one
+should be filed only when someone decides to take an item on.
 The first part lists chaos scenarios that were planned during governance and **have not been run**.
-The second lists product follow-ups. The third names the two items that already have a tracker issue.
+The second lists product follow-ups. The third names the items that already have a tracker issue.
 
 ### Chaos scenarios not run
 
@@ -589,6 +603,15 @@ separate. None is part of this design.
 
 ### Already tracked elsewhere
 
+- Open issue #5568, the connection-lifetime group: a renewed gateway certificate is not picked up on
+  an open connection (the expiry cliff), and refused CONNECTED notices are not repaired.
+- Open issue #5569, the operator-visible posture and tooling group: the mode and a pin-set digest
+  through the settings API and a metric, a pin-print helper and a `--check-config` dry run, a bound
+  on denial audit volume, and a CI run of the pinned `--tls` branch.
+- Open issue #5563: the Windows pin-file reader checks by path and then opens by path instead of
+  using one handle.
+- A comment on #4632 (issuecomment-6060710606) carries the list that appears under "Reserved gateway-side
+  documentation". #4632 is the gateway workstream's tracker, not an issue about those documents.
 - Open issue #1835, "Windows server binary has the identical SCM control-protocol defect as #1822
   (agent)": the installed Windows service cannot start under the Windows service manager, which is
   why that path is untested here (see "Provenance and limits of this record").
