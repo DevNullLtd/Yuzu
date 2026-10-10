@@ -1144,8 +1144,9 @@ TEST_CASE("OIDC binding: an unknown state is reported as unknown whatever the se
 TEST_CASE("OIDC binding: a digest failure at start throws and a flow starts again afterwards",
           "[oidc][oidc_binding][oidc_hash_failure]") {
     // The seam fires in binding_digest, before sha256_raw runs, so this covers the caller's
-    // fail-closed handling (a digest failure throws, as random_bytes() does). sha256_raw's own
-    // failure branch (a provider return code) is not reachable from a test and is not exercised.
+    // fail-closed handling (a digest failure throws, as random_bytes() does). The failure of
+    // each digest stage is covered separately in test_sha256_steps.cpp; the real OpenSSL and CNG
+    // calls themselves cannot be made to fail from a test.
     OidcProvider provider(binding_cfg());
     {
         DigestFailure fail(provider);

@@ -1,6 +1,7 @@
 #include "oidc_provider.hpp"
 
 #include "evp_raii.hpp"
+#include "sha256_steps.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -84,7 +85,7 @@ static std::string bytes_to_hex(const std::vector<uint8_t>& v) {
 
 #ifdef _WIN32
 namespace {
-// File-local RAII owners for the two CNG handles sha256_raw opens: one owner per handle,
+// File-local RAII owners for the two CNG handles CngSha256Ops opens: one owner per handle,
 // released exactly once on every path including a throw.
 class BcryptAlgHandle {
 public:
@@ -120,35 +121,67 @@ private:
 } // namespace
 #endif
 
-/// SHA-256 of `input`. THROWS (std::runtime_error, like `random_bytes` above) on ANY provider
-/// failure, so a failed digest is reported, never returned as a value.
-static std::vector<uint8_t> sha256_raw(const std::string& input) {
-    std::vector<uint8_t> hash(32);
-    bool ok = false;
+namespace {
 #ifdef _WIN32
-    BcryptAlgHandle alg;
-    if (BCRYPT_SUCCESS(
-            BCryptOpenAlgorithmProvider(alg.out(), BCRYPT_SHA256_ALGORITHM, nullptr, 0))) {
-        BcryptHashHandle hh;
-        if (BCRYPT_SUCCESS(BCryptCreateHash(alg.get(), hh.out(), nullptr, 0, nullptr, 0, 0))) {
-            // PUCHAR is a signature artefact: BCryptHashData only reads the input buffer.
-            ok = BCRYPT_SUCCESS(BCryptHashData(
-                     hh.get(), reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())),
-                     static_cast<ULONG>(input.size()), 0)) &&
-                 BCRYPT_SUCCESS(
-                     BCryptFinishHash(hh.get(), hash.data(), static_cast<ULONG>(hash.size()), 0));
-        }
+// CNG stages for sha256_via_ops. `alg_` is declared before `hh_`, so the hash handle is
+// destroyed first and the provider handle last, on success and on a throw alike.
+class CngSha256Ops {
+public:
+    bool open() {
+        return BCRYPT_SUCCESS(
+            BCryptOpenAlgorithmProvider(alg_.out(), BCRYPT_SHA256_ALGORITHM, nullptr, 0));
     }
+    bool create() {
+        return BCRYPT_SUCCESS(BCryptCreateHash(alg_.get(), hh_.out(), nullptr, 0, nullptr, 0, 0));
+    }
+    bool update(const std::string& input) {
+        // PUCHAR is a signature artefact: BCryptHashData only reads the input buffer.
+        return BCRYPT_SUCCESS(
+            BCryptHashData(hh_.get(), reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())),
+                           static_cast<ULONG>(input.size()), 0));
+    }
+    bool finish(std::vector<uint8_t>& out) {
+        return BCRYPT_SUCCESS(
+            BCryptFinishHash(hh_.get(), out.data(), static_cast<ULONG>(out.size()), 0));
+    }
+
+private:
+    BcryptAlgHandle alg_;
+    BcryptHashHandle hh_;
+};
 #else
-    if (EvpMdCtxPtr ctx{EVP_MD_CTX_new()}) {
-        ok = EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) == 1 &&
-             EVP_DigestUpdate(ctx.get(), input.data(), input.size()) == 1 &&
-             EVP_DigestFinal_ex(ctx.get(), hash.data(), nullptr) == 1;
+// OpenSSL EVP stages for sha256_via_ops. `ctx_` is the single owner of the digest context.
+class OpenSslSha256Ops {
+public:
+    bool open() {
+        ctx_.reset(EVP_MD_CTX_new());
+        return ctx_ != nullptr;
     }
+    bool create() { return EVP_DigestInit_ex(ctx_.get(), EVP_sha256(), nullptr) == 1; }
+    bool update(const std::string& input) {
+        return EVP_DigestUpdate(ctx_.get(), input.data(), input.size()) == 1;
+    }
+    bool finish(std::vector<uint8_t>& out) {
+        return EVP_DigestFinal_ex(ctx_.get(), out.data(), nullptr) == 1;
+    }
+
+private:
+    EvpMdCtxPtr ctx_;
+};
 #endif
-    if (!ok)
-        throw std::runtime_error("SHA-256 failed");
-    return hash;
+} // namespace
+
+/// SHA-256 of `input`. THROWS (std::runtime_error, like `random_bytes` above) on ANY provider
+/// failure, so a failed digest is reported, never returned as a value. The stage sequencing and
+/// the throw live in `detail::sha256_via_ops` (sha256_steps.hpp), which a unit test drives with a
+/// fake `Ops`.
+static std::vector<uint8_t> sha256_raw(const std::string& input) {
+#ifdef _WIN32
+    CngSha256Ops ops;
+#else
+    OpenSslSha256Ops ops;
+#endif
+    return detail::sha256_via_ops(ops, input);
 }
 
 std::string OidcProvider::binding_digest(const std::string& secret) const {
