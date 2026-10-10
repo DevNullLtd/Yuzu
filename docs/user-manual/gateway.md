@@ -323,8 +323,9 @@ configured for connection affinity**, meaning each client connection gets its ow
 backend connection, kept for as long as the client connection lives (see
 [Keeping each agent on one backend connection](#keeping-each-agent-on-one-backend-connection)).
 An HTTP/2-terminating proxy that pools backend connections across clients, or that
-sends one agent's calls over several of them (HAProxy's default `http-reuse safe`, a
-service-mesh sidecar that terminates HTTP/2), is **not supported**: it
+sends one agent's calls over several of them (a service-mesh sidecar that terminates
+HTTP/2, nginx `grpc_pass` as observed below), is
+**not supported**: it
 may cause repeated heartbeat rejection or share
 gateway-side connections across agents, removing the per-agent connection separation
 this check requires. It can spread one agent's calls over several
@@ -355,7 +356,13 @@ run):
   counters and the gateway summary log, not silently; that is one two-agent test, not
   a guarantee for every HTTP/2-terminating proxy.
 - Behind an L4 TCP forwarder (nginx `stream`), there were zero rejections.
-- A multiplexing HTTP/2 proxy with upstream keepalive was **not tested**.
+- Behind HAProxy 3.2.25 (default settings, and with `http-reuse never`) and behind the
+  OKD 4.21 router (HAProxy 2.8), 50 agents for ten minutes or more each, the mismatch
+  counter stayed at 0 and every agent attributed its real address. HAProxy documents
+  `safe` as reserving a backend connection to the session once it has carried a
+  stream, which matches what was measured. See
+  [Keeping each agent on one backend connection](#keeping-each-agent-on-one-backend-connection).
+- A multiplexing HTTP/2 proxy with upstream keepalive other than those was **not tested**.
 
 The agent-facing message is the same `unknown session` for every reason (this is
 deliberate, see above), so the agent log cannot tell the reasons apart. Diagnose from
@@ -1103,11 +1110,13 @@ router's, not the agent's, and the option **cannot be combined with an `auth_fun
 (boot refuses it: the check would pass on the router's certificate and say nothing about the
 agent). The entry `trusted_hops` places from the right is used; a header with fewer entries
 than that, longer than 1024 bytes, or with more than 32 entries, or an entry that is not an
-IP address, is ignored. With an OpenShift/OKD router, also set the ingress controller's
-forwarded-header policy so that a client-supplied `x-forwarded-for` is not trusted
-(`spec.httpHeaders.forwardedHeaderPolicy` on the IngressController). That cluster-side
-detail is stated from memory and must be confirmed against your cluster version. A router
-that terminates HTTP/2 must also keep each agent on one backend connection, because
+IP address, is ignored. With an OpenShift/OKD router, leave the IngressController's
+`spec.httpHeaders.forwardedHeaderPolicy` at `Append` (the default) or `Replace`: either
+puts the address the router saw last in `x-forwarded-for`, which `trusted_hops => 0`
+reads. `IfNone` and `Never` can leave a client-supplied header as the only entry; do not
+use them with this option. On OKD 4.21 with the default `Append`, the real client address
+was attributed for every agent and a forged `x-forwarded-for` was ignored. A router that
+terminates HTTP/2 must also keep each agent on one backend connection, because
 [Heartbeat admission](#heartbeat-admission) binds heartbeats to the connection that opened
 the session: see the next section.
 
@@ -1120,11 +1129,20 @@ stream, so the router must give **each client connection its own backend connect
 keep it for as long as the client connection lives**. Then all of an agent's calls arrive
 on one backend connection (and, with several gateway replicas, on the one replica that
 backend connection is to, which the node-local admission state also needs). A router that
-pools backend connections across clients (HAProxy's default `http-reuse safe` lets every
-request after a session's first travel on any idle backend connection, `aggressive` and
-`always` more so) breaks this in both directions: one agent's calls spread over several
-connections are rejected as `connection_mismatch`, and calls of different agents share one,
-which weakens the separation the check provides.
+pools backend connections across clients breaks this in both directions: one agent's
+calls spread over several connections are rejected as `connection_mismatch`, and calls of
+different agents share one, which weakens the separation the check provides.
+
+HAProxy's default `http-reuse safe` did **not** do this in testing (HAProxy 3.2.25 and
+the OKD 4.21 router's 2.8, 50 agents, ten minutes or more, zero mismatches): its
+documentation says that once a stream has been processed the connection is reserved for
+the streams of the same session. `http-reuse never` is the setting that states the
+requirement outright, costs nothing for this workload, and is what to use if you want the
+configuration to say what it needs. Even `http-reuse always` gave zero mismatches in a
+six-minute run, but it exists to share connections between clients and nothing in its
+documentation promises otherwise, so do not rely on it. A mismatch counter that stays at 0 only means
+something if it can move: a Register on one connection followed by a Heartbeat on another
+raised it to 1 in the same rig.
 
 HAProxy as the terminating proxy, re-encrypting to the gateway over HTTP/2:
 
@@ -1138,7 +1156,8 @@ frontend yuzu_agents
 backend yuzu_gateway
     http-reuse never                          # a backend connection belongs to ONE client connection
     balance leastconn                         # chooses the replica when the client connects
-    timeout server 300s                       # longer than the agent's 60 s keepalive
+    timeout client 1h                         # see "Idle timeouts" below
+    timeout server 1h
     server gw1 10.0.1.11:50051 ssl verify required ca-file /etc/haproxy/yuzu-ca.pem alpn h2
 ```
 
@@ -1147,17 +1166,50 @@ connection a session opened stays attached to that session instead of returning 
 pool other sessions draw from. `option forwardfor` adds the client address as its own
 `X-Forwarded-For` line after any the client sent; the gateway joins the lines in order and
 reads the one `trusted_hops` places from the right, so the client's own claim is never the
-one used (deleting it first keeps the header short). Keep the router's idle timeouts above
-the agent's 60 s keepalive; the agent listener itself closes a connection that has carried
-no bytes for 180 s.
+one used (deleting it first keeps the header short). `timeout client` is a frontend or
+`defaults` setting; the example lists it next to `timeout server` for brevity. The
+snippet passes `haproxy -c` on 3.2.25 (the port is 8443 rather than 443 when HAProxy does
+not run as root).
 
-**OpenShift / OKD router.** The OpenShift router is HAProxy, and its connection-reuse
-setting for a route backend is whatever its template sets: this manual does not state it
-and you must not assume it. Establish it on your cluster before sending agents through the
-router, with the check below. If the router does not pin connections, use a TLS
-**passthrough** route (the gateway then sees the agent's own TCP connection, and
-`proxy_protocol` or the transport peer give the address), or put an HAProxy configured as
-above between the router and the gateway.
+*Idle timeouts.* An agent's `Subscribe` stream is long-lived and carries no traffic while
+idle, and a router cuts it once its timeout passes. Measured: the cut came at the timeout
+plus about 60 s (30 s router default: every connection cut at 30 s; HAProxy 300 s: all
+50 cut at about 360 s; router 10 m: all 50 at about 660 s). The agents re-registered each
+time with no mismatches, but each cut is a reconnect and a fresh session, so a short
+timeout turns into constant churn. Raise **both** the client and the server timeout; on
+OpenShift a route's `haproxy.router.openshift.io/timeout` annotation changes only the
+server side. The agent listener itself closes a connection that has carried no bytes for
+180 s, so the gateway is not what ends a quiet connection behind a router.
+
+**OpenShift / OKD router.** Measured on OKD 4.21.0-okd-scos.8 (single node, router
+HAProxy 2.8.10), 50 agents, no route or router setting for connection reuse was needed.
+What was needed:
+
+- **Enable HTTP/2 on the router.** A stock router ships with HTTP/2 off, so no ALPN is
+  negotiated and a gRPC client refuses the connection. Annotate the IngressController
+  with `ingress.operator.openshift.io/default-enable-http2=true`. Red Hat's guidance for
+  gRPC through the router is that HTTP/2 on the front end needs a custom certificate on
+  the route and that HTTP/2 end to end works with a **re-encrypt** or **passthrough**
+  route, not **edge**.
+- **Use a re-encrypt route** with the gateway's certificate as the route's custom
+  certificate (or a passthrough route, which keeps the agent's own TCP connection and
+  needs no `forwarded_for`).
+- **Raise the idle timeouts** as above: `spec.tuningOptions.clientTimeout` and
+  `serverTimeout` on the IngressController.
+- **Set the listener to `forwarded_for`** with `trusted_hops => 0`. With `hostNetwork`
+  the gateway sees the router as the node's OVN management address (10.217.0.2 on the
+  test cluster), not the router pod's. If `yuzu_gw_grpc_origin_ignored_total{reason="untrusted_source"}`
+  rises for traffic that came through the router, `sources` does not name the address the
+  gateway actually sees.
+
+A second, sharded `IngressController` behaves the same and is a supported way to keep
+agent traffic off the default router. A router run from a custom HAProxy template (the
+`TEMPLATE_FILE` mechanism of the router image) also passed, but Red Hat does not support
+custom templates or an unmanaged router on OpenShift 4.x (knowledge-base solution
+5381141): treat it as your own proxy, not as the platform's. The ingress operator offers
+no setting for `http-reuse`; an HAProxy of your own, configured as above, is the way to
+control it. Repeat the check below after any change of OKD or router version: this was one
+single-node cluster and one router pod, and several router replicas were not tried.
 
 **Check it.** Run agents through the proxy for at least ten minutes. In the gateway's
 `/metrics`, `yuzu_gw_heartbeat_session_mismatch_total` and
