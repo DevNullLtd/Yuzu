@@ -1155,21 +1155,24 @@ TEST_CASE("#5604 KvStore: every public method starts with a fresh wait chain",
     // or checkpoint, but never when a step ends. A handler call at the start of one KV call can
     // therefore arrive with the count that follows the LAST call of the previous KV call on the
     // same connection and thread. Without the per-call reset it would continue that wait and
-    // inherit its old start. The seam below stands in for SQLite: it leaves the chain at count 2,
-    // lets the budget run out, makes one public call, and then presents count 3.
+    // inherit its old start. The seam below stands in for SQLite: it leaves the chain at count 2
+    // with a start that is already past a 1 ms budget, makes one public call, and then presents
+    // count 3.
     auto t = make_test_store();
-    t.store.set_busy_timeout(20ms);
 
-    // Leave the chain at count 2 with a start that is, after the sleep, past the budget.
+    // The three calls run under a 5 s budget, so a coarse timer (a Windows sleep rounds up to a
+    // tick of about 15.6 ms) or a loaded runner cannot make one of them give up. Only after they
+    // return is the budget lowered to 1 ms. The ladder sleeps of calls 0 to 2 (1, 2 and 5 ms)
+    // put the start more than 1 ms in the past, so a continuing count 3 gives up, while a
+    // restarted one has elapsed 0 and retries. The budget is only ever lowered inside arm(),
+    // after the three calls.
     auto arm = [&] {
-        for (int attempt = 0; attempt < 20; ++attempt) {
-            if (t.store.busy_handler_for_test(0) == 1 && t.store.busy_handler_for_test(1) == 1 &&
-                t.store.busy_handler_for_test(2) == 1) {
-                std::this_thread::sleep_for(30ms);
-                return true;
-            }
-        }
-        return false; // the thread was starved past the budget every time
+        t.store.set_busy_timeout(5s);
+        const bool chained = t.store.busy_handler_for_test(0) == 1 &&
+                             t.store.busy_handler_for_test(1) == 1 &&
+                             t.store.busy_handler_for_test(2) == 1;
+        t.store.set_busy_timeout(1ms);
+        return chained;
     };
 
     // Control: with no public call in between, count 3 continues the wait and its old start is

@@ -30,6 +30,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 namespace yuzu::agent {
@@ -110,6 +111,8 @@ struct WaitClock {
     int last_count{kNoPreviousCount};
 };
 constinit thread_local WaitClock t_wait;
+// A non-trivial destructor would register a TLS destructor on every thread that waits.
+static_assert(std::is_trivially_destructible_v<WaitClock>);
 
 // Forget the previous handler call on this thread, so the next one restarts the clock.
 void reset_wait_chain() noexcept {
@@ -130,12 +133,16 @@ void reset_wait_chain() noexcept {
 // <= 0, or a count other than the previous count + 1 (a fresh thread, another store). Continuity
 // is judged by the count, not by elapsed time, so a scheduler stall or one of SQLite's own
 // sleeps inside a wait (its WAL-index retries sleep outside this handler) does not renew the
-// budget. Every public KvStore method also calls reset_wait_chain() on entry (CallLock), so a
-// handler call whose count happens to equal the last count of an EARLIER call, such as a
-// prepare-time wait after a step that waited, restarts instead of inheriting that call's start.
-// What remains is a second wait inside ONE statement step: it continues the first wait's count
-// and shares its clock, so the budget is per statement step, the same as
-// sqlite3_busy_timeout()'s. When the handler gives up it forgets the count too.
+// budget. Every public KvStore method except open() also calls reset_wait_chain() on entry
+// (CallLock), so a handler call whose count happens to equal the last count of an EARLIER call,
+// such as a prepare-time wait after a step that waited, restarts instead of inheriting that
+// call's start. What remains is a second wait inside ONE statement step: it continues the first
+// wait's count and shares its clock, so the budget is per statement step, the same as
+// sqlite3_busy_timeout()'s. One more case remains inside a single call: SQLite zeroes its count
+// at the END of a prepare, not at its start (sqlite3.c 3.52), so a wait during a prepare that
+// follows a step that waited continues that step's clock. That gives up earlier and never waits
+// longer, and no current method prepares after a step that waited. When the handler gives up it
+// forgets the count too.
 //
 // `count <= 0` also keeps the `count - 1` below away from INT_MIN. For count == 0 it is
 // redundant today (last_count is never -1: it is either kNoPreviousCount or a count SQLite
@@ -160,11 +167,15 @@ int kv_busy_handler(void* ctx, int count) noexcept {
 }
 
 // Takes the connection mutex for one public KvStore call and starts the call with a fresh wait
-// chain (see kv_busy_handler). Every method that can touch the database uses it, so no call
-// can continue the count series of an earlier one.
-class CallLock {
+// chain (see kv_busy_handler). Every method except open() uses it, so no call can continue the
+// count series of an earlier one.
+class [[nodiscard]] CallLock {
 public:
     explicit CallLock(std::mutex& mu) : lock_{mu} { reset_wait_chain(); }
+    CallLock(const CallLock&) = delete;
+    CallLock& operator=(const CallLock&) = delete;
+    CallLock(CallLock&&) = delete;
+    CallLock& operator=(CallLock&&) = delete;
 
 private:
     std::lock_guard<std::mutex> lock_;

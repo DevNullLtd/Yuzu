@@ -2727,20 +2727,25 @@ Guardian ladder must check these.
   1, the loss ledger, journal flush 2, the Stop pass (its wall is checked only from the
   second tuple on, so it can make two 1 s writes, a slow success followed by a failing one,
   because the stop budget allows one failure) and an in-flight worker write; the
-  enumeration is not enforced by code. A `static_assert` keeps seven stop budgets within
+  enumeration (3 + 2 + 1) is not enforced by code and assumes WAL, the mode `open()` always
+  requests (in the rollback-journal fallback `del_keys`, `insert_if_absent` and `rename_key`
+  can each cost two waits: 1.81 s measured against a 1.0 s budget). A `static_assert` keeps
+  seven stop budgets within
   half the 20 s grace; that margin rule is the enforced part. The largest measured is 6.03 s
   (the real write row B at its slowest alignment and the emulated row E). COST PER QUEUED
   WRITER: every other single-shot KV writer queued on `KvStore::mu_` when `stop()` runs adds
   about one budget, because each serial stage queues behind it (measured on Linux, one run
   per point, with a journal record pending and a non-baseline worker write in flight: 9.0 s
   with 3 extra writers and 10.98 s with 5; extrapolated, not run: about 20 s, the watchdog,
-  at about 14 queued writers). The target therefore holds with at most one other writer
-  queued, and then with little room: with one extra writer `stop()` took 7.01 to 7.02 s,
-  about 20 ms of retry-sleep overshoot above 7 s. The allowance budget is spent twice if a
+  at about 14 queued writers). The target is therefore met with at most one other writer
+  queued, and only to within sleep overshoot: at one extra writer the measurement is about
+  7.0 to 7.1 s (cause likely, not isolated), and one earlier series under heavy load gave
+  7.12 s and 8.14 s. The allowance budget is spent twice if a
   Worker pass in flight makes two failed writes and a writer is also queued. A writer that
   loops costs more than one budget: in a standalone `KvStore` run of six serial 1 s stage
-  writes, K other threads looping `set()` with a 50 ms pause took 8.8 s for K=1 and 17.8 s
-  for K=3 against 6.0 s with none (one run per point), about 3 s per looping writer. A
+  writes, K other threads looping `set()` with a 50 ms pause took 8.7 to 9.7 s for K=1 and
+  20.8, 20.8 and 23.8 s for K=3 over repeat runs, against 6.0 s with none; the cost is not
+  linear in K because `std::mutex` is unfair, and K=3 passes the 20 s grace. A
   writer that loops with no pause at all can starve a stage outright because `std::mutex` is
   not fair (with one such writer a stage was still unserved after more than 3 minutes, and
   the run was killed); no production caller that does this was identified. All of this
@@ -2752,22 +2757,26 @@ Guardian ladder must check these.
   3 and with 5 staged captures (loss ledger 1 s + this pass 1 s); B, a journal record
   pending and the worker idle, 4.02 to 6.03 s over 16 runs (4.02 s seven times, 5.02 s six
   times, 6.03 s three times, with 3 and with 5 staged: which of the worker's own writes
-  line up with the stop decides how many of the six waits occur, and the same spread
-  appeared on the previous handler); C, a worker baseline write in flight, 3
+  line up with the stop decides how many of the six waits occur, and a measurement with
+  the handler before the final one showed the same spread); C, a worker baseline write in
+  flight, 3
   staged, stop called 0.3, 2.0, 4.5 and 5.3 s after it began waiting: 2.72, 2.01, 2.02 and
   2.01 s; D, a worker non-baseline write in flight, EMULATED by a KV write issued from the
   worker thread (not the real sent-marker write), 5 staged, first three alignments: 2.72,
   2.01 and 2.02 s; E, a journal record pending with that emulated write in flight, 3 staged,
   stop called 0, 0.3 and 0.7 s after: 6.03, 5.73 and 5.33 s (the two runs at each alignment
-  agreed within 3 ms). Rows A, C, D and E were first measured with an earlier handler (a
-  time-gap rule) and measured again at the final handler: unchanged within 11 ms. On the
+  agreed within 3 ms). Rows A, C, D and E were measured again at the final handler:
+  unchanged within 11 ms (the largest paired delta is 10.6 ms, at matched
+  alignment; the row B runs printed as 4.02, 5.02 and 6.03 s span 4.016 to 4.020,
+  5.021 to 5.029 and 6.024 to 6.029 s). On the
   code before the lateness gate the stall skipped the Stop pass and rows C and E were
   shorter: C 1.71, 1.01 and 1.01 s at its first three alignments (its fourth, 2.01 s, and
   row D did not change); E 5.03, 4.74 and 4.33 s; row B took 4.02 s and 4.03 s there in one
   run each, inside its spread above. The gate costs one or two more stop budgets on a store
   that is still locked (rows C and E) and saves the capture of a store that healed.
   Before #5604 the same scenarios reached 21 to 29 s on earlier revisions (not re-run on this
-  code). TRADE-OFF (journal-record loss is an F14 precondition, not yet accepted): an external
+  code). TRADE-OFF (journal-record loss is an F14 precondition, not yet accepted; see
+  `docs/spark-flip-gate.md` section 5): an external
   process holding the store locked for 1 to 5 s at the shutdown instant now fails the
   stop-time writes that a 5 s budget would have survived: one recapture of the affected
   baselines at the next boot (any drift between a lost capture and that boot is accepted as
@@ -2777,11 +2786,14 @@ Guardian ladder must check these.
   ledger and the journal each log a line. What the budget cannot bound: an fsync or other
   slow-I/O stall is not a lock event, so no busy handler runs; on every platform SQLite's
   WAL-index retry sleeps run outside the handler, so the bound is per busy wait, not per
-  call (measured on Linux with a peer process holding the WAL index in recovery: a write
-  under a 1000 ms budget returned after 1.74 s and, in another phasing, 2.05 s; one run per
-  phasing), and on Windows SQLite's own file-I/O retries (about 1.45 s per failing file
+  call (measured on Linux with a peer process holding the WAL index in recovery, a contrived
+  trigger: a write under a 1000 ms budget returned after 1.74 s and 2.05 s in the first two
+  phasings and after 1.06 to 2.32 s over six more; phasing dependent, up to about 2.3 s
+  measured, not a cap), and on Windows SQLite's own file-I/O retries (about 1.45 s per
+  failing file
   operation, derived from the SQLite source and not measured here) add to that; the DEX
-  observer drain and plugin `shutdown()` under the second guard stay unbounded; a stop queued behind an `apply_rules` is not cut by the
+  observer drain and plugin `shutdown()` under the second guard stay unbounded; a stop
+  queued behind an `apply_rules` is not cut by the
   lowering for a Forced drain (up to two failures of 1 s: its 2 s wall ends it) or a hung
   `watch()` (pre-existing); and
   the evidence is sampled, not continuous: a store that turns BUSY only after the evidence

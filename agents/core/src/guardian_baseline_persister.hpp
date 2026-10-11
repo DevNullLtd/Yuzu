@@ -60,8 +60,8 @@
  * store). A late start with no slow evidence (an apply_rules that held the engine mutex for
  * 18 s on a healthy store) runs: a healthy pass takes well under a millisecond per capture,
  * but it may use its whole 1 s wall plus one write, so a start in the last second of the grace
- * can run into the watchdog (accepted: the alternative is to forfeit captures on a healthy
- * store). A skip touches nothing in the store; the persister logs it with its own line.
+ * can run into the watchdog (a design decision: the alternative is to forfeit captures on a
+ * healthy store). A skip touches nothing in the store; the persister logs it with its own line.
  *
  * YIELDING: apply_rules takes the seed fence once per baseline-on-arm rule, so a worker pass
  * that kept the lock for its whole budget would make each of those fences wait. A Worker pass

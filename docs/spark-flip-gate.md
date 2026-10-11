@@ -2259,8 +2259,11 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   loss-ledger write, journal flush 2, the Stop pass (its wall is checked only from the
   second tuple on, so it can make two writes, a slow success followed by a failing one,
   because the stop budget allows one failure) and an in-flight worker write. The
-  enumeration is not enforced by any code; the `static_assert` on seven stop budgets within
-  half the 20 s grace is the enforced margin. The largest figure measured is 6.03 s on
+  enumeration (3 + 2 + 1) is not enforced by any code and assumes WAL, the mode `open()`
+  always requests (in the rollback-journal fallback `del_keys`, `insert_if_absent` and
+  `rename_key` can each cost two waits: 1.81 s measured against a 1.0 s budget; `set` and
+  `clear` stay at one); the `static_assert` on seven stop budgets within half the 20 s
+  grace is the enforced margin. The largest figure measured is 6.03 s on
   Linux (the real-write row B at its slowest alignment and the emulated row E; see the
   measured rows below), inside the seven-budget target with a 0.97 s margin. On a Docker
   agent service (stopped at 10 s) a 6 s contended stop leaves about 4 s for the DEX drain,
@@ -2270,20 +2273,23 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   behind it. Measured on Linux, one run per point, with a journal record pending and a
   non-baseline worker write in flight: 9.0 s with 3 extra writers and 10.98 s with 5.
   Extrapolated, not run: about 20 s, the watchdog, at about 14 queued writers. The
-  seven-budget target therefore holds with at most one other writer queued, and then with
-  little room: with one extra writer `stop()` took 7.01 to 7.02 s, about 20 ms of
-  retry-sleep overshoot above 7 s. The allowance budget is spent twice if a Worker pass in
+  seven-budget target is therefore met with at most one other writer queued, and only to
+  within sleep overshoot: at one extra writer the measurement is about 7.0 to 7.1 s (cause
+  likely, not isolated), and one earlier series under heavy load gave 7.12 s and 8.14 s.
+  The allowance budget is spent twice if a Worker pass in
   flight makes two failed writes and a writer is also queued. A writer that loops costs
   more than one budget: in a standalone `KvStore` run of six serial 1 s stage writes, K
-  other threads looping `set()` with a 50 ms pause took 8.8 s for K=1 and 17.8 s for K=3
-  against 6.0 s with none (one run per point), about 3 s per looping writer. A writer that
+  other threads looping `set()` with a 50 ms pause took 8.7 to 9.7 s for K=1 and 20.8, 20.8
+  and 23.8 s for K=3 over repeat runs, against 6.0 s with none; the cost is not linear in K
+  because `std::mutex` is unfair, and K=3 passes the 20 s grace. A writer that
   loops with no pause at all can starve a `stop()` stage outright because `std::mutex` is
   not fair (with one such writer a stage was still unserved after more than 3 minutes, and
   the run was killed); no production caller that does this was identified. All of this
   predates #5604 and is not fixed here (a pre-existing residual of the store's single
   mutex); to be tracked as a follow-up in the #5604 decision comment.
-  **Trace decision (AC2)**: a watchdog-cut flush is accepted as untraceable at stop time
-  (`hard_exit` forbids a log line, and a KV marker would fail on the same store); the
+  **Trace decision (AC2)**: a watchdog-cut flush stays untraceable at stop time (decided by
+  the implementer, not accepted by a stakeholder; `hard_exit` forbids a log line, and a
+  KV marker would fail on the same store); the
   evidence is exit code 4 plus the next boot's recapture lines. A recapture logs exactly
   like a first arm, so an operator should treat `file-hash-equals` rules without an authored
   `expected_hash` as possibly re-baselined after an exit-4 event. A begin-of-stop file
@@ -2296,13 +2302,16 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   2.01 s; B, a journal record pending and the worker idle, 4.02 to 6.03 s over 16 runs
   (4.02 s seven times, 5.02 s six times, 6.03 s three times, with 3 and with 5 staged:
   which of the worker's own writes line up with the stop decides how many of the six waits
-  occur, and the same spread appeared on the previous handler); C, a worker baseline write
+  occur, and a measurement with the handler before the final one showed the same spread);
+  C, a worker baseline write
   in flight, 2.01 to 2.72 s across four alignments (the 2.01 s points include the worker's
   retry write in flight); D, a worker non-baseline write in flight (emulated by a KV write
   issued from the worker thread, 5 staged), 2.01 to 2.72 s; E, a journal record pending
   with that emulated write in flight, 5.33 to 6.03 s (the two runs at each alignment
-  agreed within 3 ms). Rows A, C, D and E were first measured with an earlier handler (a
-  time-gap rule) and measured again at the final handler: unchanged within 11 ms. Where
+  agreed within 3 ms). Rows A, C, D and E were measured again at the final handler:
+  unchanged within 11 ms (the largest paired delta is 10.6 ms, at matched
+  alignment; the row B runs printed as 4.02, 5.02 and 6.03 s span 4.016 to 4.020,
+  5.021 to 5.029 and 6.024 to 6.029 s). Where
   the stall skipped the Stop pass on the code before the gate, rows C and E were shorter:
   C 1.71, 1.01 and 1.01 s at its first three alignments (its fourth, 2.01 s, and row D did
   not change), E 5.03, 4.74 and 4.33 s; row B took 4.02 s and 4.03 s there in one run each,
@@ -2335,8 +2344,10 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   other slow-I/O stall inside a write is not a lock event and no handler runs, so a stalled
   disk still runs into the watchdog. On every platform SQLite's WAL-index retry sleeps run
   outside the handler, so the bound is per busy wait, not per call (measured on Linux with a
-  peer process holding the WAL index in recovery: a write under a 1000 ms budget returned
-  after 1.74 s and, in another phasing, 2.05 s; one run per phasing). On Windows SQLite's own
+  peer process holding the WAL index in recovery, a contrived trigger: a write under a 1000
+  ms budget returned after 1.74 s and 2.05 s in the first two phasings and after 1.06 to
+  2.32 s over six more; phasing dependent, up to about 2.3 s measured, not a cap). On
+  Windows SQLite's own
   file-I/O retries (`winRetryIoerr`, about 1.45 s per failing file operation, derived from
   the SQLite source and not measured here) add to that (five stages at two failing
   operations per statement would be about 19.6 s by that derivation). The DEX observer

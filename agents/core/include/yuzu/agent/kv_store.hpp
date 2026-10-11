@@ -255,7 +255,7 @@ public:
     void enable_extended_result_codes_for_test();
 
     /**
-     * Lower (or set) the busy budget: how long ONE lock wait of a KV call waits on a locked
+     * Lower (or set) the busy budget: how long one statement step of a KV call waits on a locked
      * database before it fails with SQLITE_BUSY (#5604). The budget lives in an atomic that the
      * connection's busy handler (not sqlite3_busy_timeout) reads on every retry, so this is
      * lock-free and also shortens a wait that is ALREADY in progress on another thread:
@@ -274,15 +274,22 @@ public:
      * at most one budget per call. The budget is per statement step, the same as
      * sqlite3_busy_timeout()'s: a second lock wait inside ONE step (a rollback-journal step can
      * wait for the writer lock and then for EXCLUSIVE at commit) shares the first wait's clock,
-     * and every public method starts with a fresh clock. The rollback-journal fallback (WAL could
-     * not be enabled) lets del_keys() wait twice, in two steps, so it can cost two.
+     * and every public method except open() starts with a fresh clock. A wait during a prepare
+     * that follows a step that waited in the same call also continues that clock (SQLite zeroes
+     * its count at the END of a prepare): that gives up earlier, never later, and no current
+     * method prepares after a step that waited. In the rollback-journal fallback (WAL could not
+     * be enabled) del_keys(), insert_if_absent() and rename_key() each commit in a second step
+     * and so can cost two budgets (1.81 s against a 1.0 s budget measured on Linux, SQLite 3.52,
+     * with a reader holding SHARED through the commit); set() and clear() stay at one.
      *
-     * The bound is per BUSY WAIT, not per call, on every platform: SQLite's WAL-index retry
+     * The bound is per busy wait, not per call, on every platform: SQLite's WAL-index retry
      * sleeps happen outside the busy handler, which cannot cut them short. Measured on Linux
-     * (SQLite 3.52, a 1000 ms budget, a peer process holding the WAL index in recovery, one run
-     * per phasing): set() returned after 1741 ms in one phasing and 2046 ms in another. On
-     * Windows SQLite's own file-I/O retries (winRetryIoerr, about 1.4 to 1.5 s per failing I/O,
-     * derived from the SQLite source, not measured here) add to that.
+     * (SQLite 3.52, a 1000 ms budget, a contrived trigger: a peer process holding the WAL index
+     * in recovery): set() returned after 1741 ms and 2046 ms in the first two phasings and after
+     * 1.06 to 2.32 s over six more. The overshoot is phasing dependent, up to about 2.3 s
+     * measured; that is not a cap. On Windows SQLite's own file-I/O retries (winRetryIoerr,
+     * about 1.4 to 1.5 s per failing I/O, derived from the SQLite source, not measured here) add
+     * to that.
      *
      * Production lowers it once (GuardianEngine::stop(), to kKvStoreStopBusyTimeout) and never
      * raises it: the stop budget is terminal. noexcept and never blocks. Thread-safety
@@ -298,7 +305,7 @@ public:
     /// TEST-ONLY: invoke the busy handler directly with SQLite's `count` (retries already made in
     /// this wait). Returns what SQLite would see: 1 after sleeping (retry), 0 (give up). Lets a
     /// test drive the handler's per-thread wait clock without a contended database. It does not
-    /// reset the wait chain; every other public method does, on entry.
+    /// reset the wait chain; every other public method except open() does, on entry.
     [[nodiscard]] int busy_handler_for_test(int count) noexcept;
 
     /// TEST-ONLY: the retry sleep the handler uses for SQLite's `count` (1, 2, 5, then 10 ms).
@@ -312,6 +319,8 @@ private:
 
     sqlite3* db_{nullptr};
     std::unique_ptr<KvBusyState> busy_;
+    /// Every public method except open() takes this through CallLock (kv_store.cpp), never a bare
+    /// lock_guard, so the busy handler's wait chain restarts on every call.
     std::mutex mu_;
 };
 

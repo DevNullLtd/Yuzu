@@ -874,8 +874,9 @@ GuardianBaselinePersister::persist_staged(GuardianSparkRuntime& rt, Trigger trig
             ++out.failed;
             const auto write_ended = now();
             // Compared against the trouble threshold, not the pass's 1 s wall: a BUSY write now
-            // costs exactly the 1 s stop busy budget, so an exact-equality test against the wall
-            // would be a coin flip on timer rounding (#5604).
+            // costs the 1 s stop busy budget, and one that measures a little under the wall (a
+            // clock read, scheduler delay) would slip under an exact-equality test (#5604); the
+            // threshold's measurement slack covers it (guardian_baseline_persister.hpp).
             if (write_ended - write_began >= kBaselineStopTroubleThreshold) {
                 slow_failure = true; // timed per failing write, whatever succeeded before it
                 slow_failure_at = write_ended.time_since_epoch().count();
@@ -1407,10 +1408,10 @@ void GuardianEngine::stop() {
     // store) runs: a healthy pass takes well under a millisecond per capture, but it may use
     // its whole 1 s wall plus one write, so a start in the last second of the grace can run
     // into the watchdog (before #5604, a healthy 300-capture pass that started at 19 s ended at
-    // 20.035 s in a measurement with a slow-IO window). Accepted: the alternative is to forfeit
-    // the captures of a healthy store. An EARLY start never skips, whatever failed before it: a
-    // store that healed after a worker write failed slowly gets its Stop pass (#5604; before
-    // this the stall alone skipped it).
+    // 20.035 s in a measurement with a slow-IO window). Decided so: the alternative is to
+    // forfeit the captures of a healthy store. An EARLY start never skips, whatever failed
+    // before it: a store that healed after a worker write failed slowly gets its Stop pass
+    // (#5604; before this the stall alone skipped it).
     //
     // Ordering: this flush runs after the journal flush and the loss-ledger write, so it is the
     // one a late-start skip drops; the integrity-relevant flusher yields to the audit-replay one
@@ -1437,7 +1438,9 @@ void GuardianEngine::stop() {
     // budget of allowance for sleep overshoot and a queued caller. The six are journal flush 1,
     // the loss ledger, journal flush 2, the Stop pass (its wall is checked only from the
     // second tuple on, so it can make two 1 s writes: a slow success then a failing one) and
-    // an in-flight worker write. guardian_baseline_persister.hpp
+    // an in-flight worker write. The enumeration (3 + 2 + 1) assumes WAL, the mode open()
+    // always requests: in the rollback-journal fallback a journal flush (insert_if_absent) can
+    // cost two budgets (kv_store.hpp). guardian_baseline_persister.hpp
     // asserts that seven stop budgets fit in half the grace; that assertion, not the
     // enumeration, is the enforced margin. A Worker baseline pass in flight when stop() begins
     // can itself make two failed 1 s writes (its 2 s wall is checked from the second tuple on),
@@ -1448,15 +1451,17 @@ void GuardianEngine::stop() {
     // stop() runs adds about one budget, because each of stop()'s serial stages queues behind
     // it (measured on Linux, one run per point, with a journal record pending and a
     // non-baseline worker write in flight: 9.0 s at 3 extra writers and 10.98 s at 5;
-    // extrapolated, not run: about 20 s, the watchdog, at about 14). So the target holds with
-    // at most one other writer queued, and then with little room (7.01 to 7.02 s with one, about
-    // 20 ms of retry-sleep overshoot above 7 s); the allowance budget is spent twice if a Worker
+    // extrapolated, not run: about 20 s, the watchdog, at about 14). So the target is met with
+    // at most one other writer queued, and only to within sleep overshoot: at one extra writer
+    // the measurement is about 7.0 to 7.1 s (cause likely, not isolated), and one earlier series
+    // under heavy load gave 7.12 s and 8.14 s. The allowance budget is spent twice if a Worker
     // pass in flight makes two failed writes and a writer is also queued. A writer that LOOPS
     // costs more: in a standalone KvStore run of six serial 1 s stage writes, K other threads
-    // looping set() with a 50 ms pause took 8.8 s for K=1 and 17.8 s for K=3 against 6.0 s with
-    // none (one run per point), about 3 s per looping writer. A writer that loops with no pause
-    // can starve a stop stage outright, because std::mutex is not fair (one such writer left a
-    // stage unserved for over 3 minutes); no production caller that does this was identified.
+    // looping set() with a 50 ms pause took 8.7 to 9.7 s for K=1 and 20.8, 20.8 and 23.8 s for
+    // K=3 over repeat runs, against 6.0 s with none; the cost is not linear in K because
+    // std::mutex is unfair, and K=3 passes the 20 s grace. A writer that loops with no pause
+    // can starve a stop stage outright (one such writer left a stage unserved for over
+    // 3 minutes); no production caller that does this was identified.
     // All of this is a pre-existing property of the store's one mutex, not fixed here.
     // Trade-off (journal-record loss is an F14 precondition, not yet accepted): an
     // external process holding the store locked for 1 to 5 s at this instant now fails the
@@ -1486,10 +1491,11 @@ void GuardianEngine::stop() {
     //                                                 pass are four of the waits; the live
     //                                                 worker's own baseline writes add none,
     //                                                 one or two, depending on how its pass
-    //                                                 lines up with the stop (the previous
-    //                                                 handler gave the same spread, and the
-    //                                                 code before the gate 4.02 s and 4.03 s
-    //                                                 in one run each)
+    //                                                 lines up with the stop (a measurement
+    //                                                 with the handler before the final one
+    //                                                 gave the same spread, and the code
+    //                                                 before the gate 4.02 s and 4.03 s in
+    //                                                 one run each)
     //   worker baseline write in flight ............ 2.72 s, 2.01 s, 2.02 s, 2.01 s for a stop
     //                                                 called 0.3, 2.0, 4.5 and 5.3 s after the
     //                                                 write began waiting
@@ -1503,9 +1509,11 @@ void GuardianEngine::stop() {
     //                                                 after it began (the largest measured, as
     //                                                 on the real-write row above; the two runs
     //                                                 at each point agreed within 3 ms)
-    // Every row but the first journal-pending one (which varies from run to run) was first
-    // measured with an earlier handler (a time-gap rule) and measured again at the final one:
-    // unchanged within 11 ms.
+    // Every row but the first journal-pending one (which varies from run to run) was measured
+    // again at the final handler: unchanged within 11 ms (the largest paired delta is 10.6 ms,
+    // on rows A, C, D and E at matched alignment; row A's two figures are from the earlier
+    // measurement). The runs of the journal-pending row printed as 4.02, 5.02 and 6.03 s span
+    // 4.016 to 4.020, 5.021 to 5.029 and 6.024 to 6.029 s.
     // Before the gate, where the stall skipped the pass, the baseline-write row was shorter,
     // 1.71, 1.01 and 1.01 s at its first three points (the fourth, 2.01 s, and the NON-baseline
     // row did not change), and so was the last row, 5.03, 4.74 and 4.33 s. The gate costs one or
