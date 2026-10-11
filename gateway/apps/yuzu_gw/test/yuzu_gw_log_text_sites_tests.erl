@@ -33,9 +33,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("grpcbox/include/grpcbox.hrl").
 
--export([log/2]).  %% logger handler callback (log capture)
 
--define(LOG_HANDLER, yuzu_gw_log_text_sites_tests_logs).
 -define(AWAIT_MS, 5000).
 %% The guardian at-capacity fixture: the table of blocked workers and the key that
 %% holds the test's pid.
@@ -243,24 +241,19 @@ guardian_capacity_test_() ->
 setup_guardian() ->
     {ok, _} = application:ensure_all_started(telemetry),
     catch meck:unload(grpcbox_client),
-    stop_upstream(),
-    Prev = [{Key, application:get_env(yuzu_gw, Key)} || Key <- ?ENV_KEYS],
-    application:set_env(yuzu_gw, circuit_breaker_failure_threshold, 3),
-    application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 600000),
-    application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 600000),
+    yuzu_gw_test_upstream:stop_upstream(),
+    Prev = yuzu_gw_test_upstream:save_env(?ENV_KEYS),
+    yuzu_gw_test_upstream:set_breaker_env(3),
     ok = meck:new(grpcbox_client, [non_strict, no_link]),
     ok = meck:expect(grpcbox_client, unary,
                      fun(_Ctx, _Path, _Req, _Def, _Opts) -> {error, econnrefused} end),
-    {ok, Pid} = yuzu_gw_upstream:start_link(),
-    unlink(Pid),
+    yuzu_gw_test_upstream:start_upstream(),
     #{prev_env => Prev}.
 
 cleanup_guardian(#{prev_env := Prev}) ->
-    stop_upstream(),
+    yuzu_gw_test_upstream:stop_upstream(),
     catch meck:unload(grpcbox_client),
-    lists:foreach(fun({Key, {ok, V}}) -> application:set_env(yuzu_gw, Key, V);
-                     ({Key, undefined}) -> application:unset_env(yuzu_gw, Key)
-                  end, Prev),
+    yuzu_gw_test_upstream:restore_env(Prev),
     ok.
 
 %% The mocked client reports each call to the test process and then waits for a
@@ -272,11 +265,9 @@ cleanup_guardian(#{prev_env := Prev}) ->
 setup_guardian_blocked() ->
     {ok, _} = application:ensure_all_started(telemetry),
     catch meck:unload(grpcbox_client),
-    stop_upstream(),
-    Prev = [{Key, application:get_env(yuzu_gw, Key)} || Key <- ?ENV_KEYS],
-    application:set_env(yuzu_gw, circuit_breaker_failure_threshold, 3),
-    application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 600000),
-    application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 600000),
+    yuzu_gw_test_upstream:stop_upstream(),
+    Prev = yuzu_gw_test_upstream:save_env(?ENV_KEYS),
+    yuzu_gw_test_upstream:set_breaker_env(3),
     catch ets:delete(?BLOCKED),
     ?BLOCKED = ets:new(?BLOCKED, [named_table, public, set]),
     ok = meck:new(grpcbox_client, [non_strict, no_link]),
@@ -288,8 +279,7 @@ setup_guardian_blocked() ->
                          after 60000 -> {error, {<<"3">>, <<"never released">>}, #{}}
                          end
                      end),
-    {ok, Pid} = yuzu_gw_upstream:start_link(),
-    unlink(Pid),
+    yuzu_gw_test_upstream:start_upstream(),
     #{prev_env => Prev}.
 
 cleanup_guardian_blocked(Ctx) ->
@@ -298,19 +288,9 @@ cleanup_guardian_blocked(Ctx) ->
     catch persistent_term:erase(?BLOCKED_TEST),
     cleanup_guardian(Ctx).
 
-stop_upstream() ->
-    case whereis(yuzu_gw_upstream) of
-        undefined -> ok;
-        Pid       -> catch unlink(Pid),
-                     catch gen_server:stop(Pid, shutdown, 5000),
-                     ok
-    end.
-
 guardian_dropped_circuit_open_line() ->
     Id = control_id(<<"guardian-open">>),
-    [{error, _} = yuzu_gw_upstream:proxy_register(#{info => #{agent_id => <<"a">>}})
-     || _ <- [1, 2, 3]],
-    open = yuzu_gw_upstream:circuit_state(),
+    trip_breaker(),
     Line = capture_line(<<"Dropping guardian message for">>, fun() ->
         yuzu_gw_upstream:forward_guardian_message(Id, #{})
     end, debug),
@@ -387,19 +367,16 @@ setup_notify(Env) ->
     {ok, _} = application:ensure_all_started(telemetry),
     yuzu_gw_test_registry:ensure(),
     catch meck:unload(grpcbox_client),
-    stop_upstream(),
-    Prev = [{Key, application:get_env(yuzu_gw, Key)} || Key <- ?ENV_KEYS],
-    application:set_env(yuzu_gw, circuit_breaker_failure_threshold, 3),
-    application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 600000),
-    application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 600000),
+    yuzu_gw_test_upstream:stop_upstream(),
+    Prev = yuzu_gw_test_upstream:save_env(?ENV_KEYS),
+    yuzu_gw_test_upstream:set_breaker_env(3),
     [application:set_env(yuzu_gw, K, V) || {K, V} <- Env],
     catch ets:delete(?BLOCKED),
     ?BLOCKED = ets:new(?BLOCKED, [named_table, public, set]),
     ok = meck:new(grpcbox_client, [non_strict, no_link]),
     ok = meck:expect(grpcbox_client, unary,
                      fun(_Ctx, _Path, _Req, _Def, _Opts) -> {error, econnrefused} end),
-    {ok, Pid} = yuzu_gw_upstream:start_link(),
-    unlink(Pid),
+    yuzu_gw_test_upstream:start_upstream(),
     catch ets:delete(?NOTIFY_AGENTS),
     ?NOTIFY_AGENTS = ets:new(?NOTIFY_AGENTS, [named_table, public, set]),
     #{prev_env => Prev}.
@@ -419,10 +396,7 @@ cleanup_notify(Ctx) ->
 
 %% Three failed registrations: the breaker is open.
 trip_breaker() ->
-    [{error, _} = yuzu_gw_upstream:proxy_register(#{info => #{agent_id => <<"a">>}})
-     || _ <- [1, 2, 3]],
-    open = yuzu_gw_upstream:circuit_state(),
-    ok.
+    yuzu_gw_test_upstream:trip_breaker(#{info => #{agent_id => <<"a">>}}, 3).
 
 notify(AgentId, PeerAddr) ->
     yuzu_gw_upstream:notify_stream_status(AgentId, <<"sess">>, connected, PeerAddr, <<"home">>).
@@ -574,19 +548,10 @@ capture_line(Pattern, Fun) ->
 %% Run Fun with a capturing handler at Level and return the first line that
 %% contains Pattern and the marker prefix, waiting (bounded) for it to be logged.
 capture_line(Pattern, Fun, Level) ->
-    Prev = maps:get(level, logger:get_primary_config()),
-    ok = logger:set_primary_config(level, Level),
-    catch logger:remove_handler(?LOG_HANDLER),
-    ok = logger:add_handler(?LOG_HANDLER, ?MODULE,
-                            #{config => #{pid => self()}, level => Level}),
-    try
-        flush_logs(),
+    yuzu_gw_test_logs:with_handler(Level, fun() ->
         Fun(),
         await_line(Pattern, erlang:monotonic_time(millisecond) + ?AWAIT_MS)
-    after
-        logger:remove_handler(?LOG_HANDLER),
-        logger:set_primary_config(level, Prev)
-    end.
+    end).
 
 await_line(Pattern, Deadline) ->
     Left = max(0, Deadline - erlang:monotonic_time(millisecond)),
@@ -600,16 +565,3 @@ await_line(Pattern, Deadline) ->
     after Left ->
         erlang:error({line_not_logged, Pattern})
     end.
-
-flush_logs() ->
-    receive {captured_log, _} -> flush_logs() after 0 -> ok end.
-
-%% logger handler callback
-log(#{msg := Msg, meta := _}, #{config := #{pid := Pid}}) ->
-    Text = case Msg of
-        {string, S} -> unicode:characters_to_binary(S);
-        {report, R} -> unicode:characters_to_binary(io_lib:format("~p", [R]));
-        {Fmt, Args} -> unicode:characters_to_binary(io_lib:format(Fmt, Args))
-    end,
-    Pid ! {captured_log, Text},
-    ok.

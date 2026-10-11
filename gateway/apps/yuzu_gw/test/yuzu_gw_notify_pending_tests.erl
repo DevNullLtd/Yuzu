@@ -301,14 +301,12 @@ setup(Env) ->
     %% A prior module may have leaked the real upstream. Stop it (stop_upstream/0
     %% does so silently, it does not report the leak) so this fixture owns the
     %% registered name.
-    stop_upstream(),
+    yuzu_gw_test_upstream:stop_upstream(),
     clear_registry(),
-    Prev = [{Key, application:get_env(yuzu_gw, Key)} || Key <- ?ENV_KEYS],
+    Prev = yuzu_gw_test_upstream:save_env(?ENV_KEYS),
     application:unset_env(yuzu_gw, notify_pending_max),
     application:unset_env(yuzu_gw, registration_replay_spacing_ms),
-    application:set_env(yuzu_gw, circuit_breaker_failure_threshold, 3),
-    application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 600000),
-    application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 600000),
+    yuzu_gw_test_upstream:set_breaker_env(3),
     lists:foreach(fun({K, V}) -> application:set_env(yuzu_gw, K, V) end, Env),
     %% Public tables and counters shared with the mock, which runs in the
     %% worker processes the upstream spawns. Atomics: 1 = workers inside the
@@ -325,7 +323,7 @@ setup(Env) ->
     catch telemetry:detach(?TELEMETRY_HANDLER),
     ok = telemetry:attach_many(?TELEMETRY_HANDLER, [?EV_QUEUE, ?EV_DROPPED, ?EV_COALESCED],
                                fun ?MODULE:handle_event/4, #{log => Log}),
-    _ = start_upstream(),
+    _ = yuzu_gw_test_upstream:start_upstream(),
     Ctx.
 
 %% All cleanup lives here: open every gate and release the parked workers, let
@@ -338,7 +336,7 @@ cleanup(#{log := Log, workers := Workers, atoms := Atoms, prev_env := Prev}) ->
     %% With the gates open every held entry drains (unless the breaker is not
     %% closed, then nothing can spawn); stop once nothing is in flight.
     wait_until(fun() -> settled(Log) end, ?AWAIT_MS),
-    stop_upstream(),
+    yuzu_gw_test_upstream:stop_upstream(),
     release_parked(Workers),
     %% A wait that fails is reported, but only after the rest of the teardown
     %% ran, so one stuck process cannot leave the mock, the tables and the env
@@ -349,9 +347,7 @@ cleanup(#{log := Log, workers := Workers, atoms := Atoms, prev_env := Prev}) ->
     Cleared = guarded(fun clear_registry/0),
     ets:delete(Log),
     ets:delete(Workers),
-    lists:foreach(fun({Key, {ok, V}}) -> application:set_env(yuzu_gw, Key, V);
-                     ({Key, undefined}) -> application:unset_env(yuzu_gw, Key)
-                  end, Prev),
+    yuzu_gw_test_upstream:restore_env(Prev),
     persistent_term:erase(?CTXK),
     persistent_term:erase(?SUBK),
     persistent_term:erase(?FIELDSK),
@@ -380,21 +376,6 @@ cleanup_logs(#{prev_level := PrevLevel} = Ctx) ->
     catch logger:remove_handler(?LOG_HANDLER),
     logger:set_primary_config(level, PrevLevel),
     cleanup(maps:remove(prev_level, Ctx)).
-
-start_upstream() ->
-    {ok, Pid} = yuzu_gw_upstream:start_link(),
-    %% The fixture owns the lifetime (stop_upstream/0); a kill in a test must
-    %% not take the test process with it.
-    unlink(Pid),
-    Pid.
-
-stop_upstream() ->
-    case whereis(yuzu_gw_upstream) of
-        undefined -> ok;
-        Pid       -> catch unlink(Pid),
-                     catch gen_server:stop(Pid, shutdown, 5000),
-                     ok
-    end.
 
 %% The shared registry stays empty between tests and modules. deregister_agent
 %% is a cast, so poll (bounded) until the table is empty.
@@ -928,7 +909,7 @@ restart_starts_from_zero() ->
     after ?AWAIT_MS -> erlang:error(upstream_did_not_die)
     end,
     Before = length(gauges()),
-    _ = start_upstream(),
+    _ = yuzu_gw_test_upstream:start_upstream(),
     ?assertEqual([{0, 0}], lists:nthtail(Before, gauges())),
     NewKeys = [<<"new-", (integer_to_binary(I))/binary>> || I <- lists:seq(1, 3)],
     [cast_connected(Id) || Id <- NewKeys],
@@ -981,10 +962,10 @@ env_valid_is_kept() ->
 %% naming the key and takes the default; a valid one is kept, appears in the
 %% init INFO line, and does not warn.
 env_case(Val, Kind) ->
-    stop_upstream(),
+    yuzu_gw_test_upstream:stop_upstream(),
     application:set_env(yuzu_gw, notify_pending_max, Val),
     Mark = last_key(),
-    _ = start_upstream(),
+    _ = yuzu_gw_test_upstream:start_upstream(),
     Lines = [{Level, Text} || {Key, log, Level, Text} <- rows(), Key > Mark],
     Named = [T || {warning, T} <- Lines,
                   binary:match(T, <<"notify_pending_max">>) =/= nomatch],
@@ -1131,7 +1112,7 @@ env_key_case(Key, Val) ->
 %% The same with the Extra application env set first (the setup values are the
 %% fixture's own, far-off timers; a case that needs a particular pair sets it).
 env_key_case(Key, Val, Extra) ->
-    stop_upstream(),
+    yuzu_gw_test_upstream:stop_upstream(),
     %% {unset, K} removes a key the fixture set, so the default applies.
     [case E of
          {unset, K} -> application:unset_env(yuzu_gw, K);
@@ -1139,7 +1120,7 @@ env_key_case(Key, Val, Extra) ->
      end || E <- Extra],
     application:set_env(yuzu_gw, Key, Val),
     Mark = last_key(),
-    _ = start_upstream(),
+    _ = yuzu_gw_test_upstream:start_upstream(),
     KeyText = atom_to_binary(Key, utf8),
     [T || {Key1, log, warning, T} <- rows(), Key1 > Mark,
           binary:match(T, KeyText) =/= nomatch].
@@ -1727,9 +1708,9 @@ cluster_id_list_is_converted_to_utf8() ->
              {<<"binary-id">>, <<"binary-id">>}],
     lists:foreach(
       fun({{Configured, Expected}, N}) ->
-          stop_upstream(),
+          yuzu_gw_test_upstream:stop_upstream(),
           application:set_env(yuzu_gw, cluster_id, Configured),
-          _ = start_upstream(),
+          _ = yuzu_gw_test_upstream:start_upstream(),
           cast_connected(agent(N)),
           {entered, W, Req} = await_attempt(),
           ?assertEqual(Expected, maps:get(cluster_id, Req)),
@@ -1742,7 +1723,7 @@ cluster_id_list_is_converted_to_utf8() ->
 %% value. The caller is linked, so it traps exits for the call (whether this OTP
 %% still delivers the exit signal of a failed init or not, none is left behind).
 cluster_id_unrepresentable_stops_init() ->
-    stop_upstream(),
+    yuzu_gw_test_upstream:stop_upstream(),
     application:set_env(yuzu_gw, cluster_id, [16#110000]),
     Prev = process_flag(trap_exit, true),
     try
@@ -1920,8 +1901,7 @@ sync() ->
 %% reset timer far away.
 trip_breaker() ->
     mock(fail),
-    [{error, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}) || _ <- [1, 2, 3]],
-    ?assertEqual(open, yuzu_gw_upstream:circuit_state()).
+    yuzu_gw_test_upstream:trip_breaker(#{info => #{}}, 3).
 
 open_and_release_all() ->
     #{atoms := Atoms, workers := Workers} = ctx(),

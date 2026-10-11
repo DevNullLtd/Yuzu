@@ -30,12 +30,10 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("grpcbox/include/grpcbox.hrl").
 
--export([log/2]).           %% logger handler callback (log capture)
 -export([handle_event/4]).  %% telemetry handler callback
 -export([handle_refused/4]).  %% telemetry handler callback (edge refusals)
 
 -define(CTX_KEY, yuzu_register_bound_conn_key).
--define(LOG_HANDLER, yuzu_register_bound_tests_logs).
 -define(TELEMETRY_HANDLER, yuzu_register_bound_tests_events).
 -define(REFUSED_HANDLER, yuzu_register_bound_tests_refused).
 -define(WIRE_KEY, {?MODULE, wire}).
@@ -133,11 +131,9 @@ setup(Threshold) ->
     yuzu_gw_test_registry:ensure(),
     catch meck:unload(grpcbox_client),
     catch meck:unload(yuzu_gw_conn),
-    stop_upstream(),
-    Prev = [{Key, application:get_env(yuzu_gw, Key)} || Key <- ?ENV_KEYS],
-    application:set_env(yuzu_gw, circuit_breaker_failure_threshold, Threshold),
-    application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 600000),
-    application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 600000),
+    yuzu_gw_test_upstream:stop_upstream(),
+    Prev = yuzu_gw_test_upstream:save_env(?ENV_KEYS),
+    yuzu_gw_test_upstream:set_breaker_env(Threshold),
     Wire = atomics:new(1, [{signed, false}]),
     persistent_term:put(?WIRE_KEY, Wire),
     ok = meck:new(grpcbox_client, [non_strict, no_link]),
@@ -145,26 +141,15 @@ setup(Threshold) ->
     ok = meck:expect(yuzu_gw_conn, key_from_ctx,
                      fun(Ctx) -> ctx:get(Ctx, ?CTX_KEY, undefined) end),
     mock_server(),
-    {ok, Pid} = yuzu_gw_upstream:start_link(),
-    unlink(Pid),
+    yuzu_gw_test_upstream:start_upstream(),
     #{threshold => Threshold, prev_env => Prev}.
 
 cleanup(#{prev_env := Prev}) ->
-    stop_upstream(),
+    yuzu_gw_test_upstream:stop_upstream(),
     catch meck:unload([grpcbox_client, yuzu_gw_conn]),
-    lists:foreach(fun({Key, {ok, V}}) -> application:set_env(yuzu_gw, Key, V);
-                     ({Key, undefined}) -> application:unset_env(yuzu_gw, Key)
-                  end, Prev),
+    yuzu_gw_test_upstream:restore_env(Prev),
     persistent_term:erase(?WIRE_KEY),
     ok.
-
-stop_upstream() ->
-    case whereis(yuzu_gw_upstream) of
-        undefined -> ok;
-        Pid       -> catch unlink(Pid),
-                     catch gen_server:stop(Pid, shutdown, 5000),
-                     ok
-    end.
 
 %%%===================================================================
 %%% The mock server
@@ -226,9 +211,8 @@ breaker() ->
     {State, Failures}.
 
 restart_upstream() ->
-    stop_upstream(),
-    {ok, Pid} = yuzu_gw_upstream:start_link(),
-    unlink(Pid),
+    yuzu_gw_test_upstream:stop_upstream(),
+    yuzu_gw_test_upstream:start_upstream(),
     ok.
 
 %%%===================================================================
@@ -744,38 +728,7 @@ matching(Lines, Pattern) ->
 %%% Log capture
 %%%===================================================================
 
-%% Run Fun and return the rendered text of every warning logged meanwhile. The
-%% handler runs in the logging process and sends before the logging call
-%% returns; every body waits for the processes that log, so nothing is pending.
+%% Run Fun and return the rendered text of every warning logged meanwhile
+%% (every body waits for the processes that log, so nothing is pending).
 capture_logs(Fun) ->
-    Prev = maps:get(level, logger:get_primary_config()),
-    ok = logger:set_primary_config(level, warning),
-    catch logger:remove_handler(?LOG_HANDLER),
-    ok = logger:add_handler(?LOG_HANDLER, ?MODULE,
-                            #{config => #{pid => self()}, level => warning}),
-    try
-        flush_logs(),
-        Fun(),
-        collect_logs([])
-    after
-        logger:remove_handler(?LOG_HANDLER),
-        logger:set_primary_config(level, Prev)
-    end.
-
-flush_logs() ->
-    receive {captured_log, _} -> flush_logs() after 0 -> ok end.
-
-collect_logs(Acc) ->
-    receive {captured_log, Text} -> collect_logs([Text | Acc])
-    after 0 -> lists:reverse(Acc)
-    end.
-
-%% logger handler callback
-log(#{msg := Msg, meta := _}, #{config := #{pid := Pid}}) ->
-    Text = case Msg of
-        {string, S} -> unicode:characters_to_binary(S);
-        {report, R} -> unicode:characters_to_binary(io_lib:format("~p", [R]));
-        {Fmt, Args} -> unicode:characters_to_binary(io_lib:format(Fmt, Args))
-    end,
-    Pid ! {captured_log, Text},
-    ok.
+    yuzu_gw_test_logs:capture(warning, Fun).

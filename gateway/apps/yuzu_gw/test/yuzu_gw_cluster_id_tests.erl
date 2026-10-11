@@ -24,10 +24,7 @@
 -module(yuzu_gw_cluster_id_tests).
 -include_lib("eunit/include/eunit.hrl").
 
--export([log/2]).  %% logger handler callback (log capture)
-
 -define(VAR, "YUZU_GW_CLUSTER_ID").
--define(LOG_HANDLER, yuzu_gw_cluster_id_tests_logs).
 
 cluster_id_test_() ->
     {foreach,
@@ -132,7 +129,7 @@ env_text_by_encoding() ->
 %% as latin1 bytes.
 env_override_warning_never_echoes_the_value() ->
     Marker = <<"secret-marker-id">>,
-    Lines = capture_logs(fun() ->
+    Lines = yuzu_gw_test_logs:capture(warning, fun() ->
         application:unset_env(yuzu_gw, cluster_id),
         os:putenv(?VAR, binary_to_list(Marker) ++ [252]),
         yuzu_gw_app:apply_env_overrides(latin1)
@@ -215,38 +212,3 @@ application_start_refuses_an_unrepresentable_cluster_id() ->
             Val   -> os:putenv("YUZU_GW_ALLOW_DEFAULT_COOKIE", Val)
         end
     end.
-
-%%%===================================================================
-%%% Log capture
-%%%===================================================================
-
-%% Run Fun with a capturing logger handler at warning level; returns the rendered
-%% text of every event logged meanwhile. The handler runs in the logging process
-%% and sends before the logging call returns, so nothing is pending afterwards.
-capture_logs(Fun) ->
-    Prev = maps:get(level, logger:get_primary_config()),
-    ok = logger:set_primary_config(level, warning),
-    ok = logger:add_handler(?LOG_HANDLER, ?MODULE,
-                            #{config => #{pid => self()}, level => warning}),
-    try
-        Fun(),
-        collect_logs([])
-    after
-        logger:remove_handler(?LOG_HANDLER),
-        logger:set_primary_config(level, Prev)
-    end.
-
-collect_logs(Acc) ->
-    receive {captured_log, Text} -> collect_logs([Text | Acc])
-    after 0 -> lists:reverse(Acc)
-    end.
-
-%% logger handler callback
-log(#{msg := Msg, meta := _}, #{config := #{pid := Pid}}) ->
-    Text = case Msg of
-        {string, S} -> unicode:characters_to_binary(S);
-        {report, R} -> unicode:characters_to_binary(io_lib:format("~p", [R]));
-        {Fmt, Args} -> unicode:characters_to_binary(io_lib:format(Fmt, Args))
-    end,
-    Pid ! {captured_log, Text},
-    ok.
