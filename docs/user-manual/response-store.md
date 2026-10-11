@@ -325,9 +325,10 @@ operator-visible notes:
 - **Facets are bounded.** Each response keeps the distinct (column, value) pairs of its output as
   facets, which drive the facet filter, group-from-results and the agent-count preview.
   - **Long values.** A value over 2048 bytes is not indexed by this version. It is excluded, never
-    truncated. Older servers indexed values up to about 2704 bytes; those rows age out with
-    retention, and until then a value of 2049 to about 2704 bytes can still be listed in a facet
-    dropdown but cannot be matched.
+    truncated. Older servers indexed values that fit the database index tuple limit (about 2.7 KB
+    for an incompressible value, minus the instruction id length; a compressible value could be
+    larger); those rows age out with retention, and until then such a stored value over 2048 bytes
+    can still be listed in a facet dropdown but cannot be matched (#5670).
   - **Refused filters.** A facet filter, group-from-results or agent-count preview on a value that
     can never equal a stored facet is refused with an error (the dashboard shows a message, REST
     answers 400 and MCP answers -32602) instead of reporting no match. Such a value is one over 2048
@@ -345,15 +346,22 @@ operator-visible notes:
     be used, so no results are shown. Pick another View." A View's saved filter with an empty
     value is refused as well, because no stored field is ever empty: "This View has a built-in
     filter on <column> with no value, so no results are shown. Pick another View." REST and MCP
-    carry the technical causes.
+    carry the technical causes. There is no one-click way to view the results without a View's
+    saved filters, and choosing Default is not a guaranteed escape when the definition has an
+    authored default View (#5638). The refusal of the `POST` group-from-results is a `400` whose
+    body the dashboard never shows (htmx drops `4xx` bodies; #5637), and the same is true of its
+    other `4xx` errors.
   - **Request size.** The refusal bounds a single value. The transport answers a bare `414` for a
     request target over 8192 bytes before any handler runs, so a heavily percent-encoded value
-    (about 2.7 KB decoded) or several individually legal values can still hit that limit.
-  - **Dashboard refresh while a filter is applied.** The chart deck refreshes itself every 2 seconds
-    with a request that carries no filter state, so it can briefly overwrite the pager and summary
-    of a filtered view with unfiltered ones (#5669). A column-header sort or a pagination click made
-    while a filter change is still in flight re-sends the filters of the last render, not the
-    change in flight (same family, #5669).
+    (about 2.7 KB decoded) or several individually legal values can still hit that limit (#5668).
+  - **Dashboard refresh while a filter is applied.** The chart deck is refreshed ONCE, by a
+    request fired 2 seconds after a command is dispatched (not polling). That request carries no
+    filter state, so it can overwrite the pager and summary of a filtered view with unfiltered ones
+    (#5669). A column-header sort or a pagination click made while a filter change is still in
+    flight re-sends the filters of the last render, not the change in flight, and a dispatch
+    replaces the filter bar, so a late response for the previous command can still land (the
+    hardware list also keeps the older `this:abort` sync; all #5677). An open Create Static Group form is not cleared by a valid
+    filter change and keeps its old filters and count (#5669).
   - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column,
     then value, so a rare value can be cut. The symptom is an agent missing from a facet filter or
     preview while its response still shows in the results.
@@ -367,7 +375,7 @@ operator-visible notes:
     first; see [metrics.md](metrics.md). A refusal writes no audit row on the MCP direct path of
     `preview_management_group_agent_count`, the REST route or the refused group-from-results POST,
     so on those paths the counter is the only record. On the MCP approval-gated (supervised) tier a
-    value over 2048 characters is rejected earlier by the tool schema; that call is audited as
+    value over 2048 bytes (not characters) is rejected earlier by the tool schema; that call is audited as
     `denied` and counted in `yuzu_mcp_tool_args_invalid_total`, not here. The bare `414` is not
     counted.
 

@@ -97,10 +97,14 @@ does not restore it.
 /api/v1/management-groups/agent-count-preview` and MCP `preview_management_group_agent_count` used to
 answer `200` with `agent_count: 0` for a filter value that can never match a stored facet. They now
 refuse it: REST answers `400` (A4 envelope, `retry_after_ms: null`, not retryable) and MCP answers
-`-32602`. A value is refused when it is over 2048 bytes or contains a NUL byte, a line feed or invalid
-UTF-8. No stored facet can equal such a value, so the `0` told the caller nothing true about the fleet,
+`-32602` (A4 `error.data`). A value is refused when it is over 2048 bytes or contains a NUL byte, a line
+feed or invalid UTF-8; over MCP an invalid-UTF-8 byte or a lone surrogate escape instead fails the JSON
+parse of the request (`-32700`, null `id`, no A4 `error.data`) before the tool runs, so the handler
+itself refuses only the over-bound, NUL and line feed cases. No stored facet can equal such a value, so the `0` told the caller nothing true about the fleet,
 which is why this is fixed rather than versioned. [`api-versioning-policy.md`](../api-versioning-policy.md) lists narrowing
-accepted input as Breaking; this is a deliberate correctness fix and no security carve-out is claimed.
+accepted input as Breaking and has no carve-out for a correctness fix, so this is a deliberate exception
+that follows the #4644 / #5561 precedent (a wrong answer replaced by a refusal); no security carve-out is
+claimed.
 
 - The check runs on the raw values before the filter key is resolved, so the same value under an
   unrecognised key is refused too (it used to be silently ignored and answered `0`).
@@ -108,22 +112,37 @@ accepted input as Breaking; this is a deliberate correctness fix and no security
   filter, so ANY such parameter over 2048 bytes is refused as well, whatever its name.
 - A script that previously saw `0` and treated it as "no agent has this value" must now handle `400`
   / `-32602` and choose a different or shorter criterion.
-- **Stored values.** Older servers indexed a facet value of 2049 to about 2704 bytes; this version does
-  not index values over 2048 bytes (they are left out of the response's facets, never truncated). After
-  the upgrade such a value, already stored, cannot be matched, and the dashboard refuses to use one that
-  is picked from a facet dropdown (the dropdown can still list it) until retention removes the row.
+- **Stored values.** Older servers indexed values that fit the database index tuple limit (about 2.7 KB
+  for an incompressible value, less the instruction id length; a compressible value could be larger);
+  this version does not index values over 2048 bytes (they are left out of the response's facets, never
+  truncated). After the upgrade such a value, already stored, cannot be matched, and the dashboard
+  refuses to use one that is picked from a facet dropdown (the dropdown can still list it, #5670) until
+  retention removes the row.
 - **Dashboard.** `/fragments/results` answers HTTP `200` with a refusal row and the create-group
   fragment with a refusal marker (both carry `data-filter-refused`) instead of an empty table or a
   preview, because htmx drops `4xx` bodies. The
-  `POST` group-from-results answers `400`, whose body htmx does not display. A View whose saved
+  `POST` group-from-results answers `400`, whose body htmx does not display (#5637). A View whose saved
   `equals` filter has an empty value is refused on the results table too.
 - Above 5000 distinct facets per response, the 5000 kept are now chosen in a fixed order (most lines
   first, then column, then value). Before, they were whichever the server happened to hold first.
 
-**Rolling upgrade.** An old replica still loses ALL facets of a response that carries a value over
-about 2.6 KB, so `group-from-results` served by an old replica builds its durable group from that
-short set. Complete the rollout before using group-from-results on the output of a command with very
-long fields.
+**Rolling upgrade.** The change is server-only: there is no agent, gateway, schema or configuration step,
+and the order in which replicas are upgraded does not matter. What differs during the rollout:
+
+- **Ingest decides the facets.** A facet is lost, or kept, on whichever replica ingested the response. An
+  old replica that ingests a response carrying a value too long for the database index (about 2.7 KB for
+  an incompressible value) drops ALL facets of that response; a new replica excludes only the long value
+  and keeps the rest.
+- **Every replica reads the same table.** `group-from-results` on ANY replica reads the same
+  `response_facets` rows, so a group built from a response that an OLD replica ingested is short
+  regardless of which replica builds the group. Upgrading the replica that serves the group does not
+  repair it.
+- **Callers see two answers.** Behind a load balancer, a REST or MCP preview caller gets `200` with
+  `agent_count: 0` from an old replica and `400` (REST) or `-32602` (MCP) from a new one for the same
+  unmatchable value until the rollout completes.
+- **Workaround.** For responses ingested during the rollout, run the command again after every
+  replica is upgraded (see "Lost facets are not recoverable" in
+  [`response-store.md`](response-store.md)).
 
 See [`response-store.md`](response-store.md) (Facets are bounded), the REST route in
 [`rest-api.md`](rest-api.md) and tool 83 in [`mcp.md`](mcp.md).

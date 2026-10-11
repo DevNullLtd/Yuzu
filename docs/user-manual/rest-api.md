@@ -856,7 +856,7 @@ to report, and no store read is made.
 A filter value is refused with `400` (A4 envelope, `retry_after_ms: null`, not retryable) before any
 store read when it is longer than 2048 bytes, or contains a NUL byte, a line feed or invalid UTF-8.
 Such a value can never equal a stored facet: this version does not index a facet value over 2048
-bytes (older servers indexed up to about 2704 bytes; those rows age out with retention), ingest
+bytes (older servers indexed values that fit the database index tuple limit (about 2.7 KB for an incompressible value, less the instruction id length; a compressible value could be larger); those rows age out with retention), ingest
 rewrites each NUL or invalid-UTF-8 byte to U+FFFD, and it splits the output into lines on every
 line feed, so a stored value contains neither. The request would otherwise answer a misleading `0`
 (a NUL would additionally match as a truncated prefix). The error says the exact-match filter is not
