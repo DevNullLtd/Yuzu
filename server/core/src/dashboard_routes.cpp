@@ -2606,8 +2606,9 @@ std::string DashboardRoutes::render_results(
         auto new_dir = (sort_col == "agent" && sort_dir == "asc") ? "desc" : "asc";
         html += "<th class=\"col-agent sortable\" hx-get=\"" +
                 base_url("agent", new_dir, 1) +
-                "\" hx-target=\"#results-tbody\" hx-sync=\"this:abort\""
-                " hx-indicator=\"#results-loading\">"
+                "\" hx-target=\"#results-tbody\" hx-sync=\"" +
+                std::string(kResultsSyncScope) +
+                "\" hx-indicator=\"#results-loading\">"
                 "Agent";
         if (sort_col == "agent")
             html += (sort_dir == "asc") ? " &#9650;" : " &#9660;";
@@ -2624,8 +2625,9 @@ std::string DashboardRoutes::render_results(
         auto new_dir = (sort_col == col_key && sort_dir == "asc") ? "desc" : "asc";
         html += "<th class=\"sortable\" hx-get=\"" +
                 base_url(col_key, new_dir, 1) +
-                "\" hx-target=\"#results-tbody\" hx-sync=\"this:abort\""
-                " hx-indicator=\"#results-loading\">" +
+                "\" hx-target=\"#results-tbody\" hx-sync=\"" +
+                std::string(kResultsSyncScope) +
+                "\" hx-indicator=\"#results-loading\">" +
                 html_escape(col_names[i]);
         if (sort_col == col_key)
             html += (sort_dir == "asc") ? " &#9650;" : " &#9660;";
@@ -2641,13 +2643,15 @@ std::string DashboardRoutes::render_results(
         if (page > 1) {
             html += " <button class=\"btn-page\" hx-get=\"" +
                     base_url(sort_col, sort_dir, page - 1) +
-                    "\" hx-target=\"#results-tbody\" hx-sync=\"this:abort\">"
+                    "\" hx-target=\"#results-tbody\" hx-sync=\"" +
+                    std::string(kResultsSyncScope) + "\">"
                     "Prev</button>";
         }
         if (page < static_cast<int>(total_pages)) {
             html += " <button class=\"btn-page\" hx-get=\"" +
                     base_url(sort_col, sort_dir, page + 1) +
-                    "\" hx-target=\"#results-tbody\" hx-sync=\"this:abort\">"
+                    "\" hx-target=\"#results-tbody\" hx-sync=\"" +
+                    std::string(kResultsSyncScope) + "\">"
                     "Next</button>";
         }
     }
@@ -2760,7 +2764,8 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
     auto agent_scope = elevated ? std::nullopt : resolve_visible_scope(username);
 
     std::string html;
-    html += "<form id=\"filter-bar\" class=\"filter-bar\" hx-sync=\"this:abort\">"
+    html += "<form id=\"filter-bar\" class=\"filter-bar\" hx-sync=\"" +
+            std::string(kResultsSyncScope) + "\">"
             "<input type=\"hidden\" name=\"command_id\" value=\"" +
             html_escape(command_id) + "\">"
             "<input type=\"hidden\" name=\"plugin\" value=\"" +
@@ -2801,7 +2806,7 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
             html += "<select name=\"template_id\""
                     " hx-get=\"/fragments/results\" hx-target=\"#results-tbody\""
                     " hx-include=\"#filter-bar\" hx-indicator=\"#results-loading\""
-                    " hx-sync=\"closest form:abort\">";
+                    " hx-sync=\"" + std::string(kResultsSyncScope) + "\">";
             if (!operator_has_default) {
                 html += "<option value=\"" +
                         html_escape(ResponseTemplatesEngine::kDefaultId) + "\"";
@@ -2853,7 +2858,7 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
             html += "<select name=\"" + param_name + "\""
                     " hx-get=\"/fragments/results\" hx-target=\"#results-tbody\""
                     " hx-include=\"#filter-bar\" hx-indicator=\"#results-loading\""
-                    " hx-sync=\"closest form:abort\">"
+                    " hx-sync=\"" + std::string(kResultsSyncScope) + "\">"
                     "<option value=\"\">All</option>";
             for (const auto& fv : facet_vals) {
                 html += "<option value=\"" + html_escape(fv.value) + "\">" +
@@ -2868,7 +2873,7 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
                     " hx-get=\"/fragments/results\" hx-target=\"#results-tbody\""
                     " hx-include=\"#filter-bar\" hx-indicator=\"#results-loading\""
                     " hx-trigger=\"input changed delay:300ms\""
-                    " hx-sync=\"closest form:abort\">";
+                    " hx-sync=\"" + std::string(kResultsSyncScope) + "\">";
         }
     }
 
@@ -2878,7 +2883,7 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
             " hx-get=\"/fragments/results\" hx-target=\"#results-tbody\""
             " hx-include=\"#filter-bar\" hx-indicator=\"#results-loading\""
             " hx-trigger=\"input changed delay:300ms\""
-            " hx-sync=\"closest form:abort\">";
+            " hx-sync=\"" + std::string(kResultsSyncScope) + "\">";
 
     html += "</form>";
     return html;

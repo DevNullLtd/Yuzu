@@ -45,6 +45,16 @@ class AgentRegistry;
 class EventBus;
 } // namespace detail
 
+// #5623: the ONE hx-sync scope shared by every element whose hx-get targets /fragments/results
+// (filter-bar selects / text inputs / search, the View select, the sortable <th> headers and
+// the Prev/Next buttons). A newer request REPLACES the in-flight one; the older response is
+// aborted and never swaps. The previous per-element scopes (`closest form:abort` on the
+// filter bar, `this:abort` on th / pagination) dropped the NEWEST request while another was
+// in flight, and let a late sort/page response land after another response's out-of-band
+// swap had detached its issuer. `#filter-bar` is looked up document-wide at request time,
+// so it works for the th / pagination elements that sit OUTSIDE the form.
+inline constexpr const char* kResultsSyncScope = "#filter-bar:replace";
+
 class DashboardRoutes {
 public:
     using AuthFn = std::function<std::optional<auth::Session>(
