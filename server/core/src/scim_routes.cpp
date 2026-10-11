@@ -26,6 +26,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -927,13 +928,29 @@ bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
     return true;
 }
 
-/// What `recompute_scim_user_role` tells a per-member loop (#4966): `StoreFailure` means the
-/// guarded role write itself could not complete (a lock wait that expired, an unavailable store),
-/// the condition under which the REMAINING PROMOTIONS of the same request would each pay the same
-/// wait and fail the same way. `SkippedPromotion` means the call was told to skip promotions
-/// (`skip_promotions`) and the member needed one, so nothing was attempted. Every other outcome
-/// (applied, unchanged, refused, declined) is `Continue`.
-enum class RecomputeResult { Continue, StoreFailure, SkippedPromotion };
+/// What `recompute_scim_user_role` tells a per-member loop (#4966). Three classes, so that a
+/// caller can never read a failure as "nothing to do":
+///  - `Applied`: the member's role now equals what its groups confer (written, already so, or the
+///    member is legitimately out of scope: not a live SCIM user, not SCIM-owned, no active
+///    account).
+///  - `Refused` / `Failed` / `StoreFailure`: a role change was needed and did NOT fully land.
+///    `Refused` is the last-Administrator guard (the role is unchanged); `Failed` is any other
+///    non-`Updated` outcome (including a committed role whose durable session wipe failed);
+///    `StoreFailure` is a `Failed` whose guarded write itself could not complete (a lock wait
+///    that expired, an unavailable store), the condition under which the REMAINING PROMOTIONS of
+///    the same request would each pay the same wait and fail the same way.
+///  - `Undetermined`: a read the decision depends on failed, so it is NOT known whether an
+///    IdP-removed administrator keeps the role. The member's role was left untouched.
+/// `SkippedPromotion` is the fourth value: the call was told to skip promotions
+/// (`skip_promotions`) and the member needed one, so nothing was attempted.
+enum class RecomputeResult {
+    Applied,
+    Refused,
+    Failed,
+    StoreFailure,
+    Undetermined,
+    SkippedPromotion
+};
 
 /// ⚠️ SECURITY-CRITICAL (#2021 slice 2) — the SCIM-group->Yuzu-role
 /// application core. Re-derives `user_scim_id`'s role from its CURRENT SCIM
@@ -943,12 +960,13 @@ enum class RecomputeResult { Continue, StoreFailure, SkippedPromotion };
 /// POST including the revive-on-reprovision path) — see scim_routes.hpp's
 /// header doc.
 ///
-/// Steps (in order, each a hard gate — any failure means "return, no
-/// action"):
+/// Steps (in order, each a hard gate; a FAILED READ is `Undetermined`, never "no action"):
 ///   1. Resolve `user_scim_id` to a live SCIM User resource (`ScimStore::
 ///      get_by_scim_id`). If it doesn't resolve to a scim user resource
 ///      (e.g. a Group member value that never matched a real User, or one
-///      that has since been deleted), there is nothing to recompute.
+///      that has since been deleted), there is nothing to recompute; but `get_by_scim_id` folds
+///      "no such resource" and "the read failed" into one nullopt, so the tri-state
+///      `resource_exists` decides: a definitive `false` is `Applied`, anything else `Undetermined`.
 ///   2. PROVENANCE GUARD (LOAD-BEARING, do not weaken): the resolved
 ///      username's `AuthDB::get_provisioning_source` MUST read exactly
 ///      `"scim"` RIGHT NOW. A Group member `value` that happens to map to a
@@ -962,11 +980,11 @@ enum class RecomputeResult { Continue, StoreFailure, SkippedPromotion };
 ///   3. Resolve the role via `auth::resolve_role_from_groups` over
 ///      `ScimStore::list_group_display_names_for_user` and
 ///      `scim_admin_group` (empty ⇒ always `Role::user`, never promotes).
-///   4. Read the CURRENT role via `db_authoritative_role` (H2 — the DB row,
-///      never the in-memory cache). `nullopt` fails closed (no change) —
-///      matching every other role read on this surface.
+///   4. Read the CURRENT role from the DB row (H2: never the in-memory cache). A failed read is
+///      `Undetermined`; an account with no ACTIVE row (none at all, or soft-deleted) has no
+///      session to retain and is `Applied`.
 ///   5. If the resolved role differs from the current role, apply it via
-///      `AuthManager::update_role` (which also invalidates the user's
+///      `AuthManager::update_role_checked` (which also invalidates the user's
 ///      sessions) and audit `scim.user.role_changed` (set-and-proceed, same
 ///      posture as every other audit on this surface — see `audit()`'s doc
 ///      comment). `trigger_detail` is a caller-supplied, human-readable
@@ -1024,25 +1042,49 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
                                          const std::string& scim_admin_group,
                                          const std::string& trigger_detail,
                                          bool skip_promotions = false,
-                                         std::string* skipped_username = nullptr) {
+                                         std::string* named = nullptr) {
     if (!scim_store || !auth_mgr)
-        return RecomputeResult::Continue;
+        return RecomputeResult::Applied;
 
     static std::mutex kRecomputeMu;
     std::lock_guard<std::mutex> recompute_lock(kRecomputeMu);
 
-    // Step 1: user_scim_id must resolve to a live SCIM User resource.
+    const auto name_member = [named](const std::string& name) {
+        if (named)
+            *named = name;
+    };
+
+    // Step 1: user_scim_id must resolve to a live SCIM User resource. `get_by_scim_id` collapses
+    // "no such resource" and "the read failed" into one nullopt, so ask the tri-state existence
+    // check before treating it as "nothing to recompute".
     auto resource = scim_store->get_by_scim_id(user_scim_id);
-    if (!resource)
-        return RecomputeResult::Continue;
+    if (!resource) {
+        const auto exists = scim_store->resource_exists(user_scim_id);
+        if (exists.has_value() && !*exists)
+            return RecomputeResult::Applied; // definitively not a (live) SCIM user
+        spdlog::warn("SCIM: recompute_scim_user_role: could not resolve scim_id={} (store read "
+                     "failed); the member is UNDETERMINED, its role is untouched",
+                     user_scim_id);
+        name_member("scim_id:" + user_scim_id);
+        return RecomputeResult::Undetermined;
+    }
 
     AuthDB* db = auth_mgr->auth_db_ptr();
     if (!db)
-        return RecomputeResult::Continue;
+        return RecomputeResult::Applied; // no AuthDB: there is no durable role to retain
 
     // Step 2 — PROVENANCE GUARD (LOAD-BEARING): refuse to touch anything
     // SCIM did not provision, no matter how a Group came to reference it.
     auto source = db->get_provisioning_source(resource->username);
+    if (!source && source.error() == AuthDBError::QueryFailed) {
+        // A failed read is not "this account is not SCIM-owned": do not count it as a provenance
+        // refusal, and do not let an IdP-removed admin keep the role without evidence.
+        spdlog::warn("SCIM: recompute_scim_user_role: could not read the provisioning source of "
+                     "'{}' (scim_id={}); the member is UNDETERMINED, its role is untouched",
+                     ::yuzu::log_token(resource->username), user_scim_id);
+        name_member(resource->username);
+        return RecomputeResult::Undetermined;
+    }
     if (!source || *source != kProvisioningSourceScim) {
         spdlog::warn("SCIM: recompute_scim_user_role refusing to touch '{}' (scim_id={}) — "
                     "provisioning_source is not 'scim' (a Group referenced a non-SCIM account)",
@@ -1055,7 +1097,7 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
         // the counter is the right-weight signal for a load-bearing guard
         // that still needs to be observable.
         bump_provenance_denied(auth_mgr);
-        return RecomputeResult::Continue;
+        return RecomputeResult::Applied;
     }
 
     // Step 3: resolve the role from CURRENT group membership.
@@ -1064,37 +1106,53 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
     // is not "member of no groups". Resolving nullopt as an empty set would
     // demote a SCIM-provisioned admin to `user` on a momentary store blip —
     // the same fail-open shape step 4 below already refuses for the current
-    // role. Decline the recompute instead; it re-runs on the next POST/PUT/PATCH of a group
-    // naming this user, or a User re-provision (see `recompute_members` for when it does NOT).
+    // role. Decline the recompute, but never silently: the member is `Undetermined`, so the
+    // Group request records it (see `recompute_members`).
     auto groups = scim_store->list_group_display_names_for_user(user_scim_id);
     if (!groups.has_value()) {
         spdlog::warn("SCIM: recompute_scim_user_role — could not determine current group "
-                     "membership for '{}' (scim_id={}); declining to recompute (fail-closed)",
-                     resource->username, user_scim_id);
-        return RecomputeResult::Continue;
+                     "membership for '{}' (scim_id={}); the member is UNDETERMINED, its role is "
+                     "untouched (fail-closed)",
+                     ::yuzu::log_token(resource->username), user_scim_id);
+        name_member(resource->username);
+        return RecomputeResult::Undetermined;
     }
     auth::Role resolved = auth::resolve_role_from_groups(*groups, scim_admin_group);
 
     // Step 4: fail-closed on an undetermined current role (S-ROLE-FAILCLOSED
     // posture, matching db_authoritative_role's every other caller).
-    auto current = db_authoritative_role(auth_mgr, resource->username);
+    // `get_user` returns the ACTIVE row only; `UserNotFound` is therefore "no active row", which
+    // is either no row at all or a soft-deleted one (see `get_role_including_inactive`). Neither
+    // can hold a session, so there is nothing to retain. Any other error is a failed read.
+    std::optional<auth::Role> current;
+    {
+        auto entry = db->get_user(resource->username);
+        if (entry) {
+            current = entry->role;
+        } else if (entry.error() == AuthDBError::UserNotFound) {
+            auto any_row = db->get_role_including_inactive(resource->username);
+            if (any_row || any_row.error() == AuthDBError::UserNotFound)
+                return RecomputeResult::Applied;
+        }
+    }
     if (!current.has_value()) {
         spdlog::warn("SCIM: recompute_scim_user_role — could not determine the DB-authoritative "
-                    "current role for '{}' (scim_id={}); declining to recompute (fail-closed)",
-                    resource->username, user_scim_id);
-        return RecomputeResult::Continue;
+                    "current role for '{}' (scim_id={}); the member is UNDETERMINED, its role is "
+                    "untouched (fail-closed)",
+                    ::yuzu::log_token(resource->username), user_scim_id);
+        name_member(resource->username);
+        return RecomputeResult::Undetermined;
     }
 
     // Step 5: apply only on an actual change.
     if (resolved == *current)
-        return RecomputeResult::Continue;
+        return RecomputeResult::Applied;
 
     // Direction decides whether a skip is allowed: only a PROMOTION (the fail-safe direction) may
     // be skipped; a demotion is always attempted.
     const bool demotion = *current == auth::Role::admin && resolved != auth::Role::admin;
     if (skip_promotions && !demotion) {
-        if (skipped_username)
-            *skipped_username = resource->username;
+        name_member(resource->username);
         return RecomputeResult::SkippedPromotion;
     }
 
@@ -1132,7 +1190,8 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
                                   {"group_derived_demotion", true},
                                   {"role_unchanged", true},
                                   {"detail", refusal_detail}});
-        return RecomputeResult::Continue;
+        name_member(resource->username);
+        return RecomputeResult::Refused;
     }
     if (outcome != auth::UpdateRoleOutcome::Updated) {
         const bool role_applied = outcome == auth::UpdateRoleOutcome::UpdatedSessionWipeFailed;
@@ -1168,9 +1227,10 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
         // A guarded-write StoreFailure (a lock wait that expired, an unavailable store) will
         // repeat for the next PROMOTION too: tell the loop to stop attempting promotions rather
         // than pay a lock wait per remaining member. Demotions are still attempted (see
-        // `recompute_members`). UpdatedSessionWipeFailed and the rest are per-user outcomes.
+        // `recompute_members`). UpdatedSessionWipeFailed and the rest are per-user failures.
+        name_member(resource->username);
         return outcome == auth::UpdateRoleOutcome::StoreFailure ? RecomputeResult::StoreFailure
-                                                                 : RecomputeResult::Continue;
+                                                                 : RecomputeResult::Failed;
     }
     spdlog::info("SCIM: recompute_scim_user_role — '{}' (scim_id={}) role changed {} -> {} "
                 "via group membership",
@@ -1180,7 +1240,7 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
     audit(auth_mgr, audit_store, req, "scim.user.role_changed", "success", user_scim_id,
          "reason=group old_role=" + old_role_str + " new_role=" + new_role_str + via_detail);
     bump_role_changed(auth_mgr);
-    return RecomputeResult::Continue;
+    return RecomputeResult::Applied;
 }
 
 /// `yuzu_scim_group_recompute_skipped_total{direction}`, seeded at boot by server.cpp.
@@ -1193,66 +1253,135 @@ void bump_group_recompute_skipped(auth::AuthManager* auth_mgr, const char* direc
             .increment(static_cast<double>(count));
 }
 
-/// Recompute every member of one Group request, in order (#4966).
+/// The members of one outcome class of a Group request's recompute: a count, and up to
+/// `kMaxListed` of their `log_token`'d names (a username, or `scim_id:<id>` when the username
+/// could not be read). Bounded so one request cannot write an unbounded audit row.
+struct NamedMembers {
+    static constexpr std::size_t kMaxListed = 20;
+    std::size_t count = 0;
+    std::string listed;
+
+    void add(const std::string& name) {
+        if (count < kMaxListed)
+            listed += (listed.empty() ? "" : ",") + ::yuzu::log_token(name);
+        ++count;
+    }
+    /// ` <label>=<count> <label>_users=<names>[,+N more]`, or empty when the class is empty.
+    [[nodiscard]] std::string detail(const char* label) const {
+        if (count == 0)
+            return {};
+        std::string out = std::string(" ") + label + "=" + std::to_string(count) + " " + label +
+                          "_users=" + listed;
+        if (count > kMaxListed)
+            out += ",+" + std::to_string(count - kMaxListed) + " more";
+        return out;
+    }
+};
+
+/// A Group request's members in recompute order: the REMOVED members (in `old_members`, not in
+/// `kept`) FIRST, then every member of `kept`, each once. A removed member is the one whose
+/// admin role the IdP just took away, so it is attempted before the budget of a failing store is
+/// spent on promotions. O(N + M).
+std::vector<std::string> removed_first(const std::vector<std::string>& old_members,
+                                       const std::vector<std::string>& kept) {
+    const std::unordered_set<std::string> kept_set(kept.begin(), kept.end());
+    std::unordered_set<std::string> seen;
+    std::vector<std::string> ordered;
+    ordered.reserve(old_members.size() + kept.size());
+    for (const auto& m : old_members)
+        if (!kept_set.count(m) && seen.insert(m).second)
+            ordered.push_back(m);
+    for (const auto& m : kept)
+        if (seen.insert(m).second)
+            ordered.push_back(m);
+    return ordered;
+}
+
+/// Recompute every member of one Group request, in the given order (#4966). Returns true iff
+/// EVERY member was recomputed as intended (nothing refused, failed, undetermined or skipped):
+/// the caller writes it into the Group success audit row as `recompute=complete|incomplete`, so
+/// that row never claims a completeness the recompute did not reach.
 ///
-/// After the FIRST `RecomputeResult::StoreFailure` the remaining PROMOTION-direction members are
-/// SKIPPED: each would wait out the same lifecycle lock timeout (up to 2 s apiece, with a pooled
-/// connection pinned for that long) and fail the same way, so a 5000-member group could hold the
-/// request, and the pool, for hours, and promotion is the fail-safe direction. The remaining
-/// DEMOTION-direction members are ALWAYS attempted: skipping one would leave an IdP-removed
-/// administrator holding the role with a 2xx and no evidence (each failed demotion writes its own
-/// `scim.user.role_changed` failure row, counter, critical event and critical log line).
+/// DEMOTIONS are always attempted: skipping one would leave an IdP-removed administrator holding
+/// the role with a 2xx and no evidence. After the FIRST `RecomputeResult::StoreFailure` the
+/// remaining PROMOTIONS are skipped: each would wait out the same lifecycle lock timeout and fail
+/// the same way, and promotion is the fail-safe direction.
 ///
-/// The skipped promotions are recorded in ONE `scim.group.recompute_incomplete` audit row
-/// (`result=partial`: the Group write committed, the role side effect did not fully run) and in
-/// `yuzu_scim_group_recompute_skipped_total{direction="promotion"}`. The HTTP status of the Group
-/// request is not changed by this: its membership write already committed, and turning a
+/// Every outcome that is not "applied" leaves evidence: a refused demotion its
+/// `scim.user.last_administrator_refused` row and counter, a failed one its
+/// `scim.user.role_changed` failure row, counter and critical event (all written by
+/// `recompute_scim_user_role`); and the request as a whole ONE `scim.group.recompute_incomplete`
+/// row (`result=partial`) with the count and up to 20 names per class, plus
+/// `yuzu_scim_group_recompute_skipped_total{direction}` per skipped promotion (`promotion`) and
+/// per undetermined member (`undetermined`). The HTTP status
+/// of the Group request is not changed: its membership write already committed, and turning a
 /// committed operation into a 503 would invite a retry of a write that already happened.
 ///
-/// WHEN RECOMPUTE RE-RUNS (and so when a skipped promotion is repaired): for EVERY member (old and
-/// new) of a group on the next POST/PUT/PATCH of that SAME group, for the former members of a group
-/// on its DELETE, and for one user on `POST /Users` re-provision of the same userName. It does NOT
-/// re-run for a member that was already removed from a surviving group, nor for a Group DELETE
-/// that has already happened, nor on a timer: the audit row is the record of which members were
-/// skipped, and an operator can repair one by hand with the dashboard role change.
-void recompute_members(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* audit_store,
+/// KNOWN LIMITS (documented in the SCIM provisioning guide): nothing here repairs an incomplete
+/// member later. A re-send of the same request does not name a member that was already removed,
+/// there is no reconcile and no timer, and the loop has no time bound: a large group on a slow
+/// store holds the HTTP request (and, in the handlers, the per-process Group mutation lock) for
+/// as long as it takes.
+bool recompute_members(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* audit_store,
                        AnalyticsEventStore* analytics_store, const httplib::Request& req,
                        const std::string& group_id, const std::vector<std::string>& user_scim_ids,
                        const std::string& scim_admin_group, const std::string& trigger_detail) {
-    constexpr std::size_t kMaxListedSkipped = 20;
     bool store_failed = false;
-    std::size_t skipped = 0;
-    std::string listed;
+    NamedMembers refused, failed, undetermined, skipped_promotions;
     for (std::size_t i = 0; i < user_scim_ids.size(); ++i) {
-        std::string skipped_username;
+        std::string named;
         const auto r = recompute_scim_user_role(scim_store, auth_mgr, audit_store, analytics_store,
                                                 req, user_scim_ids[i], scim_admin_group,
-                                                trigger_detail, store_failed, &skipped_username);
-        if (r == RecomputeResult::SkippedPromotion) {
-            if (skipped < kMaxListedSkipped)
-                listed += (listed.empty() ? "" : ",") + ::yuzu::log_token(skipped_username);
-            ++skipped;
-        } else if (r == RecomputeResult::StoreFailure && !store_failed) {
-            store_failed = true;
-            spdlog::warn("SCIM: role recompute hit a store failure at member {} of {}; remaining "
-                         "promotions of this request are skipped, remaining demotions are still "
-                         "attempted",
-                         i + 1, user_scim_ids.size());
+                                                trigger_detail, store_failed, &named);
+        switch (r) {
+        case RecomputeResult::Applied:
+            break;
+        case RecomputeResult::Refused:
+            refused.add(named);
+            break;
+        case RecomputeResult::StoreFailure:
+            failed.add(named);
+            if (!store_failed) {
+                store_failed = true;
+                spdlog::warn("SCIM: role recompute hit a store failure at member {} of {}; "
+                             "remaining promotions of this request are skipped, remaining "
+                             "demotions are still attempted",
+                             i + 1, user_scim_ids.size());
+            }
+            break;
+        case RecomputeResult::Failed:
+            failed.add(named);
+            break;
+        case RecomputeResult::Undetermined:
+            undetermined.add(named.empty() ? "scim_id:" + user_scim_ids[i] : named);
+            break;
+        case RecomputeResult::SkippedPromotion:
+            skipped_promotions.add(named);
+            break;
         }
     }
-    if (skipped == 0)
-        return;
-    if (skipped > kMaxListedSkipped)
-        listed += ",+" + std::to_string(skipped - kMaxListedSkipped) + " more";
-    spdlog::error("SCIM: group recompute skipped {} promotion(s) after a store failure (group "
-                  "scim_id={}); they are repaired by the next Group operation that names the "
-                  "member or a User re-provision: {}",
-                  skipped, group_id, listed);
+    const std::size_t incomplete =
+        refused.count + failed.count + undetermined.count + skipped_promotions.count;
+    if (incomplete == 0)
+        return true;
+    spdlog::error("SCIM: group recompute incomplete (group scim_id={}): {} refused, {} failed, {} "
+                  "undetermined, {} promotion(s) skipped; nothing repairs them automatically",
+                  group_id, refused.count, failed.count, undetermined.count,
+                  skipped_promotions.count);
     audit(auth_mgr, audit_store, req, "scim.group.recompute_incomplete", "partial", group_id,
-          "skipped_promotions=" + std::to_string(skipped) + " users=" + listed +
-              " trigger=\"" + fold_control_bytes(trigger_detail) + "\"",
+          "members=" + std::to_string(user_scim_ids.size()) + refused.detail("refused") +
+              failed.detail("failed") + undetermined.detail("undetermined") +
+              skipped_promotions.detail("skipped_promotions") + " trigger=\"" +
+              fold_control_bytes(trigger_detail) + "\"",
           "Group");
-    bump_group_recompute_skipped(auth_mgr, "promotion", skipped);
+    bump_group_recompute_skipped(auth_mgr, "promotion", skipped_promotions.count);
+    bump_group_recompute_skipped(auth_mgr, "undetermined", undetermined.count);
+    return false;
+}
+
+/// The detail text of a Group success audit row: whether the recompute reached every member.
+inline const char* recompute_detail(bool complete) {
+    return complete ? "recompute=complete" : "recompute=incomplete";
 }
 
 /// ADR-2001 D2 detector: called once a deprovision has resolved its
@@ -2806,9 +2935,9 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         }
 
         // #2021 trigger (a): recompute role for every member on create.
-        recompute_members(scim_store, auth_mgr, audit_store, analytics_store, req, group->scim_id,
-                          members, scim_admin_group,
-                          neutral_free_text(input.display_name) + " op=group_create");
+        const bool recompute_complete = recompute_members(
+            scim_store, auth_mgr, audit_store, analytics_store, req, group->scim_id, members,
+            scim_admin_group, neutral_free_text(input.display_name) + " op=group_create");
 
         auto gbase = groups_location_base(req);
         auto ubase = location_base(req);
@@ -2816,8 +2945,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         res.set_header("Location", gbase + "/" + group->scim_id);
         res.set_header("ETag", "W/\"" + std::to_string(group->etag_version) + "\"");
         res.set_content(scim::group_to_json(*group, members, gbase, ubase).dump(), kScimJson);
-        audit(auth_mgr, audit_store, req, "scim.group.created", "success", group->scim_id, {},
-             "Group");
+        audit(auth_mgr, audit_store, req, "scim.group.created", "success", group->scim_id,
+             recompute_detail(recompute_complete), "Group");
         record_request(auth_mgr, "group_create", 201);
     });
 
@@ -3027,6 +3156,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 }
 
                 std::vector<std::string> new_members;
+                bool recompute_complete = true;
                 {
                     // CONCURRENCY: kGroupMutationMu's doc comment above —
                     // serializes this read-modify-write critical section
@@ -3101,14 +3231,10 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                         return;
                     }
 
-                    std::vector<std::string> affected = old_members;
-                    for (const auto& m : new_members)
-                        if (std::find(affected.begin(), affected.end(), m) == affected.end())
-                            affected.push_back(m);
-                    recompute_members(scim_store, auth_mgr, audit_store, analytics_store, req, id, affected,
-                                      scim_admin_group,
-                                      neutral_free_text(input.display_name) +
-                                          " op=group_replace");
+                    recompute_complete = recompute_members(
+                        scim_store, auth_mgr, audit_store, analytics_store, req, id,
+                        removed_first(old_members, new_members), scim_admin_group,
+                        neutral_free_text(input.display_name) + " op=group_replace");
                 }
 
                 auto updated = scim_store->get_group_by_id(id);
@@ -3122,8 +3248,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     record_request(auth_mgr, "group_replace", 500);
                     return;
                 }
-                audit(auth_mgr, audit_store, req, "scim.group.updated", "success", id, {},
-                     "Group");
+                audit(auth_mgr, audit_store, req, "scim.group.updated", "success", id,
+                     recompute_detail(recompute_complete), "Group");
                 res.set_content(scim::group_to_json(*updated, new_members,
                                                     groups_location_base(req), location_base(req))
                                     .dump(),
@@ -3182,6 +3308,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                   std::vector<std::string> final_members;
                   std::string final_display;
                   bool renamed = false;
+                  bool recompute_complete = true;
                   {
                       // CONCURRENCY: kGroupMutationMu's doc comment above —
                       // serializes this read-modify-write critical section
@@ -3328,18 +3455,13 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       // "recompute everybody current" branch — folding old ∪
                       // final already subsumes it, since a metadata-only PATCH
                       // has final == old).
-                      std::vector<std::string> to_recompute = old_members;
-                      for (const auto& uid : final_members)
-                          if (std::find(to_recompute.begin(), to_recompute.end(), uid) ==
-                              to_recompute.end())
-                              to_recompute.push_back(uid);
-
                       std::string trigger = neutral_free_text(final_display) + " op=group_patch";
                       if (renamed)
                           trigger +=
                               " renamed_from='" + neutral_free_text(pre_update_display_name) + "'";
-                      recompute_members(scim_store, auth_mgr, audit_store, analytics_store, req, id, to_recompute,
-                                        scim_admin_group, trigger);
+                      recompute_complete = recompute_members(
+                          scim_store, auth_mgr, audit_store, analytics_store, req, id,
+                          removed_first(old_members, final_members), scim_admin_group, trigger);
                   }
 
                   auto updated = scim_store->get_group_by_id(id);
@@ -3351,8 +3473,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       record_request(auth_mgr, "group_patch", 500);
                       return;
                   }
-                  audit(auth_mgr, audit_store, req, "scim.group.updated", "success", id, {},
-                       "Group");
+                  audit(auth_mgr, audit_store, req, "scim.group.updated", "success", id,
+                       recompute_detail(recompute_complete), "Group");
                   res.set_content(scim::group_to_json(*updated, final_members,
                                                       groups_location_base(req),
                                                       location_base(req))
@@ -3378,6 +3500,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                        record_request(auth_mgr, "group_delete", 404);
                        return;
                    }
+                   bool recompute_complete = true;
                    {
                        // CONCURRENCY: kGroupMutationMu's doc comment above —
                        // serializes this read-modify-write critical section
@@ -3432,14 +3555,14 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                        id);
                        }
 
-                       recompute_members(scim_store, auth_mgr, audit_store, analytics_store, req, id, former_members,
-                                         scim_admin_group,
-                                         neutral_free_text(group->display_name) +
-                                             " op=group_delete");
+                       recompute_complete = recompute_members(
+                           scim_store, auth_mgr, audit_store, analytics_store, req, id,
+                           removed_first(former_members, {}), scim_admin_group,
+                           neutral_free_text(group->display_name) + " op=group_delete");
                    }
 
-                   audit(auth_mgr, audit_store, req, "scim.group.deleted", "success", id, {},
-                        "Group");
+                   audit(auth_mgr, audit_store, req, "scim.group.deleted", "success", id,
+                        recompute_detail(recompute_complete), "Group");
                    res.status = 204;
                    record_request(auth_mgr, "group_delete", 204);
                });
