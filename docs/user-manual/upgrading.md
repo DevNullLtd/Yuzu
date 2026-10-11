@@ -4230,20 +4230,90 @@ If the server was restarted while this gateway stayed connected, see [What happe
 > any external tooling hardcoding the old full node name. See "Gateway
 > distribution-cookie length floor + shared node identity" below.
 
+The release directory holds the gateway's only configuration file,
+`/opt/yuzu_gw/releases/<vsn>/sys.config`, so replacing the directory deletes your config. Save
+it first, restore it after, pre-flight it, and only then start (a config from before this
+release must be converted first: see *Upgrade notes by release* below):
+
 ```bash
 sudo systemctl stop yuzu-gateway
-# Replace the release directory
+# 1. Save the operator-edited config; it lives inside the directory removed next
+sudo cp /opt/yuzu_gw/releases/*/sys.config /root/yuzu-gw-sys.config.saved
+# 2. Replace the release directory
 sudo rm -rf /opt/yuzu_gw
 sudo tar xzf yuzu-gateway-linux-x64.tar.gz -C /opt/
+# 3. Restore the config (converted if the release needs it)
+sudo cp /root/yuzu-gw-sys.config.saved /opt/yuzu_gw/releases/*/sys.config
+# 4. Pre-flight the NEW release against that config, with the production YUZU_GW_*
+#    variables exported (for example: set -a; . /etc/yuzu/gateway.env). Go on only at exit 0.
+R=/opt/yuzu_gw; V=$(basename $R/releases/*/); C=$R/releases/$V/sys.config
+$R/erts-*/bin/erl -noshell -noinput -boot $R/releases/$V/start_clean -config "$C" \
+  -pa $R/lib/*/ebin -eval '
+Load = [application:load(yuzu_gw)], yuzu_gw_app:apply_env_overrides(),
+Results = Load ++ [yuzu_gw_app:check_legacy_grpcbox_servers(), yuzu_gw_app:check_legacy_grpcbox_client(),
+                   yuzu_gw_app:check_grpc_listeners(), yuzu_gw_app:check_upstream_client_config(),
+                   yuzu_gw_app:check_upstream_channel_mix(), yuzu_gw_app:check_upstream_tls_posture(),
+                   yuzu_gw_app:check_mgmt_listener_posture()],
+io:format("PREFLIGHT ~p~n", [Results]),
+halt(case lists:all(fun(X) -> X =:= ok end, Results) of true -> 0; false -> 1 end).'
+# 5. Start, then verify
 sudo systemctl start yuzu-gateway
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8081/readyz     # 200
+ss -ltn | grep -E ':50051|:50063'                                  # both listening
 ```
+
+Step 4 is the pre-flight described under *Upgrade notes by release*. Skip it and a config the new
+release refuses shows up as a restart loop under systemd instead.
+
+**Packages (`rpm -U`, `dpkg -i`).** A package upgrade **replaces the operator-edited
+`/opt/yuzu_gw/releases/<vsn>/sys.config` with the stock config**, which is the plaintext dev
+config (upstream `http` to `127.0.0.1:50055`), and then restarts the gateway on it: the gateway
+boots, `/readyz` answers 200, and every registration fails. This is how the package has always
+behaved (the file is neither marked as configuration nor kept as a package conffile, so no
+`.rpmsave` is made); the root cause is tracked in the repository issue tracker. Until it is
+fixed, do the same by hand around the package step: copy `releases/*/sys.config` somewhere safe
+before `rpm -U` / `dpkg -i`, copy it back after, run the pre-flight above (step 4) and
+`systemctl restart yuzu-gateway`, then verify as in step 5. The release version directory
+changes between releases, so copy the file to the new `releases/<vsn>/` directory. `/etc/yuzu/gateway.env`
+(the cookie) is not touched by the package.
 
 ### Docker
 
 ```bash
-docker pull ghcr.io/<owner>/yuzu-gateway:v0.1.1
+docker pull ghcr.io/<owner>/yuzu-gateway:<version>
 docker compose up -d yuzu-gateway
 ```
+
+`docker compose up -d` is **not a rolling update**: it recreates every container of the service
+that changed in one step, so a config the new image refuses (it exits 1 at once and restarts in a
+loop) takes all of them down together. Mounted config and image change together or not at all.
+Update one gateway at a time, as a service of its own, with `docker compose up -d --no-deps
+<gateway-service>`, and check `curl -s localhost:8081/readyz` and the logs before the next.
+
+### Kubernetes / OpenShift
+
+Nothing here has been run on a cluster; every point below is reasoned from the image and the
+code and is **unverified: test it on the OpenShift target** before relying on it.
+
+- **Config and image change in one revision.** Mount `sys.config` from a ConfigMap whose name
+  carries a version (`yuzu-gateway-sys-config-<n>`) and change the name in the same Deployment
+  revision as the image tag. An edited ConfigMap under an unchanged name is not picked up until
+  the pods restart, and a new image on an old config refuses to boot.
+- **A refused boot keeps the old pods.** The new pod exits 1 and goes to `CrashLoopBackOff`, never
+  becomes ready, and the rolling update does not remove old pods that are still ready (reasoned from
+  Deployment behaviour, not run). Read the new pod's log for the `Refusing to start` line, fix the
+  ConfigMap, and roll out again; `kubectl rollout undo` restores image and ConfigMap name together.
+- **Probes.** Liveness is `GET /healthz` and readiness `GET /readyz`, both on port 8081. `/readyz`
+  does not test that the server is reachable: it stays 200 while the server is down until the
+  circuit breaker opens, and says nothing about a connection that is up but dead. Gate a rollout
+  on `yuzu_gw_agents_current` climbing or on the error rate of `yuzu_gw_upstream_rpc_errors_total`,
+  not on readiness alone.
+- **Security context (OpenShift `restricted-v2`).** The image runs as the named user `yuzu-gw`
+  (`USER yuzu-gw`); the SCC assigns an arbitrary UID, so files that must be read through the user
+  name will not be. Certificates are shared through the fixed group `yuzu-pki`, gid 2000, which
+  is probably outside the namespace's `supplementalGroups` range: set `fsGroup`, or give the
+  certificate Secret volume a `defaultMode` the assigned UID can read, rather than relying on
+  the image's group membership.
 
 ## Upgrading Agents
 
@@ -4829,10 +4899,13 @@ not read and the check passes falsely, and the script exits 1 if the load fails 
 that is not on the `-pa` path). **A pre-flight script from the previous release does not work
 on this one:** it also loaded `grpcbox`, which is not in the release any more, so it exits 1
 with `{error,{"no such file or directory","grpcbox.app"}}` before it checks anything. Use the
-script below. It does not
-check the distribution cookie, the upstream TLS posture (a `https` channel without
-`{verify, verify_peer}` is refused at boot, not here), that the certificate files exist, or
-that the ports can bind (a `{listen_failed, Reason}` in the crash report means one of those; see the table below). Proceed only on exit 0; a non-`ok` entry in the printed list is the refusal (`legacy_grpcbox_servers`, `legacy_grpcbox_client`, `no_grpc_listeners`, `no_agent_listener`, `bad_grpc_listeners`, `no_upstream_channel`, `bad_upstream_client_config`, or the management-posture defect), and the critical log line above it says why. On an image from before this change it fails
+script below. It also runs the upstream TLS checks the boot runs: any `https` endpoint without
+`{verify, verify_peer}` and a `cacertfile` / `cacerts` of its own, and a channel that mixes `http`
+and `https` endpoints, exit 1 here (if `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` is exported the
+unverified case passes with a warning, as it does at boot). It does not
+check the distribution cookie, whether the endpoint carries a client certificate (the server
+demands that), that the certificate files exist, or
+that the ports can bind (a `{listen_failed, Reason}` in the crash report means one of those; see the table below). The config file you pass must be named `*.config` (a file called `sys.config.prod` is looked up as `sys.config.prod.config` and not found: copy it to a `.config` name). Proceed only on exit 0; a non-`ok` entry in the printed list is the refusal (`legacy_grpcbox_servers`, `legacy_grpcbox_client`, `no_grpc_listeners`, `no_agent_listener`, `bad_grpc_listeners`, `no_upstream_channel`, `bad_upstream_client_config`, `mixed_upstream_endpoints`, `unverified_upstream_tls`, or the management-posture defect), and the critical log line above it says why. On an image from before this change it fails
 with `undef` and exits 1, which tells you the image is old.
 
 ```bash
@@ -4842,6 +4915,7 @@ $R/erts-*/bin/erl -noshell -noinput -boot $R/releases/0.2.0/start_clean -config 
 Load = [application:load(yuzu_gw)], yuzu_gw_app:apply_env_overrides(),
 Results = Load ++ [yuzu_gw_app:check_legacy_grpcbox_servers(), yuzu_gw_app:check_legacy_grpcbox_client(),
                    yuzu_gw_app:check_grpc_listeners(), yuzu_gw_app:check_upstream_client_config(),
+                   yuzu_gw_app:check_upstream_channel_mix(), yuzu_gw_app:check_upstream_tls_posture(),
                    yuzu_gw_app:check_mgmt_listener_posture()],
 io:format("PREFLIGHT ~p~n", [Results]),
 halt(case lists:all(fun(X) -> X =:= ok end, Results) of true -> 0; false -> 1 end).'
@@ -4864,6 +4938,7 @@ $R/erts-*/bin/erl -noshell -noinput -boot $R/releases/0.2.0/start_clean -config 
 Load = [application:load(yuzu_gw)], yuzu_gw_app:apply_env_overrides(),
 Results = Load ++ [yuzu_gw_app:check_legacy_grpcbox_servers(), yuzu_gw_app:check_legacy_grpcbox_client(),
                    yuzu_gw_app:check_grpc_listeners(), yuzu_gw_app:check_upstream_client_config(),
+                   yuzu_gw_app:check_upstream_channel_mix(), yuzu_gw_app:check_upstream_tls_posture(),
                    yuzu_gw_app:check_mgmt_listener_posture()],
 io:format("PREFLIGHT ~p~n", [Results]),
 halt(case lists:all(fun(X) -> X =:= ok end, Results) of true -> 0; false -> 1 end).'
@@ -4884,7 +4959,7 @@ the critical line, on a config carrying a `{grpcbox, [{client, ...}]}` block, on
 `upstream_client` is not a `channels` map, and on a `-pa` path without `yuzu_gw`) and, in the
 release layout above (`erts-*/bin/erl`, `releases/0.2.0/start_clean`, `lib/*/ebin`), on a
 scratch production release (exit 0 on its shipped `sys.config`). The scan for a legacy block reads
-the config files named by `-config`, so give the script the same file the node will start with. The `docker run` wrapper (the entrypoint override, the mounts) was
+the config files named by `-config`, so give the script the same file the node will start with. The two upstream checks added to the command (channel mix and TLS posture) were run on a compiled tree: exit 0 on the shipped `sys.config.prod`, exit 1 with the critical line on an `https` channel that has `verify_peer` and no `cacertfile`. The `docker run` wrapper (the entrypoint override, the mounts) was
 written from the Dockerfile and the compose files and has not been run.
 
 **Old and new gateways side by side is untested.** Rolling forward replaces one gateway at a time
@@ -4893,8 +4968,8 @@ beyond the protocol, but a mixed fleet has not been run against a single server,
 reason to drain each gateway from the load balancer before you replace it.
 
 **Rolling forward.** Back up first: the tarball flow above (`rm -rf /opt/yuzu_gw`) deletes
-`releases/*/sys.config` with the old release, so copy the old `sys.config` out and keep both
-files. Convert and pre-flight the new config, then upgrade one gateway at a time: drain it
+`releases/*/sys.config` with the old release and a package upgrade overwrites it (both
+described under *Linux (systemd)*), so copy the old `sys.config` out and keep both files. Convert and pre-flight the new config, then upgrade one gateway at a time: drain it
 from the load balancer, replace the image and the config together, and wait for
 `ss -ltn | grep -E ':50051|:50063'` to show both ports, `curl -s localhost:8081/readyz` to
 answer 200 (it now also requires each configured listener to be running) and
@@ -4915,7 +4990,12 @@ nothing and reports healthy.
 |---|---|---|
 | Exit 1 within seconds, `Refusing to start: {grpcbox, servers} is set` | New image, old config | Convert the config (above), or restore the old image. |
 | Exit 1 within seconds, `Refusing to start: {grpcbox, [{client, ...}]} is set` | New image, config with the upstream channel still under `grpcbox` (a listener-only conversion) | Move the value to `{yuzu_gw, [{upstream_client, ...}]}` (next section). |
-| Exit 1, `Refusing to start: no upstream channel is configured` | `upstream_client` is unset, empty, or has no channel named `default_channel` | Add the `default_channel` (next section). |
+| Exit 1, `Refusing to start: no upstream channel is configured` | `upstream_client` is unset, empty, or has no channel named `default_channel` (channels under other names do not count) | Add the `default_channel` (next section). |
+| Exit 1, `Refusing to start: the upstream channel configuration {yuzu_gw, upstream_client} is unusable (<Why>)` | `upstream_client` has a shape error (`bad_client_config`, `bad_channel`, `bad_endpoint`, `bad_host`, `bad_socket_options`) | Fix the entry the shape names (next section). |
+| Exit 1, `Refusing to start: the upstream channel uses TLS (https) WITHOUT {verify,verify_peer} and a {cacertfile,...} of its own` | An `https` endpoint lacks `verify_peer` or a CA of its own | Add `{verify, verify_peer}` and a `cacertfile` to every `https` endpoint (or use `http` on a lab rig). |
+| Exit 1, `Refusing to start: the upstream channel <name> lists both plaintext (http) and TLS (https) endpoints` | One channel mixes schemes | Give the channel one scheme. |
+| VM exits at once with `invalid config data: duplicate application config: yuzu_gw` (before any gateway log line) | The `upstream_client` or `grpc_listeners` value was added as a **second** `{yuzu_gw, [...]}` tuple | Merge it into the existing `{yuzu_gw, [...]}` list; the pre-flight exits 1 on it too. |
+| Boot succeeds but every upstream call fails and the channel logs `connection <n> down (...)`; agents do not register | The channel is unusable at run time: a CA or certificate path that does not exist (`{options,tls}` in the log, and no boot guard checks it, because the server may create the files after the gateway starts), or a name that does not resolve | Check the paths and the dialled name; see [The upstream client](gateway.md#the-upstream-client). |
 | Process up, `/readyz` 200, ports 50051 and 50063 refuse connections, `yuzu_gw_agents_current` 0, no listener log | Old image, new config | Restore the old config, or deploy the new image. |
 | Exit 1, `Refusing to start: {yuzu_gw, grpc_listeners} is unset or empty` | The `servers` block was deleted and nothing added, or `grpc_listeners` sits in the `grpcbox` block | Add the listeners to the `yuzu_gw` block. |
 | Listeners up, every TLS handshake fails with `no_suitable_ciphers` | `tls.ciphers` is set to a list with no suite for the certificate's key type (ECDSA suites with an RSA certificate, say) | Remove `ciphers` (the default follows the key type) or list suites that fit the key (below). |
@@ -5000,7 +5080,12 @@ wrote yourself is not.
 | `{grpcbox, [{client, V}]}` | `{yuzu_gw, [{upstream_client, V}]}` |
 | `{grpcbox, [{servers, L}]}` | `{yuzu_gw, [{grpc_listeners, L2}]}` (L2 is L converted, see the key mapping above) |
 
-and remove the `{grpcbox, ...}` block. Before and after for a whole file, both moves at once:
+and remove the `{grpcbox, ...}` block. **Merge the values into your existing `{yuzu_gw, [...]}` list**:
+a second `{yuzu_gw, ...}` tuple is a different mistake, and the VM refuses it before the gateway
+starts (`invalid config data: duplicate application config: yuzu_gw`). The log lines in the
+refusals below say `config/sys.config`, which is the file in the source tree; on an installed
+gateway the file is `/opt/yuzu_gw/releases/<vsn>/sys.config` (a container's mount point, or the
+file your compose file mounts, otherwise). Before and after for a whole file, both moves at once:
 
 ```erlang
 %% BEFORE (the last release)
@@ -5061,8 +5146,17 @@ a value that is not a `channels` map, or a channel, endpoint, host or `socket_op
 shape, is refused with `Refusing to start: the upstream channel configuration {yuzu_gw,
 upstream_client} is unusable (Why)`, where `Why` is one of `bad_client_config`, `bad_channel`,
 `bad_endpoint`, `bad_host` or `bad_socket_options` and the shape of the offending term, never
-its value (SSL options name key files). The same boot also still refuses an `https` channel
-without `{verify, verify_peer}` unless `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1`.
+its value (SSL options name key files). The same boot also refuses, unless
+`YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` (dev only) is set:
+
+- **any** `https` endpoint that lacks `{verify, verify_peer}` **or** a `cacertfile` / `cacerts` of
+  its own (without a CA of its own the OS trust store would be used);
+- a channel that lists both `http` and `https` endpoints (`mixed_upstream_endpoints`; this one
+  has no override).
+
+Production is `https`, `verify_peer`, a CA-pinned `cacertfile` and a client certificate and key
+(mutual TLS). The boot log says `mutual-TLS` only when every endpoint carries `certfile` and
+`keyfile`, and `server-authenticated TLS (no client certificate)` otherwise.
 
 **What else changes** (the client is described in [The upstream client](gateway.md#the-upstream-client)):
 
@@ -5081,20 +5175,28 @@ without `{verify, verify_peer}` unless `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1`.
   could not restart it with TCP_NODELAY`): an alert or a log filter on it never fires. On a live
   stack with TLS one measurement put the `ProxyRegister` mean at about 3 ms, against about 45 ms
   with nodelay off.
-- **Reconnects and failures.** A lost connection is reopened after 100 ms doubling to 5 s with
-  jitter, and logs `Upstream channel <name> connection <n> down (<word>); retrying in <ms> ms`. A
-  call that finds no live connection fails at once with the last connection error rather than
-  waiting out its timeout.
+- **Reconnects and failures.** A lost connection is reopened after 100 ms doubling to 5 s plus up
+  to 20% jitter (so up to about 5.8 s; back to 100 ms only after a connection has stayed up for
+  5 s), and logs `Upstream channel <name> connection <n> down (<word>); retrying in <ms> ms`. A
+  call that finds no live connection waits, within its own timeout, for one that is already
+  connecting, and otherwise fails at once with the last connection error.
 - **Limits.** Per-call timeout 5000 ms, covering the connection wait; the largest response message
   16 MiB (`max_receive_message_bytes`); messages are never compressed. The grpcbox-era channel
   options `balancer`, `encoding` and `sync_start` are accepted and ignored.
 - **Certificates.** A connection that is up keeps the certificate it opened with; a reconnect
   reads the files again (Erlang's `ssl` caches file contents and cleans that cache about every
   120 s). The gateway has no connection-age cap.
-- **Keys that do nothing.** `upstream_addr`, `upstream_port` (and the environment variables
-  `YUZU_GW_UPSTREAM_ADDR` / `YUZU_GW_UPSTREAM_PORT` that set them) are read by nothing; the
-  endpoints of `upstream_client` are what is dialled. Remove or ignore them, but do not rely on
+- **Keys that do nothing.** `upstream_addr` and `upstream_port` are read by nothing; the
+  endpoints of `upstream_client` are what is dialled. The environment variables
+  `YUZU_GW_UPSTREAM_ADDR` / `YUZU_GW_UPSTREAM_PORT` are now **ignored with a boot warning**
+  (they used to log an `ENV override` line as if they applied). Remove them, and do not rely on
   them to repoint a gateway.
+- **Values that quietly fall back.** A `pool_size` or `connect_timeout` out of range (or a
+  string such as `"4"`) reads as the default with no log line. An IPv6 literal host needs
+  `inet6` in the endpoint's `socket_options`; the dial is IPv4 only otherwise.
+- **Log volume.** A persistent TLS failure costs about 5.8 KB of log per attempt (DERIVED:
+  roughly 100 MB a day at `pool_size` 1). Bound Docker logs with `logging` `max-size`. Erlang's
+  `ssl` progress reports include key file paths, never the passphrase (probed on OTP 28.4.2).
 
 **Rolling forward and back** are the listener move's rules (above): replace the image and the
 config together, one gateway at a time. A new image with the old config refuses to start. An old

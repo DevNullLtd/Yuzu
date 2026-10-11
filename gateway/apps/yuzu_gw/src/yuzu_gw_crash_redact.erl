@@ -196,17 +196,28 @@ redact_statem_reason(_Other) ->
     '$redacted'.
 
 %% The data of a gen_statem terminate report: the events (the last one and the
-%% queue, which hold the request), the state, the log and the timeouts. A list
-%% keeps its length, anything else is replaced; the other keys (name, modules,
-%% callback_mode, client_info: a pid and a name) hold no request data.
+%% queue, which hold the request), the state, the log and the timeouts. The
+%% report is still FORMATTED by gen_statem:format_log/2, which expects the
+%% queue and the postponed events as lists of {EventType, Content} (and the log
+%% and timeouts in their own shapes); a value of another shape makes it raise,
+%% and logger then prints the whole raw report map in its place. So every key
+%% keeps its shape and loses its content: one {internal, '$redacted'} per
+%% queued event, no log entries, the timeouts emptied, the state replaced. The
+%% other keys (name, modules, callback_mode, client_info: a pid and a name) hold
+%% no request data.
 redact_statem_data(Report) ->
-    maps:fold(fun(Key, Value, Acc) ->
-                      case lists:member(Key, [queue, postponed, log, timeouts, state, data]) of
-                          true when is_list(Value) -> Acc#{Key := {redacted, length(Value)}};
-                          true                     -> Acc#{Key := '$redacted'};
-                          false                    -> Acc
-                      end
-              end, Report, Report).
+    maps:fold(fun(Key, Value, Acc) -> redact_statem_key(Key, Value, Acc) end, Report, Report).
+
+redact_statem_key(Key, Value, Acc) when Key =:= queue; Key =:= postponed ->
+    case is_list(Value) of
+        true  -> Acc#{Key := [{internal, '$redacted'} || _ <- Value]};
+        false -> Acc#{Key := []}
+    end;
+redact_statem_key(log, _Value, Acc) -> Acc#{log := []};
+redact_statem_key(timeouts, _Value, Acc) -> Acc#{timeouts := {0, []}};
+redact_statem_key(Key, _Value, Acc) when Key =:= state; Key =:= data ->
+    Acc#{Key := '$redacted'};
+redact_statem_key(_Key, _Value, Acc) -> Acc.
 
 redact_proc(ProcInfo) ->
     [redact_item(Item) || Item <- ProcInfo].

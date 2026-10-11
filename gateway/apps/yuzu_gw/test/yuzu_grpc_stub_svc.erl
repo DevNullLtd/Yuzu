@@ -138,6 +138,11 @@ heartbeat(<<"sleep">>, _Ctx, _Request) ->
 heartbeat(<<"big">>, _Ctx, _Request) ->
     {ok, #{acknowledged => true,
            pending_commands => [#{plugin => binary:copy(<<"x">>, 4096)}]}};
+%% 256 KiB in one field: many HTTP/2 DATA frames (the largest is 16 KiB), for a
+%% client that must stop reading a response part way.
+heartbeat(<<"huge">>, _Ctx, _Request) ->
+    {ok, #{acknowledged => true,
+           pending_commands => [#{plugin => binary:copy(<<"x">>, 256 * 1024)}]}};
 heartbeat(_Other, _Ctx, _Request) ->
     {grpc_error, {3, <<"unknown command">>}}.
 

@@ -156,6 +156,50 @@ consult_strict_configs_test_() ->
 consult_rig_configs_test_() ->
     [{Path, fun() -> check_rig(Path) end} || Path <- rig_configs()].
 
+%% The upstream channel of every tracked config faces the boot decision on its
+%% TLS posture (yuzu_gw_app:client_tls_posture/1, which check_upstream_tls_posture
+%% reads): a config that ships an https upstream must be `verified' (verify_peer
+%% AND a cacertfile or cacerts of its own), or boot would refuse it; none may
+%% ship an `unverified' one. The strict (production) configs must be https and
+%% verified: a plaintext upstream there would pass the first rule vacuously.
+shipped_upstream_posture_is_never_unverified_test_() ->
+    Wizard = ["../tests/fixtures/compose-wizard/gateway-sys.config." ++ M
+              || M <- ["plaintext", "operator"]],
+    [{Path, fun() ->
+                Posture = upstream_posture(consult(Path)),
+                ?assert(lists:member(Posture, [verified, plaintext])),
+                ?assertEqual(ok, yuzu_gw_app:evaluate_upstream_posture(Posture, false))
+            end}
+     || Path <- ["config/test.config" | listener_configs()] ++ Wizard].
+
+shipped_strict_configs_verify_their_upstream_test_() ->
+    [{Path, fun() ->
+                Cfg = consult(Path),
+                ?assertEqual(verified, upstream_posture(Cfg)),
+                %% non-vacuous: without its trust anchor the same channel is refused
+                Stripped = strip_trust_anchors(
+                             proplists:get_value(upstream_client,
+                                                 proplists:get_value(yuzu_gw, Cfg, []))),
+                ?assertEqual(unverified, yuzu_gw_app:client_tls_posture(Stripped)),
+                ?assertEqual({error, unverified_upstream_tls},
+                             yuzu_gw_app:evaluate_upstream_posture(unverified, false))
+            end}
+     || Path <- strict_configs()].
+
+upstream_posture(Cfg) ->
+    yuzu_gw_app:client_tls_posture(
+      proplists:get_value(upstream_client, proplists:get_value(yuzu_gw, Cfg, []))).
+
+%% The same channels with the cacertfile / cacerts options removed.
+strip_trust_anchors(#{channels := Channels} = Client) ->
+    Client#{channels := [{N, [strip_endpoint(E) || E <- Eps], O} || {N, Eps, O} <- Channels]}.
+
+strip_endpoint(E) when is_tuple(E), tuple_size(E) >= 4, is_list(element(4, E)) ->
+    setelement(4, E, [Opt || Opt <- element(4, E),
+                             not lists:member(element(1, Opt), [cacertfile, cacerts])]);
+strip_endpoint(E) ->
+    E.
+
 %% A leftover {grpcbox, servers} or {grpcbox, client} refuses boot
 %% (yuzu_gw_app:check_legacy_grpcbox_servers/0, check_legacy_grpcbox_client/0),
 %% so no tracked config may carry one; the upstream channels are
@@ -485,6 +529,187 @@ legacy_grpcbox_in_files_test_() ->
           %% a missing file does not hide one that is there
           ?assertEqual(found, yuzu_gw_app:legacy_grpcbox_in_files(client, [Missing, A]))
       end)}].
+
+%% A config file named inside another is resolved against the directory of the
+%% file that names it, as the VM resolves it, and never against the working
+%% directory (the scan used to read the wrong file, or none, and report `absent'
+%% for a file the VM loads).
+legacy_grpcbox_nested_paths_resolve_against_the_naming_file_test_() ->
+    Client = "[{grpcbox, [{client, #{channels => []}}]}].\n",
+    Servers = "[{grpcbox, [{servers, [x]}]}].\n",
+    None = "[{yuzu_gw, []}].\n",
+    [{"a relative name is found beside the file that names it, from any working directory",
+      with_files([{"other.config", Client}, {"sys.config", "[\"other\"].\n"}],
+                 fun([_Other, Main]) ->
+          Elsewhere = make_subdir(filename:dirname(Main), "elsewhere"),
+          in_cwd(Elsewhere, fun() ->
+              ?assertEqual(found, yuzu_gw_app:legacy_grpcbox_in_files(client, [Main])),
+              ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(servers, [Main]))
+          end)
+      end)},
+     {"the same, with the suffix given in the name",
+      with_files([{"other.config", Client}, {"sys.config", "[\"other.config\"].\n"}],
+                 fun([_Other, Main]) ->
+          in_cwd(make_subdir(filename:dirname(Main), "elsewhere"), fun() ->
+              ?assertEqual(found, yuzu_gw_app:legacy_grpcbox_in_files(client, [Main]))
+          end)
+      end)},
+     {"a file of that name in the working directory is not the one read",
+      with_files([{"other.config", None}, {"sys.config", "[\"other\"].\n"}],
+                 fun([_Other, Main]) ->
+          Elsewhere = make_subdir(filename:dirname(Main), "elsewhere"),
+          ok = file:write_file(filename:join(Elsewhere, "other.config"), Client),
+          in_cwd(Elsewhere, fun() ->
+              ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(client, [Main]))
+          end)
+      end)},
+     {"a relative name into a subdirectory is followed",
+      with_files([{"sys.config", "[\"sub/other\"].\n"}], fun([Main]) ->
+          Dir = filename:dirname(Main),
+          Sub = make_subdir(Dir, "sub"),
+          ok = file:write_file(filename:join(Sub, "other.config"), Client),
+          in_cwd(make_subdir(Dir, "elsewhere"), fun() ->
+              ?assertEqual(found, yuzu_gw_app:legacy_grpcbox_in_files(client, [Main]))
+          end)
+      end)},
+     {"a name inside a file in a subdirectory is relative to that subdirectory",
+      with_files([{"sys.config", "[\"sub/mid\"].\n"}], fun([Main]) ->
+          Dir = filename:dirname(Main),
+          Sub = make_subdir(Dir, "sub"),
+          ok = file:write_file(filename:join(Sub, "mid.config"), "[\"deeper\"].\n"),
+          ok = file:write_file(filename:join(Sub, "deeper.config"), Client),
+          in_cwd(make_subdir(Dir, "elsewhere"), fun() ->
+              ?assertEqual(found, yuzu_gw_app:legacy_grpcbox_in_files(client, [Main]))
+          end),
+          %% and a file of that name beside the top file is not the one meant
+          ok = file:write_file(filename:join(Sub, "deeper.config"), None),
+          ok = file:write_file(filename:join(Dir, "deeper.config"), Client),
+          ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(client, [Main]))
+      end)},
+     {"an absolute name is followed as before, from any working directory",
+      with_files([{"inner.config", Client}], fun([Inner]) ->
+          Dir = filename:dirname(Inner),
+          Main = write_file(Dir, "abs.config", io_lib:format("[~p].\n", [Inner])),
+          in_cwd(make_subdir(Dir, "elsewhere"), fun() ->
+              ?assertEqual(found, yuzu_gw_app:legacy_grpcbox_in_files(client, [Main]))
+          end)
+      end)},
+     {"a relative name that does not exist is absent, not a crash",
+      with_files([{"sys.config", "[\"no_such_file\", \"sub/no_such_file\"].\n"}],
+                 fun([Main]) ->
+          in_cwd(make_subdir(filename:dirname(Main), "elsewhere"), fun() ->
+              ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(client, [Main]))
+          end)
+      end)},
+     {"a missing relative name does not hide a later one",
+      with_files([{"other.config", Client}, {"sys.config", "[\"missing\", \"other\"].\n"}],
+                 fun([_Other, Main]) ->
+          ?assertEqual(found, yuzu_gw_app:legacy_grpcbox_in_files(client, [Main]))
+      end)},
+     {"a chain of four relative names is followed to its end, a fifth link is not",
+      with_files([{"l5.config", Client}], fun([L5]) ->
+          Dir = filename:dirname(L5),
+          _L4 = write_file(Dir, "l4.config", "[\"l5\"].\n"),
+          _L3 = write_file(Dir, "l3.config", "[\"l4\"].\n"),
+          L2 = write_file(Dir, "l2.config", "[\"l3\"].\n"),
+          L1 = write_file(Dir, "l1.config", "[\"l2\"].\n"),
+          %% l1 -> l2 -> l3 -> l4 -> l5: l5 is the fifth file, one past the limit
+          ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(client, [L1])),
+          %% l2 -> l3 -> l4 -> l5 is four files
+          ?assertEqual(found, yuzu_gw_app:legacy_grpcbox_in_files(client, [L2]))
+      end)},
+     {"a config that names itself by a relative name ends the scan",
+      with_files([{"self.config", "[\"self\", {yuzu_gw, []}].\n"},
+                  {"ring_a.config", "[\"ring_b\"].\n"},
+                  {"ring_b.config", "[\"ring_a\"].\n"}],
+                 fun([Self, RingA, _RingB]) ->
+          ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(client, [Self])),
+          ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(client, [RingA]))
+      end)},
+     {"the legacy block in the naming file itself is still found",
+      with_files([{"other.config", None},
+                  {"sys.config", "[\"other\", {grpcbox, [{servers, [x]}]}].\n"}],
+                 fun([_Other, Main]) ->
+          ?assertEqual(found, yuzu_gw_app:legacy_grpcbox_in_files(servers, [Main])),
+          ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(client, [Main]))
+      end)},
+     {"the other key in the nested file is not confused with the first",
+      with_files([{"other.config", Servers}, {"sys.config", "[\"other\"].\n"}],
+                 fun([_Other, Main]) ->
+          ?assertEqual(found, yuzu_gw_app:legacy_grpcbox_in_files(servers, [Main])),
+          ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(client, [Main]))
+      end)}].
+
+make_subdir(Dir, Name) ->
+    Sub = filename:join(Dir, Name),
+    ok = filelib:ensure_path(Sub),
+    Sub.
+
+%% Run Fun with Dir as the working directory of the VM, and put it back. The
+%% working directory is process-wide, so it is restored even when Fun fails.
+in_cwd(Dir, Fun) ->
+    {ok, Prev} = file:get_cwd(),
+    ok = file:set_cwd(Dir),
+    try
+        Fun()
+    after
+        ok = file:set_cwd(Prev)
+    end.
+
+%% The guards read the config files the VM was STARTED with (init:get_argument/1,
+%% which a test cannot set in its own VM): a leftover {grpcbox, ...} block in a
+%% sys.config never reaches the application env, because no application of that
+%% name is loaded. So the input of the scan is checked end to end in a VM that is
+%% started with -config (no distribution: the peer talks over standard_io).
+legacy_grpcbox_config_files_of_the_vm_test_() ->
+    Client = "[{grpcbox, [{client, #{channels => []}}]}].\n",
+    Servers = "[{grpcbox, [{servers, [x]}]}].\n",
+    None = "[{yuzu_gw, []}].\n",
+    Verdicts = fun(Args) ->
+                   {ok, Peer, _Node} = peer:start_link(
+                                         #{connection => standard_io,
+                                           args => ["-pa" | code:get_path()] ++ Args}),
+                   try
+                       {peer:call(Peer, yuzu_gw_app, check_legacy_grpcbox_client, []),
+                        peer:call(Peer, yuzu_gw_app, check_legacy_grpcbox_servers, [])}
+                   after
+                       peer:stop(Peer)
+                   end
+               end,
+    [{"a VM started without -config has nothing to find",
+      {timeout, 60, fun() -> ?assertEqual({ok, ok}, Verdicts([])) end}},
+     {"a {grpcbox, client} in the file the VM was started with is refused, servers is not",
+      {timeout, 60,
+       with_files([{"sys.config", Client}], fun([File]) ->
+           ?assertEqual({{error, legacy_grpcbox_client}, ok}, Verdicts(["-config", File]))
+       end)}},
+     {"a {grpcbox, servers} in it is refused, client is not",
+      {timeout, 60,
+       with_files([{"sys.config", Servers}], fun([File]) ->
+           ?assertEqual({ok, {error, legacy_grpcbox_servers}}, Verdicts(["-config", File]))
+       end)}},
+     {"a file without the block is fine",
+      {timeout, 60,
+       with_files([{"sys.config", None}], fun([File]) ->
+           ?assertEqual({ok, ok}, Verdicts(["-config", File]))
+       end)}},
+     {"the block in a later file of the same -config is found",
+      {timeout, 60,
+       with_files([{"a.config", None}, {"b.config", Client}], fun([A, B]) ->
+           ?assertEqual({{error, legacy_grpcbox_client}, ok}, Verdicts(["-config", A, B]))
+       end)}},
+     {"the block in a second -config option is found",
+      {timeout, 60,
+       with_files([{"a.config", None}, {"b.config", Servers}], fun([A, B]) ->
+           ?assertEqual({ok, {error, legacy_grpcbox_servers}},
+                        Verdicts(["-config", A, "-config", B]))
+       end)}},
+     {"a file the VM names without its .config suffix is found",
+      {timeout, 60,
+       with_files([{"sys.config", Client}], fun([File]) ->
+           ?assertEqual({{error, legacy_grpcbox_client}, ok},
+                        Verdicts(["-config", filename:rootname(File, ".config")]))
+       end)}}].
 
 %% A value set at run time is a leftover too; the refusal says where the value
 %% belongs.

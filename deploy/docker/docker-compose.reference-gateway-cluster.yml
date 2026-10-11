@@ -38,6 +38,14 @@ services:
     # outside this Compose network needs to reach a specific replica by
     # host port; use `docker exec` for the demo, as above).
     restart: unless-stopped
+    # Bound the gateway's stdout: a persistent upstream TLS failure logs per
+    # redial attempt (docs/user-manual/gateway.md), and the default json-file
+    # driver has no size cap.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     environment:
       # Demo-only: a real cluster needs a REAL cookie identical across every
       # node (the boot guard's minimum-length floor, #4555, refuses a short

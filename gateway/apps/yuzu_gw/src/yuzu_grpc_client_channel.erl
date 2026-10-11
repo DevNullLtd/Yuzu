@@ -50,8 +50,10 @@
              cfg :: yuzu_grpc_client_config:channel(),
              slots = #{} :: #{pos_integer() => #slot{}},
              by_pid = #{} :: #{pid() => pos_integer()},
-             %% callers of await_up waiting for a connection that is being opened
-             waiters = [] :: [gen_server:from()]}).
+             %% callers of await_up waiting for a connection that is being opened,
+             %% each with the monotonic ms at which it stops waiting (an expired
+             %% caller has already given up; its entry is dropped, never answered)
+             waiters = [] :: [{gen_server:from(), integer()}]}).
 
 %%--------------------------------------------------------------------
 %% API
@@ -70,16 +72,21 @@ start_link(#{name := Name} = Cfg) ->
     gen_server:start_link({local, Name}, ?MODULE, Cfg, []).
 
 %% @doc A live connection of the channel, or why there is none. Waits at most
-%% `Timeout' ms, and only for a connection that is already being opened.
+%% `Timeout' ms, and only for a connection that is already being opened; if none
+%% is, it answers at once with the last connection error. The channel can die
+%% at any moment (its table goes with it), so every table read is inside the one
+%% `catch': the answer is then `no_channel', never a `badarg' for the caller.
 -spec pick(atom(), non_neg_integer()) -> {ok, pid()} | {error, term()}.
 pick(Name, Timeout) ->
-    try ets:select(Name, [{{{slot, '_'}, '$1', up}, [], ['$1']}]) of
-        [] ->
-            wait_for_connection(Name, Timeout);
-        Pids ->
-            Counter = ets:lookup_element(Name, rr, 2),
-            ok = counters:add(Counter, 1, 1),
-            {ok, lists:nth(counters:get(Counter, 1) rem length(Pids) + 1, Pids)}
+    try
+        case ets:select(Name, [{{{slot, '_'}, '$1', up}, [], ['$1']}]) of
+            [] ->
+                wait_for_connection(Name, Timeout);
+            Pids ->
+                Counter = ets:lookup_element(Name, rr, 2),
+                ok = counters:add(Counter, 1, 1),
+                {ok, lists:nth(counters:get(Counter, 1) rem length(Pids) + 1, Pids)}
+        end
     catch
         error:badarg -> {error, no_channel}
     end.
@@ -96,6 +103,7 @@ max_receive(Name) ->
 %% `{options, tls}' for unusable TLS options, `other' for anything else.
 -spec compact(term()) -> atom() | {tls_alert, atom()} | {options, tls}.
 compact(normal) -> closed;
+compact({error, Reason}) -> compact(Reason);
 compact({shutdown, Reason}) -> compact(Reason);
 compact({down, Reason}) -> compact(Reason);
 compact({tls_alert, {Alert, _}}) when is_atom(Alert) -> {tls_alert, Alert};
@@ -117,19 +125,30 @@ word(Reason) when is_atom(Reason) -> Reason;
 word(_) -> other.
 
 %% @doc Delay before reconnect attempt `Fails' (0-based): 100 ms doubling to
-%% 5 s, with up to 20% jitter so a restarted server is not met by every
-%% gateway at the same instant.
+%% 5 s, then 80% to 100% of that, so a restarted server is not met by every
+%% gateway at the same instant and the delay never exceeds the 5 s cap (a
+%% jitter added on top of the cap reached 5.8 s).
 -spec backoff_ms(non_neg_integer()) -> pos_integer().
 backoff_ms(Fails) ->
     Base = min(?BACKOFF_MAX_MS, ?BACKOFF_BASE_MS * (1 bsl min(Fails, 6))),
-    Base + rand:uniform(max(1, Base div 5)) - 1.
+    Base - (rand:uniform(max(1, Base div 5)) - 1).
 
 %%--------------------------------------------------------------------
 %% gen_server
 %%--------------------------------------------------------------------
 
-init(#{name := Name, endpoints := Endpoints, pool_size := Size,
-       max_receive_message_bytes := Max} = Cfg) ->
+%% Every callback runs under guard/1: an exception here would leave through
+%% OTP's own terminate report, whose reason and stacktrace carry the argument
+%% lists of the failing calls (the endpoint and TLS option lists, with the key
+%% and certificate file paths) and whose registered name is an arbitrary channel
+%% name no crash filter can match. The channel leaves with its class alone.
+init(Cfg) ->
+    try do_init(Cfg)
+    catch Class:_ -> {stop, {channel_failed, Class}}
+    end.
+
+do_init(#{name := Name, endpoints := Endpoints, pool_size := Size,
+          max_receive_message_bytes := Max} = Cfg) ->
     process_flag(trap_exit, true),
     Name = ets:new(Name, [named_table, protected, set, {read_concurrency, true}]),
     true = ets:insert(Name, [{rr, counters:new(1, [write_concurrency])},
@@ -145,23 +164,38 @@ init(#{name := Name, endpoints := Endpoints, pool_size := Size,
 %% A caller that found no connection up while one is being opened. Only this
 %% process can learn a connection came up (gun sends gun_up to its owner), so the
 %% caller waits on a reply from here, not on the connection itself.
-handle_call(await_up, From, #st{name = Name} = State) ->
+handle_call(Request, From, State) ->
+    guard(fun() -> do_call(Request, From, State) end).
+
+do_call({await_up, Timeout}, From, #st{name = Name} = State) ->
     case up_pids(Name) of
         [Pid | _] ->
             {reply, {ok, Pid}, State};
         [] ->
             case connecting(Name) of
-                true  -> {noreply, State#st{waiters = [From | State#st.waiters]}};
-                false -> {reply, last_error(Name), State}
+                true  ->
+                    Now = erlang:monotonic_time(millisecond),
+                    Live = [W || {_, Deadline} = W <- State#st.waiters, Deadline > Now],
+                    {noreply, State#st{waiters = [{From, Now + Timeout} | Live]}};
+                false ->
+                    {reply, last_error(Name), State}
             end
     end;
-handle_call(_Request, _From, State) ->
+do_call(_Request, _From, State) ->
     {reply, {error, unsupported}, State}.
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({gun_up, Pid, _Protocol}, #st{by_pid = ByPid} = State) ->
+handle_info(Info, State) ->
+    guard(fun() -> do_info(Info, State) end).
+
+guard(Fun) ->
+    try Fun()
+    catch Class:_ -> exit({channel_failed, Class})
+    end.
+
+do_info({gun_up, Pid, _Protocol}, #st{by_pid = ByPid} = State) ->
     case maps:find(Pid, ByPid) of
         {ok, Id} ->
             erlang:send_after(?STABLE_MS, self(), {stable, Id, Pid}),
@@ -170,28 +204,28 @@ handle_info({gun_up, Pid, _Protocol}, #st{by_pid = ByPid} = State) ->
         error ->
             {noreply, State}
     end;
-handle_info({stable, Id, Pid}, #st{slots = Slots} = State) ->
+do_info({stable, Id, Pid}, #st{slots = Slots} = State) ->
     case maps:find(Id, Slots) of
         {ok, #slot{pid = Pid}} -> {noreply, reset_fails(Id, State)};
         _                      -> {noreply, State}
     end;
-handle_info({gun_down, Pid, _Protocol, Reason, _Killed}, State) ->
+do_info({gun_down, Pid, _Protocol, Reason, _Killed}, State) ->
     {noreply, lost(Pid, Reason, State)};
-handle_info({gun_error, Pid, _Ref, Reason}, State) when is_pid(Pid) ->
+do_info({gun_error, Pid, _Ref, Reason}, State) when is_pid(Pid) ->
     {noreply, lost(Pid, Reason, State)};
-handle_info({gun_error, Pid, Reason}, State) when is_pid(Pid) ->
+do_info({gun_error, Pid, Reason}, State) when is_pid(Pid) ->
     {noreply, lost(Pid, Reason, State)};
-handle_info({'EXIT', Pid, Reason}, #st{by_pid = ByPid} = State) ->
+do_info({'EXIT', Pid, Reason}, #st{by_pid = ByPid} = State) ->
     case maps:is_key(Pid, ByPid) of
         true  -> {noreply, lost(Pid, Reason, State)};
         false -> {noreply, State}
     end;
-handle_info({reconnect, Id}, #st{slots = Slots} = State) ->
+do_info({reconnect, Id}, #st{slots = Slots} = State) ->
     case maps:find(Id, Slots) of
         {ok, #slot{pid = undefined}} -> {noreply, open(Id, State)};
         _                            -> {noreply, State}
     end;
-handle_info(_Other, State) ->
+do_info(_Other, State) ->
     {noreply, State}.
 
 terminate(_Reason, #st{slots = Slots}) ->
@@ -231,6 +265,18 @@ gun_opts(#{transport := Transport, tcp_opts := Tcp} = Endpoint, #{connect_timeou
              tcp_opts => socket_opts(Tcp),
              connect_timeout => Timeout,
              domain_lookup_timeout => Timeout,
+             %% Liveness: a PING every 45 s, the connection closed when two go
+             %% unanswered (about 90 s to notice a peer that stopped answering
+             %% without a FIN or RST; the kernel alone takes about 15 minutes).
+             %% The interval must stay above the C++ server's 30 s floor for
+             %% pings without data (GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS):
+             %% a faster client draws GOAWAY too_many_pings. After a GOAWAY gun
+             %% keeps the connection for closing_timeout so in-flight calls
+             %% finish, and fails new requests on it meanwhile: 3 s, not the 15 s
+             %% default (a call takes at most 5 s), then gun_down and the slot is
+             %% redialled.
+             http2_opts => #{keepalive => 45000, keepalive_tolerance => 1,
+                             closing_timeout => 3000},
              retry => 0,
              %% gun's default puts the connection under its own supervisor, which
              %% leaves a failed connect unreported: no gun_down (it was never up),
@@ -246,10 +292,10 @@ gun_opts(#{transport := Transport, tcp_opts := Tcp} = Endpoint, #{connect_timeou
     end.
 
 %% gun's own defaults for the TCP socket (a stuck send gives up after 15 s and
-%% closes), kept unless the operator set them; gun adds binary, {active,false}
-%% and {packet,raw} itself.
+%% closes), kept unless the operator set them, and SO_KEEPALIVE; gun adds binary,
+%% {active,false} and {packet,raw} itself.
 socket_opts(Tcp) ->
-    Defaults = [{send_timeout, 15000}, {send_timeout_close, true}],
+    Defaults = [{send_timeout, 15000}, {send_timeout_close, true}, {keepalive, true}],
     Tcp ++ [D || {Key, _} = D <- Defaults, not proplists:is_defined(Key, Tcp)].
 
 lost(Pid, Reason, #st{slots = Slots, by_pid = ByPid} = State) ->
@@ -269,20 +315,34 @@ failed(Id, Reason, #st{name = Name, slots = Slots} = State) ->
     Compact = compact(Reason),
     Word = word(Compact),
     #slot{fails = Fails} = Slot = maps:get(Id, Slots),
-    true = ets:insert(Name, [{{slot, Id}, undefined, down}, {last_error, Compact}]),
-    Delay = backoff_ms(Fails),
-    logger:info("Upstream channel ~s connection ~b down (~s); retrying in ~b ms",
-                [Name, Id, Word, Delay]),
-    Timer = erlang:send_after(Delay, self(), {reconnect, Id}),
-    State1 = State#st{slots = Slots#{Id := Slot#slot{fails = Fails + 1, timer = Timer,
-                                                     pid = undefined}}},
-    case connecting(Name) orelse up_pids(Name) =/= [] of
-        true  -> State1;
-        false -> reply_waiters({error, Compact}, State1)
+    true = ets:insert(Name, {last_error, Compact}),
+    case Fails of
+        0 ->
+            %% The first loss of a healthy connection: dial again at once. The
+            %% slot goes straight to `connecting', so a caller arriving now waits
+            %% for it (await_up) instead of failing; each failed call counts
+            %% toward the caller's circuit breaker, and a backoff here turned a
+            %% 100 ms blip into 5 failures and a 10 s outage.
+            logger:info("Upstream channel ~s connection ~b down (~s); reconnecting",
+                        [Name, Id, Word]),
+            open(Id, State#st{slots = Slots#{Id := Slot#slot{fails = 1, pid = undefined}}});
+        _ ->
+            true = ets:insert(Name, {{slot, Id}, undefined, down}),
+            Delay = backoff_ms(Fails),
+            logger:info("Upstream channel ~s connection ~b down (~s); retrying in ~b ms",
+                        [Name, Id, Word, Delay]),
+            Timer = erlang:send_after(Delay, self(), {reconnect, Id}),
+            State1 = State#st{slots = Slots#{Id := Slot#slot{fails = Fails + 1, timer = Timer,
+                                                             pid = undefined}}},
+            case connecting(Name) orelse up_pids(Name) =/= [] of
+                true  -> State1;
+                false -> reply_waiters({error, Compact}, State1)
+            end
     end.
 
 reply_waiters(Reply, #st{waiters = Waiters} = State) ->
-    _ = [gen_server:reply(From, Reply) || From <- Waiters],
+    Now = erlang:monotonic_time(millisecond),
+    _ = [gen_server:reply(From, Reply) || {From, Deadline} <- Waiters, Deadline > Now],
     State#st{waiters = []}.
 
 %% gun:close/1 asks gun's connection supervisor to terminate the child, and an
@@ -315,9 +375,10 @@ mark(Id, Status, #st{name = Name, slots = Slots} = State) ->
 %%--------------------------------------------------------------------
 
 wait_for_connection(Name, Timeout) when Timeout > 0 ->
-    try gen_server:call(Name, await_up, Timeout)
+    try gen_server:call(Name, {await_up, Timeout}, Timeout)
     catch
-        exit:_ -> last_error(Name)
+        exit:{timeout, _} -> {error, timeout};
+        exit:_            -> last_error(Name)
     end;
 wait_for_connection(Name, _Timeout) ->
     last_error(Name).

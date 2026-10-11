@@ -22,6 +22,8 @@
 -module(yuzu_grpc_client_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+-export([init/2]).  %% cowboy handler of the HTTP-error tests
+
 -define(SVC, 'yuzu.agent.v1.AgentService').
 -define(HEARTBEAT, <<"/yuzu.agent.v1.AgentService/Heartbeat">>).
 -define(NOSUCH, <<"/yuzu.agent.v1.AgentService/NoSuchMethod">>).
@@ -43,6 +45,12 @@ plaintext_test_() ->
          {"concurrent calls all complete on a channel's connections", {timeout, 30, fun() -> concurrent(State) end}},
          {"calls spread over both connections of the pool", fun() -> spread(State) end},
          {"the deadline ends a call that never answers", {timeout, 20, fun() -> deadline(State) end}},
+         {"a timed-out call cancels its stream: the handler ends and nothing reaches the caller later",
+          {timeout, 20, fun() -> timeout_cancels_the_stream(State) end}},
+         {"a response over the limit that spans many frames stops the stream: nothing reaches the caller later",
+          {timeout, 20, fun() -> oversize_multi_frame_response_is_abandoned(State) end}},
+         {"a response that is not HTTP 200 is {http_error, {StatusBinary, <<>>}, Meta}, whatever its body",
+          {timeout, 20, fun() -> http_error() end}},
          {"an unknown channel is {error, no_channel}", fun() -> no_channel() end},
          {"TCP_NODELAY is set on the channel's sockets by default", fun() -> nodelay(State) end},
          {"test client: bidi echo, then close_send ends the call with status 0", fun() -> bidi_echo(State) end},
@@ -185,6 +193,126 @@ deadline(#{chan := Chan}) ->
     ?assert(Elapsed < 5000),
     %% the channel is still good afterwards
     ?assertMatch({ok, #{acknowledged := true}, _}, heartbeat(Chan, <<"ok">>)).
+
+%% The call is given up on at 300 ms. The stream is cancelled (RST_STREAM), so the
+%% server ends the handler that was sleeping on it, and no message of gun's about
+%% the stream reaches the caller afterwards (it would, if the stream were left
+%% open and the handler later answered, or if the cancel were not sent).
+timeout_cancels_the_stream(#{chan := Chan}) ->
+    yuzu_grpc_stub_svc:reset(),
+    yuzu_grpc_stub_svc:notify(self()),
+    flush_mailbox(),
+    Self = self(),
+    Caller = spawn_link(fun() ->
+                            R = yuzu_grpc_client:unary(#{}, ?HEARTBEAT, #{session_id => <<"sleep">>},
+                                                       def(), #{channel => Chan, timeout => 300}),
+                            Stray = collect_messages(500),
+                            Self ! {caller, R, Stray}
+                        end),
+    {Sleeper, Result, Stray1} =
+        receive {stub, sleeping, H} ->
+                    receive {caller, R0, S0} -> {H, R0, S0}
+                    after 10000 -> error({caller_silent, Caller})
+                    end
+        after 10000 -> error(handler_never_slept)
+        end,
+    ?assertEqual({error, timeout}, Result),
+    ?assertEqual([], Stray1),
+    ?assertEqual(ok, wait_dead(Sleeper)),
+    ?assertMatch({ok, #{acknowledged := true}, _}, heartbeat(Chan, <<"ok">>)).
+
+%% 256 KiB in many DATA frames against a limit of 1 KiB: the call fails with
+%% response_too_large at the first frame, the stream is cancelled, and the frames
+%% still in flight are not delivered to the caller afterwards. The connection is
+%% the same one, and serves the next call.
+oversize_multi_frame_response_is_abandoned(#{port := Port}) ->
+    Name = list_to_atom("yuzu_client_tests_small_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    {ok, Cfg} = yuzu_grpc_client_config:channel(
+                  {Name, [{http, "localhost", Port, []}],
+                   #{pool_size => 1, max_receive_message_bytes => 1024}}, true),
+    {ok, _} = yuzu_grpc_client_channel:start_link(Cfg),
+    try
+        Name = wait_up(Name, 1, 200),
+        [Conn] = ets:select(Name, [{{{slot, '_'}, '$1', up}, [], ['$1']}]),
+        flush_mailbox(),
+        [begin
+             ?assertEqual({error, response_too_large}, heartbeat(Name, <<"huge">>)),
+             ?assertEqual([], collect_messages(300))
+         end || _ <- lists:seq(1, 3)],
+        ?assertMatch({ok, #{acknowledged := true}, _}, heartbeat(Name, <<"ok">>)),
+        ?assertEqual([Conn], ets:select(Name, [{{{slot, '_'}, '$1', up}, [], ['$1']}])),
+        ?assert(is_process_alive(Conn))
+    after
+        stop_channel(Name)
+    end.
+
+%% Not a gRPC server at all: a cowboy handler that answers every request with
+%% the status the request asks for (x-status), with or without a body (x-body).
+%% This is a gateway talking to a proxy or a load balancer in front of the real
+%% server, and the answer must be `http_error' (status as a decimal binary, the
+%% body not returned), never an `ok' or a gRPC `error' the upstream code would
+%% read as the server's. Nothing of the stream reaches the caller afterwards, and
+%% the connection serves the next call.
+http_error() ->
+    Port = yuzu_gw_test_listener:probe_free_port(),
+    Ref = list_to_atom("yuzu_client_tests_http_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    Dispatch = cowboy_router:compile([{'_', [{"/[...]", ?MODULE, []}]}]),
+    {ok, _} = cowboy:start_clear(Ref, [{ip, {127, 0, 0, 1}}, {port, Port}],
+                                 #{env => #{dispatch => Dispatch}}),
+    Name = list_to_atom("yuzu_client_tests_http_chan_" ++ integer_to_list(erlang:unique_integer([positive]))),
+    {ok, Cfg} = yuzu_grpc_client_config:channel({Name, [{http, "127.0.0.1", Port, []}],
+                                                 #{pool_size => 1}}, true),
+    {ok, _} = yuzu_grpc_client_channel:start_link(Cfg),
+    try
+        Name = wait_up(Name, 1, 200),
+        flush_mailbox(),
+        Call = fun(Status, Body) ->
+                   Meta0 = #{<<"x-status">> => Status},
+                   Meta = case Body of
+                              none -> Meta0;
+                              _    -> Meta0#{<<"x-body">> => Body}
+                          end,
+                   yuzu_grpc_client:unary(Meta, ?HEARTBEAT, #{session_id => <<"ok">>}, def(),
+                                          #{channel => Name})
+               end,
+        [begin
+             ?assertMatch({http_error, {Status, <<>>}, #{headers := #{<<"content-type">> := <<"text/plain">>},
+                                                         trailers := #{}}},
+                          Call(Status, Body)),
+             %% with or without a body the stream ends on its own (the client reads
+             %% the body out instead of cancelling a stream gun is finishing), so
+             %% no gun message is left in the caller's mailbox
+             ?assertEqual([], collect_messages(150))
+         end || Status <- [<<"502">>, <<"503">>, <<"404">>, <<"400">>, <<"500">>],
+                Body <- [none, <<"upstream is unavailable">>]],
+        %% a 200 that is not gRPC is not an http_error: it has no grpc-status
+        ?assertNotMatch({http_error, _, _}, Call(<<"200">>, <<"hello">>))
+    after
+        stop_channel(Name),
+        cowboy:stop_listener(Ref)
+    end.
+
+%% cowboy handler: the status and body the request asks for.
+init(Req, State) ->
+    Status = binary_to_integer(cowboy_req:header(<<"x-status">>, Req, <<"502">>)),
+    Body = cowboy_req:header(<<"x-body">>, Req, <<>>),
+    {ok, cowboy_req:reply(Status, #{<<"content-type">> => <<"text/plain">>}, Body, Req), State}.
+
+flush_mailbox() ->
+    receive _ -> flush_mailbox() after 0 -> ok end.
+
+%% Every message that arrives in the next Ms milliseconds.
+collect_messages(Ms) ->
+    receive M -> [M | collect_messages(Ms)]
+    after Ms -> []
+    end.
+
+%% Wait (bounded) for a process to be gone.
+wait_dead(Pid) ->
+    Ref = erlang:monitor(process, Pid),
+    receive {'DOWN', Ref, process, Pid, _} -> ok
+    after 5000 -> {still_alive, Pid}
+    end.
 
 no_channel() ->
     ?assertEqual({error, no_channel},

@@ -90,3 +90,70 @@ no_listener_children_when_none_are_configured_test_() ->
                             ?assertEqual([pg_scope | ?CORE], child_ids())
                         end)
                     end}].
+
+%%%-------------------------------------------------------------------
+%%% The upstream client channels
+%%%
+%%% One child per channel of {yuzu_gw, upstream_client}, AHEAD of the processes
+%%% that call them (yuzu_gw_upstream, yuzu_gw_heartbeat_buffer). A supervisor that
+%%% lost them would leave every upstream call {error, no_channel}: no agent
+%%% registers while the gateway looks up, so the wiring is asserted on the specs.
+%%%-------------------------------------------------------------------
+
+with_upstream_client(Client, Fun) ->
+    Prev = application:get_env(yuzu_gw, upstream_client),
+    case Client of
+        unset -> application:unset_env(yuzu_gw, upstream_client);
+        _     -> application:set_env(yuzu_gw, upstream_client, Client)
+    end,
+    try Fun()
+    after
+        case Prev of
+            {ok, V}   -> application:set_env(yuzu_gw, upstream_client, V);
+            undefined -> application:unset_env(yuzu_gw, upstream_client)
+        end
+    end.
+
+two_channels() ->
+    #{channels => [{default_channel, [{http, "127.0.0.1", 59991, []}], #{pool_size => 2}},
+                   {second_channel, [{http, "127.0.0.1", 59992, []}], #{}}]}.
+
+channel_children_precede_their_callers_test() ->
+    with_listeners(unset, fun() -> with_upstream_client(two_channels(), fun() ->
+        ?assertEqual([pg_scope, yuzu_gw_registry,
+                      {yuzu_grpc_client_channel, default_channel},
+                      {yuzu_grpc_client_channel, second_channel},
+                      yuzu_gw_upstream, yuzu_gw_heartbeat_buffer, yuzu_gw_router,
+                      yuzu_gw_gauge, yuzu_gw_cluster_discovery, yuzu_gw_health, yuzu_gw_agent_sup],
+                     child_ids())
+    end) end).
+
+channel_children_are_permanent_workers_started_with_their_parsed_config_test() ->
+    with_listeners(unset, fun() -> with_upstream_client(two_channels(), fun() ->
+        {ok, {_, Specs}} = yuzu_gw_sup:init([]),
+        {ok, [First, Second]} = yuzu_grpc_client_config:from_env(),
+        Channels = [S || S <- Specs, is_tuple(maps:get(id, S)),
+                         element(1, maps:get(id, S)) =:= yuzu_grpc_client_channel],
+        ?assertMatch([#{id := {yuzu_grpc_client_channel, default_channel},
+                        start := {yuzu_grpc_client_channel, start_link, [First]},
+                        restart := permanent, type := worker},
+                      #{id := {yuzu_grpc_client_channel, second_channel},
+                        start := {yuzu_grpc_client_channel, start_link, [Second]},
+                        restart := permanent, type := worker}],
+                     Channels),
+        ?assertMatch(#{pool_size := 2}, First)
+    end) end).
+
+no_channel_children_without_an_upstream_client_test_() ->
+    [{"unset", fun() -> with_listeners(unset, fun() -> with_upstream_client(unset, fun() ->
+                        ?assertEqual([pg_scope | ?CORE], child_ids())
+                    end) end) end},
+     {"an empty channel list", fun() -> with_listeners(unset, fun() ->
+                        with_upstream_client(#{channels => []}, fun() ->
+                            ?assertEqual([pg_scope | ?CORE], child_ids())
+                        end) end) end},
+     {"a value that does not parse (yuzu_gw_app refuses it before the tree starts)",
+      fun() -> with_listeners(unset, fun() ->
+                   with_upstream_client(#{channels => [bogus]}, fun() ->
+                       ?assertEqual([pg_scope | ?CORE], child_ids())
+                   end) end) end}].

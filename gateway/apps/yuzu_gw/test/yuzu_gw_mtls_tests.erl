@@ -232,6 +232,95 @@ client_tls_posture_plaintext_test() ->
     ?assertEqual(plaintext, yuzu_gw_app:client_tls_posture(Cfg)),
     ?assertEqual(plaintext, yuzu_gw_app:client_tls_posture(undefined)).
 
+%% `verified' is verify_peer AND a trust anchor of the operator's own. verify_peer
+%% alone leaves gun to fill in the operating system's CA store, so the gateway
+%% would accept any publicly trusted certificate for its upstream: that is not
+%% the pinned private PKI the guard exists to enforce, and it counts as
+%% unverified (boot refuses it unless YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1).
+client_tls_posture_needs_verify_peer_and_a_trust_anchor_test_() ->
+    Posture = fun(Ssl) ->
+                  yuzu_gw_app:client_tls_posture(
+                    #{channels => [{default_channel, [{https, "server", 50055, Ssl}], #{}}]})
+              end,
+    Der = <<48, 3, 2, 1, 1>>,
+    [{"verify_peer alone is unverified",
+      ?_assertEqual(unverified, Posture([{verify, verify_peer}]))},
+     {"verify_peer with a cacertfile is verified",
+      ?_assertEqual(verified, Posture([{verify, verify_peer}, {cacertfile, "/etc/yuzu/ca.pem"}]))},
+     {"verify_peer with a binary cacertfile is verified",
+      ?_assertEqual(verified, Posture([{verify, verify_peer}, {cacertfile, <<"/etc/yuzu/ca.pem">>}]))},
+     {"verify_peer with cacerts is verified",
+      ?_assertEqual(verified, Posture([{verify, verify_peer}, {cacerts, [Der]}]))},
+     {"the order of the options does not matter",
+      ?_assertEqual(verified, Posture([{cacertfile, "/etc/yuzu/ca.pem"}, {verify, verify_peer}]))},
+     {"an empty string cacertfile is no trust anchor",
+      ?_assertEqual(unverified, Posture([{verify, verify_peer}, {cacertfile, ""}]))},
+     {"an empty binary cacertfile is no trust anchor",
+      ?_assertEqual(unverified, Posture([{verify, verify_peer}, {cacertfile, <<>>}]))},
+     {"an empty cacerts list is no trust anchor",
+      ?_assertEqual(unverified, Posture([{verify, verify_peer}, {cacerts, []}]))},
+     {"an undefined cacertfile is no trust anchor",
+      ?_assertEqual(unverified, Posture([{verify, verify_peer}, {cacertfile, undefined}]))},
+     {"empty cacertfile and cacerts together are no trust anchor",
+      ?_assertEqual(unverified, Posture([{verify, verify_peer}, {cacertfile, ""}, {cacerts, []}]))},
+     {"verify_none with a cacertfile is unverified",
+      ?_assertEqual(unverified, Posture([{verify, verify_none}, {cacertfile, "/etc/yuzu/ca.pem"}]))},
+     {"verify_none with cacerts is unverified",
+      ?_assertEqual(unverified, Posture([{verify, verify_none}, {cacerts, [Der]}]))},
+     {"a cacertfile without any verify option is unverified",
+      ?_assertEqual(unverified, Posture([{cacertfile, "/etc/yuzu/ca.pem"}]))},
+     {"no options at all is unverified",
+      ?_assertEqual(unverified, Posture([]))},
+     {"options that are not a list are unverified, not a crash",
+      ?_assertEqual(unverified, Posture(not_a_list))},
+     {"an endpoint with a settings map is judged by the same rule",
+      ?_assertEqual(unverified,
+                    yuzu_gw_app:client_tls_posture(
+                      #{channels => [{default_channel,
+                                      [{https, "server", 50055, [{verify, verify_peer}], #{}}],
+                                      #{}}]}))},
+     {"an endpoint with a settings map and a trust anchor is verified",
+      ?_assertEqual(verified,
+                    yuzu_gw_app:client_tls_posture(
+                      #{channels => [{default_channel,
+                                      [{https, "server", 50055,
+                                        [{verify, verify_peer}, {cacertfile, "ca"}], #{}}],
+                                      #{}}]}))}].
+
+%% Across channels the strongest posture wins (unchanged by the trust-anchor
+%% rule): one verified channel makes the client verified, an unverified one
+%% outranks plaintext.
+client_tls_posture_mixed_channels_test_() ->
+    Good = {https, "server", 50055, [{verify, verify_peer}, {cacertfile, "ca"}]},
+    Weak = {https, "server", 50056, [{verify, verify_peer}]},
+    Plain = {http, "server", 50057, []},
+    Posture = fun(Endpoints) ->
+                  yuzu_gw_app:client_tls_posture(
+                    #{channels => [{N, [E], #{}} || {N, E} <- Endpoints]})
+              end,
+    [{"verified and unverified channels: verified",
+      ?_assertEqual(verified, Posture([{default_channel, Good}, {other, Weak}]))},
+     {"unverified first, verified second: verified",
+      ?_assertEqual(verified, Posture([{other, Weak}, {default_channel, Good}]))},
+     {"unverified and plaintext channels: unverified",
+      ?_assertEqual(unverified, Posture([{default_channel, Weak}, {other, Plain}]))},
+     {"verified and plaintext channels: verified",
+      ?_assertEqual(verified, Posture([{default_channel, Good}, {other, Plain}]))},
+     {"only plaintext channels: plaintext",
+      ?_assertEqual(plaintext, Posture([{default_channel, Plain}, {other, Plain}]))}].
+
+%% The upstream guard decision for a verify_peer channel with no trust anchor:
+%% the posture is unverified, and an unverified posture is refused unless the
+%% dev/CI override is set.
+verify_peer_without_a_trust_anchor_is_refused_test() ->
+    Cfg = #{channels => [{default_channel,
+                          [{https, "server", 50055, [{verify, verify_peer}]}], #{}}]},
+    Posture = yuzu_gw_app:client_tls_posture(Cfg),
+    ?assertEqual(unverified, Posture),
+    ?assertEqual({error, unverified_upstream_tls},
+                 yuzu_gw_app:evaluate_upstream_posture(Posture, false)),
+    ?assertEqual(ok, yuzu_gw_app:evaluate_upstream_posture(Posture, true)).
+
 %% Fail-closed upstream-posture guard (#PR5, UP-11): only the dangerous
 %% "encrypted but unauthenticated" state is refused; plaintext (UAT/dev) and
 %% verified both boot. Override flips unverified back to ok.

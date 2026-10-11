@@ -135,8 +135,15 @@ PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
   directly internet-exposed.
 
 The gateway→server **upstream** hop supports mutual TLS (`gateway/config/sys.config.prod`
-`{https,...}`), and the gateway **fails closed** if that channel is configured `https`
-without `verify_peer`. The server's gateway-upstream service additionally requires an
+`{https,...}`). The canonical answer for this hop: mutual TLS with the SPKI pin below is
+enforced **by the server**; the gateway's own check is only that it will talk TLS to a server it
+has verified. A plaintext upstream (`http`) is a lab/UAT posture and needs the server's explicit
+acknowledgement flag (`--insecure-gateway-peer`). The gateway refuses to boot (fails closed) on
+the legacy `{grpcbox, [{client, ...}]}` key, on any `https` endpoint without `verify_peer` and a
+`cacertfile` / `cacerts` of its own, and on a channel that lists both `http` and `https`
+endpoints; a gateway that boots without a client certificate is refused by the server.
+Production is `https`, `verify_peer`, a CA-pinned `cacertfile`, and a client certificate and key.
+The server's gateway-upstream service additionally requires an
 authorized gateway peer: the gateway's client certificate must carry `serverAuth`, be inside
 its validity window and have a public key that matches a configured SPKI pin (automatic on
 the generated default certificates, explicit with `--gateway-peer-pin` /

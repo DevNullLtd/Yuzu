@@ -370,10 +370,18 @@ pieces of code:
   sets the SNI to the dialled host and installs a hostname check, and
   hands `SslOpts` to the `ssl` application unchanged, so the channel honours
   `cacertfile`/`certfile`/`keyfile`/`verify`.
-  **`{verify, verify_peer}` is mandatory** — an ssl client does not verify the
-  server otherwise (the gateway refuses to boot without it unless
-  `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1`) — and the server cert
-  SAN must cover the dialled host.
+  **`{verify, verify_peer}` plus a `cacertfile` / `cacerts` of the endpoint's own
+  are mandatory** — an ssl client does not verify the server otherwise, and gun
+  injects the operating system's CA store when no CA is given, so `verify_peer`
+  alone would trust any publicly trusted certificate for the name. The gateway
+  refuses to boot if ANY `https` endpoint lacks either (unless
+  `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1`), and if one channel lists both `http`
+  and `https` endpoints (`mixed_upstream_endpoints`; calls are spread over every
+  live connection of a channel). The server cert SAN must cover the dialled host.
+  The boot log says `mutual-TLS` only when every endpoint also carries
+  `certfile` + `keyfile`; otherwise `server-authenticated TLS (no client
+  certificate)`. The gateway does not require the client certificate: the server
+  does, with the SPKI pin.
 
 A leftover `{grpcbox, [{servers, ...}]}` or `{grpcbox, [{client, ...}]}` block refuses boot
 (`yuzu_gw_app:check_legacy_grpcbox_servers/0`, `check_legacy_grpcbox_client/0`; the gateway
@@ -442,10 +450,14 @@ startup (the older `tls_enabled`/`tls` env is advisory only — the listeners re
 their `grpc_listeners` entries, not that env).
 
 **Operational notes:**
-- **Fail-closed on misconfig** — the gateway refuses to boot if the upstream channel
-  is `https` *without* `{verify, verify_peer}` (encrypted but MITM-able);
+- **Fail-closed on misconfig** — the gateway refuses to boot if ANY `https` upstream
+  endpoint is TLS-but-unverified: no `{verify, verify_peer}`, or no `cacertfile` /
+  `cacerts` of its own (encrypted but MITM-able, or trusting the OS CA store);
   `evaluate_upstream_posture/2`, override `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` for
-  dev/CI. Plaintext upstream is still permitted (the UAT/dev posture).
+  dev/CI. It also refuses a channel mixing `http` and `https` endpoints
+  (`check_upstream_channel_mix/0`, no override). Plaintext upstream is still permitted
+  (the UAT/dev posture). Production is `https`, `verify_peer`, a CA-pinned
+  `cacertfile`, plus a client certificate and key (mutual TLS).
 - **Cert SAN ↔ dial-name (checklist)** — OTP enforces SNI hostname verification under
   `verify_peer`, so the server cert SAN must include the name the gateway dials. The
   default certs carry `localhost` + `IP:127.0.0.1` + `IP:::1` + `gethostname()`; for
@@ -453,9 +465,10 @@ their `grpc_listeners` entries, not that env).
   `hostname:` so its SAN matches, or add the dialled name with `--cert-san dns:<name>`
   (shipped — extends every default leaf's SAN).
 - **Leaf rotation.** The gateway's upstream client hands the cert/key/CA file paths to Erlang's `ssl`, which reads the files when a connection's handshake runs, so replacing `default-gateway.{pem,key}` on disk is picked up on the next upstream reconnect; an *established* connection keeps the old cert until it drops (measured on 2026-10-11 with the gun-based channel against a local TLS listener that requires a client certificate on OTP 28; before that date the claim was read from the grpcbox code and not tested). A redial can still present the previous certificate for up to about 2 minutes after the files change, because the Erlang ssl PEM cache cleans every 120 s (measured on OTP 28.4.2 with a stub by a reviewer, not on a Yuzu gateway); a node restart clears the cache. A `systemctl restart yuzu-gateway` therefore forces a rotation deterministically, but restart a gateway only if denials continue after the redial window and its agents can take the disconnect: unless the agents run a build with the #5183 fix (in no release yet), released agents stay wedged afterwards (see the gateway peer-authorization runbook in `docs/user-manual/server-admin.md`).
-- **Observability** — an upstream TLS-handshake failure currently surfaces only as the
-  generic circuit-breaker open state; a dedicated handshake-failure metric is a tracked
-  follow-up. A server-side pin refusal is not a handshake failure: the TLS session
+- **Observability** — an upstream TLS-handshake failure surfaces as
+  `yuzu_gw_upstream_tls_handshake_failures_total` (while the breaker is open it moves
+  only at the breaker's probes), the channel's `connection <n> down (<alert>)` log line, and
+  the circuit-breaker open state. A server-side pin refusal is not a handshake failure: the TLS session
   completes and the server answers with gRPC `UNAUTHENTICATED`, which the gateway counts
   as an `rpc_error` rather than a transport failure (server-side signal:
   `yuzu_server_gateway_peer_denied_total`). See the consolidated residual-risk register

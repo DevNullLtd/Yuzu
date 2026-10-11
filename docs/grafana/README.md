@@ -64,7 +64,7 @@ Scraped from the gateway's Prometheus endpoint (default `:9568`). Duration histo
 | `yuzu_gw_command_duration_ms` | histogram | Command dispatch duration in ms, labeled by `plugin`, `status` |
 | `yuzu_gw_agent_session_duration_ms` | histogram | Agent session duration in ms |
 | `yuzu_gw_upstream_rpc_duration_ms` | histogram | Upstream (gateway→server) RPC latency in ms, labeled by `rpc_name` |
-| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors, labeled by `rpc_name`, `code` |
+| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors, labeled by `rpc_name`, `code`. `code` is the gRPC status number or, for a transport failure before any status, one of `closed`, `econnrefused`, `timeout`, `stream_error`, `connection_error`, `protocol`, `response_too_large`, `invalid_metadata`, `no_channel`, `other`, or `{tls_alert,<Alert>}` |
 | `yuzu_gw_registration_replay_total` | counter | Total registration replay attempts by the drip, any outcome |
 | `yuzu_gw_registration_replay_queue_depth` | gauge | Pending registration-replay entries (queued by an upstream recovery or a heartbeat verdict), labeled by `node` |
 | `yuzu_gw_registration_replay_triggered_total` | counter | Registration replays started, labeled by `trigger` (`breaker`, `heartbeat`; both created at 0 at start). A `breaker` trigger is dropped while a verdict-seeded drip is queued |

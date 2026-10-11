@@ -21,7 +21,10 @@
 %%%   - a response over the channel's `max_receive_message_bytes' fails the
 %%%     call with `response_too_large' and the channel stays usable;
 %%%   - a failed TLS connection puts no key or certificate path, and no key
-%%%     material, in an error term or a log line.
+%%%     material, in an error term or a log line;
+%%%   - a caller that finds no connection up while a TLS handshake is still in
+%%%     progress (here delayed by a relay in front of the listener) is handed the
+%%%     connection as soon as it comes up, not left to wait out its timeout.
 %%%
 %%% Nothing sleeps to make an assertion true: the waits are bounded retry loops
 %%% on the channel's table rows.
@@ -76,7 +79,11 @@ tls_test_() ->
                  {"a response within the limit passes",
                   fun() -> response_within_limit(State) end},
                  {"a failed TLS connection leaks no key path and no key material",
-                  {timeout, 30, fun() -> failure_leaks_nothing(State) end}}];
+                  {timeout, 30, fun() -> failure_leaks_nothing(State) end}},
+                 {"pick/2 during a slow TLS handshake returns the connection as soon as it is up",
+                  {timeout, 30, fun() -> pick_waits_for_a_connecting_slot(State) end}},
+                 {"a first call during a slow TLS handshake succeeds once the connection is up",
+                  {timeout, 30, fun() -> first_call_waits_for_a_connecting_slot(State) end}}];
             {error, Why} ->
                 yuzu_gw_authz_tests:certs_unavailable("yuzu_grpc_client_tls_tests", Why)
         end
@@ -385,6 +392,105 @@ log(#{msg := Msg, meta := Meta}, _Config) ->
 format({string, S}) -> io_lib:format("~ts", [S]);
 format({report, R}) -> io_lib:format("~p", [R]);
 format({Fmt, Args}) -> io_lib:format(Fmt, Args).
+
+%%%-------------------------------------------------------------------
+%%% A caller that arrives while a connection is being opened
+%%%-------------------------------------------------------------------
+
+%% The connection is opened by the channel process, so gun's gun_up goes to the
+%% channel and to nobody else: a caller can only learn the connection is up from
+%% the channel. The relay holds the handshake for 1.2 s, so the channel has one
+%% slot `connecting' and none up when the caller comes.
+pick_waits_for_a_connecting_slot(#{certs := Certs, oneway_port := Port} = S) ->
+    with_delay_relay(Port, 1200, fun(RelayPort) ->
+        with_channel(S, https, RelayPort, ssl_opts(Certs, undefined), #{}, #{pool_size => 1},
+                     fun(Name) ->
+                         ?assertEqual([], up_slots(Name)),
+                         T0 = erlang:monotonic_time(millisecond),
+                         Result = yuzu_grpc_client_channel:pick(Name, 4000),
+                         Elapsed = erlang:monotonic_time(millisecond) - T0,
+                         ?assertMatch({ok, _}, Result),
+                         {ok, Conn} = Result,
+                         %% woken by the connection coming up, not by the 4 s timeout
+                         ?assert(Elapsed < 3000),
+                         ?assertEqual([Conn], up_slots(Name)),
+                         ?assert(is_process_alive(Conn))
+                     end)
+    end).
+
+first_call_waits_for_a_connecting_slot(#{certs := Certs, oneway_port := Port} = S) ->
+    with_delay_relay(Port, 1200, fun(RelayPort) ->
+        with_channel(S, https, RelayPort, ssl_opts(Certs, undefined), #{}, #{pool_size => 1},
+                     fun(Name) ->
+                         ?assertEqual([], up_slots(Name)),
+                         T0 = erlang:monotonic_time(millisecond),
+                         Result = heartbeat(Name, <<"ok">>),
+                         Elapsed = erlang:monotonic_time(millisecond) - T0,
+                         ?assertMatch({ok, #{acknowledged := true}, _}, Result),
+                         ?assert(Elapsed < 4000),
+                         ?assertEqual(1, length(up_slots(Name)))
+                     end)
+    end).
+
+%% A TCP relay in front of a listener that holds each connection for DelayMs
+%% before it connects to the target and passes bytes both ways: the client's
+%% connect succeeds at once (the kernel accepts it) and its TLS handshake
+%% completes DelayMs later. Fun gets the relay's port.
+with_delay_relay(TargetPort, DelayMs, Fun) ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {ip, {127, 0, 0, 1}}, {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(Listen),
+    Acceptor = spawn(fun() -> relay_accept(Listen, TargetPort, DelayMs) end),
+    try
+        Fun(Port)
+    after
+        exit(Acceptor, kill),
+        catch gen_tcp:close(Listen)
+    end.
+
+relay_accept(Listen, TargetPort, DelayMs) ->
+    case gen_tcp:accept(Listen) of
+        {ok, Client} ->
+            Self = self(),
+            Pid = spawn(fun() ->
+                            receive {socket, Client} -> relay(Client, TargetPort, DelayMs, Self) end
+                        end),
+            ok = gen_tcp:controlling_process(Client, Pid),
+            Pid ! {socket, Client},
+            relay_accept(Listen, TargetPort, DelayMs);
+        {error, _} ->
+            ok
+    end.
+
+relay(Client, TargetPort, DelayMs, Acceptor) ->
+    erlang:monitor(process, Acceptor),
+    receive after DelayMs -> ok end,
+    case gen_tcp:connect({127, 0, 0, 1}, TargetPort, [binary, {active, false}]) of
+        {ok, Target} ->
+            ok = inet:setopts(Client, [{active, once}]),
+            ok = inet:setopts(Target, [{active, once}]),
+            relay_loop(Client, Target);
+        {error, _} ->
+            gen_tcp:close(Client)
+    end.
+
+relay_loop(Client, Target) ->
+    receive
+        {tcp, Client, Data} ->
+            _ = gen_tcp:send(Target, Data),
+            _ = inet:setopts(Client, [{active, once}]),
+            relay_loop(Client, Target);
+        {tcp, Target, Data} ->
+            _ = gen_tcp:send(Client, Data),
+            _ = inet:setopts(Target, [{active, once}]),
+            relay_loop(Client, Target);
+        {tcp_closed, _} -> relay_close(Client, Target);
+        {tcp_error, _, _} -> relay_close(Client, Target);
+        {'DOWN', _, process, _, _} -> relay_close(Client, Target)
+    end.
+
+relay_close(Client, Target) ->
+    gen_tcp:close(Client),
+    gen_tcp:close(Target).
 
 %%%-------------------------------------------------------------------
 %%% Helpers

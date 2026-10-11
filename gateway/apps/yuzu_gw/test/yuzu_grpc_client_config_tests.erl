@@ -248,6 +248,24 @@ bad_channels_are_rejected_test() ->
      || C <- [{"name", [{http, "gw", 1, []}], #{}}, {?CH, not_a_list, #{}}, {?CH, [{http, "gw", 1, []}]},
               {?CH, [{http, "gw", 1, []}], #{}, extra}, ?CH, 7]].
 
+%% Two channels of one name would start two processes under one registered name
+%% and one ETS table, and the second would fail inside the supervisor with an error
+%% that names neither: refused where the config is read.
+duplicate_channel_names_are_rejected_test() ->
+    Ch = fun(Name, Port) -> {Name, [{http, "gw", Port, []}], #{}} end,
+    ?assertEqual({error, {duplicate_channel, a}},
+                 yuzu_grpc_client_config:channels(#{channels => [Ch(a, 1), Ch(a, 2)]})),
+    ?assertEqual({error, {duplicate_channel, b}},
+                 yuzu_grpc_client_config:channels(#{channels => [Ch(a, 1), Ch(b, 2), Ch(c, 3), Ch(b, 4)]})),
+    %% the same endpoint under different names is fine, and so is one channel
+    ?assertMatch({ok, [#{name := a}, #{name := b}]},
+                 yuzu_grpc_client_config:channels(#{channels => [Ch(a, 1), Ch(b, 1)]})),
+    ?assertMatch({ok, [#{name := a}]}, yuzu_grpc_client_config:channels(#{channels => [Ch(a, 1)]})),
+    %% an unusable channel is reported as itself, not as a duplicate
+    ?assertMatch({error, {bad_endpoint, _}},
+                 yuzu_grpc_client_config:channels(
+                   #{channels => [Ch(a, 1), Ch(a, 2), {a, [{http, "gw", 0, []}], #{}}]})).
+
 one_bad_channel_rejects_the_whole_value_test() ->
     ?assertMatch({error, {bad_endpoint, _}},
                  yuzu_grpc_client_config:channels(

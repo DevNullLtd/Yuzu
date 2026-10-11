@@ -1146,6 +1146,13 @@ calls the channel named **`default_channel`**, so that name is required. An endp
 handed on unchanged; `http` is plaintext HTTP/2 (the lab and UAT posture), `https` is TLS
 with ALPN `h2`. The shipped `sys.config.prod` is the mutual-TLS reference.
 
+**What is acceptable for production:** `https`, `{verify, verify_peer}`, a CA-pinned
+`cacertfile` (or `cacerts`) of the endpoint's own, and a client certificate and key
+(`certfile` and `keyfile`): mutual TLS. Everything else (plaintext `http`, `https` without
+those) is a dev or UAT posture, and the gateway refuses the unsafe half of it at boot (see
+"What the gateway refuses at boot" below). A channel is one scheme: it may not list both
+`http` and `https` endpoints.
+
 | Channel option | Default | Meaning |
 |---|---|---|
 | `pool_size` | 1 | HTTP/2 connections **per endpoint**, 1 to 64 (a value outside that range reads as the default, without a warning). One connection is what the grpcbox client held. **Raising it has consequences:** calls go round-robin over the live connections, so behind a layer-4 VIP in front of several server replicas the connections can land on different replicas (see "Several core replicas" under [What happens when the server restarts](#what-happens-when-the-server-restarts)), and after a certificate change the connections redial independently. Registration and inventory calls run one at a time, so a larger pool does not speed them up |
@@ -1157,8 +1164,10 @@ Messages are never compressed (a compressed response message fails the call).
 
 **How calls use the channel.** The channel process only owns the connections: it opens
 `pool_size` of them per endpoint when it starts, notices when one comes up or goes down, and
-reopens a lost one after a delay of 100 ms doubling to 5 s with up to 20% jitter (so a
-restarted server is not met by every gateway at the same instant). A call does not pass
+reopens a lost one after a delay of 100 ms doubling to 5 s, with up to 20% jitter added on
+top (so the longest delay is about 5.8 s, and the delay returns to 100 ms only once a
+connection has stayed up for 5 s), so a restarted server is not met by every gateway at the
+same instant. A call does not pass
 through that process: it takes the next **live** connection, round-robin, and sends its
 request there. A call that finds no live connection waits, at most for its own timeout, for
 one that is already connecting; if none is connecting it fails **at once** with the last
@@ -1183,6 +1192,17 @@ drops (a server restart does it) and can still present the previous certificate 
 about 2 minutes. With the default of one connection per endpoint this is all or nothing, as it was with grpcbox. If you raise `pool_size` above 1, each connection redials on its own when it drops, so after a certificate change (or while an expired certificate is still in use) some calls can be refused by the server's peer check while others succeed, until every connection has redialed (INFERRED from the channel code, not run); see [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization)
 for the procedure around pins and expiry.
 
+**Log volume while TLS keeps failing.** Every failed TLS handshake writes the channel's own
+`down` line plus Erlang `ssl` progress reports, about 5.8 KB per attempt in a probe. A
+connection that fails persistently (a wrong CA, an expired certificate) redials about every
+5.8 s once the delay has reached its cap, which at `pool_size` 1 comes to roughly 100 MB a day
+(DERIVED from that figure, not measured over a day); a larger pool multiplies it, and a probe
+at `pool_size` 8 wrote 369 KB in 12 s. Bound container logs (`logging: {driver: json-file,
+options: {max-size: "50m", max-file: "5"}}` in Compose) and alert on the failure rather than
+reading the log. The `ssl` progress reports list the option sets of each TLS connection,
+including the **file paths** of the key and certificate (never the key's passphrase, probed
+on OTP 28.4.2); treat the gateway log as sensitive to the same degree as the paths are.
+
 **What the gateway refuses at boot.** Before any listener is bound it exits, with a critical
 log line, when:
 
@@ -1196,14 +1216,40 @@ log line, when:
   forward no heartbeat while `/readyz` answered ready (its `upstream` check only tests that
   the `yuzu_gw_upstream` process is alive, not that the server is reachable). Only the literal
   `{yuzu_gw, [{allow_no_upstream, true}]}` excuses it, for a gateway under test;
-- the upstream channels use `https` without `{verify, verify_peer}` (encrypted but unauthenticated),
-  unless the dev/CI override `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` is set.
+- **any** `https` upstream endpoint lacks `{verify, verify_peer}`, or lacks a `cacertfile` /
+  `cacerts` of its own (`Refusing to start: the upstream channel uses TLS (https) WITHOUT
+  {verify,verify_peer} and a {cacertfile,...} of its own`). Without a CA of its own the TLS
+  stack trusts the operating system's CA store, so any publicly trusted certificate for the
+  server's name would be accepted. One verified endpoint does not excuse an unverified one:
+  calls go round-robin over all of them. Only the dev/CI override
+  `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` excuses it (the gateway then logs a warning);
+- one channel lists both `http` and `https` endpoints (`Refusing to start: the upstream
+  channel <name> lists both plaintext (http) and TLS (https) endpoints`; reason
+  `mixed_upstream_endpoints`). Calls go round-robin over every live connection, so some would
+  travel unencrypted whatever the `https` endpoint is verified against. There is no override:
+  give the channel one scheme.
 
-**Keys that look related and do nothing.** `upstream_addr` and `upstream_port` (and the
-environment variables `YUZU_GW_UPSTREAM_ADDR` and `YUZU_GW_UPSTREAM_PORT`, which only set
-those two keys) and `upstream_pool_size` are read by nothing: the endpoints of the channel
-are what is dialled, and the pool size is the channel's `pool_size`. This was already so
-before the client was replaced.
+The boot log then names the posture: `mutual-TLS` only when every endpoint also carries a
+`certfile` and `keyfile`, otherwise `server-authenticated TLS (no client certificate)`. The
+gateway does not require the client certificate; the server enforces it (mutual TLS plus
+the gateway's SPKI pin, see [Gateway upstream peer
+authorization](server-admin.md#gateway-upstream-peer-authorization)), so a gateway without one
+boots and is then refused by the server.
+
+**Keys that look related and do nothing.** `upstream_addr`, `upstream_port` and
+`upstream_pool_size` are read by nothing: the endpoints of the channel are what is dialled,
+and the pool size is the channel's `pool_size`. This was already so before the client was
+replaced. The environment variables `YUZU_GW_UPSTREAM_ADDR` and `YUZU_GW_UPSTREAM_PORT` are
+now **ignored with a boot warning** (`YUZU_GW_UPSTREAM_ADDR is set but has no effect`); they
+no longer log an `ENV override` line as if they had applied. Change the endpoint in the channel
+to repoint a gateway, not these variables.
+
+**Two limits of the endpoint.** An IPv6 literal host (`"::1"`) fails name resolution in a
+retry loop unless the endpoint's `socket_options` include `inet6`, and `"[::1]"` fails too;
+the dial is IPv4 only, with no fallback, so `localhost` against an IPv6-only listener reads as
+`econnrefused`. Both look like a server that is down. And a `pool_size` or `connect_timeout`
+outside its range, or not an integer (`"4"`), is replaced by the default **without a log
+line**: check the value you meant against the table above rather than expecting a refusal.
 
 ### TLS posture (M1)
 
@@ -1228,7 +1274,7 @@ before the client was replaced.
 
 | Hop | State | Notes |
 |---|---|---|
-| gateway → server upstream (`:50055`) | **mutual TLS** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. |
+| gateway → server upstream (`:50055`) | **mutual TLS in `sys.config.prod`; the gateway itself enforces only server verification** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. The gateway refuses to boot on `https` without `verify_peer` and a CA of its own, and on a channel mixing `http` and `https`; it does **not** require a client certificate, so mutual TLS holds only where the endpoint carries `certfile` and `keyfile` and the server demands them (SPKI pin, see [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization)). Plaintext `http` boots as the lab/UAT posture. |
 | agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `tls => #{certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` in its `grpc_listeners` entry. Of the shipped composes, only `docker-compose.reference-gateway.yml` enables it (#1314, mounting `reference-gateway-sys.config`). The cluster, demo, full-UAT, viz-UAT and sanitizer-UAT composes, and the repo-root `docker-compose.uat.yml`, run plaintext on the shipped default or a UAT/demo `sys.config` (inline in `docker-compose.uat.yml`, mounted as a file by the others); the remaining composes do not run the gateway. Heartbeats are bound to the connection that opened the session's `Subscribe` stream (see [Heartbeat admission](#heartbeat-admission)); the agent listener itself still does not authenticate agents. |
 | server → gateway mgmt (`:50063`) | **strict mTLS + SPKI peer pin (#1422)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert` from the `tls` map) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_pins}` pinning the server's cert — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs: point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one. |
 
@@ -1860,7 +1906,14 @@ agent build that re-registers by itself; released agents do not (see
 | gateway | WARN | `Register failed: registry_unavailable` | The agent was answered `INTERNAL` (13) "Registration failed: registry unavailable". The gateway's registry process could not be reached for this `Register`: its table is missing, a call timed out, or the registry restarted and lost the row (see the `Registration replay aborted: registry unavailable` row). This line no longer covers a superseded `Register` (see the next row). The agent registers again with its reconnect backoff (read from the agent code). A sustained run of lines is not expected: check `/readyz` and the registry process. |
 | gateway | INFO | `Register superseded by a newer registration` | Two `Register` calls of one agent id overlapped on one connection and the newer one committed first. The older one was answered `UNAVAILABLE` (14) and left no row; the registry is healthy. No action: the agent retries a non-OK `Register` with its reconnect backoff (read from the agent code). An occasional line is expected; a sustained run would mean an agent or forwarder keeps repeating `Register` for one agent id on one connection (INFERRED from the code, not observed). |
 | gateway | WARN | `gateway grpc handler <Method> failed: class=<class> at <frame>` | A service handler raised, and the call was answered `INTERNAL` (13). The line names only the method, the exception class and the top stack frame, never a request, headers or the exception term. At most one line is written per second per node (`{yuzu_gw, grpc_runner_warn_interval_ms}`, default 1000, `0` logs every failure, an invalid value reads as 1000 silently and one above 3600000 as 3600000); a line that follows suppressed ones ends `(N similar failures not logged since the last line)`. The number of failed calls is not in the log: it is in the status the calls were answered with. |
-| gateway | INFO | `Upstream channel <name> connection <n> down (<word>); retrying in <ms> ms` | One of the channel's connections to the server went down or could not be opened; the channel reopens it after the delay (100 ms doubling to 5 s, with up to 20% jitter). `<word>` is a socket error such as `econnrefused` or `closed`, a TLS alert name, or `bad_tls_options`. A call made while no connection is up fails at once with the last such word (see [The upstream client](#the-upstream-client)); the circuit breaker counts it. One line per failed attempt, so a server that is down for a minute writes a line per connection every 5 to 6 s once the delay has reached its cap. Expected while the server restarts; a persistent TLS alert word means the certificate, the CA or the hostname is wrong (see the runbooks in [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization)). Read from the code, not run. |
+| gateway | INFO | `Upstream channel <name> connection <n> down (<word>); retrying in <ms> ms` | One of the channel's connections to the server went down or could not be opened; the channel reopens it after the delay (100 ms doubling to 5 s, with up to 20% jitter). `<word>` is a socket error such as `econnrefused` or `closed`, a TLS alert name, or `bad_tls_options`. A call made while no connection is up and none is connecting fails at once with the last such word (see [The upstream client](#the-upstream-client)); the circuit breaker counts it. One line per failed attempt, so a server that is down for a minute writes a line per connection every 5 to 6 s once the delay has reached its cap. Expected while the server restarts; a persistent TLS alert word means the certificate, the CA or the hostname is wrong (see the runbooks in [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization)). Read from the code, not run. |
+| gateway | CRITICAL | `Refusing to start: the upstream channel configuration {yuzu_gw, upstream_client} is unusable (<Why>)` | `<Why>` names the shape of the first defect (`bad_client_config`, `bad_channel`, `bad_endpoint`, `bad_host`, `bad_socket_options`), never a value. Fix that entry; the pre-flight in [Upgrading](upgrading.md#the-upstream-channel-moves-to-upstream_client--breaking) finds it offline. |
+| gateway | CRITICAL | `Refusing to start: the upstream channel uses TLS (https) WITHOUT {verify,verify_peer} and a {cacertfile,...} of its own` | At least one `https` endpoint has no `verify_peer`, or no `cacertfile` / `cacerts` of its own (a missing CA means the operating system's CA store would be trusted). Add both to every `https` endpoint; `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` is dev/CI only and makes the gateway log a warning at every boot. |
+| gateway | CRITICAL | `Refusing to start: the upstream channel <name> lists both plaintext (http) and TLS (https) endpoints` | One channel mixes schemes, so some calls would travel unencrypted. Give the channel one scheme (two channels cannot help: only `default_channel` is called). No override. |
+| gateway | crash report | `yuzu_gw_sup` fails to start with a child specification error | Two channels share a name, or a channel is named after a registered process (`yuzu_gw_registry`, say). Loud and fail-closed, but the text does not name the duplicate. Give every channel a unique name (seen in a probe; the boot guard does not check it). |
+| gateway | INFO/metric | `Upstream channel <name> connection <n> down (<TLS alert word>)` repeating, and `yuzu_gw_upstream_tls_handshake_failures_total` rising | Certificates or the CA were replaced or expired after the connection opened: an open connection keeps the old material until it drops, then the reconnect presents the new files (after Erlang's `ssl` cache clears, about 2 minutes). Recovery takes the cache window plus up to 5.8 s of delay, plus the circuit breaker's open time if it tripped (up to 300 s, doubling). While the breaker is open the counter moves only at its probes. INFERRED from the code and the certificate probe, not run end to end. |
+| gateway | metric | `yuzu_gw_upstream_rpc_errors_total{code="timeout"}` rising on every call, no channel log line, and `/readyz` 200 until the breaker opens | A blackhole peer: the server host or a VIP failed over without a FIN or RST. The gateway sends no HTTP/2 keepalive pings and sets no TCP keepalive, so the connection is not noticed as dead until the kernel gives up on it, about 15 minutes with default TCP retries (INFERRED for a true blackhole; measured only with a peer that stopped answering, which left the connection counted as up for the whole 35 s observed). Restart the gateway only if the server is confirmed healthy and reachable by another route; it redials at once (INFERRED), but agents behind it reconnect as described for #5183 above. Not fixed in this release: a client keepalive faster than 30 s would be refused by the server with GOAWAY. |
+| gateway | metric | `yuzu_gw_upstream_rpc_errors_total{code="stream_error"}` for a few seconds to about 15 s, then recovery | The server sent HTTP/2 GOAWAY while a call was in flight (a server draining or restarting): the connection stops taking new calls for gun's 15 s closing window, calls fail immediately as `stream_error`, and each counts toward the circuit breaker. Measured with a scripted peer: still failing 12 s later, recovered by 20 s. Expected around a server restart. |
 
 The server's `renew_leases ... unknown_session` warnings stop once the agent
 is known again. How long that takes depends on the gateway's upstream circuit
@@ -2981,7 +3034,7 @@ that are actually emitted are listed.
 | `yuzu_gw_command_duration_ms` | histogram | Command dispatch duration in ms (labels `plugin`, `status`) |
 | `yuzu_gw_agent_session_duration_ms` | histogram | Agent session duration in ms (label `node`) |
 | `yuzu_gw_upstream_rpc_duration_ms` | histogram | Upstream (gateway→server) RPC latency in ms (label `rpc_name`) |
-| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors (labels `rpc_name`, `code`) |
+| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors (labels `rpc_name`, `code`). `code` is the gRPC status number the server answered (`"16"` and so on) or, for a failure before any status, one of these words: `closed`, `econnrefused`, `timeout`, `stream_error`, `connection_error`, `protocol`, `response_too_large`, `invalid_metadata`, `no_channel`, `other`, or `{tls_alert,<Alert>}` for a TLS alert (for example `{tls_alert,certificate_required}`). Alerts keyed on `code="16"` or on `yuzu_gw_upstream_tls_handshake_failures_total` are unchanged |
 | `yuzu_gw_registration_replay_total` | counter | Total registration replay attempts by the drip, any outcome. The drip runs after the upstream circuit breaker recovers, and when a heartbeat verdict lists sessions the gateway still holds |
 | `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay, whether queued by an upstream recovery or by a heartbeat verdict (0 = idle, label `node`). A non-zero value is normal while a drip runs: each entry takes the `ProxyRegister` RPC time plus the spacing (20 ms by default), so a full 10000-entry verdict queue takes at least 200 s to drain (250 s at 5 ms RPC time, see the table under "Load and convergence bounds"), and a breaker-seeded snapshot can be larger. A value that does not fall over longer than that points to a replay that is not draining (INFERRED). No alert rule ships for it. |
 | `yuzu_gw_registration_replay_triggered_total` | counter | Registration replays started, by `trigger` (`breaker` = the upstream recovered and every agent this node holds is queued for replay, unless a verdict-seeded drip is already queued, in which case the trigger is dropped, `heartbeat` = a heartbeat verdict listed sessions the server does not know and only those are replayed). Both series are created at 0 at start. |

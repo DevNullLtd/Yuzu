@@ -144,6 +144,14 @@ services:
     image: ghcr.io/devnullltd/yuzu-gateway:${YUZU_VERSION:-0.14.1}
     container_name: yuzu-gateway
     restart: unless-stopped
+    # Bound the gateway's stdout: a persistent upstream TLS failure logs per
+    # redial attempt (docs/user-manual/gateway.md), and the default json-file
+    # driver has no size cap.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     environment:
       # Single-node, ephemeral — accept the default Erlang distribution cookie
       # (the gateway fail-closes on it otherwise). NEVER set this in a clustered

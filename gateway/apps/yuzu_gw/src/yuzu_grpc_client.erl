@@ -11,8 +11,13 @@
 %%%   {http_error, {HttpStatus, <<>>}, #{headers => H, trailers => #{}}}
 %%%       a response that is not HTTP 200, so not from the gRPC layer
 %%%   {error, Reason}
-%%%       the call did not complete: `timeout', a connection error word
-%%%       (`econnrefused', `closed', a TLS alert atom), `no_channel'
+%%%       the call did not complete: `timeout' (the whole call, waiting for a
+%%%       connection included), a connection error word (`econnrefused',
+%%%       `closed', `{tls_alert, Alert}', `{options, tls}'), `no_channel',
+%%%       `stream_error' or `connection_error' (the connection reset or refused
+%%%       the stream, or went away mid-call), `response_too_large' (over the
+%%%       channel's limit), `invalid_metadata' (a refused request header; nothing
+%%%       was sent) or `protocol' (gun sent something this client does not read)
 %%% Marshalling runs in the caller: a request that cannot be encoded raises
 %%% here, and the caller decides what that means.
 %%%
@@ -111,12 +116,12 @@ call(Conn, Path, Extra, Body, Unmarshal, Max, Deadline) ->
         {response, Fin, Status, RespHeaders} ->
             case Status of
                 200 -> grpc(Conn, Ref, Fin, RespHeaders, Unmarshal, Max, Deadline);
-                _   -> abandon(Conn, Ref, Fin),
+                _   -> finish_http_error(Conn, Ref, Fin, Deadline),
                        {http_error, {integer_to_binary(Status), <<>>},
                         #{headers => to_map(RespHeaders), trailers => #{}}}
             end;
-        {error, _} = Error ->
-            abandon(Conn, Ref, nofin),
+        {error, Reason} = Error ->
+            end_stream(Conn, Ref, Reason),
             Error
     end.
 
@@ -137,7 +142,7 @@ grpc(_Conn, _Ref, fin, Headers, _Unmarshal, _Max, _Deadline) ->
 grpc(Conn, Ref, nofin, Headers, Unmarshal, Max, Deadline) ->
     case body(Conn, Ref, <<>>, Max, Deadline) of
         {ok, Data, Trailers} -> status(Data, to_map(Headers), Trailers, Unmarshal);
-        {error, _} = Error   -> abandon(Conn, Ref, nofin), Error
+        {error, Reason} = Error -> end_stream(Conn, Ref, Reason), Error
     end.
 
 %% Read the body to its end, refusing more than Max bytes plus the frame header.
@@ -201,16 +206,47 @@ to_map(Headers) ->
     maps:from_list([{K, V} || {K, V} <- Headers, is_binary(K), is_binary(V),
                               not (byte_size(K) > 0 andalso binary:first(K) =:= $:)]).
 
-%% End a stream we are no longer reading and drop what it already delivered.
-abandon(_Conn, _Ref, fin) ->
+%% A non-200 response (a proxy's 502, say) may carry a body. Reading it to the end
+%% (within the call's deadline) lets gun finish the stream on its own; cancelling
+%% a stream gun is already finishing makes gun answer with a `badstate' message
+%% that lands in the caller's mailbox. A body that does not arrive in time is
+%% cancelled like any other abandoned stream.
+finish_http_error(_Conn, _Ref, fin, _Deadline) ->
     ok;
-abandon(Conn, Ref, nofin) ->
+finish_http_error(Conn, Ref, nofin, Deadline) ->
+    case gun:await_body(Conn, Ref, remaining(Deadline)) of
+        {ok, _Body}           -> ok;
+        {ok, _Body, _Trailers} -> ok;
+        {error, Reason}       -> end_stream(Conn, Ref, Reason)
+    end.
+
+%% End a stream we are no longer reading and drop what it already delivered.
+abandon(Conn, Ref) ->
     catch gun:cancel(Conn, Ref),
+    %% gun may already have sent more of the stream before it handles the cancel.
+    %% A call to the connection is answered only after the cancel is handled, and
+    %% a message gun sent earlier reaches us before that answer, so the flush
+    %% below sees all of them.
+    catch gun:info(Conn),
+    catch gun:flush(Ref),
+    ok.
+
+%% The stream after a failure. It is cancelled only when it may still be alive:
+%% the call timed out, the response was over the limit, or gun sent something
+%% this client does not understand. When gun itself reported the stream gone (a
+%% reset, a refused stream, a GOAWAY, a closed connection) it has already removed
+%% it, and cancelling a stream gun does not have makes gun answer with a
+%% `badstate' error message that lands in the caller's mailbox, which the
+%% gen_servers above swallow in a catch-all, but only by luck.
+end_stream(Conn, Ref, Reason)
+  when Reason =:= timeout; Reason =:= response_too_large; Reason =:= protocol ->
+    abandon(Conn, Ref);
+end_stream(_Conn, Ref, _Reason) ->
     catch gun:flush(Ref),
     ok.
 
 %% A transport failure as a short term: the connection's own reason where it
-%% is a plain word (the channel's `describe/1' classification), never a term
+%% is a plain word (the channel's `compact/1' classification), never a term
 %% that could carry request data.
 transport(timeout) -> timeout;
 transport({stream_error, _}) -> stream_error;

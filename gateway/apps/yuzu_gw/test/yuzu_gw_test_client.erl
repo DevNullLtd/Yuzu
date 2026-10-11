@@ -182,8 +182,15 @@ loop(S, Owner) ->
             loop(on_data(IsFin, Data, S), Owner);
         {gun_trailers, _, Ref, Trailers} when Ref =:= S#s.ref ->
             loop(on_trailers(Trailers, S), Owner);
+        %% A reset or a closed connection AFTER the stream ended (the server may send
+        %% RST_STREAM(NO_ERROR) once a complete reply is out and the client keeps
+        %% sending) is not the stream's status: the trailers already told it.
+        {gun_error, _, Ref, _Reason} when Ref =:= S#s.ref, S#s.ended ->
+            loop(S, Owner);
         {gun_error, _, Ref, Reason} when Ref =:= S#s.ref ->
             loop(finish(S#s{status = {error, Reason}}), Owner);
+        {'DOWN', _, process, Conn, _Reason} when Conn =:= S#s.conn, S#s.ended ->
+            loop(S, Owner);
         {'DOWN', _, process, Conn, Reason} when Conn =:= S#s.conn ->
             loop(finish(S#s{status = {error, down_word(Reason)}}), Owner);
         {waiter_timeout, {From, Request} = W} ->

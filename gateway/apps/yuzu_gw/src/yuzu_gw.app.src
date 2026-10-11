@@ -17,6 +17,7 @@
         inets,
         crypto,
         public_key,
+        ssl,
         ctx,
         gun,
         cowboy,

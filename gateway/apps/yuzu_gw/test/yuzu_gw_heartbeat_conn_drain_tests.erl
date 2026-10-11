@@ -99,8 +99,11 @@ connection_death_ends_binding(State) ->
             ok = kill_connection(K, [AgentPid]),
             ?assertEqual(error, yuzu_gw_registry:lookup_session(S)),
             ?assertEqual(error, yuzu_gw_registry:lookup(Id)),
-            %% The client side of the Subscribe stream ended too.
-            ?assertMatch({holder_msg, Holder, _}, await_holder_msg(Holder)),
+            %% The client side of the Subscribe stream ended too: the holder
+            %% reports the end of the stream, and that end is not its own
+            %% recv_trailers timeout (which it reports as a stream end as well).
+            {holder_msg, Holder, {stream_end, End}} = await_holder_msg(Holder),
+            ?assertNotEqual(timeout, End),
             %% A late heartbeat for the ended session, on another connection or
             %% on a new one, is unknown session, not mismatch.
             A2 = Dial(),

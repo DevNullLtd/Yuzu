@@ -71,7 +71,10 @@ from_env() ->
 %% gateway with no upstream, or with the wrong one.
 -spec channels(term()) -> {ok, [channel()]} | {error, term()}.
 channels(#{channels := Channels}) when is_list(Channels) ->
-    collect([channel(C, nodelay_default()) || C <- Channels]);
+    case collect([channel(C, nodelay_default()) || C <- Channels]) of
+        {ok, Parsed} -> distinct(Parsed);
+        {error, _} = Error -> Error
+    end;
 channels(undefined) ->
     {ok, []};
 channels(Other) ->
@@ -110,6 +113,16 @@ channel(Other, _Nodelay) ->
 -spec nodelay_default() -> boolean().
 nodelay_default() ->
     yuzu_gw_env:env_bool(?NODELAY_ENV, true).
+
+%% Two channels of one name would start two processes under one registered
+%% name and ETS table: the second fails inside the supervisor with a start_spec
+%% error that names neither. Refused here, where the config is read.
+distinct(Channels) ->
+    Names = [N || #{name := N} <- Channels],
+    case Names -- lists:usort(Names) of
+        []            -> {ok, Channels};
+        [Name | _]    -> {error, {duplicate_channel, Name}}
+    end.
 
 endpoint({Scheme, Host, Port, Ssl}, Nodelay) ->
     endpoint({Scheme, Host, Port, Ssl, #{}}, Nodelay);

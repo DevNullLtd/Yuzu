@@ -1047,6 +1047,659 @@ boot_accepts_a_gateway_with_a_default_channel_test_() ->
           ?assertEqual(1, meck:num_calls(yuzu_gw_sup, start_link, []))
       end).
 
+%% An https upstream is verified only with {verify, verify_peer} AND a trust
+%% anchor of its own ({cacertfile, _} or {cacerts, _}); verify_peer alone would
+%% let gun use the operating system's CA store, so boot refuses it like any
+%% other unverified channel (through start/2, so a guard dropped is visible).
+boot_refuses_an_https_upstream_with_verify_peer_and_no_trust_anchor_test_() ->
+    Https = fun(Ssl) ->
+                fun() ->
+                    application:set_env(
+                      yuzu_gw, upstream_client,
+                      #{channels => [{default_channel,
+                                      [{https, "gw-upstream.example", 50051, Ssl}], #{}}]})
+                end
+            end,
+    [{"verify_peer alone",
+      boot_refusal(Https([{verify, verify_peer}]), unverified_upstream_tls)},
+     {"verify_peer with an empty cacertfile",
+      boot_refusal(Https([{verify, verify_peer}, {cacertfile, ""}]), unverified_upstream_tls)},
+     {"verify_peer with an empty cacerts list",
+      boot_refusal(Https([{verify, verify_peer}, {cacerts, []}]), unverified_upstream_tls)},
+     {"verify_none with a cacertfile",
+      boot_refusal(Https([{verify, verify_none}, {cacertfile, "/etc/yuzu/ca.pem"}]),
+                   unverified_upstream_tls)},
+     {"no verify option",
+      boot_refusal(Https([]), unverified_upstream_tls)},
+     {"the refusal is logged at critical and names the missing trust anchor, not a value",
+      boot_case(
+        fun() ->
+            Configure = Https([{verify, verify_peer}, {keyfile, "/secret/gw-leaf.key"}]),
+            Configure(),
+            Events = capture_events(fun() ->
+                         ?assertEqual({error, unverified_upstream_tls},
+                                      yuzu_gw_app:start(normal, []))
+                     end),
+            Refusals = [Text || {critical, Text} <- Events,
+                                re:run(Text, "Refusing to start", [unicode, {capture, none}]) =:= match],
+            ?assertMatch([_], Refusals),
+            [Text] = Refusals,
+            {match, _} = re:run(Text, "cacertfile", [unicode]),
+            ?assertEqual(nomatch, re:run(Text, "gw-leaf", [unicode, {capture, none}])),
+            ?assertEqual(nomatch, re:run(Text, "gw-upstream.example", [unicode, {capture, none}]))
+        end)}].
+
+boot_accepts_an_https_upstream_with_verify_peer_and_a_trust_anchor_test_() ->
+    Https = fun(Ssl) ->
+                fun() ->
+                    application:unset_env(yuzu_gw, allow_no_upstream),
+                    application:set_env(
+                      yuzu_gw, upstream_client,
+                      #{channels => [{default_channel,
+                                      [{https, "gw-upstream.example", 50051, Ssl}], #{}}]}),
+                    ?assertMatch({ok, _}, yuzu_gw_app:start(normal, []))
+                end
+            end,
+    [{"verify_peer with a cacertfile",
+      boot_case(Https([{verify, verify_peer}, {cacertfile, "/etc/yuzu/ca.pem"}]))},
+     {"verify_peer with cacerts",
+      boot_case(Https([{verify, verify_peer}, {cacerts, [<<48, 3, 2, 1, 1>>]}]))}].
+
+%% The dev/CI override still lets an unverified upstream boot (and says so).
+boot_allows_an_unverified_upstream_only_with_the_override_test_() ->
+    boot_case(
+      fun() ->
+          application:unset_env(yuzu_gw, allow_no_upstream),
+          application:set_env(yuzu_gw, upstream_client,
+                              #{channels => [{default_channel,
+                                              [{https, "gw-upstream.example", 50051,
+                                                [{verify, verify_peer}]}], #{}}]}),
+          Prev = os:getenv("YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM"),
+          try
+              os:putenv("YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM", "1"),
+              ?assertMatch({ok, _}, yuzu_gw_app:start(normal, []))
+          after
+              case Prev of
+                  false -> os:unsetenv("YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM");
+                  P     -> os:putenv("YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM", P)
+              end
+          end
+      end).
+
+%%%===================================================================
+%%% The TLS posture of the upstream channels
+%%%
+%%% Calls go round-robin over EVERY connection of a channel, so what decides
+%%% the boot guard and the boot log is the WEAKEST endpoint, not the strongest:
+%%% one unverified (or plaintext) endpoint beside a verified one carries calls.
+%%%===================================================================
+
+-define(CA_FILE, {cacertfile, "/etc/yuzu/ca.pem"}).
+-define(UP_HOST, "gw-upstream.example").
+
+%% An https endpoint: server verified against a CA of its own.
+ep_verified() -> {https, ?UP_HOST, 50051, [{verify, verify_peer}, ?CA_FILE]}.
+%% ...and presenting a certificate of its own.
+ep_mutual() ->
+    {https, ?UP_HOST, 50051, [{verify, verify_peer}, ?CA_FILE,
+                              {certfile, "/etc/yuzu/gw-leaf.pem"},
+                              {keyfile, "/etc/yuzu/gw-leaf.key"}]}.
+%% Encrypted, not authenticated.
+ep_unverified() -> {https, ?UP_HOST, 50051, []}.
+ep_plain() -> {http, ?UP_HOST, 50051, []}.
+
+client(Channels) -> #{channels => Channels}.
+chan(Name, Endpoints) -> {Name, Endpoints, #{}}.
+default(Endpoints) -> client([chan(default_channel, Endpoints)]).
+
+%%--------------------------------------------------------------------
+%% Pure: client_tls_weakest/1, client_has_unverified/1, client_mixed_channels/1,
+%% client_all_present_client_cert/1
+%%--------------------------------------------------------------------
+
+client_tls_weakest_test_() ->
+    W = fun yuzu_gw_app:client_tls_weakest/1,
+    [{"no endpoint at all is plaintext",
+      [?_assertEqual(plaintext, W(undefined)),
+       ?_assertEqual(plaintext, W(client([]))),
+       ?_assertEqual(plaintext, W(client([chan(default_channel, [])]))),
+       ?_assertEqual(plaintext, W(not_a_client)),
+       ?_assertEqual(plaintext, W(#{channels => not_a_list}))]},
+     {"one endpoint reads as itself",
+      [?_assertEqual(verified, W(default([ep_verified()]))),
+       ?_assertEqual(verified, W(default([ep_mutual()]))),
+       ?_assertEqual(unverified, W(default([ep_unverified()]))),
+       ?_assertEqual(plaintext, W(default([ep_plain()])))]},
+     {"the weakest endpoint of a channel decides",
+      [?_assertEqual(unverified, W(default([ep_verified(), ep_unverified()]))),
+       ?_assertEqual(unverified, W(default([ep_unverified(), ep_verified()]))),
+       ?_assertEqual(plaintext, W(default([ep_verified(), ep_plain()]))),
+       ?_assertEqual(plaintext, W(default([ep_plain(), ep_verified()]))),
+       ?_assertEqual(plaintext, W(default([ep_unverified(), ep_plain(), ep_verified()]))),
+       ?_assertEqual(verified, W(default([ep_verified(), ep_mutual()])))]},
+     {"and so does the weakest channel",
+      [?_assertEqual(plaintext,
+                     W(client([chan(default_channel, [ep_verified()]), chan(other, [ep_plain()])]))),
+       ?_assertEqual(unverified,
+                     W(client([chan(other, [ep_verified()]), chan(default_channel, [ep_unverified()])]))),
+       ?_assertEqual(verified,
+                     W(client([chan(default_channel, [ep_verified()]), chan(other, [ep_mutual()])])))]},
+     {"the strongest-endpoint reading (client_tls_posture/1) is a different answer for the same value",
+      [?_assertEqual(verified, yuzu_gw_app:client_tls_posture(default([ep_verified(), ep_plain()]))),
+       ?_assertEqual(plaintext, W(default([ep_verified(), ep_plain()])))]},
+     {"an endpoint of five elements (with settings) reads like one of four",
+      [?_assertEqual(verified,
+                     W(default([{https, ?UP_HOST, 50051, [{verify, verify_peer}, ?CA_FILE], #{}}]))),
+       ?_assertEqual(plaintext, W(default([{http, ?UP_HOST, 50051, [], #{}}])))]},
+     {"a channel or an endpoint of another shape counts as plaintext (it is refused elsewhere)",
+      [?_assertEqual(plaintext, W(client([not_a_channel]))),
+       ?_assertEqual(plaintext, W(default([not_an_endpoint]))),
+       ?_assertEqual(plaintext, W(default([ep_verified(), not_an_endpoint])))]}].
+
+client_has_unverified_test_() ->
+    U = fun yuzu_gw_app:client_has_unverified/1,
+    [?_assertEqual(false, U(undefined)),
+     ?_assertEqual(false, U(client([]))),
+     ?_assertEqual(false, U(not_a_client)),
+     ?_assertEqual(false, U(default([ep_verified()]))),
+     ?_assertEqual(false, U(default([ep_plain()]))),
+     ?_assertEqual(false, U(default([ep_verified(), ep_plain()]))),
+     ?_assertEqual(true, U(default([ep_unverified()]))),
+     {"beside a verified endpoint of the same channel",
+      ?_assertEqual(true, U(default([ep_verified(), ep_unverified()])))},
+     {"beside a verified endpoint of another channel",
+      ?_assertEqual(true, U(client([chan(default_channel, [ep_mutual()]),
+                                    chan(other, [ep_unverified()])])))},
+     {"beside a plaintext endpoint",
+      ?_assertEqual(true, U(default([ep_plain(), ep_unverified()])))},
+     {"verify_peer with no CA of its own is unverified",
+      ?_assertEqual(true, U(default([{https, ?UP_HOST, 50051, [{verify, verify_peer}]}])))},
+     {"a CA with verify_none is unverified",
+      ?_assertEqual(true, U(default([{https, ?UP_HOST, 50051, [{verify, verify_none}, ?CA_FILE]}])))},
+     {"SSL options that are not a list are unverified",
+      ?_assertEqual(true, U(default([{https, ?UP_HOST, 50051, not_a_list}])))}].
+
+%% What counts as a trust anchor of the endpoint's own: a CA file NAMED (a
+%% non-empty printable string or a non-empty binary) or certificates GIVEN (a
+%% non-empty list). An atom, an empty value or a list of numbers is not one.
+trust_anchor_rule_test_() ->
+    Verified = fun(Anchor) ->
+                   yuzu_gw_app:client_tls_weakest(
+                     default([{https, ?UP_HOST, 50051, [{verify, verify_peer} | Anchor]}]))
+               end,
+    NotAnchors = [{"cacertfile is an empty string", [{cacertfile, ""}]},
+                  {"cacertfile is an atom", [{cacertfile, ca_file}]},
+                  {"cacertfile is undefined", [{cacertfile, undefined}]},
+                  {"cacertfile is an empty binary", [{cacertfile, <<>>}]},
+                  {"cacertfile is a list that is not text", [{cacertfile, [1, 2, 3]}]},
+                  {"cacertfile is a number", [{cacertfile, 5}]},
+                  {"cacerts is empty", [{cacerts, []}]},
+                  {"cacerts is the atom system", [{cacerts, system}]},
+                  {"cacerts is a binary", [{cacerts, <<48, 3>>}]},
+                  {"neither is given", []}],
+    Anchors = [{"cacertfile is a string", [{cacertfile, "/etc/yuzu/ca.pem"}]},
+               {"cacertfile is a binary", [{cacertfile, <<"/etc/yuzu/ca.pem">>}]},
+               {"cacerts holds a certificate", [{cacerts, [<<48, 3, 2, 1, 1>>]}]},
+               {"an empty cacertfile beside certificates",
+                [{cacertfile, ""}, {cacerts, [<<48, 3, 2, 1, 1>>]}]}],
+    [{"not an anchor: " ++ Why, ?_assertEqual(unverified, Verified(Opts))}
+     || {Why, Opts} <- NotAnchors]
+    ++ [{"an anchor: " ++ Why, ?_assertEqual(verified, Verified(Opts))} || {Why, Opts} <- Anchors].
+
+client_mixed_channels_test_() ->
+    M = fun yuzu_gw_app:client_mixed_channels/1,
+    [?_assertEqual([], M(undefined)),
+     ?_assertEqual([], M(not_a_client)),
+     ?_assertEqual([], M(client([]))),
+     ?_assertEqual([], M(client(not_a_list))),
+     {"a channel of one scheme is not mixed, whatever the scheme",
+      [?_assertEqual([], M(default([ep_verified(), ep_mutual()]))),
+       ?_assertEqual([], M(default([ep_plain(), ep_plain()]))),
+       ?_assertEqual([], M(default([ep_unverified(), ep_verified()])))]},
+     {"channels of different schemes are not a mixed channel",
+      ?_assertEqual([], M(client([chan(default_channel, [ep_plain()]),
+                                  chan(other, [ep_verified()])])))},
+     {"http beside https in one channel is mixed, in either order",
+      [?_assertEqual([default_channel], M(default([ep_verified(), ep_plain()]))),
+       ?_assertEqual([default_channel], M(default([ep_plain(), ep_verified()]))),
+       ?_assertEqual([default_channel], M(default([ep_plain(), ep_unverified()]))),
+       ?_assertEqual([default_channel], M(default([ep_plain(), ep_mutual(), ep_plain()])))]},
+     {"every mixed channel is named, in order, and only they",
+      ?_assertEqual([b, d],
+                    M(client([chan(a, [ep_verified()]), chan(b, [ep_plain(), ep_verified()]),
+                              chan(c, [ep_plain()]), chan(d, [ep_unverified(), ep_plain()])])))},
+     {"a channel of another shape is skipped, not a crash",
+      ?_assertEqual([], M(client([not_a_channel, {x, not_a_list, #{}}])))}].
+
+client_all_present_client_cert_test_() ->
+    C = fun yuzu_gw_app:client_all_present_client_cert/1,
+    Https = fun(Ssl) -> {https, ?UP_HOST, 50051, [{verify, verify_peer}, ?CA_FILE | Ssl]} end,
+    [{"no endpoint, or no client value, is false (nothing is presented)",
+      [?_assertEqual(false, C(undefined)),
+       ?_assertEqual(false, C(not_a_client)),
+       ?_assertEqual(false, C(client([]))),
+       ?_assertEqual(false, C(client([chan(default_channel, [])])))]},
+     {"certfile and keyfile",
+      ?_assertEqual(true, C(default([ep_mutual()])))},
+     {"cert and key in memory count as well",
+      [?_assertEqual(true, C(default([Https([{cert, <<1>>}, {key, {'RSAPrivateKey', <<2>>}}])]))),
+       ?_assertEqual(true, C(default([Https([{certfile, "c.pem"}, {key, {'RSAPrivateKey', <<2>>}}])])))]},
+     {"a certificate without its key, or a key without its certificate, is not mutual",
+      [?_assertEqual(false, C(default([Https([{certfile, "c.pem"}])]))),
+       ?_assertEqual(false, C(default([Https([{keyfile, "k.pem"}])]))),
+       ?_assertEqual(false, C(default([Https([{cert, <<1>>}])]))),
+       ?_assertEqual(false, C(default([ep_verified()])))]},
+     {"EVERY endpoint must present one",
+      [?_assertEqual(false, C(default([ep_mutual(), ep_verified()]))),
+       ?_assertEqual(false, C(default([ep_verified(), ep_mutual()]))),
+       ?_assertEqual(true, C(default([ep_mutual(), ep_mutual()]))),
+       ?_assertEqual(false, C(client([chan(default_channel, [ep_mutual()]),
+                                      chan(other, [ep_verified()])]))),
+       ?_assertEqual(true, C(client([chan(default_channel, [ep_mutual()]),
+                                     chan(other, [ep_mutual()])])))]},
+     {"a plaintext endpoint presents nothing",
+      [?_assertEqual(false, C(default([ep_plain()]))),
+       ?_assertEqual(false, C(default([ep_mutual(), ep_plain()])))]},
+     {"SSL options that are not a list present nothing",
+      ?_assertEqual(false, C(default([{https, ?UP_HOST, 50051, not_a_list}])))},
+     {"an endpoint with settings is read like one without",
+      ?_assertEqual(true, C(default([erlang:append_element(ep_mutual(), #{})])))}].
+
+%%--------------------------------------------------------------------
+%% check_upstream_channel_mix/0
+%%--------------------------------------------------------------------
+
+%% A channel is one scheme: calls go round-robin over every live connection of
+%% it, so with http and https endpoints in one channel some calls (a
+%% ProxyRegister carries the enrollment token and the CSR) travel unencrypted
+%% whatever the https endpoint is verified against.
+check_upstream_channel_mix_test_() ->
+    Set = fun(Client) -> application:set_env(yuzu_gw, upstream_client, Client) end,
+    Mix = fun yuzu_gw_app:check_upstream_channel_mix/0,
+    env_case(
+      [{"no upstream_client is fine (the other guards answer for it)",
+        fun() -> ?assertEqual(ok, Mix()) end},
+       {"a value that is not a channels map is fine here (check_upstream_client_config/0 refuses it)",
+        fun() -> Set(not_a_map), ?assertEqual(ok, Mix()) end},
+       {"channels of one scheme each are fine",
+        fun() ->
+            [begin Set(Client), ?assertEqual(ok, Mix()) end
+             || Client <- [default([ep_plain()]), default([ep_verified(), ep_mutual()]),
+                           default([ep_unverified()]),
+                           client([chan(default_channel, [ep_plain()]), chan(other, [ep_verified()])])]]
+        end},
+       {"http beside https in one channel is refused",
+        fun() ->
+            [begin Set(Client), ?assertEqual({error, mixed_upstream_endpoints}, Mix()) end
+             || Client <- [default([ep_plain(), ep_verified()]), default([ep_mutual(), ep_plain()]),
+                           default([ep_plain(), ep_unverified()]),
+                           client([chan(default_channel, [ep_verified()]),
+                                   chan(other, [ep_plain(), ep_verified()])])]]
+        end},
+       {"the refusal is logged at critical, names the channel and no value of its config",
+        fun() ->
+            Set(default([{https, "gw-secret-host.example", 50077,
+                          [{verify, verify_peer}, {cacertfile, "/secret/ca/CA-FILE.pem"},
+                           {certfile, "/secret/leaf/LEAF-CERT.pem"},
+                           {keyfile, "/secret/leaf/LEAF-KEY.pem"}]},
+                         {http, "gw-secret-plain.example", 50078, []}])),
+            Events = capture_events(fun() ->
+                                        ?assertEqual({error, mixed_upstream_endpoints}, Mix())
+                                    end),
+            ?assertMatch([{critical, _}], Events),
+            [{critical, Text}] = Events,
+            {match, _} = re:run(Text, "Refusing to start", [unicode]),
+            {match, _} = re:run(Text, "default_channel", [unicode]),
+            [?assertEqual(nomatch, re:run(Text, Secret, [unicode, {capture, none}]))
+             || Secret <- ["secret", "CA-FILE", "LEAF", "50077", "50078", "gw-secret"]]
+        end},
+       {"the first mixed channel is the one named",
+        fun() ->
+            Set(client([chan(a, [ep_plain()]), chan(b, [ep_plain(), ep_verified()]),
+                        chan(c, [ep_plain(), ep_verified()])])),
+            [{critical, Text}] = capture_events(fun() -> {error, _} = Mix() end),
+            {match, _} = re:run(Text, "channel b ", [unicode])
+        end}]).
+
+%%--------------------------------------------------------------------
+%% check_upstream_tls_posture/0
+%%--------------------------------------------------------------------
+
+-define(OVERRIDE_VAR, "YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM").
+
+%% env_case, and the dev/CI override variable cleared and put back.
+posture_case(Tests) ->
+    {foreach,
+     fun() ->
+         Saved = {env_setup(), os:getenv(?OVERRIDE_VAR)},
+         os:unsetenv(?OVERRIDE_VAR),
+         Saved
+     end,
+     fun({Env, Override}) ->
+         env_cleanup(Env),
+         restore_override(Override)
+     end,
+     Tests}.
+
+restore_override(false) -> os:unsetenv(?OVERRIDE_VAR), ok;
+restore_override(Value) -> os:putenv(?OVERRIDE_VAR, Value), ok.
+
+check_upstream_tls_posture_test_() ->
+    Set = fun(Client) -> application:set_env(yuzu_gw, upstream_client, Client) end,
+    Check = fun yuzu_gw_app:check_upstream_tls_posture/0,
+    Refused = {error, unverified_upstream_tls},
+    posture_case(
+      [{"plaintext, verified and no upstream boot",
+        fun() ->
+            [begin Set(Client), ?assertEqual(ok, Check()) end
+             || Client <- [undefined, client([]), default([ep_plain()]), default([ep_verified()]),
+                           default([ep_mutual()]), default([ep_verified(), ep_mutual()]),
+                           default([ep_verified(), ep_plain()])]]
+        end},
+       {"https with no verification is refused",
+        fun() -> Set(default([ep_unverified()])), ?assertEqual(Refused, Check()) end},
+       {"an unverified https endpoint BESIDE a verified one is refused (the same channel)",
+        fun() ->
+            Set(default([ep_verified(), ep_unverified()])), ?assertEqual(Refused, Check()),
+            Set(default([ep_unverified(), ep_verified()])), ?assertEqual(Refused, Check())
+        end},
+       {"...and in another channel",
+        fun() ->
+            Set(client([chan(default_channel, [ep_mutual()]), chan(other, [ep_unverified()])])),
+            ?assertEqual(Refused, Check()),
+            Set(client([chan(other, [ep_mutual()]), chan(default_channel, [ep_unverified()])])),
+            ?assertEqual(Refused, Check())
+        end},
+       {"an unverified https endpoint beside a plaintext one is still refused",
+        fun() ->
+            Set(default([ep_plain(), ep_unverified()])), ?assertEqual(Refused, Check()),
+            Set(client([chan(default_channel, [ep_plain()]), chan(other, [ep_unverified()])])),
+            ?assertEqual(Refused, Check())
+        end},
+       {"verify_peer with no cacertfile and no cacerts counts as unverified",
+        fun() ->
+            Set(default([{https, ?UP_HOST, 50051, [{verify, verify_peer}]}])),
+            ?assertEqual(Refused, Check()),
+            Set(default([ep_verified(), {https, ?UP_HOST, 50052, [{verify, verify_peer}]}])),
+            ?assertEqual(Refused, Check())
+        end},
+       {"a cacertfile that is an empty string, an atom or an empty binary is not an anchor",
+        fun() ->
+            [begin
+                 Set(default([{https, ?UP_HOST, 50051, [{verify, verify_peer}, {cacertfile, Bad}]}])),
+                 ?assertEqual(Refused, Check())
+             end || Bad <- ["", ca_file, <<>>]]
+        end},
+       {"cacerts that is empty, or an atom, is not an anchor either",
+        fun() ->
+            [begin
+                 Set(default([{https, ?UP_HOST, 50051, [{verify, verify_peer}, {cacerts, Bad}]}])),
+                 ?assertEqual(Refused, Check())
+             end || Bad <- [[], system]]
+        end},
+       {"a trust anchor of its own makes it verified",
+        fun() ->
+            [begin
+                 Set(default([{https, ?UP_HOST, 50051, [{verify, verify_peer} | Anchor]}])),
+                 ?assertEqual(ok, Check())
+             end || Anchor <- [[{cacertfile, "/etc/yuzu/ca.pem"}], [{cacertfile, <<"/etc/yuzu/ca.pem">>}],
+                               [{cacerts, [<<48, 3, 2, 1, 1>>]}]]]
+        end},
+       {"the refusal is logged at critical without a value of the config",
+        fun() ->
+            Set(default([ep_verified(),
+                         {https, "gw-secret-host.example", 50077,
+                          [{certfile, "/secret/leaf/LEAF-CERT.pem"},
+                           {keyfile, "/secret/leaf/LEAF-KEY.pem"}]}])),
+            Events = capture_events(fun() -> ?assertEqual(Refused, Check()) end),
+            ?assertMatch([{critical, _}], Events),
+            [{critical, Text}] = Events,
+            {match, _} = re:run(Text, "Refusing to start", [unicode]),
+            {match, _} = re:run(Text, ?OVERRIDE_VAR, [unicode]),
+            [?assertEqual(nomatch, re:run(Text, Secret, [unicode, {capture, none}]))
+             || Secret <- ["secret", "LEAF", "50077", "gw-secret", "gw-upstream"]]
+        end},
+       {"YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1 lets an unverified endpoint boot, and says so",
+        fun() ->
+            os:putenv(?OVERRIDE_VAR, "1"),
+            [begin
+                 Set(Client),
+                 Events = capture_events(fun() -> ?assertEqual(ok, Check()) end),
+                 ?assertMatch([{warning, _}], Events),
+                 [{warning, Text}] = Events,
+                 {match, _} = re:run(Text, "unverified", [unicode]),
+                 {match, _} = re:run(Text, ?OVERRIDE_VAR, [unicode])
+             end || Client <- [default([ep_unverified()]), default([ep_verified(), ep_unverified()]),
+                               default([{https, ?UP_HOST, 50051, [{verify, verify_peer}]}])]]
+        end},
+       {"the override says nothing when nothing needs it",
+        fun() ->
+            os:putenv(?OVERRIDE_VAR, "1"),
+            [begin
+                 Set(Client),
+                 Events = capture_events(fun() -> ?assertEqual(ok, Check()) end),
+                 ?assertEqual([], Events)
+             end || Client <- [default([ep_verified()]), default([ep_plain()]), undefined]]
+        end},
+       {"only the value 1 is the override",
+        fun() ->
+            Set(default([ep_unverified()])),
+            [begin
+                 os:putenv(?OVERRIDE_VAR, Value),
+                 ?assertEqual(Refused, Check())
+             end || Value <- ["0", "true", "yes", "", "11", " 1"]]
+        end}]).
+
+%%--------------------------------------------------------------------
+%% The boot log: what the transport line says of the upstream
+%%--------------------------------------------------------------------
+
+%% The posture line is written before any guard runs, from start/2, so it is read
+%% through a boot. Returns {StartResult, Events}.
+boot_events(Client) ->
+    application:unset_env(yuzu_gw, allow_no_upstream),
+    application:set_env(yuzu_gw, upstream_client, Client),
+    Events = capture_events(fun() -> put(boot_result, yuzu_gw_app:start(normal, [])) end),
+    {erase(boot_result), Events}.
+
+upstream_word(Events) ->
+    [Text] = [T || {info, T} <- Events,
+                   re:run(T, "Gateway transport TLS \\(configured\\)", [{capture, none}]) =:= match],
+    {match, [Word]} = re:run(Text, "upstream->server=(.*), listeners:", [{capture, all_but_first, list}]),
+    {Word, Text}.
+
+warned(Events, Pattern) ->
+    [T || {warning, T} <- Events, re:run(T, Pattern, [unicode, {capture, none}]) =:= match].
+
+with_override(Fun) ->
+    Prev = os:getenv(?OVERRIDE_VAR),
+    try
+        os:putenv(?OVERRIDE_VAR, "1"),
+        Fun()
+    after
+        restore_override(Prev)
+    end.
+
+%% "mutual-TLS" is said only when the gateway also presents a certificate on
+%% every endpoint; a verified channel without one authenticates the server to
+%% the gateway and nothing more.
+boot_log_names_the_upstream_posture_test_() ->
+    [{"verified with no client certificate: server-authenticated TLS, not mutual",
+      boot_case(
+        fun() ->
+            {Result, Events} = boot_events(default([ep_verified()])),
+            ?assertMatch({ok, _}, Result),
+            {Word, Line} = upstream_word(Events),
+            ?assertEqual("server-authenticated TLS (no client certificate)", Word),
+            ?assertEqual(nomatch, re:run(Line, "mutual", [{capture, none}])),
+            ?assertEqual([], warned(Events, "PLAINTEXT|ENCRYPTED but")),
+            %% a value of the config is not in the line
+            [?assertEqual(nomatch, re:run(Line, V, [{capture, none}])) || V <- ["gw-upstream", "etc/yuzu"]]
+        end)},
+     {"verified with a certificate and a key: mutual-TLS",
+      boot_case(
+        fun() ->
+            {Result, Events} = boot_events(default([ep_mutual()])),
+            ?assertMatch({ok, _}, Result),
+            {Word, Line} = upstream_word(Events),
+            ?assertEqual("mutual-TLS", Word),
+            ?assertEqual(nomatch, re:run(Line, "server-authenticated", [{capture, none}])),
+            ?assertEqual([], warned(Events, "PLAINTEXT|ENCRYPTED but")),
+            [?assertEqual(nomatch, re:run(Line, V, [{capture, none}])) || V <- ["gw-leaf", "gw-upstream"]]
+        end)},
+     {"verified with a certificate but no key: server-authenticated",
+      boot_case(
+        fun() ->
+            Ep = {https, ?UP_HOST, 50051, [{verify, verify_peer}, ?CA_FILE,
+                                           {certfile, "/etc/yuzu/gw-leaf.pem"}]},
+            {_, Events} = boot_events(default([Ep])),
+            ?assertEqual("server-authenticated TLS (no client certificate)",
+                         element(1, upstream_word(Events)))
+        end)},
+     {"two endpoints, one of which presents no certificate: server-authenticated",
+      boot_case(
+        fun() ->
+            {Result, Events} = boot_events(default([ep_mutual(), ep_verified()])),
+            ?assertMatch({ok, _}, Result),
+            ?assertEqual("server-authenticated TLS (no client certificate)",
+                         element(1, upstream_word(Events)))
+        end)},
+     {"a verified endpoint beside a plaintext one is plaintext, and says so",
+      boot_case(
+        fun() ->
+            {Result, Events} = boot_events(default([ep_mutual(), ep_plain()])),
+            %% the same channel mixes schemes: the guard refuses it after the line
+            ?assertEqual({error, mixed_upstream_endpoints}, Result),
+            ?assertEqual("plaintext", element(1, upstream_word(Events))),
+            ?assertMatch([_], warned(Events, "upstream is PLAINTEXT"))
+        end)},
+     {"a verified channel beside a plaintext one of another name: plaintext, and it boots",
+      boot_case(
+        fun() ->
+            {Result, Events} = boot_events(client([chan(default_channel, [ep_plain()]),
+                                                   chan(other, [ep_mutual()])])),
+            ?assertMatch({ok, _}, Result),
+            ?assertEqual("plaintext", element(1, upstream_word(Events))),
+            ?assertMatch([_], warned(Events, "upstream is PLAINTEXT"))
+        end)},
+     {"plaintext only",
+      boot_case(
+        fun() ->
+            {Result, Events} = boot_events(default([ep_plain()])),
+            ?assertMatch({ok, _}, Result),
+            ?assertEqual("plaintext", element(1, upstream_word(Events))),
+            ?assertMatch([_], warned(Events, "upstream is PLAINTEXT"))
+        end)},
+     {"an unverified endpoint beside a verified one: UNVERIFIED, with the warning, under the override",
+      boot_case(
+        fun() ->
+            with_override(
+              fun() ->
+                  {Result, Events} = boot_events(default([ep_mutual(), ep_unverified()])),
+                  ?assertMatch({ok, _}, Result),
+                  ?assertEqual("TLS(UNVERIFIED!)", element(1, upstream_word(Events))),
+                  ?assertMatch([_], warned(Events, "does NOT verify the server certificate")),
+                  ?assertMatch([_], warned(Events, ?OVERRIDE_VAR))
+              end)
+        end)},
+     {"verify_peer with no CA of its own: UNVERIFIED, and refused without the override",
+      boot_case(
+        fun() ->
+            {Result, Events} = boot_events(default([{https, ?UP_HOST, 50051, [{verify, verify_peer}]}])),
+            ?assertEqual({error, unverified_upstream_tls}, Result),
+            ?assertEqual("TLS(UNVERIFIED!)", element(1, upstream_word(Events))),
+            ?assertMatch([_], warned(Events, "CA of its own"))
+        end)}].
+
+%%--------------------------------------------------------------------
+%% Several connections on one channel
+%%--------------------------------------------------------------------
+
+%% pool_size above 1, or several endpoints, spreads one gateway's calls over
+%% several connections: behind a layer-4 VIP in front of several core replicas
+%% that means different replicas. Allowed, and said at boot.
+check_upstream_client_config_warns_on_several_connections_test_() ->
+    Set = fun(Client) -> application:set_env(yuzu_gw, upstream_client, Client) end,
+    Check = fun() ->
+                Events = capture_events(fun() ->
+                                            ?assertEqual(ok, yuzu_gw_app:check_upstream_client_config())
+                                        end),
+                [T || {warning, T} <- Events,
+                      re:run(T, "connections", [{capture, none}]) =:= match]
+            end,
+    Ep = fun(Port) -> {http, "gw-secret-host.example", Port, []} end,
+    env_case(
+      [{"one endpoint, pool_size 1: nothing to say",
+        fun() ->
+            Set(default([Ep(50051)])),
+            ?assertEqual([], Check())
+        end},
+       {"pool_size 4: the channel and the count",
+        fun() ->
+            Set(client([{default_channel, [Ep(50051)], #{pool_size => 4}}])),
+            [Text] = Check(),
+            {match, _} = re:run(Text, "channel default_channel holds 4 connections "
+                                      "\\(pool_size 4, 1 endpoint\\(s\\)\\)", [unicode])
+        end},
+       {"two endpoints, pool_size 1",
+        fun() ->
+            Set(default([Ep(50051), Ep(50052)])),
+            [Text] = Check(),
+            {match, _} = re:run(Text, "holds 2 connections \\(pool_size 1, 2 endpoint", [unicode])
+        end},
+       {"pool_size 2 over 3 endpoints is 6 connections",
+        fun() ->
+            Set(client([{default_channel, [Ep(50051), Ep(50052), Ep(50053)], #{pool_size => 2}}])),
+            [Text] = Check(),
+            {match, _} = re:run(Text, "holds 6 connections \\(pool_size 2, 3 endpoint", [unicode])
+        end},
+       {"only the channel that holds several is named",
+        fun() ->
+            Set(client([{default_channel, [Ep(50051)], #{}},
+                        {wide, [Ep(50052)], #{pool_size => 3}}])),
+            [Text] = Check(),
+            {match, _} = re:run(Text, "channel wide holds 3 connections", [unicode])
+        end},
+       {"the warning names no endpoint",
+        fun() ->
+            Set(default([Ep(50051), Ep(50052)])),
+            [Text] = Check(),
+            [?assertEqual(nomatch, re:run(Text, V, [unicode, {capture, none}]))
+             || V <- ["gw-secret", "50051", "50052"]]
+        end},
+       {"a configuration that is refused warns of nothing",
+        fun() ->
+            Set(client([{default_channel, [Ep(50051)], #{pool_size => 4}}, bogus])),
+            Events = capture_events(
+                       fun() ->
+                           ?assertEqual({error, bad_upstream_client_config},
+                                        yuzu_gw_app:check_upstream_client_config())
+                       end),
+            ?assertEqual([], [T || {warning, T} <- Events])
+        end}]).
+
+%% Two channels of one name are refused where the config is read, and the
+%% refusal names no value.
+check_upstream_client_config_refuses_duplicate_channels_test_() ->
+    env_case(
+      [fun() ->
+          application:set_env(yuzu_gw, upstream_client,
+                              #{channels => [{default_channel,
+                                              [{https, "gw-secret-host.example", 50051,
+                                                [{keyfile, "/secret/LEAF-KEY.pem"}]}], #{}},
+                                             {default_channel,
+                                              [{http, "gw-secret-other.example", 50052, []}], #{}}]}),
+          Text = lists:flatten(
+                   capture_logs(fun() ->
+                                    ?assertEqual({error, bad_upstream_client_config},
+                                                 yuzu_gw_app:check_upstream_client_config())
+                                end)),
+          {match, _} = re:run(Text, "Refusing to start: the upstream channel configuration", [unicode]),
+          [?assertEqual(nomatch, re:run(Text, V, [unicode, {capture, none}]))
+           || V <- ["gw-secret", "LEAF-KEY", "50051", "50052"]]
+      end]).
+
+
 %%%===================================================================
 %%% The leftover {grpcbox, client} block
 %%%===================================================================

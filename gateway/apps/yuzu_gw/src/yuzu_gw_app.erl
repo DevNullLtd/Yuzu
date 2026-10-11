@@ -14,6 +14,8 @@
 -export([start/2, stop/1]).
 -export([apply_env_overrides/0, evaluate_cookie/3]).  %% exported for testing
 -export([client_has_https/1, client_tls_posture/1, listeners_have_tls/1]). %% for testing
+-export([client_all_present_client_cert/1, client_tls_weakest/1, client_has_unverified/1, client_mixed_channels/1]). %% for testing
+-export([check_upstream_tls_posture/0, check_upstream_channel_mix/0]).
 -export([evaluate_upstream_posture/2, evaluate_listeners/1]).             %% for testing
 -export([evaluate_mgmt_posture/3, apply_listener_port_overrides/0]).      %% for testing
 -export([check_legacy_grpcbox_servers/0, check_legacy_grpcbox_client/0,
@@ -63,12 +65,13 @@ do_start_guarded() ->
     %% is bound while a guard can still refuse.
     %%
     %% #PR5: fail CLOSED on a misconfigured-but-encrypted upstream (https without
-    %% verify_peer is MITM-able) -- same fail-closed philosophy as the distribution
+    %% verify_peer and a CA of its own is MITM-able) -- same fail-closed philosophy as the distribution
     %% cookie guard, rather than booting with only a log warning. PLAINTEXT upstream
     %% is still allowed (the legitimate UAT/dev posture); only the "TLS but
     %% unauthenticated" footgun is refused.
     run_guards([fun check_grpc_listeners/0,
                 fun check_upstream_client_config/0,
+                fun check_upstream_channel_mix/0,
                 fun check_upstream_tls_posture/0,
                 fun check_mgmt_listener_posture/0],
                fun do_start_services/0).
@@ -272,10 +275,23 @@ drain_pending(Deadline) ->
 %% Environment variable overrides for container deployment
 %%--------------------------------------------------------------------
 
+%% YUZU_GW_UPSTREAM_ADDR / YUZU_GW_UPSTREAM_PORT used to be copied into the
+%% upstream_addr / upstream_port app env, which nothing reads: the server the
+%% gateway dials is the endpoint list of the channel in {yuzu_gw, upstream_client}.
+%% They logged "ENV override" as if they applied. They are not applied, and a
+%% variable set in an operator's compose file now says so instead of looking
+%% like it worked.
+warn_inert_upstream_env() ->
+    [logger:warning("~s is set but has no effect: the upstream server is the endpoint "
+                    "list of the channel in {yuzu_gw, upstream_client} (see "
+                    "docs/user-manual/gateway.md 'The upstream client').", [Var])
+     || Var <- ["YUZU_GW_UPSTREAM_ADDR", "YUZU_GW_UPSTREAM_PORT"],
+        os:getenv(Var) =/= false],
+    ok.
+
 apply_env_overrides() ->
+    warn_inert_upstream_env(),
     Overrides = [
-        {"YUZU_GW_UPSTREAM_ADDR",    upstream_addr,    fun(V) -> V end},
-        {"YUZU_GW_UPSTREAM_PORT",    upstream_port,    fun list_to_integer/1},
         {"YUZU_GW_PROMETHEUS_PORT",  prometheus_port,   fun list_to_integer/1},
         {"YUZU_GW_HEALTH_PORT",      health_port,       fun list_to_integer/1},
         {"YUZU_GW_HEARTBEAT_INTERVAL_MS", heartbeat_batch_interval_ms, fun list_to_integer/1},
@@ -479,14 +495,18 @@ log_tls_state() ->
                            "client config select (below)");
         _ -> ok
     end,
-    Up = client_tls_posture(application:get_env(yuzu_gw, upstream_client, undefined)),
+    %% The WEAKEST endpoint decides what the line says: calls travel over all of
+    %% them, so a verified endpoint beside a plaintext one is not "mutual-TLS".
+    Up = client_tls_weakest(application:get_env(yuzu_gw, upstream_client, undefined)),
     Listeners = application:get_env(yuzu_gw, grpc_listeners, []),
     %% This reflects the CONFIGURED posture, not a live handshake -- the
     %% upstream channel starts after this line and keeps retrying a connection
     %% that fails (and the server may not have generated certs yet at boot), so
     %% a startup file/handshake probe would false-alarm.
     logger:info("Gateway transport TLS (configured): upstream->server=~s, listeners: ~s",
-                [posture_word(Up), listeners_summary(Listeners)]),
+                [posture_word(Up, client_all_present_client_cert(
+                                  application:get_env(yuzu_gw, upstream_client, undefined))),
+                 listeners_summary(Listeners)]),
     case Up of
         plaintext ->
             logger:warning("Gateway->server upstream is PLAINTEXT. For production point "
@@ -496,9 +516,9 @@ log_tls_state() ->
             %% https without {verify,verify_peer}: encrypted but NOT authenticated --
             %% an active MITM can impersonate the server. Do not report this as "TLS".
             logger:warning("Gateway->server upstream is ENCRYPTED but does NOT verify the "
-                           "server certificate ({verify,verify_peer} missing from the "
-                           "upstream default_channel SslOpts) -- vulnerable to MITM. Add "
-                           "{verify,verify_peer} + {cacertfile,...}.");
+                           "server certificate against a CA of its own ({verify,verify_peer} "
+                           "or {cacertfile,...} missing from an upstream channel's SslOpts) "
+                           "-- vulnerable to MITM. Add {verify,verify_peer} + {cacertfile,...}.");
         verified -> ok
     end,
     %% Advisory-env footgun: an operator who set YUZU_GW_TLS_* populated only the
@@ -563,6 +583,7 @@ tls_word(_) ->
 check_upstream_client_config() ->
     case yuzu_grpc_client_config:from_env() of
         {ok, Channels} ->
+            warn_multi_connection(Channels),
             Has = lists:any(fun(#{name := N}) -> N =:= default_channel end, Channels),
             case Has orelse application:get_env(yuzu_gw, allow_no_upstream, false) =:= true of
                 true ->
@@ -586,15 +607,57 @@ check_upstream_client_config() ->
             {error, bad_upstream_client_config}
     end.
 
-%% @private Fail-closed guard: refuse to boot if the upstream channel is
-%% TLS-but-unverified (https without {verify,verify_peer}) — encrypted yet
-%% MITM-able. PLAINTEXT upstream is permitted (the legitimate UAT/dev posture);
+%% A channel holding more than one connection (pool_size above 1, or several
+%% endpoints) sends its calls round-robin over them. Behind a layer-4 virtual IP
+%% in front of several core replicas that spreads ONE gateway's calls over
+%% different replicas, which the registration reconcile (ADR-2002 7c) assumes
+%% does not happen. Allowed, and said at boot.
+warn_multi_connection(Channels) ->
+    [logger:warning("Upstream channel ~s holds ~b connections (pool_size ~b, ~b endpoint(s)): "
+                    "its calls go round-robin over them. Behind a layer-4 VIP in front of "
+                    "several core replicas that spreads one gateway's calls over different "
+                    "replicas; keep one connection per gateway unless that is intended "
+                    "(docs/user-manual/gateway.md 'The upstream client').",
+                    [N, Size * length(Es), Size, length(Es)])
+     || #{name := N, pool_size := Size, endpoints := Es} <- Channels, Size * length(Es) > 1],
+    ok.
+
+%% @private Refuse to boot if one channel lists both plaintext (http) and TLS
+%% (https) endpoints. A call goes round-robin over every live connection of its
+%% channel, so some calls would travel unencrypted (a ProxyRegister carries the
+%% enrollment token and the CSR) whatever the https endpoint is verified against,
+%% and the boot log would still have said the upstream was TLS. A channel is
+%% one scheme.
+-spec check_upstream_channel_mix() -> ok | {error, mixed_upstream_endpoints}.
+check_upstream_channel_mix() ->
+    case client_mixed_channels(application:get_env(yuzu_gw, upstream_client, undefined)) of
+        [] ->
+            ok;
+        [Name | _] ->
+            logger:critical(
+                "Refusing to start: the upstream channel ~p lists both plaintext (http) "
+                "and TLS (https) endpoints. Calls go round-robin over every live "
+                "connection of a channel, so some would travel unencrypted. Give a "
+                "channel one scheme.", [Name]),
+            {error, mixed_upstream_endpoints}
+    end.
+
+%% @private Fail-closed guard: refuse to boot if ANY https upstream endpoint is
+%% TLS-but-unverified (no {verify,verify_peer}, or no {cacertfile,...} /
+%% {cacerts,...} of its own) — encrypted yet MITM-able, or trusting every CA in
+%% the operating system's store. PLAINTEXT upstream is permitted (the legitimate UAT/dev posture);
 %% only the dangerous "looks secure, isn't" middle state is refused. Mirrors the
 %% distribution-cookie guard's fail-closed posture. Dev/CI override:
 %% YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1.
 -spec check_upstream_tls_posture() -> ok | {error, unverified_upstream_tls}.
 check_upstream_tls_posture() ->
-    Posture = client_tls_posture(application:get_env(yuzu_gw, upstream_client, undefined)),
+    Client = application:get_env(yuzu_gw, upstream_client, undefined),
+    %% ANY unverified https endpoint refuses, even beside a verified one: calls
+    %% are spread over all of them.
+    Posture = case client_has_unverified(Client) of
+                  true  -> unverified;
+                  false -> client_tls_weakest(Client)
+              end,
     Allow = os:getenv("YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM") =:= "1",
     case evaluate_upstream_posture(Posture, Allow) of
         {error, unverified_upstream_tls} ->
@@ -607,7 +670,7 @@ check_upstream_tls_posture() ->
                 "YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1."),
             {error, unverified_upstream_tls};
         ok when Posture =:= unverified ->
-            logger:warning("Upstream TLS is unverified (no verify_peer) but "
+            logger:warning("Upstream TLS is unverified (no verify_peer, or no CA of its own) but "
                            "YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1 — proceeding (dev/CI only)."),
             ok;
         ok ->
@@ -615,8 +678,8 @@ check_upstream_tls_posture() ->
     end.
 
 %% @doc Pure upstream-posture policy decision — exported for testing. Only
-%% `unverified` (https without verify_peer) without an explicit override is
-%% refused; `verified` and `plaintext` boot.
+%% `unverified` (https without verify_peer, or without a CA of its own) without
+%% an explicit override is refused; `verified` and `plaintext` boot.
 -spec evaluate_upstream_posture(tls_posture(), boolean()) ->
           ok | {error, unverified_upstream_tls}.
 evaluate_upstream_posture(unverified, false) -> {error, unverified_upstream_tls};
@@ -1014,14 +1077,40 @@ mgmt_defects(S, Pins) ->
          {proxied_origin, not (is_map(Origin) andalso maps:get(mode, Origin, undefined) =:= transport)}],
     [Defect || {Defect, true} <- Checks].
 
--spec posture_word(tls_posture()) -> string().
-posture_word(verified)   -> "mutual-TLS";
-posture_word(unverified) -> "TLS(UNVERIFIED!)";
-posture_word(plaintext)  -> "plaintext".
+%% "mutual-TLS" is said only when the gateway also PRESENTS a certificate on
+%% every endpoint (certfile + keyfile); a verified channel without one
+%% authenticates the server to the gateway and nothing more.
+-spec posture_word(tls_posture(), boolean()) -> string().
+posture_word(verified, true)  -> "mutual-TLS";
+posture_word(verified, false) -> "server-authenticated TLS (no client certificate)";
+posture_word(unverified, _)   -> "TLS(UNVERIFIED!)";
+posture_word(plaintext, _)    -> "plaintext".
+
+%% @doc True if there is at least one endpoint and every https endpoint of every
+%% channel carries both a {certfile,..} and a {keyfile,..} (or {key,..}/{cert,..}).
+%% Pure; exported for testing.
+-spec client_all_present_client_cert(term()) -> boolean().
+client_all_present_client_cert(#{channels := Channels}) when is_list(Channels) ->
+    Es = [E || {_N, Endpoints, _O} <- Channels, is_list(Endpoints), E <- Endpoints],
+    Es =/= [] andalso lists:all(fun presents_client_cert/1, Es);
+client_all_present_client_cert(_) ->
+    false.
+
+presents_client_cert(E) when is_tuple(E), tuple_size(E) >= 4, element(1, E) =:= https ->
+    Ssl = element(4, E),
+    is_list(Ssl)
+        andalso (proplists:is_defined(certfile, Ssl) orelse proplists:is_defined(cert, Ssl))
+        andalso (proplists:is_defined(keyfile, Ssl) orelse proplists:is_defined(key, Ssl));
+presents_client_cert(_) ->
+    false.
 
 %% @doc Strongest TLS posture across the upstream client channels: `verified` (an
-%% `https` endpoint with {verify,verify_peer}), `unverified` (https without it),
-%% else `plaintext`. Pure; exported for testing.
+%% `https` endpoint with {verify,verify_peer} and a {cacertfile,..}/{cacerts,..}
+%% of its own), `unverified` (https without both), else `plaintext`. This is the
+%% STRONGEST endpoint: it answers "is there TLS at all" (client_has_https/1). The
+%% boot guard and the boot log use the weakest one (client_tls_weakest/1,
+%% client_has_unverified/1), because calls travel over every endpoint. Pure;
+%% exported for testing.
 -spec client_tls_posture(term()) -> tls_posture().
 client_tls_posture(#{channels := Channels}) when is_list(Channels) ->
     lists:foldl(fun(Ch, Acc) -> strongest(channel_posture(Ch), Acc) end,
@@ -1033,6 +1122,44 @@ client_tls_posture(_) ->
 %% not). Pure; exported for testing.
 -spec client_has_https(term()) -> boolean().
 client_has_https(Client) -> client_tls_posture(Client) =/= plaintext.
+
+%% @doc The WEAKEST posture of any endpoint of any channel: `plaintext` if any
+%% endpoint is http, else `unverified` if any https endpoint is, else `verified`
+%% (no endpoint at all is `plaintext`). Pure; exported for testing.
+-spec client_tls_weakest(term()) -> tls_posture().
+client_tls_weakest(Client) ->
+    case endpoint_postures(Client) of
+        [] -> plaintext;
+        Ps -> case {lists:member(plaintext, Ps), lists:member(unverified, Ps)} of
+                  {true, _}      -> plaintext;
+                  {false, true}  -> unverified;
+                  {false, false} -> verified
+              end
+    end.
+
+%% @doc True if any https endpoint of any channel is unverified. Pure; exported
+%% for testing.
+-spec client_has_unverified(term()) -> boolean().
+client_has_unverified(Client) ->
+    lists:member(unverified, endpoint_postures(Client)).
+
+%% @doc The names of the channels that list both plaintext and TLS endpoints.
+%% Pure; exported for testing.
+-spec client_mixed_channels(term()) -> [term()].
+client_mixed_channels(#{channels := Channels}) when is_list(Channels) ->
+    [Name || {Name, Endpoints, _Opts} <- Channels, is_list(Endpoints),
+             begin
+                 Ps = [endpoint_posture(E) || E <- Endpoints],
+                 lists:member(plaintext, Ps) andalso lists:any(fun(P) -> P =/= plaintext end, Ps)
+             end];
+client_mixed_channels(_) ->
+    [].
+
+endpoint_postures(#{channels := Channels}) when is_list(Channels) ->
+    [endpoint_posture(E) || {_Name, Endpoints, _Opts} <- Channels, is_list(Endpoints),
+                            E <- Endpoints];
+endpoint_postures(_) ->
+    [].
 
 -spec channel_posture(term()) -> tls_posture().
 channel_posture({_Name, Endpoints, _Opts}) when is_list(Endpoints) ->
@@ -1058,15 +1185,20 @@ endpoint_posture(E) when is_tuple(E), tuple_size(E) >= 4, element(1, E) =:= http
 endpoint_posture(_) ->
     plaintext.
 
+%% A CA file named (a non-empty string or binary) or certificates given (a
+%% non-empty list of them): not an atom, not an empty value. Whether the file
+%% EXISTS is not asked here: the server may generate its certificates after the
+%% gateway has started, and a missing file fails the first connection loudly.
 has_trust_anchor(SslOpts) ->
-    lists:any(fun(Key) ->
-                      case proplists:get_value(Key, SslOpts) of
-                          undefined -> false;
-                          []        -> false;
-                          <<>>      -> false;
-                          _         -> true
-                      end
-              end, [cacertfile, cacerts]).
+    anchor_file(proplists:get_value(cacertfile, SslOpts))
+        orelse anchor_certs(proplists:get_value(cacerts, SslOpts)).
+
+anchor_file(File) when is_binary(File) -> File =/= <<>>;
+anchor_file(File) when is_list(File)   -> File =/= [] andalso io_lib:printable_unicode_list(File);
+anchor_file(_)                         -> false.
+
+anchor_certs([_ | _]) -> true;
+anchor_certs(_)       -> false.
 
 -spec strongest(tls_posture(), tls_posture()) -> tls_posture().
 strongest(verified, _)            -> verified;
