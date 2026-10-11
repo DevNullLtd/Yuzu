@@ -1850,6 +1850,46 @@ FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22). One path remains genuinely open, n
 `Finish()` with zero response frames never resolves (#4691, filed, not fixed here) — "every time" describes
 every branch this PR's own scope covers, not that one.
 
+### 7f. Gateway-to-server upstream topology — several servers is the standard (2026-10-11)
+
+**Stated production topology (maintainer, 2026-10-11).** Dozens to hundreds of gateways; always at least
+two servers; very likely globally only two PostgreSQL databases in a streaming-replication pair. A gateway
+therefore dials SEVERAL upstream servers as the normal case, not a lab configuration. This section records
+what that changes. It is a **design direction**: apart from the breaker classification below, none of it is
+implemented, and no multi-server run exists.
+
+**What it supersedes.** Section 7c's "Multi-replica statement" rests on the shipped gateway using ONE
+upstream channel and connection, so that a gateway's calls are connection-sticky to one core replica. That
+premise no longer holds as a default. Likewise the gateway guidance to "keep one connection per gateway"
+and the boot warning for a channel with more than one connection (`docs/user-manual/gateway.md`,
+`yuzu_gw_app:warn_multi_connection/1`) describe the case this topology makes ordinary.
+
+**Consequences, each tracked as its own issue:**
+
+1. **Explicit backpressure (#5647).** A database failover degrades BOTH servers at once, so every gateway
+   sees errors from every server together. A circuit breaker is the wrong response (it drops every agent a
+   gateway holds); the server should say "retry in N ms" with the gRPC pushback trailer
+   (`grpc-retry-pushback-ms`) and the gateway should treat that as a pause, not a failure.
+2. **Per-endpoint breaker and failover (#5648).** There is one breaker per gateway today, whatever the
+   channel lists. One dead server out of two must not stop the gateway using the other.
+3. **The reconcile decision (#5649).** Either the verdict/replay/re-announce reconcile (7c) is made sticky
+   to one upstream endpoint on the gateway side, or it is made safe on any replica on the server side
+   (adoption that does not wipe placement; see #5244). Until that is decided and run on two replicas, 7c's
+   convergence claim holds for one replica only.
+4. **Herd sizing (#5650).** The breaker's open interval is deterministic (10 s doubling to 300 s) and the
+   reconnect jitter is narrow; with hundreds of gateways, probes and reconnects must be spread.
+5. **Defaults and guidance (#5651).** Reference configs, the boot warning, the wizard and the Settings page
+   must treat a two-server channel as the standard.
+
+**Shipped separately from the upstream-client change.** The breaker counts only server faults: a gRPC answer that blames the request
+(`INVALID_ARGUMENT`, `NOT_FOUND`, `ALREADY_EXISTS`, `PERMISSION_DENIED`, `FAILED_PRECONDITION`,
+`OUT_OF_RANGE`, `UNAUTHENTICATED`) is the server answering correctly and no longer counts towards opening it.
+`RESOURCE_EXHAUSTED` stays counted until item 1 lands.
+
+**SRE implications.** Alerts keyed on the single breaker (`YuzuGatewayUpstreamCircuitOpened`) become
+per-endpoint signals once item 2 lands; a fleet-wide simultaneous breaker open is the signature of a shared
+cause (the database pair), not of one bad server, and the runbook should say so.
+
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced *(the
 "collapse into the KEK problem" framing and the first two bullets are superseded — see the Update

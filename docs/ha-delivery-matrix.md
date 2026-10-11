@@ -19,6 +19,13 @@ this matrix *shares*, not duplicates).
 
 "HA" as a customer claim = **both** axes + WS-9 (validation) + WS-11/WS-12 (operability).
 
+**Gateway-to-server topology (ADR-2002 §7f, 2026-10-11).** Several upstream servers per gateway is the
+standard production shape (hundreds of gateways, always at least two servers, a streaming-replication
+Postgres pair). The work it adds - explicit backpressure, a per-endpoint breaker with failover, the
+registration-reconcile decision, herd jitter, and the multi-server defaults - is tracked in #5647-#5651 and
+is not yet assigned a workstream above. The reconcile decision (#5649) bears directly on WS-4's convergence
+claim.
+
 ## ⚠️ The safe-to-scale gate (read before sequencing)
 
 **Do not equate "Phase A done" with "safe to run a second replica."** The three-model review's
