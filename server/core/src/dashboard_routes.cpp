@@ -1409,11 +1409,20 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  html += "<div id=\"result-summary\" hx-swap-oob=\"true\"></div>";
                  html += "<div id=\"group-form-slot\" hx-swap-oob=\"true\"></div>";
 
-                 // Toast via HX-Trigger
+                 // Toast via HX-Trigger, then (#5623, governance G8-3) abort any
+                 // in-flight /fragments/results request BEFORE the #filter-bar OOB swap
+                 // below discards its hx-sync registry: a late response of the OLD
+                 // command would otherwise swap its rows and Create-Group chrome (carrying
+                 // the OLD command_id) over this command's table. ORDER IS LOAD-BEARING:
+                 // htmx's trigger-header handler reassigns the dispatch target on a key's
+                 // `target`, and that reassignment persists for every LATER key, so
+                 // `htmx:abort` MUST stay the LAST key (showToast stays on the issuer).
+                 // The abort target is the selector half of kResultsSyncScope.
                  res.set_header("HX-Trigger",
                      "{\"showToast\":{\"message\":\"Command sent to " +
                      std::to_string(sent) +
-                     " agent(s)\",\"level\":\"success\"}}");
+                     " agent(s)\",\"level\":\"success\"},"
+                     "\"htmx:abort\":{\"target\":\"#filter-bar\"}}");
 
                  // Closes governance CP-2 / C-16: append definition_id when
                  // the reverse-lookup resolved one, so SIEM correlation
