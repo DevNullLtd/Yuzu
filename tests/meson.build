@@ -1907,7 +1907,7 @@ if build_server
   #   - UPDATED Phase 2 (#3443) — this used to say ci.yml's Linux Test step
   #     hardcodes the full pg shard name list with "No automated check
   #     enforces this yet"; that was true before Phase 1 and is stale now.
-  #     Since Phase 1, the 14 pg shards (A-O without J or P: the original ten,
+  #     Since Phase 1, the 14 pg shards (A-O without J: the original ten,
   #     plus K, L, M, N, O added 2026-08-28 through 2026-10-11, minus J and P
   #     merged into I and M on 2026-10-11) are
   #     selected structurally via `--suite server-pg` — adding/splitting/
@@ -2184,9 +2184,10 @@ if build_server
   # H 246s, L 236s, N 228s, C 185s, K 176s, J 173s, I 169s, P 148s, B 140s,
   # M 83s. ESTIMATES for the merged shards (sums of those measured times;
   # they slightly overstate because process startup is shared): merged M
-  # (M + P) 83 + 148 = 231s on Windows (Linux 135 + 100 = 235s), merged I
+  # (M + P) 83 + 148 = 231s on Windows (Linux 135 + 100 = 235s, 16-shard Linux run), merged I
   # (I + J) 169 + 173 = 342s on Windows (Linux 119 + 119 = 238s); both below
-  # shard A's measured 393s, so A stays the longest pole. Linux ordering of the
+  # shard A's measured 393s on Windows, so A stays the longest pole there (on Linux the
+  # merged shards, about 235-238s, are comparable to A at 234-258s). Linux ordering of the
   # 16-shard layout is similar (15-shard Linux times: A 258s, C 254s, E 243s,
   # F 234s, G 200s, D 194s, O 194s, L 170s, N 168s, H 165s, M 148s, I 136s,
   # J 133s, K 115s, B 113s; P 100s in the final run). Merged priorities
@@ -2418,7 +2419,7 @@ if build_server
   # store" ([notification_store][pg], asserts against a deliberately
   # unreachable PgPool so it needs no real DSN) -- was removed as part of
   # this branch's backfill-test-suite pruning sweep (ADR-0009). That makes
-  # every one of shard I's tags fully DSN-gated, same as G/J: on a DSN-less
+  # every one of shard I's tags fully DSN-gated, same as G/J (J's clauses now live inside shard I): on a DSN-less
   # leg (the GHA-hosted macOS runner, no live Postgres) all matching cases
   # now skip, dropping the executed-case count to zero and tripping the
   # same "no tests ran" exit(4) shard E/I were split off to avoid needing

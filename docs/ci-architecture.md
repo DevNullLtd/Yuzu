@@ -1143,7 +1143,7 @@ cases and 9 more F cases than the dev base: C 914 against 886, F 541 against
 The theoretical degenerate ceiling grows with the count, as the paragraph
 above predicted for any addition. At the final 14 shards: 14 * 700 = 9800
 test-seconds, and at the Linux `--num-processes 2` that is 7 rounds of two
-shards, so 7 * 700 = 4900s = 81.7 minutes. That figure ALONE is now under the
+shards, so 7 * 700 = 4900s = 81.7 minutes. That figure ALONE (it excludes checkout, build and the non-pg test step, so the real margin is smaller) is now under the
 Linux job's `timeout-minutes: 90` (`.github/workflows/ci.yml`, the `linux`
 job), by 8.3 minutes; with the up-to-30-minute slot wait
 (`YUZU_TEST_SLOT_TIMEOUT_MIN`) it is about 112 minutes, which still exceeds
@@ -1213,8 +1213,10 @@ I + old J (550 cases), and every other shard is set-identical. The measured
 Windows times quoted in this section are from the 16-shard layout, not the
 merged one. ESTIMATES for the merged shards are sums of those measured times
 (startup is shared, so slightly less): M + P is 83 + 148 = 231s on Windows
-(Linux 135 + 100 = 235s) and I + J is 169 + 173 = 342s (Linux 119 + 119 =
-238s); both are below shard A's measured 393s, so A stays the longest pole.
+(Linux 135 + 100 = 235s, from the 16-shard Linux run) and I + J is 169 + 173 =
+342s (Linux 119 + 119 = 238s, same run); both are below shard A's measured
+393s on Windows, so A stays the longest pole there. On Linux the merged shards
+(about 235-238s) are comparable to A (234-258s), not below it.
 Re-measure the merged layout on the first CI run. Priorities are now merged M
 185 and merged I 245 (all 14 distinct); see `tests/meson.build`.
 
@@ -1289,7 +1291,7 @@ Two hardening decisions worth knowing before touching this again:
   (`AllTestsSkippedExitCode`) on every DSN-less UNFILTERED `meson test` —
   local dev without Postgres, and any future sanitizer/nightly leg that runs
   the whole suite — breaking that skip contract, the same reason shards
-  D/G/H/I/J already carry the flag. Loud-fail duty for a genuinely broken or
+  D/G/H/I already carry the flag (I now also covers J's former clauses). Loud-fail duty for a genuinely broken or
   missing DSN moved to ci.yml's own `Resolve pg_mode + assert Postgres DSN`
   step (runs immediately after `Ensure Postgres`, before ANY test invocation,
   full or smoke) and to the checker's exact-count + flag-present assertions
