@@ -214,6 +214,9 @@ extern const char* const kDashboardIndexHtml =
     }
     .form-hint { color: var(--mds-color-theme-text-tertiary); font-size: 0.7rem; }
     .feedback-error { color: var(--mds-color-theme-indicator-error); font-size: 0.75rem; }
+    /* The facet refusal in the group form slot (#5623) is a whole sentence: give it its own
+       line and some breathing room, instead of sitting flush against the panel edge. */
+    .feedback-error[data-filter-refused] { display: block; padding: 0.5rem 1rem; }
 )HTM"
     // Part 1a: CSS continued (split to stay under MSVC's 16380-byte string
     // limit — this session's degrade-banner/filter-bar CSS additions pushed

@@ -463,6 +463,12 @@ TEST_CASE("dashboard stylesheet: the facet refusal cell is allowed to wrap and u
     CHECK(contains(body, "max-width: none"));
     // A refusal is read, not skimmed: it must not inherit .empty-state's low-contrast colour.
     CHECK(contains(body, "color: var(--yellow"));
+    // The group-form refusal span gets padding and its own line (it sat flush against the edge).
+    const auto fb = css.find(".feedback-error[data-filter-refused] {");
+    REQUIRE(fb != std::string::npos);
+    const std::string fbody = css.substr(fb, css.find('}', fb) - fb);
+    CHECK(contains(fbody, "display: block"));
+    CHECK(contains(fbody, "padding:"));
     // And the generic clip it overrides still exists, so the override is what makes it readable.
     CHECK(contains(css, "tbody td {"));
 }
