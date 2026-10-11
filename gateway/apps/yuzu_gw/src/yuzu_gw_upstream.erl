@@ -959,8 +959,13 @@ record_result({ok, _}, State) ->
         {State1, noop} ->
             State1
     end;
-record_result({error, _}, State) ->
-    on_failure(State).
+record_result({error, {Status, _}} = Result, State) when is_binary(Status) ->
+    case answered_by_a_healthy_server(Status) of
+        true  -> record_result({ok, answered}, State);
+        false -> on_failure_of(Result, State)
+    end;
+record_result({error, _} = Result, State) ->
+    on_failure_of(Result, State).
 
 %% @doc Like record_result/2 but never triggers a registration replay.
 %% Used by the replay drip itself: a replay RPC must still advance the
@@ -969,8 +974,37 @@ record_result({error, _}, State) ->
 record_result_no_replay({ok, _}, State) ->
     {State1, _Trigger} = on_success(State),
     State1;
-record_result_no_replay({error, _}, State) ->
+record_result_no_replay({error, {Status, _}} = Result, State) when is_binary(Status) ->
+    case answered_by_a_healthy_server(Status) of
+        true  -> record_result_no_replay({ok, answered}, State);
+        false -> on_failure_of(Result, State)
+    end;
+record_result_no_replay({error, _} = Result, State) ->
+    on_failure_of(Result, State).
+
+on_failure_of(_Result, State) ->
     on_failure(State).
+
+%% @doc Whether a gRPC status is the server ANSWERING correctly, as opposed to
+%% the server failing. The breaker exists to stop the gateway hammering a server
+%% that is down or struggling; a status that says "your request is wrong" proves
+%% the opposite, so it must not count towards opening the breaker (and, from a
+%% half-open probe, it correctly closes it: the server answered). The set is
+%% closed and the default is to COUNT: a status not listed here (UNKNOWN,
+%% DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED, ABORTED, UNIMPLEMENTED, INTERNAL,
+%% UNAVAILABLE, DATA_LOSS, CANCELLED, or anything unparsed) is a failure, as
+%% before. RESOURCE_EXHAUSTED stays counted until the server sends explicit
+%% backpressure the gateway can act on (it is a back-off signal, not a fault,
+%% but counting it is the only brake there is today).
+-spec answered_by_a_healthy_server(binary()) -> boolean().
+answered_by_a_healthy_server(?GRPC_STATUS_INVALID_ARGUMENT)    -> true;
+answered_by_a_healthy_server(?GRPC_STATUS_NOT_FOUND)           -> true;
+answered_by_a_healthy_server(?GRPC_STATUS_ALREADY_EXISTS)      -> true;
+answered_by_a_healthy_server(?GRPC_STATUS_PERMISSION_DENIED)   -> true;
+answered_by_a_healthy_server(?GRPC_STATUS_FAILED_PRECONDITION) -> true;
+answered_by_a_healthy_server(?GRPC_STATUS_OUT_OF_RANGE)        -> true;
+answered_by_a_healthy_server(?GRPC_STATUS_UNAUTHENTICATED)     -> true;
+answered_by_a_healthy_server(_)                                -> false.
 
 %% @doc Returns {NewState, replay | noop}. `replay' means an RPC just
 %% succeeded after one or more failures — treat it as a reconnect.

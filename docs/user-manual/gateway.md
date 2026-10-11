@@ -1084,6 +1084,17 @@ proxied `Register` is left without a pending row. (4) Behaviour with real agents
 near the cap and with an L4 forwarder multiplexing agents was not run, and the
 default of 8 is a chosen value, not one derived from fleet data.
 
+**What counts as a failure.** The breaker counts calls that failed because of the
+server or the path to it: no connection, a timeout, and the gRPC statuses
+`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, `ABORTED`, `INTERNAL`,
+`UNKNOWN`, `UNIMPLEMENTED`, `DATA_LOSS` and `CANCELLED`. A status that says the
+request itself is wrong (`INVALID_ARGUMENT`, `NOT_FOUND`, `ALREADY_EXISTS`,
+`PERMISSION_DENIED`, `FAILED_PRECONDITION`, `OUT_OF_RANGE`, `UNAUTHENTICATED`) is the
+server answering correctly: it is not counted, it resets the run of consecutive
+failures, and from a half-open probe it closes the breaker. `RESOURCE_EXHAUSTED` is
+still counted, because it is the only brake the gateway has until the server sends
+explicit backpressure.
+
 **Circuit breaker tuning** (the breaker the replay and the other upstream calls
 share; read once when the upstream client starts, not range-checked, and each key
 has an environment override, unlike the replay keys above):
