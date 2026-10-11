@@ -5375,7 +5375,9 @@ automatically: `AgentImpl::stop()` and the agent's own `run()`-exit teardown
 each arm a 20-second internal watchdog, and self hard-exit (**code 4** — new,
 distinct from this section's exit 1 and the crash-loop-backstop's exit 3
 below) if guardian/spark/DEX teardown or any other blocking step hasn't
-returned within it. Separately again (#4666 PR-2), once the rest of shutdown
+returned within it (on a Windows agent with Spark detection enabled, see
+*After an agent exit with code 4* below for what a code 4 can cost). Separately again
+(#4666 PR-2), once the rest of shutdown
 has already finished (after both watchdogs above have been cancelled and
 after the F3 orphan-exit check below has run), the agent tears down its own
 async log hand-off logger before the process exits: **code 5** (distinct from
@@ -5440,6 +5442,24 @@ clean or with a "specific error" code, see below), so by construction none
 of those three changes what the SCM was already told, and none produces an
 Event Viewer entry distinguishable from a normal stop; the process simply
 takes a little longer to actually exit than the SCM's report suggested.
+
+**After an agent exit with code 4 (#5604).** On any agent with Spark detection enabled (off
+in every released agent), lifecycle-journal records waiting to be written at shutdown are
+lost when the watchdog ends the stop; they are audit evidence and are not recoverable. On a
+Windows agent with Spark detection enabled a baseline capture waiting to be written is lost
+too. Treat a `file-hash-equals` Guardian rule that has no authored `expected_hash` as
+possibly re-baselined (the next start captures the file's current content and logs it
+exactly like a first capture; any drift in between is accepted as the baseline). Find the
+process holding `kv_store.db` locked (Resource Monitor, or Sysinternals `handle`) and author
+an `expected_hash` for the rules that matter (see "Where the baseline lives" in
+[Guaranteed State](guaranteed-state.md)). On every other agent a code 4 loses no baseline,
+because the legacy path writes it at capture time; still check the disk and any process
+holding `kv_store.db` locked (`fuser` or `lsof` on Linux and macOS). At shutdown, a
+write to a locked `kv_store.db` normally waits about 1 second per statement step; SQLite's
+own internal retries (for example on the WAL index) are not covered by that cap and were
+measured at up to about 2.3
+seconds against a 1 second budget on Linux (phasing dependent), on every platform. Several
+waits follow one another, so a stop against a locked store can still take several seconds.
 
 **Two watchdogs, not one, and their budgets don't share a clock.**
 `AgentImpl::stop()` and the agent's own `run()`-exit teardown each arm their
