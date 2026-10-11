@@ -240,13 +240,13 @@ from_ctx(Ctx) ->
 
 on_receive_data(_, State=#state{method=undefined}) ->
     {ok, State};
-%% YUZU PATCH (#1422): once the server has terminated the stream (auth_fun
-%% rejection, unimplemented method, ...) its trailers are sent, but stock
-%% grpcbox v0.17.1 still delivers subsequent DATA frames to handle_message —
+%% YUZU PATCH (#1422): once end_stream has set trailers_sent (for example
+%% auth_fun rejected the peer and UNAUTHENTICATED was sent), stock grpcbox
+%% v0.17.1 still delivers subsequent DATA frames to handle_message —
 %% which EXECUTES the service handler and merely discards the response
 %% (end_stream is a no-op at trailers_sent=true). For an UNAUTHENTICATED-
 %% rejected peer that is an authorization bypass: the RPC's side effects
-%% still run. Drop all data on a terminated stream. See YUZU_PATCH.md.
+%% still run. Drop all data once trailers_sent is set. See YUZU_PATCH.md.
 on_receive_data(_, State=#state{trailers_sent=true}) ->
     {ok, State};
 on_receive_data(Bin, State=#state{request_encoding=Encoding,

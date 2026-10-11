@@ -419,6 +419,15 @@ RuleAssertion file_exists_rule(const std::string& rule_id, bool present = true) 
     a.expect_present = present;
     return a;
 }
+// #4045: a file-hash-equals rule. Empty `expected_hash` = baseline-on-arm (the capture the
+// runtime stages for the engine-owned persister); a non-empty one is an authored hash.
+RuleAssertion file_hash_rule(const std::string& rule_id, const std::string& expected_hash = "") {
+    RuleAssertion a;
+    a.kind = AssertionKind::FileHashEquals;
+    a.rule_id = rule_id;
+    a.expected_hash = expected_hash;
+    return a;
+}
 SparkSpec svc_spec(const std::string& name) {
     return SparkSpec{SparkType::Service, ServiceSparkParams{name}};
 }
@@ -10070,22 +10079,28 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     CHECK(rt->expire_overdue_claims() == 1); // only r2 - r1 already compensated and popped.
 
-    // rung 9c PR-5e (#4221, K-bound closeout): this is EXACTLY the unsettled window
-    // receipt_wedge_k_eligible() exists to exclude - receipt_status() already reads
-    // Wedged (checked below, unchanged from before this PR), but r2's own `dispatch`
-    // is still Dispatching (this test's own comment above), not yet Dispatched - a
-    // K-waiver predicate relying on receipt_status() alone would treat this as
-    // K-eligible one tick before dispatch_arm_off_lock's own re-lock corrects it.
+    // rung 9c PR-5e (#4221), reframed by #5459 (option D): this is EXACTLY the unsettled
+    // window the outstanding-wedge classification exists to exclude - receipt_status()
+    // already reads Wedged (checked below, unchanged from before this PR), but r2's own
+    // `dispatch` is still Dispatching (this test's own comment above), not yet Dispatched
+    // - a retry-suppression predicate relying on receipt_status() alone would treat this
+    // as an outstanding wedge one tick before dispatch_arm_off_lock's own re-lock
+    // corrects it. Neither flavour (hung = wedge_eligible, compensating =
+    // compensation_pending) may read true here.
     CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
     CHECK_FALSE(rt->receipt_wedge_k_eligible(res2->receipt));
+    CHECK_FALSE(rt->receipt_status_wedge_aware(res2->receipt).wedge_eligible);
+    CHECK_FALSE(rt->receipt_status_wedge_aware(res2->receipt).compensation_pending);
+    CHECK(rt->receipt_recovery_status(res2->receipt) ==
+          GuardianSparkRuntime::RecoveryStatus::Blocking);
 
     // Adversarial review finding (Kimi K3 + Codex Sol independently converging,
     // mutation-proven): GuardianArmAckLedger::drain_locked()'s own PRIMARY per-pending
-    // loop must ALSO gate on receipt_wedge_k_eligible() before inserting into
-    // failed_receipts - not just the recovery-scan loop that re-validates EXISTING
-    // entries a tick later. Drive a real ledger drain WHILE r2 sits in this exact
-    // unsettled window (receipt_status() already Wedged, receipt_wedge_k_eligible()
-    // still false) - deleting that insertion-site gate leaves every test in this file
+    // loop must ALSO gate on the outstanding-wedge classification (wedge_eligible ||
+    // compensation_pending) before inserting into failed_receipts - not just the
+    // recovery-scan loop that re-validates EXISTING entries a tick later. Drive a real
+    // ledger drain WHILE r2 sits in this exact unsettled window (receipt_status()
+    // already Wedged, neither flag true yet) - deleting that insertion-site gate leaves every test in this file
     // and in test_guardian_arm_ack.cpp green (proven by mutation during review), since
     // none of them reach this specific window through a real ledger drain. This is
     // that missing regression test.
@@ -10093,7 +10108,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         GuardianArmAckLedger ledger;
         ledger.begin_application(1, std::string(64, 'r'), false, 1);
         ledger.add_pending("r2", res2->receipt);
-        CHECK(ledger.drain_locked(*rt, 10) == 1); // resolved (Wedged), but NOT K-eligible yet
+        CHECK(ledger.drain_locked(*rt, 10) == 1); // resolved (Wedged), but NOT an outstanding wedge yet
         CHECK(ledger.failed_receipt_count_for_test() == 0); // must NOT be inserted while unsettled
         const auto s = ledger.arm_stats();
         REQUIRE(s.has_value());
@@ -10115,15 +10130,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         std::chrono::seconds(10)));
     rt->set_io_executor_fail_launch_for_test(false);
 
-    // rung 9c PR-5e (#4221, K-bound closeout): post-correction, receipt_status() has
-    // moved to Failed (checked below, unchanged) - receipt_wedge_k_eligible() must
-    // stay false too, for the OPPOSITE reason now: `dispatch` never reaches
+    // rung 9c PR-5e (#4221): post-correction, receipt_status() has
+    // moved to Failed (checked below, unchanged) - receipt_wedge_k_eligible() (and
+    // compensation_pending) must stay false too, for the OPPOSITE reason now: `dispatch` never reaches
     // Dispatched on this synchronous-admission-failure path (dispatch_arm_off_lock()
     // only ever writes Dispatched on a successful submission), so the strict
     // `dispatch == Dispatched` clause excludes it just as it did in the unsettled
     // window above - the two checks together never produce a false-eligible window
     // on either side of the correction.
     CHECK_FALSE(rt->receipt_wedge_k_eligible(res2->receipt));
+    CHECK_FALSE(rt->receipt_status_wedge_aware(res2->receipt).compensation_pending);
 
     // Pre-fix: fail_all_claims_locked()'s guard could not overwrite the stale
     // WaiterTimedOutDispatched already on r2, so this stayed Wedged even though
@@ -14166,12 +14182,15 @@ TEST_CASE("#5403: single-rule serialized retries behind a hung Disarm keep the k
 }
 
 // ---------------------------------------------------------------------------
-// #4472 post-K stranding repro: a hung arm's late success is COMPENSATED (the rule is withdrawn
-// at that instant, by a full_sync teardown), the same rule is re-attached and re-observes the
-// same retained Wedged claim, and the compensating disarm is still inside the backend when the
-// ack ledger drains. This is not the already-sanctioned "completion ownership survives K" case
-// (a late success that ADOPTS after acknowledgment): here the late success is disarmed before
-// acknowledgment, so acknowledgment is the last thing that could ever re-arm the rule.
+// #4472 stranding repro (re-based on #5459 option D): a hung arm's late success is COMPENSATED
+// (the rule is withdrawn at that instant, by a full_sync teardown), the same rule is re-attached
+// and re-observes the same retained Wedged claim, and the compensating disarm is still inside the
+// backend when the ack ledger drains. Under the deleted K-waiver acknowledgment was the last thing
+// that could ever re-arm the rule; under option D there is no waiver, so the generation stays held
+// and the server's retry arrives. What these cases pin is the ledger/runtime classification that
+// makes that cheap and safe: the compensating wedge is retained (CompensationPending), identical
+// retries are Suppressed while the teardown is outstanding, nothing acknowledges, and once the
+// teardown pops the claim the next retry is a Reapply that arms the rule.
 //
 // Level: a real GuardianSparkRuntime plus a real GuardianArmAckLedger, driven by the test thread
 // in the order GuardianEngine::apply_rules does (begin_application, detach_all, attach_rule,
@@ -14179,11 +14198,12 @@ TEST_CASE("#5403: single-rule serialized retries behind a hung Disarm keep the k
 // cannot park the arm's completion between detach_all and the re-attach (both run inside one
 // apply_rules under mtx_ with no seam between them). What is modelled rather than exercised: the
 // engine persists policy_generation iff can_advance() is true on the heartbeat drain, and the
-// server stops its heartbeat reconcile once the agent reports a generation at or above its own.
+// server re-sends its push iff the agent still reports a generation behind its own.
 // ---------------------------------------------------------------------------
 namespace {
 struct PostK4472Rig {
     using RT = GuardianSparkRuntime;
+    using Retry = GuardianArmAckLedger::RetryDecision;
     std::shared_ptr<FakeReader> r = std::make_shared<FakeReader>();
     std::shared_ptr<FakeBackend> b = std::make_shared<FakeBackend>();
     std::shared_ptr<RT> rt;
@@ -14207,8 +14227,13 @@ struct PostK4472Rig {
                                      std::chrono::seconds(10));
     }
 
+    /// What the ledger answers for the identical push the server would re-send (generation 1,
+    /// the rig's digest, full_sync). Mutates the ledger's suppression budget on a wedge Suppress,
+    /// exactly like the production call.
+    [[nodiscard]] Retry retry() { return ledger.decide_retry(1, digest, /*full_sync=*/true, *rt); }
+
     /// One full_sync application as apply_rules builds it for a single rule: a new identical
-    /// application (reapply_count rises), the teardown, the re-attach.
+    /// application, the teardown, the re-attach.
     /// Strict: this re-attach re-observes a retained Wedged claim (the key is NOT free), so it
     /// can only ever be Accepted; anything else is a regression the caller must see.
     RT::ArmReceipt reapply_attach() {
@@ -14235,8 +14260,9 @@ struct PostK4472Rig {
         return out.receipt;
     }
     /// The first application: the arm hangs inside the backend, passes its (synthetic)
-    /// deadline, and the claim is a retained Wedged head that the ledger records as the sole,
-    /// K-eligible failure.
+    /// deadline, and the claim is a retained Wedged head that the ledger records as the sole
+    /// outstanding-wedge failure. The generation is held (#5459: no waiver), and an identical
+    /// retry is Suppressed because that wedge is outstanding.
     void establish_wedge() {
         b->hang_next_arm.store(true);
         ledger.begin_application(1, digest, /*full_sync=*/true, 1);
@@ -14255,26 +14281,14 @@ struct PostK4472Rig {
         ledger.add_pending("r1", wedge_receipt);
         REQUIRE(ledger.drain_locked(*rt, 10) == 1);
         REQUIRE(ledger.failed_receipt_count_for_test() == 1);
-        REQUIRE_FALSE(ledger.can_advance()); // reapply_count 0
+        REQUIRE_FALSE(ledger.can_advance());
     }
-    /// Re-applies 1 and 2: each re-observes the same retained claim (nothing new is armed).
-    void reapply_twice_while_wedged() {
-        for (std::size_t i = 1; i <= 2; ++i) {
-            const auto rc = reapply_attach();
-            REQUIRE(ledger.reapply_count_for_test() == i);
-            ledger.add_pending("r1", rc);
-            REQUIRE(ledger.drain_locked(*rt, 10) == 1);
-            REQUIRE(ledger.failed_receipt_count_for_test() == 1);
-            REQUIRE_FALSE(ledger.can_advance());
-        }
-    }
-    /// Re-apply 3, up to and including the re-attach: reapply_count reaches the waiver
-    /// threshold; the late success lands after detach_all (rg->active is false, so it is not
-    /// adopted) and its compensating disarm parks inside the backend; the re-attach then
+    /// A further application (a forced Reapply: the safety valve, or changed content) up to and
+    /// including the re-attach: the late success lands after detach_all (rg->active is false, so
+    /// it is not adopted) and its compensating disarm parks inside the backend; the re-attach then
     /// re-observes the same claim.
-    RT::ArmReceipt third_reapply_with_compensation_outstanding() {
+    RT::ArmReceipt reapply_with_compensation_outstanding() {
         ledger.begin_application(1, digest, /*full_sync=*/true, 1);
-        REQUIRE(ledger.reapply_count_for_test() == kReapplyWaiverThreshold);
         rt->detach_all();
         b->hang_next_disarm.store(true);
         b->release_hang(); // the hung arm returns its subscription now
@@ -14295,9 +14309,9 @@ struct PostK4472Rig {
                 ++n;
         return n;
     }
-    /// The server's heartbeat reconcile re-sends the identical push iff the agent still
-    /// reports a generation behind its own (server.cpp), i.e. iff the ledger did not advance.
-    /// A further identical application: same teardown, same re-attach, now against a free key.
+    /// The server's reconcile re-sends the identical push iff the agent still reports a
+    /// generation behind its own (server.cpp), i.e. iff the ledger did not advance. A further
+    /// identical application: same teardown, same re-attach, now against a free key.
     /// The fresh arm may already be committed when attach_rule resumes (completion can precede
     /// its resumption), in which case the outcome is Armed and, exactly as in
     /// GuardianEngine::reconcile_rule_locked, there is no receipt to register with the ledger.
@@ -14309,18 +14323,16 @@ struct PostK4472Rig {
 };
 } // namespace
 
-TEST_CASE("#4472: a compensating disarm still outstanding at the drain must not K-waive the "
-          "generation, and the rule must end armed",
-          "[spark][runtime][liveness][4472]") {
+TEST_CASE("#4472: a compensating disarm still outstanding at the drain is retained, never "
+          "acknowledged, its retries are suppressed, and the rule ends armed once it pops",
+          "[spark][runtime][liveness][4472][5459]") {
     PostK4472Rig f;
     f.establish_wedge();
-    f.reapply_twice_while_wedged();
-    const auto rc = f.third_reapply_with_compensation_outstanding();
+    CHECK(f.retry() == PostK4472Rig::Retry::Suppress); // the plain hung wedge: held, retry suppressed
+    const auto rc = f.reapply_with_compensation_outstanding();
 
-    // Precondition that makes the next assertion meaningful: the receipt still reads Wedged, one
+    // Precondition that makes the next assertions meaningful: the receipt still reads Wedged, one
     // claim is still queued on the key, and its compensating disarm is parked inside the backend.
-    // (Whether receipt_wedge_k_eligible() is true here is the property under test, not a
-    // precondition: a fix may legitimately make it false while the compensation is outstanding.)
     REQUIRE(f.rt->receipt_status(rc) == PostK4472Rig::RT::ReceiptStatus::Wedged);
     REQUIRE(f.rt->claim_queue_depth_for_test(f.key) == 1);
     REQUIRE(f.b->disarm_entries.load() == 1);
@@ -14328,10 +14340,21 @@ TEST_CASE("#4472: a compensating disarm still outstanding at the drain must not 
     f.ledger.add_pending("r1", rc);
     REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
 
-    // (a) The heartbeat drain's acknowledgment decision. can_advance() true here means the engine
-    // persists policy_generation and the server stops re-sending.
-    const bool acknowledged = f.ledger.can_advance();
-    CHECK_FALSE(acknowledged);
+    // The classification: not a hung arm (nothing acknowledges it either way), a compensating
+    // wedge the ledger RETAINS so the held retry stays suppressed.
+    CHECK_FALSE(f.rt->receipt_wedge_k_eligible(rc));
+    CHECK(f.rt->receipt_recovery_status(rc) == PostK4472Rig::RT::RecoveryStatus::CompensationPending);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 1);
+
+    // (a) The acknowledgment decision: false. can_advance() true here would make the engine persist
+    // policy_generation, and the server would stop re-sending.
+    CHECK_FALSE(f.ledger.can_advance());
+    // (b) Held pushes while the teardown is outstanding cost nothing: Suppress, repeatedly.
+    CHECK(f.retry() == PostK4472Rig::Retry::Suppress);
+    CHECK(f.retry() == PostK4472Rig::Retry::Suppress);
+    CHECK_FALSE(f.ledger.can_advance()); // suppression never acknowledges
+    CHECK(f.b->disarm_entries.load() == 1); // and nothing was torn down or re-armed meanwhile
+    CHECK(f.b->arm_entries.load() == 1);
 
     // The compensating disarm completes; finalize_arm_compensation pops the claim.
     f.b->release_disarm_hang();
@@ -14339,31 +14362,36 @@ TEST_CASE("#4472: a compensating disarm still outstanding at the drain must not 
                                    std::chrono::seconds(10)));
     REQUIRE(f.b->disarm_entries.load() == 1);
 
-    // (b) With an acknowledged generation nothing re-sends the rule; with a held one the server's
-    // retry arrives. Either way the rule must end armed, on the backend, not only on a receipt.
-    if (!acknowledged) {
-        // The heal arrives through ONE fresh arm after the pop, not through a leaked second
-        // dispatch while the compensation was outstanding: the delta across the modelled
-        // retry is exactly 1, and the whole run entered the backend arm twice.
-        const int arm_base = f.b->arm_entries.load();
-        f.model_server_retry();
-        REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; },
-                                       std::chrono::seconds(10)));
-        CHECK(f.b->arm_entries.load() == arm_base + 1);
-        CHECK(f.b->arm_entries.load() == 2);
-    }
+    // The pop ends the outstanding wedge: the very next push is a Reapply, with NO drain in
+    // between (the live read, not the retained map, decides), and again after the drain.
+    CHECK(f.retry() == PostK4472Rig::Retry::Reapply);
+    CHECK_FALSE(f.ledger.can_advance());
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 0);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+    CHECK(f.retry() == PostK4472Rig::Retry::Reapply);
+    CHECK_FALSE(f.ledger.can_advance());
+
+    // The heal arrives through ONE fresh arm after the pop, not through a leaked second dispatch
+    // while the compensation was outstanding: the delta across the retry is exactly 1, and the
+    // whole run entered the backend arm twice. The rule ends armed, on the backend, not only on a
+    // receipt.
+    const int arm_base = f.b->arm_entries.load();
+    f.model_server_retry();
+    REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(f.b->arm_entries.load() == arm_base + 1);
+    CHECK(f.b->arm_entries.load() == 2);
     CHECK(f.rt->rule_count() == 1);
     CHECK(f.rt->armed_key_count() == 1);
     CHECK(f.live_subscriptions() == 1);
 }
 
-TEST_CASE("#4472 control: a compensating disarm that finished before the drain is not K-eligible, "
-          "the generation is held, and the retry arms the rule",
-          "[spark][runtime][liveness][4472]") {
+TEST_CASE("#4472 control: a compensating disarm that finished before the drain is no longer an "
+          "outstanding wedge, the generation is held, the retry is a Reapply and arms the rule",
+          "[spark][runtime][liveness][4472][5459]") {
     PostK4472Rig f;
     f.establish_wedge();
-    f.reapply_twice_while_wedged();
-    const auto rc = f.third_reapply_with_compensation_outstanding();
+    const auto rc = f.reapply_with_compensation_outstanding();
 
     // Same sequence, but the compensating disarm completes (and the claim is popped) before the
     // ledger drains.
@@ -14371,13 +14399,14 @@ TEST_CASE("#4472 control: a compensating disarm that finished before the drain i
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; },
                                    std::chrono::seconds(10)));
     CHECK_FALSE(f.rt->receipt_wedge_k_eligible(rc));
+    CHECK_FALSE(f.rt->receipt_status_wedge_aware(rc).compensation_pending);
 
     f.ledger.add_pending("r1", rc);
     REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
-    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
-    const bool acknowledged = f.ledger.can_advance();
-    CHECK_FALSE(acknowledged);
-    REQUIRE_FALSE(acknowledged); // the retry below is only owed (and only modelled) in this case
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0); // popped: not retained
+    CHECK_FALSE(f.ledger.can_advance());
+    // A counted failure with no retained outstanding wedge: the rule must be re-armed.
+    REQUIRE(f.retry() == PostK4472Rig::Retry::Reapply);
 
     f.model_server_retry();
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->rule_count() == 1; },
@@ -14390,9 +14419,11 @@ TEST_CASE("#4472 control: a compensating disarm that finished before the drain i
 // #4472 fix pins. The marker for "a compensating disarm is outstanding" is
 // KeyClaim::compensation_finished, written by on_arm_complete's CompensationOwedMark in the
 // FIRST registry_mu_ critical section (on every exit, including an exception unwinding past
-// staging). is_wedge_k_eligible_locked reads it, so a heartbeat drain can never see the
-// returned-and-being-disarmed claim as a K-eligible wedge. The cases below each park a worker
-// at a different point of that window; none sleeps.
+// staging). wedge_episode_locked reads it, so a heartbeat drain can never see the
+// returned-and-being-disarmed claim as a still-hung (Eligible) wedge: it reads
+// CompensationPending (#5459), which the ledger retains for retry suppression but never
+// acknowledges. The cases below each park a worker at a different point of that window; none
+// sleeps.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -14405,10 +14436,11 @@ void withdraw_and_return_late_arm(PostK4472Rig& f) {
 } // namespace
 
 TEST_CASE("#4472: a drain parked in the staging-to-continuation gap already sees the compensation "
-          "as owed and the wedge as not K-eligible",
+          "as owed (CompensationPending) and the wedge as not a hung arm",
           "[spark][runtime][liveness][4472]") {
     // Mutation (marking moved back to a second registry_mu_ acquisition after the gap hook):
-    // the worker parks here with the flag still true and receipt_wedge_k_eligible reads TRUE.
+    // the worker parks here with the flag still true and receipt_wedge_k_eligible reads TRUE
+    // (and compensation_pending reads false).
     PostK4472Rig f;
     auto park = std::make_shared<DrainPark>();
     struct Cleanup {
@@ -14417,9 +14449,10 @@ TEST_CASE("#4472: a drain parked in the staging-to-continuation gap already sees
     } cleanup{park.get()};
     f.rt->set_drain_gap_hook_for_test([park] { park->wait(); });
     f.establish_wedge();
-    // Precondition: a genuinely hung arm IS K-eligible, so the assertion below is the fix and
-    // not a K that is disabled altogether.
+    // Precondition: a genuinely hung arm IS an eligible (hung) wedge and not compensation-pending,
+    // so the assertions below are the fix and not a classification that is disabled altogether.
     REQUIRE(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
+    REQUIRE_FALSE(f.rt->receipt_status_wedge_aware(f.wedge_receipt).compensation_pending);
 
     withdraw_and_return_late_arm(f);
     REQUIRE(yuzu::test::spin_until([&] { return park->entered.load(); }, std::chrono::seconds(10)));
@@ -14428,11 +14461,13 @@ TEST_CASE("#4472: a drain parked in the staging-to-continuation gap already sees
     REQUIRE(f.b->disarm_entries.load() == 0);
 
     CHECK_FALSE(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
+    // #5459: outstanding (still the Dispatched FIFO front), but a compensating teardown, not a hung arm.
     CHECK(f.rt->receipt_recovery_status(f.wedge_receipt) ==
-          PostK4472Rig::RT::RecoveryStatus::Blocking);
+          PostK4472Rig::RT::RecoveryStatus::CompensationPending);
     CHECK(f.rt->receipt_status_wedge_aware(f.wedge_receipt).status ==
           PostK4472Rig::RT::ReceiptStatus::Wedged);
     CHECK_FALSE(f.rt->receipt_status_wedge_aware(f.wedge_receipt).wedge_eligible);
+    CHECK(f.rt->receipt_status_wedge_aware(f.wedge_receipt).compensation_pending);
     CHECK(f.rt->oldest_outstanding_compensation_age(clk::now()).has_value());
 
     park->release();
@@ -14447,7 +14482,7 @@ TEST_CASE("#4472: an exception unwinding past staging still leaves the compensat
           "owed (the marker is a scope guard, declared before the first fallible step)",
           "[spark][runtime][liveness][4472]") {
     // Mutation (guard declared below fault point 1): the throw unwinds before any guard
-    // exists, the flag stays true, and the parked worker reads K-eligible.
+    // exists, the flag stays true, and the parked worker reads as a hung (eligible) wedge.
     PostK4472Rig f;
     auto park = std::make_shared<DrainPark>();
     struct Cleanup {
@@ -14465,6 +14500,7 @@ TEST_CASE("#4472: an exception unwinding past staging still leaves the compensat
     REQUIRE(f.b->disarm_entries.load() == 0);
 
     CHECK_FALSE(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
+    CHECK(f.rt->receipt_status_wedge_aware(f.wedge_receipt).compensation_pending);
     const auto age = f.rt->oldest_outstanding_compensation_age(clk::now() + std::chrono::seconds(5));
     REQUIRE(age.has_value());
     CHECK(*age >= std::chrono::seconds(4)); // the deadline was set by the guard, not left unset
@@ -14477,12 +14513,15 @@ TEST_CASE("#4472: an exception unwinding past staging still leaves the compensat
     f.rt->set_drain_gap_hook_for_test({});
 }
 
-TEST_CASE("#4472: a wedge retained in failed_receipts on an earlier drain goes Blocking once its "
-          "compensation starts, with no new application",
-          "[spark][runtime][liveness][4472]") {
-    // The recovery-scan path (receipt_recovery_status) shares the predicate; the supplied repro
-    // only exercises the fresh-pending path. Mutation (predicate clause dropped): the entry
-    // stays WedgeEligible and failed_receipts keeps it.
+TEST_CASE("#4472: a wedge retained in failed_receipts on an earlier drain becomes CompensationPending "
+          "once its compensation starts, stays retained and suppressed, and settles on the pop",
+          "[spark][runtime][liveness][4472][5459]") {
+    // The recovery-scan path (receipt_recovery_status) shares the classification; the supplied
+    // repro only exercises the fresh-pending path. #5459: the entry used to go Blocking here and
+    // be ERASED from failed_receipts (the ledger lost its only handle on the compensating claim,
+    // so every held push paid a full teardown). Mutation (CompensationPending folded back into
+    // Blocking in the recovery loop): the retained count reads 0 below and the held push is a
+    // Reapply instead of a Suppress.
     PostK4472Rig f;
     f.establish_wedge();
     REQUIRE(f.ledger.failed_receipt_count_for_test() == 1);
@@ -14497,23 +14536,34 @@ TEST_CASE("#4472: a wedge retained in failed_receipts on an earlier drain goes B
     // Drain N+1 WITHOUT begin_application.
     REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 0);
     CHECK(f.rt->receipt_recovery_status(f.wedge_receipt) ==
-          PostK4472Rig::RT::RecoveryStatus::Blocking);
-    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
-    CHECK_FALSE(f.ledger.can_advance());
+          PostK4472Rig::RT::RecoveryStatus::CompensationPending);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 1); // still retained
+    CHECK_FALSE(f.ledger.can_advance());                  // and never acknowledged
+    CHECK(f.retry() == PostK4472Rig::Retry::Suppress);
 
     f.b->release_disarm_hang();
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; },
                                    std::chrono::seconds(10)));
+    // The pop settles the entry to Blocking: the push is a Reapply immediately (live read), and the
+    // next drain drops the entry while resolved_failed stays counted, so the generation stays held.
+    CHECK(f.rt->receipt_recovery_status(f.wedge_receipt) ==
+          PostK4472Rig::RT::RecoveryStatus::Blocking);
+    CHECK(f.retry() == PostK4472Rig::Retry::Reapply);
+    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 0);
+    CHECK(f.ledger.failed_receipt_count_for_test() == 0);
+    CHECK_FALSE(f.ledger.can_advance());
+    CHECK(f.retry() == PostK4472Rig::Retry::Reapply);
 }
 
-TEST_CASE("#4472: a genuinely hung arm stays K-eligible while its compensation permit is "
-          "engaged (the permit is not the marker)",
+TEST_CASE("#4472: a genuinely hung arm stays an eligible (hung) wedge, not CompensationPending, "
+          "while its compensation permit is engaged (the permit is not the marker)",
           "[spark][runtime][liveness][4472]") {
     // Mutation (predicate reads the permit): the permit is engaged for every in-flight arm, so
-    // K would be disabled for plain Wedged arms too.
+    // every plain hung arm would read CompensationPending (and not eligible).
     PostK4472Rig f;
     f.establish_wedge();
     CHECK(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
+    CHECK_FALSE(f.rt->receipt_status_wedge_aware(f.wedge_receipt).compensation_pending);
     CHECK(f.rt->receipt_recovery_status(f.wedge_receipt) ==
           PostK4472Rig::RT::RecoveryStatus::WedgeEligible);
     CHECK_FALSE(f.rt->oldest_outstanding_compensation_age(clk::now()).has_value());
@@ -14589,6 +14639,7 @@ TEST_CASE("#4472: the direct disarm fallback inside a compensation is covered by
     REQUIRE(f.b->wait_entered_disarm_hang(10s)); // inside direct_disarm_fallback
 
     CHECK_FALSE(f.rt->receipt_wedge_k_eligible(f.wedge_receipt));
+    CHECK(f.rt->receipt_status_wedge_aware(f.wedge_receipt).compensation_pending);
     const auto age = f.rt->oldest_outstanding_compensation_age(clk::now() + 50s);
     REQUIRE(age.has_value());
     CHECK(*age >= 49s);
@@ -14601,8 +14652,7 @@ TEST_CASE("#4472: the direct disarm fallback inside a compensation is covered by
 
 // ---------------------------------------------------------------------------
 // #4472 governance hardening round: tests added after review (latch ordering, begin_stop with
-// a compensation outstanding, the stress case, the reapply_count characterization, the tripwire,
-// the owed-instant identity). Same rigs, same conventions: a synthetic `now` ages claims, nothing
+// a compensation outstanding, the stress case, the tripwire, the owed-instant identity). Same rigs, same conventions: a synthetic `now` ages claims, nothing
 // sleeps to age one, every wait is event-polled.
 // ---------------------------------------------------------------------------
 
@@ -14847,50 +14897,10 @@ TEST_CASE("#4472 stress: accessors, the zero-arg expiry and aged expiry passes r
     CHECK(rt->invariant_violations_for_test(/*allow_orphans=*/true).empty());
 }
 
-TEST_CASE("#4472 characterization (ACCEPTED COST): reapply_count saturated by a compensation "
-          "hold is inherited, so a fresh hung arm after the hold is K-waived at its FIRST drain",
-          "[spark][runtime][liveness][4472][characterization]") {
-    // This pins an accepted cost of the #4472 fix, it does not endorse it as desirable:
-    // begin_application inherits (and saturates) reapply_count for identical content, so the
-    // >=3 held re-applies of a compensation hold spend the K retry budget; a LATER fresh hung
-    // arm on the same content then reaches K with zero retries. Changing the ledger is out of
-    // scope (the ack waiver path is catastrophic-class; the cheapest future fix, not
-    // incrementing reapply_count while the previous application was held by an outstanding
-    // compensation, is to be taken together with #5459). If this test goes red because that
-    // fix landed, update it, do not delete it.
-    using namespace std::chrono_literals;
-    PostK4472Rig f;
-    f.establish_wedge();
-    f.reapply_twice_while_wedged();
-    const auto held = f.third_reapply_with_compensation_outstanding();
-    f.ledger.add_pending("r1", held);
-    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
-    REQUIRE_FALSE(f.ledger.can_advance()); // the hold: the generation is not acknowledged
-    REQUIRE(f.ledger.reapply_count_for_test() == kReapplyWaiverThreshold);
-
-    f.b->release_disarm_hang(); // the compensation finishes and pops the claim
-    REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
-
-    // The next identical application inherits the saturated count (it does not restart at 0).
-    f.ledger.begin_application(1, f.digest, /*full_sync=*/true, 1);
-    CHECK(f.ledger.reapply_count_for_test() == kReapplyWaiverThreshold);
-    f.rt->detach_all();
-    f.b->reset_hang();
-    f.b->hang_next_arm.store(true);
-    const auto fresh = f.attach_r1();
-    REQUIRE(f.b->wait_entered_hang(10s));
-    REQUIRE(f.rt->expire_overdue_claims_at_for_test(clk::now() + 121s) == 1);
-    REQUIRE(f.rt->receipt_status(fresh) == PostK4472Rig::RT::ReceiptStatus::Wedged);
-    f.ledger.add_pending("r1", fresh);
-    REQUIRE(f.ledger.drain_locked(*f.rt, 10) == 1);
-    CHECK(f.rt->receipt_wedge_k_eligible(fresh)); // a genuinely hung arm: K-eligible
-    CHECK(f.ledger.can_advance());                // ... and waived at its FIRST drain, no retries
-}
-
 TEST_CASE("#4472 tripwire: compensation_finished is written with the pop, never alone (normal "
           "finalize, finalize's publish throwing, and the direct-disarm fallback)",
           "[spark][runtime][liveness][4472][tripwire]") {
-    // The invariant (see is_wedge_k_eligible_locked's comment): a claim that owed a
+    // The invariant (see wedge_episode_locked's comment): a claim that owed a
     // compensation and now reads compensation_finished is not still a Dispatched/Dispatching
     // head. invariant_violations_for_test carries the clause; this drives each path that writes
     // finished=true with a pop and checks it holds throughout. The dispatch -> Queued
@@ -14968,4 +14978,636 @@ TEST_CASE("#4472: the compensation owed instant is compensation_deadline minus "
 
     f.b->release_disarm_hang();
     REQUIRE(yuzu::test::spin_until([&] { return f.rt->claim_queue_depth_for_test(f.key) == 0; }, 10s));
+}
+
+// ── #4045: staged baseline captures ─────────────────────────────────────────────────────────
+// The runtime never touches a KvStore (file header); it STAGES the baseline-on-arm capture
+// edge and the engine-owned persister drains it by snapshot + erase-by-identity (a staged
+// entry leaves staging only after its KV write). These pin the staging rules in isolation.
+
+namespace {
+using CapturedBaseline = GuardianSparkRuntime::CapturedBaseline;
+
+bool same_capture(const CapturedBaseline& c, const std::string& rule, const std::string& path,
+                  const std::string& hash) {
+    return c.rule_id == rule && c.path == path && c.hash == hash;
+}
+} // namespace
+
+TEST_CASE("#4045 R1: a no-expected file-hash rule stages its first capture exactly once",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // file hash "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+
+    rt->evaluate_key(key, EvalReason::Initial);
+    const auto got = rt->snapshot_staged_baselines();
+    REQUIRE(got.size() == 1);
+    CHECK(same_capture(got[0], "r1", "/a", "h"));
+
+    // A snapshot is a COPY: the capture stays staged (visible to attach_core) until erased,
+    // and a committed baseline is not a new edge, so a re-evaluation never stages it again.
+    rt->evaluate_key(key, EvalReason::Event);
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    rt->erase_staged_baselines_if_unchanged(got);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    rt->evaluate_key(key, EvalReason::Convergence);
+    CHECK(rt->snapshot_staged_baselines().empty());
+}
+
+TEST_CASE("#4045 R2: an authored expected_hash stages nothing", "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1", "h"), true));
+
+    rt->evaluate_key(key, EvalReason::Initial);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    CHECK(rt->snapshot_staged_baselines().empty());
+}
+
+TEST_CASE("#4045 R3: a capture whose enqueue is rejected is not staged until it commits",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 2; // the floor: two drifting rules fill it
+    auto rt = make_rt(r, b, cfg);
+    rt->attach_rule("d1", file_spec("/d1"), file_exists_rule("d1", /*present=*/false), true);
+    rt->attach_rule("d2", file_spec("/d2"), file_exists_rule("d2", /*present=*/false), true);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/d1")), EvalReason::Initial); // slot 1 (drift)
+    rt->evaluate_key(spark_key(file_spec("/d2")), EvalReason::Initial); // slot 2 (full)
+    REQUIRE(rt->outbox_size() == 2);
+
+    // r1's compliant edge is rejected at the cap: scratch stays uncommitted, so the capture
+    // must NOT be staged (the persisted hash is always one the live state committed).
+    const auto key = spark_key(file_spec("/a"));
+    rt->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(rt->outbox_backpressure_drops() == 1);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    CHECK(rt->snapshot_staged_baselines().empty());
+
+    drain_all(*rt); // frees the slots; the retry commits and stages exactly one
+    rt->evaluate_key(key, EvalReason::Convergence);
+    const auto got = rt->snapshot_staged_baselines();
+    REQUIRE(got.size() == 1);
+    CHECK(same_capture(got[0], "r1", "/a", "h"));
+}
+
+TEST_CASE("#4045 R4: a retarget (new path, same rule_id) replaces the staged entry and counts "
+          "the lost capture",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial); // captures "h", staged
+    CHECK(rt->staged_baseline_drops() == 0);
+
+    // A DIFFERENT path for the same rule_id obsoletes the old target's capture. The old one
+    // was never persisted (it is still staged), so it is LOST and the loss is counted (an
+    // A -> B -> A re-authoring would otherwise re-baseline A from drifted content in silence).
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h3"});
+    REQUIRE(rt->attach_rule("r1", file_spec("/b"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/b")), EvalReason::Initial);
+    const auto got = rt->snapshot_staged_baselines();
+    REQUIRE(got.size() == 1);
+    CHECK(same_capture(got[0], "r1", "/b", "h3"));
+    CHECK(rt->staged_baseline_drops() == 1);
+
+    // ...and back to A while B is still unpersisted: B's capture is lost the same way.
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h4"});
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    CHECK(rt->staged_baseline_drops() == 2);
+}
+
+TEST_CASE("#4045 R4b: re-attach on the same path keeps the FIRST capture (first-capture-wins)",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+
+    const auto got = rt->snapshot_staged_baselines();
+    REQUIRE(got.size() == 1);
+    CHECK(same_capture(got[0], "r1", "/a", "h")); // NOT "h2"
+    CHECK(rt->staged_baseline_drops() == 0);       // same path: not a loss
+}
+
+TEST_CASE("#4045 R5: staging has NO cap: 300 captures all stay staged, none dropped",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 4096; // every compliant edge must enqueue
+    auto rt = make_rt(r, b, cfg);
+    constexpr std::size_t kN = 300; // more than a fixed staging cap of 256 would hold
+    for (std::size_t i = 0; i < kN; ++i) {
+        const std::string id = "r" + std::to_string(i);
+        const std::string path = "/p" + std::to_string(i);
+        REQUIRE(rt->attach_rule(id, file_spec(path), file_hash_rule(id), true));
+        rt->evaluate_key(spark_key(file_spec(path)), EvalReason::Initial);
+    }
+    CHECK(rt->staged_baseline_count_for_test() == kN);
+    CHECK(rt->staged_baseline_drops() == 0);
+
+    const auto got = rt->snapshot_staged_baselines();
+    REQUIRE(got.size() == kN);
+    rt->erase_staged_baselines_if_unchanged(got);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+}
+
+TEST_CASE("#4045 R6: erase-by-identity leaves a newer capture alone, ignores an absent one and "
+          "fires no waker",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "new1"});
+    REQUIRE(rt->attach_rule("s1", file_spec("/a"), file_hash_rule("s1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial); // s1 /a new1
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "new2"});
+    REQUIRE(rt->attach_rule("s2", file_spec("/b"), file_hash_rule("s2"), true));
+    rt->evaluate_key(spark_key(file_spec("/b")), EvalReason::Initial); // s2 /b new2
+    REQUIRE(rt->staged_baseline_count_for_test() == 2);
+
+    // Wakers are installed only AFTER the last attach_rule has returned: a commit copies the
+    // wakers under registry_mu_ at commit time, so an earlier arm can never fire these. The
+    // counter is shared state, so a late call could not touch a dead stack slot either.
+    auto wakes = std::make_shared<std::atomic<int>>(0);
+    rt->set_pending_initial_waker([wakes] { wakes->fetch_add(1); });
+    rt->set_outbox_enqueue_waker([wakes] { wakes->fetch_add(1); });
+
+    // What a persister that snapshotted earlier believes it persisted: s1 as snapshotted, s2
+    // under its OLD target, s3 (never staged).
+    const std::vector<CapturedBaseline> done{{"s1", "/a", "new1"}, {"s2", "/old", "new2"},
+                                             {"s3", "/c", "x"}};
+    rt->erase_staged_baselines_if_unchanged(done);
+    CHECK(wakes->load() == 0); // a failing or recovering KV must never spin the drain worker
+    const auto left = rt->snapshot_staged_baselines();
+    REQUIRE(left.size() == 1); // s1 erased; s2 stays (its capture is for a different path)
+    CHECK(same_capture(left[0], "s2", "/b", "new2"));
+    // A hash that no longer matches is also left alone.
+    const std::vector<CapturedBaseline> stale{{"s2", "/b", "other"}};
+    rt->erase_staged_baselines_if_unchanged(stale);
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    rt->set_pending_initial_waker({});
+    rt->set_outbox_enqueue_waker({});
+}
+
+TEST_CASE("#4045 R7: snapshot still reads staging after begin_stop()",
+          "[spark][runtime][baseline]") {
+    // The engine's stop() flush runs AFTER begin_stop(); a stopping_ early-return in the
+    // snapshot would silently empty it.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    REQUIRE(rt->staged_baseline_count_for_test() == 1);
+
+    rt->begin_stop();
+    const auto got = rt->snapshot_staged_baselines();
+    REQUIRE(got.size() == 1);
+    CHECK(same_capture(got[0], "r1", "/a", "h"));
+    rt->erase_staged_baselines_if_unchanged(got); // and the erase is not stopping_-gated either
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+}
+
+TEST_CASE("#4045 R8: a throwing snapshot leaves staging exactly as it was",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    for (int i = 0; i < 3; ++i) {
+        const std::string id = "r" + std::to_string(i);
+        const std::string path = "/p" + std::to_string(i);
+        REQUIRE(rt->attach_rule(id, file_spec(path), file_hash_rule(id), true));
+        rt->evaluate_key(spark_key(file_spec(path)), EvalReason::Initial);
+    }
+    REQUIRE(rt->staged_baseline_count_for_test() == 3);
+
+    rt->fail_next_snapshot_for_test();
+    CHECK_THROWS_AS(rt->snapshot_staged_baselines(), std::bad_alloc);
+    CHECK(rt->staged_baseline_count_for_test() == 3); // nothing was moved out, nothing lost
+    CHECK(rt->staged_baseline_drops() == 0);
+    CHECK(rt->snapshot_staged_baselines().size() == 3); // the seam fires once
+}
+
+TEST_CASE("#4045 R9: an allocation failure while staging is a COUNTED drop, the baseline STAYS "
+          "committed (drift is still detected against it) and the next evaluation re-stages the "
+          "ORIGINAL hash",
+          "[spark][runtime][baseline]") {
+    // Staging is fallible, and a capture that could not be staged must neither be forgotten nor
+    // be allowed to launder later drift. Clearing the baseline on a failed stage (the first
+    // attempt at this) made the NEXT evaluation, often the very change event, capture the
+    // drifted content as the baseline. The baseline therefore stays committed in the live
+    // state, the generation records that it is not staged yet, and every later evaluation
+    // retries staging the committed hash.
+    auto r = std::make_shared<FakeReader>(); // file hash "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->fail_next_stage_baseline_for_test();
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    CHECK(rt->staged_baseline_count_for_test() == 0); // staging failed...
+    CHECK(rt->staged_baseline_drops() == 1);          // ...and it is counted, never silent
+    // The rule's own verdict was committed (the compliant edge is on the outbox).
+    int compliant_edges = 0;
+    for (const auto& e : drain_all(*rt))
+        if (e.domain == OutboxDomain::Compliance && e.drift.compliant)
+            ++compliant_edges;
+    CHECK(compliant_edges == 1);
+
+    // The file changes BEFORE anything is staged. The baseline is still "h", so this is DRIFT
+    // against the original capture (RED if the failed stage cleared the baseline: the change is
+    // then re-captured as the baseline and no drift is reported).
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Event);
+    bool drift_vs_original = false;
+    int further_compliant = 0;
+    for (const auto& e : drain_all(*rt)) {
+        if (e.domain != OutboxDomain::Compliance)
+            continue;
+        if (e.drift.compliant)
+            ++further_compliant;
+        else
+            drift_vs_original = drift_vs_original ||
+                                (e.drift.expected_value == "h" && e.drift.detected_value == "h2");
+    }
+    CHECK(drift_vs_original);
+    CHECK(further_compliant == 0); // the retry never re-emits a compliant edge
+
+    // That same evaluation retried staging, and staged the ORIGINAL hash, not the drifted one.
+    {
+        const auto again = rt->snapshot_staged_baselines();
+        REQUIRE(again.size() == 1);
+        CHECK(same_capture(again[0], "r1", "/a", "h"));
+    }
+    CHECK(rt->staged_baseline_drops() == 1); // the retry staged cleanly: no second drop
+
+    // Once staged the retry is finished: a later evaluation stages nothing more.
+    rt->erase_staged_baselines_if_unchanged(rt->snapshot_staged_baselines());
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Convergence);
+    CHECK(rt->snapshot_staged_baselines().empty());
+
+    // stage_baseline_for_test goes through the same rule (first capture wins on one path).
+    rt->stage_baseline_for_test("r2", "/x", "h1");
+    rt->stage_baseline_for_test("r2", "/x", "h2");
+    const auto got = rt->snapshot_staged_baselines();
+    REQUIRE(got.size() == 1);
+    CHECK(same_capture(got[0], "r2", "/x", "h1"));
+}
+
+TEST_CASE("#4045 R9b: a rule whose staging keeps failing stays drift-detecting, every failed "
+          "retry is counted and re-emits nothing, and the first successful retry stages the "
+          "original hash",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    const auto key = spark_key(file_spec("/a"));
+    rt->fail_next_stage_baseline_for_test(4); // the capture and the next THREE retries all fail
+    rt->evaluate_key(key, EvalReason::Initial);
+    CHECK(rt->staged_baseline_drops() == 1);
+    int first_compliance = 0;
+    for (const auto& e : drain_all(*rt))
+        if (e.domain == OutboxDomain::Compliance)
+            ++first_compliance;
+    CHECK(first_compliance == 1); // the compliant edge
+
+    // Retry 1, file unchanged: fails again, and emits NOTHING (the verdict and emit state
+    // committed with the capture; RED if a failed stage left the scratch uncommitted, which
+    // would re-emit the compliant edge on every retry).
+    rt->evaluate_key(key, EvalReason::Event);
+    CHECK(rt->staged_baseline_drops() == 2);
+    int repeat_compliance = 0;
+    for (const auto& e : drain_all(*rt))
+        if (e.domain == OutboxDomain::Compliance)
+            ++repeat_compliance;
+    CHECK(repeat_compliance == 0);
+
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+    rt->evaluate_key(key, EvalReason::Event); // retry 2 fails
+    CHECK(rt->staged_baseline_drops() == 3);
+    int drift_edges = 0;
+    for (const auto& e : drain_all(*rt))
+        if (e.domain == OutboxDomain::Compliance && !e.drift.compliant)
+            ++drift_edges;
+    CHECK(drift_edges == 1); // drift against "h", reported while nothing is staged
+
+    r->file = read_known(FileSnapshot{.exists = true, .size = 5, .hash = "h3"});
+    rt->evaluate_key(key, EvalReason::Event); // retry 3 fails
+    CHECK(rt->staged_baseline_drops() == 4);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    bool still_vs_original = false;
+    for (const auto& e : drain_all(*rt))
+        still_vs_original = still_vs_original ||
+                            (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                             e.drift.expected_value == "h" && e.drift.detected_value == "h3");
+    CHECK(still_vs_original);
+
+    rt->evaluate_key(key, EvalReason::Convergence); // retry 4 succeeds
+    const auto got = rt->snapshot_staged_baselines();
+    REQUIRE(got.size() == 1);
+    CHECK(same_capture(got[0], "r1", "/a", "h")); // the ORIGINAL, whatever the file holds now
+    CHECK(rt->staged_baseline_drops() == 4);
+}
+
+TEST_CASE("#4045 R9c: a same-id re-attach while the capture is unstaged inherits the original "
+          "hash (staging it first); only a second staging failure falls back to a counted "
+          "re-capture",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    const auto key = spark_key(file_spec("/a"));
+    rt->fail_next_stage_baseline_for_test();
+    rt->evaluate_key(key, EvalReason::Initial); // captured "h", NOT staged
+    REQUIRE(rt->staged_baseline_count_for_test() == 0);
+    (void)drain_all(*rt);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+
+    // An identical re-push (every policy push re-attaches) must not re-baseline "h2".
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    {
+        const auto got = rt->snapshot_staged_baselines();
+        REQUIRE(got.size() == 1);
+        CHECK(same_capture(got[0], "r1", "/a", "h")); // staged at attach, from the old generation
+    }
+    rt->evaluate_key(key, EvalReason::Initial);
+    bool drift_vs_original = false;
+    for (const auto& e : drain_all(*rt))
+        drift_vs_original = drift_vs_original ||
+                            (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                             e.drift.expected_value == "h" && e.drift.detected_value == "h2");
+    CHECK(drift_vs_original);
+    CHECK(rt->staged_baseline_drops() == 1);
+
+    // Residual, counted: the retry at the re-attach AND the withdrawal's own retry fail too, so
+    // the new generation has nothing to inherit and captures afresh (the same bad_alloc window
+    // as the very first capture; the drop counter reads 3 for the three failed attempts).
+    auto r2 = std::make_shared<FakeReader>();
+    auto b2 = std::make_shared<FakeBackend>();
+    auto rt2 = make_rt(r2, b2);
+    REQUIRE(rt2->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt2->fail_next_stage_baseline_for_test(3);
+    rt2->evaluate_key(key, EvalReason::Initial);
+    REQUIRE(rt2->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    CHECK(rt2->staged_baseline_drops() == 3);
+    CHECK(rt2->staged_baseline_count_for_test() == 0);
+}
+
+TEST_CASE("#4045 R9c2: a delta re-push whose attach-time staging retry fails but whose "
+          "withdrawal retry succeeds still inherits the ORIGINAL hash",
+          "[spark][runtime][baseline]") {
+    // attach_core reads staging for the inherited hash BEFORE it detaches the prior generation,
+    // and the withdrawal's own staging retry runs inside that detach: the read has to be
+    // repeated afterwards, or the replacement captures afresh although the original is staged.
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    const auto key = spark_key(file_spec("/a"));
+    // Failure 1: the capture is not staged. Failure 2: the attach-time retry. The withdrawal's
+    // retry (inside detach_rule_locked) then succeeds.
+    rt->fail_next_stage_baseline_for_test(2);
+    rt->evaluate_key(key, EvalReason::Initial); // captured "h", NOT staged
+    REQUIRE(rt->staged_baseline_count_for_test() == 0);
+    (void)drain_all(*rt);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    CHECK(rt->staged_baseline_drops() == 2);
+    {
+        const auto got = rt->snapshot_staged_baselines();
+        REQUIRE(got.size() == 1);
+        CHECK(same_capture(got[0], "r1", "/a", "h")); // staged by the withdrawal
+    }
+    rt->evaluate_key(key, EvalReason::Initial);
+    bool drift_vs_original = false;
+    bool compliant_on_drifted_file = false;
+    for (const auto& e : drain_all(*rt)) {
+        if (e.domain != OutboxDomain::Compliance)
+            continue;
+        drift_vs_original = drift_vs_original || (!e.drift.compliant && e.drift.expected_value == "h" &&
+                                                  e.drift.detected_value == "h2");
+        compliant_on_drifted_file = compliant_on_drifted_file || e.drift.compliant;
+    }
+    // RED: the replacement captured "h2" afresh and reported compliant on the drifted file.
+    CHECK(drift_vs_original);
+    CHECK_FALSE(compliant_on_drifted_file);
+    CHECK(rt->staged_baseline_drops() == 2); // the replacement staged nothing further
+}
+
+TEST_CASE("#4045 R9c3: if reading the staged hash back after the withdrawal throws, the rule "
+          "keeps its live arm, the failure is counted, and only the inheritance is lost",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    const auto key = spark_key(file_spec("/a"));
+    rt->fail_next_stage_baseline_for_test(2); // not staged; the attach-time retry fails too
+    rt->evaluate_key(key, EvalReason::Initial);
+    (void)drain_all(*rt);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+    rt->fail_next_inherit_copy_for_test(); // the copy of the hash staged by the withdrawal
+    // The prior generation is already detached when the copy fails: attach must still succeed.
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    CHECK(rt->staged_baseline_drops() == 3); // two failed stagings + the failed read-back
+    CHECK(rt->staged_baseline_count_for_test() == 1); // the original is still staged for the persister
+    rt->evaluate_key(key, EvalReason::Initial); // the replacement captured afresh (the residual)
+    CHECK(rt->rule_count() == 1); // the rule is armed and evaluating
+}
+
+TEST_CASE("#4045 R9d: a withdrawal (detach_all, as a full_sync does, or detach_rule) while the "
+          "capture is unstaged stages the committed hash first, so the re-attached rule still "
+          "inherits the ORIGINAL baseline",
+          "[spark][runtime][baseline]") {
+    // A full_sync push tears every generation down BEFORE it re-arms (nothing is left for
+    // attach_core to retry from), and a delta push that drops a rule withdraws it the same way.
+    for (const bool all : {true, false}) {
+        auto r = std::make_shared<FakeReader>(); // "h"
+        auto b = std::make_shared<FakeBackend>();
+        auto rt = make_rt(r, b);
+        REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+        const auto key = spark_key(file_spec("/a"));
+        rt->fail_next_stage_baseline_for_test();
+        rt->evaluate_key(key, EvalReason::Initial); // captured "h", NOT staged
+        REQUIRE(rt->staged_baseline_count_for_test() == 0);
+        (void)drain_all(*rt);
+        r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+
+        if (all)
+            rt->detach_all();
+        else
+            rt->detach_rule("r1");
+        {
+            const auto got = rt->snapshot_staged_baselines();
+            REQUIRE(got.size() == 1);
+            CHECK(same_capture(got[0], "r1", "/a", "h")); // staged by the withdrawal
+        }
+        REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+        rt->evaluate_key(key, EvalReason::Initial);
+        bool drift_vs_original = false;
+        for (const auto& e : drain_all(*rt))
+            drift_vs_original = drift_vs_original ||
+                                (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                                 e.drift.expected_value == "h" && e.drift.detected_value == "h2");
+        CHECK(drift_vs_original);
+        CHECK(rt->staged_baseline_drops() == 1);
+    }
+}
+
+TEST_CASE("#4045 R10: a failing inherit copy in attach_core leaves the PRIOR generation armed and "
+          "the staged capture intact (the copy happens before the detach)",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial); // captures "h", staged
+    REQUIRE(rt->staged_baseline_count_for_test() == 1);
+    (void)drain_all(*rt);
+
+    // The same-id replace inherits the staged "h"; its copy fails. Nothing was detached yet, so
+    // the throw is a plain early return and the rule is still armed on its OLD generation.
+    rt->fail_next_inherit_copy_for_test();
+    CHECK_THROWS_AS(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true),
+                    std::bad_alloc);
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    CHECK(rt->staged_baseline_drops() == 0);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Event);
+    bool drift_vs_h = false;
+    for (const auto& e : drain_all(*rt))
+        drift_vs_h = drift_vs_h || (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                                    e.drift.expected_value == "h" && e.drift.detected_value == "h2");
+    CHECK(drift_vs_h); // RED if the detach had already run: no live arm would have evaluated
+
+    // The seam fires once: a retry attaches and still inherits the staged capture.
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    bool drift_again = false;
+    for (const auto& e : drain_all(*rt))
+        drift_again = drift_again || (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                                      e.drift.expected_value == "h" && e.drift.detected_value == "h2");
+    CHECK(drift_again);
+}
+
+
+// ── #4045: re-push inheritance guards and the stop-time sweep contract ─────────────────────
+TEST_CASE("#4045 R11: an explicit expected_hash re-push is NOT overridden by a staged leftover",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>(); // "h"
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    const auto key = spark_key(file_spec("/a"));
+    rt->evaluate_key(key, EvalReason::Initial); // captured "h" and staged
+    REQUIRE(rt->staged_baseline_count_for_test() == 1);
+    (void)drain_all(*rt);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1", "explicit"), true));
+    rt->evaluate_key(key, EvalReason::Initial);
+    bool drift_vs_explicit = false;
+    for (const auto& e : drain_all(*rt))
+        drift_vs_explicit = drift_vs_explicit ||
+                            (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                             e.drift.expected_value == "explicit");
+    CHECK(drift_vs_explicit);
+}
+TEST_CASE("#4045 R11b: same, with the staging retry failing at attach (re-read path)",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    const auto key = spark_key(file_spec("/a"));
+    rt->fail_next_stage_baseline_for_test(2);
+    rt->evaluate_key(key, EvalReason::Initial); // not staged
+    (void)drain_all(*rt);
+    r->file = read_known(FileSnapshot{.exists = true, .size = 4, .hash = "h2"});
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1", "explicit"), true));
+    rt->evaluate_key(key, EvalReason::Initial);
+    bool drift_vs_explicit = false;
+    for (const auto& e : drain_all(*rt))
+        drift_vs_explicit = drift_vs_explicit ||
+                            (e.domain == OutboxDomain::Compliance && !e.drift.compliant &&
+                             e.drift.expected_value == "explicit");
+    CHECK(drift_vs_explicit);
+}
+TEST_CASE("#4045 R12: a kind-switching re-push with a staged leftover counts no spurious drop",
+          "[spark][runtime][baseline]") {
+    // baseline_on_arm_file is three clauses (hash kind, empty authored hash, file params). The
+    // kind and params clauses mask each other for any realistic rule: dropping either ONE alone
+    // stays green here (the other still excludes the rule), so this case goes RED only when
+    // both are dropped; the authored-hash clause is pinned by R11 and R11b.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial);
+    REQUIRE(rt->staged_baseline_count_for_test() == 1);
+    REQUIRE(rt->attach_rule("r1", svc_spec("svc"), svc_running_rule("r1"), true));
+    CHECK(rt->staged_baseline_drops() == 0);
+}
+TEST_CASE("#4045 R13: the stop-time sweep is idempotent (a staged generation is not staged again)",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->fail_next_stage_baseline_for_test();
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial); // unstaged
+    CHECK(rt->stage_unstaged_baselines() == 0);
+    REQUIRE(rt->staged_baseline_count_for_test() == 1);
+    const auto snap = rt->snapshot_staged_baselines();
+    rt->erase_staged_baselines_if_unchanged(snap); // "persisted"
+    REQUIRE(rt->staged_baseline_count_for_test() == 0);
+    CHECK(rt->stage_unstaged_baselines() == 0);
+    CHECK(rt->staged_baseline_count_for_test() == 0);
+    CHECK(rt->staged_baseline_drops() == 1); // the arm-time failure only: no second attempt
+}
+TEST_CASE("#4045 R13b: a sweep whose staging failed leaves the capture retryable",
+          "[spark][runtime][baseline]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_hash_rule("r1"), true));
+    rt->fail_next_stage_baseline_for_test(2);
+    rt->evaluate_key(spark_key(file_spec("/a")), EvalReason::Initial); // unstaged (fail 1)
+    CHECK(rt->stage_unstaged_baselines() == 1);                        // fail 2: still unstaged
+    REQUIRE(rt->staged_baseline_count_for_test() == 0);
+    CHECK(rt->stage_unstaged_baselines() == 0); // the flag stayed set, so the next call retries
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    CHECK(rt->staged_baseline_drops() == 2);
+}
+
+TEST_CASE("#4045 R14: the stop-time sweep runs only AFTER the runtime began stopping",
+          "[spark][runtime][baseline]") {
+    // GuardianEngine::stop() sweeps after the runtime's begin_stop(), so no commit can stage
+    // between the sweep and the final flush (evaluate_key's commit refuses once stopping_).
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    CHECK(rt->unstaged_sweep_stopping_for_test() == -1); // not run yet
+    (void)rt->stage_unstaged_baselines();
+    CHECK(rt->unstaged_sweep_stopping_for_test() == 0);
+    rt->begin_stop();
+    (void)rt->stage_unstaged_baselines();
+    CHECK(rt->unstaged_sweep_stopping_for_test() == 1);
 }

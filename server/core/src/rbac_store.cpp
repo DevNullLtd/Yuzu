@@ -46,10 +46,13 @@ using rbac_sql::kWriteTimeout;
 // `check_permission`'s own acquire, and `resolve_perm_groups`'s two acquires via
 // `user_rbac_group_names`/`role_effects_for`) is on the request-serving critical
 // path for EVERY confined operator action, so it uses this short acquire budget
-// instead of `kReadTimeout` — under a saturated pool a wave of concurrent authz
-// checks pins each HTTP worker for at most ~250ms instead of ~2s, bounding how
-// much of the shared `http_worker` pool a Postgres degrade can exhaust before
-// the item-1-commit-B breaker (next commit) trips. CRUD/admin RbacStore calls
+// instead of `kReadTimeout` (2 s). PgPool clamps a bounded acquire that finds the
+// pool already saturated at entry to its `saturated_fast_fail` (500ms by default),
+// so `kReadTimeout` alone would wait up to ~500ms there, and the full 2 s only for
+// a pool that saturates after the call entered it. This budget bounds the acquire
+// wait at ~250ms in both cases, limiting how much of the shared `http_worker`
+// pool a Postgres degrade can exhaust before the breaker below trips (an open
+// breaker answers without a pool touch). CRUD/admin RbacStore calls
 // (`assign_role`, `set_permission`, catalogue listings, etc.) are operator-driven,
 // not per-request, and keep the wider `kReadTimeout` — matches
 // `docs/postgres-store-playbook.md`'s hot-path-vs-admin acquire-budget split.
@@ -113,8 +116,10 @@ constexpr std::int64_t kRbacStaleServeBoundMs = 5000;
 // touching the pool until one probe per cooldown succeeds. Deliberately
 // small (2, not e.g. 5) — the goal is bounding the FIRST wave's exposure,
 // not waiting for a confident failure signal; kAuthzAcquireTimeout above
-// already keeps a single failed attempt cheap (~250ms), so trip-fast costs
-// little even on a false-positive (one genuinely-slow-but-healthy query).
+// bounds a single failed acquire at ~250ms, so trip-fast costs little even on
+// a false-positive (one genuinely-slow-but-healthy query). The count is of
+// CONSECUTIVE failures: any success on the authz path, including the
+// ITServiceOwner ceiling read, resets it (see breaker_note_result).
 constexpr int kBreakerTripThreshold = 2;
 
 // Read-degrade reason labels (ADR-0037 convention). A !open_ store fails boot
@@ -1807,33 +1812,92 @@ std::vector<Permission> RbacStore::get_role_permissions(const std::string& role_
     return result;
 }
 
+namespace {
+// The SELECT behind get_role_permissions_checked (the admin read of a whole role). The
+// breaker-gated request-path read of one pair uses the narrower select_role_permission_effect
+// below.
 std::expected<std::vector<Permission>, std::string>
-RbacStore::get_role_permissions_checked(const std::string& role_name) const {
-    if (!open_)
-        return std::unexpected("rbac store not open");
-    auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return std::unexpected("pool acquire timeout");
+select_role_permissions(PGconn* conn, const std::string& role_name) {
     pg::PgResult r = pg::exec_params(
-        lease.get(),
+        conn,
         "SELECT role_name, securable_type, operation, effect FROM rbac_store.role_permissions "
         "WHERE role_name = $1 ORDER BY securable_type, operation",
         std::vector<std::string>{role_name});
     if (r.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(conn));
     std::vector<Permission> result;
     for (int i = 0; i < PQntuples(r.get()); ++i)
         result.push_back(read_perm(r.get(), i));
+    return result;
+}
+} // namespace
+
+std::expected<std::vector<Permission>, std::string>
+RbacStore::get_role_permissions_checked(const std::string& role_name) const {
+    if (!open_)
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
+    return select_role_permissions(lease.get(), role_name);
+}
+
+namespace {
+// The one SELECT behind role_permission_effect_authz_checked: the effect of the single row for
+// the triple (`role_permissions` is keyed by exactly these three columns). A parameter that
+// contains a NUL byte is bound as SQL NULL: libpq takes text parameters as C strings, so the
+// bytes after the NUL would be dropped and the truncated key could match a different row,
+// whereas no row can match a key with an embedded NUL (`= NULL` is never true).
+std::expected<std::optional<std::string>, std::string>
+select_role_permission_effect(PGconn* conn, const std::string& role_name,
+                              const std::string& securable_type, const std::string& operation) {
+    const auto bind = [](const std::string& v) -> std::optional<std::string> {
+        if (v.find('\0') != std::string::npos)
+            return std::nullopt;
+        return v;
+    };
+    pg::PgResult r = pg::exec_params(
+        conn,
+        "SELECT effect FROM rbac_store.role_permissions "
+        "WHERE role_name = $1 AND securable_type = $2 AND operation = $3",
+        std::vector<std::optional<std::string>>{bind(role_name), bind(securable_type),
+                                                bind(operation)});
+    if (r.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(conn));
+    if (PQntuples(r.get()) == 0)
+        return std::optional<std::string>{};
+    return std::optional<std::string>{text_col(r.get(), 0, 0)};
+}
+} // namespace
+
+std::expected<std::optional<std::string>, std::string>
+RbacStore::role_permission_effect_authz_checked(const std::string& role_name,
+                                                const std::string& securable_type,
+                                                const std::string& operation) const {
+    if (!open_)
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
+    // Same contract as the hot authz reads (user_rbac_group_names / role_effects_for):
+    // breaker-gated, short acquire budget, outcome fed back to the breaker. The degrade
+    // metric is NOT bumped here; the gate that consumes the error owns the counter.
+    if (!breaker_admit())
+        return std::unexpected(std::string(kRbacErrCircuitBreakerOpen));
+    auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
+    if (!lease) {
+        breaker_note_result(false);
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
+    }
+    auto result = select_role_permission_effect(lease.get(), role_name, securable_type, operation);
+    breaker_note_result(result.has_value());
     return result;
 }
 
 std::expected<std::vector<Permission>, std::string>
 RbacStore::list_all_role_permissions_checked() const {
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     pg::PgResult r = pg::exec_params(
         lease.get(),
         "SELECT role_name, securable_type, operation, effect FROM rbac_store.role_permissions "
@@ -1985,10 +2049,10 @@ std::expected<std::vector<PrincipalRole>, std::string>
 RbacStore::get_principal_roles_checked(const std::string& principal_type,
                                        const std::string& principal_id) const {
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     pg::PgResult r = pg::exec_params(
         lease.get(),
         "SELECT principal_type, principal_id, role_name FROM rbac_store.principal_roles "
@@ -2005,7 +2069,7 @@ RbacStore::get_principal_roles_checked(const std::string& principal_type,
 std::expected<std::vector<PrincipalRole>, std::string>
 RbacStore::list_all_principal_roles_checked() const {
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         // sre (Gate 6, governance round 2026-09-28): this read had no
@@ -2016,7 +2080,7 @@ RbacStore::list_all_principal_roles_checked() const {
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn("RbacStore::list_all_principal_roles_checked: pool acquire timed out");
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     }
     pg::PgResult r = pg::exec_params(
         lease.get(),
@@ -2245,10 +2309,10 @@ std::vector<RbacGroup> RbacStore::list_groups() const {
 
 std::expected<std::vector<RbacGroup>, std::string> RbacStore::list_groups_checked() const {
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     pg::PgResult r = pg::exec_params(
         lease.get(),
         "SELECT name, description, source, external_id, created_at FROM rbac_store.groups "
@@ -2831,7 +2895,7 @@ std::expected<std::vector<std::string>, std::string>
 RbacStore::user_rbac_group_names(const std::string& username) const {
     std::vector<std::string> groups;
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     // Breaker-gated (#2703 Gate 7 item 1 commit B) — see check_permission's
     // pool-fallback gate for the shared rationale.
     if (!breaker_admit()) {
@@ -2844,7 +2908,7 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn(
                 "RbacStore::user_rbac_group_names: circuit breaker open — DENY without pool touch");
-        return std::unexpected("circuit breaker open");
+        return std::unexpected(std::string(kRbacErrCircuitBreakerOpen));
     }
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
     if (!lease) {
@@ -2852,7 +2916,7 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn("RbacStore::user_rbac_group_names: pool acquire timed out — DENY");
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     }
     pg::PgResult r = pg::exec_params(
         lease.get(), "SELECT group_name FROM rbac_store.group_members WHERE username = $1",
@@ -2875,7 +2939,7 @@ std::expected<std::unordered_map<std::string, int>, std::string>
 RbacStore::role_effects_for(const std::string& securable_type, const std::string& operation) const {
     std::unordered_map<std::string, int> role_effect; // -1 deny (wins), 1 allow, 0 none
     if (!open_)
-        return std::unexpected("rbac store not open");
+        return std::unexpected(std::string(kRbacErrStoreNotOpen));
     // Breaker-gated (#2703 Gate 7 item 1 commit B) — see check_permission's
     // pool-fallback gate for the shared rationale.
     if (!breaker_admit()) {
@@ -2885,7 +2949,7 @@ RbacStore::role_effects_for(const std::string& securable_type, const std::string
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn(
                 "RbacStore::role_effects_for: circuit breaker open — DENY without pool touch");
-        return std::unexpected("circuit breaker open");
+        return std::unexpected(std::string(kRbacErrCircuitBreakerOpen));
     }
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
     if (!lease) {
@@ -2893,7 +2957,7 @@ RbacStore::role_effects_for(const std::string& securable_type, const std::string
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn("RbacStore::role_effects_for: pool acquire timed out — DENY");
-        return std::unexpected("pool acquire timeout");
+        return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     }
     pg::PgResult r = pg::exec_params(
         lease.get(),
@@ -3045,23 +3109,20 @@ ListReadAuthorization RbacStore::authorize_list_read(const std::string& username
     return out;
 }
 
-bool RbacStore::check_role_has_permission(const std::string& role_name,
-                                          const std::string& securable_type,
-                                          const std::string& operation) const {
-    // Uses the fail-closed authoritative read: on a store error the checked
-    // variant returns unexpected → DENY (never a false allow).
-    auto perms = get_role_permissions_checked(role_name);
-    if (!perms)
-        return false;
-    for (const auto& p : *perms) {
-        if (p.securable_type == securable_type && p.operation == operation) {
-            if (p.effect == "deny")
-                return false;
-            if (p.effect == "allow")
-                return true;
-        }
-    }
-    return false;
+std::expected<bool, std::string>
+RbacStore::role_permission_allowed_checked(const std::string& role_name,
+                                           const std::string& securable_type,
+                                           const std::string& operation) const {
+    // THE one read for "does this role grant this pair" (extend, never fork):
+    // `authz::service_ceiling_check` (authz_gates.cpp) delegates here. The pair has at most
+    // one row (the primary key): `allow` admits; `deny`, any other effect text, or an absent
+    // pair (a revoked default is a DELETEd row) refuses. A failed read is an error, never a
+    // false allow. The read is the breaker-gated authz read: this runs on the request path of
+    // every service-token fleet read.
+    auto effect = role_permission_effect_authz_checked(role_name, securable_type, operation);
+    if (!effect)
+        return std::unexpected(std::move(effect.error()));
+    return effect->has_value() && **effect == "allow";
 }
 
 } // namespace yuzu::server

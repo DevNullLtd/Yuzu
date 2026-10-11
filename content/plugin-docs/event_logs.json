@@ -125,7 +125,7 @@
       },
       "default": 24,
       "definition_id": "device.event_logs.errors",
-      "description": "Number of hours to look back for error events, e.g. 24 or 168. Range: 1-720 (30 days). Default: 24.\n",
+      "description": "Number of hours to look back for error events, e.g. 24 or 168. Range: 1-720 (30 days). Default: 24. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.\n",
       "name": "hours",
       "required": false,
       "type": "int32"
@@ -161,7 +161,7 @@
       },
       "default": 50,
       "definition_id": "device.event_logs.query",
-      "description": "Maximum number of recent events EXAMINED for a match on Windows (the filter is applied within that window); the maximum number of matches returned on Linux and macOS. Range: 1-500. Default: 50.\n",
+      "description": "Maximum number of recent events EXAMINED for a match on Windows (the filter is applied within that window); the maximum number of matches returned on Linux and macOS. Range: 1-500. Default: 50. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.\n",
       "name": "count",
       "required": false,
       "type": "int32"

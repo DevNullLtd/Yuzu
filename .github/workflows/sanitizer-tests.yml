@@ -231,7 +231,7 @@ jobs:
           rm -rf build-linux-asan
           # -fno-sanitize=null,alignment: same flag and rationale as the ASan configure
           # in nightly.yml (the full UBSan set makes yuzu_server_tests fail to link;
-          # #5167). Null and alignment UB are not detected in this leg.
+          # tracked in #5492). Null and alignment UB are not detected in this leg.
           meson setup build-linux-asan \
             --native-file meson/native/linux-gcc15.ini \
             --buildtype=debug \

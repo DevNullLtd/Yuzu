@@ -89,6 +89,9 @@ QA_REPO="${QA_REPO:-DevNullLtd/Yuzu}"
 BASE_URL="https://localhost:8443"
 ENV_FILE="$STATE/qa.env"
 OVERRIDE="$STATE/qa.override.yml"
+# The long-running services. The template's one-shot `ca-export` (copies the public
+# CA into the agent's volume, then exits 0) is deliberately NOT listed: it is never
+# "running", so it must not count toward `running`, `restarts` or `check-stable`.
 SERVICES=(server gateway agent postgres)
 WAIT_SECS=180
 UP_SECS=420

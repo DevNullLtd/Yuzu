@@ -34,9 +34,9 @@ spec:
 
   parameters:
     type: object
-    required: [config_path, old_value, new_value]
+    required: [path, search, replacement]
     properties:
-      config_path:
+      path:
         type: string
         displayName: Configuration File Path
         description: >
@@ -44,27 +44,51 @@ spec:
           Example: "/etc/myapp/config.ini" or "C:\ProgramData\MyApp\config.ini"
         validation:
           maxLength: 4096
-      old_value:
+      search:
         type: string
         displayName: Current Value (search)
         description: >
           The current configuration value to search for. Matched literally
-          (not regex) unless search_regex=true.
+          (not regex) unless regex=true.
         validation:
           maxLength: 256
-      new_value:
+      replacement:
         type: string
         displayName: New Value (replacement)
         description: >
           The new configuration value to replace matches with.
-      search_regex:
+      regex:
         type: string
         displayName: Use Regex
         description: >
-          If "true", interpret old_value as a regex pattern. Default: "false".
+          If "true", interpret search as a regex pattern. Default: "false".
         default: "false"
         validation:
           enum: ["true", "false"]
+      case_sensitive:
+        type: string
+        displayName: Case Sensitive
+        description: >
+          If "true" (default), match is case-sensitive.
+        default: "true"
+        validation:
+          enum: ["true", "false"]
+      dry_run:
+        type: string
+        displayName: Dry Run
+        description: >
+          If "true", count replacements without modifying the file. Default: "false".
+        default: "false"
+        validation:
+          enum: ["true", "false"]
+      max_replacements:
+        type: int32
+        displayName: Maximum Replacements
+        description: >
+          Maximum number of replacements to perform. 0 = unlimited. Default: 0.
+        default: 0
+        validation:
+          minimum: 0
       base_dir:
         type: string
         displayName: Base Directory
@@ -82,7 +106,7 @@ spec:
       - name: file_size_after
         type: int64
 
-  readablePayload: "Config update: replace '${old_value}' with '${new_value}' in ${config_path}"
+  readablePayload: "Config update: replace '${search}' with '${replacement}' in ${path}"
 
   approval:
     mode: role-gated
@@ -142,7 +166,9 @@ spec:
       timeout_seconds:
         type: int32
         displayName: Timeout (seconds)
-        description: TCP connection timeout per target.
+        description: >
+          TCP connection timeout per target, 1-60 seconds.
+          Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.
         default: 10
         validation:
           minimum: 1
@@ -227,9 +253,9 @@ spec:
 
   parameters:
     type: object
-    required: [executable_path]
+    required: [path]
     properties:
-      executable_path:
+      path:
         type: string
         displayName: Executable Path
         description: >
@@ -268,7 +294,7 @@ spec:
       - name: file_description
         type: string
 
-  readablePayload: "Version compliance check: ${executable_path} >= ${minimum_version}"
+  readablePayload: "Version compliance check: ${path} >= ${minimum_version}"
 
   gather:
     ttlSeconds: 300
@@ -294,8 +320,8 @@ status:
 ## multi-step workflow engine. To chain them:
 ##
 ## 1. Config Search + Replace:
-##    Step 1: device.filesystem.search (pattern=old_value, path=config_path)
-##    Step 2: device.filesystem.replace (search=old_value, replacement=new_value)
+##    Step 1: device.filesystem.search (pattern=search, path=path)
+##    Step 2: device.filesystem.replace (search=search, replacement=replacement)
 ##    Condition: step1.total_matches > 0
 ##
 ## 2. Patch Connectivity + Upload:
@@ -304,7 +330,7 @@ status:
 ##    Condition: always (evidence collection regardless of result)
 ##
 ## 3. Version Info + Inventory Evaluation:
-##    Step 1: device.filesystem.get_version_info (path=executable_path)
+##    Step 1: device.filesystem.get_version_info (path=path)
 ##    PolicyFragment check: inventory.filesystem.product_version version_gte minimum_version
 ##    Fix: software deployment or content_dist.stage + execute_staged
 ##
@@ -312,7 +338,7 @@ status:
 ## Parameter binding passes outputs from prior steps:
 ##   parameters:
 ##     path: "${steps.search_config.result.path}"
-##     search: "${params.old_value}"
+##     search: "${params.search}"
 ##
 ## See docs/yaml-dsl-spec.md Section 9 (Expression Language) for
 ## interpolation syntax and docs/Instruction-Engine.md for workflow

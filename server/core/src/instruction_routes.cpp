@@ -318,6 +318,12 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 }
             }
 
+            // This route edits other fields on a copy it loaded moments ago. An empty
+            // parameter_schema means "keep the stored column" (update_definition), so blank
+            // the copy rather than write it back: that would revert a schema replaced
+            // between the load and this write, and would re-run the write-time schema check
+            // on a legacy row.
+            def.parameter_schema.clear();
             auto result = deps.store->update_definition(def);
             if (!result) {
                 // ADR-0058: a genuine DB/lease failure 503s; "not_found: " -> 404 (mirrors

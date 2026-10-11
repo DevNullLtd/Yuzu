@@ -21,6 +21,8 @@
  *   - 404 path: definition does not exist
  */
 
+#include "instruction_param_schema.hpp"
+#include "instruction_schema_test_util.hpp"
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
@@ -206,6 +208,22 @@ TEST_CASE("REST templates: GET /__default__ returns the synthesised default",
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["data"]["id"] == "__default__");
     CHECK(body["data"]["default"] == true);
+}
+
+TEST_CASE("REST templates: POST keeps the definition's stored parameter_schema, even a legacy "
+          "oversize one",
+          "[rest][response_templates][create][param-schema]") {
+    RtHarness h;
+    auto def_id = h.make_def("procfetch");
+    // A legacy row written past the 256 KiB write gate: persisting a template must neither
+    // fail on it nor rewrite it.
+    const std::string legacy(yuzu::server::instr::kMaxParameterSchemaBytes + 1, ' ');
+    yuzu::server::test::force_parameter_schema(*h.inst_pool, def_id, legacy);
+    auto res = h.sink.Post("/api/v1/definitions/" + def_id + "/response-templates",
+                           R"({"name":"keeps schema","columns":["PID"]})");
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK((*h.instruction_store->get_definition(def_id))->parameter_schema == legacy);
 }
 
 TEST_CASE("REST templates: POST creates and assigns id", "[rest][response_templates][create]") {

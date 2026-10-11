@@ -13,6 +13,7 @@
 #include "custom_properties_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 #include "execution_tracker.hpp"
+#include "instruction_param_schema.hpp" // ParamValidatorCache (Deps::param_validators)
 #include "instruction_store.hpp"
 #include "policy_store.hpp"
 #include "product_pack_store.hpp"
@@ -26,6 +27,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -34,6 +36,12 @@
 namespace yuzu::server {
 
 class CommandCapabilityRegistry;
+
+/// Describe `yuzu_server_instruction_param_rejected_total{route,reason}` and pre-seed every
+/// (route, reason) series to 0 so the family exists before the first refusal. Called once at
+/// server start; idempotent. `route` is `instruction_execute` for
+/// `POST /api/instructions/{id}/execute`; `reason` is `shape`, `violation` or `schema_invalid`.
+void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics);
 
 /// Workflow, product-pack, execution fragment, and scope-estimate routes.
 /// Extracted from ServerImpl::start_web_server() for god-object decomposition.
@@ -106,7 +114,8 @@ public:
 
     /// #1712 / #3290 Phase 2 — the injected-callback twin of
     /// `AuthRoutes::require_fleet_read`, backing the executions-drawer
-    /// detail route's real per-agent/service confinement (same shape as
+    /// detail route's and the executions LIST fragment's real
+    /// per-agent/service confinement (same shape as
     /// `McpServer::FleetReadFn`/`RestApiV1::FleetReadFn`/
     /// `DashboardRoutes::FleetReadFn` — server.cpp wires the SAME
     /// conversion lambda into all of them so they cannot drift). MUST be
@@ -139,9 +148,11 @@ public:
         AuthFn auth_fn;
         PermFn perm_fn;
         /// #1712 / #3290 Phase 2 — see FleetReadFn's doc comment above.
-        /// Used ONLY by the executions-drawer detail route
-        /// (/fragments/executions/{id}/detail); every other route in this
-        /// file keeps using `perm_fn` above unchanged.
+        /// Consumed by the executions-drawer detail route
+        /// (/fragments/executions/{id}/detail), the executions LIST
+        /// fragment (/fragments/executions, #3526), /sse/executions/{id} and
+        /// GET /api/workflow-executions/{id}; the remaining routes in this
+        /// file keep using `perm_fn` above unchanged.
         FleetReadFn fleet_read_fn;
         AuditFn audit_fn;
         EmitEventFn emit_fn;
@@ -228,6 +239,12 @@ public:
         /// that leaves this nullptr is asserting an unwired-classifier
         /// configuration never reached in production.
         const yuzu::server::CommandCapabilityRegistry* capability_registry{nullptr};
+        /// The prepared `parameter_schema` validators for `POST /api/instructions/:id/execute`.
+        /// One cache owned by ServerImpl for all call sites that take it from Deps (today the
+        /// execute route), so its byte budget is global rather than per route-registration.
+        /// nullptr = register_routes creates a private cache (test harnesses that build Deps by
+        /// hand).
+        std::shared_ptr<instr::ParamValidatorCache> param_validators;
     };
 
     /// Production overload — wraps `httplib::Server&` in an HttplibRouteSink

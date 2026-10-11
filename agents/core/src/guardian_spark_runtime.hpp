@@ -57,6 +57,22 @@
  * very end of evaluate_key() (after eval_lk and registry_mu_ have both already released)
  * and in last_eval_timings_for_test(); never held while taking any lock above.
  *
+ * snapshot_staged_baselines()/erase_staged_baselines_if_unchanged() (#4045) take registry_mu_
+ * STANDALONE: their callers (the engine's GuardianBaselinePersister, under its own leaf
+ * persist_mu_) hold no runtime lock, and they never touch outbox_mu_. evaluate_key's
+ * capture-edge staging runs inside the commit section it already holds registry_mu_ for.
+ * attach_core reads staged_baselines_ under the registry_mu_ hold it already has for the prior
+ * generation's detach (an old evaluation either staged before that hold or is rejected by
+ * evaluate_key's generation recheck after it). A staged entry leaves staging only AFTER its
+ * KV write has returned, so nothing is ever "out" of staging; the engine's persister seed
+ * fence (guardian_baseline_persister.hpp) additionally orders a worker pass against a
+ * baseline-on-arm rule's KV seed read. A capture that could not be staged (bad_alloc) stays
+ * committed in its generation's eval state, flagged RuleGeneration::baseline_unstaged; the
+ * flag is read and written only under registry_mu_ (evaluate_key's commit retries staging;
+ * attach_core and every withdrawal stage the generation's committed hash before it is replaced
+ * or dropped, attach_core reads staging again after the withdrawal, and
+ * stage_unstaged_baselines() stages what is left once more when the engine stops).
+ *
  * Rung 3 builds this against FAKE seams (IStateReader, ISparkBackend). The real
  * platform readers are rung 5; the convergence scheduler that also drives
  * evaluate_key is rung 4; the unified reconcile op (merge / full-sync / kill-
@@ -88,6 +104,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -505,6 +522,11 @@ public:
     // drives these via the narrow API below. The runtime NEVER touches a KvStore:
     // it is the detach-survival object and must OWN everything it touches (file
     // header), so the durable seam stays in the engine.
+    //
+    // The same rule governs Spark's baseline-on-arm capture (#4045, further below):
+    // evaluate_key STAGES the capture edge here (a bounded map insert, no I/O) and the
+    // engine-owned GuardianBaselinePersister persists it to the #4021 baseline record;
+    // the runtime never sees the KvStore.
 
     /// A FIFO copy of the currently-staged (built + validated, not-yet-persisted)
     /// records. Immutable view; the caller serialises + writes them, then calls
@@ -583,6 +605,98 @@ public:
     }
     [[nodiscard]] std::uint64_t journal_clock_rejected() const noexcept {
         return journal_clock_rejected_.load(std::memory_order_relaxed);
+    }
+
+    // --- #4045: staged baseline captures (Spark's side of the #4021 baseline store) ----------
+    /// One file-hash-equals baseline-on-arm capture, staged for the engine-owned persister.
+    /// `path` is the RAW spark path (the same string the engine's arm-time seed fingerprints,
+    /// so the persisted fingerprint and the seed lookup cannot disagree).
+    struct CapturedBaseline {
+        std::string rule_id;
+        std::string path;
+        std::string hash;
+    };
+    /// A COPY of every staged capture (registry_mu_ standalone, strong guarantee: a throw leaves
+    /// staging untouched, because nothing is moved or erased). Deliberately NOT gated on
+    /// stopping_: the engine's stop() flush runs AFTER begin_stop(), and a stopping_
+    /// early-return would silently empty it. The caller persists the copies and then calls
+    /// erase_staged_baselines_if_unchanged() for the ones that reached the KV record.
+    [[nodiscard]] std::vector<CapturedBaseline> snapshot_staged_baselines() const;
+    /// Erase each entry of `done` from staging iff (rule_id, path, hash) are STILL identical
+    /// (registry_mu_ standalone; the erases themselves cannot throw). A newer capture or a
+    /// retarget for the same rule_id stays staged. Call ONLY for captures whose persist
+    /// returned Written or Refused: a Failed one stays staged, so a failure never loses it.
+    /// Fires NO waker (a failing KV must not spin the drain worker).
+    void erase_staged_baselines_if_unchanged(std::span<const CapturedBaseline> done);
+    /// Stage the committed hash of every generation whose capture is committed but could not be
+    /// staged (RuleGeneration::baseline_unstaged: an allocation failure), under registry_mu_.
+    /// GuardianEngine::stop() calls it after the drain worker has joined and before its final
+    /// persist pass: a stop withdraws no rule, so the withdrawal staging would never run and the
+    /// capture would die with the process. Not gated on stopping_ (like snapshot_staged_baselines);
+    /// an entry that cannot be staged again is counted by stage_baseline_locked and the capture is
+    /// then lost to this process. Idempotent: a staged generation's flag is cleared, and a
+    /// failed one stays flagged, so a repeated call retries it. Returns how many captures are
+    /// STILL unstaged afterwards (the engine logs a non-zero count: the drop counter dies with
+    /// the process). May throw only from the lock itself; the engine firewalls it.
+    [[nodiscard]] std::size_t stage_unstaged_baselines();
+    /// TEST-ONLY: whether stopping_ was already set when the last stage_unstaged_baselines() ran
+    /// (1 yes, 0 no, -1 it has not run). Pins the sweep AFTER the runtime's begin_stop(): moved
+    /// earlier, a commit could still stage between the sweep and the Stop pass. No production
+    /// caller.
+    [[nodiscard]] int unstaged_sweep_stopping_for_test() const noexcept {
+        return unstaged_sweep_stopping_for_test_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t staged_baseline_count_for_test() const;
+    /// TEST-ONLY: stage `rule_id`'s capture through the production staging rule (first capture
+    /// wins on one path; a different path replaces and is counted). No production caller.
+    void stage_baseline_for_test(const std::string& rule_id, const std::string& path,
+                                 const std::string& hash);
+    /// TEST-ONLY: make the next `n` stage_baseline_locked calls take the allocation-failure
+    /// path (nothing is staged, each failure is counted, and the generation keeps its baseline
+    /// but remembers it is unstaged). No production caller.
+    void fail_next_stage_baseline_for_test(int n = 1) noexcept {
+        fail_next_stage_baseline_.store(n, std::memory_order_relaxed);
+    }
+    /// TEST-ONLY: make the next snapshot_staged_baselines() throw bad_alloc before it touches
+    /// staging (a throw must leave staging untouched). No production caller.
+    void fail_next_snapshot_for_test() noexcept {
+        fail_next_snapshot_.store(true, std::memory_order_relaxed);
+    }
+    /// TEST-ONLY: make the next stage_unstaged_baselines() throw bad_alloc before it takes its
+    /// lock (as if the lock failed). Consumed once. No production caller.
+    void fail_next_unstaged_sweep_for_test() noexcept {
+        fail_next_unstaged_sweep_.store(true, std::memory_order_relaxed);
+    }
+    /// TEST-ONLY: make the next attach_core inherit-the-staged-hash copy throw bad_alloc (the
+    /// copy happens BEFORE the prior generation is detached, so the prior arm must survive).
+    /// No production caller.
+    void fail_next_inherit_copy_for_test() noexcept {
+        fail_next_inherit_copy_.store(true, std::memory_order_relaxed);
+    }
+    /// True iff at least one capture is staged (registry_mu_ standalone). The persister's
+    /// no-store branch uses it to count a capture that has nowhere to go.
+    [[nodiscard]] bool has_staged_baselines() const;
+    /// Staging attempts that failed or displaced a capture: an allocation failure while staging
+    /// (one per failed ATTEMPT: the baseline stays committed and staging is retried at every
+    /// later evaluation of the generation, each failed retry counted again, so a capture that
+    /// eventually stages still leaves its failed attempts here), or a retarget that replaced a
+    /// still-unpersisted capture of another path (that capture is gone; legacy loses it on any
+    /// failed write too, with no retry). It also counts the one failure that is not a staging
+    /// attempt: attach_core's read-back of a capture that staged successfully, when the copy
+    /// of its hash throws (the staged original stays, the live arm captures afresh; no separate
+    /// counter, the effect is the same one the tag already reports). GuardianBaselinePersister
+    /// reads this through staged_baseline_drops_source() so the heartbeat getter needs no
+    /// runtime lock.
+    /// A retarget landing in the instant between a capture's write and its erase also counts:
+    /// the count is an upper bound on lost captures, never an under-count.
+    [[nodiscard]] std::uint64_t staged_baseline_drops() const noexcept {
+        return staged_baseline_drops_->load(std::memory_order_relaxed);
+    }
+    /// The drop counter itself, shared so a reader outlives this object safely (the persister
+    /// keeps it for the lock-free heartbeat getter). Set once at construction, never reseated.
+    [[nodiscard]] std::shared_ptr<const std::atomic<std::uint64_t>> staged_baseline_drops_source()
+        const noexcept {
+        return staged_baseline_drops_;
     }
     /// Repeat Unknown evaluations whose guard.unhealthy was edge-suppressed (M1): a rule
     /// stuck errored is re-evaluated every convergence tick to catch recovery, but only the
@@ -719,7 +833,7 @@ public:
     /// #4508: read-only claims_ walk; W1 requires at most one candidate per rule.
     [[nodiscard]] std::size_t wedge_candidate_count_for_test(const std::string& rule_id) const;
     /// Requires both FIFO-front identity membership and is_wedge_candidate_locked.
-    /// Reuses only is_wedge_k_eligible_locked's membership shape, not its Dispatched
+    /// Reuses only wedge_episode_locked's membership shape, not its Dispatched
     /// gate: is_retained_wedge (defined in the .cpp) also accepts Dispatching.
     /// A refused, popped claim can retain every candidate field under a different
     /// committed generation (CH-4); receipt history alone cannot prove membership.
@@ -1085,7 +1199,19 @@ private:
         bool active{true};            ///< registry_mu_-guarded; uncommitted wedge desire or committed rule state
         bool emit_compliant_edge{true};
         RuleAssertion assertion;
-        RuleEvalState eval;           ///< mutated only under the key's eval_mu (single serialisation domain)
+        /// Mutated only under the key's eval_mu (single serialisation domain); evaluate_key's
+        /// COMMIT also holds registry_mu_, so a reader holding registry_mu_ alone (attach_core, a
+        /// withdrawal) never sees it torn.
+        RuleEvalState eval;
+        /// #4045: this generation's baseline-on-arm capture is committed in `eval` but could NOT
+        /// be staged (an allocation failure, counted). registry_mu_-guarded, like staging itself.
+        /// Runtime-owned on purpose: RuleEvalState is shared evaluator code and must not learn
+        /// about persistence. While set, evaluate_key retries staging the COMMITTED hash on
+        /// every commit, attach_core stages it before a same-path replacement reads staging (and
+        /// reads staging again after the withdrawal, which retries it once more), a withdrawal
+        /// stages it, and the engine's stop() sweeps what is left; the baseline keeps detecting
+        /// drift meanwhile instead of being re-captured.
+        bool baseline_unstaged{false};
     };
 
     /// M1 item (b) bookkeeping for one rule_id still awaiting its first Known eval.
@@ -1167,7 +1293,7 @@ private:
     /// adoption-catch cleanup of a mapping it re-added.
     ///
     /// `end` is a PR-5 plug point: a FACT about how the claim ended, recorded so the
-    /// fault-wiring rung (wedge marking / K-bound / arm_failed reason) has something to
+    /// fault-wiring rung (wedge marking / retry suppression / arm_failed reason) has something to
     /// classify. PR-1 carries NO classification logic on it; the only reads are the
     /// bookkeeping guards (a `Committed` claim is a rules_ entry, never "pending":
     /// detach_rule_locked's Case-0 skip, and the drain's publish fill-in).
@@ -1258,8 +1384,9 @@ private:
         // once the compensating disarm has genuinely finished (or turned out never to
         // be needed). expire_overdue_claims()'s terminal-recovery pass (up-4) reads it
         // to know a terminal/stranded head is safe to reap: never touch one whose
-        // compensation is not yet finished. is_wedge_k_eligible_locked() reads it too
-        // (#4472): a claim whose compensation is outstanding is never K-eligible.
+        // compensation is not yet finished. wedge_episode_locked() reads it too
+        // (#4472, #5459): it splits an outstanding wedge into Eligible (arm still
+        // hung) and CompensationPending (late result returned, teardown outstanding).
         // `compensation_deadline` is set ONCE, when compensation first becomes owed
         // (the same guard), from cfg_.backend_op_deadline - never reset on a fallback
         // retry. The instant compensation became owed is therefore
@@ -1412,7 +1539,7 @@ public:
     /// Convenience: receipt_status(receipt) != ReceiptStatus::Pending.
     bool is_terminal(const ArmReceipt& receipt) const;
 
-    /// rung 9c PR-5e (#4221, K-bound closeout - adversarial-review-class finding,
+    /// rung 9c PR-5e (#4221 - adversarial-review-class finding,
     /// cpp-safety): `status` exactly as receipt_status() would report, and
     /// `wedge_eligible` (meaningful ONLY when `status == Wedged`, false otherwise)
     /// exactly as receipt_wedge_k_eligible() would report - both computed under
@@ -1430,9 +1557,20 @@ public:
     /// the genuine success for this specific application (self-heals only on the
     /// NEXT identical retry, via decide_retry()'s forced Reapply once
     /// resolved_failed>0 - not truly unbounded, but a real, avoidable gap).
+    ///
+    /// #5459 (option D): `compensation_pending` (meaningful ONLY when `status ==
+    /// Wedged`, false otherwise, and never true together with `wedge_eligible`) is
+    /// the sibling observation for a wedge whose late result has RETURNED and whose
+    /// compensating teardown is still outstanding (`compensation_finished` false, the
+    /// claim still the Dispatched FIFO front). Both flags read the same single
+    /// registry_mu_ acquisition and the same private classification. The ledger
+    /// treats `wedge_eligible || compensation_pending` as "an outstanding wedge" for
+    /// RETRY SUPPRESSION only; neither flag ever authorises acknowledging a
+    /// generation (GuardianArmAckLedger::can_advance() has no wedge escape).
     struct WedgeAwareStatus {
         ReceiptStatus status{ReceiptStatus::Failed};
         bool wedge_eligible{false};
+        bool compensation_pending{false};
     };
     [[nodiscard]] WedgeAwareStatus receipt_status_wedge_aware(const ArmReceipt& receipt) const;
     /// rung 9c PR-5d (concern 2, arm-recovery): true iff `receipt`'s own claim has
@@ -1443,7 +1581,7 @@ public:
     /// receipt stays Wedged - a per-episode historical fact, docs/spark-stage2-
     /// guardian-consumer-design.md R5.3), so this is a SEPARATE signal for
     /// noticing a late-success recovery on a claim still held as a retained
-    /// failure. rung 9c PR-5e (#4221, K-bound closeout - governance Gate 4/
+    /// failure. rung 9c PR-5e (#4221 - governance Gate 4/
     /// consistency-auditor finding): `GuardianArmAckLedger::drain_locked()`'s
     /// recovery-scan loop, this accessor's own original motivating caller, now
     /// calls the atomic `receipt_recovery_status()` below instead (this standalone
@@ -1455,9 +1593,10 @@ public:
     /// internally.
     [[nodiscard]] bool receipt_recovered(const ArmReceipt& receipt) const;
 
-    /// rung 9c PR-5e (#4221, K-bound closeout): true iff `receipt`'s own claim is a
-    /// CURRENTLY, GENUINELY outstanding Wedged episode - the narrow subset of "sticky
-    /// Wedged" (see receipt_status()'s own doc comment) that K-bound may waive.
+    /// rung 9c PR-5e (#4221), reframed by #5459 (option D): true iff `receipt`'s own
+    /// claim is a CURRENTLY, GENUINELY outstanding Wedged episode whose arm is still
+    /// hung - the narrow subset of "sticky Wedged" (see receipt_status()'s own doc
+    /// comment) that decide_retry() may suppress an identical retry for.
     /// `end == ClaimEnd::WaiterTimedOutDispatched` alone is NOT sufficient - `end` is
     /// sticky (never un-Wedges) but the underlying episode is NOT: (1) a caller-side
     /// timeout can stamp WaiterTimedOutDispatched while the claim is still mid-dispatch
@@ -1477,7 +1616,7 @@ public:
     /// transitions, never collapsed") but POPS the claim from its key's FIFO the
     /// instant that resolution is published - so requiring `claim` to still be
     /// `claims_[claim->key]`'s FIFO FRONT is the "still-claimed" test
-    /// docs/spark-legacy-delta-registry.md's own K-bound row names: once popped, this
+    /// docs/spark-legacy-delta-registry.md's "still-claimed" rule: once popped, this
     /// reads false forever for that claim, regardless of what `end` still says. Both
     /// checks together, evaluated atomically under registry_mu_ (the same lock every
     /// FIFO pop and every reclassify_dispatching_race_locked() call already holds), are
@@ -1491,13 +1630,20 @@ public:
     /// #4472 (a third condition): AND no compensating disarm is outstanding for the
     /// claim (`compensation_finished`). A late result that has returned and is being
     /// disarmed leaves the claim FIFO-front until the teardown pops it, so the two
-    /// checks above alone would call it K-eligible; waiving it would acknowledge the
-    /// generation and stop the server's re-pushes, after which the pop leaves the rule
-    /// with no replacement arm. The marker is deliberately not the CompensationPermit
-    /// (engaged for every in-flight arm, a genuinely hung one included).
+    /// checks above alone cannot tell it from a hung arm; that case is reported by
+    /// `WedgeAwareStatus::compensation_pending` / `RecoveryStatus::CompensationPending`
+    /// instead (#5459), never by this predicate. The marker is deliberately not the
+    /// CompensationPermit (engaged for every in-flight arm, a genuinely hung one
+    /// included).
+    ///
+    /// #5459 (option D): the "K" in the name is historical - the K-bound waiver that
+    /// acknowledged a wedge's generation is DELETED. This predicate now answers one
+    /// question only: is this a genuinely-hung, still-claimed wedge whose late result
+    /// has NOT returned (so GuardianArmAckLedger::decide_retry() may Suppress an
+    /// identical retry on its account). It is never a licence to acknowledge.
     [[nodiscard]] bool receipt_wedge_k_eligible(const ArmReceipt& receipt) const;
 
-    /// rung 9c PR-5e (#4221, K-bound closeout - adversarial review finding, Kimi K3 +
+    /// rung 9c PR-5e (#4221 - adversarial review finding, Kimi K3 +
     /// Codex Sol independently converging): the ATOMIC combination of
     /// receipt_recovered() and receipt_wedge_k_eligible(), for a caller that needs
     /// BOTH questions answered about the exact same instant. Calling the two
@@ -1517,10 +1663,17 @@ public:
     /// SAME claim - but the priority is stated for clarity, not because the case is
     /// reachable). `Blocking` covers every other case: an empty receipt, a claim
     /// neither recovered nor currently wedge-eligible (settled to a genuine
-    /// refusal/rejection/withdrawal, already popped by a resolution nobody
-    /// adopted, or - #4472 - still the key's front but with a compensating disarm
-    /// outstanding). registry_mu_ taken ONCE, internally; never mutates state.
-    enum class RecoveryStatus { Recovered, WedgeEligible, Blocking };
+    /// refusal/rejection/withdrawal, or already popped by a resolution nobody
+    /// adopted). registry_mu_ taken ONCE, internally; never mutates state.
+    ///
+    /// #5459 (option D): `CompensationPending` is the #4472 case that used to read as
+    /// Blocking - the claim is still the key's Dispatched front with a compensating
+    /// disarm outstanding. It is a SEPARATE value so the ledger can keep tracking the
+    /// receipt (and keep suppressing identical retries) until the teardown pops the
+    /// claim, rather than erasing the only handle it has. Priority order is
+    /// Recovered, then WedgeEligible / CompensationPending (mutually exclusive), then
+    /// Blocking.
+    enum class RecoveryStatus { Recovered, WedgeEligible, CompensationPending, Blocking };
     [[nodiscard]] RecoveryStatus receipt_recovery_status(const ArmReceipt& receipt) const;
 
     enum class ArmOutcomeKind { Armed, Accepted };
@@ -1752,7 +1905,7 @@ public:
     /// (it counts as an alive worker against the executor's physical ceiling, not against a
     /// class quota) and, if blocked inside a mechanism, that type's engine lock; and before
     /// the teardown is submitted no slot is held at all. (#4472)
-    /// The claim is not K-eligible, so the generation is held while it is outstanding. `now` before the owed instant reads as zero. Takes registry_mu_ and
+    /// The generation is held while it is outstanding (nothing acknowledges it). `now` before the owed instant reads as zero. Takes registry_mu_ and
     /// scans claims_ (O(claims)); heartbeat cadence only, and never to be called with
     /// registry_mu_ held (it has a _locked twin). The once-per-claim elapsed count is the
     /// existing compensation_deadline_elapsed().
@@ -1821,7 +1974,7 @@ private:
     /// waiter_abandoned claim that carries an outcome still reaches the reservation.)
     [[nodiscard]] static bool is_dead_claim(const KeyClaim& claim) noexcept;
 
-    /// rung 9c PR-5e (#4221, K-bound closeout): the pure ClaimEnd->ReceiptStatus
+    /// rung 9c PR-5e (#4221): the pure ClaimEnd->ReceiptStatus
     /// mapping receipt_status() applies - factored out so
     /// receipt_status_wedge_aware() can compute the SAME mapping under its own
     /// single registry_mu_ acquisition without duplicating the switch (and
@@ -1830,23 +1983,26 @@ private:
     /// registry_mu_.
     [[nodiscard]] static ReceiptStatus classify_claim_end(ClaimEnd end) noexcept;
 
-    /// rung 9c PR-5e (#4221, K-bound closeout - cpp-expert governance finding):
-    /// the K-eligibility predicate (`end == WaiterTimedOutDispatched && dispatch
-    /// == Dispatched && still its key's FIFO front && no compensating disarm
-    /// outstanding`; the last term is #4472: K's premise is "the arm is physically
-    /// stuck", and a claim whose late result has returned and is in teardown is not
-    /// that - waiving it discards the server's re-push, the only owner left to re-arm
-    /// the rule once the teardown pops the claim, so the generation is held until the
-    /// teardown finishes) - factored out so
+    /// rung 9c PR-5e (#4221, cpp-expert governance finding), reshaped by #5459 (option
+    /// D): the ONE classification of a Wedged claim's outstanding-ness - `end ==
+    /// WaiterTimedOutDispatched && dispatch == Dispatched && still its key's FIFO
+    /// front` is the common base (the claim is a genuinely launched, still-claimed
+    /// episode), split by `compensation_finished` (#4472):
+    ///   - Eligible: base && compensation_finished - the arm is physically stuck, its
+    ///     late result has not returned;
+    ///   - CompensationPending: base && !compensation_finished - the late result has
+    ///     returned and its compensating disarm is outstanding (the claim stays the
+    ///     FIFO front until that teardown pops it);
+    ///   - NotOutstanding: anything else (settled to a real outcome, popped, or still
+    ///     mid-dispatch).
     /// receipt_wedge_k_eligible(), receipt_recovery_status() and
-    /// receipt_status_wedge_aware() all read ONE definition instead of three
-    /// independently-maintained copies (the drift risk classify_claim_end() was
-    /// already extracted to prevent for the ClaimEnd->ReceiptStatus mapping,
-    /// applied here to the eligibility predicate too). registry_mu_ held by the
-    /// CALLER - every call site already holds it - not this function's own
-    /// responsibility, since it never touches shared state itself beyond the
-    /// read-only `claims_` lookup a caller already has the right to make.
-    [[nodiscard]] bool is_wedge_k_eligible_locked(const std::shared_ptr<KeyClaim>& claim) const noexcept;
+    /// receipt_status_wedge_aware() all read this ONE definition, never three
+    /// independently-maintained copies. The two outstanding values are what
+    /// GuardianArmAckLedger::decide_retry() may suppress on; NEITHER ever authorises an
+    /// acknowledgment (can_advance() has no wedge escape). registry_mu_ is held by the
+    /// CALLER; this reads only the claim and a read-only `claims_` lookup.
+    enum class WedgeEpisode { NotOutstanding, Eligible, CompensationPending };
+    [[nodiscard]] WedgeEpisode wedge_episode_locked(const std::shared_ptr<KeyClaim>& claim) const noexcept;
 
     /// registry_mu_ held. Exact generation ownership, including unpublished commits.
     [[nodiscard]] bool generation_committed_locked(const KeyClaim& claim) const noexcept;
@@ -2457,6 +2613,46 @@ private:
     /// Called outside BOTH locks after any outbox_/lifecycle_log_ mutation.
     std::function<void()> outbox_enqueue_waker_;
     std::function<std::string()> agent_id_fn_;    ///< registry_mu_-guarded; wired by GuardianEngine::wire_spark_engine (#2237)
+    /// #4045: baseline-on-arm captures awaiting the engine-owned persister, keyed by rule_id
+    /// (registry_mu_-guarded). Bounded by the number of distinct rule_ids with a capture not
+    /// yet durable (one entry per rule_id), NOT by a cap: a cap would have to DROP a capture,
+    /// and a dropped capture is re-baselined from drifted content at the next re-arm. Staged by
+    /// evaluate_key's commit section, COPIED by snapshot_staged_baselines(), erased only after
+    /// its KV write by erase_staged_baselines_if_unchanged(), and READ (not drained) by
+    /// attach_core under the same registry_mu_ hold as the prior generation's detach, to seed a
+    /// replacement baseline-on-arm generation from a capture not yet durable. See
+    /// stage_baseline_locked().
+    std::map<std::string, CapturedBaseline> staged_baselines_;
+    /// Allocation-failure and replaced-unpersisted-capture drops. A shared_ptr set at
+    /// construction (never reseated) so GuardianBaselinePersister can read it without any lock.
+    std::shared_ptr<std::atomic<std::uint64_t>> staged_baseline_drops_ =
+        std::make_shared<std::atomic<std::uint64_t>>(0);
+    std::atomic<int> fail_next_stage_baseline_{0}; ///< TEST-ONLY allocation-failure seam (count)
+    mutable std::atomic<bool> fail_next_snapshot_{false}; ///< TEST-ONLY snapshot-throw seam
+    std::atomic<bool> fail_next_unstaged_sweep_{false}; ///< TEST-ONLY sweep-throw seam
+    std::atomic<bool> fail_next_inherit_copy_{false};     ///< TEST-ONLY attach_core copy seam
+    /// TEST-ONLY: see unstaged_sweep_stopping_for_test().
+    std::atomic<int> unstaged_sweep_stopping_for_test_{-1};
+    /// registry_mu_ held. First capture wins on one path; a different path (a retarget)
+    /// replaces the unpersisted capture and counts a drop. Never throws, so a throw cannot split
+    /// evaluate_key's enqueue from its commit. Returns false iff the capture could NOT be staged
+    /// (an allocation failure, counted as a drop). The caller must then NOT forget the capture
+    /// and must not discard the baseline it established (that would let the next evaluation
+    /// re-baseline drifted content): it sets RuleGeneration::baseline_unstaged so the staging is
+    /// retried with the same, committed hash.
+    [[nodiscard]] bool stage_baseline_locked(const std::string& rule_id, const std::string& path,
+                                             const std::string& hash) noexcept;
+    /// registry_mu_ held. A generation about to be dropped (withdrawn by detach_rule, or by
+    /// detach_all as a full_sync does before it re-arms) whose capture is committed but unstaged
+    /// (RuleGeneration::baseline_unstaged) stages its committed hash first, on the path of its
+    /// key's spec, so the replacement generation's staged read still inherits it. Never throws;
+    /// a second staging failure is counted by stage_baseline_locked, and the capture is then
+    /// lost to the replacement unless a later retry (attach_core's own, or its read-back after
+    /// the withdrawal) stages it.
+    /// Returns true iff the hash is now staged.
+    [[nodiscard]] bool salvage_unstaged_baseline_locked(
+        const std::string& rule_id, const RuleGeneration& rg,
+        const std::optional<std::string>& key) noexcept;
     std::unique_ptr<SparkKeyRuleIndex> index_;                          // key <-> rule fan-out + refcount
     std::unordered_map<std::string, std::shared_ptr<RuleGeneration>> rules_; // rule_id -> generation
     std::unordered_map<std::string, std::shared_ptr<PerKey>> keys_;          // spark_key -> per-key

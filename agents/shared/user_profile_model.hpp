@@ -100,6 +100,15 @@ struct ProfileInfo {
     return true;
 }
 
+/// A ProfileList subkey whose name ends `.bak` (Windows writes only `<SID>.bak`: the leftover it
+/// keeps when a temporary-profile event renames a user's real profile key). Its folder may hold
+/// the user's real hive, so consumers that read per-user data decide what to do with it
+/// (privacy_permissions names it); this predicate classifies only -- build_profile_list does not
+/// filter it.
+[[nodiscard]] inline bool is_profile_backup_entry(std::string_view sid) {
+    return sid.size() > 4 && iequals_ascii(sid.substr(sid.size() - 4), ".bak");
+}
+
 /// Last '\' or '/' separated component of `profile_image_path`, with any
 /// trailing separators stripped first (so "C:\Users\alice\" yields "alice",
 /// matching basename-style semantics). Returns "" only when the path is

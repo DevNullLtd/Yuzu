@@ -1,13 +1,15 @@
 /**
- * test_privacy_permissions_win_internals.cpp -- TU-inclusion seam over
- * privacy_permissions_win.cpp's internal-linkage StabilityWatch, walk_consent_store and
- * HiveFileGuard. The pure classifiers (classify_stability, classify_hive_file, ...) are covered
- * in test_privacy_permissions_parsers.cpp; these cases prove the production WIRING around them:
- * that the watch is armed and polled, that the walk decodes a ConsentStore subtree and honours the
- * deadline, that the guard checks the deadline first and verifies the file identity, that
- * with_user_hive reads a loaded hive before ever entering the offline arm, and that the final-path
- * comparison is Windows' own ordinal one. No fake registry interface: a per-process-salted volatile
- * HKCU key and a TempDir file.
+ * test_privacy_permissions_win_internals.cpp -- TU-inclusion seam over privacy_permissions_win.cpp:
+ * its production Win32Registry and Win32HiveFileProbe shells (and the internal-linkage
+ * StabilityWatch and with_user_hive wiring) driven through the pure walk and guard headers
+ * (privacy_permissions_win_walk.hpp, privacy_permissions_hive_guard.hpp). The pure classifiers
+ * (classify_stability, classify_hive_file, ...) are covered in
+ * test_privacy_permissions_parsers.cpp, and the walk and guard logic (the deadline-first order
+ * among it) over fakes in test_privacy_permissions_win_walk.cpp; these cases prove the production
+ * WIRING around them: that the watch is armed and polled, that the walk decodes a ConsentStore
+ * subtree, that the guard verifies the file identity, that with_user_hive reads a loaded hive
+ * before ever entering the offline arm, and that the final-path comparison is Windows' own
+ * ordinal one. This TU uses no fake: a per-process-salted volatile HKCU key and a TempDir file.
  *
  * `#if defined(_WIN32)` guards the WHOLE body -- empty TU elsewhere (the same shape as
  * test_execution_artifacts_win_internals.cpp and test_privacy_permissions_macos_internals.cpp).
@@ -28,6 +30,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -50,6 +53,13 @@ namespace fs = std::filesystem;
 #include <winioctl.h> // FSCTL_SET_SPARSE (the sparse-file oversize fixture)
 
 using namespace yuzu::privacy_permissions;
+
+static_assert(!std::is_copy_constructible_v<UniqueHandle>);
+static_assert(!std::is_copy_constructible_v<FindHandle>);
+static_assert(!std::is_copy_constructible_v<LocalFreeGuard>);
+static_assert(!std::is_copy_constructible_v<StabilityWatch>);
+static_assert(!std::is_copy_constructible_v<Win32Registry>);
+static_assert(!std::is_copy_constructible_v<Win32HiveFileProbe>);
 
 namespace {
 
@@ -162,6 +172,13 @@ struct HiveCleanup {
     ~HiveCleanup() { run(); }
 };
 
+/// A guard over the real Win32 probe, with the run budget's deadline injected.
+win::HiveFileGuard make_guard(Win32HiveFileProbe& probe, win::RetentionBudget& budget,
+                              std::string sid) {
+    return win::HiveFileGuard{probe, [&budget] { return budget.expired(); }, std::move(sid),
+                              std::nullopt};
+}
+
 const RawGrant* find(const std::vector<RawGrant>& v, std::string_view app, std::string_view cat) {
     for (const auto& g : v)
         if (g.app_id == app && g.category == cat) return &g;
@@ -185,13 +202,14 @@ TEST_CASE("privacy_permissions win: StabilityWatch reports a change armed beneat
     set_sz(grandchild.get(), L"Value", L"Deny"); // a depth-2 Value write after arming
     const auto token = win::classify_stability(watch.poll());
     REQUIRE(token.has_value());
-    CHECK(*token == "changed_during_read");
+    CHECK(*token == win::kChangedDuringRead);
 }
 
 TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture ConsentStore, reports a "
           "missing store, and stops at an expired deadline",
           "[privacy_permissions][win_internals]") {
     TestKey key;
+    Win32Registry reg;
     const std::wstring store = kStorePath;
     set_sz(key.make(store + L"\\webcam").get(), L"Value", L"Allow");
     set_sz(key.make(store + L"\\webcam\\Pkg.App_1").get(), L"Value", L"Allow");
@@ -216,7 +234,7 @@ TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture Consent
 
     SECTION("the fixture is decoded level by level; unmodelled and missing keys stay visible") {
         win::RetentionBudget budget;
-        const auto w = walk_consent_store(key.root, budget);
+        const auto w = win::walk_consent_store(reg, key.root, budget);
         CHECK(w.root_rc == ERROR_SUCCESS);
         CHECK(w.refused.empty());
         CHECK(w.structural.empty());
@@ -243,7 +261,7 @@ TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture Consent
     }
     SECTION("hostile Value shapes are unreadable with a named cause, never decoded or allocated") {
         win::RetentionBudget budget;
-        const auto w = walk_consent_store(key.root, budget);
+        const auto w = win::walk_consent_store(reg, key.root, budget);
         const auto* big = find(w.grants, "Pkg.Big", "camera");
         REQUIRE(big);
         CHECK(big->state == PermissionState::unreadable);
@@ -258,10 +276,53 @@ TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture Consent
         CHECK(dword->state == PermissionState::unreadable);
         CHECK(dword->cause == "value_type_" + std::to_string(REG_DWORD));
     }
+    SECTION("key names fold the way the registry's own do: a lowercase pair, and a non-ASCII "
+            "child") {
+        // (i) `nonpackaged` / `EXECUTABLES` differ from the canonical names only by ASCII case: the
+        // registry opens them as the same keys, so the walk must not read them as apps.
+        {
+            TestKey t;
+            set_sz(t.make(store + L"\\webcam").get(), L"Value", L"Allow");
+            set_sz(t.make(store + L"\\webcam\\nonpackaged").get(), L"Value", L"Allow");
+            t.make(store + L"\\webcam\\nonpackaged\\EXECUTABLES\\foo.exe");
+            win::RetentionBudget budget;
+            const auto w = win::walk_consent_store(reg, t.root, budget);
+            std::size_t toggles = 0;
+            for (const auto& g : w.grants) {
+                if (g.category != "camera") continue;
+                CHECK(g.app_id != "nonpackaged");
+                CHECK(g.app_id != "EXECUTABLES");
+                if (g.app_id == "NonPackaged") ++toggles;
+            }
+            CHECK(toggles == 1);
+            const auto* toggle = find(w.grants, "NonPackaged", "camera");
+            REQUIRE(toggle);
+            CHECK(toggle->state == PermissionState::allowed);
+            for (const auto& g : w.structural)
+                CHECK(g.cause.find("duplicate_app_id") == std::string::npos);
+        }
+        // (ii) `Executable` + U+017F: whether it IS the container is the registry's call, so the
+        // registry is the oracle -- the canonical name opens it exactly when the registry folds it.
+        {
+            TestKey u;
+            const std::wstring odd = L"Executable\x017f";
+            set_sz(u.make(store + L"\\webcam").get(), L"Value", L"Allow");
+            const auto nonpkg = u.make(store + L"\\webcam\\NonPackaged");
+            set_sz(u.make(store + L"\\webcam\\NonPackaged\\" + odd).get(), L"Value", L"Allow");
+            yuzu::win::RegKey folded;
+            const bool reg_folds =
+                RegOpenKeyExW(nonpkg.get(), L"Executables", 0, KEY_READ, folded.put()) ==
+                ERROR_SUCCESS;
+            CHECK(reg.key_name_equals(odd, win::kExecutablesContainerKeyName) == reg_folds);
+            win::RetentionBudget budget;
+            const auto w = win::walk_consent_store(reg, u.root, budget);
+            CHECK((find(w.grants, reg.utf8(odd), "camera") != nullptr) == !reg_folds);
+        }
+    }
     SECTION("a missing ConsentStore reads file-not-found and every category absent") {
         TestKey empty;
         win::RetentionBudget budget;
-        const auto w = walk_consent_store(empty.root, budget);
+        const auto w = win::walk_consent_store(reg, empty.root, budget);
         CHECK(w.root_rc == ERROR_FILE_NOT_FOUND);
         CHECK(w.grants.size() == win::kCapabilities.size());
         for (const auto& g : w.grants) CHECK(g.state == PermissionState::absent);
@@ -269,14 +330,14 @@ TEST_CASE("privacy_permissions win: walk_consent_store decodes a fixture Consent
     SECTION("an already-expired deadline stops the walk before any key is read") {
         win::RetentionBudget budget;
         budget.deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1};
-        const auto w = walk_consent_store(key.root, budget);
+        const auto w = win::walk_consent_store(reg, key.root, budget);
         CHECK(budget.timed_out);
         CHECK(w.grants.empty());
     }
 }
 
-TEST_CASE("privacy_permissions win: HiveFileGuard checks the deadline before any open, accepts a "
-          "regular file, refuses a directory or a missing file, and catches a swapped file",
+TEST_CASE("privacy_permissions win: HiveFileGuard accepts a regular file, refuses a directory or "
+          "a missing file, and catches a swapped file",
           "[privacy_permissions][win_internals]") {
     yuzu::test::TempDir tmp("yuzu_test_privperm_hive_");
     fs::create_directories(tmp.path);
@@ -285,64 +346,41 @@ TEST_CASE("privacy_permissions win: HiveFileGuard checks the deadline before any
     { std::ofstream(file, std::ios::binary) << "regf"; }
     const std::string sid = own_sid_string();
 
-    SECTION("an expired deadline is refused as `timeout` with no file opened") {
-        win::RetentionBudget budget;
-        budget.deadline = std::chrono::steady_clock::now() - std::chrono::seconds{1};
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
-        CHECK(guard.before_load(file.wstring()) == "timeout");
-        CHECK(guard.opens == 0);
-        CHECK(budget.timed_out); // the side effect assemble_windows_rows relies on to end the run
-    }
     SECTION("a regular file owned by the calling user is accepted, and its identity re-verifies") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load(file.wstring()) == "");
         CHECK(guard.after_load(file.wstring()) == "");
     }
     SECTION("a doubled separator before the file name is still the same path") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         const std::wstring doubled = dir.wstring() + L"\\\\hive.bin";
         CHECK(guard.before_load(doubled) == "");
     }
     SECTION("a directory is not a regular file") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load(dir.wstring()) == "hive_not_regular");
     }
     SECTION("a missing file is a stat failure carrying the Win32 code") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load((dir / "missing.bin").wstring()) == "hive_stat_failed:win32_2");
-    }
-    SECTION("a path deeper than kMaxHivePathDepth is refused before any syscall") {
-        win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
-        std::wstring deep = dir.wstring().substr(0, 3); // the drive root of a fixed disk
-        for (std::size_t i = 0; i < win::kMaxHivePathDepth; ++i) deep += L"d\\";
-        deep += L"NTUSER.DAT"; // kMaxHivePathDepth directories + the leaf = one over
-        CHECK(guard.before_load(deep) == "hive_path_too_deep");
-        CHECK(guard.opens == 0);
-    }
-    SECTION("a UNC path is refused before any syscall") {
-        win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
-        CHECK(guard.before_load(L"\\\\server\\share\\NTUSER.DAT") == "hive_path_unc");
-        CHECK(guard.opens == 0);
     }
     SECTION("a different file at the same path after the load is hive_identity_changed") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         REQUIRE(guard.before_load(file.wstring()) == "");
         const fs::path other = dir / "other.bin";
         { std::ofstream(other, std::ios::binary) << "regf"; }
         fs::rename(file, dir / "moved.bin");
         fs::rename(other, file);
-        CHECK(guard.after_load(file.wstring()) == "hive_identity_changed");
-    }
-    SECTION("after_load with no before_load snapshot refuses") {
-        win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
         CHECK(guard.after_load(file.wstring()) == "hive_identity_changed");
     }
 }
@@ -373,10 +411,11 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a drive that is not a 
     }
     if (!letter) SKIP("every drive letter is mapped: no DRIVE_NO_ROOT_DIR root to refuse");
     win::RetentionBudget budget;
-    HiveFileGuard guard{budget, synthetic_sid(), 0, std::nullopt};
+    Win32HiveFileProbe probe;
+    auto guard = make_guard(probe, budget, synthetic_sid());
     CHECK(guard.before_load(std::wstring{letter} + L":\\Users\\x\\NTUSER.DAT") ==
           "hive_path_not_fixed");
-    CHECK(guard.opens == 0);
+    CHECK(probe.opens == 0);
 }
 
 TEST_CASE("privacy_permissions win: HiveFileGuard refuses a symlinked ancestor and a reparse-point "
@@ -398,17 +437,20 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a symlinked ancestor a
 
     SECTION("a directory symlink anywhere on the path is a reparse ancestor") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load((link / "hive.bin").wstring()) == "hive_path_reparse_ancestor");
     }
     SECTION("a directory symlink as the leaf is a reparse point") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load(link.wstring()) == "hive_reparse_point");
     }
     SECTION("a file symlink as the leaf is a reparse point") {
         win::RetentionBudget budget;
-        HiveFileGuard guard{budget, sid, 0, std::nullopt};
+        Win32HiveFileProbe probe;
+        auto guard = make_guard(probe, budget, sid);
         CHECK(guard.before_load(file_link.wstring()) == "hive_reparse_point");
     }
 }
@@ -429,7 +471,8 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a hive file over the s
         REQUIRE(SetEndOfFile(h.h));
     }
     win::RetentionBudget budget;
-    HiveFileGuard guard{budget, own_sid_string(), 0, std::nullopt};
+    Win32HiveFileProbe probe;
+    auto guard = make_guard(probe, budget, own_sid_string());
     CHECK(guard.before_load(hd.file.wstring()) == "hive_oversized");
 }
 
@@ -440,7 +483,8 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a reparse-point or har
     const std::string sid = own_sid_string();
     const fs::path log1 = hd.dir / "hive.bin.LOG1"; // `<hive file name>.LOG1`, as the kernel names it
     win::RetentionBudget budget;
-    HiveFileGuard guard{budget, sid, 0, std::nullopt};
+    Win32HiveFileProbe probe;
+    auto guard = make_guard(probe, budget, sid);
 
     SECTION("a regular sidecar is what the kernel creates: accepted") {
         { std::ofstream(log1, std::ios::binary) << "log"; }
@@ -459,6 +503,11 @@ TEST_CASE("privacy_permissions win: HiveFileGuard refuses a reparse-point or har
             SKIP("a symlink needs SeCreateSymbolicLinkPrivilege or Developer Mode: " << ec.message());
         CHECK(guard.before_load(hd.file.wstring()) == "hive_sidecar_reparse");
         CHECK_FALSE(fs::exists(target));
+        // The production probe opens the link itself (FILE_FLAG_OPEN_REPARSE_POINT), so the
+        // opened handle's attribute word carries the reparse bit the guard re-checks.
+        std::uint32_t links = 0, attrs = 0;
+        CHECK(probe.sidecar_facts(log1.wstring(), links, attrs) == 0);
+        CHECK((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0);
     }
     SECTION("more than kMaxHiveSidecars sidecar-named entries are refused") {
         for (std::size_t i = 0; i <= win::kMaxHiveSidecars; ++i)
@@ -485,7 +534,8 @@ TEST_CASE("privacy_permissions win: HiveFileGuard reads the owner from the file,
         rc != ERROR_SUCCESS)
         SKIP("cannot set the fixture file's owner to S-1-5-19 (win32 " << rc << ")");
     win::RetentionBudget budget;
-    HiveFileGuard guard{budget, synthetic_sid(), 0, std::nullopt};
+    Win32HiveFileProbe probe;
+    auto guard = make_guard(probe, budget, synthetic_sid());
     CHECK(guard.before_load(hd.file.wstring()) == "hive_owner_unexpected");
 }
 
@@ -511,6 +561,7 @@ TEST_CASE("privacy_permissions win: with_user_hive reads a loaded HKU hive first
             return std::string{"must_not_run"};
         }};
     yuzu::win::HiveAccessReport report;
+    report.live_open_rc = ERROR_INVALID_HANDLE; // not the member default: the CHECK discriminates
     // The profile path is deliberately bogus: if the live branch were skipped, the offline arm
     // would be entered (and refused by the first hook, or by a missing privilege) instead.
     const auto status = yuzu::win::with_user_hive(
@@ -525,6 +576,7 @@ TEST_CASE("privacy_permissions win: with_user_hive reads a loaded HKU hive first
     CHECK(before_calls == 0);
     CHECK(after_calls == 0);
     CHECK_FALSE(report.mounted_offline);
+    CHECK(report.live_open_rc == ERROR_SUCCESS);
 }
 
 namespace {
@@ -566,6 +618,8 @@ TEST_CASE("privacy_permissions win: with_user_hive refuses on a before_load toke
     HookCounts n;
     yuzu::win::HiveAccessReport report;
     const auto status = run_offline("C:\\yuzu_bogus_profile_path", "forced_before", "", n, report);
+    // Recorded before the privilege check, so it holds on the privilege-missing path too.
+    CHECK(report.live_open_rc == ERROR_FILE_NOT_FOUND); // the synthetic SID is not loaded
     if (status == yuzu::win::HiveAccessStatus::privilege_missing)
         SKIP("the offline arm needs SeBackupPrivilege and SeRestorePrivilege: not held here");
     CHECK(status == yuzu::win::HiveAccessStatus::file_refused);

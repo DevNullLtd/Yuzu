@@ -16,7 +16,10 @@
 
 #include <yuzu/plugin.hpp>
 
+#include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
+
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <filesystem>
 #include <format>
@@ -58,21 +61,30 @@ void load_tags() {
     } catch (...) {}
 }
 
-void save_tags() {
+// Returns false when tags.json was NOT replaced: the in-memory map still advanced, and the file
+// is what Register reads (agent.cpp), so the caller must declare it.
+bool save_tags() {
     if (g_tags_path.empty())
-        return;
-
-    std::error_code ec;
-    auto parent = g_tags_path.parent_path();
-    if (!parent.empty()) {
-        fs::create_directories(parent, ec);
-    }
+        return true; // no data_dir: nothing to persist, as before
 
     nlohmann::json j = g_tags;
-    std::ofstream f(g_tags_path);
-    if (f) {
-        f << j.dump(2);
+    auto r = yuzu::shared::write_file_atomic(g_tags_path, j.dump(2), {.owner_only_mode = false});
+    if (!r) {
+        spdlog::warn("tags: state not persisted: {}", r.error().message);
+        return false;
     }
+    if (*r)
+        spdlog::warn("tags: {}", (*r)->message);
+    return true;
+}
+
+// set/delete/clear: rc stays 0 and the row is written as before; a failed persist is declared
+// CONSTRAINED / PARTIAL so the caller can see the in-memory tag advanced and the file did not
+// (asset_tags precedent, #4725).
+void persist_after_mutation(yuzu::CommandContext& ctx) {
+    if (!save_tags())
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "tags:persist_failed");
 }
 
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
@@ -183,7 +195,7 @@ private:
         }
 
         g_tags[key_str] = val_str;
-        save_tags();
+        persist_after_mutation(ctx);
         ctx.write_output(std::format("tag_set|{}|{}", key_str, val_str));
         return 0;
     }
@@ -220,7 +232,7 @@ private:
         }
         std::string key_str{key};
         bool found = g_tags.erase(key_str) > 0;
-        save_tags();
+        persist_after_mutation(ctx);
         ctx.write_output(std::format("tag_deleted|{}|{}", key_str, found ? "true" : "false"));
         return 0;
     }
@@ -240,7 +252,7 @@ private:
     int do_clear(yuzu::CommandContext& ctx) {
         auto count = g_tags.size();
         g_tags.clear();
-        save_tags();
+        persist_after_mutation(ctx);
         ctx.write_output(std::format("tags_cleared|{}", count));
         return 0;
     }

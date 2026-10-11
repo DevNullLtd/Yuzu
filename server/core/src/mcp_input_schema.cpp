@@ -215,6 +215,7 @@ std::unique_ptr<const SchemaNode> compile_node(const nlohmann::json& s, const st
         } else {
             RE2::Options opts;
             opts.set_log_errors(false);
+            opts.set_max_mem(kPatternMaxMem);
             auto re = std::make_unique<RE2>(s["pattern"].get_ref<const std::string&>(), opts);
             if (!re->ok())
                 err("'pattern' at '" + path + "' does not compile as RE2");

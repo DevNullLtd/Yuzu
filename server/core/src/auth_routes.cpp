@@ -29,6 +29,7 @@
 #include "saml_principal.hpp"  // saml_principal_id / is_valid_saml_component — ADR-2001 PR4a
 #include "saml_scim_link.hpp"  // link_saml_login_to_scim — ADR-2001 PR4a login-site orchestration
 #include "service_scope_policy.hpp" // authz::service_scope_global_safe — #2298 PR 3 default-deny table
+#include "web_utils.hpp" // audit_token — CWE-117 neutralisation for the audit-failure warn
 
 #include <ctime>
 
@@ -131,6 +132,29 @@ static std::string find_cookie_value(const std::string& hdr, const std::string& 
         pos = delim + 1; // advance past ";"
     }
     return {};
+}
+
+/// OIDC browser-binding cookie. The name follows the transport the way the session cookie picks
+/// its `Secure` attribute (`session_cookie_attrs`): behind TLS the `__Host-` prefix (browser-
+/// enforced Secure + Path=/ + no Domain, as SAML's binding cookie) is used; on plain http a
+/// `__Host-` cookie would be rejected by the browser, so the unprefixed name is used. Both
+/// sides derive the name from the same flag.
+///
+/// SameSite=Lax, not SAML's None: the IdP returns to /auth/callback by a top-level GET
+/// navigation, which a Lax cookie accompanies; a Lax cookie is not sent on subrequests or
+/// POSTs. (SAML needs None only because its assertion arrives as a POST.) This relies
+/// on the default `query` response mode; a `form_post` return would not carry a Lax cookie.
+/// Max-Age=600 matches the pending flow's TTL (OidcProvider::kChallengeTtl).
+static const char* oidc_bind_cookie_name(bool https) {
+    return https ? "__Host-yuzu_oidc_bind" : "yuzu_oidc_bind";
+}
+static std::string oidc_bind_cookie_set(bool https, const std::string& secret) {
+    return std::string(oidc_bind_cookie_name(https)) + "=" + secret +
+           "; Path=/; HttpOnly; SameSite=Lax; Max-Age=600" + (https ? "; Secure" : "");
+}
+static std::string oidc_bind_cookie_clear(bool https) {
+    return std::string(oidc_bind_cookie_name(https)) +
+           "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (https ? "; Secure" : "");
 }
 
 } // namespace
@@ -747,7 +771,7 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         // store or a genuinely-disabled one still denies here; a degraded
         // view (open, but a stale cached "disabled" that never observed a
         // real toggle) is treated as still-enforced and falls through to
-        // fail closed via `check_role_has_permission` on that same handle
+        // fail closed via `authz::service_ceiling_check` on that same handle
         // instead — deny-on-degrade either way, just a more accurate reason.
         if (!rbac_store_ || !rbac_enforcement_in_effect(rbac_store_)) {
             audit_log(req, "auth.permission_required", "denied", "", "",
@@ -759,7 +783,21 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                             "application/json");
             return false;
         }
-        if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
+        // Shared ceiling helper (authz::service_ceiling_check). Unlike require_scoped_permission
+        // and require_fleet_read, this gate does NOT answer a Degraded verdict (a failed read)
+        // with a retryable 503 up front: the allow-list check below refuses every pair today
+        // (kServiceScopeGlobalSafe is empty), so a retry hint here would advertise a recovery that
+        // cannot happen. A Degraded read therefore continues to that allow-list check and is
+        // answered by its definitive default-deny 403 with the same status, body and metrics as
+        // for a healthy read; only the audit detail differs, by a trailing marker. A definitive
+        // Deny keeps its own 403 (and audit text) before the allow-list.
+        const auto ceiling = authz::service_ceiling_check(*rbac_store_, securable_type, operation);
+        const bool ceiling_degraded = ceiling.verdict == authz::CeilingVerdict::Degraded;
+        // Everything that is not an explicit Admit is refused: a Deny verdict, and any
+        // out-of-range value, which must never fall through to the admit. A Degraded verdict is
+        // the one exception that continues (see above); it can only leave this function as a
+        // refusal through the allow-list check or the guard after it.
+        if (!ceiling_degraded && ceiling.verdict != authz::CeilingVerdict::Admit) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
@@ -774,9 +812,14 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             return false;
         }
         if (!service_scope_admits(securable_type, operation)) {
+            // The marker is audit-only: a Degraded ceiling read is answered by this same 403
+            // (status, body and metrics unchanged), so without it an outage would be
+            // indistinguishable from a healthy default-deny in the audit row. The text before
+            // the marker is the healthy row's detail, byte for byte.
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: default-deny (" + perm +
-                          " not on the service-scope global-safe allow-list)");
+                          " not on the service-scope global-safe allow-list)" +
+                          (ceiling_degraded ? "; ceiling read degraded" : ""));
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_service_scope_default_denied_total",
                            {{"permission", perm},
@@ -793,6 +836,18 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                               "needs an explicit confined path via require_fleet_read/"
                               "confine_agent_target)";
             res.set_content(detail::a4_denial(res, 403, msg), "application/json");
+            return false;
+        }
+        // Safety net, unreachable in production: the allow-list above is empty, so nothing gets
+        // past it. It exists so that a future populated allow-list can never admit on a failed
+        // ceiling read; test_authz_gates.cpp pins it through the allow-list's test override.
+        // Reaching here with a Degraded verdict means the allow-list alone would have admitted
+        // the request; refuse it as the retryable outage it is.
+        if (ceiling_degraded) {
+            respond_ceiling_degraded(req, res, "auth.permission_required",
+                                     "service-scoped token blocked: RBAC read degraded "
+                                     "resolving the ITServiceOwner ceiling",
+                                     ceiling);
             return false;
         }
         return true;
@@ -1093,7 +1148,21 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             return false;
         }
         // Check that the ITServiceOwner role grants this permission type
-        if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
+        // Shared ceiling helper (authz::service_ceiling_check). A Degraded verdict (a failed
+        // read) is a retryable 503 through the shared respond_ceiling_degraded, the same as
+        // require_fleet_read: an outage is not a missing grant. Still fail CLOSED (the request
+        // is refused). Only a definitive Deny is the 403 below.
+        const auto ceiling = authz::service_ceiling_check(*rbac_store_, securable_type, operation);
+        if (ceiling.verdict == authz::CeilingVerdict::Degraded) {
+            respond_ceiling_degraded(req, res, "auth.scoped_permission_required",
+                                     "service-scoped token blocked: RBAC read degraded "
+                                     "resolving the ITServiceOwner ceiling",
+                                     ceiling);
+            return false;
+        }
+        // Everything that is not an explicit Admit is refused: a Deny verdict, and any
+        // out-of-range value, which must never fall through to the admit.
+        if (ceiling.verdict != authz::CeilingVerdict::Admit) {
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
@@ -1324,6 +1393,8 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
     // flat list-read gate has no single agent_id to scope the token's
     // service against, so admitting it would hand a service-scoped token the
     // WHOLE fleet's data.
+    // No `.permission` on the body (routed-concern clause 5): this is a blanket deny of the
+    // credential class, so granting `perm` to anyone would not admit this caller.
     if (!session->token_scope_service.empty()) {
         audit_log(req, "auth.permission_required", "denied", "", "",
                   "service-scoped token '" + session->token_scope_service +
@@ -1331,8 +1402,7 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
         res.status = 403;
         res.set_content(
             detail::a4_denial(res, 403,
-                              "service-scoped tokens cannot read the fleet-wide status rollup",
-                              detail::A4ErrorOpts{.permission = perm}),
+                              "service-scoped tokens cannot read the fleet-wide status rollup"),
             "application/json");
         return gate;
     }
@@ -1431,9 +1501,12 @@ bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& actio
         // returns false so the caller can decide whether to abort the
         // surrounding operation; most call sites legitimately fire-and-
         // forget the return value (matches the historical contract).
+        // CWE-117: target_id is caller-controlled on the legacy `/api/responses/(.+)`
+        // route (an unrestricted instruction id), so every field is neutralised
+        // exactly as `try_persist_audit` does; the raw value stays in the audit row.
         spdlog::warn("audit_log: AuditStore::log failed for action='{}' target_type='{}' "
                      "target_id='{}'",
-                     action, target_type, target_id);
+                     audit_token(action), audit_token(target_type), audit_token(target_id));
     }
     return ok;
 }
@@ -3278,8 +3351,22 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             spdlog::error("OIDC auth flow blocked: redirect_uri not configured");
             return;
         }
-        auto auth_url = oidc_provider_->start_auth_flow(cfg_.oidc_redirect_uri);
-        res.set_redirect(auth_url);
+        // Bind this flow to THIS browser: the secret goes out only as a cookie on this very
+        // response (never in the redirect URL); the provider keeps its hash, and the callback
+        // must present the secret back. `start_auth_flow` throws if the platform crypto fails:
+        // answer a plain 500 and set nothing, never a redirect without a binding cookie.
+        oidc::OidcProvider::AuthFlowStart flow;
+        try {
+            flow = oidc_provider_->start_auth_flow(cfg_.oidc_redirect_uri);
+        } catch (const std::exception& e) {
+            spdlog::error("OIDC auth flow could not start: {}", e.what());
+            res.status = 500;
+            res.set_content(detail::a4_error(res, "could not start the SSO sign-in flow"),
+                            "application/json");
+            return;
+        }
+        res.set_header("Set-Cookie", oidc_bind_cookie_set(cfg_.https_enabled, flow.binding_secret));
+        res.set_redirect(flow.url);
     });
 
     sink.Get("/auth/callback", [this](const httplib::Request& req, httplib::Response& res) {
@@ -3320,8 +3407,49 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
-        auto result = oidc_provider_->handle_callback(code, state);
+        // Browser binding. Exact-name cookie match (a `foo__Host-yuzu_oidc_bind` cookie cannot
+        // shadow it). A MISSING cookie is refused here without consulting the provider, so the
+        // pending flow is left for the initiating browser (for example a link opened in a
+        // different browser, or an expired cookie). A WRONG cookie is refused by the
+        // provider, which also leaves the flow in place. Both answer with the same generic
+        // `sso_failed` redirect as every other callback failure and differ only in the audited
+        // reason token.
+        const std::string binding_secret = find_cookie_value(
+            req.get_header_value("Cookie"), oidc_bind_cookie_name(cfg_.https_enabled));
+        if (binding_secret.empty()) {
+            spdlog::warn("OIDC callback: missing browser-binding cookie, login refused");
+            audit_log(req, "auth.oidc_login_failed", "failure", {}, {},
+                      "reason=browser_binding_missing");
+            emit_event("auth.oidc_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "browser_binding_missing"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+            }
+            res.set_redirect("/login?error=sso_failed");
+            return;
+        }
+
+        bool binding_verified = false;
+        auto result =
+            oidc_provider_->handle_callback(code, state, binding_secret, &binding_verified);
+        // The binding cookie is single-use and is cleared only when THIS visitor's cookie proved
+        // a pending flow (a success, or a failure after the match); a success then appends the
+        // session cookie after it. A callback that matches no pending flow leaves the cookie in place,
+        // so a sign-in the visitor has in progress is not disturbed. `binding_verified` is the
+        // provider's own answer, so a failure reason added to `handle_callback` later defaults
+        // to NOT clearing.
+        if (binding_verified)
+            res.set_header("Set-Cookie", oidc_bind_cookie_clear(cfg_.https_enabled));
         if (!result) {
+            // A binding refusal keeps the generic user-facing shape; only the audit detail and
+            // the analytics event name it, by a fixed token (never the provider's free text).
+            // Empty for every other failure.
+            std::string binding_reason;
+            if (result.error() == oidc::OidcProvider::kBrowserBindingMismatch)
+                binding_reason = "browser_binding_mismatch";
+            else if (result.error() == oidc::OidcProvider::kBrowserBindingUnavailable)
+                binding_reason = "browser_binding_unavailable";
             // No display=/email= detail here — handle_callback failed before
             // claims were extracted (token exchange, signature, or
             // validate_claims rejection incl. the #1837 governance sub/iss
@@ -3329,9 +3457,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // auth.oidc_login_failed / auth.sso_group_provision emission
             // below this point (claims successfully parsed) DOES carry it.
             spdlog::warn("OIDC callback failed: {}", result.error());
-            audit_log(req, "auth.oidc_login_failed", "failure");
+            audit_log(req, "auth.oidc_login_failed", "failure", {}, {},
+                      binding_reason.empty() ? std::string{} : "reason=" + binding_reason);
             emit_event("auth.oidc_login_failed", req,
-                       {{"source_ip", req.remote_addr}, {"error", result.error()}}, {},
+                       {{"source_ip", req.remote_addr},
+                        {"error", binding_reason.empty() ? result.error() : binding_reason}},
+                       {},
                        Severity::kWarn);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();

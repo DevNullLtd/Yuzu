@@ -1,14 +1,13 @@
 <!-- The auth / access-control / request-admission half of the "Routed
-     concerns" table of CLAUDE.md (repo root), pulled in by its @-import —
-     loaded every session, same authority as CLAUDE.md itself. Split out of
-     `routed-concerns.md` (#2899) so the routed-concern tables stay under the
-     40k-per-file ceiling; the platform/product/data/observability concerns
-     remain in the sibling `routed-concerns.md`, the read-only
-     security-posture plugin rows live in
-     `routed-concerns-security-posture.md`, and Forensics / per-user-software-
-     data concerns live in `routed-concerns-software-estate.md`. Row
-     discipline unchanged: catastrophic-if-violated invariants + doc pointers
-     only — detail goes in the routed doc. -->
+     concerns" table of CLAUDE.md (repo root), @-imported, loaded every
+     session, same authority as CLAUDE.md. Split from `routed-concerns.md`
+     (#2899) for the 40k-per-file ceiling; platform/product/data/
+     observability stay there, the security-posture plugin rows and the
+     gateway-upstream peer-authorization row are in
+     `routed-concerns-security-posture.md`, Forensics / per-user-software-
+     data in `routed-concerns-software-estate.md`. Four files is the cap
+     (docs/instruction-file-standard.md). Row discipline: invariants + doc
+     pointers only; detail goes in the routed doc. -->
 
 | Concern | Doc | Loaded by |
 |---|---|---|
