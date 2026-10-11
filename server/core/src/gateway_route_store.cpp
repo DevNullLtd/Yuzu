@@ -860,6 +860,60 @@ GatewayRouteStore::lookup_routes(std::span<const std::string> agent_ids) {
     return out;
 }
 
+std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
+GatewayRouteStore::lookup_by_sessions(std::span<const std::string> session_ids) {
+    if (!open_)
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    if (session_ids.empty())
+        return std::vector<RoutableRoute>{};
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::warn("GatewayRouteStore::lookup_by_sessions: lease timeout — degraded");
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    }
+    // Same single-statement array-param idiom and in-SQL DB-clock `routable`
+    // as lookup_routes; session_id is not unique so EVERY match is returned.
+    std::vector<std::string_view> views;
+    views.reserve(session_ids.size());
+    for (const std::string& s : session_ids)
+        views.emplace_back(s);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT agent_id, cluster_id, gateway_node, connection_epoch, session_id, "
+        "       (extract(epoch FROM lease_until) * 1000)::bigint AS lease_until_ms, "
+        "       (lease_until IS NOT NULL AND lease_until < now()) AS is_stale, "
+        "       (session_id IS NOT NULL AND lease_until >= now() AND cluster_id IS NOT NULL) "
+        "         AS routable "
+        "FROM gateway_route_store.agent_routes WHERE session_id = ANY($1::text[])",
+        std::vector<std::string>{pg::to_text_array(views)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("GatewayRouteStore::lookup_by_sessions: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected(GatewayRouteStoreError::db_error);
+    }
+    const int n = PQntuples(res.get());
+    std::vector<RoutableRoute> out;
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        RoutableRoute rr;
+        rr.route.agent_id = PQgetvalue(res.get(), i, 0);
+        rr.route.cluster_id = col_opt(res.get(), i, 1);
+        rr.route.gateway_node = col_opt(res.get(), i, 2);
+        {
+            const char* v = PQgetvalue(res.get(), i, 3);
+            std::from_chars(v, v + std::char_traits<char>::length(v), rr.route.connection_epoch);
+        }
+        rr.route.session_id = col_opt(res.get(), i, 4);
+        rr.route.lease_until_ms = PQgetisnull(res.get(), i, 5)
+                                       ? std::nullopt
+                                       : parse_ms(PQgetvalue(res.get(), i, 5));
+        rr.route.is_stale = std::string_view(PQgetvalue(res.get(), i, 6)) == "t";
+        rr.routable = std::string_view(PQgetvalue(res.get(), i, 7)) == "t";
+        out.push_back(std::move(rr));
+    }
+    return out;
+}
+
 std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_stale_routes() {
     if (!open_)
         return std::unexpected(GatewayRouteStoreError::store_unavailable);

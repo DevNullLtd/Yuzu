@@ -755,6 +755,22 @@ public:
     [[nodiscard]] std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
     lookup_routes(std::span<const std::string> agent_ids);
 
+    /// Batched SESSION-keyed read (WS-5, #4246 #3): every row whose
+    /// `session_id` is in `session_ids`, in ONE query (`session_id =
+    /// ANY($1)`, served by `agent_routes_session_id_idx`) under a SINGLE
+    /// `kReadTimeout`. `RoutableRoute::route.session_id` is the matched id and
+    /// `route.agent_id` the owning agent; `routable` is computed IN-SQL on the
+    /// DB clock exactly as in `lookup_routes`. A session with no row is simply
+    /// absent. **`session_id` is NOT unique** (`register_fresh` and
+    /// `reclaim_tombstoned_session` guard only the caller's OWN agent row), so
+    /// one id can legitimately come back on SEVERAL rows — the CALLER must
+    /// treat more than one row per id as ambiguous and refuse to resolve it;
+    /// this method deliberately returns every match rather than picking one.
+    /// Use `lookup_route(agent_id)` (PK, unambiguous) whenever the agent_id is
+    /// already known.
+    [[nodiscard]] std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
+    lookup_by_sessions(std::span<const std::string> session_ids);
+
     /// Directory-hygiene reaper (4.2a, #7 in the ADR-2002 §7 "4.2 design
     /// obligations" list). CLOCK-GUARDED-RETENTION ADOPTION RECORD (routed
     /// concern, CLAUDE.md; the full seven parts are in

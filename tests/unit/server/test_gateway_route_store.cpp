@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1155,6 +1156,119 @@ TEST_CASE("GatewayRouteStore[pg]: lookup_routes on an empty span returns an empt
     auto routes = fx.store().lookup_routes(ids);
     REQUIRE(routes.has_value());
     CHECK(routes->empty());
+}
+
+// --- lookup_by_sessions (WS-5, #4246 #3) -------------------------------------
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions on an empty span returns empty without a query",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    std::vector<std::string> sids{};
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions returns zero rows for unknown sessions",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-bys-other", "s-bys-other").value().won);
+    std::vector<std::string> sids{"s-bys-nobody", "s-bys-nobody-2"};
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions resolves one session to its owning agent",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-bys-one", "s-bys-one").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-bys-one", "s-bys-one", "c1", "n1", 3600)
+                .value()
+                .matched);
+    std::vector<std::string> sids{"s-bys-one"};
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().route.agent_id == "agent-bys-one");
+    REQUIRE(rows->front().route.session_id.has_value());
+    CHECK(*rows->front().route.session_id == "s-bys-one");
+    CHECK(rows->front().routable);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions returns many rows in one call and "
+          "reports routable independently of resolution",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    // Live + routable.
+    REQUIRE(fx.store().register_fresh("agent-bys-a", "s-bys-a").value().won);
+    REQUIRE(fx.store().announce_connected("agent-bys-a", "s-bys-a", "c1", "n1", 3600).value().matched);
+    // Registered but never announced -> present, NOT routable.
+    REQUIRE(fx.store().register_fresh("agent-bys-b", "s-bys-b").value().won);
+    // Expired lease -> present, NOT routable.
+    REQUIRE(fx.store().register_fresh("agent-bys-c", "s-bys-c").value().won);
+    REQUIRE(fx.store().announce_connected("agent-bys-c", "s-bys-c", "c1", "n1", -3600).value().matched);
+
+    std::vector<std::string> sids{"s-bys-a", "s-bys-b", "s-bys-c", "s-bys-absent"};
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 3);
+
+    auto find = [&](const std::string& sid) -> const RoutableRoute* {
+        for (const auto& rr : *rows)
+            if (rr.route.session_id && *rr.route.session_id == sid)
+                return &rr;
+        return nullptr;
+    };
+    const RoutableRoute* a = find("s-bys-a");
+    const RoutableRoute* b = find("s-bys-b");
+    const RoutableRoute* c = find("s-bys-c");
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    REQUIRE(c != nullptr);
+    CHECK(a->route.agent_id == "agent-bys-a");
+    CHECK(a->routable);
+    CHECK(b->route.agent_id == "agent-bys-b");
+    CHECK_FALSE(b->routable);
+    CHECK(c->route.agent_id == "agent-bys-c");
+    CHECK_FALSE(c->routable);
+    CHECK(find("s-bys-absent") == nullptr);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions never matches a tombstoned row",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-bys-tomb", "s-bys-tomb").value().won);
+    REQUIRE(fx.store().announce_connected("agent-bys-tomb", "s-bys-tomb", "c1", "n1", 30).value().matched);
+    std::vector<std::string> sids{"s-bys-tomb"};
+
+    auto live = fx.store().lookup_by_sessions(sids);
+    REQUIRE(live.has_value());
+    REQUIRE(live->size() == 1);
+
+    // Tombstone: session_id -> NULL; the row still exists, but the id is gone.
+    REQUIRE(fx.store().deregister("agent-bys-tomb", "s-bys-tomb").value().removed);
+    REQUIRE(fx.store().lookup_route("agent-bys-tomb").value().has_value());
+
+    auto after = fx.store().lookup_by_sessions(sids);
+    REQUIRE(after.has_value());
+    CHECK(after->empty());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions returns EVERY row for a duplicated "
+          "session id so the caller can refuse it",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    // session_id is not unique (register_fresh guards only the caller's own
+    // agent row): two agents may legitimately hold the same id.
+    REQUIRE(fx.store().register_fresh("agent-bys-dup1", "s-bys-dup").value().won);
+    REQUIRE(fx.store().register_fresh("agent-bys-dup2", "s-bys-dup").value().won);
+    std::vector<std::string> sids{"s-bys-dup"};
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 2);
+    CHECK(rows->at(0).route.agent_id != rows->at(1).route.agent_id);
 }
 
 // --- reap_stale_routes ------------------------------------------------------
@@ -2468,4 +2582,25 @@ TEST_CASE("GatewayRouteStore: reap_stale_routes fails closed against a closed po
     auto out = store.reap_stale_routes();
     REQUIRE_FALSE(out.has_value());
     CHECK(out.error() == GatewayRouteStoreError::store_unavailable);
+}
+
+// WS-5: lookup_by_sessions reports the same fail-closed store_unavailable a
+// closed/unreachable pool gives every other method (distinguishable from an
+// empty result so BatchHeartbeat/ProxyInventory can take their degrade path).
+TEST_CASE("GatewayRouteStore: lookup_by_sessions fails closed against a closed pool",
+          "[gateway_route][pg]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    yuzu::server::pg::PgPool pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent connect_timeout=1", .size = 1}};
+    GatewayRouteStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+    std::vector<std::string> sids{"s-bys-closed"};
+    auto out = store.lookup_by_sessions(sids);
+    REQUIRE_FALSE(out.has_value());
+    CHECK(out.error() == GatewayRouteStoreError::store_unavailable);
+    // A closed store is reported as such even for an empty input (open check first).
+    auto empty_out = store.lookup_by_sessions(std::span<const std::string>{});
+    REQUIRE_FALSE(empty_out.has_value());
+    CHECK(empty_out.error() == GatewayRouteStoreError::store_unavailable);
 }

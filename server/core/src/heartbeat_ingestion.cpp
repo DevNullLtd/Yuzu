@@ -17,7 +17,8 @@
 namespace yuzu::server {
 
 void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
-                                std::string_view agent_id, std::string_view via) {
+                                std::string_view agent_id, std::string_view via,
+                                std::string_view resolved_session_id) {
     const std::string agent_id_str(agent_id);
     const std::string via_str(via);
 
@@ -52,6 +53,8 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
             // see agent_service_impl.cpp / gateway_service_impl.cpp.
             session_id = sess->session_id;
         }
+        if (!resolved_session_id.empty())
+            session_id = std::string(resolved_session_id);
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();

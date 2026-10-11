@@ -1842,6 +1842,56 @@ FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22). One path remains genuinely open, n
 `Finish()` with zero response frames never resolves (#4691, filed, not fixed here) — "every time" describes
 every branch this PR's own scope covers, not that one.
 
+### 7f. Durable cross-replica gateway session resolution (WS-5 slice 2, `#4246` item #3, 2026-10-11)
+
+**Status: IMPLEMENTED IN PR (PR pending, not merged). THE SAFE-TO-SCALE GATE IS NOT LIFTED** — this
+closes one more `#4246` gap; it does not make a second replica safe (WS-6 6.1b/6.3, WS-13 for
+gateway-fronted fleets, WS-5's remaining slice-1 scope and the WS-9 scenarios are still open — see
+`docs/ha-delivery-matrix.md`).
+
+**Problem.** `GatewayUpstreamServiceImpl` resolved a gateway `session_id` to an `agent_id` only through
+the per-replica in-memory `gateway_sessions_` map. A replica that did not process the agent's
+`ProxyRegister` could not resolve that agent's `BatchHeartbeat` / `ProxyInventory` /
+`NotifyStreamStatus` traffic and answered "unknown session" — a gateway re-register storm, dropped
+inventory, and rejected stream notifications.
+
+**Mechanism.** `GatewayRouteStore::lookup_by_sessions(span<string>)` issues ONE batched
+`SELECT ... WHERE session_id = ANY($1::text[])` per RPC under the existing `kReadTimeout` and returns
+`store_unavailable` on degrade; tombstoned rows (`session_id` NULL) never match. The private
+`GatewayUpstreamServiceImpl::resolve_sessions` is store-AUTHORITATIVE whenever the route store is
+configured; the local `gateway_sessions_` map is only a degrade-time hint (and a lost-race fallback).
+The `agent_routes_session_id_idx` index is non-unique, so a `session_id` matching more than one row is
+REFUSED as `ambiguous` (desync metric outcome `ambiguous_session`); a degrade is counted under
+route-store failure op `session_lookup`.
+
+- **BatchHeartbeat** ingests every resolvable entry. A session unresolved ONLY because the store is
+  degraded is not listed in `unknown_session_ids` and not acked (so the gateway does not re-register in
+  a storm) and the RPC returns OK; a genuinely unknown session is still listed.
+- **ProxyInventory** works on a non-owning replica; unknown or degraded keeps `received=false` (the
+  agent's retry nack), with the degrade counted distinctly.
+- **NotifyStreamStatus**'s session guard now uses `lookup_route(agent_id)` and accepts iff the stored
+  row's `session_id` equals the notification's (previously a stale session could pass — HIGH finding).
+  A CONNECTED on a replica with a directory row but no local `AgentSession` skips the registry
+  `set_gateway_route`/unpublish (nothing local to update) and still announces; the DISCONNECTED
+  presence-row delete is gated on `removed_current_session || store_removed`.
+- **Presence correctness (§7a).** `OfflineEndpointStore::upsert` blank-preserves `hostname` and `os`
+  (as it already did `agent_version`/`arch`): a blank incoming value never overwrites a known non-blank
+  one. `HeartbeatIngestion::ingest` takes the resolved session id, so a heartbeat on a non-owning
+  replica (no local `AgentSession`) cannot blank the presence row's `session_id`.
+
+**Deliberate deviation — `routable` is not consulted.** A UNIQUE session match resolves regardless of
+the row's computed `routable` flag (lease freshness). A heartbeat IS the lease-renewal path
+(`renew_leases`); refusing a lease-stale row would turn a short Postgres blip into a fleet-wide
+re-register storm. Tombstoned rows still never match.
+
+**Decision — NotifyStreamStatus fails closed on a route-store error.** It rejects
+(`acknowledged=false` + metric) even for a session the local map knows — the same posture as WS-4 4.4
+F1 on the `ProxyRegister` decide path. Consequence: a single replica during a Postgres outage drops
+CONNECTED/DISCONNECTED notifications until the store recovers.
+
+**Deferred, not silent.** A UNIQUE partial index on `agent_routes(session_id)` gets its own migration
+(the ambiguity refusal is the interim guard); the WS-9 validation script is follow-on PR-B.
+
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced *(the
 "collapse into the KEK problem" framing and the first two bullets are superseded — see the Update

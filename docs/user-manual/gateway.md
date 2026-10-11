@@ -1728,9 +1728,12 @@ round-robins per RPC) or a layer-7 per-RPC balancer breaks it. Convergence is
 then probabilistic, not bounded, and the per-session guard bounds the replay
 rate but not the number of rounds. No multi-replica run exists; this is
 inferred from the code. The durable cross-replica session lookup (WS-5,
-#4246 item 3) is the fix, and until it lands the safe-to-scale gate forbids a
-second replica (see [ADR-2002](../adr/2002-high-availability-architecture.md),
-section 7c, update 2026-10-04).
+#4246 item 3, ADR-2002 section 7f) is the fix for the session-resolution part:
+`BatchHeartbeat`, `ProxyInventory` and `NotifyStreamStatus` now resolve a session
+against the durable directory on any replica (in PR, not yet merged). It does
+not lift the safe-to-scale gate: the gate still forbids a second replica (see
+[ADR-2002](../adr/2002-high-availability-architecture.md), section 7c, update
+2026-10-04, and section 7f).
 
 **Agent dependency.** The ordinary restart path above does not need the agent
 to do anything. When the gateway does disconnect an agent process (an

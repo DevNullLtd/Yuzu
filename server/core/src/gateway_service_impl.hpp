@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 #include <spdlog/spdlog.h>
@@ -301,6 +302,43 @@ private:
     /// `registration_locks_mu_`, released before the returned mutex is ever
     /// locked).
     std::shared_ptr<std::mutex> registration_lock_for(const std::string& agent_id);
+
+    /// HA WS-5 (#4246 #3): the outcome of resolving gateway-presented
+    /// session ids to agent ids for the session-keyed RPCs (BatchHeartbeat,
+    /// ProxyInventory).
+    struct SessionResolution {
+        /// session_id -> agent_id for every id the caller may act on.
+        std::unordered_map<std::string, std::string> resolved;
+        /// Subset of `resolved` answered by the DIRECTORY (not the local
+        /// hint map): the only ids whose owning replica may be another one.
+        std::unordered_set<std::string> from_store;
+        /// More than one directory row carried the id (`session_id` is not
+        /// unique): refused, never guessed at. Neither acted on nor listed
+        /// as unknown (listing would trigger a gateway re-register).
+        std::unordered_set<std::string> ambiguous;
+        /// The directory read degraded: `resolved` then holds only what the
+        /// local gateway_sessions_ hint map knows, and every other id is in
+        /// `unresolved_degraded` — "cannot tell", NOT "unknown".
+        bool degraded{false};
+        std::unordered_set<std::string> unresolved_degraded;
+    };
+
+    /// Resolves `session_ids` (empty ids are skipped) with ONE directory read
+    /// when a GatewayRouteStore is configured — the directory GOVERNS and the
+    /// per-replica gateway_sessions_ map is never trusted on its own (the 4.4
+    /// F1 rule), which is what lets a replica that did not register a
+    /// session serve its heartbeats. Resolution requires exactly one row
+    /// carrying the session id and deliberately does NOT require the row to
+    /// be `routable`: a heartbeat IS the lease-renewal path, so refusing a
+    /// stale-lease row would strand it (and, after a Postgres blip, force
+    /// every agent in the fleet through a re-register). A tombstoned row
+    /// (session_id NULL) never matches, which is what excludes a zombie
+    /// session after a DISCONNECTED. A session that lost its register_fresh
+    /// epoch race has no row under its own id; it keeps resolving through
+    /// the local map exactly as before. With no store configured the local
+    /// map alone decides (monolith, unchanged). No lock is held across the
+    /// directory call; nothing is backfilled into gateway_sessions_.
+    [[nodiscard]] SessionResolution resolve_sessions(const std::vector<std::string>& session_ids);
 
     /// Test-only, see the setter above and ProxyRegister's firing-point
     /// comment. nullptr (default) in production.
