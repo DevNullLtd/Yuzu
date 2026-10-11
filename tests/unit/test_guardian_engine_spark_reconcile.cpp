@@ -10493,3 +10493,80 @@ TEST_CASE("#5604 the stop-time journal-loss ERROR line names the count and the s
     CHECK(line.find("journal_flush_2") != std::string::npos);
     CHECK(line.find("lost when this process exits") != std::string::npos);
 }
+
+TEST_CASE("#5604 stop(): a second stop() after the store healed currently does NOT persist the "
+          "capture the first stop() skipped or failed (the Stop pass runs once per engine, so the "
+          "lateness rule is never consulted again)",
+          "[spark][guardian][baseline][reconcile][busy]") {
+    // run()'s exit ScopeExit calls guardian_->stop() again after AgentImpl::stop() did, and so
+    // does the destructor. begin_stop() is first-call-wins, so a second call would be judged
+    // from the FIRST call's mark if it reached the lateness rule at all; it does not, because
+    // persist_staged_baselines_locked(at_stop) returns at once once baseline_stop_flush_done_
+    // is set. This case pins that outcome, not a design goal: a capture whose first Stop pass
+    // was skipped (or failed) stays unpersisted although the store healed before the second call.
+    using namespace std::chrono_literals;
+    using Skip = GuardianBaselinePersister::StopSkip;
+    SparkReconcileFixture f{3'600'000, std::nullopt, SparkType::File};
+    f.engine->drain_worker_for_test()->stop();
+    auto* persister = f.engine->baseline_persister_for_test();
+    auto* rt = f.engine->spark_runtime_for_test();
+    REQUIRE(persister != nullptr);
+    REQUIRE(rt != nullptr);
+    FakeClock4045 clock{*persister};
+    HookGuard4045 hooks{*f.engine};
+    f.engine->set_stop_busy_timeout_for_test(100ms); // scaled from 1 s: the lock is real
+    stage_n_4045(*rt, 1, "5604b");
+
+    // The first stop(): the loss-ledger stage is a real BUSY write that the injected clock
+    // counts as one stop busy budget (store trouble), and for the late section the second
+    // journal flush moves the clock to the 18 s latest start.
+    bool late_first_stop = false;
+    std::atomic<bool> first_stop_running{true};
+    f.engine->set_stop_stage_hook_for_test([&](const char* stage) {
+        if (!first_stop_running.load())
+            return;
+        if (std::string_view{stage} == "ledger")
+            clock.advance(1'000);
+        if (late_first_stop && std::string_view{stage} == "journal_flush_2")
+            clock.advance(yuzu::agent::kBaselineStopLatestStart.count() - 1'000);
+    });
+    SECTION("the first Stop pass was skipped as late with trouble evidence") {
+        late_first_stop = true;
+    }
+    SECTION("control: the first Stop pass started early, ran and failed on the locked store") {
+        late_first_stop = false;
+    }
+
+    sqlite3* holder = nullptr;
+    REQUIRE(sqlite3_open(f.db_.path.string().c_str(), &holder) == SQLITE_OK);
+    yuzu::test::ScopeExit close_holder{[&] { sqlite3_close(holder); }};
+    REQUIRE(sqlite3_exec(holder, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    f.engine->stop();
+    first_stop_running.store(false);
+    CHECK(persister->stop_store_trouble_for_test());
+    if (late_first_stop) {
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 1);
+        CHECK(persister->persist_failures() == 0); // skipped, never attempted
+    } else {
+        CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == 0);
+        CHECK(persister->persist_failures() == 1); // ran and failed on the locked store
+        CHECK(f.engine->baseline_stop_incomplete_logs_for_test() == 1);
+    }
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    CHECK_FALSE(baseline_record_4045(*f.kv, "r0").has_value());
+
+    // The store heals, and the second stop() (ScopeExit / destructor) runs.
+    REQUIRE(sqlite3_exec(holder, "ROLLBACK", nullptr, nullptr, nullptr) == SQLITE_OK);
+    const auto skips_late = persister->stop_skip_logs_for_test(Skip::LateStart);
+    const auto failures = persister->persist_failures();
+    f.engine->stop();
+
+    // Currently: the second stop() makes no Stop pass at all. No skip is counted, no write is
+    // attempted, the capture stays staged and unpersisted although the store is healthy.
+    CHECK(persister->stop_skip_logs_for_test(Skip::LateStart) == skips_late);
+    CHECK(persister->stop_skip_logs_for_test(Skip::Stalled) == 0);
+    CHECK(persister->persist_failures() == failures);
+    CHECK(rt->staged_baseline_count_for_test() == 1);
+    CHECK_FALSE(baseline_record_4045(*f.kv, "r0").has_value());
+}

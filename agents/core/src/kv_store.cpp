@@ -62,13 +62,13 @@ std::string escape_like_prefix(std::string_view prefix) {
 
 // How long the busy handler sleeps between retries of a locked database, by `count` (the number
 // of retries SQLite has already made in this wait): 1, 2, 5, then 10 ms from the fourth retry on.
-// SQLite's own sqlite3_busy_timeout() handler sleeps in a similar ladder (1, 2, 5, 10, 15, 20, 25,
-// 25, 25, 50, 50, 100 ms); the short head means a lock another process holds for a few
-// milliseconds costs milliseconds, not a whole 10 ms sleep, and the 10 ms tail keeps a long wait
-// from busy-spinning. A hold of 29 to 33 ms or 49 to 53 ms can cost up to about 5 ms MORE than
-// SQLite's own ladder (the grids differ); shorter holds are faster (measured on Linux, SQLite
-// 3.52, medians of 5: a 5 ms hold returned in 8.2 ms against 9.3 ms, a 52 ms hold in 58.6 ms
-// against 54.7 ms).
+// SQLite's own sqlite3_busy_timeout() handler starts with the same 1, 2, 5, 10 ms and then climbs
+// (15, 20, 25, 25, 25, 50, 50, then 100 ms); this one stays at 10 ms, so a lock released late in a
+// long wait is noticed within about 10 ms instead of up to 100 ms later, and 10 ms is still long
+// enough to keep a long wait from busy-spinning. The sleep grids differ after the fourth retry,
+// so a hold of 29 to 33 ms or 49 to 53 ms can cost up to about 5 ms MORE than with SQLite's own
+// handler (measured on Linux, SQLite 3.52, medians of 5: a 52 ms hold returned in 58.6 ms against
+// 54.7 ms).
 // The wait itself never undershoots its budget: the handler compares steady_clock readings
 // and gives up only once the budget has elapsed. The sleeps do round UP on a platform with a
 // coarse timer. Measured on macOS, one run of 200 sleeps per request: medians of 1.52, 3.03,

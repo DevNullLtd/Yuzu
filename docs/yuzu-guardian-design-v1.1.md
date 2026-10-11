@@ -2717,9 +2717,11 @@ Guardian ladder must check these.
   `steady_clock` readings); the sleeps round up on a platform with a coarse timer. Measured
   on macOS, one run of 200 sleeps per request: medians 1.52, 3.03, 7.53 and 15.03 ms for 1, 2,
   5 and 10 ms, so only the 10 ms tail rounds to about 15 ms there. Windows rounds sleeps to
-  its timer tick, about 15.6 ms (derived, not measured here). On Linux a lock held for a few
-  milliseconds costs milliseconds; a hold of 29 to 33 ms or 49 to 53 ms can cost up to about
-  5 ms more than SQLite's own ladder (its grid differs), and shorter holds are faster.
+  its timer tick, about 15.6 ms (derived, not measured here). SQLite's own default handler
+  starts with the same 1, 2, 5, 10 ms and then climbs to 100 ms; this one stays at 10 ms, so a
+  lock released late in a long wait is noticed within about 10 ms. Because the grids differ
+  after the fourth retry, a hold of 29 to 33 ms or 49 to 53 ms can cost up to about 5 ms more
+  than with SQLite's own handler.
   Every user of the shared store runs at the stop budget once `stop()` has
   lowered it: plugin actions and a plugin's `shutdown()` writes, the sync scheduler's and the
   license scan's writes. TARGET: at most seven stop budgets (7 s): six enumerated waits plus
@@ -2801,7 +2803,10 @@ Guardian ladder must check these.
   stages, or whose stages each stay under the 750 ms threshold, with the stop already 18 s
   late, still lets the Stop pass run, and the watchdog may cut it (the capture is lost and
   that loss has no log line; before #5604, 21.0 s and 20.11 s were reproduced for these
-  two shapes on the earlier 15 s / 4.5 s constants). A supervisor's own stop timeout is
+  two shapes on the earlier 15 s / 4.5 s constants); the Stop pass also runs once per
+  engine, so a store that heals between `stop()` and the second `stop()` call that
+  `run()`'s exit teardown makes gets no second pass (pre-existing from #4045, pinned by a
+  test). A supervisor's own stop timeout is
   implicit and may be shorter than the 20 s (Docker agent services stop at 10 s, so exit code
   4 never appears there). A slow SUCCESSFUL baseline write is not a failure and is
   not counted;

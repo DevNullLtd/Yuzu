@@ -1529,7 +1529,11 @@ void GuardianEngine::stop() {
     // and 4.5 s constants and not re-run since. A Worker pass is deliberately NOT deferred once
     // the mark is taken. A store that heals mid-stop does not rely on a worker retry (the worker
     // is joined early in this function and its 5 s retry backoff outlasts the stop): the Stop
-    // pass is what persists the capture.
+    // pass is what persists the capture. The Stop pass runs once per engine: run()'s exit
+    // teardown and the destructor each call stop() again, and that call returns at
+    // baseline_stop_flush_done_ without judging lateness, so a store that heals between the two
+    // calls does not get a capture back that the first call skipped or failed (pre-existing from
+    // #4045; pinned by "#5604 stop(): a second stop() after the store healed ...").
     persist_staged_baselines_locked(/*at_stop=*/true);
     stopped_ = true;
     started_ = false;
