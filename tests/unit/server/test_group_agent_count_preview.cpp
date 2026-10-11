@@ -342,7 +342,10 @@ TEST_CASE("facet reader tripwire: every production caller of a ResponseStore fac
     // Positive control: the three call sites known today are really being scanned.
     for (const char* stem : {"dashboard_routes", "group_agent_count_preview"})
         CHECK(std::regex_search(units[stem], std::regex{R"((->|\.)facet_agent_count\()"}));
-    CHECK(units_calling_facet_reader_without_refusal(units).empty());
+    // The rule: a production unit that calls a ResponseStore facet reader must also reference
+    // facet_filter_value_unmatchable / any_facet_filter_unmatchable /
+    // any_raw_filter_value_unmatchable (see the scan above). A failure names the unit(s).
+    CHECK(units_calling_facet_reader_without_refusal(units) == std::vector<std::string>{});
 }
 
 // ResponseStore's counters are only exported if server.cpp seeds them; nothing else reads
