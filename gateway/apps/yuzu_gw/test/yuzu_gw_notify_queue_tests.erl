@@ -36,26 +36,13 @@ drain(Q) ->
     end.
 
 %%--------------------------------------------------------------------
-%% put / take / size
+%% Spec examples: readable documentation of the contract. The randomized
+%% comparison below is the enforcement (it kills every mutant of the queue
+%% module on its own); these seven are kept so the contract reads as examples.
 %%--------------------------------------------------------------------
 
-basics_test_() ->
+spec_test_() ->
     [
-     {"a new queue is empty and take on it is empty",
-      fun() ->
-          Q = yuzu_gw_notify_queue:new(5),
-          ?assertEqual(0, yuzu_gw_notify_queue:size(Q)),
-          ?assertEqual([], yuzu_gw_notify_queue:to_list(Q)),
-          ?assertEqual(empty, yuzu_gw_notify_queue:take(Q))
-      end},
-     {"put of an absent key is new and grows the size",
-      fun() ->
-          Q0 = yuzu_gw_notify_queue:new(5),
-          {new, Q1} = yuzu_gw_notify_queue:put(k(1), a, 0, Q0),
-          ?assertEqual(1, yuzu_gw_notify_queue:size(Q1)),
-          {new, Q2} = yuzu_gw_notify_queue:put(k(2), b, 0, Q1),
-          ?assertEqual(2, yuzu_gw_notify_queue:size(Q2))
-      end},
      {"put of a present key is replaced, the latest event wins and size is unchanged",
       fun() ->
           Q1 = fill(5, [{k(1), a}, {k(2), b}]),
@@ -74,71 +61,12 @@ basics_test_() ->
           ?assertEqual(0, yuzu_gw_notify_queue:size(Q3)),
           ?assertEqual(empty, yuzu_gw_notify_queue:take(Q3))
       end},
-     {"a taken key can be put again as new",
-      fun() ->
-          Q1 = fill(5, [{k(1), a}]),
-          {Key1, a, Q2} = yuzu_gw_notify_queue:take(Q1),
-          ?assertEqual(k(1), Key1),
-          {new, Q3} = yuzu_gw_notify_queue:put(k(1), b, 0, Q2),
-          ?assertEqual([{k(1), b}], yuzu_gw_notify_queue:to_list(Q3))
-      end},
-     {"keys that differ in any one element are distinct keys",
-      fun() ->
-          Q = fill(5, [{{<<"a">>, <<"s1">>, <<"h">>}, e1},
-                       {{<<"a">>, <<"s2">>, <<"h">>}, e2},
-                       {{<<"a">>, <<"s1">>, <<"h2">>}, e3},
-                       {{<<"b">>, <<"s1">>, <<"h">>}, e4}]),
-          ?assertEqual(4, yuzu_gw_notify_queue:size(Q))
-      end}
-    ].
-
-%%--------------------------------------------------------------------
-%% FIFO by first insertion
-%%--------------------------------------------------------------------
-
-fifo_test_() ->
-    [
-     {"take order is insertion order",
-      fun() ->
-          Pairs = [{k(N), N} || N <- [5, 3, 9, 1, 7]],
-          ?assertEqual(Pairs, drain(fill(10, Pairs)))
-      end},
      {"a replacement keeps its queue position",
       fun() ->
           Q1 = fill(10, [{k(1), a}, {k(2), b}, {k(3), c}]),
           {replaced, Q2} = yuzu_gw_notify_queue:put(k(1), a2, 0, Q1),
           {replaced, Q3} = yuzu_gw_notify_queue:put(k(2), b2, 0, Q2),
           ?assertEqual([{k(1), a2}, {k(2), b2}, {k(3), c}], drain(Q3))
-      end},
-     {"a key taken and put again goes to the back",
-      fun() ->
-          Q1 = fill(10, [{k(1), a}, {k(2), b}]),
-          {Key1, a, Q2} = yuzu_gw_notify_queue:take(Q1),
-          ?assertEqual(k(1), Key1),
-          {new, Q3} = yuzu_gw_notify_queue:put(k(1), a2, 0, Q2),
-          ?assertEqual([{k(2), b}, {k(1), a2}], drain(Q3))
-      end}
-    ].
-
-%%--------------------------------------------------------------------
-%% full, with and without Reserved
-%%--------------------------------------------------------------------
-
-full_test_() ->
-    [
-     {"Reserved 0: the cap-th key fits and the next absent key is full",
-      fun() ->
-          Q1 = fill(3, [{k(1), a}, {k(2), b}]),
-          {new, Q2} = yuzu_gw_notify_queue:put(k(3), c, 0, Q1),
-          ?assertEqual(3, yuzu_gw_notify_queue:size(Q2)),
-          ?assertMatch({full, _}, yuzu_gw_notify_queue:put(k(4), d, 0, Q2))
-      end},
-     {"a full put leaves the queue exactly as it was",
-      fun() ->
-          Q = fill(2, [{k(1), a}, {k(2), b}]),
-          {full, Q2} = yuzu_gw_notify_queue:put(k(3), c, 0, Q),
-          ?assertEqual(2, yuzu_gw_notify_queue:size(Q2)),
-          ?assertEqual([{k(1), a}, {k(2), b}], drain(Q2))
       end},
      {"Reserved 1: one slot is held back, so the cap-th key is already full",
       fun() ->
@@ -147,13 +75,6 @@ full_test_() ->
           Q0 = fill(3, [{k(1), a}]),
           ?assertMatch({new, _}, yuzu_gw_notify_queue:put(k(2), b, 1, Q0))
       end},
-     {"a replace of a present key is never full and never grows, at the cap",
-      fun() ->
-          Q = fill(2, [{k(1), a}, {k(2), b}]),
-          {replaced, Q2} = yuzu_gw_notify_queue:put(k(1), a2, 0, Q),
-          ?assertEqual(2, yuzu_gw_notify_queue:size(Q2)),
-          ?assertEqual([{k(1), a2}, {k(2), b}], yuzu_gw_notify_queue:to_list(Q2))
-      end},
      {"a replace of a present key is never full with Reserved 1 either",
       fun() ->
           Q = fill(2, [{k(1), a}, {k(2), b}]),
@@ -161,87 +82,19 @@ full_test_() ->
           ?assertEqual(2, yuzu_gw_notify_queue:size(Q2)),
           ?assertEqual([{k(1), a}, {k(2), b2}], yuzu_gw_notify_queue:to_list(Q2))
       end},
-     {"a replace is still accepted when size plus Reserved is over the cap",
-      fun() ->
-          %% size 2, cap 2, Reserved 1: a probe is out and the store is full.
-          Q = fill(2, [{k(1), a}, {k(2), b}]),
-          ?assertMatch({replaced, _}, yuzu_gw_notify_queue:put(k(1), a2, 1, Q))
-      end},
-     {"after a take there is room again",
-      fun() ->
-          Q1 = fill(2, [{k(1), a}, {k(2), b}]),
-          ?assertMatch({full, _}, yuzu_gw_notify_queue:put(k(3), c, 0, Q1)),
-          {Key1, a, Q2} = yuzu_gw_notify_queue:take(Q1),
-          ?assertEqual(k(1), Key1),
-          ?assertMatch({new, _}, yuzu_gw_notify_queue:put(k(3), c, 0, Q2))
-      end},
-     {"a cap of 1 holds one key",
-      fun() ->
-          Q1 = fill(1, [{k(1), a}]),
-          ?assertMatch({full, _}, yuzu_gw_notify_queue:put(k(2), b, 0, Q1)),
-          ?assertMatch({replaced, _}, yuzu_gw_notify_queue:put(k(1), a2, 0, Q1)),
-          ?assertMatch({full, _},
-                       yuzu_gw_notify_queue:put(k(1), a2, 1, yuzu_gw_notify_queue:new(1)))
-      end}
-    ].
-
-%%--------------------------------------------------------------------
-%% push_front
-%%--------------------------------------------------------------------
-
-push_front_test_() ->
-    [
-     {"an absent key is inserted at the head",
+     {"push_front: an absent key is inserted at the head",
       fun() ->
           Q1 = fill(5, [{k(1), a}, {k(2), b}]),
           {inserted, Q2} = yuzu_gw_notify_queue:push_front(k(3), c, Q1),
           ?assertEqual(3, yuzu_gw_notify_queue:size(Q2)),
           ?assertEqual([{k(3), c}, {k(1), a}, {k(2), b}], drain(Q2))
       end},
-     {"push_front on an empty queue inserts",
-      fun() ->
-          Q0 = yuzu_gw_notify_queue:new(5),
-          {inserted, Q1} = yuzu_gw_notify_queue:push_front(k(1), a, Q0),
-          ?assertEqual([{k(1), a}], yuzu_gw_notify_queue:to_list(Q1))
-      end},
-     {"a present key is superseded: the held newer event stays and size is unchanged",
+     {"push_front: a present key is superseded, the held newer event stays and size is unchanged",
       fun() ->
           Q1 = fill(5, [{k(1), a}, {k(2), b}]),
           {superseded, Q2} = yuzu_gw_notify_queue:push_front(k(2), old, Q1),
           ?assertEqual(2, yuzu_gw_notify_queue:size(Q2)),
           ?assertEqual([{k(1), a}, {k(2), b}], drain(Q2))
-      end},
-     {"a superseded push_front does not move the held key to the head",
-      fun() ->
-          Q1 = fill(5, [{k(1), a}, {k(2), b}, {k(3), c}]),
-          {superseded, Q2} = yuzu_gw_notify_queue:push_front(k(3), old, Q1),
-          ?assertEqual([k(1), k(2), k(3)],
-                       [K || {K, _} <- yuzu_gw_notify_queue:to_list(Q2)])
-      end},
-     {"push_front is not bounded by the cap: the reserved probe slot always fits",
-      fun() ->
-          %% The caller reserved one slot for the probe, so a store holding
-          %% Max - 1 keys is the fullest it can be while a probe is out.
-          Q1 = fill(3, [{k(1), a}, {k(2), b}]),
-          {inserted, Q2} = yuzu_gw_notify_queue:push_front(k(3), c, Q1),
-          ?assertEqual(3, yuzu_gw_notify_queue:size(Q2)),
-          ?assertEqual([k(3), k(1), k(2)],
-                       [K || {K, _} <- yuzu_gw_notify_queue:to_list(Q2)])
-      end},
-     {"a key put after a push_front goes behind the pushed one",
-      fun() ->
-          Q1 = fill(5, [{k(1), a}]),
-          {inserted, Q2} = yuzu_gw_notify_queue:push_front(k(2), b, Q1),
-          {new, Q3} = yuzu_gw_notify_queue:put(k(3), c, 0, Q2),
-          ?assertEqual([k(2), k(1), k(3)],
-                       [K || {K, _} <- yuzu_gw_notify_queue:to_list(Q3)])
-      end},
-     {"a put onto a pushed key replaces it in place",
-      fun() ->
-          Q1 = fill(5, [{k(1), a}]),
-          {inserted, Q2} = yuzu_gw_notify_queue:push_front(k(2), b, Q1),
-          {replaced, Q3} = yuzu_gw_notify_queue:put(k(2), b2, 0, Q2),
-          ?assertEqual([{k(2), b2}, {k(1), a}], drain(Q3))
       end}
     ].
 
