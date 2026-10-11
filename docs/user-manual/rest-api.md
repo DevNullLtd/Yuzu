@@ -865,7 +865,9 @@ all the causes and does not echo the value.
 
 The check applies to the raw value of every query parameter other than `command_id` and `plugin`,
 before its key is matched to a column, so it also refuses such a value under an unrecognised key,
-and any such parameter over 2048 bytes, whatever its name.
+and any such parameter over 2048 bytes, whatever its name. Each refusal is counted in
+`yuzu_server_response_facet_filter_refused_total{surface="rest"}` (not when authorization refused
+first) but writes no audit row.
 
 The `400` bounds a single value. The transport rejects a request target longer than 8192 bytes
 (httplib `CPPHTTPLIB_REQUEST_URI_MAX_LENGTH`, for the whole target including the query string)

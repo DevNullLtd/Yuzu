@@ -781,7 +781,8 @@ for the tool to execute.
 > evaluated, is non-retryable (`retry_after_ms: null`), names all the causes and does not echo the
 > value. The served schema carries `maxLength: 2048` on each value, but input-schema validation runs
 > only on the approval-gated path, so the handler repeats the check for a direct call. That
-> direct-path refusal writes no audit row, and no counter records refusals.
+> direct-path refusal writes no audit row. Each refusal is counted in
+> `yuzu_server_response_facet_filter_refused_total{surface="mcp"}` (see [metrics.md](metrics.md)).
 
 ### Tool parameters
 

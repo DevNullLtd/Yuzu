@@ -356,8 +356,11 @@ operator-visible notes:
     by `cap`) has no facets re-derived afterwards, and nothing marks such a response as affected
     (#5630). The workaround is to run the command again. See
     `yuzu_server_response_facets_dropped_total` in [metrics.md](metrics.md).
-  - **Audit and counting.** The MCP direct-path refusal in `preview_management_group_agent_count`
-    writes no audit row, and refusals are not counted by any metric.
+  - **Audit and counting.** Each refused request is counted once in
+    `yuzu_server_response_facet_filter_refused_total{surface}` (`dashboard`, `rest` or `mcp`), unless
+    authorization refused it first; see [metrics.md](metrics.md). A refusal writes no audit row on
+    the MCP direct path of `preview_management_group_agent_count`, the REST route or the refused
+    group-from-results POST, so the counter is the only record. The bare `414` is not counted.
 
 ## Retention and cleanup
 
