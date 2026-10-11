@@ -1724,7 +1724,7 @@ bool deactivate(ScimStore* scim_store, ApiTokenStore* token_store, auth::AuthMan
     // active account, and answers 404 + `scim.user.provenance_denied` without
     // reaching `remove_user_checked`. The mirror stays active=true until it is
     // reconciled by hand or by a change that owns it (#5214, and the follow-up
-    // tracked in #FOLLOWUP-ISSUE-NUMBER). The auth account is already
+    // tracked in #5673). The auth account is already
     // deactivated, so the credential side is safe; only the SCIM mirror is
     // stale. The irreducible window between the two writes (a crash/kill
     // exactly between them) leaves the same state.
@@ -1732,7 +1732,7 @@ bool deactivate(ScimStore* scim_store, ApiTokenStore* token_store, auth::AuthMan
         spdlog::error("ScimRoutes: ScimStore::set_active(false) failed for scim_id={} after the "
                      "underlying account was already deactivated — inconsistent state, failing "
                      "closed (500); a retry will 404 and the mirror stays stale "
-                     "(#FOLLOWUP-ISSUE-NUMBER / #5214)",
+                     "(#5673 / #5214)",
                      resource.scim_id);
         send_scim_error(res, 500, "failed to persist the deactivated state");
         audit(auth_mgr, audit_store, req, audit_action, "failure", resource.scim_id,

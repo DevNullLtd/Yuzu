@@ -3333,7 +3333,7 @@ The server emits an audit event on every branch:
 > leaves the person's account (and, after an early refusal, their tokens and
 > sessions) live and raises a critical analytics event: an operator has to
 > act. No alert rule ships for these series yet (tracked in
-> #FOLLOWUP-ISSUE-NUMBER). A replica
+> #5673). A replica
 > running a build without this rule does not enforce it, so drain old
 > replicas during a rolling upgrade. A server with an authentication
 > database but no RBAC store refuses to start.

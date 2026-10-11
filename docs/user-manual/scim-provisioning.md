@@ -273,7 +273,7 @@ Deploy these alert rules alongside SCIM Groups → role mapping:
   `yuzu_server_rbac_last_admin_guard_refused_total{transport="scim"}` (the
   last-Administrator refusal counter). No alert rule ships for this counter
   or for `yuzu_scim_compensation_failed_total` yet; both are tracked in
-  #FOLLOWUP-ISSUE-NUMBER.
+  #5673.
 - **`yuzu_scim_audit_write_failures_total`** — the existing CC6.8
   evidence-integrity alert; it also covers a lost audit row for a group
   create/update/delete or role-change event (the SCIM call and the role
@@ -463,7 +463,7 @@ dropped silently:
   write committed) and the member may keep the role.
 
 **Known limits of the Group role recompute.** These are real gaps, tracked in
-#FOLLOWUP-ISSUE-NUMBER. Until then they are documented rather than engineered
+#5673. Until then they are documented rather than engineered
 around:
 
 1. Group mutations are serialized within one server process. When more than one
@@ -550,13 +550,13 @@ around:
    resource still reads `active=true`, and the IdP's retry answers `404` (the
    role guard finds no active account), so the mirror stays stale until it is
    reconciled ([#5214](https://github.com/Tr3kkR/Yuzu/issues/5214), and the
-   follow-up tracked in #FOLLOWUP-ISSUE-NUMBER). Every IdP retry also hits the
+   follow-up tracked in #5673). Every IdP retry also hits the
    role guard: it answers `404`, writes a `scim.user.provenance_denied` audit
    row and increments `yuzu_scim_provenance_denied_total`, which drives the
    shipped `YuzuScimProvenanceDenied` alert (`increase(...[1h]) > 0`, severity
    warning): it fires, and stays firing while the retries continue. There is no hand
    remedy today (no route and no SQL statement is documented for it) until #5214
-   and #FOLLOWUP-ISSUE-NUMBER land.
+   and #5673 land.
 
 See
 [`rbac.md`](rbac.md#last-administrator-guard-for-account-deactivation-and-demotion).
