@@ -53,6 +53,18 @@ class EventBus;
 // in flight, and let a late sort/page response land after another response's out-of-band
 // swap had detached its issuer. `#filter-bar` is looked up document-wide at request time,
 // so it works for the th / pagination elements that sit OUTSIDE the form.
+// Two more halves of the same contract (governance G8-2 / G8-3):
+//  * The th headers and Prev/Next carry hx-include="#filter-bar" and their hx-get URL carries
+//    ONLY sort / dir / page / per_page (render_results' base_url). The live command_id /
+//    plugin / definition_id / template_id / f_* / q come from the form at click time; a baked
+//    copy of the last render's values would let a click during a filter change's flight land
+//    stale filters (httplib reads the FIRST occurrence of a duplicated param).
+//  * `POST /api/dashboard/execute` replaces #filter-bar, discarding this scope's registry, so
+//    its HX-Trigger ends with `"htmx:abort":{"target":"#filter-bar"}` (the selector half of
+//    this constant) to abort an in-flight results request first. It must stay the LAST key.
+//    Residual (tracked with #5677): after a dispatch `#filter-bar` is an empty placeholder for
+//    ~2 seconds and the thead refresh fires on the same delay, so a th / Prev / Next click in
+//    that gap sends no command_id and answers 400, which htmx does not display.
 // Deliberate exclusion: the `#chart-deck-host` refresh (dashboard_routes.cpp; ONE request fired
 // 2 seconds after a dispatch, not polling) is NOT in this scope. It is an unscoped request that
 // carries no f_* params, so its out-of-band swap can overwrite the pager / summary /

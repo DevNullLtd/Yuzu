@@ -357,10 +357,15 @@ operator-visible notes:
   - **Dashboard refresh while a filter is applied.** The chart deck is refreshed ONCE, by a
     request fired 2 seconds after a command is dispatched (not polling). That request carries no
     filter state, so it can overwrite the pager and summary of a filtered view with unfiltered ones
-    (#5669). A column-header sort or a pagination click made while a filter change is still in
-    flight re-sends the filters of the last render, not the change in flight, and a dispatch
-    replaces the filter bar, so a late response for the previous command can still land (the
-    hardware list also keeps the older `this:abort` sync; all #5677). An open Create Static Group form is not cleared by a valid
+    (#5669). Closed: a column-header sort or a pagination click now reads the live filter bar
+    (they no longer re-send the filters of the last render), and sending a command now aborts a
+    results request still in flight, so a late response for the previous command cannot swap its
+    rows or its Create Group button over the new command's table. Still open (#5677): for about
+    2 seconds after a command is sent the filter bar is an empty placeholder and the header
+    refresh fires on the same delay, so a sort or pagination click in that gap sends no command
+    and answers `400`, which htmx does not display; the built-in `help` command and a TAR SQL
+    query clear the results area without aborting a request in flight; and the hardware list
+    keeps the older `this:abort` sync. An open Create Static Group form is not cleared by a valid
     filter change and keeps its old filters and count (#5669).
   - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column,
     then value, so a rare value can be cut. The symptom is an agent missing from a facet filter or
