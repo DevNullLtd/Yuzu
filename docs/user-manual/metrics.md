@@ -2095,6 +2095,14 @@ yuzu_scim_compensation_failed_total{outcome="store_failure"} 0
 yuzu_scim_group_recompute_skipped_total{cause="promotion"} 0
 yuzu_scim_group_recompute_skipped_total{cause="undetermined"} 0
 
+# HELP yuzu_scim_role_changes_total Total SCIM-provisioned user role changes applied via SCIM Group membership (--scim-admin-group), by the group-membership-driven role-recompute core - a sustained rate is a normal signal of IdP group-membership churn, not itself an anomaly
+# TYPE yuzu_scim_role_changes_total counter
+yuzu_scim_role_changes_total 0
+
+# HELP yuzu_scim_role_change_failures_total Total SCIM-driven role changes that did not complete during group-membership recompute: the guarded write failed, or the role changed but its durable session wipe failed - a sustained non-zero rate means role changes are not taking effect cleanly
+# TYPE yuzu_scim_role_change_failures_total counter
+yuzu_scim_role_change_failures_total 0
+
 # HELP yuzu_server_rbac_enforcement_enabled This replica's cached view of the durable rbac_enabled flag
 # TYPE yuzu_server_rbac_enforcement_enabled gauge
 yuzu_server_rbac_enforcement_enabled 0

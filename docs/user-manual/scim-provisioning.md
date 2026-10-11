@@ -230,7 +230,10 @@ from the admin group** — which demotes them back to `user`, at which point
 the next deactivate/delete call succeeds normally. The one exception: if that
 user is the last protected administrator, the demotion is refused instead, the
 role stays `admin` and the `404` persists until another administrator exists
-(see "The fleet's last administrator is protected" and "Group role recompute:
+AND the user's role is demoted by hand in the dashboard (or by a later change
+that names the user, for example through another group they belong to); a
+re-send of the same Group change cannot do it, because the member has already
+left the group (see "The fleet's last administrator is protected" and "Group role recompute:
 when it is incomplete" under
 [Deprovisioning and termination](#deprovisioning-and-termination)).
 
@@ -437,11 +440,14 @@ dropped silently:
 - a refused demotion (the last-Administrator guard) writes the
   `scim.user.last_administrator_refused` row and counter and a critical analytics
   event;
-- a failed demotion writes a `scim.user.role_changed` failure row, increments
-  `yuzu_scim_role_change_failures_total`, raises the critical analytics event
-  `scim.user.role_demotion_incomplete` and a critical log line: verify the
-  account's role (demote it if it is still `admin`) and revoke its sessions by
-  hand;
+- a failed demotion writes a `scim.user.role_changed` failure row (with
+  `role_applied=unknown` when the write may have committed and its outcome is
+  not known), increments `yuzu_scim_role_change_failures_total`, raises the
+  critical analytics event `scim.user.role_demotion_incomplete` and a critical
+  log line saying the IdP-removed administrator retains or may retain the role:
+  verify the account's role (demote it if it is still `admin`) and revoke its
+  sessions by hand. A failed promotion also counts in `failed=` (it has no
+  critical event);
 - when anything was refused, failed, undetermined or skipped, ONE
   `scim.group.recompute_incomplete` audit row (`result=partial`) records the
   count per class and up to 20 usernames (or `scim_id:<id>`) per class (first 20
@@ -451,7 +457,7 @@ dropped silently:
 - the Group `created`/`updated`/`deleted` success row says `recompute=complete`
   only when every member was recomputed as intended, otherwise
   `recompute=incomplete`. The Group request keeps its status (its membership
-  write committed) and the member keeps the role.
+  write committed) and the member may keep the role.
 
 **Known limits of the Group role recompute.** These are real gaps, tracked in
 #FOLLOWUP-ISSUE-NUMBER. Until then they are documented rather than engineered
@@ -461,16 +467,48 @@ around:
    server replica runs, send SCIM provisioning traffic to a single replica.
    `POST /Groups` does not take the per-process Group lock (`PUT`, `PATCH` and
    `DELETE` do).
-2. There is no reconcile. A crash after the membership commit leaves no audit
-   row and no marker (only the info log line naming the removed members, if
-   logs are kept). A failed or refused write IS reported: the group's success
+2. There is no reconcile, and a re-send does not reach a member who has already
+   left the group. A failed or refused write IS reported: the group's success
    row says `recompute=incomplete` and a `scim.group.recompute_incomplete`
-   summary row names the members. Re-sending the same `PUT` or `PATCH`
-   re-derives skipped promotions and undetermined members that are still in the
-   group (the recompute covers the old and the current members), but it cannot
-   re-derive a member who is no longer in the request. After any unclean
-   restart, compare the IdP's admin-group membership with the Yuzu roles and
-   demote the difference.
+   summary row names the members. But re-sending the same `PUT` or `PATCH`
+   recomputes only the old and the current members of the group at that moment,
+   so it re-derives skipped promotions and undetermined members still in the
+   group and can never re-derive a member who has left it. A retried `DELETE`
+   never reaches the recompute (the group is gone: `404`, or an idempotent
+   `204`), and an IdP's next sync sends no change for a member who is already
+   out. For a **refused**, **failed** or **undetermined** demotion of a member
+   who has left the group, demote the member by hand in the dashboard (for a
+   refused one, create a second administrator first; see
+   [`rbac.md`](rbac.md), "If the guard refuses an action you intend"). A later
+   change that names the user through another group they belong to also
+   re-derives their role. A skipped **promotion** is the exception: a re-send
+   of a `PUT` or `PATCH` retries it while the member is in the group, but a
+   `DELETE` never can.
+
+   *Crash breadcrumb.* Once a `PUT`, `PATCH` or `DELETE` has committed the
+   membership change and removed at least one member, the server writes ONE
+   info log line before the first role change and flushes the log right after
+   it: `SCIM: Group scim_id=<id> membership change committed; role recompute
+   starting for <N> removed member(s): <ids>[,+M more]`. It names the first 20
+   removed members by SCIM ID (not by username: the line performs no store
+   read, so it cannot be delayed by a degraded store; resolve an ID with
+   `GET /scim/v2/Users/<id>`) and `<N>` is the exact count. It is not written
+   by `POST`, or by a change that removed nobody, and it is also written on the
+   idempotent already-gone path of a `DELETE`. A `SIGKILL` can lose a copy that
+   a file log sink had not yet written, never the stderr or journald copy. If
+   writing it fails, the failure never blocks the recompute. Where a crash
+   stopped the request, read the signature:
+
+   | Crash point | What remains |
+   |---|---|
+   | Before the membership commit | Nothing changed. |
+   | After the commit, before the breadcrumb line | No record of the removed members. |
+   | Mid-recompute | The breadcrumb and the per-member rows written so far; no summary row and no `recompute=` marker, and no Group success row. |
+   | After the recompute, before the Group success row | The breadcrumb, the per-member rows and any summary row; roles are correct; the Group success row is missing. |
+
+   Per-member rows written before a crash persist. After any unclean restart,
+   compare the IdP's admin-group membership with the Yuzu roles and demote the
+   difference.
 3. A Group request recomputes every affected member and can be slow on a large
    group or a slow store; the HTTP request and the per-process Group lock
    (taken by `PUT`, `PATCH` and `DELETE`, not by `POST`) are held meanwhile.
@@ -482,6 +520,12 @@ around:
 6. `POST /Users` re-provisioning recomputes the one user but ignores an
    incomplete result. An undetermined result on that revive path leaves only a
    log line: no audit row and no counter.
+7. A deactivation whose SCIM mirror write failed is not retried to convergence.
+   The auth account is already deactivated, the request answers `500`, the SCIM
+   resource still reads `active=true`, and the IdP's retry answers `404` (the
+   role guard finds no active account), so the mirror stays stale until it is
+   reconciled ([#5214](https://github.com/Tr3kkR/Yuzu/issues/5214), and the
+   follow-up tracked in #FOLLOWUP-ISSUE-NUMBER).
 
 See
 [`rbac.md`](rbac.md#last-administrator-guard-for-account-deactivation-and-demotion).
@@ -887,7 +931,8 @@ with a **currently-active** account.
   touch an account whose role is not `user` (see above). Remove the user
   from the admin group first (which demotes them back to `user`; if they
   are the last protected administrator the demotion is refused and the
-  role stays `admin` until another administrator exists), or
+  role stays `admin` until another administrator exists AND their role is
+  demoted by hand or by a later change that names them), or
   disable the account from the dashboard instead.
 - **Deleting/deactivating a group-granted admin via SCIM returns 404.** This
   is expected, not a bug — see
@@ -895,7 +940,8 @@ with a **currently-active** account.
   Remove the user from the admin group first; the deactivate/delete call
   then succeeds on the next sync. If that user is the last protected
   administrator the demotion is refused, the role stays `admin` and the
-  `404` persists until another administrator exists (see "The fleet's last
+  `404` persists until another administrator exists AND the user's role is
+  demoted (by hand, or by a later change that names them; see "The fleet's last
   administrator is protected" and "Group role recompute: when it is
   incomplete" under
   [Deprovisioning and termination](#deprovisioning-and-termination)).
@@ -903,22 +949,31 @@ with a **currently-active** account.
   succeeded (its membership write committed), but the group's
   `scim.group.created`/`updated`/`deleted` audit row says `recompute=incomplete`
   and a `scim.group.recompute_incomplete` row names the affected members per
-  class (first 20 named; the count is exact). One remedy per class:
-  - **Failed demotion** (`failed=`): the member may still be `admin`. Check its
-    role in the dashboard, demote it by hand if needed and revoke its sessions,
-    then look at the store (pool waits, a stuck lock holder).
+  class (first 20 named; the count is exact). A Group change cannot be repaired
+  by re-sending it for a member who has LEFT the group: the re-send never names
+  that member, so it answers a clean `recompute=complete` while the member still
+  holds the role. One remedy per class:
+  - **Failed** (`failed=`; a demotion or a promotion): the member's role may not
+    be what the groups confer. Check it in the dashboard; if it should be
+    `user`, demote it by hand and revoke its sessions, then look at the store
+    (pool waits, a stuck lock holder).
   - **Refused demotion** (`refused=`): the last-Administrator guard kept the
-    role because no other administrator exists. Create or promote a second
-    administrator (see [`rbac.md`](rbac.md), "If the guard refuses an action
-    you intend"), then re-send the Group change or let the IdP's next sync do
-    it.
+    role because no other administrator exists. Create or restore a second
+    administrator, then demote the named member by hand in the dashboard (see
+    [`rbac.md`](rbac.md), "If the guard refuses an action you intend"). A later
+    change that names the user through another group also re-derives the role.
   - **Undetermined** (`undetermined=`): a read failed, so the role was left
     untouched and it is not known whether an administrator was kept. Check each
-    named member's role by hand; re-send the Group change while the member is
-    still in the group, or demote it by hand.
+    named member's role by hand. A re-send of the Group change works only for a
+    member who is still in the group; otherwise demote it by hand.
   - **Skipped promotion** (`skipped_promotions=`): the promotion was not
-    attempted after an earlier write failed. Re-send the Group change; it is
-    retried while the member is still in the group.
+    attempted after an earlier write failed. Re-send a `PUT` or `PATCH`; it is
+    retried while the member is still in the group. A `DELETE` can never be
+    re-sent, so promote by hand if it is needed.
+  - **The server stopped mid-request**: see the crash signature table in
+    "Known limits of the Group role recompute", item 2. Search the log for
+    `membership change committed; role recompute starting`, and check the
+    roles of the SCIM IDs it lists.
 - **The server refuses to start after upgrading, on a fresh SCIM
   migration.** As of this release, `scim_resources.external_id` is unique
   (excluding empty values) — a pre-existing duplicate `external_id` (e.g.

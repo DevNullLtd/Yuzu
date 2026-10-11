@@ -1916,7 +1916,9 @@ group** — that removal demotes them back to `user` via the next
 `recompute_scim_user_role` call, at which point the next deactivate/delete
 call proceeds normally. If that user is the last protected administrator the
 demotion is refused instead: the role stays `admin` and the `404` persists until
-another administrator exists (see `docs/user-manual/rbac.md`, "Last-Administrator
+another administrator exists AND the user's role is demoted by hand (a re-send of
+the Group change cannot do it: the member has already left the group) or by a
+later change that names the user (see `docs/user-manual/rbac.md`, "Last-Administrator
 guard for account deactivation and demotion" and "Group role recompute"). This was evaluated and accepted rather than
 special-cased: standard Okta/Entra offboarding already removes a departing
 employee from all group assignments (including any admin group) as part of
@@ -2013,7 +2015,7 @@ that triggers a `500`).
 | `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` - rename onto an existing `displayName` / fails `500`. On `success`, `detail` is `recompute=complete` or `recompute=incomplete` |
 | `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed). On `success`, `detail` is `recompute=complete` or `recompute=incomplete` |
 | `scim.group.recompute_incomplete` | `partial` | (#4966, target type `Group`) A Group request's role recompute did not apply every member as intended (a refused or failed demotion, an undetermined member whose read failed, or promotions skipped after a failed guarded write): the member count and, per class, the count and up to 20 usernames (the first 20 are named; the count is exact). Counted on `yuzu_scim_group_recompute_skipped_total{cause}`. The Group's `created`/`updated`/`deleted` success row then says `recompute=incomplete` (`recompute=complete` otherwise) |
-| `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value (user create, or a Group create/replace/patch/delete affecting admin-group membership); records `old_role`→`new_role`, `reason=group`; a `failure` row for a role that WAS applied but whose durable session wipe failed carries `role_changed=true session_wipe_failed=true` |
+| `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value (user create, or a Group create/replace/patch/delete affecting admin-group membership); records `old_role`→`new_role`, `reason=group`; a `failure` row for a role that WAS applied but whose durable session wipe failed carries `role_changed=true session_wipe_failed=true`, and a `failure` row for a guarded write whose outcome is not known (it may have committed) carries `role_applied=unknown` |
 
 All rows carry `principal = "scim-service"`, `principal_role = "scim-service"`.
 `target_type` is `"User"` for the user-lifecycle and `role_changed` rows,
@@ -2037,8 +2039,11 @@ Prometheus counters (all in the `yuzu_scim_*` namespace):
 work raises critical analytics events: `scim.user.last_administrator_refused`
 (a refused deprovision or group-derived demotion), `scim.user.role_demotion_incomplete` (a
 group-derived demotion that failed with a store failure or a failed durable session wipe) and
-`scim.user.compensation_failed`. They are a no-op under `--no-analytics`; the audit rows and the
-counters are written every time.
+`scim.user.compensation_failed`. The `scim.user.role_demotion_incomplete` event carries the
+fields `role_applied` and `session_wipe_failed`, each `true`, `false` or the string `"unknown"`
+(unknown when the guarded write may have committed and its outcome is not known; the matching
+audit row then carries `role_applied=unknown`). They are a no-op under `--no-analytics`; the
+audit rows and the counters are written every time.
 
 ### Storage
 
