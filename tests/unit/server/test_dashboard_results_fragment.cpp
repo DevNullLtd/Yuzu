@@ -31,6 +31,7 @@
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+#include "test_real_capability_registry.hpp"
 #include "test_route_sink.hpp"
 #include "test_export_cap_guard.hpp"
 
@@ -40,8 +41,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <format>
+#include <memory>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -387,12 +392,11 @@ TEST_CASE("/fragments/results: Create Group button withheld for a scoped caller"
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(contains(res->body, "in-scope output"));
-    // Gate 8 quality-engineer finding (this round): the assertion above is
-    // reachable via the thead sort-link's raw f_output echo even at zero
-    // matching rows (render_results' base_url() re-embeds every active
-    // filter regardless of match count) -- assert an actual result row
-    // rendered so a facet-population regression (the earlier draft's
-    // false-pass class) can't silently zero out this test's positive half.
+    // Gate 8 quality-engineer finding (earlier round): assert an actual result row
+    // rendered so a facet-population regression (the earlier draft's false-pass class) can't
+    // silently zero out this test's positive half. (Historically the sort links also echoed
+    // the raw f_output value, which made the string above reachable at zero matching rows;
+    // #5623 G8-2 removed that echo, so the row is now the only source.)
     CHECK(contains(res->body, "class=\"result-row\""));
     CHECK_FALSE(contains(res->body, "btn-create-group"));
     CHECK_FALSE(contains(res->body, "Create Group from"));
@@ -1151,6 +1155,220 @@ TEST_CASE("/fragments/results: filter bar, sort headers and pagination share one
         CHECK_FALSE(contains(*body, "closest form"));
         CHECK_FALSE(contains(*body, "hx-sync=\"this"));
     }
+}
+
+// -- #5623 (governance G8-2): sort headers and Prev/Next read the LIVE filter bar -----------------
+// base_url() used to bake the LAST render's command_id / plugin / definition_id / template_id /
+// f_* / q into every th and pager hx-get. With the shared replacing scope, a click during a
+// filter change's flight aborted that request and then landed its own stale-filter request, so
+// the controls and the rows disagreed. The links now carry hx-include="#filter-bar" and ONLY
+// sort / dir / page / per_page. httplib's get_param_value takes the FIRST occurrence, so a baked
+// duplicate would beat the live value: nothing but those four may appear.
+namespace {
+// Every opening tag that carries a results hx-get and is a sort header or a pager button.
+std::vector<std::string> sort_and_pager_tags(const std::string& html) {
+    std::vector<std::string> tags;
+    const std::string needle = "hx-get=\"/fragments/results?";
+    for (auto pos = html.find(needle); pos != std::string::npos;
+         pos = html.find(needle, pos + 1)) {
+        const auto open = html.rfind('<', pos);
+        const auto close = html.find('>', pos);
+        REQUIRE(open != std::string::npos);
+        REQUIRE(close != std::string::npos);
+        std::string tag = html.substr(open, close - open + 1);
+        if (contains(tag, "class=\"btn-page\"") || contains(tag, "sortable"))
+            tags.push_back(std::move(tag));
+    }
+    return tags;
+}
+
+// The hx-get URL of one tag, query string only (HTML-escaped ampersands left as-is).
+std::string hx_get_query(const std::string& tag) {
+    const std::string needle = "hx-get=\"/fragments/results?";
+    const auto b = tag.find(needle);
+    REQUIRE(b != std::string::npos);
+    const auto start = b + needle.size();
+    const auto end = tag.find('"', start);
+    REQUIRE(end != std::string::npos);
+    return tag.substr(start, end - start);
+}
+} // namespace
+
+TEST_CASE("/fragments/results: sort headers and Prev/Next include the live filter bar and bake "
+          "no filter params",
+          "[pg][server][dashboard][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, fragment_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+
+    // 25 identical lines: an exact-match f_output filter keeps all of them, so a FILTERED
+    // request still spans three pages at per_page=10 (page 2 has both Prev and Next).
+    StoredResponse r;
+    r.instruction_id = "cmd-live-filter";
+    r.agent_id = "agent-a";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.plugin = "registry";
+    for (int i = 0; i < 25; ++i)
+        r.output += "same\n";
+    rs.store(r);
+    const auto def_id = make_multi_filter_definition(is, "tpl-live", {"Output"}, {});
+
+    FragmentResultsHarness h(&rs, &is);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+
+    // Every param the form owns is present on the request, so the pre-fix base_url would have
+    // baked all of them.
+    auto page = h.get("/fragments/results?command_id=cmd-live-filter&plugin=registry"
+                      "&definition_id=" + def_id + "&template_id=tplmulti&f_output=same&q=sam"
+                      "&per_page=10&page=2");
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+    // Not vacuous: the filter really applied and the page really has both pager buttons.
+    CHECK(contains(page->body, "Showing 11-20 of 25"));
+    CHECK(contains(page->body, ">Prev</button>"));
+    CHECK(contains(page->body, ">Next</button>"));
+
+    const auto tags = sort_and_pager_tags(page->body);
+    // Output sort header + Prev + Next (the Agent header is hidden by the one-column View).
+    REQUIRE(tags.size() >= 3);
+    for (const auto& tag : tags) {
+        INFO(tag);
+        CHECK(contains(tag, "hx-include=\"#filter-bar\""));
+        const auto q = hx_get_query(tag);
+        INFO(q);
+        for (const char* baked : {"command_id=", "plugin=", "definition_id=", "template_id=",
+                                  "f_", "q="}) {
+            CHECK_FALSE(contains(q, baked));
+        }
+        CHECK(contains(q, "sort="));
+        CHECK(contains(q, "&amp;dir="));
+        CHECK(contains(q, "&amp;page="));
+        CHECK(contains(q, "&amp;per_page=10"));
+    }
+
+    // The Create Group button is NOT a sort/page link and must keep its own command_id +
+    // filters (the create-group form reads only those, not the filter bar).
+    const auto cg = page->body.find("class=\"btn-create-group\"");
+    REQUIRE(cg != std::string::npos);
+    const auto cg_open = page->body.rfind('<', cg);
+    const auto cg_close = page->body.find('>', cg);
+    const std::string cg_tag = page->body.substr(cg_open, cg_close - cg_open + 1);
+    CHECK(contains(cg_tag, "command_id=cmd-live-filter"));
+    CHECK(contains(cg_tag, "&amp;f_output=same"));
+    CHECK_FALSE(contains(cg_tag, "hx-include"));
+}
+
+// -- #5623 (governance G8-3): a dispatch aborts any in-flight results request --------------------
+// The dispatch response replaces #filter-bar with a fresh element, discarding the hx-sync
+// registry attached to the OLD form / thead / pager. A /fragments/results request in flight at
+// Send time would then survive, and its late response would swap the OLD command's rows and
+// Create-Group chrome (carrying the OLD command_id) over the NEW command's table. The response's
+// HX-Trigger therefore ends with an `htmx:abort` addressed at the scope's selector half. Read from
+// the bundled htmx 2.0.4 (static_js_bundle.cpp), not run in a browser by this test: the trigger
+// header handler reassigns the dispatch target on a key's `target` and that reassignment persists
+// for every LATER key, so `htmx:abort` must be the LAST key, with showToast first on the issuer.
+namespace {
+struct ExecDispatchHarness {
+    // MEMBER ORDER IS LOAD-BEARING: `sink` last so it is destroyed first (see the other
+    // harnesses in this file).
+    yuzu::MetricsRegistry metrics;
+    DashboardRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    std::size_t sent{2};
+
+    ExecDispatchHarness() {
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
+            auth::Session s;
+            s.username = "exec-op";
+            s.role = auth::Role::admin;
+            return s;
+        };
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) -> bool { return true; };
+        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                           const std::string&, const std::string&, const std::string&) {};
+        DashboardRoutes::DispatchFn dispatch =
+            [this](const std::string&, const std::string&, const std::vector<std::string>&,
+                   const std::string&, const std::unordered_map<std::string, std::string>&,
+                   const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            return {.sent = sent, .command_id = "cmd-exec-abort"};
+        };
+        routes.register_routes(
+            sink, auth_fn, perm_fn, audit_fn, /*response_store=*/nullptr,
+            /*mgmt_group_store=*/nullptr, /*registry=*/nullptr, /*tag_store=*/nullptr,
+            /*event_bus=*/nullptr, /*agents_json_fn=*/[] { return std::string{"[]"}; }, dispatch,
+            /*caller_fn=*/
+            [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+                return yuzu::server::DispatchCaller{.principal = "exec-op",
+                                                    .exec_visible = std::nullopt};
+            },
+            /*resolve_fn=*/
+            [](const std::string&) {
+                return std::pair<std::string, std::string>{"os_info", "os_version"};
+            },
+            &metrics, /*instruction_store=*/nullptr);
+        routes.set_capability_classify_fn(yuzu::test::real_classify_fn());
+    }
+
+    std::unique_ptr<httplib::Response> post(const std::string& body) {
+        const std::unordered_map<std::string, std::string> headers{
+            {"Host", "yuzu.example:8080"}, {"Origin", "https://yuzu.example:8080"}};
+        auto res = sink.dispatch("POST", "/api/dashboard/execute", body,
+                                 "application/x-www-form-urlencoded", headers);
+        REQUIRE(res != nullptr);
+        return res;
+    }
+};
+} // namespace
+
+TEST_CASE("dashboard execute: the HX-Trigger ends with an htmx:abort at the results sync scope",
+          "[server][dashboard][fragment][execute]") {
+    ExecDispatchHarness h;
+    auto res = h.post("instruction=run&scope=__all__");
+    REQUIRE(res->status == 200);
+    // Not vacuous: this is the success arm that replaces #filter-bar.
+    CHECK(contains(res->body, "<div id=\"filter-bar\" hx-swap-oob=\"true\""));
+
+    REQUIRE(res->has_header("HX-Trigger"));
+    const std::string raw = res->get_header_value("HX-Trigger");
+    INFO(raw);
+    const auto j = nlohmann::json::parse(raw, nullptr, /*allow_exceptions=*/false);
+    REQUIRE(j.is_object());
+    REQUIRE(j.contains("showToast"));
+    REQUIRE(j.contains("htmx:abort"));
+    REQUIRE(j["htmx:abort"].is_object());
+
+    // The abort addresses the selector half of the shared scope (the part before ':').
+    const std::string scope = kResultsSyncScope;
+    const std::string selector = scope.substr(0, scope.find(':'));
+    CHECK(selector == "#filter-bar");
+    CHECK(j["htmx:abort"].value("target", "") == selector);
+
+    // Order is load-bearing (nlohmann sorts keys, so read the raw header): showToast first,
+    // htmx:abort the LAST key, so the target reassignment cannot redirect the toast.
+    const auto toast_at = raw.find("\"showToast\"");
+    const auto abort_at = raw.find("\"htmx:abort\"");
+    REQUIRE(toast_at != std::string::npos);
+    REQUIRE(abort_at != std::string::npos);
+    CHECK(toast_at < abort_at);
+    CHECK(raw.rfind("\"showToast\"") < abort_at);
+    REQUIRE(raw.size() >= 2);
+    CHECK(raw.substr(raw.size() - 2) == "}}");
+    // No second top-level key after htmx:abort: exactly two top-level keys, and the toast does
+    // not carry a `target` of its own.
+    CHECK(j.size() == 2);
+    CHECK_FALSE(j["showToast"].contains("target"));
 }
 
 // -- #5623: authorization runs before the refusal, and a refusal is counted ---------------------
