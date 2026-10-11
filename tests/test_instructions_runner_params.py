@@ -1,66 +1,73 @@
 #!/usr/bin/env python3
-"""Unit check for scripts/test/instructions_runner.py parameter synthesis.
+"""test_instructions_runner_params.py - the /test --instructions runner must synthesise
+parameter values the server accepts.
 
 The server rejects a string parameter that does not match its definition's
-`validation.pattern` (HTTP 400), so the runner must synthesise a value that does.
-Before the runner honoured `validation.pattern`, the /test Instructions gate failed on
-device.agent_actions.set_log_level, device.discovery.scan_subnet and
-crossplatform.tar.configure. This sweeps EVERY pattern-constrained parameter in
-content/definitions/, so a new pattern the runner cannot satisfy fails here rather
-than in a 15-minute live-stack run. Hermetic: imports the runner, starts no server.
+`validation.pattern` (HTTP 400; RE2 PartialMatch, i.e. an unanchored search, which is what
+`re.search` does here). Before the runner honoured the pattern, the Instructions gate failed
+on device.agent_actions.set_log_level, device.discovery.scan_subnet and
+crossplatform.tar.configure. This sweeps EVERY pattern-constrained parameter of every
+InstructionDefinition the gate dispatches, so a new pattern the runner cannot satisfy fails
+here instead of in a 15-minute live-stack run, and pins the precedence rules around it.
 
-Run: python3 tests/test_instructions_runner_params.py
+Runnable standalone: `python3 tests/test_instructions_runner_params.py`. Hermetic: reads
+content/definitions/ only (needs PyYAML, as the runner does). No subprocess, network or clock.
 """
-import importlib.util
+import ipaddress
 import re
 import sys
+import unittest
 from pathlib import Path
 
-import yaml
-
 ROOT = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("instructions_runner", ROOT / "scripts/test/instructions_runner.py")
-runner = importlib.util.module_from_spec(spec)
-sys.modules["instructions_runner"] = runner
-spec.loader.exec_module(runner)
-
-failures = []
-
-
-def check(ok, msg):
-    if not ok:
-        failures.append(msg)
-
-
-swept = 0
-for f in sorted((ROOT / "content/definitions").glob("*.yaml")):
-    for doc in yaml.safe_load_all(f.read_text()):
-        if not doc:
-            continue
-        props = ((doc.get("spec") or doc).get("parameters") or {}).get("properties") or {}
-        for name, schema in props.items():
-            pattern = ((schema or {}).get("validation") or {}).get("pattern")
-            if not pattern or (schema or {}).get("type", "string") != "string":
-                continue
-            swept += 1
-            got = runner._value_for_property(name, schema)
-            check(re.search(pattern, got) is not None, f"{f.name}: {name}: {got!r} does not match {pattern!r}")
-check(swept > 0, "no pattern-constrained parameters found: the sweep is vacuous")
+sys.path.insert(0, str(ROOT / "scripts" / "test"))
+import instructions_runner as ir  # noqa: E402
 
 
 def synth(schema):
-    return runner.synthesise_params({"required": ["p"], "properties": {"p": schema}})["p"]
+    return ir.synthesise_params({"required": ["p"], "properties": {"p": schema}})["p"]
 
 
-# No pattern: the name-based default is unchanged. An unsatisfiable or invalid pattern keeps
-# the original value, so the server (not the runner) reports the mismatch.
-check(synth({"type": "string"}) == runner._synth_string("p", {}), "no-pattern default changed")
-check(synth({"type": "string", "validation": {"pattern": "^zzz$"}}) == runner._synth_string("p", {}),
-      "unsatisfiable pattern must leave the original value")
-check(synth({"type": "string", "validation": {"pattern": "["}}) == runner._synth_string("p", {}),
-      "invalid pattern must leave the original value")
+def string_schema(pattern, **extra):
+    return {"type": "string", "validation": {"pattern": pattern}, **extra}
 
-if failures:
-    print("FAIL:\n  " + "\n  ".join(failures))
-    sys.exit(1)
-print(f"instructions_runner params: OK ({swept} pattern-constrained parameters satisfied)")
+
+class PatternSynthesis(unittest.TestCase):
+    def test_every_definition_pattern_is_satisfied(self):
+        swept = 0
+        for d in ir.load_definitions(ROOT / "content" / "definitions", {}):
+            for name, schema in (d.parameters.get("properties") or {}).items():
+                pattern = ((schema or {}).get("validation") or {}).get("pattern")
+                if not pattern or schema.get("type", "string") != "string":
+                    continue
+                swept += 1
+                with self.subTest(definition=d.id, parameter=name):
+                    got = ir._value_for_property(name, schema)
+                    self.assertIsNotNone(re.search(pattern, got), f"{got!r} does not match {pattern!r}")
+        self.assertGreater(swept, 0, "no pattern-constrained parameters found: the sweep is vacuous")
+
+    def test_scan_subnet_never_targets_a_routable_network(self):
+        d = next(d for d in ir.load_definitions(ROOT / "content" / "definitions", {})
+                 if d.id == "device.discovery.scan_subnet")
+        got = ir._value_for_property("subnet", d.parameters["properties"]["subnet"])
+        self.assertTrue(ipaddress.ip_network(got).subnet_of(ipaddress.ip_network("192.0.2.0/24")), got)
+
+    def test_name_based_default_is_kept_when_it_matches(self):
+        # "host" synthesises 127.0.0.1; the digit fallback "10" would also satisfy this pattern.
+        self.assertEqual(ir._value_for_property("host", string_schema(r"^[a-zA-Z0-9.:\-]+$")), "127.0.0.1")
+
+    def test_no_pattern_leaves_the_name_based_default(self):
+        self.assertEqual(synth({"type": "string"}), ir._synth_string("p", {}))
+
+    def test_explicit_default_and_enum_win_over_the_pattern(self):
+        # "10" (a fallback) would satisfy this pattern, so fitting a default or enum would show.
+        self.assertEqual(synth(string_schema("^[0-9]+$", default="keep")), "keep")
+        self.assertEqual(synth(string_schema("^[0-9]+$", enum=["a", "b"])), "a")
+
+    def test_unsatisfiable_or_invalid_pattern_leaves_the_value_for_the_server(self):
+        self.assertEqual(synth(string_schema("^zzz$")), ir._synth_string("p", {}))
+        self.assertEqual(synth(string_schema("[")), ir._synth_string("p", {}))
+
+
+if __name__ == "__main__":
+    unittest.main()

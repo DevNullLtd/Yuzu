@@ -268,7 +268,9 @@ _PATTERN_FALLBACKS = (
 def _fit_pattern(value: str, schema: dict) -> str:
     """`value` if it satisfies the schema's `validation.pattern`, else the first fallback
     that does; `value` unchanged when there is no pattern or nothing matches (the server
-    then reports the mismatch, which is the honest outcome)."""
+    then reports the mismatch, which is the honest outcome). The server matches with RE2
+    PartialMatch (an unanchored search, as `re.search` is); Python's `re` is not RE2, so a
+    pattern it cannot compile is left to the server rather than raised here."""
     pattern = (schema.get("validation") or {}).get("pattern")
     if not pattern:
         return value
@@ -284,7 +286,9 @@ def _value_for_property(name: str, schema: dict) -> Any:
 
     Honours, in order: explicit YAML `default:`, `enum:`, then a per-host
     name-based table for common parameter shapes (path, sql, url, sha256,
-    group, thumbprint, ioc_*, directory, etc.).
+    group, thumbprint, ioc_*, directory, etc.), then fits a string to its
+    `validation.pattern` (`_fit_pattern`). A default or enum value is used as
+    written and is never pattern-fitted.
     """
     # 1. Honour an explicit default if the YAML provides one.
     if "default" in schema and schema["default"] not in (None, ""):
