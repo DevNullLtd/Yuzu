@@ -60,6 +60,7 @@ spec:
         description: >
           Number of hours to look back for error events, e.g. 24 or 168.
           Range: 1-720 (30 days). Default: 24.
+          Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.
         default: 24
         validation:
           minimum: 1
@@ -175,6 +176,7 @@ spec:
           Windows (the filter is applied within that window); the maximum
           number of matches returned on Linux and macOS. Range: 1-500.
           Default: 50.
+          Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute.
         default: 50
         validation:
           minimum: 1

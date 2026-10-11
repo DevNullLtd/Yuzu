@@ -15,7 +15,9 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   the `yuzu-weetam-windows` pool), one macOS variant (appleclang debug on the
   `yuzu-bigmags-macos` pool), plus `proto-compat`. Wall target: <10 min per leg.
 - **Tier 2 — push to dev/main** (`ci.yml` on push): full 4-way Linux matrix
-  (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS. **No
+  (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS (except
+  a docs-only push, which runs preflight plus the required-check stubs, #5320).
+  **No
   sanitizers, no coverage** — those moved out (#410). **Since #3443 Phase 2**,
   the Linux matrix's `pg_mode` key (via `include:`, never a third axis) means
   only ONE leg (gcc-15/debug) runs the full 11-shard `server-pg` suite on a
@@ -26,6 +28,11 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   2026-08-28)**, the Windows matrix carries the identical `pg_mode` key via
   the same `include:` mechanism (debug=full, release=smoke) — Windows and
   Linux now share one `pg_mode` concept, not two independently-invented ones.
+  **Since #5320** the push trigger has no `paths` filter: a docs-only push
+  (for example a changelog-only release commit) runs `preflight` and the
+  `docs-required-checks` stubs instead of the matrix, so the required contexts
+  still appear on the `main` commit a release tags. See "Docs-only changes
+  (#1978, #5320)" below.
 - **Tier 3 — nightly cron** (`nightly.yml`, `0 6 * * *` UTC +
   `workflow_dispatch`): ASan+UBSan, TSan, coverage on the Big Tam pool
   (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`), plus a Windows ASan
@@ -162,6 +169,68 @@ code.
 
 ## Gates outside the tier ladder
 
+### Release re-publish guard (`release-guard`, #5282)
+
+The first job in `release.yml`. It refuses any run whose ref is not a tag
+(a `workflow_dispatch` from a branch would otherwise pass, since a branch has
+no release, and push `:latest` from branch content) or whose tag is not shaped
+`vX.Y.Z` / `vX.Y.Z-{alpha,beta,rc}N` (the alphabet the prerelease classifier
+and the `:latest` enable assume). It then reads
+`gh api -i repos/<repo>/releases/tags/<tag>` and fails the run if the tag
+already has a published GitHub release. Every image-publishing job
+(`docker-publish`, `docker-publish-postgres`, `docker-publish-chisel`,
+`docker-publish-agent-bundle`), the `release` job and the three build jobs list
+it in `needs`, so a refused run stops before any build, provenance attestation
+or image push. Before it, a run started against an already-released tag (by
+mistake, or a superseded run) pushed new digests over `:X.Y.Z` (and
+`:X.Y`/`:latest` on a stable tag) that no longer matched the release's signed
+`SHA256SUMS` and SBOMs; the only existing-release check was in `Create GitHub
+Release`, after every push, and it skipped with a notice and went green. That
+step now fails instead, because a release appearing there means one arrived
+after the guard ran.
+
+It fails closed on the HTTP status line alone: `404` proceeds, `200` refuses,
+and anything else (no status line, 401/403/429/5xx) fails the run. gh's exit
+code and stderr prose are never interpreted. The step body is executed against
+a stubbed `gh` by `tests/shell/test_release_guard.sh` (in preflight's shell
+gate tests), which also checks that every job holding `packages: write` needs
+the guard.
+
+**Per-push tag re-check.** Two runs for one tag at different commits (a re-tag
+while a run is in flight, or a moved tag whose push webhook never fired) both
+pass the guard, because no release exists yet. So every image push and the
+release creation run `scripts/ci/check-release-tag-sha.sh` immediately before
+acting: it reads the tag from `origin` with `git ls-remote` and refuses unless
+the tag (or its peeled commit) is still this run's `GITHUB_SHA`, failing closed
+on any error. A run whose tag has moved away from its commit refuses at its
+next publishing step, and a re-run of a failed job re-checks too. It cannot
+see a tag moved away and back again while two runs are in flight (A -> B -> A):
+cancel in-flight release runs for a tag before re-tagging it (#5478). The script is tested by
+`tests/shell/test_release_tag_sha.sh`; `test_release_guard.sh` checks that
+each publishing job runs it once, before its first push.
+
+**There is no override.** A published release's assets and signatures describe
+the images it shipped, so any re-push over it breaks verification. To ship
+different images, cut a new version. To redo a release whose published content
+is itself wrong, delete the GitHub release first (destructive; the release
+skill requires operator confirmation), then start a fresh run, which recreates
+the release with a `SHA256SUMS` that matches its images.
+
+Limits: the guard's read-only token cannot see a **draft** release — one made
+by hand, or one `gh release create` leaves behind when interrupted while
+uploading assets (it creates a draft, uploads, then publishes). The `release`
+job's own check sees drafts and fails. Deleting an unpublished draft is not
+destructive (nothing was published): delete it, then re-run failed jobs on the
+newest run.
+
+Residual paths that can still leave `:X.Y.Z` digests and the signed
+`SHA256SUMS` apart, none closed by this change: a draft release the guard
+cannot see; a hand-run `gh release create`; the seconds between a publish
+step's tag re-check and its push; a tag moved away and back again while two
+runs are in flight (#5478); re-running an OLDER run of the tag (#5242: a re-run
+does not repeat `release-guard`); and `:latest`/`:X.Y` landing on an older
+version when runs for two tags finish out of order (#5462).
+
 ### Release artifact gate (`scripts/check-release-artifacts.sh`, release job)
 
 Runs in `release.yml`'s `release` job after the artifacts are downloaded and
@@ -194,8 +263,13 @@ Recovery: find the offending file in the error. For a stale file, clear the
 runner workspace and start a fresh run of the same tag with
 `gh workflow run release.yml --ref vX.Y.Z`, following the release skill's
 Recovery steps (no release exists for the tag, no other run for it is queued
-or running). Never use "Re-run failed jobs" on a release run: an older run can
-be superseded by a newer one and push images over a published release (#5242).
+or running). "Re-run failed jobs" does not fix this case: it re-runs only the
+`release` job, which downloads the same stale artifact again. The workflow
+enforces the first of those steps itself: `release-guard` refuses a run when
+the tag already has a published release (#5282, above). For any other failed
+job, recovery is "Re-run failed jobs" on the NEWEST run for the tag (digests
+kept; each push re-checks the tag), never on an older run (#5242); a fresh run
+is the fallback (release skill, Recovery).
 For a builder naming defect, a fresh run builds the tag's original commit
 again, so fix the builder, then delete and re-push the tag at the fixed commit.
 Either way the images are rebuilt and re-pushed under the same tags.
@@ -245,7 +319,31 @@ requests only, not a required check today) runs
 `agents/plugins/<name>/src/**` must also touch that README, or the PR body
 must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. Both scripts carry a fixture self-test that the `docs`
-suite also runs.
+suite also runs (the touch-rule one off Windows only, #5428).
+
+### Definition-description ratchet (`definition-descriptions` job + `docs` suite)
+
+`scripts/ci/check-definition-descriptions.py` lints the description text of every shipped
+`InstructionDefinition` (the text an agentic worker reads through `discover_instructions`): the
+definition description, each parameter description, each result-column description, and
+non-empty tags. It walks the files `server/core/scripts/embed_content.py` ships (every `*.yaml`
+under `content/definitions` and `content/packs`, recursively) and lints only documents whose
+`kind` is `InstructionDefinition`. It is a ratchet over
+`scripts/ci/definition-descriptions-baseline.json`: a failure absent from the baseline is `NEW`
+and fails the run, and a baselined failure that no longer fails is `STALE` and also fails it, so
+the baseline only shrinks (delete the entry in the change that fixes it). `--update-baseline`
+rewrites it from the tree; run it deliberately, never to hide a new failure, and never in CI.
+
+Two places run the same test, `tests/test_definition_descriptions.py`. The `definition-descriptions`
+job in `docs-lint.yml` (check name "Definition descriptions") is **advisory**: the workflow's own
+header names only "CHANGELOG order" as its required check. It installs PyYAML from
+`requirements-ci.txt` with `--require-hashes` (a `--user` install, skipped when PyYAML is already
+importable), so it reaches PyPI and is its own job so that an outage reds only this check. The
+same test is registered as the `definition descriptions` test in `tests/meson.build` (suite
+`docs`), and the `linux` and `windows` jobs of `ci.yml` list `--suite docs`, so the ratchet is
+enforced on the required `Linux gcc-15 debug` and `Windows MSVC debug` legs without depending on
+the advisory job. A PR that changes only `docs/**` or root `*.md` builds nothing (see "Docs-only changes"),
+but it cannot touch `content/` or the baseline, which are classified as code.
 
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
 
@@ -375,6 +473,15 @@ chisel slice change that stops shipping the busybox symlink breaks nothing at
 build time and nothing at boot — it breaks only the healthcheck, so Compose parks
 every container `unhealthy` forever and anything with `depends_on: condition:
 service_healthy` never starts, with no application failure to point at.
+
+The `server` role also probes one non-healthcheck dependency of the same image:
+the reference compose's one-shot `ca-export` service
+(`deploy/docker/docker-compose.reference-gateway.yml`) runs the server image with
+`/bin/sh -ec` and calls `install`, so the probe checks that `/bin/sh` runs and
+`install` is on its path, and a base-image change that drops either fails the
+gate instead of leaving the agent's `depends_on: ca-export` waiting forever. It
+runs as the image's default user while `ca-export` runs as root, so it proves
+presence and executability, not that user's write access.
 
 `yuzu-postgres` is published and healthchecked too (`pg_isready` + `psql`), but it
 is `FROM postgres:*` — those tools are the image's whole purpose — so it has no
@@ -525,6 +632,63 @@ of reading as NOT TESTED.
 - The gateway stays red on fedora:42 until #5171 is fixed: its bundled OTP
   crypto NIF needs OpenSSL SM4 symbols that Red Hat's OpenSSL lacks. The
   same defect is waiting behind #5143 on rockylinux:9.
+
+**Gateway-upstream peer authorization and the rigs.** The server refuses to start with
+`--gateway-upstream` unless gateway peer authorization is configured or acknowledged as disabled
+(`--insecure-gateway-peer`, or `YUZU_INSECURE_GATEWAY_PEER=1`). The rigs that run the server from
+the build under test pass the flag: `scripts/integration-test.sh` (in both its plaintext and
+`--tls` branches), `scripts/start-UAT.sh`, `scripts/win-start-UAT.sh`, `scripts/start-stack.sh`
+and the locally built full, sanitizer and viz UAT composes. None of them exercises a pinned
+gateway hop, and no workflow under `.github/` invokes `integration-test.sh` (it runs from
+`scripts/run-tests.sh`); running its `--tls` branch with a real pinned gateway leaf is a deferred
+follow-up. The pre-release `integration` job (`scripts/ci/qa-stack.sh`) starts no server itself:
+it runs this checkout's reference-gateway template on the release's published images, so any
+acknowledgement or pin that rig needs belongs in that template (an environment variable, which an
+image older than the flag ignores), not in the script.
+
+**Gateway peer authorization gates.** Four pieces enforce it in CI. (1) The `linux` job in
+`ci.yml` installs the `postgresql-client` apt package (it provides `psql`) and runs the step
+"Gateway peer boot-decision CLI test" (`tests/shell/test_gateway_peer_boot_refusal.sh`) against the
+built server with `YUZU_REQUIRE_PSQL=1`: the test creates one database per row through `psql`, so a
+missing `psql` is a failure under that variable (and under `GITHUB_ACTIONS=true`), never a skip, and
+a skipped step cannot be a green job that never ran. Besides the refusal and control rows (each
+boot configuration against its expected exit and message), the test places real calls against the
+listeners of the controls rows: anonymous calls (no client certificate) on the agent port, client-
+certificate calls that present the default gateway leaf (admitted by the automatic pin, answered by
+the real handler) and the default server leaf (a valid certificate of the same CA that is not the
+pinned one: status 16 with `not_pinned`), and listener-port rows that repeat the certificate pair on
+the dedicated gateway-upstream listener, where a call with no client certificate fails at the TLS
+handshake instead of being answered with status 16. One further row group covers the second
+deployment shape, operator-supplied certificates (`--cert/--key/--ca-cert` plus
+`--gateway-peer-pin-file` naming the gateway leaf): it generates an operator CA and leaves, asserts
+the enforce boot line carries the gateway leaf's SPKI prefix, and calls the gateway-upstream listener
+presenting the pinned leaf (answered by the real handler), an unpinned serverAuth leaf (status 16,
+`not_pinned`) and a clientAuth-only leaf (status 16, `no_server_auth_eku`). (2) The `docs` suite carries a lexical Python
+gate, `tests/test_gateway_peer_registration_lexical.py` (Meson test "gateway-upstream guard
+registration lexical gate", no build required), which fails if the gateway-upstream service is
+registered other than through the guard. It reads `server.cpp` after removing comments, blanking
+string and character literals (raw strings included, recognised only at an identifier boundary),
+stripping a leading byte-order mark, joining backslash-newline splices and removing C++14 digit
+separators, so none of those can hide a registration. Its rules: exactly three
+`builder.RegisterService` calls with the expected arguments; no generic service; one `ServerBuilder`
+that is never passed or copied; the unguarded handler used only in allow-listed contexts; the
+member order of `agent_service_`, `gateway_service_`, `gateway_peer_guard_` and `agent_server_`, all
+at the brace depth of the `ServerImpl` class body, with exactly two guard constructions; only header
+includes (and imports); and a tree-wide scan so no other source file under `server/` names
+`ServerBuilder` or a `Register*Service` API. It is lexical only, not a data-flow analysis. (3) The restart-advice lint
+`tests/test_gateway_peer_restart_advice_lint.py` runs as the "Gateway peer restart-advice lint"
+step of `docs-lint.yml` on every PR (docs-only PRs skip the Meson `docs` suite) and as the Meson
+test "gateway peer restart-advice docs lint": every place that gives gateway-restart advice
+after a peer-authorization refusal must carry the `5183` token (digit boundaries, so `15183`
+does not count) anywhere in the same paragraph, table row, list item or alert annotation, and a
+conditional marker (`only if` or `unless`) in the same sentence as the restart phrase or in the
+next one. Text is matched after markdown marks are stripped, advice that is negated (`do not
+restart the gateway`) is ignored, each file has a pinned minimum number of matching paragraphs so
+a reworded runbook cannot silently drop out of the lint's reach, and the expiry runbook must say a
+gateway redial is required. (4) The rigs
+above, which carry the acknowledgement. The decision record,
+[Gateway peer authorization (minimal), 2026-10-07](security-reviews/gateway-peer-authz-minimal-2026-10-07.md),
+states what none of these cover.
 
 ## Self-hosted runner topology
 
@@ -1302,6 +1466,8 @@ pool causes nightly preflight to fail and the nightly alert opens
 `nightly-broken`; the repository discipline remains **no merge to main while
 that issue is open**. Follow `docs/ci-troubleshooting.md` before closing it.
 
+### Docs-only changes (#1978, #5320)
+
 As of #1978, preflight also emits a `code_changed` output (from
 `scripts/ci/detect-code-change.sh`); the build jobs additionally gate on
 `&& code_changed == 'true'`, so a docs-only PR skips the whole matrix. The
@@ -1309,8 +1475,43 @@ matrix-expanded required contexts (`Linux gcc-15 debug`, `Windows MSVC debug`,
 `macOS debug`) would otherwise stay "Expected" forever on a docs-only PR
 (a top-level-skipped matrix job emits none of its inner check names), so a
 `docs-required-checks` stub emits those exact names as success when
-`code_changed == 'false'`. `ci.yml` no longer path-filters `pull_request`;
-the `push:` trigger keeps its docs `paths-ignore`.
+`code_changed == 'false'`. `ci.yml` path-filters neither trigger.
+
+Since #5320 the same applies to a push to `main`/`dev`. The push trigger used
+to keep a docs `paths` allow-list, so a changelog-only push started no run and
+the required contexts never appeared on the commit; the v0.14.0 release commit
+(50a81af91) was tagged on an operator decision for that reason. Now every push
+runs, and the codegate step's push arm sets `code_changed=false` only when:
+
+1. the previous tip's newest `ci.yml` push run on the branch concluded
+   `success` — a newer pending run cancels an older pending one in this
+   workflow's concurrency group, so without this a docs push arriving behind a
+   running build would cancel a code push's pending run and the code would
+   never be built; it also stops a docs commit turning a red code commit
+   green;
+2. the compare API reports the push as a fast-forward (`ahead`) listing 1–299
+   files (empty is missing evidence; 300 is the API cap, so the list may be
+   truncated); and
+3. every listed path, and every rename's previous path, is docs-only.
+
+Any API error or other answer builds. The classification set is unchanged,
+including the BR-010 carve-out: a push touching `docs/os-capability-matrix.md`
+builds and runs its drift gate. A docs-only push therefore costs
+`trusted_inputs`, `preflight`, three stub jobs and `detect-ci-changes`, all
+GitHub-hosted (plus the CI canary when the push touches a workflow file — the
+CI-infrastructure classifier decides that separately). The required contexts on
+such a commit read `success` (Preflight, the three stubs, CHANGELOG order) or
+`skipped` (Proto backward-compat). `success` on those three names for a
+docs-only commit means *inherited from the predecessor's build*, not *built*;
+the run's summary says so. On a PR a skipped required context satisfies the
+ruleset and an absent one does not; a push commit is never evaluated by the
+ruleset, so on `main` the only consumer of these contexts is the release
+skill's tag gate, which reads them the same way. The
+push arm is executed against a stubbed `gh` by
+`tests/shell/test_codegate_push.sh`.
+
+Which contexts are required is a repository ruleset setting ("Protect Main",
+"Protect Dev"), not part of `ci.yml`; #5320 did not change it.
 
 ## Postgres for server tests (`YUZU_TEST_POSTGRES_DSN`)
 

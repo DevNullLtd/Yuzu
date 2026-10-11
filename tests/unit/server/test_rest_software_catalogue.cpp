@@ -1,4 +1,4 @@
-// test_rest_software_catalogue.cpp — HTTP-level tests for the M.9 PR-2 catalogue twins:
+// test_rest_software_catalogue.cpp — HTTP-level tests for the software catalogue twins:
 //   GET /api/v1/inventory/software/catalogue            (titles + totals + KPIs + titles CSV)
 //   GET /api/v1/inventory/software/catalogue/versions   (installs per version)
 //
@@ -28,7 +28,7 @@
 #include "../test_helpers.hpp"
 
 #include <algorithm>
-#include <cstdio>
+#include <format>
 #include <memory>
 #include <optional>
 #include <set>
@@ -75,10 +75,12 @@ struct CatHarness {
     std::string token_scope_service;             // non-empty = a service-scoped session
     bool audit_throws{false};
     bool audit_ok{true};
+    std::string audit_fail_result; // non-empty: only rows with this result fail to persist
     std::vector<AuditRecord> audit_log;
     std::shared_ptr<FakeDeviceApi> device_api = std::make_shared<FakeDeviceApi>();
 
-    explicit CatHarness(SoftwareInventoryStore* store, bool wire_fleet_read_fn = true) {
+    explicit CatHarness(SoftwareInventoryStore* store, bool wire_fleet_read_fn = true,
+                        bool wire_device_api = true) {
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -95,7 +97,7 @@ struct CatHarness {
             if (audit_throws)
                 throw std::runtime_error("audit sink down");
             audit_log.push_back({action, result, target_id, detail});
-            return audit_ok;
+            return audit_ok && result != audit_fail_result;
         };
         RestApiV1::FleetReadFn fleet_read_fn;
         if (wire_fleet_read_fn) {
@@ -128,7 +130,8 @@ struct CatHarness {
             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
             /*auth_db=*/nullptr, /*directory_sync=*/nullptr, /*stream_budget=*/nullptr,
             /*exec_visible_fn=*/{}, /*list_read_fn=*/{}, std::move(fleet_read_fn),
-            /*agents_fn=*/{}, /*response_visible_set_fn=*/{}, /*verify_api=*/{}, device_api,
+            /*agents_fn=*/{}, /*response_visible_set_fn=*/{}, /*verify_api=*/{},
+            wire_device_api ? device_api : nullptr,
             /*dex_api=*/{});
     }
 
@@ -188,6 +191,18 @@ void seed_fixture(SoftwareInventoryStore& store, bool refresh = true) {
         REQUIRE(store.refresh_catalog_rollup());
 }
 
+// Puts the rollup back to its never-computed state (a fresh install, or the v8 upgrade before
+// its first refresh): refreshed_at = 0 on the singleton meta row of the disposable clone.
+void reset_rollup_to_building(PgPool& pool) {
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    REQUIRE(yuzu::server::pg::exec_params(
+                lease.get(),
+                "UPDATE software_inventory_store.catalog_rollup_meta SET refreshed_at = 0",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+}
+
 std::string b64url(std::string_view in) {
     static constexpr char tbl[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -218,12 +233,30 @@ TEST_CASE("catalogue routes: unwired fleet_read_fn fails closed with 503",
         auto r = h.sink.Get(std::string(path) + "?name=git");
         REQUIRE(r);
         CHECK(r->status == 503);
-        CHECK(nlohmann::json::parse(r->body).contains("error"));
+        // The unwired arm, not the null-store one that would also be a 503 here.
+        CHECK(err_of(r).at("message") == "service unavailable");
+        // A4 bodies always carry the key; null = no retry hint (nothing to retry against).
+        CHECK(err_of(r).at("retry_after_ms").is_null());
         CHECK_FALSE(nlohmann::json::parse(r->body).contains("data"));
     }
 }
 
-TEST_CASE("catalogue routes: null store → 503 'not available', no audit row",
+TEST_CASE("catalogue routes: a gate that does not admit stops the request before any read or audit "
+          "row",
+          "[rest][software_catalogue][security]") {
+    CatHarness h{/*store=*/nullptr};
+    h.fleet_admitted = false;
+    for (const char* path : {kCat, kVer}) {
+        auto r = h.sink.Get(std::string(path) + "?name=git");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(err_of(r).at("message") == "denied"); // the gate's own body, not the store 503
+        CHECK_FALSE(nlohmann::json::parse(r->body).contains("data"));
+    }
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("catalogue routes: null store is 503 'not available' with no audit row",
           "[rest][software_catalogue]") {
     CatHarness h{/*store=*/nullptr};
     for (const char* path : {kCat, kVer}) {
@@ -231,12 +264,14 @@ TEST_CASE("catalogue routes: null store → 503 'not available', no audit row",
         REQUIRE(r);
         CHECK(r->status == 503);
         CHECK(err_of(r).at("message") == "software inventory store not available");
+        CHECK(err_of(r).at("retry_after_ms").is_null());
         CHECK_FALSE(r->get_header_value("X-Correlation-Id").empty());
+        CHECK(err_of(r).at("correlation_id").get<std::string>() == r->get_header_value("X-Correlation-Id"));
     }
     CHECK(h.audit_log.empty());
 }
 
-TEST_CASE("catalogue routes: a service-scoped token is denied with NO .permission field, a denied "
+TEST_CASE("catalogue routes: a service-scoped token is denied with NO .permission field and a denied "
           "audit row and the default-deny metric",
           "[rest][software_catalogue][security]") {
     CatHarness h{/*store=*/nullptr};
@@ -290,6 +325,7 @@ TEST_CASE("catalogue routes: a confined caller is denied the fleet view (403 + I
         REQUIRE(r);
         CHECK(r->status == 403);
         CHECK(err_of(r).at("permission") == "Inventory:Read");
+        CHECK(err_of(r).at("correlation_id").get<std::string>() == r->get_header_value("X-Correlation-Id"));
         CHECK_FALSE(nlohmann::json::parse(r->body).contains("data"));
     }
     CHECK(h.audits("inventory.software.catalog", "denied") == 1);
@@ -307,25 +343,63 @@ TEST_CASE("catalogue routes: malformed parameters are 400 with a correlation id"
 
     CatHarness h{&store};
     const std::string oversize(2049, 'a');
+    const std::string too_long(257, 'a'); // > kSourceMaxBytes
     for (const std::string& url : std::vector<std::string>{std::string(kCat) + "?kind=app&kind=pkg",
                                   std::string(kCat) + "?limit=12abc",
                                   std::string(kCat) + "?versions_min=-1",
                                   std::string(kCat) + "?format=xml",
                                   std::string(kCat) + "?cursor=" + oversize,
+                                  std::string(kCat) + "?format=csv&cursor=garbage",
+                                  std::string(kCat) + "?source=" + too_long,
+                                  std::string(kCat) + "?agent_id=" + too_long,
                                   std::string(kVer),
-                                  std::string(kVer) + "?name=git&name=other"}) {
+                                  std::string(kVer) + "?name=git&name=other",
+                                  std::string(kVer) + "?name=git&source=" + too_long,
+                                  std::string(kVer) + "?name=git&agent_id=" + too_long}) {
         CAPTURE(url.substr(0, 80));
         auto r = h.sink.Get(url);
         REQUIRE(r);
         CHECK(r->status == 400);
         CHECK_FALSE(r->get_header_value("X-Correlation-Id").empty());
-        CHECK_FALSE(err_of(r).at("correlation_id").get<std::string>().empty());
+        CHECK(err_of(r).at("correlation_id").get<std::string>() == r->get_header_value("X-Correlation-Id"));
     }
+}
+
+TEST_CASE("catalogue routes: text Postgres cannot bind is a 400 and never a retryable 503 or a failure "
+          "audit row",
+          "[pg][rest][software_catalogue][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_fixture(store);
+    const auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+
+    CatHarness h{&store};
+    // A hand-minted cursor for the CURRENT generation whose decoded name is not valid UTF-8
+    // (well-formed otherwise), so only the UTF-8 refusal can answer 400 - not a stale cursor.
+    const std::string forged = "c1:" + swc::filter_fingerprint(SoftwareCatalogQuery{.limit = 100}) + ":" +
+                               std::to_string(meta->refreshed_at) + ":" +
+                               b64url(std::string("5\x1f") + "\xFF");
+    for (const std::string& url : std::vector<std::string>{std::string(kCat) + "?kind=%FF",
+                                                           std::string(kCat) + "?q=%00",
+                                                           std::string(kCat) + "?cursor=" + forged,
+                                                           std::string(kVer) + "?name=%FF"}) {
+        CAPTURE(url);
+        auto r = h.sink.Get(url);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(err_of(r).at("retry_after_ms").is_null()); // a caller fault, not a retryable degrade
+    }
+    CHECK(h.audits("inventory.software.catalog", "failure") == 0);
+    CHECK(h.audits("inventory.software.versions", "failure") == 0);
 }
 
 // ── [pg] reads ───────────────────────────────────────────────────────────────
 
-TEST_CASE("catalogue: fleet read — rows, totals, KPIs and coverage counts",
+TEST_CASE("catalogue: fleet read: rows / totals / KPIs / coverage counts",
           "[pg][rest][software_catalogue]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -353,8 +427,27 @@ TEST_CASE("catalogue: fleet read — rows, totals, KPIs and coverage counts",
     CHECK(k.at("building") == false);
     CHECK(k.at("coverage").at("reporting") == 3);
     CHECK(k.at("coverage").at("connected") == 5);
+    CHECK(k.at("coverage").at("stale") == 0); // wired from the store count, not the null arm
     CHECK_FALSE(k.at("coverage").contains("pct"));
     CHECK(h.audits("inventory.software.catalog", "success") == 1);
+}
+
+TEST_CASE("catalogue: with no DeviceApi wired coverage.connected is null and reporting still counts",
+          "[pg][rest][software_catalogue]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_fixture(store);
+
+    CatHarness h{&store, /*wire_fleet_read_fn=*/true, /*wire_device_api=*/false};
+    auto r = h.sink.Get(kCat);
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    const auto cov = data_of(r).at("kpis").at("coverage");
+    CHECK(cov.at("connected").is_null());
+    CHECK(cov.at("reporting") == 3);
 }
 
 TEST_CASE("catalogue: totals cover every row under the filters while the page shows `limit` rows",
@@ -379,7 +472,7 @@ TEST_CASE("catalogue: totals cover every row under the filters while the page sh
     CHECK(q.at("totals").at("titles") == 1);
 }
 
-TEST_CASE("catalogue: keyset walk over 250 titles pages 100/100/50 without duplicates, kpis null "
+TEST_CASE("catalogue: keyset walk over 250 titles pages 100/100/50 without duplicates and kpis null "
           "on continuation pages",
           "[pg][rest][software_catalogue]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
@@ -389,9 +482,7 @@ TEST_CASE("catalogue: keyset walk over 250 titles pages 100/100/50 without dupli
     REQUIRE(store.is_open());
     Rows rows;
     for (int i = 0; i < 250; ++i) {
-        char name[16];
-        std::snprintf(name, sizeof name, "title-%03d", i);
-        rows.push_back(ent(name, "1.0", "", "package", "deb", "pkg_inventory.packages"));
+        rows.push_back(ent(std::format("title-{:03}", i), "1.0", "", "package", "deb", "pkg_inventory.packages"));
     }
     put(store, "d1", std::move(rows));
     REQUIRE(store.refresh_catalog_rollup());
@@ -421,7 +512,7 @@ TEST_CASE("catalogue: keyset walk over 250 titles pages 100/100/50 without dupli
     CHECK(h.audits("inventory.software.catalog", "success", "page=continuation") == 2);
 }
 
-TEST_CASE("catalogue: cursor refusals — tampered, other filters, stale after a refresh",
+TEST_CASE("catalogue: cursor refusals: tampered / other filters / stale after a refresh",
           "[pg][rest][software_catalogue][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -464,7 +555,9 @@ TEST_CASE("catalogue: cursor refusals — tampered, other filters, stale after a
     CHECK(err_of(stale).at("message").get<std::string>().find("predates the current catalogue refresh") !=
           std::string::npos);
     // restarting from page one works
-    CHECK(h.sink.Get(std::string(kCat) + "?limit=1")->status == 200);
+    auto restart = h.sink.Get(std::string(kCat) + "?limit=1");
+    REQUIRE(restart);
+    CHECK(restart->status == 200);
 }
 
 TEST_CASE("catalogue: a forged head cursor walks from row 1 but is audited as a continuation",
@@ -547,7 +640,7 @@ TEST_CASE("catalogue: host view — one row per title; a confined caller sees ne
     }
 }
 
-TEST_CASE("versions: newest mark, filters, truncation, out-of-scope device",
+TEST_CASE("versions: newest mark / filters / truncation / out-of-scope device",
           "[pg][rest][software_catalogue]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -560,6 +653,7 @@ TEST_CASE("versions: newest mark, filters, truncation, out-of-scope device",
     const auto d = data_of(h.sink.Get(std::string(kVer) + "?name=git"));
     CHECK(d.at("count") == 3);
     CHECK(d.at("truncated") == false);
+    CHECK(d.at("devices_omitted") == 0);
     bool newest_seen = false;
     for (const auto& v : d.at("versions"))
         if (v.at("newest").get<bool>()) {
@@ -579,19 +673,22 @@ TEST_CASE("versions: newest mark, filters, truncation, out-of-scope device",
         c.fleet_scope = std::unordered_set<std::string>{"d1"};
         const auto v = data_of(c.sink.Get(std::string(kVer) + "?name=git&agent_id=d1"));
         CHECK(v.at("newest_omitted") == true);
+        CHECK(v.at("devices_omitted") == 0);
+        REQUIRE_FALSE(v.at("versions").empty()); // else the loop below is vacuous
         for (const auto& row : v.at("versions"))
             CHECK(row.at("newest") == false);
     }
-    SECTION("device out of scope: empty + denied") {
+    SECTION("device out of scope: empty + denied + the devices_omitted marker") {
         CatHarness c{&store};
         c.fleet_scope = std::unordered_set<std::string>{"d1"};
         const auto v = data_of(c.sink.Get(std::string(kVer) + "?name=git&agent_id=d2"));
         CHECK(v.at("versions").empty());
+        CHECK(v.at("devices_omitted") == 1); // not "no installs of git on d2"
         CHECK(c.audits("inventory.software.versions", "denied") == 1);
     }
 }
 
-TEST_CASE("catalogue routes: a degraded store is 503 + retry_after_ms + failure audit, never an "
+TEST_CASE("catalogue routes: a degraded store is 503 + retry_after_ms + failure audit and never an "
           "empty 200",
           "[pg][rest][software_catalogue][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
@@ -602,16 +699,58 @@ TEST_CASE("catalogue routes: a degraded store is 503 + retry_after_ms + failure 
 
     auto held = pool.acquire(); // starve the pool: every read times out → nullopt
     CatHarness h{&store};
-    for (const char* path : {kCat, kVer}) {
+    for (const auto& [path, what] : {std::pair<const char*, const char*>{kCat, "catalogue read"},
+                                     std::pair<const char*, const char*>{kVer, "versions read"}}) {
         auto r = h.sink.Get(std::string(path) + "?name=git");
         REQUIRE(r);
         CHECK(r->status == 503);
+        CHECK(err_of(r).at("message") ==
+              std::string("software inventory store degraded — ") + what + " failed");
         CHECK(err_of(r).at("retry_after_ms") == 5000);
         CHECK_FALSE(nlohmann::json::parse(r->body).contains("data"));
     }
-    CHECK(h.audits("inventory.software.catalog", "failure") == 1);
-    CHECK(h.audits("inventory.software.versions", "failure") == 1);
+    CHECK(h.audits("inventory.software.catalog", "failure", "catalogue read degraded") == 1);
+    CHECK(h.audits("inventory.software.versions", "failure", "versions read degraded") == 1);
     CHECK(h.audits("inventory.software.catalog", "success") == 0);
+}
+
+TEST_CASE("catalogue routes: an unreadable refresh-metadata row degrades the unfiltered versions "
+          "read only and with the versions message and a failure audit",
+          "[pg][rest][software_catalogue][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_fixture(store);
+    {
+        // The meta read is a direct statement, so renaming the table in the disposable clone
+        // fails it while version_rollup and installed_software stay readable: the pre-check's
+        // nullopt arm is then the only thing that can produce the 503.
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    lease.get(),
+                    "ALTER TABLE software_inventory_store.catalog_rollup_meta RENAME TO "
+                    "catalog_rollup_meta_renamed",
+                    std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    CatHarness h{&store};
+    auto r = h.sink.Get(std::string(kVer) + "?name=git");
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    CHECK(err_of(r).at("message") ==
+          "software inventory store degraded — versions read failed");
+    CHECK(err_of(r).at("retry_after_ms") == 5000);
+    CHECK_FALSE(nlohmann::json::parse(r->body).contains("data"));
+    CHECK(h.audits("inventory.software.versions", "failure", "versions read degraded") == 1);
+    CHECK(h.audits("inventory.software.versions", "success") == 0);
+
+    // A filtered read never touches the meta row, so it still serves.
+    auto filtered = h.sink.Get(std::string(kVer) + "?name=git&ecosystem=brew");
+    REQUIRE(filtered);
+    CHECK(filtered->status == 200);
 }
 
 TEST_CASE("catalogue routes: a throwing or failing audit sink serves 200 with audit_persisted:false",
@@ -631,6 +770,21 @@ TEST_CASE("catalogue routes: a throwing or failing audit sink serves 200 with au
         CHECK(r->status == 200);
         CHECK(data_of(r).at("audit_persisted") == false);
     }
+
+    // The out-of-scope per-device arms swallow no failed `denied` row either.
+    h.fleet_scope = std::unordered_set<std::string>{"d1"};
+    auto cat = h.sink.Get(std::string(kCat) + "?agent_id=d2");
+    REQUIRE(cat);
+    CHECK(cat->status == 200);
+    CHECK(data_of(cat).at("audit_persisted") == false);
+    auto ver = h.sink.Get(std::string(kVer) + "?name=git&agent_id=d2");
+    REQUIRE(ver);
+    CHECK(ver->status == 200);
+    CHECK(data_of(ver).at("audit_persisted") == false);
+    auto csv = h.sink.Get(std::string(kCat) + "?agent_id=d2&format=csv");
+    REQUIRE(csv);
+    CHECK(csv->status == 200);
+    CHECK(csv->get_header_value("Sec-Audit-Failed") == "true");
 }
 
 TEST_CASE("catalogue: audit target equals audit_target(query) on every call",
@@ -643,18 +797,22 @@ TEST_CASE("catalogue: audit target equals audit_target(query) on every call",
     seed_fixture(store);
 
     CatHarness h{&store};
-    REQUIRE(h.sink.Get(std::string(kCat) + "?ecosystem=brew&q=git&versions_min=1")->status == 200);
+    auto brew = h.sink.Get(std::string(kCat) + "?ecosystem=brew&q=git&versions_min=1");
+    REQUIRE(brew);
+    REQUIRE(brew->status == 200);
     SoftwareCatalogQuery q;
     q.ecosystem = "brew";
     q.q = "git";
     q.versions_min = 1;
     REQUIRE_FALSE(h.audit_log.empty());
     CHECK(h.audit_log.back().target_id == swc::audit_target(q));
-    REQUIRE(h.sink.Get(std::string(kVer) + "?name=git")->status == 200);
+    auto git = h.sink.Get(std::string(kVer) + "?name=git");
+    REQUIRE(git);
+    REQUIRE(git->status == 200);
     CHECK(h.audit_log.back().target_id == "name=git");
 }
 
-TEST_CASE("catalogue: titles CSV — header, disposition, cap truncation, audit, service deny",
+TEST_CASE("catalogue: titles CSV: header / disposition / cap truncation / audit",
           "[pg][rest][software_catalogue]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -682,7 +840,215 @@ TEST_CASE("catalogue: titles CSV — header, disposition, cap truncation, audit,
 
     CHECK(h.audits("inventory.software.export", "success") == 2);
     CHECK(h.audits("inventory.software.export", "success", "truncated=true") == 1);
+    // The route's own row count reaches the audit detail (3 titles served; 2 when cut by limit).
+    CHECK(h.audits("inventory.software.export", "success", "rows=3") == 1);
+    CHECK(h.audits("inventory.software.export", "success", "rows=2") == 1);
 
-    h.token_scope_service = "printers";
-    CHECK(h.sink.Get(std::string(kCat) + "?format=csv")->status == 403);
+    // An export whose audit row did not persist is still served, flagged on the wire.
+    h.audit_ok = false;
+    auto unaudited = h.sink.Get(std::string(kCat) + "?format=csv");
+    REQUIRE(unaudited);
+    CHECK(unaudited->status == 200);
+    CHECK(unaudited->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(unaudited->get_header_value("Content-Disposition").find("software-titles.csv") !=
+          std::string::npos);
+    h.audit_ok = true;
+    auto audited = h.sink.Get(std::string(kCat) + "?format=csv");
+    REQUIRE(audited);
+    CHECK(audited->status == 200);
+    CHECK(audited->get_header_value("Sec-Audit-Failed").empty());
+}
+
+TEST_CASE("catalogue: a titles CSV for an out-of-scope host is a header-only 200 with a denied "
+          "row AND an export success row",
+          "[pg][rest][software_catalogue][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_fixture(store);
+
+    CatHarness h{&store};
+    h.fleet_scope = std::unordered_set<std::string>{"d2"};
+    auto r = h.sink.Get(std::string(kCat) + "?format=csv&agent_id=d1");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->body == std::string(swc::kTitlesCsvHeader) + "\n"); // no oracle: same as an empty host
+    // The paired-row convention of inventory.software.query: the denial AND the (empty) export.
+    CHECK(h.audits("inventory.software.export", "denied") == 1);
+    CHECK(h.audits("inventory.software.export", "success", "rows=0") == 1);
+}
+
+TEST_CASE("catalogue: a degraded store on the titles CSV is 503 + retry_after_ms + an export "
+          "failure audit",
+          "[pg][rest][software_catalogue][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto held = pool.acquire(); // starve the pool: every read times out -> nullopt
+    CatHarness h{&store};
+    auto r = h.sink.Get(std::string(kCat) + "?format=csv");
+    REQUIRE(r);
+    CHECK(r->status == 503);
+    CHECK(err_of(r).at("retry_after_ms") == 5000);
+    CHECK(h.audits("inventory.software.export", "failure") == 1);
+    CHECK(h.audits("inventory.software.export", "success") == 0);
+}
+
+TEST_CASE("catalogue: titles CSV posture / confined fleet deny / in-scope host blanking / denied-row "
+          "carry-over",
+          "[pg][rest][software_catalogue][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_fixture(store);
+    const std::string host_csv = std::string(kCat) + "?format=csv&agent_id=d1";
+
+    SECTION("a confined fleet export is denied under the export verb") {
+        CatHarness h{&store};
+        h.fleet_scope = std::unordered_set<std::string>{"d1"};
+        auto r = h.sink.Get(std::string(kCat) + "?format=csv");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(err_of(r).at("permission") == "Inventory:Read");
+        CHECK(h.audits("inventory.software.export", "denied") == 1);
+        CHECK(h.audits("inventory.software.export", "success") == 0);
+    }
+    SECTION("a service-scoped ?format=csv is denied pre-parse under the catalogue verb") {
+        CatHarness h{&store};
+        h.token_scope_service = "printers";
+        auto r = h.sink.Get(std::string(kCat) + "?format=csv");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(h.audits("inventory.software.catalog", "denied") == 1);
+        CHECK(h.audits("inventory.software.export", "denied") == 0);
+    }
+    SECTION("a confined in-scope host export blanks the fleet-derived newest column") {
+        CatHarness top{&store};
+        auto open = top.sink.Get(host_csv);
+        REQUIRE(open);
+        REQUIRE(open->status == 200);
+        CHECK(open->body.find("2.41") != std::string::npos); // control: TOP sees the fleet newest
+
+        CatHarness h{&store};
+        h.fleet_scope = std::unordered_set<std::string>{"d1"};
+        auto r = h.sink.Get(host_csv);
+        REQUIRE(r);
+        REQUIRE(r->status == 200);
+        CHECK(r->body.find("2.41") == std::string::npos);
+        CHECK(std::ranges::count(r->body, '\n') == 3); // header + git + Chrome
+        CHECK(r->body.find(",\n", r->body.find('\n')) != std::string::npos); // empty last cell
+    }
+    SECTION("a failed denied row alone still flags the served empty export") {
+        CatHarness h{&store};
+        h.fleet_scope = std::unordered_set<std::string>{"d2"};
+        h.audit_fail_result = "denied";
+        auto r = h.sink.Get(host_csv);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(h.audits("inventory.software.export", "success", "rows=0") == 1); // that one persisted
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    }
+}
+
+TEST_CASE("catalogue: a never-built rollup is a 503 'being built' on the CSV export / the "
+          "unfiltered versions read / never an empty 200",
+          "[pg][rest][software_catalogue][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_fixture(store);
+    reset_rollup_to_building(pool);
+    const std::string csv_url = std::string(kCat) + "?format=csv";
+    const std::string ver_url = std::string(kVer) + "?name=git";
+
+    auto expect_building = [](const Res& r) {
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(err_of(r).at("message") == "software catalogue is being built; retry");
+        CHECK(err_of(r).at("retry_after_ms") == 5000);
+        CHECK(r->get_header_value("Content-Disposition").empty()); // no file was offered
+        CHECK_FALSE(nlohmann::json::parse(r->body).contains("data"));
+    };
+
+    SECTION("the CSV export") {
+        CatHarness h{&store};
+        expect_building(h.sink.Get(csv_url));
+        CHECK(h.audits("inventory.software.export", "failure", "building") == 1);
+        CHECK(h.audits("inventory.software.export", "success") == 0);
+    }
+    SECTION("the unfiltered versions read") {
+        CatHarness h{&store};
+        expect_building(h.sink.Get(ver_url));
+        CHECK(h.audits("inventory.software.versions", "failure", "building") == 1);
+        CHECK(h.audits("inventory.software.versions", "success") == 0);
+    }
+    SECTION("a dead audit sink does not turn the signal into a 500 or an empty 200") {
+        CatHarness h{&store};
+        h.audit_throws = true;
+        expect_building(h.sink.Get(csv_url));
+        expect_building(h.sink.Get(ver_url));
+    }
+    SECTION("reads that do not depend on the rollup, and the JSON page, still answer") {
+        CatHarness h{&store};
+        {
+            // reset_rollup_to_building only zeroes refreshed_at; the newest mark reads the rollup
+            // rows directly, so empty them to truly model a never-computed rollup.
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(yuzu::server::pg::exec_params(
+                        lease.get(), "DELETE FROM software_inventory_store.catalog_rollup",
+                        std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        auto eco = h.sink.Get(ver_url + "&ecosystem=brew");
+        REQUIRE(eco);
+        CHECK(eco->status == 200);
+        CHECK(data_of(eco).at("count") == 2);
+        // Rows and counts do not depend on the rollup; the newest mark does and stays false.
+        // The rpm row is git 2.41 (the fleet newest): with a populated rollup it would be true.
+        auto rpm = h.sink.Get(ver_url + "&ecosystem=rpm");
+        REQUIRE(rpm);
+        REQUIRE(rpm->status == 200);
+        REQUIRE(data_of(rpm).at("count") == 1);
+        for (const auto& row : data_of(rpm).at("versions"))
+            CHECK(row.at("newest") == false);
+        for (const auto& row : data_of(eco).at("versions"))
+            CHECK(row.at("newest") == false);
+        auto dev = h.sink.Get(ver_url + "&agent_id=d1");
+        REQUIRE(dev);
+        CHECK(dev->status == 200);
+        auto host = h.sink.Get(csv_url + "&agent_id=d1");
+        REQUIRE(host);
+        CHECK(host->status == 200);
+        // The per-device export's newest_version cell reads the rollup: blank until first refresh.
+        const auto row_start = host->body.find('\n');
+        REQUIRE(row_start != std::string::npos);
+        const auto row_end = host->body.find('\n', row_start + 1);
+        REQUIRE(row_end != std::string::npos);
+        CHECK(host->body[row_end - 1] == ',');
+        auto page = h.sink.Get(kCat);
+        REQUIRE(page);
+        CHECK(page->status == 200);
+        CHECK(data_of(page).at("kpis").at("building") == true);
+    }
+    SECTION("once the first refresh lands both arms serve") {
+        REQUIRE(store.refresh_catalog_rollup());
+        CatHarness h{&store};
+        auto csv = h.sink.Get(csv_url);
+        REQUIRE(csv);
+        CHECK(csv->status == 200);
+        auto ver = h.sink.Get(ver_url);
+        REQUIRE(ver);
+        CHECK(ver->status == 200);
+        CHECK(data_of(ver).at("count") == 3);
+    }
 }

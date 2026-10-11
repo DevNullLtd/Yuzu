@@ -140,6 +140,12 @@ struct SoftwareVersionCount {
     bool newest{false};
 };
 
+/// Hard ceiling on catalogue / version-drill rows one store read returns, independent of the
+/// caller's `limit` (the catalogue is one row per distinct title; the drill one per distinct
+/// version of a title - both bounded sets). The single source for the store clamp AND the
+/// catalogue model's export walk (a read shorter than asked for must mean "no more rows").
+inline constexpr int kCatalogRowCap = 2000;
+
 /// Fleet catalogue query. `q` is a case-insensitive LITERAL title-level predicate over
 /// name | publisher | ecosystems | sources of the (filtered) slice — `%` and `_` are not
 /// wildcards; it is clamped to 128 bytes at a UTF-8 boundary. A matched title keeps its

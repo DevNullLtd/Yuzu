@@ -741,6 +741,84 @@ std::size_t GuardianSparkRuntime::retained_tombstones() const {
     return n;
 }
 
+std::optional<std::chrono::steady_clock::duration>
+GuardianSparkRuntime::oldest_pending_disarm_age_locked(
+    std::chrono::steady_clock::time_point now) const {
+    std::optional<std::chrono::steady_clock::duration> oldest;
+    for (const auto& [key, entry] : claims_) {
+        if (entry.fifo.empty())
+            continue;
+        const auto& head = entry.fifo.front();
+        if (head->kind != ClaimKind::Disarm || head->outcome)
+            continue;
+        // A `now` before the claim's creation (a caller-supplied clock) reads as zero.
+        const auto age = std::max(now - head->created_at, std::chrono::steady_clock::duration::zero());
+        if (!oldest || age > *oldest)
+            oldest = age;
+    }
+    return oldest;
+}
+
+std::optional<std::chrono::steady_clock::duration>
+GuardianSparkRuntime::oldest_pending_disarm_age(std::chrono::steady_clock::time_point now) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return oldest_pending_disarm_age_locked(now);
+}
+
+std::optional<std::chrono::steady_clock::duration>
+GuardianSparkRuntime::oldest_outstanding_compensation_age_locked(
+    std::chrono::steady_clock::time_point now) const {
+    std::optional<std::chrono::steady_clock::duration> oldest;
+    for (const auto& [key, entry] : claims_) {
+        for (const auto& c : entry.fifo) {
+            if (c->compensation_finished ||
+                c->compensation_deadline == std::chrono::steady_clock::time_point{})
+                continue;
+            // The deadline was set once, at the owed instant, plus backend_op_deadline.
+            const auto owed_at = c->compensation_deadline - cfg_.backend_op_deadline;
+            // A `now` before the owed instant (a caller-supplied clock) reads as zero.
+            const auto age = std::max(now - owed_at, std::chrono::steady_clock::duration::zero());
+            if (!oldest || age > *oldest)
+                oldest = age;
+        }
+    }
+    return oldest;
+}
+
+std::optional<std::chrono::steady_clock::duration>
+GuardianSparkRuntime::oldest_outstanding_compensation_age(
+    std::chrono::steady_clock::time_point now) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return oldest_outstanding_compensation_age_locked(now);
+}
+
+void GuardianSparkRuntime::observe_pending_disarms_locked(
+    std::chrono::steady_clock::time_point now, ExpireWarns& warns) {
+    for (auto& [key, entry] : claims_) {
+        if (entry.fifo.empty())
+            continue;
+        auto& head = entry.fifo.front();
+        if (head->kind != ClaimKind::Disarm || head->outcome || head->disarm_deadline_observed)
+            continue;
+        const auto age = now - head->created_at;
+        if (age <= kDisarmPendingObserveThreshold)
+            continue;
+        // Latch and count first (neither can throw), so the once-per-claim contract holds
+        // even when the warn copy below fails or the per-pass warn cap is already spent.
+        head->disarm_deadline_observed = true;
+        disarm_deadline_elapsed_.fetch_add(1, std::memory_order_relaxed);
+        if (warns.disarms.size() >= kDisarmPendingWarnsPerPass) {
+            ++warns.disarms_more; // counted, not warned individually: the summary line says so
+            continue;
+        }
+        try {
+            warns.disarms.push_back(DisarmObservation{key, age});
+        } catch (...) {
+            ++warns.disarms_more;
+        }
+    }
+}
+
 std::vector<std::string> GuardianSparkRuntime::invariant_violations_for_test(
     bool allow_orphans) const {
     std::lock_guard<std::mutex> lk{registry_mu_};
@@ -757,6 +835,29 @@ std::vector<std::string> GuardianSparkRuntime::invariant_violations_for_test(
         if (!keys_.contains(*key))
             out.push_back("rule '" + rule_id + "' maps to a key absent from keys_");
     }
+    // #4472 tripwire: compensation_finished=true is written in the SAME critical section as
+    // the pop (or the dispatch -> Queued double-fault hand-back), so a claim that ever owed a
+    // compensation (deadline set) and now reads finished must not still be a Dispatched /
+    // Dispatching head. See wedge_episode_locked's invariant comment.
+    //
+    // Which writer legs the tripwire test drives: the normal finalize pop, finalize's catch
+    // when the claim already carries an outcome (the pop), and the direct-disarm fallback.
+    // NOT driven (no clean fault seam reaches them): the dispatch -> Queued hand-back, in
+    // finalize_arm_compensation's catch and in on_arm_complete's inline double-fault catch,
+    // which leaves a no-outcome claim Queued with finished=true and the deadline still set.
+    // Known false positive for that undriven leg: once such a claim is re-driven it reads
+    // Dispatched again with finished=true, which is a legitimate in-flight state this clause
+    // would flag. The clause is deliberately NOT narrowed (for example to require an outcome)
+    // because that would stop it catching a finished=true written early on a claim that has no
+    // outcome yet. Whoever adds a test that drives the hand-back must refine the clause then.
+    for (const auto& [key, entry] : claims_)
+        for (const auto& c : entry.fifo)
+            if (c->compensation_finished &&
+                c->compensation_deadline != std::chrono::steady_clock::time_point{} &&
+                (c->dispatch == ClaimDispatch::Dispatched ||
+                 c->dispatch == ClaimDispatch::Dispatching))
+                out.push_back("claim on a key reads compensation_finished while still in flight "
+                              "(finished must be written with the pop)");
     for (const auto& [key, pk] : keys_) {
         if (index_->refcount(key) > 0)
             continue;
@@ -1330,6 +1431,35 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
     try {
         {
             std::unique_lock<std::mutex> lk{registry_mu_};
+            // #4472: the compensation-owed marker is written in THIS critical section, on
+            // every exit (normal, or an exception unwinding past staging), never in a later
+            // acquisition. Between the two a heartbeat drain could read this claim as a
+            // still-hung wedge (Eligible) with its compensating disarm already owed, rather
+            // than CompensationPending. Under #5459 decide_retry() and can_advance() treat
+            // the two identically (both outstanding, neither ever acknowledges), so the mark
+            // no longer protects a suppression or acknowledgment decision. It keeps the
+            // Eligible/CompensationPending classification and the readers of
+            // !compensation_finished accurate (the compensation pending-age and deadline
+            // observation, the expiry sweep's "teardown still outstanding" break). Declared
+            // before the fallible gap_hook copy and every other fallible step below, so it
+            // covers all of them; non-throwing and non-allocating (a claim field write and a
+            // clock read), and destructed before `lk` releases. Reads `compensating` at scope
+            // exit: an adoption reset it, so an adopted claim is never marked, and a later
+            // fault with `compensating` already reset falls to the !published path that sets
+            // finished.
+            struct CompensationOwedMark {
+                const std::optional<std::uint64_t>& compensating;
+                KeyClaim& claim;
+                std::chrono::steady_clock::duration deadline_after;
+                ~CompensationOwedMark() noexcept {
+                    if (!compensating)
+                        return;
+                    claim.compensation_finished = false;
+                    // Set ONCE and never reset by a fallback retry (KeyClaim).
+                    if (claim.compensation_deadline == std::chrono::steady_clock::time_point{})
+                        claim.compensation_deadline = std::chrono::steady_clock::now() + deadline_after;
+                }
+            } owed_mark{compensating, *claim, cfg_.backend_op_deadline};
             gap_hook = drain_gap_hook_for_test_;
             const auto eit = claims_.find(key);
             const bool is_head = eit != claims_.end() && !eit->second.fifo.empty() &&
@@ -1739,17 +1869,12 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
         // `cont` null, one direct_disarm_fallback() runs, and the fallthrough
         // below is reached exactly as intended - `if (cont)` is a true single
         // discriminator again.
-        // up-3/up-4 (#4221): compensation is now owed for `claim` - mark it not-yet-
-        // finished (expire_overdue_claims()'s terminal-recovery pass must never reap
-        // a head whose compensation is still outstanding) and establish its ONE
-        // absolute observation deadline, set once and never reset by a later
-        // fallback retry.
-        {
-            std::lock_guard<std::mutex> lk{registry_mu_};
-            claim->compensation_finished = false;
-            if (claim->compensation_deadline == std::chrono::steady_clock::time_point{})
-                claim->compensation_deadline = std::chrono::steady_clock::now() + cfg_.backend_op_deadline;
-        }
+        // up-3/up-4 (#4221), #4472: `claim`'s compensation was marked owed (not-yet-
+        // finished, with its ONE absolute observation deadline) by CompensationOwedMark
+        // in the first critical section above, so no heartbeat drain can read this claim
+        // as an Eligible (hung) wedge between the staging decision and here, and
+        // expire_overdue_claims()'s terminal-recovery pass never reaps a head whose
+        // compensation is still outstanding. There is deliberately no second marking site.
         const std::uint64_t sub = *compensating;
         compensating.reset(); // ownership from here is `cont` (below) or the direct
                                // disarm on the catch path - never this optional again
@@ -2184,24 +2309,46 @@ std::optional<bool> GuardianSparkRuntime::rule_active_for_test(const std::string
     return rit->second->active;
 }
 
-bool GuardianSparkRuntime::is_wedge_k_eligible_locked(
+GuardianSparkRuntime::WedgeEpisode GuardianSparkRuntime::wedge_episode_locked(
     const std::shared_ptr<KeyClaim>& claim) const noexcept {
     if (claim->end != ClaimEnd::WaiterTimedOutDispatched || claim->dispatch != ClaimDispatch::Dispatched)
-        return false;
+        return WedgeEpisode::NotOutstanding;
     const auto eit = claims_.find(claim->key);
-    return eit != claims_.end() && !eit->second.fifo.empty() && eit->second.fifo.front() == claim;
+    if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim)
+        return WedgeEpisode::NotOutstanding;
+    // #4472: whether the arm is physically stuck (Eligible) or its late result has
+    // returned and a compensating disarm is outstanding (CompensationPending) is told
+    // apart by compensation_finished, written in on_arm_complete's first critical
+    // section; NOT the CompensationPermit, which is engaged for every in-flight arm (a
+    // genuinely hung one included). #5459 (option D): both are OUTSTANDING (the generation
+    // stays held and an identical retry is suppressed), and neither is ever acknowledged -
+    // the former waiver that acknowledged the Eligible case is deleted.
+    // INVARIANT (#4472): once a compensation was owed, compensation_finished=true is
+    // always written in the SAME registry_mu_ critical section as the pop of that claim (or the
+    // dispatch -> Queued double-fault hand-back in finalize_arm_compensation's catch), never
+    // alone. So a claim that reads finished here with its teardown behind it is already gone
+    // from the head or no longer Dispatched, and this cannot read Eligible for a compensated
+    // claim, nor CompensationPending for a claim whose teardown has finished. A future writer
+    // of compensation_finished=true that is not paired with the pop breaks that, and with it
+    // the ack ledger's retry suppression (it would hold a Suppress on a finished claim until
+    // the safety valve). Tripwire: invariant_violations_for_test's compensation clause and
+    // the "#4472 tripwire" test.
+    return claim->compensation_finished ? WedgeEpisode::Eligible : WedgeEpisode::CompensationPending;
 }
 
 GuardianSparkRuntime::WedgeAwareStatus
 GuardianSparkRuntime::receipt_status_wedge_aware(const ArmReceipt& receipt) const {
     if (!receipt.claim)
-        return WedgeAwareStatus{}; // Failed, wedge_eligible=false - nothing to observe
+        return WedgeAwareStatus{}; // Failed, flags false - nothing to observe
     std::lock_guard<std::mutex> lk{registry_mu_};
     const auto& claim = receipt.claim;
     WedgeAwareStatus out;
     out.status = classify_claim_end(claim->end);
-    if (out.status == ReceiptStatus::Wedged)
-        out.wedge_eligible = is_wedge_k_eligible_locked(claim);
+    if (out.status == ReceiptStatus::Wedged) {
+        const auto episode = wedge_episode_locked(claim);
+        out.wedge_eligible = episode == WedgeEpisode::Eligible;
+        out.compensation_pending = episode == WedgeEpisode::CompensationPending;
+    }
     return out;
 }
 
@@ -2216,7 +2363,7 @@ bool GuardianSparkRuntime::receipt_wedge_k_eligible(const ArmReceipt& receipt) c
     if (!receipt.claim)
         return false;
     std::lock_guard<std::mutex> lk{registry_mu_};
-    return is_wedge_k_eligible_locked(receipt.claim);
+    return wedge_episode_locked(receipt.claim) == WedgeEpisode::Eligible;
 }
 
 GuardianSparkRuntime::RecoveryStatus
@@ -2225,11 +2372,18 @@ GuardianSparkRuntime::receipt_recovery_status(const ArmReceipt& receipt) const {
         return RecoveryStatus::Blocking;
     std::lock_guard<std::mutex> lk{registry_mu_};
     const auto& claim = receipt.claim;
-    // Both predicates observe the same instant under this one lock.
+    // Every predicate observes the same instant under this one lock. Recovered keeps
+    // first priority (an adopted claim is never an outstanding wedge).
     if (generation_committed_locked(*claim))
         return RecoveryStatus::Recovered;
-    if (is_wedge_k_eligible_locked(claim))
+    switch (wedge_episode_locked(claim)) {
+    case WedgeEpisode::Eligible:
         return RecoveryStatus::WedgeEligible;
+    case WedgeEpisode::CompensationPending:
+        return RecoveryStatus::CompensationPending;
+    case WedgeEpisode::NotOutstanding:
+        break;
+    }
     return RecoveryStatus::Blocking;
 }
 
@@ -2381,8 +2535,9 @@ void GuardianSparkRuntime::synthesize_fallback_outcome_locked(KeyClaim& c) {
 }
 
 std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
-    std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills) {
-    const auto now = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point now,
+    std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills,
+    ExpireWarns& warns) {
     std::size_t reaped = 0;
     bool release_failed = false;
     // The key of the first claim whose release failed this pass, for the rate-limited warn.
@@ -2404,6 +2559,20 @@ std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
                 now >= c->compensation_deadline) {
                 c->compensation_deadline_observed = true;
                 compensation_deadline_elapsed_.fetch_add(1, std::memory_order_relaxed);
+                // #4472 hardening: the latch and the counter above are set BEFORE
+                // this copy, so a failed copy only drops the warn. One record per claim (the
+                // latch is once-only); the warn itself is emitted off-lock by the caller.
+                if (warns.compensations.size() >= kDisarmPendingWarnsPerPass) {
+                    ++warns.compensations_more;
+                } else {
+                    try {
+                        warns.compensations.push_back(DisarmObservation{
+                            it->first,
+                            now - (c->compensation_deadline - cfg_.backend_op_deadline)});
+                    } catch (...) {
+                        ++warns.compensations_more;
+                    }
+                }
             }
             // NOTE: deliberately Queued-only, never Dispatched/Dispatching - a
             // Dispatched head can carry an outcome that abandon_claim_locked wrote
@@ -2537,6 +2706,7 @@ void GuardianSparkRuntime::disarm_orphan_keys_locked(
                 c->key = it->first;
                 c->io_class = *ioc;
                 c->subscription = pk->subscription;
+                c->created_at = std::chrono::steady_clock::now(); // #5403: the age gauge's origin
                 // Everything fallible runs BEFORE keys_.erase, while keys_ still owns the
                 // watcher (detach_rule_locked's order); an inserted empty entry is rolled
                 // back if the push throws.
@@ -2586,10 +2756,20 @@ void GuardianSparkRuntime::disarm_orphan_keys_locked(
 }
 
 std::size_t GuardianSparkRuntime::expire_overdue_claims() {
-    const auto now = std::chrono::steady_clock::now();
+    return expire_overdue_claims_impl(std::chrono::steady_clock::now());
+}
+
+std::size_t
+GuardianSparkRuntime::expire_overdue_claims_impl(std::chrono::steady_clock::time_point now) {
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> overdue;
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> refills;
     std::vector<std::shared_ptr<KeyClaim>> disarms;
+    ExpireWarns warns; // #5403/#4472: copied under the lock, warned after the dispatch loops
+    try {
+        warns.disarms.reserve(kDisarmPendingWarnsPerPass);
+        warns.compensations.reserve(kDisarmPendingWarnsPerPass);
+    } catch (...) {
+    }
     std::size_t expired_count = 0;
     std::size_t reaped_count = 0;
     {
@@ -2621,7 +2801,7 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
         // up-4 (#4221): the terminal-recovery safety net (see this function's own
         // doc comment) - separate from the overdue-live-claim pass above, which
         // deliberately excludes anything already outcome/commit_exception/abandoned.
-        reaped_count = reap_stranded_claims_locked(refills);
+        reaped_count = reap_stranded_claims_locked(now, refills, warns);
         // #5322: the owner of a ->0 edge a release dropped. Contained here so the
         // reaper's refills (already flipped Dispatching) always reach their dispatch.
         try {
@@ -2629,6 +2809,9 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
         } catch (...) {
             claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
         }
+        // #5403: observation only (a counter and a copied key); it releases, pops and
+        // cancels nothing, so it can neither strand the refills above nor change a receipt.
+        observe_pending_disarms_locked(now, warns);
     }
     // A reaped claim may carry an outcome this pass just wrote (the synthesis arm), which a
     // blocking waiter in wait_for_claim() is waiting on, so a reap alone must wake it. The
@@ -2641,6 +2824,64 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
         dispatch_arm_off_lock(key, refill);
     for (auto& d : disarms)
         submit_disarm_off_lock(d); // takes registry_mu_ itself
+    // #4472 hardening: the synchronous warns run LAST, after the waiters are woken and every
+    // refill / Disarm has been dispatched, so a slow log sink delays no dispatch or waiter
+    // wake-up. It is not free: the production caller reaches this from the heartbeat-cadence
+    // drain, so the warns still run under GuardianEngine's mtx_ on the heartbeat thread (off
+    // registry_mu_). One pass issues at most 10 warns (the Disarm and compensation warns, each
+    // capped at kDisarmPendingWarnsPerPass = 4, plus one summary line for each), and each claim
+    // warns once because of its latch; the production logger is async. Each warn is contained:
+    // a logging failure must never escape the reaper.
+    for (const auto& w : warns.disarms) {
+        try {
+            spdlog::warn("Guardian spark: the Disarm for key '{}' has been pending for {} s "
+                         "(observation threshold {} s); its key stays held. If its backend "
+                         "call was admitted, its class quota slot stays held and, if the call "
+                         "is blocked inside a mechanism, that mechanism type's engine lock "
+                         "stays held until it returns. Nothing was released (pending too long, "
+                         "not proof the call hung)",
+                         ::yuzu::log_key_token(w.key),
+                         std::chrono::duration_cast<std::chrono::seconds>(w.age).count(),
+                         kDisarmPendingObserveThreshold.count());
+        } catch (...) {
+        }
+    }
+    if (warns.disarms_more != 0) {
+        try {
+            spdlog::warn("Guardian spark: and {} more pending {} past the {} s observation "
+                         "threshold this pass (counted in the disarm deadline total, not "
+                         "logged individually)",
+                         warns.disarms_more, warns.disarms_more == 1 ? "Disarm" : "Disarms",
+                         kDisarmPendingObserveThreshold.count());
+        } catch (...) {
+        }
+    }
+    for (const auto& w : warns.compensations) {
+        try {
+            spdlog::warn("Guardian spark: the compensating teardown for key '{}' has been "
+                         "outstanding for {} s (past its {} s compensation deadline); its key "
+                         "stays held and its generation is held, not acknowledged, until the "
+                         "teardown finishes. Nothing was released (pending too long, not "
+                         "proof the call hung)",
+                         ::yuzu::log_key_token(w.key),
+                         std::chrono::duration_cast<std::chrono::seconds>(w.age).count(),
+                         std::chrono::duration_cast<std::chrono::seconds>(
+                             cfg_.backend_op_deadline)
+                             .count());
+        } catch (...) {
+        }
+    }
+    if (warns.compensations_more != 0) {
+        try {
+            spdlog::warn("Guardian spark: and {} more compensating {} past {} deadline this "
+                         "pass (counted in the compensation deadline total, not logged "
+                         "individually)",
+                         warns.compensations_more,
+                         warns.compensations_more == 1 ? "teardown" : "teardowns",
+                         warns.compensations_more == 1 ? "its" : "their");
+        } catch (...) {
+        }
+    }
     return expired_count;
 }
 
@@ -2802,7 +3043,78 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         // both) - the "armed" entry below covers the new one, so ONE outbox-waker
         // firing at the end of this call covers both. A prior generation whose own
         // arm is still claimed is withdrawn in place (Case 0, generalised).
+        // #4045: a baseline-on-arm file-hash rule (no authored expected_hash, none seeded from
+        // the durable record by the engine) inherits a capture the PRIOR generation staged.
+        // The hash is COPIED here, BEFORE the detach below, because the copy can throw
+        // (bad_alloc past SSO) and a throw after the detach would leave the rule with no live
+        // arm; here nothing has been mutated yet, so the unwind is a plain early return.
+        // The read runs under the same registry_mu_ hold as the detach, and evaluate_key stages
+        // only under registry_mu_ after rechecking that its generation is still the active
+        // one, so an old evaluation either staged before this hold (seen here) or is dropped by
+        // that recheck after it: no capture can be staged-but-unseen. The entry stays staged
+        // (the persister writes it, then erases it). A path mismatch means a retarget, whose
+        // capture is fresh by design. Pure map read, no I/O. The persister's seed fence (held
+        // by the engine around its KV seed read through this call) covers the other half: an
+        // entry can leave staging between the seed read and this read only after its KV write,
+        // and the fence keeps a worker pass from running in that gap.
+        //
+        // A prior generation whose capture is committed but could not be staged
+        // (baseline_unstaged: an allocation failure) is staged FIRST, on the same path, so the
+        // lookup below inherits it. Without that, every identical re-push inside the failure
+        // window would re-capture whatever the file holds now. If this attempt fails too, the
+        // withdrawal below retries once more (detach_rule_locked salvages) and staging is read
+        // AGAIN after it; only if that fails as well does the replacement capture afresh
+        // (counted: stage_baseline_locked bumps the drop counter). That is the one remaining
+        // window, and it closes at the first successful staging.
+        // key_for_rule may allocate; nothing has been mutated yet, so a throw is a plain unwind.
+        std::string inherited_hash;
+        const bool baseline_on_arm_file = rg->assertion.kind == AssertionKind::FileHashEquals &&
+                                          rg->assertion.expected_hash.empty() &&
+                                          std::holds_alternative<FileSparkParams>(spec.params);
+        if (baseline_on_arm_file) {
+            if (const auto prior = rules_.find(rule_id);
+                prior != rules_.end() && prior->second->baseline_unstaged &&
+                prior->second->eval.baseline_set) { // registry_mu_ suffices, see eval's doc
+                const auto prior_key = index_->key_for_rule(rule_id);
+                const auto pkit = prior_key ? keys_.find(*prior_key) : keys_.end();
+                const auto* prior_file =
+                    pkit != keys_.end() ? std::get_if<FileSparkParams>(&pkit->second->spec.params)
+                                        : nullptr;
+                if (prior_file && prior_file->path == std::get<FileSparkParams>(spec.params).path &&
+                    stage_baseline_locked(rule_id, prior_file->path,
+                                          prior->second->eval.baseline_hash))
+                    prior->second->baseline_unstaged = false;
+            }
+            if (const auto sit = staged_baselines_.find(rule_id);
+                sit != staged_baselines_.end() &&
+                sit->second.path == std::get<FileSparkParams>(spec.params).path) {
+                if (fail_next_inherit_copy_.exchange(false, std::memory_order_relaxed))
+                    throw std::bad_alloc{}; // TEST-ONLY seam: the copy below failing
+                inherited_hash = sit->second.hash; // may throw: nothing is mutated yet
+            }
+        }
+
         prior_disarm = detach_rule_locked(rule_id);
+        // The withdrawal above retries staging a still-unstaged capture too (its salvage), and
+        // may succeed where the attempt before it failed: read staging again, or the replacement
+        // captures afresh although the original is now staged. The prior generation is gone, so
+        // this copy must not unwind (a throw would leave the rule with no live arm); a failure
+        // costs only the inheritance, counted like any other failed staging attempt.
+        if (baseline_on_arm_file && inherited_hash.empty()) {
+            try {
+                if (const auto sit = staged_baselines_.find(rule_id);
+                    sit != staged_baselines_.end() &&
+                    sit->second.path == std::get<FileSparkParams>(spec.params).path) {
+                    if (fail_next_inherit_copy_.exchange(false, std::memory_order_relaxed))
+                        throw std::bad_alloc{}; // TEST-ONLY seam: the copy below failing
+                    inherited_hash = sit->second.hash;
+                }
+            } catch (...) {
+                staged_baseline_drops_->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (!inherited_hash.empty())
+            rg->assertion.expected_hash = std::move(inherited_hash); // noexcept string move
 
         gen = ++gen_counter_;
         rg->generation = gen;
@@ -3291,6 +3603,7 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
                 c->key = *key_opt;
                 c->io_class = *ioc;
                 c->subscription = kit->second->subscription;
+                c->created_at = std::chrono::steady_clock::now(); // #5403: the age gauge's origin
                 const auto [eit, inserted] = claims_.try_emplace(*key_opt);
                 // A disarm is only ever created on a key with no LIVE claim (an arm
                 // never writes keys_ until it commits, and commit erases the entry);
@@ -3426,8 +3739,10 @@ GuardianSparkRuntime::withdraw_rule_after_wedge_sweep_locked(
     // kind string, was moved ahead of the mutation above. The inline-type synchronous
     // backend_->disarm is contained too: a throw is counted and keys_ is still erased
     // (containment, not completion: the engine subscription may remain live and unowned).
-    if (known)
+    if (known) {
+        (void)salvage_unstaged_baseline_locked(rule_id, *rit->second, key_opt); // noexcept
         rules_.erase(rule_id);
+    }
     try {
         detach_post_fault_here_for_test(2); // seam: "drop_rule's Key allocation threw"
         std::lock_guard<std::mutex> ob{outbox_mu_};
@@ -3922,6 +4237,29 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
             if (out.status == EvalStatus::Unhealthy && (out.unhealthy_edge || refresh_due))
                 scratch.last_unhealthy_emit = now;
 
+            // #4045: the baseline-on-arm capture EDGE (guardian_rule_eval.cpp's eval_file sets
+            // baseline_set on the first good hash read). Staged (a bounded insert, no I/O) for the
+            // engine-owned persister; the runtime holds no KvStore (file header). Placed after the
+            // `accepted` check and before the commit so the persisted hash is always the hash the
+            // live RuleEvalState committed: a rejected enqueue leaves scratch uncommitted and the
+            // next pass re-captures. `spec` is the local copy; std::get is safe because is_file.
+            //
+            // Staging is fallible (an allocation failure, counted) and the baseline is committed
+            // either way. Dropping it on a failed stage would make the NEXT evaluation, often the
+            // very change event, capture the drifted content as the baseline and report it
+            // compliant; so the capture stays live, the generation is marked baseline_unstaged,
+            // and every later commit retries staging the COMMITTED hash until it succeeds (the
+            // retry is counted on each failure and re-emits nothing: the verdict and emit state
+            // commit exactly as on a normal evaluation). Both reads and writes of the flag are
+            // under registry_mu_, which this commit section holds.
+            if (is_file && rg->assertion.kind == AssertionKind::FileHashEquals &&
+                scratch.baseline_set && (!rg->eval.baseline_set || rg->baseline_unstaged)) {
+                rg->baseline_unstaged =
+                    !stage_baseline_locked(rg->assertion.rule_id,
+                                           std::get<FileSparkParams>(spec.params).path,
+                                           scratch.baseline_hash);
+            }
+
             rg->eval = std::move(scratch); // COMMIT
             // M1: every committed repeat Unknown is counted on exactly one of these two
             // channels - REFRESHED (put on the wire) or SUPPRESSED (not) - so the
@@ -4195,6 +4533,135 @@ GuardianSparkRuntime::PendingSnapshot GuardianSparkRuntime::snapshot_pending() c
     // read-outside-the-lock mistake this whole mechanism exists to fix (#2345 focused review).
     return PendingSnapshot{{pending_journal_.begin(), pending_journal_.end()},
                           journal_stage_dropped_.load(std::memory_order_relaxed)};
+}
+
+// #4045: staged baseline captures. The runtime only STAGES (no I/O, no KvStore); the
+// engine-owned GuardianBaselinePersister drains via snapshot/erase-if-unchanged (header block).
+bool GuardianSparkRuntime::stage_baseline_locked(const std::string& rule_id,
+                                                 const std::string& path,
+                                                 const std::string& hash) noexcept {
+    try {
+        if (fail_next_stage_baseline_.load(std::memory_order_relaxed) > 0) {
+            fail_next_stage_baseline_.fetch_sub(1, std::memory_order_relaxed);
+            throw std::bad_alloc{}; // TEST-ONLY seam: the allocation-failure path
+        }
+        const auto it = staged_baselines_.find(rule_id);
+        if (it != staged_baselines_.end()) {
+            // First capture wins on one path (a re-arm that re-captured drifted content must not
+            // beat the capture on record). A different path is a retarget: its capture
+            // obsoletes the old target's, which was never persisted (it is still staged), so
+            // that capture is lost and counted. Legacy loses its capture on any failed write
+            // too, with no retry; the count keeps this path from being silent.
+            if (it->second.path != path) {
+                CapturedBaseline replacement{rule_id, path, hash};
+                it->second = std::move(replacement);
+                staged_baseline_drops_->fetch_add(1, std::memory_order_relaxed);
+            }
+            return true;
+        }
+        staged_baselines_.emplace(rule_id, CapturedBaseline{rule_id, path, hash});
+        return true;
+    } catch (...) {
+        // bad_alloc: counted, and reported to the caller, which keeps the committed baseline,
+        // marks the generation baseline_unstaged and retries (evaluate_key). Never a throw out of
+        // the commit section.
+        staged_baseline_drops_->fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+}
+
+bool GuardianSparkRuntime::salvage_unstaged_baseline_locked(
+    const std::string& rule_id, const RuleGeneration& rg,
+    const std::optional<std::string>& key) noexcept {
+    if (!rg.baseline_unstaged || !rg.eval.baseline_set || !key)
+        return false;
+    const auto kit = keys_.find(*key); // called before keys_ is erased
+    if (kit == keys_.end())
+        return false;
+    const auto* file = std::get_if<FileSparkParams>(&kit->second->spec.params);
+    if (!file)
+        return false;
+    // stage_baseline_locked counts a failed attempt itself. A withdrawal's flag dies with the
+    // generation, so it ignores the result; the stop-time sweep clears the flag on success.
+    return stage_baseline_locked(rule_id, file->path, rg.eval.baseline_hash);
+}
+
+std::size_t GuardianSparkRuntime::stage_unstaged_baselines() {
+    if (fail_next_unstaged_sweep_.exchange(false, std::memory_order_relaxed))
+        throw std::bad_alloc{}; // TEST-ONLY seam: as if the lock below failed
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    unstaged_sweep_stopping_for_test_.store(stopping_ ? 1 : 0, std::memory_order_relaxed);
+    std::size_t still_unstaged = 0;
+    for (auto& [rule_id, rg] : rules_) {
+        if (!rg->baseline_unstaged)
+            continue;
+        try {
+            if (salvage_unstaged_baseline_locked(rule_id, *rg, index_->key_for_rule(rule_id)))
+                rg->baseline_unstaged = false;
+            else
+                ++still_unstaged;
+        } catch (...) {
+            // key_for_rule allocates: an allocation failure here is one more failed staging
+            // attempt for this capture, counted like stage_baseline_locked's own.
+            staged_baseline_drops_->fetch_add(1, std::memory_order_relaxed);
+            ++still_unstaged;
+        }
+    }
+    return still_unstaged;
+}
+
+std::vector<GuardianSparkRuntime::CapturedBaseline>
+GuardianSparkRuntime::snapshot_staged_baselines() const {
+    // NOT gated on stopping_: the engine's stop() flush runs after begin_stop(). Allocation
+    // happens OUTSIDE the lock where it can (the vector), and the strings are copied under it
+    // WITHOUT mutating staging, so a throw anywhere leaves staging exactly as it was.
+    if (fail_next_snapshot_.exchange(false, std::memory_order_relaxed))
+        throw std::bad_alloc{}; // TEST-ONLY seam: as if the reserve below failed
+    std::vector<CapturedBaseline> out;
+    for (;;) {
+        std::size_t want = 0;
+        {
+            std::lock_guard<std::mutex> lk{registry_mu_};
+            want = staged_baselines_.size();
+        }
+        if (want == 0)
+            return out; // a valid snapshot of the empty instant: one lock take, no allocation
+        out.reserve(want + 8); // slack: a capture staged between the two holds
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (staged_baselines_.size() > out.capacity())
+            continue; // grew past the slack: reserve again, outside the lock
+        out.clear();
+        for (const auto& [rule_id, cap] : staged_baselines_)
+            out.push_back(cap); // within capacity: only the string copies can throw
+        return out;
+    }
+}
+
+void GuardianSparkRuntime::erase_staged_baselines_if_unchanged(
+    std::span<const CapturedBaseline> done) {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    for (const CapturedBaseline& d : done) {
+        const auto it = staged_baselines_.find(d.rule_id);
+        if (it != staged_baselines_.end() && it->second.path == d.path && it->second.hash == d.hash)
+            staged_baselines_.erase(it);
+    }
+}
+
+void GuardianSparkRuntime::stage_baseline_for_test(const std::string& rule_id,
+                                                   const std::string& path,
+                                                   const std::string& hash) {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    (void)stage_baseline_locked(rule_id, path, hash);
+}
+
+std::size_t GuardianSparkRuntime::staged_baseline_count_for_test() const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return staged_baselines_.size();
+}
+
+bool GuardianSparkRuntime::has_staged_baselines() const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return !staged_baselines_.empty();
 }
 
 void GuardianSparkRuntime::erase_persisted_prefix(std::size_t n, std::uint64_t drops_at_snapshot) {

@@ -50,7 +50,7 @@ All REST API v1 responses are wrapped in this envelope. The `data` key holds the
 
 ### Changing and resetting a local password
 
-Local accounts (created in Settings → User Management, by `POST /api/settings/users`, or the first administrator provisioned from the config file on first boot) have a password that can be changed in the product (#5342). SSO accounts (OIDC/SAML principals) and SCIM-provisioned accounts have no local password; their credentials are managed at the identity provider, and both routes below refuse them with `409` "not a local account". (The second account first-run setup offers, and the Windows installer's `/OPERATOR_USER`, are written to the config file only and never provisioned into the auth store, so they cannot sign in — #5343.)
+Local accounts (created in Settings → User Management, by `POST /api/settings/users`, or the first administrator provisioned from the config file on first boot) have a password that can be changed in the product (#5342). SSO accounts (OIDC/SAML principals) and SCIM-provisioned accounts have no local password; their credentials are managed at the identity provider, and both routes below refuse them with `409` "not a local account". (First-run setup creates the administrator only, and the Windows installer no longer accepts `/OPERATOR_USER`/`/OPERATOR_PASS` (#5343): a second account written to the config file alone is never provisioned into the auth store and cannot sign in. A leftover config entry with no stored account is named in a warning at boot.)
 
 **`yuzu-server.cfg` does not change a password (#5274).** Login reads the PostgreSQL auth store only. The config file seeds the first administrator into an **empty** database and is otherwise ignored for credentials, so editing it, regenerating it, or re-running the Windows installer does not change an existing account's password (the installer refuses `/ADMIN_PASS` on an upgrade). Because it re-seeds an empty database, a rebuild onto a fresh database brings back the password the file holds — change it in the product afterwards.
 
@@ -748,8 +748,9 @@ Service-scoped tokens:
 - Cannot access any `/api/v1/admin/*` routes (403 Forbidden)
 - Require RBAC to be enabled; rejected if RBAC is disabled (403 Forbidden)
 - Carry a session role floored to the base `user` level regardless of the
-  minting principal's own role — an `ITServiceOwner` RBAC grant is the sole
-  authority ceiling for a service-scoped token, never the minter's role
+  minting principal's own role — an `ITServiceOwner` RBAC grant is the
+  authority ceiling for a service-scoped token, never the minter's role, and
+  it is applied by the permission gates and by the fleet-read gate alike
 
 **Default-deny (guardian-confinement-2298 PR 3 — "the flip").** Holding
 `ITServiceOwner` for a given `securable:operation` is necessary but no

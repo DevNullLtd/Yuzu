@@ -48,7 +48,9 @@ provisioned_cert_paths(const std::filesystem::path& cert_dir);
 
 /// Persist a freshly issued credential: key 0600 via atomic stage-and-rename,
 /// leaf + chain owner-readable. Creates cert_dir (0700) if absent. Returns false
-/// on any write failure (partial output removed). `ca_chain_pem` may be empty.
+/// on any write failure; a failed write removes its own temp, but a failure AFTER the key
+/// write leaves the NEW key beside the OLD leaf — inspect_provisioned_cert() reports that pair
+/// as Missing so the next start re-enrols. `ca_chain_pem` may be empty.
 [[nodiscard]] YUZU_EXPORT bool persist_provisioned_cert(const std::filesystem::path& cert_dir,
                                                        const std::string& key_pem,
                                                        const std::string& leaf_pem,
@@ -64,7 +66,9 @@ enum class CertState {
 
 /// Inspect the persisted leaf (if any) and decide whether the agent should send a
 /// CSR. Pure read — modifies nothing. `now` is injectable for tests. A leaf that
-/// cannot be parsed, or is missing its key, is reported as Missing.
+/// cannot be parsed, or is missing its key, is reported as Missing. A leaf whose
+/// public key does not match the key on disk (a renewal that replaced the key but
+/// not the leaf) is also Missing, so startup re-enrolls instead of presenting the pair.
 [[nodiscard]] YUZU_EXPORT CertState
 inspect_provisioned_cert(const std::filesystem::path& cert_dir,
                          std::chrono::system_clock::time_point now =

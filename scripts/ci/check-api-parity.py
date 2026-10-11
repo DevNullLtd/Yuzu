@@ -173,16 +173,31 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # routes, never expected to flip to "twinned", so the count rises 203 -> 205
 # by design rather than regressing.
 #
-# M.9 PR-2 (software catalogue twins): two inventory.json rows flip to "twinned"
-# -- get.fragments-inventory-software-devices (GET /api/v1/inventory/software +
-# MCP query_installed_software) and get.fragments-inventory-software-versions
-# (GET /api/v1/inventory/software/catalogue/versions + MCP get_software_versions);
-# the title-catalogue row (already "twinned") is repointed at GET /api/v1/inventory/
-# software/catalogue + MCP query_software_catalogue. The CSV/JSON exports
-# (format=csv|json on the raw route, format=csv on the catalogue route) are REST-only
-# by design: an agent pages the same data through the MCP cursor, so no export tool
-# is twinned. Measured post-flip at 203 (205 - 2), not hand-picked.
-BASELINE_UNTWINNED = 203
+# 2026-10-06 (legacy /inventory fragment removal): the four dead
+# /fragments/inventory/{devices,device,find,find/results} rows are deleted along
+# with their routes (two `planned:#2146`, two `composed-of:`), so the count
+# falls 205 -> 201 -- the value the checker itself reported after the deletion.
+#
+# Software catalogue REST routes: get.fragments-inventory-software-versions
+# flips "planned:#2146" -> "twinned" (GET /api/v1/inventory/software/catalogue/versions;
+# MCP twin get_software_versions, added with the MCP twins) and the title-catalogue row
+# get.fragments-inventory-software is repointed at GET /api/v1/inventory/software/catalogue
+# (already "twinned", count unchanged). The catalogue route's format=csv titles export is REST-only by design: a CSV
+# body is a download for a person or a pipeline, not a structured tool result (MCP workers
+# page the JSON with `cursor`).
+# Measured post-flip at 204 (205 - 1), not hand-picked.
+#
+# Merge of the two changes above: 205 - 4 (legacy rows deleted) - 1 (versions row twinned)
+# = 200, the value the checker itself reported on the merged tree.
+#
+# MCP twins + raw-route exports (the second PR of the software catalogue): the
+# get.fragments-inventory-software-devices row flips "planned:#2146" -> "twinned" (GET
+# /api/v1/inventory/software + MCP query_installed_software, which gains version/cursor/source);
+# the title-catalogue row gains its MCP twin query_software_catalogue and the versions row
+# get_software_versions (both already "twinned", count unchanged). The raw route's
+# format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
+# same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
+BASELINE_UNTWINNED = 199
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

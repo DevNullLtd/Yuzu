@@ -184,10 +184,10 @@
     }
   ],
   "caveats": [
-    "**The capture harness never calls `init()`, so every sample reflects a fresh, path-less store.** `load_tags()`/`save_tags()` both no-op when `g_tags_path` is empty (`tags_plugin.cpp:38-39,62-63`), and only `init()` sets that path from `agent.data_dir` (`tags_plugin.cpp:132-137`) — the plugin-capture driver's `PluginHandle::load` + `LocalDispatcher::run` path never calls it (confirmed against `agent.cpp:971-982`, which calls `init()` only from the agent's own boot loop). `set`'s `tag_set` line is a real in-memory write, but nothing lands on disk, so the very next `get`/`check`/`get_all`/`count` in the same sample sees an empty store. This is a harness artifact, not evidence that `set` fails to persist in production.",
-    "**A persistence failure is silent.** `save_tags()`'s `ofstream` open and write are unchecked (`tags_plugin.cpp:72-75`); an unwritable `data_dir` or a full disk drops the write with no error returned to the caller or the operator.",
+    "**The capture harness never calls `init()`, so every sample reflects a fresh, path-less store.** `load_tags()`/`save_tags()` both no-op when `g_tags_path` is empty (`tags_plugin.cpp:41-42,67-68`), and only `init()` sets that path from `agent.data_dir` (`tags_plugin.cpp:144-149`) — the plugin-capture driver's `PluginHandle::load` + `LocalDispatcher::run` path never calls it (confirmed against `agent.cpp:971-982`, which calls `init()` only from the agent's own boot loop). `set`'s `tag_set` line is a real in-memory write, but nothing lands on disk, so the very next `get`/`check`/`get_all`/`count` in the same sample sees an empty store. This is a harness artifact, not evidence that `set` fails to persist in production.",
+    "**A persistence failure is declared, not fatal.** `save_tags()` logs `tags: state not persisted: ...` at warn and `set`/`delete`/`clear` return `rc=0` with their normal row but declare `CONSTRAINED` / `tags:persist_failed`; `get`/`check`/`count`/`get_all` keep answering from memory, and the file (what Register reads) is stale until the next successful write.",
     "**`clear` was never executed on a live host.** All three samples show `[not captured]` for `clear` — the mutator capture policy withholds Destructive/Irreversible actions. It is also the one action in this plugin whose dashboard dispatch now requires an explicit, in-scope target rather than a fleet broadcast (#3885).",
-    "**The `tests/unit` files matching \"tags\" are not this plugin's tests.** `test_guardian_health_fleet_tags.cpp`, `test_guardian_journal_fleet_tags.cpp`, and `test_spark_fleet_tags.cpp` bind Prometheus heartbeat *label* keys for Guardian/Spark telemetry — none load `TagsPlugin` or reference `tags_plugin.cpp`. No dedicated unit test exercises this plugin's `execute()`.",
+    "**The `tests/unit` files matching \"tags\" are not this plugin's tests.** `test_guardian_health_fleet_tags.cpp`, `test_guardian_journal_fleet_tags.cpp`, and `test_spark_fleet_tags.cpp` bind Prometheus heartbeat *label* keys for Guardian/Spark telemetry — none load `TagsPlugin` or reference `tags_plugin.cpp`. `tests/unit/test_tags_plugin.cpp` includes the TU and drives `save_tags()`/`load_tags()` directly (atomic write, round-trip, no leftover temp, creation mode); nothing exercises `execute()`.",
     "**`service` is the one key this plugin can set locally that the server will never honor.** A `tags.json` `service` entry is dropped both at Register ingest (`agent_registry.cpp:56-67`) and at TagStore sync (`tag_store.cpp:374-379`) — see #3289/#3295. Every other key set here reaches `tag:<key>` scope-DSL evaluation normally."
   ],
   "definitions": [
@@ -339,7 +339,7 @@
     }
   ],
   "description": "Device tagging — set, get, delete, list tags for scope evaluation",
-  "how_it_works": "All 7 actions are pure in-process reads/writes of a flat `<data_dir>/tags.json` object (tags_plugin.cpp:13,80-104); `load_tags()`/`save_tags()` re-serialize the whole file on every mutating call (tags_plugin.cpp:36-76). `set` validates the key (≤64 chars, `^[a-zA-Z0-9_.:\\-]+$` by convention) and value (≤448 bytes) before writing (tags_plugin.cpp:166-189); `get`/`check`/`delete` look a single key up in the in-memory map, and `get_all`/`count` walk the whole map (tags_plugin.cpp:191-251). `clear` wipes every tag in one call and is classified Destructive/Irreversible (capdecls `plugin_action_catalogue_d.hpp:107-120`) rather than the Mutating/Reversible tier `set`/`delete` carry, and is the only action gated `AdminOrApproval` and restricted to `endpoint-admin` (`tags.yaml` `device.tags.clear`).\n\nIt is deliberately not the channel that reaches the server. `tags.json` is separately read verbatim by the agent's Register RPC path (`agent.cpp:1701-1725`), independent of this plugin's own load path, and the server drops any self-reported `service` key at ingest (`agent_registry.cpp:56-67`, #3295) before persisting the rest to the Postgres-backed TagStore (`tag_store.cpp` `sync_agent_tags:345-433`). It is also not the structured 4-category tag store — that role belongs to the sibling `asset_tags` plugin (see Siblings below).",
+  "how_it_works": "All 7 actions are pure in-process reads/writes of a flat `<data_dir>/tags.json` object (tags_plugin.cpp:13,92-116); `load_tags()`/`save_tags()` re-serialize the whole file on every mutating call (tags_plugin.cpp:39-79). `set` validates the key (≤64 chars, `^[a-zA-Z0-9_.:\\-]+$` by convention) and value (≤448 bytes) before writing (tags_plugin.cpp:178-201); `get`/`check`/`delete` look a single key up in the in-memory map, and `get_all`/`count` walk the whole map (tags_plugin.cpp:203-263). `clear` wipes every tag in one call and is classified Destructive/Irreversible (capdecls `plugin_action_catalogue_d.hpp:107-120`) rather than the Mutating/Reversible tier `set`/`delete` carry, and is the only action gated `AdminOrApproval` and restricted to `endpoint-admin` (`tags.yaml` `device.tags.clear`).\n\nIt is deliberately not the channel that reaches the server. `tags.json` is separately read verbatim by the agent's Register RPC path (`agent.cpp:1701-1725`), independent of this plugin's own load path, and the server drops any self-reported `service` key at ingest (`agent_registry.cpp:56-67`, #3295) before persisting the rest to the Postgres-backed TagStore (`tag_store.cpp` `sync_agent_tags:345-433`). It is also not the structured 4-category tag store — that role belongs to the sibling `asset_tags` plugin (see Siblings below).",
   "inputs": [
     {
       "constraints": {
@@ -599,7 +599,7 @@
       "definition_id": "device.tags.set"
     }
   ],
-  "outputs_note": "Every action writes one or more pipe-delimited lines via `ctx.write_output`; there is no shared discriminator across actions — each uses its own literal prefix (`tag_set`, `tag`, `tag_deleted`, `tag_exists`, `tags_cleared`, `count`) rather than the field names declared below. A missing/unset value reports as an empty string (a trailing empty field), never a `-` placeholder (`tags_plugin.cpp:200`; see the macOS sample's `get`). A validation failure returns `rc=1` and a distinct `error|<message>` line instead of the success row (`tags_plugin.cpp:169-172,180-183,193-196,217-220,230-233`).",
+  "outputs_note": "Every action writes one or more pipe-delimited lines via `ctx.write_output`; there is no shared discriminator across actions — each uses its own literal prefix (`tag_set`, `tag`, `tag_deleted`, `tag_exists`, `tags_cleared`, `count`) rather than the field names declared below. A missing/unset value reports as an empty string (a trailing empty field), never a `-` placeholder (`tags_plugin.cpp:212`; see the macOS sample's `get`). A validation failure returns `rc=1` and a distinct `error|<message>` line instead of the success row (`tags_plugin.cpp:181-184,192-195,205-208,229-232,242-245`).",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -607,8 +607,8 @@
   },
   "privileges": [
     {
-      "grant": "None — plain file I/O under `<data_dir>`, no OS API, no elevated right",
-      "if_refused": "No refusal path exists; a failed `save_tags()` write is silently swallowed (see below)",
+      "grant": "None — plain file I/O under `<data_dir>`; the shared writer calls `ReplaceFileW` (no extra privilege)",
+      "if_refused": "No refusal path exists; a failed `save_tags()` write is logged and declared `CONSTRAINED` / `tags:persist_failed` on `set`/`delete`/`clear` (see Result status)",
       "measured": "2026-09-07 on bare metal as SYSTEM",
       "os": "Windows",
       "runs_as": "agent service account — LocalSystem today, not yet the intended `NT SERVICE\\YuzuAgent` (#1442; `docs/agent-privilege-model.md:12`)"
@@ -629,7 +629,14 @@
     }
   ],
   "readme": "agents/plugins/tags/README.md",
-  "result_status": [],
+  "result_status": [
+    {
+      "completeness": "partial",
+      "provenance": "`tags:persist_failed`",
+      "status": "`CONSTRAINED`",
+      "when": "`set` / `delete` / `clear`: the atomic write of `<data_dir>/tags.json` failed (data dir not creatable or not a directory, disk error, fsync failure, or on Windows another process holding the file open without `FILE_SHARE_DELETE`); the reason is in the agent log and the tag is lost on restart"
+    }
+  ],
   "samples": {
     "linux": {
       "actions": [
@@ -1063,10 +1070,13 @@
       "agents/plugins/tags/src/tags_plugin.cpp"
     ],
     "privilege_row": false,
-    "tests": []
+    "tests": [
+      "tests/unit/test_tags_plugin.cpp"
+    ]
   },
   "version": "0.1.0",
   "where_the_data_goes": [
+    "**Persistence.** Writes stage through a randomly-named, exclusively-created sibling temp that is fsync'd (POSIX only — `F_FULLFSYNC`, then `fsync`, on macOS; the Windows leg writes through `std::ofstream` and does not fsync) and renamed into place (`agents/shared/atomic_file_write.hpp`) at the ordinary `0666 & ~umask` creation mode for a new file; an existing regular file keeps its rwx bits on POSIX (owner, group, ACLs and hard links are not preserved — the rename replaces the inode); a `tags.json` that is a symlink or hard link is replaced by a regular file, not written through (the old in-place write followed the link); a pre-existing file at the temp path fails the write rather than being followed or overwritten.",
     "**Instruction result only** for row data — reaches the ResponseStore via the standard command-response path, queryable at `/api/responses/{id}`.",
     "**`tags.json` is also read independently of this plugin, at agent Register time** (`agent.cpp:1701-1725`), populating `AgentInfo.scopable_tags` on the gRPC `Register` call; the server's handler syncs it into the Postgres-backed TagStore (`agent_service_impl.cpp:577-585` → `tag_store.cpp` `sync_agent_tags:345-433`) after dropping any self-reported `service` key (`agent_registry.cpp:56-67`, `tag_store.cpp:374-379`, #3289/#3295) — this happens whether or not an operator ever dispatches a `tags.*` action.",
     "Every other key reaches `tag:<key>` scope-DSL evaluation via the store-first resolver (#3295) and management-group targeting.",

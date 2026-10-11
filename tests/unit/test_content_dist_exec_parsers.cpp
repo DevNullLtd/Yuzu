@@ -19,6 +19,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cerrno>
+#include <chrono>
+#include <climits>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -410,4 +413,57 @@ TEST_CASE("build_execution_options keeps exec_verify Linux-only while inherit_pa
     CHECK(lin.inherit_parent_env);
     CHECK_FALSE(win.exec_verify.enabled);
     CHECK(win.inherit_parent_env);
+}
+
+// -- parse_cleanup_hours ----------------------------------------
+
+TEST_CASE("parse_cleanup_hours saturates, floors at zero and falls back only on non-numbers",
+          "[agent][content_dist][exec]") {
+    CHECK(parse_cleanup_hours("24", 7) == 24);
+    CHECK(parse_cleanup_hours("876000", 7) == 876000);
+    CHECK(parse_cleanup_hours("876001", 7) == 876000);
+    CHECK(parse_cleanup_hours("2147483647", 7) == 876000);
+    // Beyond int range: std::stoi would throw and the old code fell back to 24.
+    CHECK(parse_cleanup_hours("2147483648", 7) == 876000);
+    CHECK(parse_cleanup_hours("99999999999999999999999999", 7) == 876000);
+    // Documented "remove every staged file": zero and negative, any magnitude.
+    CHECK(parse_cleanup_hours("0", 7) == 0);
+    CHECK(parse_cleanup_hours("-1", 7) == 0);
+    CHECK(parse_cleanup_hours("-2147483648", 7) == 0);
+    CHECK(parse_cleanup_hours("-99999999999999999999", 7) == 0);
+    // std::stoi prefix rules are kept.
+    CHECK(parse_cleanup_hours("  +5", 7) == 5);
+    CHECK(parse_cleanup_hours("12abc", 7) == 12);
+    // No leading number, or empty: the fallback.
+    CHECK(parse_cleanup_hours("", 7) == 7);
+    CHECK(parse_cleanup_hours("abc", 7) == 7);
+    CHECK(parse_cleanup_hours("-", 7) == 7);
+    CHECK(parse_cleanup_hours(" ", 7) == 7);
+}
+
+TEST_CASE("a parsed huge or negative cleanup cutoff is never in the future",
+          "[agent][content_dist][exec]") {
+    // Same arithmetic as do_cleanup. Unbounded, 1500000 and 2000000000 hours
+    // wrap the cutoff into the future on Linux/libstdc++ (INT_MAX happens to
+    // wrap back into the past, and very negative values wrap the other way).
+    const auto now = std::filesystem::file_time_type::clock::now();
+    for (const char* text : {"1500000", "2000000000", "2147483647", "99999999999", "-4000000",
+                             "-2147483648", "0", "-1"}) {
+        // Compare into a bool: Catch2 cannot stringify a file_clock time_point
+        // on libc++ (its rep is __int128, which has no operator<<).
+        const bool in_future = now < now - std::chrono::hours(parse_cleanup_hours(text, 24));
+        CHECK_FALSE(in_future);
+    }
+}
+
+TEST_CASE("cleanup_is_stale never treats an unreadable age as old", "[agent][content_dist][exec]") {
+    using clock = std::filesystem::file_time_type::clock;
+    const auto cutoff = clock::now();
+    const std::error_code none;
+    const std::error_code denied = std::make_error_code(std::errc::permission_denied);
+    CHECK(cleanup_is_stale(none, cutoff - std::chrono::hours(2), cutoff));
+    CHECK_FALSE(cleanup_is_stale(none, cutoff + std::chrono::hours(2), cutoff));
+    // last_write_time(ec) returns file_time_type::min() on error: must not read as old.
+    CHECK_FALSE(cleanup_is_stale(denied, std::filesystem::file_time_type::min(), cutoff));
+    CHECK_FALSE(cleanup_is_stale(denied, cutoff - std::chrono::hours(2), cutoff));
 }

@@ -20,7 +20,7 @@ Here are the key concepts you will use in this tutorial:
 
 - **Question vs. Action** -- Definitions have a `type` field. A `question` is read-only: it gathers information without modifying endpoint state (list services, read OS info, check disk space). An `action` may modify state (restart a service, install a package, change a registry value). This distinction drives the approval workflow -- questions can auto-execute, while actions can require sign-off.
 
-- **Parameters** -- Typed inputs with validation rules. Parameters are declared with a JSON Schema-style syntax (type, required fields, max length, allowed values) and validated before the command is dispatched to any agent.
+- **Parameters** -- Typed inputs with validation rules. Parameters are declared with a JSON Schema-style syntax (type, required fields, max length, allowed values) and `POST /api/instructions/{id}/execute` validates them before the command is dispatched to any agent (no other dispatch surface does yet).
 
 - **Result Schema** -- Typed output columns (string, int32, int64, bool, datetime) that describe the structure of response data. Typed results enable server-side aggregation (COUNT, SUM, AVG grouped by column) and clean export to CSV, JSON, ClickHouse, or Splunk.
 
@@ -364,6 +364,15 @@ This downloads a CSV file with headers:
 ```
 id,instruction_id,agent_id,timestamp,status,output,error_detail
 ```
+
+An export is capped at 10,000 rows and at 50 MiB of output. A cut CSV ends with one extra record
+beginning `# result_truncated_by_cap` (parse the file as CSV and read the final record before
+trusting a bulk pull; a quoted cell can contain text that looks like it, so do not regex-match
+lines), and a cut JSON export has a top-level `result_truncated_by_cap: true` in the response body
+on this legacy route (under `pagination` on the v1 route). A cut export is also saved under a
+`-truncated` name by `-OJ` and carries `X-Result-Truncated-By-Cap: true`; a plain `-o` keeps neither
+the name nor the header, so add `-D -` to print the headers (`curl -sS -D - -o service-results.csv
+...`).
 
 ### Export as JSON
 
@@ -896,6 +905,8 @@ curl -s "http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8?status=1&
 curl -s "http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8/export?format=csv" \
   -b "$COOKIE" -o responses.csv
 ```
+
+(A cut export is marked; the first "Export as CSV" section in this guide shows how to tell a cut export from a complete one.)
 
 The CSV file contains one row per agent response with headers:
 

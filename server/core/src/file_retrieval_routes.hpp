@@ -8,8 +8,10 @@
 /// for the design rationale.
 ///
 /// Two trust domains on one surface:
-///   * Operator routes (mint/list/revoke) — `AuthFn`/`PermFn`-gated exactly
-///     like every other REST securable (`UploadGrant:Write/Read/Delete`).
+///   * Operator routes (mint/list/revoke): mint and revoke are `AuthFn`/`PermFn`-gated
+///     like every other REST securable (`UploadGrant:Write/Delete`). The list route
+///     refuses a service-scoped token through `deny_service_scoped_fn` and is otherwise
+///     gated by the `list_read_fn` list-admit resolver (`UploadGrant:Read`), not `PermFn`.
 ///   * Agent routes (session open/chunk/status/commit/cancel) — there is NO
 ///     authenticated agent REST transport (see the parsers header's WHY THE
 ///     DESIGN CHANGED note), so these gate on the grant/session BEARER
@@ -75,6 +77,16 @@ struct Deps {
     /// only thing that turns `kDenyAll` into the actual 403 body. Unwired
     /// (empty) fails closed (`kDenyAll`).
     using ListReadFn = std::function<UploadGrantListAuthorization(const std::string& username)>;
+    /// Wraps `AuthRoutes::deny_service_scoped_session` (the shared server.cpp closure the
+    /// other route modules take, e.g. `health_routes.hpp`'s). Called by the list route
+    /// only for a service-scoped session: it writes the A4 403 (no `.permission`, since no
+    /// grant would admit the caller) and the audit row, and returns true iff the route must
+    /// return. REQUIRED: registration throws if it is unbound. A bound closure that returns
+    /// false without writing a response still gets the route's generic 403.
+    using DenyServiceScopedFn =
+        std::function<bool(const httplib::Request&, httplib::Response&, const std::string& action,
+                           const std::string& message, const std::string& target_type,
+                           const std::string& target_id)>;
     /// Same shape as `DexRoutes::AuditFn` (dex_routes.hpp) — bool-returning
     /// so a dropped audit row is visible to the caller, not silently eaten.
     /// Called on every state-changing operator AND agent transition (mint,
@@ -94,6 +106,9 @@ struct Deps {
     AuthFn auth_fn;
     PermFn perm_fn;
     ListReadFn list_read_fn;
+    /// REQUIRED: registration throws if unbound (`register_file_retrieval_routes` throws
+    /// `std::invalid_argument` before adding any route).
+    DenyServiceScopedFn deny_service_scoped_fn;
     AuditFn audit_fn;
     UploadGrantStore* store{nullptr};
 
@@ -121,7 +136,8 @@ struct Deps {
 
 /// Register the upload-grant + chunked-receive REST surface. A free
 /// function (not a class method) — the frozen deliverable signature;
-/// server.cpp constructs one `Deps` and calls this once.
+/// server.cpp constructs one `Deps` and calls this once. Throws `std::invalid_argument`
+/// before registering any route when `deps.deny_service_scoped_fn` is unbound.
 void register_file_retrieval_routes(HttpRouteSink& sink, Deps deps);
 
 /// Live entry count of the process-static per-upload write-lock map.

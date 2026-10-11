@@ -1,11 +1,20 @@
 #include "software_catalogue_model.hpp"
 
+#include "data_export.hpp"
+#include "software_catalog_rules.hpp"
+#include "utf8_sanitize.hpp"
+
 #include <yuzu/log_token.hpp>
 
 #include <algorithm>
 #include <charconv>
-#include <climits>
 #include <cmath>
+#include <expected>
+#include <format>
+#include <initializer_list>
+#include <iterator>
+#include <optional>
+#include <utility>
 
 namespace yuzu::server::software_catalogue {
 
@@ -14,18 +23,27 @@ namespace sc = software_catalog;
 namespace {
 
 constexpr char kSep = '\x1f';
+// Longest accepted `name` (matches the ingest-side field cap, inventory_ingestion.cpp kMaxFieldLen).
+constexpr std::size_t kNameMaxBytes = 1024;
+
+// True for text Postgres can bind: strict UTF-8 and no NUL. Anything else would surface as a
+// store error (SQLSTATE 22021) and be reported as a retryable 503 instead of a caller 400.
+bool valid_text(std::string_view v) {
+    return v.find('\0') == std::string_view::npos && ::yuzu::server::sanitize_utf8_strict(v) == v;
+}
 
 // ── Parameter helpers ────────────────────────────────────────────────────────
 
-// Value of `key`, or nullptr when absent. `strict` (the two new routes) rejects a repeated key;
-// otherwise the first value wins (the raw route's legacy behaviour).
+// Value of `key`, or nullptr when absent. `strict` (the two catalogue routes) turns a repeated key
+// into `err` (and yields nullptr); otherwise the first value wins (the raw route's legacy
+// behaviour).
 const std::string* find_param(const Params& p, const std::string& key, bool strict,
-                              std::optional<ParseError>& err) {
+                              std::optional<std::string>& err) {
     const auto [lo, hi] = p.equal_range(key);
     if (lo == hi)
         return nullptr;
     if (strict && std::next(lo) != hi) {
-        err = ParseError{400, "repeated query parameter " + key};
+        err = "repeated query parameter " + key;
         return nullptr;
     }
     return &lo->second;
@@ -40,14 +58,14 @@ std::optional<std::int64_t> parse_i64(std::string_view s) {
     return v;
 }
 
-// Shared by the three parsers: reads `limit` (empty == absent) into [1, max].
-std::expected<std::int64_t, ParseError> read_limit(const std::string* v, std::int64_t def,
-                                                   std::int64_t max) {
-    if (!v || v->empty())
+// Shared by the two parsers: reads `limit` (empty == absent) into [1, max].
+std::expected<std::int64_t, std::string> read_limit(const std::string& v, std::int64_t def,
+                                                    std::int64_t max) {
+    if (v.empty())
         return def;
-    const auto n = parse_i64(*v);
+    const auto n = parse_i64(v);
     if (!n)
-        return std::unexpected(ParseError{400, "invalid limit (expected integer)"});
+        return std::unexpected("invalid limit (expected integer)");
     return std::clamp<std::int64_t>(*n, 1, max);
 }
 
@@ -58,44 +76,30 @@ constexpr std::string_view kB64 =
 
 std::string b64url_encode(std::string_view in) {
     std::string out;
-    out.reserve((in.size() * 4 + 2) / 3);
-    std::size_t i = 0;
-    for (; i + 2 < in.size(); i += 3) {
-        const std::uint32_t n = (static_cast<std::uint8_t>(in[i]) << 16) |
-                                (static_cast<std::uint8_t>(in[i + 1]) << 8) |
-                                static_cast<std::uint8_t>(in[i + 2]);
-        out += kB64[(n >> 18) & 63];
-        out += kB64[(n >> 12) & 63];
-        out += kB64[(n >> 6) & 63];
-        out += kB64[n & 63];
-    }
-    if (const std::size_t rem = in.size() - i; rem == 1) {
-        const std::uint32_t n = static_cast<std::uint8_t>(in[i]) << 16;
-        out += kB64[(n >> 18) & 63];
-        out += kB64[(n >> 12) & 63];
-    } else if (rem == 2) {
-        const std::uint32_t n = (static_cast<std::uint8_t>(in[i]) << 16) |
-                                (static_cast<std::uint8_t>(in[i + 1]) << 8);
-        out += kB64[(n >> 18) & 63];
-        out += kB64[(n >> 12) & 63];
-        out += kB64[(n >> 6) & 63];
-    }
-    return out;
-}
-
-// Strict: alphabet only (no '=' padding), tail length != 1 mod 4.
-std::optional<std::string> b64url_decode(std::string_view in) {
-    if (in.size() % 4 == 1)
-        return std::nullopt;
-    std::string out;
-    out.reserve(in.size() * 3 / 4);
     std::uint32_t acc = 0;
     int bits = 0;
     for (const char c : in) {
-        const auto pos = kB64.find(c);
-        if (pos == std::string_view::npos)
-            return std::nullopt;
-        acc = (acc << 6) | static_cast<std::uint32_t>(pos);
+        acc = acc << 8 | static_cast<std::uint8_t>(c);
+        bits += 8;
+        while (bits >= 6) {
+            bits -= 6;
+            out += kB64[(acc >> bits) & 63];
+        }
+    }
+    if (bits > 0)
+        out += kB64[(acc << (6 - bits)) & 63];
+    return out;
+}
+
+// Strict: alphabet only (no '=' padding, no skipped bytes), tail length != 1 mod 4.
+std::optional<std::string> b64url_decode(std::string_view in) {
+    if (in.size() % 4 == 1 || in.find_first_not_of(kB64) != std::string_view::npos)
+        return std::nullopt;
+    std::string out;
+    std::uint32_t acc = 0;
+    int bits = 0;
+    for (const char c : in) {
+        acc = acc << 6 | static_cast<std::uint32_t>(kB64.find(c));
         bits += 6;
         if (bits >= 8) {
             bits -= 8;
@@ -113,11 +117,7 @@ std::string fnv1a_hex16(std::string_view s) {
         h ^= static_cast<std::uint8_t>(c);
         h *= 1099511628211ULL;
     }
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string out(16, '0');
-    for (int i = 15; i >= 0; --i, h >>= 4)
-        out[static_cast<std::size_t>(i)] = hex[h & 0xF];
-    return out;
+    return std::format("{:016x}", h);
 }
 
 bool is_lower_hex16(std::string_view s) {
@@ -193,14 +193,14 @@ void tail(std::string& out, std::string_view key, const std::string& v) {
 
 // ── Parsers ──────────────────────────────────────────────────────────────────
 
-std::expected<CatalogueRequest, ParseError> parse_catalogue_params(const Params& p) {
-    std::optional<ParseError> err;
+std::expected<CatalogueRequest, std::string> parse_catalogue_params(const Params& p) {
+    std::optional<std::string> err;
     auto get = [&](const char* k) -> std::string {
         const auto* v = find_param(p, k, true, err);
         return v ? *v : std::string{};
     };
     CatalogueRequest r;
-    r.query.q = sc::clamp_utf8(get("q"), sc::kSearchMaxBytes);
+    std::string q = get("q");
     r.query.kind = get("kind");
     r.query.ecosystem = get("ecosystem");
     r.query.source = get("source");
@@ -211,35 +211,44 @@ std::expected<CatalogueRequest, ParseError> parse_catalogue_params(const Params&
     const std::string format = get("format");
     if (err)
         return std::unexpected(*err);
-    if (r.query.source.size() > kSourceMaxBytes || r.query.agent_id.size() > kSourceMaxBytes)
-        return std::unexpected(ParseError{400, "parameter too long"});
+    for (const std::string* f : {&q, &r.query.kind, &r.query.ecosystem, &r.query.source,
+                                 &r.query.agent_id, &r.cursor})
+        if (!valid_text(*f))
+            return std::unexpected("invalid parameter encoding");
+    for (const std::string* f : {&r.query.kind, &r.query.ecosystem, &r.query.source,
+                                 &r.query.agent_id})
+        if (f->size() > kSourceMaxBytes)
+            return std::unexpected("parameter too long");
+    // Clamp only validated text: clamp_utf8 over a run of stray continuation bytes returns "".
+    r.query.q = sc::clamp_utf8(q, sc::kSearchMaxBytes);
     if (!versions_min.empty()) {
         const auto n = parse_i64(versions_min);
         if (!n || *n < 0)
-            return std::unexpected(ParseError{400, "invalid versions_min (expected integer >= 0)"});
+            return std::unexpected("invalid versions_min (expected integer >= 0)");
         r.query.versions_min = static_cast<int>(std::min<std::int64_t>(*n, 100000));
     }
     if (!format.empty()) {
         if (format != "json" && format != "csv")
-            return std::unexpected(ParseError{400, "invalid format (expected json or csv)"});
+            return std::unexpected("invalid format (expected json or csv)");
         r.format = format;
     }
     if (r.cursor.size() > kCursorMaxBytes)
-        return std::unexpected(ParseError{400, "invalid cursor"});
+        return std::unexpected("invalid cursor");
     const bool csv = r.format == "csv";
-    const auto lim = read_limit(limit.empty() ? nullptr : &limit,
-                                csv ? kExportCap : kCatalogueDefaultLimit,
+    // An export is one whole walk: a continuation token has no meaning there, never a silent drop.
+    if (csv && !r.cursor.empty())
+        return std::unexpected("cursor is not accepted with format=csv");
+    // For csv the limit is the TOTAL export cap (default and ceiling kExportCap).
+    const auto lim = read_limit(limit, csv ? kExportCap : kCatalogueDefaultLimit,
                                 csv ? kExportCap : kCataloguePageMax);
     if (!lim)
         return std::unexpected(lim.error());
-    if (csv)
-        r.export_cap = *lim;
     r.query.limit = static_cast<int>(*lim);
     return r;
 }
 
-std::expected<VersionsRequest, ParseError> parse_versions_params(const Params& p) {
-    std::optional<ParseError> err;
+std::expected<VersionsRequest, std::string> parse_versions_params(const Params& p) {
+    std::optional<std::string> err;
     auto get = [&](const char* k) -> std::string {
         const auto* v = find_param(p, k, true, err);
         return v ? *v : std::string{};
@@ -254,18 +263,26 @@ std::expected<VersionsRequest, ParseError> parse_versions_params(const Params& p
     if (err)
         return std::unexpected(*err);
     if (r.query.name.empty())
-        return std::unexpected(ParseError{400, "name is required"});
-    if (r.query.source.size() > kSourceMaxBytes || r.query.agent_id.size() > kSourceMaxBytes)
-        return std::unexpected(ParseError{400, "parameter too long"});
-    const auto lim = read_limit(limit.empty() ? nullptr : &limit, kVersionsDefaultLimit, kVersionsMax);
+        return std::unexpected("name is required");
+    for (const std::string* f : {&r.query.name, &r.query.kind, &r.query.ecosystem, &r.query.source,
+                                 &r.query.agent_id})
+        if (!valid_text(*f))
+            return std::unexpected("invalid parameter encoding");
+    for (const std::string* f : {&r.query.kind, &r.query.ecosystem, &r.query.source,
+                                 &r.query.agent_id})
+        if (f->size() > kSourceMaxBytes)
+            return std::unexpected("parameter too long");
+    if (r.query.name.size() > kNameMaxBytes)
+        return std::unexpected("parameter too long");
+    const auto lim = read_limit(limit, kVersionsDefaultLimit, kVersionsMax);
     if (!lim)
         return std::unexpected(lim.error());
     r.query.limit = static_cast<int>(*lim);
     return r;
 }
 
-std::expected<DevicesRequest, ParseError> parse_devices_params(const Params& p) {
-    std::optional<ParseError> err; // never set: strict=false
+std::expected<DevicesRequest, std::string> parse_devices_params(const Params& p) {
+    std::optional<std::string> err; // never set: strict=false
     auto get = [&](const char* k) -> std::string {
         const auto* v = find_param(p, k, false, err);
         return v ? *v : std::string{};
@@ -275,20 +292,34 @@ std::expected<DevicesRequest, ParseError> parse_devices_params(const Params& p) 
     r.query.name = get("name");
     if (const auto* v = find_param(p, "version", false, err))
         r.query.version = *v;
-    r.query.q = sc::clamp_utf8(get("q"), sc::kSearchMaxBytes);
+    std::string q = get("q");
     r.query.kind = get("kind");
     r.query.ecosystem = get("ecosystem");
     r.query.source = get("source");
     r.cursor = get("cursor");
     r.format = get("format");
     const std::string limit = get("limit");
+    for (const std::string* f : {&r.query.agent_id, &r.query.name, &q, &r.query.kind,
+                                 &r.query.ecosystem, &r.query.source, &r.cursor})
+        if (!valid_text(*f))
+            return std::unexpected("invalid parameter encoding");
+    if (r.query.version && !valid_text(*r.query.version))
+        return std::unexpected("invalid parameter encoding");
+    for (const std::string* f : {&r.query.agent_id, &r.query.kind, &r.query.ecosystem,
+                                 &r.query.source})
+        if (f->size() > kSourceMaxBytes)
+            return std::unexpected("parameter too long");
+    if (r.query.name.size() > kNameMaxBytes ||
+        (r.query.version && r.query.version->size() > kNameMaxBytes))
+        return std::unexpected("parameter too long");
+    // Clamp only validated text: clamp_utf8 over a run of stray continuation bytes returns "".
+    r.query.q = sc::clamp_utf8(q, sc::kSearchMaxBytes);
     if (!r.format.empty() && r.format != "json" && r.format != "csv")
-        return std::unexpected(ParseError{400, "invalid format (expected json or csv)"});
+        return std::unexpected("invalid format (expected json or csv)");
     if (r.cursor.size() > kCursorMaxBytes)
-        return std::unexpected(ParseError{400, "invalid cursor"});
+        return std::unexpected("invalid cursor");
     r.export_mode = !r.format.empty();
-    const auto lim = read_limit(limit.empty() ? nullptr : &limit,
-                                r.export_mode ? kExportCap : 100,
+    const auto lim = read_limit(limit, r.export_mode ? kExportCap : 100,
                                 r.export_mode ? kExportCap : kDevicesPageMax);
     if (!lim)
         return std::unexpected(lim.error());
@@ -304,7 +335,7 @@ std::optional<std::string> strict_args_error(const nlohmann::json& args) {
         const char* key;
         std::size_t max;
     };
-    for (const StrKey k : {StrKey{"q", sc::kSearchMaxBytes}, StrKey{"name", 1024},
+    for (const StrKey k : {StrKey{"q", sc::kSearchMaxBytes}, StrKey{"name", kNameMaxBytes},
                            StrKey{"source", kSourceMaxBytes}, StrKey{"agent_id", kSourceMaxBytes},
                            StrKey{"cursor", kCursorMaxBytes}, StrKey{"kind", 16},
                            StrKey{"ecosystem", 32}}) {
@@ -408,6 +439,9 @@ std::string_view cursor_error_message(CursorError e) {
 std::string filter_fingerprint(const SoftwareCatalogQuery& q) {
     std::string s;
     for (const std::string* f : {&q.kind, &q.ecosystem, &q.source, &q.q, &q.agent_id}) {
+        // Length-prefixed so no byte content (incl. the separator) can shift a boundary.
+        s += std::to_string(f->size());
+        s += ':';
         s += *f;
         s += kSep;
     }
@@ -416,14 +450,16 @@ std::string filter_fingerprint(const SoftwareCatalogQuery& q) {
 }
 
 std::string devices_fingerprint(const SoftwareFleetQuery& q) {
-    std::string s = q.agent_id;
-    s += kSep;
-    s += q.name;
-    s += kSep;
-    s += q.version ? "1" + *q.version : std::string("0");
-    for (const std::string* f : {&q.q, &q.kind, &q.ecosystem, &q.source}) {
-        s += kSep;
+    static const std::string kNoVersion;
+    // A present-empty version (the exact empty-version bucket) is not an absent one.
+    std::string s(1, q.version ? '1' : '0');
+    for (const std::string* f : {&q.agent_id, &q.name, q.version ? &*q.version : &kNoVersion, &q.q,
+                                 &q.kind, &q.ecosystem, &q.source}) {
+        // Length-prefixed so no byte content (incl. the separator) can shift a boundary.
+        s += std::to_string(f->size());
+        s += ':';
         s += *f;
+        s += kSep;
     }
     return fnv1a_hex16(s);
 }
@@ -450,7 +486,7 @@ decode_catalogue_cursor(std::string_view token, std::string_view fp, std::int64_
         return std::unexpected(CursorError::kMalformed);
     // installs, then the name verbatim (the name may itself contain the separator).
     const auto sep = payload->find(kSep);
-    if (sep == std::string::npos)
+    if (sep == std::string::npos || !valid_text(std::string_view(*payload).substr(sep + 1)))
         return std::unexpected(CursorError::kMalformed);
     const auto installs = parse_nonneg(std::string_view(*payload).substr(0, sep));
     if (!installs)
@@ -487,21 +523,26 @@ std::expected<SoftwareCursor, CursorError> decode_devices_cursor(std::string_vie
     const auto mid = payload->rfind(kSep, last - 1);
     if (mid == std::string::npos)
         return std::unexpected(CursorError::kMalformed);
-    const auto id = parse_nonneg(std::string_view(*payload).substr(last + 1));
-    if (!id)
+    const std::string_view view(*payload);
+    const auto id = parse_nonneg(view.substr(last + 1));
+    // The decoded text is bound as SQL parameters: strict UTF-8 and no NUL, like the parsers.
+    if (!id || !valid_text(view.substr(0, mid)) || !valid_text(view.substr(mid + 1, last - mid - 1)))
         return std::unexpected(CursorError::kMalformed);
     if (parts[1] != fp)
         return std::unexpected(CursorError::kFilterMismatch);
     return SoftwareCursor{payload->substr(0, mid), payload->substr(mid + 1, last - mid - 1), *id};
 }
 
-SkewAction skew_action(bool cursor_present, std::int64_t gen_before, std::int64_t gen_after) {
-    if (gen_before == gen_after)
-        return SkewAction::kNone;
-    return cursor_present ? SkewAction::kStale : SkewAction::kRetry;
-}
-
 // ── KPIs ─────────────────────────────────────────────────────────────────────
+
+Coverage gather_coverage(const CoverageReads& io, std::int64_t now_epoch) {
+    Coverage c;
+    if (io.connected)
+        c.connected = io.connected();
+    if (io.stale)
+        c.stale = io.stale(now_epoch - kStaleWindowSecs);
+    return c;
+}
 
 KpiFigures derive_kpis(const CatalogRollupMeta& meta, const Coverage& coverage) {
     KpiFigures k;
@@ -603,9 +644,13 @@ nlohmann::json version_row_json(const SoftwareVersionCount& v, bool omit_newest)
     };
 }
 
+bool versions_read_needs_rollup(const SoftwareVersionsQuery& q) {
+    return q.agent_id.empty() && q.kind.empty() && q.ecosystem.empty() && q.source.empty();
+}
+
 nlohmann::json versions_response_json(std::string_view name,
                                       const std::vector<SoftwareVersionCount>& rows, bool truncated,
-                                      bool omit_newest) {
+                                      bool omit_newest, std::int64_t devices_omitted) {
     auto versions = nlohmann::json::array();
     for (const auto& v : rows)
         versions.push_back(version_row_json(v, omit_newest));
@@ -614,6 +659,7 @@ nlohmann::json versions_response_json(std::string_view name,
         {"versions", std::move(versions)},
         {"count", rows.size()},
         {"truncated", truncated},
+        {"devices_omitted", devices_omitted},
     };
     if (omit_newest)
         out["newest_omitted"] = true;
@@ -686,20 +732,18 @@ std::string titles_csv(const std::vector<SoftwareCatalogRow>& rows, bool omit_ne
     return out;
 }
 
-std::optional<std::string> titles_export(const CatalogueReader& read, SoftwareCatalogQuery q,
-                                         std::int64_t cap, bool omit_newest, bool& truncated) {
-    truncated = false;
+std::optional<TitlesExport> titles_export(const CatalogueReader& read, SoftwareCatalogQuery q,
+                                          std::int64_t cap, bool omit_newest) {
+    TitlesExport out;
     std::vector<SoftwareCatalogRow> all;
     q.after.reset();
     while (static_cast<std::int64_t>(all.size()) < cap) {
         const std::int64_t want =
-            std::min<std::int64_t>(cap - static_cast<std::int64_t>(all.size()), kCatalogReadMax);
+            std::min<std::int64_t>(cap - static_cast<std::int64_t>(all.size()), kCatalogRowCap);
         q.limit = static_cast<int>(want);
         auto page = read(q);
         if (!page)
             return std::nullopt;
-        if (page->empty())
-            break;
         const bool full = static_cast<std::int64_t>(page->size()) == want;
         for (auto& r : *page)
             all.push_back(std::move(r));
@@ -708,107 +752,98 @@ std::optional<std::string> titles_export(const CatalogueReader& read, SoftwareCa
         // A full read that reaches the cap may have left rows behind: report it, as the raw
         // route does whenever rows == the effective limit.
         if (static_cast<std::int64_t>(all.size()) >= cap) {
-            truncated = true;
+            out.truncated = true;
             break;
         }
         q.after = SoftwareCatalogCursor{all.back().device_count, all.back().name};
     }
-    return titles_csv(all, omit_newest);
+    out.rows = static_cast<std::int64_t>(all.size());
+    out.csv = titles_csv(all, omit_newest);
+    return out;
 }
 
-PageStatus read_catalogue_page(const CatalogueReads& io, const CatalogueRequest& rq,
-                               CataloguePage& out) {
+std::expected<CataloguePage, std::optional<CursorError>>
+read_catalogue_page(const CatalogueReads& io, const CatalogueRequest& rq) {
     const auto& q = rq.query;
     const bool host = !q.agent_id.empty();
     const bool continuation = !rq.cursor.empty();
     const std::string fp = filter_fingerprint(q);
-    enum class Step { kOk, kDegraded, kBadCursor, kStale, kMoved };
-    auto attempt = [&]() -> Step {
-        out = {};
+    bool moved = false; // generation moved under a first page: re-read once
+    auto attempt = [&]() -> std::expected<CataloguePage, std::optional<CursorError>> {
+        CataloguePage out;
         std::int64_t gen = 0;
         if (!host) {
             out.meta = io.meta();
             if (!out.meta)
-                return Step::kDegraded;
+                return std::unexpected(std::nullopt);
             gen = out.meta->refreshed_at;
         }
         auto query = q;
         if (continuation) {
             auto cur = decode_catalogue_cursor(rq.cursor, fp, gen);
-            if (!cur) {
-                out.cursor_error = cur.error();
-                return cur.error() == CursorError::kStale ? Step::kStale : Step::kBadCursor;
-            }
+            if (!cur)
+                return std::unexpected(cur.error());
             query.after = *cur;
         }
         auto rows = io.rows(query);
         if (!rows)
-            return Step::kDegraded;
+            return std::unexpected(std::nullopt);
         auto totals = io.totals(query);
         if (!totals)
-            return Step::kDegraded;
+            return std::unexpected(std::nullopt);
         out.rows = std::move(*rows);
         out.totals = *totals;
         if (!host) {
             const auto after = io.meta();
             if (!after)
-                return Step::kDegraded;
-            switch (skew_action(continuation, gen, after->refreshed_at)) {
-            case SkewAction::kNone:
-                break;
-            case SkewAction::kStale:
-                out.cursor_error = CursorError::kStale;
-                return Step::kStale;
-            case SkewAction::kRetry:
-                return Step::kMoved;
+                return std::unexpected(std::nullopt);
+            if (after->refreshed_at != gen) {
+                // A continuation never re-pages an old keyset over a new snapshot.
+                if (continuation)
+                    return std::unexpected(CursorError::kStale);
+                moved = true;
+                return std::unexpected(std::nullopt); // a second move: 503
             }
         }
-        if (static_cast<int>(out.rows.size()) == q.limit)
+        if (!out.rows.empty() && static_cast<int>(out.rows.size()) == q.limit)
             out.next_cursor = encode_catalogue_cursor(out.rows.back(), fp, gen);
-        return Step::kOk;
+        return out;
     };
-    Step st = attempt();
-    if (st == Step::kMoved)
-        st = attempt(); // first page only: one retry over the new snapshot
-    switch (st) {
-    case Step::kOk:
-        return PageStatus::kOk;
-    case Step::kBadCursor:
-        return PageStatus::kBadCursor;
-    case Step::kStale:
-        return PageStatus::kStale;
-    case Step::kDegraded:
-    case Step::kMoved:
-        break;
+    auto page = attempt();
+    if (moved) {
+        moved = false;
+        page = attempt();
     }
-    return PageStatus::kDegraded;
+    return page;
 }
 
-PageStatus read_titles_export(const CatalogueReads& io, const CatalogueRequest& rq,
-                              bool omit_newest, std::string& csv, bool& truncated) {
+std::optional<TitlesExport> read_titles_export(const CatalogueReads& io,
+                                               const CatalogueRequest& rq, bool omit_newest) {
     const bool host = !rq.query.agent_id.empty();
     for (int attempt = 0; attempt < 2; ++attempt) {
         std::int64_t gen = 0;
         if (!host) {
             const auto before = io.meta();
             if (!before)
-                return PageStatus::kDegraded;
+                break;
             gen = before->refreshed_at;
+            // Never computed: an empty file would read as "no titles". Say so, read nothing.
+            if (gen == 0)
+                return TitlesExport{.building = true};
         }
-        auto body = titles_export(io.rows, rq.query, rq.export_cap, omit_newest, truncated);
+        auto body = titles_export(io.rows, rq.query, rq.query.limit, omit_newest);
         if (!body)
-            return PageStatus::kDegraded;
+            break;
         if (!host) {
             const auto after = io.meta();
             if (!after)
-                return PageStatus::kDegraded;
+                break;
             if (after->refreshed_at != gen)
                 continue; // moved under the walk: restart once
         }
-        csv = std::move(*body);
-        return PageStatus::kOk;
+        return std::move(*body);
     }
-    return PageStatus::kDegraded;
+    return std::nullopt;
 }
 
 } // namespace yuzu::server::software_catalogue

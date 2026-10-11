@@ -59,7 +59,7 @@ fi
 # concurrent CI jobs on a shared runner never collide and the shared base DB is
 # never mutated. Derive a child DSN by swapping the database name in the URI.
 SALT="$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-BG_DB="yuzu_bgtest_$$_${SALT}"
+BG_DB="yuzu_test_$(date +%s)_bgtest_$$_${SALT}"
 dsn_base="${PG_DSN%%\?*}"                       # strip any ?query
 dsn_query=""
 [ "$dsn_base" != "$PG_DSN" ] && dsn_query="?${PG_DSN#*\?}"

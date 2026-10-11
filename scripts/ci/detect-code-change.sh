@@ -7,8 +7,10 @@
 #
 #   detect-code-change.sh [--class code] [TOTAL] < changed-paths
 #
-#     The existing docs-only gate (issue #1978). Reads one path per line from
-#     stdin. TOTAL is GitHub's authoritative pull_request.changed_files count.
+#     The docs-only gate (issue #1978; push to main/dev too since #5320).
+#     Reads one path per line from stdin. TOTAL, when given, is GitHub's
+#     authoritative pull_request.changed_files count (the push arm omits it
+#     and does its own truncation check).
 #
 #   detect-code-change.sh --class ci-infrastructure --git-diff BASE [HEAD]
 #
@@ -24,17 +26,16 @@
 # than this count the list was truncated, and we FAIL CLOSED to "true" (build)
 # rather than trust a partial view that might hide a code file past the cap.
 #
-# The docs-only ignore set mirrors the ci.yml `push:` trigger's `paths`
-# allow-list (an ALLOW-list with `!`-negations, not `paths-ignore` — BR-010;
-# the pull_request trigger carries no path filter at all, #1978), with
-# GitHub's root-anchored filter semantics — a bare `*.md`,
-# `LICENSE`, or `.gitignore` pattern matches ONLY the repository root, never a
-# nested path:
+# The docs-only ignore set is the one the ci.yml `push:` trigger's `paths`
+# allow-list used to carry (BR-010). Since #5320 neither ci.yml trigger has a
+# path filter: both always run, and this classifier alone decides docs-only
+# for a PR and for a push to main/dev. It keeps GitHub's root-anchored filter
+# semantics — a bare `*.md`, `LICENSE`, or `.gitignore` pattern matches ONLY
+# the repository root, never a nested path:
 #   - docs/**                        (any depth under docs/), EXCEPT
 #     docs/os-capability-matrix.md — carved OUT of docs/** (#2204 PR1.1): it
 #     carries a machine-generated block, so a hand-edit there must still run
-#     the build/gate matrix. Kept in lockstep with the ci.yml `push:`
-#     trigger's `paths` allow-list re-include entry.
+#     the build/gate matrix (and its drift gate, BR-010), on a PR or a push.
 #   - root-level *.md                (README.md, but NOT sdk/README.md)
 #   - LICENSE, .gitignore            (root only)
 #   - .github/runner-inventory.json
@@ -42,9 +43,9 @@
 # Anything else -> code_changed=true. Fail-closed throughout: any uncertainty
 # (empty list, truncated list) builds rather than silently skipping the matrix.
 #
-# KEEP IN SYNC: this ignore set must match the `push:` trigger's `paths`
-# allow-list negations in .github/workflows/ci.yml — editing one without the
-# other diverges PR-time and post-merge build behaviour.
+# SINGLE SOURCE: ci.yml no longer carries a copy of this set in a `paths`
+# filter (#5320), so there is nothing to keep in sync; never re-add one to
+# either trigger — a path-filtered run leaves required checks absent.
 #
 # Run tests:  bash tests/shell/test_detect_code_change.sh
 set -euo pipefail
@@ -191,8 +192,8 @@ for f in "${files[@]}"; do
         # scripts/ci/check-capability-matrix.sh) that only stays honest if a
         # hand-edit here still runs the full build/gate matrix — a docs-only
         # PR that quietly edited the generated block would otherwise skip
-        # the drift gate entirely. Matched IN LOCKSTEP with the ci.yml
-        # `push:` trigger's `paths` allow-list re-include — edit both or neither.
+        # the drift gate entirely. Applies to pushes to main/dev as well
+        # (#5320), which no longer have a `paths` filter of their own.
         echo "detect-code-change: docs/os-capability-matrix.md carved out of docs-only -> building: $f" >&2
         emit true
         ;;
@@ -203,7 +204,7 @@ for f in "${files[@]}"; do
       *.md)
         # GitHub's `*.md` filter is root-only; a nested .md is NOT ignored.
         if [[ "$f" == */* ]]; then
-          echo "detect-code-change: nested markdown is code-side per the paths allow-list -> building: $f" >&2
+          echo "detect-code-change: nested markdown is code-side (root-only *.md rule) -> building: $f" >&2
           emit true
         fi
         ;;

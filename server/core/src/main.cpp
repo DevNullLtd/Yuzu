@@ -23,6 +23,7 @@
 #include <CLI/CLI.hpp>
 
 #include "secret_file.hpp"        // --postgres-dsn-file / --oidc-client-secret-file (#5272)
+#include "server_gateway_peer_options.hpp"
 #include "server_ota_options.hpp"
 #include "shutdown_drain_rules.hpp" // HA WS-8: --shutdown-drain-seconds bound
 #include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
@@ -508,6 +509,13 @@ int main(int argc, char* argv[]) {
     // see test_server_ota_options.cpp.
     register_ota_options(app, cfg);
 
+    // Gateway-upstream peer authorization: pins, pin files and the explicit
+    // --insecure-gateway-peer acknowledgement. Registered from
+    // server_gateway_peer_options.hpp so names, env spellings and defaults are pinned
+    // by test_server_gateway_peer_options.cpp. The cross-flag decision (which
+    // combination may boot) is made in ServerImpl::run() after certificate bootstrap.
+    register_gateway_peer_options(app, cfg);
+
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
                    "MFA enforcement (default: optional). \"optional\" = self-service "
@@ -989,6 +997,7 @@ int main(int argc, char* argv[]) {
     // Apply configuration floors ONCE, before anything reads cfg, so the metrics,
     // the settings page and the docs all report the value the server enforces.
     yuzu::server::normalize_ota_options(cfg);
+    yuzu::server::normalize_gateway_peer_options(cfg);
 
     // ── CSRF trusted origins: normalise ONCE, here (#2537) ──
     // Comma-splitting, trimming, lowercasing and default-port stripping happen

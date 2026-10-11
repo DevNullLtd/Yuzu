@@ -81,6 +81,7 @@ Host :50052  →  server container  :50052  (management gRPC)
 
 The server runs in gateway mode with three flags:
 - `--gateway-upstream 0.0.0.0:50055` — gateway connects here to proxy registrations/heartbeats
+  (the server refuses to start with it unless gateway peer authorization resolves: a pin, `--gateway-peer-pin` / `--gateway-peer-pin-file`, automatic on the generated default certificates, or on a plaintext rig only `--insecure-gateway-peer` / `YUZU_INSECURE_GATEWAY_PEER=1`; `--no-tls` alone is not an acknowledgement; see `docs/user-manual/server-admin.md` "Gateway upstream peer authorization")
 - `--gateway-mode` — relaxes Subscribe peer validation for gateway-proxied agents
 - `--gateway-command-addr gateway:50063` — server forwards commands to gateway for fanout
 
