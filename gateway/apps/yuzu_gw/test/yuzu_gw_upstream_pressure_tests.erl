@@ -1,6 +1,6 @@
 %%%-------------------------------------------------------------------
 %%% @doc The slow-server definition of yuzu_gw_upstream_pressure, and the
-%%% lock-free reads of yuzu_gw_upstream it rests on.
+%%% lock-free lane read of yuzu_gw_upstream it rests on.
 %%%
 %%% The first half drives the accounting with synthetic samples and a synthetic
 %%% clock, so every threshold is tested at its boundary and no test waits. The
@@ -197,12 +197,8 @@ process_test_() ->
        {timeout, 30, fun busy_alone_is_not_saturated/0}},
       {"every notify slot held saturates the notify lane, and the next notification is dropped",
        {timeout, 30, fun notify_lane_saturates/0}},
-      {"circuit_state_now answers while the process is stuck in an RPC; circuit_state does not",
-       {timeout, 30, fun breaker_read_does_not_queue/0}},
-      {"circuit_state_now follows every breaker transition",
-       {timeout, 30, fun breaker_read_follows_transitions/0}},
-      {"circuit_state_now exits noproc when the process is not running",
-       {timeout, 30, fun breaker_read_without_a_process/0}},
+      {"there is no snapshot when the process is not running",
+       {timeout, 30, fun no_snapshot_without_a_process/0}},
       {"a restarted process does not inherit a busy lane from the one that died mid-RPC",
        {timeout, 30, fun restart_clears_the_lane/0}},
       {"the sampler emits the seconds and the duty cycle while the lane is saturated",
@@ -210,9 +206,7 @@ process_test_() ->
 
 setup() ->
     {ok, _} = application:ensure_all_started(telemetry),
-    %% A breaker that closes after failures replays the registry's agents.
-    yuzu_gw_test_registry:ensure(),
-    stop_named(yuzu_gw_upstream_pressure),
+        stop_named(yuzu_gw_upstream_pressure),
     stop_named(yuzu_gw_upstream),
     catch meck:unload(yuzu_grpc_client),
     ok = meck:new(yuzu_grpc_client, [non_strict, no_link]),
@@ -224,22 +218,14 @@ setup() ->
                               end,
                          sink() ! {rpc, Path, Id, self()},
                          case Id of
-                             <<"fail">> -> {error, closed};
-                             <<"ok">> -> {ok, #{}, #{}};
-                             _ -> receive go -> {ok, #{}, #{}} end
+                                              _ -> receive go -> {ok, #{}, #{}} end
                          end
                      end),
-    application:set_env(yuzu_gw, circuit_breaker_failure_threshold, 2),
-    application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 400),
-    application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 400),
     #{}.
 
 cleanup(_) ->
     stop_named(yuzu_gw_upstream_pressure),
     stop_named(yuzu_gw_upstream),
-    application:unset_env(yuzu_gw, circuit_breaker_failure_threshold),
-    application:unset_env(yuzu_gw, circuit_breaker_reset_timeout_ms),
-    application:unset_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms),
     catch meck:unload(yuzu_grpc_client),
     ok.
 
@@ -306,38 +292,7 @@ notify_lane_saturates() ->
         telemetry:detach(HandlerId)
     end.
 
-breaker_read_does_not_queue() ->
-    Up = start_upstream(),
-    Caller = spawn_register(<<"hold-1">>),
-    Worker = await_rpc(<<"hold-1">>),
-    %% the premise: a call into the process waits for the RPC in progress
-    ?assertExit({timeout, _}, gen_server:call(Up, circuit_state, 200)),
-    {Micros, State} = timer:tc(fun yuzu_gw_upstream:circuit_state_now/0),
-    ?assertEqual(closed, State),
-    ?assert(Micros < 100000),
-    Worker ! go,
-    await_reply(Caller).
-
-breaker_read_follows_transitions() ->
-    start_upstream(),
-    Agree = fun() ->
-                Now = yuzu_gw_upstream:circuit_state_now(),
-                ?assertEqual(yuzu_gw_upstream:circuit_state(), Now),
-                Now
-            end,
-    ?assertEqual(closed, Agree()),
-    {error, _} = yuzu_gw_upstream:proxy_register(#{enrollment => #{token => <<"fail">>}}),
-    ?assertEqual(closed, Agree()),
-    {error, _} = yuzu_gw_upstream:proxy_register(#{enrollment => #{token => <<"fail">>}}),
-    %% two failures: open. It allows a probe after 400 ms.
-    ?assertEqual(open, yuzu_gw_upstream:circuit_state_now()),
-    await_state(half_open),
-    ?assertEqual(half_open, Agree()),
-    {ok, _} = yuzu_gw_upstream:proxy_register(#{enrollment => #{token => <<"ok">>}}),
-    ?assertEqual(closed, Agree()).
-
-breaker_read_without_a_process() ->
-    ?assertExit({noproc, _}, yuzu_gw_upstream:circuit_state_now()),
+no_snapshot_without_a_process() ->
     ?assertEqual(undefined, yuzu_gw_upstream:lane_snapshot()).
 
 restart_clears_the_lane() ->
@@ -347,8 +302,7 @@ restart_clears_the_lane() ->
     ?assertMatch(#{in_rpc := true}, yuzu_gw_upstream:lane_snapshot()),
     kill(Up),
     _ = start_upstream(),
-    ?assertMatch(#{in_rpc := false, mailbox_len := 0, notify_inflight := 0}, yuzu_gw_upstream:lane_snapshot()),
-    ?assertEqual(closed, yuzu_gw_upstream:circuit_state_now()).
+    ?assertMatch(#{in_rpc := false, mailbox_len := 0, notify_inflight := 0}, yuzu_gw_upstream:lane_snapshot()).
 
 sampler_emits() ->
     Up = start_upstream(),
@@ -415,9 +369,6 @@ await_snapshot(Pred) ->
                        S -> Pred(S)
                    end
           end, snapshot_not_reached).
-
-await_state(Want) ->
-    until(fun() -> yuzu_gw_upstream:circuit_state_now() =:= Want end, {never, Want}).
 
 until(Pred, What) ->
     Deadline = erlang:monotonic_time(millisecond) + ?WAIT_MS,

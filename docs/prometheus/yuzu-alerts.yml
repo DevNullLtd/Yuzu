@@ -608,6 +608,49 @@ groups:
             the counter is flat rather than waiting for it to clear.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md"
 
+      # yuzu_gw_upstream_slow is 1 while the gateway's backpressure duty cycle over
+      # the last 60 s is 0.5 or more: for at least half of the last minute, work
+      # waited on the path to the server or was refused because it answered slower
+      # than work arrived (definition and the lanes: docs/user-manual/gateway.md
+      # "Slow server"; gateway/apps/yuzu_gw/src/yuzu_gw_upstream_pressure.erl). The
+      # breaker cannot see this: it counts failed calls, and a server that answers
+      # every call in 3 to 5 s never fails one. The gauge is created at 0 when the
+      # gateway starts, so a gateway that has never been slow has a series to
+      # compare, and it is already a trailing 60 s figure; `for: 5m` asks for it
+      # to hold across five minutes of evaluations, so a restart herd that drains
+      # in a few minutes does not fire, and a dip to 0 starts the five minutes
+      # again. A gateway with no series (down, or an older build) is YuzuGatewayDown's.
+      # The rule is per gateway on purpose, like its neighbours; with hundreds of
+      # gateways behind one slow server they fire together, so route this alert
+      # name with group_by in Alertmanager. INITIAL threshold and window, to be
+      # tuned on a real deployment.
+      - alert: YuzuGatewayUpstreamSlow
+        expr: |
+          yuzu_gw_upstream_slow == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The server is slow for gateway {{ $labels.instance }}"
+          description: >-
+            For at least half of the last minute, and continuously for 5 minutes,
+            the path from {{ $labels.instance }} to the server was backed up: the
+            upstream process was inside an RPC with work waiting, or every
+            stream-status notification or Guardian forward slot was held.
+            Registrations queue behind the slow call and notifications beyond
+            the cap are dropped (yuzu_gw_upstream_notify_dropped_total). The
+            circuit breaker stays closed, because the calls succeed. FIRST: is it
+            every gateway? avg(yuzu_gw_upstream_slow) near 1 means the server or
+            its database is slow (check PostgreSQL, including a failover that
+            slowed both servers); one gateway among many at 0 means that gateway
+            or its network path. THEN: rate(yuzu_gw_upstream_lane_saturated_seconds_total[5m])
+            by lane says which lane, and yuzu_gw_upstream_rpc_duration_ms says
+            whether the server is slow or the gateway is simply carrying more
+            work than one serial lane drains (a restarted fleet registering at
+            once looks the same). Nothing is wrong with the gateway's readiness;
+            do not restart it, which disconnects its agents.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md"
+
       # A listener configured as behind a proxy counts every call whose
       # claimed client address was not used
       # (yuzu_gw_grpc_origin_ignored_total{mode,reason}, pre-seeded to 0 for

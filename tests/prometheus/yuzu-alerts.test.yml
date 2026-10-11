@@ -3686,3 +3686,76 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGatewayOriginSourcesMismatch", alertstate="firing"}'
         eval_time: 60m
         exp_samples: []
+
+  # ── YuzuGatewayUpstreamSlow (up-5) ────────────────────────────────────────
+  #
+  # The gauge is the gateway's own trailing-60 s figure, so the rule only asks
+  # that it HOLD: 5 minutes of 1 before firing, and a dip to 0 starts the 5
+  # minutes again. A rule that fired on the first 1 would page on every restart
+  # herd; one that never reset on a dip would fire on a gateway that flaps.
+
+  # CASE A -- slow from minute 5: pending (quiet) at 8m, firing at 12m, for the
+  # slow gateway only. The other gateway sits at 0 the whole time. RED if the
+  # `== 1` were dropped (g2 would fire) or `for:` shortened (8m would fire).
+  - interval: 1m
+    name: gateway upstream slow - sustained slow fires after for, for that gateway only
+    input_series:
+      - series: 'yuzu_gw_upstream_slow{job="yuzu-gateway",instance="g1"}'
+        values: "0x4 1x40"
+      - series: 'yuzu_gw_upstream_slow{job="yuzu-gateway",instance="g2"}'
+        values: "0x44"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
+  # CASE B -- a herd that drains: slow for 4 minutes, then clear. Never fires.
+  # RED if `for:` were under 4m.
+  - interval: 1m
+    name: gateway upstream slow - a short episode stays quiet
+    input_series:
+      - series: 'yuzu_gw_upstream_slow{job="yuzu-gateway",instance="g1"}'
+        values: "1x3 0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE C -- a dip resets the five minutes: slow for 3m, 0 at minute 4, slow
+  # again from minute 5. The first run is shorter than `for:`, so the alert is
+  # quiet at 9m (4 minutes after the dip) and firing at 12m. RED if the rule
+  # smoothed the gauge so that a dip did not reset (it would fire at 9m or earlier).
+  - interval: 1m
+    name: gateway upstream slow - a dip to 0 starts the for period again
+    input_series:
+      - series: 'yuzu_gw_upstream_slow{job="yuzu-gateway",instance="g1"}'
+        values: "1x3 0 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamSlow", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+
+  # CASE D -- a gateway that has never been slow (the gauge is created at 0)
+  # never fires, however long it runs.
+  - interval: 1m
+    name: gateway upstream slow - a gauge that stays 0 never fires
+    input_series:
+      - series: 'yuzu_gw_upstream_slow{job="yuzu-gateway",instance="g1"}'
+        values: "0x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamSlow"}'
+        eval_time: 100m
+        exp_samples: []

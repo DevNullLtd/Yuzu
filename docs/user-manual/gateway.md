@@ -916,11 +916,6 @@ listener `{yuzu_grpc, Name}` reports `running`, shown as `listeners` in the chec
 them to route the AgentService (the same rule as boot: the entry's `services` map has the key `'yuzu.agent.v1.AgentService'`); an empty list, or a list with no entry that routes it, is ready only with `allow_no_listeners` set to `true`. It asks
 Ranch and does not connect to the ports. A listener that has stopped therefore turns
 `/readyz` red (503) instead of leaving a "ready" gateway that accepts nothing.
-Its `circuit_breaker` check reads the breaker state the `yuzu_gw_upstream` process publishes and
-does not call the process. Before, it called it: the call queued behind the RPC in progress, so
-against a slow server it waited out its 5 s timeout and `/readyz` answered 503 although the
-breaker was closed, which would have taken every gateway out of a load balancer's rotation at the
-moment the server was slow. A slow server is not a readiness input (see "Slow server").
 
 **Registration replay tuning** (application env keys read by the upstream
 client at start, except `upstream_call_timeout_ms`, which is read on every call; set them in the `yuzu_gw` section of `sys.config`. No
@@ -2664,8 +2659,7 @@ How it is measured: a process in the gateway samples the lanes every 100 ms. It 
 `yuzu_gw_upstream` process's state without calling it (a call would wait for the slow RPC being
 measured), credits each sample with the time until the next, and credits one step at most 1 s, so a
 stalled VM does not credit a minute. It is a sampled estimate with a resolution of 100 ms: a state
-that begins and ends between two samples is missed. The same reading is why `/readyz` no longer
-queues behind the upstream process.
+that begins and ends between two samples is missed.
 
 What it does not tell apart, and does not do:
 
@@ -2678,11 +2672,20 @@ What it does not tell apart, and does not do:
 - It is one figure for the gateway, not one per upstream endpoint. With several servers behind a
   channel it does not say which server is slow; per-endpoint state is not exported yet (#5648,
   #5655).
-- It does not change what the gateway does. A slow server is a reason to look, not a readiness
-  input: the gateways left in rotation would carry the same load against the same server. The
-  breaker is unchanged and still counts only failed calls, so a server that answers every call in 3
-  to 5 s never opens it; this is how that case is seen.
-- No alert rule ships for it.
+- It does not change what the gateway does. The breaker still counts only failed calls, so a
+  server that answers every call in 3 to 5 s never opens it; this is how that case is seen. What
+  the gateway should do about it is open (#5681). The process still runs one RPC at a time
+  (#5381).
+- A slow server is not a readiness input, and `/readyz` is not immune to one: its
+  `circuit_breaker` check calls the `yuzu_gw_upstream` process, so while that process is inside a
+  slow RPC the call can wait out its 5 s timeout and `/readyz` can answer 503 with the breaker
+  closed (INFERRED from the code, and a call into the stuck process was seen to time out in a test;
+  the 503 was not observed end to end). A load balancer probing `/readyz` can then take the gateway
+  out of rotation while the server is slow (#5680).
+- One alert ships: `YuzuGatewayUpstreamSlow` (warning) fires when `yuzu_gw_upstream_slow` has been 1
+  for 5 minutes, per gateway, so with many gateways behind one slow server they fire together and
+  its alert name should be grouped in Alertmanager. The threshold and window are initial values,
+  to be tuned on a real deployment.
 - Covered by unit tests against a mocked server whose RPC does not return and against synthetic
   samples; not run against a live server.
 

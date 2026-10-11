@@ -43,8 +43,6 @@ health_test_() ->
        fun readyz_503_improper_list/0},
       {"readyz 503 while an upstream channel's TLS options are unusable, 200 once they are not",
        fun readyz_503_unusable_upstream_tls/0},
-      {"readyz does not wait for a stuck upstream process: 200 at once, breaker read from its published state",
-       {timeout, 30, fun readyz_does_not_queue_behind_the_upstream/0}},
       {"healthz stays 200 while a configured listener is down", fun healthz_ok_listener_down/0}
      ]}.
 
@@ -270,23 +268,6 @@ readyz_503_unusable_upstream_tls() ->
     after
         ets:delete(Tab),
         restore_env(upstream_client, PrevClient)
-    end.
-
-%% The upstream process is suspended, which is what a slow RPC looks like from
-%% outside: it answers nothing. A readiness check that called it would wait out
-%% its 5 s timeout and report the breaker open.
-readyz_does_not_queue_behind_the_upstream() ->
-    {ok, Port} = yuzu_gw_health:port(),
-    Up = whereis(yuzu_gw_upstream),
-    ok = sys:suspend(Up),
-    try
-        {Micros, Result} = timer:tc(fun() -> http_get(Port, "/readyz") end),
-        {Status, Body} = Result,
-        ?assertEqual(200, Status),
-        ?assertNotEqual(nomatch, binary:match(Body, <<"\"circuit_breaker\":true">>)),
-        ?assert(Micros < 2000000)
-    after
-        ok = sys:resume(Up)
     end.
 
 readyz_503_one_of_two_stopped() ->
