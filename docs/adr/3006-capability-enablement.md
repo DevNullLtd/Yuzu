@@ -146,9 +146,9 @@ practice is accepted; existing behaviour is retrofitted to match.
   existing flags say so, before the server has adopted it as a rule (D8, D9).
 - **Not covered** — a unit that the state an agent holds does not cover, which the agent keeps
   off until a state that covers it arrives (D10).
-- **Usage class** — the capture sources that record what users do on the endpoint, such as
-  application use, DNS lookups and mapped drives. The enablement catalogue assigns every source
-  to a class (D8).
+- **Usage class** — the capture sources and daily-sync sources that record what users do on the
+  endpoint, such as application use, DNS lookups and mapped drives. The enablement catalogue
+  assigns every source to a class (D8).
 - **Unknown** — the reason shown when state is lost or cannot be read (D13, D14).
 - **Provider fault** — an attribute provider cannot be read (D14).
 - **Awaiting decision** — a unit that arrived in a release and is held off until the customer
@@ -240,7 +240,7 @@ actions) and requirements (one unit needs another).
   actions are never switched off by an enablement rule, directly or by switching off their
   plugin, and widening that set is a security decision. Whether a device is isolated is decided
   by an operator under the existing permission and approval gates, not by enablement. A rule
-  that names one has no effect and is shown as having none. The control channel is likewise not
+  that names one has no effect on it and is shown as having none. The control channel is likewise not
   a unit.
 - For the Spark engine, off means the engine is not used and the existing detection path
   carries on; it never means no detection. Each rule stays armed in at most one path.
@@ -364,7 +364,9 @@ Switching a unit back on does not recover the time it was off. The one exception
 (D3) that is itself on. It reads history the operating system retained, for a source's first
 baseline on an endpoint and for a source that already recovers a paused window that way (the
 connection source does today). Re-enabling a source, or recovering from a lost position in a
-log, otherwise resumes from the present and records the gap.
+log, otherwise resumes from the present and records the gap. While a source is off it takes no
+baseline, and its look-back, on or off, does no work: a look-back reads only at a baseline that
+its source takes.
 
 *Rejected:* a switch-off that only refuses new requests; purging automatically on every
 switch-off (a mistaken or temporary switch-off would destroy history that cannot be recovered);
@@ -393,12 +395,12 @@ endpoint, so that a rule narrowed or deleted after the package was issued cannot
 the package kept off. Any other
 starting state is adopted as a rule that covers only the endpoint that presented it. An agent
 installed without a starting state runs the shipped-on units until it first receives state from
-the server, which is why a customer who needs a unit never to run carries the starting state.
+the server, or is told that the control plane is unavailable, when D14 governs. That is why a
+customer who needs a unit never to run carries the starting state.
 
-At least one preset ships with this decision: the one that keeps off every source in the usage
-class, which is the sources that record what users do on the endpoint, and the catalogue
-assigns each source that ships off today to a class. It is how a customer deploys with those
-sources off from the first second. Further presets remain open.
+At least one preset ships with this decision: the one that keeps off every source that ships off
+today and every other source in the usage class. It is how a customer deploys with those sources
+off from the first second. Further presets remain open.
 
 Every route by which an agent is installed or enrolled can carry a starting state; a route that
 cannot is a defect against this ADR.
@@ -626,17 +628,17 @@ action came to read as "permission denied".
 - A server whose enablement state is behind what its agents report — restored from an older
   backup, or rebuilt — switches nothing on, says that the store has regressed, and waits for an
   operator's decision. While it waits it applies the invariant of D9 to every endpoint: a unit
-  that either view has off stays off, and the switchable units of an endpoint that cannot show
-  its state, including a new installation, are held off for dispatch with a retryable cause and
-  the status *regression pending*. A single endpoint's claim cannot declare a regression. Where
-  a regression cannot be told from a few returning endpoints, the server treats the store as
-  regressed, and an operator can declare one. A store that has been restored or rebuilt starts
-  as regressed unless continuity with the last ordering it issued is shown, so that a new
-  installation is held off before any agent report could declare it. The operator chooses
-  between restoring the store from a newer backup, which keeps the existing ordering of states,
-  and accepting the regressed state, which is previewed as any switch-on and starts a new
-  ordering of states (D9). The enablement state, and the record of what each endpoint last
-  reported, are part of what the server backs up.
+  that either view has off stays off, and the switchable units of an endpoint that cannot show its
+  state, including a new installation, are held off for dispatch with a retryable cause and the
+  status *regression pending*. Protective actions (D3) are not refused. A single endpoint's claim
+  cannot declare a regression. Where a regression cannot be told from a few returning endpoints,
+  the server treats the store as regressed, and an operator can declare one. A store that has been
+  restored or rebuilt starts as regressed unless continuity with the last ordering it issued is
+  shown, so that a new installation is held off before any agent report could declare it. The
+  operator chooses between restoring the store from a newer backup, which keeps the existing
+  ordering of states, and accepting the regressed state, which is previewed as any switch-on and
+  starts a new ordering of states (D9). The enablement state, and the record of what each endpoint
+  last reported, are part of what the server backs up.
 
 An endpoint that stays offline for a long time therefore keeps doing what was last on, and a
 switch-off made in the meantime does not reach it until it reconnects. This is accepted and
@@ -772,15 +774,15 @@ plugins (#5057) is closed first.
 
 ### Default posture for the sources that record what users do
 
-Under this ADR the usage-class sources that ship off today ship on. That is a deliberate
-departure from the opt-in posture of ADR-0015, ADR-0020 and the 2026-09-04 ruling. A customer
-can keep them off from the first second by deploying with the usage-class preset (D8), and at
-any time afterwards. Look-back is its own switch (D3), an upgrade changes nothing that already
-exists (D9), and every release states what it adds (D10). An install that carries no starting
-state collects until its first contact, and D13 shows every unit's default once the endpoint is
-known. Collecting this data by default is a data-protection decision for each customer as well
-as for the product, so the default is stated openly and the choice is available at deployment,
-through the preset and the starting state.
+Under this ADR the sources that ship off today, which include the usage class, ship on. That is a
+deliberate departure from the opt-in posture of ADR-0015, ADR-0020 and the 2026-09-04 ruling. A
+customer can keep them off from the first second by deploying with the preset (D8), and at any
+time afterwards. Look-back is its own switch (D3), an upgrade changes nothing that already exists
+(D9), and every release states what it adds (D10). An install that carries no starting state
+collects until its first contact, and D13 shows every unit's default once the endpoint is known.
+Collecting this data by default is a data-protection decision for each customer as well as for the
+product, so the default is stated openly and the choice is available at deployment, through the
+preset and the starting state.
 
 ### Accepted residuals
 
@@ -793,7 +795,7 @@ through the preset and the starting state.
 - An agent too old to enforce state keeps doing its own work after a switch-off; it is shown as
   enforced at the server only.
 - An agent installed without a starting state runs the shipped-on units until it first receives
-  state from the server.
+  state from the server, or is told that the control plane is unavailable (D14).
 - A fact that has gone stale keeps its last value, so a rule that depends on the absence of
   something, such as a tag, can hold a unit on after the fact has changed, until the provider
   reports again.
@@ -889,8 +891,8 @@ The decision is being followed when all of the following are true.
     request, and the operator's audit record does not wait for it.
 26. An agent upgraded from before this model runs no unit that was not in its catalogue before
     the upgrade until state covers it.
-27. A preset that keeps off every usage-class source is available at server deployment and at
-    agent install.
+27. A preset that keeps off every source that ships off today, and every other usage-class
+    source, is available at server deployment and at agent install.
 28. Before an engine is switched off, the operator is shown where it would stop, and the change
     is audited under an action of its own.
 29. After an operator resolves a regressed store, no endpoint adopts a state issued before the
