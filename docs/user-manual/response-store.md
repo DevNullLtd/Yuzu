@@ -322,29 +322,42 @@ operator-visible notes:
   are replaced with the Unicode replacement character (U+FFFD) at ingest. The
   response row is still stored and still renders (defanged) — it is not
   dropped or turned into a 500.
-- **Facets are bounded.** Each response keeps the distinct (column, value) pairs
-  of its output as facets, which drive the facet filter, group-from-results and
-  the agent-count preview. A value over 2048 bytes is excluded, never
-  truncated, and a facet filter, group-from-results or agent-count preview on
-  a value over 2048 bytes, or one containing a NUL byte, a line feed or invalid UTF-8
-  (ingest replaces those bytes with U+FFFD and splits the output on line feeds, so a stored
-  value never has them), is
-  refused with an error (the dashboard shows a message, REST answers 400 and
-  MCP -32602) instead of reporting no match. The refusal means the filter is not
-  supported, not that no agent has the value: a stored value containing a carriage return
-  can, depending on how the browser and htmx submit it, reach the server with a line feed
-  when it is picked from the dashboard, and would then be refused although an agent has it. The dashboard shows a short plain message
-  (REST and MCP carry the technical causes): "That filter value can't be searched. It may be
-  too long, or contain a line break. Shorten it or clear the filter." for a filter you set, or
-  "This View has a built-in filter on <column> that can't be used, so no results are shown.
-  Pick another View." for a View's saved filter. A View's saved filter with an empty value is
-  refused as well, because no stored field is ever empty, with "This View has a built-in
-  filter on <column> with no value, so no results are shown. Pick another View." At
-  most 5,000 facets are kept per response, chosen by most lines first, then
-  column, then value, so a rare value can be cut. The symptom is an agent
-  missing from a facet filter or preview while its response still shows in
-  the results. See `yuzu_server_response_facets_dropped_total` in
-  [metrics.md](metrics.md).
+- **Facets are bounded.** Each response keeps the distinct (column, value) pairs of its output as
+  facets, which drive the facet filter, group-from-results and the agent-count preview.
+  - **Long values.** A value over 2048 bytes is not indexed by this version. It is excluded, never
+    truncated. Older servers indexed values up to about 2704 bytes; those rows age out with
+    retention, and until then a value of 2049 to about 2704 bytes can still be listed in a facet
+    dropdown but cannot be matched.
+  - **Refused filters.** A facet filter, group-from-results or agent-count preview on a value that
+    can never equal a stored facet is refused with an error (the dashboard shows a message, REST
+    answers 400 and MCP answers -32602) instead of reporting no match. Such a value is one over 2048
+    bytes, or one containing a NUL byte, a line feed or invalid UTF-8. Ingest rewrites each NUL or
+    invalid-UTF-8 byte to U+FFFD, and it splits the output into lines at every line feed, so a
+    stored value never contains one. The refusal means the filter is not supported, not that no
+    agent has the value.
+  - **Carriage return.** A stored value that contains a carriage return can reach the server with a
+    line feed when it is picked from the dashboard, and is then refused although an agent has it.
+    This was confirmed in headless Chromium (an option value of `x\ny` was sent by htmx as `%0A`);
+    other browsers were not tested.
+  - **Dashboard wording.** The dashboard shows a short plain message. For a filter you set: "That
+    filter value can't be searched. It may be too long, or contain a line break. Shorten it or clear
+    the filter." For a View's saved filter: "This View has a built-in filter on <column> that can't
+    be used, so no results are shown. Pick another View." A View's saved filter with an empty
+    value is refused as well, because no stored field is ever empty: "This View has a built-in
+    filter on <column> with no value, so no results are shown. Pick another View." REST and MCP
+    carry the technical causes.
+  - **Request size.** The refusal bounds a single value. The transport answers a bare `414` for a
+    request target over 8192 bytes before any handler runs, so a heavily percent-encoded value
+    (about 2.7 KB decoded) or several individually legal values can still hit that limit.
+  - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column,
+    then value, so a rare value can be cut. The symptom is an agent missing from a facet filter or
+    preview while its response still shows in the results.
+  - **Lost facets are not recoverable.** A response whose facets were lost (`batch_failed`, or cut
+    by `cap`) has no facets re-derived afterwards, and nothing marks such a response as affected
+    (#5630). The workaround is to run the command again. See
+    `yuzu_server_response_facets_dropped_total` in [metrics.md](metrics.md).
+  - **Audit and counting.** The MCP direct-path refusal in `preview_management_group_agent_count`
+    writes no audit row, and refusals are not counted by any metric.
 
 ## Retention and cleanup
 

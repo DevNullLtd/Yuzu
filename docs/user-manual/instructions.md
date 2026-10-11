@@ -1487,7 +1487,7 @@ Reads are gated on `InstructionDefinition:Read`, mutations on `InstructionDefini
 
 **Limitations operators should expect:**
 
-- **Equals-op only in dashboard auto-apply.** The dashboard's filter map is exact-match; `contains`/`starts_with`/`ends_with` filters in a template are stored and returned by REST but the dashboard only auto-applies the `equals` clauses. Operators can still use the column-by-column filter controls to narrow the view further once the template is loaded.
+- **Equals-op only in dashboard auto-apply.** The dashboard's filter map is exact-match; `contains`/`starts_with`/`ends_with` filters in a template are stored and returned by REST but the dashboard only auto-applies the `equals` clauses. Operators can still use the column-by-column filter controls to narrow the view further once the template is loaded. An `equals` default that is empty, over 2048 bytes, or contains a NUL byte, a line feed or invalid UTF-8 can never match a stored value, so the dashboard refuses to show that View instead of showing an empty table (see [response-store.md](response-store.md), "Facets are bounded").
 - **Detail drawer ignores the column subset.** The expandable per-row detail drawer always shows every parsed field — hiding values there would defeat its "expand for full record" purpose.
 - **Dashboard YAML editor strips `spec.responseTemplates`.** Same caveat as `spec.visualization`. Author through `POST /api/v1/definitions/import` (JSON envelope) or the REST template endpoints.
 

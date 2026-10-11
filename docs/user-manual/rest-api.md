@@ -853,14 +853,25 @@ this route performs no mutation.
 An empty filter set (no recognised filter keys supplied) returns a genuine `0` — no scoped count
 to report, and no store read is made.
 
-A filter value longer than 2048 bytes, or containing a NUL byte, a line feed or invalid UTF-8, is refused with
-`400` (A4 envelope, `retry_after_ms: null`, not retryable) before any store read: the response
-store never indexes a facet value over that length, ingest replaces every NUL / invalid-UTF-8
-byte with U+FFFD, and ingest splits the output into lines on every line feed, so the value as
-sent cannot be stored and the request would only answer a misleading `0` (a NUL would additionally
-match as a truncated prefix). The refusal says the exact-match filter is not supported and the
-request was not evaluated; it does not claim that no agent has the value, and the message names all the causes and does not echo the value. The check applies to every filter value before its key is
-matched to a column, so it also refuses such a value under an unrecognised key.
+A filter value is refused with `400` (A4 envelope, `retry_after_ms: null`, not retryable) before any
+store read when it is longer than 2048 bytes, or contains a NUL byte, a line feed or invalid UTF-8.
+Such a value can never equal a stored facet: this version does not index a facet value over 2048
+bytes (older servers indexed up to about 2704 bytes; those rows age out with retention), ingest
+rewrites each NUL or invalid-UTF-8 byte to U+FFFD, and it splits the output into lines on every
+line feed, so a stored value contains neither. The request would otherwise answer a misleading `0`
+(a NUL would additionally match as a truncated prefix). The error says the exact-match filter is not
+supported and the request was not evaluated. It does not claim that no agent has the value, names
+all the causes and does not echo the value.
+
+The check applies to the raw value of every query parameter other than `command_id` and `plugin`,
+before its key is matched to a column, so it also refuses such a value under an unrecognised key,
+and any such parameter over 2048 bytes, whatever its name.
+
+The `400` bounds a single value. The transport rejects a request target longer than 8192 bytes
+(httplib `CPPHTTPLIB_REQUEST_URI_MAX_LENGTH`, for the whole target including the query string)
+with a bare `414` before any handler runs, so that status carries no A4 envelope. A heavily
+percent-encoded value (about 2.7 KB decoded when every byte is a 3-byte percent escape) or several
+individually legal values (for example four values of 2048 bytes) can still reach that limit.
 
 **Response:**
 
