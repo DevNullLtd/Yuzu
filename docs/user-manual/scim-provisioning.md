@@ -481,7 +481,7 @@ around:
    `204`), and an IdP's next sync sends no change for a member who is already
    out. For a **refused**, **failed** or **undetermined** demotion of a member
    who has left the group, demote the member by hand with
-   `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button. Make the call while signed in as an administrator other than that account, because a self-target answers `403` `self_role_change_blocked`. It needs a cookie session with a fresh MFA step-up, where a SAML session gets `403`, or an administrator API token, which bypasses step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)). For a refused one, a second active local
+   `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button. Make the call while signed in as an administrator other than that account, because a self-target answers `403` `self_role_change_blocked`. It needs a cookie session (an account with MFA enrolled also needs a fresh step-up: a proof older than `--mfa-step-up-window-secs`, default 300 s, answers `401` with `meta.mfa_step_up_required`, and a fresh password plus TOTP login counts; an account with no MFA enrolled is not challenged under the default `--mfa-enforcement=optional`; a SAML session gets `403`) or an administrator API token (`Authorization: Bearer` or `X-Yuzu-Token`), which is never challenged for step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)). For a refused one, a second active local
    administrator account has to exist first and the call has to be made as that
    second administrator; see [`rbac.md`](rbac.md), "If the guard refuses an
    action you intend", for the steps and for the break-glass exit when no
@@ -986,7 +986,7 @@ with a **currently-active** account.
   holds the role. One remedy per class:
   - **Failed** (`failed=`; a demotion or a promotion): the member's role may not
     be what the groups confer. Check it in Settings > User Management; if it
-    should be `user`, demote it with `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button. Make the call while signed in as an administrator other than that account, because a self-target answers `403` `self_role_change_blocked`. It needs a cookie session with a fresh MFA step-up, where a SAML session gets `403`, or an administrator API token, which bypasses step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)) and
+    should be `user`, demote it with `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button. Make the call while signed in as an administrator other than that account, because a self-target answers `403` `self_role_change_blocked`. It needs a cookie session (an account with MFA enrolled also needs a fresh step-up: a proof older than `--mfa-step-up-window-secs`, default 300 s, answers `401` with `meta.mfa_step_up_required`, and a fresh password plus TOTP login counts; an account with no MFA enrolled is not challenged under the default `--mfa-enforcement=optional`; a SAML session gets `403`) or an administrator API token (`Authorization: Bearer` or `X-Yuzu-Token`), which is never challenged for step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)) and
     revoke its sessions (Settings > User Management > Revoke sessions, or
     `DELETE /api/v1/sessions?username=<name>`, which also needs a fresh MFA step-up
     for a cookie session), then look at the store (pool
@@ -1000,12 +1000,12 @@ with a **currently-active** account.
     Management > Add User, which ignores `role`, then `POST
     /api/settings/users/{username}/role` with `{"role":"admin"}`), then demote
     the named member, signed in as the NEW administrator and not as the member,
-    with `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button. Make the call while signed in as an administrator other than that account, because a self-target answers `403` `self_role_change_blocked`. It needs a cookie session with a fresh MFA step-up, where a SAML session gets `403`, or an administrator API token, which bypasses step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)). Add User has no step-up but the role call does: if no
+    with `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button. Make the call while signed in as an administrator other than that account, because a self-target answers `403` `self_role_change_blocked`. It needs a cookie session (an account with MFA enrolled also needs a fresh step-up: a proof older than `--mfa-step-up-window-secs`, default 300 s, answers `401` with `meta.mfa_step_up_required`, and a fresh password plus TOTP login counts; an account with no MFA enrolled is not challenged under the default `--mfa-enforcement=optional`; a SAML session gets `403`) or an administrator API token (`Authorization: Bearer` or `X-Yuzu-Token`), which is never challenged for step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)). Add User has no step-up but the role call can ask for one: if no
     administrator session can pass it, use the break-glass account. See
     [`rbac.md`](rbac.md), "If the guard refuses an action you intend", for that
-    exit, and demote or remove the temporary local administrator afterwards, once a
-    permanent administrator exists (the temporary account is the last one after
-    the demotion, so the guard refuses its removal until then). A later
+    exit, and demote or remove the temporary local administrator afterwards from a
+    permanent administrator account once one exists (it cannot demote or delete
+    itself: `403` `self_role_change_blocked`). A later
     change that names the user through another group also re-derives the role.
   - **Undetermined** (`undetermined=`): a read failed, so the role was left
     untouched and it is not known whether an administrator was kept. Check each
