@@ -1916,7 +1916,8 @@ group** — that removal demotes them back to `user` via the next
 `recompute_scim_user_role` call, at which point the next deactivate/delete
 call proceeds normally. If that user is the last protected administrator the
 demotion is refused instead: the role stays `admin` and the `404` persists until
-another administrator exists AND the user's role is demoted by hand (a re-send of
+another administrator exists AND the user's role is demoted by hand (`POST
+/api/settings/users/{username}/role` with `{"role":"user"}`; a re-send of
 the Group change cannot do it: the member has already left the group) or by a
 later change that names the user (see `docs/user-manual/rbac.md`, "Last-Administrator
 guard for account deactivation and demotion" and "Group role recompute"). This was evaluated and accepted rather than
@@ -2333,9 +2334,9 @@ principals=N` in `detail` on success, and `partial` is now a possible
 `result` for those two actions specifically (a non-persisted credential
 revoke — see "Deprovision-time revoke" above), in addition to the existing
 `success`/`failure`. When the detail lists the revoked principals
-(`revoked_principals=a,b,c`), each principal string is tokenised before it is
+(`revoked_principals=a,b,c`), each principal string is tokenized before it is
 written (#4966, CWE-117): `,`, space, `=`, control bytes and every byte
->= 0x80 become `_`, and a string over 256 bytes is shortened. The tokenisation
+>= 0x80 become `_`, and a string over 256 bytes is shortened. The tokenization
 is **lossy**: two distinct principals (for example two OIDC subjects differing
 only in a non-ASCII character) can collapse into one token, so a SIEM rule
 must not treat the list as an identity key; the exact identities are in the
