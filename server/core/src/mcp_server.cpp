@@ -10007,15 +10007,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (args.contains("filters")) {
                     if (!args["filters"].is_object()) {
                         res.set_content(
-                            error_response(id, kInvalidParams, "filters must be an object"),
+                            a4_error(kInvalidParams, "filters must be an object",
+                                     "Send filters as a JSON object of string values"),
                             "application/json");
                         return;
                     }
                     for (const auto& [key, value] : args["filters"].items()) {
                         if (!value.is_string()) {
                             res.set_content(
-                                error_response(id, kInvalidParams,
-                                               "filters values must be strings"),
+                                a4_error(kInvalidParams, "filters values must be strings",
+                                         "Send every filters value as a JSON string"),
                                 "application/json");
                             return;
                         }
