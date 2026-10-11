@@ -125,10 +125,11 @@ inline constexpr std::size_t kMaxFacetValueBytes = 2048;
 /// deliberately does NOT claim that no agent has the value: the predicate refuses a line feed
 /// but accepts a CR, and a stored value holding a CR may reach the server with an LF when it
 /// is picked from the dashboard dropdown (the HTML parser and form submission normalise
-/// newlines; reasoned from the HTML spec, not browser-verified), in which case it is refused
-/// here although an agent has it. Sentence case with no final
-/// period, so the dashboard can join message + ". " + <its own provenance sentence>; the REST
-/// and MCP envelopes carry the message and the remediation in their own fields.
+/// newlines: confirmed in headless Chrome, where an option value 'x\ny' was sent by htmx as
+/// %0A; only that one engine, Chromium, was tested), in which case it is refused here although
+/// an agent has it. The REST and MCP envelopes carry this message and the remediation in their
+/// own fields. The dashboard does not use this builder: it words its refusal separately, in
+/// plain language (dashboard_routes.cpp).
 [[nodiscard]] inline std::string facet_filter_value_refusal_message() {
     return std::format("This exact-match filter is not supported: the value is longer than {} "
                        "bytes, or it contains a NUL byte, a line feed or invalid UTF-8. The "

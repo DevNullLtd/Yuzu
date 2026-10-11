@@ -654,6 +654,9 @@ void ResponseStore::store(const StoredResponse& resp) {
                 if (sp.status() != PGRES_COMMAND_OK) {
                     spdlog::warn("ResponseStore: facet SAVEPOINT failed for response_id={}: {}",
                                  response_id, PQerrorMessage(conn));
+                    // Never published: with_txn_for refuses to commit on this branch (the
+                    // transaction is aborted), so store() returns early and the whole
+                    // response is counted by ingest_dropped{query_error} instead.
                     facets_batch_failed = flat.size();
                 } else {
                     bool facets_ok = true;
