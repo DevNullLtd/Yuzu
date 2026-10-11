@@ -2287,7 +2287,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   not fair (with one such writer a stage was still unserved after more than 3 minutes, and
   the run was killed); no production caller that does this was identified. All of this
   predates #5604 and is not fixed here (a pre-existing residual of the store's single
-  mutex); to be tracked as a follow-up in the #5604 decision comment.
+  mutex); tracked as #5642.
   **Trace decision (AC2)**: a watchdog-cut flush stays untraceable at stop time (decided by
   the implementer, not accepted by a stakeholder; `hard_exit` forbids a log line, and a
   KV marker would fail on the same store); the
@@ -2340,8 +2340,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   while `prefer_spark_` is false. The KvStore handler, the 1 s stop budget, the stop-time
   loss-ledger write and the sync scheduler's, license scan's and plugin `shutdown()` writes at
   that budget are LIVE in released agents.
-  **Residual (stands; a flip-gate item, to be tracked in the #5604 decision comment and
-  #3756)**: the busy handler only bounds lock waits. An fsync or
+  **Residual (stands; a flip-gate item, to be tracked in #3756)**: the busy handler only bounds lock waits. An fsync or
   other slow-I/O stall inside a write is not a lock event and no handler runs, so a stalled
   disk still runs into the watchdog. On every platform SQLite's WAL-index retry sleeps run
   outside the handler, so the bound is per statement step, not per call: a busy wait that
@@ -2360,9 +2359,9 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   evidence is still sampled. The Stop pass runs once per engine: a second `stop()` call
   (`run()`'s exit teardown, the destructor) returns before it, so a store that heals between
   the two calls does not get back a capture the first call skipped or failed (pre-existing
-  from #4045; pinned by a test, not changed here).
+  from #4045; pinned by a test, not changed here; tracked as #5641).
   Supervisor stop timeouts are implicit and may be shorter than the 20 s grace (Docker
-  agent services stop at 10 s, so exit code 4 never appears there). A remaining-deadline
+  agent services stop at 10 s, so exit code 4 never appears there; tracked as #5643). A remaining-deadline
   wall threaded through every stage was considered and not done.
   **Not done (diagnosability)**: no log line marks the moment the budget is lowered and no
   end-of-stop line reports per-stage timings. An operator therefore cannot see that the 1 s
