@@ -1145,9 +1145,10 @@ Linux `--num-processes 2` that is 8 rounds of two shards, so 8 * 700 = 5600s
 up-to-30-minute slot wait (`YUZU_TEST_SLOT_TIMEOUT_MIN`) it is about 123
 minutes, before checkout and build time. The actual dev base of 12 shards was
 6 rounds, 4200s = 70 minutes, which cleared the job limit on its own (about
-100 minutes with the slot wait). This is the first shard count where the
+100 minutes with the slot wait). This is the first shard count on dev where the
 all-at-cap ceiling alone, without the slot wait, passes the 90-minute job
-limit. It is still a ceiling that requires every shard to hit its own cap,
+limit (an intermediate 15-shard layout that never reached dev was also 8
+rounds). It is still a ceiling that requires every shard to hit its own cap,
 not an expected case: the degenerate figure applies only when every shard
 runs to 700s, and the makespan is lower whenever any shard finishes under its
 cap (the earlier "BEST and WORST makespan are the same number" holds only in
@@ -1155,8 +1156,10 @@ that all-at-cap case). The expected case moves the other way, see the
 measured 16-shard Windows run below. On Windows the pg step runs
 `--num-processes 6` (`ci.yml`, "Test (pg shards, full)" in the `windows`
 job), so 16 shards are ceil(16/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
-65 minutes with a 30-minute slot wait, under that job's `timeout-minutes:
-120`. The Linux ceiling is the one that needs attention: the "revisit the
+65 minutes with a 30-minute slot wait for the pg step alone. The job also
+acquires a slot for its non-pg step, so the worst case with both 30-minute
+waits is 95 minutes plus that step's own run time, still under that job's
+`timeout-minutes: 120`. The Linux ceiling is the one that needs attention: the "revisit the
 700s per-shard budget or the Linux `--num-processes 2` cap" follow-up
 tracked on #3443 (see the shard-K paragraph above) now has a concrete
 trigger. Neither number is adjusted here. The tag assignment is the tuning
