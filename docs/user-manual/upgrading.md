@@ -91,6 +91,42 @@ this release or any other, until its schema is replaced (see
 [Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)); rolling forward
 does not restore it.
 
+## Behaviour change: an unmatchable facet filter value is refused, not answered as zero (#5623)
+
+**Breaking for scripts that relied on a `200` with `agent_count: 0`.** `GET
+/api/v1/management-groups/agent-count-preview` and MCP `preview_management_group_agent_count` used to
+answer `200` with `agent_count: 0` for a filter value that can never match a stored facet. They now
+refuse it: REST answers `400` (A4 envelope, `retry_after_ms: null`, not retryable) and MCP answers
+`-32602`. A value is refused when it is over 2048 bytes or contains a NUL byte, a line feed or invalid
+UTF-8. The `0` was a false answer (the request was never evaluated), which is why this is fixed
+rather than versioned. [`api-versioning-policy.md`](../api-versioning-policy.md) lists narrowing
+accepted input as Breaking; this is a deliberate correctness fix and no security carve-out is claimed.
+
+- The check runs on the raw values before the filter key is resolved, so the same value under an
+  unrecognised key is refused too (it used to be silently ignored and answered `0`).
+- On the REST route every query parameter other than `command_id` and `plugin` is treated as a
+  filter, so ANY such parameter over 2048 bytes is refused as well, whatever its name.
+- A script that previously saw `0` and treated it as "no agent has this value" must now handle `400`
+  / `-32602` and choose a different or shorter criterion.
+- **Stored values.** Older servers indexed a facet value of 2049 to about 2704 bytes; this version does
+  not index values over 2048 bytes (they are left out of the response's facets, never truncated). After
+  the upgrade such a value, already stored, cannot be matched, and the dashboard refuses to use one that
+  is picked from a facet dropdown (the dropdown can still list it) until retention removes the row.
+- **Dashboard.** `/fragments/results` and the create-group fragment answer HTTP `200` with a
+  refusal row (`data-filter-refused`) instead of an empty table, because htmx drops `4xx` bodies. The
+  `POST` group-from-results answers `400`, whose body htmx does not display. A View whose saved
+  `equals` filter has an empty value is refused on the results table too.
+- Above 5000 distinct facets per response, the 5000 kept are now chosen in a fixed order (most lines
+  first, then column, then value). Before, they were whichever the server happened to hold first.
+
+**Rolling upgrade.** An old replica still loses ALL facets of a response that carries a value over
+about 2.6 KB, so `group-from-results` served by an old replica builds its durable group from that
+short set. Complete the rollout before using group-from-results on the output of a command with very
+long fields.
+
+See [`response-store.md`](response-store.md) (Facets are bounded), the REST route in
+[`rest-api.md`](rest-api.md) and tool 83 in [`mcp.md`](mcp.md).
+
 ## Behaviour change: response routes parse numeric parameters strictly and exports are bounded (#4644, #4703)
 
 **Breaking for scripts that relied on a malformed value being silently misread.** On the legacy
