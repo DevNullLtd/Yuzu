@@ -1,0 +1,1 @@
+- Guardian compliance census: a `guard.errored` lifecycle event (spark subscription-death detach, #2818) now sets the per-(agent, rule) state to `errored` instead of leaving the last verdict in place. Inert until the agent's `prefer_spark` default flips; no schema, REST or MCP shape change.
