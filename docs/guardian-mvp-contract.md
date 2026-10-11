@@ -116,7 +116,9 @@ used as-is — they aren't renames, so they create no split-brain.
    - `event_type` is an **open string** over a **frozen v1 taxonomy**:
      `drift.detected`, `guard.armed`, `guard.compliant`, `guard.unhealthy` (MVP);
      `drift.remediated`, `remediation.failed` (remediate); `resilience.escalated`,
-     `reconciliation.swept` (later). Unknown types render generic, not broken.
+     `reconciliation.swept` (later); `guard.errored` (lifecycle detach, #2818, spark
+     backend only, dormant until `prefer_spark` ships). Unknown types render generic,
+     not broken.
      `guard.compliant` is the agent's **on-change** signal that a watched value is at /
      returned to expected (emitted on the compliant↔drift edge only, never in steady
      state); it drives the server-side compliance census (`guardian_agent_rule_status`)

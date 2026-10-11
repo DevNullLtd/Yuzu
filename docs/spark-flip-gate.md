@@ -2384,10 +2384,11 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   Decision and implementation: #5604.
 - Owner: not assigned for any item above.
 - Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + two remaining pre-PR-5 GATING items
-  (the three sre observability gaps; the
-  yuzu.guardian_backend server-side-reader gap; guard.errored census recognition, C-1, is done by #5667; plus, from #4045, the fleet-visible
+  from the PR-2d follow-ups (the three sre observability gaps; the
+  yuzu.guardian_backend server-side-reader gap), plus two items from #4045 (the fleet-visible
   baseline-persist signal (F14 precondition, section 3a) and the missing
-  remaining-deadline wall in `stop()`) - no issue numbers, tracked here; those two #4045 items
+  remaining-deadline wall in `stop()`); the third PR-2d follow-up, guard.errored census
+  recognition (C-1), is done by #5667 - no issue numbers, tracked here; those two #4045 items
   are tracked in #5605 (fleet signal) and #5604 (the `stop()` deadline; the decision closes
   with the stop busy budget, while the slow-I/O residual stays F14-gating, section 5, and
   the lifecycle-journal records lost at stop are a further F14 precondition there: a fleet
