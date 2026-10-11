@@ -32,7 +32,8 @@ init_includes_cluster_discovery_child_spec_test() ->
 %%% asserted on the child specs the supervisor starts.
 %%%-------------------------------------------------------------------
 
--define(CORE, [yuzu_gw_registry, yuzu_gw_upstream, yuzu_gw_heartbeat_buffer, yuzu_gw_router,
+-define(CORE, [yuzu_gw_registry, yuzu_gw_upstream, yuzu_gw_upstream_pressure,
+               yuzu_gw_heartbeat_buffer, yuzu_gw_router,
                yuzu_gw_gauge, yuzu_gw_cluster_discovery, yuzu_gw_health, yuzu_gw_agent_sup]).
 
 entry(Name) ->
@@ -123,8 +124,9 @@ channel_children_precede_their_callers_test() ->
         ?assertEqual([pg_scope, yuzu_gw_registry,
                       {yuzu_grpc_client_channel, default_channel},
                       {yuzu_grpc_client_channel, second_channel},
-                      yuzu_gw_upstream, yuzu_gw_heartbeat_buffer, yuzu_gw_router,
-                      yuzu_gw_gauge, yuzu_gw_cluster_discovery, yuzu_gw_health, yuzu_gw_agent_sup],
+                      yuzu_gw_upstream, yuzu_gw_upstream_pressure, yuzu_gw_heartbeat_buffer,
+                      yuzu_gw_router, yuzu_gw_gauge, yuzu_gw_cluster_discovery, yuzu_gw_health,
+                      yuzu_gw_agent_sup],
                      child_ids())
     end) end).
 

@@ -916,6 +916,11 @@ listener `{yuzu_grpc, Name}` reports `running`, shown as `listeners` in the chec
 them to route the AgentService (the same rule as boot: the entry's `services` map has the key `'yuzu.agent.v1.AgentService'`); an empty list, or a list with no entry that routes it, is ready only with `allow_no_listeners` set to `true`. It asks
 Ranch and does not connect to the ports. A listener that has stopped therefore turns
 `/readyz` red (503) instead of leaving a "ready" gateway that accepts nothing.
+Its `circuit_breaker` check reads the breaker state the `yuzu_gw_upstream` process publishes and
+does not call the process. Before, it called it: the call queued behind the RPC in progress, so
+against a slow server it waited out its 5 s timeout and `/readyz` answered 503 although the
+breaker was closed, which would have taken every gateway out of a load balancer's rotation at the
+moment the server was slow. A slow server is not a readiness input (see "Slow server").
 
 **Registration replay tuning** (application env keys read by the upstream
 client at start, except `upstream_call_timeout_ms`, which is read on every call; set them in the `yuzu_gw` section of `sys.config`. No
@@ -2626,8 +2631,60 @@ plus the call.
 
 | Symptom | What you see | Cause | Action |
 |---|---|---|---|
-| Agents slow to come back after a server restart on a large fleet | The server log shows more than one `[gateway] ProxyRegister succeeded` line per agent (5.9 attempts per agent in the 2000-agent stock run); agents give up on a `Register` after 30 s; `yuzu_gw_upstream_rpc_duration_ms` for the `register` rpc name has a mean near 40 ms | Before the `upstream_tcp_nodelay` change, the 43 ms per-`Register` Nagle delay (OBSERVED on a rig, see above); also a slow server, because the upstream process runs one call at a time | Confirm `upstream_tcp_nodelay` is not `false` in the `yuzu_gw` section of `sys.config` (and that no endpoint has a hand-set `{nodelay, false}`); check the server's `ProxyRegister` latency. There is no queue metric for the upstream process: the mailbox depth was read on a rig with `process_info`, and no metric or log line shows it |
+| Agents slow to come back after a server restart on a large fleet | The server log shows more than one `[gateway] ProxyRegister succeeded` line per agent (5.9 attempts per agent in the 2000-agent stock run); agents give up on a `Register` after 30 s; `yuzu_gw_upstream_rpc_duration_ms` for the `register` rpc name has a mean near 40 ms | Before the `upstream_tcp_nodelay` change, the 43 ms per-`Register` Nagle delay (OBSERVED on a rig, see above); also a slow server, because the upstream process runs one call at a time | Confirm `upstream_tcp_nodelay` is not `false` in the `yuzu_gw` section of `sys.config` (and that no endpoint has a hand-set `{nodelay, false}`); check the server's `ProxyRegister` latency. A slow server shows as `yuzu_gw_upstream_slow` 1 and a duty cycle (`yuzu_gw_upstream_backpressure_duty_cycle`) near 1; see "Slow server" below |
 | Registrations are being abandoned while the gateway is busy | `yuzu_gw_upstream_calls_dropped_total{rpc_name="register"}` rises; agents log `Register` deadline errors or retry in a loop | The serial upstream process is saturated and clients reset the stream or hit their deadline while their `Register` was still queued; the queued call is skipped (counted) instead of creating a server session for a request nobody is waiting for | Look at the cause of the saturation (a slow server `ProxyRegister`, a restart herd; see the table above). A caller that is alive but has stopped waiting is not detected, so a skip count of 0 does not prove no call ran for an abandoned request. The share of attempts skipped is the ratio query in the metrics table |
+
+**Slow server.** A gateway reaches the server through lanes of bounded capacity, and
+"slow" is defined from how often those lanes are full, not from a latency figure.
+
+- A lane is *saturated* at an instant when work is waiting on it or would be refused. There are
+  three. `serial`: the `yuzu_gw_upstream` process is inside an RPC of its own (a proxied
+  `Register` or `Inventory`, a registration-replay step) and at least one message waits in its
+  mailbox; it runs one RPC at a time, so everything that arrives during one waits. `notify`: all 10
+  stream-status notification slots are held, so the next notification would be dropped
+  (`yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`). `guardian`: all 50 Guardian
+  forward slots are held.
+- *Backpressure* is present at an instant when at least one lane is saturated. The *duty cycle* is
+  the share of a window during which it was present, 0 to 1.
+- A *slow server*, as one gateway sees it, is a duty cycle of **0.5 or more over the last 60 s**
+  (`yuzu_gw_upstream_slow` is 1): for at least half of the last minute, work waited on the server
+  or was refused because it answered slower than work arrived. Exactly 0.5 counts. The window is 60
+  one-second buckets, and until the gateway has run for a minute the missing seconds count as not
+  saturated, so after a start the figure can only read low.
+
+| To see | Query |
+|---|---|
+| This gateway's duty cycle over any window | `rate(yuzu_gw_upstream_backpressure_seconds_total[5m])` |
+| The same over the last 60 s, and the flag | `yuzu_gw_upstream_backpressure_duty_cycle`, `yuzu_gw_upstream_slow` |
+| Which lane | `rate(yuzu_gw_upstream_lane_saturated_seconds_total[5m])` by `lane`. The lanes overlap: never add them |
+| The server or its database, not one gateway | `avg(yuzu_gw_upstream_slow)` across the gateways. Near 1 means every gateway sees it; one gateway at 1 among many at 0 points at that gateway or its path |
+| Slow, or just a lot of work | `histogram_quantile(0.5, sum by (le) (rate(yuzu_gw_upstream_rpc_duration_ms_bucket{rpc_name="register"}[5m])))` beside the duty cycle |
+
+How it is measured: a process in the gateway samples the lanes every 100 ms. It reads the
+`yuzu_gw_upstream` process's state without calling it (a call would wait for the slow RPC being
+measured), credits each sample with the time until the next, and credits one step at most 1 s, so a
+stalled VM does not credit a minute. It is a sampled estimate with a resolution of 100 ms: a state
+that begins and ends between two samples is missed. The same reading is why `/readyz` no longer
+queues behind the upstream process.
+
+What it does not tell apart, and does not do:
+
+- A server that answers slowly, and more work than one serial lane drains at a healthy server's pace
+  (every agent of a restarted fleet registering at once), both read as a slow server: the server's
+  service rate is below the rate work arrives, which is the thing measured. The latency histogram in
+  the table says which it was.
+- The mailbox condition counts any waiting message, including the bookkeeping message that follows a
+  finished notification, so the `serial` lane can read slightly high while notifications flow.
+- It is one figure for the gateway, not one per upstream endpoint. With several servers behind a
+  channel it does not say which server is slow; per-endpoint state is not exported yet (#5648,
+  #5655).
+- It does not change what the gateway does. A slow server is a reason to look, not a readiness
+  input: the gateways left in rotation would carry the same load against the same server. The
+  breaker is unchanged and still counts only failed calls, so a server that answers every call in 3
+  to 5 s never opens it; this is how that case is seen.
+- No alert rule ships for it.
+- Covered by unit tests against a mocked server whose RPC does not return and against synthetic
+  samples; not run against a live server.
 
 **Several core replicas.** The verdict and replay reconcile is correct and
 bounded on one core replica. On several replicas it converges in one round only
@@ -3145,6 +3202,10 @@ that are actually emitted are listed.
 | `yuzu_gw_grpc_origin_ignored_total` | counter | gRPC calls on a listener configured as behind a proxy whose claimed client address was not used (labels `mode` = `proxy_protocol` or `forwarded_for`, `reason` = `untrusted_source`, `no_claim` or `bad_claim`). The call is served either way: for `untrusted_source` it is attributed to the TCP peer, for `no_claim` and `bad_claim` it is sent upstream with no observed address (empty `gateway_observed_peer`; the server records `origin_observed=false`). Created at 0 for every pair at start; no listener label. See [Client addresses behind a proxy](#client-addresses-behind-a-proxy) and [Origin counters](#origin-counters). |
 | `yuzu_gw_grpc_dropped_data_bytes_total` | counter | Request bytes the gRPC layer discarded in a state that must not run a handler (label `reason`, closed set: `extra_request_data` = a second message on a unary call, `stream_ended` = data after the stream's status). |
 | `yuzu_gw_upstream_calls_dropped_total` | counter | Queued upstream proxy calls skipped because the requesting gRPC call had already ended: the client reset the stream or its deadline passed while the call waited behind the serial `yuzu_gw_upstream` process (label `rpc_name`, closed set `register` and `inventory`, both created at 0 at start; any other value would be counted as `unknown`, and none is emitted today). A skipped `Register` is never sent to the server, so it creates no server session. Only a requesting process that has exited is detected; a caller that is alive but has stopped waiting (it passed `upstream_call_timeout_ms`) is not, and its call still runs. A steady rate means clients are abandoning registrations while the upstream is saturated. The share skipped, relative to registrations successfully forwarded upstream (errors are not in the denominator, so the figure overstates the share while the server is returning errors), is `rate(yuzu_gw_upstream_calls_dropped_total{rpc_name="register"}[5m]) / (rate(yuzu_gw_upstream_calls_dropped_total{rpc_name="register"}[5m]) + rate(yuzu_gw_upstream_rpc_duration_ms_count{rpc_name="register"}[5m]))`. |
+| `yuzu_gw_upstream_backpressure_seconds_total` | counter | Seconds during which the path to the server was backed up: at least one lane saturated (the `yuzu_gw_upstream` process inside an RPC of its own with a message waiting, all 10 stream-status notification slots held, or all 50 Guardian forward slots held). `rate()` of it over a window is the backpressure duty cycle, 0 to 1. Sampled every 100 ms. See "Slow server" in the gateway manual |
+| `yuzu_gw_upstream_lane_saturated_seconds_total` | counter | The same, per lane (label `lane`: `serial`, `notify`, `guardian`; all three created at 0 at start). The lanes overlap, so never add them: the figure for the gateway as a whole is the counter above |
+| `yuzu_gw_upstream_backpressure_duty_cycle` | gauge | The backpressure duty cycle over the last 60 s, 0 to 1. Reads low for the first minute after a start (the missing seconds count as not saturated) |
+| `yuzu_gw_upstream_slow` | gauge | 1 when the duty cycle above is 0.5 or more (a slow server, as this gateway sees it), else 0. Not a readiness input |
 | `yuzu_gw_session_limit_rejected_total` | counter | Registrations refused because one connection already holds the configured number of agent sessions, pending plus live (`max_sessions_per_connection`, default 8). Unlabelled, created at 0 at start. A `Register` over the cap is answered `UNAVAILABLE` (14); a `Subscribe` over the cap is also answered `UNAVAILABLE` (14) and is counted the same. A stock agent holds one session per connection (INFERRED), so a rise points to an L4 balancer, forwarder or client that carries several agents on one connection; see "Per-connection session cap" under Configuration. |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and

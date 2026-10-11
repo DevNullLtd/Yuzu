@@ -65,6 +65,10 @@
          forward_guardian_message/2,
          replay_sessions/1,
          circuit_state/0]).
+%% Read without a call into this process, so they answer while it is inside a
+%% slow RPC: the breaker state for /readyz, the lane counts for the pressure
+%% sampler (yuzu_gw_upstream_pressure).
+-export([circuit_state_now/0, lane_snapshot/0]).
 -export([classify_tls_error/1]).  %% for testing (R-3 TLS-error classifier)
 -export([call_timeout/0]).        %% for testing (upstream_call_timeout_ms validation)
 %% The reason/stacktrace redaction format_status/1 applies, shared with the
@@ -100,6 +104,28 @@
 %% ?MAX_VERDICT_IDS in yuzu_gw_heartbeat_buffer, which applies it before the
 %% cast; keep the two equal.
 -define(MAX_REPLAY_SESSION_IDS, 4096).
+
+%% The lock-free cell: an `atomics' array behind a persistent_term, written only
+%% by this process and read by anyone. It exists because everything else this
+%% process knows is behind its mailbox, and a mailbox read waits for the RPC in
+%% progress; the two readers (the readiness probe and the pressure sampler) are
+%% the ones that must answer exactly when that RPC is slow.
+%%   CB        the breaker state (CB_CLOSED, CB_OPEN, CB_HALF_OPEN)
+%%   IN_RPC    1 while this process is inside an RPC it makes itself (a proxied
+%%             Register or Inventory, a replay step), 0 otherwise. The notify and
+%%             Guardian workers run their RPCs in their own processes and do not
+%%             set it.
+%%   NOTIFY    stream-status notifications in flight (of MAX_NOTIFY_INFLIGHT)
+%%   GUARDIAN  Guardian forwards in flight (of MAX_GUARDIAN_INFLIGHT)
+-define(CELL, {?MODULE, cell}).
+-define(CELL_SLOTS, 4).
+-define(CELL_CB, 1).
+-define(CELL_IN_RPC, 2).
+-define(CELL_NOTIFY, 3).
+-define(CELL_GUARDIAN, 4).
+-define(CB_CLOSED, 0).
+-define(CB_OPEN, 1).
+-define(CB_HALF_OPEN, 2).
 
 %% CC-03 wire-capability handshake (proto/yuzu/gateway/v1/gateway.proto,
 %% StreamStatusNotification.wire_capabilities): the literal this gateway
@@ -208,6 +234,85 @@ replay_sessions(SessionIds) ->
 circuit_state() ->
     gen_server:call(?SERVER, circuit_state, 5000).
 
+%% @doc The circuit breaker state as last published by this process, read
+%% without a call into it. circuit_state/0 queues behind whatever RPC the process
+%% is making, so against a slow server it waits (it gives up after 5 s) and a
+%% readiness probe built on it fails although the breaker is closed. Exits with
+%% `noproc' when this process is not running, as a call would.
+-spec circuit_state_now() -> closed | open | half_open.
+circuit_state_now() ->
+    case {whereis(?SERVER), persistent_term:get(?CELL, undefined)} of
+        {Pid, Cell} when is_pid(Pid), Cell =/= undefined ->
+            case atomics:get(Cell, ?CELL_CB) of
+                ?CB_OPEN      -> open;
+                ?CB_HALF_OPEN -> half_open;
+                _             -> closed
+            end;
+        _ ->
+            exit({noproc, {?MODULE, circuit_state_now}})
+    end.
+
+%% @doc What the pressure sampler needs, read without a call into this process:
+%% whether it is inside an RPC of its own, how many messages wait in its mailbox,
+%% and the in-flight count and limit of each worker lane. `undefined' when the
+%% process is not running. See yuzu_gw_upstream_pressure for what is made of it.
+-spec lane_snapshot() -> undefined | #{in_rpc := boolean(),
+                                       mailbox_len := non_neg_integer(),
+                                       notify_inflight := non_neg_integer(),
+                                       notify_limit := pos_integer(),
+                                       guardian_inflight := non_neg_integer(),
+                                       guardian_limit := pos_integer()}.
+lane_snapshot() ->
+    case {whereis(?SERVER), persistent_term:get(?CELL, undefined)} of
+        {Pid, Cell} when is_pid(Pid), Cell =/= undefined ->
+            case erlang:process_info(Pid, message_queue_len) of
+                {message_queue_len, Len} ->
+                    #{in_rpc            => atomics:get(Cell, ?CELL_IN_RPC) =:= 1,
+                      mailbox_len       => Len,
+                      notify_inflight   => atomics:get(Cell, ?CELL_NOTIFY),
+                      notify_limit      => ?MAX_NOTIFY_INFLIGHT,
+                      guardian_inflight => atomics:get(Cell, ?CELL_GUARDIAN),
+                      guardian_limit    => ?MAX_GUARDIAN_INFLIGHT};
+                undefined ->
+                    undefined
+            end;
+        _ ->
+            undefined
+    end.
+
+%% Create the cell on first use and zero it on every start, so a restarted
+%% process never inherits the previous one's `in an RPC'. The term is put once
+%% and kept: replacing a persistent_term makes the VM scan every process.
+init_cell() ->
+    Cell = case persistent_term:get(?CELL, undefined) of
+               undefined ->
+                   New = atomics:new(?CELL_SLOTS, [{signed, false}]),
+                   persistent_term:put(?CELL, New),
+                   New;
+               Existing ->
+                   Existing
+           end,
+    [atomics:put(Cell, Slot, 0) || Slot <- lists:seq(1, ?CELL_SLOTS)],
+    ok.
+
+cell_put(Slot, Value) ->
+    case persistent_term:get(?CELL, undefined) of
+        undefined -> ok;
+        Cell      -> atomics:put(Cell, Slot, Value)
+    end.
+
+publish_breaker(closed)    -> cell_put(?CELL_CB, ?CB_CLOSED);
+publish_breaker(open)      -> cell_put(?CELL_CB, ?CB_OPEN);
+publish_breaker(half_open) -> cell_put(?CELL_CB, ?CB_HALF_OPEN).
+
+%% Run an RPC this process makes itself, one at a time, with the lane marked busy
+%% for as long as it lasts.
+serial(Fun) ->
+    cell_put(?CELL_IN_RPC, 1),
+    try Fun()
+    after cell_put(?CELL_IN_RPC, 0)
+    end.
+
 %% How long proxy_register/1 and proxy_inventory/1 wait for the upstream
 %% process. The application env key upstream_call_timeout_ms (ms, valid
 %% 100..300000, default 30000) overrides the default; it exists so a test can
@@ -239,6 +344,8 @@ init([]) ->
                 "replay_spacing=~bms, replay_session_guard=~bms, replay_queue_max=~b, "
                 "cluster_id=~s)",
                 [Threshold, BaseTimeout, ReplaySpacing, SessionGuard, QueueMax, ClusterId]),
+
+    ok = init_cell(),
 
     {ok, #state{
         notify_pids     = #{},
@@ -290,7 +397,7 @@ handle_call({proxy_register, RegisterReq}, From, State) ->
                 {reject, State1} ->
                     {reply, {error, circuit_open}, State1};
                 {allow, State1} ->
-                    Result = do_rpc('ProxyRegister', RegisterReq, register),
+                    Result = serial(fun() -> do_rpc('ProxyRegister', RegisterReq, register) end),
                     State2 = record_result(Result, State1),
                     {reply, Result, State2}
             end
@@ -305,7 +412,7 @@ handle_call({proxy_inventory, InventoryReport}, From, State) ->
                 {reject, State1} ->
                     {reply, {error, circuit_open}, State1};
                 {allow, State1} ->
-                    Result = do_rpc('ProxyInventory', InventoryReport, inventory),
+                    Result = serial(fun() -> do_rpc('ProxyInventory', InventoryReport, inventory) end),
                     State2 = record_result(Result, State1),
                     {reply, Result, State2}
             end
@@ -370,7 +477,9 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr, StreamHo
                                                [AgentId, Reason])
                         end
                     end),
-                    {noreply, State#state{notify_pids = Pids#{Pid => true}}}
+                    NewPids = Pids#{Pid => true},
+                    cell_put(?CELL_NOTIFY, map_size(NewPids)),
+                    {noreply, State#state{notify_pids = NewPids}}
             end
     end;
 
@@ -407,7 +516,9 @@ handle_cast({forward_guardian_message, AgentId, ResponseFrame},
                                                [AgentId, Reason])
                         end
                     end),
-                    {noreply, State#state{guardian_pids = GPids#{Pid => true}}}
+                    NewGPids = GPids#{Pid => true},
+                    cell_put(?CELL_GUARDIAN, map_size(NewGPids)),
+                    {noreply, State#state{guardian_pids = NewGPids}}
             end
     end;
 
@@ -580,14 +691,18 @@ handle_info(circuit_half_open, State) ->
     telemetry:execute([yuzu, gw, upstream, circuit_state],
                       #{count => 1},
                       #{state => <<"half_open">>}),
+    publish_breaker(half_open),
     {noreply, State#state{cb_state = half_open, cb_timer = undefined}};
 
 handle_info({'DOWN', _MonRef, process, Pid, _Reason},
             #state{notify_pids = Pids, guardian_pids = GPids} = State) ->
     %% A finished notify OR guardian-forward worker. Remove from whichever set
     %% holds it (maps:remove on an absent key is a no-op, so both are safe).
-    {noreply, State#state{notify_pids = maps:remove(Pid, Pids),
-                          guardian_pids = maps:remove(Pid, GPids)}};
+    NewPids = maps:remove(Pid, Pids),
+    NewGPids = maps:remove(Pid, GPids),
+    cell_put(?CELL_NOTIFY, map_size(NewPids)),
+    cell_put(?CELL_GUARDIAN, map_size(NewGPids)),
+    {noreply, State#state{notify_pids = NewPids, guardian_pids = NewGPids}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -606,7 +721,9 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
     %% every upstream reconnect (which would otherwise let a zombie replay
     %% clobber a live agent's route once the routing directory is
     %% dispatch-authoritative, WS-4 4.2).
-    Result = do_rpc_replay('ProxyRegister', RegisterReq, register, SessionId),
+    Result = serial(fun() ->
+                        do_rpc_replay('ProxyRegister', RegisterReq, register, SessionId)
+                    end),
     NewState =
         case Result of
             {ok, #{accepted := false} = Response} ->
@@ -892,6 +1009,7 @@ on_success(#state{cb_state = half_open, cb_base_timeout = BaseTimeout} = State) 
     telemetry:execute([yuzu, gw, upstream, circuit_state],
                       #{count => 1},
                       #{state => <<"closed">>}),
+    publish_breaker(closed),
     {State#state{
         cb_state      = closed,
         cb_failures   = 0,
@@ -922,6 +1040,7 @@ trip_circuit(#state{cb_cur_timeout = CurTimeout, cb_max_timeout = MaxTimeout} = 
                       #{count => 1},
                       #{state => <<"open">>}),
 
+    publish_breaker(open),
     State#state{
         cb_state      = open,
         cb_cur_timeout = NewTimeout,

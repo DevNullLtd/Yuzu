@@ -66,6 +66,12 @@
     %% had already ended (yuzu_gw_upstream).
     [yuzu, gw, upstream, call_dropped],
 
+    %% How much of the time the path to the server is backed up
+    %% (yuzu_gw_upstream_pressure): the seconds credited since the last event,
+    %% and the trailing duty cycle with the slow-server flag derived from it.
+    [yuzu, gw, upstream, backpressure],
+    [yuzu, gw, upstream, backpressure_state],
+
     %% Mgmt-plane peer authorization (#1422)
     [yuzu, gw, mgmt_auth, rejected],
     [yuzu, gw, mgmt_auth, pin_unresolved],
@@ -274,6 +280,23 @@ handle_event([yuzu, gw, upstream, call_dropped], #{count := N}, Meta, _Config) -
               _ -> <<"unknown">>
           end,
     prometheus_counter:inc(yuzu_gw_upstream_calls_dropped_total, [Rpc], N);
+
+%% Milliseconds credited since the last event, as seconds: a counter whose rate()
+%% is the share of time, so its unit is the base unit and the figure needs no
+%% scaling. The lanes overlap and are never summed; `any' is the union.
+handle_event([yuzu, gw, upstream, backpressure],
+             #{any_ms := Any, serial_ms := Serial, notify_ms := Notify,
+               guardian_ms := Guardian}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_upstream_backpressure_seconds_total, [], Any / 1000),
+    [prometheus_counter:inc(yuzu_gw_upstream_lane_saturated_seconds_total,
+                            [atom_to_binary(Lane, utf8)], Ms / 1000)
+     || {Lane, Ms} <- [{serial, Serial}, {notify, Notify}, {guardian, Guardian}]],
+    ok;
+
+handle_event([yuzu, gw, upstream, backpressure_state],
+             #{duty_cycle := DutyCycle, slow := Slow}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_upstream_backpressure_duty_cycle, [], DutyCycle),
+    prometheus_gauge:set(yuzu_gw_upstream_slow, [], Slow);
 
 handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
@@ -609,6 +632,25 @@ declare_metrics() ->
                             [atom_to_binary(R, utf8)], 0)
      || R <- upstream_dropped_rpcs()],
     prometheus_counter:declare([
+        {name, yuzu_gw_upstream_backpressure_seconds_total},
+        {labels, []},
+        {help, "Seconds during which the path to the server was backed up: at "
+               "least one lane saturated (the serial upstream process inside an "
+               "RPC with a message waiting, all 10 stream-status notification "
+               "slots held, or all 50 Guardian forward slots held). rate() of "
+               "this is the backpressure duty cycle, 0 to 1. Sampled every "
+               "100 ms"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_upstream_lane_saturated_seconds_total},
+        {labels, [lane]},
+        {help, "Seconds each lane (serial, notify, guardian) was saturated. The "
+               "lanes overlap: do not add them, use "
+               "yuzu_gw_upstream_backpressure_seconds_total for the whole"}]),
+    [prometheus_counter:inc(yuzu_gw_upstream_lane_saturated_seconds_total,
+                            [atom_to_binary(L, utf8)], 0)
+     || L <- yuzu_gw_upstream_pressure:lanes()],
+    prometheus_counter:inc(yuzu_gw_upstream_backpressure_seconds_total, [], 0),
+    prometheus_counter:declare([
         {name, yuzu_gw_registration_replay_triggered_total},
         {labels, [trigger]},
         {help, "Registration replays started, by trigger (breaker = the upstream "
@@ -738,6 +780,21 @@ declare_metrics() ->
         {name, yuzu_gw_beam_scheduler_util},
         {labels, [node]},
         {help, "BEAM scheduler utilization (weighted average)"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_upstream_backpressure_duty_cycle},
+        {labels, []},
+        {help, "Share of the last 60 s during which the path to the server was "
+               "backed up (0 to 1; see yuzu_gw_upstream_backpressure_seconds_total). "
+               "Reads low for the first minute after a start"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_upstream_slow},
+        {labels, []},
+        {help, "1 when yuzu_gw_upstream_backpressure_duty_cycle is 0.5 or more: "
+               "the server answered slower than work arrived for at least half of "
+               "the last minute. 0 otherwise. Not a readiness input"}]),
+    %% Present from the first scrape, before the sampler's first event.
+    prometheus_gauge:set(yuzu_gw_upstream_backpressure_duty_cycle, [], 0.0),
+    prometheus_gauge:set(yuzu_gw_upstream_slow, [], 0),
     prometheus_gauge:declare([
         {name, yuzu_gw_registration_replay_queue_depth},
         {labels, [node]},

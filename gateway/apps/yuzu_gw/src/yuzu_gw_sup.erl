@@ -6,6 +6,7 @@
 %%%   2. one yuzu_grpc_client_channel per {yuzu_gw, upstream_client} channel — the upstream
 %%%      connections (gun), ahead of the processes that call them
 %%%      yuzu_gw_upstream          — gRPC client + circuit breaker
+%%%      yuzu_gw_upstream_pressure — samples how backed up the path to the server is
 %%%   3. yuzu_gw_heartbeat_buffer  — dedicated heartbeat batching worker
 %%%   4. yuzu_gw_router            — command fanout coordinator
 %%%   5. yuzu_gw_gauge             — periodic VM/agent gauge emitter
@@ -84,6 +85,12 @@ init([]) ->
     ] ++ client_channel_children() ++ [
         #{id       => yuzu_gw_upstream,
           start    => {yuzu_gw_upstream, start_link, []},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker},
+
+        #{id       => yuzu_gw_upstream_pressure,
+          start    => {yuzu_gw_upstream_pressure, start_link, []},
           restart  => permanent,
           shutdown => 5000,
           type     => worker},

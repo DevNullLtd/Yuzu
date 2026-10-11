@@ -509,3 +509,65 @@ verdict_families_test_() ->
            ?assertEqual(7, prometheus_gauge:value(yuzu_gw_registration_replay_queue_depth, [node()]))
        end}
      ]}.
+
+%% The slow-server metrics (yuzu_gw_upstream_pressure): present from the first
+%% scrape, driven by the two events, and the per-lane series exist for the closed
+%% set of lanes the sampler can name.
+backpressure_metrics_test_() ->
+    Seconds = yuzu_gw_upstream_backpressure_seconds_total,
+    Lane = yuzu_gw_upstream_lane_saturated_seconds_total,
+    LaneValue = fun(L) -> prometheus_counter:value(Lane, [L]) end,
+    {setup,
+     fun() ->
+        {ok, Started} = application:ensure_all_started(prometheus),
+        {ok, Started2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        _ = prometheus_counter:deregister(Seconds),
+        _ = prometheus_counter:deregister(Lane),
+        ok = yuzu_gw_telemetry:setup(),
+        Started ++ Started2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"every series exists straight after setup, at zero",
+       fun() ->
+           ?assertEqual(0, prometheus_counter:value(Seconds, [])),
+           ?assertEqual([guardian, notify, serial], lists:sort(yuzu_gw_upstream_pressure:lanes())),
+           [?assertEqual(0, LaneValue(atom_to_binary(L, utf8))) || L <- yuzu_gw_upstream_pressure:lanes()],
+           ?assertEqual(0.0, prometheus_gauge:value(yuzu_gw_upstream_backpressure_duty_cycle, [])),
+           ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_slow, []))
+       end},
+      {"the scrape carries all four metrics with their types",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch, binary:match(Out, <<"# TYPE ", N/binary, " ", T/binary>>))
+            || {N, T} <- [{<<"yuzu_gw_upstream_backpressure_seconds_total">>, <<"counter">>},
+                          {<<"yuzu_gw_upstream_lane_saturated_seconds_total">>, <<"counter">>},
+                          {<<"yuzu_gw_upstream_backpressure_duty_cycle">>, <<"gauge">>},
+                          {<<"yuzu_gw_upstream_slow">>, <<"gauge">>}]],
+           ?assertNotEqual(nomatch,
+                           binary:match(Out, <<"yuzu_gw_upstream_lane_saturated_seconds_total{lane=\"serial\"} ">>))
+       end},
+      {"the counter event adds its milliseconds as seconds, per lane and for the whole",
+       fun() ->
+           S0 = prometheus_counter:value(Seconds, []),
+           {Se0, N0, G0} = {LaneValue(<<"serial">>), LaneValue(<<"notify">>), LaneValue(<<"guardian">>)},
+           telemetry:execute([yuzu, gw, upstream, backpressure],
+                             #{any_ms => 1500, serial_ms => 1000, notify_ms => 1500, guardian_ms => 0}, #{}),
+           ?assert(abs(prometheus_counter:value(Seconds, []) - (S0 + 1.5)) < 1.0e-9),
+           ?assert(abs(LaneValue(<<"serial">>) - (Se0 + 1.0)) < 1.0e-9),
+           ?assert(abs(LaneValue(<<"notify">>) - (N0 + 1.5)) < 1.0e-9),
+           ?assert(G0 == LaneValue(<<"guardian">>))
+       end},
+      {"the state event sets both gauges, and a later one replaces them",
+       fun() ->
+           telemetry:execute([yuzu, gw, upstream, backpressure_state],
+                             #{duty_cycle => 0.75, slow => 1}, #{}),
+           ?assertEqual(0.75, prometheus_gauge:value(yuzu_gw_upstream_backpressure_duty_cycle, [])),
+           ?assertEqual(1, prometheus_gauge:value(yuzu_gw_upstream_slow, [])),
+           telemetry:execute([yuzu, gw, upstream, backpressure_state],
+                             #{duty_cycle => 0.1, slow => 0}, #{}),
+           ?assertEqual(0.1, prometheus_gauge:value(yuzu_gw_upstream_backpressure_duty_cycle, [])),
+           ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_slow, []))
+       end}
+     ]}.
