@@ -2518,33 +2518,21 @@ std::string DashboardRoutes::render_results(
 
     // Phase 5: render HTML
 
-    // Build base URL for sort/page links (preserving all current params)
+    // Build the sort/page link URL. #5623 (governance G8-2): this carries ONLY the
+    // params the filter bar does not own (sort / dir / page / per_page). The th headers
+    // and Prev/Next carry hx-include="#filter-bar" like the filter controls do, so the
+    // live command_id / plugin / definition_id (hidden inputs), template_id (View select),
+    // f_* and q values are read at click time. Baking the LAST render's values here let a
+    // click during a filter change's flight (which now aborts that request through the
+    // shared replacing scope) land a request with stale filters: control state and rows
+    // disagreed. Do NOT re-add a baked filter param: httplib's get_param_value takes the
+    // FIRST occurrence, so a baked duplicate would beat the live form value.
     auto base_url = [&](const std::string& new_sort, const std::string& new_dir,
                         int new_page) {
-        std::string url = "/fragments/results?command_id=" + html_escape(command_id) +
-                          "&amp;plugin=" + html_escape(plugin) +
-                          "&amp;sort=" + html_escape(new_sort) +
-                          "&amp;dir=" + html_escape(new_dir) +
-                          "&amp;page=" + std::to_string(new_page) +
-                          "&amp;per_page=" + std::to_string(per_page);
-        if (!definition_id.empty())
-            url += "&amp;definition_id=" + html_escape(definition_id);
-        if (!template_id.empty())
-            url += "&amp;template_id=" + html_escape(template_id);
-        for (const auto& f : filters) {
-            // Reconstruct f_<col> params
-            if (f.col_idx >= 0 && f.col_idx + 1 < static_cast<int>(col_names.size())) {
-                std::string pname = "f_";
-                for (char c : col_names[f.col_idx + 1]) {
-                    if (c == ' ' || c == '-') pname += '_';
-                    else pname += static_cast<char>(std::tolower(c));
-                }
-                url += "&amp;" + pname + "=" + html_escape(f.value);
-            }
-        }
-        if (!text_query.empty())
-            url += "&amp;q=" + html_escape(text_query);
-        return url;
+        return "/fragments/results?sort=" + html_escape(new_sort) +
+               "&amp;dir=" + html_escape(new_dir) +
+               "&amp;page=" + std::to_string(new_page) +
+               "&amp;per_page=" + std::to_string(per_page);
     };
 
     std::string html;
@@ -2623,7 +2611,7 @@ std::string DashboardRoutes::render_results(
         auto new_dir = (sort_col == "agent" && sort_dir == "asc") ? "desc" : "asc";
         html += "<th class=\"col-agent sortable\" hx-get=\"" +
                 base_url("agent", new_dir, 1) +
-                "\" hx-target=\"#results-tbody\" hx-sync=\"" +
+                "\" hx-target=\"#results-tbody\" hx-include=\"#filter-bar\" hx-sync=\"" +
                 std::string(kResultsSyncScope) +
                 "\" hx-indicator=\"#results-loading\">"
                 "Agent";
@@ -2642,7 +2630,7 @@ std::string DashboardRoutes::render_results(
         auto new_dir = (sort_col == col_key && sort_dir == "asc") ? "desc" : "asc";
         html += "<th class=\"sortable\" hx-get=\"" +
                 base_url(col_key, new_dir, 1) +
-                "\" hx-target=\"#results-tbody\" hx-sync=\"" +
+                "\" hx-target=\"#results-tbody\" hx-include=\"#filter-bar\" hx-sync=\"" +
                 std::string(kResultsSyncScope) +
                 "\" hx-indicator=\"#results-loading\">" +
                 html_escape(col_names[i]);
@@ -2660,14 +2648,14 @@ std::string DashboardRoutes::render_results(
         if (page > 1) {
             html += " <button class=\"btn-page\" hx-get=\"" +
                     base_url(sort_col, sort_dir, page - 1) +
-                    "\" hx-target=\"#results-tbody\" hx-sync=\"" +
+                    "\" hx-target=\"#results-tbody\" hx-include=\"#filter-bar\" hx-sync=\"" +
                     std::string(kResultsSyncScope) + "\">"
                     "Prev</button>";
         }
         if (page < static_cast<int>(total_pages)) {
             html += " <button class=\"btn-page\" hx-get=\"" +
                     base_url(sort_col, sort_dir, page + 1) +
-                    "\" hx-target=\"#results-tbody\" hx-sync=\"" +
+                    "\" hx-target=\"#results-tbody\" hx-include=\"#filter-bar\" hx-sync=\"" +
                     std::string(kResultsSyncScope) + "\">"
                     "Next</button>";
         }
