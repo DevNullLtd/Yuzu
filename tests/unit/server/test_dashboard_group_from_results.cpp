@@ -183,6 +183,11 @@ struct GroupFromResultsHarness {
     /// every request with 403 "gate-denied", to prove a gate runs before any facet refusal.
     bool deny_perm{false};
 
+    /// Reassignable AFTER construction (live-read via `this`). True makes `auth_fn` return no
+    /// session (401 "unauthenticated"), the branch after the perm gate, to prove it too runs
+    /// before any facet refusal.
+    bool unauthenticated{false};
+
     /// Counts invocations of `visible_set_fn` regardless of what it
     /// returns (CDX-FV-04) -- lets a degrade-path test prove the scope
     /// resolver was never even CALLED, not merely that its result was
@@ -223,7 +228,12 @@ struct GroupFromResultsHarness {
         }
 
         auto auth_fn = [this](const httplib::Request&,
-                             httplib::Response&) -> std::optional<auth::Session> {
+                             httplib::Response& res) -> std::optional<auth::Session> {
+            if (unauthenticated) {
+                res.status = 401;
+                res.set_content("unauthenticated", "text/plain");
+                return std::nullopt;
+            }
             auth::Session s;
             s.username = kUser;
             s.role = auth::Role::admin;
@@ -811,6 +821,35 @@ TEST_CASE("create-group-form / group-from-results: a denied caller gets the gate
         CHECK(post->body == "gate-denied");
         CHECK_FALSE(contains(post->body, "data-filter-refused"));
         CHECK_FALSE(h.mg.find_group_by_name("denied-group").has_value());
+    }
+    CHECK(h.refused("dashboard") == 0.0);
+    CHECK(h.visible_set_fn_calls == 0);
+}
+
+// The session check after the perm gate is the second place a request can end before the
+// refusal: a caller with no session gets the auth response, never the refusal or a count.
+TEST_CASE("create-group-form / group-from-results: an unauthenticated caller gets the auth "
+          "response, not a facet refusal",
+          "[pg][server][dashboard][group_from_results][auth]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    h.unauthenticated = true;
+
+    for (const std::string value : {std::string(2049, 't'), std::string("high%00x")}) {
+        INFO(value.substr(0, 20));
+        auto form = h.sink.Get(std::string{"/fragments/create-group-form?command_id="} +
+                               kCommandId + "&plugin=" + kPlugin + "&f_title=" + value);
+        REQUIRE(form != nullptr);
+        CHECK(form->status == 401);
+        CHECK(form->body == "unauthenticated");
+        CHECK_FALSE(contains(form->body, "data-filter-refused"));
+
+        auto post = h.post("group_name=unauth-group&command_id=" + std::string{kCommandId} +
+                           "&plugin=" + kPlugin + "&f_title=" + value);
+        CHECK(post->status == 401);
+        CHECK(post->body == "unauthenticated");
+        CHECK_FALSE(contains(post->body, "data-filter-refused"));
+        CHECK_FALSE(h.mg.find_group_by_name("unauth-group").has_value());
     }
     CHECK(h.refused("dashboard") == 0.0);
     CHECK(h.visible_set_fn_calls == 0);

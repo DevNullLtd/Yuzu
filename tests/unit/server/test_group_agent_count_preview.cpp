@@ -8,9 +8,10 @@
 // fragment keeps its own separate, behaviourally-equivalent inline
 // implementation (dashboard_routes.cpp); it also refuses an unmatchable filter value (#5623).
 //
-// No httplib, no MCP, no Postgres: these are direct calls against the pure
+// No httplib, no MCP, no Postgres: the model tests are direct calls against the pure
 // functions. The real facet_agent_count store-backed count is
-// ResponseStore's own tested contract, not re-tested here.
+// ResponseStore's own tested contract, not re-tested here. The tripwire tests at the end
+// of this file are not pure: they also read the server source tree (YUZU_SERVER_SRC_DIR).
 
 #include "group_agent_count_preview.hpp"
 
@@ -277,22 +278,136 @@ std::string read_text(const std::filesystem::path& p) {
     return std::string{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
-// Production units (one .cpp or .hpp, plus its same-stem sibling, as one unit: a .cpp that
-// calls a reader may rely on the predicate its own header supplies) that call a ResponseStore
-// facet reader (`->facet_agent_count(` and friends) without referencing any of the three
-// predicate entry points. response_store.{hpp,cpp} define the readers and the predicate and
-// are exempt. A reader returns the exact-match answer for the value it is given, so a caller
-// that skips the refusal answers an unmatchable value (over the bound, NUL, line feed, invalid
-// UTF-8) with a plausible exact 0 or a prefix match. Pure over (stem -> text), so the
-// self-test below can drive it with synthetic sources.
+// Blank out `//` line comments and `/* */` blocks (newlines are kept, so line structure
+// survives). String, character and raw-string literals are copied through untouched, so a
+// "http://" literal does not swallow the rest of its line. Not a full lexer: it does not
+// model line-continuation backslashes in a `//` comment or digit separators (1'000), which
+// no facet-reader caller uses. A comment can therefore neither supply a reader call nor
+// exempt a unit by naming the predicate.
+std::string strip_comments(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    const auto n = in.size();
+    std::size_t i = 0;
+    while (i < n) {
+        const char c = in[i];
+        if (c == '/' && i + 1 < n && in[i + 1] == '/') {
+            while (i < n && in[i] != '\n')
+                ++i;
+        } else if (c == '/' && i + 1 < n && in[i + 1] == '*') {
+            i += 2;
+            while (i < n && !(in[i] == '*' && i + 1 < n && in[i + 1] == '/')) {
+                if (in[i] == '\n')
+                    out.push_back('\n');
+                ++i;
+            }
+            i = (i < n) ? i + 2 : n;
+            out.push_back(' ');
+        } else if (c == 'R' && i + 1 < n && in[i + 1] == '"') {
+            // Raw string literal R"delim( ... )delim"
+            const auto open = in.find('(', i + 2);
+            if (open == std::string::npos || open - (i + 2) > 16) {
+                out.push_back(c);
+                ++i;
+                continue;
+            }
+            const std::string close = ")" + in.substr(i + 2, open - (i + 2)) + "\"";
+            auto end = in.find(close, open + 1);
+            end = (end == std::string::npos) ? n : end + close.size();
+            out.append(in, i, end - i);
+            i = end;
+        } else if (c == '"' || c == '\'') {
+            const char quote = c;
+            out.push_back(c);
+            ++i;
+            while (i < n && in[i] != quote && in[i] != '\n') {
+                if (in[i] == '\\' && i + 1 < n) {
+                    out.push_back(in[i]);
+                    ++i;
+                }
+                out.push_back(in[i]);
+                ++i;
+            }
+            if (i < n) {
+                out.push_back(in[i]);
+                ++i;
+            }
+        } else {
+            out.push_back(c);
+            ++i;
+        }
+    }
+    return out;
+}
+
+// Blank the body of every `#if 0` ... `#endif` region (an `#else`/`#elif` at the region's own
+// depth re-activates the text after it). Textual rule only: `#if 0` spelled any other way
+// (`#if (0)`, `#ifdef NEVER_DEFINED`) is a known limit and is treated as active.
+std::string strip_if_zero_blocks(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    int depth = 0; // 0 = active; >0 = inside an `#if 0`, counting nested conditionals
+    std::size_t pos = 0;
+    while (pos < in.size()) {
+        auto eol = in.find('\n', pos);
+        const bool has_nl = eol != std::string::npos;
+        if (!has_nl)
+            eol = in.size();
+        const std::string line = in.substr(pos, eol - pos);
+        const auto first = line.find_first_not_of(" \t");
+        std::string directive;
+        if (first != std::string::npos && line[first] == '#') {
+            const auto word = line.find_first_not_of(" \t", first + 1);
+            directive = (word == std::string::npos) ? std::string{} : line.substr(word);
+        }
+        const auto starts = [&](const char* kw) { return directive.rfind(kw, 0) == 0; };
+        bool keep = (depth == 0);
+        if (depth == 0) {
+            if (starts("if 0") && (directive.size() == 4 || !std::isalnum(static_cast<unsigned char>(
+                                                                 directive[4])))) {
+                depth = 1;
+                keep = false;
+            }
+        } else if (starts("if")) { // if / ifdef / ifndef nested inside the dead region
+            ++depth;
+        } else if (starts("endif")) {
+            --depth;
+        } else if ((starts("else") || starts("elif")) && depth == 1) {
+            depth = 0;
+        }
+        if (keep)
+            out.append(line);
+        if (has_nl)
+            out.push_back('\n');
+        pos = has_nl ? eol + 1 : eol;
+    }
+    return out;
+}
+
+// Production units (one .cpp or .hpp, plus its same-stem sibling in the same directory, as one
+// unit: a .cpp that calls a reader may rely on the predicate its own header supplies) that call
+// a ResponseStore facet reader (`->facet_agent_count(`, `.facet_agent_ids(`, `facet_response_ids`,
+// `facet_line_count`) without referencing any of the three predicate entry points. The unit key
+// is the path under the scanned root without its extension. response_store.{hpp,cpp} define the
+// readers and the predicate and are exempt. Comments are stripped BEFORE both matches, so a
+// commented-out reader call is not a call and a comment naming the predicate does not exempt a
+// unit. A reader returns the exact-match answer for the value it is given, so a caller that
+// skips the refusal answers an unmatchable value (over the bound, NUL, line feed, invalid UTF-8)
+// with a plausible exact 0 or a prefix match. Pure over (unit key -> text), so the self-test
+// below can drive it with synthetic sources.
 std::vector<std::string>
 units_calling_facet_reader_without_refusal(const std::map<std::string, std::string>& units) {
     static const std::regex reader_call{
         R"((->|\.)facet_(agent_count|agent_ids|response_ids|line_count)\()"};
     std::vector<std::string> bad;
-    for (const auto& [stem, text] : units) {
+    for (const auto& [stem, raw] : units) {
         if (stem == "response_store")
             continue;
+        // Cheap prefilter: every reader name contains "facet_", and std::regex over the whole
+        // tree is slow (3.5 s in a debug build).
+        if (raw.find("facet_") == std::string::npos)
+            continue;
+        const std::string text = strip_comments(raw);
         if (!std::regex_search(text, reader_call))
             continue;
         if (text.find("facet_filter_value_unmatchable") != std::string::npos ||
@@ -304,17 +419,50 @@ units_calling_facet_reader_without_refusal(const std::map<std::string, std::stri
     return bad;
 }
 
+// True when `src` contains a call of `name(` that is live: not in a comment, not in an
+// `#if 0` region, and not directly under a literal `if (false)`. `if constexpr (false)`, a
+// never-true macro condition and an early `return;` before the call are known limits.
+bool has_live_call(const std::string& src, const std::string& name) {
+    const std::string text = strip_if_zero_blocks(strip_comments(src));
+    const std::string needle = name + "(";
+    std::size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string::npos) {
+        auto back = pos;
+        while (back > 0 && (text[back - 1] == ' ' || text[back - 1] == '\t' ||
+                            text[back - 1] == '\n' || text[back - 1] == '{'))
+            --back;
+        const std::string before = text.substr(back > 16 ? back - 16 : 0, back > 16 ? 16 : back);
+        const bool under_false = before.ends_with("if (false)") || before.ends_with("if(false)");
+        if (!under_false)
+            return true;
+        pos += needle.size();
+    }
+    return false;
+}
+
 } // namespace
 
 TEST_CASE("facet reader tripwire: the scan flags a unit with no refusal and passes one with it",
           "[server][devices]") {
+    // Positive control: every one of the four readers is recognised, via both -> and .
     CHECK(units_calling_facet_reader_without_refusal(
               {{"a", "auto n = store->facet_agent_count(id, f);"}}) ==
+          std::vector<std::string>{"a"});
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"a", "auto n = store->facet_agent_ids(id, f);"}}) == std::vector<std::string>{"a"});
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"a", "auto n = store->facet_response_ids(id, f);"}}) ==
           std::vector<std::string>{"a"});
     CHECK(units_calling_facet_reader_without_refusal(
               {{"b", "auto n = rs.facet_line_count(id, f);"}}) == std::vector<std::string>{"b"});
     CHECK(units_calling_facet_reader_without_refusal(
               {{"c", "if (any_facet_filter_unmatchable(f)) return; store->facet_agent_ids(f);"}})
+              .empty());
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"c", "if (facet_filter_value_unmatchable(v)) return; rs.facet_line_count(f);"}})
+              .empty());
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"c", "if (any_raw_filter_value_unmatchable(f)) return; rs.facet_agent_count(f);"}})
               .empty());
     CHECK(units_calling_facet_reader_without_refusal(
               {{"d", "// facet_agent_count(...) is mentioned in a comment only"}})
@@ -324,50 +472,100 @@ TEST_CASE("facet reader tripwire: the scan flags a unit with no refusal and pass
               .empty());
 }
 
+TEST_CASE("facet reader tripwire: comments neither supply a call nor exempt a unit",
+          "[server][devices]") {
+    // A predicate name that only a comment mentions must NOT exempt the unit (line + block).
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"e", "// any_facet_filter_unmatchable(f) would go here\n"
+                     "auto n = store->facet_agent_count(id, f);"}}) ==
+          std::vector<std::string>{"e"});
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"e", "/* any_raw_filter_value_unmatchable(f);\n facet_filter_value_unmatchable */\n"
+                     "auto n = store->facet_line_count(id, f);"}}) ==
+          std::vector<std::string>{"e"});
+    // A commented-out reader call is not a call (line + block), with or without a predicate.
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"f", "// auto n = store->facet_agent_count(id, f);\n"
+                     "/* auto m = rs.facet_agent_ids(id, f); */\nint x = 0;"}})
+              .empty());
+    // A "//" inside a string literal does not hide a real call that follows it on the line.
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"g", "auto u = \"http://x\"; auto n = store->facet_agent_count(id, f);"}}) ==
+          std::vector<std::string>{"g"});
+    // Units key on the path under the scanned root, so a same-stem file elsewhere is distinct.
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"sub/dir/g", "auto n = store->facet_response_ids(id, f);"}}) ==
+          std::vector<std::string>{"sub/dir/g"});
+}
+
 TEST_CASE("facet reader tripwire: every production caller of a ResponseStore facet reader refuses "
           "an unmatchable value",
           "[server][devices]") {
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
+    const std::filesystem::path root{YUZU_SERVER_SRC_DIR};
+    REQUIRE(std::filesystem::is_directory(root));
     std::map<std::string, std::string> units;
-    for (const auto& entry : std::filesystem::directory_iterator(YUZU_SERVER_SRC_DIR)) {
+    // Recursive: a caller in a subdirectory must not escape the scan.
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
         const auto ext = entry.path().extension();
         if (!entry.is_regular_file() || (ext != ".cpp" && ext != ".hpp"))
             continue;
-        units[entry.path().stem().string()] += read_text(entry.path());
+        auto key = std::filesystem::relative(entry.path(), root);
+        key.replace_extension();
+        units[key.generic_string()] += read_text(entry.path());
     }
     REQUIRE(units.size() > 100); // the scan found the real tree, not an empty directory
     REQUIRE(units.count("dashboard_routes") == 1);
-    // Positive control: the three call sites known today are really being scanned.
-    for (const char* stem : {"dashboard_routes", "group_agent_count_preview"})
-        CHECK(std::regex_search(units[stem], std::regex{R"((->|\.)facet_agent_count\()"}));
+    REQUIRE(units.count("response_store") == 1);
+    // Positive control: the units known to call a reader today are really being scanned and
+    // really contain a (comment-stripped) call, so the rule below cannot pass vacuously. The
+    // scan checks the stems in this list; any other unit that gains a reader call is caught by
+    // the rule itself.
+    for (const char* stem : {"dashboard_routes", "group_agent_count_preview"}) {
+        REQUIRE(units.count(stem) == 1);
+        CHECK(std::regex_search(strip_comments(units[stem]),
+                                std::regex{R"((->|\.)facet_agent_count\()"}));
+    }
     // The rule: a production unit that calls a ResponseStore facet reader must also reference
     // facet_filter_value_unmatchable / any_facet_filter_unmatchable /
     // any_raw_filter_value_unmatchable (see the scan above). A failure names the unit(s).
     CHECK(units_calling_facet_reader_without_refusal(units) == std::vector<std::string>{});
 }
 
+TEST_CASE("seed wiring tripwire: comments, #if 0 and if (false) are not calls",
+          "[server][devices]") {
+    const std::string name = "seed_response_facet_metrics";
+    CHECK(has_live_call("  seed_response_facet_metrics(*metrics_);", name));
+    CHECK(has_live_call("x();\n  seed_response_facet_metrics(*m);\n", name));
+    CHECK_FALSE(has_live_call("// seed_response_facet_metrics(*m);", name));
+    CHECK_FALSE(has_live_call("/* seed_response_facet_metrics(*m);\n */", name));
+    CHECK_FALSE(has_live_call("x(); /* a */ // seed_response_facet_metrics(*m);", name));
+    CHECK_FALSE(has_live_call("#if 0\n  seed_response_facet_metrics(*m);\n#endif\n", name));
+    CHECK_FALSE(
+        has_live_call("#if 0\n#ifdef X\n#endif\n  seed_response_facet_metrics(*m);\n#endif\n", name));
+    // The #else branch of an `#if 0` is live.
+    CHECK(has_live_call("#if 0\nx();\n#else\n  seed_response_facet_metrics(*m);\n#endif\n", name));
+    // Live again after the closing #endif.
+    CHECK(has_live_call("#if 0\nx();\n#endif\n  seed_response_facet_metrics(*m);\n", name));
+    CHECK_FALSE(has_live_call("if (false) seed_response_facet_metrics(*m);", name));
+    CHECK_FALSE(has_live_call("if (false) {\n  seed_response_facet_metrics(*m);\n}", name));
+    // Known limit, pinned so a change is deliberate: other never-true spellings read as live.
+    CHECK(has_live_call("if (0) seed_response_facet_metrics(*m);", name));
+}
+
 // ResponseStore's counters are only exported if server.cpp seeds them; nothing else reads
 // server.cpp, so a dropped seeding call would leave every metric test green while an idle
 // server exported no `yuzu_server_response_facets_dropped_total` or
-// `yuzu_server_response_facet_filter_refused_total` series.
+// `yuzu_server_response_facet_filter_refused_total` series. Known limit: the scan is textual
+// (see has_live_call), so a never-true condition other than a literal `if (false)` or
+// `#if 0`, or an early return before the call, is not detected.
 TEST_CASE("response facet metrics: server.cpp still calls seed_response_facet_metrics",
           "[server][devices]") {
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
     const auto src = read_text(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
-    bool called = false;
-    std::size_t pos = 0;
-    while ((pos = src.find("seed_response_facet_metrics(", pos)) != std::string::npos) {
-        const auto line_start = src.rfind('\n', pos);
-        const auto first = src.find_first_not_of(" \t", line_start + 1);
-        if (src.compare(first, 2, "//") != 0) {
-            called = true; // a real call, not a mention in a comment
-            break;
-        }
-        ++pos;
-    }
-    CHECK(called);
+    CHECK(has_live_call(src, "seed_response_facet_metrics"));
 }

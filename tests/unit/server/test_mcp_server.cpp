@@ -20713,6 +20713,72 @@ TEST_CASE("MCP preview_management_group_agent_count: a denied caller gets the ga
               .value() == 0.0);
 }
 
+// The tier gate is the other check that must precede the refusal: a readonly-tier token is
+// denied ManagementGroup:Write by tier, so an unmatchable value gets the tier error, no facet
+// refusal text, and no count.
+TEST_CASE("MCP preview_management_group_agent_count: a tier-denied caller gets the tier error, "
+          "not the facet refusal",
+          "[mcp][devices][security]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.start("readonly");
+    for (const std::string& value :
+         {std::string(2049, 'a'), std::string(R"(a\u0000b)"), std::string(R"(a\nb)")}) {
+        INFO(value.substr(0, 20));
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":104,)"
+            R"("params":{"name":"preview_management_group_agent_count",)"
+            R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":{"name":")" +
+            value + R"("}}}})";
+        auto res = ts.call(body);
+        REQUIRE(res != nullptr);
+        auto envelope = nlohmann::json::parse(res->body);
+        REQUIRE(envelope.contains("error"));
+        CHECK(envelope["error"]["code"].get<int>() == yuzu::server::mcp::kTierDenied);
+        CHECK(res->body.find("not evaluated") == std::string::npos);
+        CHECK(res->body.find("2048 bytes") == std::string::npos);
+    }
+    CHECK(reg.counter(yuzu::server::kResponseFacetFilterRefusedMetric, {{"surface", "mcp"}})
+              .value() == 0.0);
+}
+
+// On the approval-gated tier (supervised: ManagementGroup:Write requires approval) the served
+// input schema's per-value maxLength rejects an over-bound value BEFORE the handler runs: it is
+// audited `denied`, counted in yuzu_mcp_tool_args_invalid_total, and NOT counted by the facet
+// refusal counter (which the handler increments after authorization).
+TEST_CASE("MCP preview_management_group_agent_count: on the approval-gated tier the schema "
+          "rejects an over-bound value first and the facet counter does not move",
+          "[pg][mcp][devices][security][schema]") {
+    yuzu::MetricsRegistry reg;
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised");
+    const std::string body =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":105,)"
+        R"("params":{"name":"preview_management_group_agent_count",)"
+        R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":{"name":")" +
+        std::string(2049, 'a') + R"("}}}})";
+    auto res = ts.call(body);
+    REQUIRE(res != nullptr);
+    auto envelope = nlohmann::json::parse(res->body);
+    REQUIRE(envelope.contains("error"));
+    CHECK(envelope["error"]["code"].get<int>() == -32602);
+    CHECK(envelope["error"]["message"].get<std::string>().find(
+              "arguments do not match the tool input schema") != std::string::npos);
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("arguments do not match the tool input schema") !=
+          std::string::npos);
+    CHECK(reg.counter("yuzu_mcp_tool_args_invalid_total",
+                      {{"tool", "preview_management_group_agent_count"}})
+              .value() == 1.0);
+    CHECK(reg.counter(yuzu::server::kResponseFacetFilterRefusedMetric, {{"surface", "mcp"}})
+              .value() == 0.0);
+}
+
 TEST_CASE("MCP preview_management_group_agent_count: a refusal increments "
           "yuzu_server_response_facet_filter_refused_total{surface=mcp}, nothing else does",
           "[mcp][devices][metrics]") {

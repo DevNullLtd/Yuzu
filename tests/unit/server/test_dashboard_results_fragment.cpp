@@ -1044,8 +1044,11 @@ TEST_CASE("/fragments/results: a cut read that parses to zero lines still says i
 // `this:abort`, so a correction typed during a refused or slow response was never sent, and a
 // late sort/page response could land after another response's OOB swap had detached its issuer.
 // Every element whose hx-get targets /fragments/results (filter-bar controls, the View select,
-// th sort links, Prev/Next) carries the same `#filter-bar:replace`. Verified in a real browser by
-// the lead, not here: this pins that no element is left behind.
+// th sort links, Prev/Next) carries the same `#filter-bar:replace`. The one deliberate exception
+// is the `#chart-deck-host` self-refresh (an unscoped request that carries no f_* params; see
+// #5669), which this count does not cover. The replacing semantics were verified in headless
+// Chromium during the #5623 review, not by this test: it pins the exact scope string and that
+// no element is left behind.
 namespace {
 // Number of elements whose hx-get is /fragments/results[?...] (not /filter-bar), failing the
 // calling test for any one of them whose tag lacks the shared scope or carries a second hx-sync.
@@ -1070,6 +1073,12 @@ std::size_t count_results_requests_sharing_scope(const std::string& html) {
     return found;
 }
 } // namespace
+
+TEST_CASE("kResultsSyncScope is the replacing scope, not a dropping or queueing one",
+          "[server][dashboard][fragment]") {
+    // `:drop` / `:abort` / `:queue` would drop or defer the newest request (the #5623 defect).
+    CHECK(std::string(kResultsSyncScope) == "#filter-bar:replace");
+}
 
 TEST_CASE("/fragments/results: filter bar, sort headers and pagination share one replacing "
           "hx-sync scope",
@@ -1161,6 +1170,41 @@ TEST_CASE("/fragments/results: a denied caller gets the gate's response, not a f
         INFO(value.substr(0, 20));
         auto res = h.get("/fragments/results?command_id=cmd-deny-1&plugin=registry&f_output=" +
                          value);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(contains(res->body, "permission denied"));
+        CHECK_FALSE(contains(res->body, "data-filter-refused"));
+        CHECK_FALSE(contains(res->body, "can&#39;t be searched"));
+    }
+    CHECK(h.metrics.counter(kResponseFacetFilterRefusedMetric, {{"surface", "dashboard"}})
+              .value() == 0.0);
+}
+
+// The same ordering with a stored View whose own saved default is unmatchable: the View is
+// resolved from a real InstructionStore, but a denied caller still gets only the gate's response.
+TEST_CASE("/fragments/results: a denied caller with a bad View gets the gate's response, "
+          "not a facet refusal",
+          "[pg][server][dashboard][fragment][auth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, fragment_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+    const auto empty_view = make_provenance_definition(is, "tpl-deny-empty", nlohmann::json(""));
+    const auto over_view = make_provenance_definition(is, "tpl-deny-over",
+                                                      nlohmann::json(std::string(2049, 'v')));
+
+    FragmentResultsHarness h(/*response_store=*/nullptr, &is);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response& res, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            res.status = 403;
+            res.set_content(R"({"error":"permission denied"})", "application/json");
+            return {false, yuzu::server::authz::deny_all()};
+        });
+    for (const auto& def_id : {empty_view, over_view}) {
+        INFO(def_id);
+        auto res = h.get("/fragments/results?command_id=cmd-deny-view&plugin=registry"
+                         "&definition_id=" + def_id + "&template_id=tplprov");
         REQUIRE(res);
         CHECK(res->status == 403);
         CHECK(contains(res->body, "permission denied"));
