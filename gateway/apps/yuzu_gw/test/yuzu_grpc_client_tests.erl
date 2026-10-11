@@ -285,6 +285,15 @@ http_error() ->
              ?assertEqual([], collect_messages(150))
          end || Status <- [<<"502">>, <<"503">>, <<"404">>, <<"400">>, <<"500">>],
                 Body <- [none, <<"upstream is unavailable">>]],
+        %% a body that never ends (a proxy dripping an error page) cannot hold the
+        %% caller past its deadline, and leaves nothing in its mailbox
+        T0 = erlang:monotonic_time(millisecond),
+        ?assertMatch({http_error, {<<"502">>, <<>>}, _},
+                     yuzu_grpc_client:unary(#{<<"x-status">> => <<"502">>, <<"x-drip">> => <<"1">>},
+                                            ?HEARTBEAT, #{session_id => <<"ok">>}, def(),
+                                            #{channel => Name, timeout => 1000})),
+        ?assert(erlang:monotonic_time(millisecond) - T0 < 2500),
+        ?assertEqual([], collect_messages(300)),
         %% a 200 that is not gRPC is not an http_error: it has no grpc-status
         ?assertNotMatch({http_error, _, _}, Call(<<"200">>, <<"hello">>))
     after
@@ -294,6 +303,20 @@ http_error() ->
 
 %% cowboy handler: the status and body the request asks for.
 init(Req, State) ->
+    case cowboy_req:header(<<"x-drip">>, Req, undefined) of
+        undefined -> reply(Req, State);
+        _ -> drip(Req, State)
+    end.
+
+%% A 502 whose body arrives 100 kB every 300 ms for up to 30 s.
+drip(Req0, State) ->
+    Req = cowboy_req:stream_reply(502, #{<<"content-type">> => <<"text/plain">>}, Req0),
+    Chunk = binary:copy(<<"x">>, 100000),
+    [begin cowboy_req:stream_body(Chunk, nofin, Req), timer:sleep(300) end || _ <- lists:seq(1, 100)],
+    cowboy_req:stream_body(<<>>, fin, Req),
+    {ok, Req, State}.
+
+reply(Req, State) ->
     Status = binary_to_integer(cowboy_req:header(<<"x-status">>, Req, <<"502">>)),
     Body = cowboy_req:header(<<"x-body">>, Req, <<>>),
     {ok, cowboy_req:reply(Status, #{<<"content-type">> => <<"text/plain">>}, Body, Req), State}.

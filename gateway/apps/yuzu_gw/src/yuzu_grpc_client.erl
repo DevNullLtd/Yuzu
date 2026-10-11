@@ -31,6 +31,9 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_grpc_client).
 
+%% How long the barrier after a cancel waits for the connection to answer.
+-define(BARRIER_MS, 500).
+
 -export([unary/5]).
 -export([metadata_headers/1]).
 -export_type([def/0, result/0]).
@@ -116,7 +119,7 @@ call(Conn, Path, Extra, Body, Unmarshal, Max, Deadline) ->
         {response, Fin, Status, RespHeaders} ->
             case Status of
                 200 -> grpc(Conn, Ref, Fin, RespHeaders, Unmarshal, Max, Deadline);
-                _   -> finish_http_error(Conn, Ref, Fin, Deadline),
+                _   -> finish_http_error(Conn, Ref, Fin, Max, Deadline),
                        {http_error, {integer_to_binary(Status), <<>>},
                         #{headers => to_map(RespHeaders), trailers => #{}}}
             end;
@@ -207,17 +210,28 @@ to_map(Headers) ->
                               not (byte_size(K) > 0 andalso binary:first(K) =:= $:)]).
 
 %% A non-200 response (a proxy's 502, say) may carry a body. Reading it to the end
-%% (within the call's deadline) lets gun finish the stream on its own; cancelling
-%% a stream gun is already finishing makes gun answer with a `badstate' message
-%% that lands in the caller's mailbox. A body that does not arrive in time is
-%% cancelled like any other abandoned stream.
-finish_http_error(_Conn, _Ref, fin, _Deadline) ->
+%% lets gun finish the stream on its own; cancelling a stream gun is already
+%% finishing makes gun answer with a `badstate' message that lands in the
+%% caller's mailbox. The read is bounded like any response body: by the call's
+%% deadline (each wait is for what is left of it, so the total cannot exceed it)
+%% and by the same byte limit, and past either the stream is abandoned.
+finish_http_error(_Conn, _Ref, fin, _Max, _Deadline) ->
     ok;
-finish_http_error(Conn, Ref, nofin, Deadline) ->
-    case gun:await_body(Conn, Ref, remaining(Deadline)) of
-        {ok, _Body}           -> ok;
-        {ok, _Body, _Trailers} -> ok;
-        {error, Reason}       -> end_stream(Conn, Ref, Reason)
+finish_http_error(Conn, Ref, nofin, Max, Deadline) ->
+    drain(Conn, Ref, 0, Max, Deadline).
+
+drain(Conn, Ref, Seen, Max, Deadline) ->
+    case gun:await(Conn, Ref, remaining(Deadline)) of
+        {data, fin, _}      -> ok;
+        {data, nofin, Data} ->
+            Seen1 = Seen + byte_size(Data),
+            case Seen1 > Max + 5 of
+                true  -> end_stream(Conn, Ref, response_too_large);
+                false -> drain(Conn, Ref, Seen1, Max, Deadline)
+            end;
+        {trailers, _}       -> ok;
+        {error, Reason}     -> end_stream(Conn, Ref, transport(Reason));
+        _Other              -> end_stream(Conn, Ref, protocol)
     end.
 
 %% End a stream we are no longer reading and drop what it already delivered.
@@ -227,7 +241,7 @@ abandon(Conn, Ref) ->
     %% A call to the connection is answered only after the cancel is handled, and
     %% a message gun sent earlier reaches us before that answer, so the flush
     %% below sees all of them.
-    catch gun:info(Conn),
+    catch sys:get_state(Conn, ?BARRIER_MS),
     catch gun:flush(Ref),
     ok.
 
