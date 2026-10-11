@@ -407,7 +407,7 @@ your connector: a `409` does not prove an IdP will stop retrying, so expect the
 same request again on the next sync (every attempt is audited and counted and
 raises a critical analytics event; the server log line is limited to one
 warning per username per minute); and resolving it is an operator action, not
-an IdP one: grant the `Administrator` role to another account first. Until then
+an IdP one: grant the `Administrator` role to another active local account first (an SSO-only or inactive principal is not counted). Until then
 the person the IdP terminated is still active here: after an early refusal
 their API tokens and sessions are live as well, and after a late one the
 account remains active in Yuzu, so any credential the IdP still accepts for it
@@ -1003,7 +1003,9 @@ with a **currently-active** account.
     with `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button. Make the call while signed in as an administrator other than that account, because a self-target answers `403` `self_role_change_blocked`. It needs a cookie session with a fresh MFA step-up, where a SAML session gets `403`, or an administrator API token, which bypasses step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)). Add User has no step-up but the role call does: if no
     administrator session can pass it, use the break-glass account. See
     [`rbac.md`](rbac.md), "If the guard refuses an action you intend", for that
-    exit, and demote or remove the temporary local administrator afterwards. A later
+    exit, and demote or remove the temporary local administrator afterwards, once a
+    permanent administrator exists (the temporary account is the last one after
+    the demotion, so the guard refuses its removal until then). A later
     change that names the user through another group also re-derives the role.
   - **Undetermined** (`undetermined=`): a read failed, so the role was left
     untouched and it is not known whether an administrator was kept. Check each

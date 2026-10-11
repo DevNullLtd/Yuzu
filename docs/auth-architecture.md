@@ -2157,7 +2157,7 @@ the account remains active in Yuzu, so any credential the identity provider
 still accepts for it works. A refused SCIM
 deprovision therefore raises a critical analytics event and the
 operator revokes manually or lets the identity provider retry once another
-administrator exists; see `docs/user-manual/rbac.md`, "Last-Administrator guard
+active local account holds the Administrator grant; see `docs/user-manual/rbac.md`, "Last-Administrator guard
 for account deactivation and demotion". The guard stays a recovery rule, not a
 proof that anyone can sign in.
 
