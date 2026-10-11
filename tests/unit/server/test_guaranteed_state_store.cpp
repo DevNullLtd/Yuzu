@@ -2873,9 +2873,12 @@ TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state 
         CHECK(census()[{"a1", "r2"}] == "compliant");
     }
     SECTION("D5: an exact redelivery of the errored event never reaches the census write") {
+        // Equal timestamps (compliant arrives after errored, so it wins the >= tie): had the
+        // redelivery reached the upsert, the tie would flip the row to errored, so the final
+        // census assertion can observe a reached census write.
         const auto errored = ev("d5x", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z");
         CHECK(store.insert_event_classified(errored).outcome == EventInsertOutcome::Inserted);
-        REQUIRE(store.insert_event(ev("d5y", "r1", "a1", "guard.compliant", "2026-06-04T10:01:00Z")));
+        REQUIRE(store.insert_event(ev("d5y", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
         CHECK(census()[{"a1", "r1"}] == "compliant");
         CHECK(store.insert_event_classified(errored).outcome == EventInsertOutcome::Redelivered);
         CHECK(census()[{"a1", "r1"}] == "compliant");

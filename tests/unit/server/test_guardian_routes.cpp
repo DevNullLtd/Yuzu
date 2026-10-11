@@ -253,8 +253,9 @@ struct Harness {
     // store.cpp): "guard.compliant"/"drift.remediated" -> compliant,
     // "drift.detected" -> drifted, "remediation.failed"/"guard.unhealthy"/
     // "guard.errored" -> errored. The upsert keeps a row only when the new
-    // updated_at >= the existing one, so reuse a strictly increasing ts per
-    // (agent, rule) across multiple seeds.
+    // updated_at >= the existing one: an EQUAL timestamp overwrites (the later
+    // arrival wins) and an earlier one is silently dropped, so use a strictly
+    // increasing ts per (agent, rule) across multiple seeds.
     void seed_status(const std::string& event_id, const std::string& agent_id,
                      const std::string& rule_id, const std::string& event_type,
                      const std::string& ts = "2026-09-01T00:00:00Z") {
