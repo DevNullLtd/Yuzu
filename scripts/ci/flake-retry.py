@@ -927,14 +927,16 @@ def _selftest():
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
     # Counted from tests/meson.build 2026-10-11 (regex over the test()
-    # entries, cross-checked against check-pg-shard-partition.py): 16 pg
-    # shards (A-P: the original ten, K, L, then M, N, O and P from the
-    # pg-shard rebalance) + 4 non-pg shards (A/B + shard C, then shard D
-    # carved from B's [body_cap] tests) + the smoke entry (also
-    # server_test_exe) = 21. The floor stays a loose ">=" (not an exact pin):
+    # entries, cross-checked against check-pg-shard-partition.py): 14 pg
+    # shards (A-O without J or P: the original ten minus J, then K, L, M, N
+    # and O from the pg-shard rebalance; J and P were merged into I and M on
+    # 2026-10-11 to stay at 14 pg shards) + 4 non-pg shards (A/B + shard C,
+    # then shard D carved from B's [body_cap] tests) + the smoke entry (also
+    # server_test_exe) = 19. The floor stays a loose ">=" (not an exact pin):
     # exactness is check-pg-shard-partition.py's job, against the real
-    # binary. Raised from 17 in the same change that grew the pg suite to 16.
-    check(len(_entries) >= 21, "meson.build: all twenty-one server shard entries located")
+    # binary. Lowered from 21 in the same change that merged the pg suite
+    # from 16 shards back to 14.
+    check(len(_entries) >= 19, "meson.build: all nineteen server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -995,9 +997,9 @@ def _selftest():
     # 2026-08-28) -- comparatively stable, unlike the pg shards, which get
     # rebalanced -- so a small verbatim pin is proportionate for them
     # specifically. Plus a COUNT-based (not exact-string) sanity check that
-    # extraction still finds a real pg-shard population (now 16, plus the
-    # smoke entry makes 17 total non-excluded specs -- see the comment on the
-    # >= 17 floor below), as a second, independent signal
+    # extraction still finds a real pg-shard population (now 14, plus the
+    # smoke entry makes 15 total non-excluded specs -- see the comment on the
+    # >= 15 floor below), as a second, independent signal
     # alongside check-pg-shard-partition.py's own hollow-discovery guard, in
     # case the two checks are ever run without each other.
     _NONPG_SPECS = (
@@ -1010,14 +1012,15 @@ def _selftest():
     _pg_specs = [s for s in _shard_specs if s not in _NONPG_SPECS]
     check(all(spec in _shard_specs for spec in _NONPG_SPECS),
           "meson.build: all four non-pg shard tag filters extracted verbatim")
-    # _pg_specs = 16 real pg shards (A-P; counted 2026-10-11) + the smoke
-    # entry (also server_test_exe, also not one of the four excluded non-pg
-    # tuples) = 17. The smoke entry's own spec ('[pg-smoke]',) has always
-    # been counted here; this is a pre-existing property of the extraction,
-    # not new to any split. Raised from 13 in the same change that grew the
-    # pg suite from 12 to 16 shards.
-    check(len(_pg_specs) >= 17,
-          f"meson.build: at least 17 pg-shard-or-smoke entries found (got {len(_pg_specs)}) "
+    # _pg_specs = 14 real pg shards (A-O without J or P; counted 2026-10-11)
+    # + the smoke entry (also server_test_exe, also not one of the four
+    # excluded non-pg tuples) = 15. The smoke entry's own spec ('[pg-smoke]',)
+    # has always been counted here; this is a pre-existing property of the
+    # extraction, not new to any split. Lowered from 17 in the same change that
+    # merged the pg suite from 16 shards back to 14 (it had been raised from 13
+    # when the suite grew from 12 to 16).
+    check(len(_pg_specs) >= 15,
+          f"meson.build: at least 15 pg-shard-or-smoke entries found (got {len(_pg_specs)}) "
           "-- exact partition identity is proven separately, against the real "
           "binary, by check-pg-shard-partition.py")
 

@@ -20,7 +20,7 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   **No
   sanitizers, no coverage** — those moved out (#410). **Since #3443 Phase 2**,
   the Linux matrix's `pg_mode` key (via `include:`, never a third axis) means
-  only ONE leg (gcc-15/debug) runs the full 16-shard `server-pg` suite on a
+  only ONE leg (gcc-15/debug) runs the full 14-shard `server-pg` suite on a
   push; the other three legs run a small `[pg-smoke]`-tagged subset instead —
   see "PG push-leg policy" below. PR coverage is unaffected (the PR `exclude:`
   already trims the matrix to gcc-15/debug alone, which always resolves to
@@ -836,7 +836,7 @@ point, `--num-processes 2` — deliberately, rather than guessing ahead of
 data. One sample (cold cache, first run of the branch on Wee Tam):
 `Test (non-pg suites)` 4m30s, `Test (pg shards, full)` 10m02s (602s) —
 the pg step alone was 61% of the 16m32s total job, confirming the plan's
-own diagnosis that the then-11 pg shards (16 now) through 2 workers leave real serialization
+own diagnosis that the then-11 pg shards (14 now) through 2 workers leave real serialization
 on the table. (This baseline is itself only one sample — the huge margin
 in every subsequent push's improvement makes that imprecision moot, but
 it's not a second-sampled median the way k=4 and later are.)
@@ -889,7 +889,7 @@ push 2's paragraph above). This is the current head's width; no push 4
 (k=8) has been made. `docs/ci-architecture.md`'s own worst-case job-budget arithmetic
 (below, under "Worst-case job-budget arithmetic") and the round-count
 math (at the then-11 shards, 11 over 6 workers is already 2 scheduling rounds,
-identical to 11 over 8; at 16 shards k=6 is 3 rounds against 2 at k=8, see the
+identical to 11 over 8; at 14 shards k=6 is 3 rounds against 2 at k=8, see the
 2026-10-11 paragraph) are why k=6 is where the staged widening
 stopped rather than continuing to k=8; going wider buys no
 round-reduction here and only adds CCD-thread-contention risk on Wee
@@ -1122,8 +1122,11 @@ paragraph exists to make the new fact visible to the next reviewer, not to
 resolve it unilaterally.
 
 **Re-derived 2026-10-11 after shards M, N, O and P (pg-shard rebalance).** The
-pg suite is now 16 shards (12 on dev before this change; 15 after the first
-step, P added by the follow-up below): shards M and N were carved from C (12
+pg suite grew to 16 shards during this rebalance (12 on dev before it; 15 after
+the first step, P added by the follow-up below) and was then merged back to 14
+to meet the maintainer limit of 14 pg shards (J into I, P into M; see the last
+paragraph of this section). The arithmetic below is for the final 14. Shards M
+and N were carved from C (12
 tags moved, C 886 to 542 cases) and shard O from F (its `[dex]` clause, F 532
 to 418 cases; the 28 cases tagged both `[dex]` and `[mcp]` go to O). The
 motivation was the weecolin Windows runner. The old figures of C 895s and F
@@ -1138,32 +1141,34 @@ cases and 9 more F cases than the dev base: C 914 against 886, F 541 against
 532).
 
 The theoretical degenerate ceiling grows with the count, as the paragraph
-above predicted for any addition: 16 * 700 = 11200 test-seconds, and at the
-Linux `--num-processes 2` that is 8 rounds of two shards, so 8 * 700 = 5600s
-= 93.3 minutes. That figure ALONE exceeds the Linux job's `timeout-minutes:
-90` (`.github/workflows/ci.yml`, the `linux` job), by 3.3 minutes, and with the
-up-to-30-minute slot wait (`YUZU_TEST_SLOT_TIMEOUT_MIN`) it is about 123
-minutes, before checkout and build time. The actual dev base of 12 shards was
-6 rounds, 4200s = 70 minutes, which cleared the job limit on its own (about
-100 minutes with the slot wait). This is the first shard count on dev where the
-all-at-cap ceiling alone, without the slot wait, passes the 90-minute job
-limit (an intermediate 15-shard layout that never reached dev was also 8
-rounds). It is still a ceiling that requires every shard to hit its own cap,
-not an expected case: the degenerate figure applies only when every shard
-runs to 700s, and the makespan is lower whenever any shard finishes under its
-cap (the earlier "BEST and WORST makespan are the same number" holds only in
-that all-at-cap case). The expected case moves the other way, see the
-measured 16-shard Windows run below. On Windows the pg step runs
+above predicted for any addition. At the final 14 shards: 14 * 700 = 9800
+test-seconds, and at the Linux `--num-processes 2` that is 7 rounds of two
+shards, so 7 * 700 = 4900s = 81.7 minutes. That figure ALONE is now under the
+Linux job's `timeout-minutes: 90` (`.github/workflows/ci.yml`, the `linux`
+job), by 8.3 minutes; with the up-to-30-minute slot wait
+(`YUZU_TEST_SLOT_TIMEOUT_MIN`) it is about 112 minutes, which still exceeds
+the 90-minute limit, before checkout and build time. For comparison, the 16-
+and 15-shard layouts (never on dev) were 8 rounds, 5600s = 93.3 minutes, over
+the limit on their own (about 123 minutes with the slot wait), and the actual
+dev base of 12 shards was 6 rounds, 4200s = 70 minutes (about 100 minutes with
+the slot wait). The ceiling is a figure that requires every shard to hit its
+own cap, not an expected case: the degenerate figure applies only when every
+shard runs to 700s, and the makespan is lower whenever any shard finishes
+under its cap (the earlier "BEST and WORST makespan are the same number" holds
+only in that all-at-cap case). The expected case moves the other way, see the
+measured Windows run of the 16-shard layout below. On Windows the pg step runs
 `--num-processes 6` (`ci.yml`, "Test (pg shards, full)" in the `windows`
-job), so 16 shards are ceil(16/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
+job), so 14 shards are ceil(14/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
 65 minutes with a 30-minute slot wait for the pg step alone. The job also
 acquires a slot for its non-pg step, so the worst case with both 30-minute
 waits is 95 minutes plus that step's own run time, still under that job's
-`timeout-minutes: 120`. The Linux ceiling is the one that needs attention: the "revisit the
-700s per-shard budget or the Linux `--num-processes 2` cap" follow-up
-tracked on #3443 (see the shard-K paragraph above) now has a concrete
-trigger. Neither number is adjusted here. The tag assignment is the tuning
-knob (move a tag between M and N, or O and F), documented in
+`timeout-minutes: 120`. The Linux slot-wait case is the one that still needs
+attention: the "revisit the 700s per-shard budget or the Linux
+`--num-processes 2` cap" follow-up tracked on #3443 (see the shard-K paragraph
+above) remains open, with a less severe trigger than at 16 shards (the
+all-at-cap ceiling alone now fits the job limit; the ceiling plus a full slot
+wait does not). Neither number is adjusted here. The tag assignment is the
+tuning knob (move a tag between M and N, or O and F), documented in
 `tests/meson.build` above shard M.
 
 **Follow-up, same day: shard P carved from C.** A healthy-Postgres Windows
@@ -1178,7 +1183,8 @@ Postgres setup and the lever is case count. Shard P takes six C-resident tags
 `[app_perf]`): 202 cases and 46.9% of C's profiled seconds, leaving C 340
 cases. Scaling C's 542s by the profiled share predicted P about 254s and C
 about 288s. Measured on the 16-shard layout (weecolin Windows, restarted
-Postgres, 4-wide, full server suite, 23/23 OK, wall 1064s): A 393s, F 347s,
+Postgres, 4-wide, full server suite, 23/23 OK, wall 1064s; this is the
+unmerged 16-shard layout, measured before the J and P merges below): A 393s, F 347s,
 E 335s, D 287s, G 256s, O 247s, H 246s, L 236s, N 228s, C 185s, K 176s,
 J 173s, I 169s, P 148s, B 140s, M 83s. So C and P came in under the
 prediction (predicted 288/254, measured 185/148); the intermediate run above
@@ -1192,6 +1198,25 @@ setup cost. Partition proof: the 16 shards' union equals the `[pg]`
 population (4729), no case runs twice, the 202 cases leaving C are exactly
 P's, and every other shard is set-identical. Rebalance by moving a TAG
 (between P and C, or M and N, or O and F) before touching any timeout.
+
+**Final step, same day: shards J and P merged into I and M (14 pg shards).**
+The maintainer limit is at most 14 pg shards, so the 16-shard layout above
+never shipped. Shards J and P were merged into I and M on 2026-10-11 to stay
+at 14 pg shards; the names J and P no longer exist (the gaps are deliberate,
+noted in `tests/meson.build`). Each merged entry's spec is the earlier shard's
+clause list followed by the later shard's clause list verbatim (M then P;
+I then J), every clause keeping its own exclusions, so no case moved between
+any other shards. Partition proof (`--list-tests` on the built binary, by
+name, file and line): the union of the 14 shards equals the `[pg]` population
+(4729), zero duplicates, merged M = old M + old P (278 cases), merged I = old
+I + old J (550 cases), and every other shard is set-identical. The measured
+Windows times quoted in this section are from the 16-shard layout, not the
+merged one. ESTIMATES for the merged shards are sums of those measured times
+(startup is shared, so slightly less): M + P is 83 + 148 = 231s on Windows
+(Linux 135 + 100 = 235s) and I + J is 169 + 173 = 342s (Linux 119 + 119 =
+238s); both are below shard A's measured 393s, so A stays the longest pole.
+Re-measure the merged layout on the first CI run. Priorities are now merged M
+185 and merged I 245 (all 14 distinct); see `tests/meson.build`.
 
 **Drift risk — automated (#3443 Phase 1, 2026-08-26):** this used to hardcode
 the 10 pg shard names and the 3 non-pg server test names directly in `ci.yml`,
@@ -1709,9 +1734,9 @@ libpq connection attempt inside a PG-tagged test.
 
 | Platform | pg shards | Migration-DDL tests | Notes |
 |---|---|---|---|
-| Linux (gcc-15/debug, every PR + primary push) | full (16 shards) | run | ADR-0006 reference platform |
+| Linux (gcc-15/debug, every PR + primary push) | full (14 shards) | run | ADR-0006 reference platform |
 | Linux (other push legs) | smoke (`[pg-smoke]`, 11 cases) | run | #3443 Phase 2 |
-| Windows (debug, every PR + push) | full (16 shards) | **skipped** (`YUZU_REQUIRE_PG_MIGRATION_DB`) | #2354; behaviour covered on Linux |
+| Windows (debug, every PR + push) | full (14 shards) | **skipped** (`YUZU_REQUIRE_PG_MIGRATION_DB`) | #2354; behaviour covered on Linux |
 | Windows (release, push only) | smoke | **skipped** (2 of the 11 smoke cases) | never runs on a PR |
 | macOS | none (ADR-0035) | n/a | server is Linux-only |
 
