@@ -671,26 +671,37 @@ unhealthy_status_warning_is_not_limited() ->
 concurrent_burst_is_bounded() ->
     N = 200,
     Parent = self(),
+    Provoke = fun() ->
+        {grpc_error, _} = yuzu_gw_agent_service:register(
+                            ctx(), register_req(binary:copy(<<"x">>, 400)))
+    end,
+    %% One refusal logs the first line, then the kind is held quiet: the interval
+    %% cannot pass mid burst, so the number of lines the burst writes does not
+    %% depend on how long it takes.
+    yuzu_gw_safe_call:reset_limits(),
+    First = capture_logs(fun() -> Provoke(), yuzu_gw_safe_call:hold_limit(register_refused) end),
+    ?assertMatch([_], matching(First, <<"Register refused">>)),
     Pids = [spawn_monitor(fun() ->
                 Parent ! {burst_ready, self()},
                 receive go -> ok end,
-                {grpc_error, _} = yuzu_gw_agent_service:register(
-                                    ctx(), register_req(binary:copy(<<"x">>, 400)))
+                Provoke()
             end) || _ <- lists:seq(1, N)],
     [receive {burst_ready, P} -> ok after 5000 -> error(burst_not_ready) end
      || {P, _} <- Pids],
-    %% The interval cannot pass mid burst: the kind is held after its first line.
-    yuzu_gw_safe_call:reset_limits(),
     Lines = capture_logs(fun() ->
         [P ! go || {P, _} <- Pids],
         [receive {'DOWN', M, process, P, normal} -> ok
          after 5000 -> error({burst_caller_failed, P})
          end || {P, M} <- Pids]
     end),
-    Refused = matching(Lines, <<"Register refused">>),
-    %% One line per interval; a second only if the burst straddled the interval.
-    ?assert(length(Refused) >= 1),
-    ?assert(length(Refused) =< 2),
+    ?assertEqual([], matching(Lines, <<"Register refused">>)),
+    %% Every one of the N concurrent refusals was counted, none lost: the next
+    %% line reports exactly N.
+    yuzu_gw_safe_call:expire_limit(register_refused),
+    Next = capture_logs(Provoke),
+    Expected = iolist_to_binary(io_lib:format("~b similar line(s) suppressed since the last", [N])),
+    ?assertMatch([_ | _], [L || L <- matching(Next, <<"Register refused">>),
+                                binary:match(L, Expected) =/= nomatch]),
     ?assertEqual({closed, 0}, breaker()).
 
 %% The first call logs, the kind is then held quiet, Count - 1 more calls log

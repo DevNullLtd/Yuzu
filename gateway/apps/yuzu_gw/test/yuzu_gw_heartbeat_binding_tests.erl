@@ -688,9 +688,12 @@ agent_text_is_logged_without_control_characters() ->
                  agent_info => #{agent_id => A}, peer_addr => Peer, conn_key => conn_a},
         {ok, Agent} = yuzu_gw_agent:start_link(Args),
         unlink(Agent),
+        Mon = erlang:monitor(process, Agent),
         {ok, _} = yuzu_gw_agent:get_info(Agent),
         yuzu_gw_agent:disconnect(Agent),
-        ok = wait_until(fun() -> not is_process_alive(Agent) end, 2000)
+        receive {'DOWN', Mon, process, Agent, _} -> ok
+        after 5000 -> erlang:error(agent_did_not_exit)
+        end
     end),
     Registered = [L || L <- Lines, binary:match(L, <<"registered, awaiting Subscribe">>) =/= nomatch,
                        binary:match(L, <<"crlf-marker">>) =/= nomatch],
