@@ -686,9 +686,11 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): failed_out feeds an async arm "
 
     // TARGET: drain_locked()'s optional out-param must be INCREMENTED (never reset)
     // by exactly the number of receipts THIS call resolved to non-Committed, so
-    // GuardianEngine::journal_maintenance_tick() can fold it into the durable
-    // fleet-visible arm_failures_ counter (previously only this ledger's own
-    // internal resolved_failed and a local log line saw an async-resolved failure).
+    // GuardianEngine::journal_maintenance_tick() can fold it into the engine's
+    // arm_failures_ counter (previously only this ledger's own internal
+    // resolved_failed and a local log line saw an async-resolved failure). That counter
+    // has no production reader today (arm_failure_count() is read only by tests, #4062),
+    // so this is not a fleet-visible signal.
     std::size_t failed = 0;
     const auto resolved = ledger.drain_locked(*rt, 10, &failed);
     CHECK(resolved == 1);
@@ -928,7 +930,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a Wedged receipt (timed out whi
 
 TEST_CASE("GuardianArmAckLedger::drain_locked(): concern 2 (rung 9c PR-5d) - a Wedged "
           "receipt's arm-failed contribution clears once the runtime ADOPTS its late "
-          "success, without touching the cumulative fleet-visible failed_out counter",
+          "success, without touching the cumulative failed_out counter",
           "[spark][ack]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
@@ -987,7 +989,7 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): concern 2 (rung 9c PR-5d) - a W
     // Second drain: the recovery scan notices the adoption via
     // receipt_recovery_status() and clears this rule's own resolved_failed
     // contribution - failed_out (the
-    // cumulative fleet-visible counter) does NOT move, since this is a recovery,
+    // cumulative failure counter) does NOT move, since this is a recovery,
     // not a new failure.
     std::size_t failed_out2 = 0;
     CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out2) == 0); // nothing NEW resolved

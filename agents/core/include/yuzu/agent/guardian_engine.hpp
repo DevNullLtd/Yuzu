@@ -538,17 +538,61 @@ public:
     /// mech_unsupported_total heartbeat tag.
     [[nodiscard]] std::map<SparkType, std::uint64_t> unsupported_counts_by_type() const;
 
-    /// Current policy generation — monotonically increasing; bumped on
-    /// every successful apply_rules call. Persisted across restarts.
+    /// The policy generation REPORTED to the server (the heartbeat's yuzu.guardian_generation
+    /// tag, via generation_report() below, and the `__guard__ push_rules` reply text). Reads 0
+    /// while a boot re-arm is unresolved (boot_rearm_unresolved(), #5513): a boot re-arm that
+    /// failed at an already-acknowledged generation would otherwise leave the agent reporting
+    /// that generation while the rule is not armed, and the server's heartbeat reconcile only
+    /// pushes while the reported value is BEHIND its current. This accessor is const and pure:
+    /// it reads 0 for the WHOLE unresolved window. The heartbeat's own report,
+    /// generation_report(), is the one exception: after a failed catch-up it reports the real
+    /// value for a bounded number of heartbeats (the #5513 back-off, see boot_report_holdoff_).
+    /// Only the INTERNAL value (policy_generation_, the one persisted under kKeyGen) is
+    /// monotonically increasing and bumped on a successful apply_rules call; this REPORTED
+    /// value is not monotonic by design (it drops to 0 on an unresolved boot re-arm and
+    /// returns to the internal value when a clean application clears it). Persisted across
+    /// restarts is the internal value only.
     std::uint64_t policy_generation() const;
 
-    /// Cumulative count of reconcile (arm) ATTEMPTS that threw and were firewalled in
-    /// apply_rules — a rule that persisted but did not arm. This counts attempts, NOT
-    /// distinct rules: one persistently-failing rule increments it once per push (so it
-    /// is a rate signal / "a gap is open", not "how many rules are gapped"). A nonzero
-    /// value means an enforcement gap is (or was) open on this endpoint; surfaced via the
-    /// heartbeat by item 9 so a persistent gap stays fleet-visible even after the
-    /// generation later advances past it (rung 7.7b PR-1 item 3 / Sol B1). Lock-free.
+    /// The reported generation and the boot-re-arm flag read under ONE mtx_ acquisition, so a
+    /// heartbeat that ships both tags can never pair a value from before an apply_rules clear
+    /// with a flag from after it (#5513). `reported` is what policy_generation() would return at
+    /// the same instant, EXCEPT during the back-off: while the boot re-arm is unresolved and
+    /// boot_report_holdoff_ is positive, `reported` is the real persisted generation while
+    /// `boot_rearm_unresolved` stays true. Only an agent whose persisted generation EQUALS the
+    /// server's current generation is left alone by the server for that many heartbeats; one
+    /// whose persisted generation is behind the server's (or is 0) is still re-pushed at the
+    /// server's 25 s per-agent limit (the pre-existing held-generation retry, unchanged).
+    ///
+    /// NOT const, and NOT idempotent: each call is exactly ONE heartbeat's report and consumes
+    /// one unit of holdoff, so it must be called once per heartbeat (agent.cpp does) and never
+    /// as a read-only probe. Use policy_generation() / boot_rearm_unresolved() to observe.
+    struct GenerationReport {
+        std::uint64_t reported{0};
+        bool boot_rearm_unresolved{false};
+    };
+    [[nodiscard]] GenerationReport generation_report();
+
+    /// The most heartbeats one failed catch-up can make generation_report() report the real
+    /// generation (the back-off ceiling; the 5th and later failed catch-ups all get this).
+    static constexpr std::uint32_t kBootReportBackoffMaxHeartbeats = 10;
+
+    /// True while a boot re-arm is unresolved (#5513): start_local()'s walk failed to re-arm a
+    /// cached rule (a returned Failed or a throw), or a boot-application receipt later drained
+    /// as a failure, and no clean application has cleared it since. In-memory only: a restart
+    /// rebuilds it from the walk, so the persisted generation is never rewritten for it. Takes
+    /// mtx_.
+    [[nodiscard]] bool boot_rearm_unresolved() const;
+
+    /// Cumulative count of reconcile (arm) ATTEMPTS that threw or returned Failed and were
+    /// firewalled in apply_rules (and full_sync sweep/teardown failures), plus failed boot
+    /// re-arms (start_local's walk, #5513) and arm receipts that resolved to a failure in the maintenance tick's drain — a rule that persisted but did
+    /// not arm. This counts attempts, NOT distinct rules: one persistently-failing rule
+    /// increments it once per push (so it is a rate signal / "a gap is open", not "how many
+    /// rules are gapped"). A nonzero value means an enforcement gap is (or was) open on this
+    /// endpoint. NOT surfaced anywhere today: it has no production caller (no heartbeat tag,
+    /// no metric; tracked by #4062), so it is readable only from tests, and must not be cited
+    /// as fleet-visible evidence (rung 7.7b PR-1 item 3 / Sol B1). Lock-free.
     [[nodiscard]] std::uint64_t arm_failure_count() const noexcept {
         return arm_failures_.load(std::memory_order_relaxed);
     }
@@ -624,6 +668,20 @@ public:
     /// accessor that reads engine-owned state). No production caller.
     [[nodiscard]] std::size_t ack_pending_count_for_test() const;
 
+    /// TEST-ONLY: the current application's retained failed-receipt count (see
+    /// GuardianArmAckLedger::failed_receipt_count_for_test) - lets a test assert that a drained
+    /// wedge was RETAINED (kept recoverable) before it releases the late outcome (#5513).
+    /// Defined out-of-line like ack_pending_count_for_test(); takes mtx_. No production caller.
+    [[nodiscard]] std::size_t ack_failed_receipt_count_for_test() const;
+
+    /// TEST-ONLY: the #5513 back-off state, read WITHOUT consuming holdoff (generation_report()
+    /// consumes it, so it cannot be used to observe it). boot_catchup_failures_for_test() is
+    /// the saturating count of failed catch-up applications; boot_report_holdoff_for_test() is
+    /// the number of upcoming heartbeat reports that will carry the real generation. Take
+    /// mtx_. No production caller.
+    [[nodiscard]] std::uint32_t boot_catchup_failures_for_test() const;
+    [[nodiscard]] std::uint32_t boot_report_holdoff_for_test() const;
+
     /// TEST-ONLY: the spark drain worker / convergence scheduler, for started-state
     /// introspection (#2238, fixes BLOCKING-2b). wire_spark_engine() constructs both
     /// unconditionally but starts them only under prefer_spark_ — journal_age_stats()
@@ -691,8 +749,8 @@ public:
     /// TEST-ONLY: if set, invoked inside start_local()'s re-arm walk once per cached
     /// enabled rule, immediately BEFORE reconcile_rule_locked() — so a throw from the
     /// hook simulates the failure class the surrounding catch exists for (a legacy
-    /// guard's std::thread ctor throwing std::system_error under thread/handle
-    /// exhaustion), aimed at exactly one rule by rule_id. Deliberately NOT fired from
+    /// guard's std::thread ctor throwing std::system_error on thread-creation
+    /// failure), aimed at exactly one rule by rule_id. Deliberately NOT fired from
     /// inside reconcile_rule_locked() itself, which would also fire on the apply_rules
     /// path this seam is not meant to touch.
     ///
@@ -933,9 +991,56 @@ private:
     bool started_{false};
     bool stopped_{false};
     std::uint64_t policy_generation_{0};
+    /// #5513: true while a boot re-arm is unresolved; policy_generation() then reports 0, and
+    /// generation_report() reports 0 except during the back-off holdoff below
+    /// (policy_generation_ itself is never touched, so the persisted value and the two
+    /// `> policy_generation_` advance gates are unchanged). Set by
+    /// note_boot_rearm_failure_locked() (start_local's walk) and by the maintenance tick when a
+    /// receipt of the still-open boot application drains as a failure; cleared by any clean
+    /// application (apply_rules' tail, or the tick's can_advance() block). Under mtx_, no atomics.
+    bool boot_unresolved_{false};
+    /// #5513 back-off (governance finding P-1): the number of catch-up applications (apply_rules
+    /// calls that reached the tail) that finished with boot_unresolved_ still set, saturating at
+    /// kBootCatchupFailuresCap. Drives boot_report_holdoff_. Reset to 0 whenever the flag clears
+    /// (apply_rules' tail or the tick's can_advance() block). Under mtx_, no atomics.
+    std::uint32_t boot_catchup_failures_{0};
+    /// Saturation point of boot_catchup_failures_: keeps the increment overflow-free and the
+    /// holdoff shift (failures - 1 <= 15) well defined.
+    static constexpr std::uint32_t kBootCatchupFailuresCap = 16;
+    /// #5513 back-off: the number of upcoming generation_report() calls (one per heartbeat) that
+    /// report the REAL persisted generation instead of 0 while boot_unresolved_ is set. Without
+    /// it an unresolved boot re-arm reports 0 on every heartbeat, so the server re-pushes a full
+    /// sync about every heartbeat forever if the rule keeps failing. The back-off bites only
+    /// when the persisted generation equals the server's current one and the failed catch-up
+    /// reaches apply_rules' tail: a push that returns before the tail earns no holdoff, a
+    /// Suppress repeat under prefer_spark_ does not extend it, and an agent whose persisted
+    /// generation is behind the server's keeps being re-pushed at the server's 25 s per-agent
+    /// limit (the pre-existing held-generation retry; a generic server-side back-off for it is
+    /// a follow-up). Set by a failed catch-up to
+    /// min(2^(boot_catchup_failures_-1), kBootReportBackoffMaxHeartbeats) (1, 2, 4, 8, 10, 10,
+    /// ...), consumed one per generation_report(), reset to 0 when the flag clears. Touches
+    /// neither policy_generation_ (the persisted and internal value is never altered) nor
+    /// boot_unresolved_ (the companion tag stays set during holdoff), nor policy_generation()
+    /// (the __guard__ reply text keeps reading 0). Under mtx_, no atomics.
+    std::uint32_t boot_report_holdoff_{0};
+    /// #5513: true from the boot application's begin_application() succeeding until
+    /// apply_rules' own begin_application() succeeds (which supersedes it) or stop(). Only the
+    /// SET side (boot_unresolved_ from a drained failure) reads it, so an ordinary held push's
+    /// failure never reports 0. Under mtx_, no atomics.
+    bool boot_app_open_{false};
     std::size_t rule_count_{0};
-    std::atomic<std::uint64_t> arm_failures_{0}; ///< reconcile-throw count (item 3 / Sol B1)
+    /// Cumulative arm-failure count (item 3 / Sol B1): reconcile throws and returned-Failed
+    /// arms, full_sync sweep/teardown failures, boot-walk failures and drained async arm
+    /// failures. Not fleet-visible (#4062).
+    std::atomic<std::uint64_t> arm_failures_{0};
 
+    /// #5513: the ONE place a boot re-arm failure is recorded, shared by start_local's
+    /// returned-Failed arm and both catch arms. mtx_ held. noexcept and allocation-free: it
+    /// runs inside the exhaustion catch. Sets boot_unresolved_, counts the failure into
+    /// arm_failures_, and latches the boot application (a no-op when begin_application failed:
+    /// no current application) so the tick's can_advance() cannot clear the flag before the
+    /// server's catch-up push has applied cleanly.
+    void note_boot_rearm_failure_locked() noexcept;
     bool put_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void refresh_count_locked();
     /// Persists `gen` to the policy-generation KV key. Returns kv_->set()'s own
