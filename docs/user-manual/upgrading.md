@@ -710,7 +710,7 @@ No config or data migration is required.
 
 - **`GET /api/v1/hardware`:** a failed roster read now answers `503` with `retry_after_ms` instead of a `200` with no rows. The Hardware list shows the "Hardware roster unavailable" banner instead of an empty table.
 - **`GET /api/v1/hardware/{id}`:** when the roster read failed and the device was not otherwise found (CI record readable-and-absent, no software, no tags) the route answers `503`, not `404`. A record that can still be served carries a new additive key `identity_state` (`found`, `degraded` or `absent`).
-- **`GET /api/v1/hardware/{id}` and `POST /api/v1/hardware/{id}/sync`:** a device id longer than the agent-id limit or containing control characters now answers `400` (it previously fell through to `404` or `503`). A registered agent id never matches, so this is unreachable for a real device; it only bounds what reaches an audit row.
+- **`GET /api/v1/hardware/{id}` and `POST /api/v1/hardware/{id}/sync`:** a device id longer than the agent-id limit or containing control characters now answers `400` (it previously fell through to the permission check, which answered `403` to a caller without access, and otherwise to the normal `404` or `503` path). A registered agent id never matches, so this is unreachable for a real device; it only bounds what reaches an audit row.
 - **`GET /api/v1/viz/fleet/topology` and MCP `get_fleet_topology`:** still return the live fleet; the body now carries `offline_roster_degraded: true` when the durable offline-host read failed.
 - **Observability:** the failure is counted on `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}` (once per failed read, not per cache window) and the audit rows record `result=failure`.
 

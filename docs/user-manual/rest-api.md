@@ -442,7 +442,7 @@ The Hardware list: the device roster (identity fields as for `/devices`) plus de
 | `200` | The roster was read. `ci_degraded` / `tags_degraded` are `true` when the CI or tag store could not be read, so those columns are blank rather than genuinely absent. At most the 100,000 most recently seen endpoints within the 30-day window are served, with no truncation signal yet. |
 | `400` | Unrecognised `sort`, `dir`, `os` or `status` token. |
 | `403` | Caller lacks `Inventory:Read`. |
-| `503` | Route misconfigured (roster or audit unwired), the device roster could not be read (`retry_after_ms` set), or the audit row could not be persisted. A failed roster read is never a `200` with an empty list. |
+| `503` | Route misconfigured (roster provider unwired), the device roster could not be read (`retry_after_ms` set), or the audit row could not be persisted. A failed roster read is never a `200` with an empty list. |
 
 **Audit:** `inventory.devices`; `result=success` on a served page, `result=failure` (detail `hardware roster read failed`) when the roster could not be read. A persist failure on the success row fails the request closed with `503`.
 
