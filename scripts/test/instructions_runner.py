@@ -262,8 +262,6 @@ _PATTERN_FALLBACKS = (
     "true",                                  # boolean string
     "00000000-0000-0000-0000-000000000000",  # UUID
     "00:00:00:00:00:00",                     # MAC
-    "yuzu-uat-test-id",
-    "x",
 )
 
 

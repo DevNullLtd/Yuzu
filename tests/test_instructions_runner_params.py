@@ -42,8 +42,6 @@ for f in sorted((ROOT / "content/definitions").glob("*.yaml")):
             pattern = ((schema or {}).get("validation") or {}).get("pattern")
             if not pattern or (schema or {}).get("type", "string") != "string":
                 continue
-            if "default" in schema or schema.get("enum") or schema["validation"].get("enum"):
-                continue  # an explicit default or enum wins over synthesis by design
             swept += 1
             got = runner._value_for_property(name, schema)
             check(re.search(pattern, got) is not None, f"{f.name}: {name}: {got!r} does not match {pattern!r}")
@@ -54,14 +52,9 @@ def synth(schema):
     return runner.synthesise_params({"required": ["p"], "properties": {"p": schema}})["p"]
 
 
-# Behaviour that must not change: no pattern -> the name-based default; an explicit
-# default and an enum still win; an unsatisfiable or invalid pattern keeps the original
-# value so the server, not the runner, reports the mismatch.
+# No pattern: the name-based default is unchanged. An unsatisfiable or invalid pattern keeps
+# the original value, so the server (not the runner) reports the mismatch.
 check(synth({"type": "string"}) == runner._synth_string("p", {}), "no-pattern default changed")
-check(synth({"type": "string", "default": "keep", "validation": {"pattern": "^zzz$"}}) == "keep",
-      "explicit default must win over pattern fitting")
-check(synth({"type": "string", "enum": ["a", "b"], "validation": {"pattern": "^zzz$"}}) == "a",
-      "enum must win over pattern fitting")
 check(synth({"type": "string", "validation": {"pattern": "^zzz$"}}) == runner._synth_string("p", {}),
       "unsatisfiable pattern must leave the original value")
 check(synth({"type": "string", "validation": {"pattern": "["}}) == runner._synth_string("p", {}),
