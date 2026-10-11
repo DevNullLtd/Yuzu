@@ -1,15 +1,14 @@
 %%%-------------------------------------------------------------------
 %%% @doc Agent supplied text in log lines (#4632).
 %%%
-%%% An agent id, a session id header and a command id in a response frame are
-%%% text an agent chooses. Written raw with ~s, a carriage return, line feed or
-%%% escape in them starts a second log line or recolours a terminal. Every log
-%%% line that names such a value passes it through yuzu_gw_env:log_text/1 (cut to
-%%% 128 bytes, control characters become `?'). The connect, registered and
-%%% notification lines are pinned by the heartbeat-binding and notify-pending
-%%% modules, the registration replay lines by the replay module; this module pins
-%%% the sites listed here and nothing else (a log_text/1 call at a site not named
-%%% here is not pinned by it):
+%%% An agent id, a session id header and a command id are text an agent chooses;
+%%% written raw with ~s, a CR, LF or ESC starts a second log line or recolours a
+%%% terminal. Every log line naming such a value passes it through
+%%% yuzu_gw_env:log_text/1 (cut to 128 bytes, control characters become `?').
+%%% The connect and registered lines are pinned by the heartbeat-binding module,
+%%% the registration replay lines by the replay module; this module pins exactly
+%%% the sites listed here (a log_text/1 call at a site not named here is not
+%%% pinned by it):
 %%%   - yuzu_gw_agent: stream error, stream handler died, adopted replay
 %%%     re-announce (streaming and connecting), stale re-announce ignored,
 %%%     orphaned response, disconnect
@@ -18,15 +17,12 @@
 %%%     failed); the notification lines (pending store full, peer address
 %%%     replaced, failed to notify from a closed-state worker and from the
 %%%     half_open probe, probe worker exited, evicted held notification); the
-%%%     registration replay line for a request that could not be encoded; and
-%%%     "Upstream RPC failed" with a server message (the request-fault branch and
-%%%     the other branch)
+%%%     replay line for a request that could not be encoded; and "Upstream RPC
+%%%     failed" with a server message (the request-fault branch and the other)
 %%%
-%%% Each test names an agent (or session or command) id made of a marker, CR, LF,
-%%% an injected word and ESC, provokes the line, waits for it to be logged (the
-%%% capturing handler sends a message before the logging call returns, so the
-%%% wait is event driven with a bounded deadline) and requires the line to carry
-%%% the marker and none of the raw control characters.
+%%% Each test provokes its line with an id made of a marker, CR, LF, an injected
+%%% word and ESC, waits for it (event driven, bounded) and requires the marker
+%%% and none of the raw control characters.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_log_text_sites_tests).
@@ -256,12 +252,10 @@ cleanup_guardian(#{prev_env := Prev}) ->
     yuzu_gw_test_upstream:restore_env(Prev),
     ok.
 
-%% The mocked client reports each call to the test process and then waits for a
-%% release message, so the workers stay in flight for as long as the test needs.
-%% The fixture's setup does not run in the test's process (eunit starts the test
-%% in its own), so the test registers its pid under ?BLOCKED_TEST for the mock to
-%% read at call time, and the workers are kept in a public table the teardown
-%% releases (by exact pid) whatever the test did.
+%% The mocked client reports each call to the test and waits for a release
+%% message. The test registers its pid under ?BLOCKED_TEST (setup does not run in
+%% the test's process) and the workers sit in a public table the teardown
+%% releases by exact pid whatever the test did.
 setup_guardian_blocked() ->
     {ok, _} = application:ensure_all_started(telemetry),
     catch meck:unload(grpcbox_client),

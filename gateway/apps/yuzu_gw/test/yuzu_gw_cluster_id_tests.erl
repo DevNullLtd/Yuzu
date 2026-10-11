@@ -2,22 +2,16 @@
 %%% @doc Tests for the cluster_id configuration read (#4632).
 %%%
 %%% The cluster id is stamped on every stream-status notification as a protobuf
-%%% string, so it must be valid UTF-8. A name such as one with an umlaut arrives
-%%% from the environment (or sys.config) as a list of Unicode code points, and a
-%%% byte-wise conversion truncates it to latin-1: every notification then fails
-%%% the encoder. These tests pin the conversion (YUZU_GW_CLUSTER_ID override and
-%%% yuzu_gw_env:utf8_binary/1) and the boot refusal for a value that cannot be
-%%% represented (yuzu_gw_app:evaluate_cluster_id/2).
+%%% string, so it must be valid UTF-8. A name with an umlaut arrives from the
+%%% environment (or sys.config) as a list of Unicode code points; a byte-wise
+%%% conversion truncates it to latin-1 and every notification then fails the
+%%% encoder. These tests pin the conversion (YUZU_GW_CLUSTER_ID override,
+%%% yuzu_gw_env:utf8_binary/1) and the boot refusal for an unrepresentable value
+%%% (yuzu_gw_app:evaluate_cluster_id/2).
 %%%
-%%% The environment text is read in the VM's native name encoding: os:getenv/1
-%%% returns the variable's BYTES as code points when the node runs with a latin1
-%%% native encoding (what a container with no LANG/LC_ALL and no +fnu gets), so
-%%% UTF-8 bytes come back as a list of code points below 256, while a UTF-8 node
-%%% returns the decoded characters. The tests put the variable in through
-%%% env_text/1, the form the real environment takes under the running node's
-%%% encoding, and the encoding-parameterised function pins both encodings on
-%%% whatever locale the runner has.
-%%%
+%%% os:getenv/1 returns the variable's BYTES as code points on a latin1 native
+%%% encoding node (no LANG/LC_ALL, no +fnu) and decoded characters on a utf8 one,
+%%% so the encoding-parameterised tests pin both whatever locale the runner has.
 %%% Every test restores the application env key and the OS variable it touched.
 %%% @end
 %%%-------------------------------------------------------------------
