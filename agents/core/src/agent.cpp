@@ -1096,11 +1096,13 @@ public:
             // completion barrier (lifecycle_mu_+teardown_complete_, early-out on repeat -
             // its own header comment names this exact stop()-vs-ScopeExit scenario as the
             // reason). GuardianEngine::stop() has no such early-out: it takes mtx_ and
-            // RE-EXECUTES its whole body on a second call, safe only because every
+            // RE-EXECUTES most of its body on a second call, safe only because every
             // downstream step in it (ConvergenceScheduler::stop(), OutboxDrainWorker::stop(),
             // stop_all_guards_locked(), GuardianSparkRuntime::begin_stop(),
             // lifecycle_journal_->request_stop()) is independently idempotent - verified, not
-            // a barrier. #2233 item 3's watchdog above
+            // a barrier. The Spark baseline Stop pass is the exception: a once-only latch
+            // makes a second call skip it (see GuardianEngine::stop()). #2233 item 3's
+            // watchdog above
             // covers the case where the call THIS thread is executing hangs; it is
             // deliberately NOT layered with an AgentImpl-level once-only guard on top of
             // these calls - an earlier revision of this PR added one (stop_guardian_once/
