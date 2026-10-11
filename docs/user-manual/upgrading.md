@@ -55,8 +55,10 @@ and the new counters are listed in the changelog entry and in `docs/user-manual/
   `unassign_rbac_role`); an elevated tombstone has its role cleared with
   `UPDATE auth.users SET role = 'user' WHERE username = '<name>' AND NOT is_active;` (see `rbac.md`).
   The `503` for a store failure no longer carries a `retry_after_ms` body member (the `Retry-After`
-  header stays), and a Group request that hits a store failure now skips the remaining promotions and
-  records one `scim.group.recompute_incomplete` audit row.
+  header stays). A Group request whose role recompute is incomplete (a refused or failed demotion, a
+  member whose read failed, or promotions skipped after a store failure) now records one
+  `scim.group.recompute_incomplete` audit row, and its success row says `recompute=incomplete`. Known
+  limits of the Group recompute are listed in the SCIM provisioning guide.
 
 ## Behaviour change: `POST /api/instructions/{id}/execute` now validates `params` against the stored schema
 

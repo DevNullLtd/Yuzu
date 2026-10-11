@@ -251,6 +251,14 @@ Deploy these alert rules alongside SCIM Groups → role mapping:
   Yuzu app, or bulk-edited the admin group's membership), not routine
   churn. Alert on a rate threshold well above your organization's normal
   onboarding/offboarding cadence.
+- **`yuzu_scim_group_recompute_skipped_total{direction}` > 0**: a Group request
+  did not apply (or could not determine) every member's role: `promotion`
+  (skipped after a failed guarded write) or `undetermined` (a read failed).
+  Find the members in the `scim.group.recompute_incomplete` audit row for the
+  Group and repair them by hand; see "Known limits of the Group role recompute"
+  below. A failed or refused demotion is counted separately
+  (`yuzu_scim_role_change_failures_total`, the last-Administrator refusal
+  counter).
 - **`yuzu_scim_audit_write_failures_total`** — the existing CC6.8
   evidence-integrity alert; it also covers a lost audit row for a group
   create/update/delete or role-change event (the SCIM call and the role
@@ -407,23 +415,57 @@ operator has to act). A late refusal is audited with `result=partial` (the
 credentials were revoked); an early refusal and a refused demotion are
 `denied`.
 
-**Group role recompute after a store failure.** After a Group create, replace,
-patch or delete commits, Yuzu recomputes the role of each affected member. If one
-member's guarded role write hits a store failure (a lock wait that expired, an
-unavailable store), the remaining **demotions** are still attempted (skipping one
-would leave an IdP-removed administrator holding the role), and the remaining
-**promotions** are skipped. Skipped promotions are recorded as ONE
-`scim.group.recompute_incomplete` audit row (`result=partial`, the skipped count
-and up to 20 usernames) and counted on
-`yuzu_scim_group_recompute_skipped_total{direction="promotion"}`. A failed
-demotion writes a `scim.user.role_changed` failure row, increments
-`yuzu_scim_role_change_failures_total`, raises the critical analytics event
-`scim.user.role_demotion_incomplete` and a critical log line: demote the account
-and revoke its sessions by hand. The Group request keeps its status (its
-membership write committed). A skipped promotion is repaired by the next
-create/replace/patch of the same Group, by its delete (for former members), or by
-a `POST /Users` re-provision of that user; it is not repaired for a member already
-removed from a surviving group, or on a timer, so use the audit row to find them.
+**Group role recompute: when it is incomplete.** After a Group create, replace,
+patch or delete commits, Yuzu recomputes the role of each affected member, the
+members the request REMOVES first. Every **demotion** is attempted (skipping one
+would leave an IdP-removed administrator holding the role). After the first
+failed guarded write (a lock wait that expired, an unavailable store) the
+remaining **promotions** are skipped. A member whose read failed (its SCIM
+resource, provisioning source, group memberships or current role) is
+**undetermined**: its role is left untouched and it is recorded. Nothing is
+dropped silently:
+
+- a refused demotion (the last-Administrator guard) writes the
+  `scim.user.last_administrator_refused` row and counter and a critical analytics
+  event;
+- a failed demotion writes a `scim.user.role_changed` failure row, increments
+  `yuzu_scim_role_change_failures_total`, raises the critical analytics event
+  `scim.user.role_demotion_incomplete` and a critical log line: verify the
+  account's role (demote it if it is still `admin`) and revoke its sessions by
+  hand;
+- when anything was refused, failed, undetermined or skipped, ONE
+  `scim.group.recompute_incomplete` audit row (`result=partial`) records the
+  count per class and up to 20 usernames (or `scim_id:<id>`) per class, and
+  `yuzu_scim_group_recompute_skipped_total{direction="promotion"|"undetermined"}`
+  counts the skipped promotions and the undetermined members;
+- the Group `created`/`updated`/`deleted` success row says `recompute=complete`
+  only when every member was recomputed as intended, otherwise
+  `recompute=incomplete`. The Group request keeps its status (its membership
+  write committed) and the member keeps the role.
+
+**Known limits of the Group role recompute.** These are real gaps, scheduled to
+be removed by a follow-up change (tracked as a follow-up; the issue number is
+added when it is filed). Until then they are documented rather than engineered
+around:
+
+1. Group mutations are serialised within one server process. When more than one
+   server replica runs, send SCIM provisioning traffic to a single replica.
+2. There is no reconcile. After a crash or a failed write following the
+   membership commit, the role is not re-derived until a later change names the
+   member (the `recompute=incomplete` marker and the summary row report it), and
+   re-sending the same request does not do so, because the member is no longer in
+   the request. To re-derive it by hand: compare the IdP's removed members with the Yuzu roles and demote them,
+   or re-add the member and remove it again.
+3. A Group request recomputes every affected member and can be slow on a large
+   group or a slow store; the HTTP request and the per-process Group lock are
+   held meanwhile. There is no time bound on the loop.
+4. A Group `POST` that fails after the group row is created leaves an empty
+   group, and a retry answers `409`.
+5. Deactivation of an account whose role is not `user` is refused with `404`
+   until the role is corrected.
+6. `POST /Users` re-provisioning recomputes the one user but ignores an
+   incomplete result.
+
 See
 [`rbac.md`](rbac.md#last-administrator-guard-for-account-deactivation-and-demotion).
 

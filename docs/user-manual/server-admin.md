@@ -3309,9 +3309,9 @@ The server emits an audit event on every branch:
 > `user.delete` / `partial` (credentials were revoked), and both are counted on
 > `yuzu_server_rbac_last_admin_guard_refused_total{transport="dashboard"}`.
 > If the delete cannot complete because the store is unavailable, the answer
-> is HTTP 503 with `Retry-After: 2`; repeating the delete converges (a repeat
-> on an already-deactivated account answers 404 and re-runs the durable
-> session wipe).
+> is HTTP 503 with `Retry-After: 2`; a repeat re-runs the guarded write and
+> the session wipe (on an already-deactivated account it answers 404 after
+> re-running the wipe), and it succeeds only if that repeat itself succeeds.
 >
 > **Operator notes.** Every guarded delete and role change takes the same
 > database row lock, waiting at most 2000 ms, so a burst of SCIM
