@@ -17,6 +17,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <regex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -80,6 +85,7 @@ TEST_CASE("group_agent_count_preview: non-empty filters against an unconfigured 
 TEST_CASE("facet_filter_value_unmatchable: strictly over 2048 bytes", "[server][devices]") {
     static_assert(kMaxFacetValueBytes == 2048);
     CHECK_FALSE(facet_filter_value_unmatchable(""));
+    CHECK_FALSE(facet_filter_value_unmatchable(std::string(2047, 'a')));
     CHECK_FALSE(facet_filter_value_unmatchable(std::string(2048, 'a')));
     CHECK(facet_filter_value_unmatchable(std::string(2049, 'a')));
     // Bytes, not characters: 1025 two-byte code points is 2050 bytes.
@@ -246,7 +252,8 @@ TEST_CASE("any_raw_filter_value_unmatchable: independent of whether the key reso
     // "no_such_column" matches nothing, so the resolver drops it: the resolved set is empty.
     Fields misspelled{{"no_such_column", over}};
     CHECK(resolve_group_preview_filters("procfetch", misspelled).empty());
-    CHECK_FALSE(any_facet_filter_unmatchable(resolve_group_preview_filters("procfetch", misspelled)));
+    CHECK_FALSE(
+        any_facet_filter_unmatchable(resolve_group_preview_filters("procfetch", misspelled)));
     CHECK(any_raw_filter_value_unmatchable(misspelled));
     CHECK(any_raw_filter_value_unmatchable(Fields{{"name", "x"}, {"no_such_column", over}}));
     CHECK(any_raw_filter_value_unmatchable(Fields{{"name", over}}));
@@ -255,4 +262,109 @@ TEST_CASE("any_raw_filter_value_unmatchable: independent of whether the key reso
     // NUL / line feed / invalid UTF-8 under an unrecognised key are refused the same way.
     CHECK(any_raw_filter_value_unmatchable(Fields{{"no_such_column", std::string("a\0b", 3)}}));
     CHECK(any_raw_filter_value_unmatchable(Fields{{"no_such_column", "\xC0\x80"}}));
+}
+
+// ---------------------------------------------------------------------------
+// Tripwires (#5623): the facet-filter refusal is a CALLER obligation, so two source scans keep
+// a future caller from silently skipping it.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string read_text(const std::filesystem::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    REQUIRE(in.is_open());
+    return std::string{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// Production units (one .cpp or .hpp, plus its same-stem sibling, as one unit: a .cpp that
+// calls a reader may rely on the predicate its own header supplies) that call a ResponseStore
+// facet reader (`->facet_agent_count(` and friends) without referencing any of the three
+// predicate entry points. response_store.{hpp,cpp} define the readers and the predicate and
+// are exempt. A reader returns the exact-match answer for the value it is given, so a caller
+// that skips the refusal answers an unmatchable value (over the bound, NUL, line feed, invalid
+// UTF-8) with a plausible exact 0 or a prefix match. Pure over (stem -> text), so the
+// self-test below can drive it with synthetic sources.
+std::vector<std::string>
+units_calling_facet_reader_without_refusal(const std::map<std::string, std::string>& units) {
+    static const std::regex reader_call{
+        R"((->|\.)facet_(agent_count|agent_ids|response_ids|line_count)\()"};
+    std::vector<std::string> bad;
+    for (const auto& [stem, text] : units) {
+        if (stem == "response_store")
+            continue;
+        if (!std::regex_search(text, reader_call))
+            continue;
+        if (text.find("facet_filter_value_unmatchable") != std::string::npos ||
+            text.find("any_facet_filter_unmatchable") != std::string::npos ||
+            text.find("any_raw_filter_value_unmatchable") != std::string::npos)
+            continue;
+        bad.push_back(stem);
+    }
+    return bad;
+}
+
+} // namespace
+
+TEST_CASE("facet reader tripwire: the scan flags a unit with no refusal and passes one with it",
+          "[server][devices]") {
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"a", "auto n = store->facet_agent_count(id, f);"}}) ==
+          std::vector<std::string>{"a"});
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"b", "auto n = rs.facet_line_count(id, f);"}}) == std::vector<std::string>{"b"});
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"c", "if (any_facet_filter_unmatchable(f)) return; store->facet_agent_ids(f);"}})
+              .empty());
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"d", "// facet_agent_count(...) is mentioned in a comment only"}})
+              .empty());
+    CHECK(units_calling_facet_reader_without_refusal(
+              {{"response_store", "return conn->facet_agent_count(id, f);"}})
+              .empty());
+}
+
+TEST_CASE("facet reader tripwire: every production caller of a ResponseStore facet reader refuses "
+          "an unmatchable value",
+          "[server][devices]") {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    std::map<std::string, std::string> units;
+    for (const auto& entry : std::filesystem::directory_iterator(YUZU_SERVER_SRC_DIR)) {
+        const auto ext = entry.path().extension();
+        if (!entry.is_regular_file() || (ext != ".cpp" && ext != ".hpp"))
+            continue;
+        units[entry.path().stem().string()] += read_text(entry.path());
+    }
+    REQUIRE(units.size() > 100); // the scan found the real tree, not an empty directory
+    REQUIRE(units.count("dashboard_routes") == 1);
+    // Positive control: the three call sites known today are really being scanned.
+    for (const char* stem : {"dashboard_routes", "group_agent_count_preview"})
+        CHECK(std::regex_search(units[stem], std::regex{R"((->|\.)facet_agent_count\()"}));
+    CHECK(units_calling_facet_reader_without_refusal(units).empty());
+}
+
+// ResponseStore's counters are only exported if server.cpp seeds them; nothing else reads
+// server.cpp, so a dropped seeding call would leave every metric test green while an idle
+// server exported no `yuzu_server_response_facets_dropped_total` or
+// `yuzu_server_response_facet_filter_refused_total` series.
+TEST_CASE("response facet metrics: server.cpp still calls seed_response_facet_metrics",
+          "[server][devices]") {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    const auto src = read_text(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    bool called = false;
+    std::size_t pos = 0;
+    while ((pos = src.find("seed_response_facet_metrics(", pos)) != std::string::npos) {
+        const auto line_start = src.rfind('\n', pos);
+        const auto first = src.find_first_not_of(" \t", line_start + 1);
+        if (src.compare(first, 2, "//") != 0) {
+            called = true; // a real call, not a mention in a comment
+            break;
+        }
+        ++pos;
+    }
+    CHECK(called);
 }

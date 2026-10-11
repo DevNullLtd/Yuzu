@@ -40,6 +40,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <format>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -502,10 +503,11 @@ TEST_CASE("/fragments/results: a filter value over the facet bound is refused, n
 }
 
 // A NUL, line feed or invalid UTF-8 byte in a filter value can never equal a stored value
-// (ingest rewrites each NUL / bad byte to U+FFFD and splits on every LF), and a NUL is
-// C-string-truncated by the libpq bind, which matched the prefix (`short%00zzz` showed the
-// rows of `short`). Refused like an over-bound value, before any store access (the store is
-// nullptr: "Response store not available" would mean it was reached).
+// (ingest rewrites each NUL / bad byte to U+FFFD, and separately splits the output on every
+// LF, so no LF is ever stored), and a NUL is C-string-truncated by the libpq bind, which
+// matched the prefix (`short%00zzz` showed the rows of `short`). Refused like an over-bound
+// value, before any store access (the store is nullptr: "Response store not available"
+// would mean it was reached).
 TEST_CASE("/fragments/results: a filter value with a NUL / a line feed / invalid UTF-8 is "
           "refused, not matched as a prefix or rendered as an empty result",
           "[server][dashboard][fragment]") {
@@ -711,8 +713,8 @@ TEST_CASE("/fragments/results: a refused filter says whether it is the operator'
         CHECK(res->status == 200);
         CHECK(contains(res->body, "data-filter-refused=\"true\""));
         CHECK(contains(res->body,
-                       "This View has a built-in filter on A&lt;b&gt;&amp;D that can&#39;t be used, "
-                       "so no results are shown. Pick another View."));
+                       "This View has a built-in filter on A&lt;b&gt;&amp;D that can&#39;t be "
+                       "used, so no results are shown. Pick another View."));
         check_plain_refusal_wording(res->body);
         CHECK_FALSE(contains(res->body, "That filter value"));
         CHECK_FALSE(contains(res->body, "A<b>&D")); // the column name is escaped
@@ -754,7 +756,8 @@ TEST_CASE("/fragments/results: a View equals default with an empty value is refu
     InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
     const auto empty_id = make_provenance_definition(is, "tpl-prov-empty", nlohmann::json(""));
-    const auto at_id = make_provenance_definition(is, "tpl-prov-at", nlohmann::json(std::string(2048, 'v')));
+    const auto at_id = make_provenance_definition(is, "tpl-prov-at",
+                                                  nlohmann::json(std::string(2048, 'v')));
 
     FragmentResultsHarness h(/*response_store=*/nullptr, &is);
     h.routes.set_fleet_read_fn(
@@ -918,8 +921,8 @@ TEST_CASE("/fragments/results: an explicit empty f_ value does not bypass an emp
     PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
     InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
-    const auto id = make_multi_filter_definition(is, "tpl-multi-output-empty",
-                                                 {"Name", "Output"}, {{"Output", nlohmann::json("")}});
+    const auto id = make_multi_filter_definition(is, "tpl-multi-output-empty", {"Name", "Output"},
+                                                 {{"Output", nlohmann::json("")}});
 
     FragmentResultsHarness h(/*response_store=*/nullptr, &is);
     h.routes.set_fleet_read_fn(
@@ -927,8 +930,9 @@ TEST_CASE("/fragments/results: an explicit empty f_ value does not bypass an emp
            const std::string&) -> yuzu::server::authz::FleetReadGate {
             return {true, std::nullopt};
         });
-    const std::string base = "/fragments/results?command_id=cmd-multi-2&plugin=registry&definition_id=" +
-                             id + "&template_id=tplmulti";
+    const std::string base =
+        "/fragments/results?command_id=cmd-multi-2&plugin=registry&definition_id=" + id +
+        "&template_id=tplmulti";
 
     auto empty = h.get(base + "&f_output=");
     REQUIRE(empty);
@@ -1033,4 +1037,245 @@ TEST_CASE("/fragments/results: a cut read that parses to zero lines still says i
     CHECK(contains(cut->body, "data-result-truncated=\"true\""));
     CHECK(contains(cut->body, "so these rows and counts are partial"));
     CHECK_FALSE(contains(cut->body, " results across "));
+}
+
+// -- #5623: every /fragments/results request shares ONE replacing hx-sync scope ------------------
+// The filter bar used `closest form:abort` (drops the NEWEST request) while th / pagination used
+// `this:abort`, so a correction typed during a refused or slow response was never sent, and a
+// late sort/page response could land after another response's OOB swap had detached its issuer.
+// Every element whose hx-get targets /fragments/results (filter-bar controls, the View select,
+// th sort links, Prev/Next) carries the same `#filter-bar:replace`. Verified in a real browser by
+// the lead, not here: this pins that no element is left behind.
+namespace {
+// Number of elements whose hx-get is /fragments/results[?...] (not /filter-bar), failing the
+// calling test for any one of them whose tag lacks the shared scope or carries a second hx-sync.
+std::size_t count_results_requests_sharing_scope(const std::string& html) {
+    const std::string needle = "hx-get=\"/fragments/results";
+    const std::string scope = std::string("hx-sync=\"") + kResultsSyncScope + "\"";
+    std::size_t found = 0;
+    for (auto pos = html.find(needle); pos != std::string::npos;
+         pos = html.find(needle, pos + 1)) {
+        if (html.compare(pos + needle.size(), 11, "/filter-bar") == 0)
+            continue;
+        const auto open = html.rfind('<', pos);
+        const auto close = html.find('>', pos);
+        REQUIRE(open != std::string::npos);
+        REQUIRE(close != std::string::npos);
+        const std::string tag = html.substr(open, close - open + 1);
+        INFO(tag);
+        CHECK(contains(tag, scope));
+        CHECK(tag.find("hx-sync=", tag.find("hx-sync=") + 1) == std::string::npos);
+        ++found;
+    }
+    return found;
+}
+} // namespace
+
+TEST_CASE("/fragments/results: filter bar, sort headers and pagination share one replacing "
+          "hx-sync scope",
+          "[pg][server][dashboard][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, fragment_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+
+    // 25 distinct lines of one column: more than 20 facet values (a text input in the bar) and
+    // three pages at per_page=10 (page 2 has both Prev and Next).
+    const auto store_lines = [&](const std::string& command_id, int lines) {
+        StoredResponse r;
+        r.instruction_id = command_id;
+        r.agent_id = "agent-a";
+        r.received_at_ms = 1000;
+        r.status = 0;
+        r.plugin = "registry";
+        for (int i = 0; i < lines; ++i)
+            r.output += std::format("line-{:02}\n", i);
+        rs.store(r);
+    };
+    store_lines("cmd-sync-many", 25);
+    store_lines("cmd-sync-few", 3);
+    const auto def_id = make_multi_filter_definition(is, "tpl-sync", {"Output"}, {});
+
+    FragmentResultsHarness h(&rs, &is);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+
+    // Filter bar, high cardinality: View select + text input + free-text search.
+    auto many_bar = h.get("/fragments/results/filter-bar?command_id=cmd-sync-many&plugin=registry"
+                          "&definition_id=" + def_id);
+    REQUIRE(many_bar);
+    CHECK(contains(many_bar->body, "<select name=\"template_id\""));
+    CHECK(contains(many_bar->body, "<input type=\"text\" name=\"f_output\""));
+    CHECK(contains(many_bar->body, "<input type=\"search\" name=\"q\""));
+    CHECK(count_results_requests_sharing_scope(many_bar->body) == 3);
+    CHECK(contains(many_bar->body,
+                   std::string("<form id=\"filter-bar\" class=\"filter-bar\" hx-sync=\"") +
+                       kResultsSyncScope + "\">"));
+
+    // Filter bar, low cardinality: the column is a select instead of a text input.
+    auto few_bar = h.get("/fragments/results/filter-bar?command_id=cmd-sync-few&plugin=registry"
+                         "&definition_id=" + def_id);
+    REQUIRE(few_bar);
+    CHECK(contains(few_bar->body, "<select name=\"f_output\""));
+    CHECK_FALSE(contains(few_bar->body, "<input type=\"text\" name=\"f_output\""));
+    CHECK(count_results_requests_sharing_scope(few_bar->body) == 3);
+
+    // Results page 2 of 3: Agent + Output sort headers, Prev and Next.
+    auto page = h.get("/fragments/results?command_id=cmd-sync-many&plugin=registry&per_page=10"
+                      "&page=2");
+    REQUIRE(page);
+    CHECK(contains(page->body, "<th class=\"col-agent sortable\""));
+    CHECK(contains(page->body, ">Prev</button>"));
+    CHECK(contains(page->body, ">Next</button>"));
+    CHECK(count_results_requests_sharing_scope(page->body) == 4);
+
+    // No results request anywhere still uses a dropping/aborting scope.
+    for (const auto* body : {&many_bar->body, &few_bar->body, &page->body}) {
+        CHECK_FALSE(contains(*body, ":abort"));
+        CHECK_FALSE(contains(*body, "closest form"));
+        CHECK_FALSE(contains(*body, "hx-sync=\"this"));
+    }
+}
+
+// -- #5623: authorization runs before the refusal, and a refusal is counted ---------------------
+TEST_CASE("/fragments/results: a denied caller gets the gate's response, not a facet refusal",
+          "[server][dashboard][fragment][auth]") {
+    FragmentResultsHarness h(/*response_store=*/nullptr);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response& res, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            res.status = 403;
+            res.set_content(R"({"error":"permission denied"})", "application/json");
+            return {false, yuzu::server::authz::deny_all()};
+        });
+    // Each value would be refused for an admitted caller (tests above).
+    for (const std::string value : {std::string(2049, 'v'), std::string("a%00b"),
+                                    std::string("a%0Ab"), std::string("%FF")}) {
+        INFO(value.substr(0, 20));
+        auto res = h.get("/fragments/results?command_id=cmd-deny-1&plugin=registry&f_output=" +
+                         value);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(contains(res->body, "permission denied"));
+        CHECK_FALSE(contains(res->body, "data-filter-refused"));
+        CHECK_FALSE(contains(res->body, "can&#39;t be searched"));
+    }
+    CHECK(h.metrics.counter(kResponseFacetFilterRefusedMetric, {{"surface", "dashboard"}})
+              .value() == 0.0);
+}
+
+TEST_CASE("/fragments/results: each refused request increments "
+          "yuzu_server_response_facet_filter_refused_total{surface=dashboard} once",
+          "[pg][server][dashboard][fragment][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, fragment_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+    const auto empty_view = make_provenance_definition(is, "tpl-cnt-empty", nlohmann::json(""));
+    const auto over_view = make_provenance_definition(is, "tpl-cnt-over",
+                                                      nlohmann::json(std::string(2049, 'v')));
+    const auto at_view = make_provenance_definition(is, "tpl-cnt-at",
+                                                    nlohmann::json(std::string(2048, 'v')));
+
+    FragmentResultsHarness h(/*response_store=*/nullptr, &is);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    const auto refused = [&] {
+        return h.metrics.counter(kResponseFacetFilterRefusedMetric, {{"surface", "dashboard"}})
+            .value();
+    };
+    const std::string base = "/fragments/results?command_id=cmd-cnt-1&plugin=registry&";
+    REQUIRE(refused() == 0.0);
+
+    // Not refused: an at-bound View value and a valid operator filter (both reach the store,
+    // which is absent here: "Response store not available" proves the refusal did not run).
+    auto ok_view = h.get(base + "definition_id=" + at_view + "&template_id=tplprov");
+    REQUIRE(ok_view);
+    CHECK(contains(ok_view->body, "Response store not available"));
+    auto ok_filter = h.get(base + "f_output=fine");
+    REQUIRE(ok_filter);
+    CHECK(contains(ok_filter->body, "Response store not available"));
+    CHECK(refused() == 0.0);
+
+    auto operator_filter = h.get(base + "f_output=" + std::string(2049, 'v'));
+    REQUIRE(operator_filter);
+    CHECK(contains(operator_filter->body, "data-filter-refused"));
+    CHECK(refused() == 1.0);
+
+    auto view_over = h.get(base + "definition_id=" + over_view + "&template_id=tplprov");
+    REQUIRE(view_over);
+    CHECK(contains(view_over->body, "data-filter-refused"));
+    CHECK(refused() == 2.0);
+
+    auto view_empty = h.get(base + "definition_id=" + empty_view + "&template_id=tplprov");
+    REQUIRE(view_empty);
+    CHECK(contains(view_empty->body, "data-filter-refused"));
+    CHECK(refused() == 3.0);
+
+    // The other surfaces did not move.
+    CHECK(h.metrics.counter(kResponseFacetFilterRefusedMetric, {{"surface", "rest"}}).value() ==
+          0.0);
+    CHECK(h.metrics.counter(kResponseFacetFilterRefusedMetric, {{"surface", "mcp"}}).value() ==
+          0.0);
+}
+
+// -- #5623: a VALID View `equals` default still filters, through a real store -------------------
+// The refusal tests above run with no response store; this one proves the happy path is
+// unchanged: a View whose saved `equals` value is storable returns just the matching rows, and
+// the same request without the View returns them all.
+TEST_CASE("/fragments/results: a valid View equals default filters the rows through a real store",
+          "[pg][server][dashboard][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, fragment_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+
+    StoredResponse r;
+    r.instruction_id = "cmd-view-valid-1";
+    r.agent_id = "agent-a";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.plugin = "registry";
+    r.output = "line-03\nline-07\nline-09\n";
+    rs.store(r);
+    const auto def_id = make_multi_filter_definition(is, "tpl-view-valid", {"Output"},
+                                                     {{"Output", nlohmann::json("line-07")}});
+
+    FragmentResultsHarness h(&rs, &is);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    const std::string base = "/fragments/results?command_id=cmd-view-valid-1&plugin=registry";
+
+    auto unfiltered = h.get(base);
+    REQUIRE(unfiltered);
+    CHECK(contains(unfiltered->body, "line-03"));
+    CHECK(contains(unfiltered->body, "line-07"));
+    CHECK(contains(unfiltered->body, "line-09"));
+
+    auto viewed = h.get(base + "&definition_id=" + def_id + "&template_id=tplmulti");
+    REQUIRE(viewed);
+    CHECK(viewed->status == 200);
+    CHECK_FALSE(contains(viewed->body, "data-filter-refused"));
+    CHECK(contains(viewed->body, "line-07"));
+    CHECK_FALSE(contains(viewed->body, "line-03"));
+    CHECK_FALSE(contains(viewed->body, "line-09"));
+    CHECK(h.metrics.counter(kResponseFacetFilterRefusedMetric, {{"surface", "dashboard"}})
+              .value() == 0.0);
 }

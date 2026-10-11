@@ -23,6 +23,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <format>
 #include <limits>
 #include <map>
 
@@ -2019,9 +2020,7 @@ TEST_CASE("ResponseStore: the facet cap keeps the most frequent facets, determin
     // Value prefixes sort opposite to the column order: col 3 < col 2 < col 1 < col 0.
     const std::array<std::string, 4> prefix{"d-", "c-", "b-", "a-"};
     auto value_for = [&](int col, const char* tier, int i) {
-        char num[8];
-        std::snprintf(num, sizeof num, "%04d", i);
-        return prefix[static_cast<std::size_t>(col)] + tier + num;
+        return prefix[static_cast<std::size_t>(col)] + tier + std::format("{:04}", i);
     };
     auto field_line = [](int col, const std::string& value) {
         std::string line;
@@ -2132,6 +2131,108 @@ TEST_CASE("ResponseStore: a failed facet batch is counted and the response row p
     CHECK(dropped_count(metrics, "cap") == 0.0);
 }
 
+// #5623: the facet-drop counters are published only after the response COMMITS. A failure at
+// COMMIT itself (a deferred constraint, a serialization failure, a lost connection) rolls the
+// whole response back, so counting its facets would report drops for rows that never existed
+// and double count when the agent retries. A test-local DEFERRABLE INITIALLY DEFERRED
+// constraint trigger raises at COMMIT for one instruction_id, after every INSERT (response and
+// facets) has succeeded. The output carries both an over-bound value (value_too_long) and more
+// than kMaxFacetsPerResponse distinct facets (cap), so a regression that publishes before the
+// commit result is known moves those counters.
+TEST_CASE("ResponseStore: a failed COMMIT drops the response and publishes no facet counter",
+          "[pg][response_store][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    yuzu::MetricsRegistry metrics;
+    seed_response_facet_metrics(metrics);
+    store.set_metrics(&metrics);
+
+    exec_sql(db.dsn(),
+             "CREATE FUNCTION response_store.yuzu_test_commit_fail_fn() RETURNS trigger "
+             "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'yuzu_test: forced COMMIT failure'; "
+             "END $$");
+    exec_sql(db.dsn(),
+             "CREATE CONSTRAINT TRIGGER yuzu_test_commit_fail AFTER INSERT ON "
+             "response_store.responses DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN "
+             "(NEW.instruction_id = 'cmd-commit-fail') EXECUTE FUNCTION "
+             "response_store.yuzu_test_commit_fail_fn()");
+
+    // vuln_scan schema: severity|category|title|detail. 5100 distinct categories (> the 5000
+    // cap) and one over-bound title.
+    std::string output = "high|cat-over|" + incompressible_text(2049, 11) + "|detail\n";
+    for (int i = 0; i < 5100; ++i)
+        output += "high|category-" + std::to_string(i) + "|title|detail\n";
+    const auto make = [&](const std::string& instruction_id) {
+        StoredResponse resp;
+        resp.instruction_id = instruction_id;
+        resp.agent_id = "agent-1";
+        resp.status = 1;
+        resp.plugin = "vuln_scan";
+        resp.output = output;
+        return resp;
+    };
+    const auto ingest_dropped = [&](const char* reason) {
+        return metrics.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}})
+            .value();
+    };
+
+    store.store(make("cmd-commit-fail"));
+
+    auto failed = store.get_by_instruction("cmd-commit-fail");
+    REQUIRE(failed.has_value());
+    CHECK(failed->empty()); // the whole response, not just its facets, was rolled back
+    CHECK(ingest_dropped("query_error") == 1.0);
+    CHECK(dropped_count(metrics, "value_too_long") == 0.0);
+    CHECK(dropped_count(metrics, "cap") == 0.0);
+    CHECK(dropped_count(metrics, "batch_failed") == 0.0);
+
+    // Control: the same output under another id commits, and the counters DO move, so the
+    // zeros above cannot come from a counter that never fires.
+    store.store(make("cmd-commit-ok"));
+    auto ok = store.get_by_instruction("cmd-commit-ok");
+    REQUIRE(ok.has_value());
+    CHECK(ok->size() == 1);
+    CHECK(ingest_dropped("query_error") == 1.0); // unchanged
+    CHECK(dropped_count(metrics, "value_too_long") == 1.0);
+    CHECK(dropped_count(metrics, "cap") == 104.0); // 5104 distinct facets, 5000 kept
+    CHECK(dropped_count(metrics, "batch_failed") == 0.0);
+
+    exec_sql(db.dsn(), "DROP TRIGGER yuzu_test_commit_fail ON response_store.responses");
+    exec_sql(db.dsn(), "DROP FUNCTION response_store.yuzu_test_commit_fail_fn()");
+}
+
+// #5623: the filter-refused counter is described and pre-seeded at zero for every surface, so an
+// idle server exports the series, and a null registry is a no-op for the increment helper.
+TEST_CASE("seed_response_facet_metrics: the filter-refused counter is pre-seeded per surface",
+          "[response_store][facets][metrics]") {
+    yuzu::MetricsRegistry metrics;
+    seed_response_facet_metrics(metrics);
+    const auto text = metrics.serialize();
+    CHECK(text.find(std::string("# HELP ") + kResponseFacetFilterRefusedMetric + " ") !=
+          std::string::npos);
+    CHECK(text.find(std::string("# TYPE ") + kResponseFacetFilterRefusedMetric + " counter") !=
+          std::string::npos);
+    for (const char* surface : {"dashboard", "rest", "mcp"})
+        CHECK(text.find(std::string(kResponseFacetFilterRefusedMetric) + "{surface=\"" +
+                        surface + "\"} 0") != std::string::npos);
+
+    note_facet_filter_refused(&metrics, kFacetRefusedSurfaceRest);
+    note_facet_filter_refused(nullptr, kFacetRefusedSurfaceRest); // no-op, must not crash
+    CHECK(metrics.counter(kResponseFacetFilterRefusedMetric, {{"surface", "rest"}}).value() ==
+          1.0);
+    CHECK(metrics.counter(kResponseFacetFilterRefusedMetric, {{"surface", "dashboard"}}).value() ==
+          0.0);
+
+    // The HELP text is plain ASCII (the exposition format is read by tools that are not UTF-8
+    // clean).
+    const auto help_pos = text.find(std::string("# HELP ") + kResponseFacetFilterRefusedMetric);
+    REQUIRE(help_pos != std::string::npos);
+    const auto help_line = text.substr(help_pos, text.find('\n', help_pos) - help_pos);
+    for (const unsigned char c : help_line)
+        CHECK(c < 0x80);
+}
+
 // #2691 (Doomgoose finding #7): facet_agent_count/facet_line_count were a
 // plain int64_t degrading silently to 0 on a store/pool/query failure — the
 // SAME observable value as a genuine zero-match answer. The group-creation
@@ -2223,6 +2324,8 @@ TEST_CASE("ResponseStore: the facet filter predicate agrees with what ingest sto
         {"U+D7FF", "\xED\x9F\xBF"s},
         {"U+10000", "\xF0\x90\x80\x80"s},
         {"2048 bytes multibyte", multibyte_2048},
+        {"2047 bytes", std::string(2047, 'a')},
+        {"2048 bytes", std::string(2048, 'a')},
         {"contains U+FFFD itself", "x\xEF\xBF\xBD" "y"s},
         {"control 0x01", "a\x01" "b"s},
     };
@@ -2233,6 +2336,12 @@ TEST_CASE("ResponseStore: the facet filter predicate agrees with what ingest sto
         {"overlong NUL C0 80", "\xC0\x80"s},
         {"surrogate ED A0 80", "\xED\xA0\x80"s},
         {"2049 bytes", std::string(2049, 'a')},
+    };
+
+    const std::map<std::string, std::string> rewritten_forms{
+        {"0xFF", "a\xEF\xBF\xBD" "b"s},
+        {"overlong NUL C0 80", "\xEF\xBF\xBD\xEF\xBF\xBD"s},
+        {"surrogate ED A0 80", "\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD"s},
     };
 
     int n = 0;
@@ -2273,10 +2382,18 @@ TEST_CASE("ResponseStore: the facet filter predicate agrees with what ingest sto
     for (const auto& [name, v] : refused) {
         INFO(name << ": ingest does not store this value as sent, so the predicate must refuse it");
         const auto resp = ingest(v);
+        // The response row itself is stored (one row), never dropped for an unmatchable value.
+        const auto rows = store.get_by_instruction(resp.instruction_id);
+        REQUIRE(rows.has_value());
+        CHECK(rows->size() == 1);
         // Whatever was stored is not v: a reader that ran this filter could never match it.
         const auto stored = stored_col1(resp);
         CHECK(std::find(stored.begin(), stored.end(), v) == stored.end());
         CHECK(facet_filter_value_unmatchable(v));
+        // Invalid UTF-8 is stored in its rewritten form: each bad byte becomes one U+FFFD.
+        const auto rewritten = rewritten_forms.find(name);
+        if (rewritten != rewritten_forms.end())
+            CHECK(stored == std::vector<std::string>{rewritten->second});
     }
     // Spot-check that the refused NUL really was stored in its rewritten form (not dropped).
     {
@@ -2334,9 +2451,9 @@ TEST_CASE("ResponseStore: the facet filter predicate agrees with what ingest sto
     {
         const auto r = store_output("crmid", "high|x\ry|title|detail");
         CHECK(stored_col(r.instruction_id, 1) == std::vector<std::string>{"x\ry"});
-        auto n = store.facet_agent_count(r.instruction_id, {FacetFilter{1, "x\ry"}});
-        REQUIRE(n.has_value());
-        CHECK(*n == 1);
+        auto cr_count = store.facet_agent_count(r.instruction_id, {FacetFilter{1, "x\ry"}});
+        REQUIRE(cr_count.has_value());
+        CHECK(*cr_count == 1);
     }
 
     // Trailing CR of the last column: split_output_lines strips exactly ONE per line, so

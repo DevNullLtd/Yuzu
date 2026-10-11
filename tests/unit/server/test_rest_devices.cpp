@@ -33,6 +33,7 @@
 #include "device_routes.hpp"
 #include "rest_api_v1.hpp"
 #include "authz_gates.hpp"
+#include "response_store.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -461,10 +462,11 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview: an over-bound valu
 }
 
 // A NUL, line feed or invalid UTF-8 byte in a filter can never equal a stored value (ingest
-// rewrites each NUL / bad byte to U+FFFD and splits on every LF), and a NUL is
-// C-string-truncated by the libpq bind, so `short%00zzz` used to match the rows of `short`
-// and be reported as an exact count. Refused like an over-bound value, before any store
-// access (the harness store is nullptr: 503 would mean it was reached).
+// rewrites each NUL / bad byte to U+FFFD, and separately splits the output on every LF, so no
+// LF is ever stored), and a NUL is C-string-truncated by the libpq bind, so `short%00zzz`
+// used to match the rows of `short` and be reported as an exact count. Refused like an
+// over-bound value, before any store access (the harness store is nullptr: 503 would mean it
+// was reached).
 TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a filter value with a NUL / a "
           "line feed / invalid UTF-8 is refused (400), not matched as a prefix or answered "
           "as 0",
@@ -532,4 +534,70 @@ TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a filter value exa
                           at);
     REQUIRE(res != nullptr);
     CHECK(res->status == 503);
+}
+
+// #5623: authorization runs before the refusal. A caller the gate denies (perm_fn, then auth_fn)
+// gets the gate's own response, never the 400 refusal, and nothing is counted. The same values
+// are refused (400) for an admitted caller in the tests above.
+TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a denied caller gets the gate's "
+          "response, not the facet refusal",
+          "[rest][devices][auth]") {
+    const std::string over(2049, 'a');
+    const std::string base =
+        "/api/v1/management-groups/agent-count-preview?command_id=cmd-1&plugin=procfetch&name=";
+    for (const std::string value : {over, std::string("a%00b"), std::string("a%0Ab"),
+                                    std::string("%FF")}) {
+        INFO(value.substr(0, 20));
+        {
+            DeviceRestHarness h;
+            h.perm_grant = false;
+            auto res = h.sink.Get(base + value);
+            REQUIRE(res != nullptr);
+            CHECK(res->status == 403);
+            CHECK(res->body.find("remediation") == std::string::npos);
+            CHECK(res->body.find("not evaluated") == std::string::npos);
+            CHECK(h.metrics.counter(kResponseFacetFilterRefusedMetric, {{"surface", "rest"}})
+                      .value() == 0.0);
+        }
+        {
+            DeviceRestHarness h;
+            h.auth_ok = false;
+            auto res = h.sink.Get(base + value);
+            REQUIRE(res != nullptr);
+            CHECK(res->status == 401);
+            CHECK(res->body.find("not evaluated") == std::string::npos);
+            CHECK(h.metrics.counter(kResponseFacetFilterRefusedMetric, {{"surface", "rest"}})
+                      .value() == 0.0);
+        }
+    }
+}
+
+TEST_CASE("GET /api/v1/management-groups/agent-count-preview: a refusal increments "
+          "yuzu_server_response_facet_filter_refused_total{surface=rest}, an accepted request "
+          "does not",
+          "[rest][devices][metrics]") {
+    DeviceRestHarness h;
+    const auto refused = [&](const char* surface) {
+        return h.metrics.counter(kResponseFacetFilterRefusedMetric, {{"surface", surface}})
+            .value();
+    };
+    const std::string base =
+        "/api/v1/management-groups/agent-count-preview?command_id=cmd-1&plugin=procfetch&";
+
+    auto at = h.sink.Get(base + "name=" + std::string(2048, 'a')); // reaches the (absent) store
+    REQUIRE(at != nullptr);
+    CHECK(at->status == 503);
+    CHECK(refused("rest") == 0.0);
+
+    auto over = h.sink.Get(base + "name=" + std::string(2049, 'a'));
+    REQUIRE(over != nullptr);
+    CHECK(over->status == 400);
+    CHECK(refused("rest") == 1.0);
+
+    auto nul = h.sink.Get(base + "no_such_column=a%00b");
+    REQUIRE(nul != nullptr);
+    CHECK(nul->status == 400);
+    CHECK(refused("rest") == 2.0);
+    CHECK(refused("dashboard") == 0.0);
+    CHECK(refused("mcp") == 0.0);
 }

@@ -20682,6 +20682,102 @@ TEST_CASE("MCP preview_management_group_agent_count: a filter value exactly at t
     CHECK(envelope["error"]["code"].get<int>() == -32603); // store degrade, not a refusal
 }
 
+// #5623: authorization runs before the refusal. A caller the perm gate denies gets the gate's
+// own response, never the -32602 refusal (which would tell an unauthorised caller about the
+// filter), and nothing is counted. The same values are refused for an admitted caller above.
+TEST_CASE("MCP preview_management_group_agent_count: a denied caller gets the gate's response, "
+          "not the facet refusal",
+          "[mcp][devices][security]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    ts.start();
+    for (const std::string& value :
+         {std::string(2049, 'a'), std::string(R"(a\u0000b)"), std::string(R"(a\nb)")}) {
+        INFO(value.substr(0, 20));
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":101,)"
+            R"("params":{"name":"preview_management_group_agent_count",)"
+            R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":{"name":")" +
+            value + R"("}}}})";
+        auto res = ts.call(body);
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 403);
+        CHECK(res->body.find("-32602") == std::string::npos);
+        CHECK(res->body.find("not evaluated") == std::string::npos);
+    }
+    CHECK(reg.counter(yuzu::server::kResponseFacetFilterRefusedMetric, {{"surface", "mcp"}})
+              .value() == 0.0);
+}
+
+TEST_CASE("MCP preview_management_group_agent_count: a refusal increments "
+          "yuzu_server_response_facet_filter_refused_total{surface=mcp}, nothing else does",
+          "[mcp][devices][metrics]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.start();
+    const auto refused = [&](const char* surface) {
+        return reg.counter(yuzu::server::kResponseFacetFilterRefusedMetric,
+                           {{"surface", surface}})
+            .value();
+    };
+    const auto call_with = [&](const std::string& filters_json) {
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":102,)"
+            R"("params":{"name":"preview_management_group_agent_count",)"
+            R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":)" +
+            filters_json + "}}}";
+        auto res = ts.call(body);
+        REQUIRE(res != nullptr);
+        return nlohmann::json::parse(res->body);
+    };
+
+    // Not refused: an at-bound value reaches the (absent) store, and a malformed filters shape
+    // is a different -32602 that is not a facet refusal.
+    CHECK(call_with(R"({"name":")" + std::string(2048, 'a') + R"("})")["error"]["code"] == -32603);
+    CHECK(call_with(R"(["pid"])")["error"]["code"] == -32602);
+    CHECK(call_with(R"({"pid":1234})")["error"]["code"] == -32602);
+    CHECK(refused("mcp") == 0.0);
+
+    CHECK(call_with(R"({"name":")" + std::string(2049, 'a') + R"("})")["error"]["code"] == -32602);
+    CHECK(refused("mcp") == 1.0);
+    CHECK(call_with(R"({"no_such_column":"a\u0000b"})")["error"]["code"] == -32602);
+    CHECK(refused("mcp") == 2.0);
+    CHECK(refused("dashboard") == 0.0);
+    CHECK(refused("rest") == 0.0);
+}
+
+// The two malformed-shape rejections use the same A4 envelope as the facet refusal (#5623
+// follow-up): error.data carries a correlation id, a non-retryable retry_after_ms and a
+// remediation, so an agentic worker handles all three -32602s of this tool the same way.
+TEST_CASE("MCP preview_management_group_agent_count: a malformed filters shape carries the "
+          "A4 error data",
+          "[mcp][devices][security]") {
+    McpTestServer ts;
+    ts.start();
+    for (const std::string filters_json :
+         {std::string(R"(["pid"])"), std::string(R"({"pid":1})")}) {
+        INFO(filters_json);
+        const std::string body =
+            R"({"jsonrpc":"2.0","method":"tools/call","id":103,)"
+            R"("params":{"name":"preview_management_group_agent_count",)"
+            R"("arguments":{"command_id":"cmd-1","plugin":"procfetch","filters":)" +
+            filters_json + "}}}";
+        auto res = ts.call(body);
+        REQUIRE(res != nullptr);
+        auto envelope = nlohmann::json::parse(res->body);
+        REQUIRE(envelope.contains("error"));
+        CHECK(envelope["error"]["code"].get<int>() == -32602);
+        CHECK(envelope["error"]["data"]["retry_after_ms"].is_null());
+        CHECK_FALSE(envelope["error"]["data"]["remediation"].is_null());
+        CHECK_FALSE(envelope["error"]["data"]["correlation_id"].is_null());
+    }
+}
+
 // The served schema's per-value maxLength is the same contract as kMaxFacetValueBytes,
 // expressed twice in a raw literal; this binds them (the C8 approval path rejects on the
 // schema, the handler above on the bytes).

@@ -65,6 +65,8 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
@@ -158,6 +160,7 @@ struct GroupFromResultsHarness {
     std::unique_ptr<ResponseStore> rs_;
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
+    yuzu::MetricsRegistry metrics; // before `routes`: it holds a pointer to this
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
@@ -175,6 +178,10 @@ struct GroupFromResultsHarness {
     /// (CDX-FV-02): `auth_fn` below stamps `elevated_until` in the future
     /// whenever this is true, at the moment each request is authenticated.
     bool elevated_session{false};
+
+    /// Reassignable AFTER construction (live-read via `this`). True makes the perm gate DENY
+    /// every request with 403 "gate-denied", to prove a gate runs before any facet refusal.
+    bool deny_perm{false};
 
     /// Counts invocations of `visible_set_fn` regardless of what it
     /// returns (CDX-FV-04) -- lets a degrade-path test prove the scope
@@ -237,8 +244,14 @@ struct GroupFromResultsHarness {
             }
             return s;
         };
-        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) -> bool { return true; };
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                              const std::string&) -> bool {
+            if (!deny_perm)
+                return true;
+            res.status = 403;
+            res.set_content("gate-denied", "text/plain");
+            return false;
+        };
         auto audit_fn = [this](const httplib::Request&, const std::string& a,
                                const std::string& r, const std::string& tt,
                                const std::string& tid, const std::string& d) {
@@ -255,7 +268,7 @@ struct GroupFromResultsHarness {
             /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
             /*caller_fn=*/DashboardRoutes::CallerFn{},
             /*resolve_fn=*/DashboardRoutes::ResolveFn{},
-            /*metrics=*/nullptr, /*instruction_store=*/nullptr,
+            &metrics, /*instruction_store=*/nullptr,
             /*visible_set_fn=*/
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
                 ++visible_set_fn_calls;
@@ -264,6 +277,11 @@ struct GroupFromResultsHarness {
     }
 
     ResponseStore& rs() const { return *rs_; }
+
+    /// Value of `yuzu_server_response_facet_filter_refused_total{surface=<surface>}`.
+    double refused(const char* surface) {
+        return metrics.counter(kResponseFacetFilterRefusedMetric, {{"surface", surface}}).value();
+    }
 
     static std::unordered_map<std::string, std::string> same_site_headers() {
         return {{"Host", kHost}, {"Origin", std::string{"https://"} + kHost}};
@@ -601,14 +619,14 @@ TEST_CASE("create-group-form: a filter value over the facet bound is refused, no
     CHECK(h.visible_set_fn_calls == 0);
 }
 
-// A NUL / line feed / invalid UTF-8 filter value can never equal a stored value (ingest rewrites
-// each NUL / bad byte to U+FFFD and splits on every LF) and a NUL is truncated by the libpq
-// bind, so `high%00ignored-suffix` used to show the count of `high`. Refused like an
-// over-bound value; visible_set_fn_calls == 0 shows no store read or scope resolution
-// happened. The matching `high` rows ARE seeded, so a dropped or truncated filter would
-// surface as "agents will be added".
-TEST_CASE("create-group-form: a filter value with a NUL, line feed or invalid UTF-8 is refused, not "
-          "previewed as the count of its prefix",
+// A NUL / line feed / invalid UTF-8 filter value can never equal a stored value (ingest
+// rewrites each NUL / bad byte to U+FFFD, and separately splits the output on every LF, so no
+// LF is ever stored) and a NUL is truncated by the libpq bind, so `high%00ignored-suffix`
+// used to show the count of `high`. Refused like an over-bound value; visible_set_fn_calls ==
+// 0 shows no store read or scope resolution happened. The matching `high` rows ARE seeded, so
+// a dropped or truncated filter would surface as "agents will be added".
+TEST_CASE("create-group-form: a filter value with a NUL, line feed or invalid UTF-8 is refused, "
+          "not previewed as the count of its prefix",
           "[pg][server][dashboard][group_from_results]") {
     GroupFromResultsHarness h;
     seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
@@ -738,4 +756,91 @@ TEST_CASE("group-from-results: a filter value exactly at the facet bound builds 
     REQUIRE(group.has_value());
     CHECK(member_ids_of(h.mg, group->id) == std::set<std::string>{"agent-A"});
     CHECK(h.visible_set_fn_calls > 0); // positive control for the == 0 refusal case above
+}
+
+// POST: the invalid-UTF-8 forms of an unmatchable value are refused like the NUL and line feed
+// ones above (#5623): a lone 0xFF, an overlong NUL (C0 80), a surrogate (ED A0 80) and a
+// truncated sequence. The matching f_category filter is present too, so a dropped value would
+// still match both agents and a group would appear.
+TEST_CASE("group-from-results: a filter value with invalid UTF-8 is refused and creates no "
+          "group",
+          "[pg][server][dashboard][group_from_results]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A", "agent-B"});
+    for (const std::string value : {std::string("%FF"), std::string("%C0%80"),
+                                    std::string("%ED%A0%80"), std::string("high%C3")}) {
+        INFO(value);
+        auto res = h.post("group_name=utf8-group&command_id=" + std::string{kCommandId} +
+                          "&plugin=" + kPlugin + "&f_category=cat-a&f_severity=" + value);
+        CHECK(res->status == 400);
+        CHECK(contains(res->body, "data-filter-refused=\"true\""));
+        CHECK(contains(res->body, "That filter value can&#39;t be searched."));
+        check_plain_refusal_wording(res->body);
+        CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
+        CHECK_FALSE(h.mg.find_group_by_name("utf8-group").has_value());
+    }
+    CHECK(h.visible_set_fn_calls == 0);
+}
+
+// Authorization runs before the refusal (#5623): a caller the gate denies gets the gate's own
+// response, never the refusal (which would tell an unauthorised caller about the filter and
+// would count a refusal that no operator saw). The over-bound / NUL values below would be
+// refused by an admitted caller (the tests above), so the deny response is the only thing that
+// can explain the absence of the marker.
+TEST_CASE("create-group-form / group-from-results: a denied caller gets the gate's response, "
+          "not a facet refusal",
+          "[pg][server][dashboard][group_from_results][auth]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    h.deny_perm = true;
+    const std::string over(2049, 't');
+
+    for (const std::string value : {over, std::string("high%00x")}) {
+        INFO(value.substr(0, 20));
+        auto form = h.sink.Get(std::string{"/fragments/create-group-form?command_id="} +
+                               kCommandId + "&plugin=" + kPlugin + "&f_title=" + value);
+        REQUIRE(form != nullptr);
+        CHECK(form->status == 403);
+        CHECK(form->body == "gate-denied");
+        CHECK_FALSE(contains(form->body, "data-filter-refused"));
+        CHECK_FALSE(contains(form->body, "can&#39;t be searched"));
+
+        auto post = h.post("group_name=denied-group&command_id=" + std::string{kCommandId} +
+                           "&plugin=" + kPlugin + "&f_title=" + value);
+        CHECK(post->status == 403);
+        CHECK(post->body == "gate-denied");
+        CHECK_FALSE(contains(post->body, "data-filter-refused"));
+        CHECK_FALSE(h.mg.find_group_by_name("denied-group").has_value());
+    }
+    CHECK(h.refused("dashboard") == 0.0);
+    CHECK(h.visible_set_fn_calls == 0);
+}
+
+// One increment per refused request at each of the two group sites, none for an accepted
+// request or one the gate denied (#5623).
+TEST_CASE("create-group-form / group-from-results: a refusal increments "
+          "yuzu_server_response_facet_filter_refused_total{surface=dashboard} once",
+          "[pg][server][dashboard][group_from_results][metrics]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    REQUIRE(h.refused("dashboard") == 0.0);
+
+    auto accepted = h.sink.Get(std::string{"/fragments/create-group-form?command_id="} +
+                               kCommandId + "&plugin=" + kPlugin + "&f_category=cat-a");
+    REQUIRE(accepted != nullptr);
+    CHECK_FALSE(contains(accepted->body, "data-filter-refused"));
+    CHECK(h.refused("dashboard") == 0.0);
+
+    auto form = h.sink.Get(std::string{"/fragments/create-group-form?command_id="} + kCommandId +
+                           "&plugin=" + kPlugin + "&f_title=" + std::string(2049, 't'));
+    REQUIRE(form != nullptr);
+    CHECK(contains(form->body, "data-filter-refused"));
+    CHECK(h.refused("dashboard") == 1.0);
+
+    auto post = h.post("group_name=counted-group&command_id=" + std::string{kCommandId} +
+                       "&plugin=" + kPlugin + "&f_severity=high%00x");
+    CHECK(post->status == 400);
+    CHECK(h.refused("dashboard") == 2.0);
+    CHECK(h.refused("rest") == 0.0);
+    CHECK(h.refused("mcp") == 0.0);
 }
