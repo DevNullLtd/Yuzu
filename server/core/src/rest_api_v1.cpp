@@ -9045,19 +9045,7 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            swc::CatalogueReads io{
-                [&] { return software_inventory_store->catalog_rollup_meta(); },
-                [&](const SoftwareCatalogQuery& c) { return software_inventory_store->software_catalog(c); },
-                [&](const SoftwareCatalogQuery& c) {
-                    return software_inventory_store->software_catalog_totals(c);
-                }};
-            if (device_api)
-                io.connected = [&] {
-                    return static_cast<std::int64_t>(device_api->list_devices().size());
-                };
-            io.stale = [&](std::int64_t cutoff) {
-                return software_inventory_store->count_stale_agents(cutoff);
-            };
+            const auto io = swc::catalogue_reads(*software_inventory_store, device_api.get());
             if (csv) {
                 const auto ex = swc::read_titles_export(io, rq, omit_newest);
                 if (!ex) {
@@ -9138,12 +9126,7 @@ void RestApiV1::register_routes(
                 res.set_content(ok_json(swc::dump_safe(body)), "application/json");
                 return;
             }
-            const auto rows = swc::read_versions(
-                {[&] { return software_inventory_store->catalog_rollup_meta(); },
-                 [&](const SoftwareVersionsQuery& v) {
-                     return software_inventory_store->software_versions(v);
-                 }},
-                q);
+            const auto rows = swc::read_versions(swc::versions_reads(*software_inventory_store), q);
             if (!rows) {
                 if (rows.error() == swc::VersionsError::kBuilding)
                     sw_building(req, res, cid, "inventory.software.versions", target);
@@ -9356,10 +9339,7 @@ void RestApiV1::register_routes(
                  // VisibleSet (#3290). `devices_omitted` is DEFINED as the devices hidden by that
                  // filter (0 under push-down).
                  const auto read = swc::read_devices_page(
-                     [&](const SoftwareFleetQuery& dq) {
-                         return software_inventory_store->query_software(dq);
-                     },
-                     rq, gate.scope);
+                     swc::devices_reader(*software_inventory_store), rq, gate.scope);
                  if (!read) {
                      if (read.error()) {
                          res.status = 400;
@@ -9381,8 +9361,6 @@ void RestApiV1::register_routes(
                      return;
                  }
                  const auto& page = *read;
-                 const auto& rows = page.rows;
-                 const auto dropped_agents = page.devices_omitted;
 
                  // Audit posture: SET-AND-PROCEED (see route header) — capture the persist
                  // bool, surface audit_persisted:false, never withhold. Routed through the
@@ -9392,18 +9370,18 @@ void RestApiV1::register_routes(
                  // opaque but unauthenticated, so per-call audit keeps a forged cursor from
                  // walking the fleet unrecorded. A post-filter drop is audited distinctly.
                  bool denied_ok = true;
-                 if (dropped_agents > 0)
+                 if (page.devices_omitted > 0)
                      denied_ok = detail::try_persist_audit(
                          audit_fn, req, verb, "denied", "Inventory", audit_key,
-                         "scope: filtered " + std::to_string(dropped_agents) +
+                         "scope: filtered " + std::to_string(page.devices_omitted) +
                              " out-of-scope device(s) (management-group and/or service-tag "
                              "axis); cid=" +
                              cid);
                  const std::string detail_text =
                      (export_mode ? "installs format=" + rq.format +
-                                        " rows=" + std::to_string(rows.size()) +
+                                        " rows=" + std::to_string(page.rows.size()) +
                                         " truncated=" + (page.hit_cap ? "true" : "false")
-                                  : "rows=" + std::to_string(rows.size())) +
+                                  : "rows=" + std::to_string(page.rows.size())) +
                      (continuation ? " page=continuation" : "") + " cid=" + cid;
                  const bool audit_ok =
                      detail::try_persist_audit(audit_fn, req, verb, "success", "Inventory",
@@ -9417,11 +9395,11 @@ void RestApiV1::register_routes(
                          res.set_header("X-Result-Truncated-By-Cap", "true");
                      if (!audit_ok)
                          res.set_header("Sec-Audit-Failed", "true");
-                     res.set_content(swc::installs_csv(rows), "text/csv; charset=utf-8");
+                     res.set_content(swc::installs_csv(page.rows), "text/csv; charset=utf-8");
                      return;
                  }
-                 auto body = swc::devices_response_json(rows, page.next_cursor, dropped_agents,
-                                                        page.hit_cap);
+                 auto body = swc::devices_response_json(page.rows, page.next_cursor,
+                                                        page.devices_omitted, page.hit_cap);
                  if (!audit_ok)
                      body["audit_persisted"] = false;
                  res.set_content(ok_json(swc::dump_safe(body)), "application/json");

@@ -8969,10 +8969,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // twin calls the same function). devices_omitted is DEFINED as the devices hidden
                 // by that filter: 0 under push-down, where the SQL returned only in-scope rows.
                 const auto read = swc::read_devices_page(
-                    [&](const SoftwareFleetQuery& dq) {
-                        return software_inventory_store->query_software(dq);
-                    },
-                    *parsed, gate.scope);
+                    swc::devices_reader(*software_inventory_store), *parsed, gate.scope);
                 if (!read) {
                     if (read.error()) {
                         res.set_content(error_response(id, kInvalidParams, std::string(swc::cursor_error_message(*read.error()))), "application/json"); // retry-hint-exempt: caller-input rejection
@@ -9120,12 +9117,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "scope: device out of the caller's scope; " + target));
                         return;
                     }
-                    const auto rows = swc::read_versions(
-                        {[&] { return software_inventory_store->catalog_rollup_meta(); },
-                         [&](const SoftwareVersionsQuery& v) {
-                             return software_inventory_store->software_versions(v);
-                         }},
-                        q);
+                    const auto rows =
+                        swc::read_versions(swc::versions_reads(*software_inventory_store), q);
                     if (!rows) {
                         if (rows.error() == swc::VersionsError::kBuilding)
                             building(target);
@@ -9162,19 +9155,7 @@ McpServer::HandlerFn McpServer::build_handler(
                           mcp_audit("denied", "scope: device out of the caller's scope; " + target));
                     return;
                 }
-                swc::CatalogueReads io{
-                    [&] { return software_inventory_store->catalog_rollup_meta(); },
-                    [&](const SoftwareCatalogQuery& c) { return software_inventory_store->software_catalog(c); },
-                    [&](const SoftwareCatalogQuery& c) {
-                        return software_inventory_store->software_catalog_totals(c);
-                    }};
-                if (device_api)
-                    io.connected = [&] {
-                        return static_cast<std::int64_t>(device_api->list_devices().size());
-                    };
-                io.stale = [&](std::int64_t cutoff) {
-                    return software_inventory_store->count_stale_agents(cutoff);
-                };
+                const auto io = swc::catalogue_reads(*software_inventory_store, device_api.get());
                 const auto read = swc::read_catalogue_page(
                     io, *parsed, static_cast<std::int64_t>(std::time(nullptr)));
                 if (!read) {

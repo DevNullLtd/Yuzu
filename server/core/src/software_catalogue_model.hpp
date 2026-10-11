@@ -28,6 +28,10 @@
 #include <string_view>
 #include <vector>
 
+namespace yuzu::server {
+class DeviceApi;
+}
+
 namespace yuzu::server::software_catalogue {
 
 // ── Bounds ───────────────────────────────────────────────────────────────────
@@ -198,17 +202,24 @@ struct TitlesExport {
 // ── One consistent catalogue read ────────────────────────────────────────────
 
 /// The store reads a catalogue page needs, injected so the generation-skew logic is pure and
-/// unit-tested with fakes (the shells bind them to the SoftwareInventoryStore). `connected` and
-/// `stale` feed the KPI coverage figures: `connected` is empty when no device registry is wired;
-/// `stale` takes the cutoff (epoch seconds) and answers nullopt when its bounded read degraded.
-/// The titles export never reads them.
+/// unit-tested with fakes (catalogue_reads() binds them to the SoftwareInventoryStore). `stale`
+/// and `connected` feed the KPI coverage figures: `stale` is always wired, takes the cutoff
+/// (epoch seconds) and answers nullopt when its bounded read degraded; `connected` is empty when
+/// no device registry is wired. The titles export never reads them.
 struct CatalogueReads {
     std::function<std::optional<CatalogRollupMeta>()> meta;
     CatalogueReader rows;
     std::function<std::optional<SoftwareCatalogTotals>(const SoftwareCatalogQuery&)> totals;
+    std::function<std::optional<std::int64_t>(std::int64_t)> stale;
     std::function<std::int64_t()> connected{};
-    std::function<std::optional<std::int64_t>(std::int64_t)> stale{};
 };
+
+/// The production binding of CatalogueReads, shared by every transport. `device_api` may be null
+/// (no registry wired: `connected` stays empty). Captures `store` by reference and `device_api`
+/// by pointer: both are owned by the server and outlive the handler that consumes the result
+/// synchronously, so the returned struct must not be stored past that frame.
+[[nodiscard]] CatalogueReads catalogue_reads(SoftwareInventoryStore& store,
+                                             const DeviceApi* device_api);
 
 struct CataloguePage {
     std::vector<SoftwareCatalogRow> rows;
@@ -244,6 +255,9 @@ struct VersionsReads {
         versions;
 };
 
+/// The production binding of VersionsReads (same lifetime rule as catalogue_reads()).
+[[nodiscard]] VersionsReads versions_reads(SoftwareInventoryStore& store);
+
 enum class VersionsError { kDegraded, kBuilding };
 
 /// Only the UNFILTERED fleet drill (no agent_id, kind, ecosystem or source) reads the precomputed
@@ -257,6 +271,9 @@ read_versions(const VersionsReads& io, const SoftwareVersionsQuery& q);
 
 using DevicesReader =
     std::function<std::optional<std::vector<SoftwareFleetRow>>(const SoftwareFleetQuery&)>;
+
+/// The production binding of DevicesReader (same lifetime rule as catalogue_reads()).
+[[nodiscard]] DevicesReader devices_reader(SoftwareInventoryStore& store);
 
 struct DevicesPage {
     std::vector<SoftwareFleetRow> rows;

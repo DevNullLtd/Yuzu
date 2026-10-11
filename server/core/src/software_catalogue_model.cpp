@@ -1,6 +1,7 @@
 #include "software_catalogue_model.hpp"
 
 #include "data_export.hpp"
+#include "device_api.hpp"
 #include "software_catalog_rules.hpp"
 #include "utf8_sanitize.hpp"
 
@@ -82,23 +83,6 @@ std::string length_prefixed(Fields fields) {
         s += kSep;
     }
     return s;
-}
-
-// Narrow a raw-route query to a confined caller's scope; true when the caller must post-filter
-// (a scope wider than the push-down bound). TOP leaves the query alone; engaged-empty is
-// agent_ids = {} (the store returns empty without SQL); a bounded set is pushed into SQL.
-bool post_filter(SoftwareFleetQuery& q, const authz::VisibleSet& scope) {
-    if (!scope)
-        return false;
-    if (scope->size() > kScopePushdownMaxIds)
-        return true;
-    q.agent_ids = std::vector<std::string>(scope->begin(), scope->end());
-    return false;
-}
-
-// Only the unfiltered fleet drill reads the precomputed version rollup.
-bool versions_read_needs_rollup(const SoftwareVersionsQuery& q) {
-    return q.agent_id.empty() && q.kind.empty() && q.ecosystem.empty() && q.source.empty();
 }
 
 // Full-consume signed decimal; nullopt on any defect (empty, sign-only, trailing bytes, range).
@@ -817,11 +801,33 @@ read_catalogue_page(const CatalogueReads& io, const CatalogueRequest& rq, std::i
         Coverage coverage;
         if (io.connected)
             coverage.connected = io.connected();
-        if (io.stale)
-            coverage.stale = io.stale(now_epoch - kStaleWindowSecs);
+        coverage.stale = io.stale(now_epoch - kStaleWindowSecs);
         page->kpis = derive_kpis(*page->meta, coverage);
     }
     return page;
+}
+
+CatalogueReads catalogue_reads(SoftwareInventoryStore& store, const DeviceApi* device_api) {
+    CatalogueReads io{[&store] { return store.catalog_rollup_meta(); },
+                      [&store](const SoftwareCatalogQuery& c) { return store.software_catalog(c); },
+                      [&store](const SoftwareCatalogQuery& c) {
+                          return store.software_catalog_totals(c);
+                      },
+                      [&store](std::int64_t cutoff) { return store.count_stale_agents(cutoff); }};
+    if (device_api)
+        io.connected = [device_api] {
+            return static_cast<std::int64_t>(device_api->list_devices().size());
+        };
+    return io;
+}
+
+VersionsReads versions_reads(SoftwareInventoryStore& store) {
+    return {[&store] { return store.catalog_rollup_meta(); },
+            [&store](const SoftwareVersionsQuery& v) { return store.software_versions(v); }};
+}
+
+DevicesReader devices_reader(SoftwareInventoryStore& store) {
+    return [&store](const SoftwareFleetQuery& q) { return store.query_software(q); };
 }
 
 std::optional<TitlesExport> read_titles_export(const CatalogueReads& io,
@@ -855,7 +861,8 @@ std::optional<TitlesExport> read_titles_export(const CatalogueReads& io,
 
 std::expected<std::vector<SoftwareVersionCount>, VersionsError>
 read_versions(const VersionsReads& io, const SoftwareVersionsQuery& q) {
-    if (versions_read_needs_rollup(q)) {
+    // Only the unfiltered fleet drill reads the precomputed version rollup.
+    if (q.agent_id.empty() && q.kind.empty() && q.ecosystem.empty() && q.source.empty()) {
         const auto meta = io.meta();
         if (!meta)
             return std::unexpected(VersionsError::kDegraded);
@@ -881,7 +888,11 @@ read_devices_page(const DevicesReader& read, const DevicesRequest& rq,
             return std::unexpected(cur.error());
         q.after = *cur;
     }
-    const bool filter = post_filter(q, scope);
+    // TOP leaves the query alone; engaged-empty is agent_ids = {} (the store returns empty without
+    // SQL); a bounded set is pushed into SQL; a wider one is post-filtered below.
+    const bool filter = scope && scope->size() > kScopePushdownMaxIds;
+    if (scope && !filter)
+        q.agent_ids.emplace(scope->begin(), scope->end());
     auto rows = read(q);
     if (!rows)
         return std::unexpected(std::nullopt);

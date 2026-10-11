@@ -914,46 +914,43 @@ struct FakeIo {
     bool rows_ok{true}, totals_ok{true};
     std::vector<SoftwareCatalogRow> rows;
     int rows_reads{0};
-    // Coverage: unwired by default (the host-path and export tests never read it).
-    bool wire_connected{false}, wire_stale{false};
+    // `stale` is always wired (as in production); the registry count only when asked.
+    bool wire_connected{false};
     std::int64_t connected_n{0};
     std::optional<std::int64_t> stale_n;
     int connected_calls{0}, stale_calls{0};
     std::int64_t cutoff_seen{-1};
     CatalogueReads io() {
-        CatalogueReads r = bare_io();
+        CatalogueReads r{
+            [this]() -> std::optional<CatalogRollupMeta> {
+                if (meta_reads++ == meta_nullopt_at)
+                    return std::nullopt;
+                CatalogRollupMeta m;
+                m.refreshed_at = gens[std::min(gen_i++, gens.size() - 1)];
+                return m;
+            },
+            [this](const SoftwareCatalogQuery&) -> std::optional<std::vector<SoftwareCatalogRow>> {
+                ++rows_reads;
+                if (!rows_ok)
+                    return std::nullopt;
+                return rows;
+            },
+            [this](const SoftwareCatalogQuery&) -> std::optional<SoftwareCatalogTotals> {
+                if (!totals_ok)
+                    return std::nullopt;
+                return SoftwareCatalogTotals{static_cast<std::int64_t>(rows.size()), 5};
+            },
+            [this](std::int64_t cutoff) {
+                ++stale_calls;
+                cutoff_seen = cutoff;
+                return stale_n;
+            }};
         if (wire_connected)
             r.connected = [this] {
                 ++connected_calls;
                 return connected_n;
             };
-        if (wire_stale)
-            r.stale = [this](std::int64_t cutoff) {
-                ++stale_calls;
-                cutoff_seen = cutoff;
-                return stale_n;
-            };
         return r;
-    }
-    CatalogueReads bare_io() {
-        return {[this]() -> std::optional<CatalogRollupMeta> {
-                    if (meta_reads++ == meta_nullopt_at)
-                        return std::nullopt;
-                    CatalogRollupMeta m;
-                    m.refreshed_at = gens[std::min(gen_i++, gens.size() - 1)];
-                    return m;
-                },
-                [this](const SoftwareCatalogQuery&) -> std::optional<std::vector<SoftwareCatalogRow>> {
-                    ++rows_reads;
-                    if (!rows_ok)
-                        return std::nullopt;
-                    return rows;
-                },
-                [this](const SoftwareCatalogQuery&) -> std::optional<SoftwareCatalogTotals> {
-                    if (!totals_ok)
-                        return std::nullopt;
-                    return SoftwareCatalogTotals{static_cast<std::int64_t>(rows.size()), 5};
-                }};
     }
 };
 
@@ -991,10 +988,17 @@ TEST_CASE("read_catalogue_page: a refresh landing mid-read", "[server][software_
         FakeIo f;
         f.gens = {10, 11, 11, 11}; // before, after (moved) -> retry: before, after (stable)
         f.rows = {row("a", 3)};
+        f.wire_connected = true;
         auto page = read_catalogue_page(f.io(), req(1), kNow);
         REQUIRE(page);
         CHECK(f.rows_reads == 2);
         CHECK(decode_catalogue_cursor(page->next_cursor, filter_fingerprint({}), 11));
+        // the re-read does not repeat the coverage reads, and the KPIs carry the returned page's
+        // generation
+        CHECK(f.connected_calls == 1);
+        CHECK(f.stale_calls == 1);
+        REQUIRE(page->kpis.has_value());
+        CHECK(page->kpis->meta.refreshed_at == 11);
     }
     SECTION("moving twice is a degrade, never a third read") {
         FakeIo f;
@@ -1076,7 +1080,7 @@ TEST_CASE("read_catalogue_page: KPIs and coverage", "[server][software_catalogue
         FakeIo f;
         f.gens = {10};
         f.rows = {row("a", 3)};
-        f.wire_connected = f.wire_stale = true;
+        f.wire_connected = true;
         f.connected_n = 7;
         f.stale_n = 3;
         auto page = read_catalogue_page(f.io(), req(1), kNow);
@@ -1091,37 +1095,18 @@ TEST_CASE("read_catalogue_page: KPIs and coverage", "[server][software_catalogue
         FakeIo f;
         f.gens = {10};
         f.rows = {row("a", 3)};
-        f.wire_stale = true; // answers nullopt: the bounded count degraded
+        // stale_n is nullopt: the bounded count degraded
         auto page = read_catalogue_page(f.io(), req(1), kNow);
         REQUIRE(page);
         REQUIRE(page->kpis.has_value());
         CHECK_FALSE(page->kpis->coverage.connected.has_value());
         CHECK_FALSE(page->kpis->coverage.stale.has_value());
-        FakeIo none;
-        none.gens = {10};
-        none.rows = {row("a", 3)};
-        auto bare = read_catalogue_page(none.io(), req(1), kNow); // nothing wired at all
-        REQUIRE(bare);
-        REQUIRE(bare->kpis.has_value());
-        CHECK_FALSE(bare->kpis->coverage.stale.has_value());
-    }
-    SECTION("a refresh landing mid-read re-reads the page but gathers coverage ONCE") {
-        FakeIo f;
-        f.gens = {10, 11, 11, 11};
-        f.rows = {row("a", 3)};
-        f.wire_connected = f.wire_stale = true;
-        auto page = read_catalogue_page(f.io(), req(1), kNow);
-        REQUIRE(page);
-        CHECK(f.rows_reads == 2);
-        CHECK(f.connected_calls == 1);
-        CHECK(f.stale_calls == 1);
-        CHECK(page->kpis->meta.refreshed_at == 11);
     }
     SECTION("no KPIs on a continuation, the host path, or a failed read") {
         FakeIo f;
         f.gens = {10};
         f.rows = {row("b", 2)};
-        f.wire_connected = f.wire_stale = true;
+        f.wire_connected = true;
         const auto tok = encode_catalogue_cursor(row("a", 3), filter_fingerprint({}), 10);
         auto cont = read_catalogue_page(f.io(), req(1, tok), kNow);
         REQUIRE(cont);
