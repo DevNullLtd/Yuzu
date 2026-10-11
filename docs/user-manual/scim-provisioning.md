@@ -251,7 +251,7 @@ Deploy these alert rules alongside SCIM Groups → role mapping:
   Yuzu app, or bulk-edited the admin group's membership), not routine
   churn. Alert on a rate threshold well above your organization's normal
   onboarding/offboarding cadence.
-- **`yuzu_scim_group_recompute_skipped_total{direction}` > 0**: a Group request
+- **`yuzu_scim_group_recompute_skipped_total{cause}` > 0**: a Group request
   did not apply (or could not determine) every member's role: `promotion`
   (skipped after a failed guarded write) or `undetermined` (a read failed).
   Find the members in the `scim.group.recompute_incomplete` audit row for the
@@ -436,7 +436,7 @@ dropped silently:
 - when anything was refused, failed, undetermined or skipped, ONE
   `scim.group.recompute_incomplete` audit row (`result=partial`) records the
   count per class and up to 20 usernames (or `scim_id:<id>`) per class, and
-  `yuzu_scim_group_recompute_skipped_total{direction="promotion"|"undetermined"}`
+  `yuzu_scim_group_recompute_skipped_total{cause="promotion"|"undetermined"}`
   counts the skipped promotions and the undetermined members;
 - the Group `created`/`updated`/`deleted` success row says `recompute=complete`
   only when every member was recomputed as intended, otherwise

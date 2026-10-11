@@ -1998,8 +1998,8 @@ public:
                           "yuzu_server_rbac_read_degrade_total to rule that out. A SCIM "
                           "compensation undo the guard refused is NOT counted here (it is not "
                           "an IdP removal attempt); see yuzu_scim_compensation_failed_total. "
-                          "Every refusal is counted, including repeats; a Severity::kCritical "
-                          "analytics event accompanies each SCIM refusal (a no-op under "
+                          "Every refusal is counted, including repeats; a critical analytics "
+                          "event accompanies each SCIM refusal (a no-op under "
                           "--no-analytics; the audit row and this counter still fire).",
                           "counter");
         for (const auto transport : {"rest", "mcp", "dashboard", "scim"})
@@ -2018,9 +2018,10 @@ public:
                           "pre-provisioning Administrator-grant read). The unwired fail-closed "
                           "arm also counts, for deactivate and set_role only. A sustained "
                           "non-zero rate means deprovisioning or role changes are being "
-                          "answered with a store-unavailable error rather than judged (SCIM "
-                          "answers 503 with Retry-After; the dashboard role route gives no "
-                          "retry hint): look at yuzu_pg_pool_waiters and "
+                          "answered with a store-unavailable error rather than judged, except "
+                          "for would_strand, which never stops the request (SCIM answers 503 "
+                          "with Retry-After; the dashboard role route gives no retry hint): "
+                          "look at yuzu_pg_pool_waiters and "
                           "yuzu_pg_acquire_wait_seconds, and for a stuck rbac_enabled row lock "
                           "holder.",
                           "counter");
@@ -2036,7 +2037,7 @@ public:
                           "is left active; deactivated_but_session_wipe_failed: deactivated, a "
                           "session may survive; store_failure: state indeterminate). Every "
                           "increment needs operator attention: check the account. The "
-                          "Severity::kCritical analytics event that accompanies it is a no-op "
+                          "critical analytics event that accompanies it is a no-op "
                           "under --no-analytics; the audit row and this counter still fire.",
                           "counter");
         for (const auto outcome : {"guard_refused_last_administrator",
@@ -2049,16 +2050,16 @@ public:
         // so a zero is visible and stays seeded as evidence.
         metrics_.describe("yuzu_scim_group_recompute_skipped_total",
                           "SCIM Group role-recompute members not applied in one Group request, "
-                          "by direction. promotion: skipped after the first failed guarded write "
+                          "by cause. promotion: skipped after the first failed guarded write "
                           "of the request. undetermined: a read the decision needed failed, so "
                           "the member's role was left untouched and it is unknown whether an "
                           "administrator was kept. Each increment is recorded by one "
-                          "scim.group.recompute_incomplete audit row naming the members; there is "
-                          "no automatic repair (see the SCIM provisioning guide, Known limits).",
+                          "scim.group.recompute_incomplete audit row naming the members (first 20 "
+                          "named; the count is exact); there is no automatic repair (see the "
+                          "SCIM provisioning guide, Known limits).",
                           "counter");
-        for (const auto direction : {"promotion", "undetermined"})
-            metrics_.counter("yuzu_scim_group_recompute_skipped_total",
-                             {{"direction", direction}});
+        for (const auto cause : {"promotion", "undetermined"})
+            metrics_.counter("yuzu_scim_group_recompute_skipped_total", {{"cause", cause}});
         // #2703 Gate 7 merge-slice item 1 commit C. Neither metric duplicates the
         // existing shared-pool signals (yuzu_pg_acquire_wait_seconds,
         // yuzu_pg_pool_in_use — both already cover every RbacStore acquire, since
@@ -3551,9 +3552,10 @@ public:
         // a durable role change that could not be applied, distinct from
         // yuzu_scim_role_changes_total's success path.
         metrics_.describe("yuzu_scim_role_change_failures_total",
-                          "Total SCIM-driven role changes that failed to write to AuthDB during "
-                          "group-membership recompute - a sustained non-zero rate means role "
-                          "changes are silently not taking effect",
+                          "Total SCIM-driven role changes that did not complete during "
+                          "group-membership recompute: the guarded write failed, or the role "
+                          "changed but its durable session wipe failed - a sustained non-zero "
+                          "rate means role changes are not taking effect cleanly",
                           "counter");
         // ADR-2001 D1/D2 (governance Gate 7 BLOCKING fix, #3): describe()'d
         // unconditionally here rather than left to lazily create at first
@@ -3741,6 +3743,8 @@ public:
         metrics_.counter("yuzu_scim_deprovision_role_refused_with_active_link_total");
         metrics_.counter("yuzu_scim_deprovision_unlinked_total");
         metrics_.counter("yuzu_scim_provenance_denied_total");
+        metrics_.counter("yuzu_scim_role_changes_total");
+        metrics_.counter("yuzu_scim_role_change_failures_total");
         metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
         metrics_.counter("yuzu_scim_saml_link_write_failures_total");
         metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_total");

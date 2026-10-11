@@ -140,8 +140,9 @@ void respond_last_administrator_refused(httplib::Response& res, yuzu::MetricsReg
     res.set_content(detail::a4_error(res, message), "application/json");
 }
 
-// #4966: the retryable store-fault answer shared by the guarded delete and role writes: 503 with
-// `Retry-After: 2` and a matching `retry_after_ms`, like the token-revoke route's store-fault arm.
+// #4966: the retryable store-fault answer of the guarded DELETE: 503 with `Retry-After: 2` and a
+// matching `retry_after_ms`, like the token-revoke route's store-fault arm. The role writes use
+// `respond_committed_no_retry` instead (a store failure there may have committed).
 void respond_lifecycle_store_unavailable(httplib::Response& res, std::string_view message) {
     res.status = 503;
     res.set_header("Retry-After", "2");

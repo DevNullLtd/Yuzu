@@ -152,13 +152,29 @@ std::optional<std::vector<std::string>> list_active_local_admin_accounts(PGconn*
 // and holds only across lock-free recounts and the COMMIT, and this owner never waits on a lock
 // either of them holds while holding the `auth.users` row, so no chain of waits forms.
 
-// "SELECT set_config('lock_timeout', $1, true)": transaction-local (never leaks to the pooled
-// connection), bound parameter, the same shape `AuthDB`'s own transaction-scoped bound uses.
-bool set_txn_lock_timeout(PGconn* c, std::chrono::milliseconds timeout, std::string& err) {
+// The longest a guard transaction may sit idle BETWEEN statements. The first lock each
+// guard transaction takes is the fleet-wide `rbac_enabled` row lock, so a holder whose client died
+// without closing the connection (an orphaned backend, until the OS TCP keepalive reaps it) would
+// otherwise block EVERY guarded lifecycle write for that long. A lock WAIT is not idle time (the
+// backend is executing a statement), so a waiter is unaffected; only a holder that stops sending
+// statements is cut. Fixed, not configurable.
+constexpr std::chrono::milliseconds kLifecycleIdleInTxnTimeout{15000};
+
+// "SELECT set_config('lock_timeout', $1, true)" and the idle-in-transaction bound: both
+// transaction-local (never leak to the pooled connection), bound parameters, the same shape
+// `AuthDB`'s own transaction-scoped bound uses.
+bool set_txn_timeouts(PGconn* c, std::chrono::milliseconds lock_timeout, std::string& err) {
     pg::PgResult r = pg::exec_params(
         c, "SELECT set_config('lock_timeout', $1, true)",
-        std::vector<std::string>{std::to_string(timeout.count()) + "ms"});
+        std::vector<std::string>{std::to_string(lock_timeout.count()) + "ms"});
     if (r.status() != PGRES_TUPLES_OK) {
+        err = PQerrorMessage(c);
+        return false;
+    }
+    pg::PgResult idle = pg::exec_params(
+        c, "SELECT set_config('idle_in_transaction_session_timeout', $1, true)",
+        std::vector<std::string>{std::to_string(kLifecycleIdleInTxnTimeout.count()) + "ms"});
+    if (idle.status() != PGRES_TUPLES_OK) {
         err = PQerrorMessage(c);
         return false;
     }
@@ -793,7 +809,7 @@ RbacAdminAuthorityOwner::deactivate_account(const std::string& username) const {
     std::string err;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         // 0.
-        if (!set_txn_lock_timeout(c, lifecycle_lock_timeout_, err))
+        if (!set_txn_timeouts(c, lifecycle_lock_timeout_, err))
             return false;
 
         // 1.
@@ -883,7 +899,7 @@ LocalRoleChangeResult RbacAdminAuthorityOwner::set_local_role(const std::string&
     std::string err;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         // 0.
-        if (!set_txn_lock_timeout(c, lifecycle_lock_timeout_, err))
+        if (!set_txn_timeouts(c, lifecycle_lock_timeout_, err))
             return false;
 
         // 1. The regime value is not used; the row LOCK is the point (see the header banner).

@@ -129,14 +129,22 @@ public:
         if (!held_)
             return;
         held_ = false;
-        yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
-            lease_.get(), "SELECT pg_advisory_unlock(hashtext($1))",
-            std::vector<std::string>{principal_});
-        // A destructor cannot REQUIRE. A failed unlock would leave the lock on a pooled
-        // connection and strand a later test's request, so say so loudly instead of ignoring it.
-        if (r.status() != PGRES_TUPLES_OK)
-            std::fprintf(stderr, "PrincipalLockGate: pg_advisory_unlock('%s') failed\n",
+        // The argument vector allocates, which can throw; this runs from the destructor and from
+        // the pre-join callback of `Workers`, both implicitly noexcept, so a throw would
+        // terminate. A destructor cannot REQUIRE either. A failed unlock would leave the lock on a
+        // pooled connection and strand a later test's request, so say so loudly instead of
+        // ignoring it.
+        try {
+            yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+                lease_.get(), "SELECT pg_advisory_unlock(hashtext($1))",
+                std::vector<std::string>{principal_});
+            if (r.status() != PGRES_TUPLES_OK)
+                std::fprintf(stderr, "PrincipalLockGate: pg_advisory_unlock('%s') failed\n",
+                             principal_.c_str());
+        } catch (...) {
+            std::fprintf(stderr, "PrincipalLockGate: pg_advisory_unlock('%s') threw\n",
                          principal_.c_str());
+        }
     }
 
 private:

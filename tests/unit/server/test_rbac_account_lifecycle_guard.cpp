@@ -354,7 +354,9 @@ TEST_CASE("lifecycle guard: a burst of paired concurrent deactivations never emp
         std::atomic<bool> go{false};
         AccountDeactivationResult rp, rq;
         {
-            Workers workers(nullptr);
+            // If creating the second thread throws, the first spins on `go`: release it before the
+            // destructor joins, or the test hangs.
+            Workers workers([&] { go = true; });
             workers.add([&] {
                 while (!go.load())
                     std::this_thread::yield();
@@ -1099,3 +1101,41 @@ TEST_CASE("AuthManager lifecycle guard: the advisory read and the grant read cou
     CHECK(f.store_failures("set_role") == 0.0);
 }
 
+
+TEST_CASE("lifecycle guard: both guarded transactions run under the lock and idle-in-transaction "
+          "bounds, transaction-locally",
+          "[pg][auth_db][lifecycle_guard]") {
+    LIFECYCLE_FIXTURE(store, auth_db);
+    seed(auth_db, "bound_a", Role::user);
+    seed(auth_db, "bound_b", Role::user);
+    // A BEFORE UPDATE trigger on auth.users records the session settings in force INSIDE the
+    // guarded transaction (the only place the owner's set_config calls are observable). The
+    // throwaway database is private to this case, so nothing needs undoing.
+    exec_raw(auth_db.pool(), "CREATE TABLE public.yuzu_test_bound_probe (op text, idle text, lock text)");
+    exec_raw(auth_db.pool(),
+             "CREATE FUNCTION public.yuzu_test_bound_probe_fn() RETURNS trigger LANGUAGE plpgsql AS "
+             "$$ BEGIN INSERT INTO public.yuzu_test_bound_probe VALUES (TG_OP, "
+             "current_setting('idle_in_transaction_session_timeout'), "
+             "current_setting('lock_timeout')); RETURN NEW; END $$");
+    exec_raw(auth_db.pool(),
+             "CREATE TRIGGER yuzu_test_bound_probe_trg BEFORE UPDATE ON auth.users FOR EACH ROW "
+             "EXECUTE FUNCTION public.yuzu_test_bound_probe_fn()");
+
+    REQUIRE(store.deactivate_account("bound_a").kind == DKind::kDeactivated);
+    REQUIRE(store.set_local_role("bound_b", Role::admin).kind == RKind::kChanged);
+
+    const auto idle = query_col(auth_db.pool(), "SELECT idle FROM public.yuzu_test_bound_probe");
+    const auto lock = query_col(auth_db.pool(), "SELECT lock FROM public.yuzu_test_bound_probe");
+    REQUIRE(idle.size() >= 2); // one row per guarded write
+    for (const auto& v : idle)
+        CHECK(v == "15s");
+    for (const auto& v : lock)
+        CHECK(v == "2s");
+
+    // Transaction-local: a later statement on a pooled connection sees neither bound.
+    for (int i = 0; i < 3; ++i) {
+        const auto after = query_col(auth_db.pool(), "SHOW idle_in_transaction_session_timeout");
+        REQUIRE(after.size() == 1);
+        CHECK(after[0] != "15s");
+    }
+}

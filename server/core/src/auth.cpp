@@ -1949,12 +1949,14 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     // mode, so a failed durable delete would leave the old-role session live.
     //
     // RETRY-SAFETY CAVEAT (security-guardian Gate 8, LOW/latent): unlike
-    // update_role/remove_user — which re-attempt the wipe unconditionally on a
-    // retry — this path recomputes `role_changed` against the NOW-mutated in-memory
-    // role, so a retry after a wipe failure sees role_changed=false and skips the
-    // wipe. That is safe today ONLY because no production path demotes via
-    // upsert_user (dashboard create 409s on a dup username; role edits route
-    // through update_role; SCIM upserts at a fixed Role::user). A future
+    // update_role_checked (whose repeat call also takes the `Unchanged` branch and so
+    // re-runs the wipe; no route-level retry is promised, see
+    // `UpdateRoleOutcome::UpdatedSessionWipeFailed`), this path recomputes `role_changed`
+    // against the NOW-mutated in-memory role, so a retry after a wipe failure sees
+    // role_changed=false and skips the wipe. That is safe today ONLY because no
+    // production path demotes via upsert_user (dashboard create 409s on a dup
+    // username; role edits route through update_role_checked; SCIM upserts at a
+    // fixed Role::user). A future
     // demote-via-upsert MUST recompute role_changed against the durable/DB row (or
     // wipe unconditionally) before relying on retry to converge.
     if (role_changed && !wipe_user_sessions_durable(username))

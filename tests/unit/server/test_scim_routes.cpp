@@ -44,6 +44,7 @@
 #include "test_route_sink.hpp"
 #include "web_utils.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -4534,6 +4535,15 @@ json deactivate_ops() {
     return json{{"Operations", json::array({{{"op", "replace"}, {"value", {{"active", false}}}}})}};
 }
 
+/// The captured spdlog text ends each line with the sink's platform EOL ("\r\n" on Windows). The
+/// CWE-117 checks look for an INJECTED carriage return, so drop that terminator first.
+std::string without_sink_crlf(std::string text) {
+    for (std::size_t pos = 0; (pos = text.find("\r\n", pos)) != std::string::npos;) {
+        text.erase(pos, 1);
+    }
+    return text;
+}
+
 /// RBAC ON with `name` as the SOLE authenticatable Administrator grant holder.
 void make_sole_grant_holder(Fixture& f, const std::string& name) {
     REQUIRE(f.rbac_guard->assign_role({"user", name, "Administrator"}).has_value());
@@ -4974,7 +4984,7 @@ TEST_CASE("ScimRoutes: a hostile group displayName is neutralised in the demotio
         CHECK(r.detail.find('\n') == std::string::npos);
     }
 
-    const std::string logs = capture.text();
+    const std::string logs = without_sink_crlf(capture.text());
     CHECK(logs.find('\r') == std::string::npos);
     // The forged prefix never starts a physical log line of its own ...
     CHECK(logs.find("\n[error] FORGED") == std::string::npos);
@@ -5035,7 +5045,7 @@ TEST_CASE("ScimRoutes: Unicode line separators (NEL, U+2028, U+2029) and quote c
     REQUIRE(close != std::string::npos);
     CHECK(refused[0].detail.find('\'', close + 1) == std::string::npos);
 
-    const std::string logs = capture.text();
+    const std::string logs = without_sink_crlf(capture.text());
     CHECK(logs.find("\xE2\x80\xA8") == std::string::npos);
     CHECK(logs.find("\xE2\x80\xA9") == std::string::npos);
     CHECK(logs.find("\xC2\x85") == std::string::npos);
@@ -5199,8 +5209,8 @@ bool wait_until(Pred pred, std::chrono::milliseconds deadline = std::chrono::mil
     return pred();
 }
 
-double recompute_skipped(Fixture& f, const char* direction) {
-    return f.metrics.counter("yuzu_scim_group_recompute_skipped_total", {{"direction", direction}})
+double recompute_skipped(Fixture& f, const char* cause) {
+    return f.metrics.counter("yuzu_scim_group_recompute_skipped_total", {{"cause", cause}})
         .value();
 }
 
@@ -5319,7 +5329,7 @@ TEST_CASE("ScimRoutes: a group role recompute skips the remaining PROMOTIONS aft
         CHECK(f.auth_mgr.get_user_role(name).value() == auth::Role::user);
 
     // The skipped promotions are recorded ONCE, with the count and the (neutralised) usernames,
-    // as a `partial` Group row, and counted by direction.
+    // as a `partial` Group row, and counted by cause.
     const auto incomplete = audit_rows(f, "scim.group.recompute_incomplete",
                                        group_body["id"].get<std::string>());
     REQUIRE(incomplete.size() == 1);
@@ -5409,6 +5419,15 @@ TEST_CASE("ScimRoutes: after a store failure the remaining DEMOTIONS are still a
     CHECK(crit[0].attributes.value("username", "") == retained);
     CHECK(capture.text().find("IdP-removed admin '" + retained + "'") != std::string::npos);
     CHECK(capture.text().find("retains role") != std::string::npos);
+    // A StoreFailure is INDETERMINATE (the write may have committed): the event says "unknown",
+    // never the false "role_applied":false, and the log does not claim the change did not apply.
+    REQUIRE(crit[0].attributes.contains("role_applied"));
+    CHECK(crit[0].attributes["role_applied"] == "unknown");
+    CHECK(crit[0].attributes["session_wipe_failed"] == false);
+    CHECK(capture.text().find("may not have completed") != std::string::npos);
+    CHECK(capture.text().find("the role change may not have applied") != std::string::npos);
+    CHECK(capture.text().find("did NOT complete") == std::string::npos);
+    CHECK(capture.text().find("role change did NOT apply") == std::string::npos);
 }
 
 TEST_CASE("ScimRoutes: a refused group-derived demotion raises the critical analytics event "
@@ -5698,6 +5717,139 @@ TEST_CASE("ScimRoutes: PATCH/PUT active:true applies the same pre-checks as a PO
     const auto rows = audit_rows(f, action, id);
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].detail == expect_detail);
+}
+
+TEST_CASE("ScimRoutes: a Group request that removes members writes ONE crash-breadcrumb log "
+          "line naming them; one that removes nobody writes none (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto id_of = [&](const std::string& name) {
+        return json::parse(f.post("/scim/v2/Users", {{"userName", name}})->body)["id"]
+            .get<std::string>();
+    };
+    const auto b1 = id_of("bc_one");
+    const auto b2 = id_of("bc_two");
+    const auto b3 = id_of("bc_three");
+    const auto members = [](std::initializer_list<std::string> ids) {
+        json a = json::array();
+        for (const auto& i : ids)
+            a.push_back({{"value", i}});
+        return a;
+    };
+    const auto gid = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Crumbs"},
+                                                            {"members", members({b1, b2, b3})}})
+                                     ->body)["id"].get<std::string>();
+    const std::string marker = "role recompute starting for";
+
+    SECTION("PUT that removes one member") {
+        yuzu::test::LogCapture capture;
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Crumbs"}, {"members", members({b1, b2})}})->status == 200);
+        capture.stop();
+        const std::string logs = without_sink_crlf(capture.text());
+        const auto at = logs.find(marker);
+        REQUIRE(at != std::string::npos);
+        CHECK(logs.find(marker, at + 1) == std::string::npos); // exactly one line
+        CHECK(logs.find("1 removed member(s): bc_three") != std::string::npos);
+        CHECK(logs.find("bc_one", at) == std::string::npos); // kept members are not named
+    }
+    SECTION("PUT that removes nobody") {
+        yuzu::test::LogCapture capture;
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Crumbs"}, {"members", members({b1, b2, b3})}})
+                    ->status == 200);
+        capture.stop();
+        CHECK(capture.text().find(marker) == std::string::npos);
+    }
+    SECTION("PATCH remove") {
+        json ops{{"Operations",
+                  json::array({{{"op", "remove"},
+                                {"path", "members[value eq \"" + b2 + "\"]"}}})}};
+        yuzu::test::LogCapture capture;
+        REQUIRE(f.patch("/scim/v2/Groups/" + gid, ops)->status == 200);
+        capture.stop();
+        CHECK(capture.text().find("1 removed member(s): bc_two") != std::string::npos);
+    }
+    SECTION("PATCH add removes nobody") {
+        json ops{{"Operations", json::array({{{"op", "add"},
+                                              {"path", "members"},
+                                              {"value", members({b1})}}})}};
+        yuzu::test::LogCapture capture;
+        REQUIRE(f.patch("/scim/v2/Groups/" + gid, ops)->status == 200);
+        capture.stop();
+        CHECK(capture.text().find(marker) == std::string::npos);
+    }
+    SECTION("DELETE names every former member") {
+        yuzu::test::LogCapture capture;
+        REQUIRE(f.del("/scim/v2/Groups/" + gid)->status == 204);
+        capture.stop();
+        const std::string logs = capture.text();
+        CHECK(logs.find("3 removed member(s): ") != std::string::npos);
+        CHECK(logs.find("bc_one") != std::string::npos);
+        CHECK(logs.find("bc_two") != std::string::npos);
+        CHECK(logs.find("bc_three") != std::string::npos);
+    }
+}
+
+TEST_CASE("ScimRoutes: the crash-breadcrumb names at most 20 members and counts the rest (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    json members = json::array();
+    for (int i = 0; i < 22; ++i) {
+        const auto name = "bulk" + std::to_string(i);
+        members.push_back(
+            {{"value", json::parse(f.post("/scim/v2/Users", {{"userName", name}})->body)["id"]}});
+    }
+    const auto gid = json::parse(
+        f.post("/scim/v2/Groups", {{"displayName", "Crumbs"}, {"members", members}})->body)["id"]
+                         .get<std::string>();
+
+    yuzu::test::LogCapture capture;
+    REQUIRE(f.put("/scim/v2/Groups/" + gid, {{"displayName", "Crumbs"}, {"members", json::array()}})
+                ->status == 200);
+    capture.stop();
+    const std::string logs = capture.text();
+    const auto at = logs.find("22 removed member(s): ");
+    REQUIRE(at != std::string::npos);
+    const auto eol = logs.find('\n', at);
+    const std::string line = logs.substr(at, eol == std::string::npos ? eol : eol - at);
+    CHECK(line.find(",+2 more") != std::string::npos);
+    std::size_t named = 0;
+    for (std::size_t pos = 0; (pos = line.find("bulk", pos)) != std::string::npos; ++pos)
+        ++named;
+    CHECK(named == 20);
+}
+
+TEST_CASE("ScimRoutes: a hostile stored username is log_token'd in the crash-breadcrumb "
+          "(CWE-117, #4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb][logforge]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    // A stored name the usual validators would reject, planted directly in the SCIM store: the
+    // breadcrumb reads names back from the store, so it must neutralise them itself.
+    const std::string hostile = "evil=1,x\r\n[error] FORGED";
+    auto planted = f.scim_store->create_resource(hostile);
+    REQUIRE(planted.has_value());
+    const auto gid = json::parse(
+        f.post("/scim/v2/Groups", {{"displayName", "Crumbs"},
+                                   {"members", json::array({{{"value", planted->scim_id}}})}})
+            ->body)["id"].get<std::string>();
+
+    yuzu::test::LogCapture capture;
+    REQUIRE(f.put("/scim/v2/Groups/" + gid, {{"displayName", "Crumbs"}, {"members", json::array()}})
+                ->status == 200);
+    capture.stop();
+    const std::string logs = without_sink_crlf(capture.text());
+    const std::string neutral = ::yuzu::log_token(hostile);
+    REQUIRE(neutral.find_first_of("\r\n=,") == std::string::npos);
+    // Judge the breadcrumb's OWN physical line (other log sites on this path are not its
+    // concern): the whole neutralised name sits on it, and it ends there.
+    const std::string marker = "1 removed member(s): ";
+    const auto at = logs.find(marker);
+    REQUIRE(at != std::string::npos);
+    const auto eol = logs.find('\n', at);
+    const std::string line = logs.substr(at, eol == std::string::npos ? eol : eol - at);
+    CHECK(line == marker + neutral);
+    CHECK(line.find('\r') == std::string::npos);
 }
 
 TEST_CASE("RefusalLogThrottle: one warn per key per interval, bounded memory, clock-injected "

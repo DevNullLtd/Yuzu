@@ -1298,10 +1298,10 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard WAITS for a "
     CHECK(is_rbac_last_admin_refusal(b_error));
     // Refused => rolled back => the grant survives.
     CHECK(store.get_principal_roles("user", "ghostadmin").size() == 1);
-    // Not asserted here: the two cases the guard does NOT close (an auth.users row
-    // created concurrently for a pre-provisioned grant, and deactivation of a
-    // surviving Administrator, #4966). Pinning a known hole would have to be
-    // inverted when #4966 lands.
+    // Not asserted here: the one case this recheck does NOT close (an auth.users row
+    // created concurrently for a pre-provisioned grant). Deactivation of a surviving
+    // Administrator is closed by the account-lifecycle guard (#4966), which
+    // test_rbac_account_lifecycle_guard.cpp covers.
 }
 
 // Complement of the test above: the in-flight reactivation ROLLS BACK, so the
