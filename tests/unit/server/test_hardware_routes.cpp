@@ -912,6 +912,73 @@ TEST_CASE("route: hardware record id with control bytes is 400 and never audited
     REQUIRE(h.audits.empty());
 }
 
+// Kills: dropping the LENGTH arm of the audit-trail id floor, or skipping the floor on either
+// route - an over-long id would reach target_id on the audit rows. One byte over the limit.
+TEST_CASE("route: hardware record id one byte over the length limit is 400 and never audited",
+          "[hardware][route][rest][security]") {
+    const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
+    HwHarness h;
+    h.ci_detail = degraded_identity_detail(false);
+    auto rest = h.sink.Get("/api/v1/hardware/" + too_long);
+    REQUIRE(rest);
+    REQUIRE(rest->status == 400);
+    REQUIRE(contains(rest->body, "invalid device id"));
+    REQUIRE(h.audits.empty());
+    auto frag = h.sink.Get("/fragments/hardware/ci?id=" + too_long);
+    REQUIRE(frag);
+    REQUIRE(frag->status == 400);
+    REQUIRE(contains(frag->body, "Invalid device id."));
+    REQUIRE(h.audits.empty());
+}
+
+// Kills: `<` for `<=` on the length arm - an id of exactly the limit is legal, so it must pass the
+// floor on both routes and reach its normal audit row (any status but the floor's 400).
+TEST_CASE("route: hardware record id of exactly the length limit passes the floor and is audited",
+          "[hardware][route][rest][security]") {
+    const std::string at_limit(auth::kMaxAgentIdLength, 'a');
+    const std::string expected_row = "inventory.device.ci|success|Agent|" + at_limit;
+    {
+        HwHarness h;
+        auto rest = h.sink.Get("/api/v1/hardware/" + at_limit);
+        REQUIRE(rest);
+        REQUIRE(rest->status != 400);
+        REQUIRE_FALSE(h.audit_full.empty());
+        REQUIRE(h.audit_full.back() == expected_row);
+    }
+    {
+        HwHarness h;
+        auto frag = h.sink.Get("/fragments/hardware/ci?id=" + at_limit);
+        REQUIRE(frag);
+        REQUIRE(frag->status != 400);
+        REQUIRE_FALSE(h.audit_full.empty());
+        REQUIRE(h.audit_full.back() == expected_row);
+    }
+}
+
+// Kills: moving the floor BELOW the scope gate on either route - an invalid id is refused before
+// the scope check, so an out-of-scope (REST) or unpermitted (fragment) caller still sees the
+// floor's 400, never the scope 404 / permission 403.
+TEST_CASE("route: hardware record id floor is applied before the scope gate",
+          "[hardware][route][rest][security]") {
+    const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
+    {
+        HwHarness h;
+        h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+        auto rest = h.sink.Get("/api/v1/hardware/" + too_long);
+        REQUIRE(rest);
+        REQUIRE(rest->status == 400);
+        REQUIRE(h.audits.empty());
+    }
+    {
+        HwHarness h;
+        h.allow_scoped_perm = false;
+        auto frag = h.sink.Get("/fragments/hardware/ci?id=" + too_long);
+        REQUIRE(frag);
+        REQUIRE(frag->status == 400);
+        REQUIRE(h.audits.empty());
+    }
+}
+
 // Pins the documented dual-degraded shape: a degraded CI store alongside a degraded roster
 // defeats truly_absent, so the record is served (200), not 503.
 TEST_CASE("route: GET /api/v1/hardware/{id} — degraded roster AND degraded CI store is 200 with both "
