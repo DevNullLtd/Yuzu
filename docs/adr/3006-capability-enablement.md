@@ -383,7 +383,9 @@ at two points:
   before it has spoken to the server.
 
 The two are one choice. The server can export its current off-rules as the starting state an
-install or enrolment carries, so a customer decides once. An exported starting state refers to
+install or enrolment carries, so a customer decides once. A rule whose selector depends on facts
+the endpoint has not yet reported is exported under D5: it contributes its units until those
+facts settle it. An exported starting state refers to
 the server's rules and also carries the units the package kept off, as issued. A reference
 binds only when the enrolment that carried it was issued by the server: it then attaches the
 endpoint to the rule, and the units the package kept off are adopted as rules covering only that
@@ -444,9 +446,10 @@ A new installation has held none, and starts as D8 and D10 say, except while a r
 pending (D14). It is applied at contact, by comparing what the agent says it holds with what
 the server's enrolment record says the identifier has held; neither is trusted alone.
 
-- An identifier that neither side has held state for is a new installation, and so is a retired
-  identifier that returns with nothing. It gets the shipped default unless its install carries a
-  starting state or a rule selects it.
+- An identifier that neither side has held state for is a new installation. It gets the shipped
+  default unless its install carries a starting state or a rule selects it. A retired
+  identifier that returns holding none is lost state, because its history shows it held state; it
+  is a new installation only if an operator re-admits it.
 - An agent that holds none, for an identifier the server knows has held state, has lost state
   (D14), reimaged or not.
 - An agent that holds state, for an identifier the server has no record of or has retired, is
@@ -627,11 +630,13 @@ action came to read as "permission denied".
   its state, including a new installation, are held off for dispatch with a retryable cause and
   the status *regression pending*. A single endpoint's claim cannot declare a regression. Where
   a regression cannot be told from a few returning endpoints, the server treats the store as
-  regressed, and an operator can declare one. The operator chooses between
-  restoring the store from a newer backup, which keeps the existing ordering of states, and
-  accepting the regressed state, which is previewed as any switch-on and starts a new ordering
-  of states (D9). The enablement state, and the record of what each endpoint last reported, are
-  part of what the server backs up.
+  regressed, and an operator can declare one. A store that has been restored or rebuilt starts
+  as regressed unless continuity with the last ordering it issued is shown, so that a new
+  installation is held off before any agent report could declare it. The operator chooses
+  between restoring the store from a newer backup, which keeps the existing ordering of states,
+  and accepting the regressed state, which is previewed as any switch-on and starts a new
+  ordering of states (D9). The enablement state, and the record of what each endpoint last
+  reported, are part of what the server backs up.
 
 An endpoint that stays offline for a long time therefore keeps doing what was last on, and a
 switch-off made in the meantime does not reach it until it reconnects. This is accepted and
@@ -891,7 +896,8 @@ The decision is being followed when all of the following are true.
 29. After an operator resolves a regressed store, no endpoint adopts a state issued before the
     resolution.
 30. An agent that holds none, presenting an identifier the server has seen hold state, is
-    treated as lost state and never as a new installation. An agent that holds state, presenting
+    treated as lost state and never as a new installation; so is a retired identifier that
+    returns holding none. An agent that holds state, presenting
     an identifier the server has no record of or has retired, is restored from the state it
     reports and nothing is switched on. A record that cannot be read is never read as empty.
 
