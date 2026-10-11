@@ -358,6 +358,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                         httplib::Response& res) {
         detail::ensure_correlation_id(res);
         const std::string id = req.matches[1].str();
+        if (!id_is_audit_safe(id)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid device id"), "application/json");
+            return;
+        }
         if (!deps_.scoped_perm_fn(req, res, "Execution", "Execute", id)) return;
 
         std::string source = "all";
@@ -625,6 +630,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                       httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
         if (id.empty()) { res.status = 400; send_html(res, "bad request"); return; }
+        if (!id_is_audit_safe(id)) {
+            res.status = 400;
+            send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
+            return;
+        }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
         if (!deps_.scoped_probe_fn || !deps_.scoped_probe_fn(req, "Execution", "Execute", id)) {
@@ -699,6 +709,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const std::string command_id = req.has_param("command_id") ? req.get_param_value("command_id") : "";
         const std::string plugin = req.has_param("plugin") ? req.get_param_value("plugin") : "";
         if (id.empty()) { res.status = 400; send_html(res, "bad request"); return; }
+        if (!id_is_audit_safe(id)) {
+            res.status = 400;
+            send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
+            return;
+        }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
         if (bad_hw_ident(plugin) || command_id.size() > 64 ||

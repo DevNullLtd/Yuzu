@@ -512,6 +512,7 @@ TEST_CASE("hardware CI fragment: identity_degraded + no record -> roster unreada
     SECTION("not degraded, no record") {
         const auto html = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
         CHECK(html.find("Device not found") != std::string::npos);
+        CHECK(html.find("last 30 days") != std::string::npos);
     }
 }
 

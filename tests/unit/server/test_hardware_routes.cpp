@@ -979,6 +979,37 @@ TEST_CASE("route: hardware record id floor is applied before the scope gate",
     }
 }
 
+// Kills: skipping the audit-trail id floor on any of the three routes that take a raw device id
+// and audit it (REST sync, Actions lens, result poll) - an over-long or CR/LF id would reach
+// target_id. Each refusal is the floor's own 400 (body-checked, so the pre-existing 400 arms
+// cannot mask a missing floor), writes no audit row, and the sync dispatch is never reached.
+TEST_CASE("route: sync and actions-lens ids are floored: over-length or control byte is 400 and unaudited",
+          "[hardware][route][security]") {
+    const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
+    const std::string ctrl = "a\r\nb";
+    for (const auto& bad_id : {too_long, ctrl}) {
+        HwHarness h;
+        auto sync = h.sink.Post("/api/v1/hardware/" + bad_id + "/sync", R"({"source":"all"})");
+        REQUIRE(sync);
+        REQUIRE(sync->status == 400);
+        REQUIRE(contains(sync->body, "invalid device id"));
+        REQUIRE(h.sync_dispatch_calls == 0);
+
+        auto actions = h.sink.Get("/fragments/hardware/ci/actions?id=" + bad_id);
+        REQUIRE(actions);
+        REQUIRE(actions->status == 400);
+        REQUIRE(contains(actions->body, "Invalid device id."));
+
+        auto result = h.sink.Get("/fragments/hardware/ci/result?id=" + bad_id +
+                                 "&plugin=plug&command_id=plug-1");
+        REQUIRE(result);
+        REQUIRE(result->status == 400);
+        REQUIRE(contains(result->body, "Invalid device id."));
+
+        REQUIRE(h.audits.empty());
+    }
+}
+
 // Pins the documented dual-degraded shape: a degraded CI store alongside a degraded roster
 // defeats truly_absent, so the record is served (200), not 503.
 TEST_CASE("route: GET /api/v1/hardware/{id} — degraded roster AND degraded CI store is 200 with both "

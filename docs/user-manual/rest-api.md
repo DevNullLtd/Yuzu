@@ -61,6 +61,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
 - [REST API v1 Endpoints](#rest-api-v1-endpoints)
   - [Current User](#current-user)
   - [Devices](#devices)
+  - [Hardware](#hardware)
   - [Management Groups](#management-groups)
   - [API Tokens](#api-tokens)
   - [Engine Principals](#engine-principals)
@@ -422,6 +423,10 @@ existence-oracle closure exactly).
 
 ---
 
+### Hardware
+
+The Hardware CI list and single-device CI record (OpenAPI tag `Hardware`). Both routes are audited on a successful read.
+
 #### `GET /api/v1/hardware`
 
 The Hardware list: the device roster (identity fields as for `/devices`) plus device-CI columns, a per-page DEX score, claimed IPs and tags.
@@ -434,7 +439,7 @@ The Hardware list: the device roster (identity fields as for `/devices`) plus de
 
 | Status | Meaning |
 |---|---|
-| `200` | The roster was read. `ci_degraded` / `tags_degraded` are `true` when the CI or tag store could not be read, so those columns are blank rather than genuinely absent. |
+| `200` | The roster was read. `ci_degraded` / `tags_degraded` are `true` when the CI or tag store could not be read, so those columns are blank rather than genuinely absent. At most the 100,000 most recently seen endpoints within the 30-day window are served, with no truncation signal yet. |
 | `400` | Unrecognised `sort`, `dir`, `os` or `status` token. |
 | `403` | Caller lacks `Inventory:Read`. |
 | `503` | Route misconfigured (roster or audit unwired), the device roster could not be read (`retry_after_ms` set), or the audit row could not be persisted. A failed roster read is never a `200` with an empty list. |
@@ -449,7 +454,7 @@ One device's CI record: identity, device-CI blob, installed software and tags, e
 
 **Permission:** `Inventory:Read`, via `require_fleet_read`. An id outside the caller's fleet-read scope returns the same `404` as a nonexistent id.
 
-**Response:** `{ "data": { "agent_id", "hostname", "os", "online", "last_seen", "identity_state", "ci", "ci_state", "software", "tags", ... }, "meta" }`. `identity_state` is `found`, `degraded` (the device roster could not be read) or `absent`; `ci_state` is `found`, `absent` or `degraded`.
+**Response:** `{ "data": { "agent_id", "hostname", "os", "online", "last_seen", "identity_state", "ci", "ci_state", "software", "tags", ... }, "meta" }`. `identity_state` is `found`, `degraded` (the device roster could not be read) or `absent`; `ci_state` is `found`, `absent` or `degraded`. `agent_id`, `hostname`, `os` and `last_seen` are `null` (and `online` is `false`) unless `identity_state` is `found`.
 
 | Status | Meaning |
 |---|---|

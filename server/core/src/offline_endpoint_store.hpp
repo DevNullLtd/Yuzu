@@ -160,12 +160,12 @@ public:
                 std::string_view session_id = {});
 
     /// Every endpoint whose last heartbeat is within `window` of now, newest
-    /// first. Its consumers (Hardware list/record, viz, MCP) render those NOT
-    /// currently online as offline rows / stale cubes; rows older than `window`
-    /// are withheld so a long-departed host eventually stops cluttering the
-    /// view. #5531: typed — `std::unexpected`
-    /// (`StoreUnavailable`: no connection in time; `DbError`: the query
-    /// failed) on a failed read, never an empty vector; an empty success
+    /// first. Its consumers (Hardware list/record, viz, MCP, and the Software
+    /// page's display-only hostname map) render those NOT currently online as
+    /// offline rows / stale cubes; rows older than `window` are withheld so a
+    /// long-departed host eventually stops cluttering the view. #5531: typed —
+    /// `std::unexpected` (`StoreUnavailable`: no connection in time; `DbError`:
+    /// the query failed) on a failed read, never an empty vector; an empty success
     /// means "no rows". `Truncated` is never produced: the read keeps
     /// `LIMIT kQueryRowCap` newest-first and serves the capped set. A failure
     /// is counted on `yuzu_server_agent_presence_store_failed_total`

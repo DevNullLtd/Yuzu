@@ -655,7 +655,7 @@ TEST_CASE("apply_roster_read: failed read sets every degraded bit; healthy read 
 // Kills: a failed key read collapsed to "no keys" (blank Tags column reads as authoritative), a
 // failed values read ignored, the reader being called after a failed key read, a healthy read
 // (incl. empty keys / a device with no tags) being flagged degraded, and tags not being attached.
-TEST_CASE("apply_tag_read: every failed read degrades, every healthy read populates without degrading",
+TEST_CASE("apply_tag_read: every failed read degrades and every healthy read populates without degrading",
           "[hardware][model]") {
     using Keys = std::expected<std::vector<std::string>, TagReadError>;
     struct Row {
@@ -716,6 +716,18 @@ TEST_CASE("offline_identity_row: error propagates; hit is offline; miss is nullo
         OfflineRosterRead{std::vector<OfflineEndpoint>{make_offline_ep("a1", 0)}}, "a1", 10 * kDayMs, fake_age);
     REQUIRE(old.has_value());
     CHECK((*old)->stale);
+
+    // kHardwareStaleAfterMs boundary: exactly two days old is fresh, one millisecond over is stale.
+    const auto at_edge = offline_identity_row(
+        OfflineRosterRead{std::vector<OfflineEndpoint>{make_offline_ep("a1", 8 * kDayMs)}}, "a1", 10 * kDayMs,
+        fake_age);
+    REQUIRE(at_edge.has_value());
+    CHECK_FALSE((*at_edge)->stale);
+    const auto past_edge = offline_identity_row(
+        OfflineRosterRead{std::vector<OfflineEndpoint>{make_offline_ep("a1", 8 * kDayMs - 1)}}, "a1",
+        10 * kDayMs, fake_age);
+    REQUIRE(past_edge.has_value());
+    CHECK((*past_edge)->stale);
 
     const auto miss = offline_identity_row(roster, "zzz", 10 * kDayMs, fake_age);
     REQUIRE(miss.has_value());

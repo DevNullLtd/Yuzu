@@ -12,6 +12,7 @@
 
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -497,7 +498,9 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
 
 std::string render_hardware_not_found(const std::string& agent_id) {
     return hw_style() + "<div class=\"hw-wrap\"><div class=\"gp-placeholder\"><b>Device not found.</b> "
-           "'" + esc(agent_id) + "' has not been seen in the last 30 days, or does not exist.</div></div>";
+           "'" + esc(agent_id) + "' has not been seen in the last " +
+           std::to_string(std::chrono::duration_cast<std::chrono::days>(kHardwareRosterWindow).count()) +
+           " days, or does not exist.</div></div>";
 }
 
 std::string render_hardware_roster_unreadable(const std::string& agent_id) {
