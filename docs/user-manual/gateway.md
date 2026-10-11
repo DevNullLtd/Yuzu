@@ -1223,6 +1223,12 @@ log line, when:
   server's name would be accepted. One verified endpoint does not excuse an unverified one:
   calls go round-robin over all of them. Only the dev/CI override
   `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` excuses it (the gateway then logs a warning);
+- a TLS file named by an `https` endpoint (`cacertfile`, `certfile`, `keyfile`) is a directory or
+  another non-file (`Refusing to start: a TLS file of an upstream endpoint is a directory or not
+  a regular file`; reason `unusable_upstream_tls_file`). It cannot become a file by waiting, and a
+  container runtime creates exactly this in place of a bind-mounted file that does not exist on
+  the host. A file that is merely **missing**, empty or without a certificate is not refused;
+  see [A CA, certificate or key file that is wrong](#a-ca-certificate-or-key-file-that-is-wrong);
 - one channel lists both `http` and `https` endpoints (`Refusing to start: the upstream
   channel <name> lists both plaintext (http) and TLS (https) endpoints`; reason
   `mixed_upstream_endpoints`). Calls go round-robin over every live connection, so some would
@@ -1250,6 +1256,49 @@ the dial is IPv4 only, with no fallback, so `localhost` against an IPv6-only lis
 `econnrefused`. Both look like a server that is down. A `pool_size`,
 `connect_timeout` or `max_receive_message_bytes` that is out of range or not an integer is
 replaced by its default; see [Bad values replaced by defaults](#bad-values-replaced-by-defaults).
+
+#### A CA, certificate or key file that is wrong
+
+When the CA, certificate or key file an `https` endpoint names is missing, unreadable, empty
+or holds no PEM certificate (or no PEM key, for `keyfile`), Erlang's `ssl` rejects the whole
+option set. Every connection attempt then fails in about 2 ms with the one word
+`bad_tls_options`, which says nothing about which file. The gateway therefore looks at the
+files itself and says it in three places:
+
+1. **At boot**, one WARNING per file: `Upstream channel default_channel endpoint
+   gw.example:50055: cacertfile /etc/yuzu/ca.pem does not exist (yet). Every connection to it
+   fails until this is fixed. The gateway starts anyway ...`. The gateway starts on purpose: the
+   server generates its certificates on its first start, which can be after the gateway's, and
+   the channel keeps retrying. A **directory** where a file belongs is the one case it refuses
+   (see above).
+2. **While it keeps failing**, an ERROR line from the channel, the first at once and then at
+   most once a minute: `Upstream channel default_channel: the TLS client options cannot be used,
+   so every connection fails: cacertfile /etc/yuzu/ca.pem does not exist (yet). The gateway
+   keeps retrying and /readyz stays 503 until this is fixed`. If none of the files is at fault,
+   it says so, and the cause is one of the other `ssl` options.
+3. **In `/readyz`**: the check `upstream_tls_files` is `false` and the whole answer is 503
+   `not_ready` while the most recent connection attempt of any channel failed because its TLS
+   options are unusable. It is a table read, so a slow upstream cannot hold it. The circuit
+   breaker alone would have stayed closed until five calls had failed.
+
+The reasons are `does not exist (yet)`, `cannot be read (permission denied)`, `is a directory,
+not a file`, `is not a regular file`, `is empty`, `contains no PEM certificate` and `contains no
+PEM private key`; any other file error is shown as its POSIX name (`eio`). The path of a
+`cacertfile` or `certfile` is printed, the path of a `keyfile` is **never** printed (the line
+says `keyfile`, and you know which key your configuration names).
+
+Limits, so the signal is not read as more than it is:
+
+- It reports the **most recent attempt**. If the server is also down, the TCP connect fails
+  before TLS is tried, the report clears, and it returns once the server is reachable. A gateway
+  with both problems is not ready for the first reason either way.
+- The file check reads each file once per failed attempt and parses it only up to 4 MiB. A file that is
+  a valid PEM certificate but the wrong one (another CA) is not a file problem: it fails the
+  handshake with a TLS alert such as `unknown_ca` instead, which the `down (<alert>)` lines
+  and `yuzu_gw_upstream_tls_handshake_failures_total` carry.
+- A key that does not match its certificate is not detected here.
+- The OTP `ssl` progress reports that also appear on each attempt still print the option set,
+  key file paths included (tracked separately); this line adds none.
 
 #### Bad values replaced by defaults
 
@@ -1955,6 +2004,7 @@ agent build that re-registers by itself; released agents do not (see
 | gateway | CRITICAL | `Refusing to start: the upstream channel uses TLS (https) WITHOUT {verify,verify_peer} and a {cacertfile,...} of its own` | At least one `https` endpoint has no `verify_peer`, or no `cacertfile` / `cacerts` of its own (a missing CA means the operating system's CA store would be trusted). Add both to every `https` endpoint; `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` is dev/CI only and makes the gateway log a warning at every boot. |
 | gateway | CRITICAL | `Refusing to start: the upstream channel <name> lists both plaintext (http) and TLS (https) endpoints` | One channel mixes schemes, so some calls would travel unencrypted. Give the channel one scheme (two channels cannot help: only `default_channel` is called). No override. |
 | gateway | crash report | `yuzu_gw_sup` fails to start with a child specification error | Two channels share a name, or a channel is named after a registered process (`yuzu_gw_registry`, say). Loud and fail-closed, but the text does not name the duplicate. Give every channel a unique name (seen in a probe; the boot guard does not check it). |
+| gateway | ERROR | `Upstream channel <name>: the TLS client options cannot be used, so every connection fails: <file> ...`, `/readyz` 503 with `upstream_tls_files` false | A CA, certificate or key file named by an `https` endpoint is missing, unreadable, empty or holds no certificate or key. The line names the option and, except for a `keyfile`, the path. Create or fix the file; the channel finds it on its next attempt (within about 5 s, or up to about 2 minutes if `ssl` had cached an earlier version of the same file; see Certificates above) with no restart, and `/readyz` returns to 200 once a connection attempt fails for any other reason or succeeds. If the line says none of the files is at fault, check the other `ssl` options. A file that is a directory refuses boot instead. See [A CA, certificate or key file that is wrong](#a-ca-certificate-or-key-file-that-is-wrong). Covered by tests; not run against a live server. |
 | gateway | INFO/metric | `Upstream channel <name> connection <n> down (<TLS alert word>)` repeating, and `yuzu_gw_upstream_tls_handshake_failures_total` rising | Certificates or the CA were replaced or expired after the connection opened: an open connection keeps the old material until it drops, then the reconnect presents the new files (after Erlang's `ssl` cache clears, about 2 minutes). Recovery takes the cache window plus up to 5.8 s of delay, plus the circuit breaker's open time if it tripped (up to 300 s, doubling). While the breaker is open the counter moves only at its probes. INFERRED from the code and the certificate probe, not run end to end. |
 | gateway | metric | `yuzu_gw_upstream_rpc_errors_total{code="timeout"}` rising on every call, no channel log line, and `/readyz` 200 until the breaker opens | A blackhole peer: the server host or a VIP failed over without a FIN or RST. The gateway sends no HTTP/2 keepalive pings and sets no TCP keepalive, so the connection is not noticed as dead until the kernel gives up on it, about 15 minutes with default TCP retries (INFERRED for a true blackhole; measured only with a peer that stopped answering, which left the connection counted as up for the whole 35 s observed). Restart the gateway only if the server is confirmed healthy and reachable by another route; it redials at once (INFERRED), but agents behind it reconnect as described for #5183 above. Not fixed in this release: a client keepalive faster than 30 s would be refused by the server with GOAWAY. |
 | gateway | metric | `yuzu_gw_upstream_rpc_errors_total{code="stream_error"}` for a few seconds to about 15 s, then recovery | The server sent HTTP/2 GOAWAY while a call was in flight (a server draining or restarting): the connection stops taking new calls for gun's 15 s closing window, calls fail immediately as `stream_error`, and each counts toward the circuit breaker. Measured with a scripted peer: still failing 12 s later, recovered by 20 s. Expected around a server restart. |

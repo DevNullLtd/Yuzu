@@ -41,6 +41,8 @@ health_test_() ->
        fun readyz_503_combined_without_agent_route/0},
       {"readyz 503, not a crash, for a listeners value that is an improper list",
        fun readyz_503_improper_list/0},
+      {"readyz 503 while an upstream channel's TLS options are unusable, 200 once they are not",
+       fun readyz_503_unusable_upstream_tls/0},
       {"healthz stays 200 while a configured listener is down", fun healthz_ok_listener_down/0}
      ]}.
 
@@ -240,6 +242,33 @@ readyz_503_listener_stopped() ->
         yuzu_gw_test_listener:stop(A),
         ?assertEqual({503, false}, ready(Port))
     end).
+
+%% A stand-in for a channel's table: config_error/1 reads one row of a named
+%% table, so the readiness wiring is tested without opening a connection.
+readyz_503_unusable_upstream_tls() ->
+    {ok, Port} = yuzu_gw_health:port(),
+    Chan = yuzu_health_test_chan,
+    Tab = ets:new(Chan, [named_table, public, set]),
+    PrevClient = application:get_env(yuzu_gw, upstream_client),
+    application:set_env(yuzu_gw, upstream_client,
+                        #{channels => [{Chan, [{http, "127.0.0.1", 59999, []}], #{}}]}),
+    %% {HTTP status, whether the body says upstream_tls_files is true}
+    Tls = fun() ->
+              {Status, Body} = http_get(Port, "/readyz"),
+              {Status, binary:match(Body, <<"\"upstream_tls_files\":true">>) =/= nomatch}
+          end,
+    try
+        ?assertEqual({200, true}, Tls()),
+        true = ets:insert(Tab, {config_error, [{cacertfile, "/nonexistent/ca.pem", enoent}]}),
+        ?assertEqual({503, false}, Tls()),
+        true = ets:insert(Tab, {config_error, []}),
+        ?assertEqual({503, false}, Tls()),
+        true = ets:delete(Tab, config_error),
+        ?assertEqual({200, true}, Tls())
+    after
+        ets:delete(Tab),
+        restore_env(upstream_client, PrevClient)
+    end.
 
 readyz_503_one_of_two_stopped() ->
     {ok, Port} = yuzu_gw_health:port(),

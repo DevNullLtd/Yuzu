@@ -5196,6 +5196,12 @@ Production is `https`, `verify_peer`, a CA-pinned `cacertfile` and a client cert
   gateway now logs one warning per option at boot (see
   [Bad values replaced by defaults](gateway.md#bad-values-replaced-by-defaults)). An IPv6 literal host needs
   `inet6` in the endpoint's `socket_options`; the dial is IPv4 only otherwise.
+- **A wrong CA or certificate file is now loud.** It used to show only as `bad_tls_options` on
+  every attempt, with `/readyz` green until five calls had failed. The gateway now warns at boot,
+  logs an ERROR naming the file (not a key file's path) at most once a minute, and `/readyz`
+  answers 503 (`upstream_tls_files`) until it is fixed. A directory where a file belongs refuses
+  boot. A merely missing file does not, because the server may create it after the gateway starts
+  (see [A CA, certificate or key file that is wrong](gateway.md#a-ca-certificate-or-key-file-that-is-wrong)).
 - **Log volume.** A persistent TLS failure costs about 5.8 KB of log per attempt (DERIVED:
   roughly 100 MB a day at `pool_size` 1). Bound Docker logs with `logging` `max-size`. Erlang's
   `ssl` progress reports include key file paths, never the passphrase (probed on OTP 28.4.2).

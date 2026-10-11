@@ -26,6 +26,7 @@
 
 %% API
 -export([start_link/0, port/0]).
+-export([check_upstream_tls_files/0]). %% for testing
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -140,6 +141,7 @@ readiness_check() ->
         check_process(<<"agent_sup">>, yuzu_gw_agent_sup),
         check_process(<<"router">>, yuzu_gw_router),
         check_listeners(),
+        check_upstream_tls_files(),
         check_circuit_breaker()
     ],
     AllOk = lists:all(fun({_, V}) -> V end, Checks),
@@ -185,6 +187,19 @@ listener_running(#{name := Name}) ->
     end;
 listener_running(_) ->
     false.
+
+%% Not ready while any upstream channel's most recent connection attempt failed
+%% because its TLS options are unusable (a missing, empty or wrong CA, certificate
+%% or key file; yuzu_grpc_client_channel:config_error/1). Such a gateway can reach
+%% no server, and the breaker above stays closed until five calls have failed. A
+%% table read, never a call into the channel, so a slow upstream cannot hold it.
+check_upstream_tls_files() ->
+    Names = case yuzu_grpc_client_config:from_env() of
+                {ok, Channels} -> [N || #{name := N} <- Channels];
+                {error, _}     -> []
+            end,
+    {<<"upstream_tls_files">>,
+     lists:all(fun(N) -> yuzu_grpc_client_channel:config_error(N) =:= none end, Names)}.
 
 check_circuit_breaker() ->
     try

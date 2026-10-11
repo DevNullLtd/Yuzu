@@ -15,6 +15,9 @@
 %%%                            process, callers increment the counter, not the table
 %%%   {last_error, Compact}    why the most recent connection attempt failed
 %%%   {max_receive, Bytes}     the response size limit of the channel
+%%%   {config_error, Problems} present while the most recent attempt failed because
+%%%                            the TLS options are unusable (config_error/1); the
+%%%                            row is deleted when a connection comes up
 %%%
 %%% A call finding no connection up waits on one that is connecting (at most its
 %%% own timeout); if none is, it fails at once with the last connection error,
@@ -28,7 +31,7 @@
 -module(yuzu_grpc_client_channel).
 -behaviour(gen_server).
 
--export([child_spec/1, start_link/1, pick/2, max_receive/1]).
+-export([child_spec/1, start_link/1, pick/2, max_receive/1, config_error/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, format_status/1]).
 -export([compact/1, word/1, backoff_ms/1]).
 
@@ -39,6 +42,8 @@
 %% closes (or a middlebox resetting after the handshake) draw a reconnect every
 %% 100 ms per slot, each with a TLS handshake.
 -define(STABLE_MS, 5000).
+%% The unusable-TLS-options error line is repeated no more often than this.
+-define(CONFIG_LOG_EVERY_MS, 60000).
 
 -record(slot, {id :: pos_integer(),
                endpoint :: yuzu_grpc_client_config:endpoint(),
@@ -53,7 +58,10 @@
              %% callers of await_up waiting for a connection that is being opened,
              %% each with the monotonic ms at which it stops waiting (an expired
              %% caller has already given up; its entry is dropped, never answered)
-             waiters = [] :: [{gen_server:from(), integer()}]}).
+             waiters = [] :: [{gen_server:from(), integer()}],
+             %% monotonic ms of the last unusable-TLS-options error log line. Last in
+             %% the record: the backoff tests read the fields above by position.
+             config_logged_at :: integer() | undefined}).
 
 %%--------------------------------------------------------------------
 %% API
@@ -89,6 +97,16 @@ pick(Name, Timeout) ->
         end
     catch
         error:badarg -> {error, no_channel}
+    end.
+
+%% @doc `none' while the channel's connections can be tried, or the problems
+%% found while its most recent attempt failed because the TLS options are
+%% unusable: the list may be empty (the options are unusable for a reason that is
+%% not one of the files). Read by /readyz; reads a table row, never the channel.
+-spec config_error(atom()) -> none | [yuzu_gw_tls_files:problem()].
+config_error(Name) ->
+    try ets:lookup_element(Name, config_error, 2)
+    catch error:badarg -> none
     end.
 
 -spec max_receive(atom()) -> pos_integer().
@@ -199,7 +217,8 @@ do_info({gun_up, Pid, _Protocol}, #st{by_pid = ByPid} = State) ->
     case maps:find(Pid, ByPid) of
         {ok, Id} ->
             erlang:send_after(?STABLE_MS, self(), {stable, Id, Pid}),
-            State1 = mark(Id, up, State),
+            true = ets:delete(State#st.name, config_error),
+            State1 = mark(Id, up, State#st{config_logged_at = undefined}),
             {noreply, reply_waiters({ok, Pid}, State1)};
         error ->
             {noreply, State}
@@ -311,11 +330,12 @@ lost(Pid, Reason, #st{slots = Slots, by_pid = ByPid} = State) ->
     end.
 
 %% A slot is down: record why, schedule the reopen.
-failed(Id, Reason, #st{name = Name, slots = Slots} = State) ->
+failed(Id, Reason, #st{name = Name, slots = Slots} = State0) ->
     Compact = compact(Reason),
     Word = word(Compact),
     #slot{fails = Fails} = Slot = maps:get(Id, Slots),
     true = ets:insert(Name, {last_error, Compact}),
+    State = unusable_options(Compact, Slot, State0),
     case Fails of
         0 ->
             %% The first loss of a healthy connection: dial again at once. The
@@ -339,6 +359,39 @@ failed(Id, Reason, #st{name = Name, slots = Slots} = State) ->
                 false -> reply_waiters({error, Compact}, State1)
             end
     end.
+
+%% The TLS options of an endpoint are unusable: `ssl' rejected the whole option
+%% set, which is what a missing, empty or wrong CA, certificate or key file looks
+%% like. Every attempt then fails the same way in about two milliseconds, so the
+%% reason is looked up (yuzu_gw_tls_files) and put where it can be seen: an ERROR
+%% log line (at most one a minute per channel, the first at once, because attempts
+%% repeat every 5 s per connection) and the `config_error' row /readyz reads. It
+%% is not a stop: the server creates its certificates on first start, possibly
+%% after the gateway's, and the next attempt may find them.
+unusable_options({options, tls}, #slot{endpoint = Endpoint},
+                 #st{name = Name, config_logged_at = At} = State) ->
+    Problems = yuzu_gw_tls_files:diagnose_endpoint(Endpoint),
+    true = ets:insert(Name, {config_error, Problems}),
+    Now = erlang:monotonic_time(millisecond),
+    case At =:= undefined orelse Now - At >= ?CONFIG_LOG_EVERY_MS of
+        true ->
+            logger:error("Upstream channel ~s: the TLS client options cannot be used, so "
+                         "every connection fails: ~ts. The gateway keeps retrying and /readyz "
+                         "stays 503 until this is fixed (logged at most once a minute).",
+                         [Name, problem_text(Problems)]),
+            State#st{config_logged_at = Now};
+        false ->
+            State
+    end;
+unusable_options(_Other, _Slot, #st{name = Name} = State) ->
+    true = ets:delete(Name, config_error),
+    State.
+
+problem_text([]) ->
+    "none of the files named in the TLS options is missing, empty or unreadable, so check "
+    "the other ssl options";
+problem_text(Problems) ->
+    lists:join("; ", [yuzu_gw_tls_files:describe(P) || P <- Problems]).
 
 reply_waiters(Reply, #st{waiters = Waiters} = State) ->
     Now = erlang:monotonic_time(millisecond),

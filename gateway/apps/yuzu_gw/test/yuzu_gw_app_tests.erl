@@ -926,6 +926,56 @@ boot_creates_runner_throttle_before_sup_test_() ->
 %% unusable value is refused rather than skipped; so is none at all, because
 %% the two callers of the channel use `default_channel' and /readyz would
 %% answer for a gateway that can register no agent.
+%% The files an https endpoint names. A file that is missing is warned about and
+%% the gateway starts (the server creates its certificates on first start,
+%% possibly after the gateway's); a DIRECTORY where a file belongs is refused, as
+%% it never becomes one. No path of a key file is ever logged.
+check_upstream_tls_files_test_() ->
+    Chan = fun(Ssl) ->
+               #{channels => [{default_channel, [{https, "gw.example", 50055, Ssl}], #{}}]}
+           end,
+    Set = fun(Ssl) -> application:set_env(yuzu_gw, upstream_client, Chan(Ssl)) end,
+    env_case(
+      [{"a plaintext endpoint has nothing to check",
+        fun() ->
+            application:set_env(yuzu_gw, upstream_client, ?DEFAULT_CHANNEL_CONFIG),
+            Events = capture_events(fun() -> ?assertEqual(ok, yuzu_gw_app:check_upstream_tls_files()) end),
+            ?assertEqual([], Events)
+        end},
+       {"no upstream_client at all is not this guard's business",
+        fun() -> ?assertEqual(ok, yuzu_gw_app:check_upstream_tls_files()) end},
+       {"a missing CA file is warned about with its path and the gateway starts",
+        fun() ->
+            Set([{verify, verify_peer}, {cacertfile, "/nonexistent/ca.pem"},
+                 {keyfile, "/marker/private/KEY-bb88.pem"}]),
+            Events = capture_events(fun() -> ?assertEqual(ok, yuzu_gw_app:check_upstream_tls_files()) end),
+            Warnings = [T || {warning, T} <- Events],
+            ?assertEqual(2, length(Warnings)),
+            Text = lists:flatten(Warnings),
+            {match, _} = re:run(Text, "default_channel endpoint gw.example:50055: cacertfile "
+                                      "/nonexistent/ca.pem does not exist \\(yet\\)", [unicode]),
+            {match, _} = re:run(Text, "starts anyway", [unicode]),
+            nomatch = re:run(Text, "KEY-bb88", [unicode])
+        end},
+       {"a CA path that is a directory refuses boot, and says why",
+        fun() ->
+            Set([{verify, verify_peer}, {cacertfile, "/tmp"}]),
+            Events = capture_events(
+                       fun() ->
+                           ?assertEqual({error, unusable_upstream_tls_file},
+                                        yuzu_gw_app:check_upstream_tls_files())
+                       end),
+            Text = lists:flatten([T || {_, T} <- Events]),
+            {match, _} = re:run(Text, "cacertfile /tmp is a directory, not a file", [unicode]),
+            {match, _} = re:run(Text, "Refusing to start: a TLS file of an upstream endpoint", [unicode]),
+            nomatch = re:run(Text, "starts anyway", [unicode])
+        end},
+       {"an unusable upstream_client value is left to the config guard",
+        fun() ->
+            application:set_env(yuzu_gw, upstream_client, not_a_map),
+            ?assertEqual(ok, yuzu_gw_app:check_upstream_tls_files())
+        end}]).
+
 check_upstream_client_config_test_() ->
     env_case(
       [{"a well-formed default_channel is fine",

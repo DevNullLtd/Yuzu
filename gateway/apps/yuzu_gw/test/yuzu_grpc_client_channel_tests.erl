@@ -243,6 +243,12 @@ process_test_() ->
                  {timeout, 30, fun() -> connections_carry_the_liveness_options(S) end}} end,
       fun(S) -> {"an operator's own socket options win over the channel's defaults",
                  {timeout, 30, fun() -> operator_socket_options_win(S) end}} end,
+      fun(S) -> {"a CA file that does not exist is reported once, with its path, and never a key path; /readyz says not ready",
+                 {timeout, 30, fun() -> unusable_ca_is_reported(S) end}} end,
+      fun(S) -> {"the report clears once an attempt fails for another reason, and /readyz recovers",
+                 {timeout, 30, fun() -> unusable_ca_report_clears(S) end}} end,
+      fun(S) -> {"a plaintext channel with a connection up reports no TLS file problem",
+                 {timeout, 30, fun() -> plaintext_channel_has_no_config_error(S) end}} end,
       fun(S) -> {"a channel whose init/1 fails leaves with its class alone, nothing of its config logged",
                  {timeout, 30, fun() -> init_failure_logs_no_config(S) end}} end,
       fun(S) -> {"a channel whose callback raises leaves with its class alone, nothing of its state logged",
@@ -875,6 +881,98 @@ raw_accept(Listen, HoldMs) ->
             raw_accept(Listen, HoldMs);
         {error, _} ->
             ok
+    end.
+
+%% An https endpoint whose CA file does not exist. A raw listening socket lets the
+%% TCP connect succeed, so the failure is the TLS options being rejected, as it is
+%% against a real server: every attempt then fails in about 2 ms.
+unusable_ca_is_reported(#{name := Name}) ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}]),
+    {ok, Port} = inet:port(Listen),
+    Missing = "/nonexistent/yuzu_test_ca.pem",
+    Ssl = [{verify, verify_peer}, {cacertfile, Missing},
+           {keyfile, "/marker/private/KEY-aa77.pem"}],
+    {ok, Cfg} = yuzu_grpc_client_config:channel({Name, [{https, "localhost", Port, Ssl}], #{}}, true),
+    application:set_env(yuzu_gw, upstream_client,
+                        #{channels => [{Name, [{https, "localhost", Port, Ssl}], #{}}]}),
+    try
+        {_, Text} = capture(
+                      fun() ->
+                          {ok, _} = yuzu_grpc_client_channel:start_link(Cfg),
+                          ok = wait_for(fun() ->
+                                            yuzu_grpc_client_channel:config_error(Name) =/= none
+                                        end),
+                          %% several attempts have failed, yet one line was logged
+                          ok = wait_for(fun() -> slot_fails(Name, 1) >= 3 end)
+                      end),
+        ?assertEqual([{cacertfile, Missing, enoent}, {keyfile, undefined, enoent}],
+                     yuzu_grpc_client_channel:config_error(Name)),
+        {match, _} = re:run(Text, "TLS client options cannot be used", [unicode]),
+        {match, _} = re:run(Text, "cacertfile " ++ Missing ++ " does not exist", [unicode]),
+        {match, _} = re:run(Text, "keyfile does not exist", [unicode]),
+        %% the line this channel writes names no key path (OTP's own ssl progress
+        %% reports do, a separate known gap; those are not this line)
+        {match, [{Start, _}]} = re:run(Text, "TLS client options cannot be used", [unicode]),
+        Own = lists:sublist(Text, Start + 1, 400),
+        [OwnLine | _] = string:split(Own, "\n"),
+        nomatch = re:run(OwnLine, "KEY-aa77", [unicode]),
+        ?assertEqual(1, length(re:split(Text, "TLS client options cannot be used", [unicode])) - 1),
+        ?assertEqual({<<"upstream_tls_files">>, false}, yuzu_gw_health:check_upstream_tls_files())
+    after
+        application:unset_env(yuzu_gw, upstream_client),
+        gen_tcp:close(Listen)
+    end.
+
+%% The row means "the most recent attempt failed because the options are
+%% unusable", so an attempt that fails otherwise (here the CA now exists and the
+%% peer never answers the handshake) clears it, and /readyz with it.
+unusable_ca_report_clears(S) ->
+    case yuzu_gw_authz_tests:setup_certs() of
+        #{ca := Cert} = Certs ->
+            try unusable_ca_report_clears(S, Cert)
+            after yuzu_gw_authz_tests:cleanup_certs(Certs)
+            end;
+        {error, Why} ->
+            io:format(user, "SKIPPED unusable_ca_report_clears: openssl certificates "
+                      "unavailable: ~p~n", [Why])
+    end.
+
+unusable_ca_report_clears(#{name := Name}, Cert) ->
+    {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}]),
+    {ok, Port} = inet:port(Listen),
+    Dir = "/tmp/yuzu_test_chan_ca_" ++ integer_to_list(erlang:unique_integer([positive])),
+    ok = filelib:ensure_path(Dir),
+    Ca = filename:join(Dir, "ca.pem"),
+    Ssl = [{verify, verify_peer}, {cacertfile, Ca}],
+    Endpoint = {https, "localhost", Port, Ssl},
+    {ok, Cfg} = yuzu_grpc_client_config:channel({Name, [Endpoint], #{connect_timeout => 300}}, true),
+    application:set_env(yuzu_gw, upstream_client,
+                        #{channels => [{Name, [Endpoint], #{connect_timeout => 300}}]}),
+    try
+        {ok, _} = yuzu_grpc_client_channel:start_link(Cfg),
+        ok = wait_for(fun() -> yuzu_grpc_client_channel:config_error(Name) =/= none end),
+        ?assertEqual({<<"upstream_tls_files">>, false}, yuzu_gw_health:check_upstream_tls_files()),
+        {ok, _} = file:copy(Cert, Ca),
+        ok = wait_for(fun() -> yuzu_grpc_client_channel:config_error(Name) =:= none end),
+        ?assertEqual({<<"upstream_tls_files">>, true}, yuzu_gw_health:check_upstream_tls_files())
+    after
+        application:unset_env(yuzu_gw, upstream_client),
+        gen_tcp:close(Listen),
+        file:del_dir_r(Dir)
+    end.
+
+plaintext_channel_has_no_config_error(#{name := Name} = S) ->
+    Port = yuzu_gw_test_listener:probe_free_port(),
+    start_listener(S, Port),
+    start(Name, Port, #{}),
+    ok = wait_for(fun() -> length(up_slots(Name)) =:= 1 end),
+    application:set_env(yuzu_gw, upstream_client,
+                        #{channels => [{Name, [{http, "localhost", Port, []}], #{}}]}),
+    try
+        ?assertEqual(none, yuzu_grpc_client_channel:config_error(Name)),
+        ?assertEqual({<<"upstream_tls_files">>, true}, yuzu_gw_health:check_upstream_tls_files())
+    after
+        application:unset_env(yuzu_gw, upstream_client)
     end.
 
 %% The slot record is private to the channel; these are the positions in the

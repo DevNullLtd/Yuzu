@@ -15,7 +15,8 @@
 -export([apply_env_overrides/0, evaluate_cookie/3]).  %% exported for testing
 -export([client_has_https/1, client_tls_posture/1, listeners_have_tls/1]). %% for testing
 -export([client_all_present_client_cert/1, client_tls_weakest/1, client_has_unverified/1, client_mixed_channels/1]). %% for testing
--export([check_upstream_tls_posture/0, check_upstream_channel_mix/0, warn_replaced_options/0]).
+-export([check_upstream_tls_posture/0, check_upstream_channel_mix/0, warn_replaced_options/0,
+         check_upstream_tls_files/0]).
 -export([evaluate_upstream_posture/2, evaluate_listeners/1]).             %% for testing
 -export([evaluate_mgmt_posture/3, apply_listener_port_overrides/0]).      %% for testing
 -export([check_legacy_grpcbox_servers/0, check_legacy_grpcbox_client/0,
@@ -73,6 +74,7 @@ do_start_guarded() ->
                 fun check_upstream_client_config/0,
                 fun check_upstream_channel_mix/0,
                 fun check_upstream_tls_posture/0,
+                fun check_upstream_tls_files/0,
                 fun check_mgmt_listener_posture/0],
                fun do_start_services/0).
 
@@ -641,6 +643,49 @@ warn_multi_connection(Channels) ->
                     [N, Size * length(Es), Size, length(Es)])
      || #{name := N, pool_size := Size, endpoints := Es} <- Channels, Size * length(Es) > 1],
     ok.
+
+%% @private The files an https endpoint's TLS options name, looked at once at
+%% boot. A file that is missing, empty or holds no certificate is WARNED about
+%% and the gateway starts: the server creates its certificates on first start,
+%% possibly after the gateway's, the channel keeps retrying, and its own error
+%% line and /readyz carry on saying so until a connection is made. A DIRECTORY
+%% (or other non-file) where a file belongs is REFUSED: it can never become one
+%% by waiting, and it is what a container runtime creates in place of a
+%% bind-mounted file that does not exist on the host. Reads files, not the option
+%% values: a key file's path is never logged (yuzu_gw_tls_files).
+-spec check_upstream_tls_files() -> ok | {error, unusable_upstream_tls_file}.
+check_upstream_tls_files() ->
+    case yuzu_grpc_client_config:from_env() of
+        {ok, Channels} ->
+            Found = [{N, H, P, Problem}
+                     || #{name := N, endpoints := Es} <- Channels,
+                        #{host := H, port := P} = E <- Es,
+                        Problem <- yuzu_gw_tls_files:diagnose_endpoint(E)],
+            [logger:warning("Upstream channel ~s endpoint ~s:~b: ~ts. Every connection to it "
+                            "fails until this is fixed.~ts",
+                            [N, H, P, yuzu_gw_tls_files:describe(Problem),
+                             case yuzu_gw_tls_files:has_definite_defect([Problem]) of
+                                 true  -> "";
+                                 false -> " The gateway starts anyway because the server may "
+                                          "create the file after the gateway does; /readyz stays "
+                                          "503 until a connection is made."
+                             end])
+             || {N, H, P, Problem} <- Found],
+            case yuzu_gw_tls_files:has_definite_defect([Pr || {_, _, _, Pr} <- Found]) of
+                false ->
+                    ok;
+                true ->
+                    logger:critical(
+                        "Refusing to start: a TLS file of an upstream endpoint is a directory "
+                        "or not a regular file (see the warning above). It cannot become a file "
+                        "by waiting. A container runtime creates a directory in place of a "
+                        "bind-mounted file that does not exist on the host: create the file, "
+                        "or fix the path (docs/user-manual/gateway.md 'The upstream client')."),
+                    {error, unusable_upstream_tls_file}
+            end;
+        {error, _} ->
+            ok
+    end.
 
 %% @private Refuse to boot if one channel lists both plaintext (http) and TLS
 %% (https) endpoints. A call goes round-robin over every live connection of its
