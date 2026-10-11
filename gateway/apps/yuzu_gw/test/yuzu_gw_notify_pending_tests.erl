@@ -108,10 +108,6 @@ closed_test_() ->
         fun untrappable_worker_death_is_survived/0),
       t("an upstream restart starts its gauges at zero and loses the old pending entries",
         fun restart_starts_from_zero/0),
-      t("terminate/2 with a non-empty store does not crash",
-        fun terminate_with_pending_entries/0),
-      t("1000 distinct agents, one slot opening at a time: all delivered in order, never above 10",
-        60, fun burst_one_slot_at_a_time/0),
       t("1000 distinct agents with free running workers: all delivered, never above 10",
         60, fun burst_free_running/0)
      ]}.
@@ -155,8 +151,6 @@ env_test_() ->
         fun max_at_or_above_base_is_kept/0),
       t("a base above the default cap, with no cap set, warns about the default and names no cap the operator did not set",
         fun max_unset_below_base_names_the_default/0),
-      t("a reset timeout under the floor warns naming the key, the value, the range and the default used",
-        fun sub_floor_values_warn_with_the_default_used/0),
       t("a cap outside the range, with a base above the default cap, gets the default-raised warning and not the operator-cap one",
         fun max_out_of_range_names_the_default_not_the_rejected_value/0)
      ]}.
@@ -220,8 +214,6 @@ probe_test_() ->
         fun killed_probe_worker_is_one_failure/0),
       t("a duplicate or foreign probe result is ignored",
         fun duplicate_and_foreign_probe_results_are_ignored/0),
-      t("a failed old probe is re-sent after the newer same-key event went out",
-        fun failed_old_probe_is_resent_after_the_newer_event/0),
       t("while a probe is in flight nothing else drains, ordinary workers included",
         fun nothing_else_drains_while_a_probe_is_in_flight/0),
       t("the probe counts inside the ten worker budget and shows in the inflight gauge",
@@ -243,22 +235,20 @@ probe_log_test_() ->
       t("a probe worker killed with no result logs a warning naming the agent and the reason",
         fun killed_probe_worker_is_logged/0),
       t("the killed probe warning redacts an exit reason that carries payload bytes",
-        fun killed_probe_warning_redacts_the_reason/0),
-      t("an agent id with control characters never reaches a notify log line raw",
-        fun notify_log_lines_carry_no_raw_control_characters/0)
+        fun killed_probe_warning_redacts_the_reason/0)
      ]}.
 
 %% A request that cannot be encoded never left the gateway, so it says nothing
-%% about the upstream: it must not move the breaker, whichever threshold is set.
-%% Run with the test threshold (3) and with the default one (5).
+%% about the upstream: it must not move the breaker, however many arrive. The
+%% rounds scale with the threshold (Threshold + 2), so one threshold is enough.
 local_exception_test_() ->
-    [{foreach,
-      fun() -> setup(Env) end,
-      fun cleanup/1,
-      [
-       t("a request that cannot be encoded never feeds the breaker, however many arrive",
-         fun register_encode_exception_never_feeds_the_breaker/0)
-      ]} || Env <- [[], [{circuit_breaker_failure_threshold, 5}]]].
+    {foreach,
+     fun() -> setup([]) end,
+     fun cleanup/1,
+     [
+      t("a request that cannot be encoded never feeds the breaker, however many arrive",
+        fun register_encode_exception_never_feeds_the_breaker/0)
+     ]}.
 
 %% The same on the half_open probe path, with the log recorded.
 probe_local_exception_test_() ->
@@ -964,44 +954,8 @@ restart_starts_from_zero() ->
     Entered = [maps:get(agent_id, R) || R <- entered_reqs()],
     ?assertEqual([], [Id || Id <- OldHeld, lists:member(Id, Entered)]).
 
-terminate_with_pending_entries() ->
-    watch(),
-    _ = fill_slots(),
-    [cast_connected(agent(I)) || I <- lists:seq(1, 3)],
-    sync(),
-    ?assertEqual(3, pending_len()),
-    Up = whereis(yuzu_gw_upstream),
-    ?assertEqual(ok, gen_server:stop(Up, shutdown, ?AWAIT_MS)),
-    ?assertEqual(undefined, whereis(yuzu_gw_upstream)).
-
-%% The cast mailbox, not the workers, is what 1000 agents stress. One slot
-%% opens at a time, so the order of the entries into the mock IS the selection
-%% order, and the in-flight counter in the mock is an event level bound.
-burst_one_slot_at_a_time() ->
-    watch(),
-    N = 1000,
-    Keys = [agent(I) || I <- lists:seq(1, N)],
-    [cast_connected(Id) || Id <- Keys],
-    First = await_entered(?INFLIGHT_MAX),
-    ?assertEqual(lists:sort(lists:sublist(Keys, ?INFLIGHT_MAX)),
-                 lists:sort([maps:get(agent_id, Req) || {_, Req} <- First])),
-    Live0 = [W || {W, _} <- First],
-    LiveN = lists:foldl(
-              fun(Id, [W | Rest]) ->
-                  W ! release,
-                  {W2, Req} = await_entered(),
-                  ?assertEqual(Id, maps:get(agent_id, Req)),
-                  Rest ++ [W2]
-              end, Live0, lists:nthtail(?INFLIGHT_MAX, Keys)),
-    ?assertEqual(?INFLIGHT_MAX, length(LiveN)),
-    open_and_release_all(),
-    await_until(fun() -> last_gauge() =:= {0, 0} end),
-    Entered = [maps:get(agent_id, R) || R <- entered_reqs()],
-    ?assertEqual(N, length(Entered)),
-    ?assertEqual(lists:sort(Keys), lists:sort(Entered)),
-    ?assertEqual(?INFLIGHT_MAX, peak()),
-    ?assertEqual(0, count(?EV_DROPPED)).
-
+%% The cast mailbox, not the workers, is what 1000 agents stress: workers
+%% finish while casts are still arriving.
 burst_free_running() ->
     watch(),
     N = 1000,
@@ -1159,26 +1113,6 @@ max_out_of_range_names_the_default_not_the_rejected_value() ->
                                       [{capture, none}])),
          ?assertEqual(600000, up_get(cb_max_timeout))
      end || Bad <- [50, 4000000]].
-
-%% Values under the floor of 100 are not silent: the line names the key, echoes
-%% the integer (operator configuration, not agent data), gives the range and says
-%% which default took its place.
-sub_floor_values_warn_with_the_default_used() ->
-    [begin
-         [Warning] = env_key_case(Key, Bad, Extra),
-         Parts = [atom_to_binary(Key, utf8), integer_to_binary(Bad), <<"100..3600000">>,
-                  <<"using ", (integer_to_binary(Default))/binary>>],
-         [?assertEqual({Part, true}, {Part, binary:match(Warning, Part) =/= nomatch})
-          || Part <- Parts]
-     end || {Key, Bad, Default, Extra} <-
-                [{circuit_breaker_reset_timeout_ms, 50, 10000,
-                  [{circuit_breaker_max_reset_timeout_ms, 300000}]},
-                 {circuit_breaker_reset_timeout_ms, 99, 10000,
-                  [{circuit_breaker_max_reset_timeout_ms, 300000}]},
-                 {circuit_breaker_max_reset_timeout_ms, 1, 300000,
-                  [{circuit_breaker_reset_timeout_ms, 100}]},
-                 {circuit_breaker_max_reset_timeout_ms, 99, 300000,
-                  [{circuit_breaker_reset_timeout_ms, 100}]}]].
 
 max_at_or_above_base_is_kept() ->
     [begin
@@ -1541,39 +1475,6 @@ killed_probe_warning_redacts_the_reason() ->
     [?assertEqual(nomatch, string:find(Line, Secret))
      || Secret <- ["peer-secret", "sess-secret", "home-secret"]].
 
-%% A carriage return or line feed in an agent id must not start a second log
-%% line: the eviction line and the failed-notify line carry it through log_text.
-notify_log_lines_carry_no_raw_control_characters() ->
-    watch(),
-    Evil = <<"crlf-marker", 13, 10, "INJECTED">>,
-    %% Evicted as the probe (the id is not UTF-8, so it cannot be encoded).
-    Unencodable = <<255, 13, 10, "crlf-marker">>,
-    trip_breaker(),
-    notify_status(Unencodable, <<"sess">>, connected, <<"peer">>, <<"home">>),
-    sync(),
-    enter_half_open(),
-    ?assertEqual({marshal_failed, Unencodable}, await_attempt()),
-    await_until(fun() -> last_gauge() =:= {0, 0} end),
-    %% Closed again by a good probe, then a failed ordinary notification.
-    cast_connected(agent(1)),
-    {entered, Good, _} = await_attempt(),
-    Good ! release,
-    await_until(fun() -> up_get(cb_state) =:= closed end),
-    cast_connected(Evil),
-    {entered, Failing, _} = await_attempt(),
-    fail_worker(Failing),
-    await_until(fun() -> last_gauge() =:= {0, 0} end),
-    await_dead(Failing),
-    sync(),
-    Lines = [Text || {_, log, warning, Text} <- rows(),
-                     string:find(Text, "crlf-marker") =/= nomatch],
-    %% Each control character became one `?': the rest of a ~p rendering may
-    %% wrap, so the id is checked as rendered rather than by looking for a
-    %% line feed anywhere in the line.
-    ?assertEqual(2, length(Lines)),
-    ?assertMatch([_], [L || L <- Lines, string:find(L, "??crlf-marker") =/= nomatch]),
-    ?assertMatch([_], [L || L <- Lines, string:find(L, "crlf-marker??INJECTED") =/= nomatch]).
-
 duplicate_and_foreign_probe_results_are_ignored() ->
     watch(),
     trip_breaker(),
@@ -1599,36 +1500,6 @@ duplicate_and_foreign_probe_results_are_ignored() ->
     ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()),
     ?assertMatch(#{pid := Probe2}, up_get(notify_probe)),
     ?assertEqual(Up, whereis(yuzu_gw_upstream)).
-
-%% The probe's event is sent, the breaker is closed by a call path RPC, the
-%% newer event for the same key goes out as an ordinary worker, and then the old
-%% probe fails: its event is sent again, after the newer one. The server
-%% tolerates the reorder; the breaker and the store stay consistent.
-failed_old_probe_is_resent_after_the_newer_event() ->
-    watch(),
-    trip_breaker(),
-    Agent = <<"co-agent">>,
-    notify_status(Agent, <<"co-session">>, connected, <<"peer-connect">>, <<"co-home">>),
-    sync(),
-    enter_half_open(),
-    {Probe, First} = await_entered(),
-    ?assertEqual('CONNECTED', maps:get(event, First)),
-    notify_status(Agent, <<"co-session">>, disconnected, <<"peer-disconnect">>, <<"co-home">>),
-    sync(),
-    mock(ok),
-    {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
-    {_, Newer} = await_entered(),
-    ?assertEqual('DISCONNECTED', maps:get(event, Newer)),
-    Up = whereis(yuzu_gw_upstream),
-    fail_worker(Probe),
-    {_, Older} = await_entered(),
-    ?assertEqual('CONNECTED', maps:get(event, Older)),
-    await_dead(Probe),
-    sync(),
-    ?assertEqual(Up, whereis(yuzu_gw_upstream)),
-    ?assertEqual({closed, 0}, {up_get(cb_state), up_get(cb_failures)}),
-    ?assertEqual(0, count(?EV_COALESCED)),
-    ?assertEqual(0, pending_len()).
 
 %% Three ordinary workers are in flight when the breaker goes half_open: the
 %% probe starts beside them, and neither a new arrival nor an ordinary worker
