@@ -567,12 +567,16 @@ distinguishes "not found" (`404`) from "roster unreadable" (`503`, the device wa
 otherwise found: CI record readable-and-absent, no software, no tags) from a record
 served with a degraded identity (`identity_state: degraded`). **REST:** a degraded CI store
 alongside a degraded roster is a `200` carrying both `identity_state` and `ci_state` as
-`degraded`. The Hardware list and its KPI strip serve at most the 100,000 most
-recently seen endpoints within the 30-day window; a fleet above that sees a capped
-list without a warning (a truncation signal is a tracked follow-up). The **per-device CI record's Overview
-lens**, by contrast, has always been an authoritative three-state read: found /
-genuinely-not-yet-synced ("no CI record synced yet") / degraded (an explicit "CI record
-unavailable" banner) are never conflated.
+`degraded`. The **per-device CI record's Overview lens**, by contrast, has always been
+an authoritative three-state read: found / genuinely-not-yet-synced ("no CI record
+synced yet") / degraded (an explicit "CI record unavailable" banner) are never
+conflated.
+
+The Hardware list and its KPI strip serve at most the 100,000 most recently seen
+endpoints within the 30-day window; a fleet above that sees a capped list without a
+warning (a truncation signal is a tracked follow-up). The per-device record's offline
+identity fallback reads the same capped set, so an offline device outside it shows no
+identity and, with nothing else synced, reads as not found.
 
 ## Access control
 

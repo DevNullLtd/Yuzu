@@ -30,7 +30,7 @@
 /// fail-closed posture `member_set_owned` already holds for result-set
 /// membership. `evaluate_scope_local` never calls into presence at all and so
 /// can never fail this way (see its own doc comment). `query_stale_within`
-/// (the roster read: Hardware list/record, viz, MCP) is typed the same way
+/// (the roster read: Hardware list/record, viz, MCP, and the Software page's hostname map) is typed the same way
 /// (#5531) — a failed read is `std::unexpected`, never an empty roster.
 ///
 /// Substrate contract (ADR-0008): the store holds a `PgPool&` (not a

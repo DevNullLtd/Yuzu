@@ -425,7 +425,7 @@ existence-oracle closure exactly).
 
 ### Hardware
 
-The Hardware CI list and single-device CI record (OpenAPI tag `Hardware`). Both routes are audited on a successful read.
+The Hardware CI list and single-device CI record: the two read routes of the OpenAPI tag `Hardware`. The on-demand sync `POST /api/v1/hardware/{id}/sync` is described in the OpenAPI document and `audit-log.md`. Both read routes are audited on a successful read.
 
 #### `GET /api/v1/hardware`
 

@@ -695,7 +695,8 @@ TEST_CASE("apply_tag_read: every failed read degrades and every healthy read pop
     }
 }
 
-// Kills: offline_identity_row swallowing the read error into an empty optional ("not found").
+// Kills: offline_identity_row swallowing the read error into an empty optional ("not found"); and
+// the stale-boundary mutant (`>=` for `>` on kHardwareStaleAfterMs).
 TEST_CASE("offline_identity_row: error propagates; hit is offline; miss is nullopt",
           "[hardware][model]") {
     const auto err = offline_identity_row(
@@ -719,13 +720,15 @@ TEST_CASE("offline_identity_row: error propagates; hit is offline; miss is nullo
 
     // kHardwareStaleAfterMs boundary: exactly two days old is fresh, one millisecond over is stale.
     const auto at_edge = offline_identity_row(
-        OfflineRosterRead{std::vector<OfflineEndpoint>{make_offline_ep("a1", 8 * kDayMs)}}, "a1", 10 * kDayMs,
-        fake_age);
+        OfflineRosterRead{
+            std::vector<OfflineEndpoint>{make_offline_ep("a1", 10 * kDayMs - kHardwareStaleAfterMs)}},
+        "a1", 10 * kDayMs, fake_age);
     REQUIRE(at_edge.has_value());
     CHECK_FALSE((*at_edge)->stale);
     const auto past_edge = offline_identity_row(
-        OfflineRosterRead{std::vector<OfflineEndpoint>{make_offline_ep("a1", 8 * kDayMs - 1)}}, "a1",
-        10 * kDayMs, fake_age);
+        OfflineRosterRead{
+            std::vector<OfflineEndpoint>{make_offline_ep("a1", 10 * kDayMs - kHardwareStaleAfterMs - 1)}},
+        "a1", 10 * kDayMs, fake_age);
     REQUIRE(past_edge.has_value());
     CHECK((*past_edge)->stale);
 

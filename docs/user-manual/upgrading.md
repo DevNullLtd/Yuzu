@@ -706,7 +706,7 @@ No config or data migration is required.
 
 ## Behaviour change: a failed device-roster read is reported instead of shown as an empty fleet (#5531)
 
-**Not a Breaking lead:** `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` already declared a `503` response; what changes is when it fires. Before this release a failed read of the persisted device roster (pool timeout or query error) was shown as an empty roster.
+**Not a Breaking lead:** `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` already declared a `503` response; what changes is when it fires. (The new `400` on the record and sync routes, below, is only reachable with an id no registered agent can carry.) Before this release a failed read of the persisted device roster (pool timeout or query error) was shown as an empty roster.
 
 - **`GET /api/v1/hardware`:** a failed roster read now answers `503` with `retry_after_ms` instead of a `200` with no rows. The Hardware list shows the "Hardware roster unavailable" banner instead of an empty table.
 - **`GET /api/v1/hardware/{id}`:** when the roster read failed and the device was not otherwise found (CI record readable-and-absent, no software, no tags) the route answers `503`, not `404`. A record that can still be served carries a new additive key `identity_state` (`found`, `degraded` or `absent`).
