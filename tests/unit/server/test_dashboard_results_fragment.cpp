@@ -75,6 +75,16 @@ bool contains(const std::string& hay, std::string_view needle) {
     return hay.find(needle) != std::string::npos;
 }
 
+// The dashboard refusal wording is plain language (#5623): none of the REST/MCP technical
+// jargon may reach an operator. Case-sensitive on purpose ("NUL" the byte name).
+void check_plain_refusal_wording(const std::string& body) {
+    for (const char* jargon :
+         {"exact-match", "NUL", "UTF-8", "line feed", "not evaluated", "bypass"}) {
+        INFO(jargon);
+        CHECK_FALSE(contains(body, jargon));
+    }
+}
+
 struct FragmentResultsHarness {
     // MEMBER ORDER IS LOAD-BEARING (mirrors test_dashboard_tar_fragments.cpp):
     // `sink` is declared LAST so it is destroyed FIRST, while the
@@ -477,7 +487,9 @@ TEST_CASE("/fragments/results: a filter value over the facet bound is refused, n
     // 200, not 4xx: the dashboard htmx config drops 4xx bodies, which would leave stale rows.
     CHECK(res->status == 200);
     CHECK(contains(res->body, "data-filter-refused=\"true\""));
-    CHECK(contains(res->body, "2048 bytes"));
+    CHECK(contains(res->body, "That filter value can&#39;t be searched."));
+    CHECK_FALSE(contains(res->body, "2048")); // the technical bound is left to REST/MCP
+    check_plain_refusal_wording(res->body);
     CHECK_FALSE(contains(res->body, "Response store not available"));
     CHECK_FALSE(contains(res->body, over)); // the value is never echoed
     check_results_chrome_cleared(res->body);
@@ -510,10 +522,11 @@ TEST_CASE("/fragments/results: a filter value with a NUL / a line feed / invalid
         REQUIRE(res);
         CHECK(res->status == 200);
         CHECK(contains(res->body, "data-filter-refused=\"true\""));
-        CHECK(contains(res->body, "NUL byte, a line feed or invalid UTF-8"));
-        CHECK(contains(res->body, "The filter you set is not supported"));
-        CHECK_FALSE(contains(res->body, "selected View"));
-        CHECK_FALSE(contains(res->body, "line break"));
+        CHECK(contains(res->body, "That filter value can&#39;t be searched."));
+        CHECK(contains(res->body, "It may be too long, or contain a line break."));
+        CHECK(contains(res->body, "Shorten it or clear the filter."));
+        check_plain_refusal_wording(res->body);
+        CHECK_FALSE(contains(res->body, "This View"));
         CHECK_FALSE(contains(res->body, "no agent"));
         CHECK_FALSE(contains(res->body, "Response store not available"));
         check_results_chrome_cleared(res->body);
@@ -614,7 +627,9 @@ TEST_CASE("/fragments/results: a response-template equals default over the facet
     REQUIRE(over);
     CHECK(over->status == 200);
     CHECK(contains(over->body, "data-filter-refused=\"true\""));
-    CHECK(contains(over->body, "2048 bytes"));
+    CHECK(contains(over->body, "This View has a built-in filter on Name that can&#39;t be used"));
+    CHECK_FALSE(contains(over->body, "2048"));
+    check_plain_refusal_wording(over->body);
     CHECK_FALSE(contains(over->body, "Response store not available"));
     CHECK_FALSE(contains(over->body, std::string(2049, 'v'))); // the value is never echoed
 
@@ -627,9 +642,10 @@ TEST_CASE("/fragments/results: a response-template equals default over the facet
 }
 
 // Provenance of a refused filter (#5623): the dashboard says WHICH source of the filter is at
-// fault. The operator's own f_* filter -> "the filter you set"; the selected View's saved
-// `equals` default -> "the selected View's saved filter on <column>" with the two real
-// remedies. The column name is template-author text, so it must appear html-escaped; the
+// fault. The operator's own f_* filter -> "That filter value can't be searched ..."; the
+// selected View's saved `equals` default -> "This View has a built-in filter on <column> that
+// can't be used ... Pick another View." (plain wording, no jargon). The column name is
+// template-author text, so it must appear html-escaped; the
 // value must never be echoed. The response store is nullptr, so "Response store not
 // available" proves a request reached render_results.
 namespace {
@@ -688,13 +704,11 @@ TEST_CASE("/fragments/results: a refused filter says whether it is the operator'
         REQUIRE(res);
         CHECK(res->status == 200);
         CHECK(contains(res->body, "data-filter-refused=\"true\""));
-        CHECK(contains(res->body, "The selected View&#39;s saved filter on A&lt;b&gt;&amp;D"));
-        CHECK(contains(res->body, "is not supported"));
-        CHECK(contains(res->body, "choose another View"));
-        CHECK(contains(res->body, "bypasses the View"));
-        CHECK(contains(res->body, "should correct it"));
-        CHECK(contains(res->body, "a line feed"));
-        CHECK_FALSE(contains(res->body, "you set"));
+        CHECK(contains(res->body,
+                       "This View has a built-in filter on A&lt;b&gt;&amp;D that can&#39;t be used, "
+                       "so no results are shown. Pick another View."));
+        check_plain_refusal_wording(res->body);
+        CHECK_FALSE(contains(res->body, "That filter value"));
         CHECK_FALSE(contains(res->body, "A<b>&D")); // the column name is escaped
         CHECK_FALSE(contains(res->body, over_value)); // the value is never echoed
         CHECK_FALSE(contains(res->body, "Response store not available"));
@@ -708,8 +722,9 @@ TEST_CASE("/fragments/results: a refused filter says whether it is the operator'
     REQUIRE(op);
     CHECK(op->status == 200);
     CHECK(contains(op->body, "data-filter-refused=\"true\""));
-    CHECK(contains(op->body, "The filter you set is not supported"));
-    CHECK_FALSE(contains(op->body, "selected View"));
+    CHECK(contains(op->body, "That filter value can&#39;t be searched."));
+    check_plain_refusal_wording(op->body);
+    CHECK_FALSE(contains(op->body, "This View"));
     CHECK_FALSE(contains(op->body, "A&lt;b&gt;"));
     CHECK_FALSE(contains(op->body, "Response store not available"));
 
@@ -747,9 +762,10 @@ TEST_CASE("/fragments/results: a View equals default with an empty value is refu
     REQUIRE(empty);
     CHECK(empty->status == 200);
     CHECK(contains(empty->body, "data-filter-refused=\"true\""));
-    CHECK(contains(empty->body, "The selected View&#39;s saved filter on A&lt;b&gt;&amp;D has no value"));
-    CHECK(contains(empty->body, "Choose another View"));
-    CHECK(contains(empty->body, "should correct it"));
+    CHECK(contains(empty->body,
+                   "This View has a built-in filter on A&lt;b&gt;&amp;D with no value, so no "
+                   "results are shown. Pick another View."));
+    check_plain_refusal_wording(empty->body);
     CHECK_FALSE(contains(empty->body, "A<b>&D"));
     CHECK_FALSE(contains(empty->body, "Response store not available"));
     check_results_chrome_cleared(empty->body);
@@ -840,8 +856,8 @@ TEST_CASE("/fragments/results: a refusal names the View column that is bad, not 
                 {{"Alpha", good}, {"Beta", bad}});
             const auto body = fetch(id);
             CHECK(contains(body, "data-filter-refused=\"true\""));
-            CHECK(contains(body, "The selected View&#39;s saved filter on Beta is not supported"));
-            CHECK_FALSE(contains(body, "saved filter on Alpha"));
+            CHECK(contains(body, "This View has a built-in filter on Beta that can&#39;t be used"));
+            CHECK_FALSE(contains(body, "built-in filter on Alpha"));
             CHECK_FALSE(contains(body, "Response store not available"));
         }
     }
@@ -851,7 +867,7 @@ TEST_CASE("/fragments/results: a refusal names the View column that is bad, not 
             is, "tpl-multi-unknown", cols, {{"NoSuchColumn", good}, {"Beta", over}});
         const auto body = fetch(id);
         CHECK(contains(body, "data-filter-refused=\"true\""));
-        CHECK(contains(body, "The selected View&#39;s saved filter on Beta is not supported"));
+        CHECK(contains(body, "This View has a built-in filter on Beta that can&#39;t be used"));
         CHECK_FALSE(contains(body, "NoSuchColumn"));
     }
 
@@ -860,8 +876,8 @@ TEST_CASE("/fragments/results: a refusal names the View column that is bad, not 
         const auto id = make_multi_filter_definition(is, "tpl-multi-two-bad", cols,
                                                      {{"Alpha", over}, {"Beta", nul}});
         const auto body = fetch(id);
-        CHECK(contains(body, "The selected View&#39;s saved filter on Alpha is not supported"));
-        CHECK_FALSE(contains(body, "saved filter on Beta"));
+        CHECK(contains(body, "This View has a built-in filter on Alpha that can&#39;t be used"));
+        CHECK_FALSE(contains(body, "built-in filter on Beta"));
     }
 
     SECTION("an empty default is refused before an unsupported one, whatever the order") {
@@ -871,17 +887,17 @@ TEST_CASE("/fragments/results: a refusal names the View column that is bad, not 
                                                      {{"Alpha", over}, {"Beta", empty}});
         const auto body = fetch(id);
         CHECK(contains(body, "data-filter-refused=\"true\""));
-        CHECK(contains(body, "The selected View&#39;s saved filter on Beta has no value"));
-        CHECK_FALSE(contains(body, "saved filter on Alpha"));
-        CHECK_FALSE(contains(body, "is not supported"));
+        CHECK(contains(body, "This View has a built-in filter on Beta with no value"));
+        CHECK_FALSE(contains(body, "built-in filter on Alpha"));
+        CHECK_FALSE(contains(body, "that can&#39;t be used"));
     }
 
     SECTION("two empty defaults: the first empty one is named") {
         const auto id = make_multi_filter_definition(is, "tpl-multi-two-empty", cols,
                                                      {{"Alpha", empty}, {"Beta", empty}});
         const auto body = fetch(id);
-        CHECK(contains(body, "The selected View&#39;s saved filter on Alpha has no value"));
-        CHECK_FALSE(contains(body, "saved filter on Beta"));
+        CHECK(contains(body, "This View has a built-in filter on Alpha with no value"));
+        CHECK_FALSE(contains(body, "built-in filter on Beta"));
     }
 }
 
@@ -912,8 +928,8 @@ TEST_CASE("/fragments/results: an explicit empty f_ value does not bypass an emp
     REQUIRE(empty);
     CHECK(empty->status == 200);
     CHECK(contains(empty->body, "data-filter-refused=\"true\""));
-    CHECK(contains(empty->body, "The selected View&#39;s saved filter on Output has no value"));
-    CHECK(contains(empty->body, "set any filter of your own"));
+    CHECK(contains(empty->body, "This View has a built-in filter on Output with no value"));
+    check_plain_refusal_wording(empty->body);
     CHECK_FALSE(contains(empty->body, "Response store not available"));
 
     auto explicit_ok = h.get(base + "&f_output=ok");

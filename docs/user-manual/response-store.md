@@ -333,9 +333,13 @@ operator-visible notes:
   MCP -32602) instead of reporting no match. The refusal means the filter is not
   supported, not that no agent has the value: a stored value containing a carriage return
   can, depending on how the browser and htmx submit it, reach the server with a line feed
-  when it is picked from the dashboard, and would then be refused although an agent has it. On the dashboard the message says whether the refused filter is
-  the one you set or the selected View's saved filter; a View's saved filter with an empty
-  value is refused as well, because no stored field is ever empty. At
+  when it is picked from the dashboard, and would then be refused although an agent has it. The dashboard shows a short plain message
+  (REST and MCP carry the technical causes): "That filter value can't be searched. It may be
+  too long, or contain a line break. Shorten it or clear the filter." for a filter you set, or
+  "This View has a built-in filter on <column> that can't be used, so no results are shown.
+  Pick another View." for a View's saved filter. A View's saved filter with an empty value is
+  refused as well, because no stored field is ever empty, with "This View has a built-in
+  filter on <column> with no value, so no results are shown. Pick another View." At
   most 5,000 facets are kept per response, chosen by most lines first, then
   column, then value, so a rare value can be cut. The symptom is an agent
   missing from a facet filter or preview while its response still shows in

@@ -111,34 +111,33 @@ static std::string results_refusal_html(const std::string& message) {
 }
 
 // -- Helpers: dashboard refusal sentences with provenance (#5623) -------------
-// The shared sentence (facet_filter_value_refusal_message: causes, never the value) plus ONE
-// provenance sentence saying which source of the filter is at fault, so the operator knows
-// what to change. Plain text: callers html_escape it (results_refusal_html does). The
-// column name is template-author text, so it is escaped by that same call, never spliced raw.
-// The view sentences name no value. The saved-filter remedies are the two real ones: another
-// View, or any filter of the operator's own (a non-empty f_* param disables the View's
-// saved `equals` defaults, see the filters_explicit branch of /fragments/results).
+// Plain-language operator wording, one or two short sentences ending in what to do. Which
+// source of the filter is at fault is the only distinction kept (the operator's own filter,
+// the selected View's saved filter, or a saved filter with no value). Plain text: callers
+// html_escape it (results_refusal_html does). The column name is template-author text, so
+// it is escaped by that same call, never spliced raw. No text names a filter value.
+// The technical causes (the 2048-byte bound, NUL, line feed, invalid UTF-8, "not
+// evaluated") are deliberately left to the REST/MCP errors and the docs, which carry the
+// shared facet_filter_value_refusal_message. The View texts also omit that setting any
+// filter of the operator's own bypasses a View's saved `equals` defaults (the
+// filters_explicit branch of /fragments/results): that bypass still works, but advertising
+// it here pointed operators at a workaround, and "pick another View" is the plain remedy.
 static std::string facet_refusal_text_operator() {
-    return facet_filter_value_refusal_message() +
-           ". The filter you set is not supported; change it or clear it.";
+    return "That filter value can't be searched. It may be too long, or contain a line "
+           "break. Shorten it or clear the filter.";
 }
 
 static std::string facet_refusal_text_view(const std::string& column) {
-    return facet_filter_value_refusal_message() + ". The selected View's saved filter on " +
-           column +
-           " is not supported; choose another View, or set any filter of your own (setting a "
-           "filter bypasses the View's saved filters). The author of the View's definition "
-           "should correct it.";
+    return "This View has a built-in filter on " + column +
+           " that can't be used, so no results are shown. Pick another View.";
 }
 
 // A template `equals` filter whose value is EMPTY. Ingest never stores an empty field, so
 // applying it would silently empty the table; the REST/shared predicate is unchanged (REST
 // reads an empty value as "no filter"), this guard is dashboard-results only.
 static std::string facet_refusal_text_view_empty(const std::string& column) {
-    return "The selected View's saved filter on " + column +
-           " has no value, so it cannot be applied. The request was not evaluated. Choose "
-           "another View, or set any filter of your own (setting a filter bypasses the "
-           "View's saved filters). The author of the View's definition should correct it.";
+    return "This View has a built-in filter on " + column +
+           " with no value, so no results are shown. Pick another View.";
 }
 
 // -- Helper: column index by name (case-insensitive, excl. Agent col) ---------
@@ -707,7 +706,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // A filter value that matches no stored facet (over kMaxFacetValueBytes, or
                  // a NUL / line feed / invalid UTF-8) would build the group from an empty
                  // set: refuse (#5623). This site (and /fragments/create-group-form) only
-                 // ever sees the operator's own filters, so it uses the 'your filter'
+                 // ever sees the operator's own filters, so it uses the operator
                  // wording. The dashboard UI cannot produce this POST for an over-bound, NUL
                  // or invalid-UTF-8 value (/fragments/create-group-form refuses it first and
                  // renders no form). A stored value holding a mid-value CR is the exception:

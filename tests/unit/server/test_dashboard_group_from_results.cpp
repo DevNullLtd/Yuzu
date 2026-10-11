@@ -112,6 +112,16 @@ bool contains(const std::string& hay, std::string_view needle) {
     return hay.find(needle) != std::string::npos;
 }
 
+// The dashboard refusal wording is plain language (#5623): none of the REST/MCP technical
+// jargon may reach an operator. Case-sensitive on purpose ("NUL" the byte name).
+void check_plain_refusal_wording(const std::string& body) {
+    for (const char* jargon :
+         {"exact-match", "NUL", "UTF-8", "line feed", "not evaluated", "bypass"}) {
+        INFO(jargon);
+        CHECK_FALSE(contains(body, jargon));
+    }
+}
+
 std::set<std::string> member_ids_of(ManagementGroupStore& mg, const std::string& group_id) {
     std::set<std::string> ids;
     for (const auto& m : mg.get_members(group_id))
@@ -582,7 +592,9 @@ TEST_CASE("create-group-form: a filter value over the facet bound is refused, no
     REQUIRE(res != nullptr);
     CHECK(res->status == 200); // 4xx bodies are dropped by the dashboard htmx config
     CHECK(contains(res->body, "data-filter-refused=\"true\""));
-    CHECK(contains(res->body, "2048 bytes"));
+    CHECK(contains(res->body, "That filter value can&#39;t be searched."));
+    CHECK_FALSE(contains(res->body, "2048")); // the technical bound is left to REST/MCP
+    check_plain_refusal_wording(res->body);
     CHECK_FALSE(contains(res->body, "agents will be added"));
     CHECK_FALSE(contains(res->body, over)); // the value is never echoed
     CHECK(res->get_header_value("Cache-Control") == "no-store, private");
@@ -613,10 +625,11 @@ TEST_CASE("create-group-form: a filter value with a NUL, line feed or invalid UT
         REQUIRE(res != nullptr);
         CHECK(res->status == 200);
         CHECK(contains(res->body, "data-filter-refused=\"true\""));
-        CHECK(contains(res->body, "NUL byte, a line feed or invalid UTF-8"));
-        CHECK(contains(res->body, "The filter you set is not supported"));
-        CHECK_FALSE(contains(res->body, "selected View"));
-        CHECK_FALSE(contains(res->body, "line break"));
+        CHECK(contains(res->body, "That filter value can&#39;t be searched."));
+        CHECK(contains(res->body, "It may be too long, or contain a line break."));
+        CHECK(contains(res->body, "Shorten it or clear the filter."));
+        check_plain_refusal_wording(res->body);
+        CHECK_FALSE(contains(res->body, "This View"));
         CHECK_FALSE(contains(res->body, "agents will be added"));
         CHECK_FALSE(contains(res->body, "agent will be added"));
         CHECK(res->get_header_value("Cache-Control") == "no-store, private");
@@ -651,10 +664,11 @@ TEST_CASE("group-from-results: a filter value with a line feed is refused and cr
                           "&plugin=" + kPlugin + "&f_category=cat-a&f_severity=" + value);
         CHECK(res->status == 400);
         CHECK(contains(res->body, "data-filter-refused=\"true\""));
-        CHECK(contains(res->body, "NUL byte, a line feed or invalid UTF-8"));
-        CHECK(contains(res->body, "The filter you set is not supported"));
-        CHECK_FALSE(contains(res->body, "selected View"));
-        CHECK_FALSE(contains(res->body, "line break"));
+        CHECK(contains(res->body, "That filter value can&#39;t be searched."));
+        CHECK(contains(res->body, "It may be too long, or contain a line break."));
+        CHECK(contains(res->body, "Shorten it or clear the filter."));
+        check_plain_refusal_wording(res->body);
+        CHECK_FALSE(contains(res->body, "This View"));
         CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
         CHECK_FALSE(h.mg.find_group_by_name("lf-group").has_value());
     }
@@ -696,7 +710,9 @@ TEST_CASE("group-from-results: a filter value over the facet bound is refused an
                       "&plugin=" + kPlugin + "&f_category=cat-a&f_title=" + over);
     CHECK(res->status == 400);
     CHECK(contains(res->body, "data-filter-refused=\"true\""));
-    CHECK(contains(res->body, "2048 bytes"));
+    CHECK(contains(res->body, "That filter value can&#39;t be searched."));
+    CHECK_FALSE(contains(res->body, "2048")); // the technical bound is left to REST/MCP
+    check_plain_refusal_wording(res->body);
     CHECK_FALSE(contains(res->body, over)); // the value is never echoed
     CHECK(res->get_header_value("HX-Retarget") == "#group-form-slot");
     CHECK_FALSE(h.mg.find_group_by_name("over-bound-group").has_value());
