@@ -664,19 +664,19 @@ TEST_CASE("apply_tag_read: every failed read degrades, every healthy read popula
         TagValuesRead values;
         bool reader_called;
         bool degraded;
-        std::size_t a1_tags;
+        std::vector<std::pair<std::string, std::string>> a1_tags;
     };
     const TagValuesRead no_values{TagValuesRead::value_type{}};
     const std::array<Row, 5> table{{
-        {"key read fails", std::unexpected(TagReadError::kDegraded), no_values, false, true, 0},
+        {"key read fails", std::unexpected(TagReadError::kDegraded), no_values, false, true, {}},
         {"keys ok, values fail", Keys{std::vector<std::string>{"env"}},
-         std::unexpected(TagReadError::kDegraded), true, true, 0},
+         std::unexpected(TagReadError::kDegraded), true, true, {}},
         {"keys ok, values ok",
          Keys{std::vector<std::string>{"env"}},
-         TagValuesRead{TagValuesRead::value_type{{"a1", {{"env", "prod"}}}}}, true, false, 1},
-        {"keys ok but empty", Keys{std::vector<std::string>{}}, no_values, true, false, 0},
+         TagValuesRead{TagValuesRead::value_type{{"a1", {{"env", "prod"}}}}}, true, false, {{"env", "prod"}}},
+        {"keys ok but empty", Keys{std::vector<std::string>{}}, no_values, true, false, {}},
         {"keys ok, device has no tags", Keys{std::vector<std::string>{"env"}},
-         TagValuesRead{TagValuesRead::value_type{{"a2", {{"env", "dev"}}}}}, true, false, 0},
+         TagValuesRead{TagValuesRead::value_type{{"a2", {{"env", "dev"}}}}}, true, false, {}},
     }};
     for (const auto& row : table) {
         CAPTURE(row.name);
@@ -691,11 +691,7 @@ TEST_CASE("apply_tag_read: every failed read degrades, every healthy read popula
         });
         CHECK(called == row.reader_called);
         CHECK(result.tags_degraded == row.degraded);
-        CHECK(result.rows[0].tags.size() == row.a1_tags);
-        if (row.a1_tags) {
-            CHECK(result.rows[0].tags.front().first == "env");
-            CHECK(result.rows[0].tags.front().second == "prod");
-        }
+        CHECK(result.rows[0].tags == row.a1_tags);
     }
 }
 

@@ -603,14 +603,9 @@ void apply_tag_read(InventoryDevicesResult& result,
         result.tags_degraded = true;
         return;
     }
-    for (auto& r : result.rows) {
-        auto it = values->find(r.agent_id);
-        if (it == values->end())
-            continue;
-        r.tags.reserve(it->second.size());
-        for (const auto& [k, v] : it->second)
-            r.tags.emplace_back(k, v);
-    }
+    for (auto& r : result.rows)
+        if (const auto it = values->find(r.agent_id); it != values->end())
+            r.tags.assign(it->second.begin(), it->second.end());
 }
 
 std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>
