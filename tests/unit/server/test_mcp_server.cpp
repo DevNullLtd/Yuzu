@@ -20394,7 +20394,7 @@ TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's group
     CHECK(envelope.at("result").at("next_cursor").is_null());
 }
 
-TEST_CASE("MCP query_installed_software: a scope wider than the push-down bound post-filters, "
+TEST_CASE("MCP query_installed_software: a scope wider than the push-down bound post-filters; "
           "reports devices_omitted and audits denied",
           "[mcp][pg][inventory]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
@@ -20432,7 +20432,7 @@ TEST_CASE("MCP query_installed_software: a scope wider than the push-down bound 
     CHECK(saw_denied);
 }
 
-TEST_CASE("MCP query_installed_software: version, cursor walk and source; legacy envelope kept",
+TEST_CASE("MCP query_installed_software: version; cursor walk and source; legacy envelope kept",
           "[mcp][pg][inventory]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -20619,7 +20619,7 @@ std::size_t mcp_audits(const McpTestServer& ts, const std::string& entry) {
 }
 } // namespace
 
-TEST_CASE("MCP catalogue twins: tools/list advertises both, read-only, with typed schemas and "
+TEST_CASE("MCP catalogue twins: tools/list advertises both; read-only; with typed schemas and "
           "vocabulary enums",
           "[mcp][inventory]") {
     McpTestServer ts;
@@ -20667,7 +20667,7 @@ TEST_CASE("MCP catalogue twins: unwired store is an internal error", "[mcp][inve
     }
 }
 
-TEST_CASE("MCP catalogue twins: fleet rows, totals and kpis; cursor continuation; strict input",
+TEST_CASE("MCP catalogue twins: fleet rows; totals and kpis; cursor continuation; strict input",
           "[mcp][pg][inventory]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -20723,8 +20723,8 @@ TEST_CASE("MCP catalogue twins: fleet rows, totals and kpis; cursor continuation
     }
 }
 
-TEST_CASE("MCP catalogue twins: confined caller — fleet denied, in-scope host admitted with newest "
-          "omitted, out-of-scope host empty",
+TEST_CASE("MCP catalogue twins: confined caller — fleet denied; in-scope host admitted with newest "
+          "omitted; out-of-scope host empty",
           "[mcp][pg][inventory][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -20776,7 +20776,7 @@ TEST_CASE("MCP catalogue twins: confined caller — fleet denied, in-scope host 
     CHECK(v["devices_omitted"] == 0); // the in-scope drill above hides nothing
 }
 
-TEST_CASE("MCP get_software_versions: newest mark, filters and truncation", "[mcp][pg][inventory]") {
+TEST_CASE("MCP get_software_versions: newest mark; filters and truncation", "[mcp][pg][inventory]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -20803,7 +20803,7 @@ TEST_CASE("MCP get_software_versions: newest mark, filters and truncation", "[mc
 }
 
 TEST_CASE("MCP get_software_versions: a never-built rollup is a retryable error on the unfiltered "
-          "read, never an empty list",
+          "read; never an empty list",
           "[mcp][pg][inventory][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -20890,7 +20890,7 @@ TEST_CASE("MCP get_software_versions: a never-built rollup is a retryable error 
     }
 }
 
-TEST_CASE("MCP catalogue twins: a degraded store is a retryable internal error, never an empty "
+TEST_CASE("MCP catalogue twins: a degraded store is a retryable internal error; never an empty "
           "result",
           "[mcp][pg][inventory]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);

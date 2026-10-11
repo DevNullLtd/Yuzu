@@ -406,8 +406,8 @@ TEST_CASE("REST inventory/software: name filter narrows the fleet result",
         CHECK(row.at("name").get<std::string>() == "Google Chrome");
 }
 
-TEST_CASE("REST inventory/software: a confined scope is pushed into SQL — complete page, "
-          "nothing omitted, no denied row",
+TEST_CASE("REST inventory/software: a confined scope is pushed into SQL — complete page; "
+          "nothing omitted; no denied row",
           "[pg][rest][inventory_software][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -434,7 +434,7 @@ TEST_CASE("REST inventory/software: a confined scope is pushed into SQL — comp
     CHECK(h.has_audit("success"));
 }
 
-TEST_CASE("REST inventory/software: a scope wider than the push-down bound post-filters, "
+TEST_CASE("REST inventory/software: a scope wider than the push-down bound post-filters; "
           "reports devices_omitted and audits denied",
           "[pg][rest][inventory_software][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
@@ -1041,7 +1041,7 @@ TEST_CASE("REST inventory/software: rows carry the 14 documented fields incl. so
     CHECK(row.at("source") == "installed_apps.list_inventory");
 }
 
-TEST_CASE("REST inventory/software: keyset walk pages without duplicates or gaps, and every page "
+TEST_CASE("REST inventory/software: keyset walk pages without duplicates or gaps; and every page "
           "is audited",
           "[pg][rest][inventory_software]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
@@ -1081,7 +1081,7 @@ TEST_CASE("REST inventory/software: keyset walk pages without duplicates or gaps
     CHECK(count_audit(h, "inventory.software.query", "success", "page=continuation") == 2);
 }
 
-TEST_CASE("REST inventory/software: cursor refusals — tampered, wrong filter set; forged head "
+TEST_CASE("REST inventory/software: cursor refusals — tampered; wrong filter set; forged head "
           "cursor works but is audited",
           "[pg][rest][inventory_software][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
@@ -1163,7 +1163,7 @@ TEST_CASE("REST inventory/software: post-filter arm advances the cursor from the
     CHECK(page2.at("software")[0].at("agent_id") == "z1");
 }
 
-TEST_CASE("REST inventory/software: text a store cannot bind is a 400, never a retryable 503",
+TEST_CASE("REST inventory/software: text a store cannot bind is a 400; never a retryable 503",
           "[pg][rest][inventory_software][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1203,7 +1203,7 @@ TEST_CASE("REST inventory/software: limit=12abc → 400 against a live store",
     CHECK(h.sink.Get("/api/v1/inventory/software?limit=12abc")->status == 400);
 }
 
-TEST_CASE("REST inventory/software: exports — csv, truncation, json, bad format, audit verb",
+TEST_CASE("REST inventory/software: exports — csv; truncation; json; bad format; audit verb",
           "[pg][rest][inventory_software]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1235,7 +1235,7 @@ TEST_CASE("REST inventory/software: exports — csv, truncation, json, bad forma
 }
 
 TEST_CASE("REST inventory/software: the per-install page and exports do not depend on the "
-          "catalogue rollup, so a never-built rollup never blocks or empties them",
+          "catalogue rollup; so a never-built rollup never blocks or empties them",
           "[pg][rest][inventory_software]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

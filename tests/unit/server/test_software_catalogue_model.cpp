@@ -338,7 +338,7 @@ TEST_CASE("versions_read_needs_rollup: only the unfiltered fleet drill", "[serve
     }
 }
 
-TEST_CASE("gather_coverage: connected, stale cutoff and the honest nulls", "[server][software_catalogue_model]") {
+TEST_CASE("gather_coverage: connected; stale cutoff and the honest nulls", "[server][software_catalogue_model]") {
     std::int64_t cutoff_seen = -1;
     CoverageReads io;
     io.connected = [] { return std::int64_t{7}; };
@@ -424,7 +424,7 @@ TEST_CASE("fingerprints are stable and sensitive to every field and blind to pag
     CHECK(filter_fingerprint(c1) != filter_fingerprint(c2));
 }
 
-TEST_CASE("devices fingerprint: every filter, present-empty version, blind to paging and scope",
+TEST_CASE("devices fingerprint: every filter; present-empty version; blind to paging and scope",
           "[server][software_catalogue_model]") {
     SoftwareFleetQuery f;
     const auto base = devices_fingerprint(f);
