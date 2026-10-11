@@ -1137,7 +1137,8 @@ TEST_CASE("lifecycle guard: both guarded transactions run under the lock and idl
     // each lease is a distinct connection) and read the setting on each.
     std::vector<decltype(auth_db.pool().acquire())> leases;
     for (std::size_t i = 0; i < auth_db.pool().size(); ++i) {
-        leases.push_back(auth_db.pool().acquire());
+        // Bounded, so a leaked lease fails here fast instead of hanging the suite.
+        leases.push_back(auth_db.pool().try_acquire_for(std::chrono::seconds(5)));
         REQUIRE(leases.back());
     }
     for (auto& lease : leases) {

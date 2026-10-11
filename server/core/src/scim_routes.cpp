@@ -1176,8 +1176,8 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
         // fault, with the counter and the bounded log line the other refusal sites use. The
         // recompute re-runs on the next POST/PUT/PATCH of a group naming this user or a User
         // re-provision (not on a timer, and not after a Group DELETE that already happened), so
-        // this repeats for as long as the IdP keeps the user out of the admin group while they
-        // are the last admin.
+        // the recompute only re-runs via another group the user belongs to, or a revive; a
+        // re-send of the same Group change never names a member already removed.
         const std::string refusal_detail = "attempted_action=scim.user.role_changed reason=group "
                                            "old_role=" + old_role_str + " intended_new_role=" +
                                            new_role_str + via_detail + " role_unchanged=true";
@@ -1214,7 +1214,7 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
         bump_role_change_failure(auth_mgr);
         if (demotion) {
             // An IdP-removed administrator whose demotion did not complete: with a store failure
-            // the role is still admin (or indeterminate); with a session-wipe failure the role is
+            // the role may still be admin; with a session-wipe failure the role is
             // user but a live session may still carry the old authority. Either way a person the
             // IdP removed from the admin group retains or may retain privilege until an operator
             // acts.
@@ -1311,26 +1311,45 @@ std::vector<std::string> removed_first(const std::vector<std::string>& old_membe
     return ordered;
 }
 
-/// Crash breadcrumb for a Group request whose membership write has COMMITTED (#4966): ONE info
-/// line naming the Group, the exact number of members this request removed and the SCIM IDs of the
-/// first `NamedMembers::kMaxListed` of them (`,+N more` beyond that), written BEFORE the recompute
+/// True iff renaming a Group from `old_name` to `new_name` changes whether it IS the configured
+/// admin group (`auth::resolve_role_from_groups` matches the display name exactly; an empty
+/// `scim_admin_group` never matches). Such a rename moves the role of every current member, not
+/// only of the removed ones.
+bool rename_flips_admin_group_match(const std::string& old_name, const std::string& new_name,
+                                    const std::string& scim_admin_group) {
+    if (scim_admin_group.empty())
+        return false;
+    return (old_name == scim_admin_group) != (new_name == scim_admin_group);
+}
+
+/// Crash breadcrumb for a Group request whose membership write has COMMITTED (#4966): ONE WARN
+/// line naming the Group and why a role recompute is about to run, written BEFORE the recompute
 /// loop. A process that dies inside the loop leaves no audit row and no counter, so this line is
 /// the only record of who was being recomputed. It is a log line, not an audit row, and it is
-/// written only when the request removed somebody. One helper for PUT, PATCH and DELETE (`kept` is
-/// empty for DELETE).
+/// written only when the request (a) removed somebody, naming the exact number removed and the
+/// SCIM IDs of the first `NamedMembers::kMaxListed` of them (`,+N more` beyond that), and/or (b)
+/// renamed the Group such that the admin-group match flips (`admin_match_flipped`), naming how many
+/// CURRENT members will be recomputed. One helper for PUT, PATCH and DELETE (`kept` is empty for
+/// DELETE, which never renames).
+///
+/// WARN, not INFO: it is a diagnostic about a possibly-incomplete security operation, and the
+/// default log level (info) writes it while `--log-level warn` still does; only `error` and `off`
+/// drop it.
 ///
 /// It performs NO store read: a read on a degraded store can wait out its timeout per member, and
 /// the line has to exist before anything slow happens. The members are therefore named by SCIM ID
 /// (an ID resolves to a username in the SCIM store). The default logger is flushed right after the
 /// line so a file sink does not hold it in a buffer when the process dies; a SIGKILL can still lose
-/// a file-sink copy that was not yet written, never the stderr / journald copy.
+/// a file-sink copy that was not yet written, never the stderr / journald copy. There is no fsync:
+/// power loss or a kernel panic can lose any copy.
 ///
 /// The whole body is `try`/`catch(...)`: this is a diagnostic aid and must NEVER gate the
-/// recompute (a throwing logger, a failed format allocation). On a failure it falls back to a bare
-/// stderr line, itself guarded.
+/// recompute (a throwing logger, a failed format allocation). A missing default logger or a
+/// failure falls back to a bare stderr line, itself guarded.
 void log_removed_members_breadcrumb(const std::string& group_id,
                                     const std::vector<std::string>& old_members,
-                                    const std::vector<std::string>& kept) noexcept {
+                                    const std::vector<std::string>& kept,
+                                    bool admin_match_flipped = false) noexcept {
     try {
         const std::unordered_set<std::string> kept_set(kept.begin(), kept.end());
         std::unordered_set<std::string> seen;
@@ -1340,17 +1359,28 @@ void log_removed_members_breadcrumb(const std::string& group_id,
                 continue;
             removed.add(m); // counted always, listed only up to kMaxListed
         }
-        if (removed.count == 0)
+        if (removed.count == 0 && !admin_match_flipped)
             return;
-        spdlog::info("SCIM: Group scim_id={} membership change committed; role recompute starting "
-                     "for {} removed member(s): {}{}",
-                     group_id, removed.count, removed.listed,
-                     removed.count > NamedMembers::kMaxListed
-                         ? ",+" + std::to_string(removed.count - NamedMembers::kMaxListed) +
-                               " more"
-                         : std::string{});
-        if (auto logger = spdlog::default_logger())
-            logger->flush();
+        std::string line = "SCIM: Group scim_id=" + group_id +
+                           " membership change committed; role recompute starting";
+        if (removed.count > 0) {
+            line += " for " + std::to_string(removed.count) + " removed member(s): " +
+                    removed.listed;
+            if (removed.count > NamedMembers::kMaxListed)
+                line += ",+" + std::to_string(removed.count - NamedMembers::kMaxListed) + " more";
+        }
+        if (admin_match_flipped)
+            line += "; the group rename changes the admin-group match and " +
+                    std::to_string(kept_set.size()) + " current member(s) will be recomputed";
+        // Fetch the default logger ONCE: a null one (not expected after boot) falls back to stderr
+        // instead of being dereferenced.
+        const auto logger = spdlog::default_logger();
+        if (!logger) {
+            std::fputs((line + "\n").c_str(), stderr);
+            return;
+        }
+        logger->warn("{}", line);
+        logger->flush();
     } catch (...) {
         try {
             std::fputs("SCIM: Group membership change committed; role recompute starting "
@@ -1692,7 +1722,8 @@ bool deactivate(ScimStore* scim_store, ApiTokenStore* token_store, auth::AuthMan
     if (!scim_store->set_active(resource.scim_id, false)) {
         spdlog::error("ScimRoutes: ScimStore::set_active(false) failed for scim_id={} after the "
                      "underlying account was already deactivated — inconsistent state, failing "
-                     "closed so the IdP retries",
+                     "closed (500); a retry will 404 and the mirror stays stale "
+                     "(#FOLLOWUP-ISSUE-NUMBER / #5214)",
                      resource.scim_id);
         send_scim_error(res, 500, "failed to persist the deactivated state");
         audit(auth_mgr, audit_store, req, audit_action, "failure", resource.scim_id,
@@ -3291,7 +3322,10 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                         return;
                     }
 
-                    log_removed_members_breadcrumb(id, old_members, new_members);
+                    log_removed_members_breadcrumb(
+                        id, old_members, new_members,
+                        rename_flips_admin_group_match(group->display_name,
+                                                       input.display_name, scim_admin_group));
                     recompute_complete = recompute_members(
                         scim_store, auth_mgr, audit_store, analytics_store, req, id,
                         removed_first(old_members, new_members), scim_admin_group,
@@ -3520,7 +3554,10 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       if (renamed)
                           trigger +=
                               " renamed_from='" + neutral_free_text(pre_update_display_name) + "'";
-                      log_removed_members_breadcrumb(id, old_members, final_members);
+                      log_removed_members_breadcrumb(
+                          id, old_members, final_members,
+                          rename_flips_admin_group_match(pre_update_display_name,
+                                                         final_display, scim_admin_group));
                       recompute_complete = recompute_members(
                           scim_store, auth_mgr, audit_store, analytics_store, req, id,
                           removed_first(old_members, final_members), scim_admin_group, trigger);

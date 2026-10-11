@@ -65,6 +65,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -5430,6 +5431,7 @@ TEST_CASE("ScimRoutes: after a store failure the remaining DEMOTIONS are still a
     CHECK(crit[0].attributes["role_applied"] == "unknown");
     CHECK(crit[0].attributes["session_wipe_failed"] == "unknown"); // the wipe state is unknown too
     // The failure AUDIT row carries the same marker, so it never reads like a definite no-apply.
+    REQUIRE(!retained.empty()); // the lookup below indexes by it
     const auto retained_id =
         ids[static_cast<std::size_t>(std::find(names.begin(), names.end(), retained) -
                                      names.begin())];
@@ -5758,13 +5760,15 @@ TEST_CASE("ScimRoutes: a Group request that removes members writes ONE crash-bre
     const std::string marker = "role recompute starting for";
 
     SECTION("PUT that removes one member") {
-        yuzu::test::LogCapture capture;
+        // Captured at WARN: the line must reach a logger configured with --log-level warn.
+        yuzu::test::LogCapture capture(spdlog::level::warn);
         REQUIRE(f.put("/scim/v2/Groups/" + gid,
                       {{"displayName", "Crumbs"}, {"members", members({b1, b2})}})->status == 200);
         capture.stop();
         const std::string logs = without_sink_crlf(capture.text());
         const auto at = logs.find(marker);
         REQUIRE(at != std::string::npos);
+        CHECK(logs.find("[warning] SCIM: Group scim_id=" + gid) != std::string::npos);
         CHECK(logs.find(marker, at + 1) == std::string::npos); // exactly one line
         // The member is named by SCIM id, never by username: the line needs no store read.
         CHECK(logs.find("1 removed member(s): " + b3) != std::string::npos);
@@ -5808,6 +5812,82 @@ TEST_CASE("ScimRoutes: a Group request that removes members writes ONE crash-bre
         CHECK(logs.find(b1) != std::string::npos);
         CHECK(logs.find(b2) != std::string::npos);
         CHECK(logs.find(b3) != std::string::npos);
+    }
+}
+
+TEST_CASE("ScimRoutes: a Group rename that flips the admin-group match writes the crash "
+          "breadcrumb even when nobody is removed; one that does not writes none (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto id_of = [&](const std::string& name) {
+        return json::parse(f.post("/scim/v2/Users", {{"userName", name}})->body)["id"]
+            .get<std::string>();
+    };
+    const auto r1 = id_of("rn_one");
+    const auto r2 = id_of("rn_two");
+    const json members = json::array({{{"value", r1}}, {{"value", r2}}});
+    const std::string marker = "membership change committed; role recompute starting";
+    const std::string flip_text =
+        "the group rename changes the admin-group match and 2 current member(s) will be "
+        "recomputed";
+    const auto rename_ops = [](const std::string& to) {
+        return json{{"Operations", json::array({{{"op", "replace"},
+                                                  {"path", "displayName"},
+                                                  {"value", to}}})}};
+    };
+
+    SECTION("PATCH rename onto the admin group name") {
+        const auto gid = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Crumbs"},
+                                                                {"members", members}})
+                                         ->body)["id"].get<std::string>();
+        yuzu::test::LogCapture capture(spdlog::level::warn);
+        REQUIRE(f.patch("/scim/v2/Groups/" + gid, rename_ops("Yuzu-Admins"))->status == 200);
+        capture.stop();
+        const std::string logs = without_sink_crlf(capture.text());
+        CHECK(logs.find("[warning] SCIM: Group scim_id=" + gid + " " + marker) !=
+              std::string::npos);
+        CHECK(logs.find(flip_text) != std::string::npos);
+        CHECK(logs.find("removed member(s)") == std::string::npos); // nobody was removed
+    }
+    SECTION("PUT rename away from the admin group name") {
+        const auto gid = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"},
+                                                                {"members", members}})
+                                         ->body)["id"].get<std::string>();
+        yuzu::test::LogCapture capture(spdlog::level::warn);
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Crumbs"}, {"members", members}})->status == 200);
+        capture.stop();
+        const std::string logs = without_sink_crlf(capture.text());
+        CHECK(logs.find("Group scim_id=" + gid + " " + marker) != std::string::npos);
+        CHECK(logs.find(flip_text) != std::string::npos);
+    }
+    SECTION("PUT rename that also removes a member writes ONE line with both facts") {
+        const auto gid = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Crumbs"},
+                                                                {"members", members}})
+                                         ->body)["id"].get<std::string>();
+        yuzu::test::LogCapture capture(spdlog::level::warn);
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Yuzu-Admins"},
+                       {"members", json::array({{{"value", r1}}})}})->status == 200);
+        capture.stop();
+        const std::string logs = without_sink_crlf(capture.text());
+        const auto at = logs.find(marker);
+        REQUIRE(at != std::string::npos);
+        CHECK(logs.find(marker, at + 1) == std::string::npos);
+        CHECK(logs.find("for 1 removed member(s): " + r2) != std::string::npos);
+        CHECK(logs.find("the group rename changes the admin-group match and 1 current member(s) "
+                        "will be recomputed") != std::string::npos);
+    }
+    SECTION("a rename that does not change the admin-group match writes nothing") {
+        const auto gid = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Crumbs"},
+                                                                {"members", members}})
+                                         ->body)["id"].get<std::string>();
+        yuzu::test::LogCapture capture(spdlog::level::warn);
+        REQUIRE(f.patch("/scim/v2/Groups/" + gid, rename_ops("Crumbs-Renamed"))->status == 200);
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Crumbs-Again"}, {"members", members}})->status == 200);
+        capture.stop();
+        CHECK(capture.text().find(marker) == std::string::npos);
     }
 }
 
@@ -5856,6 +5936,9 @@ public:
     int breadcrumb_attempts = 0;
     std::vector<std::string> lines;
     int flushes_after_breadcrumb = 0;
+    /// Invoked ONCE, on the first flush after the breadcrumb line, from inside flush_(). It must
+    /// not log (the sink mutex is held) and must not take a lock the logging path holds.
+    std::function<void()> on_first_flush_after_breadcrumb;
 
 protected:
     void sink_it_(const spdlog::details::log_msg& msg) override {
@@ -5870,8 +5953,10 @@ protected:
     }
     void flush_() override {
         ++flushes;
-        if (seen_breadcrumb_)
-            ++flushes_after_breadcrumb;
+        if (seen_breadcrumb_) {
+            if (++flushes_after_breadcrumb == 1 && on_first_flush_after_breadcrumb)
+                on_first_flush_after_breadcrumb();
+        }
     }
 
 private:
@@ -5890,30 +5975,51 @@ struct BreadcrumbProbe {
         spdlog::set_default_logger(logger);
         spdlog::set_level(spdlog::level::trace);
     }
+    /// Idempotent: the destructor does not re-install `prev` after an explicit stop(), which
+    /// would clobber a default logger some later scope installed in between.
     void stop() {
+        if (stopped_)
+            return;
+        stopped_ = true;
         spdlog::set_default_logger(prev);
         spdlog::set_level(prev_level);
     }
     ~BreadcrumbProbe() { stop(); }
+
+private:
+    bool stopped_ = false;
 };
 
 } // namespace
 
-TEST_CASE("ScimRoutes: the crash-breadcrumb flushes the logger right after its line (#4966)",
+TEST_CASE("ScimRoutes: the crash-breadcrumb flushes the logger right after its line, before "
+          "the first member is recomputed (#4966)",
           "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb]") {
     Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
-    const auto uid = json::parse(f.post("/scim/v2/Users", {{"userName", "fl_one"}})->body)["id"]
+    const auto uid = json::parse(f.post("/scim/v2/Users", {{"userName", "fl_admin"}})->body)["id"]
                          .get<std::string>();
     const auto gid =
-        json::parse(f.post("/scim/v2/Groups", {{"displayName", "Crumbs"},
+        json::parse(f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"},
                                                {"members", json::array({{{"value", uid}}})}})
                         ->body)["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.get_user_role("fl_admin").value() == auth::Role::admin);
     BreadcrumbProbe probe;
-    REQUIRE(f.put("/scim/v2/Groups/" + gid, {{"displayName", "Crumbs"}, {"members", json::array()}})
+    // The removed member is demoted by the recompute loop. At the first flush after the
+    // breadcrumb line the demotion must NOT have happened yet: the flush precedes the loop, so a
+    // SIGKILL inside the loop cannot lose a line still sitting in a buffer.
+    std::optional<auth::Role> role_at_first_flush;
+    probe.sink->on_first_flush_after_breadcrumb = [&] {
+        role_at_first_flush = f.auth_mgr.get_user_role("fl_admin");
+    };
+    REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                  {{"displayName", "Yuzu-Admins"}, {"members", json::array()}})
                 ->status == 200);
     probe.stop();
     CHECK(probe.sink->breadcrumb_attempts == 1);
     CHECK(probe.sink->flushes_after_breadcrumb >= 1);
+    REQUIRE(role_at_first_flush.has_value());
+    CHECK(*role_at_first_flush == auth::Role::admin);
+    CHECK(f.auth_mgr.get_user_role("fl_admin").value() == auth::Role::user); // demoted after
 }
 
 TEST_CASE("ScimRoutes: a logger that throws on the crash-breadcrumb does not skip the recompute "
