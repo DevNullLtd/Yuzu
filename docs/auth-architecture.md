@@ -1916,7 +1916,7 @@ group** — that removal demotes them back to `user` via the next
 `recompute_scim_user_role` call, at which point the next deactivate/delete
 call proceeds normally. If that user is the last protected administrator the
 demotion is refused instead: the role stays `admin` and the `404` persists until
-another administrator exists AND the user's role is demoted by hand (`POST
+another active local administrator account (`role` `admin`) exists AND the user's role is demoted by hand, signed in as that other administrator (`POST
 /api/settings/users/{username}/role` with `{"role":"user"}`; a re-send of
 the Group change cannot do it: the member has already left the group) or by a
 later change that names the user (see `docs/user-manual/rbac.md`, "Last-Administrator

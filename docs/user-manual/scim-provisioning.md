@@ -229,10 +229,11 @@ membership cannot be SCIM-deprovisioned until the IdP first removes them
 from the admin group** — which demotes them back to `user`, at which point
 the next deactivate/delete call succeeds normally. The one exception: if that
 user is the last protected administrator, the demotion is refused instead, the
-role stays `admin` and the `404` persists until another administrator exists
-AND the user's role is demoted by hand (`POST /api/settings/users/{username}/role` with `{"role":"user"}`;
+role stays `admin` and the `404` persists until another active local administrator
+account (`role` `admin`) exists AND the user's role is demoted by hand, signed in as
+that other administrator (`POST /api/settings/users/{username}/role` with `{"role":"user"}`;
 the dashboard has no role button, and "If the guard refuses an action you intend"
-in [`rbac.md`](rbac.md) lists the steps), or by a later change
+in [`rbac.md`](rbac.md) lists the steps, including step-up and the break-glass exit), or by a later change
 that names the user, for example through another group they belong to; a
 re-send of the same Group change cannot do it, because the member has already
 left the group (see "The fleet's last administrator is protected" and "Group role recompute:
@@ -480,9 +481,11 @@ around:
    `204`), and an IdP's next sync sends no change for a member who is already
    out. For a **refused**, **failed** or **undetermined** demotion of a member
    who has left the group, demote the member by hand with
-   `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button; the call needs an administrator's cookie session with a fresh MFA step-up, and a SAML session gets `403` at step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)). For a refused one, a second active local
-   administrator account has to exist first; see [`rbac.md`](rbac.md), "If the
-   guard refuses an action you intend", for the steps. A later
+   `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button. Make the call while signed in as an administrator other than that account, because a self-target answers `403` `self_role_change_blocked`. It needs a cookie session with a fresh MFA step-up, where a SAML session gets `403`, or an administrator API token, which bypasses step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)). For a refused one, a second active local
+   administrator account has to exist first and the call has to be made as that
+   second administrator; see [`rbac.md`](rbac.md), "If the guard refuses an
+   action you intend", for the steps and for the break-glass exit when no
+   administrator session can pass step-up. A later
    change that names the user through another group they belong to also
    re-derives their role. A skipped **promotion** is the exception: a re-send
    of a `PUT` or `PATCH` retries it while the member is in the group, but a
@@ -502,13 +505,15 @@ around:
    20 removed members by SCIM ID (not by username: the line performs no store
    read, so it cannot be delayed by a degraded store; resolve an ID with
    `GET /scim/v2/Users/<id>`) and `<N>` is the exact count. It is not written by
-   `POST`, or by a change that removed nobody and did not flip the match (an
-   add-only change writes none; a re-send recovers it). It is also written on
+   `POST`, or by a change that removed nobody and did not flip the match of a
+   group that still has members (an add-only change writes none, and neither
+   does a flipping rename of an empty group; a re-send recovers it). It is also written on
    the idempotent already-gone path of a `DELETE`, which is reachable only
-   through a cross-process race. Without `--log-file` the line goes to stderr
-   only. The flush precedes the recompute, so the line survives a `SIGKILL`
+   through a cross-process race. Without `--log-file` the line goes to stdout
+   (with `--log-file`, to stderr and the file); journald and container logs
+   capture both, and only the null-logger fallback writes to stderr directly. The flush precedes the recompute, so the line survives a `SIGKILL`
    once written to the sink in use (a file sink may still hold a copy that was
-   not yet written; the stderr or journald copy is not lost), but not power
+   not yet written; the copy the console stream already took is not lost), but not power
    loss or a kernel panic (there is no fsync). If writing it fails, the failure
    never blocks the recompute. Where a crash stopped the request, read the
    signature:
@@ -548,7 +553,8 @@ around:
    follow-up tracked in #FOLLOWUP-ISSUE-NUMBER). Every IdP retry also hits the
    role guard: it answers `404`, writes a `scim.user.provenance_denied` audit
    row and increments `yuzu_scim_provenance_denied_total`, which drives the
-   shipped `YuzuScimProvenanceDenied` alert at the retry rate. There is no hand
+   shipped `YuzuScimProvenanceDenied` alert (`increase(...[1h]) > 0`, severity
+   warning): it fires, and stays firing while the retries continue. There is no hand
    remedy today (no route and no SQL statement is documented for it) until #5214
    and #FOLLOWUP-ISSUE-NUMBER land.
 
@@ -956,7 +962,7 @@ with a **currently-active** account.
   touch an account whose role is not `user` (see above). Remove the user
   from the admin group first (which demotes them back to `user`; if they
   are the last protected administrator the demotion is refused and the
-  role stays `admin` until another administrator exists AND their role is
+  role stays `admin` until another active local administrator account exists AND their role is
   demoted by hand or by a later change that names them), or
   disable the account from the dashboard instead.
 - **Deleting/deactivating a group-granted admin via SCIM returns 404.** This
@@ -965,7 +971,7 @@ with a **currently-active** account.
   Remove the user from the admin group first; the deactivate/delete call
   then succeeds on the next sync. If that user is the last protected
   administrator the demotion is refused, the role stays `admin` and the
-  `404` persists until another administrator exists AND the user's role is
+  `404` persists until another active local administrator account exists AND the user's role is
   demoted (by hand, or by a later change that names them; see "The fleet's last
   administrator is protected" and "Group role recompute: when it is
   incomplete" under
@@ -980,9 +986,10 @@ with a **currently-active** account.
   holds the role. One remedy per class:
   - **Failed** (`failed=`; a demotion or a promotion): the member's role may not
     be what the groups confer. Check it in Settings > User Management; if it
-    should be `user`, demote it with `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button; the call needs an administrator's cookie session with a fresh MFA step-up, and a SAML session gets `403` at step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)) and
+    should be `user`, demote it with `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button. Make the call while signed in as an administrator other than that account, because a self-target answers `403` `self_role_change_blocked`. It needs a cookie session with a fresh MFA step-up, where a SAML session gets `403`, or an administrator API token, which bypasses step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)) and
     revoke its sessions (Settings > User Management > Revoke sessions, or
-    `DELETE /api/v1/sessions?username=<name>`), then look at the store (pool
+    `DELETE /api/v1/sessions?username=<name>`, which also needs a fresh MFA step-up
+    for a cookie session), then look at the store (pool
     waits, a stuck lock holder). If the role is already `user` (the role change
     applied and only the session wipe failed), the role call answers "Role
     unchanged" and does nothing else, so revoke the sessions separately.
@@ -992,8 +999,11 @@ with a **currently-active** account.
     administrator, does not unlock the demotion. Create one (Settings > User
     Management > Add User, which ignores `role`, then `POST
     /api/settings/users/{username}/role` with `{"role":"admin"}`), then demote
-    the named member with `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button; the call needs an administrator's cookie session with a fresh MFA step-up, and a SAML session gets `403` at step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)). See
-    [`rbac.md`](rbac.md), "If the guard refuses an action you intend". A later
+    the named member, signed in as the NEW administrator and not as the member,
+    with `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button. Make the call while signed in as an administrator other than that account, because a self-target answers `403` `self_role_change_blocked`. It needs a cookie session with a fresh MFA step-up, where a SAML session gets `403`, or an administrator API token, which bypasses step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)). Add User has no step-up but the role call does: if no
+    administrator session can pass it, use the break-glass account. See
+    [`rbac.md`](rbac.md), "If the guard refuses an action you intend", for that
+    exit, and demote or remove the temporary local administrator afterwards. A later
     change that names the user through another group also re-derives the role.
   - **Undetermined** (`undetermined=`): a read failed, so the role was left
     untouched and it is not known whether an administrator was kept. Check each
