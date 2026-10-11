@@ -603,6 +603,33 @@ TEST_CASE("group-from-results: a configured trusted origin is accepted "
     CHECK(h.mg.find_group_by_name("csrf-trusted-group").has_value());
 }
 
+// The CSRF same-site gate runs BEFORE the unmatchable-value refusal (#5623): a cross-origin POST
+// carrying a value the handler would otherwise refuse (over the bound, NUL) gets the CSRF 403
+// and its audit row, never the refusal text, and no refusal is counted. Without this ordering a
+// cross-site page could use the refusal to probe the filter handling and would inflate the
+// operator-facing refusal counter.
+TEST_CASE("group-from-results: the CSRF gate runs before the unmatchable-value refusal",
+          "[pg][server][dashboard][group_from_results][csrf]") {
+    GroupFromResultsHarness h;
+    seed_matching_responses(h.rs(), {"agent-A"});
+    REQUIRE(h.refused("dashboard") == 0.0);
+
+    for (const std::string value : {std::string(2049, 't'), std::string("high%00x")}) {
+        INFO(value.substr(0, 20));
+        auto res = h.post("group_name=csrf-first-group&command_id=" + std::string{kCommandId} +
+                              "&plugin=" + kPlugin + "&f_title=" + value,
+                          {{"Host", kHost}, {"Origin", "https://evil.example"}});
+        CHECK(res->status == 403);
+        CHECK(h.audit_detail("group.create_from_results", "denied") == "csrf_cross_origin");
+        CHECK(res->body == "<span class=\"feedback-error\">Cross-origin request refused.</span>");
+        CHECK_FALSE(contains(res->body, "data-filter-refused"));
+        CHECK_FALSE(contains(res->body, "can&#39;t be searched"));
+        CHECK_FALSE(h.mg.find_group_by_name("csrf-first-group").has_value());
+    }
+    CHECK(h.refused("dashboard") == 0.0);
+    CHECK(h.visible_set_fn_calls == 0);
+}
+
 // -- #5623: a facet filter value over kMaxFacetValueBytes is refused ---------
 // Such a value is never stored (response_store.hpp), so a filter on it matches no agent.
 // Both surfaces must refuse it visibly instead of previewing "0 agents" or building a group

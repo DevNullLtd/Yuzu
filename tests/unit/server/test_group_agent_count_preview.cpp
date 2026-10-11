@@ -363,8 +363,10 @@ std::string strip_if_zero_blocks(const std::string& in) {
         const auto starts = [&](const char* kw) { return directive.rfind(kw, 0) == 0; };
         bool keep = (depth == 0);
         if (depth == 0) {
-            if (starts("if 0") && (directive.size() == 4 || !std::isalnum(static_cast<unsigned char>(
-                                                                 directive[4])))) {
+            const bool is_if0 =
+                starts("if 0") &&
+                (directive.size() == 4 || !std::isalnum(static_cast<unsigned char>(directive[4])));
+            if (is_if0) {
                 depth = 1;
                 keep = false;
             }
@@ -395,6 +397,16 @@ std::string strip_if_zero_blocks(const std::string& in) {
 // skips the refusal answers an unmatchable value (over the bound, NUL, line feed, invalid UTF-8)
 // with a plausible exact 0 or a prefix match. Pure over (unit key -> text), so the self-test
 // below can drive it with synthetic sources.
+//
+// This is a COARSE per-unit tripwire for a NEW unit, not proof that every call site refuses.
+// Known limits (a change here should be deliberate):
+//  - A unit that mentions a predicate ANYWHERE is exempt as a whole, so a second reader call in
+//    dashboard_routes, rest_api_v1, mcp_server or group_agent_count_preview with no refusal in
+//    front of it is not caught. The per-site behavioural refusal tests are the real guard.
+//  - Callers of the shared group_agent_count_preview( wrapper are not scanned at all.
+//  - The reader regex needs `->facet_x(` or `.facet_x(`, so `facet_agent_count (` (space),
+//    `&ResponseStore::facet_*`, `std::invoke`, `->template facet_*` and any NEW reader name
+//    are not recognised as a reader call.
 std::vector<std::string>
 units_calling_facet_reader_without_refusal(const std::map<std::string, std::string>& units) {
     static const std::regex reader_call{
@@ -420,8 +432,18 @@ units_calling_facet_reader_without_refusal(const std::map<std::string, std::stri
 }
 
 // True when `src` contains a call of `name(` that is live: not in a comment, not in an
-// `#if 0` region, and not directly under a literal `if (false)`. `if constexpr (false)`, a
-// never-true macro condition and an early `return;` before the call are known limits.
+// `#if 0` region, and not directly under a literal `if (false)`. Textual heuristic; known
+// limits (pinned where trivial, so a change is deliberate):
+//  - Reads LIVE when it is not: `if constexpr (false)`, a never-true macro condition, an early
+//    `return;` before the call, `if (false) { a(); seed(); }` (only a call directly after the
+//    condition or its `{` is recognised), a declaration or a string literal containing the
+//    name, and a digit separator (`1'000; // seed(`: the `'` opens a character literal that
+//    runs to the end of the line, so the comment is kept). A `//` comment continued by a
+//    trailing backslash is also not modelled, so its continuation line reads as code.
+//  - No identifier boundary before the name: `foo_seed_x(` matches `seed_x(`.
+//  - Reads DEAD when it is live (falsely RED, which fails loudly rather than hiding a drop):
+//    `#if 0 || X` is treated as `#if 0`, and a `#if 0` line inside a raw string literal is
+//    treated as a directive because the region scan is line-based, not string-aware.
 bool has_live_call(const std::string& src, const std::string& name) {
     const std::string text = strip_if_zero_blocks(strip_comments(src));
     const std::string needle = name + "(";
@@ -521,8 +543,9 @@ TEST_CASE("facet reader tripwire: every production caller of a ResponseStore fac
     REQUIRE(units.count("response_store") == 1);
     // Positive control: the units known to call a reader today are really being scanned and
     // really contain a (comment-stripped) call, so the rule below cannot pass vacuously. The
-    // scan checks the stems in this list; any other unit that gains a reader call is caught by
-    // the rule itself.
+    // rule is the coarse per-unit check documented on units_calling_facet_reader_without_refusal
+    // (it catches a NEW unit that calls a reader with no predicate reference; it does not police
+    // the sites inside the units listed here).
     for (const char* stem : {"dashboard_routes", "group_agent_count_preview"}) {
         REQUIRE(units.count(stem) == 1);
         CHECK(std::regex_search(strip_comments(units[stem]),
@@ -543,8 +566,8 @@ TEST_CASE("seed wiring tripwire: comments, #if 0 and if (false) are not calls",
     CHECK_FALSE(has_live_call("/* seed_response_facet_metrics(*m);\n */", name));
     CHECK_FALSE(has_live_call("x(); /* a */ // seed_response_facet_metrics(*m);", name));
     CHECK_FALSE(has_live_call("#if 0\n  seed_response_facet_metrics(*m);\n#endif\n", name));
-    CHECK_FALSE(
-        has_live_call("#if 0\n#ifdef X\n#endif\n  seed_response_facet_metrics(*m);\n#endif\n", name));
+    CHECK_FALSE(has_live_call(
+        "#if 0\n#ifdef X\n#endif\n  seed_response_facet_metrics(*m);\n#endif\n", name));
     // The #else branch of an `#if 0` is live.
     CHECK(has_live_call("#if 0\nx();\n#else\n  seed_response_facet_metrics(*m);\n#endif\n", name));
     // Live again after the closing #endif.
@@ -553,6 +576,11 @@ TEST_CASE("seed wiring tripwire: comments, #if 0 and if (false) are not calls",
     CHECK_FALSE(has_live_call("if (false) {\n  seed_response_facet_metrics(*m);\n}", name));
     // Known limit, pinned so a change is deliberate: other never-true spellings read as live.
     CHECK(has_live_call("if (0) seed_response_facet_metrics(*m);", name));
+    CHECK(has_live_call("if (false) { x(); seed_response_facet_metrics(*m); }", name));
+    CHECK(has_live_call("int n = 1'000; // seed_response_facet_metrics(*m);", name));
+    CHECK(has_live_call("foo_seed_response_facet_metrics(*m);", name));
+    // Known limit in the safe direction: `#if 0 || X` reads as `#if 0` (falsely RED).
+    CHECK_FALSE(has_live_call("#if 0 || X\n  seed_response_facet_metrics(*m);\n#endif\n", name));
 }
 
 // ResponseStore's counters are only exported if server.cpp seeds them; nothing else reads

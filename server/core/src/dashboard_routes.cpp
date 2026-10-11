@@ -1381,8 +1381,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      html += "&amp;definition_id=" + html_escape(def_id);
                  html += "\" hx-trigger=\"load delay:2s\" hx-swap=\"outerHTML\"></div>";
 
-                 // OOB: chart deck — empty initially, self-refreshes once
-                 // responses are in. Same delay window as the filter bar.
+                 // OOB: chart deck, empty initially; ONE request fired 2 s after this
+                 // response (`load delay:2s`, not polling). Same as the filter bar.
                  // Without this, the deck only appears after the operator
                  // touches a filter; users expect the chart to render as
                  // soon as the data arrives. `hx-swap-oob="true"` replaces

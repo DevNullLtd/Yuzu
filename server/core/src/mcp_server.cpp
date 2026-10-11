@@ -801,9 +801,10 @@ static const ToolDef kTools[] = {
      "store read. Requires ManagementGroup:Write — approval-gated (supervised MCP "
      "tier maker-checker), matching every other ManagementGroup:Write surface, even "
      "though this tool itself performs no mutation. A filter value over 2048 bytes, or "
-     "containing a NUL byte, a line feed or invalid UTF-8, is refused with -32602 (this "
-     "exact-match filter is not supported; the request is not evaluated, so a refusal "
-     "is never a count of 0).",
+     "containing a NUL byte or a line feed, is refused with -32602 (this exact-match "
+     "filter is not supported; the request is not evaluated, so a refusal is never a "
+     "count of 0). Invalid UTF-8 (a bad byte or a lone surrogate escape) cannot reach the "
+     "tool: it fails the JSON parse of the request itself (-32700, null id).",
      R"j({"type":"object","properties":{)j"
      R"j("command_id":{"type":"string","minLength":1,"description":"The response set's instruction/command id to count against"},)j"
      R"j("plugin":{"type":"string","minLength":1,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
@@ -10029,7 +10030,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // line feed / invalid UTF-8) is refused (non-retryable) rather than answered
                 // as an exact 0 (#5623). Same check, bound and text as the REST twin, on the
                 // RAW values before key resolution (an unknown key is skipped by the
-                // resolver); the value is never echoed.
+                // resolver); the value is never echoed. Over MCP the invalid-UTF-8 arm of the
+                // shared predicate is unreachable: a bad byte or a lone surrogate escape fails
+                // the JSON parse in parse_request first (-32700, null id). An over-2048-BYTE
+                // value is normally rejected even earlier by the tool's input schema on the
+                // approval-gated path (the validator counts bytes, not characters).
                 if (any_raw_filter_value_unmatchable(raw_fields)) {
                     note_facet_filter_refused(metrics, kFacetRefusedSurfaceMcp);
                     res.set_content(a4_error(kInvalidParams, facet_filter_value_refusal_message(),
