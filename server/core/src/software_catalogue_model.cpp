@@ -381,6 +381,7 @@ std::optional<std::string> strict_args_error(const nlohmann::json& args) {
         const char* key;
         std::int64_t min, max;
     };
+    static_assert(kCataloguePageMax == kVersionsMax, "one `limit` bound serves both MCP tools below");
     for (const IntKey k : {IntKey{"limit", 1, kCataloguePageMax}, IntKey{"versions_min", 0, 100000}}) {
         if (!args.contains(k.key))
             continue;

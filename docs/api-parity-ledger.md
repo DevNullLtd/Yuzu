@@ -117,6 +117,11 @@ through the cursor on `query_software_catalogue` / `query_installed_software`; a
 download is a human/automation convenience, so the ledger rows for those routes are `twinned` on
 the paged shape and the export mode is recorded here rather than as a separate row.
 
+**Known asymmetry on the raw-route pair.** The `q`, `kind`, `ecosystem` and `source` filters of
+`GET /api/v1/inventory/software` are REST-only: `query_installed_software` takes `name`, `agent_id`,
+`version`, `limit` and `cursor` only (an unknown argument name is ignored, as on every MCP tool). The row
+stays `twinned` on the paged shape; the gap is recorded here so it is not silent.
+
 ## Summary
 
 <!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; regenerate with `python3 scripts/ci/check-api-parity.py --render-doc` and splice between these markers -->

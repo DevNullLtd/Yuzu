@@ -1014,6 +1014,13 @@ TEST_CASE("REST inventory/software: cursor refusals — tampered; wrong filter s
     CHECK(wrong->status == 400);
     CHECK(wrong->body.find("different filter set") != std::string::npos);
 
+    // the version VALUE is part of the binding, not only its presence
+    const auto versioned =
+        nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software?limit=1&version=1")->body);
+    const auto vcursor = versioned.at("data").at("next_cursor").get<std::string>();
+    CHECK(h.sink.Get("/api/v1/inventory/software?limit=1&version=1&cursor=" + vcursor)->status == 200);
+    CHECK(h.sink.Get("/api/v1/inventory/software?limit=1&version=2&cursor=" + vcursor)->status == 400);
+
     // A hand-made head cursor (name "", agent "", id 0) over the unfiltered query is accepted by
     // design — opaque is not authenticated — so the audit row is what keeps it from being silent.
     const auto fp = software_catalogue::devices_fingerprint(SoftwareFleetQuery{});
@@ -1123,6 +1130,15 @@ TEST_CASE("REST inventory/software: exports — csv; truncation; json; bad forma
     CHECK(h.sink.Get("/api/v1/inventory/software?format=xml")->status == 400);
     CHECK(count_audit(h, "inventory.software.export", "success") == 3);
     CHECK(count_audit(h, "inventory.software.export", "success", "truncated=true") == 2);
+
+    // A dropped audit row is flagged on the csv (a body-less channel for the honesty flag);
+    // the export is still served.
+    CHECK(csv->get_header_value("Sec-Audit-Failed").empty());
+    h.audit_ok = false;
+    auto unaudited = h.sink.Get("/api/v1/inventory/software?format=csv");
+    REQUIRE(unaudited);
+    CHECK(unaudited->status == 200);
+    CHECK(unaudited->get_header_value("Sec-Audit-Failed") == "true");
 }
 
 TEST_CASE("REST inventory/software: success audit target equals audit_target(query)",

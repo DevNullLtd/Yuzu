@@ -101,7 +101,9 @@ TEST_CASE("parse_catalogue_params: defaults / clamps / refusals", "[server][soft
         CHECK_FALSE(parse_catalogue_params(params({{"versions_min", "-1"}})));
         CHECK_FALSE(parse_catalogue_params(params({{"format", "xml"}})));
         CHECK_FALSE(parse_catalogue_params(params({{"cursor", std::string(2049, 'a')}})));
-        CHECK_FALSE(parse_catalogue_params(params({{"limit", "x"}})).error().empty());
+        auto bad_limit = parse_catalogue_params(params({{"limit", "x"}}));
+        REQUIRE_FALSE(bad_limit);
+        CHECK_FALSE(bad_limit.error().empty());
     }
     SECTION("a cursor with format=csv is a 400, never silently dropped") {
         auto r = parse_catalogue_params(params({{"format", "csv"}, {"cursor", "garbage"}}));
@@ -167,7 +169,9 @@ TEST_CASE("parse_catalogue_params: defaults / clamps / refusals", "[server][soft
 
 TEST_CASE("parse_versions_params", "[server][software_catalogue_model]") {
     CHECK_FALSE(parse_versions_params(params({})));
-    CHECK(parse_versions_params(params({{"name", ""}})).error() == "name is required");
+    auto no_name = parse_versions_params(params({{"name", ""}}));
+    REQUIRE_FALSE(no_name);
+    CHECK(no_name.error() == "name is required");
     auto r = parse_versions_params(params({{"name", "git"}, {"ecosystem", "brew"}, {"agent_id", "a1"}}));
     REQUIRE(r);
     CHECK(r->query.name == "git");
@@ -392,6 +396,85 @@ TEST_CASE("read_devices_page: cursor and degrade outcomes", "[server][software_c
     }
 }
 
+TEST_CASE("read_devices_page: a scope of exactly kScopePushdownMaxIds is pushed down; one more is "
+          "post-filtered",
+          "[server][software_catalogue_model]") {
+    FakeDevices f;
+    f.rows = {fleet_row("git", "a", 1)};
+    std::unordered_set<std::string> exact{"a"};
+    for (std::size_t i = 1; i < kScopePushdownMaxIds; ++i)
+        exact.insert("pad-" + std::to_string(i));
+    REQUIRE(exact.size() == kScopePushdownMaxIds);
+    auto at_bound = read_devices_page(f.reader(), dreq(5), VisibleSet{exact});
+    REQUIRE(at_bound);
+    REQUIRE(f.seen.agent_ids.has_value()); // pushed into the query: "up to 10 000" is inclusive
+    CHECK(f.seen.agent_ids->size() == kScopePushdownMaxIds);
+    CHECK(at_bound->devices_omitted == 0);
+    exact.insert("pad-over");
+    auto over = read_devices_page(f.reader(), dreq(5), VisibleSet{exact});
+    REQUIRE(over);
+    CHECK_FALSE(f.seen.agent_ids.has_value()); // wide query, rows post-filtered
+}
+
+TEST_CASE("read_devices_page: a cursor binds the filters, never the scope",
+          "[server][software_catalogue_model]") {
+    FakeDevices f;
+    f.rows = {fleet_row("git", "a", 1), fleet_row("git", "a", 2)};
+    const std::vector<VisibleSet> scopes = {std::nullopt,
+                                            VisibleSet{std::unordered_set<std::string>{"a"}},
+                                            VisibleSet{std::unordered_set<std::string>{"a", "b", "c"}},
+                                            authz::deny_all(), wide_scope("a")};
+    // minted under each scope (the fake store answers its rows whatever the scope, so a cursor
+    // exists for every one), read under every other scope, TOP and deny-all included
+    for (std::size_t i = 0; i < scopes.size(); ++i) {
+        auto minted = read_devices_page(f.reader(), dreq(2), scopes[i]);
+        REQUIRE(minted);
+        REQUIRE_FALSE(minted->next_cursor.empty());
+        for (std::size_t j = 0; j < scopes.size(); ++j) {
+            INFO("minted under scope #" << i << ", read under scope #" << j);
+            CHECK(read_devices_page(f.reader(), dreq(1, minted->next_cursor), scopes[j]));
+        }
+    }
+}
+
+TEST_CASE("read_devices_page: a cursor is bound to the version value and refused on any changed "
+          "filter",
+          "[server][software_catalogue_model]") {
+    FakeDevices f;
+    f.rows = {fleet_row("git", "a", 1), fleet_row("git", "b", 2)};
+    DevicesRequest v1 = dreq(2);
+    v1.query.version = "1.0";
+    auto first = read_devices_page(f.reader(), v1, std::nullopt);
+    REQUIRE(first);
+    REQUIRE_FALSE(first->next_cursor.empty());
+    for (const char* other : {"2.0", ""}) { // another value, and present-empty
+        DevicesRequest changed = dreq(1, first->next_cursor);
+        changed.query.version = other;
+        auto refused = read_devices_page(f.reader(), changed, std::nullopt);
+        REQUIRE_FALSE(refused);
+        REQUIRE(refused.error().has_value());
+        CHECK(*refused.error() == CursorError::kFilterMismatch);
+    }
+    // the same filters under a different scope still decode: the refusal is the filter's alone
+    DevicesRequest same = dreq(1, first->next_cursor);
+    same.query.version = "1.0";
+    CHECK(read_devices_page(f.reader(), same, VisibleSet{std::unordered_set<std::string>{"a"}}));
+    CHECK(read_devices_page(f.reader(), same, authz::deny_all()));
+    // and refused under a changed filter whatever the scope
+    DevicesRequest other_name = dreq(1, first->next_cursor);
+    other_name.query.version = "1.0";
+    other_name.query.name = "git";
+    const std::vector<VisibleSet> scopes = {std::nullopt,
+                                            VisibleSet{std::unordered_set<std::string>{"a"}},
+                                            authz::deny_all(), wide_scope("a")};
+    for (const VisibleSet& scope : scopes) {
+        auto refused = read_devices_page(f.reader(), other_name, scope);
+        REQUIRE_FALSE(refused);
+        REQUIRE(refused.error().has_value());
+        CHECK(*refused.error() == CursorError::kFilterMismatch);
+    }
+}
+
 TEST_CASE("strict_args_error: MCP refuses what REST clamps", "[server][software_catalogue_model]") {
     using nlohmann::json;
     CHECK_FALSE(strict_args_error(json::object()));
@@ -567,6 +650,11 @@ TEST_CASE("devices fingerprint: every filter; present-empty version; blind to pa
     SoftwareFleetQuery empty_version;
     empty_version.version = ""; // present-empty differs from absent
     CHECK(devices_fingerprint(empty_version) != base);
+    // ... and the version VALUE is bound, not only its presence
+    SoftwareFleetQuery v1, v2;
+    v1.version = "1.0";
+    v2.version = "2.0";
+    CHECK(devices_fingerprint(v1) != devices_fingerprint(v2));
     f.limit = 7;
     f.agent_ids = std::vector<std::string>{"a"};
     f.after = SoftwareCursor{"n", "a", 1};
@@ -671,29 +759,41 @@ TEST_CASE("devices cursor round trip and refusals", "[server][software_catalogue
     CHECK(cur->agent_id == "agent:1");
     CHECK(cur->install_id == 77);
 
-    CHECK(decode_devices_cursor(tok, "ffffffffffffffff").error() == CursorError::kFilterMismatch);
-    CHECK(decode_devices_cursor("c1:" + fp + ":x", fp).error() == CursorError::kMalformed);
-    CHECK(decode_devices_cursor("d1:" + fp, fp).error() == CursorError::kMalformed);
-    CHECK(decode_devices_cursor("d1:" + fp + ":" + b64url_of("onlyone"), fp).error() ==
-          CursorError::kMalformed);
-    CHECK(decode_devices_cursor("d1:" + fp + ":" + b64url_of("n\x1f" "a\x1f" "x"), fp).error() ==
-          CursorError::kMalformed);
-    CHECK(decode_devices_cursor("d1:" + fp + ":" + b64url_of("n\x1f" "a\x1f" "1") + "=", fp).error() ==
-          CursorError::kMalformed);
+    // A refusal is asserted behind a REQUIRE_FALSE: reading .error() of an engaged result would
+    // abort the whole binary under libc++ hardening instead of failing this case.
+    auto refuses = [](std::string_view token, std::string_view for_fp, CursorError expected) {
+        auto r = decode_devices_cursor(token, for_fp);
+        REQUIRE_FALSE(r);
+        CHECK(r.error() == expected);
+    };
+    refuses(tok, "ffffffffffffffff", CursorError::kFilterMismatch);
+    refuses("c1:" + fp + ":x", fp, CursorError::kMalformed);
+    refuses("d1:" + fp, fp, CursorError::kMalformed);
+    refuses("d1:" + fp + ":" + b64url_of("onlyone"), fp, CursorError::kMalformed);
+    refuses("d1:" + fp + ":" + b64url_of("n\x1f" "a\x1f" "x"), fp, CursorError::kMalformed);
+    refuses("d1:" + fp + ":" + b64url_of("n\x1f" "a\x1f" "1") + "=", fp, CursorError::kMalformed);
     // The decoded name and agent id are bound as SQL parameters: invalid UTF-8 or a NUL is
     // malformed, and is refused before the filter check.
     const std::string nul("a\0b", 3);
     for (const std::string& bad : {std::string("\xFF"), nul}) {
-        CHECK(decode_devices_cursor("d1:" + fp + ":" + b64url_of(bad + "\x1f" "a\x1f" "1"), fp).error() ==
-              CursorError::kMalformed);
-        CHECK(decode_devices_cursor("d1:" + fp + ":" + b64url_of("n\x1f" + bad + "\x1f" "1"), fp).error() ==
-              CursorError::kMalformed);
-        CHECK(decode_devices_cursor("d1:" + fp + ":" + b64url_of(bad + "\x1f" "a\x1f" "1"),
-                                    "ffffffffffffffff")
-                  .error() == CursorError::kMalformed);
+        refuses("d1:" + fp + ":" + b64url_of(bad + "\x1f" "a\x1f" "1"), fp, CursorError::kMalformed);
+        refuses("d1:" + fp + ":" + b64url_of("n\x1f" + bad + "\x1f" "1"), fp, CursorError::kMalformed);
+        refuses("d1:" + fp + ":" + b64url_of(bad + "\x1f" "a\x1f" "1"), "ffffffffffffffff",
+                CursorError::kMalformed);
     }
     // hand-made head: name "", agent "", id 0 - ACCEPTED (opaque, not authenticated)
     CHECK(decode_devices_cursor("d1:" + fp + ":" + b64url_of(std::string("\x1f\x1f") + "0"), fp));
+
+    // Known answer: the rest-api.md example token (0x1F separators, base64url of
+    // "git\x1fagent-002\x1f5"), so the documented example cannot drift from what the codec mints.
+    const std::string doc_fp = "0f3a9c1d5b7e2a64";
+    constexpr const char* kDocToken = "d1:0f3a9c1d5b7e2a64:Z2l0H2FnZW50LTAwMh81";
+    CHECK(encode_devices_cursor(fleet_row("git", "agent-002", 5), doc_fp) == kDocToken);
+    auto doc = decode_devices_cursor(kDocToken, doc_fp);
+    REQUIRE(doc);
+    CHECK(doc->name == "git");
+    CHECK(doc->agent_id == "agent-002");
+    CHECK(doc->install_id == 5);
 }
 
 TEST_CASE("derive_kpis maps every figure", "[server][software_catalogue_model]") {

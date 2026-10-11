@@ -731,7 +731,7 @@ static const ToolDef kTools[] = {
      "resumes the keyset walk — pass it back as `cursor`; a malformed cursor or one issued for a "
      "different filter set is refused with kInvalidParams. For the fleet title rollup use "
      "query_software_catalogue.",
-     R"j({"type":"object","properties":{"name":{"type":"string","description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","description":"Exact agent/device filter; omit for fleet-wide"},"version":{"type":"string","description":"Exact version filter; an empty string selects the empty-version rows"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}}})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":1024,"description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","maxLength":256,"description":"Exact agent/device filter; omit for fleet-wide"},"version":{"type":"string","maxLength":1024,"description":"Exact version filter; an empty string selects the empty-version rows"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}}})j",
      R"j({"type":"object","properties":{"software":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"},"kind":{"type":"string"},"ecosystem":{"type":"string"},"epoch":{"type":"string"},"release":{"type":"string"},"arch":{"type":"string"},"signature_status":{"type":"string"},"distro_id":{"type":"string"},"distro_version":{"type":"string"},"source":{"type":"string"}},"required":["agent_id","name","version","publisher","install_date","kind","ecosystem","epoch","release","arch","signature_status","distro_id","distro_version","source"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the page is full (more rows may exist)"},"devices_omitted":{"type":"integer","description":"Count of devices hidden by the in-process scope post-filter (0 under SQL push-down)"},"next_cursor":{"type":["string","null"],"description":"Pass back as cursor for the next page; null when the page is not full"}},"required":["software","devices_omitted","next_cursor"]})j"},
 
     {"get_tags", "Get all tags for a specific agent.",
@@ -3584,7 +3584,7 @@ static const ToolDef kTools[] = {
      "first hourly refresh, PERMANENT when the refresh cannot complete - see "
      "query_software_catalogue), are retryable errors, never an empty result. Audited as "
      "mcp.get_software_versions.",
-     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"]},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","windows","macos","macos_pkgutil","brew","optional_feature"]},"source":{"type":"string","maxLength":256},"agent_id":{"type":"string","maxLength":256},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000}},"required":["name"]})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
      R"j({"type":"object","properties":{"name":{"type":"string"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"installs":{"type":"integer"},"newest":{"type":"boolean"}},"required":["version","installs","newest"]}},"count":{"type":"integer"},"truncated":{"type":"boolean"},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["name","versions","count","truncated","devices_omitted"]})j"},
 };
 
@@ -8982,8 +8982,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     // CVE-triage caller under a sustained outage must still leave a
                     // behavioural trail (who/when/what filter).
                     mcp_audit("failure", "store degraded; " + audit_key);
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Software inventory store degraded — query failed"),
+                    res.set_content(a4_error(kInternalError,
+                                             "Software inventory store degraded — query failed",
+                                             "retry the request", mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
