@@ -2183,7 +2183,8 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   that column; and the events-feed chip class (`event_type_class`), which still renders
   `guard.errored` as generic. `guard.errored` remains dormant until `prefer_spark` ships.
   RESOLVED means the state mapping and its tests are done; it is not "DONE with no
-  residual". Residuals to resolve or risk-accept before PR-6 sign-off: (a) on the single-event
+  residual". Residuals to resolve or risk-accept before PR-6 sign-off (the Sign-off row's gate; the
+  "pre-PR-5" tags elsewhere in this section are the original tag, kept for history): (a) on the single-event
   ingest path the census write is best-effort after the event commit and a Redelivered event returns before it
   (`guaranteed_state_store.cpp:920-922`, `:962-968`), so a transient Postgres failure
   leaves a detached rule showing its last verdict and mixed-version redelivery never
@@ -2406,8 +2407,8 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   baseline-persist signal (F14 precondition, section 3a) and the missing
   remaining-deadline wall in `stop()`); the third PR-2d follow-up, guard.errored census
   recognition (C-1), is resolved by #5667 with residuals (a)-(d) carried in the C-1 bullet
-  of section 5 (#5674/#5675/#5676; the three PR-2d follow-up gaps themselves have no issue numbers,
-  tracked here; residuals (a)-(d) also gate); those two #4045 items
+  of section 5 (#5674/#5675/#5676; the two still-open PR-2d follow-ups have no issue numbers of their
+  own, tracked here; residuals (a)-(d) also gate); those two #4045 items
   are tracked in #5605 (fleet signal) and #5604 (the `stop()` deadline; the decision closes
   with the stop busy budget, while the slow-I/O residual stays F14-gating, section 5, and
   the lifecycle-journal records lost at stop are a further F14 precondition there: a fleet
