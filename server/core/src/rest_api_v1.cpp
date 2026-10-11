@@ -1157,7 +1157,7 @@ const std::string& openapi_spec() {
         R"json(
     "/offload-targets": {
       "get": {"summary": "List configured offload targets", "tags": ["Offload"], "description": "Requires Infrastructure:Read. Returns every registered offload target. The auth_credential is never returned in any response (issue #255, Phase 8.3).", "responses": {"200": {"description": "List of offload targets"}, "503": {"description": "Offload store unavailable"}}},
-      "post": {"summary": "Create an offload target", "tags": ["Offload"], "description": "Requires Infrastructure:Write. Validation: URL must be http(s)://, name must be non-empty and unique, batch_size must be >= 1, auth_credential must not contain control bytes (defends against Authorization header CRLF injection).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["name", "url"], "properties": {"name": {"type": "string", "description": "Unique stable identifier referenced from spec.offload.targets"}, "url": {"type": "string", "description": "http:// or https:// POST endpoint"}, "auth_type": {"type": "string", "enum": ["none", "bearer", "basic", "hmac"], "default": "none"}, "auth_credential": {"type": "string", "description": "Bearer token, user:pass, or shared HMAC secret. Never returned by any read endpoint."}, "event_types": {"type": "string", "default": "*", "description": "Comma-separated event names or *"}, "batch_size": {"type": "integer", "minimum": 1, "default": 1}, "enabled": {"type": "boolean", "default": true}}}}}}, "responses": {"201": {"description": "Target created"}, "400": {"description": "Invalid JSON, missing name/url, bad URL scheme, control bytes in credential, batch_size < 1, or duplicate name"}, "503": {"description": "Offload store unavailable"}}}
+      "post": {"summary": "Create an offload target", "tags": ["Offload"], "description": "Requires Infrastructure:Write. Validation: URL must be http(s)://, name must be non-empty and unique, batch_size must be an integer from 1 to 10000, auth_credential must not contain control bytes (defends against Authorization header CRLF injection).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["name", "url"], "properties": {"name": {"type": "string", "description": "Unique stable identifier referenced from spec.offload.targets"}, "url": {"type": "string", "description": "http:// or https:// POST endpoint"}, "auth_type": {"type": "string", "enum": ["none", "bearer", "basic", "hmac"], "default": "none"}, "auth_credential": {"type": "string", "description": "Bearer token, user:pass, or shared HMAC secret. Never returned by any read endpoint."}, "event_types": {"type": "string", "default": "*", "description": "Comma-separated event names or *"}, "batch_size": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1}, "enabled": {"type": "boolean", "default": true}}}}}}, "responses": {"201": {"description": "Target created"}, "400": {"description": "Invalid JSON, a wrong-typed field (including a non-integer batch_size), missing name/url, bad URL scheme, control bytes in credential, batch_size outside 1 to 10000, or duplicate name"}, "503": {"description": "Offload store unavailable"}}}
     },
     "/offload-targets/{id}": {
       "get": {"summary": "Get a single offload target", "tags": ["Offload"], "description": "Requires Infrastructure:Read. auth_credential is never returned.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}], "responses": {"200": {"description": "Offload target"}, "404": {"description": "Target not found"}, "503": {"description": "Offload store unavailable"}}},
@@ -1225,8 +1225,8 @@ const std::string& openapi_spec() {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
     },)json"
         // Split here (MSVC C2026 ~16,380-byte per-literal cap): the segment
-        // opening at /guaranteed-state/device-compliance reached 16,402 bytes
-        // (#4644 PR2 governance, policy floor). Adjacent string literals are
+        // opening at /guaranteed-state/device-compliance reached 16,402 bytes,
+        // over that cap. Adjacent string literals are
         // concatenated at compile time, so the emitted OpenAPI JSON is
         // byte-identical to the unsplit form.
         R"json(
@@ -1499,10 +1499,10 @@ const std::string& openapi_spec() {
       "get": {"summary": "Fleet-wide execution summary", "tags": ["Executions"], "description": "Requires Execution:Read. Aggregate counters over the ExecutionTracker fleet summary.", "responses": {"200": {"description": "{total_executions, executions_today, active_agents, overall_success_rate, avg_duration_seconds}"}}}
     },
     "/execution-statistics/agents": {
-      "get": {"summary": "Per-agent execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read, gated via the ADR-0017 admit-then-filter fleet-read chokepoint (#3526): a management-group-confined caller sees only rows for the agents it can see, filtered in SQL before the limit; a global grant sees every agent. A malformed since or limit is a 400, and a negative since is a 400.", "parameters": [{"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single agent"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0}, "description": "Inclusive lower bound on dispatched_at, epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it; a negative value is rejected with 400."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per agent: {agent_id, total_executions, success_count, failure_count, success_rate, avg_duration_seconds, last_execution_at}"}, "400": {"description": "since or limit is not one base-10 integer, or since is negative"}, "403": {"description": "Insufficient permission (Execution:Read)"}}}
+      "get": {"summary": "Per-agent execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read, gated via the ADR-0017 admit-then-filter fleet-read chokepoint (#3526): a management-group-confined caller sees only rows for the agents it can see, filtered in SQL before the limit; a global grant sees every agent. A malformed since or limit is a 400, and a negative since is a 400.", "parameters": [{"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single agent"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0}, "description": "Inclusive lower bound on dispatched_at, epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it; a negative value is rejected with 400."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per agent: {agent_id, total_executions, success_count, failure_count, success_rate, avg_duration_seconds, last_execution_at}"}, "400": {"description": "since or limit is not one base-10 integer, since is negative, or limit is below 1"}, "403": {"description": "Insufficient permission (Execution:Read)"}}}
     },
     "/execution-statistics/definitions": {
-      "get": {"summary": "Per-InstructionDefinition execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read.", "parameters": [{"name": "definition_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single definition"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0}, "description": "Inclusive lower bound on dispatched_at, epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it; a negative value is rejected with 400."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per definition: {definition_id, total_executions, total_agents, success_rate, avg_duration_seconds}"}}}
+      "get": {"summary": "Per-InstructionDefinition execution statistics", "tags": ["Executions"], "description": "Requires Execution:Read.", "parameters": [{"name": "definition_id", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Filter to a single definition"}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0}, "description": "Inclusive lower bound on dispatched_at, epoch seconds. Omit for no lower bound; 0 is accepted and matches the same rows as omitting it; a negative value is rejected with 400."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1}, "description": "Max results (default 50, clamped to 1000)"}], "responses": {"200": {"description": "List, one row per definition: {definition_id, total_executions, total_agents, success_rate, avg_duration_seconds}"}, "400": {"description": "since or limit is not one base-10 integer, since is negative, or limit is below 1"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — the merge of dev's
         // ROUTES-campaign OpenAPI additions with this branch's own #4027 entries
@@ -1578,7 +1578,7 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Revoke a device token", "tags": ["Device Tokens"], "description": "Only available when DeviceTokenStore is wired — the server does not construct it today (capability 18.8 deliberately shelved, ADR-0052); documented for when a future change re-wires it. Requires DeviceToken:Delete.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{revoked: true}"}, "404": {"description": "No token with this id — \"token not found\""}, "503": {"description": "A genuine database write failure (Retry-After: 2)"}}}
     },
     "/result-sets": {
-      "get": {"summary": "List the caller's own result sets", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped: every result set is visible only to its owner_principal (session->username). Service-scoped API tokens are denied outright (403) — owner-scoping keys on the minting principal's username, which a sibling service token of the same minter would otherwise share.", "parameters": [{"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor from a prior response's next_cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-500 (default 50)"}], "responses": {"200": {"description": "{result_sets: [<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>], next_cursor}"}, "403": {"description": "Fleet-wide result-set list denied to a service-scoped token"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — a genuine database read failure (Retry-After present)"}}},
+      "get": {"summary": "List the caller's own result sets", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped: every result set is visible only to its owner_principal (session->username). Service-scoped API tokens are denied outright (403) — owner-scoping keys on the minting principal's username, which a sibling service token of the same minter would otherwise share.", "parameters": [{"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor from a prior response's next_cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-500 (default 50); an integer outside the range uses the default"}], "responses": {"200": {"description": "{result_sets: [<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>], next_cursor}"}, "400": {"description": "limit is not one base-10 integer"}, "403": {"description": "Fleet-wide result-set list denied to a service-scoped token"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — a genuine database read failure (Retry-After present)"}}},
       "post": {"summary": "Create a result set directly from pre-computed device ids", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires an authenticated session; service-scoped API tokens are denied outright (403, same cross-service-reach reasoning as the GET list). Synchronous — lands materialized immediately (e.g. dashboard \"I have a CSV\" import), unlike the from-* async producers below. An optional parent_id parents the new set onto an owned existing set (governance B2: the parent is owner-checked before the lineage edge is persisted). When device_ids is non-empty, the route additionally gates that field through the admit-then-filter Infrastructure:Read chokepoint (fleet_read_fn, ADR-0017) — a request that omits device_ids (or supplies an empty array) is unaffected and pays no extra cost (#4983).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "source_kind": {"type": "string", "default": "manual_curate"}, "source_payload": {"description": "Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"}, "parent_id": {"type": "string", "maxLength": 64, "description": "An existing set owned by the caller to parent this one onto"}, "device_ids": {"type": "array", "items": {"type": "string", "maxLength": 256}, "description": "The initial member set. Each entry is capped at 256 bytes (400 RESULT_SET_DEVICE_ID_TOO_LONG, checked before the existence/scope lookup below). #4983: every entry must name a device that exists and is visible to the caller's own scope (checked via the Infrastructure:Read fleet_read_fn chokepoint, ADR-0017) -- a nonexistent or out-of-scope id rejects the WHOLE request (400 RESULT_SET_UNKNOWN_DEVICE_ID), never a silent drop or a partial create"}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "400": {"description": "Invalid JSON, a device_ids entry exceeding 256 bytes (RESULT_SET_DEVICE_ID_TOO_LONG), device_ids exceeds the per-set member cap (100000, RESULT_SET_TOO_MANY_MEMBERS), device_ids contains an id that does not exist or is not visible to the caller (RESULT_SET_UNKNOWN_DEVICE_ID -- rejects the whole request, checked only when device_ids is non-empty), parent_id supplied but empty/non-string (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "403": {"description": "Result-set create denied to a service-scoped token"}, "404": {"description": "parent_id supplied but not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (10000, RESULT_SET_QUOTA)"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE -- the device_ids existence/scope check itself is unwired or its backing agent registry is unavailable; only reachable when device_ids is non-empty, a request without it is unaffected"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #4980 fix: the
@@ -1611,7 +1611,7 @@ const std::string& openapi_spec() {
         // continues: remaining result-set / software-deployment / license CRUD.
         R"json(
     "/result-sets/{id}/members": {
-      "get": {"summary": "List a result set's member device ids", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped; service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}, {"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-10000 (default 1000)"}], "responses": {"200": {"description": "{device_ids: [...], next_cursor}"}, "403": {"description": "Result-set members denied to a service-scoped token"}, "404": {"description": "Not found, or not owned by the caller"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership"}}}
+      "get": {"summary": "List a result set's member device ids", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped; service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}, {"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-10000 (default 1000); an integer outside the range uses the default"}], "responses": {"200": {"description": "{device_ids: [...], next_cursor}"}, "400": {"description": "limit is not one base-10 integer"}, "403": {"description": "Result-set members denied to a service-scoped token"}, "404": {"description": "Not found, or not owned by the caller"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership"}}}
     },
     "/result-sets/{id}/lineage": {
       "get": {"summary": "Walk a result set's parent chain", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped; service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "{chain: [{id, name, source_kind, device_count}, ...]} — root-to-self order"}, "403": {"description": "Result-set lineage denied to a service-scoped token"}, "404": {"description": "Not found, or not owned by the caller"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership"}}}
@@ -5055,9 +5055,21 @@ void RestApiV1::register_routes(
             }
 
             auto body = nlohmann::json::parse(req.body, nullptr, false);
+            // ttl_days is ABSENT-only defaulted (90): a string, float, bool, null or a value
+            // above INT64_MAX is a 400, like the MCP twin, not a thrown type error or a
+            // truncated float. An empty or non-JSON body is "no ttl_days" (the route's body is
+            // optional).
             int64_t ttl_days = 90;
-            if (!body.is_discarded() && body.is_object() && body.contains("ttl_days"))
-                ttl_days = body.value("ttl_days", int64_t{90});
+            if (!body.is_discarded()) {
+                const auto ttl_opt = read_json_int_strict(body, "ttl_days", 90);
+                if (!ttl_opt) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "ttl_days must be between 1 and 90"),
+                                    "application/json");
+                    return;
+                }
+                ttl_days = *ttl_opt;
+            }
             if (ttl_days < 1 || ttl_days > 90) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "ttl_days must be between 1 and 90"),
@@ -8982,9 +8994,13 @@ void RestApiV1::register_routes(
             res.set_content(detail::a4_error(res, *bound_err), "application/json");
             return;
         }
-        q.limit = body.value("limit", 100);
-        if (q.limit > 1000)
-            q.limit = 1000;
+        // #4644: `limit` is read as 64 bits and range-checked before narrowing (a JSON
+        // 4294967297 wrapped to 1 through the int read); below 1 or non-integer is a 400.
+        if (const auto limit_err = read_json_page_limit(body, "limit", 100, 1000, q.limit)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, *limit_err), "application/json");
+            return;
+        }
 
         bool inventory_truncated = false;
         auto records = inventory_store->query(q, &inventory_truncated);
@@ -9467,6 +9483,14 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
+                 // A limit below 1 is refused like the MCP twin (-32602); it used to be read as
+                 // the default 50, answering a different query than the caller asked.
+                 if (q.limit < 1) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "limit must be at least 1"),
+                                     "application/json");
+                     return;
+                 }
                  if (q.limit > 1000)
                      q.limit = 1000;
                  if (gate.scope)
@@ -9517,6 +9541,12 @@ void RestApiV1::register_routes(
                  if (q.since && *q.since < 0) {
                      res.status = 400;
                      res.set_content(detail::a4_error(res, "since must not be negative"),
+                                     "application/json");
+                     return;
+                 }
+                 if (q.limit < 1) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "limit must be at least 1"),
                                      "application/json");
                      return;
                  }
@@ -15275,7 +15305,7 @@ void RestApiV1::register_routes(
 
         // Validate the paging parameters BEFORE the behavioural-PII access audit below: a request
         // rejected with a 400 serves no device data, so it must not leave a `success` access row
-        // (#4644: the strict parse introduced a 400 path that used to be unreachable).
+        // (the audit row would otherwise claim an access that never happened).
         if (req.has_param("limit")) {
             // Strict full-consumption parse: `10abc` is a 400, not 10 (#4644).
             const auto parsed = parse_query_int<int>(req.get_param_value("limit"));

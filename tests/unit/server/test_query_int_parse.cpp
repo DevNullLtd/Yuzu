@@ -235,3 +235,52 @@ TEST_CASE("read_json_epoch_window: presence-tracked bounds and until of zero ref
         }
     }
 }
+
+// The JSON-body page-size reader shared by the legacy and v1 inventory query routes (#4644): a
+// 4294967297 used to wrap to 1 through the int read.
+TEST_CASE("read_json_page_limit: 64-bit read, range check, then narrow", "[query_int_parse][numeric_params]") {
+    using yuzu::server::read_json_page_limit;
+    const auto run = [](const char* body, int& out) {
+        return read_json_page_limit(nlohmann::json::parse(body), "limit", 100, 1000, out);
+    };
+    int out = -1;
+
+    SECTION("absent takes the default") {
+        CHECK_FALSE(run("{}", out).has_value());
+        CHECK(out == 100);
+    }
+    SECTION("in-range values pass through, an oversize value clamps to the maximum") {
+        CHECK_FALSE(run(R"({"limit":1})", out).has_value());
+        CHECK(out == 1);
+        CHECK_FALSE(run(R"({"limit":1000})", out).has_value());
+        CHECK(out == 1000);
+        CHECK_FALSE(run(R"({"limit":1001})", out).has_value());
+        CHECK(out == 1000);
+    }
+    SECTION("a value that would wrap through a 32-bit read clamps, never wraps to a small one") {
+        for (const char* body : {R"({"limit":4294967297})", R"({"limit":4294977296})",
+                                 R"({"limit":9223372036854775807})", R"({"limit":18446744073709551615})"}) {
+            INFO(body);
+            out = -1;
+            CHECK_FALSE(run(body, out).has_value());
+            CHECK(out == 1000);
+        }
+    }
+    SECTION("below one is refused") {
+        for (const char* body : {R"({"limit":0})", R"({"limit":-1})", R"({"limit":-9223372036854775808})"}) {
+            INFO(body);
+            const auto err = run(body, out);
+            REQUIRE(err.has_value());
+            CHECK(*err == "limit must be at least 1");
+        }
+    }
+    SECTION("a present non-integer is refused, never read as the default") {
+        for (const char* body : {R"({"limit":"5"})", R"({"limit":5.5})", R"({"limit":null})",
+                                 R"({"limit":true})", R"({"limit":[]})"}) {
+            INFO(body);
+            const auto err = run(body, out);
+            REQUIRE(err.has_value());
+            CHECK(*err == "limit must be a JSON integer");
+        }
+    }
+}

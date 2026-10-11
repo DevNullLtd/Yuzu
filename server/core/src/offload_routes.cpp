@@ -3,6 +3,7 @@
 
 #include "offload_target_model.hpp" // adversarial-review fix (#2146 Batch B5): shared REST+MCP JSON builders (Rule 1)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
+#include "web_utils.hpp"             // audit_token (CWE-117: the caller-supplied name is a target_id)
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -118,16 +119,16 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // A present-but-wrong-typed field (e.g. batch_size as a
                       // string) throws type_error out of body.value() — that's
                       // still a caller mistake, not a server fault (#3097).
-                      audit_fn(req, "offload_target.create", "denied", "offload_target", name,
-                               "invalid_field_type");
+                      audit_fn(req, "offload_target.create", "denied", "offload_target",
+                               audit_token(name), "invalid_field_type");
                       send_bad_json(res);
                       return;
                   }
                   if (!batch_size_is_integer) {
                       // A float/bool/null/string batch_size: same caller mistake as a
                       // wrong-typed field above (a float used to truncate silently).
-                      audit_fn(req, "offload_target.create", "denied", "offload_target", name,
-                               "invalid_field_type");
+                      audit_fn(req, "offload_target.create", "denied", "offload_target",
+                               audit_token(name), "invalid_field_type");
                       send_bad_json(res);
                       return;
                   }
@@ -138,8 +139,8 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       return;
                   }
                   if (batch_size_wide < 1 || batch_size_wide > kMaxOffloadBatchSize) {
-                      audit_fn(req, "offload_target.create", "denied", "offload_target", name,
-                               "validation_failed");
+                      audit_fn(req, "offload_target.create", "denied", "offload_target",
+                               audit_token(name), "validation_failed");
                       res.status = 400;
                       res.set_content(
                           detail::a4_error(res, "batch_size must be an integer from 1 to " +
@@ -156,8 +157,8 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // "bearre" into an unauthenticated target instead of
                       // rejecting it — round-trip through to_string() to catch
                       // exactly that case without touching the shared helper.
-                      audit_fn(req, "offload_target.create", "denied", "offload_target", name,
-                               "invalid_auth_type");
+                      audit_fn(req, "offload_target.create", "denied", "offload_target",
+                               audit_token(name), "invalid_auth_type");
                       res.status = 400;
                       res.set_content(detail::a4_error(res, "unrecognized auth_type"),
                                       "application/json");
@@ -172,8 +173,8 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // store/infra degradation (503) — distinct in the
                       // audit record even where the HTTP status collapses.
                       if (result.error() == OffloadWriteError::invalid_input) {
-                          audit_fn(req, "offload_target.create", "denied", "offload_target", name,
-                                   "validation_failed");
+                          audit_fn(req, "offload_target.create", "denied", "offload_target",
+                                   audit_token(name), "validation_failed");
                           res.status = 400;
                           res.set_content(
                               detail::a4_error(res, "target rejected: invalid url, name, "
@@ -183,8 +184,8 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                           const char* detail = result.error() == OffloadWriteError::store_unavailable
                                                   ? "store_unavailable"
                                                   : "db_error";
-                          audit_fn(req, "offload_target.create", "denied", "offload_target", name,
-                                   detail);
+                          audit_fn(req, "offload_target.create", "denied", "offload_target",
+                                   audit_token(name), detail);
                           send_unavailable(res);
                       }
                       return;

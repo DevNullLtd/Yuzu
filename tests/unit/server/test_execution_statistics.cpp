@@ -594,6 +594,10 @@ TEST_CASE("ExecutionStatistics: try_get_* reports a degraded store as nullopt an
     CHECK_FALSE(tracker.try_get_agent_statistics().has_value());
     CHECK_FALSE(tracker.try_get_definition_statistics().has_value());
     CHECK_FALSE(tracker.try_get_fleet_summary().has_value());
+    // The deny-all fast path answers before any query, so it stays an honest empty even while the
+    // store is degraded (a present-empty visible set reads nothing it could fail to read).
+    REQUIRE(tracker.try_get_agent_statistics(none).has_value());
+    CHECK(tracker.try_get_agent_statistics(none)->empty());
     // The plain forms keep their documented collapse for callers that cannot report a degrade.
     CHECK(tracker.get_agent_statistics().empty());
     CHECK(tracker.get_fleet_summary().total_executions == 0);

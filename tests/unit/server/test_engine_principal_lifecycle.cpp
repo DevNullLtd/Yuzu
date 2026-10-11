@@ -1252,6 +1252,48 @@ TEST_CASE("Engine-principal REST: transfer-owner 200 success path (previously "
 // [audit_failclose] cases.)
 // ═══════════════════════════════════════════════════════════════════════════
 
+TEST_CASE("Engine-principal REST: mint reads ttl_days strictly, the default applies only when the "
+          "key is ABSENT (#4644)",
+          "[pg][rest][engine_principal]") {
+    RestEngineHarness h;
+    const auto post_mint = [&h](const std::string& principal_id, const std::string& body) {
+        return h.sink.Post("/api/v1/engine-principals/" + principal_id + "/credentials", body);
+    };
+    const auto fresh_principal = [&h](const std::string& slug) {
+        auto cres = h.create(slug);
+        REQUIRE(cres);
+        REQUIRE(cres->status == 201);
+        return nlohmann::json::parse(cres->body)["data"]["principal_id"].get<std::string>();
+    };
+
+    // A wrong-typed, fractional or out-of-range value used to throw a nlohmann type error, truncate
+    // (5.5 -> 5) or wrap (4294967297); each is a 400 and mints nothing. A fresh principal per body:
+    // a successful mint would otherwise turn the next probe into a 409.
+    int n = 0;
+    for (const char* bad : {R"({"ttl_days":"7"})", R"({"ttl_days":5.5})", R"({"ttl_days":true})",
+                            R"({"ttl_days":null})", R"({"ttl_days":0})", R"({"ttl_days":91})",
+                            R"({"ttl_days":-1})", R"({"ttl_days":4294967297})",
+                            R"({"ttl_days":18446744073709551615})"}) {
+        INFO(bad);
+        const auto pid = fresh_principal("ttl-strict-" + std::to_string(n++));
+        auto res = post_mint(pid, bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.token_store->list_active_for_principal(pid).empty());
+    }
+
+    // The ABSENT paths keep working: an empty object, and an in-range integer.
+    const auto absent = fresh_principal("ttl-strict-absent");
+    auto res_absent = post_mint(absent, "{}");
+    REQUIRE(res_absent);
+    CHECK(res_absent->status == 201);
+
+    const auto seven = fresh_principal("ttl-strict-seven");
+    auto res_seven = post_mint(seven, R"({"ttl_days":7})");
+    REQUIRE(res_seven);
+    CHECK(res_seven->status == 201);
+}
+
 TEST_CASE("Engine-principal REST: a mutation whose audit write drops fails CLOSED "
           "(503 + Sec-Audit-Failed)",
           "[pg][rest][engine_principal][audit_failclose]") {

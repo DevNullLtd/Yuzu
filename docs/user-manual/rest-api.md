@@ -264,7 +264,7 @@ Routes that parse strictly (the response routes are listed in
 
 | Family | Routes and parameters |
 |---|---|
-| Execution statistics | `GET /api/v1/execution-statistics/agents` and `/definitions`: `since`, `limit` (a negative `since` is `400` too; a `limit` of `0` or below uses the default 50, whereas the MCP twins reject it with `-32602`) |
+| Execution statistics | `GET /api/v1/execution-statistics/agents` and `/definitions`: `since`, `limit` (a negative `since` is `400` too, and so is a `limit` below 1, which the MCP twins also reject with `-32602`) |
 | Executions | `GET /api/executions`, `GET /api/v1/executions`: `limit`; `GET /api/v1/executions/{id}/visualization`: `index` |
 | Audit | `GET /api/v1/audit`: `limit`; `GET /api/audit`: `since`, `until`, `limit`, `offset`; `GET /api/analytics/recent`: `limit` (a malformed value used to be ignored) |
 | Instructions, product packs, workflows | `GET /api/instructions`, `GET /api/v1/instructions`, `GET /api/v1/product-packs`, `GET /api/product-packs`, `GET /api/workflows`, `GET /api/v1/workflows`: `limit` |
@@ -272,7 +272,7 @@ Routes that parse strictly (the response routes are listed in
 | Patches | `GET /api/patches`, `GET /api/patches/deployments`: `limit` (a malformed value used to be ignored; a negative `limit` is `400` too, where the store answered an empty `200`) |
 | Inventory | `GET /api/v1/inventory/software`: `limit` (trailing characters were read as their numeric prefix) |
 | Fleet visualization | `GET /api/v1/viz/fleet/topology`: `machines_max` |
-| Verification | the app-performance compare route: `window` (a malformed value used to fall back to 7 days). This dashboard fragment keeps its own rejection style: an honest `200` note ("The window must be a whole number of days."), because the dashboard's htmx config drops `4xx` bodies; nothing is computed or audited. The other dashboard fragments in this table (results, inventory, hardware, DEX perf, network quality) still answer a JSON `400` that an operator in the dashboard never sees: that is a known UX gap that a follow-up tracks, not a deliberate inconsistency |
+| Verification | the app-performance compare route: `window` (a malformed value used to fall back to 7 days). This dashboard fragment keeps its own rejection style: an honest `200` note ("The window must be a whole number of days."), because the dashboard's htmx config drops `4xx` bodies; nothing is computed or audited. The other dashboard fragments in this table (results, inventory, hardware, DEX perf, network quality) still answer a JSON `400` that an operator in the dashboard never sees: that is a known UX gap, tracked as an open ledger row (no issue is filed yet), not a deliberate inconsistency |
 | Dashboard fragments | `GET /fragments/results`: `page`, `per_page`; the software inventory fragments (`/fragments/inventory/software`, `/software/devices`): `limit`; the DEX perf devices fragment and the network quality devices fragment: `limit`; the hardware list fragment and `GET /api/v1/hardware`: `offset`, `limit` (a negative value is refused too, it used to be clamped to `0`); the hardware sync poll: `await_since` (a malformed freshness bound used to read as "no bound", so a stale snapshot could be served as fresh); `GET /fragments/tar/process-tree/detail`: `node` (`stoul` read `-1` as the largest node id and `5x` as `5`) |
 | Delivery and list routes | `GET /api/notifications`: `limit`, `offset` (a negative value is `400` too, where the store answered an empty `200`); `GET /api/webhooks/{id}/deliveries` and `GET /api/v1/offload-targets/{id}/deliveries`: `limit`; `GET /api/v1/ca/issued`: `limit`, `offset`; `GET /api/v1/preflight/runs`: `limit`; the pre-flight run form: `min_gib` and `window` (a malformed value is `400`; a negative `min_gib` is `400` too; see [Pre-flight readiness checks](preflight.md)); `GET /api/v1/result-sets` and `GET /api/v1/result-sets/{id}/members`: `limit` (trailing characters are `400`, not their numeric prefix; an integer outside the route's page range still uses the default page size); `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices` and `GET /api/v1/network/devices`: `limit`; `GET /api/v1/guaranteed-state/events`: `limit` and `offset` (a negative value is `400` too; both are parsed before the `dex.device.view` audit row is written, so a `400` leaves no access row) |
 | Event streams | `GET /api/v1/events`: `since` (a non-negative integer; a malformed value is `400`, answered before the stream budget is touched). A malformed `Last-Event-ID` **header** on `GET /api/v1/events` or the workflow execution stream is served **live only**: nothing buffered is replayed (never the whole ring buffer) and it is not a `400`, because the header is browser-supplied inference and a `400` would fail a reconnect. The cursor is parsed strictly, so `-1` and `5abc` are never accepted as a position (`5abc` used to replay from position 5; `-1` wrapped past every event and also replayed nothing, so that input's outcome is unchanged); valid ids replay exactly as before. A rejected `?since` leaves no success audit row, because it is parsed before the audit write |
@@ -1273,7 +1273,7 @@ Mint the **first** credential for an engine principal. The raw secret is returne
 { "ttl_days": 90 }
 ```
 
-`ttl_days` defaults to `90` and must be between `1` and `90` (`400` otherwise — the engine-credential ceiling matches the tiered-token 90-day cap elsewhere on this surface).
+`ttl_days` defaults to `90` only when it is omitted. It must be a JSON integer between `1` and `90` (`400` otherwise, including a string, float, boolean or `null` — the engine-credential ceiling matches the tiered-token 90-day cap elsewhere on this surface).
 
 **Response (201):** headers carry `Cache-Control: no-store, no-cache, must-revalidate` and `Pragma: no-cache` so a shared proxy or browser history never retains the secret.
 
@@ -6787,7 +6787,7 @@ Query inventory data across agents with filters.
 | `plugin` | string | No | Filter by plugin name |
 | `since` | integer | No | Unix timestamp, inclusive lower bound on collection time. Omit for no lower bound; `0` is accepted and matches the same rows as omitting it; a negative value or a non-integer is `400` |
 | `until` | integer | No | Unix timestamp, inclusive upper bound on collection time. Omit for no upper bound; `0`, a negative value or a non-integer is `400` (`0` is not a way to say unbounded) |
-| `limit` | integer | No | Max results (default 100, max 1000) |
+| `limit` | integer | No | Max results (default 100, max 1000; a larger integer is clamped to 1000, a value below 1 or a non-integer is `400`) |
 
 **Response:** List of inventory records matching the query, plus top-level
 `result_truncated_by_cap`. When that flag is `true`, the server's row or 8 MiB aggregate
@@ -10278,7 +10278,7 @@ valid, else returned as a raw string. `404` if no record exists for that agent+p
 
 Query inventory records across agents. Request body (all fields optional):
 `{"agent_id": "...", "plugin": "...", "since": <epoch>, "until": <epoch>, "limit": N}`.
-`limit` is capped at 1000 regardless of the requested value. Returns `{"results": [...],
+`limit` is capped at 1000 regardless of the requested value (any larger integer, including one above the 32-bit range, clamps to 1000); a `limit` below 1 or one that is not a JSON integer is `400`. Returns `{"results": [...],
 "count": N, "result_truncated_by_cap": bool, "results_excluded_by_poison": N}`.
 `result_truncated_by_cap` is `true` when more matching rows existed than `limit`
 allowed; `results_excluded_by_poison` (#4496) is the count of matching rows

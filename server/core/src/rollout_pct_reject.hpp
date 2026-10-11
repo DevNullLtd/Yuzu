@@ -1,9 +1,10 @@
 #pragma once
 
-// The ONE response a malformed OTA `rollout_pct` gets, shared by BOTH routes that read it: the
-// package UPLOAD route (multipart, which the unit-test route sink cannot drive) and the ROLLOUT
-// route. A malformed percentage must never fall back to the 100% default (a full-fleet rollout
-// nobody asked for), so both answer 400 with nothing stored or changed. Sharing the response
+// The ONE response a rejected OTA `rollout_pct` gets, shared by BOTH routes that read it: the
+// package UPLOAD route (multipart, which the unit-test route sink cannot drive), which rejects a
+// malformed percentage, and the ROLLOUT route, which also rejects an empty or above-100 one
+// (`parse_rollout_pct_strict`). A rejected percentage must never fall back to the 100% default
+// (a full-fleet rollout nobody asked for), so both answer 400 with nothing stored or changed. Sharing the response
 // means the toast + A4 body are unit-testable without a multipart request, and the two sites
 // cannot drift apart (#4644 Gate 8 round 5).
 //

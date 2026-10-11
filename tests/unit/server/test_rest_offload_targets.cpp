@@ -164,6 +164,26 @@ TEST_CASE("REST offload-targets: create refuses a batch_size that wraps or is no
     }
 }
 
+TEST_CASE("REST offload-targets: a denied create row records the submitted name neutralised "
+          "(CWE-117)",
+          "[rest][offload][pg][security]") {
+    OffloadHarness h;
+    // CR/LF would split the audit line, a space or '=' would forge a `k=v` field, ',' separates
+    // fields: each maps to '_' in the recorded target_id (audit_token), on a rejection written
+    // before the store call.
+    nlohmann::json body = {{"name", "evil\r\nresult=success x,y"},
+                           {"url", "https://siem.example.com/ingest"},
+                           {"batch_size", 0}};
+    auto res = h.sink.Post("/api/v1/offload-targets", body.dump());
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "offload_target.create");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].detail == "validation_failed");
+    CHECK(h.audit_log[0].target_id == "evil__result_success_x_y");
+}
+
 TEST_CASE("REST offload-targets: create returns 201 and id", "[rest][offload][pg]") {
     OffloadHarness h;
     nlohmann::json body = {{"name", "siem-primary"},

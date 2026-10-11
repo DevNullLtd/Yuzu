@@ -77,9 +77,9 @@ struct SseReplayCursor {
 /// A rollout percentage from a form/query value: EMPTY means `empty_default` (the route's own
 /// documented default, 100 on the OTA routes), a malformed value is rejected (nullopt, the caller
 /// answers 400 and stores nothing -- a typo must never become a full-fleet rollout), and a valid
-/// integer is clamped to 0..100 as the routes have always documented. One helper for the OTA
-/// upload route (multipart, which TestRouteSink cannot drive) and the rollout route, so a unit
-/// test of THIS function covers both.
+/// integer is clamped to 0..100 as the routes have always documented. Used by the OTA upload
+/// route (multipart, which TestRouteSink cannot drive), so a unit test of THIS function covers
+/// it; the rollout (change) route uses the stricter `parse_rollout_pct_strict` below.
 [[nodiscard]] inline std::optional<int> parse_rollout_pct(std::string_view s, int empty_default = 100) {
     if (s.empty())
         return empty_default;
@@ -141,6 +141,60 @@ template <typename Json>
         return "since must not be negative";
     if (until && *until <= 0)
         return "until must be a positive epoch second or omitted";
+    return std::nullopt;
+}
+
+/// Strict JSON-body integer, the REST twin of mcp_server.cpp's `param_int_strict` (#4644). `Json`
+/// is nlohmann's type, taken as a template parameter so this header never includes it. ABSENT
+/// yields `def`. A PRESENT key must be one JSON integer in signed 64-bit range: a string, float,
+/// bool, null, or a value above INT64_MAX yields nullopt (the caller answers 400), never a
+/// truncation, a thrown type error, or a wrap to a different valid value. Range rules stay with
+/// the caller.
+template <typename Json>
+[[nodiscard]] std::optional<std::int64_t> read_json_int_strict(const Json& body, const char* key,
+                                                                std::int64_t def) {
+    if (!body.is_object() || !body.contains(key))
+        return def;
+    const auto& v = body[key];
+    if (!v.is_number_integer())
+        return std::nullopt;
+    if (v.is_number_unsigned() &&
+        v.template get<std::uint64_t>() >
+            static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+        return std::nullopt;
+    return v.template get<std::int64_t>();
+}
+
+/// Read an OPTIONAL page-size `limit` from a JSON request body (#4644). `Json` is nlohmann's type,
+/// taken as a template parameter so this header never includes it. ABSENT yields `default_value`.
+/// A PRESENT key must be one JSON integer: a string, float, bool or null is refused (the old
+/// `body.value("limit", 100)` threw on those or truncated a float), and the value is read as 64
+/// bits so a large integer can no longer wrap through a narrower read (4294967297 read as int is
+/// 1). An unsigned value above INT64_MAX saturates (it is then clamped like any other oversize
+/// value). A value below 1 is refused; one above `max_value` is clamped to it, as these routes have
+/// always documented. Returns nullopt when accepted (`out` holds the narrowed result), else the 400
+/// message for the caller to wrap in its route's error envelope. Shared by the legacy and v1
+/// inventory query routes so the two cannot drift.
+template <typename Json>
+[[nodiscard]] std::optional<std::string> read_json_page_limit(const Json& body, const char* key,
+                                                              int default_value, int max_value,
+                                                              int& out) {
+    out = default_value;
+    if (!body.contains(key))
+        return std::nullopt;
+    const auto& v = body[key];
+    if (!v.is_number_integer())
+        return std::string(key) + " must be a JSON integer";
+    std::int64_t wide{};
+    if (v.is_number_unsigned() &&
+        v.template get<std::uint64_t>() >
+            static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
+        wide = std::numeric_limits<std::int64_t>::max();
+    else
+        wide = v.template get<std::int64_t>();
+    if (wide < 1)
+        return std::string(key) + " must be at least 1";
+    out = wide > max_value ? max_value : static_cast<int>(wide);
     return std::nullopt;
 }
 

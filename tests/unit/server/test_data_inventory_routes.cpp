@@ -287,6 +287,40 @@ TEST_CASE("POST /api/inventory/query: since and until are presence-tracked and u
           "until must be a positive epoch second or omitted");
 }
 
+TEST_CASE("POST /api/inventory/query: limit is read as 64 bits and a wrapped, zero, negative or "
+          "non-integer value is not silently a different page size (#4644)",
+          "[server][routes][data_inventory_routes][rest][pg]") {
+    PgHarness h;
+    h.store->upsert("agent-1", "limit_src", R"({"x":1})", 100);
+    h.store->upsert("agent-2", "limit_src", R"({"x":2})", 200);
+    h.store->upsert("agent-3", "limit_src", R"({"x":3})", 300);
+
+    const auto rows = [&h](const std::string& limit) -> std::size_t {
+        auto res = h.sink.Post("/api/inventory/query",
+                               R"({"plugin":"limit_src","limit":)" + limit + "}");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        return body["results"].size();
+    };
+    CHECK(rows("2") == 2);
+    // 4294967297 wrapped to 1 through the int read and answered one row.
+    CHECK(rows("4294967297") == 3);
+    CHECK(rows("18446744073709551615") == 3);
+
+    for (const char* bad : {R"({"limit":0})", R"({"limit":-1})", R"({"limit":"5"})",
+                            R"({"limit":5.5})", R"({"limit":null})", R"({"limit":true})"}) {
+        INFO(bad);
+        auto res = h.sink.Post("/api/inventory/query", bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto body = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["error"]["code"] == 400);
+    }
+}
+
 TEST_CASE("POST /api/inventory/query: invalid JSON body is a 400",
           "[server][routes][data_inventory_routes][rest][pg]") {
     PgHarness h;

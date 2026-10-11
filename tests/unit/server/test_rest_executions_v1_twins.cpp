@@ -787,6 +787,28 @@ TEST_CASE("GET /api/v1/execution-statistics/{agents|definitions}: a malformed si
     CHECK(ok->status == 200);
 }
 
+TEST_CASE("GET /api/v1/execution-statistics/{agents|definitions}: a limit below 1 is a 400 like "
+          "the MCP twin, not the default 50 (#4644)",
+          "[pg][rest][executions][v1][statistics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    h.make_exec_with_agents("def-stats-limit-floor");
+
+    const std::string route = GENERATE(as<std::string>{}, "/api/v1/execution-statistics/agents",
+                                       "/api/v1/execution-statistics/definitions");
+    for (const char* bad : {"limit=0", "limit=-1", "limit=-2147483648"}) {
+        INFO(route << "?" << bad);
+        auto res = h.sink.Get(route + "?" + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "limit must be at least 1");
+    }
+    auto one = h.sink.Get(route + "?limit=1");
+    REQUIRE(one);
+    CHECK(one->status == 200);
+}
+
 TEST_CASE("GET /api/v1/executions: a trailing-garbage limit is a 400 not the numeric prefix "
           "(#4644)",
           "[pg][rest][executions][v1]") {

@@ -22,6 +22,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <optional>
 #include <stdexcept>
@@ -365,7 +366,27 @@ TEST_CASE("preflight routes: /fragments/auto/run 400s on a malformed min_gib or 
         REQUIRE(res);
         CHECK(res->status == 200);
     }
-    CHECK(dispatched >= 3);
+    // Each accepted run dispatches every applicable check once. With no app_name the "app" check is
+    // skipped, leaving 4 of the 5, so the count is exact: 3 runs.
+    constexpr int per_run = 4;
+    CHECK(dispatched == 3 * per_run);
+
+    // A window of zero or below is not malformed, it means the default 30 minutes (1800 s).
+    for (const char* dflt : {"min_gib=20&window=0", "min_gib=20&window=-5"}) {
+        INFO(dflt);
+        auto res = sink.Post("/fragments/auto/run", dflt, "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    // Five runs now: the explicit 30, the empty field and the two non-positive windows are all
+    // 1800 s; only the explicit 1-minute window differs.
+    const auto runs = run_store.list_runs("", /*is_admin=*/true, /*limit=*/10);
+    REQUIRE(runs.size() == 5);
+    CHECK(std::count_if(runs.begin(), runs.end(),
+                        [](const auto& r) { return r.window_seconds == 30 * 60; }) == 4);
+    CHECK(std::count_if(runs.begin(), runs.end(),
+                        [](const auto& r) { return r.window_seconds == 60; }) == 1);
+    CHECK(dispatched == 5 * per_run);
 }
 
 // SEC-2/SEC-3 confinement-gap class (Gate 4 unhappy-path review, UP-1):

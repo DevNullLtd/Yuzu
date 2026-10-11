@@ -2478,8 +2478,20 @@ TEST_CASE("MCP mint_engine_credential: a wrong-typed ttl_days is -32602 and mint
         auto body = nlohmann::json::parse(r->body);
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("ttl_days") != std::string::npos);
     }
     CHECK(store.list_active_for_principal(principal).empty());
+
+    // Control: an in-range integer ttl_days is accepted by the same call shape, so the -32602s
+    // above are the value's doing and not a broken request.
+    auto ok = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,)"
+        R"("params":{"name":"mint_engine_credential","arguments":)"
+        R"({"principal_id":"engine:mcp-mint-ttl-type","ttl_days":7}}})");
+    REQUIRE(ok->status == 200);
+    auto ok_body = nlohmann::json::parse(ok->body);
+    CHECK_FALSE(ok_body.contains("error"));
+    CHECK(store.list_active_for_principal(principal).size() == 1);
 }
 
 // #3937 adversarial-review CDX-001/K6: a THROWING audit sink (bad_alloc-class) must

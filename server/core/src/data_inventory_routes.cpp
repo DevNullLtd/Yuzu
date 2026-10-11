@@ -4,7 +4,7 @@
 #include "inventory_store.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
-#include "query_int_parse.hpp" // read_json_epoch_window (#4644)
+#include "query_int_parse.hpp" // read_json_epoch_window, read_json_page_limit (#4644)
 
 #include <nlohmann/json.hpp>
 
@@ -143,9 +143,16 @@ void register_data_inventory_routes(HttpRouteSink& sink, Deps deps) {
                             "application/json");
             return;
         }
-        q.limit = body.value("limit", 100);
-        if (q.limit > 1000)
-            q.limit = 1000;
+        // #4644: `limit` is read as 64 bits and range-checked before narrowing (a JSON
+        // 4294967297 wrapped to 1 through the int read); below 1 or non-integer is a 400.
+        if (const auto limit_err = read_json_page_limit(body, "limit", 100, 1000, q.limit)) {
+            res.status = 400;
+            res.set_content(nlohmann::json{{"error", {{"code", 400}, {"message", *limit_err}}},
+                                           {"meta", {{"api_version", "v1"}}}}
+                                .dump(),
+                            "application/json");
+            return;
+        }
 
         bool inventory_truncated = false;
         auto records = deps.store->query(q, &inventory_truncated);

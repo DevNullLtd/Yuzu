@@ -217,6 +217,8 @@ TEST_CASE("OTA rollout change refuses an empty or above-100 percentage and chang
     OtaAuditHarness h{db.dsn()};
     h.seed(/*rollout_pct=*/10, /*mandatory=*/false);
 
+    // "%205" is a form-encoded leading space (" 5"): whitespace is not part of a base-10 integer,
+    // so it is refused rather than trimmed.
     for (const char* bad : {"", "101", "500", "%205"}) {
         INFO("rollout_pct='" << bad << "'");
         auto res = h.post_rollout("1.2.3", bad);
@@ -233,6 +235,18 @@ TEST_CASE("OTA rollout change refuses an empty or above-100 percentage and chang
         CHECK(res->status == 200);
         CHECK(h.registry->list_packages().front().rollout_pct == ok);
     }
+
+    // A negative value keeps its documented clamp to 0 (the least exposure, never a full-fleet
+    // value), and a percent-encoded digit is decoded before the parse.
+    h.seed(/*rollout_pct=*/60, /*mandatory=*/false);
+    auto neg = h.post_rollout("1.2.3", "-5");
+    REQUIRE(neg);
+    CHECK(neg->status == 200);
+    CHECK(h.registry->list_packages().front().rollout_pct == 0);
+    auto encoded = h.post_rollout("1.2.3", "%37");
+    REQUIRE(encoded);
+    CHECK(encoded->status == 200);
+    CHECK(h.registry->list_packages().front().rollout_pct == 7);
 }
 
 TEST_CASE("a rollout whose registry write does not commit is audited as failure, not success",

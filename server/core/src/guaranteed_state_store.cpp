@@ -537,7 +537,12 @@ GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
                 conn,
                 "SELECT 1 FROM guaranteed_state_store.guaranteed_state_rules WHERE rule_id = $1",
                 std::vector<std::string>{row.rule_id});
-            if (exists.status() == PGRES_TUPLES_OK && PQntuples(exists.get()) > 0)
+            // A failed probe is a store error, not "no such rule": reporting not-found would
+            // answer an operator 404 for a rule that exists.
+            if (exists.status() != PGRES_TUPLES_OK)
+                return std::unexpected("update failed: " +
+                                       std::string(PQresultErrorMessage(exists.get())));
+            if (PQntuples(exists.get()) > 0)
                 return std::unexpected("rule version out of range (1.." +
                                        std::to_string(kMaxRuleVersion) + ")");
         }

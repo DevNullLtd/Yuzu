@@ -2112,7 +2112,7 @@ ExecutionTracker::try_get_agent_statistics(const ExecutionStatsQuery& q) const {
     // Present-empty is deny-all, never "no filter" (answered before the lease above).
     if (visible_array) {
         sql += " AND a.agent_id = ANY($" + std::to_string(idx++) + "::text[])";
-        params.push_back(*visible_array);
+        params.push_back(std::move(*visible_array));
     }
     sql += " GROUP BY a.agent_id ORDER BY total DESC LIMIT $" + std::to_string(idx++);
     params.push_back(std::to_string(q.limit > 0 ? q.limit : 50));

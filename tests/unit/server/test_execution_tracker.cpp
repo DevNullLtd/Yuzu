@@ -1377,6 +1377,13 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades every
     closed.refresh_counts("exec-1");
     CHECK_FALSE(closed.mark_cancelled("exec-1", "tester"));
     CHECK_FALSE(closed.set_agents_targeted("exec-1", 1));
+
+    // #4644: a closed tracker is a degraded statistics read even for a present-empty (deny-all)
+    // visible set -- the deny-all fast path must not turn "store not open" into an honest empty.
+    CHECK_FALSE(closed.try_get_agent_statistics().has_value());
+    ExecutionStatsQuery deny_all;
+    deny_all.visible_agents = std::vector<std::string>{};
+    CHECK_FALSE(closed.try_get_agent_statistics(deny_all).has_value());
 }
 
 // "v2 probe stamps straight through..."/"v2 probe does not silently skip

@@ -1256,6 +1256,12 @@ TEST_CASE("REST gs.events: a trailing-garbage limit or offset is a 400 not its p
     }
     // A rejected request serves no device data, so it must leave no dex.device.view access row.
     CHECK(h.audit_log.empty());
+
+    // Control: the same route with a clean limit/offset is a 200, so the 400s above are the
+    // value's doing and not a broken route.
+    auto ok = h.sink.Get("/api/v1/guaranteed-state/events?limit=10&offset=0");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
 }
 
 // ── SEC-3 regression coverage: agent_id present → scoped_perm_fn, agent_id
