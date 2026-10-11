@@ -363,3 +363,17 @@ TEST_CASE("openapi_spec_json(): every $ref (including discriminator.mapping "
     INFO("Unresolved $ref targets:\n" << unresolved_list);
     REQUIRE(unresolved.empty());
 }
+
+TEST_CASE("openapi_spec_json(): agent-count-preview documents the 414 transport limit and the "
+          "filter parameter bound (#5623)",
+          "[openapi][facet]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& get = spec["paths"]["/management-groups/agent-count-preview"]["get"];
+    const std::string desc = get.value("description", "");
+    CHECK(desc.find("bare 414") != std::string::npos);
+    CHECK(desc.find("8192 bytes") != std::string::npos);
+    CHECK(desc.find("other than command_id and plugin is treated as a filter") !=
+          std::string::npos);
+    CHECK(desc.find("2048 bytes") != std::string::npos);
+}
