@@ -118,8 +118,8 @@ used as-is — they aren't renames, so they create no split-brain.
      `drift.remediated`, `remediation.failed` (remediate); `resilience.escalated`,
      `reconciliation.swept` (later); `guard.errored` (lifecycle detach, #2818, spark
      backend only, dormant until `prefer_spark` ships). The list is not exhaustive:
-     `guard.disarmed` and `guard.healthy` are also live wire tokens
-     (`agents/core/src/guardian_outbox.hpp:65-66`). Unknown types render generic,
+     `guard.disarmed` and `guard.healthy` are also wire tokens, emitted only by the spark
+     backend (`agents/core/src/guardian_outbox.hpp:65-66`). Unknown types render generic,
      not broken.
      `guard.compliant` is the agent's **on-change** signal that a watched value is at /
      returned to expected (emitted on the compliant↔drift edge only, never in steady
