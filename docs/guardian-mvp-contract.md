@@ -119,7 +119,10 @@ used as-is — they aren't renames, so they create no split-brain.
      `reconciliation.swept` (later). Unknown types render generic, not broken.
      `guard.compliant` is the agent's **on-change** signal that a watched value is at /
      returned to expected (emitted on the compliant↔drift edge only, never in steady
-     state); it drives the server-side compliance census (`guardian_agent_rule_status`).
+     state); it drives the server-side compliance census (`guardian_agent_rule_status`)
+     together with `drift.remediated` and `drift.detected` (compliant / drifted) and
+     `remediation.failed`, `guard.unhealthy` and the lifecycle detach `guard.errored`
+     (#2818, spark backend only, dormant until `prefer_spark` ships) (errored).
    - The agent reports **observation-only** fields (`rule_id`/guard id, `event_type`,
      `guard_type`, `guard_category`, `detected_value`, `expected_value`,
      `detection_latency_us`, agent-stamped `timestamp`; + `remediation_*` on remediate
