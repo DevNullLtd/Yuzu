@@ -926,15 +926,15 @@ def _selftest():
     # or the guard fails loudly instead of silently inspecting half the
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
-    # Windows CI test-phase restructuring (#3443, 2026-08-28): 12 pg shards
-    # (10 + shard K + shard L, ADR-0065's instruction-cluster carve,
-    # 2026-08-31) + 4 non-pg shards (A/B + shard C, then a later
-    # measured-by-time follow-up added shard D, carved from B's [body_cap]
-    # tests) + the smoke entry (also server_test_exe) = 17. The floor stays
-    # a loose ">=", same spirit as the original "twelve" (itself a floor,
-    # not an exact pin) -- exactness is check-pg-shard-partition.py's job,
-    # against the real binary.
-    check(len(_entries) >= 17, "meson.build: all seventeen server shard entries located")
+    # Counted from tests/meson.build 2026-10-11 (regex over the test()
+    # entries, cross-checked against check-pg-shard-partition.py): 16 pg
+    # shards (A-P: the original ten, K, L, then M, N, O and P from the
+    # pg-shard rebalance) + 4 non-pg shards (A/B + shard C, then shard D
+    # carved from B's [body_cap] tests) + the smoke entry (also
+    # server_test_exe) = 21. The floor stays a loose ">=" (not an exact pin):
+    # exactness is check-pg-shard-partition.py's job, against the real
+    # binary. Raised from 17 in the same change that grew the pg suite to 16.
+    check(len(_entries) >= 21, "meson.build: all twenty-one server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -995,9 +995,9 @@ def _selftest():
     # 2026-08-28) -- comparatively stable, unlike the pg shards, which get
     # rebalanced -- so a small verbatim pin is proportionate for them
     # specifically. Plus a COUNT-based (not exact-string) sanity check that
-    # extraction still finds a real pg-shard population (now 12: 10 + shard
-    # K + shard L, plus the smoke entry makes 13 total non-excluded specs --
-    # see the comment on the >= 13 floor below), as a second, independent signal
+    # extraction still finds a real pg-shard population (now 16, plus the
+    # smoke entry makes 17 total non-excluded specs -- see the comment on the
+    # >= 17 floor below), as a second, independent signal
     # alongside check-pg-shard-partition.py's own hollow-discovery guard, in
     # case the two checks are ever run without each other.
     _NONPG_SPECS = (
@@ -1010,16 +1010,14 @@ def _selftest():
     _pg_specs = [s for s in _shard_specs if s not in _NONPG_SPECS]
     check(all(spec in _shard_specs for spec in _NONPG_SPECS),
           "meson.build: all four non-pg shard tag filters extracted verbatim")
-    # _pg_specs = 12 real pg shards (10 + K + L, ADR-0065's instruction-
-    # cluster carve, 2026-08-31) + the smoke entry (also server_test_exe,
-    # also not one of the three excluded non-pg tuples) = 13. The smoke
-    # entry's own spec ('[pg-smoke]',) has always been counted here; this is
-    # a pre-existing property of the extraction, not new to any split
-    # (verified against the pre-split source: smoke was already included,
-    # making the OLD floor's true value 11 before K, not the "10 pg-shard
-    # entries" an even older message claimed).
-    check(len(_pg_specs) >= 13,
-          f"meson.build: at least 13 pg-shard-or-smoke entries found (got {len(_pg_specs)}) "
+    # _pg_specs = 16 real pg shards (A-P; counted 2026-10-11) + the smoke
+    # entry (also server_test_exe, also not one of the four excluded non-pg
+    # tuples) = 17. The smoke entry's own spec ('[pg-smoke]',) has always
+    # been counted here; this is a pre-existing property of the extraction,
+    # not new to any split. Raised from 13 in the same change that grew the
+    # pg suite from 12 to 16 shards.
+    check(len(_pg_specs) >= 17,
+          f"meson.build: at least 17 pg-shard-or-smoke entries found (got {len(_pg_specs)}) "
           "-- exact partition identity is proven separately, against the real "
           "binary, by check-pg-shard-partition.py")
 

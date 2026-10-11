@@ -1199,7 +1199,8 @@ jobs:
         # cpu_count() (this runner's job is genuinely confined to execute on 16
         # logical CPUs via cgroup, "Self-hosted runner topology" in
         # docs/ci-architecture.md, but meson's own pool sizing ignores that) — so
-        # the ~10 server pg shards ran CONCURRENTLY inside this one job, sharing
+        # the server pg shards (~10 when this was diagnosed; 16 now) ran
+        # CONCURRENTLY inside this one job, sharing
         # those 16 CPUs AND the one ensure-postgres.sh container this job got.
         # Proved via back-computed shard start times (printed-timestamp minus
         # elapsed) landing within ~0.01s of each other across every pg shard in a
