@@ -251,6 +251,27 @@ def _synth_string(name: str, schema: dict) -> str:
     return "x" * max(int(min_len), 1)
 
 
+# Values tried, in order, when the name-based string default fails the parameter's
+# `validation.pattern`. The server rejects a value that does not match (HTTP 400), so
+# without this the runner reports a false FAIL for every pattern-constrained string
+# whose name the table above does not recognise.
+_PATTERN_FALLBACKS = ("10", "info", "192.168.1.0/24", "yuzu-uat-test-id", "x")
+
+
+def _fit_pattern(value: str, schema: dict) -> str:
+    """`value` if it satisfies the schema's `validation.pattern`, else the first fallback
+    that does; `value` unchanged when there is no pattern or nothing matches (the server
+    then reports the mismatch, which is the honest outcome)."""
+    pattern = (schema.get("validation") or {}).get("pattern")
+    if not pattern:
+        return value
+    try:
+        rx = re.compile(pattern)
+    except re.error:
+        return value
+    return next((c for c in (value, *_PATTERN_FALLBACKS) if rx.search(c)), value)
+
+
 def _value_for_property(name: str, schema: dict) -> Any:
     """Synthesise a sane default for a single parameter property.
 
@@ -269,7 +290,7 @@ def _value_for_property(name: str, schema: dict) -> Any:
     t = schema.get("type", "string")
 
     if t in ("string", None):
-        return _synth_string(name, schema)
+        return _fit_pattern(_synth_string(name, schema), schema)
 
     if t in ("integer", "int", "int32", "int64", "number"):
         validation = schema.get("validation", {}) or {}
