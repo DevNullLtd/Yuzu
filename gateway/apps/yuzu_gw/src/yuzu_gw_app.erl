@@ -600,7 +600,8 @@ check_upstream_tls_posture() ->
         {error, unverified_upstream_tls} ->
             logger:critical(
                 "Refusing to start: the upstream channel uses TLS (https) WITHOUT "
-                "{verify,verify_peer} — encrypted but UNAUTHENTICATED (MITM-able). Add "
+                "{verify,verify_peer} and a {cacertfile,...} of its own — encrypted but "
+                "UNAUTHENTICATED (MITM-able), or trusting the operating system's CAs. Add "
                 "{verify,verify_peer} + {cacertfile,...} to the default_channel SslOpts "
                 "(see config/sys.config.prod). Dev/CI may override with "
                 "YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1."),
@@ -697,20 +698,30 @@ scan_config(_Path, _Key, 0) ->
     false;
 scan_config(Path, Key, Depth) ->
     case read_config(Path) of
-        {ok, Terms} -> scan_terms(Terms, Key, Depth);
-        error       -> false
+        {ok, File, Terms} -> scan_terms(Terms, Key, Depth, filename:dirname(File));
+        error             -> false
     end.
 
 read_config(Path) ->
     Candidates = [Path, Path ++ ".config"],
     try
-        [Terms | _] = [T || C <- Candidates, {ok, [T]} <- [file:consult(C)]],
-        {ok, Terms}
+        [{File, Terms} | _] = [{C, T} || C <- Candidates, {ok, [T]} <- [file:consult(C)]],
+        {ok, File, Terms}
     catch
         _:_ -> error
     end.
 
-scan_terms(Terms, Key, Depth) when is_list(Terms) ->
+%% A config file named inside another is resolved against the directory of the
+%% file that names it, as the VM does; a path relative to the working directory
+%% would find a different file, or none, and the scan would report `absent' for
+%% a file the VM loads.
+nested_path(Nested, Dir) ->
+    case filename:pathtype(Nested) of
+        absolute -> Nested;
+        _        -> filename:join(Dir, Nested)
+    end.
+
+scan_terms(Terms, Key, Depth, Dir) when is_list(Terms) ->
     lists:any(fun({grpcbox, KVs}) when is_list(KVs) ->
                       case proplists:get_value(Key, KVs, undefined) of
                           undefined -> false;
@@ -718,11 +729,11 @@ scan_terms(Terms, Key, Depth) when is_list(Terms) ->
                           _         -> true
                       end;
                  (Nested) when is_list(Nested), Nested =/= [], is_integer(hd(Nested)) ->
-                      scan_config(Nested, Key, Depth - 1);
+                      scan_config(nested_path(Nested, Dir), Key, Depth - 1);
                  (_) ->
                       false
               end, Terms);
-scan_terms(_, _, _) ->
+scan_terms(_, _, _, _) ->
     false.
 
 %% @private Refuse to boot with a listener entry that cannot start, and with no
@@ -1032,13 +1043,30 @@ channel_posture(_) ->
 
 -spec endpoint_posture(term()) -> tls_posture().
 endpoint_posture(E) when is_tuple(E), tuple_size(E) >= 4, element(1, E) =:= https ->
+    %% verify_peer AND a trust anchor of the operator's own. Without one, gun
+    %% fills in the operating system's CA store ({cacerts, system}), where ssl
+    %% on its own refuses verify_peer with no CA; a channel left that way would
+    %% trust every public CA to vouch for the gateway's own server, which is not
+    %% what a pinned private PKI means, so it counts as unverified.
     SslOpts = element(4, E),
-    case is_list(SslOpts) andalso proplists:get_value(verify, SslOpts) =:= verify_peer of
+    case is_list(SslOpts)
+         andalso proplists:get_value(verify, SslOpts) =:= verify_peer
+         andalso has_trust_anchor(SslOpts) of
         true  -> verified;
         false -> unverified
     end;
 endpoint_posture(_) ->
     plaintext.
+
+has_trust_anchor(SslOpts) ->
+    lists:any(fun(Key) ->
+                      case proplists:get_value(Key, SslOpts) of
+                          undefined -> false;
+                          []        -> false;
+                          <<>>      -> false;
+                          _         -> true
+                      end
+              end, [cacertfile, cacerts]).
 
 -spec strongest(tls_posture(), tls_posture()) -> tls_posture().
 strongest(verified, _)            -> verified;

@@ -29,11 +29,16 @@
 -behaviour(gen_server).
 
 -export([child_spec/1, start_link/1, pick/2, max_receive/1]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, format_status/1]).
 -export([compact/1, word/1, backoff_ms/1]).
 
 -define(BACKOFF_BASE_MS, 100).
 -define(BACKOFF_MAX_MS, 5000).
+%% A connection that has stayed up this long is healthy: only then does the backoff
+%% start over. Resetting at the moment it comes up lets a server that accepts and
+%% closes (or a middlebox resetting after the handshake) draw a reconnect every
+%% 100 ms per slot, each with a TLS handshake.
+-define(STABLE_MS, 5000).
 
 -record(slot, {id :: pos_integer(),
                endpoint :: yuzu_grpc_client_config:endpoint(),
@@ -44,7 +49,9 @@
 -record(st, {name :: atom(),
              cfg :: yuzu_grpc_client_config:channel(),
              slots = #{} :: #{pos_integer() => #slot{}},
-             by_pid = #{} :: #{pid() => pos_integer()}}).
+             by_pid = #{} :: #{pid() => pos_integer()},
+             %% callers of await_up waiting for a connection that is being opened
+             waiters = [] :: [gen_server:from()]}).
 
 %%--------------------------------------------------------------------
 %% API
@@ -135,6 +142,19 @@ init(#{name := Name, endpoints := Endpoints, pool_size := Size,
     State0 = #st{name = Name, cfg = Cfg, slots = Slots},
     {ok, lists:foldl(fun(Id, S) -> open(Id, S) end, State0, Ids)}.
 
+%% A caller that found no connection up while one is being opened. Only this
+%% process can learn a connection came up (gun sends gun_up to its owner), so the
+%% caller waits on a reply from here, not on the connection itself.
+handle_call(await_up, From, #st{name = Name} = State) ->
+    case up_pids(Name) of
+        [Pid | _] ->
+            {reply, {ok, Pid}, State};
+        [] ->
+            case connecting(Name) of
+                true  -> {noreply, State#st{waiters = [From | State#st.waiters]}};
+                false -> {reply, last_error(Name), State}
+            end
+    end;
 handle_call(_Request, _From, State) ->
     {reply, {error, unsupported}, State}.
 
@@ -143,8 +163,17 @@ handle_cast(_Msg, State) ->
 
 handle_info({gun_up, Pid, _Protocol}, #st{by_pid = ByPid} = State) ->
     case maps:find(Pid, ByPid) of
-        {ok, Id} -> {noreply, mark(Id, up, reset_fails(Id, State))};
-        error    -> {noreply, State}
+        {ok, Id} ->
+            erlang:send_after(?STABLE_MS, self(), {stable, Id, Pid}),
+            State1 = mark(Id, up, State),
+            {noreply, reply_waiters({ok, Pid}, State1)};
+        error ->
+            {noreply, State}
+    end;
+handle_info({stable, Id, Pid}, #st{slots = Slots} = State) ->
+    case maps:find(Id, Slots) of
+        {ok, #slot{pid = Pid}} -> {noreply, reset_fails(Id, State)};
+        _                      -> {noreply, State}
     end;
 handle_info({gun_down, Pid, _Protocol, Reason, _Killed}, State) ->
     {noreply, lost(Pid, Reason, State)};
@@ -166,8 +195,15 @@ handle_info(_Other, State) ->
     {noreply, State}.
 
 terminate(_Reason, #st{slots = Slots}) ->
-    _ = [gun:close(P) || #slot{pid = P} <- maps:values(Slots), is_pid(P)],
+    _ = [close_conn(P) || #slot{pid = P} <- maps:values(Slots), is_pid(P)],
     ok.
+
+%% What a crash report or sys:get_status shows of this process: the shape, not
+%% the endpoint and TLS option lists (they name key and certificate files).
+format_status(#{state := #st{name = Name, slots = Slots, waiters = Waiters}} = Status) ->
+    Status#{state := #{channel => Name, slots => maps:size(Slots), waiters => length(Waiters)}};
+format_status(Status) ->
+    Status.
 
 %%--------------------------------------------------------------------
 %% Connections
@@ -194,6 +230,7 @@ gun_opts(#{transport := Transport, tcp_opts := Tcp} = Endpoint, #{connect_timeou
              transport => Transport,
              tcp_opts => socket_opts(Tcp),
              connect_timeout => Timeout,
+             domain_lookup_timeout => Timeout,
              retry => 0,
              %% gun's default puts the connection under its own supervisor, which
              %% leaves a failed connect unreported: no gun_down (it was never up),
@@ -218,7 +255,7 @@ socket_opts(Tcp) ->
 lost(Pid, Reason, #st{slots = Slots, by_pid = ByPid} = State) ->
     case maps:find(Pid, ByPid) of
         {ok, Id} ->
-            catch gun:close(Pid),
+            close_conn(Pid),
             Slot = maps:get(Id, Slots),
             State1 = State#st{slots = Slots#{Id := Slot#slot{pid = undefined}},
                               by_pid = maps:remove(Pid, ByPid)},
@@ -237,7 +274,32 @@ failed(Id, Reason, #st{name = Name, slots = Slots} = State) ->
     logger:info("Upstream channel ~s connection ~b down (~s); retrying in ~b ms",
                 [Name, Id, Word, Delay]),
     Timer = erlang:send_after(Delay, self(), {reconnect, Id}),
-    State#st{slots = Slots#{Id := Slot#slot{fails = Fails + 1, timer = Timer, pid = undefined}}}.
+    State1 = State#st{slots = Slots#{Id := Slot#slot{fails = Fails + 1, timer = Timer,
+                                                     pid = undefined}}},
+    case connecting(Name) orelse up_pids(Name) =/= [] of
+        true  -> State1;
+        false -> reply_waiters({error, Compact}, State1)
+    end.
+
+reply_waiters(Reply, #st{waiters = Waiters} = State) ->
+    _ = [gen_server:reply(From, Reply) || From <- Waiters],
+    State#st{waiters = []}.
+
+%% gun:close/1 asks gun's connection supervisor to terminate the child, and an
+%% unsupervised connection (supervise => false, see gun_opts/2) is not its child:
+%% the call returns {error, not_found} and the process lives on. This process is
+%% the connection's parent and its link, so exit/2 with `shutdown' ends it, and
+%% unlinking first keeps the dead connection's EXIT out of the mailbox.
+close_conn(Pid) ->
+    unlink(Pid),
+    exit(Pid, shutdown),
+    ok.
+
+up_pids(Name) ->
+    ets:select(Name, [{{{slot, '_'}, '$1', up}, [], ['$1']}]).
+
+connecting(Name) ->
+    ets:select_count(Name, [{{{slot, '_'}, '_', connecting}, [], [true]}]) > 0.
 
 reset_fails(Id, #st{slots = Slots} = State) ->
     Slot = maps:get(Id, Slots),
@@ -252,16 +314,13 @@ mark(Id, Status, #st{name = Name, slots = Slots} = State) ->
 %% pick/2 helpers
 %%--------------------------------------------------------------------
 
-wait_for_connection(Name, Timeout) ->
-    case ets:select(Name, [{{{slot, '_'}, '$1', connecting}, [], ['$1']}]) of
-        [Pid | _] when Timeout > 0 ->
-            case gun:await_up(Pid, Timeout) of
-                {ok, _Protocol} -> {ok, Pid};
-                {error, _}      -> last_error(Name)
-            end;
-        _ ->
-            last_error(Name)
-    end.
+wait_for_connection(Name, Timeout) when Timeout > 0 ->
+    try gen_server:call(Name, await_up, Timeout)
+    catch
+        exit:_ -> last_error(Name)
+    end;
+wait_for_connection(Name, _Timeout) ->
+    last_error(Name).
 
 last_error(Name) ->
     try {error, ets:lookup_element(Name, last_error, 2)}
