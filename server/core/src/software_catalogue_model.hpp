@@ -36,7 +36,6 @@ inline constexpr std::int64_t kCatalogueDefaultLimit = 100;
 inline constexpr std::int64_t kCataloguePageMax = 1000;
 inline constexpr std::int64_t kVersionsDefaultLimit = 200;
 inline constexpr std::int64_t kVersionsMax = 1000;
-inline constexpr std::int64_t kDevicesPageMax = 1000;
 inline constexpr std::int64_t kExportCap = 10000;
 inline constexpr std::size_t kCursorMaxBytes = 2048; ///< longest cursor token accepted; a longer one is refused
 inline constexpr std::size_t kScopePushdownMaxIds = 10000;
@@ -75,12 +74,11 @@ struct VersionsRequest {
 struct DevicesRequest {
     SoftwareFleetQuery query;
     std::string cursor;
-    std::string format; ///< "" | "json" | "csv"
-    bool export_mode{false};
+    std::string format; ///< "" | "json" | "csv"; non-empty = an export (the TOTAL-rows cap applies)
 };
 /// The raw per-install route keeps its legacy semantics: a repeated key keeps the FIRST value; a
 /// present-empty `version` is the exact empty-version bucket; `limit` parses with full-consume
-/// from_chars (a non-integer is refused); page cap kDevicesPageMax, export cap kExportCap
+/// from_chars (a non-integer is refused); page cap kCataloguePageMax, export cap kExportCap
 /// (default kExportCap, the TOTAL rows). Text hygiene and length bounds are the catalogue
 /// parser's. The error is the 400 message.
 [[nodiscard]] std::expected<DevicesRequest, std::string> parse_devices_params(const Params& p);
@@ -90,17 +88,6 @@ struct DevicesRequest {
 /// over-long string, or a `kind`/`ecosystem` outside the closed vocabulary is refused rather
 /// than clamped or ignored. nullopt = acceptable; otherwise the kInvalidParams message.
 [[nodiscard]] std::optional<std::string> strict_args_error(const nlohmann::json& args);
-
-// ── Scope ────────────────────────────────────────────────────────────────────
-
-enum class ScopeApply { kUnfiltered, kPushedDown, kDenyAll, kPostFilter };
-
-/// Push a confined caller's VisibleSet into the query. TOP -> kUnfiltered; engaged-empty ->
-/// agent_ids = {} (the store returns empty without SQL), kDenyAll; engaged and
-/// <= kScopePushdownMaxIds -> agent_ids = the set, kPushedDown (complete pages, nothing
-/// hidden); larger -> agent_ids untouched, kPostFilter (caller applies authz::in_scope and
-/// reports `devices_omitted`). `devices_omitted` means "hidden by the in-process post-filter".
-[[nodiscard]] ScopeApply apply_scope(SoftwareFleetQuery& q, const authz::VisibleSet& scope);
 
 // ── Audit targets ────────────────────────────────────────────────────────────
 
@@ -151,16 +138,6 @@ struct KpiFigures {
     std::int64_t avg_installs_per_device{0};
 };
 
-/// The two reads behind `Coverage`, injected like CatalogueReads so the transports share one
-/// gather: `connected` is empty when no device registry is wired; `stale` takes the cutoff
-/// (epoch seconds) and answers nullopt when its bounded read degraded.
-struct CoverageReads {
-    std::function<std::int64_t()> connected;
-    std::function<std::optional<std::int64_t>(std::int64_t)> stale;
-};
-/// Coverage as of `now_epoch`: connected-agent count and devices not seen for kStaleWindowSecs.
-[[nodiscard]] Coverage gather_coverage(const CoverageReads& io, std::int64_t now_epoch);
-
 [[nodiscard]] KpiFigures derive_kpis(const CatalogRollupMeta& meta, const Coverage& coverage);
 [[nodiscard]] nlohmann::json kpis_json(const KpiFigures& k);
 
@@ -174,12 +151,6 @@ catalogue_response_json(const std::vector<SoftwareCatalogRow>& rows,
                         std::string_view next_cursor, bool omit_newest,
                         std::int64_t devices_omitted);
 [[nodiscard]] nlohmann::json version_row_json(const SoftwareVersionCount& v, bool omit_newest);
-/// True for the UNFILTERED fleet drill (no agent_id, kind, ecosystem or source): the only
-/// versions read served from the precomputed version rollup, so the only one that has nothing to
-/// answer before the first catalogue refresh (`refreshed_at == 0` -> building). Filtered and
-/// per-device drills read installed_software directly.
-[[nodiscard]] bool versions_read_needs_rollup(const SoftwareVersionsQuery& q);
-
 /// `devices_omitted` is 1 when the per-device drill was refused as out of the caller's scope
 /// (an empty list there is not "no installs"), else 0 - the same marker the catalogue carries.
 [[nodiscard]] nlohmann::json versions_response_json(std::string_view name,
@@ -226,12 +197,17 @@ struct TitlesExport {
 
 // ── One consistent catalogue read ────────────────────────────────────────────
 
-/// The three store reads a catalogue page needs, injected so the generation-skew logic is pure
-/// and unit-tested with fakes (the shells bind them to the SoftwareInventoryStore).
+/// The store reads a catalogue page needs, injected so the generation-skew logic is pure and
+/// unit-tested with fakes (the shells bind them to the SoftwareInventoryStore). `connected` and
+/// `stale` feed the KPI coverage figures: `connected` is empty when no device registry is wired;
+/// `stale` takes the cutoff (epoch seconds) and answers nullopt when its bounded read degraded.
+/// The titles export never reads them.
 struct CatalogueReads {
     std::function<std::optional<CatalogRollupMeta>()> meta;
     CatalogueReader rows;
     std::function<std::optional<SoftwareCatalogTotals>(const SoftwareCatalogQuery&)> totals;
+    std::function<std::int64_t()> connected{};
+    std::function<std::optional<std::int64_t>(std::int64_t)> stale{};
 };
 
 struct CataloguePage {
@@ -239,6 +215,7 @@ struct CataloguePage {
     SoftwareCatalogTotals totals;
     std::optional<CatalogRollupMeta> meta; ///< fleet path only (nullopt on the host path)
     std::string next_cursor;               ///< non-empty iff rows.size() == query.limit
+    std::optional<KpiFigures> kpis;        ///< first fleet page only (nullopt on a continuation / the host path)
 };
 
 /// Reads {meta, rows, totals, meta} for one catalogue page. Fleet path: the rollup generation
@@ -246,9 +223,11 @@ struct CataloguePage {
 /// generation read first. Host path (query.agent_id set): no meta, generation 0.
 /// Error: nullopt = degraded (any read returned nullopt, or the generation moved twice: 503 +
 /// retry); a CursorError = the cursor was refused (malformed / other filter set / stale: the
-/// generation moved under a continuation page, restart from page one) -> 400.
+/// generation moved under a continuation page, restart from page one) -> 400. The KPIs are derived
+/// ONCE, from the page that is returned (never inside a re-read), with the coverage as of
+/// `now_epoch`: connected-agent count and devices not seen for kStaleWindowSecs.
 [[nodiscard]] std::expected<CataloguePage, std::optional<CursorError>>
-read_catalogue_page(const CatalogueReads& io, const CatalogueRequest& rq);
+read_catalogue_page(const CatalogueReads& io, const CatalogueRequest& rq, std::int64_t now_epoch);
 
 /// Titles export: the whole walk is bracketed by the generation (restart once, then
 /// degraded = nullopt, never a partial body). `rq.query.limit` is the TOTAL row cap. On the fleet
@@ -256,5 +235,44 @@ read_catalogue_page(const CatalogueReads& io, const CatalogueRequest& rq);
 /// an empty file there would read as "no titles", not "not built yet".
 [[nodiscard]] std::optional<TitlesExport>
 read_titles_export(const CatalogueReads& io, const CatalogueRequest& rq, bool omit_newest);
+
+// ── One consistent versions read ─────────────────────────────────────────────
+
+struct VersionsReads {
+    std::function<std::optional<CatalogRollupMeta>()> meta;
+    std::function<std::optional<std::vector<SoftwareVersionCount>>(const SoftwareVersionsQuery&)>
+        versions;
+};
+
+enum class VersionsError { kDegraded, kBuilding };
+
+/// Only the UNFILTERED fleet drill (no agent_id, kind, ecosystem or source) reads the precomputed
+/// version rollup, so only it has nothing to answer before the first catalogue refresh
+/// (`refreshed_at == 0` -> kBuilding); `meta` is read for it alone. Filtered and per-device drills
+/// read installed_software directly. kDegraded = any read returned nullopt.
+[[nodiscard]] std::expected<std::vector<SoftwareVersionCount>, VersionsError>
+read_versions(const VersionsReads& io, const SoftwareVersionsQuery& q);
+
+// ── One devices page ─────────────────────────────────────────────────────────
+
+using DevicesReader =
+    std::function<std::optional<std::vector<SoftwareFleetRow>>(const SoftwareFleetQuery&)>;
+
+struct DevicesPage {
+    std::vector<SoftwareFleetRow> rows;
+    std::string next_cursor;           ///< non-empty iff the SCANNED page hit the limit
+    bool hit_cap{false};               ///< rows scanned == the effective limit (before any post-filter)
+    std::int64_t devices_omitted{0};   ///< DISTINCT devices hidden by the post-filter (0 under push-down)
+};
+
+/// One raw per-install page: decode the cursor (bound to the filter set, never to the scope),
+/// push the caller's scope into the query, read, then post-filter. The scope: TOP -> unfiltered;
+/// engaged-empty -> agent_ids = {} (the store returns empty without SQL); engaged and
+/// <= kScopePushdownMaxIds -> agent_ids = the set (complete pages, nothing hidden); larger ->
+/// the rows are filtered here with authz::in_scope and `devices_omitted` counts the devices that
+/// dropped. The next cursor is the last SCANNED row, so a post-filtered page still advances.
+/// Error: nullopt = degraded (the read returned nullopt); a CursorError = the cursor was refused.
+[[nodiscard]] std::expected<DevicesPage, std::optional<CursorError>>
+read_devices_page(const DevicesReader& read, const DevicesRequest& rq, const authz::VisibleSet& scope);
 
 } // namespace yuzu::server::software_catalogue

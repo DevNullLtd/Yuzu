@@ -9045,12 +9045,19 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            const swc::CatalogueReads io{
+            swc::CatalogueReads io{
                 [&] { return software_inventory_store->catalog_rollup_meta(); },
                 [&](const SoftwareCatalogQuery& c) { return software_inventory_store->software_catalog(c); },
                 [&](const SoftwareCatalogQuery& c) {
                     return software_inventory_store->software_catalog_totals(c);
                 }};
+            if (device_api)
+                io.connected = [&] {
+                    return static_cast<std::int64_t>(device_api->list_devices().size());
+                };
+            io.stale = [&](std::int64_t cutoff) {
+                return software_inventory_store->count_stale_agents(cutoff);
+            };
             if (csv) {
                 const auto ex = swc::read_titles_export(io, rq, omit_newest);
                 if (!ex) {
@@ -9065,7 +9072,8 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            const auto read = swc::read_catalogue_page(io, rq);
+            const auto read =
+                swc::read_catalogue_page(io, rq, static_cast<std::int64_t>(std::time(nullptr)));
             if (!read) {
                 if (!read.error()) {
                     sw_fail_degraded(req, res, cid, verb, target, "catalogue read");
@@ -9079,27 +9087,12 @@ void RestApiV1::register_routes(
             }
             const auto& page = *read;
 
-            // Coverage + KPIs only on a first fleet page (continuation pages carry kpis:null).
-            std::optional<swc::KpiFigures> kpis;
-            if (page.meta && !continuation) {
-                swc::CoverageReads cov_io;
-                if (device_api)
-                    cov_io.connected = [&] {
-                        return static_cast<std::int64_t>(device_api->list_devices().size());
-                    };
-                cov_io.stale = [&](std::int64_t cutoff) {
-                    return software_inventory_store->count_stale_agents(cutoff);
-                };
-                kpis = swc::derive_kpis(
-                    *page.meta,
-                    swc::gather_coverage(cov_io, static_cast<std::int64_t>(std::time(nullptr))));
-            }
             audit_ok = detail::try_persist_audit(
                 audit_fn, req, "inventory.software.catalog", "success", "Inventory", target,
                 "titles=" + std::to_string(page.rows.size()) + " totals=" +
                     std::to_string(page.totals.titles) + "/" + std::to_string(page.totals.installs) +
                     (continuation ? " page=continuation" : "") + " cid=" + cid);
-            auto body = swc::catalogue_response_json(page.rows, page.totals, kpis, page.next_cursor,
+            auto body = swc::catalogue_response_json(page.rows, page.totals, page.kpis, page.next_cursor,
                                                      omit_newest, 0);
             if (!audit_ok)
                 body["audit_persisted"] = false;
@@ -9145,25 +9138,18 @@ void RestApiV1::register_routes(
                 res.set_content(ok_json(swc::dump_safe(body)), "application/json");
                 return;
             }
-            // Only the unfiltered read serves the precomputed version_rollup; filtered and
-            // per-device drills read installed_software, so their rows and counts do not depend
-            // on the rollup (newest is false/blank until the first refresh).
-            if (swc::versions_read_needs_rollup(q)) {
-                const auto meta = software_inventory_store->catalog_rollup_meta();
-                if (!meta) {
+            const auto rows = swc::read_versions(
+                {[&] { return software_inventory_store->catalog_rollup_meta(); },
+                 [&](const SoftwareVersionsQuery& v) {
+                     return software_inventory_store->software_versions(v);
+                 }},
+                q);
+            if (!rows) {
+                if (rows.error() == swc::VersionsError::kBuilding)
+                    sw_building(req, res, cid, "inventory.software.versions", target);
+                else
                     sw_fail_degraded(req, res, cid, "inventory.software.versions", target,
                                      "versions read");
-                    return;
-                }
-                if (meta->refreshed_at == 0) {
-                    sw_building(req, res, cid, "inventory.software.versions", target);
-                    return;
-                }
-            }
-            auto rows = software_inventory_store->software_versions(q);
-            if (!rows) {
-                sw_fail_degraded(req, res, cid, "inventory.software.versions", target,
-                                 "versions read");
                 return;
             }
             const bool truncated = static_cast<int>(rows->size()) == q.limit;
@@ -9356,35 +9342,33 @@ void RestApiV1::register_routes(
                      res.set_content(detail::a4_error(res, parsed.error()), "application/json");
                      return;
                  }
-                 auto& rq = *parsed;
-                 auto& q = rq.query;
+                 const auto& rq = *parsed;
                  const bool csv = rq.format == "csv";
+                 const bool export_mode = !rq.format.empty();
                  const bool continuation = !rq.cursor.empty();
                  const char* const verb =
-                     rq.export_mode ? "inventory.software.export" : "inventory.software.query";
+                     export_mode ? "inventory.software.export" : "inventory.software.query";
+                 const std::string audit_key = swc::audit_target(rq.query);
 
-                 // The cursor is bound to the filter set (never to the scope: the scope only
-                 // narrows what the same keyset position yields).
-                 const std::string fp = swc::devices_fingerprint(q);
-                 if (continuation) {
-                     auto cur = swc::decode_devices_cursor(rq.cursor, fp);
-                     if (!cur) {
+                 // The model decodes the cursor, pushes the scope into SQL up to
+                 // kScopePushdownMaxIds (complete pages, nothing hidden) and post-filters only a
+                 // wider scope — the gate's own composed meet(management-group, service-scope)
+                 // VisibleSet (#3290). `devices_omitted` is DEFINED as the devices hidden by that
+                 // filter (0 under push-down).
+                 const auto read = swc::read_devices_page(
+                     [&](const SoftwareFleetQuery& dq) {
+                         return software_inventory_store->query_software(dq);
+                     },
+                     rq, gate.scope);
+                 if (!read) {
+                     if (read.error()) {
                          res.status = 400;
                          res.set_content(
-                             detail::a4_error(res, std::string(swc::cursor_error_message(cur.error()))),
+                             detail::a4_error(res,
+                                              std::string(swc::cursor_error_message(*read.error()))),
                              "application/json");
                          return;
                      }
-                     q.after = *cur;
-                 }
-
-                 // Scope: pushed into SQL up to kScopePushdownMaxIds (complete pages, nothing
-                 // hidden); only a wider scope falls back to the in-process post-filter below.
-                 const auto scope_mode = swc::apply_scope(q, gate.scope);
-                 const std::string audit_key = swc::audit_target(q);
-
-                 auto rows_opt = software_inventory_store->query_software(q);
-                 if (!rows_opt) {
                      // Store degraded (pool/query failure) — surface it, NEVER an empty list.
                      // A silent empty reads as "installed nowhere" for a fleet vuln query
                      // (ADR-0016 §7 authoritative reads; agentic-first A4 failure-vs-empty).
@@ -9396,33 +9380,9 @@ void RestApiV1::register_routes(
                             "software inventory store degraded — query failed");
                      return;
                  }
-                 auto& rows = *rows_opt;
-
-                 // Cap hit BEFORE any post-filtering → the page is full (page mode) or the
-                 // export was cut (export mode). The next keyset position is the LAST SCANNED
-                 // row, so a post-filtered page still advances.
-                 const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
-                 const std::string next =
-                     hit_cap ? swc::encode_devices_cursor(rows.back(), fp) : std::string();
-
-                 // Post-filter only for a scope wider than the push-down bound — the gate's own
-                 // composed meet(management-group, service-scope) VisibleSet (#3290).
-                 // `devices_omitted` is DEFINED as the devices hidden by THIS filter (0 under
-                 // push-down, where the SQL already returned only in-scope rows).
-                 std::size_t dropped_agents = 0;
-                 if (scope_mode == swc::ScopeApply::kPostFilter) {
-                     std::unordered_set<std::string> dropped_ids;
-                     std::vector<SoftwareFleetRow> visible;
-                     visible.reserve(rows.size());
-                     for (auto& r : rows) {
-                         if (authz::in_scope(gate.scope, r.agent_id))
-                             visible.push_back(std::move(r));
-                         else
-                             dropped_ids.insert(r.agent_id); // count each DISTINCT device once
-                     }
-                     rows.swap(visible);
-                     dropped_agents = dropped_ids.size();
-                 }
+                 const auto& page = *read;
+                 const auto& rows = page.rows;
+                 const auto dropped_agents = page.devices_omitted;
 
                  // Audit posture: SET-AND-PROCEED (see route header) — capture the persist
                  // bool, surface audit_persisted:false, never withhold. Routed through the
@@ -9440,11 +9400,10 @@ void RestApiV1::register_routes(
                              "axis); cid=" +
                              cid);
                  const std::string detail_text =
-                     (rq.export_mode ? "installs format=" + (csv ? std::string("csv")
-                                                                  : std::string("json")) +
-                                           " rows=" + std::to_string(rows.size()) +
-                                           " truncated=" + (hit_cap ? "true" : "false")
-                                     : "rows=" + std::to_string(rows.size())) +
+                     (export_mode ? "installs format=" + rq.format +
+                                        " rows=" + std::to_string(rows.size()) +
+                                        " truncated=" + (page.hit_cap ? "true" : "false")
+                                  : "rows=" + std::to_string(rows.size())) +
                      (continuation ? " page=continuation" : "") + " cid=" + cid;
                  const bool audit_ok =
                      detail::try_persist_audit(audit_fn, req, verb, "success", "Inventory",
@@ -9454,15 +9413,15 @@ void RestApiV1::register_routes(
                  if (csv) {
                      res.set_header("Content-Disposition",
                                     "attachment; filename=\"software-installs.csv\"");
-                     if (hit_cap)
+                     if (page.hit_cap)
                          res.set_header("X-Result-Truncated-By-Cap", "true");
                      if (!audit_ok)
                          res.set_header("Sec-Audit-Failed", "true");
                      res.set_content(swc::installs_csv(rows), "text/csv; charset=utf-8");
                      return;
                  }
-                 auto body = swc::devices_response_json(
-                     rows, next, static_cast<std::int64_t>(dropped_agents), hit_cap);
+                 auto body = swc::devices_response_json(rows, page.next_cursor, dropped_agents,
+                                                        page.hit_cap);
                  if (!audit_ok)
                      body["audit_persisted"] = false;
                  res.set_content(ok_json(swc::dump_safe(body)), "application/json");

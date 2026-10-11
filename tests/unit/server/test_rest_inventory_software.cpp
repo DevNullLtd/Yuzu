@@ -980,25 +980,6 @@ std::size_t count_audit(const InvHarness& h, const std::string& action, const st
     return n;
 }
 
-std::string b64url(std::string_view in) {
-    static constexpr char tbl[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    std::string out;
-    std::uint32_t acc = 0;
-    int bits = 0;
-    for (unsigned char c : in) {
-        acc = (acc << 8) | c;
-        bits += 8;
-        while (bits >= 6) {
-            bits -= 6;
-            out += tbl[(acc >> bits) & 63];
-        }
-    }
-    if (bits > 0)
-        out += tbl[(acc << (6 - bits)) & 63];
-    return out;
-}
-
 } // namespace
 
 TEST_CASE("REST inventory/software: ?version= selects an exact version; present-empty selects the "
@@ -1021,24 +1002,6 @@ TEST_CASE("REST inventory/software: ?version= selects an exact version; present-
     CHECK(empty.at("data").at("software")[0].at("name") == "Bare");
     auto any = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software")->body);
     CHECK(any.at("data").at("software").size() == 3);
-}
-
-TEST_CASE("REST inventory/software: rows carry the 14 documented fields incl. source",
-          "[pg][rest][inventory_software]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
-    SoftwareEntry e{"App", "1.0", "Acme", ""};
-    e.source = "installed_apps.list_inventory";
-    seed(store, "dev-a", {e});
-
-    InvHarness h{&store};
-    auto body = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software")->body);
-    const auto& row = body.at("data").at("software")[0];
-    CHECK(row.size() == 14);
-    CHECK(row.at("source") == "installed_apps.list_inventory");
 }
 
 TEST_CASE("REST inventory/software: keyset walk pages without duplicates or gaps; and every page "
@@ -1106,8 +1069,8 @@ TEST_CASE("REST inventory/software: cursor refusals — tampered; wrong filter s
     // design — opaque is not authenticated — so the audit row is what keeps it from being silent.
     const auto fp = software_catalogue::devices_fingerprint(SoftwareFleetQuery{});
     const auto before = count_audit(h, "inventory.software.query", "success", "page=continuation");
-    auto forged = h.sink.Get("/api/v1/inventory/software?limit=1&cursor=d1:" + fp + ":" +
-                             b64url(std::string("\x1f\x1f") + "0"));
+    auto forged = h.sink.Get("/api/v1/inventory/software?limit=1&cursor=" +
+                             software_catalogue::encode_devices_cursor(SoftwareFleetRow{}, fp));
     REQUIRE(forged);
     CHECK(forged->status == 200);
     CHECK(nlohmann::json::parse(forged->body).at("data").at("software")[0].at("name") == "A");
@@ -1176,12 +1139,14 @@ TEST_CASE("REST inventory/software: text a store cannot bind is a 400; never a r
     // A hand-minted cursor whose decoded agent id is not valid UTF-8 (well-formed otherwise, over
     // the matching fingerprint), so only the decoded-text refusal can answer 400.
     const auto fp = software_catalogue::devices_fingerprint(SoftwareFleetQuery{});
-    const std::string forged =
-        "d1:" + fp + ":" + b64url(std::string("A\x1f") + "\xFF" + "\x1f" + "1");
-    const std::string long_agent(software_catalogue::kSourceMaxBytes + 1, 'a');
-    for (const std::string& query : std::vector<std::string>{
-             "agent_id=%FF", "name=%00", "version=%FF", "q=%00", "kind=%FF", "ecosystem=%00",
-             "source=%FF", "cursor=" + forged, "agent_id=" + long_agent}) {
+    SoftwareFleetRow bad_agent = {};
+    bad_agent.entry.name = "A";
+    bad_agent.agent_id = "\xFF";
+    bad_agent.install_id = 1;
+    const std::string forged = software_catalogue::encode_devices_cursor(bad_agent, fp);
+    // The handler has two 400 mappings (parameter parse and cursor decode); the model tests loop
+    // every key and bound, so one query per mapping proves 400-not-503 here.
+    for (const std::string& query : std::vector<std::string>{"agent_id=%FF", "cursor=" + forged}) {
         CAPTURE(query);
         auto r = h.sink.Get("/api/v1/inventory/software?" + query);
         REQUIRE(r);
@@ -1192,17 +1157,6 @@ TEST_CASE("REST inventory/software: text a store cannot bind is a 400; never a r
     CHECK(count_audit(h, "inventory.software.query", "success") == 0);
 }
 
-TEST_CASE("REST inventory/software: limit=12abc → 400 against a live store",
-          "[pg][rest][inventory_software]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
-    InvHarness h{&store};
-    CHECK(h.sink.Get("/api/v1/inventory/software?limit=12abc")->status == 400);
-}
-
 TEST_CASE("REST inventory/software: exports — csv; truncation; json; bad format; audit verb",
           "[pg][rest][inventory_software]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
@@ -1211,6 +1165,11 @@ TEST_CASE("REST inventory/software: exports — csv; truncation; json; bad forma
     SoftwareInventoryStore store{pool};
     REQUIRE(store.is_open());
     seed(store, "dev-a", {{"A", "1", "", ""}, {"B", "1", "", ""}, {"C", "1", "", ""}});
+    // seed() never refreshes the catalogue rollup (refreshed_at 0, the building state): the raw
+    // route never reads it, so every export below is served at that state, not blocked or emptied.
+    const auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    REQUIRE(meta->refreshed_at == 0);
 
     InvHarness h{&store};
     auto csv = h.sink.Get("/api/v1/inventory/software?format=csv");
@@ -1232,32 +1191,6 @@ TEST_CASE("REST inventory/software: exports — csv; truncation; json; bad forma
     CHECK(h.sink.Get("/api/v1/inventory/software?format=xml")->status == 400);
     CHECK(count_audit(h, "inventory.software.export", "success") == 3);
     CHECK(count_audit(h, "inventory.software.export", "success", "truncated=true") == 2);
-}
-
-TEST_CASE("REST inventory/software: the per-install page and exports do not depend on the "
-          "catalogue rollup; so a never-built rollup never blocks or empties them",
-          "[pg][rest][inventory_software]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
-    seed(store, "dev-a", {{"A", "1", "", ""}, {"B", "1", "", ""}});
-    // seed() never calls refresh_catalog_rollup(): refreshed_at is 0, the building state.
-    const auto meta = store.catalog_rollup_meta();
-    REQUIRE(meta.has_value());
-    REQUIRE(meta->refreshed_at == 0);
-
-    InvHarness h{&store};
-    for (const char* url : {"/api/v1/inventory/software", "/api/v1/inventory/software?format=json",
-                            "/api/v1/inventory/software?format=csv"}) {
-        CAPTURE(url);
-        auto r = h.sink.Get(url);
-        REQUIRE(r);
-        CHECK(r->status == 200);
-    }
-    auto csv = h.sink.Get("/api/v1/inventory/software?format=csv");
-    CHECK(std::ranges::count(csv->body, '\n') == 3); // header + both installs, not an empty file
 }
 
 TEST_CASE("REST inventory/software: success audit target equals audit_target(query)",

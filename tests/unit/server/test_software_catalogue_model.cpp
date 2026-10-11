@@ -10,6 +10,8 @@
 #include "software_catalogue_model.hpp"
 
 #include <algorithm>
+#include <functional>
+#include <unordered_set>
 #include <string>
 #include <vector>
 
@@ -212,11 +214,11 @@ TEST_CASE("parse_devices_params: legacy first-value semantics", "[server][softwa
     }
     SECTION("export mode caps at 10000 and defaults to it; page caps at 1000") {
         auto e = parse_devices_params(params({{"format", "csv"}}));
-        CHECK(e->export_mode);
+        CHECK_FALSE(e->format.empty());
         CHECK(e->query.limit == 10000);
         CHECK(parse_devices_params(params({{"format", "json"}, {"limit", "50000"}}))->query.limit ==
               10000);
-        CHECK_FALSE(parse_devices_params(params({}))->export_mode);
+        CHECK(parse_devices_params(params({}))->format.empty());
         CHECK(parse_devices_params(params({{"limit", "50000"}}))->query.limit == 1000);
         CHECK(parse_devices_params(params({}))->query.limit == 100);
         CHECK(parse_devices_params(params({{"limit", "-3"}}))->query.limit == 1);
@@ -274,31 +276,119 @@ TEST_CASE("parse_devices_params: encoding and length bounds", "[server][software
     CHECK_FALSE(parse_devices_params(params({{"cursor", std::string(kCursorMaxBytes + 1, 'a')}})));
 }
 
-TEST_CASE("apply_scope: the four push-down outcomes", "[server][software_catalogue_model]") {
-    SoftwareFleetQuery q;
-    SECTION("TOP") {
-        CHECK(apply_scope(q, std::nullopt) == ScopeApply::kUnfiltered);
-        CHECK_FALSE(q.agent_ids.has_value());
+namespace {
+
+DevicesRequest dreq(int limit, std::string cursor = {}) {
+    DevicesRequest r;
+    r.query.limit = limit;
+    r.cursor = std::move(cursor);
+    return r;
+}
+
+// A fake store read: records the query it was handed and answers a fixed row set.
+struct FakeDevices {
+    std::vector<SoftwareFleetRow> rows;
+    bool ok{true};
+    int reads{0};
+    SoftwareFleetQuery seen;
+    DevicesReader reader() {
+        return [this](const SoftwareFleetQuery& q) -> std::optional<std::vector<SoftwareFleetRow>> {
+            ++reads;
+            seen = q;
+            if (!ok)
+                return std::nullopt;
+            return rows;
+        };
     }
-    SECTION("engaged-empty is deny-all") {
-        CHECK(apply_scope(q, authz::deny_all()) == ScopeApply::kDenyAll);
-        REQUIRE(q.agent_ids.has_value());
-        CHECK(q.agent_ids->empty());
+};
+
+VisibleSet wide_scope(std::string in_scope_id) {
+    std::unordered_set<std::string> big{std::move(in_scope_id)};
+    for (std::size_t i = 0; i <= kScopePushdownMaxIds; ++i)
+        big.insert("agent-" + std::to_string(i));
+    return VisibleSet{std::move(big)};
+}
+
+} // namespace
+
+TEST_CASE("read_devices_page: scope push-down and the post-filter", "[server][software_catalogue_model]") {
+    FakeDevices f;
+    f.rows = {fleet_row("git", "a", 1), fleet_row("git", "b", 2)};
+    SECTION("TOP reads unfiltered and hides nothing") {
+        auto page = read_devices_page(f.reader(), dreq(5), std::nullopt);
+        REQUIRE(page);
+        CHECK_FALSE(f.seen.agent_ids.has_value());
+        CHECK(page->rows.size() == 2);
+        CHECK(page->devices_omitted == 0);
+        CHECK_FALSE(page->hit_cap);
+        CHECK(page->next_cursor.empty());
     }
-    SECTION("engaged within the bound is pushed down") {
-        VisibleSet v = std::unordered_set<std::string>{"a", "b", "c"};
-        CHECK(apply_scope(q, v) == ScopeApply::kPushedDown);
-        REQUIRE(q.agent_ids.has_value());
-        auto ids = *q.agent_ids;
+    SECTION("engaged-empty is deny-all in the query") {
+        auto page = read_devices_page(f.reader(), dreq(5), authz::deny_all());
+        REQUIRE(page);
+        REQUIRE(f.seen.agent_ids.has_value());
+        CHECK(f.seen.agent_ids->empty());
+    }
+    SECTION("engaged within the bound is pushed down and rows are NOT re-filtered") {
+        VisibleSet v = std::unordered_set<std::string>{"a", "c"};
+        auto page = read_devices_page(f.reader(), dreq(5), v);
+        REQUIRE(page);
+        REQUIRE(f.seen.agent_ids.has_value());
+        auto ids = *f.seen.agent_ids;
         std::ranges::sort(ids);
-        CHECK(ids == std::vector<std::string>{"a", "b", "c"});
+        CHECK(ids == std::vector<std::string>{"a", "c"});
+        CHECK(page->rows.size() == 2); // the store already narrowed; nothing is hidden here
+        CHECK(page->devices_omitted == 0);
     }
-    SECTION("engaged beyond the bound falls back to the post-filter") {
-        std::unordered_set<std::string> big;
-        for (std::size_t i = 0; i <= kScopePushdownMaxIds; ++i)
-            big.insert("agent-" + std::to_string(i));
-        CHECK(apply_scope(q, VisibleSet{std::move(big)}) == ScopeApply::kPostFilter);
-        CHECK_FALSE(q.agent_ids.has_value());
+    SECTION("beyond the bound the query stays wide and the rows are post-filtered") {
+        f.rows = {fleet_row("git", "a", 1), fleet_row("git", "b", 2), fleet_row("git", "b", 3)};
+        auto page = read_devices_page(f.reader(), dreq(3), wide_scope("a"));
+        REQUIRE(page);
+        CHECK_FALSE(f.seen.agent_ids.has_value());
+        REQUIRE(page->rows.size() == 1);
+        CHECK(page->rows[0].agent_id == "a");
+        CHECK(page->devices_omitted == 1); // the DISTINCT dropped device, counted once
+        // The cap was hit BEFORE filtering, and the cursor is the last SCANNED row (id 3, dropped)
+        // so the next page advances past it.
+        CHECK(page->hit_cap);
+        const auto cur = decode_devices_cursor(page->next_cursor, devices_fingerprint(dreq(3).query));
+        REQUIRE(cur);
+        CHECK(cur->install_id == 3);
+        CHECK(cur->agent_id == "b");
+    }
+}
+
+TEST_CASE("read_devices_page: cursor and degrade outcomes", "[server][software_catalogue_model]") {
+    FakeDevices f;
+    f.rows = {fleet_row("git", "a", 1)};
+    SECTION("a continuation hands the decoded keyset position to the read") {
+        const auto fp = devices_fingerprint(dreq(1).query);
+        const auto tok = encode_devices_cursor(fleet_row("git", "a", 1), fp);
+        auto page = read_devices_page(f.reader(), dreq(1, tok), std::nullopt);
+        REQUIRE(page);
+        REQUIRE(f.seen.after.has_value());
+        CHECK(f.seen.after->name == "git");
+        CHECK(f.seen.after->install_id == 1);
+        CHECK(page->hit_cap);
+        CHECK_FALSE(page->next_cursor.empty());
+    }
+    SECTION("a refused cursor never reaches the store") {
+        auto bad = read_devices_page(f.reader(), dreq(1, "garbage"), std::nullopt);
+        REQUIRE_FALSE(bad);
+        CHECK(bad.error() == CursorError::kMalformed);
+        DevicesRequest other = dreq(1);
+        other.query.kind = "app";
+        const auto tok = encode_devices_cursor(fleet_row("git", "a", 1), devices_fingerprint(other.query));
+        auto mismatch = read_devices_page(f.reader(), dreq(1, tok), std::nullopt);
+        REQUIRE_FALSE(mismatch);
+        CHECK(mismatch.error() == CursorError::kFilterMismatch);
+        CHECK(f.reads == 0);
+    }
+    SECTION("a nullopt read is a degrade, never an empty page") {
+        f.ok = false;
+        auto page = read_devices_page(f.reader(), dreq(1), std::nullopt);
+        REQUIRE_FALSE(page);
+        CHECK_FALSE(page.error());
     }
 }
 
@@ -325,38 +415,74 @@ TEST_CASE("strict_args_error: MCP refuses what REST clamps", "[server][software_
         CHECK_FALSE(strict_args_error(json{{"ecosystem", eco}}));
 }
 
-TEST_CASE("versions_read_needs_rollup: only the unfiltered fleet drill", "[server][software_catalogue_model]") {
+TEST_CASE("read_versions: the rollup gate applies to the unfiltered fleet drill only",
+          "[server][software_catalogue_model]") {
+    struct Fake {
+        std::optional<std::int64_t> refreshed_at{10}; // nullopt: the meta read degrades
+        bool versions_ok{true};
+        int meta_reads{0}, version_reads{0};
+        VersionsReads io() {
+            return {[this]() -> std::optional<CatalogRollupMeta> {
+                        ++meta_reads;
+                        if (!refreshed_at)
+                            return std::nullopt;
+                        CatalogRollupMeta m;
+                        m.refreshed_at = *refreshed_at;
+                        return m;
+                    },
+                    [this](const SoftwareVersionsQuery&) -> std::optional<std::vector<SoftwareVersionCount>> {
+                        ++version_reads;
+                        if (!versions_ok)
+                            return std::nullopt;
+                        return std::vector<SoftwareVersionCount>{SoftwareVersionCount{"1.0", 3, true}};
+                    }};
+        }
+    };
     SoftwareVersionsQuery q;
     q.name = "git";
-    CHECK(versions_read_needs_rollup(q));
-    for (auto mutate : std::vector<std::function<void(SoftwareVersionsQuery&)>>{
-             [](auto& v) { v.kind = "app"; }, [](auto& v) { v.ecosystem = "brew"; },
-             [](auto& v) { v.source = "s"; }, [](auto& v) { v.agent_id = "a"; }}) {
-        SoftwareVersionsQuery f = q;
-        mutate(f);
-        CHECK_FALSE(versions_read_needs_rollup(f));
+    SECTION("unfiltered: meta is read first and rows are served once built") {
+        Fake f;
+        const auto r = read_versions(f.io(), q);
+        REQUIRE(r);
+        CHECK(r->size() == 1);
+        CHECK(f.meta_reads == 1);
     }
-}
-
-TEST_CASE("gather_coverage: connected; stale cutoff and the honest nulls", "[server][software_catalogue_model]") {
-    std::int64_t cutoff_seen = -1;
-    CoverageReads io;
-    io.connected = [] { return std::int64_t{7}; };
-    io.stale = [&](std::int64_t cutoff) {
-        cutoff_seen = cutoff;
-        return std::optional<std::int64_t>{3};
-    };
-    auto c = gather_coverage(io, 1'000'000);
-    CHECK(c.connected == 7);
-    CHECK(c.stale == 3);
-    CHECK(cutoff_seen == 1'000'000 - kStaleWindowSecs);
-
-    io.connected = nullptr; // no device registry wired
-    io.stale = [](std::int64_t) { return std::optional<std::int64_t>{}; }; // bounded count degraded
-    c = gather_coverage(io, 1'000'000);
-    CHECK_FALSE(c.connected.has_value());
-    CHECK_FALSE(c.stale.has_value());
-    CHECK_FALSE(gather_coverage({}, 1).stale.has_value()); // nothing wired at all
+    SECTION("unfiltered: a never-refreshed rollup is building and reads no rows") {
+        Fake f;
+        f.refreshed_at = 0;
+        const auto r = read_versions(f.io(), q);
+        REQUIRE_FALSE(r);
+        CHECK(r.error() == VersionsError::kBuilding);
+        CHECK(f.version_reads == 0);
+    }
+    SECTION("unfiltered: a degraded meta read is a degrade") {
+        Fake f;
+        f.refreshed_at = std::nullopt;
+        const auto r = read_versions(f.io(), q);
+        REQUIRE_FALSE(r);
+        CHECK(r.error() == VersionsError::kDegraded);
+        CHECK(f.version_reads == 0);
+    }
+    SECTION("a degraded rows read is a degrade") {
+        Fake f;
+        f.versions_ok = false;
+        const auto r = read_versions(f.io(), q);
+        REQUIRE_FALSE(r);
+        CHECK(r.error() == VersionsError::kDegraded);
+    }
+    SECTION("every filtered or per-device drill skips the meta read entirely") {
+        for (auto mutate : std::vector<std::function<void(SoftwareVersionsQuery&)>>{
+                 [](auto& v) { v.kind = "app"; }, [](auto& v) { v.ecosystem = "brew"; },
+                 [](auto& v) { v.source = "s"; }, [](auto& v) { v.agent_id = "a"; }}) {
+            Fake f;
+            f.refreshed_at = std::nullopt; // would degrade if it were read
+            SoftwareVersionsQuery filtered = q;
+            mutate(filtered);
+            const auto r = read_versions(f.io(), filtered);
+            REQUIRE(r);
+            CHECK(f.meta_reads == 0);
+        }
+    }
 }
 
 TEST_CASE("audit_target: fixed field order", "[server][software_catalogue_model]") {
@@ -788,7 +914,28 @@ struct FakeIo {
     bool rows_ok{true}, totals_ok{true};
     std::vector<SoftwareCatalogRow> rows;
     int rows_reads{0};
+    // Coverage: unwired by default (the host-path and export tests never read it).
+    bool wire_connected{false}, wire_stale{false};
+    std::int64_t connected_n{0};
+    std::optional<std::int64_t> stale_n;
+    int connected_calls{0}, stale_calls{0};
+    std::int64_t cutoff_seen{-1};
     CatalogueReads io() {
+        CatalogueReads r = bare_io();
+        if (wire_connected)
+            r.connected = [this] {
+                ++connected_calls;
+                return connected_n;
+            };
+        if (wire_stale)
+            r.stale = [this](std::int64_t cutoff) {
+                ++stale_calls;
+                cutoff_seen = cutoff;
+                return stale_n;
+            };
+        return r;
+    }
+    CatalogueReads bare_io() {
         return {[this]() -> std::optional<CatalogRollupMeta> {
                     if (meta_reads++ == meta_nullopt_at)
                         return std::nullopt;
@@ -810,6 +957,8 @@ struct FakeIo {
     }
 };
 
+constexpr std::int64_t kNow = 1'000'000;
+
 CatalogueRequest req(int limit, std::string cursor = {}) {
     CatalogueRequest r;
     r.query.limit = limit;
@@ -823,7 +972,7 @@ TEST_CASE("read_catalogue_page: stable generation", "[server][software_catalogue
     FakeIo f;
     f.gens = {10};
     f.rows = {row("a", 3), row("b", 2)};
-    auto page = read_catalogue_page(f.io(), req(2));
+    auto page = read_catalogue_page(f.io(), req(2), kNow);
     REQUIRE(page);
     CHECK(page->rows.size() == 2);
     CHECK(page->totals.installs == 5);
@@ -832,7 +981,7 @@ TEST_CASE("read_catalogue_page: stable generation", "[server][software_catalogue
     REQUIRE_FALSE(page->next_cursor.empty());
     CHECK(decode_catalogue_cursor(page->next_cursor, filter_fingerprint({}), 10));
     // short page -> no cursor
-    auto shorter = read_catalogue_page(f.io(), req(5));
+    auto shorter = read_catalogue_page(f.io(), req(5), kNow);
     REQUIRE(shorter);
     CHECK(shorter->next_cursor.empty());
 }
@@ -842,7 +991,7 @@ TEST_CASE("read_catalogue_page: a refresh landing mid-read", "[server][software_
         FakeIo f;
         f.gens = {10, 11, 11, 11}; // before, after (moved) -> retry: before, after (stable)
         f.rows = {row("a", 3)};
-        auto page = read_catalogue_page(f.io(), req(1));
+        auto page = read_catalogue_page(f.io(), req(1), kNow);
         REQUIRE(page);
         CHECK(f.rows_reads == 2);
         CHECK(decode_catalogue_cursor(page->next_cursor, filter_fingerprint({}), 11));
@@ -851,7 +1000,7 @@ TEST_CASE("read_catalogue_page: a refresh landing mid-read", "[server][software_
         FakeIo f;
         f.gens = {10, 11, 11, 12};
         f.rows = {row("a", 3)};
-        auto page = read_catalogue_page(f.io(), req(1));
+        auto page = read_catalogue_page(f.io(), req(1), kNow);
         REQUIRE_FALSE(page);
         CHECK_FALSE(page.error());
         CHECK(f.rows_reads == 2);
@@ -861,7 +1010,7 @@ TEST_CASE("read_catalogue_page: a refresh landing mid-read", "[server][software_
         FakeIo f;
         f.gens = {10, 11};
         f.rows = {row("b", 2)};
-        auto page = read_catalogue_page(f.io(), req(1, tok));
+        auto page = read_catalogue_page(f.io(), req(1, tok), kNow);
         REQUIRE_FALSE(page);
         CHECK(page.error() == CursorError::kStale);
         CHECK(f.rows_reads == 1);
@@ -876,7 +1025,7 @@ TEST_CASE("read_catalogue_page: cursor and degrade outcomes", "[server][software
         const auto tok = encode_catalogue_cursor(row("a", 3), filter_fingerprint({}), 9);
         FakeIo f;
         f.gens = {10};
-        auto page = read_catalogue_page(f.io(), req(1, tok));
+        auto page = read_catalogue_page(f.io(), req(1, tok), kNow);
         REQUIRE_FALSE(page);
         CHECK(page.error() == CursorError::kStale);
         CHECK(f.rows_reads == 0);
@@ -887,10 +1036,10 @@ TEST_CASE("read_catalogue_page: cursor and degrade outcomes", "[server][software
         const auto tok = encode_catalogue_cursor(row("a", 3), filter_fingerprint(other), 10);
         FakeIo f;
         f.gens = {10};
-        auto mismatch = read_catalogue_page(f.io(), req(1, tok));
+        auto mismatch = read_catalogue_page(f.io(), req(1, tok), kNow);
         REQUIRE_FALSE(mismatch);
         CHECK(mismatch.error() == CursorError::kFilterMismatch);
-        auto garbage = read_catalogue_page(f.io(), req(1, "garbage"));
+        auto garbage = read_catalogue_page(f.io(), req(1, "garbage"), kNow);
         REQUIRE_FALSE(garbage);
         CHECK(garbage.error() == CursorError::kMalformed);
     }
@@ -898,13 +1047,13 @@ TEST_CASE("read_catalogue_page: cursor and degrade outcomes", "[server][software
         FakeIo rows_down;
         rows_down.gens = {10};
         rows_down.rows_ok = false;
-        auto a = read_catalogue_page(rows_down.io(), req(1));
+        auto a = read_catalogue_page(rows_down.io(), req(1), kNow);
         REQUIRE_FALSE(a);
         CHECK_FALSE(a.error());
         FakeIo totals_down;
         totals_down.gens = {10};
         totals_down.totals_ok = false;
-        auto b = read_catalogue_page(totals_down.io(), req(1));
+        auto b = read_catalogue_page(totals_down.io(), req(1), kNow);
         REQUIRE_FALSE(b);
         CHECK_FALSE(b.error());
     }
@@ -914,7 +1063,7 @@ TEST_CASE("read_catalogue_page: cursor and degrade outcomes", "[server][software
         f.rows = {row("a", 1)};
         auto rq = req(1);
         rq.query.agent_id = "dev-1";
-        auto page = read_catalogue_page(f.io(), rq);
+        auto page = read_catalogue_page(f.io(), rq, kNow);
         REQUIRE(page);
         CHECK_FALSE(page->meta.has_value());
         CHECK(f.gen_i == 0);
@@ -922,11 +1071,78 @@ TEST_CASE("read_catalogue_page: cursor and degrade outcomes", "[server][software
     }
 }
 
+TEST_CASE("read_catalogue_page: KPIs and coverage", "[server][software_catalogue_model]") {
+    SECTION("a first fleet page derives them once, with the cutoff and the wired counts") {
+        FakeIo f;
+        f.gens = {10};
+        f.rows = {row("a", 3)};
+        f.wire_connected = f.wire_stale = true;
+        f.connected_n = 7;
+        f.stale_n = 3;
+        auto page = read_catalogue_page(f.io(), req(1), kNow);
+        REQUIRE(page);
+        REQUIRE(page->kpis.has_value());
+        CHECK(page->kpis->coverage.connected == 7);
+        CHECK(page->kpis->coverage.stale == 3);
+        CHECK(page->kpis->meta.refreshed_at == 10);
+        CHECK(f.cutoff_seen == kNow - kStaleWindowSecs);
+    }
+    SECTION("an unwired registry and a degraded stale count are honest nulls") {
+        FakeIo f;
+        f.gens = {10};
+        f.rows = {row("a", 3)};
+        f.wire_stale = true; // answers nullopt: the bounded count degraded
+        auto page = read_catalogue_page(f.io(), req(1), kNow);
+        REQUIRE(page);
+        REQUIRE(page->kpis.has_value());
+        CHECK_FALSE(page->kpis->coverage.connected.has_value());
+        CHECK_FALSE(page->kpis->coverage.stale.has_value());
+        FakeIo none;
+        none.gens = {10};
+        none.rows = {row("a", 3)};
+        auto bare = read_catalogue_page(none.io(), req(1), kNow); // nothing wired at all
+        REQUIRE(bare);
+        REQUIRE(bare->kpis.has_value());
+        CHECK_FALSE(bare->kpis->coverage.stale.has_value());
+    }
+    SECTION("a refresh landing mid-read re-reads the page but gathers coverage ONCE") {
+        FakeIo f;
+        f.gens = {10, 11, 11, 11};
+        f.rows = {row("a", 3)};
+        f.wire_connected = f.wire_stale = true;
+        auto page = read_catalogue_page(f.io(), req(1), kNow);
+        REQUIRE(page);
+        CHECK(f.rows_reads == 2);
+        CHECK(f.connected_calls == 1);
+        CHECK(f.stale_calls == 1);
+        CHECK(page->kpis->meta.refreshed_at == 11);
+    }
+    SECTION("no KPIs on a continuation, the host path, or a failed read") {
+        FakeIo f;
+        f.gens = {10};
+        f.rows = {row("b", 2)};
+        f.wire_connected = f.wire_stale = true;
+        const auto tok = encode_catalogue_cursor(row("a", 3), filter_fingerprint({}), 10);
+        auto cont = read_catalogue_page(f.io(), req(1, tok), kNow);
+        REQUIRE(cont);
+        CHECK_FALSE(cont->kpis.has_value());
+        auto host_rq = req(1);
+        host_rq.query.agent_id = "dev-1";
+        auto host = read_catalogue_page(f.io(), host_rq, kNow);
+        REQUIRE(host);
+        CHECK_FALSE(host->kpis.has_value());
+        f.rows_ok = false;
+        CHECK_FALSE(read_catalogue_page(f.io(), req(1), kNow));
+        CHECK(f.connected_calls == 0);
+        CHECK(f.stale_calls == 0);
+    }
+}
+
 TEST_CASE("read_catalogue_page: limit 0 on an empty page yields no cursor and no back() on empty",
           "[server][software_catalogue_model]") {
     FakeIo f;
     f.gens = {10};
-    auto page = read_catalogue_page(f.io(), req(0));
+    auto page = read_catalogue_page(f.io(), req(0), kNow);
     REQUIRE(page);
     CHECK(page->rows.empty());
     CHECK(page->next_cursor.empty());
@@ -938,7 +1154,7 @@ TEST_CASE("the second generation read degrades like the first", "[server][softwa
         f.gens = {10};
         f.meta_nullopt_at = 1; // the bracketing read after rows + totals
         f.rows = {row("a", 3)};
-        auto page = read_catalogue_page(f.io(), req(1));
+        auto page = read_catalogue_page(f.io(), req(1), kNow);
         REQUIRE_FALSE(page);
         CHECK_FALSE(page.error());
         CHECK(f.rows_reads == 1);

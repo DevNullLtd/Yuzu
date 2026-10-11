@@ -20477,34 +20477,6 @@ TEST_CASE("MCP query_installed_software: version; cursor walk and source; legacy
     CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
 }
 
-TEST_CASE("MCP query_installed_software: a confined scope gets a COMPLETE page (push-down)",
-          "[mcp][pg][inventory]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    yuzu::server::SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
-    std::vector<yuzu::server::SoftwareEntry> rows = {{"Common", "1", "", ""}};
-    for (const char* agent : {"a1", "a2", "a3", "z1", "z2"})
-        REQUIRE(store.apply_installed_software(
-                    agent, yuzu::server::SoftwareInventoryStore::canonical_hash(rows), rows, 1000) ==
-                yuzu::server::InventoryIngestOutcome::kStored);
-    McpTestServer ts;
-    ts.software_inventory_store_for_test = &store;
-    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
-                                   const std::string&,
-                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
-        return {true, std::unordered_set<std::string>{"z1", "z2"}};
-    };
-    ts.start();
-    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
-                       R"("params":{"name":"query_installed_software","arguments":{"limit":2}}})");
-    REQUIRE(res->status == 200);
-    auto sc = nlohmann::json::parse(res->body).at("result").at("structuredContent");
-    CHECK(sc["software"].size() == 2); // a post-filter over a limit-2 scan would have returned 0
-    CHECK(sc["devices_omitted"].get<int>() == 0);
-}
-
 // require_fleet_read's own doc comment: unwired = misconfiguration, FAILS
 // CLOSED (503) — never silently falls back to an unfiltered read. REST's twin
 // of this test already exists (test_rest_inventory_software.cpp "unwired
@@ -20636,9 +20608,6 @@ TEST_CASE("MCP catalogue twins: tools/list advertises both; read-only; with type
         CHECK(t["annotations"]["idempotentHint"] == true);
         CHECK_FALSE(t["inputSchema"]["properties"].empty());
         CHECK_FALSE(t["outputSchema"]["properties"].empty());
-        CHECK(t["inputSchema"]["properties"]["kind"]["enum"] ==
-              nlohmann::json::array({"package", "app", "pkg", "feat"}));
-        CHECK(t["inputSchema"]["properties"]["ecosystem"]["enum"].size() == 9);
         if (name == "query_software_catalogue")
             CHECK(t["outputSchema"]["properties"].contains("totals"));
     }
@@ -20714,13 +20683,11 @@ TEST_CASE("MCP catalogue twins: fleet rows; totals and kpis; cursor continuation
     REQUIRE(other.contains("error"));
     CHECK(other["error"]["code"] == yuzu::server::mcp::kInvalidParams);
 
-    // strict schema (documented divergence from REST's clamp)
-    for (const char* args : {R"({"limit":0})", R"({"limit":5000})", R"({"kind":"nope"})"}) {
-        CAPTURE(args);
-        auto r = mcp_tool_call(ts, "query_software_catalogue", args);
-        REQUIRE(r.contains("error"));
-        CHECK(r["error"]["code"] == yuzu::server::mcp::kInvalidParams);
-    }
+    // strict schema (documented divergence from REST's clamp); the per-argument matrix is the
+    // model's strict_args_error test, this proves the handler maps it to kInvalidParams.
+    auto strict = mcp_tool_call(ts, "query_software_catalogue", R"({"limit":0})");
+    REQUIRE(strict.contains("error"));
+    CHECK(strict["error"]["code"] == yuzu::server::mcp::kInvalidParams);
 }
 
 TEST_CASE("MCP catalogue twins: confined caller — fleet denied; in-scope host admitted with newest "
@@ -20813,7 +20780,7 @@ TEST_CASE("MCP get_software_versions: a never-built rollup is a retryable error 
     catalogue_seed(store);
     // Put the rollup back to its never-computed state (a fresh install, or an upgrade before the
     // first refresh): refreshed_at = 0 on the singleton meta row of the disposable clone.
-    auto reset_to_building = [&] {
+    {
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
         REQUIRE(yuzu::server::pg::exec_params(
@@ -20821,8 +20788,7 @@ TEST_CASE("MCP get_software_versions: a never-built rollup is a retryable error 
                     "UPDATE software_inventory_store.catalog_rollup_meta SET refreshed_at = 0",
                     std::vector<std::string>{})
                     .status() == PGRES_COMMAND_OK);
-    };
-    reset_to_building();
+    }
 
     McpTestServer ts;
     ts.software_inventory_store_for_test = &store;

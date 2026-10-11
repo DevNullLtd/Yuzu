@@ -84,11 +84,8 @@ def extract_json_enums(text, field):
         rf'"{field}":\s*\{{[^{{}}]*?"enum":\s*\[([^\]]*)\]',
         rf'"name":\s*"{field}"[^{{}}]*"schema":\s*\{{[^{{}}]*?"enum":\s*\[([^\]]*)\]',
     )
-    found = []
-    for pat in patterns:
-        for m in re.finditer(pat, text):
-            found.append(set(re.findall(r'"([a-z_]+)"', m.group(1))))
-    return found
+    return [set(re.findall(r'"([a-z_]+)"', m.group(1))) for pat in patterns
+            for m in re.finditer(pat, text)]
 
 
 def extract_table_row(text, field):

@@ -8961,24 +8961,23 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
                     return;
                 }
-                auto& q = parsed->query;
-                // The cursor is bound to the filter set (never to the scope).
-                const std::string fp = swc::devices_fingerprint(q);
+                const std::string audit_key = swc::audit_target(parsed->query);
                 const bool continuation = !parsed->cursor.empty();
-                if (continuation) {
-                    auto cur = swc::decode_devices_cursor(parsed->cursor, fp);
-                    if (!cur) {
-                        res.set_content(error_response(id, kInvalidParams, std::string(swc::cursor_error_message(cur.error()))), "application/json"); // retry-hint-exempt: caller-input rejection
+                // The model decodes the cursor, pushes the scope into SQL up to
+                // kScopePushdownMaxIds (complete pages) and post-filters only a wider scope (the
+                // gate's own composed meet(management-group, service-scope) VisibleSet; the REST
+                // twin calls the same function). devices_omitted is DEFINED as the devices hidden
+                // by that filter: 0 under push-down, where the SQL returned only in-scope rows.
+                const auto read = swc::read_devices_page(
+                    [&](const SoftwareFleetQuery& dq) {
+                        return software_inventory_store->query_software(dq);
+                    },
+                    *parsed, gate.scope);
+                if (!read) {
+                    if (read.error()) {
+                        res.set_content(error_response(id, kInvalidParams, std::string(swc::cursor_error_message(*read.error()))), "application/json"); // retry-hint-exempt: caller-input rejection
                         return;
                     }
-                    q.after = *cur;
-                }
-                // Scope pushed into SQL up to kScopePushdownMaxIds (complete pages); only a wider
-                // scope falls back to the in-process post-filter below.
-                const auto scope_mode = swc::apply_scope(q, gate.scope);
-                const std::string audit_key = swc::audit_target(q);
-                auto rows_opt = software_inventory_store->query_software(q);
-                if (!rows_opt) {
                     // Store degraded (pool/query failure) — surface it, never return
                     // success+[]. A silent empty here reads as "installed nowhere" for a
                     // fleet vuln query (ADR-0016 §7 authoritative-reads; agentic-first A4
@@ -8991,73 +8990,46 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto& rows = *rows_opt;
+                const auto& page = *read;
 
-                // Cap hit BEFORE any post-filtering → the page is full. The next keyset
-                // position is the LAST SCANNED row, so a post-filtered page still advances.
-                const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
-                const std::string next =
-                    hit_cap ? swc::encode_devices_cursor(rows.back(), fp) : std::string();
-
-                // Post-filter only for a scope wider than the push-down bound (the gate's own
-                // composed meet(management-group, service-scope) VisibleSet; mirrors the REST
-                // twin exactly). devices_omitted is DEFINED as the devices hidden by THIS
-                // filter: 0 under push-down, where the SQL returned only in-scope rows.
-                std::size_t dropped_agents = 0;
-                if (scope_mode == swc::ScopeApply::kPostFilter) {
-                    std::unordered_set<std::string> dropped_ids;
-                    std::vector<SoftwareFleetRow> visible;
-                    visible.reserve(rows.size());
-                    for (auto& r : rows) {
-                        if (authz::in_scope(gate.scope, r.agent_id))
-                            visible.push_back(std::move(r));
-                        else
-                            dropped_ids.insert(r.agent_id); // count each DISTINCT dropped device once
-                    }
-                    rows.swap(visible);
-                    dropped_agents = dropped_ids.size();
-                }
-
-                JArr arr;
-                for (const auto& r : rows)
-                    arr.add_raw(swc::dump_safe(swc::device_row_json(r)));
                 // A post-filter drop is security-relevant — audit it distinctly (mirrors #1634)
                 // with the DISTINCT dropped-device count, and fold its persistence bool into
                 // audit_persisted. `success` is written on EVERY call (continuation pages
                 // tagged page=continuation): the cursor is opaque but unauthenticated.
                 bool denied_ok = true;
-                if (dropped_agents > 0)
+                if (page.devices_omitted > 0)
                     denied_ok = mcp_audit(
-                        "denied", "scope: filtered " + std::to_string(dropped_agents) +
+                        "denied", "scope: filtered " + std::to_string(page.devices_omitted) +
                                       " out-of-scope device(s) (management-group and/or "
                                       "service-tag axis) for " +
                                       audit_key);
                 const bool audit_ok =
                     mcp_audit("success", audit_key + (continuation ? " page=continuation" : "")) &&
                     denied_ok;
-                const std::string next_json = next.empty() ? "null" : json_quoted_string(next);
+                // The same body builder the REST twin uses, so the two cannot drift.
+                // structuredContent carries the schema-conformant object (#2712); content[0].text
+                // stays the legacy bare rows array, and devices_omitted / next_cursor stay
+                // repeated at the result's top level, spliced with .raw() so they are a genuine
+                // JSON integer and string-or-null (only .add() would quote).
+                auto body = swc::devices_response_json(page.rows, page.next_cursor,
+                                                       page.devices_omitted, page.hit_cap);
+                if (!audit_ok)
+                    body["audit_persisted"] = false;
                 JObj result_obj;
                 result_obj.raw("content",
-                               JArr().add(JObj().add("type", "text").add("text", arr.str())).str());
+                               JArr()
+                                   .add(JObj().add("type", "text").add("text",
+                                                                       swc::dump_safe(body["software"])))
+                                   .str());
                 if (!audit_ok)
                     result_obj.raw("audit_persisted", "false");
-                if (hit_cap)
+                if (page.hit_cap)
                     result_obj.raw("result_truncated_by_cap", "true");
-                // devices_omitted / next_cursor are spliced with .raw(): a genuine JSON integer
-                // and string-or-null (only .add() would quote). Also repeated in
-                // structuredContent (#2712) so the schema-conformant object carries the same
-                // fields; content[0].text stays the legacy bare rows array.
-                result_obj.raw("devices_omitted", std::to_string(dropped_agents));
-                result_obj.raw("next_cursor", next_json);
-                JObj structured;
-                structured.raw("software", arr.str());
-                if (!audit_ok)
-                    structured.add("audit_persisted", false);
-                if (hit_cap)
-                    structured.add("result_truncated_by_cap", true);
-                structured.raw("devices_omitted", std::to_string(dropped_agents));
-                structured.raw("next_cursor", next_json);
-                result_obj.raw("structuredContent", structured.str());
+                result_obj.raw("devices_omitted", std::to_string(page.devices_omitted));
+                result_obj.raw("next_cursor", page.next_cursor.empty()
+                                                  ? "null"
+                                                  : json_quoted_string(page.next_cursor));
+                result_obj.raw("structuredContent", swc::dump_safe(body));
                 res.set_content(success_response(id, result_obj.str()), "application/json");
                 return;
             }
@@ -9148,20 +9120,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "scope: device out of the caller's scope; " + target));
                         return;
                     }
-                    if (swc::versions_read_needs_rollup(q)) {
-                        const auto meta = software_inventory_store->catalog_rollup_meta();
-                        if (!meta) {
-                            degraded(target);
-                            return;
-                        }
-                        if (meta->refreshed_at == 0) {
-                            building(target);
-                            return;
-                        }
-                    }
-                    auto rows = software_inventory_store->software_versions(q);
+                    const auto rows = swc::read_versions(
+                        {[&] { return software_inventory_store->catalog_rollup_meta(); },
+                         [&](const SoftwareVersionsQuery& v) {
+                             return software_inventory_store->software_versions(v);
+                         }},
+                        q);
                     if (!rows) {
-                        degraded(target);
+                        if (rows.error() == swc::VersionsError::kBuilding)
+                            building(target);
+                        else
+                            degraded(target);
                         return;
                     }
                     const bool audit_ok = mcp_audit("success", target);
@@ -9193,13 +9162,21 @@ McpServer::HandlerFn McpServer::build_handler(
                           mcp_audit("denied", "scope: device out of the caller's scope; " + target));
                     return;
                 }
-                const swc::CatalogueReads io{
+                swc::CatalogueReads io{
                     [&] { return software_inventory_store->catalog_rollup_meta(); },
                     [&](const SoftwareCatalogQuery& c) { return software_inventory_store->software_catalog(c); },
                     [&](const SoftwareCatalogQuery& c) {
                         return software_inventory_store->software_catalog_totals(c);
                     }};
-                const auto read = swc::read_catalogue_page(io, *parsed);
+                if (device_api)
+                    io.connected = [&] {
+                        return static_cast<std::int64_t>(device_api->list_devices().size());
+                    };
+                io.stale = [&](std::int64_t cutoff) {
+                    return software_inventory_store->count_stale_agents(cutoff);
+                };
+                const auto read = swc::read_catalogue_page(
+                    io, *parsed, static_cast<std::int64_t>(std::time(nullptr)));
                 if (!read) {
                     if (!read.error()) {
                         degraded(target);
@@ -9209,27 +9186,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto& page = *read;
-                // Coverage + KPIs only on a first fleet page (continuation pages carry kpis:null).
-                std::optional<swc::KpiFigures> kpis;
-                if (page.meta && !continuation) {
-                    swc::CoverageReads cov_io;
-                    if (device_api)
-                        cov_io.connected = [&] {
-                            return static_cast<std::int64_t>(device_api->list_devices().size());
-                        };
-                    cov_io.stale = [&](std::int64_t cutoff) {
-                        return software_inventory_store->count_stale_agents(cutoff);
-                    };
-                    kpis = swc::derive_kpis(*page.meta,
-                                            swc::gather_coverage(
-                                                cov_io, static_cast<std::int64_t>(std::time(nullptr))));
-                }
                 const bool audit_ok = mcp_audit(
                     "success", target + " titles=" + std::to_string(page.rows.size()) + " totals=" +
                                    std::to_string(page.totals.titles) + "/" +
                                    std::to_string(page.totals.installs) +
                                    (continuation ? " page=continuation" : ""));
-                reply(swc::catalogue_response_json(page.rows, page.totals, kpis, page.next_cursor,
+                reply(swc::catalogue_response_json(page.rows, page.totals, page.kpis, page.next_cursor,
                                                    omit_newest, 0),
                       audit_ok);
                 return;
