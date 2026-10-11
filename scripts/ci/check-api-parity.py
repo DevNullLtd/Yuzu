@@ -183,8 +183,8 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # REST only until the MCP twin lands, #3988) and the title-catalogue row
 # get.fragments-inventory-software is repointed at GET /api/v1/inventory/software/catalogue
 # (already "twinned", count unchanged). The catalogue route's format=csv titles export is REST-only by design: a CSV
-# body is a download for a person or a pipeline, not a structured tool result (MCP workers
-# page the JSON with `cursor`).
+# body is a download for a person or a pipeline, not a structured tool result (the JSON route
+# is the structured surface; its MCP twin is tracked by #3988).
 # Measured post-flip at 204 (205 - 1), not hand-picked.
 #
 # Merge of the two changes above: 205 - 4 (legacy rows deleted) - 1 (versions row twinned)

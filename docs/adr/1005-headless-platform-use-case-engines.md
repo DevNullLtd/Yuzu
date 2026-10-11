@@ -557,20 +557,20 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 
    - **2026-10-07 — software title catalogue REST routes
      (`GET /api/v1/inventory/software/catalogue`,
-     `GET /api/v1/inventory/software/catalogue/versions`, M.9 PR-2a).**
+     `GET /api/v1/inventory/software/catalogue/versions`).**
      REST-only for now, no MCP twin yet — a "no" on Decision 1/4's
      both-surfaces requirement. Recorded rather than fixed pre-merge because:
      - **A build-order gap, not a boundary.** The catalogue read surface
        (shared pure model, totals, cursors, CSV export) lands first so the
        MCP twins are a thin transport over the same model
        (`docs/api-twin-recipe.md` Rule 1) instead of a second shaper; the
-       MCP tools follow as PR-2b of the same programme. The `titles` CSV
+       MCP tools follow in the follow-up change tracked by #3988. The `titles` CSV
        export is REST-only by design (a download, not a structured tool
        result).
      - **Tracked by the open P1 issue #3988** ("Inventory catalogue-grain
-       read ... has no REST/MCP twin"); PR-2b closes the MCP-twin half only;
+       read ... has no REST/MCP twin"); that follow-up closes the MCP-twin half only;
        #3988's confinement criterion is superseded by the refuse-to-confined
-       ruling, so the issue's disposition is a decision, not this PR's merge.
+       ruling, so the issue's disposition is a decision, not this change's merge.
        **Revisit by 2026-11-07**; until the MCP tools merge, the parity
        ledger rows for these routes read `twinned` with `mcp_twin: null`.
      - **The exception relaxes no control.** The fleet view is gated on a
