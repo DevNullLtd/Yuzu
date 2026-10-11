@@ -1,9 +1,10 @@
 %%%-------------------------------------------------------------------
 %%% @doc AgentService over the wire: the REAL yuzu_gw_agent_service on REAL
-%%% agent listeners (yuzu_gw_test_listener), driven by grpcbox_client. Only the
-%%% process boundaries it calls are replaced (yuzu_gw_upstream, yuzu_gw_registry,
-%%% yuzu_gw_heartbeat_buffer), so every assertion is on what a client receives
-%%% (a gRPC status) or on what the service handed those boundaries:
+%%% agent listeners (yuzu_gw_test_listener), driven by the gun-based client
+%%% (yuzu_gw_test_client). Only the process boundaries it calls are replaced
+%%% (yuzu_gw_upstream, yuzu_gw_registry, yuzu_gw_heartbeat_buffer), so every
+%%% assertion is on what a client receives (a gRPC status) or on what the
+%%% service handed those boundaries:
 %%%
 %%%   - Register overwrites RegisterRequest.gateway_observed_peer with the
 %%%     address the gateway decided: the TCP peer on a plain listener, the
@@ -25,7 +26,6 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_agent_service_wire_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
 
 -define(SVC, 'yuzu.agent.v1.AgentService').
 -define(REGISTER, <<"/yuzu.agent.v1.AgentService/Register">>).
@@ -90,7 +90,7 @@ agent_service_wire_test_() ->
      end}.
 
 setup() ->
-    {ok, _} = application:ensure_all_started(grpcbox),
+    {ok, _} = application:ensure_all_started(gun),
     {ok, _} = application:ensure_all_started(cowboy),
     {ok, _} = application:ensure_all_started(telemetry),
     [begin
@@ -296,8 +296,8 @@ register_upstream_failed(#{plain := Chan}) ->
 %%--------------------------------------------------------------------
 
 execute_unimplemented(#{plain := Chan}) ->
-    {ok, S} = grpcbox_client:stream(ctx:new(), ?EXECUTE, #{command_id => <<"c">>, plugin => <<"p">>},
-                                    command_def(), #{channel => Chan}),
+    {ok, S} = yuzu_gw_test_client:stream(ctx:new(), ?EXECUTE, #{command_id => <<"c">>, plugin => <<"p">>},
+                                         command_def(), #{channel => Chan}),
     ?assertMatch({[], <<"12">>, _}, collect(S)).
 
 %%--------------------------------------------------------------------
@@ -369,12 +369,12 @@ register(Chan, AgentId, Forged) ->
 register(Chan, AgentId, Forged, ForwardedFor) ->
     Ctx = case ForwardedFor of
         undefined -> ctx:new();
-        _ -> grpcbox_metadata:append_to_outgoing_ctx(ctx:new(), #{<<"x-forwarded-for">> => ForwardedFor})
+        _ -> yuzu_gw_test_client:with_metadata(ctx:new(), #{<<"x-forwarded-for">> => ForwardedFor})
     end,
     Request = #{info => #{agent_id => AgentId, hostname => <<"host-", AgentId/binary>>},
                 enrollment_token => <<"enroll-secret">>,
                 gateway_observed_peer => Forged},
-    grpcbox_client:unary(Ctx, ?REGISTER, Request, register_def(), #{channel => Chan}).
+    yuzu_gw_test_client:unary(Ctx, ?REGISTER, Request, register_def(), #{channel => Chan}).
 
 binary_to_ip(Text) ->
     {ok, Ip} = inet:parse_strict_address(binary_to_list(Text)),
@@ -390,8 +390,8 @@ stored() ->
     list_to_tuple(Call).
 
 heartbeat(Chan, Session) ->
-    grpcbox_client:unary(ctx:new(), ?HEARTBEAT, #{session_id => Session}, heartbeat_def(),
-                         #{channel => Chan}).
+    yuzu_gw_test_client:unary(ctx:new(), ?HEARTBEAT, #{session_id => Session}, heartbeat_def(),
+                              #{channel => Chan}).
 
 %% The status a Subscribe stream ends with when the handler refuses it before
 %% sending anything. The client keeps the stream open for sending until it says
@@ -399,42 +399,42 @@ heartbeat(Chan, Session) ->
 subscribe_status(Chan, Session) ->
     Ctx = case Session of
         undefined -> ctx:new();
-        _ -> grpcbox_metadata:append_to_outgoing_ctx(ctx:new(), #{<<"x-yuzu-session-id">> => Session})
+        _ -> yuzu_gw_test_client:with_metadata(ctx:new(), #{<<"x-yuzu-session-id">> => Session})
     end,
-    {ok, S} = grpcbox_client:stream(Ctx, ?SUBSCRIBE, subscribe_def(), #{channel => Chan}),
-    {ok, {Status, Message, _}} = grpcbox_client:recv_trailers(S, 5000),
-    ok = grpcbox_client:close_send(S),
+    {ok, S} = yuzu_gw_test_client:stream(Ctx, ?SUBSCRIBE, subscribe_def(), #{channel => Chan}),
+    {ok, {Status, Message, _}} = yuzu_gw_test_client:recv_trailers(S, 5000),
+    ok = yuzu_gw_test_client:close_send(S),
     {Status, Message}.
 
-%% Every message of a stream, then its status and message: a clean end is
-%% `stream_finished' (status 0), any other status comes back as an error.
+%% Every message of a stream, then its status and message. The stream ends
+%% with `stream_finished' whatever its status; the status (0 or an error) and
+%% its message are then read from the trailers.
 collect(S) ->
     collect(S, []).
 
 collect(S, Acc) ->
-    case grpcbox_client:recv_data(S, 5000) of
+    case yuzu_gw_test_client:recv_data(S, 5000) of
         {ok, Message} -> collect(S, [Message | Acc]);
-        stream_finished -> {lists:reverse(Acc), <<"0">>, <<>>};
-        {error, {Status, Message}, _} -> {lists:reverse(Acc), Status, Message};
+        stream_finished ->
+            case yuzu_gw_test_client:recv_trailers(S, 5000) of
+                {ok, {Status, Message, _}} -> {lists:reverse(Acc), Status, Message};
+                Other -> {lists:reverse(Acc), {unexpected, Other}, undefined}
+            end;
         Other -> {lists:reverse(Acc), {unexpected, Other}, undefined}
     end.
 
 register_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.RegisterRequest') end,
-                 unmarshal_fun = fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.RegisterResponse') end}.
+    #{marshal => fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.RegisterRequest') end,
+      unmarshal => fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.RegisterResponse') end}.
 
 heartbeat_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.HeartbeatRequest') end,
-                 unmarshal_fun = fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.HeartbeatResponse') end}.
+    #{marshal => fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.HeartbeatRequest') end,
+      unmarshal => fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.HeartbeatResponse') end}.
 
 command_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandRequest') end,
-                 unmarshal_fun = fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandResponse') end}.
+    #{marshal => fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandRequest') end,
+      unmarshal => fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandResponse') end}.
 
 subscribe_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandResponse') end,
-                 unmarshal_fun = fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandRequest') end}.
+    #{marshal => fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandResponse') end,
+      unmarshal => fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandRequest') end}.

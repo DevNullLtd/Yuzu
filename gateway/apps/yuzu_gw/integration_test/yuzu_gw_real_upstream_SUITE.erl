@@ -1,7 +1,7 @@
 %%%-------------------------------------------------------------------
 %%% @doc Real-upstream tests: gateway modules against a live C++ server.
 %%%
-%%% Unlike yuzu_gw_fullstack_SUITE which mocks grpcbox, these tests
+%%% Unlike yuzu_gw_fullstack_SUITE which mocks the upstream client, these tests
 %%% connect to the actual C++ yuzu-server running in gateway mode.
 %%% This validates the full gRPC/protobuf wire protocol end-to-end.
 %%%
@@ -57,35 +57,18 @@ init_per_suite(Config) ->
     end.
 
 do_init_per_suite(Config) ->
-    %% Start dependencies. ORDER MATTERS: grpcbox reads its client
-    %% channels config at application start (`grpcbox_client_sup` builds
-    %% the channel registry once); subsequent `application:set_env`
-    %% changes are NOT observed. Set the client env BEFORE starting
-    %% grpcbox, otherwise `default_channel` is never registered and
-    %% every `proxy_register` call blocks the gen_server:call until its
-    %% 30s timeout fires (manifests as 6/7 tests failing with
-    %% `{timeout, {gen_server,call, ...}}`).
+    %% Start dependencies. The upstream channel (a yuzu_grpc_client_channel
+    %% over gun) is started below from the {yuzu_gw, upstream_client} env, the
+    %% same shape yuzu_gw_sup reads; this suite starts the gateway modules one by
+    %% one instead of the supervision tree, so it starts the channel itself.
+    %% Without it every `proxy_register' returns `{error, no_channel}'.
     ok = ensure_started(ctx),
-    ok = ensure_started(gproc),
+    ok = ensure_started(gun),
 
-    %% Configure grpcbox client channel to point at the real server
-    %% BEFORE starting the application.
-    application:set_env(grpcbox, client,
-        #{channels => [
-            {default_channel,
-             [{http, ?UPSTREAM_HOST, ?UPSTREAM_PORT, []}],
-             #{}}
-        ]}),
-
-    %% If grpcbox is already started (e.g. from a prior suite in the
-    %% same CT run), stop it so the new client env takes effect on the
-    %% next start. application:set_env on an already-started app does
-    %% not retroactively reconfigure its supervision tree.
-    case lists:keyfind(grpcbox, 1, application:which_applications()) of
-        false -> ok;
-        _ -> ok = application:stop(grpcbox)
-    end,
-    ok = ensure_started(grpcbox),
+    %% Point the client channel at the real server BEFORE the upstream
+    %% process starts. A channel left over from a prior suite in the same CT
+    %% run is replaced, so the new endpoint takes effect.
+    start_upstream_channel(?UPSTREAM_HOST, ?UPSTREAM_PORT),
 
     %% Start the gateway process group.
     case whereis(yuzu_gw) of
@@ -120,6 +103,7 @@ end_per_suite(_Config) ->
         timer:sleep(500)
     catch _:_ -> ok
     end,
+    stop_upstream_channel(),
     ok.
 
 init_per_testcase(_TC, Config) ->
@@ -296,17 +280,8 @@ circuit_breaker_recovery(_Config) ->
     catch gen_server:stop(yuzu_gw_upstream),
     timer:sleep(100),
 
-    %% Reconfigure grpcbox to point at a dead port temporarily.
-    application:set_env(grpcbox, client,
-        #{channels => [
-            {default_channel, [{http, "127.0.0.1", 59999, []}], #{}}
-        ]}),
-
-    %% Restart grpcbox to pick up new config.
-    catch application:stop(grpcbox),
-    timer:sleep(200),
-    ok = ensure_started(grpcbox),
-    timer:sleep(500),
+    %% Repoint the client channel at a dead port temporarily.
+    start_upstream_channel("127.0.0.1", 59999),
 
     application:set_env(yuzu_gw, circuit_breaker_failure_threshold, 2),
     application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 1500),
@@ -330,14 +305,7 @@ circuit_breaker_recovery(_Config) ->
     catch gen_server:stop(yuzu_gw_upstream),
     timer:sleep(100),
 
-    application:set_env(grpcbox, client,
-        #{channels => [
-            {default_channel, [{http, ?UPSTREAM_HOST, ?UPSTREAM_PORT, []}], #{}}
-        ]}),
-    catch application:stop(grpcbox),
-    timer:sleep(200),
-    ok = ensure_started(grpcbox),
-    timer:sleep(500),
+    start_upstream_channel(?UPSTREAM_HOST, ?UPSTREAM_PORT),
 
     application:set_env(yuzu_gw, circuit_breaker_failure_threshold, 3),
     application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 2000),
@@ -460,6 +428,29 @@ ensure_started(App) ->
         {ok, _}                       -> ok;
         {error, {already_started, _}} -> ok;
         {error, Reason}               -> {error, Reason}
+    end.
+
+%% (Re)start the `default_channel' upstream client channel against Host:Port.
+%% The channel config goes through the same {yuzu_gw, upstream_client} env and
+%% parser yuzu_gw_sup uses. The channel is unlinked so it outlives the CT
+%% process that started it.
+start_upstream_channel(Host, Port) ->
+    stop_upstream_channel(),
+    Env = #{channels => [{default_channel, [{http, Host, Port, []}], #{}}]},
+    application:set_env(yuzu_gw, upstream_client, Env),
+    {ok, [Channel]} = yuzu_grpc_client_config:from_env(),
+    {ok, Pid} = yuzu_grpc_client_channel:start_link(Channel),
+    unlink(Pid),
+    ok.
+
+stop_upstream_channel() ->
+    case whereis(default_channel) of
+        undefined -> ok;
+        Pid ->
+            %% The channel traps exits, so an exit signal from a process
+            %% that is not its parent would be ignored; stop it
+            %% synchronously instead.
+            ok = gen_server:stop(Pid, shutdown, 5000)
     end.
 
 start_module(Module) ->

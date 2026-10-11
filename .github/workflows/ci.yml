@@ -879,14 +879,6 @@ jobs:
           otp-version: '28'
           rebar3-version: '3.24'
 
-      # PKI PR5c: the gateway vendors a 2-line-patched grpcbox in
-      # gateway/_checkouts/grpcbox. This supply-chain gate fails the PR build if
-      # that copy is ever anything other than upstream grpcbox at the
-      # rebar.config-pinned tag + the documented grpcbox.yuzu.patch (tamper /
-      # drift / version skew). Runs on the merge-guarding path, not only release.
-      - name: Verify vendored grpcbox integrity
-        run: bash gateway/scripts/verify-vendored-grpcbox.sh
-
       # ADR-0016 / gov build-ci: the committed gateway _pb.erl are GENERATED from
       # the vendored proto (regen_pb.escript). Re-regenerate + byte-diff so an
       # un-regenerated, silently field-dropping _pb.erl (e.g. management_pb, which

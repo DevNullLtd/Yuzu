@@ -29,10 +29,10 @@ circuit_breaker_test_() ->
      ]}.
 
 setup() ->
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     catch meck:unload(telemetry),
-    meck:new(grpcbox_client, [non_strict, no_link]),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{}, #{}}
     end),
     meck:new(telemetry, [passthrough, no_link]),
@@ -52,7 +52,7 @@ cleanup(Pid) ->
     %% Synchronous stop — see issue #336 for the race exit/sleep replaces.
     catch unlink(Pid),
     catch gen_server:stop(Pid, shutdown, 5000),
-    meck:unload([grpcbox_client, telemetry]),
+    meck:unload([yuzu_grpc_client, telemetry]),
     ok.
 
 %%%===================================================================
@@ -60,7 +60,7 @@ cleanup(Pid) ->
 %%%===================================================================
 
 trip_circuit() ->
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
@@ -99,14 +99,14 @@ starts_closed() ->
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()).
 
 stays_closed_on_success() ->
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{session_id => <<"s1">>}, #{}}
     end),
     {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()).
 
 opens_after_threshold() ->
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     %% Failures 1 and 2 — still closed
@@ -120,12 +120,12 @@ opens_after_threshold() ->
 
 rejects_when_open() ->
     trip_circuit(),
-    %% Now calls should be rejected immediately without hitting grpcbox
-    meck:reset(grpcbox_client),
+    %% Now calls should be rejected immediately without hitting yuzu_grpc_client
+    meck:reset(yuzu_grpc_client),
     Result = yuzu_gw_upstream:proxy_register(#{info => #{}}),
     ?assertEqual({error, circuit_open}, Result),
-    %% Verify grpcbox was NOT called
-    ?assertEqual(0, meck:num_calls(grpcbox_client, unary, '_')).
+    %% Verify yuzu_grpc_client was NOT called
+    ?assertEqual(0, meck:num_calls(yuzu_grpc_client, unary, '_')).
 
 transitions_to_half_open() ->
     trip_circuit(),
@@ -137,7 +137,7 @@ closes_on_probe_success() ->
     %% Wait for the timer-driven half_open.
     ?assertEqual(half_open, await_state(half_open)),
     %% Make the probe succeed
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{session_id => <<"recovered">>}, #{}}
     end),
     {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),

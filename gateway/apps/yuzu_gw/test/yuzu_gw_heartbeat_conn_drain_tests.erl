@@ -3,7 +3,7 @@
 %%%
 %%% Companion to yuzu_gw_heartbeat_conn_rpc_tests: the same REAL
 %%% yuzu_grpc_listener serving the REAL yuzu_gw_agent_service, driven by REAL
-%%% grpcbox client channels over plaintext HTTP/2 (the death of a connection is
+%%% gRPC client channels (yuzu_grpc_client_channel) over plaintext HTTP/2 (the death of a connection is
 %%% transport independent). The intent: a connection's death drains its
 %%% sessions, and until it has, no other connection is admitted for them.
 %%%
@@ -44,7 +44,6 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_heartbeat_conn_drain_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
 
 -define(SVC, 'yuzu.agent.v1.AgentService').
 -define(REGISTER_PATH,  <<"/yuzu.agent.v1.AgentService/Register">>).
@@ -251,7 +250,7 @@ new_connection_during_drain_window(State) ->
         end
     end).
 
-%% The agent-side recovery path, modelled with grpcbox clients (the real agent
+%% The agent-side recovery path, modelled with the test gRPC client (the real agent
 %% is gRPC core): heartbeats arrive on a connection other than the Subscribe's,
 %% are answered NOT_FOUND, and the agent then cancels the Subscribe and
 %% registers again on the connection it is using.
@@ -368,23 +367,24 @@ agent_id(Prefix) ->
 register_session(Chan, AgentId) ->
     Req = #{info => #{agent_id => AgentId, hostname => <<"h">>}},
     {ok, #{session_id := S}, _} =
-        grpcbox_client:unary(ctx:new(), ?REGISTER_PATH, Req, register_def(),
-                             #{channel => Chan}),
+        yuzu_gw_test_client:unary(ctx:new(), ?REGISTER_PATH, Req, register_def(),
+                                  #{channel => Chan}),
     S.
 
 %% Open the Subscribe stream from a dedicated process, like a real agent holds
 %% it (see yuzu_gw_heartbeat_conn_rpc_tests). The holder is not linked to the
-%% test process: its stream ends when the connection does. Every message the
-%% holder receives (the client library reports the end of a stream as a
-%% message) is passed on to the test process.
+%% test process: its stream ends when the connection does. The test client's
+%% stream process is linked to the holder, so it ends with the holder. The
+%% holder reads the end of its stream (its status, or the error that ended it)
+%% on request and passes it on to the test process.
 subscribe(Chan, SessionId) ->
     Owner = self(),
     Holder = spawn(fun() ->
-        Ctx = grpcbox_metadata:append_to_outgoing_ctx(
+        Ctx = yuzu_gw_test_client:with_metadata(
                 ctx:new(), #{<<"x-yuzu-session-id">> => SessionId}),
-        {ok, Stream} = grpcbox_client:stream(Ctx, ?SUBSCRIBE_PATH, subscribe_def(),
-                                             #{channel => Chan}),
-        ok = grpcbox_client:send(Stream, #{command_id => <<"hello">>}),
+        {ok, Stream} = yuzu_gw_test_client:stream(Ctx, ?SUBSCRIBE_PATH, subscribe_def(),
+                                                  #{channel => Chan}),
+        ok = yuzu_gw_test_client:send(Stream, #{command_id => <<"hello">>}),
         Owner ! {subscribed, self()},
         holder_loop(Owner, Stream)
     end),
@@ -395,10 +395,12 @@ subscribe(Chan, SessionId) ->
 holder_loop(Owner, Stream) ->
     receive
         {close, From} ->
-            catch grpcbox_client:close_send(Stream),
+            catch yuzu_gw_test_client:close_send(Stream),
             From ! {closed, self()};
-        Msg ->
-            Owner ! {holder_msg, self(), Msg},
+        await_end ->
+            Owner ! {holder_msg, self(), {stream_end, yuzu_gw_test_client:recv_trailers(Stream, 5000)}},
+            holder_loop(Owner, Stream);
+        _Other ->
             holder_loop(Owner, Stream)
     end.
 
@@ -422,10 +424,10 @@ stop_holder(Holder) ->
     receive {closed, Holder} -> ok after 0 -> ok end,
     ok.
 
-%% The first message the holder saw (the client library's end-of-stream
-%% report). The text of the message is a client library detail and is not
-%% asserted.
+%% The holder's report of how its stream ended: its status, or the error that
+%% ended it. The content is a client detail and is not asserted.
 await_holder_msg(Holder) ->
+    Holder ! await_end,
     receive {holder_msg, Holder, _} = Msg -> Msg
     after 5000 -> {error, no_holder_message}
     end.
@@ -437,8 +439,8 @@ register_and_subscribe(Chan, AgentId) ->
     {S, Holder}.
 
 heartbeat(Chan, SessionId) ->
-    grpcbox_client:unary(ctx:new(), ?HEARTBEAT_PATH, #{session_id => SessionId},
-                         heartbeat_def(), #{channel => Chan}).
+    yuzu_gw_test_client:unary(ctx:new(), ?HEARTBEAT_PATH, #{session_id => SessionId},
+                              heartbeat_def(), #{channel => Chan}).
 
 queued_for(SessionId) ->
     length([x || {_, {_, queue_heartbeat, [#{session_id := S}]}, _} <-
@@ -464,25 +466,22 @@ wait_until(Pred, Timeout) ->
     end.
 
 register_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) ->
-                     agent_pb:encode_msg(M, 'yuzu.agent.v1.RegisterRequest') end,
-                 unmarshal_fun = fun(B) ->
-                     agent_pb:decode_msg(B, 'yuzu.agent.v1.RegisterResponse') end}.
+    #{marshal => fun(M) ->
+          agent_pb:encode_msg(M, 'yuzu.agent.v1.RegisterRequest') end,
+      unmarshal => fun(B) ->
+          agent_pb:decode_msg(B, 'yuzu.agent.v1.RegisterResponse') end}.
 
 heartbeat_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) ->
-                     agent_pb:encode_msg(M, 'yuzu.agent.v1.HeartbeatRequest') end,
-                 unmarshal_fun = fun(B) ->
-                     agent_pb:decode_msg(B, 'yuzu.agent.v1.HeartbeatResponse') end}.
+    #{marshal => fun(M) ->
+          agent_pb:encode_msg(M, 'yuzu.agent.v1.HeartbeatRequest') end,
+      unmarshal => fun(B) ->
+          agent_pb:decode_msg(B, 'yuzu.agent.v1.HeartbeatResponse') end}.
 
 subscribe_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) ->
-                     agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandResponse') end,
-                 unmarshal_fun = fun(B) ->
-                     agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandRequest') end}.
+    #{marshal => fun(M) ->
+          agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandResponse') end,
+      unmarshal => fun(B) ->
+          agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandRequest') end}.
 
 %%%-------------------------------------------------------------------
 %%% Fixture
@@ -569,11 +568,11 @@ with_channels(#{port := Port, counts := Counts}, Fun) ->
         ets:delete(Opened)
     end.
 
-%% Cold-start guard: the first call on a fresh channel dials the listener, and
-%% under CPU oversubscription grpcbox's internal 5 s call into the subchannel
-%% can time out. Retry a harmless unary call (an unknown session is answered
-%% with a gRPC status, which proves the connection works) until it gets an
-%% answer, so the case bodies only ever see a warm connection.
+%% Cold-start guard: the channel is up when client_channel/2 returns, but the
+%% first call on it can still outlast the call's default 5 s timeout under CPU
+%% oversubscription. Retry a harmless unary call (an unknown session is
+%% answered with a gRPC status, which proves the connection works) until it
+%% gets an answer, so the case bodies only ever see a warm connection.
 warm_chan(Chan) ->
     warm_chan(Chan, 5).
 

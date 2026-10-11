@@ -3,7 +3,8 @@
 %%%
 %%% Starts a REAL yuzu_grpc_listener serving the REAL yuzu_gw_agent_service,
 %%% with the real registry and agent supervisor behind it, and drives it with
-%%% real grpcbox client channels (one channel = one HTTP/2 connection).
+%%% real gRPC client channels (yuzu_grpc_client_channel with a pool of one: one
+%%% channel = one HTTP/2 connection).
 %%% Only the upstream C++ server client and the heartbeat buffer are mocked.
 %%% No part of the connection key is injected: it comes from the layer's own
 %%% accessors, for both the bidi Subscribe stream and the unary Register /
@@ -45,7 +46,6 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_heartbeat_conn_rpc_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
 
 -define(SVC, 'yuzu.agent.v1.AgentService').
 -define(REGISTER_PATH,  <<"/yuzu.agent.v1.AgentService/Register">>).
@@ -280,29 +280,29 @@ agent_id(Prefix) ->
 register_session(Chan, AgentId) ->
     Req = #{info => #{agent_id => AgentId, hostname => <<"h">>}},
     {ok, #{session_id := S}, _} =
-        grpcbox_client:unary(ctx:new(), ?REGISTER_PATH, Req, register_def(),
-                             #{channel => Chan}),
+        yuzu_gw_test_client:unary(ctx:new(), ?REGISTER_PATH, Req, register_def(),
+                                  #{channel => Chan}),
     S.
 
 %% Open the Subscribe stream from a dedicated process, like a real agent
-%% holds it. A grpcbox client delivers a stream's messages to the process that
-%% opened it, tagged with the HTTP/2 stream id only, and stream ids repeat
-%% across connections: opening the stream in the test process would let its
-%% messages be picked up by a unary call on another channel.
+%% holds it. The test client's stream process is linked to the process that
+%% opened it and cancels the stream when that process exits: opening the stream
+%% from a dedicated holder keeps it open until close_stream/1 asks the holder to
+%% half-close it, and ties its end to the holder, not to the test process.
 subscribe(Chan, SessionId) ->
     Owner = self(),
     Holder = spawn_link(fun() ->
-        Ctx = grpcbox_metadata:append_to_outgoing_ctx(
+        Ctx = yuzu_gw_test_client:with_metadata(
                 ctx:new(), #{<<"x-yuzu-session-id">> => SessionId}),
-        {ok, Stream} = grpcbox_client:stream(Ctx, ?SUBSCRIBE_PATH, subscribe_def(),
-                                             #{channel => Chan}),
+        {ok, Stream} = yuzu_gw_test_client:stream(Ctx, ?SUBSCRIBE_PATH, subscribe_def(),
+                                                  #{channel => Chan}),
         %% Open the stream on the wire; the gateway ignores agent frames that
         %% carry no command id.
-        ok = grpcbox_client:send(Stream, #{command_id => <<"hello">>}),
+        ok = yuzu_gw_test_client:send(Stream, #{command_id => <<"hello">>}),
         Owner ! {subscribed, self()},
         receive
             {close, From} ->
-                catch grpcbox_client:close_send(Stream),
+                catch yuzu_gw_test_client:close_send(Stream),
                 From ! {closed, self()}
         end
     end),
@@ -319,8 +319,8 @@ register_and_subscribe(Chan, AgentId) ->
     {S, Stream}.
 
 heartbeat(Chan, SessionId) ->
-    grpcbox_client:unary(ctx:new(), ?HEARTBEAT_PATH, #{session_id => SessionId},
-                         heartbeat_def(), #{channel => Chan}).
+    yuzu_gw_test_client:unary(ctx:new(), ?HEARTBEAT_PATH, #{session_id => SessionId},
+                              heartbeat_def(), #{channel => Chan}).
 
 %% End the client side of a Subscribe stream (the stream's owner process).
 close_stream(Holder) ->
@@ -352,25 +352,22 @@ wait_until(Pred, Timeout) ->
     end.
 
 register_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) ->
-                     agent_pb:encode_msg(M, 'yuzu.agent.v1.RegisterRequest') end,
-                 unmarshal_fun = fun(B) ->
-                     agent_pb:decode_msg(B, 'yuzu.agent.v1.RegisterResponse') end}.
+    #{marshal => fun(M) ->
+          agent_pb:encode_msg(M, 'yuzu.agent.v1.RegisterRequest') end,
+      unmarshal => fun(B) ->
+          agent_pb:decode_msg(B, 'yuzu.agent.v1.RegisterResponse') end}.
 
 heartbeat_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) ->
-                     agent_pb:encode_msg(M, 'yuzu.agent.v1.HeartbeatRequest') end,
-                 unmarshal_fun = fun(B) ->
-                     agent_pb:decode_msg(B, 'yuzu.agent.v1.HeartbeatResponse') end}.
+    #{marshal => fun(M) ->
+          agent_pb:encode_msg(M, 'yuzu.agent.v1.HeartbeatRequest') end,
+      unmarshal => fun(B) ->
+          agent_pb:decode_msg(B, 'yuzu.agent.v1.HeartbeatResponse') end}.
 
 subscribe_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) ->
-                     agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandResponse') end,
-                 unmarshal_fun = fun(B) ->
-                     agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandRequest') end}.
+    #{marshal => fun(M) ->
+          agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandResponse') end,
+      unmarshal => fun(B) ->
+          agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandRequest') end}.
 
 %%%-------------------------------------------------------------------
 %%% TLS-only cases
@@ -379,8 +376,9 @@ subscribe_def() ->
 %% A raw client handshake against the listener: the server certificate is
 %% verified against the minted CA (verify_peer, so a non-TLS or wrongly signed
 %% listener fails here), the negotiated version is the listener's TLS 1.2, and
-%% HTTP/2 is negotiated for a client that offers it the way the grpcbox client
-%% does (both ALPN and NPN).
+%% HTTP/2 is negotiated for a client that offers it by ALPN, as the gun-based
+%% gateway client does (NPN is offered as well; the assertion is on the
+%% negotiated protocol).
 tls_handshake_observed(#{port := Port, client_ssl := ClientSsl}) ->
     {ok, Sock} = ssl:connect("localhost", Port,
                              ClientSsl ++ [{mode, binary}, {active, false},
@@ -538,11 +536,11 @@ warmed(Chan) ->
     ok = warm_chan(Chan),
     Chan.
 
-%% Cold-start guard: the first call on a fresh channel dials the listener, and
-%% under CPU oversubscription grpcbox's internal 5 s call into the subchannel
-%% can time out. Retry a harmless unary call (an unknown session is answered
-%% with a gRPC status, which proves the connection works) until it gets an
-%% answer, so the case bodies only ever see a warm connection.
+%% Cold-start guard: the channel is up when start_chan/2 returns, but the first
+%% call on it can still outlast the call's default 5 s timeout under CPU
+%% oversubscription. Retry a harmless unary call (an unknown session is
+%% answered with a gRPC status, which proves the connection works) until it
+%% gets an answer, so the case bodies only ever see a warm connection.
 warm_chan(Chan) ->
     warm_chan(Chan, 5).
 

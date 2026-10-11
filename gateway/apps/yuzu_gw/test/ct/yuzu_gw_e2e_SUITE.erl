@@ -56,7 +56,6 @@ all() ->
 init_per_suite(Config) ->
     %% Ensure all required applications are started.
     application:ensure_all_started(telemetry),
-    application:ensure_all_started(gproc),
     application:ensure_all_started(gpb),
 
     %% Configure gateway for testing.
@@ -70,9 +69,7 @@ init_per_suite(Config) ->
     application:set_env(yuzu_gw, max_sessions_per_connection, 1000),
 
     %% Mock upstream so we don't need a real C++ server.
-    meck:new(grpcbox_channel, [non_strict, no_link]),
-    meck:expect(grpcbox_channel, pick, fun(_, _) -> {ok, mock_channel} end),
-    meck:new(grpcbox_client, [non_strict, no_link]),
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
     setup_upstream_mocks(),
 
     %% Connection key for the in-process agent service calls (see ?CONN_KEY).
@@ -98,7 +95,7 @@ end_per_suite(_Config) ->
     stop_gateway_processes(),
 
     %% Unload mocks.
-    meck:unload([grpcbox_channel, grpcbox_client, yuzu_gw_conn]),
+    meck:unload([yuzu_grpc_client, yuzu_gw_conn]),
     application:unset_env(yuzu_gw, max_sessions_per_connection),
 
     ok.
@@ -255,7 +252,7 @@ heartbeat_batching_e2e(_Config) ->
     ct:pal("Testing heartbeat batching"),
 
     %% Reset meck history so we can check for new BatchHeartbeat calls.
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
 
     %% Heartbeats are admitted only for sessions this node holds, on the
     %% connection that opened them: hold ten live sessions bound to
@@ -279,8 +276,8 @@ heartbeat_batching_e2e(_Config) ->
     timer:sleep(700),
 
     %% Verify a batch was sent by inspecting meck history.
-    Calls = meck:history(grpcbox_client),
-    BatchCalls = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
+    Calls = meck:history(yuzu_grpc_client),
+    BatchCalls = [Req || {_, {yuzu_grpc_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
                          binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch],
     ?assert(length(BatchCalls) > 0),
     [LastBatch | _] = BatchCalls,
@@ -405,7 +402,7 @@ stop_gateway_processes() ->
 
 setup_upstream_mocks() ->
     SessionCounter = atomics:new(1, []),
-    meck:expect(grpcbox_client, unary, fun(_, Path, _Req, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, _Req, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch ->
                 case binary:match(Path, <<"BatchHeartbeat">>) of

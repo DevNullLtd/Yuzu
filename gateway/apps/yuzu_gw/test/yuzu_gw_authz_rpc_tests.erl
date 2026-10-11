@@ -4,9 +4,9 @@
 %%% Starts a REAL yuzu_grpc_listener TLS listener shaped like the :50063
 %%% mgmt listener (strict mTLS + auth_fun => yuzu_gw_authz:check_mgmt_peer/1)
 %%% plus a second listener shaped like the :50051 agent listener
-%%% (verify_none, no auth_fun), then drives them with real grpcbox client
-%%% channels holding different leaf certs. Proves, at gRPC-status level
-%%% (NOT just a TLS handshake):
+%%% (verify_none, no auth_fun), then drives them with real gRPC client
+%%% channels (yuzu_grpc_client_channel) holding different leaf certs. Proves,
+%%% at gRPC-status level (NOT just a TLS handshake):
 %%%   - the pinned server leaf is admitted (unary + streaming);
 %%%   - a CA-issued agent leaf gets UNAUTHENTICATED (status 16) and the
 %%%     service callback is NEVER invoked;
@@ -22,7 +22,6 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_authz_rpc_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
 
 -define(SVC, 'yuzu.server.v1.ManagementService').
 -define(LIST_PATH, <<"/yuzu.server.v1.ManagementService/ListAgents">>).
@@ -77,19 +76,19 @@ unary_gateway_rejected(#{chan_gw := Chan}) ->
 
 stream_agent_rejected(#{chan_agent := Chan}) ->
     yuzu_gw_authz_stub_svc:init_counters(),
-    {ok, S} = grpcbox_client:stream(ctx:new(), ?SEND_PATH, send_command_def(),
-                                    #{channel => Chan}),
-    ok = grpcbox_client:send(S, #{agent_ids => [], timeout_seconds => 1}),
-    ok = grpcbox_client:close_send(S),
+    {ok, S} = yuzu_gw_test_client:stream(ctx:new(), ?SEND_PATH, send_command_def(),
+                                       #{channel => Chan}),
+    ok = yuzu_gw_test_client:send(S, #{agent_ids => [], timeout_seconds => 1}),
+    ok = yuzu_gw_test_client:close_send(S),
     ?assertMatch({error, {<<"16">>, _}}, stream_result(S)),
     ?assertEqual(0, yuzu_gw_authz_stub_svc:invocations()).
 
 stream_ok(#{chan_srv := Chan}) ->
     yuzu_gw_authz_stub_svc:init_counters(),
-    {ok, S} = grpcbox_client:stream(ctx:new(), ?SEND_PATH, send_command_def(),
-                                    #{channel => Chan}),
-    ok = grpcbox_client:send(S, #{agent_ids => [], timeout_seconds => 1}),
-    ok = grpcbox_client:close_send(S),
+    {ok, S} = yuzu_gw_test_client:stream(ctx:new(), ?SEND_PATH, send_command_def(),
+                                       #{channel => Chan}),
+    ok = yuzu_gw_test_client:send(S, #{agent_ids => [], timeout_seconds => 1}),
+    ok = yuzu_gw_test_client:close_send(S),
     ?assertMatch({ok, {<<"0">>, _, _}}, stream_result(S)),
     ?assertEqual(1, yuzu_gw_authz_stub_svc:invocations()).
 
@@ -122,32 +121,30 @@ certless_agent_listener_ok(#{chan_agentless := Chan}) ->
     ?assertEqual(1, yuzu_gw_authz_stub_svc:invocations()).
 
 %%%-------------------------------------------------------------------
-%%% grpcbox plumbing
+%%% client plumbing
 %%%-------------------------------------------------------------------
 
 list_agents(Chan) ->
-    Def = #grpcbox_def{service = ?SVC,
-                       marshal_fun = fun(M) ->
-                           management_pb:encode_msg(M, 'yuzu.server.v1.ListAgentsRequest')
-                       end,
-                       unmarshal_fun = fun(B) ->
-                           management_pb:decode_msg(B, 'yuzu.server.v1.ListAgentsResponse')
-                       end},
-    grpcbox_client:unary(ctx:new(), ?LIST_PATH, #{limit => 10}, Def,
-                         #{channel => Chan}).
+    Def = #{marshal => fun(M) ->
+                management_pb:encode_msg(M, 'yuzu.server.v1.ListAgentsRequest')
+            end,
+            unmarshal => fun(B) ->
+                management_pb:decode_msg(B, 'yuzu.server.v1.ListAgentsResponse')
+            end},
+    yuzu_gw_test_client:unary(ctx:new(), ?LIST_PATH, #{limit => 10}, Def,
+                             #{channel => Chan}).
 
 send_command_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) ->
-                     management_pb:encode_msg(M, 'yuzu.server.v1.SendCommandRequest')
-                 end,
-                 unmarshal_fun = fun(B) ->
-                     management_pb:decode_msg(B, 'yuzu.server.v1.SendCommandResponse')
-                 end}.
+    #{marshal => fun(M) ->
+          management_pb:encode_msg(M, 'yuzu.server.v1.SendCommandRequest')
+      end,
+      unmarshal => fun(B) ->
+          management_pb:decode_msg(B, 'yuzu.server.v1.SendCommandResponse')
+      end}.
 
 %% Drain a client stream to its terminating trailers.
 stream_result(S) ->
-    case grpcbox_client:recv_trailers(S, 5000) of
+    case yuzu_gw_test_client:recv_trailers(S, 5000) of
         {ok, {<<"0">>, _, _} = T} -> {ok, T};
         {ok, {Status, Msg, _}}    -> {error, {Status, Msg}};
         Other                     -> Other

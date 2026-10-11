@@ -61,10 +61,11 @@ configs:
                     service_protos => [management_pb],
                     services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},
                     listen => #{port => 50063, ip => {0,0,0,0}}}
-              ]}
-          ]},
-          {grpcbox, [
-              {client, #{channels => [
+              ]},
+              %% Upstream channel to the server (plaintext HTTP/2). Read from
+              %% {yuzu_gw, upstream_client}; a {grpcbox, client} entry is never
+              %% applied by the VM and refuses boot.
+              {upstream_client, #{channels => [
                   {default_channel, [{http, "server", 50055, []}], #{}}
               ]}}
           ]},

@@ -6,7 +6,7 @@
 %%% are preserved end-to-end: queued into the heartbeat buffer, batched,
 %%% and forwarded in the BatchHeartbeat RPC to the upstream server.
 %%%
-%%% Mocks grpcbox_client to inspect what the gateway actually sends.
+%%% Mocks yuzu_grpc_client to inspect what the gateway actually sends.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_heartbeat_metrics_tests).
@@ -33,10 +33,10 @@ heartbeat_metrics_test_() ->
      ]}.
 
 setup() ->
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     catch meck:unload(telemetry),
-    meck:new(grpcbox_client, [non_strict, no_link]),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     meck:new(telemetry, [passthrough, no_link]),
@@ -55,7 +55,7 @@ cleanup(Pid) ->
     unlink(Pid),
     exit(Pid, shutdown),
     timer:sleep(50),
-    meck:unload([grpcbox_client, telemetry]),
+    meck:unload([yuzu_grpc_client, telemetry]),
     ok.
 
 %%%===================================================================
@@ -80,7 +80,7 @@ linux_tags() ->
 
 %% Drain any stale heartbeats from prior tests, then reset meck history.
 drain_buffer() ->
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     Pid = whereis(yuzu_gw_heartbeat_buffer),
@@ -88,12 +88,12 @@ drain_buffer() ->
     %% Barrier, not a sleep: the reply proves the drain flush was handled
     %% before meck history is reset (see flush_and_await/0).
     _ = sys:get_state(Pid),
-    meck:reset(grpcbox_client).
+    meck:reset(yuzu_grpc_client).
 
 %% Extract all BatchHeartbeat request maps from meck history.
 batch_requests() ->
-    Calls = meck:history(grpcbox_client),
-    [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
+    Calls = meck:history(yuzu_grpc_client),
+    [Req || {_, {yuzu_grpc_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
             binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch].
 
 %% Send the buffer a `flush` and wait until its BatchHeartbeat RPC is visible
@@ -126,7 +126,7 @@ await_batches(Deadline) ->
 
 %% Set up the unary mock so BatchHeartbeat succeeds and returns ack count.
 mock_batch_success() ->
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"BatchHeartbeat">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -212,13 +212,13 @@ tags_survive_failure() ->
     timer:sleep(20),
 
     %% Make flush fail.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     _ = flush_and_await(),
 
     %% Now make flush succeed and retry.
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     mock_batch_success(),
 
     Batches = flush_and_await(),
@@ -235,11 +235,11 @@ tags_survive_failure() ->
     ?assertEqual(<<"0">>,       maps:get(<<"yuzu.healthy">>, maps:get(<<"fail2">>, BySession))).
 
 real_grpc_status_error_does_not_crash() ->
-    %% HA WS-4 4.4 review fix (F3): grpcbox_client:unary/5's REAL error
+    %% HA WS-4 4.4 review fix (F3): yuzu_grpc_client:unary/5's REAL error
     %% shape for a genuine (non-transport) grpc status is a 3-element
-    %% tuple — `error` + `{Status, Message}` + a trailers map — verified
-    %% against the vendored _checkouts/grpcbox/src/grpcbox_client.erl. The
-    %% OLD do_batch_heartbeat/2 error clause matched a shape grpcbox never
+    %% tuple — `error` + `{Status, Message}` + a metadata map — the shape
+    %% the client documents (and yuzu_grpc_client returned before it). The
+    %% OLD do_batch_heartbeat/2 error clause matched a shape the client never
     %% actually returns, so a real status like UNAVAILABLE would have crashed
     %% this process with a case_clause exception instead of retaining the
     %% buffer for the next flush. (RESOURCE_EXHAUSTED and INVALID_ARGUMENT are
@@ -251,7 +251,7 @@ real_grpc_status_error_does_not_crash() ->
     yuzu_gw_heartbeat_buffer:queue_heartbeat(HB),
     timer:sleep(20),
 
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, {<<"14">>, <<"UNAVAILABLE">>}, #{}}
     end),
     _ = flush_and_await(),
@@ -263,7 +263,7 @@ real_grpc_status_error_does_not_crash() ->
     ?assert(is_pid(Pid)),
     ?assert(is_process_alive(Pid)),
 
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     mock_batch_success(),
     Batches = flush_and_await(),
     ?assert(length(Batches) > 0),
@@ -275,7 +275,7 @@ real_grpc_status_error_does_not_crash() ->
 
 http_error_shape_does_not_crash() ->
     %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 / chaos-injector
-    %% CH-2): a FOURTH real grpcbox_client:unary/5 return shape,
+    %% CH-2): a FOURTH real yuzu_grpc_client:unary/5 return shape,
     %% `{http_error, {Status, Message}, Trailers}`, was left uncovered by the
     %% F3 fix above despite sharing its root cause.
     drain_buffer(),
@@ -284,8 +284,8 @@ http_error_shape_does_not_crash() ->
     yuzu_gw_heartbeat_buffer:queue_heartbeat(HB),
     timer:sleep(20),
 
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
-        {http_error, {502, <<>>}, #{}}
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
+        {http_error, {<<"502">>, <<>>}, #{}}
     end),
     _ = flush_and_await(),
 
@@ -293,7 +293,7 @@ http_error_shape_does_not_crash() ->
     ?assert(is_pid(Pid)),
     ?assert(is_process_alive(Pid)),
 
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     mock_batch_success(),
     Batches = flush_and_await(),
     ?assert(length(Batches) > 0),

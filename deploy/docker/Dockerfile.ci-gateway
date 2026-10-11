@@ -45,8 +45,6 @@ RUN curl -fsSL "https://github.com/erlang/rebar3/releases/download/${REBAR3_VERS
 # Copy gateway source and compile deps so CI only compiles app code
 COPY gateway/rebar.config gateway/rebar.lock /tmp/gateway/
 COPY gateway/apps/yuzu_gw/src/yuzu_gw.app.src /tmp/gateway/apps/yuzu_gw/src/
-# Vendored+patched grpcbox (PKI PR5c) — pre-bake the checkout, not stock grpcbox.
-COPY gateway/_checkouts /tmp/gateway/_checkouts/
 RUN cd /tmp/gateway \
     && rebar3 compile --deps_only 2>/dev/null || true \
     && mkdir -p /opt/rebar3_deps \

@@ -8,7 +8,7 @@
 %%%   - Command fanout through the full stack
 %%%   - Telemetry and metrics collection
 %%%
-%%% This suite uses real grpcbox and real pb modules (not mocked),
+%%% This suite uses real pb modules (not mocked),
 %%% exercising the actual encode/decode paths and service handlers.
 %%% @end
 %%%-------------------------------------------------------------------
@@ -111,7 +111,6 @@ groups() ->
 init_per_suite(Config) ->
     %% Start required applications.
     {ok, _} = application:ensure_all_started(telemetry),
-    {ok, _} = application:ensure_all_started(gproc),
 
     %% Set up mock upstream configuration.
     application:set_env(yuzu_gw, upstream_addr, "127.0.0.1"),
@@ -185,13 +184,10 @@ init_per_group(upstream, Config) ->
             catch gen_server:stop(OldPid, shutdown, 5000),
             timer:sleep(100)
     end,
-    %% Mock grpcbox for upstream tests.
-    catch meck:unload(grpcbox_channel),
-    catch meck:unload(grpcbox_client),
-    meck:new(grpcbox_channel, [non_strict, no_link]),
-    meck:expect(grpcbox_channel, pick, fun(_, _) -> {ok, mock_channel} end),
-    meck:new(grpcbox_client, [non_strict, no_link]),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    %% Mock the upstream gRPC client for upstream tests.
+    catch meck:unload(yuzu_grpc_client),
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     %% Start real upstream and heartbeat buffer (unlink so they outlive CT process).
@@ -217,8 +213,7 @@ end_per_group(upstream, Config) ->
         false ->
             ok
     end,
-    catch meck:unload(grpcbox_channel),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     %% Reinstall the global upstream mock for subsequent groups.
     catch meck:unload(yuzu_gw_upstream),
     catch meck:unload(yuzu_gw_heartbeat_buffer),
@@ -538,19 +533,19 @@ upstream_register_error_handling(Config) ->
     %%
     %% #4708 contract decision: the GATEWAY side is authoritative. A genuine
     %% (non-transport) gRPC status reaches yuzu_gw_upstream:do_rpc/4 in
-    %% grpcbox_client:unary/5's REAL shape -- `{error, {Status, Message},
+    %% yuzu_grpc_client:unary/5's REAL shape -- `{error, {Status, Message},
     %% Trailers}`, Status being the raw `grpc-status` trailer as a binary
     %% digit string -- and do_rpc
     %% surfaces it UNWRAPPED as `{error, {Status, Message}}`, which is what
     %% callers such as do_replay_one/6's FAILED_PRECONDITION branch match
     %% on. `{error, {internal, Bin}}` is reserved for transport-level
     %% `{error, Reason}` and HTTP-layer errors. This mock previously returned
-    %% `{error, {14, <<"UNAVAILABLE">>, #{}}}`, a shape grpcbox never
+    %% `{error, {14, <<"UNAVAILABLE">>, #{}}}`, a shape the client never
     %% produces, so it fell through to the transport arm; HA WS-4 4.4
     %% (e0e4f6a17) corrected the eunit twin (yuzu_gw_upstream_tests
     %% proxy_register_error) but this CT copy was hidden by #4800 (the ct
     %% gate ran zero suites).
-    meck:expect(grpcbox_client, unary, fun(_, Path, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, _, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
             _ -> {error, {<<"14">>, <<"UNAVAILABLE">>}, #{}}
@@ -563,8 +558,8 @@ upstream_register_error_handling(Config) ->
 
 upstream_batch_heartbeat_flush(Config) ->
     %% Queue several heartbeats and trigger flush.
-    meck:reset(grpcbox_client),
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:reset(yuzu_grpc_client),
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"BatchHeartbeat">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -585,8 +580,8 @@ upstream_batch_heartbeat_flush(Config) ->
     timer:sleep(150),
 
     %% Verify batch was sent.
-    Calls = meck:history(grpcbox_client),
-    BatchCalls = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
+    Calls = meck:history(yuzu_grpc_client),
+    BatchCalls = [Req || {_, {yuzu_grpc_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
                          binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch],
     ?assert(length(BatchCalls) > 0),
 
@@ -600,7 +595,7 @@ upstream_stream_status_notification(Config) ->
     %% Test stream status notifications.
     Self = self(),
     Ref = make_ref(),
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"NotifyStreamStatus">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->

@@ -105,9 +105,9 @@ end_per_suite(_Config) ->
 
 init_per_group(heartbeat, Config) ->
     ensure_registry(),
-    catch meck:unload(grpcbox_client),
-    meck:new(grpcbox_client, [non_strict, no_link]),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    catch meck:unload(yuzu_grpc_client),
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     %% Long interval — tests trigger flush manually.
@@ -133,7 +133,7 @@ init_per_group(_Group, Config) ->
 
 end_per_group(heartbeat, Config) ->
     catch gen_server:stop(?config(hb_pid, Config)),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     drain_registry(),
     ok;
 
@@ -272,7 +272,7 @@ batch_flush_latency(_Config) ->
     N = yuzu_gw_perf_helpers:get_env("YUZU_PERF_HEARTBEATS", 50000),
     ct:pal("--- batch_flush_latency: ~B heartbeats ---", [N]),
 
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     lists:foreach(fun(I) ->
         ok = yuzu_gw_heartbeat_buffer:queue_heartbeat(
                  #{session_id => integer_to_binary(I),
@@ -284,8 +284,8 @@ batch_flush_latency(_Config) ->
         trigger_hb_flush()
     end),
 
-    History = meck:history(grpcbox_client),
-    BatchCalls = [Args || {_Pid, {grpcbox_client, unary, Args}, _Ret} <- History],
+    History = meck:history(yuzu_grpc_client),
+    BatchCalls = [Args || {_Pid, {yuzu_grpc_client, unary, Args}, _Ret} <- History],
     ct:pal("Flush ~B HBs: ~B ms, ~B batch RPCs", [N, FlushMs, length(BatchCalls)]),
     ?assert(length(BatchCalls) >= 1, "Expected at least one BatchHeartbeat RPC"),
     ?assert(FlushMs < 200,
@@ -298,7 +298,7 @@ buffer_backpressure(_Config) ->
     N = 5000,
 
     %% Make flush fail.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, {14, <<"upstream unavailable">>}}
     end),
 
@@ -317,8 +317,8 @@ buffer_backpressure(_Config) ->
     end, lists:seq(1, MaxBuf)),
 
     %% Make flush succeed.
-    meck:reset(grpcbox_client),
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:reset(yuzu_grpc_client),
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"BatchHeartbeat">>) of
             nomatch -> {ok, #{}, #{}};
             _       ->
@@ -330,8 +330,8 @@ buffer_backpressure(_Config) ->
     trigger_hb_flush(),
 
     %% Verify batch was sent (capped).
-    History = meck:history(grpcbox_client),
-    BatchReqs = [Req || {_, {grpcbox_client, unary,
+    History = meck:history(yuzu_grpc_client),
+    BatchReqs = [Req || {_, {yuzu_grpc_client, unary,
                             [_, Path, Req, _, _]}, _} <- History,
                         binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch],
     ?assert(length(BatchReqs) >= 1, "Expected BatchHeartbeat after recovery"),
@@ -541,8 +541,8 @@ sustained_load_5min(_Config) ->
     ct:pal("--- sustained_load: ~B agents, ~Bs ---", [N, DurationSecs]),
 
     %% --- per-test setup (endurance needs router + upstream) -----------
-    meck:new(grpcbox_client, [non_strict, no_link]),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 5000),
@@ -556,7 +556,7 @@ sustained_load_5min(_Config) ->
         do_sustained_load(N, DurationSecs)
     after
         catch gen_server:stop(UpstreamPid),
-        catch meck:unload(grpcbox_client)
+        catch meck:unload(yuzu_grpc_client)
     end.
 
 %%%===================================================================

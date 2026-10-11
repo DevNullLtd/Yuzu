@@ -25,10 +25,6 @@ WORKDIR /src
 
 # Copy only dependency manifests — this layer caches until deps change
 COPY gateway/rebar.config gateway/rebar.lock ./
-# Vendored+patched grpcbox (PKI PR5c): present at deps-time so `--deps_only` uses
-# the checkout instead of git-fetching the stock unpatched grpcbox into a tree the
-# release would never use. See gateway/_checkouts/grpcbox/YUZU_PATCH.md.
-COPY gateway/_checkouts ./_checkouts
 
 # Fetch and compile deps (but not app code). The rebar3 global cache holds
 # downloaded Hex package tarballs; mounting it skips the network round-trip
@@ -41,17 +37,6 @@ FROM deps AS builder
 
 # Copy the rest of the gateway source
 COPY gateway/ .
-
-# PKI PR5c (#1244 B-3): fail the build if the vendored grpcbox is the STOCK
-# upstream (hardcoded fail_if_no_peer_cert=true) instead of the Yuzu-patched copy
-# — a stock grpcbox rejects the one-way-TLS agent listener, so unenrolled agents
-# can't bootstrap (a confusing "agents won't connect"). Network-free
-# patch-presence assertion so the integrity check travels with the artifact; the
-# full clone+byte-diff verify (gateway/scripts/verify-vendored-grpcbox.sh) runs in
-# CI + release where network is available.
-RUN grep -q 'YUZU PATCH (PKI PR5c)' _checkouts/grpcbox/src/grpcbox_pool.erl \
-    || (echo 'FATAL: vendored grpcbox is not Yuzu-patched — one-way TLS agent listener '\
-'would be rejected (see gateway/_checkouts/grpcbox/YUZU_PATCH.md)'; exit 1)
 
 RUN rebar3 as prod release
 

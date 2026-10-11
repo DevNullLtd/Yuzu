@@ -387,14 +387,17 @@ ${c.tlsMode === 'plaintext'
     y += `                    service_protos => [management_pb],\n`;
     y += `                    services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},\n`;
     y += `                    listen => #{port => 50063, ip => {0,0,0,0}}}\n`;
-    y += `              ]}\n`;
-    y += `          ]},\n`;
+    y += `              ]},\n`;
     // Plaintext gateway: gateway + TLS isn't generated yet (see the C1/N2 guard),
     // so this path is only reached in plaintext mode — the gateway dials the server
     // over plain HTTP/2 and its listeners are plaintext.
     // ⚠️ Do NOT internet-expose :50051 in this mode (command fan-out = fleet RCE).
-    y += `          {grpcbox, [\n`;
-    y += `              {client, #{channels => [\n`;
+    // The upstream channels live in the yuzu_gw env (upstream_client), NOT under a
+    // {grpcbox, client} key: OTP applies a sys.config entry only to a loaded
+    // application, none is named grpcbox, and the gateway refuses to boot if the
+    // old key is present.
+    y += `              %% Upstream channel to the server (plaintext HTTP/2).\n`;
+    y += `              {upstream_client, #{channels => [\n`;
     y += `                  {default_channel, [{http, "server", ${c.gwUpstreamPort}, []}], #{}}\n`;
     y += `              ]}}\n`;
     y += `          ]},\n`;

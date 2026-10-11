@@ -1,8 +1,10 @@
 %%%-------------------------------------------------------------------
 %%% @doc Wire tests of the yuzu_grpc layer: a REAL Cowboy/Ranch listener
 %%% (yuzu_grpc_listener) serving a stub AgentService (yuzu_grpc_stub_svc),
-%%% driven by grpcbox_client, a chatterbox HTTP/2 client that shares no code
-%%% with the server side. They prove, at gRPC-status level:
+%%% driven by a gun client (the production channel for unary calls,
+%%% yuzu_gw_test_client for streams) whose HTTP/2 stack is independent of the
+%%% server's Cowboy and which shares only the length-prefixed frame codec
+%%% (yuzu_grpc_frame) with the server side. They prove, at gRPC-status level:
 %%%
 %%%   - the four handler kinds: unary, server-streaming (including an error
 %%%     status and no messages at all) and bidirectional;
@@ -28,7 +30,6 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_grpc_wire_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
 
 %% logger handler and telemetry handler callbacks
 -export([log/2, forward_dropped/4]).
@@ -148,7 +149,7 @@ unary_bad_return(#{chan := Chan}) ->
 unimplemented(#{chan := Chan}) ->
     yuzu_grpc_stub_svc:reset(),
     ?assertMatch({error, {<<"12">>, _}, _},
-                 grpcbox_client:unary(ctx:new(), ?UPDATE, #{}, update_def(), #{channel => Chan})),
+                 yuzu_gw_test_client:unary(ctx:new(), ?UPDATE, #{}, update_def(), #{channel => Chan})),
     ?assertEqual(0, yuzu_grpc_stub_svc:calls()).
 
 %%--------------------------------------------------------------------
@@ -185,19 +186,19 @@ bidi_echo(#{chan := Chan}) ->
     yuzu_grpc_stub_svc:notify(self()),
     {ok, S} = subscribe(Chan),
     [begin
-         ok = grpcbox_client:send(S, #{command_id => Id}),
-         ?assertMatch({ok, #{command_id := Id}}, grpcbox_client:recv_data(S, 5000))
+         ok = yuzu_gw_test_client:send(S, #{command_id => Id}),
+         ?assertMatch({ok, #{command_id := Id}}, yuzu_gw_test_client:recv_data(S, 5000))
      end || Id <- [<<"a">>, <<"b">>, <<"c">>]],
-    ok = grpcbox_client:close_send(S),
-    ?assertMatch({ok, {<<"0">>, _, _}}, grpcbox_client:recv_trailers(S, 5000)),
+    ok = yuzu_gw_test_client:close_send(S),
+    ?assertMatch({ok, {<<"0">>, _, _}}, yuzu_gw_test_client:recv_trailers(S, 5000)),
     %% the handler saw the end of its input
     _ = await(eos),
     ?assertEqual(eos, yuzu_grpc_stub_svc:result(subscribe)).
 
 bidi_error(#{chan := Chan}) ->
     {ok, S} = subscribe(Chan),
-    ok = grpcbox_client:send(S, #{command_id => <<"fail">>}),
-    ?assertMatch({ok, {<<"3">>, <<"bad message">>, _}}, grpcbox_client:recv_trailers(S, 5000)).
+    ok = yuzu_gw_test_client:send(S, #{command_id => <<"fail">>}),
+    ?assertMatch({ok, {<<"3">>, <<"bad message">>, _}}, yuzu_gw_test_client:recv_trailers(S, 5000)).
 
 %%--------------------------------------------------------------------
 %% Exactly once (#1422, #5591)
@@ -212,10 +213,10 @@ unary_second_message(#{chan := Chan}) ->
     Id = {?MODULE, dropped, make_ref()},
     ok = telemetry:attach(Id, [yuzu, gw, grpc, dropped_data], fun ?MODULE:forward_dropped/4, self()),
     try
-        {ok, S} = grpcbox_client:stream(ctx:new(), ?HEARTBEAT, heartbeat_def(), #{channel => Chan}),
-        ok = grpcbox_client:send(S, #{session_id => <<"sleep">>}),
+        {ok, S} = yuzu_gw_test_client:stream(ctx:new(), ?HEARTBEAT, heartbeat_def(), #{channel => Chan}),
+        ok = yuzu_gw_test_client:send(S, #{session_id => <<"sleep">>}),
         Sleeper = await(sleeping),
-        ok = grpcbox_client:send(S, #{session_id => <<"sleep">>}),
+        ok = yuzu_gw_test_client:send(S, #{session_id => <<"sleep">>}),
         receive
             {dropped, #{bytes := Bytes}, #{reason := extra_request_data}} -> ?assert(Bytes > 0)
         after 5000 -> error(second_message_was_not_dropped)
@@ -223,8 +224,8 @@ unary_second_message(#{chan := Chan}) ->
         ?assertEqual(1, yuzu_grpc_stub_svc:calls()),
         %% let the handler answer: the one reply, then the end of the call
         Sleeper ! release,
-        ?assertMatch({ok, #{acknowledged := true}}, grpcbox_client:recv_data(S, 5000)),
-        ?assertMatch({ok, {<<"0">>, _, _}}, grpcbox_client:recv_trailers(S, 5000)),
+        ?assertMatch({ok, #{acknowledged := true}}, yuzu_gw_test_client:recv_data(S, 5000)),
+        ?assertMatch({ok, {<<"0">>, _, _}}, yuzu_gw_test_client:recv_trailers(S, 5000)),
         ?assertEqual(1, yuzu_grpc_stub_svc:calls())
     after
         telemetry:detach(Id)
@@ -234,11 +235,11 @@ unary_second_message(#{chan := Chan}) ->
 %% finds the stream still open or gone, nothing runs a second time.
 unary_second_message_after_reply(#{chan := Chan}) ->
     yuzu_grpc_stub_svc:reset(),
-    {ok, S} = grpcbox_client:stream(ctx:new(), ?HEARTBEAT, heartbeat_def(), #{channel => Chan}),
-    ok = grpcbox_client:send(S, #{session_id => <<"ok">>}),
-    ?assertMatch({ok, #{acknowledged := true}}, grpcbox_client:recv_data(S, 5000)),
-    _ = (catch grpcbox_client:send(S, #{session_id => <<"ok">>})),
-    ?assertMatch({ok, {<<"0">>, _, _}}, grpcbox_client:recv_trailers(S, 5000)),
+    {ok, S} = yuzu_gw_test_client:stream(ctx:new(), ?HEARTBEAT, heartbeat_def(), #{channel => Chan}),
+    ok = yuzu_gw_test_client:send(S, #{session_id => <<"ok">>}),
+    ?assertMatch({ok, #{acknowledged := true}}, yuzu_gw_test_client:recv_data(S, 5000)),
+    _ = (catch yuzu_gw_test_client:send(S, #{session_id => <<"ok">>})),
+    ?assertMatch({ok, {<<"0">>, _, _}}, yuzu_gw_test_client:recv_trailers(S, 5000)),
     ?assertEqual(1, yuzu_grpc_stub_svc:calls()).
 
 %%--------------------------------------------------------------------
@@ -251,17 +252,17 @@ stream_deadline(#{chan := Chan}) ->
     Ctx = ctx:with_deadline_after(ctx:new(), 800, millisecond),
     S = execute(Chan, Ctx, <<"sleep">>, <<>>),
     Sleeper = await(sleeping),
-    ?assertMatch({ok, {<<"4">>, _, _}}, grpcbox_client:recv_trailers(S, 10000)),
+    ?assertMatch({ok, {<<"4">>, _, _}}, yuzu_gw_test_client:recv_trailers(S, 10000)),
     assert_dead(Sleeper).
 
 bidi_deadline(#{chan := Chan}) ->
     yuzu_grpc_stub_svc:reset(),
     yuzu_grpc_stub_svc:notify(self()),
     Ctx = ctx:with_deadline_after(ctx:new(), 800, millisecond),
-    {ok, S} = grpcbox_client:stream(Ctx, ?SUBSCRIBE, subscribe_def(), #{channel => Chan}),
-    ok = grpcbox_client:send(S, #{command_id => <<"sleep">>}),
+    {ok, S} = yuzu_gw_test_client:stream(Ctx, ?SUBSCRIBE, subscribe_def(), #{channel => Chan}),
+    ok = yuzu_gw_test_client:send(S, #{command_id => <<"sleep">>}),
     Sleeper = await(sleeping),
-    ?assertMatch({ok, {<<"4">>, _, _}}, grpcbox_client:recv_trailers(S, 10000)),
+    ?assertMatch({ok, {<<"4">>, _, _}}, yuzu_gw_test_client:recv_trailers(S, 10000)),
     assert_dead(Sleeper).
 
 %%--------------------------------------------------------------------
@@ -314,10 +315,10 @@ assert_no_leak(Lines) ->
 %%--------------------------------------------------------------------
 
 ctx_headers(#{chan := Chan}) ->
-    Ctx = grpcbox_metadata:append_to_outgoing_ctx(ctx:new(), #{<<"x-test">> => <<"hello">>}),
+    Ctx = yuzu_gw_test_client:with_metadata(ctx:new(), #{<<"x-test">> => <<"hello">>}),
     {ok, #{pending_commands := [#{plugin := Header, action := Cert}]}, _} =
-        grpcbox_client:unary(Ctx, ?HEARTBEAT, #{session_id => <<"ctx">>}, heartbeat_def(),
-                             #{channel => Chan}),
+        yuzu_gw_test_client:unary(Ctx, ?HEARTBEAT, #{session_id => <<"ctx">>}, heartbeat_def(),
+                                  #{channel => Chan}),
     ?assertEqual(<<"hello">>, Header),
     ?assertEqual(<<"no-cert">>, Cert).
 
@@ -331,13 +332,13 @@ conn_key(#{chan := A, chan_b := B}) ->
 
 conn_key_unary_vs_bidi(#{chan := Chan}) ->
     {ok, S} = subscribe(Chan),
-    ok = grpcbox_client:send(S, #{command_id => <<"conn">>}),
-    {ok, #{command_id := BidiKey}} = grpcbox_client:recv_data(S, 5000),
+    ok = yuzu_gw_test_client:send(S, #{command_id => <<"conn">>}),
+    {ok, #{command_id := BidiKey}} = yuzu_gw_test_client:recv_data(S, 5000),
     %% a second stream while the first is open, on the same connection
     UnaryKey = conn_key_of(Chan),
     ?assertEqual(BidiKey, UnaryKey),
-    ok = grpcbox_client:close_send(S),
-    ?assertMatch({ok, {<<"0">>, _, _}}, grpcbox_client:recv_trailers(S, 5000)).
+    ok = yuzu_gw_test_client:close_send(S),
+    ?assertMatch({ok, {<<"0">>, _, _}}, yuzu_gw_test_client:recv_trailers(S, 5000)).
 
 %% The connection ends under a handler that is sending: the handler is stopped
 %% by Cowboy, or sees {error, closed}; it never crashes and nothing is logged as
@@ -349,7 +350,7 @@ send_after_disconnect(#{port := Port}) ->
     Chan = yuzu_gw_test_listener:client_channel(wire_plain_gone, #{port => Port}),
     S = execute(Chan, <<"until_closed">>, <<>>),
     Handler = await(sleeping),
-    {ok, _First} = grpcbox_client:recv_data(S, 5000),
+    {ok, _First} = yuzu_gw_test_client:recv_data(S, 5000),
     yuzu_gw_test_listener:stop_channel(Chan),
     assert_dead(Handler),
     ?assertEqual([], [L || L <- logs(), contains(L, "gateway grpc")]).
@@ -395,10 +396,10 @@ limits_test_() ->
           fun() ->
               yuzu_grpc_stub_svc:reset(),
               {ok, S} = subscribe(Chan),
-              ok = grpcbox_client:send(S, #{command_id => <<"first">>}),
-              ?assertMatch({ok, #{command_id := <<"first">>}}, grpcbox_client:recv_data(S, 5000)),
-              ok = grpcbox_client:send(S, #{command_id => binary:copy(<<"x">>, 2000)}),
-              ?assertMatch({ok, {<<"8">>, _, _}}, grpcbox_client:recv_trailers(S, 5000))
+              ok = yuzu_gw_test_client:send(S, #{command_id => <<"first">>}),
+              ?assertMatch({ok, #{command_id := <<"first">>}}, yuzu_gw_test_client:recv_data(S, 5000)),
+              ok = yuzu_gw_test_client:send(S, #{command_id => binary:copy(<<"x">>, 2000)}),
+              ?assertMatch({ok, {<<"8">>, _, _}}, yuzu_gw_test_client:recv_trailers(S, 5000))
           end}]
      end}.
 
@@ -448,14 +449,14 @@ no_margin_test_() ->
               {ok, S} = subscribe(Chan),
               Body = binary:copy(<<"y">>, 20000),
               Ids = [<<(integer_to_binary(I))/binary, ":", Body/binary>> || I <- lists:seq(1, 10)],
-              [ok = grpcbox_client:send(S, #{command_id => Id}) || Id <- Ids],
+              [ok = yuzu_gw_test_client:send(S, #{command_id => Id}) || Id <- Ids],
               Echoed = [begin
-                            {ok, #{command_id := Echo}} = grpcbox_client:recv_data(S, 10000),
+                            {ok, #{command_id := Echo}} = yuzu_gw_test_client:recv_data(S, 10000),
                             Echo
                         end || _ <- Ids],
               ?assertEqual(Ids, Echoed),
-              ok = grpcbox_client:close_send(S),
-              ?assertMatch({ok, {<<"0">>, _, _}}, grpcbox_client:recv_trailers(S, 5000))
+              ok = yuzu_gw_test_client:close_send(S),
+              ?assertMatch({ok, {<<"0">>, _, _}}, yuzu_gw_test_client:recv_trailers(S, 5000))
           end}}]
      end}.
 
@@ -581,18 +582,18 @@ auth_refused_stream(#{chan_agent := Chan}) ->
 auth_refused_bidi(#{chan_agent := Chan}) ->
     yuzu_grpc_stub_svc:reset(),
     {ok, S} = subscribe(Chan),
-    _ = (catch grpcbox_client:send(S, #{command_id => <<"a">>})),
-    _ = (catch grpcbox_client:send(S, #{command_id => <<"b">>})),
-    _ = (catch grpcbox_client:close_send(S)),
-    ?assertMatch({ok, {<<"16">>, _, _}}, grpcbox_client:recv_trailers(S, 5000)),
+    _ = (catch yuzu_gw_test_client:send(S, #{command_id => <<"a">>})),
+    _ = (catch yuzu_gw_test_client:send(S, #{command_id => <<"b">>})),
+    _ = (catch yuzu_gw_test_client:close_send(S)),
+    ?assertMatch({ok, {<<"16">>, _, _}}, yuzu_gw_test_client:recv_trailers(S, 5000)),
     ?assertEqual(0, yuzu_grpc_stub_svc:calls()).
 
 auth_refused_unknown_method(#{chan_agent := Chan}) ->
     ?assertMatch({error, {<<"16">>, _}, _},
-                 grpcbox_client:unary(ctx:new(), ?UPDATE, #{}, update_def(), #{channel => Chan})),
+                 yuzu_gw_test_client:unary(ctx:new(), ?UPDATE, #{}, update_def(), #{channel => Chan})),
     ?assertMatch({error, {<<"16">>, _}, _},
-                 grpcbox_client:unary(ctx:new(), <<"/no.such.Service/Nothing">>, #{}, update_def(),
-                                      #{channel => Chan})).
+                 yuzu_gw_test_client:unary(ctx:new(), <<"/no.such.Service/Nothing">>, #{}, update_def(),
+                                           #{channel => Chan})).
 
 certless_blocked(#{auth_port := Port, certs := #{ca := Ca}}) ->
     yuzu_grpc_stub_svc:reset(),
@@ -630,10 +631,10 @@ oneway_certless_ok(#{chan_oneway := Chan}) ->
 oneway_stream_ok(#{chan_oneway := Chan}) ->
     ?assertMatch({[_, _], <<"0">>, _}, collect(execute(Chan, <<"count">>, <<"2">>))),
     {ok, S} = subscribe(Chan),
-    ok = grpcbox_client:send(S, #{command_id => <<"x">>}),
-    ?assertMatch({ok, #{command_id := <<"x">>}}, grpcbox_client:recv_data(S, 5000)),
-    ok = grpcbox_client:close_send(S),
-    ?assertMatch({ok, {<<"0">>, _, _}}, grpcbox_client:recv_trailers(S, 5000)).
+    ok = yuzu_gw_test_client:send(S, #{command_id => <<"x">>}),
+    ?assertMatch({ok, #{command_id := <<"x">>}}, yuzu_gw_test_client:recv_data(S, 5000)),
+    ok = yuzu_gw_test_client:close_send(S),
+    ?assertMatch({ok, {<<"0">>, _, _}}, yuzu_gw_test_client:recv_trailers(S, 5000)).
 
 alpn_h2_only(#{oneway_port := Port, certs := #{ca := Ca}}) ->
     Opts = fun(Offer) ->
@@ -651,11 +652,11 @@ alpn_h2_only(#{oneway_port := Port, certs := #{ca := Ca}}) ->
 %%%-------------------------------------------------------------------
 
 list_agents(Chan, Command) ->
-    grpcbox_client:unary(ctx:new(), ?LIST_AGENTS, #{filter => Command},
+    yuzu_gw_test_client:unary(ctx:new(), ?LIST_AGENTS, #{filter => Command},
                          list_agents_def(), #{channel => Chan}).
 
 send_command(Chan, Action, Arg) ->
-    {ok, S} = grpcbox_client:stream(ctx:new(), ?SEND_COMMAND,
+    {ok, S} = yuzu_gw_test_client:stream(ctx:new(), ?SEND_COMMAND,
                                     #{command => #{action => Action, command_id => Arg}},
                                     send_command_def(), #{channel => Chan}),
     S.
@@ -664,27 +665,27 @@ heartbeat(Chan, Command) ->
     heartbeat(Chan, Command, #{}).
 
 heartbeat(Chan, Command, Extra) ->
-    grpcbox_client:unary(ctx:new(), ?HEARTBEAT, maps:merge(#{session_id => Command}, Extra),
-                         heartbeat_def(), #{channel => Chan}).
+    yuzu_gw_test_client:unary(ctx:new(), ?HEARTBEAT, maps:merge(#{session_id => Command}, Extra),
+                              heartbeat_def(), #{channel => Chan}).
 
 execute(Chan, Command, Arg) ->
     execute(Chan, ctx:new(), Command, Arg).
 
 execute(Chan, Ctx, Command, Arg) ->
-    {ok, S} = grpcbox_client:stream(Ctx, ?EXECUTE, #{action => Command, command_id => Arg},
-                                    command_def(), #{channel => Chan}),
+    {ok, S} = yuzu_gw_test_client:stream(Ctx, ?EXECUTE, #{action => Command, command_id => Arg},
+                                         command_def(), #{channel => Chan}),
     S.
 
 subscribe(Chan) ->
-    grpcbox_client:stream(ctx:new(), ?SUBSCRIBE, subscribe_def(), #{channel => Chan}).
+    yuzu_gw_test_client:stream(ctx:new(), ?SUBSCRIBE, subscribe_def(), #{channel => Chan}).
 
 conn_key_of(Chan) ->
     {ok, #{pending_commands := [#{command_id := Key}]}, _} = heartbeat(Chan, <<"ctx">>),
     Key.
 
-%% Every message of a server stream, then its status and message. The client
-%% reads the trailers itself when the stream ends: a clean end is
-%% `stream_finished' (status 0), any other status comes back as an error.
+%% Every message of a server stream, then its status and message. The stream
+%% ends with `stream_finished' whatever its status; the status (0 or an error)
+%% and its message are then read from the trailers.
 collect(S) ->
     collect(S, 5000).
 
@@ -692,49 +693,48 @@ collect(S, Timeout) ->
     collect(S, Timeout, []).
 
 collect(S, Timeout, Acc) ->
-    case grpcbox_client:recv_data(S, Timeout) of
+    case yuzu_gw_test_client:recv_data(S, Timeout) of
         {ok, Message} -> collect(S, Timeout, [Message | Acc]);
-        stream_finished -> {lists:reverse(Acc), <<"0">>, <<>>};
-        {error, {Status, Message}, _} -> {lists:reverse(Acc), Status, Message};
+        stream_finished -> end_status(S, Timeout, Acc);
+        Other -> {lists:reverse(Acc), {unexpected, Other}, undefined}
+    end.
+
+end_status(S, Timeout, Acc) ->
+    case yuzu_gw_test_client:recv_trailers(S, Timeout) of
+        {ok, {Status, Message, _}} -> {lists:reverse(Acc), Status, Message};
         Other -> {lists:reverse(Acc), {unexpected, Other}, undefined}
     end.
 
 list_agents_def() ->
-    #grpcbox_def{service = ?MGMT_SVC,
-                 marshal_fun = fun(M) -> management_pb:encode_msg(M, 'yuzu.server.v1.ListAgentsRequest') end,
-                 unmarshal_fun = fun(B) -> management_pb:decode_msg(B, 'yuzu.server.v1.ListAgentsResponse') end}.
+    #{marshal => fun(M) -> management_pb:encode_msg(M, 'yuzu.server.v1.ListAgentsRequest') end,
+      unmarshal => fun(B) -> management_pb:decode_msg(B, 'yuzu.server.v1.ListAgentsResponse') end}.
 
 send_command_def() ->
-    #grpcbox_def{service = ?MGMT_SVC,
-                 marshal_fun = fun(M) -> management_pb:encode_msg(M, 'yuzu.server.v1.SendCommandRequest') end,
-                 unmarshal_fun = fun(B) -> management_pb:decode_msg(B, 'yuzu.server.v1.SendCommandResponse') end}.
+    #{marshal => fun(M) -> management_pb:encode_msg(M, 'yuzu.server.v1.SendCommandRequest') end,
+      unmarshal => fun(B) -> management_pb:decode_msg(B, 'yuzu.server.v1.SendCommandResponse') end}.
 
 heartbeat_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.HeartbeatRequest') end,
-                 unmarshal_fun = fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.HeartbeatResponse') end}.
+    #{marshal => fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.HeartbeatRequest') end,
+      unmarshal => fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.HeartbeatResponse') end}.
 
 command_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandRequest') end,
-                 unmarshal_fun = fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandResponse') end}.
+    #{marshal => fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandRequest') end,
+      unmarshal => fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandResponse') end}.
 
 subscribe_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandResponse') end,
-                 unmarshal_fun = fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandRequest') end}.
+    #{marshal => fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.CommandResponse') end,
+      unmarshal => fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.CommandRequest') end}.
 
 update_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.CheckForUpdateRequest') end,
-                 unmarshal_fun = fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.CheckForUpdateResponse') end}.
+    #{marshal => fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.CheckForUpdateRequest') end,
+      unmarshal => fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.CheckForUpdateResponse') end}.
 
 %%%-------------------------------------------------------------------
 %%% Waiting on events, capturing logs
 %%%-------------------------------------------------------------------
 
 start_apps() ->
-    {ok, _} = application:ensure_all_started(grpcbox),
+    {ok, _} = application:ensure_all_started(gun),
     {ok, _} = application:ensure_all_started(cowboy),
     {ok, _} = application:ensure_all_started(telemetry),
     ok.

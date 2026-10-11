@@ -10,7 +10,7 @@
 %%%
 %%% The upstream is suspended (sys:suspend/1) while the calls are queued, so
 %%% that "queued" is a fact the test waits for, not a timing it hopes for; the
-%%% RPC itself is a mocked grpcbox_client:unary/5 that records which request it
+%%% RPC itself is a mocked yuzu_grpc_client:unary/5 that records which request it
 %%% was made for.
 %%% @end
 %%%-------------------------------------------------------------------
@@ -43,10 +43,10 @@ dead_caller_test_() ->
 setup() ->
     {ok, _} = application:ensure_all_started(telemetry),
     stop_named(yuzu_gw_upstream),
-    catch meck:unload(grpcbox_client),
-    ok = meck:new(grpcbox_client, [non_strict, no_link]),
-    ok = meck:expect(grpcbox_client, unary,
-                     fun(_Ctx, Path, Req, _Def, _Opts) ->
+    catch meck:unload(yuzu_grpc_client),
+    ok = meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    ok = meck:expect(yuzu_grpc_client, unary,
+                     fun(_Meta, Path, Req, _Def, _Opts) ->
                          Id = maps:get(token, maps:get(enrollment, Req, Req), undefined),
                          sink() ! {rpc, Path, Id, self()},
                          case Id of
@@ -66,7 +66,7 @@ cleanup(#{upstream := Up, handler := HandlerId}) ->
     telemetry:detach(HandlerId),
     application:unset_env(yuzu_gw, circuit_breaker_failure_threshold),
     catch gen_server:stop(Up, shutdown, ?WAIT_MS),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     ok.
 
 %%--------------------------------------------------------------------
@@ -211,7 +211,7 @@ kill(Pid) ->
 
 %% The enrollment tokens the mocked RPC was made for, in call order.
 rpc_ids() ->
-    [Id || {_, {grpcbox_client, unary, [_, _, Req, _, _]}, _} <- meck:history(grpcbox_client),
+    [Id || {_, {yuzu_grpc_client, unary, [_, _, Req, _, _]}, _} <- meck:history(yuzu_grpc_client),
            Id <- [maps:get(token, maps:get(enrollment, Req))]].
 
 id_bin(Id) when is_binary(Id) -> Id;

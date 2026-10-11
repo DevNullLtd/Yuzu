@@ -55,7 +55,7 @@
 -module(yuzu_gw_upstream).
 -behaviour(gen_server).
 
--include_lib("grpcbox/include/grpcbox.hrl").
+-include("yuzu_grpc_client.hrl").
 
 %% API
 -export([start_link/0,
@@ -155,7 +155,7 @@ start_link() ->
 %% timeout or dies serving the call gives `{error, upstream_unavailable}'. The
 %% exit of a gen_server:call carries the request, which here holds the
 %% enrollment token, certificate and CSR, and the caller's own crash handling
-%% (grpcbox logs it) would print it. See yuzu_gw_safe_call.
+%% (the gRPC runner logs it) would print it. See yuzu_gw_safe_call.
 -spec proxy_register(map()) -> {ok, term()} | {error, term()}.
 proxy_register(RegisterReq) ->
     yuzu_gw_safe_call:call(?SERVER, {proxy_register, RegisterReq}, call_timeout(),
@@ -659,7 +659,7 @@ do_replay_one(AgentId, Pid, SessionId, RegisterReq, QueueDepth, State) ->
                 logger:warning("Registration replay: ~s got an upstream answer that is "
                                "not a response message", [AgentId]),
                 record_result_no_replay({error, malformed_response}, State);
-            {error, {Status, _Message}} when Status =:= ?GRPC_STATUS_FAILED_PRECONDITION ->
+            {error, {Status, _Message}} when Status =:= ?GRPC_STATUS_BIN_FAILED_PRECONDITION ->
                 %% The presented session was superseded by a DIFFERENT, LIVE
                 %% session server-side — a genuine stale/zombie replay, not
                 %% an outage. The server answered authoritatively, so this
@@ -1094,35 +1094,26 @@ rpc_types('ForwardGuardianMessage') -> {'yuzu.gateway.v1.ForwardGuardianRequest'
                                         'yuzu.gateway.v1.ForwardGuardianAck'}.
 
 do_rpc(Method, Request, Tag) ->
-    do_rpc(Method, Request, Tag, ctx:background()).
+    do_rpc(Method, Request, Tag, #{}).
 
 %% @doc Like do_rpc/3 but for the registration-replay path (HA WS-4 4.1):
-%% attaches the agent's EXISTING session id as `x-yuzu-session-id` outgoing
-%% gRPC metadata, via grpcbox's ctx-carried metadata (grpcbox_metadata:
-%% append_to_outgoing_ctx/2 + grpcbox_client_stream's metadata_headers/1,
-%% which turns it into real request headers — this is the standard grpcbox
-%% client mechanism, not a new wire path). Undefined/empty SessionId (the
-%% register_agent/5 back-compat path) sends the request with no such header,
-%% same as before this change.
+%% attaches the agent's EXISTING session id as the `x-yuzu-session-id' request
+%% header, through the client's metadata argument (yuzu_grpc_client:unary/5).
+%% Undefined/empty SessionId (the register_agent/5 back-compat path) sends the
+%% request with no such header, same as before this change.
 do_rpc_replay(Method, Request, Tag, SessionId) when is_binary(SessionId), SessionId =/= <<>> ->
-    Ctx = grpcbox_metadata:append_to_outgoing_ctx(
-            ctx:background(), #{<<"x-yuzu-session-id">> => SessionId}),
-    do_rpc(Method, Request, Tag, Ctx);
+    do_rpc(Method, Request, Tag, #{<<"x-yuzu-session-id">> => SessionId});
 do_rpc_replay(Method, Request, Tag, _SessionId) ->
-    do_rpc(Method, Request, Tag, ctx:background()).
+    do_rpc(Method, Request, Tag, #{}).
 
-do_rpc(Method, Request, Tag, Ctx) ->
+do_rpc(Method, Request, Tag, Metadata) ->
     {InputType, OutputType} = rpc_types(Method),
-    Def = #grpcbox_def{
-        service       = 'yuzu.gateway.v1.GatewayUpstream',
-        message_type  = atom_to_binary(InputType, utf8),
-        marshal_fun   = fun(Msg) -> gateway_pb:encode_msg(Msg, InputType) end,
-        unmarshal_fun = fun(Bin) -> gateway_pb:decode_msg(Bin, OutputType) end
-    },
+    Def = #{marshal   => fun(Msg) -> gateway_pb:encode_msg(Msg, InputType) end,
+            unmarshal => fun(Bin) -> gateway_pb:decode_msg(Bin, OutputType) end},
     Path = <<"/yuzu.gateway.v1.GatewayUpstream/", (atom_to_binary(Method, utf8))/binary>>,
     StartTime = erlang:monotonic_time(millisecond),
-    Result = try grpcbox_client:unary(Ctx, Path, Request, Def,
-                                      #{channel => default_channel})
+    Result = try yuzu_grpc_client:unary(Metadata, Path, Request, Def,
+                                        #{channel => default_channel})
              catch
                  %% The stacktrace is dropped on purpose: a frame prints its
                  %% argument list (the request, with its credentials) in the
@@ -1147,10 +1138,11 @@ do_rpc(Method, Request, Tag, Ctx) ->
                               #{rpc_name => atom_to_binary(Tag, utf8)}),
             {ok, Response};
         {error, {Status, Message}, _Trailers} ->
-            %% HA WS-4 4.4 fix: grpcbox_client:unary/5's REAL error shape for
+            %% HA WS-4 4.4 fix: yuzu_grpc_client:unary/5's error shape for
             %% a genuine (non-transport) grpc status is a 3-element tuple —
             %% `error`, the `{Status, Message}` pair, and the trailers map
-            %% (grpcbox_client.erl's unary_handler, via recv_trailers/1) —
+            %% (the shape its predecessor grpcbox_client defined, kept so
+            %% these clauses did not change; yuzu_grpc_client:status/4) —
             %% not the 2-element `{error, {Status, Message, Trailers}}` this
             %% clause used to match. That mismatch meant this clause could
             %% NEVER fire: any real upstream grpc-status error (anything
@@ -1164,7 +1156,7 @@ do_rpc(Method, Request, Tag, Ctx) ->
             %% real, deliberate non-OK grpc status (FAILED_PRECONDITION) on
             %% this RPC, so this had to be fixed to ship that feature at
             %% all. `Status` is the raw `grpc-status` trailer value, a
-            %% binary digit string (`?GRPC_STATUS_*` in grpcbox.hrl), e.g.
+            %% binary digit string (`?GRPC_STATUS_BIN_*` in yuzu_grpc_client.hrl), e.g.
             %% `<<"9">>` for FAILED_PRECONDITION — never an atom.
             telemetry:execute([yuzu, gw, upstream, rpc_error],
                               #{count => 1},
@@ -1174,9 +1166,9 @@ do_rpc(Method, Request, Tag, Ctx) ->
             {error, {Status, Message}};
         {http_error, {Status, _}, _Trailers} ->
             %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 /
-            %% chaos-injector CH-2): a FOURTH real grpcbox_client:unary/5
-            %% return shape (unary_handler's `{http_error, Status, Headers}`
-            %% branch, grpcbox_client.erl) for a non-grpc-layer HTTP error
+            %% chaos-injector CH-2): a FOURTH real unary/5
+            %% return shape (the `{http_error, Status, Meta}` result of
+            %% yuzu_grpc_client, as grpcbox_client's was) for a non-grpc-layer HTTP error
             %% (e.g. a stripped/mangled response from something in front of
             %% the actual gRPC service) — same crash-class gap as the
             %% `{error, {Status, Message}, Trailers}` fix above, and left

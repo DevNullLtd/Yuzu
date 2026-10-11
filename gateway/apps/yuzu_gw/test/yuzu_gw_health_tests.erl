@@ -75,14 +75,14 @@ setup() ->
         end
     end, MockNames),
 
-    %% Start upstream with mocked grpcbox for circuit_state/0
+    %% Start upstream with a mocked yuzu_grpc_client for circuit_state/0
     NeedUpstream = (whereis(yuzu_gw_upstream) =:= undefined),
     UpPid = case NeedUpstream of
         true ->
-            catch meck:unload(grpcbox_client),
+            catch meck:unload(yuzu_grpc_client),
             catch meck:unload(telemetry),
-            meck:new(grpcbox_client, [non_strict, no_link]),
-            meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+            meck:new(yuzu_grpc_client, [non_strict, no_link]),
+            meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
                 {ok, #{}, #{}}
             end),
             meck:new(telemetry, [passthrough, no_link]),
@@ -113,7 +113,7 @@ cleanup({_Port, HealthPid, UpPid, NeedUpstream, MockPids, {PrevListeners, PrevAl
         true ->
             catch unlink(UpPid),
             catch exit(UpPid, shutdown),
-            meck:unload([grpcbox_client, telemetry]);
+            meck:unload([yuzu_grpc_client, telemetry]);
         false ->
             ok
     end,

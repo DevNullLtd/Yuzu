@@ -9,7 +9,9 @@
 %%
 %% The gateway's two listeners are the entries of {yuzu_gw, grpc_listeners}
 %% below, each with its own `tls` map; the upstream channel to the C++ server is
-%% the {grpcbox, client} block (grpcbox is still the client). yuzu_gw's
+%% the {yuzu_gw, upstream_client} entry (read by yuzu_grpc_client_config:from_env/0;
+%% the client itself is yuzu_grpc_client over gun). A legacy {grpcbox, client}
+%% entry is invisible to the VM and refuses boot -- move it. yuzu_gw's
 %% `tls`/`tls_enabled` env (set by YUZU_GW_TLS_* in yuzu_gw_app:apply_tls_
 %% overrides/0) is ADVISORY ONLY and drives neither; an env-substituted
 %% sys.config.src that wires YUZU_GW_TLS_* into the config is a tracked
@@ -109,7 +111,7 @@
         %% children, and every entry is validated before anything is bound.
         %% `tls` present means TLS and certfile, keyfile AND cacertfile are all
         %% required (an incomplete map refuses boot); omit `tls` for plaintext.
-        %% Do NOT also set {grpcbox, servers}: a leftover block refuses boot.
+        %% Do NOT also set {grpcbox, servers}: a leftover entry refuses boot.
         {grpc_listeners, [
             %% Agent listener (:50051): ONE-WAY (server-authenticated) TLS --
             %% encrypts the hop and authenticates the GATEWAY to agents WITHOUT
@@ -226,12 +228,13 @@
               limits => #{max_connections => 256, max_message_bytes => 4194304},
               %% The server's command client does not ping: 10 minutes idle.
               http2 => #{idle_timeout => 600000, max_concurrent_streams => 1024}}
-        ]}
-    ]},
+        ]},
 
-    {grpcbox, [
         %% ── Upstream channel: mutual TLS to the C++ server ──────────────────
-        %% `https` selects ssl (grpcbox prepends ALPN h2). verify_peer is
+        %% Read from {yuzu_gw, upstream_client} by yuzu_grpc_client_config:
+        %% from_env/0 (NOT from a {grpcbox, client} entry, which the VM never
+        %% applies and which refuses boot if left in this file).
+        %% `https` selects ssl (the client advertises ALPN h2). verify_peer is
         %% REQUIRED — an ssl client does NOT verify the server otherwise.
         %% certfile/keyfile present the gateway leaf for the server's client-cert
         %% check (the server's gateway-upstream listener requires a client cert
@@ -243,7 +246,7 @@
         %% server's gethostname() — so the "127.0.0.1" below validates against a
         %% default-cert, same-host install. For cross-container dialing use the
         %% server's hostname and set that service's `hostname:` so its SAN matches.
-        {client, #{channels => [
+        {upstream_client, #{channels => [
             {default_channel, [{https, "127.0.0.1", 50055, [
                 {cacertfile, "/etc/yuzu/certs/default-ca.pem"},
                 {certfile,   "/etc/yuzu/certs/default-gateway.pem"},

@@ -5,8 +5,8 @@
 %%%
 %%% Listener ports are OS-assigned-then-probed with a retry on the probe->bind
 %%% race: two runner agents share each CI box, so a fixed port collides across
-%%% jobs. The client is grpcbox_client (a chatterbox HTTP/2 client), which is
-%%% also a second, independent implementation to interoperate with.
+%%% jobs. The client is the production channel (gun) with yuzu_gw_test_client for
+%%% streams; neither shares the HTTP/2 stack of the listener (cowboy).
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_test_listener).
@@ -27,7 +27,7 @@ probe_free_port() ->
 start(Entry) ->
     {ok, _} = application:ensure_all_started(cowboy),
     {ok, _} = application:ensure_all_started(telemetry),
-    {ok, _} = application:ensure_all_started(grpcbox),
+    {ok, _} = application:ensure_all_started(gun),
     start(Entry, 5).
 
 start(_Entry, 0) ->
@@ -46,18 +46,33 @@ start(Entry0, Retries) ->
 stop(Pid) ->
     yuzu_grpc_listener:stop(Pid).
 
-%% @doc A client channel (one HTTP/2 connection) to a listener port. Opts:
-%% `scheme' (http | https, default http) and `ssl' (client TLS options for
-%% https). sync_start registers the endpoint before this returns: without it the
-%% next RPC races the channel's connect and sees {error, no_endpoints}.
+%% @doc A client channel (one HTTP/2 connection) to a listener port, up before
+%% this returns: without that the next RPC races the connect. Opts: `scheme'
+%% (http | https, default http), `ssl' (client TLS options for https) and
+%% `pool_size' (connections, default 1).
 -spec client_channel(atom(), #{port := inet:port_number(), scheme => http | https,
-                               ssl => [ssl:tls_client_option()]}) -> atom().
+                               ssl => [ssl:tls_client_option()], pool_size => pos_integer()}) -> atom().
 client_channel(Name, #{port := Port} = Opts) ->
     Endpoint = {maps:get(scheme, Opts, http), "localhost", Port, maps:get(ssl, Opts, [])},
-    {ok, _} = grpcbox_channel_sup:start_child(Name, [Endpoint], #{sync_start => true}),
+    PoolSize = maps:get(pool_size, Opts, 1),
+    {ok, Cfg} = yuzu_grpc_client_config:channel({Name, [Endpoint], #{pool_size => PoolSize}}, true),
+    {ok, _} = yuzu_grpc_client_channel:start_link(Cfg),
+    ok = wait_up(Name, PoolSize, 400),
     Name.
+
+wait_up(Name, _Want, 0) -> error({channel_not_up, Name});
+wait_up(Name, Want, N) ->
+    case ets:select_count(Name, [{{{slot, '_'}, '_', up}, [], [true]}]) of
+        Want -> ok;
+        _ -> receive after 25 -> ok end, wait_up(Name, Want, N - 1)
+    end.
 
 -spec stop_channel(atom()) -> ok.
 stop_channel(Name) ->
-    _ = (catch grpcbox_channel:stop(Name)),
-    ok.
+    case whereis(Name) of
+        undefined -> ok;
+        Pid -> unlink(Pid),
+               Ref = erlang:monitor(process, Pid),
+               exit(Pid, shutdown),
+               receive {'DOWN', Ref, process, Pid, _} -> ok end
+    end.

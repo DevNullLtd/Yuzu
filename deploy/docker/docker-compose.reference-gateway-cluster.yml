@@ -7,8 +7,8 @@
 ## collide across replicas). Deliberately does NOT include the C++ server,
 ## Postgres, or an agent — those exercise the SEPARATE server<->gateway
 ## upstream and agent<->gateway concerns this rig is not testing. A gateway
-## boots and serves fine with no reachable upstream (grpcbox client channels
-## connect lazily; a missing server just means repeated, logged, harmless
+## boots and serves fine with no reachable upstream (the upstream client channel
+## reconnects in the background; a missing server just means repeated, logged, harmless
 ## ProxyRegister/heartbeat failures) — this rig only proves gateway<->gateway
 ## cluster formation in isolation.
 ##

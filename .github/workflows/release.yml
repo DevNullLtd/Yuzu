@@ -440,15 +440,6 @@ jobs:
       # persistence is functionally equivalent without GHA round-trip.
       # Issue #569.
 
-      # PKI PR5c: the gateway vendors a 2-line-patched grpcbox in
-      # _checkouts/grpcbox (one-way TLS on the agent listener). This gate fails
-      # the build if that copy is ever anything other than upstream grpcbox at the
-      # rebar.config-pinned tag + the documented grpcbox.yuzu.patch — catching
-      # tamper, drift, or version skew. See gateway/_checkouts/grpcbox/YUZU_PATCH.md.
-      - name: Verify vendored grpcbox integrity
-        working-directory: gateway
-        run: bash scripts/verify-vendored-grpcbox.sh
-
       - name: Compile gateway
         working-directory: gateway
         run: rebar3 compile

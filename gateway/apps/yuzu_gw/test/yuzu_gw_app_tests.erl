@@ -98,7 +98,8 @@ override_allows_short_custom_cookie_test() ->
 -define(ENV_KEYS, [{yuzu_gw, grpc_listeners}, {yuzu_gw, allow_insecure_mgmt},
                    {yuzu_gw, allow_no_listeners},
                    {yuzu_gw, mgmt_peer_pins}, {yuzu_gw, agent_listen_port},
-                   {yuzu_gw, mgmt_listen_port}, {grpcbox, servers}]).
+                   {yuzu_gw, mgmt_listen_port}, {grpcbox, servers}, {grpcbox, client},
+                   {yuzu_gw, upstream_client}, {yuzu_gw, allow_no_upstream}]).
 -define(PORT_VARS, ["YUZU_GW_AGENT_PORT", "YUZU_GW_MGMT_PORT"]).
 
 env_setup() ->
@@ -136,9 +137,9 @@ mgmt_entry() ->
       tls => #{certfile => "gw.pem", keyfile => "gw.key", cacertfile => "ca.pem"},
       auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1}.
 
-%% A leftover {grpcbox, servers} would make the grpcbox application bind a
-%% listener of its own, next to ours and without the management peer pin: boot
-%% refuses it. Only the upstream {client, ...} may remain in the grpcbox env.
+%% Nothing reads a leftover {grpcbox, servers}, so an operator who kept the block
+%% believes a listener is configured that is not: boot refuses it. Only the
+%% upstream {client, ...} may remain in the grpcbox env (the key keeps its name).
 check_legacy_grpcbox_servers_test_() ->
     env_case(
       [{"no servers key is fine",
@@ -824,7 +825,6 @@ apply_listener_port_overrides_test_() ->
 -define(SAFE_CALL_KEYS, [{yuzu_gw_safe_call, S}
                          || S <- [yuzu_gw_upstream, yuzu_gw_registry,
                                   yuzu_gw_agent_sup, yuzu_gw_router]]).
--define(NODELAY_KEY, {?MODULE, nodelay_applied}).
 -define(THROTTLE_KEY, {yuzu_grpc_runner, warn_throttle}).
 
 %% yuzu_gw_app:start/2 must create the summary-log state before it starts the
@@ -915,29 +915,304 @@ boot_creates_runner_throttle_before_sup_test_() ->
       end).
 
 %%%===================================================================
-%%% Boot wiring: TCP_NODELAY on the upstream channel
+%%% Boot wiring: the upstream channel configuration guard
 %%%===================================================================
 
-%% yuzu_gw_app:start/2 applies the upstream channel's nodelay rewrite before the
-%% supervision tree starts (the tree holds the channel's only callers, so no
-%% call can see the channel mid-restart). Nothing else boots the app, so a
-%% deleted or reordered apply_nodelay/0 call is invisible without this.
-boot_applies_upstream_nodelay_before_sup_test_() ->
+-define(DEFAULT_CHANNEL_CONFIG,
+        #{channels => [{default_channel, [{http, "127.0.0.1", 59999, []}], #{}}]}).
+
+%% The upstream channels are read from {yuzu_gw, upstream_client}. A channel
+%% dropped as unreadable would leave the gateway with no upstream, so an
+%% unusable value is refused rather than skipped; so is none at all, because
+%% the two callers of the channel use `default_channel' and /readyz would
+%% answer for a gateway that can register no agent.
+check_upstream_client_config_test_() ->
+    env_case(
+      [{"a well-formed default_channel is fine",
+        fun() ->
+            application:set_env(yuzu_gw, upstream_client, ?DEFAULT_CHANNEL_CONFIG),
+            ?assertEqual(ok, yuzu_gw_app:check_upstream_client_config())
+        end},
+       {"no upstream_client key is refused",
+        fun() ->
+            ?assertEqual({error, no_upstream_channel},
+                         yuzu_gw_app:check_upstream_client_config())
+        end},
+       {"an empty channel list is refused",
+        fun() ->
+            application:set_env(yuzu_gw, upstream_client, #{channels => []}),
+            ?assertEqual({error, no_upstream_channel},
+                         yuzu_gw_app:check_upstream_client_config())
+        end},
+       {"channels none of which is default_channel are refused",
+        fun() ->
+            application:set_env(yuzu_gw, upstream_client,
+                                #{channels => [{other_channel,
+                                                [{http, "127.0.0.1", 59999, []}], #{}}]}),
+            ?assertEqual({error, no_upstream_channel},
+                         yuzu_gw_app:check_upstream_client_config())
+        end},
+       {"{allow_no_upstream, true} accepts a gateway with none",
+        fun() ->
+            application:set_env(yuzu_gw, allow_no_upstream, true),
+            ?assertEqual(ok, yuzu_gw_app:check_upstream_client_config())
+        end},
+       {"only the literal true is an acknowledgement",
+        fun() ->
+            [begin
+                 application:set_env(yuzu_gw, allow_no_upstream, Value),
+                 ?assertEqual({error, no_upstream_channel},
+                              yuzu_gw_app:check_upstream_client_config())
+             end || Value <- [false, "true", <<"true">>, 1, yes]]
+        end},
+       {"{allow_no_upstream, true} does not excuse an unusable channel",
+        fun() ->
+            application:set_env(yuzu_gw, allow_no_upstream, true),
+            application:set_env(yuzu_gw, upstream_client, #{channels => [bogus]}),
+            ?assertEqual({error, bad_upstream_client_config},
+                         yuzu_gw_app:check_upstream_client_config())
+        end},
+       {"a value that is not a channels map is refused",
+        fun() ->
+            application:set_env(yuzu_gw, upstream_client, not_a_map),
+            ?assertEqual({error, bad_upstream_client_config},
+                         yuzu_gw_app:check_upstream_client_config())
+        end},
+       {"a channel that is not {Name, Endpoints, Options} is refused",
+        fun() ->
+            application:set_env(yuzu_gw, upstream_client, #{channels => [default_channel]}),
+            ?assertEqual({error, bad_upstream_client_config},
+                         yuzu_gw_app:check_upstream_client_config())
+        end},
+       {"an endpoint with a port out of range is refused",
+        fun() ->
+            application:set_env(yuzu_gw, upstream_client,
+                                #{channels => [{default_channel,
+                                                [{http, "127.0.0.1", 0, []}], #{}}]}),
+            ?assertEqual({error, bad_upstream_client_config},
+                         yuzu_gw_app:check_upstream_client_config())
+        end}]).
+
+%% The refusal names the shape of the defect and nothing of the value: an
+%% endpoint's SSL options name key files.
+check_upstream_client_config_logs_no_value_test_() ->
+    env_case(
+      [fun() ->
+          application:set_env(yuzu_gw, upstream_client,
+                              #{channels => [{default_channel,
+                                              [{https, "gw-upstream.example", 50051,
+                                                [{certfile, "/secret/gw-leaf.pem"}], not_a_map}],
+                                              #{}}]}),
+          Text = lists:flatten(
+                   capture_logs(fun() ->
+                                    ?assertEqual({error, bad_upstream_client_config},
+                                                 yuzu_gw_app:check_upstream_client_config())
+                                end)),
+          {match, _} = re:run(Text, "Refusing to start: the upstream channel configuration",
+                              [unicode]),
+          ?assertEqual(nomatch, re:run(Text, "gw-leaf", [unicode, {capture, none}])),
+          ?assertEqual(nomatch, re:run(Text, "gw-upstream.example", [unicode, {capture, none}]))
+      end]).
+
+%% What an operator reads when there is no channel: where to put one.
+check_upstream_client_config_no_channel_names_the_key_test_() ->
+    env_case(
+      [fun() ->
+          Text = lists:flatten(
+                   capture_logs(fun() ->
+                                    ?assertEqual({error, no_upstream_channel},
+                                                 yuzu_gw_app:check_upstream_client_config())
+                                end)),
+          {match, _} = re:run(Text, "Refusing to start: no upstream channel is configured",
+                              [unicode]),
+          {match, _} = re:run(Text, "upstream_client", [unicode])
+      end]).
+
+%% Boot refuses an unusable upstream configuration before it starts anything
+%% (through start/2 itself, so a guard dropped from the list is visible).
+boot_refuses_an_unusable_upstream_client_config_test_() ->
+    boot_refusal(fun() -> application:set_env(yuzu_gw, upstream_client, #{channels => [bogus]}) end,
+                 bad_upstream_client_config).
+
+boot_refuses_a_gateway_without_a_default_channel_test_() ->
+    boot_refusal(fun() -> application:unset_env(yuzu_gw, allow_no_upstream) end,
+                 no_upstream_channel).
+
+boot_accepts_a_gateway_with_a_default_channel_test_() ->
     boot_case(
-      [yuzu_gw_upstream_channel],
       fun() ->
-          Self = self(),
-          meck:expect(yuzu_gw_upstream_channel, apply_nodelay,
-                      fun() -> persistent_term:put(?NODELAY_KEY, true), ok end),
-          meck:expect(yuzu_gw_sup, start_link,
-                      fun() ->
-                          Self ! {sup_started, persistent_term:get(?NODELAY_KEY, false)},
-                          {ok, self()}
-                      end),
+          application:unset_env(yuzu_gw, allow_no_upstream),
+          application:set_env(yuzu_gw, upstream_client, ?DEFAULT_CHANNEL_CONFIG),
           ?assertMatch({ok, _}, yuzu_gw_app:start(normal, [])),
-          ?assertEqual(true, receive {sup_started, A} -> A after 0 -> missing end),
-          ?assertEqual(1, meck:num_calls(yuzu_gw_upstream_channel, apply_nodelay, []))
+          ?assertEqual(1, meck:num_calls(yuzu_gw_sup, start_link, []))
       end).
+
+%%%===================================================================
+%%% The leftover {grpcbox, client} block
+%%%===================================================================
+
+%% OTP applies a sys.config entry only to a LOADED application and none is named
+%% grpcbox, so a leftover {grpcbox, [{client, ...}]} is invisible rather than
+%% unused: the gateway would start without the TLS options the operator can
+%% read in the file. Boot refuses it, as it refuses {grpcbox, servers}.
+check_legacy_grpcbox_client_test_() ->
+    env_case(
+      [{"no client key is fine",
+        fun() ->
+            ?assertEqual(ok, yuzu_gw_app:check_legacy_grpcbox_client())
+        end},
+       {"an empty or undefined client value is fine",
+        fun() ->
+            [begin
+                 application:set_env(grpcbox, client, V),
+                 ?assertEqual(ok, yuzu_gw_app:check_legacy_grpcbox_client())
+             end || V <- [[], undefined]]
+        end},
+       {"a client value in the application env is refused",
+        fun() ->
+            application:set_env(grpcbox, client, ?DEFAULT_CHANNEL_CONFIG),
+            ?assertEqual({error, legacy_grpcbox_client},
+                         yuzu_gw_app:check_legacy_grpcbox_client())
+        end},
+       {"anything else under client is refused too",
+        fun() ->
+            application:set_env(grpcbox, client, not_a_map),
+            ?assertEqual({error, legacy_grpcbox_client},
+                         yuzu_gw_app:check_legacy_grpcbox_client())
+        end},
+       {"the refusal names the new key and quotes no value",
+        fun() ->
+            application:set_env(grpcbox, client,
+                                #{channels => [{default_channel,
+                                                [{https, "gw-upstream.example", 50051,
+                                                  [{certfile, "/secret/gw-leaf.pem"}]}], #{}}]}),
+            Text = lists:flatten(
+                     capture_logs(fun() ->
+                                      ?assertEqual({error, legacy_grpcbox_client},
+                                                   yuzu_gw_app:check_legacy_grpcbox_client())
+                                  end)),
+            {match, _} = re:run(Text, "Refusing to start: \\{grpcbox, \\[\\{client, \\.\\.\\.\\}\\]\\} is set",
+                                [unicode]),
+            {match, _} = re:run(Text, "upstream_client", [unicode]),
+            ?assertEqual(nomatch, re:run(Text, "gw-leaf", [unicode, {capture, none}])),
+            ?assertEqual(nomatch, re:run(Text, "gw-upstream.example", [unicode, {capture, none}]))
+        end}]).
+
+boot_refuses_a_leftover_grpcbox_client_block_test_() ->
+    boot_refusal(fun() -> application:set_env(grpcbox, client, ?DEFAULT_CHANNEL_CONFIG) end,
+                 legacy_grpcbox_client).
+
+%% Which refusal an operator reads first when several guards would refuse:
+%% the two leftover grpcbox blocks (servers, then client), then the listener
+%% entries, then the upstream channel configuration. Each pair below holds the
+%% earlier defect and the later one at once.
+boot_refuses_in_the_order_the_guards_run_test_() ->
+    Legacy = fun() -> application:set_env(grpcbox, client, ?DEFAULT_CHANNEL_CONFIG) end,
+    BadListeners = fun() -> application:set_env(yuzu_gw, grpc_listeners, [bogus]) end,
+    BadUpstream = fun() -> application:set_env(yuzu_gw, upstream_client, #{channels => [bogus]}) end,
+    [{"servers before client",
+      boot_refusal(fun() ->
+                       application:set_env(grpcbox, servers, [#{listen_opts => #{port => 50051}}]),
+                       Legacy()
+                   end,
+                   legacy_grpcbox_servers)},
+     {"a leftover client before a bad listener entry",
+      boot_refusal(fun() -> Legacy(), BadListeners() end, legacy_grpcbox_client)},
+     {"a bad listener entry before a bad upstream configuration",
+      boot_refusal(fun() -> BadListeners(), BadUpstream() end, bad_grpc_listeners)},
+     {"a bad upstream configuration before a missing default channel",
+      boot_refusal(fun() ->
+                       application:unset_env(yuzu_gw, allow_no_upstream),
+                       BadUpstream()
+                   end,
+                   bad_upstream_client_config)}].
+
+%% The leftover block is looked for in the config files the VM was started
+%% with as well: OTP never copies an entry for an unloaded application into the
+%% application env, so that is where a sys.config one is. Each case writes its
+%% own files and removes them.
+legacy_grpcbox_in_files_test_() ->
+    {foreach,
+     fun config_dir_setup/0,
+     fun config_dir_cleanup/1,
+     [fun(Dir) ->
+          {"a grpcbox client entry in a config file is found, and servers is not",
+           fun() ->
+               F = write_config(Dir, "a.config", [{grpcbox, [{client, #{channels => []}}]}]),
+               ?assertEqual(found, yuzu_gw_app:legacy_grpcbox_in_files(client, [F])),
+               ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(servers, [F]))
+           end}
+      end,
+      fun(Dir) ->
+          {"a servers entry in a config file is found, and client is not",
+           fun() ->
+               F = write_config(Dir, "b.config", [{grpcbox, [{servers, [#{}]}]}]),
+               ?assertEqual(found, yuzu_gw_app:legacy_grpcbox_in_files(servers, [F])),
+               ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(client, [F]))
+           end}
+      end,
+      fun(Dir) ->
+          {"an empty value, and other applications' entries, are not a leftover",
+           fun() ->
+               F = write_config(Dir, "c.config",
+                                [{grpcbox, [{client, []}, {servers, []}]},
+                                 {yuzu_gw, [{upstream_client, ?DEFAULT_CHANNEL_CONFIG}]}]),
+               ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(client, [F])),
+               ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(servers, [F]))
+           end}
+      end,
+      fun(Dir) ->
+          {"the file name may omit .config, as the VM's -config accepts",
+           fun() ->
+               F = write_config(Dir, "d.config", [{grpcbox, [{client, #{channels => []}}]}]),
+               ?assertEqual(found,
+                            yuzu_gw_app:legacy_grpcbox_in_files(client, [filename:rootname(F)]))
+           end}
+      end,
+      fun(Dir) ->
+          {"a file named by another config file is followed",
+           fun() ->
+               Inner = write_config(Dir, "inner.config",
+                                    [{grpcbox, [{client, #{channels => []}}]}]),
+               Outer = write_config(Dir, "outer.config", [Inner]),
+               ?assertEqual(found, yuzu_gw_app:legacy_grpcbox_in_files(client, [Outer]))
+           end}
+      end,
+      fun(Dir) ->
+          {"a file that is missing or is not a config is skipped, not a crash",
+           fun() ->
+               Bad = filename:join(Dir, "bad.config"),
+               ok = file:write_file(Bad, <<"this is not [erlang">>),
+               ?assertEqual(absent,
+                            yuzu_gw_app:legacy_grpcbox_in_files(
+                              client, [filename:join(Dir, "missing.config"), Bad]))
+           end}
+      end,
+      fun(Dir) ->
+          {"a file that names itself ends: nesting is bounded",
+           fun() ->
+               Self = filename:join(Dir, "self.config"),
+               ok = file:write_file(Self, io_lib:format("~p.~n", [[Self]])),
+               ?assertEqual(absent, yuzu_gw_app:legacy_grpcbox_in_files(client, [Self]))
+           end}
+      end]}.
+
+config_dir_setup() ->
+    Dir = filename:join(os:getenv("TMPDIR", "/tmp"),
+                        "yuzu_test_app_cfg_" ++ os:getpid() ++ "_"
+                        ++ integer_to_list(erlang:unique_integer([positive]))),
+    ok = filelib:ensure_path(Dir),
+    Dir.
+
+config_dir_cleanup(Dir) ->
+    _ = [file:delete(F) || F <- filelib:wildcard(filename:join(Dir, "*"))],
+    _ = file:del_dir(Dir),
+    ok.
+
+write_config(Dir, Name, Terms) ->
+    Path = filename:join(Dir, Name),
+    ok = file:write_file(Path, io_lib:format("~p.~n", [Terms])),
+    Path.
 
 %%%===================================================================
 %%% Boot wiring: the configuration guards run before anything is started
@@ -1031,6 +1306,20 @@ boot_refusals_are_logged_at_critical_test_() ->
                                              application:set_env(grpcbox, servers,
                                                                  [#{listen_opts => #{port => 50051}}])
                                          end))())
+                end)},
+     {"a leftover grpcbox client block",
+      boot_case(fun() ->
+                    ?assertEqual([critical],
+                                 (Levels(fun() ->
+                                             application:set_env(grpcbox, client, ?DEFAULT_CHANNEL_CONFIG)
+                                         end))())
+                end)},
+     {"no upstream channel",
+      boot_case(fun() ->
+                    ?assertEqual([critical],
+                                 (Levels(fun() ->
+                                             application:unset_env(yuzu_gw, allow_no_upstream)
+                                         end))())
                 end)}].
 
 %% An entry in the shape of the former grpcbox block (certificates in
@@ -1122,14 +1411,12 @@ boot_applies_the_listener_port_overrides_before_the_guards_test_() ->
 
 boot_refusal(Configure, Reason) ->
     boot_case(
-      [yuzu_gw_upstream_channel],
       fun() ->
           Configure(),
           ?assertEqual({error, Reason}, yuzu_gw_app:start(normal, [])),
           ?assertEqual(0, meck:num_calls(yuzu_gw_sup, start_link, [])),
           ?assertEqual(0, meck:num_calls(prometheus_httpd, start, [])),
           ?assertEqual(0, meck:num_calls(yuzu_gw_telemetry, setup, [])),
-          ?assertEqual(0, meck:num_calls(yuzu_gw_upstream_channel, apply_nodelay, [])),
           ?assertEqual(false, crash_filter_installed())
       end).
 
@@ -1157,6 +1444,8 @@ boot_setup(Extra) ->
     %% ...and with no listeners at all, which boot refuses unless told it is meant
     %% (the tests that are about that unset it again).
     application:set_env(yuzu_gw, allow_no_listeners, true),
+    %% ...and with no upstream channel, likewise.
+    application:set_env(yuzu_gw, allow_no_upstream, true),
     PrevPrometheus = application:get_env(prometheus, prometheus_http),
     AbsentKeys = [K || K <- [?SUMMARY_KEY, ?THROTTLE_KEY | ?SAFE_CALL_KEYS],
                        persistent_term:get(K, undefined) =:= undefined],
@@ -1199,7 +1488,6 @@ boot_cleanup(#{env := PrevEnv, cookie_flag := PrevCookieFlag, prometheus := Prev
     env_cleanup(PrevEnv),
     [persistent_term:erase(K) || K <- AbsentKeys],
     persistent_term:erase(?SUMMARY_KEY),
-    persistent_term:erase(?NODELAY_KEY),
     unpark_foreign_agents(Parked).
 
 park_foreign_agents() ->

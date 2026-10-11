@@ -43,7 +43,7 @@
 %%% under the server's receive limit: nothing here relies on the sender being well
 %%% behaved (the gateway puts no inbound size limit on a Heartbeat).
 %%%
-%%% Flushing calls do_flush/2 which sends BatchHeartbeat RPCs via grpcbox.
+%%% Flushing calls do_flush/2 which sends BatchHeartbeat RPCs via yuzu_grpc_client.
 %%% The buffer is split into chunks, oldest entry first, each estimated under
 %%% 3 MiB, and a flush (the timer's, or flush_sync/0) sends at most
 %%% ?MAX_CHUNKS_PER_FLUSH of them (about 24 MiB): the rest stays buffered for
@@ -75,7 +75,7 @@
 %%% one cast per successful chunk (plus a look at its mailbox length first): a
 %%% cast returns at once, so the handoff adds no wait to the flush (the
 %%% BatchHeartbeat RPC itself is still a synchronous unary call under
-%%% grpcbox's default deadline). A cast to an upstream that is not running is
+%%% yuzu_grpc_client's default 5 s call timeout). A cast to an upstream that is not running is
 %%% a no-op, never a flush failure. While the upstream's mailbox holds more
 %%% than 100 messages the cast is skipped and counted (queue_full), so the
 %%% cast rate cannot outrun the drip whatever the flush interval is.
@@ -90,7 +90,7 @@
 -module(yuzu_gw_heartbeat_buffer).
 -behaviour(gen_server).
 
--include_lib("grpcbox/include/grpcbox.hrl").
+-include("yuzu_grpc_client.hrl").
 
 %% API
 -export([start_link/0, queue_heartbeat/1, flush_sync/0]).
@@ -342,27 +342,23 @@ redact_log(_Other)                 -> [].
 
 %% @doc Send one BatchHeartbeat RPC (a chunk of N heartbeats) to the upstream
 %% C++ server. A success returns the decoded response untouched; flush_chunks/2
-%% consumes its verdict. This calls grpcbox_client directly, never through
+%% consumes its verdict. This calls yuzu_grpc_client directly, never through
 %% yuzu_gw_upstream, so a flush result can not feed the circuit breaker.
 -spec do_flush(map(), non_neg_integer()) -> {ok, term()} | {error, term()}.
 do_flush(BatchReq, N) ->
     InputType = ?BATCH_REQUEST,
     OutputType = 'yuzu.gateway.v1.BatchHeartbeatResponse',
-    Def = #grpcbox_def{
-        service       = 'yuzu.gateway.v1.GatewayUpstream',
-        message_type  = atom_to_binary(InputType, utf8),
-        marshal_fun   = fun(Msg) -> gateway_pb:encode_msg(Msg, InputType) end,
-        unmarshal_fun = fun(Bin) -> gateway_pb:decode_msg(Bin, OutputType) end
-    },
+    Def = #{marshal   => fun(Msg) -> gateway_pb:encode_msg(Msg, InputType) end,
+            unmarshal => fun(Bin) -> gateway_pb:decode_msg(Bin, OutputType) end},
     Path = <<"/yuzu.gateway.v1.GatewayUpstream/BatchHeartbeat">>,
     StartTime = erlang:monotonic_time(millisecond),
     %% The marshal fun runs inside the call, so an invalid heartbeat raises here
     %% (error), and the HTTP/2 connection can exit under it (an exit that
-    %% grpcbox_client does not catch). Neither may end this process, which holds
+    %% yuzu_grpc_client does not catch). Neither may end this process, which holds
     %% every buffered heartbeat: only the class is kept, never the reason (it
     %% can hold the request).
-    Result = try grpcbox_client:unary(ctx:background(), Path, BatchReq, Def,
-                                      #{channel => default_channel})
+    Result = try yuzu_grpc_client:unary(#{}, Path, BatchReq, Def,
+                                        #{channel => default_channel})
              catch
                  Caught:_ -> {caught, Caught}
              end,
@@ -382,11 +378,13 @@ do_flush(BatchReq, N) ->
             {ok, Response};
         {error, {Status, Message}, _Trailers} ->
             %% HA WS-4 4.4 review fix (F3, mirrors yuzu_gw_upstream:do_rpc/4's
-            %% identical bug): grpcbox_client:unary/5's REAL error shape for a
+            %% identical bug): yuzu_grpc_client:unary/5's error shape for a
             %% genuine (non-transport) grpc status is a 3-ELEMENT tuple —
-            %% `error`, the `{Status, Message}` pair, and the trailers map —
-            %% not the 2-element `{error, {Status, Message, Trailers}}` this
-            %% clause used to match, which grpcbox never actually returns. A
+            %% `error`, the `{Status, Message}` pair, and the trailers map (the
+            %% shape its predecessor grpcbox_client defined, kept so these
+            %% clauses did not change) — not the 2-element
+            %% `{error, {Status, Message, Trailers}}` this clause used to
+            %% match, which was never returned. A
             %% real grpc-status error on BatchHeartbeat (e.g. RESOURCE_EXHAUSTED
             %% on an oversized batch) previously matched NEITHER this clause
             %% nor the transport-level `{error, Reason}` one below, crashing
@@ -402,7 +400,7 @@ do_flush(BatchReq, N) ->
             %% HA WS-4 4.4 round-2 review fix (consistency-auditor c-1 /
             %% chaos-injector CH-2), mirrors yuzu_gw_upstream:do_rpc/4's
             %% identical fix — see that clause's comment for the full
-            %% rationale (a fourth real grpcbox_client:unary/5 return shape
+            %% rationale (a fourth real unary/5 return shape
             %% this file's classifier didn't cover either).
             telemetry:execute([yuzu, gw, upstream, rpc_error],
                               #{count => 1},
@@ -751,14 +749,14 @@ flush_loop([Chunk | Rest], State, #acc{rpcs = Rpcs} = Acc) ->
             failed(classify(Error), Error, Chunk, Rest, State, Acc1)
     end.
 
-%% How a failed RPC is handled. The status of a gRPC error is the binary grpcbox
-%% returns (<<"8">> is RESOURCE_EXHAUSTED, <<"3">> INVALID_ARGUMENT); the server
+%% How a failed RPC is handled. The status of a gRPC error is the binary
+%% yuzu_grpc_client returns (<<"8">> is RESOURCE_EXHAUSTED, <<"3">> INVALID_ARGUMENT); the server
 %% refusing a request this way will refuse the same request again, so retrying
 %% it every cycle would hold back everything behind it. Any other failure,
 %% including a status this module does not know, is transient: the data stays.
 -spec classify(term()) -> refused | raised | transient.
-classify({Status, _Message}) when Status =:= ?GRPC_STATUS_RESOURCE_EXHAUSTED;
-                                  Status =:= ?GRPC_STATUS_INVALID_ARGUMENT ->
+classify({Status, _Message}) when Status =:= ?GRPC_STATUS_BIN_RESOURCE_EXHAUSTED;
+                                  Status =:= ?GRPC_STATUS_BIN_INVALID_ARGUMENT ->
     refused;
 classify({exception, error}) ->
     raised;
@@ -846,7 +844,7 @@ flushed(#acc{sent = Sent, nchunks = NChunks}) ->
 %% ?TRUNC_WARN_INTERVAL_MS; the warning says how many were suppressed since the
 %% last one. The timestamps live in the returned state.
 %%
-%% A body that is not a map is no verdict (grpcbox returns {ok, <<>>, Trailers}
+%% A body that is not a map is no verdict (yuzu_grpc_client returns {ok, <<>>, Meta}
 %% for an OK with trailers and no DATA frame): nothing is cast or counted and
 %% the flush still succeeds. A key of the wrong type is treated as absent. A
 %% crash here would take this process, and every heartbeat it buffers, with it.

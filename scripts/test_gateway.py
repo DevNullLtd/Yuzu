@@ -80,7 +80,7 @@ suite = sys.argv[2]  # "eunit" or "ct"
 
 # Clean the app's beam directory to prevent stale beam files from crashing
 # Erlang's cover module during instrumentation.  Only the app ebin is
-# removed — dependency beams (meck, proper, grpcbox, …) are kept so they
+# removed — dependency beams (meck, proper, gun, …) are kept so they
 # don't need to be recompiled on every run.
 #
 # REBAR_BASE_DIR selects the rebar3 `_build/` root; meson.build sets

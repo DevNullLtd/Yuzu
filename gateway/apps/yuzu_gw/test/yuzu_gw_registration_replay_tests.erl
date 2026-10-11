@@ -18,7 +18,7 @@
 %%%
 %%% Real:  yuzu_gw_registry (needs pg + ETS — all_register_reqs/0 reads
 %%%        straight from the table).
-%%% Mocks: grpcbox_client, telemetry.
+%%% Mocks: yuzu_grpc_client, telemetry.
 %%%
 %%% #1197 adds the targeted path: the server's unknown-session verdict
 %%% (BatchHeartbeatResponse.unknown_session_ids) reaches
@@ -33,6 +33,7 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_registration_replay_tests).
 -include_lib("eunit/include/eunit.hrl").
+-include("../src/yuzu_grpc_client.hrl").
 
 -export([log/2]).  %% logger handler callback, see capture_logs/1
 
@@ -248,7 +249,7 @@ setup(Env) ->
     yuzu_gw_test_registry:ensure(),
 
     %% Clean up stale mocks from prior modules.
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     catch meck:unload(telemetry),
     catch meck:unload(yuzu_gw_agent),
 
@@ -271,7 +272,7 @@ setup(Env) ->
     persistent_term:put(?DUMMYK, ets:new(replay_test_dummies, [public, bag])),
     persistent_term:erase(?SUBK),
 
-    meck:new(grpcbox_client, [non_strict, no_link]),
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
     %% Default: every RPC succeeds. Individual tests override this.
     mock_unary(fun default_rpc/3),
     meck:new(telemetry, [passthrough, no_link]),
@@ -319,7 +320,7 @@ cleanup(UpPid) ->
                   yuzu_gw_registry:all_agents()),
     wait_until(fun() -> yuzu_gw_registry:agent_count() =:= 0 end, 2000),
     kill_dummies(),
-    meck:unload([grpcbox_client, telemetry, yuzu_gw_agent]),
+    meck:unload([yuzu_grpc_client, telemetry, yuzu_gw_agent]),
     persistent_term:erase(?SUBK),
     persistent_term:erase(?LOGK),
     %% The two verdict replay tunables are read once in init/1; do not leak
@@ -343,7 +344,7 @@ reconnect_replays_all_agents() ->
     %% The success-after-failure is the reconnect signal.
     cause_one_failure(),
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     succeed_rpcs(),
     %% The trigger RPC itself succeeds and is a ProxyRegister.
     {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
@@ -365,7 +366,7 @@ reconnect_zero_agents_no_rpc() ->
 
     cause_one_failure(),
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     succeed_rpcs(),
     {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
 
@@ -386,7 +387,7 @@ deregistered_agent_not_replayed() ->
     wait_until(fun() -> yuzu_gw_registry:lookup(DroppedId) =:= error end, 2000),
 
     cause_one_failure(),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     succeed_rpcs(),
     {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
 
@@ -419,7 +420,7 @@ replay_payload_is_verbatim() ->
                                          [<<"svc">>], <<"verbatim-host">>, Req),
 
     cause_one_failure(),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     succeed_rpcs(),
     {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
 
@@ -435,7 +436,7 @@ half_open_recovery_triggers_replay() ->
     N = 2,
     Agents = register_n_agents(N),
 
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     lists:foreach(fun(_) ->
@@ -448,7 +449,7 @@ half_open_recovery_triggers_replay() ->
         yuzu_gw_upstream:circuit_state() =:= half_open
     end, 2000),
 
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     succeed_rpcs(),
     %% This probe succeeds: half_open -> closed, which schedules replay.
     {ok, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
@@ -476,12 +477,12 @@ adopted_replay_reannounces_connected() ->
     ok = yuzu_gw_registry:register_agent(Id, Pid, SessionId, [<<"svc">>], <<"host">>, Req),
 
     cause_one_failure(),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     %% Distinguish the trigger RPC (always succeeds, kicking off the
     %% replay) from THIS agent's own replayed request (verbatim-equal to
     %% Req, per replay_payload_is_verbatim's own precedent) by CONTENT —
     %% Path is identical ("ProxyRegister") for both.
-    meck:expect(grpcbox_client, unary, fun(_, Path, IncomingReq, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, IncomingReq, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -520,9 +521,9 @@ adopted_replay_leaves_session_binding() ->
     ?assertMatch([_], RouteBefore),
 
     cause_one_failure(),
-    meck:reset(grpcbox_client),
+    meck:reset(yuzu_grpc_client),
     meck:reset(telemetry),
-    meck:expect(grpcbox_client, unary, fun(_, Path, IncomingReq, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, IncomingReq, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -565,20 +566,20 @@ superseded_replay_forces_reconnect() ->
     ok = yuzu_gw_registry:register_agent(Id, Pid, SessionId, [<<"svc">>], <<"host">>, Req),
 
     cause_one_failure(),
-    meck:reset(grpcbox_client),
-    meck:expect(grpcbox_client, unary, fun(_, Path, IncomingReq, _, _) ->
+    meck:reset(yuzu_grpc_client),
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, IncomingReq, _, _) ->
         case binary:match(Path, <<"ProxyRegister">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
                 case IncomingReq of
-                    %% ?GRPC_STATUS_FAILED_PRECONDITION (grpcbox.hrl) is the
+                    %% ?GRPC_STATUS_BIN_FAILED_PRECONDITION (yuzu_grpc_client.hrl) is the
                     %% BINARY digit string <<"9">> — the raw grpc-status
-                    %% trailer value (grpcbox_client_stream.erl reads it
+                    %% trailer value (yuzu_grpc_client.erl reads it
                     %% straight off the HTTP/2 header, never converting to
                     %% an integer). Using the integer 9 here (as the
                     %% pre-existing proxy_register_error test's OWN mock
                     %% does for a different status) would silently miss
-                    %% do_replay_one's `Status =:= ?GRPC_STATUS_FAILED_PRECONDITION`
+                    %% do_replay_one's `Status =:= ?GRPC_STATUS_BIN_FAILED_PRECONDITION`
                     %% guard and fall through to the generic error branch.
                     Req -> {error, {<<"9">>, <<"session superseded; reconnect">>}, #{}};
                     _   -> {ok, #{session_id => <<"ok">>}, #{}}
@@ -639,7 +640,7 @@ count_test_agents() ->
 %% One failing RPC. With threshold 5 the circuit stays closed but
 %% cb_failures becomes 1 — the precondition for closed-state recovery.
 cause_one_failure() ->
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     {error, _} = yuzu_gw_upstream:proxy_register(trigger_req()),
@@ -647,7 +648,7 @@ cause_one_failure() ->
 
 %% Make every subsequent RPC succeed.
 succeed_rpcs() ->
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{session_id => <<"ok">>}, #{}}
     end).
 
@@ -655,10 +656,10 @@ succeed_rpcs() ->
 %%% Helpers — meck history inspection
 %%%===================================================================
 
-%% All ProxyRegister request payloads currently in grpcbox_client history.
+%% All ProxyRegister request payloads currently in yuzu_grpc_client history.
 proxy_register_requests() ->
-    [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _}
-                <- meck:history(grpcbox_client),
+    [Req || {_, {yuzu_grpc_client, unary, [_, Path, Req, _, _]}, _}
+                <- meck:history(yuzu_grpc_client),
             is_binary(Path),
             binary:match(Path, <<"ProxyRegister">>) =/= nomatch].
 
@@ -1879,14 +1880,13 @@ mock_batch(Resp) ->
 %%% Helpers: mocks and the call log
 %%%===================================================================
 
-%% Install a logging grpcbox_client:unary mock. Fun(Method, Req, SessionHdr)
+%% Install a logging yuzu_grpc_client:unary mock. Fun(Method, Req, SessionHdr)
 %% returns the unary result; Method is the last path segment and SessionHdr is
-%% the x-yuzu-session-id outgoing metadata or `undefined'.
+%% the x-yuzu-session-id request metadata (the Meta map) or `undefined'.
 mock_unary(Fun) ->
-    meck:expect(grpcbox_client, unary, fun(Ctx, Path, Req, _Def, _Opts) ->
+    meck:expect(yuzu_grpc_client, unary, fun(Meta, Path, Req, _Def, _Opts) ->
         Method = lists:last(binary:split(Path, <<"/">>, [global])),
-        Hdr = maps:get(<<"x-yuzu-session-id">>,
-                       grpcbox_metadata:from_outgoing_ctx(Ctx), undefined),
+        Hdr = maps:get(<<"x-yuzu-session-id">>, Meta, undefined),
         log({rpc, Method, Req, Hdr}),
         Fun(Method, Req, Hdr)
     end).

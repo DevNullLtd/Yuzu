@@ -55,7 +55,7 @@ send(#yuzu_grpc_stream{conn = Conn, stream_id = StreamId, pb = Pb, output = Outp
     end.
 
 %% @doc End the call with a status: throws, and the runner turns the throw into
-%% the trailers. Unlike grpcbox's error/2 this is a plain throw, so it works from
+%% the trailers. This is a plain throw, so it works from
 %% a nested function of the handler and from every kind of handler.
 -spec error(yuzu_grpc_frame:status() | binary(), iodata()) -> no_return().
 error(Status, Message) ->

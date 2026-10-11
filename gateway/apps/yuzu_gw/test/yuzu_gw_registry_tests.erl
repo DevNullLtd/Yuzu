@@ -209,8 +209,8 @@ pending_take_deletes() ->
 
 %% Regression pin for the take_pending atomicity fix (PR #4299 round 6).
 %% take_pending is called directly from yuzu_gw_agent_service:subscribe/2, which
-%% grpcbox runs as an independent process per incoming stream, against a `public`
-%% ETS table with no serialization. The old lookup-then-delete let two concurrent
+%% the listener layer (Cowboy) runs as an independent process per incoming
+%% stream, against a `public` ETS table with no serialization. The old lookup-then-delete let two concurrent
 %% Subscribe handlers presenting the SAME session id BOTH consume the one pending
 %% registration, each spawning an agent process and each emitting its own
 %% CONNECTED(S) — a second-CONNECTED-per-session producer that breaks the HA WS-4

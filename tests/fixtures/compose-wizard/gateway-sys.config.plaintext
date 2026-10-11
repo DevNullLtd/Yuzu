@@ -28,10 +28,9 @@
               service_protos => [management_pb],
               services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},
               listen => #{port => 50063, ip => {0,0,0,0}}}
-        ]}
-    ]},
-    {grpcbox, [
-        {client, #{channels => [
+        ]},
+        %% Upstream channel to the server (plaintext HTTP/2).
+        {upstream_client, #{channels => [
             {default_channel, [{http, "server", 50055, []}], #{}}
         ]}}
     ]},

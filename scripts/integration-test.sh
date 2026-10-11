@@ -546,10 +546,10 @@ cat > "$GW_SYS_CONFIG" << ERLCFG
                   'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service
               },
               listen => #{port => $GW_AGENT_PORT, ip => {0,0,0,0}}}
-        ]}
-    ]},
-    {grpcbox, [
-        {client, #{channels => [
+        ]},
+        %% Upstream channel to the server. Read from {yuzu_gw, upstream_client}; a
+        %% {grpcbox, client} entry is never applied by the VM and refuses boot.
+        {upstream_client, #{channels => [
             {default_channel, [{http, "127.0.0.1", $SERVER_GW_PORT, []}], #{}}
         ]}}
     ]},
@@ -601,7 +601,6 @@ for mod in apps/yuzu_gw/src/management_pb.erl; do
 done
 # Start with all deps and generated proto modules on path
 erl -pa _build/default/lib/*/ebin \
-    -pa _checkouts/*/ebin \
     -config "$GW_SYS_CONFIG" \
     -args_file "$GW_VM_ARGS" \
     -noshell \

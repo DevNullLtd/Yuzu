@@ -1,7 +1,8 @@
 %%%-------------------------------------------------------------------
 %%% @doc Which address a call is attributed to, over a real listener
 %%% (yuzu_grpc_origin; the decision table is in yuzu_grpc_origin_tests). The
-%%% client is grpcbox_client; a test-only TCP relay (yuzu_gw_test_relay) plays
+%%% client is the gun-based production channel, driven through
+%%% yuzu_gw_test_client; a test-only TCP relay (yuzu_gw_test_relay) plays
 %%% the load balancer that prepends a PROXY protocol header, an F5 iRule or
 %%% HAProxy `send-proxy-v2'.
 %%%
@@ -26,7 +27,6 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_grpc_origin_wire_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
 
 -export([forward_origin/4]).
 %% the service of the plain listeners (see heartbeat/2)
@@ -361,7 +361,7 @@ heartbeat(Ctx, Request) ->
 %%%-------------------------------------------------------------------
 
 start_apps() ->
-    {ok, _} = application:ensure_all_started(grpcbox),
+    {ok, _} = application:ensure_all_started(gun),
     {ok, _} = application:ensure_all_started(cowboy),
     {ok, _} = application:ensure_all_started(telemetry),
     ok.
@@ -373,7 +373,7 @@ origin_of(Chan) ->
 origin_of(Chan, Forwarded) ->
     Ctx = case Forwarded of
         undefined -> ctx:new();
-        _ -> grpcbox_metadata:append_to_outgoing_ctx(ctx:new(), #{<<"x-forwarded-for">> => Forwarded})
+        _ -> yuzu_gw_test_client:with_metadata(ctx:new(), #{<<"x-forwarded-for">> => Forwarded})
     end,
     {ok, #{pending_commands := [#{command_id := Origin, plugin := Source, action := Peer,
                                   parameters := #{<<"cert">> := Cert}}]}, _} =
@@ -381,23 +381,21 @@ origin_of(Chan, Forwarded) ->
     {Origin, Source, Peer, Cert}.
 
 heartbeat(Chan, Command, Ctx) ->
-    grpcbox_client:unary(Ctx, ?HEARTBEAT, #{session_id => Command}, heartbeat_def(),
-                         #{channel => Chan}).
+    yuzu_gw_test_client:unary(Ctx, ?HEARTBEAT, #{session_id => Command}, heartbeat_def(),
+                              #{channel => Chan}).
 
 list_agents(Chan) ->
-    Def = #grpcbox_def{service = ?MGMT_SVC,
-                       marshal_fun = fun(M) ->
+    Def = #{marshal => fun(M) ->
                            management_pb:encode_msg(M, 'yuzu.server.v1.ListAgentsRequest')
                        end,
-                       unmarshal_fun = fun(B) ->
-                           management_pb:decode_msg(B, 'yuzu.server.v1.ListAgentsResponse')
-                       end},
-    grpcbox_client:unary(ctx:new(), ?LIST_AGENTS, #{limit => 10}, Def, #{channel => Chan}).
+            unmarshal => fun(B) ->
+                             management_pb:decode_msg(B, 'yuzu.server.v1.ListAgentsResponse')
+                         end},
+    yuzu_gw_test_client:unary(ctx:new(), ?LIST_AGENTS, #{limit => 10}, Def, #{channel => Chan}).
 
 heartbeat_def() ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.HeartbeatRequest') end,
-                 unmarshal_fun = fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.HeartbeatResponse') end}.
+    #{marshal => fun(M) -> agent_pb:encode_msg(M, 'yuzu.agent.v1.HeartbeatRequest') end,
+      unmarshal => fun(B) -> agent_pb:decode_msg(B, 'yuzu.agent.v1.HeartbeatResponse') end}.
 
 forward_origin(_Event, #{count := 1}, #{mode := Mode, reason := Reason}, _Config) ->
     ets:insert(?EVENTS, {erlang:unique_integer([monotonic]), Mode, Reason}),

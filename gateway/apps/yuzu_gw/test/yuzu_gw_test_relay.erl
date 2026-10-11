@@ -5,7 +5,7 @@
 %%% `send-proxy-v2' would) and then copies bytes both ways without looking at
 %%% them. Because it is a plain TCP splice, TLS passes through it untouched:
 %%% the client's handshake, and its certificate, reach the upstream listener.
-%%% grpcbox_client needs no change to use it: point the channel at the relay.
+%%% yuzu_grpc_client needs no change to use it: point the channel at the relay.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_test_relay).

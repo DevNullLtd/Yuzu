@@ -1,9 +1,10 @@
 %%%-------------------------------------------------------------------
 %%% @doc ManagementService over the wire: the REAL yuzu_gw_mgmt_service served
-%%% by a REAL listener (yuzu_gw_test_listener) and driven by grpcbox_client.
-%%% Only the process boundaries it calls are replaced (yuzu_gw_registry,
-%%% yuzu_gw_router, yuzu_gw_agent), so what a handler returns is judged by the
-%%% gRPC status and messages a client receives, not by calling the function:
+%%% by a REAL listener (yuzu_gw_test_listener) and driven by the gun-based
+%%% client (yuzu_gw_test_client). Only the process boundaries it calls are
+%%% replaced (yuzu_gw_registry, yuzu_gw_router, yuzu_gw_agent), so what a
+%%% handler returns is judged by the gRPC status and messages a client receives,
+%%% not by calling the function:
 %%%
 %%%   - the unary handlers take `(Ctx, Request)' and answer `{ok, Response, Ctx}'
 %%%     (called with the arguments swapped they would not serve a single call);
@@ -17,7 +18,6 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_mgmt_wire_tests).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("grpcbox/include/grpcbox.hrl").
 
 -define(SVC, 'yuzu.server.v1.ManagementService').
 -define(LIST, <<"/yuzu.server.v1.ManagementService/ListAgents">>).
@@ -71,7 +71,7 @@ mgmt_wire_test_() ->
      end}.
 
 setup() ->
-    {ok, _} = application:ensure_all_started(grpcbox),
+    {ok, _} = application:ensure_all_started(gun),
     {ok, _} = application:ensure_all_started(cowboy),
     {ok, _} = application:ensure_all_started(telemetry),
     Pg = case pg:start_link(yuzu_gw) of
@@ -336,8 +336,8 @@ send_fanout_failed(#{chan := Chan}) ->
 watch_events(#{chan := Chan}) ->
     {Monitor, _} = pg:monitor(yuzu_gw, event_watchers),
     try
-        {ok, S} = grpcbox_client:stream(ctx:new(), ?WATCH, #{agent_ids => [<<"a1">>]}, watch_def(),
-                                        #{channel => Chan}),
+        {ok, S} = yuzu_gw_test_client:stream(ctx:new(), ?WATCH, #{agent_ids => [<<"a1">>]}, watch_def(),
+                                             #{channel => Chan}),
         Watcher = receive
             {Monitor, join, event_watchers, [Pid]} -> Pid
         after 5000 -> error(watcher_did_not_join)
@@ -350,7 +350,7 @@ watch_events(#{chan := Chan}) ->
         Watcher ! Event(<<"b2">>),
         Watcher ! Event(<<"a1">>),
         ?assertMatch({ok, #{agent_id := <<"a1">>, event := {connected, #{session_id := <<"s-a1">>}}}},
-                     grpcbox_client:recv_data(S, 5000)),
+                     yuzu_gw_test_client:recv_data(S, 5000)),
         Watcher ! stop_watching,
         ?assertEqual({[], <<"0">>, <<>>}, collect(S))
     after
@@ -362,29 +362,32 @@ watch_events(#{chan := Chan}) ->
 %%--------------------------------------------------------------------
 
 unary(Chan, Path, Request, Def) ->
-    grpcbox_client:unary(ctx:new(), Path, Request, Def, #{channel => Chan}).
+    yuzu_gw_test_client:unary(ctx:new(), Path, Request, Def, #{channel => Chan}).
 
 send(Chan, Request) ->
-    {ok, S} = grpcbox_client:stream(ctx:new(), ?SEND, Request, send_def(), #{channel => Chan}),
+    {ok, S} = yuzu_gw_test_client:stream(ctx:new(), ?SEND, Request, send_def(), #{channel => Chan}),
     S.
 
-%% Every message of a server stream, then its status and message: a clean end is
-%% `stream_finished' (status 0), any other status comes back as an error.
+%% Every message of a stream, then its status and message. The stream ends
+%% with `stream_finished' whatever its status; the status (0 or an error) and
+%% its message are then read from the trailers.
 collect(S) ->
     collect(S, []).
 
 collect(S, Acc) ->
-    case grpcbox_client:recv_data(S, 5000) of
+    case yuzu_gw_test_client:recv_data(S, 5000) of
         {ok, Message} -> collect(S, [Message | Acc]);
-        stream_finished -> {lists:reverse(Acc), <<"0">>, <<>>};
-        {error, {Status, Message}, _} -> {lists:reverse(Acc), Status, Message};
+        stream_finished ->
+            case yuzu_gw_test_client:recv_trailers(S, 5000) of
+                {ok, {Status, Message, _}} -> {lists:reverse(Acc), Status, Message};
+                Other -> {lists:reverse(Acc), {unexpected, Other}, undefined}
+            end;
         Other -> {lists:reverse(Acc), {unexpected, Other}, undefined}
     end.
 
 def(Request, Response) ->
-    #grpcbox_def{service = ?SVC,
-                 marshal_fun = fun(M) -> management_pb:encode_msg(M, Request) end,
-                 unmarshal_fun = fun(B) -> management_pb:decode_msg(B, Response) end}.
+    #{marshal => fun(M) -> management_pb:encode_msg(M, Request) end,
+      unmarshal => fun(B) -> management_pb:decode_msg(B, Response) end}.
 
 list_def() -> def('yuzu.server.v1.ListAgentsRequest', 'yuzu.server.v1.ListAgentsResponse').
 get_def() -> def('yuzu.server.v1.GetAgentRequest', 'yuzu.server.v1.GetAgentResponse').

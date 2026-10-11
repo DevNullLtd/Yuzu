@@ -2,9 +2,10 @@
 %%% default limits of the yuzu_grpc layer (see yuzu_grpc_stream_h).
 %%%
 %%% Statuses are integers 0..16. A handler may also return the decimal binary
-%%% form (<<"5">>): yuzu_grpc_frame:normalize_status/1 accepts both. Do NOT
-%%% include this file next to grpcbox/include/grpcbox.hrl: the macro names are
-%%% the same and their values differ (binaries there, integers here).
+%%% form (<<"5">>): yuzu_grpc_frame:normalize_status/1 accepts both. The
+%%% client side (yuzu_grpc_client) returns the status as a decimal binary and has
+%%% its own codes in yuzu_grpc_client.hrl under GRPC_STATUS_BIN_*: the names
+%%% differ so the two can be included together and never be mistaken.
 
 -define(GRPC_STATUS_OK, 0).
 -define(GRPC_STATUS_CANCELLED, 1).

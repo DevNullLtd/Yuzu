@@ -16,7 +16,9 @@
 -export([client_has_https/1, client_tls_posture/1, listeners_have_tls/1]). %% for testing
 -export([evaluate_upstream_posture/2, evaluate_listeners/1]).             %% for testing
 -export([evaluate_mgmt_posture/3, apply_listener_port_overrides/0]).      %% for testing
--export([check_legacy_grpcbox_servers/0, check_grpc_listeners/0,
+-export([check_legacy_grpcbox_servers/0, check_legacy_grpcbox_client/0,
+         legacy_grpcbox_in_files/2, check_grpc_listeners/0,
+         check_upstream_client_config/0,
          check_mgmt_listener_posture/0]).                                 %% for testing
 
 %%--------------------------------------------------------------------
@@ -40,27 +42,25 @@ do_start() ->
     %% the listeners: the summary below would read "none configured" for it, and
     %% the refusal is the whole explanation.
     case check_legacy_grpcbox_servers() of
-        ok -> do_start_guarded();
-        {error, _} = Error -> Error
+        ok ->
+            case check_legacy_grpcbox_client() of
+                ok -> do_start_guarded();
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error ->
+            Error
     end.
 
 do_start_guarded() ->
     %% Log the ACTUAL transport TLS posture: the {yuzu_gw, grpc_listeners} entries
-    %% for the two listeners and grpcbox's {grpcbox, client} for the upstream hop;
+    %% for the two listeners and {yuzu_gw, upstream_client} for the upstream hop;
     %% the yuzu_gw `tls`/`tls_enabled` env is advisory only (nothing wires it into
     %% a listener or the channel -- see docs/pki-architecture.md "Gateway TLS").
     log_tls_state(),
 
     %% Every guard below runs on configuration alone, before the supervision
     %% tree is started, and the listeners are the tree's last children: nothing
-    %% is bound while a guard can still refuse (one exception, below).
-    %%
-    %% A leftover {grpcbox, servers} would make the grpcbox application bind an
-    %% unguarded listener next to ours. grpcbox starts before this application
-    %% does, so that listener is already up when check_legacy_grpcbox_servers/0
-    %% refuses. It binds for the moments before the release halts, and every
-    %% request it receives fails: the registry, the router and the ETS tables
-    %% its handlers use do not exist yet.
+    %% is bound while a guard can still refuse.
     %%
     %% #PR5: fail CLOSED on a misconfigured-but-encrypted upstream (https without
     %% verify_peer is MITM-able) -- same fail-closed philosophy as the distribution
@@ -68,6 +68,7 @@ do_start_guarded() ->
     %% is still allowed (the legitimate UAT/dev posture); only the "TLS but
     %% unauthenticated" footgun is refused.
     run_guards([fun check_grpc_listeners/0,
+                fun check_upstream_client_config/0,
                 fun check_upstream_tls_posture/0,
                 fun check_mgmt_listener_posture/0],
                fun do_start_services/0).
@@ -94,11 +95,6 @@ do_start_services() ->
     %% And for the runner's WARN limit (yuzu_grpc_runner): the same burst, the
     %% same reason, and no lock to take when it comes.
     ok = yuzu_grpc_runner:init_throttle(),
-
-    %% TCP_NODELAY on the upstream channel, before the supervision tree below
-    %% (the only caller of the channel) exists: grpcbox already started the
-    %% channel from sys.config, so this restarts it with the rewritten endpoints.
-    ok = yuzu_gw_upstream_channel:apply_nodelay(),
 
     %% Start Prometheus HTTP exporter for /metrics endpoint.
     Port = application:get_env(yuzu_gw, prometheus_port, 9568),
@@ -471,36 +467,37 @@ apply_tls_overrides() ->
 -type tls_posture() :: verified | unverified | plaintext.
 
 %% @private Report the real transport TLS posture: the listener entries of
-%% {yuzu_gw, grpc_listeners} and, for the upstream hop, grpcbox's own
-%% {grpcbox, client} config (the channel is still a grpcbox client). Never
-%% crashes on unexpected shapes.
+%% {yuzu_gw, grpc_listeners} and, for the upstream hop, the upstream channel
+%% config {yuzu_gw, upstream_client} (see yuzu_grpc_client_config). Never crashes
+%% on unexpected shapes.
 -spec log_tls_state() -> ok.
 log_tls_state() ->
     case application:get_env(yuzu_gw, tls_enabled, auto) of
         false ->
             logger:warning("YUZU_GW_TLS_ENABLED=false is advisory only -- the actual "
-                           "transport is whatever the listener entries and the grpcbox "
+                           "transport is whatever the listener entries and the upstream "
                            "client config select (below)");
         _ -> ok
     end,
-    Up = client_tls_posture(application:get_env(grpcbox, client, undefined)),
+    Up = client_tls_posture(application:get_env(yuzu_gw, upstream_client, undefined)),
     Listeners = application:get_env(yuzu_gw, grpc_listeners, []),
     %% This reflects the CONFIGURED posture, not a live handshake -- the
-    %% upstream channel connects lazily (and the server may not have generated
-    %% certs yet at boot), so a startup file/handshake probe would false-alarm.
+    %% upstream channel starts after this line and keeps retrying a connection
+    %% that fails (and the server may not have generated certs yet at boot), so
+    %% a startup file/handshake probe would false-alarm.
     logger:info("Gateway transport TLS (configured): upstream->server=~s, listeners: ~s",
                 [posture_word(Up), listeners_summary(Listeners)]),
     case Up of
         plaintext ->
             logger:warning("Gateway->server upstream is PLAINTEXT. For production point "
-                           "the grpcbox default_channel at {https,...} with the gateway "
+                           "the upstream default_channel at {https,...} with the gateway "
                            "leaf + CA (see config/sys.config.prod / deploy gateway-sys.config).");
         unverified ->
             %% https without {verify,verify_peer}: encrypted but NOT authenticated --
             %% an active MITM can impersonate the server. Do not report this as "TLS".
             logger:warning("Gateway->server upstream is ENCRYPTED but does NOT verify the "
                            "server certificate ({verify,verify_peer} missing from the "
-                           "grpcbox default_channel SslOpts) -- vulnerable to MITM. Add "
+                           "upstream default_channel SslOpts) -- vulnerable to MITM. Add "
                            "{verify,verify_peer} + {cacertfile,...}.");
         verified -> ok
     end,
@@ -550,7 +547,46 @@ tls_word(#{tls := Tls}) when is_map(Tls) ->
 tls_word(_) ->
     "plaintext".
 
-%% @private Fail-closed guard: refuse to boot if the grpcbox upstream channel is
+%% @private Refuse to boot with an upstream channel config the client cannot
+%% use, and with none. The value is `{yuzu_gw, upstream_client}' (see
+%% yuzu_grpc_client_config); a channel dropped as unreadable would leave the
+%% gateway with no upstream, and one whose TLS options were ignored would be
+%% worse than none. Nothing of the offending value is logged, only its shape:
+%% an endpoint's SSL options name key files.
+%%
+%% The two callers of the channel, yuzu_gw_upstream and yuzu_gw_heartbeat_buffer,
+%% use `default_channel'. A gateway without one registers no agent and forwards
+%% no heartbeat while /readyz answers (its upstream check is that a process is
+%% alive), so it is refused unless {yuzu_gw, allow_no_upstream} is the literal
+%% `true' (a gateway under test).
+-spec check_upstream_client_config() -> ok | {error, bad_upstream_client_config | no_upstream_channel}.
+check_upstream_client_config() ->
+    case yuzu_grpc_client_config:from_env() of
+        {ok, Channels} ->
+            Has = lists:any(fun(#{name := N}) -> N =:= default_channel end, Channels),
+            case Has orelse application:get_env(yuzu_gw, allow_no_upstream, false) =:= true of
+                true ->
+                    ok;
+                false ->
+                    logger:critical(
+                        "Refusing to start: no upstream channel is configured. Set "
+                        "{yuzu_gw, [{upstream_client, #{channels => [{default_channel, "
+                        "[Endpoint], #{}}]}}]} (see config/sys.config and "
+                        "docs/user-manual/gateway.md); without it the gateway can register "
+                        "no agent and forward no heartbeat."),
+                    {error, no_upstream_channel}
+            end;
+        {error, Why} ->
+            logger:critical(
+                "Refusing to start: the upstream channel configuration "
+                "{yuzu_gw, upstream_client} is unusable (~p). Each channel is "
+                "{Name, [Endpoint], Options}; an endpoint is "
+                "{http | https, Host, Port, SslOptions} (see config/sys.config and "
+                "docs/user-manual/gateway.md).", [Why]),
+            {error, bad_upstream_client_config}
+    end.
+
+%% @private Fail-closed guard: refuse to boot if the upstream channel is
 %% TLS-but-unverified (https without {verify,verify_peer}) — encrypted yet
 %% MITM-able. PLAINTEXT upstream is permitted (the legitimate UAT/dev posture);
 %% only the dangerous "looks secure, isn't" middle state is refused. Mirrors the
@@ -558,12 +594,12 @@ tls_word(_) ->
 %% YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1.
 -spec check_upstream_tls_posture() -> ok | {error, unverified_upstream_tls}.
 check_upstream_tls_posture() ->
-    Posture = client_tls_posture(application:get_env(grpcbox, client, undefined)),
+    Posture = client_tls_posture(application:get_env(yuzu_gw, upstream_client, undefined)),
     Allow = os:getenv("YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM") =:= "1",
     case evaluate_upstream_posture(Posture, Allow) of
         {error, unverified_upstream_tls} ->
             logger:critical(
-                "Refusing to start: the grpcbox upstream channel uses TLS (https) WITHOUT "
+                "Refusing to start: the upstream channel uses TLS (https) WITHOUT "
                 "{verify,verify_peer} — encrypted but UNAUTHENTICATED (MITM-able). Add "
                 "{verify,verify_peer} + {cacertfile,...} to the default_channel SslOpts "
                 "(see config/sys.config.prod). Dev/CI may override with "
@@ -590,30 +626,104 @@ evaluate_upstream_posture(_Posture, _Allow)  -> ok.
 %%--------------------------------------------------------------------
 
 %% @private Refuse to boot with a non-empty {grpcbox, servers}. The listeners are
-%% {yuzu_gw, grpc_listeners} now; a deploy config that still has the old block
-%% would make the grpcbox application bind a second, unguarded listener on the
-%% same ports (no mgmt peer pin, no origin handling) next to ours. grpcbox
-%% starts before this application, so that listener is already bound when this
-%% refuses; the release halts at once, and in the meantime every request it
-%% receives fails, because the registry, router and ETS tables its handlers use
-%% are not started yet.
+%% {yuzu_gw, grpc_listeners}; the gateway does not contain grpcbox, so nothing
+%% reads a leftover block, and the operator who kept it believes a listener is
+%% configured that is not. It is refused rather than ignored for that reason.
 -spec check_legacy_grpcbox_servers() -> ok | {error, legacy_grpcbox_servers}.
 check_legacy_grpcbox_servers() ->
-    case application:get_env(grpcbox, servers, []) of
-        [] ->
+    case legacy_grpcbox_value(servers) of
+        absent ->
             ok;
-        undefined ->
-            ok;
-        _ ->
+        found ->
             logger:critical(
                 "Refusing to start: {grpcbox, servers} is set. The gateway's listeners "
-                "are configured in {yuzu_gw, grpc_listeners} (one entry per listener); "
-                "a leftover grpcbox listener would serve the same RPCs without the "
-                "management-plane peer pin. Move the listener settings into "
-                "grpc_listeners and remove the {servers, ...} block (see "
-                "config/sys.config.prod and docs/user-manual/gateway.md)."),
+                "are configured in {yuzu_gw, grpc_listeners} (one entry per listener) "
+                "and nothing reads {grpcbox, servers}: that block would configure no "
+                "listener. Move the listener settings into grpc_listeners and remove "
+                "the {servers, ...} block (see config/sys.config.prod and "
+                "docs/user-manual/gateway.md)."),
             {error, legacy_grpcbox_servers}
     end.
+
+%% @private Refuse to boot with a {grpcbox, client}. The upstream channels are
+%% {yuzu_gw, upstream_client} (same value); nothing reads the old key. Left in
+%% place it would be INVISIBLE, not merely unused: OTP applies a sys.config entry
+%% only to a loaded application, and none is named grpcbox, so the gateway would
+%% start with no TLS client options and the operator would read the file and
+%% see them.
+-spec check_legacy_grpcbox_client() -> ok | {error, legacy_grpcbox_client}.
+check_legacy_grpcbox_client() ->
+    case legacy_grpcbox_value(client) of
+        absent ->
+            ok;
+        found ->
+            logger:critical(
+                "Refusing to start: {grpcbox, [{client, ...}]} is set. The upstream "
+                "channels are configured in {yuzu_gw, [{upstream_client, ...}]} and "
+                "nothing reads the old key. Move the value across unchanged and remove "
+                "the {grpcbox, ...} block (see config/sys.config and "
+                "docs/user-manual/gateway.md)."),
+            {error, legacy_grpcbox_client}
+    end.
+
+%% A `grpcbox' key counts when it is in the application env (set at run time) or
+%% in one of the config files the VM was started with. The files have to be read
+%% because a sys.config entry for an application that is not loaded never reaches
+%% the application env. A key whose value is empty or undefined is no key.
+legacy_grpcbox_value(Key) ->
+    case application:get_env(grpcbox, Key) of
+        {ok, V} when V =/= [], V =/= undefined -> found;
+        _ -> legacy_grpcbox_in_files(Key, config_files())
+    end.
+
+config_files() ->
+    case init:get_argument(config) of
+        {ok, Lists} -> [P || L <- Lists, P <- L];
+        error       -> []
+    end.
+
+%% @doc Whether a `{grpcbox, KVs}' entry with a non-empty `Key' is in any of
+%% these config files (or a file they name; nesting is followed a few levels).
+%% A file that cannot be read or parsed is skipped: the gateway's own boot is the
+%% place that fails on a bad config, not this scan. Exported for testing.
+-spec legacy_grpcbox_in_files(servers | client, [file:filename()]) -> found | absent.
+legacy_grpcbox_in_files(Key, Paths) ->
+    case lists:any(fun(P) -> scan_config(P, Key, 4) end, Paths) of
+        true  -> found;
+        false -> absent
+    end.
+
+scan_config(_Path, _Key, 0) ->
+    false;
+scan_config(Path, Key, Depth) ->
+    case read_config(Path) of
+        {ok, Terms} -> scan_terms(Terms, Key, Depth);
+        error       -> false
+    end.
+
+read_config(Path) ->
+    Candidates = [Path, Path ++ ".config"],
+    try
+        [Terms | _] = [T || C <- Candidates, {ok, [T]} <- [file:consult(C)]],
+        {ok, Terms}
+    catch
+        _:_ -> error
+    end.
+
+scan_terms(Terms, Key, Depth) when is_list(Terms) ->
+    lists:any(fun({grpcbox, KVs}) when is_list(KVs) ->
+                      case proplists:get_value(Key, KVs, undefined) of
+                          undefined -> false;
+                          []        -> false;
+                          _         -> true
+                      end;
+                 (Nested) when is_list(Nested), Nested =/= [], is_integer(hd(Nested)) ->
+                      scan_config(Nested, Key, Depth - 1);
+                 (_) ->
+                      false
+              end, Terms);
+scan_terms(_, _, _) ->
+    false.
 
 %% @private Refuse to boot with a listener entry that cannot start, and with no
 %% entries at all. Everything checked here is checked before any child of the
@@ -753,8 +863,7 @@ listeners_have_tls(_) ->
 %%
 %% This runs on configuration before the supervision tree starts, and the
 %% listeners are the tree's last children: when it refuses, no management port
-%% was ever bound. (Before the listeners moved out of the grpcbox application
-%% this guard ran after the ports were already bound.)
+%% was ever bound.
 %%
 %% Escape hatch: {yuzu_gw, allow_insecure_mgmt} set to the literal `true'
 %% boots anyway with a loud warning -- an ACKNOWLEDGEMENT for lab/UAT rigs
@@ -899,7 +1008,7 @@ posture_word(verified)   -> "mutual-TLS";
 posture_word(unverified) -> "TLS(UNVERIFIED!)";
 posture_word(plaintext)  -> "plaintext".
 
-%% @doc Strongest TLS posture across grpcbox client channels: `verified` (an
+%% @doc Strongest TLS posture across the upstream client channels: `verified` (an
 %% `https` endpoint with {verify,verify_peer}), `unverified` (https without it),
 %% else `plaintext`. Pure; exported for testing.
 -spec client_tls_posture(term()) -> tls_posture().
@@ -909,7 +1018,7 @@ client_tls_posture(#{channels := Channels}) when is_list(Channels) ->
 client_tls_posture(_) ->
     plaintext.
 
-%% @doc True if any grpcbox client channel has an `https` endpoint (verified or
+%% @doc True if any upstream client channel has an `https` endpoint (verified or
 %% not). Pure; exported for testing.
 -spec client_has_https(term()) -> boolean().
 client_has_https(Client) -> client_tls_posture(Client) =/= plaintext.

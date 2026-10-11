@@ -5,7 +5,7 @@
 %%% to the connection, and is the pid the handler's ctx names. The handlers are
 %%% yuzu_grpc_probe_svc, which hands the test everything it receives.
 %%%
-%%% These cases cover what a chatterbox client cannot provoke or cannot be told
+%%% These cases cover what a real HTTP/2 client cannot provoke or cannot be told
 %%% apart on the wire: that every refusal ends in `stop' (Cowboy then drops the
 %%% stream and the handler), that DATA after a start is dropped and counted,
 %%% that an exit term never reaches a log command, and that no callback raises

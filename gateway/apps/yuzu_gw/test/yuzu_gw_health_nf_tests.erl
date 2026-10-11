@@ -99,8 +99,8 @@ setup() ->
     end, MockNames),
 
     %% Safely set up meck — unload first if already mocked by a prior suite.
-    safe_meck_new(grpcbox_client, [non_strict, no_link]),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    safe_meck_new(yuzu_grpc_client, [non_strict, no_link]),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{}, #{}}
     end),
     safe_meck_new(telemetry, [passthrough, no_link]),
@@ -159,7 +159,7 @@ cleanup({_Port, HealthPid, UpPid, MockPids, {PrevListeners, PrevAllow}}) ->
             end
     end, MockPids),
     drain_exits(),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     catch meck:unload(telemetry),
     process_flag(trap_exit, false),
     ok.
@@ -273,7 +273,7 @@ readyz_503_missing_session_index(Port) ->
 
 readyz_503_circuit_open(Port) ->
     %% Trip the circuit breaker to open state.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     _ = yuzu_gw_upstream:proxy_register(#{info => #{}}),
@@ -291,7 +291,7 @@ readyz_503_circuit_open(Port) ->
     %% Wait for the timer-driven half_open, then succeed a probe. A fixed
     %% sleep(350) here raced the timer on a loaded runner (see await_state/1).
     ?assertEqual(half_open, await_state(half_open)),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{session_id => <<"recovered">>}, #{}}
     end),
     {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),

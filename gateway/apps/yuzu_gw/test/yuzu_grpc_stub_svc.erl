@@ -123,7 +123,7 @@ heartbeat(<<"err_msg">>, _Ctx, _Request) ->
 heartbeat(<<"throw12">>, _Ctx, _Request) ->
     yuzu_grpc_stream:error(12, "thrown");
 heartbeat(<<"badreturn">>, _Ctx, _Request) ->
-    %% The shape of a mgmt handler defect: a tuple grpcbox did not understand.
+    %% The shape of a mgmt handler defect: a tuple the gRPC layer does not understand.
     {error, #{status => 5, message => <<"not a grpc_error">>}};
 %% A gen_server:call to nothing exits with a reason that embeds the request.
 heartbeat(<<"crash">>, _Ctx, Request) ->
@@ -133,6 +133,11 @@ heartbeat(<<"error">>, _Ctx, Request) ->
 heartbeat(<<"sleep">>, _Ctx, _Request) ->
     sleep(),
     {ok, #{acknowledged => true}};
+%% A unary response of a known size (4 KiB in one field), for the client's
+%% response-size limit.
+heartbeat(<<"big">>, _Ctx, _Request) ->
+    {ok, #{acknowledged => true,
+           pending_commands => [#{plugin => binary:copy(<<"x">>, 4096)}]}};
 heartbeat(_Other, _Ctx, _Request) ->
     {grpc_error, {3, <<"unknown command">>}}.
 

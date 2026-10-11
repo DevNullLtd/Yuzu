@@ -11111,7 +11111,7 @@ private:
     // policy): verify_peer authenticates to the CA, NOT to a specific identity.
     //
     // #1422: the gateway side no longer stops at the CA check. Its mgmt
-    // listener's grpcbox auth_fun (yuzu_gw_authz:check_mgmt_peer/1) pins the
+    // listener's auth_fun (yuzu_gw_authz:check_mgmt_peer/1) pins the
     // peer to THIS server's key — SPKI SHA-256 of the presented leaf against
     // {yuzu_gw, mgmt_peer_pins} (default: the default-server.pem in the shared
     // cert volume), plus a serverAuth-EKU requirement agent leaves can never
@@ -13238,8 +13238,10 @@ private:
                         return; // success — done
                     }
                     // #1422: the gateway's mgmt-plane peer pin rejects with
-                    // UNAUTHENTICATED and an EMPTY message (grpcbox sends no
-                    // grpc-message when an auth_fun rejects) — the generic
+                    // UNAUTHENTICATED and, from a gateway built before the yuzu_grpc
+                    // listener, an EMPTY message (the old listener sent no
+                    // grpc-message when an auth_fun rejected; the current one
+                    // sends "unauthenticated") — the generic
                     // warn below would render as "failed:  (16)", which is
                     // invisible as the fleet-wide forwarding outage it
                     // actually is. Name the cause and the fix.

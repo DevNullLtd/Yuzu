@@ -3,7 +3,9 @@
 %%%
 %%% Supervision tree (one_for_one):
 %%%   1. yuzu_gw_registry          — ETS owner + pg coordinator
-%%%   2. yuzu_gw_upstream          — gRPC client + circuit breaker
+%%%   2. one yuzu_grpc_client_channel per {yuzu_gw, upstream_client} channel — the upstream
+%%%      connections (gun), ahead of the processes that call them
+%%%      yuzu_gw_upstream          — gRPC client + circuit breaker
 %%%   3. yuzu_gw_heartbeat_buffer  — dedicated heartbeat batching worker
 %%%   4. yuzu_gw_router            — command fanout coordinator
 %%%   5. yuzu_gw_gauge             — periodic VM/agent gauge emitter
@@ -74,8 +76,12 @@ init([]) ->
           start    => {yuzu_gw_registry, start_link, []},
           restart  => permanent,
           shutdown => 5000,
-          type     => worker},
+          type     => worker}
 
+        %% The upstream client channels, ahead of the processes that call them
+        %% (yuzu_gw_upstream, yuzu_gw_heartbeat_buffer). The config was validated
+        %% by yuzu_gw_app (check_upstream_client_config/0) before this started.
+    ] ++ client_channel_children() ++ [
         #{id       => yuzu_gw_upstream,
           start    => {yuzu_gw_upstream, start_link, []},
           restart  => permanent,
@@ -124,6 +130,14 @@ init([]) ->
     ] ++ listener_children(),
 
     {ok, {SupFlags, Children}}.
+
+%% One child per configured upstream channel; none when the key is unset (a
+%% gateway under test, which starts its own channels).
+client_channel_children() ->
+    case yuzu_grpc_client_config:from_env() of
+        {ok, Channels} -> [yuzu_grpc_client_channel:child_spec(C) || C <- Channels];
+        {error, _}     -> []
+    end.
 
 %% One child per configured listener entry; none when the key is unset (a
 %% gateway under test, which starts its own listeners).

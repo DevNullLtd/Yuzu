@@ -40,7 +40,6 @@ all() ->
 
 init_per_suite(Config) ->
     application:ensure_all_started(telemetry),
-    application:ensure_all_started(gproc),
     %% Use long interval so flushes are manual.
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 60000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, 100),
@@ -50,9 +49,9 @@ end_per_suite(_Config) ->
     ok.
 
 init_per_testcase(_TC, Config) ->
-    catch meck:unload(grpcbox_client),
-    meck:new(grpcbox_client, [non_strict, no_link]),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    catch meck:unload(yuzu_grpc_client),
+    meck:new(yuzu_grpc_client, [non_strict, no_link]),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     catch meck:unload(telemetry),
@@ -71,7 +70,7 @@ end_per_testcase(_TC, Config) ->
     catch unlink(Pid),
     catch exit(Pid, shutdown),
     timer:sleep(50),
-    catch meck:unload(grpcbox_client),
+    catch meck:unload(yuzu_grpc_client),
     catch meck:unload(telemetry),
     ok.
 
@@ -95,7 +94,7 @@ heartbeat_tags_flow_through_batch(_Config) ->
 
     %% Set up mock to capture the BatchHeartbeat request.
     Self = self(),
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"BatchHeartbeat">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -133,7 +132,7 @@ multiple_agents_tags_in_single_batch(_Config) ->
     timer:sleep(20),
 
     Self = self(),
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"BatchHeartbeat">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -163,7 +162,7 @@ heartbeat_without_tags_is_valid(_Config) ->
     timer:sleep(20),
 
     Self = self(),
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"BatchHeartbeat">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
@@ -191,7 +190,7 @@ tags_survive_batch_retry(_Config) ->
     timer:sleep(20),
 
     %% Make first flush fail.
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
     whereis(yuzu_gw_heartbeat_buffer) ! flush,
@@ -199,8 +198,8 @@ tags_survive_batch_retry(_Config) ->
 
     %% Now make flush succeed and capture.
     Self = self(),
-    meck:reset(grpcbox_client),
-    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+    meck:reset(yuzu_grpc_client),
+    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
         case binary:match(Path, <<"BatchHeartbeat">>) of
             nomatch -> {ok, #{}, #{}};
             _ ->
