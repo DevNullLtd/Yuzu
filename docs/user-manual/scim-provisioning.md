@@ -407,7 +407,7 @@ your connector: a `409` does not prove an IdP will stop retrying, so expect the
 same request again on the next sync (every attempt is audited and counted and
 raises a critical analytics event; the server log line is limited to one
 warning per username per minute); and resolving it is an operator action, not
-an IdP one: grant the `Administrator` role to another active local account first (an SSO-only or inactive principal is not counted). Until then
+an IdP one: grant the `Administrator` role to another active local account first (an SSO-only or inactive principal is not counted). Do this before the identity provider removes the member: once the refusal has fired, only direct SQL can add the grant (see [`rbac.md`](rbac.md), "If the guard refuses an action you intend"). Until then
 the person the IdP terminated is still active here: after an early refusal
 their API tokens and sessions are live as well, and after a late one the
 account remains active in Yuzu, so any credential the IdP still accepts for it
@@ -989,7 +989,8 @@ with a **currently-active** account.
     should be `user`, demote it with `POST /api/settings/users/{username}/role` with `{"role":"user"}` (the dashboard has no role button. Make the call while signed in as an administrator other than that account, because a self-target answers `403` `self_role_change_blocked`. It needs a cookie session (an account with MFA enrolled also needs a fresh step-up: a proof older than `--mfa-step-up-window-secs`, default 300 s, answers `401` with `meta.mfa_step_up_required`, and a fresh password plus TOTP login counts; an account with no MFA enrolled is not challenged under the default `--mfa-enforcement=optional`; a SAML session gets `403`) or an administrator API token (`Authorization: Bearer` or `X-Yuzu-Token`), which is never challenged for step-up; see [Changing a User's Role](server-admin.md#changing-a-users-role)) and
     revoke its sessions (Settings > User Management > Revoke sessions, or
     `DELETE /api/v1/sessions?username=<name>`, which also needs a fresh MFA step-up
-    for a cookie session), then look at the store (pool
+    for a cookie session and, under RBAC enforcement, `UserManagement:Write`
+    through an Administrator grant), then look at the store (pool
     waits, a stuck lock holder). If the role is already `user` (the role change
     applied and only the session wipe failed), the role call answers "Role
     unchanged" and does nothing else, so revoke the sessions separately.
