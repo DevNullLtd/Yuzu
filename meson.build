@@ -127,7 +127,8 @@ if host_os == 'windows'
   # search dirs. Keep BOTH halves in sync; neither can be simplified
   # alone. Full diagnosis:
   #   .claude/agents/build-ci.md "Windows MSVC static-link history and #375"
-  # Strategic escape (P1): #376 "Migrate transport off gRPC to QUIC".
+  # Permanent: gRPC is the long-term transport (ADR-0066 withdrew the QUIC
+  # escape, #376), so this wiring is not a stopgap.
 
   _cxx = meson.get_compiler('cpp')
   _vcpkg_root_win = meson.project_source_root() / 'vcpkg_installed' / 'x64-windows'

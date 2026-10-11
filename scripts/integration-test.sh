@@ -421,7 +421,7 @@ if ! $REUSE_STACK; then
     mkdir -p "$SERVER_DATA_DIR"
     SERVER_CFG="$SERVER_DATA_DIR/yuzu-server.cfg"
     log "Running first-run setup to generate server config..."
-    printf 'admin\nadminpassword1\nadminpassword1\nuser\nuserpassword1\nuserpassword1\n' | \
+    printf 'admin\nadminpassword1\nadminpassword1\n' | \
         "$BUILDDIR/server/core/yuzu-server" \
             --config "$SERVER_CFG" \
             --no-tls --no-https --listen "127.0.0.1:$SERVER_AGENT_PORT" \

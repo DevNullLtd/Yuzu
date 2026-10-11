@@ -140,6 +140,13 @@ extern const char* const kDashboardIndexHtml =
       border-bottom: 1px solid var(--border);
     }
     .yuzu-chart-deck:empty { display: none; }
+    /* The partial-result notice yuzu-charts.js inserts before a cut chart's card. The
+       deck is a wrapping flex row, so without this the notice would sit BESIDE the
+       cards as a flex item; take a full row instead. Colours come from
+       .result-degrade-banner (dark-theme tokens), nothing is overridden here. */
+    .yuzu-chart-deck > .yuzu-chart-truncated {
+      flex: 0 0 100%; box-sizing: border-box; margin: 0;
+    }
     .yuzu-chart-card {
       flex: 1 1 360px; min-width: 320px; max-width: 600px; height: 280px;
       background: var(--bg); border: 1px solid var(--border);

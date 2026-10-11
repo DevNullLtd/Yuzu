@@ -212,7 +212,9 @@ After setup completes, the server writes `yuzu-server.cfg` and starts normally. 
 **No image or installer provisions a default account.** No image `COPY`s a
 `yuzu-server.cfg`, and there is no built-in account: a server started without a
 config runs interactive first-run setup, which prompts for an administrator
-**and** a second user account.
+account only (since 0.15.0; earlier versions also prompted for a second user
+account that could never sign in on PostgreSQL — #5343). Create further accounts
+in Settings → User Management after the first sign-in.
 
 One checked-in file, `deploy/config/uat/yuzu-server.cfg`, does hold a single
 `admin` entry — with a **fixed salt and a fixed PBKDF2 digest committed to git**,
@@ -302,12 +304,12 @@ The server's own CA, default certificates and key-encryption keys stay where the
 - **A connection string is required on a fresh install, and on an upgrade from any earlier version**, because no earlier version stored one. Give `/POSTGRES_DSN_FILE=<file>` (preferred) or `/POSTGRES_DSN=<connection string>`. Without one the install stops with exit code 7. The exception is a `YUZU_POSTGRES_DSN` environment variable, set machine-wide or for the service: the installer then goes ahead and logs a warning that local users can read it. Earlier installers never passed a connection string, so the service they registered could not start.
 - **A `YUZU_POSTGRES_DSN` or `YUZU_OIDC_CLIENT_SECRET` environment variable cannot be combined with a stored secret of the same kind.** The server refuses to start with both, so the installer refuses first and changes nothing. Remove the environment variable, then run the installer again.
 - **An OIDC client secret is not carried from an earlier version:** none stored it anywhere except the service's command line, and their own command line lost its arguments. Give it with `/OIDC_CLIENT_SECRET_FILE=` (preferred) or `/OIDC_CLIENT_SECRET=`. If you had added `--oidc-client-secret` to the service's command line by hand and OIDC is enabled on the upgrade (`/OIDC_ISSUER`), the upgrade refuses until you give the secret again; rotate it in your identity provider afterwards, since local users could read it.
-- **An upgrade keeps the existing accounts; leave out `/ADMIN_USER`, `/ADMIN_PASS` and the operator pair.** An upgrade is any run where `%ProgramData%\Yuzu Server\yuzu-server.cfg` already exists, including an upgrade from an earlier version. The installer can no longer change a stored password: `yuzu-server.cfg` only seeds the first administrator into an empty database and is not consulted for an account the PostgreSQL auth store already holds (#5274), so a new hash written there would be ignored and the old password would stay valid. A non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` on an upgrade is therefore **refused with exit code 11** before anything is stopped or changed, and the interactive wizard skips the account pages on an upgrade. Change or reset passwords in the product instead (Settings → User Management → **Change password** / **Reset password**), or with the direct-SQL fallback in `docs/ops-runbooks/auth-db-recovery.md` if no administrator can sign in. On a fresh install the passwords must be at least 12 characters and at most 1024 bytes of UTF-8 (the server's limit; a character outside ASCII takes 2–4 bytes). The optional `/OPERATOR_USER` account is written to `yuzu-server.cfg` but is never provisioned into the PostgreSQL auth store, so it cannot sign in (#5343); create further accounts in Settings → User Management. An upgrade keeps the stored connection string unless a new one is given, and keeps the stored OIDC secret when `/OIDC_ISSUER` is given again. Repeat your other options (`/GATEWAY`, `/OIDC_ISSUER`, `/OIDC_CLIENT_ID`, …) on an upgrade: they are not remembered. `/GATEWAY` with your own gRPC certificates also needs `/GATEWAY_PEER_PIN_FILE=<cert.pem>` (preferred; the leaf certificate only) or `/GATEWAY_PEER_PIN=<64 hex>` the first time (see [Gateway upstream peer authorization](#gateway-upstream-peer-authorization), "Windows service"); `/GATEWAY` with `/NOTLS` starts the service with `--insecure-gateway-peer`, and is refused if a pin parameter is also given.
+- **An upgrade keeps the existing accounts; leave out `/ADMIN_USER` and `/ADMIN_PASS`.** An upgrade is any run where `%ProgramData%\Yuzu Server\yuzu-server.cfg` already exists, including an upgrade from an earlier version. The installer can no longer change a stored password: `yuzu-server.cfg` only seeds the first administrator into an empty database and is not consulted for an account the PostgreSQL auth store already holds (#5274), so a new hash written there would be ignored and the old password would stay valid. A non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` on an upgrade is therefore **refused with exit code 11** before anything is stopped or changed, and the interactive wizard skips the account pages on an upgrade. Change or reset passwords in the product instead (Settings → User Management → **Change password** / **Reset password**), or with the direct-SQL fallback in `docs/ops-runbooks/auth-db-recovery.md` if no administrator can sign in. On a fresh install the passwords must be at least 12 characters and at most 1024 bytes of UTF-8 (the server's limit; a character outside ASCII takes 2–4 bytes). The installer's `/OPERATOR_USER` and `/OPERATOR_PASS` were removed in 0.15.0 (#5343): the account they wrote went to `yuzu-server.cfg` only and could never sign in on PostgreSQL. A non-empty value is now **refused with exit code 7** (nothing changed; on an upgrade a non-empty `/OPERATOR_PASS=` is still exit code 11, as above) — create further accounts in Settings → User Management after the install. An upgrade keeps the stored connection string unless a new one is given, and keeps the stored OIDC secret when `/OIDC_ISSUER` is given again. Repeat your other options (`/GATEWAY`, `/OIDC_ISSUER`, `/OIDC_CLIENT_ID`, …) on an upgrade: they are not remembered. `/GATEWAY` with your own gRPC certificates also needs `/GATEWAY_PEER_PIN_FILE=<cert.pem>` (preferred; the leaf certificate only) or `/GATEWAY_PEER_PIN=<64 hex>` the first time (see [Gateway upstream peer authorization](#gateway-upstream-peer-authorization), "Windows service"); `/GATEWAY` with `/NOTLS` starts the service with `--insecure-gateway-peer`, and is refused if a pin parameter is also given.
 - **Upgrade in place; do not uninstall the previous version first.** Uninstalling removes the service and the installation record but keeps the old, unlocked data directory. The new installer then cannot tell that an administrator created that directory, and refuses it.
 - **Exit code 7** means the install was stopped before any file was installed: an input was missing or invalid, or something could not be secured. The reason is in the setup log on a line starting `PrepareToInstall:`. If the existing service had been stopped by then, it is left stopped, and the message says so (and says if it was disabled). The exception is an upgrade from an unsecured directory that stops before the old directory is moved: the service is then started again. On an upgrade of an already-secured install, the message also lists any files in the data directory that had already been replaced.
 - **Exit code 10** means the files were installed but the service could not be registered or its command line could not be written. Setup disables the service if it can, and the message and log say whether it did; if not, disable it yourself (`sc.exe config YuzuServer start= disabled`) until the cause is fixed.
-- **Exit code 11** means an upgrade was given a non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` (see above). Setup stopped before the wizard, before the service was stopped and before anything was written; the reason is in the setup log on a line starting `InitializeSetup:`. Run it again without the account parameters, then change the password in the product. (Setup's own temporary folder in `%TEMP%` is left behind in this case; it holds nothing secret.)
-- **Secrets on the command line are recorded** in the setup log (`/LOG=`) and by deployment tools such as SCCM (AppEnforce.log) and Intune, including any `/ADMIN_PASS=`, `/OPERATOR_PASS=`, `/POSTGRES_DSN=` or `/OIDC_CLIENT_SECRET=` value. Prefer `/POSTGRES_DSN_FILE=` and `/OIDC_CLIENT_SECRET_FILE=`. Stage those files in a pre-step, with permissions only Administrators and SYSTEM can read, and delete them afterwards: the installer copies them and leaves the originals. `/ADMIN_PASS=` and `/OPERATOR_PASS=` have no file form, so treat those logs as secrets: restrict or purge them after the deployment.
+- **Exit code 11** means an upgrade was given a non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` (see above; `/OPERATOR_PASS=` is itself removed, #5343). Setup stopped before the wizard, before the service was stopped and before anything was written; the reason is in the setup log on a line starting `InitializeSetup:`. Run it again without the account parameters, then change the password in the product. (Setup's own temporary folder in `%TEMP%` is left behind in this case; it holds nothing secret.)
+- **Secrets on the command line are recorded** in the setup log (`/LOG=`) and by deployment tools such as SCCM (AppEnforce.log) and Intune, including any `/ADMIN_PASS=`, `/POSTGRES_DSN=` or `/OIDC_CLIENT_SECRET=` value. Prefer `/POSTGRES_DSN_FILE=` and `/OIDC_CLIENT_SECRET_FILE=`. Stage those files in a pre-step, with permissions only Administrators and SYSTEM can read, and delete them afterwards: the installer copies them and leaves the originals. `/ADMIN_PASS=` has no file form, so treat those logs as secrets: restrict or purge them after the deployment.
 
 **Upgrading from an earlier version.** Its data directory is not locked, so the installer builds a new, locked one. It copies across only plain files that are owned by Administrators or SYSTEM and that no other account can change, from folders that are owned by Administrators or SYSTEM and in which no other account can delete or rename anything: the configuration, `postgres.dsn`, `oidc-client-secret`, and the files directly in `certs\` and `data\`. Subdirectories stay behind. The old directory is renamed to `%ProgramData%\Yuzu Server.insecure-<date>-<time>`; it is never changed or deleted.
 
@@ -5076,6 +5078,86 @@ is no in-process recovery.
 server process's memory. Behind a load balancer with N replicas the effective
 ceiling is `configured_cap x N`, and a peer that reconnects to a different replica
 gets a fresh allowance.
+
+## Response export bounds
+
+Runbook for the response routes' export limits (#4644, #4703). `GET /api/responses/{id}/export` and
+`GET /api/v1/responses/{id}/export` serve at most 10,000 rows and at most 50 MiB of row payload
+(`output` plus `error_detail`); neither bound is configurable.
+
+**Detecting a cut export.** Watch `yuzu_server_response_export_truncated_total{surface,cause}`:
+`cause="row_cap"` means more rows matched than the limit, `cause="byte_cap"` means the payload cap
+cut the export (preferred when both applied). A byte-cap cut also logs one warning, at most one a
+minute per process, naming the surface and (on v1) the request's correlation id. For a single
+download, the signals are the trailer record that ends a cut CSV (`# result_truncated_by_cap
+cause=...`), the `result_truncated_by_cap` field (JSON; under `pagination` on v1), the
+`X-Result-Truncated-By-Cap: true` header (CSV) and a `responses-<id>-truncated` download name. A
+plain `curl -o out.csv ...` loses the header and the name but not the trailer; `curl -sS -D - -o
+out.csv ...` prints the headers. The byte-cap warning is rate-limited per surface (legacy `rest`
+and `rest_v1` each get their own one-a-minute allowance).
+
+**What the counters do not cover.** `yuzu_server_response_export_truncated_total` counts the two
+export routes only. A cut on the execution visualization route, the dashboard results fragment's
+unfiltered read and the TAR retention-paused scan page is NOT counted: the visualization route logs
+a warning naming the cause (not rate-limited), the dashboard fragment and the scan page log
+nothing, and the in-band signal (`result_truncated_by_cap` and `truncation_cause` in the
+visualization payload, the "Partial result" notices on the dashboard, the `result_truncated_by_cap`
+boolean on the scan page's REST and MCP JSON) is the only evidence. If a count is wanted, a sibling
+`..._read_truncated_total{surface,cause}` family is the shape; it does not exist today.
+
+**A response read that answers 503 `Sec-Audit-Failed`.** The legacy `GET /api/responses/{id}`,
+`GET /api/responses/{id}/aggregate` and `GET /api/responses/{id}/export`, and their v1 twins
+`GET /api/v1/responses/{id}`, `.../aggregate` and `.../export`, write a `response.read` success row
+after the store read and before any body is built, and fail closed (the scope-drop `denied` row is
+fail-closed too): if a row cannot be persisted, the read answers `503` (A4
+envelope, `retry_after_ms: 5000`, header `Sec-Audit-Failed: true`) and serves no data. A run of
+these after an upgrade means the audit store is unhealthy, not the response store: check
+`/healthz` `stores.audit`, free disk and Postgres connection saturation, and watch
+`yuzu_server_audit_emit_failed_total` (the bundled `YuzuAuditPersistFailures` alert fires on it).
+A failure the audit pipeline reports by THROWING (an allocation failure, for example) is
+answered the same way but is not counted in that metric, so a 503 spike with a flat counter points
+at that case; correlate by the `X-Correlation-Id` on the 503. Scripted consumers of the legacy
+routes must treat that `503` as retryable.
+
+**What the bound covers.** The cut is applied inside the store query, so an export holds about 50
+MiB of payload plus one final row while it is fetched. The cap is on whole rows, so the last row
+kept can run past it by up to its own size (each of `output` and `error_detail` is cut to 2 MiB at
+ingest before invalid bytes and NULs become the 3-byte U+FFFD, so a row is about 4 MiB for text
+output and up to about 12 MiB for output dense in invalid bytes or NULs; the `error_detail` written when a terminal frame closes a running row is cut the same way). The serialization-time
+backstop counts escaped bytes (the whole body so far for CSV, each serialized row object for JSON),
+so a result under 50 MiB of raw payload can still be cut and reported as `byte_cap`. One measurement, 400 rows
+of 512 KiB: the store query's peak resident memory rose by 99 MiB with the bounded fetch, against
+398 MiB with the unbounded one; other row shapes were not measured, and the serialized body built
+afterwards is additional. These named routes are not covered by the byte cap: the plain list
+routes (`GET /api/v1/responses/{id}`, the legacy `GET /api/responses/{id}`, MCP `query_responses`,
+`GET /api/v1/executions/{id}/responses`) are capped by row count only, at most 1000 rows of up to
+2 MiB of raw bytes per field, and the dashboard
+results fragment's filtered branch (it reads by response id) has no byte bound. The execution
+visualization route, the dashboard results fragment's unfiltered read and the TAR
+retention-paused scan page's read are bounded by the same 50 MiB cap in SQL and say so when it
+cuts (`result_truncated_by_cap`, or a visible "truncated" notice on the dashboard). The visualization route applies the caller's management-group scope inside that query; the dashboard fragment and the scan page apply it after the fetch, so a confined caller can see a cut notice when every dropped row was outside their scope, and out-of-scope rows can use up the 50 MiB budget that would otherwise reach their own rows.
+Other internal reads also have no byte bound and take their limit from something other than a
+request parameter; for example (not an exhaustive list), the fleet visualization snapshot's collect poll (the number of agents it
+dispatched to, plus 16), the deployment poll (a fixed 50,000), the pre-flight per-check read (a fixed 50,000),
+a bundle execution's result read (1000) and an execution-detail page read (500).
+
+**Pool sizing.** An export holds one connection from the server's shared Postgres pool for the
+fetch and the parse. The pool is sized by `--postgres-pool-size` (default 16) and is shared by
+AuthDB, the session store, the response store, the audit store and the RBAC store, among others.
+The response store's read path waits up to 2000 ms to acquire a connection; the RBAC permission
+lookup waits only 250 ms, and two consecutive failed pool touches open a breaker that denies every
+authorization check without touching the pool until a probe succeeds. So at the default size, 16
+exports in flight at once occupy every connection, and a permission check can then be refused
+(fail closed) while they run. This change adds no concurrency limit on exports, so bound it from
+outside: lower `limit`, narrow with `since`/`until`/`agent_id`/`status`, use a
+management-group-confined principal, or rate-limit the export routes at the proxy. Watch
+`yuzu_pg_pool_in_use` and `yuzu_pg_acquire_wait_seconds` (see "Connection-pool sizing" above). A
+pool-acquire timeout on a response read surfaces as `503` `response store degraded`.
+
+**Malformed filters.** `yuzu_server_response_param_rejected_total{surface}` counts requests refused
+for a malformed numeric parameter on the response routes and MCP `query_responses` only. A steady
+non-zero rate on one surface is a client sending fractional timestamps, `null`s or trailing
+characters; it is not a server fault.
 
 ## File Logging
 

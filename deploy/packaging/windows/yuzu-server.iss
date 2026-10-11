@@ -12,20 +12,20 @@
 ;                          an existing database the stored password wins and a
 ;                          rewritten file would be ignored.
 ;                          ON AN UPGRADE (yuzu-server.cfg already exists) leave
-;                          out /ADMIN_USER, /ADMIN_PASS and the operator pair:
+;                          out /ADMIN_USER and /ADMIN_PASS:
 ;                          the existing accounts are kept, and a non-empty
 ;                          /ADMIN_PASS= or /OPERATOR_PASS= is REFUSED with exit
 ;                          code 11 before anything changes. Change or reset a
 ;                          password in the dashboard (Settings > User Management
 ;                          > Change password / Reset password), or follow
 ;                          docs/ops-runbooks/auth-db-recovery.md.
-;   /OPERATOR_USER=name    Operator username (optional; only with /ADMIN_PASS).
-;                          On a PostgreSQL auth store (every supported
-;                          deployment) this account is not provisioned and
-;                          cannot sign in today (#5343); create further
-;                          accounts in Settings > User Management instead.
-;   /OPERATOR_PASS=pass    Operator password (required with /OPERATOR_USER; same
-;                          length rules; fresh install only)
+;   /OPERATOR_USER, /OPERATOR_PASS   REMOVED in 0.15.0 (#5343). The second account
+;                          they wrote went to yuzu-server.cfg only and could never
+;                          sign in on PostgreSQL. A non-empty value is REFUSED
+;                          (exit code 7, nothing changed, on a fresh install or on an
+;                          upgrade given /OPERATOR_USER= alone; on an upgrade a non-empty
+;                          /OPERATOR_PASS= is exit code 11, as above). Create further
+;                          accounts in Settings > User Management after the install.
 ;   /POSTGRES_DSN_FILE=f   File holding the PostgreSQL connection string. One of
 ;                          this or /POSTGRES_DSN is required on a fresh install and
 ;                          on an upgrade from any earlier version (none stored one),
@@ -93,7 +93,7 @@
 ; (Inno Setup's own exit codes are 0-8.)
 ;
 ; THE SETUP LOG RECORDS THE FULL COMMAND LINE, including any /ADMIN_PASS=,
-; /OPERATOR_PASS=, /POSTGRES_DSN= or /OIDC_CLIENT_SECRET= value. Prefer the
+; /POSTGRES_DSN= or /OIDC_CLIENT_SECRET= value. Prefer the
 ; *_FILE parameters, and protect or delete the log.
 ;
 ; KNOWN ISSUE (#1835, "Windows server binary has the identical SCM control-protocol
@@ -173,7 +173,6 @@ Type: filesandordirs; Name: "{app}\logs"
 var
   // Wizard pages
   AdminPage: TInputQueryWizardPage;
-  OperatorPage: TInputQueryWizardPage;
   NetworkPage: TWizardPage;
   DatabasePage: TInputQueryWizardPage;
   IdentityPage: TWizardPage;
@@ -511,21 +510,8 @@ begin
   AdminPage.Values[1] := GetCmdParam('ADMIN_PASS');
   AdminPage.Values[2] := GetCmdParam('ADMIN_PASS');
 
-  // ── Page: Operator credentials ──
-  OperatorPage := CreateInputQueryPage(AdminPage.ID,
-    'Operator Account (Optional)',
-    'Create a read-only operator account.',
-    'Operators can view fleet status, query responses, and monitor compliance ' +
-    'but cannot execute instructions or change settings. Leave the username blank to skip.');
-  OperatorPage.Add('Username:', False);
-  OperatorPage.Add('Password (at least 12 characters, at most 1024 bytes):', True);
-  OperatorPage.Add('Confirm password:', True);
-  OperatorPage.Values[0] := GetCmdParam('OPERATOR_USER');
-  OperatorPage.Values[1] := GetCmdParam('OPERATOR_PASS');
-  OperatorPage.Values[2] := GetCmdParam('OPERATOR_PASS');
-
   // ── Page: Network / Gateway ──
-  NetworkPage := CreateCustomPage(OperatorPage.ID,
+  NetworkPage := CreateCustomPage(AdminPage.ID,
     'Network Configuration',
     'Configure gateway mode if you have a Yuzu Gateway on this machine.');
 
@@ -698,40 +684,6 @@ begin
     end;
   end;
 
-  // Validate operator credentials (only if username provided)
-  if CurPageID = OperatorPage.ID then
-  begin
-    if OperatorPage.Values[0] <> '' then
-    begin
-      if AdminPage.Values[1] = '' then
-      begin
-        MsgBox('An operator account can only be set together with a new admin password.',
-               mbError, MB_OK);
-        Result := False;
-        Exit;
-      end;
-      if Length(OperatorPage.Values[1]) < 12 then
-      begin
-        MsgBox('Operator password must be at least 12 characters.', mbError, MB_OK);
-        Result := False;
-        Exit;
-      end;
-      if Utf8ByteLength(OperatorPage.Values[1]) > MaxPasswordBytes then
-      begin
-        MsgBox('Operator password must be at most 1024 bytes as UTF-8 (a character outside ' +
-               'ASCII takes 2 to 4 bytes).', mbError, MB_OK);
-        Result := False;
-        Exit;
-      end;
-      if OperatorPage.Values[1] <> OperatorPage.Values[2] then
-      begin
-        MsgBox('Operator passwords do not match.', mbError, MB_OK);
-        Result := False;
-        Exit;
-      end;
-    end;
-  end;
-
   // A connection string is required unless one is stored already
   if CurPageID = DatabasePage.ID then
   begin
@@ -788,11 +740,11 @@ begin
   Result := False;
   // An upgrade keeps the existing accounts: the installer cannot change a
   // stored password (#5274), so the credential pages are not offered.
-  if ((PageID = AdminPage.ID) or (PageID = OperatorPage.ID)) and ExistingConfig then
+  if (PageID = AdminPage.ID) and ExistingConfig then
     Result := True;
   if WizardSilent then
   begin
-    if (PageID = AdminPage.ID) or (PageID = OperatorPage.ID) or
+    if (PageID = AdminPage.ID) or
        (PageID = NetworkPage.ID) or (PageID = DatabasePage.ID) or (PageID = IdentityPage.ID) or
        (PageID = TLSPage.ID) then
       Result := True;
@@ -838,7 +790,7 @@ end;
 
 type
   TInstallInputs = record
-    AdminUser, AdminPass, OpUser, OpPass: string;
+    AdminUser, AdminPass: string;
     Dsn, DsnFile: string;
     UseOIDC: Boolean;
     OidcIssuer, OidcClientId, OidcSecret, OidcSecretFile, OidcAdminGroup: string;
@@ -853,8 +805,6 @@ begin
   begin
     R.AdminUser := GetCmdParam('ADMIN_USER');
     R.AdminPass := GetCmdParam('ADMIN_PASS');
-    R.OpUser := GetCmdParam('OPERATOR_USER');
-    R.OpPass := GetCmdParam('OPERATOR_PASS');
     R.Dsn := GetCmdParam('POSTGRES_DSN');
     R.UseOIDC := GetCmdParam('OIDC_ISSUER') <> '';
     R.OidcIssuer := GetCmdParam('OIDC_ISSUER');
@@ -879,8 +829,6 @@ begin
   begin
     R.AdminUser := AdminPage.Values[0];
     R.AdminPass := AdminPage.Values[1];
-    R.OpUser := OperatorPage.Values[0];
-    R.OpPass := OperatorPage.Values[1];
     R.Dsn := DatabasePage.Values[0];
     R.UseOIDC := OIDCCheckbox.Checked;
     R.OidcIssuer := OIDCIssuerEdit.Text;
@@ -1454,8 +1402,6 @@ begin
 
   SetEnvironmentVariable('YUZU_SETUP_ADMIN_USER', Inp.AdminUser);
   SetEnvironmentVariable('YUZU_SETUP_ADMIN_PASS', Inp.AdminPass);
-  SetEnvironmentVariable('YUZU_SETUP_OPERATOR_USER', Inp.OpUser);
-  SetEnvironmentVariable('YUZU_SETUP_OPERATOR_PASS', Inp.OpPass);
   try
     Ran := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
                 '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + Cmd + '"',
@@ -1463,8 +1409,6 @@ begin
   finally
     SetEnvironmentVariable('YUZU_SETUP_ADMIN_USER', '');
     SetEnvironmentVariable('YUZU_SETUP_ADMIN_PASS', '');
-    SetEnvironmentVariable('YUZU_SETUP_OPERATOR_USER', '');
-    SetEnvironmentVariable('YUZU_SETUP_OPERATOR_PASS', '');
   end;
 
   if LoadStringFromFile(ReasonFile, ReasonText) then
@@ -1634,31 +1578,24 @@ end;
 function CheckInputs(const Inp: TInstallInputs): string;
 begin
   Result := '';
-  if Inp.AdminPass <> '' then
+  // The second first-run account was removed (#5343): it was written to
+  // yuzu-server.cfg only and could never sign in on PostgreSQL. Read from the
+  // command line (wizard and silent alike) so no run silently ignores it.
+  if (GetCmdParam('OPERATOR_USER') <> '') or (GetCmdParam('OPERATOR_PASS') <> '') then
+    Result := '/OPERATOR_USER= and /OPERATOR_PASS= were removed in 0.15.0 (#5343): the ' +
+              'account they created could never sign in. Run the installer without them, ' +
+              'then create further accounts in Settings > User Management after the install.'
+  else if Inp.AdminPass <> '' then
   begin
     if BadUsername(Inp.AdminUser) then
       Result := 'An admin username is required (/ADMIN_USER=), without '':'' or control characters.'
     else if Length(Inp.AdminPass) < 12 then
       Result := 'The admin password (/ADMIN_PASS=) must be at least 12 characters.'
     else if Utf8ByteLength(Inp.AdminPass) > MaxPasswordBytes then
-      Result := 'The admin password (/ADMIN_PASS=) must be at most 1024 bytes as UTF-8.'
-    else if Inp.OpUser <> '' then
-    begin
-      if BadUsername(Inp.OpUser) then
-        Result := 'The operator username (/OPERATOR_USER=) may not contain '':'' or control characters.'
-      else if CompareText(Inp.OpUser, Inp.AdminUser) = 0 then
-        Result := 'The operator username must differ from the admin username.'
-      else if Length(Inp.OpPass) < 12 then
-        Result := 'The operator password (/OPERATOR_PASS=) must be at least 12 characters.'
-      else if Utf8ByteLength(Inp.OpPass) > MaxPasswordBytes then
-        Result := 'The operator password (/OPERATOR_PASS=) must be at most 1024 bytes as UTF-8.';
-    end;
+      Result := 'The admin password (/ADMIN_PASS=) must be at most 1024 bytes as UTF-8.';
   end
   else if WizardSilent and (Inp.AdminUser <> '') then
-    Result := '/ADMIN_USER= was given without /ADMIN_PASS=.'
-  else if Inp.OpUser <> '' then
-    Result := 'An operator account can only be set together with the admin password; leave both ' +
-              'out to keep the existing accounts.';
+    Result := '/ADMIN_USER= was given without /ADMIN_PASS=.';
   if Result = '' then
   begin
     if (Inp.Dsn <> '') and (Inp.DsnFile <> '') then

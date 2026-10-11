@@ -20,7 +20,7 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   **No
   sanitizers, no coverage** — those moved out (#410). **Since #3443 Phase 2**,
   the Linux matrix's `pg_mode` key (via `include:`, never a third axis) means
-  only ONE leg (gcc-15/debug) runs the full 11-shard `server-pg` suite on a
+  only ONE leg (gcc-15/debug) runs the full 14-shard `server-pg` suite on a
   push; the other three legs run a small `[pg-smoke]`-tagged subset instead —
   see "PG push-leg policy" below. PR coverage is unaffected (the PR `exclude:`
   already trims the matrix to gcc-15/debug alone, which always resolves to
@@ -320,6 +320,30 @@ requests only, not a required check today) runs
 must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. Both scripts carry a fixture self-test that the `docs`
 suite also runs (the touch-rule one off Windows only, #5428).
+
+### Definition-description ratchet (`definition-descriptions` job + `docs` suite)
+
+`scripts/ci/check-definition-descriptions.py` lints the description text of every shipped
+`InstructionDefinition` (the text an agentic worker reads through `discover_instructions`): the
+definition description, each parameter description, each result-column description, and
+non-empty tags. It walks the files `server/core/scripts/embed_content.py` ships (every `*.yaml`
+under `content/definitions` and `content/packs`, recursively) and lints only documents whose
+`kind` is `InstructionDefinition`. It is a ratchet over
+`scripts/ci/definition-descriptions-baseline.json`: a failure absent from the baseline is `NEW`
+and fails the run, and a baselined failure that no longer fails is `STALE` and also fails it, so
+the baseline only shrinks (delete the entry in the change that fixes it). `--update-baseline`
+rewrites it from the tree; run it deliberately, never to hide a new failure, and never in CI.
+
+Two places run the same test, `tests/test_definition_descriptions.py`. The `definition-descriptions`
+job in `docs-lint.yml` (check name "Definition descriptions") is **advisory**: the workflow's own
+header names only "CHANGELOG order" as its required check. It installs PyYAML from
+`requirements-ci.txt` with `--require-hashes` (a `--user` install, skipped when PyYAML is already
+importable), so it reaches PyPI and is its own job so that an outage reds only this check. The
+same test is registered as the `definition descriptions` test in `tests/meson.build` (suite
+`docs`), and the `linux` and `windows` jobs of `ci.yml` list `--suite docs`, so the ratchet is
+enforced on the required `Linux gcc-15 debug` and `Windows MSVC debug` legs without depending on
+the advisory job. A PR that changes only `docs/**` or root `*.md` builds nothing (see "Docs-only changes"),
+but it cannot touch `content/` or the baseline, which are classified as code.
 
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
 
@@ -812,7 +836,7 @@ point, `--num-processes 2` — deliberately, rather than guessing ahead of
 data. One sample (cold cache, first run of the branch on Wee Tam):
 `Test (non-pg suites)` 4m30s, `Test (pg shards, full)` 10m02s (602s) —
 the pg step alone was 61% of the 16m32s total job, confirming the plan's
-own diagnosis that 11 shards through 2 workers leaves real serialization
+own diagnosis that the then-11 pg shards (14 now) through 2 workers leave real serialization
 on the table. (This baseline is itself only one sample — the huge margin
 in every subsequent push's improvement makes that imprecision moot, but
 it's not a second-sampled median the way k=4 and later are.)
@@ -864,8 +888,9 @@ step's box-contention noise on an otherwise-stable pg-shards step — see
 push 2's paragraph above). This is the current head's width; no push 4
 (k=8) has been made. `docs/ci-architecture.md`'s own worst-case job-budget arithmetic
 (below, under "Worst-case job-budget arithmetic") and the round-count
-math (11 shards over 6 workers is already 2 scheduling rounds —
-identical to 11 over 8) are why k=6 is where the staged widening
+math (at the then-11 shards, 11 over 6 workers is already 2 scheduling rounds,
+identical to 11 over 8; at 14 shards k=6 is 3 rounds against 2 at k=8, see the
+2026-10-11 paragraph) are why k=6 is where the staged widening
 stopped rather than continuing to k=8; going wider buys no
 round-reduction here and only adds CCD-thread-contention risk on Wee
 Tam's fixed 16-thread envelope.
@@ -1096,6 +1121,109 @@ discipline the rest of this PR applies to the Windows widths — this
 paragraph exists to make the new fact visible to the next reviewer, not to
 resolve it unilaterally.
 
+**Re-derived 2026-10-11 after shards M, N, O and P (pg-shard rebalance).** The
+pg suite grew to 16 shards during this rebalance (12 on dev before it; 15 after
+the first step, P added by the follow-up below) and was then merged back to 14
+to meet the maintainer limit of 14 pg shards (J into I, P into M; see the last
+paragraph of this section). The arithmetic below is for the final 14. Shards M
+and N were carved from C (12
+tags moved, C 886 to 542 cases) and shard O from F (its `[dex]` clause, F 532
+to 418 cases; the 28 cases tagged both `[dex]` and `[mcp]` go to O). The
+motivation was the weecolin Windows runner. The old figures of C 895s and F
+765s came from re-running shards C and F alone with `--timeout-multiplier 3`
+(so the 700s cap did not apply) on that box BEFORE its Postgres restart
+(localhost DSN, 2s connects, 14 shards timed out). After the restart the old
+12-shard layout (branch 32a37a5ac, 4-wide, full server suite, wall 1090s)
+measured C TIMEOUT at 700s, F 585s, A 386s, E 343s, D 282s, L 267s, G 249s,
+H 244s, K 192s, J 170s, I 162s, B 137s. Linux 4-wide on a loaded box measured
+C 629s and F 470s (profiled on the pr2-sweep binary, which carries 28 more C
+cases and 9 more F cases than the dev base: C 914 against 886, F 541 against
+532).
+
+The theoretical degenerate ceiling grows with the count, as the paragraph
+above predicted for any addition. At the final 14 shards: 14 * 700 = 9800
+test-seconds, and at the Linux `--num-processes 2` that is 7 rounds of two
+shards, so 7 * 700 = 4900s = 81.7 minutes. That figure ALONE (it excludes checkout, build and the non-pg test step, so the real margin is smaller) is now under the
+Linux job's `timeout-minutes: 90` (`.github/workflows/ci.yml`, the `linux`
+job), by 8.3 minutes; with the up-to-30-minute slot wait
+(`YUZU_TEST_SLOT_TIMEOUT_MIN`) it is about 112 minutes, which still exceeds
+the 90-minute limit, before checkout and build time. For comparison, the 16-
+and 15-shard layouts (never on dev) were 8 rounds, 5600s = 93.3 minutes, over
+the limit on their own (about 123 minutes with the slot wait), and the actual
+dev base of 12 shards was 6 rounds, 4200s = 70 minutes (about 100 minutes with
+the slot wait). The ceiling is a figure that requires every shard to hit its
+own cap, not an expected case: the degenerate figure applies only when every
+shard runs to 700s, and the makespan is lower whenever any shard finishes
+under its cap (the earlier "BEST and WORST makespan are the same number" holds
+only in that all-at-cap case). The expected case moves the other way, see the
+measured Windows run of the 16-shard layout below. On Windows the pg step runs
+`--num-processes 6` (`ci.yml`, "Test (pg shards, full)" in the `windows`
+job), so 14 shards are ceil(14/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
+65 minutes with a 30-minute slot wait for the pg step alone. The job also
+acquires a slot for its non-pg step, so the worst case with both 30-minute
+waits is 95 minutes plus that step's own run time, still under that job's
+`timeout-minutes: 120`. The Linux slot-wait case is the one that still needs
+attention: the "revisit the 700s per-shard budget or the Linux
+`--num-processes 2` cap" follow-up tracked on #3443 (see the shard-K paragraph
+above) remains open, with a less severe trigger than at 16 shards (the
+all-at-cap ceiling alone now fits the job limit; the ceiling plus a full slot
+wait does not). Neither number is adjusted here. The tag assignment is the
+tuning knob (move a tag between M and N, or O and F), documented in
+`tests/meson.build` above shard M.
+
+**Follow-up, same day: shard P carved from C.** A healthy-Postgres Windows
+run of an intermediate 15-shard layout (4-wide, under heavier box load; this
+layout was never on dev) measured C 542s (only 23% under the 700s
+timeout), F 552s, A 615s, E 535s, D 450s, O 424s, K 269s, I 263s, J 260s,
+B 175s and M 99s; Linux 4-wide on a loaded box ran C 254s and the others
+113-258s, so C's Windows/Linux ratio was about 2.1. C's profile was flat (542
+cases, 148s solo serial, mean 0.27s per case), so its cost is per-test
+Postgres setup and the lever is case count. Shard P takes six C-resident tags
+(`[rest]`, `[auth]`, `[dashboard]`, `[adversarial]`, `[authz_model]`,
+`[app_perf]`): 202 cases and 46.9% of C's profiled seconds, leaving C 340
+cases. Scaling C's 542s by the profiled share predicted P about 254s and C
+about 288s. Measured on the 16-shard layout (weecolin Windows, restarted
+Postgres, 4-wide, full server suite, 23/23 OK, wall 1064s; this is the
+unmerged 16-shard layout, measured before the J and P merges below): A 393s, F 347s,
+E 335s, D 287s, G 256s, O 247s, H 246s, L 236s, N 228s, C 185s, K 176s,
+J 173s, I 169s, P 148s, B 140s, M 83s. So C and P came in under the
+prediction (predicted 288/254, measured 185/148); the intermediate run above
+was under heavier box load, so the two are not a like-for-like comparison.
+The tightest shards are now A (393s, 43.9% under the cap), F and E; every
+shard is at least 43% under 700s. P is a new shard rather than more M clauses
+because the same C-based scaling (an estimate) would have put M near 350s
+(M's 99s in the intermediate run plus P's predicted 254s); also an estimate:
+M's `[readyz]` cases are likely dominated by waits that do not scale with
+setup cost. Partition proof: the 16 shards' union equals the `[pg]`
+population (4729), no case runs twice, the 202 cases leaving C are exactly
+P's, and every other shard is set-identical. Rebalance by moving a TAG
+(between P and C, or M and N, or O and F) before touching any timeout.
+
+**Final step, same day: shards J and P merged into I and M (14 pg shards).**
+The maintainer limit is at most 14 pg shards, so the 16-shard layout above
+never shipped. Shards J and P were merged into I and M on 2026-10-11 to stay
+at 14 pg shards; the names J and P no longer exist (the gaps are deliberate,
+noted in `tests/meson.build`). Each merged entry's spec is the earlier shard's
+clause list followed by the later shard's clause list verbatim (M then P;
+I then J), every clause keeping its own exclusions, so no case moved between
+any other shards. Partition proof (`--list-tests` on the built binary, by
+name, file and line): the union of the 14 shards equals the `[pg]` population
+(4729), zero duplicates, merged M = old M + old P (278 cases), merged I = old
+I + old J (550 cases), and every other shard is set-identical. The measured
+Windows times quoted in this section are from the 16-shard layout, not the
+merged one. ESTIMATES for the merged shards are sums of those measured times
+(startup is shared, so slightly less): M + P is 83 + 148 = 231s on Windows
+(Linux 135 + 100 = 235s, from the 16-shard Linux run) and I + J is 169 + 173 =
+342s (Linux 119 + 119 = 238s, same run); the estimate was
+low for I. MEASURED on the merged 14-shard layout (Windows weecolin, 4-wide,
+restarted Postgres, 21/21 OK): I 398s, A 393s, F 351s, E 340s, D 303s, G 282s,
+H 257s, O 254s, M 239s, N 239s, L 238s, C 195s, K 160s, B 136s, so merged I is
+the longest pole by 5s and every shard is at least 43% under 700s. Linux
+4-wide, same layout, 23/23 OK: I 307s, A 284s, M 264s, F 263s, E 259s. These
+runs were on a shared box, so treat the ordering among the top shards as
+noise-level. Re-measure on the first CI run. Priorities are now merged M
+185 and merged I 245 (all 14 distinct); see `tests/meson.build`.
+
 **Drift risk — automated (#3443 Phase 1, 2026-08-26):** this used to hardcode
 the 10 pg shard names and the 3 non-pg server test names directly in `ci.yml`,
 hand-synced against `tests/meson.build`'s own tag filters and
@@ -1167,7 +1295,7 @@ Two hardening decisions worth knowing before touching this again:
   (`AllTestsSkippedExitCode`) on every DSN-less UNFILTERED `meson test` —
   local dev without Postgres, and any future sanitizer/nightly leg that runs
   the whole suite — breaking that skip contract, the same reason shards
-  D/G/H/I/J already carry the flag. Loud-fail duty for a genuinely broken or
+  D/G/H/I already carry the flag (I now also covers J's former clauses). Loud-fail duty for a genuinely broken or
   missing DSN moved to ci.yml's own `Resolve pg_mode + assert Postgres DSN`
   step (runs immediately after `Ensure Postgres`, before ANY test invocation,
   full or smoke) and to the checker's exact-count + flag-present assertions
@@ -1212,8 +1340,8 @@ inert). Tracked on #3443, not silently dropped.
 
 **Nightly and sanitizer legs are unaffected and still run the full
 population, redundantly**: both invoke `meson test` UNFILTERED (no `--suite`
-at all), so every `test()` entry runs once regardless of suite — the 11 pg
-shards AND the smoke entry both fire, meaning the 11 `[pg-smoke]` cases
+at all), so every `test()` entry runs once regardless of suite, so all the
+`server-pg` shards AND the smoke entry both fire, meaning the 11 `[pg-smoke]` cases
 execute twice there. Harmless (seconds of cost) but real, and not specific
 to any one platform — the same is true of a plain local `meson test` in any
 worktree. Not worth special-casing.
@@ -1223,7 +1351,7 @@ PG-tagged invocation in the Test sequence, so (per the JUnit-overwrite
 behavior the "Persistent runner-local test history" section below
 documents for both platforms) it is what `ci-suite-stats` sees for that
 leg's PG timing — a full leg's `ci-suite-stats` entry still reflects the
-11-shard run, not the smoke entry, since `pg_mode` fully separates which
+full-shard run, not the smoke entry, since `pg_mode` fully separates which
 one actually executes per leg. The same overwrite silently drops the
 non-pg step's own `flake-retry` recovery reporting from that job's
 queryable history too, not just its per-suite timing rows — the non-pg
@@ -1612,9 +1740,9 @@ libpq connection attempt inside a PG-tagged test.
 
 | Platform | pg shards | Migration-DDL tests | Notes |
 |---|---|---|---|
-| Linux (gcc-15/debug, every PR + primary push) | full (11 shards) | run | ADR-0006 reference platform |
+| Linux (gcc-15/debug, every PR + primary push) | full (14 shards) | run | ADR-0006 reference platform |
 | Linux (other push legs) | smoke (`[pg-smoke]`, 11 cases) | run | #3443 Phase 2 |
-| Windows (debug, every PR + push) | full (11 shards) | **skipped** (`YUZU_REQUIRE_PG_MIGRATION_DB`) | #2354; behaviour covered on Linux |
+| Windows (debug, every PR + push) | full (14 shards) | **skipped** (`YUZU_REQUIRE_PG_MIGRATION_DB`) | #2354; behaviour covered on Linux |
 | Windows (release, push only) | smoke | **skipped** (2 of the 11 smoke cases) | never runs on a PR |
 | macOS | none (ADR-0035) | n/a | server is Linux-only |
 

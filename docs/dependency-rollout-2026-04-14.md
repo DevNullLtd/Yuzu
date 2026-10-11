@@ -4,6 +4,10 @@
 **Started:** 2026-04-14
 **Owner:** TBD per tier (see Resume Pointer)
 **Closes:** #363 (rollout completion), #366 follow-up (CODEOWNERS)
+
+> **Update 2026-10-08:** the "strategic escape" to QUIC (P1 #376) referenced below was
+> withdrawn by ADR-0066 — gRPC is the permanent transport and option D is permanent.
+> The references are kept as the historical record.
 **Driver PR (foundation):** #372 (merged 2026-04-14)
 
 ## Why this doc exists
