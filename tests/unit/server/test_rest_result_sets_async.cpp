@@ -665,6 +665,37 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
             CHECK(status == 400);
         }
     }
+    SECTION("v1 inventory query: limit is read as 64 bits, clamps above 1000 and a zero, negative "
+            "or non-integer value is a 400 (#4644)") {
+        InventoryStore inventory{pool};
+        REQUIRE(inventory.is_open());
+        inventory.upsert("limit-agent-1", "limit_src", R"({"n":1})", 100);
+        inventory.upsert("limit-agent-2", "limit_src", R"({"n":2})", 200);
+        inventory.upsert("limit-agent-3", "limit_src", R"({"n":3})", 300);
+        AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+        int status = 0;
+        const auto rows = [&](const std::string& limit) -> std::size_t {
+            const std::string extra = limit.empty() ? "" : R"(,"limit":)" + limit;
+            auto j = h.post("/api/v1/inventory/query", R"({"plugin":"limit_src")" + extra + "}",
+                            status);
+            REQUIRE(status == 200);
+            return j["data"].size();
+        };
+        CHECK(rows("") == 3); // absent: the default of 100
+        CHECK(rows("2") == 2);
+        CHECK(rows("1") == 1);
+        // 4294967297 wrapped to 1 through the int read and answered one row.
+        CHECK(rows("4294967297") == 3);
+        CHECK(rows("18446744073709551615") == 3);
+        CHECK(rows("1000") == 3);
+        CHECK(rows("1001") == 3); // above the cap clamps, it is not a 400
+        for (const char* bad : {R"({"limit":0})", R"({"limit":-1})", R"({"limit":"5"})",
+                                R"({"limit":5.5})", R"({"limit":null})", R"({"limit":true})"}) {
+            INFO(bad);
+            h.post("/api/v1/inventory/query", bad, status);
+            CHECK(status == 400);
+        }
+    }
     SECTION("from-inventory-query refuses a byte-capped read without creating a set") {
         InventoryStore inventory{pool};
         REQUIRE(inventory.is_open());

@@ -192,7 +192,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                   }
                   const int64_t id = *result;
                   audit_fn(req, "offload_target.create", "success", "offload_target",
-                           std::to_string(id), name);
+                           std::to_string(id), audit_token(name));
                   res.status = 201;
                   res.set_content(
                       nlohmann::json({{"id", id}, {"status", "created"}}).dump(),

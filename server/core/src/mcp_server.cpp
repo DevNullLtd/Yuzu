@@ -19903,10 +19903,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                int limit = args.value("limit", 200);
-                int offset = args.value("offset", 0);
-                limit = std::clamp(limit, 1, 1000);
-                offset = std::clamp(offset, 0, 1000000);
+                // #4644: read both as 64 bits and clamp BEFORE narrowing. `args.value()`
+                // narrowed through int (4294967297 wrapped to 1, 4294967296 to 0) and threw on
+                // a wrong-typed value; a present non-integer (or above INT64_MAX) is now -32602.
+                const auto limit_opt = param_int_strict(args, "limit", 200);
+                const auto offset_opt = param_int_strict(args, "offset", 0);
+                if (!limit_opt || !offset_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON type), not a
+                    // store/query fault - resending the same value fails identically.
+                    yuzu::server::count_response_param_rejected(metrics, "mcp");
+                    res.set_content(a4_error(kInvalidParams,
+                                             "limit and offset must be JSON integers that fit in "
+                                             "a signed 64-bit value"),
+                                    "application/json");
+                    return;
+                }
+                const int limit = static_cast<int>(std::clamp<int64_t>(*limit_opt, 1, 1000));
+                const int offset = static_cast<int>(std::clamp<int64_t>(*offset_opt, 0, 1000000));
                 // REST/MCP parity with GET /api/v1/ca/issued: probe limit+1 for a
                 // precise has_more so an agentic client can paginate deterministically.
                 auto records_or_err = ca_store->list_issued(limit + 1, offset);

@@ -17480,6 +17480,80 @@ TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
     CHECK(ts.audit_log.back() == "mcp.list_issued_certs|success");
 }
 
+TEST_CASE("MCP CA: list_issued_certs reads limit/offset as 64 bits, saturates, and refuses a "
+          "non-integer (#4644)",
+          "[mcp][integration][pki][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+    for (const char* serial : {"A1", "A2", "A3"}) {
+        yuzu::server::IssuedCertRecord rec;
+        rec.serial_hex = serial;
+        rec.subject = "agent-limit";
+        rec.purpose = "agent";
+        rec.not_after = 4102444800;
+        rec.issued_at = 1700000000;
+        REQUIRE(store.record_issued(rec).has_value());
+    }
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.start("operator");
+
+    const auto call = [&ts](const std::string& args) {
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{)"
+                           R"("name":"list_issued_certs","arguments":)" +
+                           args + "}}");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    const auto payload_of = [&call](const std::string& args) {
+        auto body = call(args);
+        REQUIRE(body.contains("result"));
+        return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    };
+
+    // Absent: the documented defaults.
+    {
+        auto p = payload_of("{}");
+        CHECK(p["limit"] == 200);
+        CHECK(p["offset"] == 0);
+        CHECK(p["count"] == 3);
+    }
+    // In range, and the boundaries.
+    CHECK(payload_of(R"({"limit":2})")["count"] == 2);
+    CHECK(payload_of(R"({"limit":1})")["limit"] == 1);
+    CHECK(payload_of(R"({"limit":1000})")["limit"] == 1000);
+    CHECK(payload_of(R"({"limit":1001})")["limit"] == 1000);
+    CHECK(payload_of(R"({"offset":2})")["count"] == 1);
+    CHECK(payload_of(R"({"offset":1000000})")["offset"] == 1000000);
+    CHECK(payload_of(R"({"offset":1000001})")["offset"] == 1000000);
+    // Below the range clamps to the nearest bound, as it always did.
+    CHECK(payload_of(R"({"limit":0})")["limit"] == 1);
+    CHECK(payload_of(R"({"limit":-5})")["limit"] == 1);
+    CHECK(payload_of(R"({"offset":-1})")["offset"] == 0);
+    // The wrapped values: 4294967297 narrowed to 1 and 4294967296 to 0 through the int read.
+    {
+        auto p = payload_of(R"({"limit":4294967297})");
+        CHECK(p["limit"] == 1000);
+        CHECK(p["count"] == 3);
+    }
+    CHECK(payload_of(R"({"limit":4294967296})")["limit"] == 1000);
+    CHECK(payload_of(R"({"offset":4294967296})")["offset"] == 1000000);
+    CHECK(payload_of(R"({"offset":4294967297})")["offset"] == 1000000);
+    // A present non-integer is -32602 (the old read threw a type error on a string), as is an
+    // unsigned value that does not fit a signed 64-bit integer.
+    for (const char* bad :
+         {R"({"limit":"5"})", R"({"limit":5.5})", R"({"limit":null})", R"({"limit":true})",
+          R"({"limit":18446744073709551615})", R"({"offset":"5"})", R"({"offset":5.5})",
+          R"({"offset":null})", R"({"offset":false})", R"({"offset":18446744073709551615})"}) {
+        INFO(bad);
+        auto body = call(bad);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == -32602);
+    }
+}
+
 TEST_CASE("MCP CA: list_issued_certs is allowed on the readonly tier (Security:Read)",
           "[mcp][integration][pki][security][pg]") {
     // #1240 L3: the readonly tier permits ALL Read ops, so a read-only agentic

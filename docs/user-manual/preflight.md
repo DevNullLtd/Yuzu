@@ -100,8 +100,7 @@ evicts the **oldest** rows first, which are the **earliest** answerers. On a lar
 with a long window (up to 2,880 minutes) and a cohort near its 20,000-device cap, devices that
 passed early can therefore flip to "inconclusive" before the deadline. To resolve those
 devices, re-run the pre-flight against a smaller group. Changing the re-dispatch rule, and
-per-device paging of the response read, are known limitations, tracked as open rows in the
-governance ledger (no issue is filed yet).
+per-device paging of the response read, are known limitations that this release does not address.
 
 ## Verify — before / after performance
 
