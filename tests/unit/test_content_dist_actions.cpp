@@ -44,9 +44,13 @@
 #include <yuzu/plugin.h>
 
 #include "local_dispatcher.hpp"
+#include "scoped_env.hpp"
+#include "test_helpers.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -174,6 +178,48 @@ TEST_CASE("content_dist plugin: execute_staged reports file-not-staged for a wel
     CHECK(result.captured.find("error|file not staged: "
                                "test-content-dist-actions-nonexistent-payload.bin") !=
           std::string::npos);
+}
+
+TEST_CASE("content_dist plugin: cleanup bounds a huge hours value instead of wrapping the "
+          "cutoff into the future",
+          "[agent][content_dist][posix_actions]") {
+    auto plugin = load_content_dist_plugin();
+    REQUIRE(plugin.has_value());
+
+    // An un-init()'d plugin stages under temp_directory_path()/"yuzu-staged";
+    // point TMPDIR at a private dir so the sweep cannot touch a shared one.
+    yuzu::test::TempDir tmp{"yuzu_test_cd_cleanup_"};
+    const auto staged = tmp.path / "yuzu-staged";
+    fs::create_directories(staged);
+    yuzu::test::ScopedEnv scoped_tmpdir{"TMPDIR", tmp.path.string()};
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    // Positive control: a file two hours old IS removed by hours=1, so a
+    // sweep that does not reach `staged` (changed staging convention) fails
+    // here instead of leaving the checks below to pass on an empty directory.
+    const auto old_file = staged / "old.bin";
+    { std::ofstream{old_file} << "x"; }
+    fs::last_write_time(old_file, fs::file_time_type::clock::now() - std::chrono::hours(2));
+    {
+        std::vector<YuzuParam> params{{"hours", "1"}};
+        auto result = dispatcher.run(plugin->descriptor, "cleanup", params);
+        REQUIRE(result.rc == 0);
+        REQUIRE(result.captured.find("removed|1") != std::string::npos);
+        REQUIRE_FALSE(fs::exists(old_file));
+    }
+
+    // A fresh file must survive a huge value, whatever its magnitude or sign
+    // handling in the parser: hours=2000000000 once wrapped the cutoff into
+    // the future on libstdc++ and removed everything.
+    const auto recent = staged / "recent.bin";
+    { std::ofstream{recent} << "x"; }
+    for (const char* hours : {"2000000000", "99999999999999999999"}) {
+        std::vector<YuzuParam> params{{"hours", hours}};
+        auto result = dispatcher.run(plugin->descriptor, "cleanup", params);
+        CHECK(result.rc == 0);
+        CHECK(result.captured.find("removed|0") != std::string::npos);
+        CHECK(fs::exists(recent));
+    }
 }
 
 #endif // !_WIN32

@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-24 · euid 0 · leg-hash e3b945e9e6db
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-24 · euid 0 · leg-hash 35cf8bb6e007
 == action=firmware
 firmware|vendor|absent|dmi
 firmware|version|absent|dmi

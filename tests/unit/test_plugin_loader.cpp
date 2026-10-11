@@ -258,7 +258,11 @@ TEST_CASE("verify_plugin_signature rejects when trust bundle is unreadable",
     auto fx = build_signing_fixtures();
     auto err = yuzu::agent::verify_plugin_signature(fx.artifact_file, fx.dir / "does-not-exist.pem");
     REQUIRE(err.has_value());
+    // #5249 gave the verifier a separate kBundleUnreadable kind; the plugin
+    // loader deliberately keeps reporting it as an untrusted-chain refusal (its
+    // reason set is unchanged), with the bundle fault named in the detail.
     REQUIRE(err->starts_with(yuzu::agent::kSignatureUntrustedReason));
+    CHECK(err->find("not found") != std::string::npos);
 }
 
 TEST_CASE("verify_plugin_signature rejects malformed PEM in sig file", "[plugin_loader][signing]") {

@@ -554,7 +554,9 @@ public:
     /// Persist current user list to disk.
     bool save_config() const;
 
-    /// Interactive first-run: prompt for admin + user credentials, write config.
+    /// Interactive first-run: prompt for the ADMIN credentials only, write config.
+    /// (No second account: only the admin cfg entry is provisioned into the auth
+    /// store, so a cfg-only user could never sign in - #5343.)
     static bool first_run_setup(const std::filesystem::path& cfg_path);
 
     /// Authenticate; returns session token on success.

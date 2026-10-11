@@ -40,14 +40,32 @@ async function generate() {
     return;
   }
 
+  // #5420: operator PEM material is bind-mounted read-only from ./certs at
+  // OPERATOR_TLS_DIR, a path SEPARATE from /etc/yuzu/certs (the server's own
+  // writable directory for its internal CA and secrets KEK). A path anywhere
+  // else would point at a file that is not there: under /etc/yuzu/certs it
+  // lands in the writable cert volume, which holds only what the server wrote.
+  if (tlsMode === 'operator') {
+    const bad = operatorPathsOutsideTlsDir(val('tls-cert'), val('tls-key'), val('tls-ca-cert'));
+    if (bad.length) {
+      alert('Operator certs: every path must be under ' + OPERATOR_TLS_DIR + '/ — that is where the wizard mounts ./certs (read-only). ' +
+            'Not under it: ' + bad.join(', ') +
+            '\nPut your PEM files in ./certs on the host and use e.g. ' + OPERATOR_TLS_DIR + '/server.pem. ' +
+            'Do not point at /etc/yuzu/certs: that is the server\'s own writable directory (internal CA + secrets KEK), not your files.');
+      return;
+    }
+  }
+
   // C1/N2: the secure gateway↔server topology (mutual-TLS upstream, --cert-group
-  // cert sharing, TLS mgmt listener) depends on server features that live in the
-  // PKI go-live PR (#1314) and are NOT on the current images — emitting them
-  // produces a stack that crash-loops at argv parse (--cert-group) or fails command
-  // forwarding (server dials the mgmt port plaintext). Until that ships, the gateway
-  // is only generated for Plaintext mode. (Tracked: re-enable once #1314 lands.)
+  // cert sharing, TLS mgmt listener) was written against the PKI go-live work
+  // (#1314), which is now merged; the wizard has not been updated to emit that
+  // topology, and a stack generated against an older image could still crash-loop at
+  // argv parse (--cert-group) or fail command forwarding (server dials the mgmt port
+  // plaintext). Until the wizard is reworked for it, the gateway is only generated
+  // for Plaintext mode. For the secure topology use
+  // deploy/docker/docker-compose.reference-gateway.yml.
   if (gateway && tlsMode !== 'plaintext') {
-    alert('Gateway + TLS is not generated yet: the secure gateway↔server wiring depends on server features still in flight (PKI go-live, #1314) that no current image ships, so the stack would not boot. Either pick Plaintext for the gateway, or disable the gateway and use Default/Operator certs for a server-only stack. For a secure gateway today, follow deploy/docker/docker-compose.reference.yml + gateway/config/sys.config.prod.');
+    alert('Gateway + TLS is not generated yet: the wizard does not generate the secure gateway↔server wiring, so the stack would not boot. Either pick Plaintext for the gateway, or disable the gateway and use Default/Operator certs for a server-only stack. The Plaintext gateway stack sets YUZU_INSECURE_GATEWAY_PEER=1 on the server, which disables gateway peer authorization (not for production). For a secure gateway today, follow deploy/docker/docker-compose.reference-gateway.yml + gateway/config/sys.config.prod.');
     return;
   }
 
@@ -125,6 +143,35 @@ async function generate() {
   document.getElementById('output').scrollIntoView({ behavior: 'smooth' });
 }
 
+// #5420: container directory the operator's ./certs is bind-mounted at
+// (read-only). Deliberately NOT /etc/yuzu/certs, which must stay a writable
+// volume the server owns (internal CA + secrets KEK).
+const OPERATOR_TLS_DIR = '/etc/yuzu/tls';
+
+// Return the non-empty operator cert/key/CA paths that are not strictly inside
+// OPERATOR_TLS_DIR. Normalises '.'/'..' segments first so '/etc/yuzu/tls/../certs/x'
+// cannot slip past a bare prefix test.
+function operatorPathsOutsideTlsDir(...paths) {
+  const norm = p => {
+    const out = [];
+    for (const seg of p.split('/')) {
+      if (!seg || seg === '.') continue;
+      if (seg === '..') out.pop(); else out.push(seg);
+    }
+    return '/' + out.join('/');
+  };
+  // A path is accepted only if it is absolute, already in normal form (the
+  // `norm(p) === p` test is what makes the `..` handling in norm() a refusal
+  // rather than a rewrite: `/etc/yuzu/tls/../certs/k` normalises to a different
+  // string and is refused), sits under OPERATOR_TLS_DIR, and contains no quote,
+  // backslash or control character (the paths are written into double-quoted
+  // YAML items, so any of those would break the generated compose).
+  return paths.filter(p => p && !(p.startsWith('/') &&
+                                  !/["\\\x00-\x1f]/.test(p) &&
+                                  norm(p).startsWith(OPERATOR_TLS_DIR + '/') &&
+                                  norm(p) === p));
+}
+
 // Hex-encode `n` cryptographically-random bytes.
 function randHex(n) {
   return Array.from(crypto.getRandomValues(new Uint8Array(n)),
@@ -190,6 +237,8 @@ ${c.gateway ? `
 YUZU_GW_AGENT_PORT=${c.gwAgentPort}
 YUZU_GW_HEALTH_PORT=${c.gwHealthPort}
 YUZU_GW_METRICS_PORT=${c.gwMetricsPort}
+# This stack's server sets YUZU_INSECURE_GATEWAY_PEER=1 (plaintext gateway; gateway
+# peer authorization is disabled). Not for production. See docker-compose.yml.
 # Erlang distribution cookie — the gateway fail-closes on the insecure default.
 # Generated unique per stack; keep it out of git. Rotate with: openssl rand -hex 32
 # (Single ephemeral node? You may instead set YUZU_GW_ALLOW_DEFAULT_COOKIE=1.)
@@ -217,7 +266,7 @@ function validateCertSans(raw) {
 
 // Effective (validated) --cert-san set for the auto-generated default certs.
 // Gateway service names aren't added — gateway + TLS isn't generated yet (the
-// secure gateway topology is #1314; see the C1/N2 guard in generate()).
+// secure gateway topology is not emitted by the wizard; see the C1/N2 guard in generate()).
 function effectiveCertSans(c) {
   return validateCertSans(c.certSans || '').sans;
 }
@@ -229,18 +278,20 @@ function generateCompose(c) {
   const tls = c.tlsMode !== 'plaintext';
   const webScheme = tls ? 'https' : 'http';
   const webContainerPort = tls ? 8443 : 8080;
-  // Named cert volume: every mode except operator, whenever named volumes are on
-  // OR Postgres is external. /etc/yuzu/certs holds the secrets KEK, which is
-  // registered in Postgres, so it must live exactly as long as the database, in
-  // Plaintext mode too (the server still writes the KEK there with --no-tls).
-  // Not optional (#5370). With named volumes off and BUNDLED Postgres, an
-  // anonymous cert volume is correct: it lives and dies with postgres-data's
-  // anonymous volume. With an EXTERNAL Postgres the database outlives every
-  // `docker compose down`, so the cert volume must be named or the next
-  // `down` + `up` strands the KEK on a dangling anonymous volume.
-  // (Gateway + TLS isn't generated — see the C1/N2 guard — so there's no
-  // cross-container cert sharing to force a named volume.)
-  const certVolNamed = c.tlsMode !== 'operator' && (c.persistentVolumes || !c.pgBundled);
+  // Named cert volume: EVERY mode (Plaintext, Default and Operator), whenever
+  // named volumes are on OR Postgres is external. /etc/yuzu/certs holds the
+  // secrets KEK, which is registered in Postgres, so it must live exactly as
+  // long as the database, in Plaintext mode too (the server still writes the
+  // KEK there with --no-tls) and in Operator mode too (the operator's PEMs are
+  // mounted separately at OPERATOR_TLS_DIR; the server still writes its KEK and
+  // internal CA here). Not optional (#5370, #5420). With named volumes off and
+  // BUNDLED Postgres, an anonymous cert volume is correct: it lives and dies
+  // with postgres-data's anonymous volume. With an EXTERNAL Postgres the
+  // database outlives every `docker compose down`, so the cert volume must be
+  // named or the next `down` + `up` strands the KEK on a dangling anonymous
+  // volume. (Gateway + TLS isn't generated — see the C1/N2 guard — so there's
+  // no cross-container cert sharing to force a named volume.)
+  const certVolNamed = c.persistentVolumes || !c.pgBundled;
 
   let y = `## Yuzu Stack — Generated by Yuzu Compose Wizard
 ##
@@ -251,11 +302,21 @@ function generateCompose(c) {
 ##   docker compose logs -f
 ##   docker compose down -v    # ⚠️ -v removes data volumes!
 ##
-${tls ? `## ⚠️ REQUIRES SECURE-BY-DEFAULT IMAGES. This TLS config relies on the server
+${c.tlsMode === 'default' ? `## ⚠️ REQUIRES SECURE-BY-DEFAULT IMAGES. This TLS config relies on the server
 ##    auto-generating a per-install CA + leaf certs on first boot and serving HTTPS
 ##    on 8443 — behaviour from the secure-by-default release (v0.13.0+, tracked by
 ##    the 'latest' tag). Older images (incl. 0.12.0) don't support it; use Plaintext
 ##    mode there. (Plaintext works on any image.)
+##
+` : ``}${c.tlsMode === 'operator' ? `## OPERATOR CERTS — before the first \`docker compose up\`:
+##   Put server.pem, server.key and ca.pem in ./certs next to this file. They
+##   are mounted READ-ONLY at ${OPERATOR_TLS_DIR} and must be readable by the
+##   container's yuzu user (uid 999). The server refuses a key with any group or
+##   other permission bit set, so the key must be OWNED by uid 999 with mode 0600:
+##     sudo chown 999:999 ./certs/server.key && sudo chmod 600 ./certs/server.key
+##   /etc/yuzu/certs is a separate, WRITABLE volume the server owns (its
+##   internal CA + the secrets KEK registered in Postgres). Back it up with the
+##   database and never replace it with your own or a read-only mount (#5420).
 ##
 ` : ``}## Dashboard:   ${webScheme}://localhost:${c.dashboardPort}  (${c.adminUser} / <your-password>)
 ${c.grafana ? `## Grafana:     http://localhost:${c.grafanaPort}  (admin / ${c.grafanaPass})` : ''}
@@ -265,6 +326,11 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
 ## Connect an agent:
 ${c.tlsMode === 'plaintext'
   ? `##   yuzu-agent --server localhost:${c.gateway ? c.gwAgentPort : c.grpcPort} --no-tls`
+  : c.tlsMode === 'operator'
+  ? `##   # TLS is on with YOUR certs, and the server REQUIRES agent client certs
+##   # (mTLS). Issue each agent a client cert + key from the same CA as server.pem:
+##   yuzu-agent --server localhost:${c.gateway ? c.gwAgentPort : c.grpcPort} --ca-cert ./certs/ca.pem \\
+##     --client-cert agent.pem --client-key agent.key`
   : `##   # TLS is on. Give the agent the server's CA so it can verify the cert:
 ##   #   curl -sk ${webScheme}://localhost:${c.dashboardPort}/api/v1/ca/root -o ca.pem
 ##   yuzu-agent --server localhost:${c.gateway ? c.gwAgentPort : c.grpcPort} --ca-cert ca.pem`}
@@ -497,6 +563,19 @@ ${c.tlsMode === 'plaintext'
   y += `    environment:\n`;
   y += `      - YUZU_LOG_LEVEL=info\n`;
   y += `      - YUZU_LOG_FORMAT=json\n`;
+  if (c.gateway && c.tlsMode === 'plaintext') {
+    // The gateway stack is plaintext-only (see the C1/N2 guard in generate()), and
+    // the server refuses to start a plaintext gateway-upstream service unless the
+    // acknowledgement is set. It is an ENVIRONMENT variable, not the
+    // --insecure-gateway-peer flag, because the Version field accepts older image
+    // tags: an older image ignores an unknown environment variable but exits on an
+    // unknown flag. The environment value is bool-parsed on images that know it.
+    y += `      # Plaintext gateway stack: this acknowledges that gateway peer\n`;
+    y += `      # authorization is DISABLED on the gateway-upstream service (:${c.gwUpstreamPort}).\n`;
+    y += `      # Not for production: use TLS + a gateway key pin instead\n`;
+    y += `      # (deploy/docker/docker-compose.reference-gateway.yml).\n`;
+    y += `      - YUZU_INSECURE_GATEWAY_PEER=1\n`;
+  }
   // Postgres substrate DSN (ADR-0006/0008). Consumed via env var, NOT a CLI
   // flag — the server reads YUZU_POSTGRES_DSN from the environment. The DSN
   // carries the APP role password (interpolated from .env), never the
@@ -517,7 +596,8 @@ ${c.tlsMode === 'plaintext'
     y += `      - "--no-tls"\n`;
     y += `      - "--no-https"\n`;
   } else if (c.tlsMode === 'operator') {
-    // Operator-supplied PEM material, bind-mounted read-only below.
+    // Operator-supplied PEM material, bind-mounted read-only below at
+    // OPERATOR_TLS_DIR (generate() refuses paths outside it, #5420).
     y += `      - "--cert"\n`;
     y += `      - "${c.tlsCert}"\n`;
     y += `      - "--key"\n`;
@@ -586,24 +666,30 @@ ${c.tlsMode === 'plaintext'
     y += `      - ${c.dataDir}\n`;
   }
   // Cert directory (/etc/yuzu/certs = auth::default_cert_dir()). It holds the
-  // secrets KEK (registered in Postgres) and, in default mode, the auto-generated
-  // CA, so in every non-operator mode it MUST persist across recreates: losing it
-  // leaves a server that refuses to boot (kek_unresolvable, #5370). It is a
-  // named volume whenever named volumes are on or Postgres is external (see
-  // certVolNamed). Only with named volumes off AND bundled Postgres is it
-  // anonymous, which is safe there because postgres-data is anonymous too and
-  // the two are discarded together. In operator mode bind-mount the host PEM
-  // material read-only (the server cannot write its KEK into that mount and
-  // fails at first boot — tracked in #5420).
-  if (c.tlsMode !== 'operator') {
-    if (certVolNamed) {
-      y += `      - server-certs:/etc/yuzu/certs\n`;
-    } else {
-      y += `      - /etc/yuzu/certs\n`;
-    }
+  // secrets KEK (registered in Postgres) and the internal CA (plus, in default
+  // mode, the auto-generated leaves), so in EVERY mode it MUST be writable and
+  // persist across recreates: losing it leaves a server that refuses to boot
+  // (kek_unresolvable, #5370), and a read-only mount stops the first boot
+  // (provider_failure, #5420). It is a named volume whenever named volumes are
+  // on or Postgres is external (see certVolNamed). Only with named volumes off
+  // AND bundled Postgres is it anonymous, which is safe there because
+  // postgres-data is anonymous too and the two are discarded together.
+  y += `      # /etc/yuzu/certs is the server's own WRITABLE directory: internal CA +\n`;
+  y += `      # secrets KEK (registered in Postgres). Keep it exactly as long as the\n`;
+  y += `      # database; never replace it with a read-only or host mount (#5370/#5420).\n`;
+  if (certVolNamed) {
+    y += `      - server-certs:/etc/yuzu/certs\n`;
   } else {
-    y += `      # Put server.pem / server.key (and ca.pem for mTLS) in ./certs.\n`;
-    y += `      - ./certs:/etc/yuzu/certs:ro\n`;
+    y += `      - /etc/yuzu/certs\n`;
+  }
+  if (c.tlsMode === 'operator') {
+    // Operator PEM material: a SEPARATE read-only bind mount, so the server can
+    // still write its KEK and CA into /etc/yuzu/certs above (#5420).
+    y += `      # Your PEM files: put server.pem / server.key / ca.pem in ./certs on the\n`;
+    y += `      # host, readable by the container's yuzu user (uid 999; server.key owned\n`;
+    y += `      # by uid 999, mode 0600 — see the header). Mounted read-only at\n`;
+    y += `      # ${OPERATOR_TLS_DIR}; the --cert/--key/--ca-cert paths point here.\n`;
+    y += `      - ./certs:${OPERATOR_TLS_DIR}:ro\n`;
   }
   y += `    healthcheck:\n`;
   // #1487: the server image ships bash but NOT curl, so probe the listening port

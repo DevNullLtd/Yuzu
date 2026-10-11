@@ -131,12 +131,23 @@ extern const char* const kSettingsHtml =
 
     /* ── Add user form ─────────────────────────────────────── */
     .add-user-form {
-      display: flex; gap: 0.5rem; align-items: flex-end;
+      display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: flex-end;
       margin-top: 1rem; padding-top: 0.75rem;
       border-top: 1px solid var(--border);
     }
+    /* #5572 — the base class had no flex-wrap, so a row with enough fields
+       (the OTA upload form: platform/arch selects + two file inputs +
+       rollout + mandatory + submit, the widest consumer of this class)
+       overflows its container with nowrap and pushes the submit button out
+       of view with no scroll affordance inside a form row. Wrapping is a
+       no-op for every narrower .add-user-form instance that already fits
+       on one line. */
     .add-user-form .mini-field {
       display: flex; flex-direction: column; gap: 0.2rem;
+      min-width: 0;
+    }
+    .add-user-form input[type="file"] {
+      max-width: 180px;
     }
     .add-user-form .mini-field label {
       font-size: 0.65rem; color: var(--mds-color-theme-text-tertiary); font-weight: 600;
@@ -147,7 +158,10 @@ extern const char* const kSettingsHtml =
       border: 1px solid var(--border); border-radius: 0.3rem;
       font-size: 0.8rem; outline: none;
     }
-    .pw-form { flex-wrap: wrap; margin-top: 0.25rem; padding-top: 0; border-top: none; }
+    /* #5572 — flex-wrap now comes from the .add-user-form base rule; this
+       override only needs the layout tweaks still specific to the nested
+       password-change variant. */
+    .pw-form { margin-top: 0.25rem; padding-top: 0; border-top: none; }
 
     /* ── Token reveal ──────────────────────────────────────── */
     .token-reveal {
@@ -172,7 +186,15 @@ extern const char* const kSettingsHtml =
     .htmx-request.htmx-indicator { display: inline; }
   </style>
 </head>
-<body>
+)HTM"
+    // #5572 CI fix — MSVC's raw-string literal has a hard ~16,380-byte cap
+    // (C2026 "string too big"); the CSS growth here pushed the first chunk
+    // over it. Split here, at the </head>/<body> boundary — already the
+    // idiom this file uses (see every other )HTM"\n R"HTM( pair below).
+    // GCC/Clang have no such limit, so this only shows up on the Windows
+    // CI leg; docs/build-guide.md and
+    // build-and-observability-gotchas-from-pki.md document the pattern.
+    R"HTM(<body>
 
   <nav class="nav-bar">
     <a href="/" class="nav-brand">

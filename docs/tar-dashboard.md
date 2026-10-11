@@ -99,6 +99,8 @@ This avoids a new persistent server-side mirror, which would have to be reconcil
 - Manual **Refresh** button for ad-hoc re-fan-out (automatic background refresh is planned for Phase 15.G operational hardening)
 - Manual "Refresh" button for ad-hoc re-fan-out
 
+> **Bounded scan read (#4644).** The scan's response read goes through the byte-aware store fetch (10,000 rows / 50 MiB of response payload). A cut is reported, never silent: the page shows a "Partial result" banner, qualifies its header counts and, with no rows in the part that was read, replaces the "still in progress" / "all clear" empty states with one saying the page cannot tell; `GET /api/v1/tar/retention-paused` and `list_tar_retention_paused` carry `result_truncated_by_cap: true` and also set `store_degraded: true`. This page is a dispatch-and-poll view, not a capture source, so the CORE capture-source pattern (§8 of the implementer doc) does not apply.
+
 ### 3.2 Extending `tar.status`
 
 The action's response gains four lines per source (so 16 new lines total for the 4 sources):
@@ -343,7 +345,7 @@ Per `docs/observability-conventions.md`:
 | Metric | Type | Labels | Status |
 |---|---|---|---|
 | `yuzu_tar_dashboard_view_total` | counter | `frame` (retention/sql/tree), `result` | shipped (PR-A.A) |
-| `yuzu_tar_retention_paused_devices` | gauge | `source` | shipped (PR-A.A) |
+| `yuzu_tar_retention_paused_devices` | gauge | `source` | shipped (PR-A.A). Set from the rows of the page's own scan read. A cut scan (`result_truncated_by_cap`, see the bounded-read note in §3.1) does not update it, because its rows would under-count; the gauge keeps the last value from an uncut scan, so it can be stale. It is a per-render view, not a fleet total. |
 | `yuzu_tar_source_purge_total` | counter | `result` | **shipped** (Phase 15.A — dashboard fragment + `POST /api/v1/tar/retention-paused/purge`) |
 | `yuzu_tar_source_reenable_total` | counter | `result` | shipped (PR-A.A — dashboard fragment only, no REST twin) |
 | `yuzu_tar_scan_dispatched_total` | counter | `result` | shipped (PR-A.A) |

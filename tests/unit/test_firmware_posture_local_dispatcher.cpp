@@ -128,6 +128,14 @@ TEST_CASE("firmware_posture plugin: `firmware` yields >= 3 well-formed rows on t
         // hw.model always exists on macOS; version_source proves the IOKit leg ran.
         CHECK(count_prefix(rows, "firmware|model|") == 1);
         CHECK(count_prefix(rows, "firmware|version_source|") == 1);
+#if defined(__arm64__)
+        // Apple Silicon: a misread hw.optional.arm64 (false or nullopt) would make /rom's absence
+        // an unexpected failure; read correctly, /rom reads absent and neither token appears.
+        CHECK(result.result_provenance.find("iokit:IODeviceTree:/rom:lookup_failed") ==
+              std::string::npos);
+        CHECK(result.result_provenance.find("sysctl:hw_optional_arm64:unreadable") ==
+              std::string::npos);
+#endif
     }
 }
 

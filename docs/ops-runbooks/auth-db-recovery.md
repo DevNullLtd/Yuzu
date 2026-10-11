@@ -159,7 +159,7 @@ server is restart-looping, use
 In the affected 0.14.0 stacks there was no volume there, so recreating the
 container (an image upgrade, `down` then `up`, `--force-recreate`) deleted the
 key files, and `kek_unresolvable` follows on the next start (#5370).
-Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` and `docker-compose.reference-gateway.yml` (their `certs` volume).
+Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the 0.14.0 README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` (which the README quickstart saves as `docker-compose.yml` since #5419) and `docker-compose.reference-gateway.yml` (their `certs` volume).
 A `kek_unresolvable` there does not always mean the files are gone: a compose
 that lost its volume line, files owned by the wrong uid, or keys left behind on
 a dangling anonymous volume give the same error.
@@ -486,8 +486,8 @@ also clears the account's lockout, recording `auth.lockout.cleared`
 is no MCP tool for either (#5357 tracks a temporary-password reset tool).
 
 **Re-running the Windows server installer is not a reset.** On an upgrade it
-refuses `/ADMIN_PASS=` and `/OPERATOR_PASS=` with exit code 11 (the config
-file it would write only seeds an empty database).
+refuses `/ADMIN_PASS=` (and the removed `/OPERATOR_PASS=`) with exit code 11
+(the config file it would write only seeds an empty database).
 
 **Fallback — direct SQL**, when no administrator can sign in at all (the only
 admin forgot their password). This writes no audit row and revokes no
@@ -745,9 +745,11 @@ sudo systemctl restart yuzu-server
 ## What you cannot recover from
 
 - **Lost `yuzu-server.cfg` and an empty `auth` schema.** The config is the seed
-  for the admin account on first boot. If both are gone, run
-  `yuzu-server --first-run-setup` to create a new admin interactively and write
-  a fresh config.
+  for the admin account on first boot. If both are gone, start `yuzu-server`
+  interactively on a terminal with no `yuzu-server.cfg` at the configured path
+  (`--config`): it runs first-run setup, prompts for a new administrator and
+  writes a fresh config. (There is no `--first-run-setup` flag; setup runs
+  whenever the config file is absent and needs a TTY.)
 
 - <a id="kek-permanently-lost"></a>**KEK permanently lost.** First, the server
   **will not start** on a database that still registers the lost version.

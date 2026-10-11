@@ -70,7 +70,8 @@ now enforces, in order:
    list-read filters use, so the gate and the filter can never disagree on
    a corrupt store). Not in effect → `403`.
 2. The `ITServiceOwner` role itself must hold `securable_type:operation`
-   (`check_role_has_permission`) — this remains the **authority ceiling**:
+   (`RbacStore::role_permission_allowed_checked`, reached through
+   `authz::service_ceiling_check`) — this remains the **authority ceiling**:
    a service token can never exceed what that role grants, regardless of
    what other roles its minter separately holds.
 3. The pair must **also** appear in `kServiceScopeGlobalSafe`

@@ -255,6 +255,38 @@ extern const std::string kYuzuChartsJs = R"JS((function () {
     });
   }
 
+  // A chart built from a cut result is a wrong picture, not a smaller one.
+  // The visualization route says so with rows_capped (row cap only) and
+  // result_truncated_by_cap + truncation_cause (row_cap | byte_cap). Show it
+  // in the chart deck on its own full-width row directly above the card (the CSS
+  // rule for .yuzu-chart-truncated lives in dashboard_ui.cpp), and clear it on a
+  // re-render that is not cut.
+  // textContent only: nothing from the payload is interpreted as markup.
+  function truncationNotice(target, data) {
+    var prior = target.previousElementSibling;
+    if (prior && prior.classList && prior.classList.contains('yuzu-chart-truncated')) {
+      prior.parentNode.removeChild(prior);
+    }
+    var cut = !!(data && (data.result_truncated_by_cap || data.rows_capped));
+    if (!cut || !target.parentNode) return;
+    var msg;
+    if (data.truncation_cause === 'byte_cap') {
+      msg = 'Partial result: this chart was built from responses cut at the '
+          + '50 MiB payload cap, so some agents are missing from it.';
+    } else {
+      var n = Number(data.rows_cap);
+      msg = 'Partial result: this chart was built from the first '
+          + (n > 0 ? n.toLocaleString('en-US') : 'capped number of') + ' rows only, '
+          + 'so some agents are missing from it.';
+    }
+    var note = document.createElement('div');
+    note.className = 'result-degrade-banner yuzu-chart-truncated';
+    note.setAttribute('data-chart-truncated',
+        data.truncation_cause === 'byte_cap' ? 'byte_cap' : 'row_cap');
+    note.textContent = msg;
+    target.parentNode.insertBefore(note, target);
+  }
+
   function chartHostHeight(target) {
     // Cards are typically ~280px; let CSS height: drive it if set, else
     // default to a comfortable 280px.
@@ -271,6 +303,7 @@ extern const std::string kYuzuChartsJs = R"JS((function () {
       setTimeout(function () { render(target, data); }, 50);
       return;
     }
+    truncationNotice(target, data);
     if (data.error) { emptyState(target, data.error); return; }
     if (!data.chart_type) { emptyState(target, 'No chart type configured.'); return; }
 

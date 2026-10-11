@@ -50,6 +50,7 @@
 #include <vector>
 
 #include <constraint_accumulator.hpp>
+#include <row_byte_budget.hpp>
 
 #include <yuzu/plugin.h> // YuzuResultStatus / Completeness (C ABI: no OS types)
 #include <yuzu/string_utils.hpp>
@@ -216,7 +217,7 @@ inline void fill_uncovered_categories(std::string_view os, std::vector<Permissio
     }
 }
 
-// ── run-wide output budget (shared by every leg) ────────────────────────
+// ── run-wide output budget (shared by the macOS and Windows legs) ────────────────────────
 
 inline constexpr std::size_t kMaxRunOutputBytes = 16u * 1024u * 1024u;
 inline constexpr std::string_view kBudgetExceededToken = "collection:budget_exceeded";
@@ -226,19 +227,19 @@ inline constexpr std::string_view kBudgetExceededToken = "collection:budget_exce
 /// source that crosses it (itself bounded) is kept; Windows asks would_exceed() before a
 /// profile's rows are emitted, and charges the machine-wide rows first so they always fit.
 struct OutputBudget {
-    std::size_t max_bytes = kMaxRunOutputBytes;
-    std::size_t bytes = 0;
+    yuzu::shared::RowByteBudget budget{.max_bytes = kMaxRunOutputBytes};
 
-    [[nodiscard]] bool exhausted() const noexcept { return bytes >= max_bytes; }
+    [[nodiscard]] bool exhausted() const noexcept { return budget.full(); }
     [[nodiscard]] static std::size_t cost(std::span<const PermissionRow> rows) {
         std::size_t n = 0;
         for (const auto& r : rows) n += format_row(r).size() + 1; // +1: the row separator
         return n;
     }
     [[nodiscard]] bool would_exceed(std::span<const PermissionRow> rows) const {
-        return cost(rows) > max_bytes - (std::min)(bytes, max_bytes);
+        return !budget.fits(cost(rows), rows.size());
     }
-    void charge(std::span<const PermissionRow> rows) { bytes += cost(rows); } // allocates
+    // Allocates: the unconditional reserve.
+    void charge(std::span<const PermissionRow> rows) { budget.add(cost(rows), rows.size()); }
 };
 
 // ── status selection (pure; the one decision every leg shares) ──────────
