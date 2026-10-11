@@ -1340,12 +1340,16 @@ bool rename_flips_admin_group_match(const std::string& old_name, const std::stri
 /// the line has to exist before anything slow happens. The members are therefore named by SCIM ID
 /// (an ID resolves to a username in the SCIM store). The default logger is flushed right after the
 /// line so a file sink does not hold it in a buffer when the process dies; a SIGKILL can still lose
-/// a file-sink copy that was not yet written, never the stderr / journald copy. There is no fsync:
-/// power loss or a kernel panic can lose any copy.
+/// a file-sink copy that was not yet written, not the copy the console stream already took. Where
+/// the line goes: without `--log-file` the default logger is spdlog's stdout sink; with
+/// `--log-file` it writes to stderr and the file (main.cpp); only the null-logger fallback below
+/// writes to stderr on its own. journald and container logs capture stdout and stderr alike. There
+/// is no fsync: power loss or a kernel panic can lose any copy.
 ///
 /// The whole body is `try`/`catch(...)`: this is a diagnostic aid and must NEVER gate the
 /// recompute (a throwing logger, a failed format allocation). A missing default logger or a
-/// failure falls back to a bare stderr line, itself guarded.
+/// failure falls back to a bare stderr line, itself guarded (its text says the line "may not have
+/// been flushed" because a flush() that throws after a successful write lands here too).
 void log_removed_members_breadcrumb(const std::string& group_id,
                                     const std::vector<std::string>& old_members,
                                     const std::vector<std::string>& kept,
@@ -1359,7 +1363,10 @@ void log_removed_members_breadcrumb(const std::string& group_id,
                 continue;
             removed.add(m); // counted always, listed only up to kMaxListed
         }
-        if (removed.count == 0 && !admin_match_flipped)
+        // A flip with nobody kept recomputes nobody: say nothing rather than a "0 current
+        // member(s)" line (an empty group that nobody was removed from has nothing at stake).
+        const bool flip_clause = admin_match_flipped && !kept_set.empty();
+        if (removed.count == 0 && !flip_clause)
             return;
         std::string line = "SCIM: Group scim_id=" + group_id +
                            " membership change committed; role recompute starting";
@@ -1369,7 +1376,7 @@ void log_removed_members_breadcrumb(const std::string& group_id,
             if (removed.count > NamedMembers::kMaxListed)
                 line += ",+" + std::to_string(removed.count - NamedMembers::kMaxListed) + " more";
         }
-        if (admin_match_flipped)
+        if (flip_clause)
             line += "; the group rename changes the admin-group match and " +
                     std::to_string(kept_set.size()) + " current member(s) will be recomputed";
         // Fetch the default logger ONCE: a null one (not expected after boot) falls back to stderr
@@ -1384,7 +1391,7 @@ void log_removed_members_breadcrumb(const std::string& group_id,
     } catch (...) {
         try {
             std::fputs("SCIM: Group membership change committed; role recompute starting "
-                       "(the breadcrumb log line could not be written)\n",
+                       "(the breadcrumb log line may not have been flushed)\n",
                        stderr);
         } catch (...) { // NOLINT(bugprone-empty-catch): a diagnostic must never gate the recompute
         }
@@ -3255,6 +3262,20 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     // concurrent PUT/PATCH/DELETE.
                     std::lock_guard<std::mutex> group_mutation_lock(kGroupMutationMu);
 
+                    // Re-read the group's CURRENT name under the lock, as PATCH does: the
+                    // pre-lock `group` snapshot (top of handler) can be stale by now, and the
+                    // name it holds feeds the rename-flip breadcrumb below. A stale name would
+                    // make that line be written or omitted wrongly after a concurrent rename.
+                    // The pre-lock snapshot still serves the early, cheap rename-uniqueness
+                    // check above, which only refuses and writes nothing. Also covers the
+                    // group having been deleted in that window.
+                    const auto current = scim_store->get_group_by_id(id);
+                    if (!current) {
+                        send_scim_error(res, 404, "resource not found");
+                        record_request(auth_mgr, "group_replace", 404);
+                        return;
+                    }
+
                     // Snapshot membership BEFORE the replace so the recompute
                     // below can cover the union of old+new (a PUT replace can
                     // both add and remove members in the same call — spec
@@ -3324,7 +3345,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
                     log_removed_members_breadcrumb(
                         id, old_members, new_members,
-                        rename_flips_admin_group_match(group->display_name,
+                        rename_flips_admin_group_match(current->display_name,
                                                        input.display_name, scim_admin_group));
                     recompute_complete = recompute_members(
                         scim_store, auth_mgr, audit_store, analytics_store, req, id,

@@ -5878,6 +5878,17 @@ TEST_CASE("ScimRoutes: a Group rename that flips the admin-group match writes th
         CHECK(logs.find("the group rename changes the admin-group match and 1 current member(s) "
                         "will be recomputed") != std::string::npos);
     }
+    SECTION("a flipping rename of an EMPTY group writes nothing (no '0 current member(s)' line)") {
+        const auto gid = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Crumbs"}})
+                                         ->body)["id"].get<std::string>();
+        yuzu::test::LogCapture capture(spdlog::level::warn);
+        REQUIRE(f.patch("/scim/v2/Groups/" + gid, rename_ops("Yuzu-Admins"))->status == 200);
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Crumbs"}, {"members", json::array()}})->status == 200);
+        capture.stop();
+        CHECK(capture.text().find(marker) == std::string::npos);
+        CHECK(capture.text().find("0 current member(s)") == std::string::npos);
+    }
     SECTION("a rename that does not change the admin-group match writes nothing") {
         const auto gid = json::parse(f.post("/scim/v2/Groups", {{"displayName", "Crumbs"},
                                                                 {"members", members}})
@@ -5928,7 +5939,7 @@ namespace {
 
 /// A spdlog sink that records what reaches it, counts flushes, and optionally throws on the
 /// crash-breadcrumb line (its logger's error handler rethrows, so the exception reaches the
-/// caller of `spdlog::info`, as a failing format or a broken sink would).
+/// caller of `logger->warn`, as a failing format or a broken sink would).
 class BreadcrumbProbeSink final : public spdlog::sinks::base_sink<std::mutex> {
 public:
     bool throw_on_breadcrumb = false;
@@ -5936,9 +5947,24 @@ public:
     int breadcrumb_attempts = 0;
     std::vector<std::string> lines;
     int flushes_after_breadcrumb = 0;
-    /// Invoked ONCE, on the first flush after the breadcrumb line, from inside flush_(). It must
-    /// not log (the sink mutex is held) and must not take a lock the logging path holds.
+    /// Invoked at most ONCE, on the first flush after the breadcrumb line made by
+    /// `callback_thread`, from inside flush_(). A flush from any other thread (a background
+    /// store thread holding a copy of this logger) is counted but never runs it.
+    ///
+    /// The real constraint: flush_() runs with this sink's (non-recursive) mutex held, so
+    /// anything the callback does that logs through the logger owning this sink on the SAME
+    /// thread re-enters sink_it_ and self-deadlocks. The callback must therefore silence that
+    /// logger for its duration (the test does) and must not take a lock the logging path holds.
+    /// It captures test locals by reference: call `disarm()` before they go out of scope.
     std::function<void()> on_first_flush_after_breadcrumb;
+    std::thread::id callback_thread{}; ///< the only thread allowed to run the callback
+
+    /// Drops the callback under the sink mutex, so no later flush can run a closure whose
+    /// captures have been destroyed.
+    void disarm() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        on_first_flush_after_breadcrumb = nullptr;
+    }
 
 protected:
     void sink_it_(const spdlog::details::log_msg& msg) override {
@@ -5954,22 +5980,28 @@ protected:
     void flush_() override {
         ++flushes;
         if (seen_breadcrumb_) {
-            if (++flushes_after_breadcrumb == 1 && on_first_flush_after_breadcrumb)
+            ++flushes_after_breadcrumb;
+            if (!callback_fired_ && on_first_flush_after_breadcrumb &&
+                std::this_thread::get_id() == callback_thread) {
+                callback_fired_ = true; // strictly one-shot, set before the call
                 on_first_flush_after_breadcrumb();
+            }
         }
     }
 
 private:
     bool seen_breadcrumb_ = false;
+    bool callback_fired_ = false;
 };
 
 /// Installs a probe-sink logger as the default logger for its lifetime.
 struct BreadcrumbProbe {
     std::shared_ptr<BreadcrumbProbeSink> sink = std::make_shared<BreadcrumbProbeSink>();
+    std::shared_ptr<spdlog::logger> logger;
     std::shared_ptr<spdlog::logger> prev = spdlog::default_logger();
     spdlog::level::level_enum prev_level = spdlog::get_level();
     BreadcrumbProbe() {
-        auto logger = std::make_shared<spdlog::logger>("breadcrumb_probe", sink);
+        logger = std::make_shared<spdlog::logger>("breadcrumb_probe", sink);
         logger->set_level(spdlog::level::trace);
         logger->set_error_handler([](const std::string& msg) { throw std::runtime_error(msg); });
         spdlog::set_default_logger(logger);
@@ -6007,13 +6039,23 @@ TEST_CASE("ScimRoutes: the crash-breadcrumb flushes the logger right after its l
     // The removed member is demoted by the recompute loop. At the first flush after the
     // breadcrumb line the demotion must NOT have happened yet: the flush precedes the loop, so a
     // SIGKILL inside the loop cannot lose a line still sitting in a buffer.
+    //
+    // The callback runs under the sink mutex, so it reads the role with AuthDB::get_user (a
+    // plain store read) rather than AuthManager::get_user_role, whose error paths log, and it
+    // silences the probe logger for its duration: a Postgres blip inside the read would
+    // otherwise log through this very sink and self-deadlock the test instead of failing it.
     std::optional<auth::Role> role_at_first_flush;
+    probe.sink->callback_thread = std::this_thread::get_id();
     probe.sink->on_first_flush_after_breadcrumb = [&] {
-        role_at_first_flush = f.auth_mgr.get_user_role("fl_admin");
+        probe.logger->set_level(spdlog::level::off);
+        if (auto u = f.auth_db->get_user("fl_admin"))
+            role_at_first_flush = u->role;
+        probe.logger->set_level(spdlog::level::trace);
     };
     REQUIRE(f.put("/scim/v2/Groups/" + gid,
                   {{"displayName", "Yuzu-Admins"}, {"members", json::array()}})
                 ->status == 200);
+    probe.sink->disarm(); // the closure's captures die before the sink does
     probe.stop();
     CHECK(probe.sink->breadcrumb_attempts == 1);
     CHECK(probe.sink->flushes_after_breadcrumb >= 1);
