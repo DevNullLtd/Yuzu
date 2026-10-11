@@ -1132,10 +1132,19 @@ TEST_CASE("lifecycle guard: both guarded transactions run under the lock and idl
     for (const auto& v : lock)
         CHECK(v == "2s");
 
-    // Transaction-local: a later statement on a pooled connection sees neither bound.
-    for (int i = 0; i < 3; ++i) {
-        const auto after = query_col(auth_db.pool(), "SHOW idle_in_transaction_session_timeout");
-        REQUIRE(after.size() == 1);
-        CHECK(after[0] != "15s");
+    // Transaction-local: NO pooled connection sees either bound afterwards. Deterministic, not a
+    // sample of a FIFO pool: lease EVERY connection at once (the pool has `size()` of them, so
+    // each lease is a distinct connection) and read the setting on each.
+    std::vector<decltype(auth_db.pool().acquire())> leases;
+    for (std::size_t i = 0; i < auth_db.pool().size(); ++i) {
+        leases.push_back(auth_db.pool().acquire());
+        REQUIRE(leases.back());
+    }
+    for (auto& lease : leases) {
+        pg::PgResult r = pg::exec_params(lease.get(), "SHOW idle_in_transaction_session_timeout",
+                                         std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(r.get()) == 1);
+        CHECK(std::string(PQgetvalue(r.get(), 0, 0)) != "15s");
     }
 }

@@ -21,6 +21,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <expected>
 #include <mutex>
 #include <optional>
@@ -934,7 +935,7 @@ bool deprovision_role_ok(auth::AuthManager* auth_mgr, AuditStore* audit_store,
 ///  - `Applied`: the member's role now equals what its groups confer (written, already so, or the
 ///    member is legitimately out of scope: not a live SCIM user, not SCIM-owned, no active
 ///    account).
-///  - `Refused` / `Failed` / `StoreFailure`: a role change was needed and did NOT fully land.
+///  - `Refused` / `Failed` / `StoreFailure`: a role change was needed and may not have landed.
 ///    `Refused` is the last-Administrator guard (the role is unchanged); `Failed` is any other
 ///    non-`Updated` outcome (including a committed role whose durable session wipe failed);
 ///    `StoreFailure` is a `Failed` whose guarded write itself could not complete (a lock wait
@@ -1208,28 +1209,32 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
                                     : "role change did NOT apply");
         audit(auth_mgr, audit_store, req, "scim.user.role_changed", "failure", user_scim_id,
              "reason=group old_role=" + old_role_str + " intended_new_role=" + new_role_str +
-                 via_detail + (role_applied ? " role_changed=true session_wipe_failed=true" : ""));
+                 via_detail + (role_applied ? " role_changed=true session_wipe_failed=true" : "") +
+                 (role_unknown ? " role_applied=unknown" : ""));
         bump_role_change_failure(auth_mgr);
         if (demotion) {
             // An IdP-removed administrator whose demotion did not complete: with a store failure
             // the role is still admin (or indeterminate); with a session-wipe failure the role is
             // user but a live session may still carry the old authority. Either way a person the
-            // IdP removed from the admin group keeps privilege until an operator acts.
+            // IdP removed from the admin group retains or may retain privilege until an operator
+            // acts.
             const std::string safe_user = neutral_free_text(resource->username);
-            spdlog::critical("SCIM: IdP-removed admin '{}' (scim_id={}) retains role: the "
-                             "group-derived demotion {} -> {} {}; an operator must demote the "
-                             "account and revoke its sessions",
+            spdlog::critical("SCIM: IdP-removed admin '{}' (scim_id={}) retains or may retain "
+                             "role: the group-derived demotion {} -> {} {}; an operator must "
+                             "demote the account and revoke its sessions",
                              safe_user, user_scim_id, old_role_str, new_role_str,
                              role_applied   ? "was applied but the durable session wipe failed"
                              : role_unknown ? "may not have completed"
                                             : "did NOT complete");
-            // `role_applied` is true / false, or the string "unknown" for a StoreFailure.
+            // `role_applied` and `session_wipe_failed` are true / false, or the string "unknown"
+            // for a StoreFailure (the write may have committed and the wipe state is not known).
             emit_scim_critical_event(analytics_store, "scim.user.role_demotion_incomplete",
                                      {{"scim_id", user_scim_id},
                                       {"username", resource->username},
                                       {"role_applied", role_unknown ? json("unknown")
                                                                     : json(role_applied)},
-                                      {"session_wipe_failed", role_applied},
+                                      {"session_wipe_failed", role_unknown ? json("unknown")
+                                                                           : json(role_applied)},
                                       {"old_role", old_role_str},
                                       {"intended_new_role", new_role_str}});
         }
@@ -1307,37 +1312,53 @@ std::vector<std::string> removed_first(const std::vector<std::string>& old_membe
 }
 
 /// Crash breadcrumb for a Group request whose membership write has COMMITTED (#4966): ONE info
-/// line naming the Group, the number of members this request removed and the first
-/// `NamedMembers::kMaxListed` of their `log_token`'d usernames (`,+N more` beyond that), written
-/// BEFORE the recompute loop. A process that dies inside the loop leaves no audit row and no
-/// counter, so this line is the only record of who was being recomputed. It is a log line, not an
-/// audit row, and it is written only when the request removed somebody. One helper for PUT,
-/// PATCH and DELETE (`kept` is empty for DELETE).
-void log_removed_members_breadcrumb(ScimStore* scim_store, const std::string& group_id,
+/// line naming the Group, the exact number of members this request removed and the SCIM IDs of the
+/// first `NamedMembers::kMaxListed` of them (`,+N more` beyond that), written BEFORE the recompute
+/// loop. A process that dies inside the loop leaves no audit row and no counter, so this line is
+/// the only record of who was being recomputed. It is a log line, not an audit row, and it is
+/// written only when the request removed somebody. One helper for PUT, PATCH and DELETE (`kept` is
+/// empty for DELETE).
+///
+/// It performs NO store read: a read on a degraded store can wait out its timeout per member, and
+/// the line has to exist before anything slow happens. The members are therefore named by SCIM ID
+/// (an ID resolves to a username in the SCIM store). The default logger is flushed right after the
+/// line so a file sink does not hold it in a buffer when the process dies; a SIGKILL can still lose
+/// a file-sink copy that was not yet written, never the stderr / journald copy.
+///
+/// The whole body is `try`/`catch(...)`: this is a diagnostic aid and must NEVER gate the
+/// recompute (a throwing logger, a failed format allocation). On a failure it falls back to a bare
+/// stderr line, itself guarded.
+void log_removed_members_breadcrumb(const std::string& group_id,
                                     const std::vector<std::string>& old_members,
-                                    const std::vector<std::string>& kept) {
-    const std::unordered_set<std::string> kept_set(kept.begin(), kept.end());
-    std::unordered_set<std::string> seen;
-    NamedMembers removed;
-    for (const auto& m : old_members) {
-        if (kept_set.count(m) || !seen.insert(m).second)
-            continue;
-        if (removed.count < NamedMembers::kMaxListed) {
-            // At most kMaxListed store reads; a failed read names the member by its scim_id.
-            const auto resource = scim_store->get_by_scim_id(m);
-            removed.add(resource ? resource->username : "scim_id:" + m);
-        } else {
-            removed.add({}); // counted, not named (add() drops the name beyond kMaxListed)
+                                    const std::vector<std::string>& kept) noexcept {
+    try {
+        const std::unordered_set<std::string> kept_set(kept.begin(), kept.end());
+        std::unordered_set<std::string> seen;
+        NamedMembers removed;
+        for (const auto& m : old_members) {
+            if (kept_set.count(m) || !seen.insert(m).second)
+                continue;
+            removed.add(m); // counted always, listed only up to kMaxListed
+        }
+        if (removed.count == 0)
+            return;
+        spdlog::info("SCIM: Group scim_id={} membership change committed; role recompute starting "
+                     "for {} removed member(s): {}{}",
+                     group_id, removed.count, removed.listed,
+                     removed.count > NamedMembers::kMaxListed
+                         ? ",+" + std::to_string(removed.count - NamedMembers::kMaxListed) +
+                               " more"
+                         : std::string{});
+        if (auto logger = spdlog::default_logger())
+            logger->flush();
+    } catch (...) {
+        try {
+            std::fputs("SCIM: Group membership change committed; role recompute starting "
+                       "(the breadcrumb log line could not be written)\n",
+                       stderr);
+        } catch (...) { // NOLINT(bugprone-empty-catch): a diagnostic must never gate the recompute
         }
     }
-    if (removed.count == 0)
-        return;
-    spdlog::info("SCIM: Group scim_id={} membership change committed; role recompute starting for "
-                 "{} removed member(s): {}{}",
-                 group_id, removed.count, removed.listed,
-                 removed.count > NamedMembers::kMaxListed
-                     ? ",+" + std::to_string(removed.count - NamedMembers::kMaxListed) + " more"
-                     : std::string{});
 }
 
 /// Recompute every member of one Group request, in the given order (#4966). Returns true iff
@@ -1657,19 +1678,17 @@ bool deactivate(ScimStore* scim_store, ApiTokenStore* token_store, auth::AuthMan
     // M-ATOMICITY (UP-5): the AuthManager (AuthDB connection) write above
     // succeeded; now persist the SCIM-side mirror on ScimStore's SEPARATE
     // connection. If THIS write fails, the auth account is already
-    // deactivated but the SCIM resource still reports active=true - fail
-    // closed (500) so the IdP retries. The retry converges: the soft-delete
-    // SQL carries `AND is_active = TRUE`, so a repeat call matches no row,
-    // `remove_user_checked` answers NotFound, and `remove_account_or_respond`
-    // treats that as `AccountRemoval::Done` (the account is already down),
-    // after which this mirror write runs again. Retry safety therefore does
-    // not rest on a return value distinguishing first from repeat calls; it
-    // comes from the NotFound convergence plus the handler's re-fetch-and-skip
-    // at every call site (`deactivate()` is only invoked when the
-    // freshly-fetched `resource->active` is still true - see the
-    // PATCH/PUT/DELETE call sites). The irreducible window between the two
-    // writes (a crash/kill exactly between them) is a documented residual -
-    // reconciled by the IdP's next full sync.
+    // deactivated but the SCIM resource still reports active=true. We answer
+    // 500, but a retry does NOT converge: the resource is still active, so the
+    // IdP's retry re-enters `deactivate()`, whose `deprovision_role_ok` reads
+    // the role through `AuthDB::get_user` (`WHERE is_active = TRUE`), finds no
+    // active account, and answers 404 + `scim.user.provenance_denied` without
+    // reaching `remove_user_checked`. The mirror stays active=true until it is
+    // reconciled by hand or by a change that owns it (#5214, and the follow-up
+    // tracked in #FOLLOWUP-ISSUE-NUMBER). The auth account is already
+    // deactivated, so the credential side is safe; only the SCIM mirror is
+    // stale. The irreducible window between the two writes (a crash/kill
+    // exactly between them) leaves the same state.
     if (!scim_store->set_active(resource.scim_id, false)) {
         spdlog::error("ScimRoutes: ScimStore::set_active(false) failed for scim_id={} after the "
                      "underlying account was already deactivated — inconsistent state, failing "
@@ -3272,7 +3291,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                         return;
                     }
 
-                    log_removed_members_breadcrumb(scim_store, id, old_members, new_members);
+                    log_removed_members_breadcrumb(id, old_members, new_members);
                     recompute_complete = recompute_members(
                         scim_store, auth_mgr, audit_store, analytics_store, req, id,
                         removed_first(old_members, new_members), scim_admin_group,
@@ -3501,7 +3520,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       if (renamed)
                           trigger +=
                               " renamed_from='" + neutral_free_text(pre_update_display_name) + "'";
-                      log_removed_members_breadcrumb(scim_store, id, old_members, final_members);
+                      log_removed_members_breadcrumb(id, old_members, final_members);
                       recompute_complete = recompute_members(
                           scim_store, auth_mgr, audit_store, analytics_store, req, id,
                           removed_first(old_members, final_members), scim_admin_group, trigger);
@@ -3598,7 +3617,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                        id);
                        }
 
-                       log_removed_members_breadcrumb(scim_store, id, former_members, {});
+                       log_removed_members_breadcrumb(id, former_members, {});
                        recompute_complete = recompute_members(
                            scim_store, auth_mgr, audit_store, analytics_store, req, id,
                            removed_first(former_members, {}), scim_admin_group,

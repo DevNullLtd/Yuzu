@@ -152,12 +152,16 @@ std::optional<std::vector<std::string>> list_active_local_admin_accounts(PGconn*
 // and holds only across lock-free recounts and the COMMIT, and this owner never waits on a lock
 // either of them holds while holding the `auth.users` row, so no chain of waits forms.
 
-// The longest a guard transaction may sit idle BETWEEN statements. The first lock each
-// guard transaction takes is the fleet-wide `rbac_enabled` row lock, so a holder whose client died
-// without closing the connection (an orphaned backend, until the OS TCP keepalive reaps it) would
-// otherwise block EVERY guarded lifecycle write for that long. A lock WAIT is not idle time (the
-// backend is executing a statement), so a waiter is unaffected; only a holder that stops sending
-// statements is cut. Fixed, not configurable.
+// The longest a LIFECYCLE guard transaction (`deactivate_account` and `set_local_role`, the two
+// that call `set_txn_timeouts`) may sit idle BETWEEN statements. The first lock each of them takes
+// is the fleet-wide `rbac_enabled` row lock, so a holder whose client died without closing the
+// connection (an orphaned backend, until the OS TCP keepalive reaps it) would otherwise block
+// every guarded lifecycle write for that long. A lock WAIT is not idle time (the backend is
+// executing a statement), so a waiter is unaffected; only a holder that stops sending statements
+// is cut. Fixed, not configurable. It does NOT cover `unassign_role`, `set_enforcement` or
+// `provision_first_admin`: those transactions keep only the pool defaults. A transaction-local
+// setting also OVERRIDES a stricter operator-set `idle_in_transaction_session_timeout` upward to
+// 15 s for these two transactions.
 constexpr std::chrono::milliseconds kLifecycleIdleInTxnTimeout{15000};
 
 // "SELECT set_config('lock_timeout', $1, true)" and the idle-in-transaction bound: both

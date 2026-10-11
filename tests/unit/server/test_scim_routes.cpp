@@ -58,6 +58,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
+#include <spdlog/sinks/base_sink.h>
 
 #include <libpq-fe.h>
 
@@ -65,7 +66,9 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -4536,7 +4539,9 @@ json deactivate_ops() {
 }
 
 /// The captured spdlog text ends each line with the sink's platform EOL ("\r\n" on Windows). The
-/// CWE-117 checks look for an INJECTED carriage return, so drop that terminator first.
+/// CWE-117 checks look for an INJECTED carriage return, so drop that terminator first. It erases
+/// the '\r' of EVERY "\r\n" pair, an injected pair included: an injected CRLF pair is covered by
+/// the LF checks, and the '\r' checks only see a lone injected '\r'.
 std::string without_sink_crlf(std::string text) {
     for (std::size_t pos = 0; (pos = text.find("\r\n", pos)) != std::string::npos;) {
         text.erase(pos, 1);
@@ -5418,12 +5423,23 @@ TEST_CASE("ScimRoutes: after a store failure the remaining DEMOTIONS are still a
     CHECK(crit[0].severity == Severity::kCritical);
     CHECK(crit[0].attributes.value("username", "") == retained);
     CHECK(capture.text().find("IdP-removed admin '" + retained + "'") != std::string::npos);
-    CHECK(capture.text().find("retains role") != std::string::npos);
+    CHECK(capture.text().find("retains or may retain role") != std::string::npos);
     // A StoreFailure is INDETERMINATE (the write may have committed): the event says "unknown",
     // never the false "role_applied":false, and the log does not claim the change did not apply.
     REQUIRE(crit[0].attributes.contains("role_applied"));
     CHECK(crit[0].attributes["role_applied"] == "unknown");
-    CHECK(crit[0].attributes["session_wipe_failed"] == false);
+    CHECK(crit[0].attributes["session_wipe_failed"] == "unknown"); // the wipe state is unknown too
+    // The failure AUDIT row carries the same marker, so it never reads like a definite no-apply.
+    const auto retained_id =
+        ids[static_cast<std::size_t>(std::find(names.begin(), names.end(), retained) -
+                                     names.begin())];
+    std::vector<AuditEvent> fail_rows;
+    for (const auto& r : audit_rows(f, "scim.user.role_changed", retained_id))
+        if (r.result == "failure") // the earlier promotion's success row is not the subject
+            fail_rows.push_back(r);
+    REQUIRE(fail_rows.size() == 1);
+    CHECK(fail_rows[0].detail.find(" role_applied=unknown") != std::string::npos);
+    CHECK(fail_rows[0].detail.find("role_changed=true") == std::string::npos);
     CHECK(capture.text().find("may not have completed") != std::string::npos);
     CHECK(capture.text().find("the role change may not have applied") != std::string::npos);
     CHECK(capture.text().find("did NOT complete") == std::string::npos);
@@ -5720,7 +5736,7 @@ TEST_CASE("ScimRoutes: PATCH/PUT active:true applies the same pre-checks as a PO
 }
 
 TEST_CASE("ScimRoutes: a Group request that removes members writes ONE crash-breadcrumb log "
-          "line naming them; one that removes nobody writes none (#4966)",
+          "line naming their SCIM ids; one that removes nobody writes none (#4966)",
           "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb]") {
     Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
     const auto id_of = [&](const std::string& name) {
@@ -5750,8 +5766,12 @@ TEST_CASE("ScimRoutes: a Group request that removes members writes ONE crash-bre
         const auto at = logs.find(marker);
         REQUIRE(at != std::string::npos);
         CHECK(logs.find(marker, at + 1) == std::string::npos); // exactly one line
-        CHECK(logs.find("1 removed member(s): bc_three") != std::string::npos);
-        CHECK(logs.find("bc_one", at) == std::string::npos); // kept members are not named
+        // The member is named by SCIM id, never by username: the line needs no store read.
+        CHECK(logs.find("1 removed member(s): " + b3) != std::string::npos);
+        CHECK(logs.find("bc_three", at) == std::string::npos);
+        CHECK(logs.find("Group scim_id=" + gid + " membership change committed; " + marker) !=
+              std::string::npos);
+        CHECK(logs.find(b1, at) == std::string::npos); // kept members are not named
     }
     SECTION("PUT that removes nobody") {
         yuzu::test::LogCapture capture;
@@ -5768,7 +5788,7 @@ TEST_CASE("ScimRoutes: a Group request that removes members writes ONE crash-bre
         yuzu::test::LogCapture capture;
         REQUIRE(f.patch("/scim/v2/Groups/" + gid, ops)->status == 200);
         capture.stop();
-        CHECK(capture.text().find("1 removed member(s): bc_two") != std::string::npos);
+        CHECK(capture.text().find("1 removed member(s): " + b2) != std::string::npos);
     }
     SECTION("PATCH add removes nobody") {
         json ops{{"Operations", json::array({{{"op", "add"},
@@ -5785,20 +5805,23 @@ TEST_CASE("ScimRoutes: a Group request that removes members writes ONE crash-bre
         capture.stop();
         const std::string logs = capture.text();
         CHECK(logs.find("3 removed member(s): ") != std::string::npos);
-        CHECK(logs.find("bc_one") != std::string::npos);
-        CHECK(logs.find("bc_two") != std::string::npos);
-        CHECK(logs.find("bc_three") != std::string::npos);
+        CHECK(logs.find(b1) != std::string::npos);
+        CHECK(logs.find(b2) != std::string::npos);
+        CHECK(logs.find(b3) != std::string::npos);
     }
 }
 
-TEST_CASE("ScimRoutes: the crash-breadcrumb names at most 20 members and counts the rest (#4966)",
+TEST_CASE("ScimRoutes: the crash-breadcrumb names at most 20 member ids and counts the rest "
+          "exactly (#4966)",
           "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb]") {
     Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
     json members = json::array();
+    std::vector<std::string> ids;
     for (int i = 0; i < 22; ++i) {
         const auto name = "bulk" + std::to_string(i);
-        members.push_back(
-            {{"value", json::parse(f.post("/scim/v2/Users", {{"userName", name}})->body)["id"]}});
+        ids.push_back(json::parse(f.post("/scim/v2/Users", {{"userName", name}})->body)["id"]
+                          .get<std::string>());
+        members.push_back({{"value", ids.back()}});
     }
     const auto gid = json::parse(
         f.post("/scim/v2/Groups", {{"displayName", "Crumbs"}, {"members", members}})->body)["id"]
@@ -5815,41 +5838,107 @@ TEST_CASE("ScimRoutes: the crash-breadcrumb names at most 20 members and counts 
     const std::string line = logs.substr(at, eol == std::string::npos ? eol : eol - at);
     CHECK(line.find(",+2 more") != std::string::npos);
     std::size_t named = 0;
-    for (std::size_t pos = 0; (pos = line.find("bulk", pos)) != std::string::npos; ++pos)
-        ++named;
+    for (const auto& id : ids)
+        if (line.find(id) != std::string::npos)
+            ++named;
     CHECK(named == 20);
 }
 
-TEST_CASE("ScimRoutes: a hostile stored username is log_token'd in the crash-breadcrumb "
-          "(CWE-117, #4966)",
-          "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb][logforge]") {
-    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
-    // A stored name the usual validators would reject, planted directly in the SCIM store: the
-    // breadcrumb reads names back from the store, so it must neutralise them itself.
-    const std::string hostile = "evil=1,x\r\n[error] FORGED";
-    auto planted = f.scim_store->create_resource(hostile);
-    REQUIRE(planted.has_value());
-    const auto gid = json::parse(
-        f.post("/scim/v2/Groups", {{"displayName", "Crumbs"},
-                                   {"members", json::array({{{"value", planted->scim_id}}})}})
-            ->body)["id"].get<std::string>();
+namespace {
 
-    yuzu::test::LogCapture capture;
+/// A spdlog sink that records what reaches it, counts flushes, and optionally throws on the
+/// crash-breadcrumb line (its logger's error handler rethrows, so the exception reaches the
+/// caller of `spdlog::info`, as a failing format or a broken sink would).
+class BreadcrumbProbeSink final : public spdlog::sinks::base_sink<std::mutex> {
+public:
+    bool throw_on_breadcrumb = false;
+    int flushes = 0;
+    int breadcrumb_attempts = 0;
+    std::vector<std::string> lines;
+    int flushes_after_breadcrumb = 0;
+
+protected:
+    void sink_it_(const spdlog::details::log_msg& msg) override {
+        const std::string text(msg.payload.data(), msg.payload.size());
+        if (text.find("role recompute starting") != std::string::npos) {
+            ++breadcrumb_attempts;
+            seen_breadcrumb_ = true;
+            if (throw_on_breadcrumb)
+                throw std::runtime_error("injected sink failure");
+        }
+        lines.push_back(text);
+    }
+    void flush_() override {
+        ++flushes;
+        if (seen_breadcrumb_)
+            ++flushes_after_breadcrumb;
+    }
+
+private:
+    bool seen_breadcrumb_ = false;
+};
+
+/// Installs a probe-sink logger as the default logger for its lifetime.
+struct BreadcrumbProbe {
+    std::shared_ptr<BreadcrumbProbeSink> sink = std::make_shared<BreadcrumbProbeSink>();
+    std::shared_ptr<spdlog::logger> prev = spdlog::default_logger();
+    spdlog::level::level_enum prev_level = spdlog::get_level();
+    BreadcrumbProbe() {
+        auto logger = std::make_shared<spdlog::logger>("breadcrumb_probe", sink);
+        logger->set_level(spdlog::level::trace);
+        logger->set_error_handler([](const std::string& msg) { throw std::runtime_error(msg); });
+        spdlog::set_default_logger(logger);
+        spdlog::set_level(spdlog::level::trace);
+    }
+    void stop() {
+        spdlog::set_default_logger(prev);
+        spdlog::set_level(prev_level);
+    }
+    ~BreadcrumbProbe() { stop(); }
+};
+
+} // namespace
+
+TEST_CASE("ScimRoutes: the crash-breadcrumb flushes the logger right after its line (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto uid = json::parse(f.post("/scim/v2/Users", {{"userName", "fl_one"}})->body)["id"]
+                         .get<std::string>();
+    const auto gid =
+        json::parse(f.post("/scim/v2/Groups", {{"displayName", "Crumbs"},
+                                               {"members", json::array({{{"value", uid}}})}})
+                        ->body)["id"].get<std::string>();
+    BreadcrumbProbe probe;
     REQUIRE(f.put("/scim/v2/Groups/" + gid, {{"displayName", "Crumbs"}, {"members", json::array()}})
                 ->status == 200);
-    capture.stop();
-    const std::string logs = without_sink_crlf(capture.text());
-    const std::string neutral = ::yuzu::log_token(hostile);
-    REQUIRE(neutral.find_first_of("\r\n=,") == std::string::npos);
-    // Judge the breadcrumb's OWN physical line (other log sites on this path are not its
-    // concern): the whole neutralised name sits on it, and it ends there.
-    const std::string marker = "1 removed member(s): ";
-    const auto at = logs.find(marker);
-    REQUIRE(at != std::string::npos);
-    const auto eol = logs.find('\n', at);
-    const std::string line = logs.substr(at, eol == std::string::npos ? eol : eol - at);
-    CHECK(line == marker + neutral);
-    CHECK(line.find('\r') == std::string::npos);
+    probe.stop();
+    CHECK(probe.sink->breadcrumb_attempts == 1);
+    CHECK(probe.sink->flushes_after_breadcrumb >= 1);
+}
+
+TEST_CASE("ScimRoutes: a logger that throws on the crash-breadcrumb does not skip the recompute "
+          "(#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][breadcrumb]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto uid = json::parse(f.post("/scim/v2/Users", {{"userName", "th_admin"}})->body)["id"]
+                         .get<std::string>();
+    const auto gid =
+        json::parse(f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"},
+                                               {"members", json::array({{{"value", uid}}})}})
+                        ->body)["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.get_user_role("th_admin").value() == auth::Role::admin);
+
+    BreadcrumbProbe probe;
+    probe.sink->throw_on_breadcrumb = true;
+    const auto res = f.put("/scim/v2/Groups/" + gid,
+                           {{"displayName", "Yuzu-Admins"}, {"members", json::array()}});
+    probe.stop();
+    REQUIRE(res);
+    CHECK(res->status == 200); // the helper swallowed the logger failure
+    CHECK(probe.sink->breadcrumb_attempts == 1);
+    // The recompute loop still ran: the removed member was demoted and the request says complete.
+    CHECK(f.auth_mgr.get_user_role("th_admin").value() == auth::Role::user);
+    CHECK(only_detail(f, "scim.group.updated", gid) == "recompute=complete");
 }
 
 TEST_CASE("RefusalLogThrottle: one warn per key per interval, bounded memory, clock-injected "
