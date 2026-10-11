@@ -871,7 +871,7 @@ first) but writes no audit row.
 
 The `400` bounds a single value. The transport rejects a request target longer than 8192 bytes
 (httplib `CPPHTTPLIB_REQUEST_URI_MAX_LENGTH`, for the whole target including the query string)
-with a bare `414` before any handler runs, so that status carries no A4 envelope. A heavily
+with a bare `414` (an empty body, no Content-Type and no A4 envelope) before any handler runs. A heavily
 percent-encoded value (about 2.7 KB decoded when every byte is a 3-byte percent escape) or several
 individually legal values (for example four values of 2048 bytes) can still reach that limit.
 

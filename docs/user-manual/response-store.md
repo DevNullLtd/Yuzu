@@ -337,8 +337,8 @@ operator-visible notes:
     agent has the value.
   - **Carriage return.** A stored value that contains a carriage return can reach the server with a
     line feed when it is picked from the dashboard, and is then refused although an agent has it.
-    This was confirmed in headless Chromium (an option value of `x\ny` was sent by htmx as `%0A`);
-    other browsers were not tested.
+    In headless Chromium a stored `x<CR>y` appeared as option.value `x<LF>y` and htmx sent `%0A`;
+    other engines were not tested.
   - **Dashboard wording.** The dashboard shows a short plain message. For a filter you set: "That
     filter value can't be searched. It may be too long, or contain a line break. Shorten it or clear
     the filter." For a View's saved filter: "This View has a built-in filter on <column> that can't
@@ -349,6 +349,11 @@ operator-visible notes:
   - **Request size.** The refusal bounds a single value. The transport answers a bare `414` for a
     request target over 8192 bytes before any handler runs, so a heavily percent-encoded value
     (about 2.7 KB decoded) or several individually legal values can still hit that limit.
+  - **Dashboard refresh while a filter is applied.** The chart deck refreshes itself every 2 seconds
+    with a request that carries no filter state, so it can briefly overwrite the pager and summary
+    of a filtered view with unfiltered ones (#5669). A column-header sort or a pagination click made
+    while a filter change is still in flight re-sends the filters of the last render, not the
+    change in flight (same family, #5669).
   - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column,
     then value, so a rare value can be cut. The symptom is an agent missing from a facet filter or
     preview while its response still shows in the results.
@@ -356,11 +361,15 @@ operator-visible notes:
     by `cap`) has no facets re-derived afterwards, and nothing marks such a response as affected
     (#5630). The workaround is to run the command again. See
     `yuzu_server_response_facets_dropped_total` in [metrics.md](metrics.md).
-  - **Audit and counting.** Each refused request is counted once in
-    `yuzu_server_response_facet_filter_refused_total{surface}` (`dashboard`, `rest` or `mcp`), unless
-    authorization refused it first; see [metrics.md](metrics.md). A refusal writes no audit row on
-    the MCP direct path of `preview_management_group_agent_count`, the REST route or the refused
-    group-from-results POST, so the counter is the only record. The bare `414` is not counted.
+  - **Audit and counting.** A refusal is counted once in
+    `yuzu_server_response_facet_filter_refused_total{surface}` (`dashboard`, `rest` or `mcp`) at the
+    handler's refusal site, after authorization, so it is not counted when authorization refused
+    first; see [metrics.md](metrics.md). A refusal writes no audit row on the MCP direct path of
+    `preview_management_group_agent_count`, the REST route or the refused group-from-results POST,
+    so on those paths the counter is the only record. On the MCP approval-gated (supervised) tier a
+    value over 2048 characters is rejected earlier by the tool schema; that call is audited as
+    `denied` and counted in `yuzu_mcp_tool_args_invalid_total`, not here. The bare `414` is not
+    counted.
 
 ## Retention and cleanup
 

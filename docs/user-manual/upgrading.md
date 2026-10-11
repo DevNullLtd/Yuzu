@@ -98,8 +98,8 @@ does not restore it.
 answer `200` with `agent_count: 0` for a filter value that can never match a stored facet. They now
 refuse it: REST answers `400` (A4 envelope, `retry_after_ms: null`, not retryable) and MCP answers
 `-32602`. A value is refused when it is over 2048 bytes or contains a NUL byte, a line feed or invalid
-UTF-8. The `0` was a false answer (the request was never evaluated), which is why this is fixed
-rather than versioned. [`api-versioning-policy.md`](../api-versioning-policy.md) lists narrowing
+UTF-8. No stored facet can equal such a value, so the `0` told the caller nothing true about the fleet,
+which is why this is fixed rather than versioned. [`api-versioning-policy.md`](../api-versioning-policy.md) lists narrowing
 accepted input as Breaking; this is a deliberate correctness fix and no security carve-out is claimed.
 
 - The check runs on the raw values before the filter key is resolved, so the same value under an
@@ -112,8 +112,9 @@ accepted input as Breaking; this is a deliberate correctness fix and no security
   not index values over 2048 bytes (they are left out of the response's facets, never truncated). After
   the upgrade such a value, already stored, cannot be matched, and the dashboard refuses to use one that
   is picked from a facet dropdown (the dropdown can still list it) until retention removes the row.
-- **Dashboard.** `/fragments/results` and the create-group fragment answer HTTP `200` with a
-  refusal row (`data-filter-refused`) instead of an empty table, because htmx drops `4xx` bodies. The
+- **Dashboard.** `/fragments/results` answers HTTP `200` with a refusal row and the create-group
+  fragment with a refusal marker (both carry `data-filter-refused`) instead of an empty table or a
+  preview, because htmx drops `4xx` bodies. The
   `POST` group-from-results answers `400`, whose body htmx does not display. A View whose saved
   `equals` filter has an empty value is refused on the results table too.
 - Above 5000 distinct facets per response, the 5000 kept are now chosen in a fixed order (most lines
