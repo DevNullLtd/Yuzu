@@ -13,6 +13,8 @@
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, ensure_correlation_id
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit, try_persist_audit
 
+#include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -124,6 +126,14 @@ scoped_roster(const InventoryDevicesResult& all, const authz::VisibleSet& scope)
         out.push_back(row);
     }
     return {std::move(out), dropped};
+}
+
+// Audit-trail floor for an id taken raw from a URL: a device id reaches `target_id`
+// on the roster-failure audit rows, so over-long ids and C0 control bytes (CR/LF) are
+// refused before any audit write. Mirrors viz_routes.cpp's agent_id floor.
+bool id_is_audit_safe(const std::string& id) {
+    return id.size() <= auth::kMaxAgentIdLength &&
+           std::none_of(id.begin(), id.end(), [](unsigned char c) { return c < 0x20; });
 }
 
 } // namespace
@@ -238,6 +248,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (id.empty()) {
             res.status = 400;
             send_html(res, "<div class=\"gp-placeholder\">Missing device id.</div>");
+            return;
+        }
+        if (!id_is_audit_safe(id)) {
+            res.status = 400;
+            send_html(res, "<div class=\"gp-placeholder\">Invalid device id.</div>");
             return;
         }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
@@ -532,6 +547,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!gate.admitted) return;
 
         const std::string agent_id = req.matches[1].str();
+        if (!id_is_audit_safe(agent_id)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid device id"), "application/json");
+            return;
+        }
         if (!authz::in_scope(gate.scope, agent_id)) {
             // Out-of-scope collapses to the same "not found" as a genuinely
             // nonexistent id — the SAME 404 existence-oracle closure

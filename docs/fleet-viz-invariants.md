@@ -426,8 +426,9 @@ rules for the `viz_routes.cpp::handle_topology` merge:
 - **The DoS cap counts merged nodes.** `machines_max` is enforced on the
   merged total (`live + offline`), so the offline merge can never smuggle the
   response past the cap.
-- **Typed read, live-only on failure (UP-13, closed by #5531).** The offline read
-  is typed; a failure still renders live-only (do not "fix" this by hard-failing
+- **Typed read, live-only on failure (UP-13, closed by #5531 for REST/MCP/audit/metric
+  consumers; the 3D page itself shows no indicator, deliberately out of scope).**
+  The offline read is typed; a failure still renders live-only (do not "fix" this by hard-failing
   the request) but sets `offline_roster_degraded: true` in the `fleet_topology.v1`
   envelope on REST and MCP, appends `offline_roster_degraded=1` to the
   `viz.fleet_topology` audit detail, and increments

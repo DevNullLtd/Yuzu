@@ -704,6 +704,15 @@ On Linux, `vuln_scan` (`scan`, `config_scan`) now reports a config file it could
 
 No config or data migration is required.
 
+## Behaviour change: a failed device-roster read is reported instead of shown as an empty fleet (#5531)
+
+**Not a Breaking lead:** `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` already declared a `503` response; what changes is when it fires. Before this release a failed read of the persisted device roster (pool timeout or query error) was shown as an empty roster.
+
+- **`GET /api/v1/hardware`:** a failed roster read now answers `503` with `retry_after_ms` instead of a `200` with no rows. The Hardware list shows the "Hardware roster unavailable" banner instead of an empty table.
+- **`GET /api/v1/hardware/{id}`:** when the roster read failed and the device was not otherwise found (CI record readable-and-absent, no software, no tags) the route answers `503`, not `404`. A record that can still be served carries a new additive key `identity_state` (`found`, `degraded` or `absent`).
+- **`GET /api/v1/viz/fleet/topology` and MCP `get_fleet_topology`:** still return the live fleet; the body now carries `offline_roster_degraded: true` when the durable offline-host read failed.
+- **Observability:** the failure is counted on `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}` (once per failed read, not per cache window) and the audit rows record `result=failure`.
+
 ## Informational: internal-CA CRL publish/audit/observability follow-ups (HA WS-6, #4828–#4830)
 
 No schema, config, or wire-shape change — this is documentation of behaviour that already

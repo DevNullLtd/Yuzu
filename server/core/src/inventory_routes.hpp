@@ -106,7 +106,7 @@ struct InventoryDeviceRow {
 /// "CI columns unavailable" banner and the REST `ci_degraded` field read this bit so a
 /// partial read is never shown as genuinely-empty columns (#1785 review HIGH-1). The
 /// `inventory.devices` audit row is emitted as `success` regardless; this bit does not
-/// gate it.
+/// gate it (except when `roster_degraded` is set, which audits `failure`).
 struct InventoryDevicesResult {
     std::vector<InventoryDeviceRow> rows;
     bool ci_degraded = false;

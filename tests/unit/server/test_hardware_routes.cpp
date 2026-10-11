@@ -722,8 +722,8 @@ HardwareCiDetail degraded_identity_detail(bool with_ci) {
 } // namespace
 
 // Kills: dropping the roster_degraded guard in the list fragment (empty table, no failure audit).
-TEST_CASE("route: list fragment — roster read failure renders the roster-unavailable banner, "
-          "never an empty table, and audits failure",
+TEST_CASE("route: list fragment — roster read failure renders the roster-unavailable banner; "
+          "never an empty table; and audits failure",
           "[hardware][route]") {
     HwHarness h;
     h.roster_degraded = true;
@@ -742,6 +742,7 @@ TEST_CASE("route: list fragment — roster read failure renders the roster-unava
     REQUIRE(ro->body.rfind("<div id=\"hw-results\" data-url=\"", 0) == 0);
     REQUIRE(contains(ro->body, "q=abc"));
     REQUIRE(contains(ro->body, "Hardware roster unavailable"));
+    REQUIRE(contains(ro->body, "results_only=1")); // retry must not nest a full page in #hw-results
 
     // A bad request still precedes the degrade arm.
     auto bad = h.sink.Get("/fragments/hardware/list?sort=bogus");
@@ -765,7 +766,7 @@ TEST_CASE("route: list fragment — roster failure with a degraded audit store k
 }
 
 // Kills: dropping the roster_degraded guard in the REST list (200 with an empty data page).
-TEST_CASE("route: GET /api/v1/hardware — roster read failure is 503 with retry_after_ms, no data",
+TEST_CASE("route: GET /api/v1/hardware — roster read failure is 503 with retry_after_ms and no data",
           "[hardware][route][rest]") {
     {
         HwHarness h;
@@ -823,7 +824,7 @@ TEST_CASE("route: CI fragment — identity_degraded with no readable record says
 
 // Kills: widening the degrade arm to a blanket "roster unreadable" (hides a readable CI record),
 // and dropping the result=failure on a degraded identity.
-TEST_CASE("route: CI fragment — identity_degraded with a readable CI record still renders it, "
+TEST_CASE("route: CI fragment — identity_degraded with a readable CI record still renders it "
           "with the identity note",
           "[hardware][route]") {
     HwHarness h;
@@ -844,7 +845,7 @@ TEST_CASE("route: CI fragment — identity_degraded with a readable CI record st
 }
 
 // Kills: letting truly_absent fall through to the existence 404 when identity_degraded.
-TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with nothing else readable is 503, "
+TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with nothing else readable is 503 - "
           "never 404",
           "[hardware][route][rest]") {
     {
@@ -879,6 +880,36 @@ TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with nothing e
         REQUIRE(res);
         REQUIRE(res->status == 404);
     }
+}
+
+// Kills: moving the scope check below the roster 503 arm (out-of-scope ids would answer
+// 503-vs-404, an existence oracle).
+TEST_CASE("route: GET /api/v1/hardware/{id} - scope 404 precedes the roster 503 arm",
+          "[hardware][route][rest][security]") {
+    HwHarness h;
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    h.ci_detail = degraded_identity_detail(false);
+    auto res = h.sink.Get("/api/v1/hardware/agent-out");
+    REQUIRE(res);
+    REQUIRE(res->status == 404);
+    REQUIRE(h.audits.empty());
+}
+
+// Kills: dropping the audit-trail id floor - a CR/LF id would reach target_id on the
+// roster-failure audit row.
+TEST_CASE("route: hardware record id with control bytes is 400 and never audited",
+          "[hardware][route][rest][security]") {
+    HwHarness h;
+    h.ci_detail = degraded_identity_detail(false);
+    // TestRouteSink does not percent-decode, so pass the raw CR/LF a decoded request carries.
+    const std::string bad_id = "a\r\nb";
+    auto rest = h.sink.Get("/api/v1/hardware/" + bad_id);
+    REQUIRE(rest);
+    REQUIRE(rest->status == 400);
+    auto frag = h.sink.Get("/fragments/hardware/ci?id=" + bad_id);
+    REQUIRE(frag);
+    REQUIRE(frag->status == 400);
+    REQUIRE(h.audits.empty());
 }
 
 // Pins the documented dual-degraded shape: a degraded CI store alongside a degraded roster

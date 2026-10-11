@@ -92,7 +92,8 @@ struct PresenceIdentity {
     std::string arch;
 };
 
-/// `query_live_ids`'s typed failure surface (#4981 PR-1, Finding B).
+/// `query_live_ids`'s and `query_stale_within`'s typed failure surface (#4981 PR-1, Finding B;
+/// #5531). `query_stale_within` never produces `Truncated`.
 /// `StoreUnavailable`/`DbError` mirror `record_presence_store_failure`'s
 /// existing `reason` label vocabulary (`store_unavailable`/`db_error`,
 /// offline_endpoint_store.cpp) exactly — do not introduce a third spelling.
@@ -159,9 +160,10 @@ public:
                 std::string_view session_id = {});
 
     /// Every endpoint whose last heartbeat is within `window` of now, newest
-    /// first. The viz handler renders those NOT currently online as stale
-    /// cubes; rows older than `window` are withheld so a long-departed host
-    /// eventually stops cluttering the view. #5531: typed — `std::unexpected`
+    /// first. Its consumers (Hardware list/record, viz, MCP) render those NOT
+    /// currently online as offline rows / stale cubes; rows older than `window`
+    /// are withheld so a long-departed host eventually stops cluttering the
+    /// view. #5531: typed — `std::unexpected`
     /// (`StoreUnavailable`: no connection in time; `DbError`: the query
     /// failed) on a failed read, never an empty vector; an empty success
     /// means "no rows". `Truncated` is never produced: the read keeps

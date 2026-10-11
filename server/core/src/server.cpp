@@ -17649,7 +17649,7 @@ private:
             // Persisted endpoints within a 30-day window — OFFLINE-INCLUSIVE (the whole
             // point of the device tab: readable when a device is offline). Aged-out hosts
             // beyond the window are withheld so the list doesn't accrete dead hosts forever.
-            auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
+            auto eps = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
             if (!apply_roster_read(result, eps)) // #5531: unread, not empty — no enrichment
                 return result;
             // currently-connected agents (live registry). all_ids() copies only the ids
@@ -17673,7 +17673,7 @@ private:
                 r.arch = e.arch;
                 r.online = online.count(e.agent_id) > 0;
                 const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
-                r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000); // matches the inventory stale window
+                r.stale = age_ms > kHardwareStaleAfterMs; // matches the inventory stale window
                 r.last_seen = r.online ? std::string("now") : inv_human_age(age_ms);
                 r.last_seen_ms = r.online ? now_ms : e.last_heartbeat_ms;
                 out.push_back(std::move(r));
@@ -17686,9 +17686,8 @@ private:
             // UNFILTERED roster — confinement is HardwareRoutes' `scoped_roster` on the
             // FleetReadGate scope, downstream of this join; attach_device_ci only ever
             // looks up by an agent_id already in `out`, never re-deriving
-            // visibility. A degrade (nullopt) leaves CI columns
-            // blank — the roster itself is still shown (this list is best-effort, unlike
-            // the Software tab's authoritative reads; see the existing empty-roster note).
+            // visibility. A CI-join degrade (nullopt) leaves CI columns
+            // blank; the roster read itself is typed and handled by apply_roster_read above.
             // KNOWN FOLLOW-UP (#1783 — gov Gate 3 performance + architect + Gate 5 chaos
             // review): this reads the WHOLE fleet's CI on every render regardless of how
             // few devices are visible, unlike the Software tab's hourly rollup
@@ -17746,20 +17745,10 @@ private:
                 }
             }
             if (tag_store_) {
-                const auto keys = tag_store_->get_distinct_keys().value_or(std::vector<std::string>{});
-                auto values_res = tag_store_->get_values_for_keys(keys);
-                if (values_res) {
-                    for (auto& r : out) {
-                        auto it = values_res->find(r.agent_id);
-                        if (it == values_res->end())
-                            continue;
-                        r.tags.reserve(it->second.size());
-                        for (const auto& [k, v] : it->second)
-                            r.tags.emplace_back(k, v);
-                    }
-                } else {
-                    result.tags_degraded = true;
-                }
+                apply_tag_read(result, tag_store_->get_distinct_keys(),
+                               [this](const std::vector<std::string>& keys) {
+                                   return tag_store_->get_values_for_keys(keys);
+                               });
             } else {
                 result.tags_degraded = true;
             }
@@ -17791,7 +17780,7 @@ private:
             }
             if (!offline_endpoint_store_)
                 return std::optional<InventoryDeviceRow>{};
-            const auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
+            const auto eps = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
@@ -17897,7 +17886,7 @@ private:
                 // #5531 exception: display-only; a failed read leaves hostnames
                 // unresolved and the page falls back to the agent_id.
                 for (auto& e : offline_endpoint_store_->query_stale_within(
-                                   std::chrono::hours(24 * 30))
+                                   kHardwareRosterWindow)
                                    .value_or(std::vector<OfflineEndpoint>{}))
                     out.emplace(std::move(e.agent_id), std::move(e.hostname));
                 return out;

@@ -28026,6 +28026,8 @@ TEST_CASE("MCP get_fleet_topology: reads LIVE FleetTopologyStore snapshot, shari
     CHECK(payload["schema"] == "fleet_topology.v1");
     REQUIRE(payload["machines"].is_array());
     CHECK(payload["machines"].size() == 2);
+    // Unwired roster closure = live-only legacy behaviour, never "degraded".
+    CHECK_FALSE(payload.contains("offline_roster_degraded"));
 
     REQUIRE(ts.audit_log.size() == 1);
     CHECK(ts.audit_log[0] == "viz.fleet_topology|success");

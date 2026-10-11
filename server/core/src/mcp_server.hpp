@@ -545,8 +545,8 @@ public:
     /// `get_fleet_topology`/`get_host_topology` (mirrors GET
     /// /api/v1/viz/fleet/topology and GET /api/v1/viz/host/{id}/topology).
     /// Same setter idiom as `set_preflight_run_store` above. `offline_roster_fn`
-    /// may be empty (offline hosts are then not stale-flagged, matching
-    /// `VizRoutes`' own null-offline-store legacy behavior); `kill_switch`
+    /// may be empty (offline hosts are then not stale-flagged: the empty
+    /// roster function is the live-only legacy behaviour); `kill_switch`
     /// may be null (then the viz kill switch is never consulted on the MCP
     /// path — production MUST wire the same `--viz-disable` /
     /// `yuzu_viz_disabled` atomic the REST `VizRoutes` registration uses, or

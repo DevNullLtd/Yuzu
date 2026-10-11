@@ -422,6 +422,47 @@ existence-oracle closure exactly).
 
 ---
 
+#### `GET /api/v1/hardware`
+
+The Hardware list: the device roster (identity fields as for `/devices`) plus device-CI columns, a per-page DEX score, claimed IPs and tags.
+
+**Permission:** `Inventory:Read`, via `require_fleet_read` (admit-then-filter).
+
+**Query parameters:** `q`, `os`, `status`, `sort`, `dir`, `tag`, `offset`, `limit`. An unrecognised `sort`, `dir`, `os` or `status` token is a `400`.
+
+**Response:** `{ "data": { "devices": [...], "count", "total_matching", "devices_omitted", "ci_degraded", "tags_degraded", "kpis", "query" }, "pagination", "meta" }`.
+
+| Status | Meaning |
+|---|---|
+| `200` | The roster was read. `ci_degraded` / `tags_degraded` are `true` when the CI or tag store could not be read, so those columns are blank rather than genuinely absent. |
+| `400` | Unrecognised `sort`, `dir`, `os` or `status` token. |
+| `403` | Caller lacks `Inventory:Read`. |
+| `503` | Route misconfigured (roster or audit unwired), the device roster could not be read (`retry_after_ms` set), or the audit row could not be persisted. A failed roster read is never a `200` with an empty list. |
+
+**Audit:** `inventory.devices`; `result=success` on a served page, `result=failure` (detail `hardware roster read failed`) when the roster could not be read. A persist failure on the success row fails the request closed with `503`.
+
+---
+
+#### `GET /api/v1/hardware/{id}`
+
+One device's CI record: identity, device-CI blob, installed software and tags, each read independently so a degraded read is distinguishable from an absent one.
+
+**Permission:** `Inventory:Read`, via `require_fleet_read`. An id outside the caller's fleet-read scope returns the same `404` as a nonexistent id.
+
+**Response:** `{ "data": { "agent_id", "hostname", "os", "online", "last_seen", "identity_state", "ci", "ci_state", "software", "tags", ... }, "meta" }`. `identity_state` is `found`, `degraded` (the device roster could not be read) or `absent`; `ci_state` is `found`, `absent` or `degraded`.
+
+| Status | Meaning |
+|---|---|
+| `200` | The record. A degraded CI store alongside a degraded roster is still a `200` carrying `identity_state` and `ci_state` as `degraded`. |
+| `400` | Device id longer than the agent-id limit or containing control characters. |
+| `403` | Caller lacks `Inventory:Read`. |
+| `404` | Not found, or outside the caller's fleet-read scope (indistinguishable by design). |
+| `503` | Route misconfigured, audit row not persisted, or the device roster could not be read (`retry_after_ms` set) and the device was not otherwise found (CI record readable-and-absent, no software, no tags). Never a `404`. |
+
+**Audit:** `inventory.device.ci`; `result=failure` when the roster read failed (detail `state=roster unreadable` on the `503`, `state=<...> identity=roster unreadable` on a served `200`).
+
+---
+
 ### Management Groups
 
 Management groups organize agents into a hierarchy for access scoping. Groups can be **static** (manually assigned members) or **dynamic** (membership determined by a scope expression evaluated against agent tags and properties).
@@ -8136,7 +8177,7 @@ Returns the full topology as JSON.
 
 `schema_minor` is bumped (not `schema`) on additive evolution; renderers MUST ignore unknown keys.
 
-Optional top-level key `offline_roster_degraded: true` is present only when the durable offline-host read failed; `machines` is then live-only. It is a request-time, envelope-level annotation like `audit_persisted` (set per request, outside the cached snapshot document), not a `schema_minor` change.
+Optional top-level key `offline_roster_degraded: true` is present only when the durable offline-host read failed; `machines` is then live-only. It is a request-time, envelope-level annotation like the MCP twin's `audit_persisted` (set per request, outside the cached snapshot document), not a `schema_minor` change.
 
 **`schema_minor` history:**
 

@@ -652,6 +652,53 @@ TEST_CASE("apply_roster_read: failed read sets every degraded bit; healthy read 
     CHECK_FALSE(healthy.tags_degraded);
 }
 
+// Kills: a failed key read collapsed to "no keys" (blank Tags column reads as authoritative), a
+// failed values read ignored, the reader being called after a failed key read, a healthy read
+// (incl. empty keys / a device with no tags) being flagged degraded, and tags not being attached.
+TEST_CASE("apply_tag_read: every failed read degrades, every healthy read populates without degrading",
+          "[hardware][model]") {
+    using Keys = std::expected<std::vector<std::string>, TagReadError>;
+    struct Row {
+        const char* name;
+        Keys keys;
+        TagValuesRead values;
+        bool reader_called;
+        bool degraded;
+        std::size_t a1_tags;
+    };
+    const TagValuesRead no_values{TagValuesRead::value_type{}};
+    const std::array<Row, 5> table{{
+        {"key read fails", std::unexpected(TagReadError::kDegraded), no_values, false, true, 0},
+        {"keys ok, values fail", Keys{std::vector<std::string>{"env"}},
+         std::unexpected(TagReadError::kDegraded), true, true, 0},
+        {"keys ok, values ok",
+         Keys{std::vector<std::string>{"env"}},
+         TagValuesRead{TagValuesRead::value_type{{"a1", {{"env", "prod"}}}}}, true, false, 1},
+        {"keys ok but empty", Keys{std::vector<std::string>{}}, no_values, true, false, 0},
+        {"keys ok, device has no tags", Keys{std::vector<std::string>{"env"}},
+         TagValuesRead{TagValuesRead::value_type{{"a2", {{"env", "dev"}}}}}, true, false, 0},
+    }};
+    for (const auto& row : table) {
+        CAPTURE(row.name);
+        InventoryDevicesResult result;
+        result.rows.resize(2);
+        result.rows[0].agent_id = "a1";
+        result.rows[1].agent_id = "a2";
+        bool called = false;
+        apply_tag_read(result, row.keys, [&](const std::vector<std::string>&) {
+            called = true;
+            return row.values;
+        });
+        CHECK(called == row.reader_called);
+        CHECK(result.tags_degraded == row.degraded);
+        CHECK(result.rows[0].tags.size() == row.a1_tags);
+        if (row.a1_tags) {
+            CHECK(result.rows[0].tags.front().first == "env");
+            CHECK(result.rows[0].tags.front().second == "prod");
+        }
+    }
+}
+
 // Kills: offline_identity_row swallowing the read error into an empty optional ("not found").
 TEST_CASE("offline_identity_row: error propagates; hit is offline; miss is nullopt",
           "[hardware][model]") {

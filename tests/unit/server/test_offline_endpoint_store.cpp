@@ -299,7 +299,7 @@ TEST_CASE("OfflineEndpointStore reports !is_open on a migration failure", "[pg][
 // roster read) shares the same held lock — a failed read is never an empty
 // vector and is counted under op=query_stale_within.
 TEST_CASE("OfflineEndpointStore query_live_ids and query_stale_within report DbError on a "
-          "genuine query failure, not a silent empty vector",
+          "genuine query failure - not a silent empty vector",
           "[pg][offline]") {
     YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
 

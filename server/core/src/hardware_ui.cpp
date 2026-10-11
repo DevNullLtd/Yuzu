@@ -570,8 +570,8 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
             h += "</div></div>";
         } else if (detail.identity_degraded) {
             h += "<div class=\"hw-degrade\"><b>Device identity unavailable.</b> The device roster "
-                 "could not be read &mdash; hostname, OS and last-seen are shown from the CI record "
-                 "or omitted; this is not \"not found\".</div>";
+                 "could not be read &mdash; the agent id is shown in place of the hostname, OS is "
+                 "omitted and last-seen is unknown; this is not \"not found\".</div>";
         }
         if (!detail.ci.has_value()) {
             h += "<div class=\"hw-degrade\"><b>CI record unavailable.</b> The device-CI store could "

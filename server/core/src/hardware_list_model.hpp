@@ -26,11 +26,14 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server {
@@ -154,11 +157,30 @@ inline constexpr std::size_t kHwSoftwareCap = 2000;
 inline constexpr std::array<int, 3> kSyncNowMinAgentVersion{0, 13, 1};
 [[nodiscard]] bool agent_supports_sync_now(std::string_view agent_version) noexcept;
 
+/// Hardware roster read window and stale threshold: the list and the record fallback must
+/// agree, or a listed device's record reads "not found".
+inline constexpr std::chrono::hours kHardwareRosterWindow{24 * 30};
+inline constexpr std::int64_t kHardwareStaleAfterMs = 2LL * 24 * 60 * 60 * 1000;
+
 // ── #5531: the store-to-bit mappings, pure so a revert is visible to a unit test ──
 
 /// Failed read -> `roster_degraded` + `ci_degraded` + `tags_degraded` (no enrichment of an
 /// unknown roster) and returns false; a healthy read touches nothing and returns true.
 [[nodiscard]] bool apply_roster_read(InventoryDevicesResult& result, const OfflineRosterRead& eps);
+
+/// `agent_id -> (key -> value)` bulk tag read (`TagStore::get_values_for_keys`).
+using TagValuesRead =
+    std::expected<std::unordered_map<std::string, std::unordered_map<std::string, std::string>>,
+                  TagReadError>;
+using TagValuesReader = std::function<TagValuesRead(const std::vector<std::string>&)>;
+
+/// Fills `result.rows[*].tags` from the bulk tag read, or sets `tags_degraded`. A failed KEY read
+/// degrades without calling `read_values` (an empty key list would otherwise read back as an
+/// authoritative blank); a failed VALUES read degrades; a healthy read — including an empty key
+/// list or a device with no tags — leaves `tags_degraded` false.
+void apply_tag_read(InventoryDevicesResult& result,
+                    const std::expected<std::vector<std::string>, TagReadError>& keys,
+                    const TagValuesReader& read_values);
 
 /// One device's identity from an offline-roster read: the error is propagated (a failed read
 /// is never "not in the roster"); a healthy read yields the matching row (online=false, stale

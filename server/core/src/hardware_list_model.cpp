@@ -591,6 +591,28 @@ bool apply_roster_read(InventoryDevicesResult& result, const OfflineRosterRead& 
     return false;
 }
 
+void apply_tag_read(InventoryDevicesResult& result,
+                    const std::expected<std::vector<std::string>, TagReadError>& keys,
+                    const TagValuesReader& read_values) {
+    if (!keys) {
+        result.tags_degraded = true; // unread keys, not "no keys"
+        return;
+    }
+    const auto values = read_values(*keys);
+    if (!values) {
+        result.tags_degraded = true;
+        return;
+    }
+    for (auto& r : result.rows) {
+        auto it = values->find(r.agent_id);
+        if (it == values->end())
+            continue;
+        r.tags.reserve(it->second.size());
+        for (const auto& [k, v] : it->second)
+            r.tags.emplace_back(k, v);
+    }
+}
+
 std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>
 offline_identity_row(const OfflineRosterRead& eps, std::string_view agent_id, std::int64_t now_ms,
                      std::string (*human_age)(std::int64_t)) {
@@ -607,7 +629,7 @@ offline_identity_row(const OfflineRosterRead& eps, std::string_view agent_id, st
         r.arch = e.arch;
         r.online = false;
         const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
-        r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000);
+        r.stale = age_ms > kHardwareStaleAfterMs;
         r.last_seen = human_age(age_ms);
         r.last_seen_ms = e.last_heartbeat_ms;
         return std::optional<InventoryDeviceRow>{std::move(r)};

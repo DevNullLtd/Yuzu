@@ -143,6 +143,8 @@ TEST_CASE("REST viz: GET JSON returns fleet_topology.v1 envelope", "[viz][routes
     REQUIRE(j.contains("machines"));
     REQUIRE(j["machines"].is_array());
     CHECK(j["machines"].size() == 2);
+    // Unwired roster closure = live-only legacy behaviour, never "degraded".
+    CHECK_FALSE(j.contains("offline_roster_degraded"));
 
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "viz.fleet_topology");
@@ -674,7 +676,7 @@ TEST_CASE("REST viz: a failed offline-roster read renders live-only with offline
 }
 
 // Kills: setting the flag on success, or not merging the closure's rows.
-TEST_CASE("REST viz: a healthy offline-roster read merges the stale cube, no degraded flag",
+TEST_CASE("REST viz: a healthy offline-roster read merges the stale cube with no degraded flag",
           "[viz][routes]") {
     OfflineRosterFn healthy = [](std::chrono::seconds) {
         OfflineEndpoint ep;
@@ -696,6 +698,7 @@ TEST_CASE("REST viz: a healthy offline-roster read merges the stale cube, no deg
             found_stale = true;
     CHECK(found_stale);
     CHECK_FALSE(j.contains("offline_roster_degraded"));
+    REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].detail.find("offline_roster_degraded") == std::string::npos);
     CHECK(h.metrics.counter("yuzu_viz_offline_hosts_total").value() == 1);
 }
