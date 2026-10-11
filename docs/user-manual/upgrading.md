@@ -4022,7 +4022,7 @@ Before upgrading any component:
   configuration (#1822) auto-restarts on a watchdog fire similarly to the
   Linux `Restart=always` unit, but the exit shows up as a generic unexpected
   termination rather than one of the SCM's own "specific error" buckets.
-  During shutdown the agent now waits about 1 second per lock wait (5 in normal
+  During shutdown the agent now waits about 1 second per statement step (5 in normal
   operation) for a `kv_store.db` that another process holds locked (#5604). SQLite's
   own internal retries (for example on the WAL index) are not covered by that cap and
   were measured at up to about 2.3 seconds against a 1 second budget on Linux (phasing

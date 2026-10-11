@@ -2272,14 +2272,14 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   when `stop()` runs adds about one budget, because each of `stop()`'s serial stages queues
   behind it. Measured on Linux, one run per point, with a journal record pending and a
   non-baseline worker write in flight: 9.0 s with 3 extra writers and 10.98 s with 5.
-  Extrapolated, not run: about 20 s, the watchdog, at about 14 queued writers. The
-  seven-budget target is therefore met with at most one other writer queued, and only to
-  within sleep overshoot: at one extra writer the measurement is about 7.0 to 7.1 s (cause
-  likely, not isolated), and one earlier series under heavy load gave 7.12 s and 8.14 s.
-  The allowance budget is spent twice if a Worker pass in
+  Extrapolated, not run: about 20 s, the watchdog, at about 14 queued writers. At one extra
+  writer the measurement is about 7.0 to 7.1 s in the latest quiet reruns, which meets the
+  7 s target only to within sleep overshoot (cause likely, not isolated); earlier runs under
+  heavy load gave 7.12 s and 8.14 s, so the target is not met under load at one extra
+  writer. The allowance budget is spent twice if a Worker pass in
   flight makes two failed writes and a writer is also queued. A writer that loops costs
   more than one budget: in a standalone `KvStore` run of six serial 1 s stage writes, K
-  other threads looping `set()` with a 50 ms pause took 8.7 to 9.7 s for K=1 and 20.8, 20.8
+  other threads looping `set()` with a 50 ms pause took 8.7 to 9.8 s for K=1 and 20.8, 20.8
   and 23.8 s for K=3 over repeat runs, against 6.0 s with none; the cost is not linear in K
   because `std::mutex` is unfair, and K=3 passes the 20 s grace. A writer that
   loops with no pause at all can starve a `stop()` stage outright because `std::mutex` is
@@ -2343,7 +2343,8 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   #3756)**: the busy handler only bounds lock waits. An fsync or
   other slow-I/O stall inside a write is not a lock event and no handler runs, so a stalled
   disk still runs into the watchdog. On every platform SQLite's WAL-index retry sleeps run
-  outside the handler, so the bound is per busy wait, not per call (measured on Linux with a
+  outside the handler, so the bound is per statement step, not per call: a busy wait that
+  continues within one statement step shares one budget (measured on Linux with a
   peer process holding the WAL index in recovery, a contrived trigger: a write under a 1000
   ms budget returned after 1.74 s and 2.05 s in the first two phasings and after 1.06 to
   2.32 s over six more; phasing dependent, up to about 2.3 s measured, not a cap). On

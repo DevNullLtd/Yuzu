@@ -1451,13 +1451,14 @@ void GuardianEngine::stop() {
     // stop() runs adds about one budget, because each of stop()'s serial stages queues behind
     // it (measured on Linux, one run per point, with a journal record pending and a
     // non-baseline worker write in flight: 9.0 s at 3 extra writers and 10.98 s at 5;
-    // extrapolated, not run: about 20 s, the watchdog, at about 14). So the target is met with
-    // at most one other writer queued, and only to within sleep overshoot: at one extra writer
-    // the measurement is about 7.0 to 7.1 s (cause likely, not isolated), and one earlier series
-    // under heavy load gave 7.12 s and 8.14 s. The allowance budget is spent twice if a Worker
+    // extrapolated, not run: about 20 s, the watchdog, at about 14). At one extra writer the
+    // measurement is about 7.0 to 7.1 s in the latest quiet reruns, which meets the 7 s target
+    // only to within sleep overshoot (cause likely, not isolated); earlier runs under heavy
+    // load gave 7.12 s and 8.14 s, so the target is not met under load at one extra writer.
+    // The allowance budget is spent twice if a Worker
     // pass in flight makes two failed writes and a writer is also queued. A writer that LOOPS
     // costs more: in a standalone KvStore run of six serial 1 s stage writes, K other threads
-    // looping set() with a 50 ms pause took 8.7 to 9.7 s for K=1 and 20.8, 20.8 and 23.8 s for
+    // looping set() with a 50 ms pause took 8.7 to 9.8 s for K=1 and 20.8, 20.8 and 23.8 s for
     // K=3 over repeat runs, against 6.0 s with none; the cost is not linear in K because
     // std::mutex is unfair, and K=3 passes the 20 s grace. A writer that loops with no pause
     // can starve a stop stage outright (one such writer left a stage unserved for over
@@ -1511,9 +1512,11 @@ void GuardianEngine::stop() {
     //                                                 at each point agreed within 3 ms)
     // Every row but the first journal-pending one (which varies from run to run) was measured
     // again at the final handler: unchanged within 11 ms (the largest paired delta is 10.6 ms,
-    // on rows A, C, D and E at matched alignment; row A's two figures are from the earlier
-    // measurement). The runs of the journal-pending row printed as 4.02, 5.02 and 6.03 s span
-    // 4.016 to 4.020, 5.021 to 5.029 and 6.024 to 6.029 s.
+    // on the nothing-pending, baseline-write-in-flight, NON-baseline-write-in-flight and
+    // pending-plus-emulated-write rows at matched alignment; the 3 and 5 staged figures of the
+    // nothing-pending row are from the earlier measurement). The runs of the journal-pending
+    // row printed as 4.02, 5.02 and 6.03 s span 4.016 to 4.020, 5.021 to 5.029 and 6.024 to
+    // 6.029 s.
     // Before the gate, where the stall skipped the pass, the baseline-write row was shorter,
     // 1.71, 1.01 and 1.01 s at its first three points (the fourth, 2.01 s, and the NON-baseline
     // row did not change), and so was the last row, 5.03, 4.74 and 4.33 s. The gate costs one or

@@ -10322,7 +10322,8 @@ TEST_CASE("#5604 A1: a worker baseline write cut by stop()'s lowered budget does
             "capture stays staged with the incomplete ERROR line") {
         heal = Heal::Never;
     }
-    SECTION("the same stall followed by a LATE start is skipped (the accepted late-start rule)") {
+    SECTION("the same stall followed by a LATE start is skipped "
+            "(the late-start rule, implementer decision)") {
         stall_ms = yuzu::agent::kBaselineStopLatestStart.count();
         expect_stall_skip = true;
     }

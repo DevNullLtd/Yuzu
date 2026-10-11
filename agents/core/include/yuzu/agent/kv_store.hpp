@@ -272,17 +272,19 @@ public:
      * measured).
      * In WAL mode, which open() sets, every method takes the write lock at most once, so that is
      * at most one budget per call. The budget is per statement step, the same as
-     * sqlite3_busy_timeout()'s: a second lock wait inside ONE step (a rollback-journal step can
-     * wait for the writer lock and then for EXCLUSIVE at commit) shares the first wait's clock,
-     * and every public method except open() starts with a fresh clock. A wait during a prepare
-     * that follows a step that waited in the same call also continues that clock (SQLite zeroes
-     * its count at the END of a prepare): that gives up earlier, never later, and no current
-     * method prepares after a step that waited. In the rollback-journal fallback (WAL could not
-     * be enabled) del_keys(), insert_if_absent() and rename_key() each commit in a second step
-     * and so can cost two budgets (1.81 s against a 1.0 s budget measured on Linux, SQLite 3.52,
-     * with a reader holding SHARED through the commit); set() and clear() stay at one.
+     * sqlite3_busy_timeout()'s: a busy wait that continues within one statement step shares one
+     * budget (a rollback-journal step can wait for the writer lock and then for EXCLUSIVE at
+     * commit), and every public method except open() starts with a fresh clock. A wait during a
+     * prepare that follows a step that waited in the same call also continues that clock (SQLite
+     * zeroes its count at the END of a prepare): that gives up earlier, never later. The only
+     * prepares that follow a waiting step are the COMMIT and ROLLBACK of del_keys; they read no
+     * table and the schema is already loaded, so they are not expected to wait (not measured).
+     * No other method prepares after a waiting step. In the rollback-journal fallback (WAL could
+     * not be enabled) del_keys(), insert_if_absent() and rename_key() each commit in a second
+     * step and so can cost two budgets (1.81 s against a 1.0 s budget measured on Linux, SQLite
+     * 3.52, with a reader holding SHARED through the commit); set() and clear() stay at one.
      *
-     * The bound is per busy wait, not per call, on every platform: SQLite's WAL-index retry
+     * The bound is per statement step, not per call, on every platform: SQLite's WAL-index retry
      * sleeps happen outside the busy handler, which cannot cut them short. Measured on Linux
      * (SQLite 3.52, a 1000 ms budget, a contrived trigger: a peer process holding the WAL index
      * in recovery): set() returned after 1741 ms and 2046 ms in the first two phasings and after

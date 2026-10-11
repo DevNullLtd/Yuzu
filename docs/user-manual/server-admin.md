@@ -5454,9 +5454,10 @@ process holding `kv_store.db` locked (Resource Monitor, or Sysinternals `handle`
 an `expected_hash` for the rules that matter (see "Where the baseline lives" in
 [Guaranteed State](guaranteed-state.md)). On every other agent a code 4 loses no baseline,
 because the legacy path writes it at capture time; still check the disk and any process
-holding `kv_store.db` locked (`fuser` or `lsof` on Linux and macOS). Each lock wait at
-shutdown normally lasts about 1 second per lock wait; SQLite's own internal retries (for
-example on the WAL index) are not covered by that cap and were measured at up to about 2.3
+holding `kv_store.db` locked (`fuser` or `lsof` on Linux and macOS). At shutdown, a
+write to a locked `kv_store.db` normally waits about 1 second per statement step; SQLite's
+own internal retries (for example on the WAL index) are not covered by that cap and were
+measured at up to about 2.3
 seconds against a 1 second budget on Linux (phasing dependent), on every platform. Several
 waits follow one another, so a stop against a locked store can still take several seconds.
 

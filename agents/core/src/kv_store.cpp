@@ -137,12 +137,14 @@ void reset_wait_chain() noexcept {
 // (CallLock), so a handler call whose count happens to equal the last count of an EARLIER call,
 // such as a prepare-time wait after a step that waited, restarts instead of inheriting that
 // call's start. What remains is a second wait inside ONE statement step: it continues the first
-// wait's count and shares its clock, so the budget is per statement step, the same as
-// sqlite3_busy_timeout()'s. One more case remains inside a single call: SQLite zeroes its count
-// at the END of a prepare, not at its start (sqlite3.c 3.52), so a wait during a prepare that
-// follows a step that waited continues that step's clock. That gives up earlier and never waits
-// longer, and no current method prepares after a step that waited. When the handler gives up it
-// forgets the count too.
+// wait's count and shares its clock, so the budget is per statement step (a busy wait that
+// continues within one statement step shares one budget), the same as sqlite3_busy_timeout()'s.
+// One more case remains inside a single call: SQLite zeroes its count at the END of a prepare,
+// not at its start (sqlite3.c 3.52), so a wait during a prepare that follows a step that waited
+// continues that step's clock. That gives up earlier and never waits longer. The only prepares
+// that follow a waiting step are the COMMIT and ROLLBACK of del_keys; they read no table and the
+// schema is already loaded, so they are not expected to wait (not measured). No other method
+// prepares after a waiting step. When the handler gives up it forgets the count too.
 //
 // `count <= 0` also keeps the `count - 1` below away from INT_MIN. For count == 0 it is
 // redundant today (last_count is never -1: it is either kNoPreviousCount or a count SQLite
