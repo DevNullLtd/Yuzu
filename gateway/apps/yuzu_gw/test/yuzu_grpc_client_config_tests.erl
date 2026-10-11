@@ -193,6 +193,43 @@ pool_size_bounds_test() ->
     [?assertMatch(#{pool_size := 1}, ok_opts(#{pool_size => P}))
      || P <- [0, -1, 65, 1000, "4", 2.0, undefined, infinity]].
 
+%% replaced_options/1 reports exactly what channel/2 replaces, so the boot
+%% warning and the behaviour cannot drift: for every value, a replacement is
+%% reported if and only if the option comes out as its default for that reason.
+replaced_options_agree_with_channel_test() ->
+    Values = [0, -1, 1, 2, 64, 65, 1000, 600000, 600001, 1 bsl 30, (1 bsl 30) + 1,
+              "4", <<"4">>, 2.0, undefined, infinity, #{}, {a}, [1]],
+    [begin
+         Raw = #{channels => [{?CH, [{http, "gw", 1, []}], #{Key => V}}]},
+         Reported = [O || #{option := O} <- yuzu_grpc_client_config:replaced_options(Raw)],
+         {ok, [#{Key := Got}]} = yuzu_grpc_client_config:channels(Raw),
+         InRange = is_integer(V) andalso V >= Min andalso V =< Max,
+         ?assertEqual(not InRange, Reported =:= [Key]),
+         ?assertEqual(InRange orelse Got =:= Default, true)
+     end || {Key, Min, Max, Default} <- yuzu_grpc_client_config:option_limits(), V <- Values],
+    ok.
+
+replaced_options_describes_without_contents_test() ->
+    Raw = #{channels => [{?CH, [{http, "gw", 1, []}],
+                          #{pool_size => 100, connect_timeout => "secret-looking",
+                            max_receive_message_bytes => infinity}}]},
+    ?assertEqual(
+       [#{channel => ?CH, option => pool_size, given => "100", min => 1, max => 64, default => 1},
+        #{channel => ?CH, option => connect_timeout, given => "a list", min => 1,
+          max => 600000, default => 5000},
+        #{channel => ?CH, option => max_receive_message_bytes, given => "infinity", min => 1,
+          max => 1 bsl 30, default => 16 * 1024 * 1024}],
+       yuzu_grpc_client_config:replaced_options(Raw)).
+
+replaced_options_ignores_absent_and_malformed_test() ->
+    ?assertEqual([], yuzu_grpc_client_config:replaced_options(undefined)),
+    ?assertEqual([], yuzu_grpc_client_config:replaced_options(#{channels => []})),
+    ?assertEqual([], yuzu_grpc_client_config:replaced_options(
+                       #{channels => [{?CH, [{http, "gw", 1, []}], #{}}]})),
+    ?assertEqual([], yuzu_grpc_client_config:replaced_options(
+                       #{channels => [garbage, {?CH, [{http, "gw", 1, []}], [{pool_size, 0}]}]})),
+    ?assertEqual([], yuzu_grpc_client_config:replaced_options(not_a_map)).
+
 connect_timeout_bounds_test() ->
     [?assertMatch(#{connect_timeout := T}, ok_opts(#{connect_timeout => T})) || T <- [1, 5000, 600000]],
     [?assertMatch(#{connect_timeout := 5000}, ok_opts(#{connect_timeout => T}))

@@ -1155,7 +1155,7 @@ those) is a dev or UAT posture, and the gateway refuses the unsafe half of it at
 
 | Channel option | Default | Meaning |
 |---|---|---|
-| `pool_size` | 1 | HTTP/2 connections **per endpoint**, 1 to 64 (a value outside that range reads as the default, without a warning). One connection is what the grpcbox client held. **Raising it has consequences:** calls go round-robin over the live connections, so behind a layer-4 VIP in front of several server replicas the connections can land on different replicas (see "Several core replicas" under [What happens when the server restarts](#what-happens-when-the-server-restarts)), and after a certificate change the connections redial independently. Registration and inventory calls run one at a time, so a larger pool does not speed them up |
+| `pool_size` | 1 | HTTP/2 connections **per endpoint**, 1 to 64 (a value outside that range is replaced by the default and the gateway logs a warning at boot, see [Bad values replaced by defaults](#bad-values-replaced-by-defaults)). One connection is what the grpcbox client held. **Raising it has consequences:** calls go round-robin over the live connections, so behind a layer-4 VIP in front of several server replicas the connections can land on different replicas (see "Several core replicas" under [What happens when the server restarts](#what-happens-when-the-server-restarts)), and after a certificate change the connections redial independently. Registration and inventory calls run one at a time, so a larger pool does not speed them up |
 | `connect_timeout` | 5000 | Milliseconds allowed for the TCP connect and, separately, for the TLS handshake, 1 to 600000 |
 | `max_receive_message_bytes` | 16777216 (16 MiB) | The largest response message accepted, up to 1 GiB; a larger one fails the call as soon as the limit is passed |
 
@@ -1247,9 +1247,53 @@ to repoint a gateway, not these variables.
 **Two limits of the endpoint.** An IPv6 literal host (`"::1"`) fails name resolution in a
 retry loop unless the endpoint's `socket_options` include `inet6`, and `"[::1]"` fails too;
 the dial is IPv4 only, with no fallback, so `localhost` against an IPv6-only listener reads as
-`econnrefused`. Both look like a server that is down. And a `pool_size` or `connect_timeout`
-outside its range, or not an integer (`"4"`), is replaced by the default **without a log
-line**: check the value you meant against the table above rather than expecting a refusal.
+`econnrefused`. Both look like a server that is down. A `pool_size`,
+`connect_timeout` or `max_receive_message_bytes` that is out of range or not an integer is
+replaced by its default; see [Bad values replaced by defaults](#bad-values-replaced-by-defaults).
+
+#### Bad values replaced by defaults
+
+A channel option that is present but is not an integer inside its range does not stop the
+gateway. It is replaced by the option's default, and the gateway logs one warning per option at
+boot, before it binds any listener:
+
+```
+Upstream channel default_channel: pool_size is 100, not an integer from 1 to 64; the default 1
+is used instead (docs/user-manual/gateway.md 'Bad values replaced by defaults').
+```
+
+The gateway starts anyway on purpose: a typo in a tuning option would otherwise turn into a
+refusal to boot on the next restart, on every gateway that shares the file. The cost is that the
+gateway that runs is not the one the file describes, so look for this warning after any change to
+`upstream_client`.
+
+| Option | Accepted | Default used instead |
+|---|---|---|
+| `pool_size` | integer, 1 to 64 | 1 |
+| `connect_timeout` (ms) | integer, 1 to 600000 | 5000 |
+| `max_receive_message_bytes` | integer, 1 to 1073741824 | 16777216 (16 MiB) |
+
+What the warning says about the value: an integer is printed as it is, an atom by name
+(`infinity`), and anything else only by its type (`a list`, `a binary`, `a float`, `a map`). So
+`"4"` (a string) and `2.0` (a float) are both replaced, and the warning reads `a list` and `a
+float`. The contents are not printed, because these options sit beside the channel's SSL options
+in the same file.
+
+To clear the warning, correct the value in `sys.config`. It takes effect the next time the
+gateway starts, and a restart disconnects every agent the node holds (see [What happens when the
+server restarts](#what-happens-when-the-server-restarts)), so schedule it like any other restart.
+
+What this warning does **not** cover:
+
+- A value that is valid but unwise. A `max_receive_message_bytes` of a few hundred bytes is in
+  range, so it is used as written, and every response larger than that then fails the call
+  after the server has already acted on the request (a `ProxyRegister` is committed on the
+  server and the gateway sees an error).
+- An option that is misspelled or unknown, such as `poolsize`. It is not a bad value, it is
+  simply not read, and nothing is logged.
+- Other gateway settings. Each is described where it is introduced; this warning concerns the
+  channel options above only. `upstream_tcp_nodelay` and the other boolean environment
+  settings log a warning of their own when their value is invalid.
 
 ### TLS posture (M1)
 

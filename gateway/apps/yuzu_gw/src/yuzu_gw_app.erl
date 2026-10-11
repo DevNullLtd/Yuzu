@@ -15,7 +15,7 @@
 -export([apply_env_overrides/0, evaluate_cookie/3]).  %% exported for testing
 -export([client_has_https/1, client_tls_posture/1, listeners_have_tls/1]). %% for testing
 -export([client_all_present_client_cert/1, client_tls_weakest/1, client_has_unverified/1, client_mixed_channels/1]). %% for testing
--export([check_upstream_tls_posture/0, check_upstream_channel_mix/0]).
+-export([check_upstream_tls_posture/0, check_upstream_channel_mix/0, warn_replaced_options/0]).
 -export([evaluate_upstream_posture/2, evaluate_listeners/1]).             %% for testing
 -export([evaluate_mgmt_posture/3, apply_listener_port_overrides/0]).      %% for testing
 -export([check_legacy_grpcbox_servers/0, check_legacy_grpcbox_client/0,
@@ -583,6 +583,7 @@ tls_word(_) ->
 check_upstream_client_config() ->
     case yuzu_grpc_client_config:from_env() of
         {ok, Channels} ->
+            warn_replaced_options(),
             warn_multi_connection(Channels),
             Has = lists:any(fun(#{name := N}) -> N =:= default_channel end, Channels),
             case Has orelse application:get_env(yuzu_gw, allow_no_upstream, false) =:= true of
@@ -606,6 +607,25 @@ check_upstream_client_config() ->
                 "docs/user-manual/gateway.md).", [Why]),
             {error, bad_upstream_client_config}
     end.
+
+%% A channel option that is present but not an integer in its range is replaced
+%% by its default (yuzu_grpc_client_config:channel/2), which is a different gateway
+%% from the one the file describes: a pool_size of 100 runs as 1, a connect_timeout
+%% of 0 as 5000. Said at boot, one line per option, naming the channel, the option,
+%% what was given (a number or a type word, never the contents) and what runs. The
+%% gateway still starts: a refusal here would turn a typo in a tuning knob into a
+%% fleet outage on the next restart.
+-spec warn_replaced_options() -> ok.
+warn_replaced_options() ->
+    [logger:warning(
+       "Upstream channel ~s: ~s is ~s, not an integer from ~b to ~b; the default ~b is "
+       "used instead (docs/user-manual/gateway.md 'Bad values replaced by defaults').",
+       [Channel, Option, Given, Min, Max, Default])
+     || #{channel := Channel, option := Option, given := Given,
+          min := Min, max := Max, default := Default}
+            <- yuzu_grpc_client_config:replaced_options(
+                 application:get_env(yuzu_gw, yuzu_grpc_client_config:env_key(), undefined))],
+    ok.
 
 %% A channel holding more than one connection (pool_size above 1, or several
 %% endpoints) sends its calls round-robin over them. Behind a layer-4 virtual IP

@@ -20,6 +20,9 @@
 %%%   max_receive_message_bytes
 %%%                            the largest response message accepted
 %%%                            (default 16 MiB); a larger one fails the call
+%%% An option that is present but not an integer in its range is replaced by its
+%%% default, not refused; replaced_options/1 lists those so yuzu_gw_app can warn
+%%% at boot.
 %%% One connection per endpoint is the default, as it was: every call a gateway
 %%% makes then reaches ONE server replica through a layer-4 virtual IP, which the
 %%% multi-replica registration reconcile relies on (ADR-2002 7c), and every call
@@ -36,8 +39,8 @@
 -module(yuzu_grpc_client_config).
 
 -export([from_env/0, channels/1, channel/2, nodelay_default/0]).
--export([env_key/0]).
--export_type([channel/0, endpoint/0]).
+-export([env_key/0, replaced_options/1, option_limits/0]).
+-export_type([channel/0, endpoint/0, replaced/0]).
 
 -define(DEFAULT_POOL_SIZE, 1).
 -define(MAX_POOL_SIZE, 64).
@@ -45,11 +48,25 @@
 -define(DEFAULT_MAX_RECEIVE_BYTES, 16 * 1024 * 1024).
 -define(NODELAY_ENV, upstream_tcp_nodelay).
 
+%% The integer options a channel takes, each `{Key, Min, Max, Default}'. A value
+%% outside [Min, Max] or not an integer is replaced by Default (bounded/4);
+%% replaced_options/1 reports each such replacement so the boot log can say so.
+-define(OPTION_LIMITS,
+        [{pool_size,                 1, ?MAX_POOL_SIZE,        ?DEFAULT_POOL_SIZE},
+         {connect_timeout,           1, 600000,                ?DEFAULT_CONNECT_TIMEOUT_MS},
+         {max_receive_message_bytes, 1, 1 bsl 30,              ?DEFAULT_MAX_RECEIVE_BYTES}]).
+
 -type endpoint() :: #{host := string(),
                       port := inet:port_number(),
                       transport := tcp | tls,
                       tls_opts := [ssl:tls_client_option()],
                       tcp_opts := [gen_tcp:connect_option()]}.
+-type replaced() :: #{channel := atom(),
+                      option := atom(),
+                      given := string(),
+                      min := integer(),
+                      max := integer(),
+                      default := integer()}.
 -type channel() :: #{name := atom(),
                      endpoints := [endpoint(), ...],
                      pool_size := pos_integer(),
@@ -89,15 +106,9 @@ channel({Name, Endpoints, Options}, Nodelay)
         {ok, Parsed} ->
             {ok, #{name => Name,
                    endpoints => Parsed,
-                   pool_size => bounded(maps:get(pool_size, Options, ?DEFAULT_POOL_SIZE),
-                                        1, ?MAX_POOL_SIZE, ?DEFAULT_POOL_SIZE),
-                   connect_timeout => bounded(maps:get(connect_timeout, Options,
-                                                       ?DEFAULT_CONNECT_TIMEOUT_MS),
-                                              1, 600000, ?DEFAULT_CONNECT_TIMEOUT_MS),
-                   max_receive_message_bytes =>
-                       bounded(maps:get(max_receive_message_bytes, Options,
-                                        ?DEFAULT_MAX_RECEIVE_BYTES),
-                               1, 1 bsl 30, ?DEFAULT_MAX_RECEIVE_BYTES)}};
+                   pool_size => option(pool_size, Options),
+                   connect_timeout => option(connect_timeout, Options),
+                   max_receive_message_bytes => option(max_receive_message_bytes, Options)}};
         {error, _} = Error ->
             Error
     end;
@@ -167,6 +178,44 @@ socket_options(Settings, Nodelay) ->
         Bad ->
             {error, {bad_socket_options, shape(Bad)}}
     end.
+
+%% @doc The integer options this module's channels accept: `{Key, Min, Max, Default}'.
+-spec option_limits() -> [{atom(), integer(), integer(), integer()}, ...].
+option_limits() -> ?OPTION_LIMITS.
+
+%% @doc Every channel option in a `upstream_client' value that channels/1 would
+%% replace by its default: present, but not an integer in range. A value that is
+%% merely absent is not a replacement. `given' describes the value without
+%% reproducing it unless it is an integer or an atom (neither can hold a secret):
+%% a channel's options sit beside its SSL options, and a rejection is logged.
+-spec replaced_options(term()) -> [replaced()].
+replaced_options(#{channels := Channels}) when is_list(Channels) ->
+    [R || {Name, _Endpoints, Options} <- Channels, is_atom(Name), is_map(Options),
+          {Key, Min, Max, Default} <- ?OPTION_LIMITS,
+          R <- replaced(Name, Key, Min, Max, Default, Options)];
+replaced_options(_Other) ->
+    [].
+
+replaced(Name, Key, Min, Max, Default, Options) ->
+    case maps:find(Key, Options) of
+        {ok, N} when is_integer(N), N >= Min, N =< Max -> [];
+        {ok, Value} -> [#{channel => Name, option => Key, given => given(Value),
+                          min => Min, max => Max, default => Default}];
+        error -> []
+    end.
+
+given(N) when is_integer(N) -> integer_to_list(N);
+given(A) when is_atom(A)    -> atom_to_list(A);
+given(F) when is_float(F)   -> "a float";
+given(B) when is_binary(B)  -> "a binary";
+given(L) when is_list(L)    -> "a list";
+given(M) when is_map(M)     -> "a map";
+given(T) when is_tuple(T)   -> "a tuple";
+given(_)                    -> "a value of another type".
+
+option(Key, Options) ->
+    {Key, Min, Max, Default} = lists:keyfind(Key, 1, ?OPTION_LIMITS),
+    bounded(maps:get(Key, Options, Default), Min, Max, Default).
 
 bounded(N, Min, Max, _Default) when is_integer(N), N >= Min, N =< Max -> N;
 bounded(_Other, _Min, _Max, Default) -> Default.

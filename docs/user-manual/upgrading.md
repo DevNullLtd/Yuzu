@@ -5191,8 +5191,10 @@ Production is `https`, `verify_peer`, a CA-pinned `cacertfile` and a client cert
   `YUZU_GW_UPSTREAM_ADDR` / `YUZU_GW_UPSTREAM_PORT` are now **ignored with a boot warning**
   (they used to log an `ENV override` line as if they applied). Remove them, and do not rely on
   them to repoint a gateway.
-- **Values that quietly fall back.** A `pool_size` or `connect_timeout` out of range (or a
-  string such as `"4"`) reads as the default with no log line. An IPv6 literal host needs
+- **Values replaced by defaults.** A `pool_size`, `connect_timeout` or `max_receive_message_bytes`
+  out of range (or a string such as `"4"`) is replaced by the default, as it was before, but the
+  gateway now logs one warning per option at boot (see
+  [Bad values replaced by defaults](gateway.md#bad-values-replaced-by-defaults)). An IPv6 literal host needs
   `inet6` in the endpoint's `socket_options`; the dial is IPv4 only otherwise.
 - **Log volume.** A persistent TLS failure costs about 5.8 KB of log per attempt (DERIVED:
   roughly 100 MB a day at `pool_size` 1). Bound Docker logs with `logging` `max-size`. Erlang's

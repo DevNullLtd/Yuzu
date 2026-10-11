@@ -933,6 +933,37 @@ check_upstream_client_config_test_() ->
             application:set_env(yuzu_gw, upstream_client, ?DEFAULT_CHANNEL_CONFIG),
             ?assertEqual(ok, yuzu_gw_app:check_upstream_client_config())
         end},
+       {"a replaced option is warned about at boot, and the gateway still starts",
+        fun() ->
+            application:set_env(
+              yuzu_gw, upstream_client,
+              #{channels => [{default_channel, [{http, "127.0.0.1", 59999, []}],
+                              #{pool_size => 100, connect_timeout => "5s"}}]}),
+            Events = capture_events(
+                       fun() -> ?assertEqual(ok, yuzu_gw_app:check_upstream_client_config()) end),
+            Warned = [T || {warning, T} <- Events,
+                           string:find(T, "Bad values replaced") =/= nomatch],
+            ?assertEqual(2, length(Warned)),
+            Text = lists:flatten(Warned),
+            {match, _} = re:run(Text, "default_channel: pool_size is 100, not an integer from 1 to 64; "
+                                      "the default 1 is used", [unicode]),
+            {match, _} = re:run(Text, "connect_timeout is a list, not an integer from 1 to 600000; "
+                                      "the default 5000 is used", [unicode]),
+            {match, _} = re:run(Text, "Bad values replaced by defaults", [unicode]),
+            %% the value of a non-integer is never printed
+            nomatch = re:run(Text, "5s", [unicode])
+        end},
+       {"an in-range configuration warns about nothing of the kind",
+        fun() ->
+            application:set_env(
+              yuzu_gw, upstream_client,
+              #{channels => [{default_channel, [{http, "127.0.0.1", 59999, []}],
+                              #{pool_size => 1, connect_timeout => 1000}}]}),
+            Events = capture_events(
+                       fun() -> ?assertEqual(ok, yuzu_gw_app:check_upstream_client_config()) end),
+            ?assertEqual([], [T || {_, T} <- Events,
+                                   string:find(T, "Bad values replaced") =/= nomatch])
+        end},
        {"no upstream_client key is refused",
         fun() ->
             ?assertEqual({error, no_upstream_channel},
