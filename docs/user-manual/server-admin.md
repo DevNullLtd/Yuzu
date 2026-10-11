@@ -3304,14 +3304,15 @@ The server emits an audit event on every branch:
 > linked SSO identities) **were already revoked** and that the account
 > **remains active**; the account's holder must sign in again and re-create
 > any API tokens. Credentials are revoked before the delete on purpose, so a
-> deprovision never leaves live credentials behind. An early refusal is audited
+> completed deprovision never leaves live credentials behind (an early
+> refusal revokes nothing, so those credentials stay live). An early refusal is audited
 > as `user.delete` / `denied` / `last_administrator_blocked`, a late one as
 > `user.delete` / `partial` (credentials were revoked), and both are counted on
 > `yuzu_server_rbac_last_admin_guard_refused_total{transport="dashboard"}`.
 > If the delete cannot complete because the store is unavailable, the answer
 > is HTTP 503 with `Retry-After: 2`; a repeat re-runs the guarded write and
 > the session wipe (on an already-deactivated account it answers 404 after
-> re-running the wipe), and it succeeds only if that repeat itself succeeds.
+> re-running the wipe).
 >
 > **Operator notes.** Every guarded delete and role change takes the same
 > database row lock, waiting at most 2000 ms, so a burst of SCIM
@@ -3331,7 +3332,8 @@ The server emits an audit event on every branch:
 > guard for account deactivation and demotion". A refused SCIM deprovision
 > leaves the person's account (and, after an early refusal, their tokens and
 > sessions) live and raises a critical analytics event: an operator has to
-> act. Alert rules for these series ship in a later change. A replica
+> act. No alert rule ships for these series yet (tracked in
+> #FOLLOWUP-ISSUE-NUMBER). A replica
 > running a build without this rule does not enforce it, so drain old
 > replicas during a rolling upgrade. A server with an authentication
 > database but no RBAC store refuses to start.

@@ -54,8 +54,7 @@ and the new counters are listed in the changelog entry and in `docs/user-manual/
   of an `Administrator` grant but cannot reactivate it until the grant is removed (MCP
   `unassign_rbac_role`); an elevated tombstone has its role cleared with
   `UPDATE auth.users SET role = 'user' WHERE username = '<name>' AND NOT is_active;` (see `rbac.md`).
-  The `503` for a store failure no longer carries a `retry_after_ms` body member (the `Retry-After`
-  header stays). A Group request whose role recompute is incomplete (a refused or failed demotion, a
+  A Group request whose role recompute is incomplete (a refused or failed demotion, a
   member whose read failed, or promotions skipped after a store failure) now records one
   `scim.group.recompute_incomplete` audit row, and its success row says `recompute=incomplete`. Known
   limits of the Group recompute are listed in the SCIM provisioning guide.
