@@ -290,7 +290,11 @@ probe_cap_test_() ->
      fun cleanup/1,
      [
       t("a probe in flight reserves one slot, so a failed probe's event fits back at the cap",
-        fun probe_reserves_a_slot_for_its_requeue/0)
+        fun probe_reserves_a_slot_for_its_requeue/0),
+      t("at the cap a newer event for the in-flight probe's own key is held, and sent after a probe success",
+        fun newer_probe_key_event_at_the_cap_is_held_and_sent_after_probe_ok/0),
+      t("at the cap a newer event for the in-flight probe's own key supersedes the requeued probe event",
+        fun newer_probe_key_event_at_the_cap_supersedes_failed_probe/0)
      ]}.
 
 setup(Env) ->
@@ -1364,6 +1368,79 @@ probe_reserves_a_slot_for_its_requeue() ->
     [{HeadKey, _} | _] = yuzu_gw_notify_queue:to_list(up_get(notify_pending)),
     ?assertEqual({agent(1), <<"sess">>, <<"home">>}, HeadKey),
     ?assertEqual(2, length(dropped_reasons())).
+
+%% The cap-full cases of the probe's own key. The probe took its key out of the
+%% store, so the store holds two keys and the probe's reserved slot fills the cap
+%% of 3. A newer event for the probe's key is a replacement of a held key (the
+%% probe key counts as held), so it is never an at_capacity drop, whereas a new
+%% key still is.
+%% Returns {Probe, ProbeReq} with the newer event already sent and checked.
+cap_full_with_newer_probe_key_event() ->
+    watch(),
+    trip_breaker(),
+    [cast_connected(agent(I)) || I <- lists:seq(1, 3)],
+    sync(),
+    enter_half_open(),
+    {Probe, ProbeReq} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, ProbeReq)),
+    ?assertEqual('CONNECTED', maps:get(event, ProbeReq)),
+    sync(),
+    ?assertEqual({2, 1}, last_gauge()),
+    %% A different new key at the full cap is still refused (not over-fixed).
+    cast_connected(agent(4)),
+    sync(),
+    ?assertEqual([<<"at_capacity">>], dropped_reasons()),
+    ?assertEqual(2, pending_len()),
+    %% The newer event for the probe's own key is held, not dropped.
+    notify_status(agent(1), <<"sess">>, disconnected, <<"peer-newer">>, <<"home">>),
+    sync(),
+    ?assertEqual([<<"at_capacity">>], dropped_reasons()),
+    ?assertEqual(3, pending_len()),
+    ?assertEqual(0, count(?EV_COALESCED)),
+    {Probe, ProbeReq}.
+
+newer_probe_key_event_at_the_cap_is_held_and_sent_after_probe_ok() ->
+    {Probe, _} = cap_full_with_newer_probe_key_event(),
+    mock(ok),
+    Probe ! release,
+    %% The probe succeeded: the breaker closes and the three held keys go out.
+    Sent = await_entered(3),
+    await_until(fun() -> last_gauge() =:= {0, 3} end),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(lists:sort([{agent(2), 'CONNECTED', <<"peer">>},
+                             {agent(3), 'CONNECTED', <<"peer">>},
+                             {agent(1), 'DISCONNECTED', <<"peer-newer">>}]),
+                 lists:sort([{maps:get(agent_id, R), maps:get(event, R),
+                              maps:get(peer_addr, R)} || {_, R} <- Sent])),
+    ?assertEqual([<<"at_capacity">>], dropped_reasons()),
+    ?assertEqual(0, count(?EV_COALESCED)),
+    open_and_release_all(),
+    await_until(fun() -> last_gauge() =:= {0, 0} end).
+
+newer_probe_key_event_at_the_cap_supersedes_failed_probe() ->
+    {Probe, _} = cap_full_with_newer_probe_key_event(),
+    %% The probe fails: its older event finds the newer one held and is dropped
+    %% (counted as coalesced, not as a capacity drop); the store stays within 3.
+    fail_worker(Probe),
+    await_until(fun() -> last_gauge() =:= {3, 0} end),
+    ?assertEqual(1, count(?EV_COALESCED)),
+    ?assertEqual([<<"at_capacity">>], dropped_reasons()),
+    ?assertEqual(3, pending_len()),
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
+    %% The next probe is the head, agent 2. Close the breaker and drain the rest.
+    mock(ok),
+    enter_half_open(),
+    {Probe2, P2} = await_entered(),
+    ?assertEqual(agent(2), maps:get(agent_id, P2)),
+    Probe2 ! release,
+    _ = await_entered(2),
+    open_and_release_all(),
+    await_until(fun() -> last_gauge() =:= {0, 0} end),
+    %% The older CONNECTED for agent 1 went out once (the failed probe) and never
+    %% again; the newer DISCONNECTED went out once.
+    ?assertEqual(['CONNECTED', 'DISCONNECTED'],
+                 [maps:get(event, R) || R <- entered_reqs(),
+                                        maps:get(agent_id, R) =:= agent(1)]).
 
 newer_same_key_event_supersedes_a_failed_probe() ->
     watch(),

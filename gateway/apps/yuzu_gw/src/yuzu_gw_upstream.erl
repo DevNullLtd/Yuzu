@@ -546,7 +546,18 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr0, StreamH
     %% probe is out one slot is held back, so the probe's event always fits back
     %% if the probe fails.
     Key = {AgentId, maps:get(session_id, Notification), StreamHomeId},
-    Reserved = case Probe of undefined -> 0; _ -> 1 end,
+    %% The probe's own key is the exception: take/1 removed it from the store,
+    %% but its slot is already the one reserved above, so a newer event for that
+    %% key is a replacement of a held key and must not be charged a second slot
+    %% (else at a full store the newer event is dropped and the stale probe event
+    %% is requeued). If the probe fails, push_front/3 then finds the newer event
+    %% held and supersedes the old one; if it succeeds, the newer one is sent
+    %% later. Either way the store stays within notify_pending_max.
+    Reserved = case Probe of
+                   undefined         -> 0;
+                   #{key := Key}     -> 0;
+                   #{}               -> 1
+               end,
     State1 =
         case yuzu_gw_notify_queue:put(Key, {AgentId, Notification}, Reserved, Pending) of
             {new, Pending1} ->
