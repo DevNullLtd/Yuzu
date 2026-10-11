@@ -1214,10 +1214,14 @@ Windows times quoted in this section are from the 16-shard layout, not the
 merged one. ESTIMATES for the merged shards are sums of those measured times
 (startup is shared, so slightly less): M + P is 83 + 148 = 231s on Windows
 (Linux 135 + 100 = 235s, from the 16-shard Linux run) and I + J is 169 + 173 =
-342s (Linux 119 + 119 = 238s, same run); both are below shard A's measured
-393s on Windows, so A stays the longest pole there. On Linux the merged shards
-(about 235-238s) are comparable to A (234-258s), not below it.
-Re-measure the merged layout on the first CI run. Priorities are now merged M
+342s (Linux 119 + 119 = 238s, same run); the estimate was
+low for I. MEASURED on the merged 14-shard layout (Windows weecolin, 4-wide,
+restarted Postgres, 21/21 OK): I 398s, A 393s, F 351s, E 340s, D 303s, G 282s,
+H 257s, O 254s, M 239s, N 239s, L 238s, C 195s, K 160s, B 136s, so merged I is
+the longest pole by 5s and every shard is at least 43% under 700s. Linux
+4-wide, same layout, 23/23 OK: I 307s, A 284s, M 264s, F 263s, E 259s. These
+runs were on a shared box, so treat the ordering among the top shards as
+noise-level. Re-measure on the first CI run. Priorities are now merged M
 185 and merged I 245 (all 14 distinct); see `tests/meson.build`.
 
 **Drift risk — automated (#3443 Phase 1, 2026-08-26):** this used to hardcode

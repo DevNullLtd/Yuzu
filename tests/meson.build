@@ -2186,8 +2186,9 @@ if build_server
   # they slightly overstate because process startup is shared): merged M
   # (M + P) 83 + 148 = 231s on Windows (Linux 135 + 100 = 235s, 16-shard Linux run), merged I
   # (I + J) 169 + 173 = 342s on Windows (Linux 119 + 119 = 238s); both below
-  # shard A's measured 393s on Windows, so A stays the longest pole there (on Linux the
-  # merged shards, about 235-238s, are comparable to A at 234-258s). Linux ordering of the
+  # shard A's measured 393s on Windows (estimates; MEASURED on the merged layout, Windows
+  # 4-wide: I 398s, A 393s, M 239s; Linux: I 307s, A 284s, M 264s, so merged I is the
+  # longest pole by a small margin and the top shards are within noise of each other). Linux ordering of the
   # 16-shard layout is similar (15-shard Linux times: A 258s, C 254s, E 243s,
   # F 234s, G 200s, D 194s, O 194s, L 170s, N 168s, H 165s, M 148s, I 136s,
   # J 133s, K 115s, B 113s; P 100s in the final run). Merged priorities
