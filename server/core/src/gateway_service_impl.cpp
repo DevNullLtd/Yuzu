@@ -1,6 +1,8 @@
 #include "gateway_service_impl.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <string_view>
 
@@ -78,6 +80,16 @@ static_assert(kGatewayRouteLeaseTtlSecs == yuzu::server::kKnownLeaseTtlSecs,
 // branches below.
 constexpr std::size_t kMaxStreamHomeIdLen = 64;
 
+// The exact shape ProxyRegister mints below; the gateway only stores and replays it.
+bool is_server_minted_session_id(std::string_view id) {
+    constexpr std::string_view kPrefix = "gw-session-";
+    if (id.size() != kPrefix.size() + 32 || !id.starts_with(kPrefix))
+        return false;
+    return std::ranges::all_of(id.substr(kPrefix.size()), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+}
+
 // HA WS-4 4.3: kMaxClusterIdLen is declared in gateway_service_impl.hpp, not
 // here — see that declaration's comment for why (main.cpp's CLI parser needs
 // it too).
@@ -133,13 +145,38 @@ constexpr std::size_t kMaxStreamHomeIdLen = 64;
 //     independently re-checks the same affinity atomically — see
 //     `AnnounceResult::cluster_affinity_violation` and its call site's
 //     comment for the narrow race the pre-check alone cannot close.
+// One WARN per 5s per key: a counter carries the magnitude, so a store outage must
+// not turn into one log line per heartbeat batch. Per-key slots so a heartbeat-path
+// degrade cannot mask a fail-closed register/adopt one; unlisted keys share the last.
+constexpr std::array<std::string_view, 9> kWarnSlotKeys{
+    "register_fresh",         "announce_connected",
+    "deregister",             "renew_leases",
+    "reclaim_tombstoned_session", "cluster_affinity_check",
+    "session_lookup",         "ambiguous_session",
+    "connected_unverified"};
+
+bool warn_slot_due(std::string_view key) {
+    static std::array<std::atomic<std::int64_t>, kWarnSlotKeys.size() + 1> last_warn_ms{};
+    auto& slot = last_warn_ms[static_cast<std::size_t>(std::ranges::find(kWarnSlotKeys, key) -
+                                                       kWarnSlotKeys.begin())];
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    auto prev = slot.load(std::memory_order_relaxed);
+    return now_ms - prev >= 5000 &&
+           slot.compare_exchange_strong(prev, now_ms, std::memory_order_relaxed);
+}
+
 void record_route_store_failure(yuzu::MetricsRegistry* metrics, std::string_view op,
                                 GatewayRouteStoreError err) {
     const char* reason =
         err == GatewayRouteStoreError::store_unavailable ? "store_unavailable" : "db_error";
-    spdlog::warn("[gateway] GatewayRouteStore {} degraded ({}) — see call site for fail-open vs "
-                 "fail-closed handling",
-                 op, reason);
+    if (warn_slot_due(op)) {
+        spdlog::warn("[gateway] GatewayRouteStore {} degraded ({}) — see call site for fail-open "
+                     "vs fail-closed handling (logged at most once per 5s; see "
+                     "yuzu_server_gateway_route_write_failed_total)",
+                     op, reason);
+    }
     if (metrics) {
         metrics
             ->counter("yuzu_server_gateway_route_write_failed_total",
@@ -175,11 +212,12 @@ void record_directory_desync(yuzu::MetricsRegistry* metrics, std::string_view op
                      "this replica does not hold (outcome={}); no write was attempted. Likely a "
                      "buggy gateway or an agent sending a malformed session_id",
                      count, outcome);
-    } else if (op == "session_lookup" && outcome == "ambiguous_session") {
-        spdlog::warn("[gateway] GatewayRouteStore session lookup: {} session id(s) matched more "
-                     "than one directory row (outcome={}); refused, nothing acted on. A "
-                     "session_id must identify exactly one placement",
-                     count, outcome);
+    } else if (op == "proxy_register" || op == "session_lookup" ||
+               (op == "notify_stream_status" && outcome == "connected_unverified")) {
+        // The call site logs these itself, naming the sanitized id.
+    } else if (op == "proxy_inventory" && outcome == "unknown_session") {
+        spdlog::warn("[gateway] ProxyInventory: presented session matched no directory row and no "
+                     "local hint (outcome={}); report refused, the agent will retry", outcome);
     } else {
         spdlog::warn("[gateway] GatewayRouteStore {} guard rejected the write (outcome={}, "
                      "count={}) — directory may be out of sync with the in-memory session map",
@@ -223,9 +261,11 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "\"announce_connected\", which stays the write's own count. HA WS-5: "
             "op=\"session_lookup\" is the batched session_id -> agent_id directory READ behind "
             "BatchHeartbeat/ProxyInventory/NotifyStreamStatus; a degrade there is handled "
-            "per-site without ever listing a session as unknown (BatchHeartbeat ingests only "
-            "what the local hint map knows and answers OK; ProxyInventory answers "
-            "received=false so the agent retries).",
+            "per-site without ever listing a session as unknown (BatchHeartbeat ingests and "
+            "still renews only what the local hint map knows and answers OK; ProxyInventory "
+            "answers received=false for a session with no local hint, so the agent retries; "
+            "NotifyStreamStatus acknowledges a CONNECTED only when this replica holds the "
+            "matching local session).",
             "counter");
         // Post-merge review #4344 follow-up (MEDIUM finding 2, docs/observability-conventions.md):
         // pre-seed every (op,reason) combo this counter can ACTUALLY emit (record_route_store_failure
@@ -252,6 +292,18 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             }
         }
         metrics_->describe(
+            "yuzu_server_gateway_route_degraded_renewal_total",
+            "HA WS-5: BatchHeartbeat batches whose batched session_id directory READ was "
+            "degraded and whose lease renewal of locally-hinted (agent,session) pairs then "
+            "succeeded and renewed at least one row; counted once per batch, after the write. "
+            "The write is correlated on agent_id AND session_id so it cannot renew a foreign "
+            "row; a rise alongside "
+            "yuzu_server_gateway_route_write_failed_total{op=\"session_lookup\"} means the read "
+            "path is failing while hinted renewals still land.",
+            "counter");
+        metrics_->counter("yuzu_server_gateway_route_degraded_renewal_total",
+                          {{"op", "batch_heartbeat"}});
+        metrics_->describe(
             "yuzu_server_gateway_route_desync_total",
             "HA WS-4 4.2a: GatewayRouteStore session-guard writes (announce_connected/"
             "deregister/renew_leases) that succeeded but matched/renewed zero rows for the "
@@ -269,7 +321,21 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "DIFFERENT cluster_id than the agent's durably-bound home affinity, refused "
             "fail-closed. ANY non-zero rate is worth investigating (a misconfigured/renamed "
             "gateway cluster_id, or a genuine rogue-gateway claim attempt), not a background rate "
-            "to tolerate like the others. #1197: op=\"batch_heartbeat\", "
+            "to tolerate like the others. HA WS-5: op=\"proxy_register\" outcome "
+            "\"session_superseded\" is a stale/zombie replay whose agent's own row now holds a "
+            "different live session (a low rate after a reconnect storm is expected); "
+            "\"malformed_session_id\" is a replayed id that is not the gw-session- plus 32 "
+            "lowercase hex shape this server mints, and \"session_held_by_other_agent\" is a "
+            "replayed id another agent's row already holds (a forged or colliding id); both are "
+            "refused and both expect zero, so any increase is actionable. "
+            "op=\"notify_stream_status\" outcome \"connected_unverified\" is a CONNECTED refused "
+            "because the directory read degraded and this replica holds no matching local "
+            "session (the agent recovers by reconnecting). HA WS-5 lookups: "
+            "op=\"session_lookup\" outcome=\"ambiguous_session\" means one presented "
+            "session_id matched more than one directory row (never trusted; expected zero), "
+            "and outcome=\"unknown_session\" under op=\"renew_leases\" or "
+            "\"proxy_inventory\" is a presented id the directory does not know (a "
+            "rise after a restart is the replay working). #1197: op=\"batch_heartbeat\", "
             "outcome=\"malformed_session_id\" counts BatchHeartbeat entries whose session_id "
             "is over-length and not held by this replica, counted per entry and not deduped "
             "(no write is attempted and the id is never echoed in unknown_session_ids); the "
@@ -319,13 +385,13 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "notify_stream_status"}, {"outcome", "unknown_session"}});
         // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
-        // BLOCKER 2): a CONNECTED whose session_id is a live entry in
-        // gateway_sessions_ (passes the check above) but is no longer the
+        // BLOCKER 2): a CONNECTED whose session_id passed the session check
+        // above (directory row, lost-race id, or local hint) but is no longer the
         // CURRENTLY-installed session for this agent in the in-memory
-        // registry — a delayed/superseded reannounce arriving after a
-        // genuine newer registration has already installed. Rejected by
-        // AgentRegistry::set_gateway_route's own session check rather than
-        // clobbering the newer session's placement.
+        // registry, or whose directory row names a different session — a
+        // delayed/superseded reannounce arriving after a genuine newer
+        // registration has already installed. Rejected rather than clobbering
+        // the newer session's placement.
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "notify_stream_status"}, {"outcome", "stale_connected_session"}});
         // HA WS-4 4.4 (`#4246` #6): a replay's presented session belonged to
@@ -334,6 +400,14 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         // ProxyRegister's adopt/refuse decision above).
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "proxy_register"}, {"outcome", "session_superseded"}});
+        // HA WS-5 adopt hardening: ProxyRegister's replay-adopt refusals.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "proxy_register"}, {"outcome", "malformed_session_id"}});
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "proxy_register"}, {"outcome", "session_held_by_other_agent"}});
+        // HA WS-5: CONNECTED refused on a degraded read with no matching local session.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "notify_stream_status"}, {"outcome", "connected_unverified"}});
         // #1197: BatchHeartbeat's over-length unknown session_id, same shape
         // as malformed_home_id / malformed_cluster_id above.
         metrics_->counter("yuzu_server_gateway_route_desync_total",
@@ -385,8 +459,8 @@ GatewayUpstreamServiceImpl::resolve_sessions(const std::vector<std::string>& ses
         return out;
     }
 
-    // ONE batched read, no lock held (lock order: PG calls stay outside
-    // sessions_mu_).
+    // One lease, chunked statements (see lookup_by_sessions), no lock held
+    // (lock order: PG calls stay outside sessions_mu_).
     auto rows = gateway_route_store_->lookup_by_sessions(ids);
     if (!rows) {
         record_route_store_failure(metrics_, "session_lookup", rows.error());
@@ -403,18 +477,24 @@ GatewayUpstreamServiceImpl::resolve_sessions(const std::vector<std::string>& ses
             by_session[*rr.route.session_id].push_back(&rr);
 
     std::size_t ambiguous = 0;
+    std::unordered_set<std::string> lost_race_ids;
+    std::unordered_set<std::string> local_ids;
+    {
+        std::lock_guard lock(sessions_mu_);
+        for (const auto& id : ids) {
+            if (lost_race_sessions_.contains(id))
+                lost_race_ids.insert(id);
+            if (gateway_sessions_.contains(id))
+                local_ids.insert(id);
+        }
+    }
     for (const auto& id : ids) {
         auto it = by_session.find(id);
         if (it == by_session.end()) {
             // No directory row. A session that lost its register_fresh epoch
             // race never has one under its own id and keeps the pre-WS-5
             // local-map behaviour; anything else is unknown to the directory.
-            bool lost_race = false;
-            {
-                std::lock_guard lock(sessions_mu_);
-                lost_race = lost_race_sessions_.contains(id);
-            }
-            if (lost_race)
+            if (lost_race_ids.contains(id))
                 resolve_from_local_map(id);
             continue;
         }
@@ -425,10 +505,24 @@ GatewayUpstreamServiceImpl::resolve_sessions(const std::vector<std::string>& ses
         }
         out.resolved.emplace(id, it->second.front()->route.agent_id);
         out.from_store.insert(id);
+        if (!local_ids.contains(id))
+            out.store_only.insert(id);
     }
-    if (ambiguous > 0)
+    if (ambiguous > 0) {
+        if (warn_slot_due("ambiguous_session")) {
+            std::string sample;
+            std::size_t named = 0;
+            for (auto it = out.ambiguous.begin(); it != out.ambiguous.end() && named < 4;
+                 ++it, ++named)
+                sample.append(named ? ", " : "").append(onbehalf::sanitize_for_log(*it, 64));
+            spdlog::warn("[gateway] GatewayRouteStore session lookup: {} session id(s) matched "
+                         "more than one directory row; refused, nothing acted on (logged at most "
+                         "once per 5s). First {}: {}",
+                         ambiguous, named, sample);
+        }
         record_directory_desync(metrics_, "session_lookup", "ambiguous_session",
                                 static_cast<double>(ambiguous));
+    }
     return out;
 }
 
@@ -889,7 +983,17 @@ gw_enrolled:
     std::string session_id; // non-empty here means "adopting an existing session"
     bool store_confirmed_adopt = false; // did renew_leases/reclaim actually touch a row?
     if (!presented_session.empty()) {
+        if (!is_server_minted_session_id(presented_session)) {
+            record_directory_desync(metrics_, "proxy_register", "malformed_session_id");
+            spdlog::warn("[gateway] ProxyRegister: presented session id {} for agent {} is not a "
+                        "server-minted session id — refusing the replay so the gateway forces the "
+                        "agent to reconnect fresh",
+                        onbehalf::sanitize_for_log(presented_session, 64), info.agent_id());
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                "invalid session id; reconnect");
+        }
         bool adopt;
+        bool held_by_other_agent = false;
         if (gateway_route_store_) {
             // HA WS-4 4.4 review fix (F1): the DIRECTORY governs this
             // decision whenever it is configured — an in-memory
@@ -968,16 +1072,17 @@ gw_enrolled:
                                 info.agent_id());
                     return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                                         "routing directory unavailable");
-                } else if (*reclaim_res) {
-                    adopt = true;
-                    store_confirmed_adopt = true;
                 } else {
-                    // The row belongs to a DIFFERENT, LIVE session — a
-                    // genuine stale/zombie replay (including the zombie
-                    // case above: THIS node's memory says S1, the store
-                    // says S2 owns the row). adopt stays false regardless
-                    // of what gateway_sessions_ believes.
-                    adopt = false;
+                    // `superseded`: the row belongs to a DIFFERENT, LIVE
+                    // session — a genuine stale/zombie replay (including the
+                    // zombie case above: THIS node's memory says S1, the store
+                    // says S2 owns the row). `held_by_other_agent`: another
+                    // agent's row carries the presented id — a forged or
+                    // colliding id. Either way adopt stays false regardless of
+                    // what gateway_sessions_ believes.
+                    adopt = *reclaim_res == ReclaimOutcome::adopted;
+                    store_confirmed_adopt = adopt;
+                    held_by_other_agent = *reclaim_res == ReclaimOutcome::held_by_other_agent;
                 }
             }
         } else {
@@ -990,12 +1095,21 @@ gw_enrolled:
             adopt = it != gateway_sessions_.end() && it->second == info.agent_id();
         }
 
+        if (held_by_other_agent) {
+            record_directory_desync(metrics_, "proxy_register", "session_held_by_other_agent");
+            spdlog::warn("[gateway] ProxyRegister: presented session {} for agent {} is already "
+                        "held by a different agent's directory row — refusing the replay (a forged "
+                        "or colliding session id; expected never)",
+                        onbehalf::sanitize_for_log(presented_session, 64), info.agent_id());
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                "session held by another agent; reconnect");
+        }
         if (!adopt) {
             record_directory_desync(metrics_, "proxy_register", "session_superseded");
             spdlog::warn("[gateway] ProxyRegister: presented session {} for agent {} is "
                         "superseded by a different live session — refusing the replay so the "
                         "gateway forces the agent to reconnect fresh",
-                        presented_session, info.agent_id());
+                        onbehalf::sanitize_for_log(presented_session, 64), info.agent_id());
             return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                                 "session superseded; reconnect");
         }
@@ -1193,8 +1307,13 @@ gw_enrolled:
         // never a stale leftover from a prior session reusing this id (a
         // freshly-minted random 128-bit session_id does not collide with an
         // old entry still needing eviction).
-        if (lost_epoch_race)
+        if (lost_epoch_race) {
+            // Clear-at-bound: see lost_race_sessions_'s header comment for the
+            // one forced reconnect this can cost a still-live lost-race session.
+            if (lost_race_sessions_.size() >= max_lost_race_sessions_)
+                lost_race_sessions_.clear();
             lost_race_sessions_.insert(session_id);
+        }
     }
 
     spdlog::info("[gateway] ProxyRegister succeeded: agent={}, session={}", info.agent_id(),
@@ -1220,16 +1339,20 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
     // #1197: distinct session ids this replica does not hold, reported back to
     // the gateway in the response, plus a count of over-length unknown ids.
     // ORDER IS LOAD-BEARING: the session resolution (directory, then local
-    // hint) runs FIRST and the length cap applies only on a MISS. A reclaim-absent ProxyRegister adopts
-    // a gateway-presented id of any length, so a known session may be longer
-    // than kMaxGatewaySessionIdLen; capping before the lookup would silently
-    // drop that session's heartbeats (no ingest, no renew, no presence).
+    // hint) runs FIRST and the length cap here applies only to the unknown-id
+    // listing on a MISS, so an id the local hint resolves is never dropped by
+    // it. The directory lookup itself drops ids over the same 64 bytes, so a
+    // legacy over-length directory row no longer resolves (counted malformed
+    // here); ids this server mints are 43 bytes.
     std::unordered_set<std::string> unknown_ids;
+    // Directory-known ids this replica holds no local session for: listed so the
+    // gateway replays ProxyRegister, but NOT a desync (see store_only).
+    std::unordered_set<std::string> replay_ids;
     std::size_t malformed_session_ids = 0;
     // HA WS-5 (#4246 #3): resolve every distinct session id in the batch with
-    // ONE directory read BEFORE the ingest loop (folded into the batch's store
-    // round trip), so a replica that did not register a session can still
-    // serve its heartbeats. See resolve_sessions for the semantics.
+    // one directory read (one lease, chunked statements) BEFORE the ingest
+    // loop, so a replica that did not register a session can still serve its
+    // heartbeats. See resolve_sessions for the semantics.
     SessionResolution resolution;
     {
         std::vector<std::string> ids;
@@ -1246,6 +1369,9 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
         if (auto it = resolution.resolved.find(hb.session_id()); it != resolution.resolved.end()) {
             agent_id = it->second;
             store_resolved = resolution.from_store.contains(hb.session_id());
+            if (resolution.store_only.contains(hb.session_id()) &&
+                hb.session_id().size() <= kMaxGatewaySessionIdLen)
+                replay_ids.insert(hb.session_id());
         } else {
             const auto& sid = hb.session_id();
             if (sid.empty()) {
@@ -1262,8 +1388,9 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
             }
         }
         if (agent_id.empty()) {
-            spdlog::debug("[gateway] BatchHeartbeat: unknown session {}",
-                          std::string_view{hb.session_id()}.substr(0, kMaxGatewaySessionIdLen));
+            spdlog::debug("[gateway] BatchHeartbeat: session {} not resolved (unknown, ambiguous, "
+                          "malformed, or unverifiable on a degraded read) — not acked",
+                          onbehalf::sanitize_for_log(hb.session_id(), kMaxGatewaySessionIdLen));
             continue;
         }
         // #1000 / arch-S2: shared HeartbeatIngestion keeps the per-heartbeat
@@ -1316,31 +1443,25 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
     // that did not register a session still renews and ingests it. A session
     // the directory does not know (and this replica holds no lost-race hint
     // for) is unknown: excluded from the renewal batch and listed back to the
-    // gateway. A degraded directory read renews nothing and lists nothing
-    // (see resolve_sessions). Re-deriving via `session_to_agent` (rather than
+    // gateway. A degraded directory read lists nothing and still renews the
+    // locally-hinted pairs (see resolve_sessions). Re-deriving via `session_to_agent` (rather than
     // the ingest loop's per-iteration `agent_id`) keeps renewal independent of
     // whether ingest threw on that entry, matching the prior "not gated on
     // ingest success" property.
     if (gateway_route_store_) {
         std::unordered_map<std::string, std::string> session_to_agent; // session_id -> agent_id
-        // Sessions this replica's gateway_sessions_ doesn't recognize —
-        // excluded from the renew batch above (nothing to correlate), but
-        // still surfaced via the desync counter below so a systemic
-        // "gateway sending heartbeats for sessions the server doesn't know"
-        // condition (or, once multi-replica routing exists, an LB handing a
-        // batch to a replica that never registered the session) stays
-        // visible rather than silently dropped — the exact signal #4246 #8
-        // exists for. #1197: the unknown set is NOT recomputed here; it is the
-        // first loop's `unknown_ids`, which also feeds the response verdict.
-        // It is a snapshot taken in the first loop, not atomic with this
-        // block's lookup: an id that registers in between is renewed AND
-        // listed/counted unknown for that batch; an id that is erased in
-        // between was acked and ingested but is neither renewed nor counted.
-        // Over-length unknown ids are excluded from the set (counted as
-        // batch_heartbeat/malformed_session_id instead), so a session that
-        // legitimately holds a >64-byte presented id (reclaim-absent adopt)
-        // is counted malformed and never listed after a server restart; that
-        // is by design (ids this server mints are 43 bytes).
+        // Sessions the route directory does not know (and no local hint covers)
+        // have nothing to correlate, so they are excluded from the renew batch
+        // but surfaced via the desync counter below: a gateway heartbeating
+        // sessions the cluster has no record of must stay visible (#4246 #8).
+        // The unknown set is NOT recomputed here; it is the first loop's
+        // `unknown_ids`, which also feeds the response verdict. It is a
+        // snapshot, not atomic with this block's lookup: an id that registers in
+        // between is renewed AND listed/counted unknown for that batch.
+        // Directory-known ids that merely lack a LOCAL session (`store_only`)
+        // are renewed and listed for replay but not counted here. Over-length
+        // ids are counted as batch_heartbeat/malformed_session_id and never
+        // listed; ids this server mints are 43 bytes.
         {
             // HA WS-5: the renew set is the batch's RESOLVED sessions (directory
             // or local hint — see resolve_sessions), not the per-replica map.
@@ -1387,9 +1508,10 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
             record_directory_desync(metrics_, "renew_leases", "unknown_session",
                                     static_cast<double>(unknown_ids.size()));
         }
-        // A degraded directory read cannot be renewed against either (the
-        // write would hit the same store); resolve_sessions already counted it.
-        if (!session_to_agent.empty() && !resolution.degraded) {
+        // A degraded READ does not imply a failing WRITE (a pool-timeout on the
+        // read leaves the writer fine): locally-hinted pairs still renew, since
+        // the write is correlated on agent_id AND session_id.
+        if (!session_to_agent.empty()) {
             // A `std::unordered_map` keyed on session_id already collapses a
             // repeated session id to one entry. The Erlang buffer
             // (gateway/apps/yuzu_gw/src/yuzu_gw_heartbeat_buffer.erl) keeps one
@@ -1420,6 +1542,11 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                 // much larger blast radius than the staleness it avoids.
                 record_route_store_failure(metrics_, "renew_leases", res.error());
             } else {
+                if (resolution.degraded && *res > 0 && metrics_) {
+                    metrics_->counter("yuzu_server_gateway_route_degraded_renewal_total",
+                                      {{"op", "batch_heartbeat"}})
+                        .increment();
+                }
                 const int eligible = static_cast<int>(renew_sessions.size());
                 const int shortfall = eligible - *res; // clamp >= 0 via the guard below
                 if (shortfall > 0) {
@@ -1437,22 +1564,34 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
     // deliberately not sorted); omitted ids are typically reported again when
     // those agents next heartbeat (not guaranteed when a batch carries a very
     // large number of distinct unknown ids). No presence marker by design.
-    if (!unknown_ids.empty()) {
-        const auto total = unknown_ids.size();
+    if (!unknown_ids.empty() || !replay_ids.empty()) {
+        const auto total = unknown_ids.size() + replay_ids.size();
         const auto cap = static_cast<std::size_t>(kMaxUnknownSessionIdsPerResponse);
         response->mutable_unknown_session_ids()->Reserve(static_cast<int>(std::min(total, cap)));
         std::size_t listed = 0;
-        for (const auto& id : unknown_ids) {
-            if (listed == cap)
-                break;
-            response->add_unknown_session_ids(id);
-            ++listed;
+        for (const auto* set : {&unknown_ids, &replay_ids}) {
+            for (const auto& id : *set) {
+                if (listed == cap)
+                    break;
+                response->add_unknown_session_ids(id);
+                ++listed;
+            }
         }
         if (total > cap) {
             response->set_unknown_session_ids_truncated(true);
-            spdlog::warn("[gateway] BatchHeartbeat from node '{}': unknown-session verdict "
-                         "truncated, listed {} of {} distinct unknown ids",
-                         request->gateway_node(), listed, total);
+            // Directory-unknown ids list first, so overflow of the replay-only tail is routine.
+            if (unknown_ids.size() > cap) {
+                spdlog::warn("[gateway] BatchHeartbeat from node '{}': unknown-session verdict "
+                             "truncated, listed {} of {} distinct unknown ids",
+                             onbehalf::sanitize_for_log(request->gateway_node(), 64), listed,
+                             total);
+            } else {
+                spdlog::info("[gateway] BatchHeartbeat from node '{}': re-register verdict "
+                             "truncated (directory-known ids lacking a local session), listed "
+                             "{} of {}",
+                             onbehalf::sanitize_for_log(request->gateway_node(), 64), listed,
+                             total);
+            }
         }
     }
     if (malformed_session_ids > 0) {
@@ -1479,10 +1618,10 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
     // HA WS-5: the DIRECTORY resolves the session, not this replica's local
     // map — the gateway may have routed this call to a replica that did not
     // handle the agent's ProxyRegister. `received=false` is the agent's retry
-    // nack, so every non-resolution (unknown, ambiguous, degraded store) is
-    // retryable; only an `unknown` is counted as a desync here — an ambiguous
-    // match and a store degrade were already counted by resolve_sessions under
-    // their own labels.
+    // nack. A degraded read with a local hint still resolves (and ingests);
+    // an unknown, ambiguous or unhinted-degraded id is nacked. Only `unknown`
+    // is counted as a desync here: ambiguous and degraded were already counted
+    // by resolve_sessions under their own labels.
     std::string agent_id;
     {
         const auto resolution = resolve_sessions({request->session_id()});
@@ -1492,14 +1631,13 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
         } else if (resolution.degraded) {
             spdlog::warn("[gateway] ProxyInventory: session {} unresolvable while the route "
                          "directory is degraded; agent will retry",
-                         request->session_id());
+                         onbehalf::sanitize_for_log(request->session_id(), 64));
         } else if (resolution.ambiguous.contains(request->session_id())) {
             spdlog::warn("[gateway] ProxyInventory: session {} is ambiguous in the route "
                          "directory; refusing",
-                         request->session_id());
+                         onbehalf::sanitize_for_log(request->session_id(), 64));
         } else {
             record_directory_desync(metrics_, "proxy_inventory", "unknown_session");
-            spdlog::warn("[gateway] ProxyInventory: unknown session {}", request->session_id());
         }
     }
     if (agent_id.empty()) {
@@ -1677,33 +1815,73 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
     const auto& agent_id = request->agent_id();
     const auto& session_id = request->session_id();
 
-    // Verify session. The durable directory is the cross-replica truth; the
-    // local map covers single-replica deployments and lost-race sessions
-    // (which never own a directory row under their own id).
+    // Verify session. The durable directory is the cross-replica truth. The local
+    // map is a fallback for a missing/tombstoned row, a lost-race session (which
+    // never owns a row under its own id) and a degraded read; a CONNECTED never
+    // takes it over a row that names a DIFFERENT session, and on a degraded read
+    // a CONNECTED needs this replica's own registry to hold the session too.
+    const bool is_connected = request->event() == gw::StreamStatusNotification::CONNECTED;
     bool session_in_directory = false;
+    bool directory_names_other_session = false;
     if (gateway_route_store_) {
         auto row = gateway_route_store_->lookup_route(agent_id);
         if (!row) {
             record_route_store_failure(metrics_, "session_lookup", row.error());
-            response->set_acknowledged(false);
-            return grpc::Status::OK;
+            if (is_connected) {
+                bool local_hint = false;
+                {
+                    std::lock_guard lock(sessions_mu_);
+                    auto it = gateway_sessions_.find(session_id);
+                    local_hint = it != gateway_sessions_.end() && it->second == agent_id;
+                }
+                // Single replica: that local session was directory-verified at
+                // ProxyRegister, and set_gateway_route still rejects a superseded one.
+                if (!local_hint || !registry_.session_is(agent_id, session_id)) {
+                    if (warn_slot_due("connected_unverified")) {
+                        spdlog::warn(
+                            "[gateway] NotifyStreamStatus: CONNECTED for session {} (agent {}) "
+                            "refused — the directory read degraded and this replica holds no "
+                            "matching local session; the agent recovers by reconnecting (logged "
+                            "at most once per 5s; see yuzu_server_gateway_route_desync_total)",
+                            onbehalf::sanitize_for_log(session_id, 64),
+                            onbehalf::sanitize_for_log(agent_id, 64));
+                    }
+                    record_directory_desync(metrics_, "notify_stream_status",
+                                            "connected_unverified");
+                    response->set_acknowledged(false);
+                    return grpc::Status::OK;
+                }
+            }
+        } else {
+            const bool has_sid = row->has_value() && (*row)->session_id.has_value();
+            session_in_directory = has_sid && *(*row)->session_id == session_id;
+            directory_names_other_session = has_sid && !session_in_directory;
         }
-        session_in_directory = row->has_value() && (*row)->session_id &&
-                               *(*row)->session_id == session_id;
     }
     if (!session_in_directory) {
-        std::lock_guard lock(sessions_mu_);
-        auto it = gateway_sessions_.find(session_id);
-        if (it == gateway_sessions_.end() || it->second != agent_id) {
-            spdlog::warn("[gateway] NotifyStreamStatus: unknown session {} for agent {}",
-                         session_id, agent_id);
-            // 4.2a #8: this in-memory gateway_sessions_ guard, not the
-            // directory store, but the same "systemic desync visibility"
-            // signal the architect flagged as the dominant post-restart
-            // symptom (a replica that lost its gateway_sessions_ map, or a
-            // notification for a session that was never wired through
-            // ProxyRegister on this replica).
-            record_directory_desync(metrics_, "notify_stream_status", "unknown_session");
+        bool stale_connected = false;
+        {
+            std::lock_guard lock(sessions_mu_);
+            auto it = gateway_sessions_.find(session_id);
+            if (it == gateway_sessions_.end() || it->second != agent_id) {
+                spdlog::warn("[gateway] NotifyStreamStatus: unknown session {} for agent {}",
+                             onbehalf::sanitize_for_log(session_id, 64),
+                             onbehalf::sanitize_for_log(agent_id, 64));
+                // 4.2a #8: systemic desync visibility for a replica that lost its
+                // gateway_sessions_ map or never saw this session's ProxyRegister.
+                record_directory_desync(metrics_, "notify_stream_status", "unknown_session");
+                response->set_acknowledged(false);
+                return grpc::Status::OK;
+            }
+            stale_connected = is_connected && directory_names_other_session &&
+                              !lost_race_sessions_.contains(session_id);
+        }
+        if (stale_connected) {
+            spdlog::warn("[gateway] NotifyStreamStatus: CONNECTED for session {} (agent {}) but "
+                         "the directory names a different session — rejecting",
+                         onbehalf::sanitize_for_log(session_id, 64),
+                         onbehalf::sanitize_for_log(agent_id, 64));
+            record_directory_desync(metrics_, "notify_stream_status", "stale_connected_session");
             response->set_acknowledged(false);
             return grpc::Status::OK;
         }
@@ -1732,11 +1910,11 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // Only the replica that handled ProxyRegister holds an AgentSession;
         // a non-owning replica validated this session via the directory and
         // must not publish into (or revert) a local registry entry it lacks.
-        // A DIFFERENT local session for a session the directory does not hold is
-        // a superseded one: it must still reach set_gateway_route's rejection.
-        const auto local_session = registry_.get_session(agent_id);
+        // When the directory holds this session, publish only if it is also the
+        // local one. A session the directory does not hold always reaches
+        // set_gateway_route, whose rejection handles a superseded local session.
         const bool has_local_session =
-            !session_in_directory || (local_session && local_session->session_id == session_id);
+            !session_in_directory || registry_.session_is(agent_id, session_id);
         // HA WS-4 #4324: stream_home_id is gateway-asserted, untrusted input
         // (see kMaxStreamHomeIdLen's comment) — bound it once, here, before
         // publishing it into the registry or the directory below. An

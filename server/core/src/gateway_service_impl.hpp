@@ -83,14 +83,19 @@ inline constexpr std::size_t kMaxUnmappedClustersWarned = 256;
 // inexact.
 inline constexpr int kMaxUnknownSessionIdsPerResponse = 4096;
 
-// #1197: a session_id longer than this that does NOT resolve in
-// gateway_sessions_ is counted malformed and never listed or echoed. Mirrors
-// kMaxStreamHomeIdLen (gateway_service_impl.cpp) and sits above the 43-byte
-// "gw-session-" + 32 hex shape this server mints. It is applied ONLY after the
-// lookup misses: a reclaim-absent ProxyRegister adopts a gateway-presented id
-// of any length, so a KNOWN session may legitimately exceed this and must keep
-// being ingested.
+// #1197: a session_id longer than this that does NOT resolve is counted
+// malformed and never listed or echoed. Mirrors kMaxStreamHomeIdLen
+// (gateway_service_impl.cpp) and sits above the 43-byte "gw-session-" + 32 hex
+// shape this server mints. ProxyRegister now adopts only that exact 43-byte
+// shape and the directory lookup drops ids over 64 bytes (the same bound as
+// GatewayRouteStore's kMaxLookupSessionIdLen), so an over-length id resolves
+// only through a lost-race or degraded-read local hint. A legacy directory row
+// holding a longer id is no longer resolved: its heartbeats are counted
+// malformed and not listed, so its lease lapses and the reaper tombstones it.
 inline constexpr std::size_t kMaxGatewaySessionIdLen = 64;
+
+// Bound on lost_race_sessions_ (see that member's comment for what the clear costs).
+inline constexpr std::size_t kMaxLostRaceSessions = 65536;
 
 class GatewayUpstreamServiceImpl : public gw::GatewayUpstream::Service {
 public:
@@ -124,6 +129,8 @@ public:
     void set_proxy_register_interleave_hook_for_test(std::function<void()> hook) {
         proxy_register_interleave_hook_for_test_ = std::move(hook);
     }
+    /// Test-only: lowers the lost_race_sessions_ bound. Call before any RPC.
+    void set_max_lost_race_sessions_for_test(std::size_t cap) { max_lost_race_sessions_ = cap; }
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
     void set_software_inventory_store(SoftwareInventoryStore* store) {
@@ -265,8 +272,16 @@ private:
     // benign, expected race loss (see record_directory_desync's header
     // comment). Same lock (sessions_mu_) as gateway_sessions_, entries added
     // at ProxyRegister time and removed together with gateway_sessions_'s
-    // entry on DISCONNECTED.
+    // entry on DISCONNECTED. HA WS-5: membership is also what lets a lost-race
+    // id (which has no directory row of its own) resolve in resolve_sessions,
+    // what exempts its CONNECTED from the stale_connected_session refusal, and
+    // what keeps it out of the renew shortfall. Bounded at
+    // max_lost_race_sessions_: an insert at the bound clears the whole set, so
+    // a lost-race session that is still LIVE then goes through one
+    // listed-unknown -> replay -> refuse cycle (or a refused CONNECTED) and its
+    // agent reconnects fresh. Bounded per session, never a loop.
     std::unordered_set<std::string> lost_race_sessions_;
+    std::size_t max_lost_race_sessions_{kMaxLostRaceSessions};
 
     // HA WS-4 4.4 post-build adversarial review (PR #4636 FortitudeEtc,
     // BLOCKER 1): a per-agent striped lock serializing ProxyRegister's own
@@ -312,6 +327,13 @@ private:
         /// Subset of `resolved` answered by the DIRECTORY (not the local
         /// hint map): the only ids whose owning replica may be another one.
         std::unordered_set<std::string> from_store;
+        /// Subset of `from_store` with NO gateway_sessions_ entry on this
+        /// replica (checked under sessions_mu_): the directory knows it but
+        /// this replica never saw its ProxyRegister (server-only restart or
+        /// another replica's session). Ingested and renewed like any resolved
+        /// id, and ALSO listed in unknown_session_ids so the gateway replays
+        /// ProxyRegister and this replica adopts it.
+        std::unordered_set<std::string> store_only;
         /// More than one directory row carried the id (`session_id` is not
         /// unique): refused, never guessed at. Neither acted on nor listed
         /// as unknown (listing would trigger a gateway re-register).
@@ -323,11 +345,14 @@ private:
         std::unordered_set<std::string> unresolved_degraded;
     };
 
-    /// Resolves `session_ids` (empty ids are skipped) with ONE directory read
-    /// when a GatewayRouteStore is configured — the directory GOVERNS and the
-    /// per-replica gateway_sessions_ map is never trusted on its own (the 4.4
-    /// F1 rule), which is what lets a replica that did not register a
-    /// session serve its heartbeats. Resolution requires exactly one row
+    /// Resolves `session_ids` (empty ids are skipped) with one batched
+    /// directory read (one lease, chunked statements — see
+    /// GatewayRouteStore::lookup_by_sessions) when a GatewayRouteStore is
+    /// configured — the directory GOVERNS: the
+    /// per-replica gateway_sessions_ map is consulted only for lost-race ids
+    /// (no row under their own id) and, when the read degrades, as a hint
+    /// (the 4.4 F1 rule), which is what lets a replica that did not register
+    /// a session serve its heartbeats. Resolution requires exactly one row
     /// carrying the session id and deliberately does NOT require the row to
     /// be `routable`: a heartbeat IS the lease-renewal path, so refusing a
     /// stale-lease row would strand it (and, after a Postgres blip, force

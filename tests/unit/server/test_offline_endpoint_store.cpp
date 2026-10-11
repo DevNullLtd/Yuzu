@@ -156,7 +156,7 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
 
     // HA WS-5: a replica without the local AgentSession ingests heartbeats whose
     // hostname/os are blank; that must never wipe what the owning replica wrote.
-    SECTION("WS-5 blank-preserve: a blank hostname AND os never clobber known values") {
+    SECTION("WS-5 blank-preserve: a blank hostname or os never clobbers a known one") {
         REQUIRE(store.upsert("agent-ws5-bp", "known-host", "linux", t - 1000, 0, "3.0.0", "arm64"));
         REQUIRE(store.upsert("agent-ws5-bp", "", "", t, 7, "", ""));
         auto rows = store.query_stale_within(std::chrono::hours(1));

@@ -23,6 +23,7 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -1269,6 +1270,88 @@ TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions returns EVERY row for a dup
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 2);
     CHECK(rows->at(0).route.agent_id != rows->at(1).route.agent_id);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions reads every chunk and drops empty and "
+          "over-length ids",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("yuzu_test_bys_chunk_first", "s-bys-chunk-first").value().won);
+    REQUIRE(fx.store().register_fresh("yuzu_test_bys_chunk_edge", "s-bys-chunk-edge").value().won);
+    REQUIRE(
+        fx.store().register_fresh("yuzu_test_bys_chunk_second", "s-bys-chunk-second").value().won);
+    const std::string too_long(65, 'x');
+    REQUIRE(fx.store().register_fresh("yuzu_test_bys_long", "s-bys-long").value().won);
+    fx.raw_bump_epoch("yuzu_test_bys_long", 5, too_long);
+
+    // The empty and over-length ids are dropped before chunking, so the 1026th
+    // input is the 1024th looked-up id: the last of the first chunk.
+    std::vector<std::string> sids;
+    sids.push_back("s-bys-chunk-first");
+    sids.emplace_back();
+    sids.push_back(too_long);
+    for (int i = 0; sids.size() < 1025; ++i)
+        sids.push_back("s-bys-filler-" + std::to_string(i));
+    sids.push_back("s-bys-chunk-edge");
+    for (int i = 0; i < 500; ++i)
+        sids.push_back("s-bys-filler2-" + std::to_string(i));
+    sids.push_back("s-bys-chunk-second");
+
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    std::vector<std::string> agents;
+    for (const auto& rr : *rows)
+        agents.push_back(rr.route.agent_id);
+    std::sort(agents.begin(), agents.end());
+    CHECK(agents == std::vector<std::string>{"yuzu_test_bys_chunk_edge",
+                                             "yuzu_test_bys_chunk_first",
+                                             "yuzu_test_bys_chunk_second"});
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_by_sessions returns a row once when its id repeats "
+          "across chunks",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("yuzu_test_bys_repeat", "s-bys-repeat").value().won);
+    std::vector<std::string> sids{"s-bys-repeat"};
+    for (int i = 0; i < 1100; ++i)
+        sids.push_back("s-bys-repeat-filler-" + std::to_string(i));
+    sids.push_back("s-bys-repeat");
+
+    auto rows = fx.store().lookup_by_sessions(sids);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().route.agent_id == "yuzu_test_bys_repeat");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: reclaim_tombstoned_session reports which guard refused it",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("yuzu_test_rcl_owner", "s-rcl-owner").value().won);
+    auto reclaim = [&](const char* agent, const char* sid) {
+        return fx.store().reclaim_tombstoned_session(agent, sid, 90).value();
+    };
+
+    SECTION("an absent row is adopted") {
+        CHECK(reclaim("yuzu_test_rcl_new", "s-rcl-new") == ReclaimOutcome::adopted);
+    }
+    SECTION("the caller's own row holding a different live session is superseded") {
+        CHECK(reclaim("yuzu_test_rcl_owner", "s-rcl-stale") == ReclaimOutcome::superseded);
+    }
+    SECTION("another agent holding the id refuses an absent caller") {
+        CHECK(reclaim("yuzu_test_rcl_thief", "s-rcl-owner") ==
+              ReclaimOutcome::held_by_other_agent);
+        CHECK_FALSE(fx.store().lookup_route("yuzu_test_rcl_thief").value().has_value());
+    }
+    SECTION("another agent holding the id refuses a tombstoned caller") {
+        REQUIRE(fx.store().register_fresh("yuzu_test_rcl_thief", "s-rcl-thief").value().won);
+        REQUIRE(fx.store().deregister("yuzu_test_rcl_thief", "s-rcl-thief").value().removed);
+        CHECK(reclaim("yuzu_test_rcl_thief", "s-rcl-owner") ==
+              ReclaimOutcome::held_by_other_agent);
+        auto row = fx.store().lookup_route("yuzu_test_rcl_thief").value();
+        REQUIRE(row.has_value());
+        CHECK_FALSE(row->session_id.has_value());
+    }
 }
 
 // --- reap_stale_routes ------------------------------------------------------
