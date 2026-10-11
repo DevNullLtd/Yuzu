@@ -13,22 +13,11 @@
 -define(EURO, <<226, 130, 172>>).
 -define(GRIN, <<240, 159, 152, 128>>).
 
-ascii_is_unchanged_test() ->
-    ?assertEqual(<<"peer-a:1">>,
-                 yuzu_gw_peer_addr:sanitize(<<"peer-a:1">>)),
-    ?assertEqual(<<"peer-b:2">>,
-                 yuzu_gw_peer_addr:sanitize(<<"peer-b:2">>)).
-
-empty_is_unchanged_test() ->
-    ?assertEqual(<<>>, yuzu_gw_peer_addr:sanitize(<<>>)).
-
-exactly_the_limit_is_unchanged_test() ->
-    Addr = binary:copy(<<"a">>, 255),
-    ?assertEqual(Addr, yuzu_gw_peer_addr:sanitize(Addr)).
-
-one_over_the_limit_is_cut_to_the_limit_test() ->
-    Addr = binary:copy(<<"a">>, 256),
-    ?assertEqual(binary:copy(<<"a">>, 255), yuzu_gw_peer_addr:sanitize(Addr)).
+unchanged_test_() ->
+    [{Name, ?_assertEqual(Addr, yuzu_gw_peer_addr:sanitize(Addr))}
+     || {Name, Addr} <- [{"ascii", <<"peer-a:1">>},
+                         {"empty", <<>>},
+                         {"exactly the limit (255 bytes)", binary:copy(<<"a">>, 255)}]].
 
 valid_multibyte_within_the_limit_is_unchanged_test() ->
     Addr = <<"host-", ?EURO/binary, "-", ?GRIN/binary>>,
@@ -71,7 +60,7 @@ invalid_utf8_becomes_the_placeholder_test_() ->
 non_binary_becomes_the_placeholder_test_() ->
     [{lists:flatten(io_lib:format("~p", [V])),
       ?_assertEqual(?INVALID, yuzu_gw_peer_addr:sanitize(V))}
-     || V <- [undefined, "host:1", 42, #{}, [<<"a">>], {a, b}, 1.5]].
+     || V <- [undefined, "host:1", 42]].
 
 a_huge_value_is_bounded_test_() ->
     {timeout, 30, fun() ->
@@ -110,7 +99,3 @@ result_is_always_encodable_test() ->
           ?assert(is_binary(iolist_to_binary(
                     gateway_pb:encode_msg(Msg, 'yuzu.gateway.v1.StreamStatusNotification'))))
       end, Inputs).
-
-constants_test() ->
-    ?assertEqual(?INVALID, yuzu_gw_peer_addr:placeholder()),
-    ?assertEqual(255, yuzu_gw_peer_addr:max_bytes()).

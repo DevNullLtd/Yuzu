@@ -92,10 +92,9 @@ binding_test_() ->
        {timeout, 30, fun register_records_conn_key/0}},
       {"Register with an upstream answer that is not a map fails without raising",
        {timeout, 30, fun register_non_map_upstream_response/0}},
-      {"Register sanitises the peer address and warns once when it changed it",
+      {"Register sanitises the peer address and warns once when it changed it, "
+       "and keeps an ordinary one without a warning",
        {timeout, 30, fun register_sanitises_the_peer_address_and_warns_once/0}},
-      {"Register keeps an ordinary peer address and does not warn",
-       {timeout, 30, fun register_keeps_an_ordinary_peer_address/0}},
       {"agent id and peer address are logged without raw control characters",
        {timeout, 30, fun agent_text_is_logged_without_control_characters/0}},
       {"rejections produce a rate-limited summary log with no session id",
@@ -662,16 +661,18 @@ register_sanitises_the_peer_address_and_warns_once() ->
           %% Never the value: neither the long run of a's nor the raw bytes.
           ?assertEqual(nomatch, binary:match(Line, <<"aaaaaaaaaa">>)),
           ?assertEqual(nomatch, binary:match(Line, <<255, 254>>))
-      end, Cases).
-
-register_keeps_an_ordinary_peer_address() ->
-    A = uid(<<"peer-marker">>),
-    Req = #{info => #{agent_id => A, hostname => <<"h">>}},
-    Lines = capture_logs(fun() ->
-        {ok, _, _} = yuzu_gw_agent_service:register(ctx_authority(conn_a, <<"peer-a:1">>), Req)
+      end, Cases),
+    %% The negative case: an ordinary address is stored as it is and says nothing.
+    %% The limit is reset first, or a warning would be suppressed by the one the
+    %% cases above just logged and this could not fail.
+    A2 = uid(<<"peer-marker">>),
+    Req2 = #{info => #{agent_id => A2, hostname => <<"h">>}},
+    yuzu_gw_safe_call:reset_limits(),
+    Lines2 = capture_logs(fun() ->
+        {ok, _, _} = yuzu_gw_agent_service:register(ctx_authority(conn_a, <<"peer-a:1">>), Req2)
     end),
-    ?assertEqual(<<"peer-a:1">>, pending_peer_addr(<<"reg-session-", A/binary>>)),
-    ?assertEqual([], [L || L <- Lines, binary:match(L, <<"the peer address was replaced">>) =/= nomatch]).
+    ?assertEqual(<<"peer-a:1">>, pending_peer_addr(<<"reg-session-", A2/binary>>)),
+    ?assertEqual([], [L || L <- Lines2, binary:match(L, <<"the peer address was replaced">>) =/= nomatch]).
 
 %% A carriage return or line feed in an agent id or peer address must not start
 %% a second log line: the connect and register lines carry both through log_text.

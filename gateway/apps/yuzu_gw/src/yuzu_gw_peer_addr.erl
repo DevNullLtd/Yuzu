@@ -26,18 +26,10 @@
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_peer_addr).
 
--export([sanitize/1, placeholder/0, max_bytes/0]).
+-export([sanitize/1]).
 
 -define(PLACEHOLDER, <<"invalid">>).
 -define(MAX_BYTES, 255).
-
-%% @doc The value that stands in for a peer address that cannot be used.
--spec placeholder() -> binary().
-placeholder() -> ?PLACEHOLDER.
-
-%% @doc The longest peer address, in bytes, that is passed on.
--spec max_bytes() -> pos_integer().
-max_bytes() -> ?MAX_BYTES.
 
 %% @doc Make an agent supplied peer address safe to encode and send.
 -spec sanitize(term()) -> binary().

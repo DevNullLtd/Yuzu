@@ -872,22 +872,21 @@ targeted_request_fault_replay_leaves_the_breaker_alone() ->
 targeted_unhealthy_status_replay_counts_as_a_failure() ->
     watch(),
     cause_one_failure(),
-    {_, Counted} =
-        lists:foldl(
-          fun(Status, {Want, _}) ->
-              A = bind_agent(<<"e9d-", Status/binary>>),
-              mock_unary(fun(<<"ProxyRegister">>, _Req, _Hdr) ->
-                                 {error, {Status, <<"upstream trouble">>}, #{}};
-                            (M, R, H) -> default_rpc(M, R, H)
-                         end),
-              ok = yuzu_gw_upstream:replay_sessions([sid(A)]),
-              await(fun() -> lists:member(sid(A), replay_hdrs()) end),
-              await_idle(),
-              ?assertEqual(Want + 1, up_get(cb_failures)),
-              ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
-              {Want + 1, ok}
-          end, {1, ok}, [<<"14">>, <<"13">>, <<"4">>]),
-    ?assertEqual(ok, Counted).
+    lists:foldl(
+      fun(Status, Want) ->
+          A = bind_agent(<<"e9d-", Status/binary>>),
+          mock_unary(fun(<<"ProxyRegister">>, _Req, _Hdr) ->
+                             {error, {Status, <<"upstream trouble">>}, #{}};
+                        (M, R, H) -> default_rpc(M, R, H)
+                     end),
+          ok = yuzu_gw_upstream:replay_sessions([sid(A)]),
+          await(fun() -> lists:member(sid(A), replay_hdrs()) end),
+          await_idle(),
+          ?assertEqual(Want + 1, up_get(cb_failures)),
+          ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+          Want + 1
+      end, 1, [<<"14">>, <<"13">>, <<"4">>]),
+    ok.
 
 %% E10.
 triggered_event_is_labelled_heartbeat() ->

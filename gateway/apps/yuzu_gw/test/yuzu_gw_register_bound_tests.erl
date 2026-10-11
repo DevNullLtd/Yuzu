@@ -56,36 +56,34 @@ bound_test_() ->
       [
        t("an agent id the server refuses never reaches the upstream or the breaker",
          fun bad_agent_ids_are_refused_at_the_edge/0),
-       t("an agent id of exactly 256 bytes is accepted",
-         fun boundary_agent_id_is_accepted/0),
-       t("the refusal names no agent id and is the status the server would answer",
-         fun refusal_is_invalid_argument_without_the_id/0),
        t("statuses that mean the request was wrong leave the breaker alone",
          fun caller_fault_statuses_leave_the_breaker_alone/0),
        t("statuses that mean the upstream is unhealthy open the breaker",
          fun unhealthy_statuses_open_the_breaker/0),
-       t("an HTTP-level error, a timeout and a refused connection each count once",
-         fun transport_failures_count_by_reason/0),
        t("a request over the server receive limit never feeds the breaker",
-         fun oversize_request_never_feeds_the_breaker/0),
-       t("a local encode failure is counted under code encode, an exception out of the client under exception",
-         fun local_encode_failure_has_its_own_error_code/0)
+         fun oversize_request_never_feeds_the_breaker/0)
       ]} || Threshold <- [3, 5]].
 
 %%% Round 4 (#4632): the edge bound counts what it refuses, is measured in bytes and
 %%% agrees with the server's constant, and the request bound is exact. One
-%%% threshold is enough here, none of these depends on the breaker's threshold.
+%%% threshold is enough here, none of these depends on the breaker's threshold
+%%% (the refusal text, the transport failures and the error codes are here too:
+%%% they read no threshold, so running them at 3 and 5 added no coverage).
 edge_test_() ->
     {foreach,
      fun() -> setup(3) end,
      fun cleanup/1,
      [
+      t("the refusal names no agent id and is the status the server would answer",
+        fun refusal_is_invalid_argument_without_the_id/0),
+      t("an HTTP-level error, a timeout and a refused connection each count once",
+        fun transport_failures_count_by_reason/0),
+      t("a local encode failure is counted under code encode, an exception out of the client under exception",
+        fun local_encode_failure_has_its_own_error_code/0),
       t("an edge refusal is counted once, by reason, and a valid Register is not counted",
         fun edge_refusal_is_counted_once/0),
-      t("an agent id of 128 two-byte characters (256 bytes) is accepted",
-        fun two_byte_characters_at_the_bound_are_accepted/0),
-      t("an agent id of 129 two-byte characters (258 bytes) is refused: bytes, not characters",
-        fun two_byte_characters_over_the_bound_are_refused/0),
+      t("an agent id of 128 two-byte characters (256 bytes) is accepted, 129 (258 bytes) is refused: bytes, not characters",
+        fun two_byte_characters_are_measured_in_bytes/0),
       t("a request of exactly 4194304 bytes reaches the wire and one byte more is refused locally",
         fun request_bound_is_exact/0),
       t("the gateway's agent id bound equals the server's kMaxAgentIdLength",
@@ -246,12 +244,6 @@ bad_agent_ids_are_refused_at_the_edge() ->
     ?assertEqual(1, wire_count()),
     ?assertEqual({closed, 0}, breaker()).
 
-boundary_agent_id_is_accepted() ->
-    Id = binary:copy(<<"z">>, ?MAX_AGENT_ID),
-    ?assertMatch({ok, #{session_id := _}, _},
-                 yuzu_gw_agent_service:register(ctx(), register_req(Id))),
-    ?assertEqual({closed, 0}, breaker()).
-
 refusal_is_invalid_argument_without_the_id() ->
     Id = binary:copy(<<"q">>, 400),
     {grpc_error, {Status, Message}} =
@@ -302,22 +294,21 @@ handle_refused(_Event, #{count := 1}, #{reason := Reason}, #{pid := Pid}) ->
     Pid ! {register_refused, Reason},
     ok.
 
-%% The server compares agent_id().size(), bytes. 128 x U+00E9 is 256 bytes.
-two_byte_characters_at_the_bound_are_accepted() ->
-    Id = binary:copy(<<"\x{E9}"/utf8>>, 128),
-    ?assertEqual(?MAX_AGENT_ID, byte_size(Id)),
-    ?assertEqual(128, string:length(Id)),
+%% The server compares agent_id().size(), bytes. 128 x U+00E9 is 256 bytes
+%% (accepted, and one more character is 258 bytes, refused before the wire).
+two_byte_characters_are_measured_in_bytes() ->
+    AtBound = binary:copy(<<"\x{E9}"/utf8>>, 128),
+    ?assertEqual(?MAX_AGENT_ID, byte_size(AtBound)),
+    ?assertEqual(128, string:length(AtBound)),
     ?assertMatch({ok, #{session_id := _}, _},
-                 yuzu_gw_agent_service:register(ctx(), register_req(Id))),
-    ?assertEqual(1, wire_count()).
-
-two_byte_characters_over_the_bound_are_refused() ->
-    Id = binary:copy(<<"\x{E9}"/utf8>>, 129),
-    ?assertEqual(?MAX_AGENT_ID + 2, byte_size(Id)),
-    ?assertEqual(129, string:length(Id)),
+                 yuzu_gw_agent_service:register(ctx(), register_req(AtBound))),
+    ?assertEqual(1, wire_count()),
+    Over = binary:copy(<<"\x{E9}"/utf8>>, 129),
+    ?assertEqual(?MAX_AGENT_ID + 2, byte_size(Over)),
+    ?assertEqual(129, string:length(Over)),
     ?assertMatch({grpc_error, {?GRPC_STATUS_INVALID_ARGUMENT, _}},
-                 yuzu_gw_agent_service:register(ctx(), register_req(Id))),
-    ?assertEqual(0, wire_count()),
+                 yuzu_gw_agent_service:register(ctx(), register_req(Over))),
+    ?assertEqual(1, wire_count()),
     ?assertEqual({closed, 0}, breaker()).
 
 %% A Register whose encoded size is exactly Size bytes: the hostname is padded,

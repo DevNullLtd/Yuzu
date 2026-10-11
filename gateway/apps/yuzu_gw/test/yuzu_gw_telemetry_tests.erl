@@ -35,46 +35,15 @@ notify_dropped_test_() ->
      end,
      fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
      [
-      {"a drop with a reason outside the closed set counts as unknown and "
-       "creates no series of its own",
+      {"a reason outside the closed set, the retired circuit_open, a missing reason and a "
+       "non-binary reason all fold into unknown and create no series of their own",
        fun() ->
-           Before = counter_val(yuzu_gw_upstream_notify_dropped_total,
-                                 [<<"unknown">>]),
-           telemetry:execute([yuzu, gw, upstream, notify_dropped],
-                             #{count => 1}, #{reason => <<"other_reason">>}),
-           ?assertEqual(Before + 1,
-                        counter_val(yuzu_gw_upstream_notify_dropped_total,
-                                    [<<"unknown">>])),
-           ?assertEqual(undefined,
-                        prometheus_counter:value(yuzu_gw_upstream_notify_dropped_total,
-                                                 [<<"other_reason">>]))
-       end},
-      {"a missing or non-binary reason also counts as unknown without crashing "
-       "the handler",
-       fun() ->
-           Before = counter_val(yuzu_gw_upstream_notify_dropped_total,
-                                 [<<"unknown">>]),
-           telemetry:execute([yuzu, gw, upstream, notify_dropped],
-                             #{count => 2}, #{}),
-           telemetry:execute([yuzu, gw, upstream, notify_dropped],
-                             #{count => 3}, #{reason => {not_a, label}}),
-           ?assertEqual(Before + 5,
-                        counter_val(yuzu_gw_upstream_notify_dropped_total,
-                                    [<<"unknown">>]))
-       end},
-      {"a circuit_open reason, retired from the emitters, folds into unknown "
-       "and creates no series of its own",
-       fun() ->
-           Before = counter_val(yuzu_gw_upstream_notify_dropped_total,
-                                 [<<"unknown">>]),
-           telemetry:execute([yuzu, gw, upstream, notify_dropped],
-                             #{count => 1}, #{reason => <<"circuit_open">>}),
-           ?assertEqual(Before + 1,
-                        counter_val(yuzu_gw_upstream_notify_dropped_total,
-                                    [<<"unknown">>])),
-           ?assertEqual(undefined,
-                        prometheus_counter:value(yuzu_gw_upstream_notify_dropped_total,
-                                                 [<<"circuit_open">>]))
+           assert_folds_into_unknown([yuzu, gw, upstream, notify_dropped],
+                                     yuzu_gw_upstream_notify_dropped_total,
+                                     [#{reason => <<"other_reason">>},
+                                      #{reason => <<"circuit_open">>},
+                                      #{},
+                                      #{reason => {not_a, label}}])
        end},
       {"the atom at_capacity counts in the at_capacity series, not unknown",
        fun() ->
@@ -109,6 +78,22 @@ counter_val(Name, Labels) ->
         undefined -> 0;
         V -> V
     end.
+
+%% Every event in Metas folds into the `unknown' series of Counter (so the series
+%% moves once per event) and creates no series named after a binary reason.
+assert_folds_into_unknown(Event, Counter, Metas) ->
+    Before = counter_val(Counter, [<<"unknown">>]),
+    [telemetry:execute(Event, #{count => 1}, Meta) || Meta <- Metas],
+    ?assertEqual(Before + length(Metas), counter_val(Counter, [<<"unknown">>])),
+    [?assertEqual(undefined, prometheus_counter:value(Counter, [Reason]))
+     || #{reason := Reason} <- Metas, is_binary(Reason)],
+    ok.
+
+%% The scrape output contains every one of Parts.
+assert_scrape_has(Parts) ->
+    Out = prometheus_text_format:format(),
+    [?assertNotEqual(nomatch, binary:match(Out, Part)) || Part <- Parts],
+    ok.
 
 %% #5177: every scrape of :9568/metrics returned HTTP 500 from 0.14.0-rc1 to
 %% rc3. Five HELP strings in declare_metrics/0 held an em-dash; in a UTF-8
@@ -486,18 +471,16 @@ notify_queue_families_test_() ->
        end},
       {"the scrape renders every notify family with its HELP line and series",
        fun() ->
-           Out = prometheus_text_format:format(),
            Node = atom_to_binary(node(), utf8),
-           [?assertNotEqual(nomatch, binary:match(Out, Part))
-            || Part <- [<<"# HELP yuzu_gw_upstream_notify_pending ">>,
-                        <<"# HELP yuzu_gw_upstream_notify_inflight ">>,
-                        <<"# HELP yuzu_gw_upstream_notify_coalesced_total ">>,
-                        <<"# HELP yuzu_gw_upstream_notify_dropped_total ">>,
-                        <<"yuzu_gw_upstream_notify_pending{node=\"", Node/binary, "\"} ">>,
-                        <<"yuzu_gw_upstream_notify_inflight{node=\"", Node/binary, "\"} ">>,
-                        <<"yuzu_gw_upstream_notify_coalesced_total ">>,
-                        <<"yuzu_gw_upstream_notify_dropped_total{reason=\"at_capacity\"} ">>,
-                        <<"yuzu_gw_upstream_notify_dropped_total{reason=\"unknown\"} ">>]]
+           assert_scrape_has([<<"# HELP yuzu_gw_upstream_notify_pending ">>,
+                              <<"# HELP yuzu_gw_upstream_notify_inflight ">>,
+                              <<"# HELP yuzu_gw_upstream_notify_coalesced_total ">>,
+                              <<"# HELP yuzu_gw_upstream_notify_dropped_total ">>,
+                              <<"yuzu_gw_upstream_notify_pending{node=\"", Node/binary, "\"} ">>,
+                              <<"yuzu_gw_upstream_notify_inflight{node=\"", Node/binary, "\"} ">>,
+                              <<"yuzu_gw_upstream_notify_coalesced_total ">>,
+                              <<"yuzu_gw_upstream_notify_dropped_total{reason=\"at_capacity\"} ">>,
+                              <<"yuzu_gw_upstream_notify_dropped_total{reason=\"unknown\"} ">>])
        end}
      ]}.
 
@@ -562,15 +545,11 @@ register_refused_families_test_() ->
       {"a reason outside the closed set, a missing reason and a non-binary reason fold into "
        "unknown and create no series of their own",
        fun() ->
-           U0 = counter_val(yuzu_gw_register_refused_total, [<<"unknown">>]),
-           telemetry:execute([yuzu, gw, register, refused], #{count => 1},
-                             #{reason => <<"other_reason">>}),
-           telemetry:execute([yuzu, gw, register, refused], #{count => 1}, #{}),
-           telemetry:execute([yuzu, gw, register, refused], #{count => 1},
-                             #{reason => {not_a, label}}),
-           ?assertEqual(U0 + 3, counter_val(yuzu_gw_register_refused_total, [<<"unknown">>])),
-           ?assertEqual(undefined, prometheus_counter:value(yuzu_gw_register_refused_total,
-                                                            [<<"other_reason">>]))
+           assert_folds_into_unknown([yuzu, gw, register, refused],
+                                     yuzu_gw_register_refused_total,
+                                     [#{reason => <<"other_reason">>},
+                                      #{},
+                                      #{reason => {not_a, label}}])
        end},
       {"every error code the gateway can emit locally exists at 0 for each RPC name that can emit it",
        fun() ->
@@ -587,13 +566,11 @@ register_refused_families_test_() ->
        end},
       {"the scrape renders the refusal family and the seeded error series",
        fun() ->
-           Out = prometheus_text_format:format(),
-           [?assertNotEqual(nomatch, binary:match(Out, Part))
-            || Part <- [<<"# HELP yuzu_gw_register_refused_total ">>,
-                        <<"yuzu_gw_register_refused_total{reason=\"agent_id_length\"} ">>,
-                        <<"yuzu_gw_register_refused_total{reason=\"unknown\"} ">>,
-                        <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"register\",code=\"encode\"} ">>,
-                        <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"inventory\",code=\"exception\"} ">>,
-                        <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"batch_heartbeat\",code=\"exception\"} ">>]]
+           assert_scrape_has([<<"# HELP yuzu_gw_register_refused_total ">>,
+                              <<"yuzu_gw_register_refused_total{reason=\"agent_id_length\"} ">>,
+                              <<"yuzu_gw_register_refused_total{reason=\"unknown\"} ">>,
+                              <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"register\",code=\"encode\"} ">>,
+                              <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"inventory\",code=\"exception\"} ">>,
+                              <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"batch_heartbeat\",code=\"exception\"} ">>])
        end}
      ]}.
