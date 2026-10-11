@@ -4173,6 +4173,22 @@ Before upgrading any component:
   configuration (#1822) auto-restarts on a watchdog fire similarly to the
   Linux `Restart=always` unit, but the exit shows up as a generic unexpected
   termination rather than one of the SCM's own "specific error" buckets.
+  During shutdown the agent now waits about 1 second per statement step (5 in normal
+  operation) for a `kv_store.db` that another process holds locked (#5604). SQLite's
+  own internal retries (for example on the WAL index) are not covered by that cap and
+  were measured at up to about 2.3 seconds against a 1 second budget on Linux (phasing
+  dependent), on every platform. A locked `kv_store.db` no longer pushes the
+  stage-by-stage shutdown past the deadline in the cases measured (6.03 s largest; see
+  the limits in [Guaranteed State](guaranteed-state.md)); a shutdown-time write to
+  that store can fail where the longer wait would have succeeded. Live in every agent,
+  that can leave the legacy-sink loss counters showing their previous value after the
+  restart, and can lose a plugin's last shutdown-time storage write or a sync
+  scheduler or license scan write made at shutdown. Once Spark detection is enabled it
+  can also cost one Guardian baseline recapture at the next start (a file that drifted
+  between the lost capture and that start is accepted as the baseline) and lose
+  pending lifecycle-journal records; see the baseline note in [Guaranteed
+  State](guaranteed-state.md) and, after an exit 4, *Stopping a wedged agent* in
+  [Server Administration](server-admin.md).
   `AgentImpl::stop()` and the run()-exit teardown each arm this deadline
   separately, and in the worst case the two can compose sequentially to as
   much as ~40s before either one fires, past the 30s SCM hint — but that
