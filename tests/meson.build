@@ -2990,6 +2990,16 @@ test('installed-software vocabulary consistency',
   timeout: 10,
 )
 
+# The /test Instructions gate's parameter synthesis must satisfy every definition's
+# validation.pattern (the server answers 400 otherwise). Hermetic — imports the
+# runner and parses content/definitions/, starts no server.
+test('instructions runner parameter synthesis',
+  _python3_test,
+  args: [files('test_instructions_runner_params.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # server/core/scripts/embed_content.py must not rewrite an unchanged
 # bundled_content.cpp: the custom_target is build_always_stale, so a rewrite
 # would recompile and relink the server on every ninja run. Runs the real

@@ -255,7 +255,16 @@ def _synth_string(name: str, schema: dict) -> str:
 # `validation.pattern`. The server rejects a value that does not match (HTTP 400), so
 # without this the runner reports a false FAIL for every pattern-constrained string
 # whose name the table above does not recognise.
-_PATTERN_FALLBACKS = ("10", "info", "192.168.1.0/24", "yuzu-uat-test-id", "x")
+_PATTERN_FALLBACKS = (
+    "10",                                    # digits
+    "info",                                  # log level
+    "192.0.2.0/30",                          # CIDR; RFC 5737 TEST-NET-1, never routed
+    "true",                                  # boolean string
+    "00000000-0000-0000-0000-000000000000",  # UUID
+    "00:00:00:00:00:00",                     # MAC
+    "yuzu-uat-test-id",
+    "x",
+)
 
 
 def _fit_pattern(value: str, schema: dict) -> str:
