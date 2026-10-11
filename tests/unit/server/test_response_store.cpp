@@ -22,7 +22,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <cstdio>
 #include <format>
 #include <limits>
 #include <map>
@@ -2231,6 +2230,13 @@ TEST_CASE("seed_response_facet_metrics: the filter-refused counter is pre-seeded
     const auto help_line = text.substr(help_pos, text.find('\n', help_pos) - help_pos);
     for (const unsigned char c : help_line)
         CHECK(c < 0x80);
+    // The HELP says where the count is taken: after authorization, and not when the MCP tool
+    // schema rejected the value first. It must not claim one count per refused request.
+    CHECK(help_line.find("counted at the refusal site after authorization") != std::string::npos);
+    CHECK(help_line.find("not counted when authorization refused first or, on the MCP "
+                         "approval-gated tier, when the tool schema rejected the value first") !=
+          std::string::npos);
+    CHECK(help_line.find("one per refused request") == std::string::npos);
 }
 
 // #2691 (Doomgoose finding #7): facet_agent_count/facet_line_count were a

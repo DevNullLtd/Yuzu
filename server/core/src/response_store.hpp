@@ -125,8 +125,8 @@ inline constexpr std::size_t kMaxFacetValueBytes = 2048;
 /// deliberately does NOT claim that no agent has the value: the predicate refuses a line feed
 /// but accepts a CR, and a stored value holding a CR may reach the server with an LF when it
 /// is picked from the dashboard dropdown (the HTML parser and form submission normalise
-/// newlines: confirmed in headless Chrome, where an option value 'x\ny' was sent by htmx as
-/// %0A; only that one engine, Chromium, was tested), in which case it is refused here although
+/// newlines: in headless Chromium a stored 'x<CR>y' appeared as option.value 'x<LF>y' and htmx
+/// sent %0A; other engines were not tested), in which case it is refused here although
 /// an agent has it. The REST and MCP envelopes carry this message and the remediation in their
 /// own fields. The dashboard does not use this builder: it words its refusal separately, in
 /// plain language (dashboard_routes.cpp).
@@ -167,8 +167,10 @@ inline constexpr const char* kFacetDropBatchFailed = "batch_failed";
 /// saved View's empty `equals` value on the dashboard). One increment per refused request,
 /// by the surface that refused it: the dashboard (`/fragments/results`, the create-group
 /// form's count preview, and group-from-results), the REST agent-count-preview, or the MCP
-/// `preview_management_group_agent_count` tool. Not counted: a request refused earlier by
-/// authorization.
+/// `preview_management_group_agent_count` tool. Counted at the handler's refusal site, after
+/// authorization. Not counted: a request refused earlier by authorization, or, on the MCP
+/// approval-gated tier, a value the tool's input schema (`maxLength`) rejected before the
+/// handler ran (that is audited `denied` and counted in `yuzu_mcp_tool_args_invalid_total`).
 inline constexpr const char* kResponseFacetFilterRefusedMetric =
     "yuzu_server_response_facet_filter_refused_total";
 inline constexpr const char* kFacetRefusedSurfaceDashboard = "dashboard";

@@ -719,9 +719,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // hidden-input attribute value) into LF at input-stream preprocessing, and
                  // form submission normalises newlines in submitted values too. That affects
                  // the GET dropdown path (option value, then /fragments/create-group-form's
-                 // hidden input) as much as this POST. Confirmed in headless Chrome (an
-                 // option value 'x\ny' was sent by htmx as %0A); only that one engine,
-                 // Chromium, was tested. Whether a CR survives depends on how the markup was
+                 // hidden input) as much as this POST. In headless Chromium a stored
+                 // 'x<CR>y' appeared as option.value 'x<LF>y' and htmx sent %0A; other
+                 // engines were not tested. Whether a CR survives depends on how the markup was
                  // escaped and how htmx builds the request.
                  // Before #5623 the POST answered 422 "no agents match" (htmx drops both
                  // bodies). 400 is the honest status for the direct/automation caller (see
@@ -1389,6 +1389,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // the whole element (outerHTML) so the new hx-get /
                  // hx-trigger attributes attach; `innerHTML` would lose
                  // them.
+                 // Deliberately NOT in kResultsSyncScope: this unscoped refresh
+                 // carries no f_* params, so its OOB can overwrite the pager /
+                 // summary / Create-Group chrome with UNFILTERED content while
+                 // a filter is applied (browser-confirmed; tracked in #5669).
                  if (!def_id.empty()) {
                      html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\""
                              " hx-get=\"/fragments/results?command_id=" +

@@ -455,8 +455,10 @@ void seed_response_facet_metrics(yuzu::MetricsRegistry& m) {
                "Requests refused because a facet filter value can match no stored facet (over "
                "the facet value bound, or containing a NUL byte, a line feed or invalid "
                "UTF-8; on the dashboard also a saved View whose equals filter is empty), by "
-               "the surface that refused them (dashboard, rest, mcp); one per refused "
-               "request, and not counted when authorization refused first",
+               "the surface that refused them (dashboard, rest, mcp); counted at the "
+               "refusal site after authorization, so not counted when authorization "
+               "refused first or, on the MCP approval-gated tier, when the tool schema "
+               "rejected the value first",
                "counter");
     for (const auto* surface :
          {kFacetRefusedSurfaceDashboard, kFacetRefusedSurfaceRest, kFacetRefusedSurfaceMcp})

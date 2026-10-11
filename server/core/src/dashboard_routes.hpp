@@ -53,6 +53,10 @@ class EventBus;
 // in flight, and let a late sort/page response land after another response's out-of-band
 // swap had detached its issuer. `#filter-bar` is looked up document-wide at request time,
 // so it works for the th / pagination elements that sit OUTSIDE the form.
+// Deliberate exclusion: the `#chart-deck-host` 2-second self-refresh (dashboard_routes.cpp) is
+// NOT in this scope. It is an unscoped request that carries no f_* params, so its out-of-band
+// swap can overwrite the pager / summary / Create-Group chrome with UNFILTERED content
+// (confirmed in a browser; tracked in #5669).
 inline constexpr const char* kResultsSyncScope = "#filter-bar:replace";
 
 class DashboardRoutes {
