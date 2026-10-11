@@ -1120,16 +1120,18 @@ discipline the rest of this PR applies to the Windows widths — this
 paragraph exists to make the new fact visible to the next reviewer, not to
 resolve it unilaterally.
 
-**Re-derived 2026-10-11 after shards M, N and O (pg-shard rebalance).** The
-pg suite is now 15 shards: shards M and N were carved from C (12 tags moved,
+**Re-derived 2026-10-11 after shards M, N, O and P (pg-shard rebalance).** The
+pg suite is now 16 shards (15 after the first step, P added by the follow-up
+below): shards M and N were carved from C (12 tags moved,
 C 886 to 542 cases) and shard O from F (its `[dex]` clause, F 532 to 418
 cases; the 28 cases tagged both `[dex]` and `[mcp]` go to O), motivated by
 Windows C at 895s and F at 765s against the 700s per-shard timeout (Linux
 4-wide: C 629s, F 470s, every other shard 120-260s). The theoretical
 degenerate ceiling grows with the count, as the paragraph above predicted for
-any addition: 15 * 700 = 10500 test-seconds, and at `--num-processes 2` that
-is 8 rounds (the eighth runs a single shard), so BEST and WORST makespan are
-both 8 * 700 = 5600s, roughly 93 minutes before the cross-job slot wait. This
+any addition: 16 * 700 = 11200 test-seconds, and at `--num-processes 2` that
+is 8 full rounds (15 shards were also 8 rounds, the eighth running a single
+shard, so P adds no round), so BEST and WORST makespan are both 8 * 700 =
+5600s, roughly 93 minutes before the cross-job slot wait. This
 is still a ceiling that requires every shard to hit its own cap, not an
 expected case. The expected case moves the other way: the two shards that set
 the makespan floor shrink, and the new shards' predicted costs are ESTIMATES
@@ -1137,6 +1139,26 @@ until the first CI run on each platform measures them. The tag assignment is
 the tuning knob (move a tag between M and N, or O and F), documented in
 `tests/meson.build` above shard M. The per-shard timeout and the Linux
 `--num-processes 2` cap are deliberately unchanged here.
+
+**Follow-up, same day: shard P carved from C.** A healthy-Postgres Windows
+run of the 15-shard layout (4-wide) measured C 542s (only 23% under the 700s
+timeout), F 552s, A 615s, E 535s, D 450s, O 424s, K 269s, I 263s, J 260s,
+B 175s and M 99s; Linux 4-wide on a loaded box ran C 254s and the others
+113-258s, so C's Windows/Linux ratio is about 2.1. C's profile was flat (542
+cases, 148s solo serial, mean 0.27s per case), so its cost is per-test
+Postgres setup and the lever is case count. Shard P takes six C-resident tags
+(`[rest]`, `[auth]`, `[dashboard]`, `[adversarial]`, `[authz_model]`,
+`[app_perf]`): 202 cases and 46.9% of C's profiled seconds, leaving C 340
+cases. The ESTIMATED Windows times, scaling C's 542s by the profiled share
+and not measured, are P about 254s and C about 288s. P is a new shard rather
+than more M clauses because the same C-based scaling would put M near 350s;
+M's own Windows/Linux ratio (0.67) is not used since M is likely dominated by
+waits that do not scale with setup cost. A, F and E (615s, 552s, 535s) are
+left untouched by this change and remain the tightest shards on Windows.
+Partition proof: the 16 shards' union equals the `[pg]` population (4729),
+no case runs twice, the 202 cases leaving C are exactly P's, and every other
+shard is set-identical. Re-measure on the first Windows run before moving
+anything else.
 
 **Drift risk — automated (#3443 Phase 1, 2026-08-26):** this used to hardcode
 the 10 pg shard names and the 3 non-pg server test names directly in `ci.yml`,
