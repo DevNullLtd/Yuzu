@@ -161,8 +161,26 @@ inline constexpr const char* kFacetDropCap = "cap";
 /// so none of the response's facets persisted (the response itself committed).
 inline constexpr const char* kFacetDropBatchFailed = "batch_failed";
 
-/// Describe and pre-seed every reason of the facets-dropped counter at zero, so an
-/// idle server exports the series. Called once at startup from `ServerImpl`.
+/// `yuzu_server_response_facet_filter_refused_total{surface}`: requests refused because a
+/// facet filter value can match no stored facet (`facet_filter_value_unmatchable`, or a
+/// saved View's empty `equals` value on the dashboard). One increment per refused request,
+/// by the surface that refused it: the dashboard (`/fragments/results`, the create-group
+/// form's count preview, and group-from-results), the REST agent-count-preview, or the MCP
+/// `preview_management_group_agent_count` tool. Not counted: a request refused earlier by
+/// authorization.
+inline constexpr const char* kResponseFacetFilterRefusedMetric =
+    "yuzu_server_response_facet_filter_refused_total";
+inline constexpr const char* kFacetRefusedSurfaceDashboard = "dashboard";
+inline constexpr const char* kFacetRefusedSurfaceRest = "rest";
+inline constexpr const char* kFacetRefusedSurfaceMcp = "mcp";
+
+/// Count one refused request on `surface` (one of the `kFacetRefusedSurface*` values). A
+/// null registry is a no-op.
+void note_facet_filter_refused(yuzu::MetricsRegistry* metrics, const char* surface);
+
+/// Describe and pre-seed every reason of the facets-dropped counter, and every surface of
+/// the filter-refused counter, at zero, so an idle server exports the series. Called once
+/// at startup from `ServerImpl`.
 void seed_response_facet_metrics(yuzu::MetricsRegistry& m);
 
 struct StoredResponse {

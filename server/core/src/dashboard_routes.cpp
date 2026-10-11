@@ -451,6 +451,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // Rendered at 200, not 400: the dashboard htmx config drops 4xx bodies
                 // (responseHandling swap:false), which would leave the old rows in place.
                 if (view_empty_col) {
+                    note_facet_filter_refused(metrics_, kFacetRefusedSurfaceDashboard);
                     res.set_content(
                         results_refusal_html(facet_refusal_text_view_empty(*view_empty_col)),
                         "text/html; charset=utf-8");
@@ -459,6 +460,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 for (size_t fi = 0; fi < filters.size(); ++fi) {
                     if (!facet_filter_value_unmatchable(filters[fi].value)) continue;
                     const bool from_view = !filters_explicit && fi < view_filter_cols.size();
+                    note_facet_filter_refused(metrics_, kFacetRefusedSurfaceDashboard);
                     res.set_content(
                         results_refusal_html(
                             from_view ? facet_refusal_text_view(view_filter_cols[fi])
@@ -612,6 +614,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // or a NUL / line feed / invalid UTF-8) rather than preview an exact
                 // "0 agents". 200 for the same reason as /fragments/results.
                 if (any_facet_filter_unmatchable(filters)) {
+                    note_facet_filter_refused(metrics_, kFacetRefusedSurfaceDashboard);
                     res.set_header("Cache-Control", "no-store, private");
                     res.set_header("Vary", "Cookie");
                     res.set_content(
@@ -724,6 +727,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // bodies). 400 is the honest status for the direct/automation caller (see
                  // NOTE above).
                  if (any_facet_filter_unmatchable(filters)) {
+                     note_facet_filter_refused(metrics_, kFacetRefusedSurfaceDashboard);
                      res.status = 400;
                      res.set_header("HX-Retarget", "#group-form-slot");
                      res.set_content(

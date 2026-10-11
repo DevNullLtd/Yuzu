@@ -3715,7 +3715,7 @@ void RestApiV1::register_routes(
     // call, matching the fragment's own "no filter -> no scoped count"
     // branch exactly.
     sink.Get("/api/v1/management-groups/agent-count-preview",
-             [auth_fn, perm_fn, response_store, response_visible_set_fn](
+             [auth_fn, perm_fn, response_store, response_visible_set_fn, metrics_registry](
                  const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
@@ -3744,11 +3744,12 @@ void RestApiV1::register_routes(
                  // would otherwise turn a misspelled key into an empty filter set and an
                  // exact 0), and before any store access; the value is never echoed.
                  if (any_raw_filter_value_unmatchable(raw_fields)) {
+                     note_facet_filter_refused(metrics_registry, kFacetRefusedSurfaceRest);
                      res.status = 400;
-                     res.set_content(detail::error_json_a4(400, facet_filter_value_refusal_message(),
-                                                           cid,
-                                                           facet_filter_value_refusal_remediation()),
-                                     "application/json");
+                     res.set_content(
+                         detail::error_json_a4(400, facet_filter_value_refusal_message(), cid,
+                                               facet_filter_value_refusal_remediation()),
+                         "application/json");
                      return;
                  }
                  auto filters = resolve_group_preview_filters(plugin, raw_fields);

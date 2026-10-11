@@ -10029,6 +10029,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // RAW values before key resolution (an unknown key is skipped by the
                 // resolver); the value is never echoed.
                 if (any_raw_filter_value_unmatchable(raw_fields)) {
+                    note_facet_filter_refused(metrics, kFacetRefusedSurfaceMcp);
                     res.set_content(a4_error(kInvalidParams, facet_filter_value_refusal_message(),
                                              facet_filter_value_refusal_remediation()),
                                     "application/json");
