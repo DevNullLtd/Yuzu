@@ -2017,9 +2017,10 @@ public:
                           "proceeds to the guarded write; grant_read: the SCIM "
                           "pre-provisioning Administrator-grant read). The unwired fail-closed "
                           "arm also counts, for deactivate and set_role only. A sustained "
-                          "non-zero "
-                          "rate means deprovisioning or role changes are being answered with a "
-                          "retryable error rather than judged: look at yuzu_pg_pool_waiters and "
+                          "non-zero rate means deprovisioning or role changes are being "
+                          "answered with a store-unavailable error rather than judged (SCIM "
+                          "answers 503 with Retry-After; the dashboard role route gives no "
+                          "retry hint): look at yuzu_pg_pool_waiters and "
                           "yuzu_pg_acquire_wait_seconds, and for a stuck rbac_enabled row lock "
                           "holder.",
                           "counter");
@@ -2041,18 +2042,21 @@ public:
         for (const auto outcome : {"guard_refused_last_administrator",
                                    "deactivated_but_session_wipe_failed", "store_failure"})
             metrics_.counter("yuzu_scim_compensation_failed_total", {{"outcome", outcome}});
-        // #4966: SCIM Group role-recompute members that were NOT attempted after a store failure
-        // earlier in the same request. Only promotions are ever skipped (the fail-safe direction):
-        // the demotion series exists so its zero is visible and stays seeded as evidence.
+        // #4966: SCIM Group role-recompute members NOT applied in one Group request. Promotions
+        // after the first failed guarded write of the request are skipped (the fail-safe
+        // direction); a member whose reads failed is "undetermined" (its role was left untouched).
+        // Demotions are always attempted, so there is no demotion series. Both series are seeded
+        // so a zero is visible and stays seeded as evidence.
         metrics_.describe("yuzu_scim_group_recompute_skipped_total",
-                          "SCIM Group role-recompute members skipped after the first store "
-                          "failure of a request, by direction. Only promotions are skipped; "
-                          "demotions are always attempted, so direction=demotion should stay 0. "
-                          "Each increment is recorded by one scim.group.recompute_incomplete "
-                          "audit row listing the skipped users; they are repaired by the next "
-                          "Group operation that names them or a User re-provision.",
+                          "SCIM Group role-recompute members not applied in one Group request, "
+                          "by direction. promotion: skipped after the first failed guarded write "
+                          "of the request. undetermined: a read the decision needed failed, so "
+                          "the member's role was left untouched and it is unknown whether an "
+                          "administrator was kept. Each increment is recorded by one "
+                          "scim.group.recompute_incomplete audit row naming the members; there is "
+                          "no automatic repair (see the SCIM provisioning guide, Known limits).",
                           "counter");
-        for (const auto direction : {"promotion", "demotion"})
+        for (const auto direction : {"promotion", "undetermined"})
             metrics_.counter("yuzu_scim_group_recompute_skipped_total",
                              {{"direction", direction}});
         // #2703 Gate 7 merge-slice item 1 commit C. Neither metric duplicates the

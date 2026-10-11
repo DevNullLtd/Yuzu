@@ -159,9 +159,10 @@ public:
         yuzu::server::pg::PgResult begin = yuzu::server::pg::exec_params(
             lease_.get(), "BEGIN", std::vector<std::string>{});
         REQUIRE(begin.status() == PGRES_COMMAND_OK);
-        // From here a failing REQUIRE still rolls back: the destructor of a constructor that THREW
-        // does not run, but `lease_` (a fully constructed member) is destroyed and the pool's
-        // release path rolls an open transaction back before the connection is reused.
+        // From here a failing REQUIRE still rolls back: the destructor of an object whose
+        // constructor threw does not run, but `lease_` (a fully constructed member) is destroyed
+        // and the pool's release path rolls an open transaction back before the connection is
+        // reused.
         open_ = true;
         yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
             lease_.get(),
@@ -227,7 +228,8 @@ public:
     void repair() noexcept {
         if (!armed_)
             return;
-        armed_ = false;
+        // `armed_` is cleared only once the undo SUCCEEDED, so a failed explicit repair() is
+        // retried by the destructor instead of being forgotten.
         try {
             // A bounded wait, never the deadline-less acquire(): a drained pool must not hang a
             // destructor. A null lease means the schema is STILL BROKEN for the next test sharing
@@ -242,6 +244,8 @@ public:
                 lease.get(), undo_.c_str(), std::vector<std::string>{});
             if (r.status() != PGRES_COMMAND_OK)
                 std::fprintf(stderr, "SqlFault: repair failed: %s\n", undo_.c_str());
+            else
+                armed_ = false;
         } catch (...) {
             std::fprintf(stderr, "SqlFault: repair threw: %s\n", undo_.c_str());
         }

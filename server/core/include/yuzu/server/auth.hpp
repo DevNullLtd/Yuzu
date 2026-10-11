@@ -942,8 +942,8 @@ public:
     /// change, and `mu_` is NEVER held across it (the file-wide "no mu_ across a DB call" rule,
     /// which `recheck_role_after_credential_check`'s mu_-inside-row-lock acquisition depends on).
     /// The `users_` erase and the session wipe (in-memory, then durable) run only AFTER a
-    /// committed deactivation, and are re-attempted on `NotFound` so a retry converges after a
-    /// failed wipe. Config-file mode (no AuthDB) keeps the in-memory path unchanged.
+    /// committed deactivation, and are re-attempted on `NotFound`, so a repeat re-runs the guarded
+    /// write and the session wipe. Config-file mode (no AuthDB) keeps the in-memory path unchanged.
     [[nodiscard]] RemoveUserOutcome remove_user_checked(const std::string& username);
 
     /// #4966 best-effort EARLY refusal for a deactivation: true iff removing `username` would

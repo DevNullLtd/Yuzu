@@ -2029,8 +2029,8 @@ RemoveUserOutcome AuthManager::remove_user_checked(const std::string& username) 
         // VALUE of the cache erase: on a cold-booted server users_ may never have been warmed
         // for this username even though the DB row existed and was just soft-deleted, and
         // reporting that as failure would turn a SCIM deprovision into a fail-closed 500 loop
-        // on restart. The DB write is authoritative. It also runs for NotFound, so a retry
-        // after a failed durable wipe (the row is then already inactive) converges.
+        // on restart. The DB write is authoritative. It also runs for NotFound, so a repeat after a
+        // failed durable wipe (the row is then already inactive) re-runs the session wipe.
         std::unique_lock lock(mu_);
         users_.erase(username);
         // Invalidate all active sessions belonging to this user
@@ -2362,7 +2362,8 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
         // this username even though the DB row existed and was just updated, and reporting that
         // as failure would be false (e.g. an unaudited SCIM role recompute after restart). The
         // DB write is authoritative - same pattern as remove_user_checked. Also runs for
-        // Unchanged, so a retry after a failed durable wipe converges.
+        // Unchanged, so a repeat call re-runs the session wipe (no route-level retry is promised:
+        // see `UpdateRoleOutcome::UpdatedSessionWipeFailed`).
         std::unique_lock lock(mu_);
         auto it = users_.find(username);
         if (it != users_.end()) {

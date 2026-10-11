@@ -221,6 +221,13 @@ struct RbacEnforcementError {
 /// `RbacStore`'s constructor takes it as a parameter so a test can shorten it; nothing in
 /// production passes anything but this default.
 inline constexpr std::chrono::milliseconds kDefaultLifecycleLockTimeout{2000};
+/// The accepted range of the lifecycle lock bound; the constructor clamps into it. The floor is
+/// 1 ms because Postgres reads `lock_timeout = 0` as "no bound" and a negative value is a
+/// statement error. The ceiling is 60 s because Postgres rejects a `lock_timeout` above 2^31-1 ms
+/// (a statement error that would fail every guarded write) and because a bound longer than the
+/// pool's own statement bound would pin a pooled connection for no benefit.
+inline constexpr std::chrono::milliseconds kMinLifecycleLockTimeout{1};
+inline constexpr std::chrono::milliseconds kMaxLifecycleLockTimeout{60000};
 
 class RbacStore {
 public:
@@ -230,9 +237,10 @@ public:
     /// (fail-closed, every authz read then DENIES, the right posture for the
     /// authorization substrate). `lifecycle_lock_timeout` bounds the lock waits of the
     /// account-lifecycle guard (#4966); the default is the production value and is a constructor
-    /// parameter, never a mutable member, so it is fixed for the store's lifetime. A value below
-    /// 1 ms is clamped to 1 ms (0 would disable the bound in Postgres; a negative value is an
-    /// error).
+    /// parameter, never a mutable member, so it is fixed for the store's lifetime. The value is
+    /// clamped into [`kMinLifecycleLockTimeout`, `kMaxLifecycleLockTimeout`] (1 ms to 60000 ms):
+    /// below the floor Postgres would read 0 as "no bound" or reject a negative value, above the
+    /// ceiling it would reject a value over 2^31-1 ms.
     explicit RbacStore(pg::PgPool& pool, std::chrono::milliseconds lifecycle_lock_timeout =
                                              kDefaultLifecycleLockTimeout);
     ~RbacStore();

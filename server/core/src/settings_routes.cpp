@@ -153,10 +153,10 @@ void respond_lifecycle_store_unavailable(httplib::Response& res, std::string_vie
 
 // #4966: the answer for "the change COMMITTED but the durable session wipe failed" AND for the
 // role route's indeterminate StoreFailure (the commit may have been acknowledged-lost and the
-// failure path's wipe may have failed). A plain 503 with NO retry hint (no `Retry-After`, no `retry_after_ms`): a repeat of the
-// role POST finds the role already set and answers 200 "Role unchanged" WITHOUT redoing the wipe,
-// so telling a client to retry would promise a convergence the route does not provide. The
-// operator finishes it by revoking the user's sessions.
+// failure path's wipe may have failed). A plain 503 with NO retry hint (no `Retry-After`, no
+// `retry_after_ms`): a repeat of the role POST finds the role already set and answers 200 "Role
+// unchanged" WITHOUT redoing the wipe, so telling a client to retry would promise a convergence
+// the route does not provide. The operator finishes it by revoking the user's sessions.
 void respond_committed_no_retry(httplib::Response& res, std::string_view message) {
     res.status = 503;
     res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::string(message) +

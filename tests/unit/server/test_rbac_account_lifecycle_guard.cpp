@@ -541,8 +541,8 @@ TEST_CASE("lifecycle guard: a lock wait that expires is reported as a store fail
     CHECK(store.deactivate_account("to_a").kind == DKind::kDeactivated);
 }
 
-TEST_CASE("lifecycle guard: a lifecycle lock timeout below 1 ms is clamped to 1 ms, so zero does "
-          "not disable the bound and a negative value does not fail every write",
+TEST_CASE("lifecycle guard: the lifecycle lock timeout is clamped into [1 ms, 60 s], so zero does "
+          "not disable the bound and a negative or oversized value does not fail every write",
           "[pg][auth_db][lifecycle_guard]") {
     LIFECYCLE_FIXTURE(seeding_store, auth_db);
     build_world(auth_db, seeding_store, /*rbac_on=*/false,
@@ -573,6 +573,19 @@ TEST_CASE("lifecycle guard: a lifecycle lock timeout below 1 ms is clamped to 1 
         REQUIRE(store.is_open());
         CHECK(store.deactivate_account("cl_b").kind == DKind::kDeactivated);
         CHECK_FALSE(account_active(auth_db.pool(), "cl_b"));
+    }
+    SECTION("above 2^31 ms: the write still works (an unclamped value is a statement error)") {
+        // Postgres rejects a lock_timeout above 2^31-1 ms; the constructor clamps to the 60 s
+        // ceiling (kMaxLifecycleLockTimeout), so the guarded write is not failed by the setting.
+        RbacStore store{auth_db.pool(), std::chrono::milliseconds(3'000'000'000LL)};
+        REQUIRE(store.is_open());
+        CHECK(store.deactivate_account("cl_c").kind == DKind::kDeactivated);
+        CHECK_FALSE(account_active(auth_db.pool(), "cl_c"));
+    }
+    SECTION("the maximum representable duration is clamped too") {
+        RbacStore store{auth_db.pool(), std::chrono::milliseconds::max()};
+        REQUIRE(store.is_open());
+        CHECK(store.deactivate_account("cl_c").kind == DKind::kDeactivated);
     }
 }
 
