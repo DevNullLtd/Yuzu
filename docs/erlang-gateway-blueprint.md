@@ -113,8 +113,10 @@ yuzu_gateway/
 ```erlang
 %% rebar.config
 {deps, [
-    {grpcbox,   "0.17.1"},     % gRPC client (upstream channel); the listeners are the yuzu_grpc* layer over cowboy
-    {gpb,       "4.21.7"},     % Protobuf compiler/runtime (grpcbox dep)
+    {cowboy,    "2.19.0"},     % HTTP/2 server under the gateway's own gRPC listeners (yuzu_grpc*); brings ranch
+    {gun,       "2.5.0"},      % HTTP/2 client under the gateway-to-server gRPC client (yuzu_grpc_client)
+    {ctx,       "0.6.0"},      % request-context type of the yuzu_grpc* layer
+    {gpb,       "4.21.7"},     % Protobuf compiler/runtime
     {telemetry,  "1.3.0"},     % Metrics event API
     {prometheus, "4.11.0"},    % Prometheus exposition (telemetry handler)
     {recon,      "2.5.5"}      % Production introspection
@@ -151,7 +153,9 @@ States:
 **Key properties:**
 
 - The process **owns** the gRPC stream writer handle. All writes to this agent
-  go through its mailbox — no mutex needed.
+  go through its mailbox — no mutex needed. (As shipped, the Subscribe handler
+  process owns the stream and the agent process sends it `{send_command, Cmd}`;
+  the sketch below shows that.)
 - Incoming `CommandRequest` messages are delivered via `gen_statem:cast/2`.
   The process writes to the stream immediately; backpressure is handled by
   the HTTP/2 flow control window.
@@ -166,7 +170,7 @@ States:
 -record(data, {
     agent_id    :: binary(),
     session_id  :: binary(),
-    stream_ref  :: grpcbox:stream_ref(),
+    stream_pid  :: pid(),                      % the Subscribe handler process that owns the stream
     plugins     :: [binary()],
     pending     :: #{command_id() => from()}   % who to send responses to
 }).
@@ -174,14 +178,14 @@ States:
 %% In 'streaming' state, handle command dispatch:
 streaming(cast, {dispatch, CommandReq, ReplyTo}, Data) ->
     CmdId = maps:get(command_id, CommandReq),
-    ok = grpcbox_client:send(Data#data.stream_ref, CommandReq),
+    Data#data.stream_pid ! {send_command, CommandReq},   % that process calls yuzu_grpc_stream:send/2
     telemetry:execute([yuzu, gw, command, dispatched],
                       #{count => 1},
                       #{agent_id => Data#data.agent_id, plugin => maps:get(plugin, CommandReq)}),
     {keep_state, Data#data{pending = maps:put(CmdId, ReplyTo, Data#data.pending)}};
 
 %% Incoming response from agent stream:
-streaming(info, {grpc_data, _StreamRef, ResponseFrame}, Data) ->
+streaming(info, {stream_data, ResponseFrame}, Data) ->
     CmdId  = maps:get(command_id, ResponseFrame),
     Status = maps:get(status, ResponseFrame),
     case maps:find(CmdId, Data#data.pending) of
@@ -704,7 +708,7 @@ LB/DNS ────────├─── gw3 (1M agents) ───├──�
    list and updates `last_seen` in bulk.
 
 3. **Add the Erlang OTP project** under `gateway/` (or a separate repo).
-   Wire up the gateway's gRPC layer (`yuzu_grpc*` over Cowboy; `grpcbox` for the upstream client) with the proto files using `gpb` for code generation.
+   Wire up the gateway's gRPC layer (`yuzu_grpc*` over Cowboy for the listeners; `yuzu_grpc_client` over gun for the upstream client) with the proto files using `gpb` for code generation.
 
 ### Phase 1: Shadow Mode (read-only gateway, agents still connect to C++)
 

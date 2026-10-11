@@ -208,23 +208,31 @@ toolchain-contract inventory test finds an unlisted active reference.
 package cache — it does not bump the pins in `rebar.config`. Automating
 rebar3 bumps requires custom per-dep logic (hex.pm API for hex deps,
 `git ls-remote --tags` for git deps) that isn't worth the complexity for
-a project with 7 gateway dependencies that change a few times a year.
+a project with 8 direct gateway dependencies that change a few times a year.
 
 **We review `gateway/rebar.config` manually every quarter**, or whenever
 a gateway change is blocked on an upstream fix. Checklist:
 
 1. `cd gateway && source ../scripts/ensure-erlang.sh`
 2. For each hex dep in `rebar.config`, check the latest stable release:
-   - `grpcbox` — https://github.com/tsloughter/grpcbox/tags
+   - `cowboy` — https://hex.pm/packages/cowboy (the gateway's listeners: the
+     `yuzu_grpc_*` layer is a `cowboy_stream` handler; `ranch` and `cowlib` come with it)
+   - `gun` — https://hex.pm/packages/gun (the HTTP/2 client under the upstream gRPC
+     client `yuzu_grpc_client`; it needs `cowlib` too)
+   - `ctx` — https://hex.pm/packages/ctx (the request-context type of the gRPC layer)
    - `gpb` — https://hex.pm/packages/gpb
    - `telemetry` — https://hex.pm/packages/telemetry
    - `prometheus` — https://hex.pm/packages/prometheus
    - `prometheus_httpd` — https://hex.pm/packages/prometheus_httpd
    - `recon` — https://hex.pm/packages/recon
-   - `gproc` — https://hex.pm/packages/gproc
    - `meck` (test profile) — https://hex.pm/packages/meck
    - `proper` (test profile) — https://hex.pm/packages/proper
-3. For each git-pinned dep (`grpcbox_plugin`), `git ls-remote --tags`.
+3. There are no git-pinned deps: the gateway used to vendor a patched grpcbox
+   (`_checkouts/grpcbox`) and pin a `grpcbox_plugin` git tag, and both are gone, as is
+   everything grpcbox brought (chatterbox, hpack, acceptor_pool, gproc). If a git-pinned dep
+   is ever added, `git ls-remote --tags` it. Transitive deps (`ranch`, `cowlib`, `accept`,
+   `quantile_estimator`) are pinned only by `rebar.lock`; they move when the dep that needs
+   them is bumped, so read the lock diff.
 4. Bump any dep whose latest stable is > 1 minor version ahead of the
    pin, or any dep with a known security advisory (check GitHub
    Security Advisories for the repo).
@@ -232,6 +240,15 @@ a gateway change is blocked on an upstream fix. Checklist:
    each bump — do not batch bumps without testing in between.
 6. Commit the `rebar.config` change with a conventional
    `build(deps): bump <dep> to <version>` message.
+
+**Pin policy.** `cowboy` and `gun` (the two HTTP/2 stacks the gateway's gRPC layer sits on)
+are pinned to a release **at least a month old**, as the comments in `rebar.config` say; a
+release newer than that waits. Apply the same rule to any bump. Pin an exact version (as every
+dep there is), and refresh `rebar.lock` with `rebar3 upgrade <dep>` so its package hashes
+cover the new tarball; commit both files together. After a `cowboy`, `gun`, `cowlib` or
+`ranch` bump also run the wire suites that exercise them (`yuzu_grpc_wire_tests`,
+`yuzu_grpc_origin_wire_tests`, `yuzu_grpc_client_tls_tests`) and `rebar3 dialyzer`
+(`cowlib` and `gun` are in `plt_extra_apps`).
 
 ## Vendored JavaScript assets
 

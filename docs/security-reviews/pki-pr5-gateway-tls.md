@@ -105,3 +105,15 @@ withdrawn by ADR-0066. The durable fix is now a gRPC gateway-hop identity design
 client-cert verification on the agent listener + gateway attestation / per-gateway scoping,
 #1292), designed in #5578. R-1's longer-term path is no longer QUIC: it stays #1289 (the TLS
 flip) plus #4722's mandatory-TLS sequence. The residual ratings above are unchanged.
+
+**Update (2026-10-11).** The grpcbox this review names no longer exists in the gateway. The listener-side
+patch (`ssl => true`, configurable `verify`/`fail_if_no_peer_cert`, the vendored `_checkouts/grpcbox`) was
+replaced on 2026-10-10 by the gateway's own listener layer over Cowboy (`{yuzu_gw, grpc_listeners}`), and the
+upstream client by `yuzu_grpc_client` over gun on 2026-10-11 (`{yuzu_gw, upstream_client}`); the vendored copy,
+its integrity check and the `grpcbox_plugin` are deleted. The postures this review records are unchanged and
+re-checked in the new code: the upstream channel is TLS 1.2 mutual TLS with `verify_peer` mandatory (boot refuses
+an `https` channel without it, `evaluate_upstream_posture/2`), and the listeners' `tls` map is closed and requires
+`certfile`, `keyfile` and `cacertfile`. The silent-downgrade mitigation named in the "Silent downgrade" row (the
+missing `ssl => true`) is moot: there is no `transport_opts` any more, and a legacy key refuses boot by name. A
+leftover `{grpcbox, [{client, ...}]}` or `{grpcbox, [{servers, ...}]}` block also refuses boot, because nothing reads
+it and it would read as configured. The rest of the review is left as written for the record.

@@ -632,3 +632,26 @@ separate. None is part of this design.
   test (`tests/shell/test_gateway_peer_boot_refusal.sh`, a step in `.github/workflows/ci.yml`; it
   needs the server binary and Postgres) exercises the refusal and acknowledgement rows against the
   real binary.
+
+## Update (2026-10-11): the gateway's upstream client is no longer grpcbox
+
+This record was written when the gateway's connection to the server was a grpcbox client
+channel. Two statements above no longer describe the code. (1) "Redialling is inferred from
+reading the grpcbox code ... and a channel reconnects lazily after its connection process dies"
+and the later "(inferred from reading the grpcbox code, not tested)": the client is now the
+gateway's own `yuzu_grpc_client` over gun, and its channel (`yuzu_grpc_client_channel`) opens its
+connections when it starts and reopens a lost one after a delay of 100 ms doubling to 5 s with
+jitter, not lazily on the next call. (2) The certificate and key are still file paths in the
+channel's TLS options, handed to Erlang's `ssl`, which reads them when a connection's handshake
+runs. Unlike the original claim, this was **measured** on 2026-10-11 with the new channel
+against a local TLS listener that requires a client certificate, on OTP 28: after the files were
+replaced an open connection kept presenting the old certificate, a reconnect before the `ssl`
+PEM cache was cleared presented the old one again, and a reconnect after it was cleared presented
+the new one (not measured on a Yuzu gateway against a Yuzu server). What did not change, read from
+the code: a connection that is up is never closed because of an RPC status (a status 16 refusal
+cancels the stream only), there is no connection-age cap, so the "gateway does not redial by
+itself on a refusal" and "renew before `notAfter`" statements stand; and the upstream channel is
+`{yuzu_gw, [{upstream_client, ...}]}` instead of `{grpcbox, [{client, ...}]}`. By default the
+channel opens one connection per endpoint, as the previous client did (`pool_size` can raise it);
+the pin and the per-call checks on the server are unaffected. See
+`docs/user-manual/gateway.md`, "The upstream client".

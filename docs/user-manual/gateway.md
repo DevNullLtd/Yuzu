@@ -109,7 +109,8 @@ The gateway source lives in `gateway/apps/yuzu_gw/src/`:
 | `yuzu_gw_agent` | `gen_statem`: one process per agent bidi stream |
 | `yuzu_gw_registry` | Process groups + ETS routing table, plus the node-local session index used by heartbeat admission |
 | `yuzu_gw_router` | Command fanout coordinator |
-| `yuzu_gw_upstream` | gRPC client to the C++ server: one channel, one HTTP/2 connection, one call at a time (see "Registration rate per gateway" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
+| `yuzu_gw_upstream` | Caller of the C++ server: runs the proxy RPCs of registration and inventory one at a time, with the circuit breaker (see "Registration rate per gateway" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
+| `yuzu_grpc_client`, `yuzu_grpc_client_channel`, `yuzu_grpc_client_config` | The upstream gRPC client, unary calls only (see [The upstream client](#the-upstream-client)): `yuzu_grpc_client` makes one call over a connection the channel hands it, `yuzu_grpc_client_channel` keeps a pool of HTTP/2 connections (gun) per endpoint open and reopens them, `yuzu_grpc_client_config` reads `{yuzu_gw, upstream_client}` |
 | `yuzu_gw_agent_service` | Agent-facing gRPC server (AgentService proxy) |
 | `yuzu_gw_conn` | Connection key (the HTTP/2 connection pid) of an agent-facing gRPC call, read from the call's context or stream |
 | `yuzu_gw_heartbeat_admission` | Admission decision for agent `Heartbeat` calls (session held by this node and call on the connection that opened it), rejection counters and the rate-limited summary log line |
@@ -680,12 +681,15 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
     %% below. The agent_listen_* / mgmt_listen_* keys that older configs carry
     %% are read by nothing and have no effect.
 
-    %% Upstream C++ server (GatewayUpstream service)
+    %% No effect: no gateway code reads upstream_addr or upstream_port (the
+    %% environment variables YUZU_GW_UPSTREAM_ADDR / YUZU_GW_UPSTREAM_PORT only
+    %% set these two keys). The address the gateway dials is the endpoint of
+    %% the default_channel in {upstream_client, ...} (see "The upstream client")
     {upstream_addr, "127.0.0.1"},
     {upstream_port, 50055},
 
-    %% No effect: no gateway code reads this key. The upstream channel is one
-    %% connection whatever the value (see "Registration rate per gateway")
+    %% No effect either: no gateway code reads this key. The connections per
+    %% endpoint are the `pool_size` option of the channel (default 1)
     {upstream_pool_size, 16},
 
     %% Heartbeat batching interval (ms)
@@ -863,12 +867,13 @@ peer that wants to hold connections, and this is what it does on each listener:
   block it at the firewall. A process restart does not clear it (the peer reconnects), and
   the server's established connection is unaffected throughout.
 
-A leftover `{grpcbox, [{servers, ...}]}` block **refuses boot**: it would start a second
-listener, with no peer pin and no origin handling, next to these. Only
-`{grpcbox, [{client, ...}]}` (the upstream channel to the C++ server) remains in
-`{grpcbox, ...}`. A grpcbox listener binds before the check runs, so a config with both
-shapes is listening for the moments before the refusal; every handler on it fails because
-the registry, the router and their tables do not exist yet, and the release then halts.
+A leftover `{grpcbox, [{servers, ...}]}` block **refuses boot**: nothing reads it, so
+it would configure no listener while the file reads as if it did. The same goes for a
+leftover `{grpcbox, [{client, ...}]}` block (the upstream channel to the C++ server, now
+`{yuzu_gw, [{upstream_client, ...}]}`; see [The upstream client](#the-upstream-client)).
+The gateway contains no `grpcbox` application, so no `{grpcbox, ...}` block of any kind
+belongs in a `sys.config` any more. Both refusals are checked before any listener is
+bound.
 
 **Moving an old config.** The key mapping from the grpcbox shape, one listener at a time
 (a worked before and after, the refusal text and the roll-out order are in
@@ -919,7 +924,7 @@ client at start, except `upstream_call_timeout_ms`, which is read on every call;
 | Key | Default | Valid range | Meaning |
 |---|---|---|---|
 | `registration_replay_spacing_ms` | 20 | 0 to 60000 | Gap between two replay `ProxyRegister` calls in the replay drip |
-| `registration_replay_session_guard_ms` | 10000 | 0 to 3600000 | A session that was just replayed is not queued again by a heartbeat verdict until this many ms have passed. The stamp is taken when the replay is sent, so a stale verdict can arrive up to the 5 s flush deadline (the vendored grpcbox client default) plus the replay RPC time later (INFERRED from the code): do not set it below 5000 plus the expected replay RPC time, because a smaller guard lets such a stale verdict replay a session the server already knows; the default 10000 is safe (see "Replaying a session the server already knows is not free" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
+| `registration_replay_session_guard_ms` | 10000 | 0 to 3600000 | A session that was just replayed is not queued again by a heartbeat verdict until this many ms have passed. The stamp is taken when the replay is sent, so a stale verdict can arrive up to the 5 s flush deadline (the upstream client's default per-call timeout, 5000 ms in `yuzu_grpc_client`) plus the replay RPC time later (INFERRED from the code): do not set it below 5000 plus the expected replay RPC time, because a smaller guard lets such a stale verdict replay a session the server already knows; the default 10000 is safe (see "Replaying a session the server already knows is not free" under [What happens when the server restarts](#what-happens-when-the-server-restarts)) |
 | `registration_replay_queue_max` | 10000 | 1 to 1000000 | Most agents the replay queue holds when a heartbeat verdict appends to it; there is one pending entry per agent, and an id past the cap is counted in `yuzu_gw_heartbeat_verdict_dropped_total{reason="queue_full"}` (so is an id in a verdict that the heartbeat buffer did not cast because the upstream client's mailbox held more than 100 messages, see "Heartbeat batching interval" below). The cap bounds only verdict appends: the snapshot a breaker recovery seeds is not capped (it is bounded by the number of agents the node holds, as before), and while a snapshot of this size or larger drains, every verdict id for an agent not already queued counts as `queue_full` |
 | `upstream_call_timeout_ms` | 30000 | 100 to 300000 | How long `yuzu_gw_upstream:proxy_register/1` and `proxy_inventory/1` wait for the upstream client before the call gives up with `{error, upstream_unavailable}` and one caller-side warning that names the class `timeout`. Read on every call, not at start. It exists so a test can exercise the timeout without waiting 30 s, and it also works as a setting. A value outside the range, or one that is not an integer, falls back to the default with a WARN that names the key |
 
@@ -927,14 +932,14 @@ An invalid value for any of these keys falls back to the default and logs a
 warning that names the key. See
 [What happens when the server restarts](#what-happens-when-the-server-restarts).
 
-**Upstream channel tuning** (read once, by `yuzu_gw_app` before the supervision
-tree starts; set it in the `yuzu_gw` section of `sys.config`. No `YUZU_GW_*`
+**Upstream channel tuning** (read when the upstream channel configuration is parsed,
+at start-up; set it in the `yuzu_gw` section of `sys.config`. No `YUZU_GW_*`
 environment variable maps to it, so a compose deployment cannot switch it off
 through the environment; it takes a `sys.config` edit):
 
 | Key | Default | Valid values | Meaning |
 |---|---|---|---|
-| `upstream_tcp_nodelay` | `true` | `true` or `false` | Sets TCP_NODELAY on the gateway-to-server (upstream) gRPC channel. Without it, every upstream call with a request under about 64 KiB waited about 41 to 43 ms for Nagle's algorithm and the server's delayed ACK, which capped registration at about 24 agents per gateway per second (see "Registration rate per gateway"). At start the gateway restarts grpcbox's `default_channel` with `{nodelay, true}` added to the `socket_options` of each endpoint; the channel connects on its first call, so the restart drops no connection and existing `sys.config` files need no edit. Other `socket_options` of an endpoint are kept, and a `nodelay` entry you set there yourself wins (a hand-set `{nodelay, false}` keeps Nagle on that endpoint). It applies only to the upstream channel, not to the agent listener or the management channel. A value that is not a boolean logs a warning that names the key and uses the default `true`. `false` logs one INFO line and leaves the channel as configured. If the restart fails, one WARN `could not restart it with TCP_NODELAY` is logged and the channel is restored with the endpoints as configured; if that restore fails as well, one further WARN `could not restore it with the endpoints as configured either` is logged, and the node then has no upstream channel (the restart itself was observed on a rig in pass 6, run K0; the restore paths are read from the code and its eunit tests, not run on a rig). |
+| `upstream_tcp_nodelay` | `true` | `true` or `false` | Sets TCP_NODELAY on the gateway-to-server (upstream) gRPC channel. Without it, every upstream call with a request under about 64 KiB waited about 41 to 43 ms for Nagle's algorithm and the server's delayed ACK, which capped registration at about 24 agents per gateway per second (see "Registration rate per gateway"). Each upstream connection is opened with `{nodelay, true}` among its TCP socket options, for `http` and `https` endpoints alike (the options go to the TCP socket that TLS is then started on). An endpoint whose own `socket_options` (the optional fifth element of the endpoint tuple, see [The upstream client](#the-upstream-client)) already hold a `nodelay` entry keeps it, in either direction: a hand-set `{nodelay, false}` keeps Nagle on that endpoint. Other `socket_options` are kept. Existing `sys.config` files need no edit. It applies only to the upstream channel, not to the agent listener or the management channel. A value that is not a boolean logs a warning that names the key and uses the default `true` (the warning can appear more than once, because the configuration is parsed more than once at start). `false` leaves the endpoints as configured and logs nothing. Since 2026-10-11 nothing restarts the channel and the gateway logs no line about nodelay (an earlier release restarted grpcbox's `default_channel` at start and logged `Upstream channel default_channel: TCP_NODELAY on`; the `could not restart it with TCP_NODELAY` warning no longer exists). The option placement was checked in `yuzu_grpc_client_channel:gun_opts/2` and the default in `yuzu_grpc_client_config`; the effect on a live stack was one measurement, see the update under "Registration rate per gateway". |
 
 **gRPC handler failure log** (read on every failure; set it in the `yuzu_gw` section of
 `sys.config`. No `YUZU_GW_*` environment variable maps to it):
@@ -1108,6 +1113,98 @@ container picked a surprising address):
 
 See `deploy/docker/gateway-entrypoint.sh` for the exact logic.
 
+### The upstream client
+
+The gateway calls the server's `GatewayUpstream` service (registration, inventory, heartbeat
+batches, stream-status notices, Guardian forwarding) with its own unary gRPC client,
+`yuzu_grpc_client`, over a **channel** of HTTP/2 connections opened by gun
+(`yuzu_grpc_client_channel`). Before 2026-10-11 this hop was grpcbox, configured in
+`{grpcbox, [{client, ...}]}`; the wire protocol, the protobuf contracts and the server are
+unchanged, and the value moved without changing shape (see *Upgrade notes by release* in
+[Upgrading](upgrading.md#the-upstream-channel-moves-to-upstream_client--breaking)).
+
+The channels are the `upstream_client` entry of the `yuzu_gw` application:
+
+```erlang
+{yuzu_gw, [
+    {upstream_client, #{channels => [
+        {default_channel,
+         [{https, "yuzu-server.example.com", 50055, [
+              {cacertfile, "/etc/yuzu/certs/default-ca.pem"},
+              {certfile,   "/etc/yuzu/certs/default-gateway.pem"},
+              {keyfile,    "/etc/yuzu/certs/default-gateway.key"},
+              {verify, verify_peer}]}],
+         #{pool_size => 1}}
+    ]}}
+]}
+```
+
+A channel is `{Name, Endpoints, Options}`. The registration, inventory and heartbeat code
+calls the channel named **`default_channel`**, so that name is required. An endpoint is
+`{http | https, Host, Port, SslOptions}`, or the same with a fifth element, a map whose
+`socket_options` (a list) go to the TCP socket. `SslOptions` are Erlang `ssl` client options,
+handed on unchanged; `http` is plaintext HTTP/2 (the lab and UAT posture), `https` is TLS
+with ALPN `h2`. The shipped `sys.config.prod` is the mutual-TLS reference.
+
+| Channel option | Default | Meaning |
+|---|---|---|
+| `pool_size` | 1 | HTTP/2 connections **per endpoint**, 1 to 64 (a value outside that range reads as the default, without a warning). One connection is what the grpcbox client held. **Raising it has consequences:** calls go round-robin over the live connections, so behind a layer-4 VIP in front of several server replicas the connections can land on different replicas (see "Several core replicas" under [What happens when the server restarts](#what-happens-when-the-server-restarts)), and after a certificate change the connections redial independently. Registration and inventory calls run one at a time, so a larger pool does not speed them up |
+| `connect_timeout` | 5000 | Milliseconds allowed for the TCP connect and, separately, for the TLS handshake, 1 to 600000 |
+| `max_receive_message_bytes` | 16777216 (16 MiB) | The largest response message accepted, up to 1 GiB; a larger one fails the call as soon as the limit is passed |
+
+The grpcbox-era options `balancer`, `encoding` and `sync_start` are accepted and ignored.
+Messages are never compressed (a compressed response message fails the call).
+
+**How calls use the channel.** The channel process only owns the connections: it opens
+`pool_size` of them per endpoint when it starts, notices when one comes up or goes down, and
+reopens a lost one after a delay of 100 ms doubling to 5 s with up to 20% jitter (so a
+restarted server is not met by every gateway at the same instant). A call does not pass
+through that process: it takes the next **live** connection, round-robin, and sends its
+request there. A call that finds no live connection waits, at most for its own timeout, for
+one that is already connecting; if none is connecting it fails **at once** with the last
+connection error (`econnrefused`, `closed`, a TLS alert name), so a dead server is answered
+in microseconds and the circuit breaker sees it. The per-call timeout is 5000 ms and covers
+the connection wait; the callers do not change it. Nothing recycles a connection that is up:
+there is no connection-age cap.
+
+**TCP_NODELAY** is on for every connection by default (`upstream_tcp_nodelay`, see the table
+under *Upstream channel tuning*).
+
+**Certificates.** The gateway reads no certificate file itself: `SslOptions` reach Erlang's
+`ssl` application, which reads `certfile`, `keyfile` and `cacertfile` when a connection's TLS
+handshake runs. A connection that is up keeps presenting the certificate it opened with; a
+reconnect presents the files as they are then, except that `ssl` caches file contents and
+cleans that cache about every 120 s. MEASURED with this channel on OTP 28 against a local TLS
+listener that requires a client certificate: after the files were replaced, the open connection
+kept presenting the old certificate; a reconnect inside the cache window presented the old
+one again; a reconnect after the `ssl` cache was cleared presented the new one. Replacing
+the files therefore takes effect on the next reconnect, which happens when the connection
+drops (a server restart does it) and can still present the previous certificate for up to
+about 2 minutes. With the default of one connection per endpoint this is all or nothing, as it was with grpcbox. If you raise `pool_size` above 1, each connection redials on its own when it drops, so after a certificate change (or while an expired certificate is still in use) some calls can be refused by the server's peer check while others succeed, until every connection has redialed (INFERRED from the channel code, not run); see [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization)
+for the procedure around pins and expiry.
+
+**What the gateway refuses at boot.** Before any listener is bound it exits, with a critical
+log line, when:
+
+- a `{grpcbox, [{client, _}]}` or `{grpcbox, [{servers, _}]}` entry exists, in the application
+  environment or in any config file the VM was started with (nothing reads them; see the
+  upgrade notes);
+- `upstream_client` is present but unusable: the log line gives the shape of the first defect
+  (`bad_client_config`, `bad_channel`, `bad_endpoint`, `bad_host`, `bad_socket_options`),
+  never the value, because SSL options name key files;
+- no channel is named `default_channel`. A gateway with none would register no agent and
+  forward no heartbeat while `/readyz` answered ready (its `upstream` check only tests that
+  the `yuzu_gw_upstream` process is alive, not that the server is reachable). Only the literal
+  `{yuzu_gw, [{allow_no_upstream, true}]}` excuses it, for a gateway under test;
+- the upstream channels use `https` without `{verify, verify_peer}` (encrypted but unauthenticated),
+  unless the dev/CI override `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` is set.
+
+**Keys that look related and do nothing.** `upstream_addr` and `upstream_port` (and the
+environment variables `YUZU_GW_UPSTREAM_ADDR` and `YUZU_GW_UPSTREAM_PORT`, which only set
+those two keys) and `upstream_pool_size` are read by nothing: the endpoints of the channel
+are what is dialled, and the pool size is the channel's `pool_size`. This was already so
+before the client was replaced.
+
 ### TLS posture (M1)
 
 > **⚠ SECURITY — do not expose the agent listener (`:50051`) to an untrusted
@@ -1136,10 +1233,12 @@ See `deploy/docker/gateway-entrypoint.sh` for the exact logic.
 | server → gateway mgmt (`:50063`) | **strict mTLS + SPKI peer pin (#1422)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert` from the `tls` map) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_pins}` pinning the server's cert — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs: point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one. |
 
 TLS is configured in two places: the `tls` map of each `grpc_listeners` entry (the
-two listeners) and the `{grpcbox, [{client, ...}]}` block (the upstream channel). The
+two listeners) and the `{yuzu_gw, [{upstream_client, ...}]}` entry (the upstream channel;
+it was `{grpcbox, [{client, ...}]}` before 2026-10-11, and a leftover block under that
+name refuses boot). The
 old `{tls, [...]}` advisory key under `yuzu_gw` was removed in PKI PR5 and does
-**nothing**. To enable upstream mutual TLS, copy the `{grpcbox, [{client, ...}]}`
-`{https,...}` channel from `gateway/config/sys.config.prod`. A listener without a `tls`
+**nothing**. To enable upstream mutual TLS, copy the `{https,...}` channel of
+`upstream_client` from `gateway/config/sys.config.prod`. A listener without a `tls`
 map is plaintext, and a `tls` map must carry all three of `certfile`, `keyfile` and
 `cacertfile` or the gateway refuses to boot.
 
@@ -1202,7 +1301,7 @@ cp /etc/yuzu/certs/default-ca.pem ./install-ca.pem   # or GET /api/v1/ca/root
 
 # 1. Point the gateway's upstream at the server over mutual TLS (PR5) and turn on
 #    the agent-listener one-way TLS (PR5c) — both live in sys.config.prod:
-#      {grpcbox,[{client,...,{https,...,[{ssl_options,...}]}}]}   % upstream mTLS
+#      {yuzu_gw,[{upstream_client,#{channels=>[{default_channel,[{https,...,[{certfile,...},...]}],#{}}]}}]}   % upstream mTLS
 #      grpc_listeners agent entry: tls => #{certfile, keyfile, cacertfile,
 #                                   verify=>verify_none, fail_if_no_peer_cert=>false}
 
@@ -1683,8 +1782,9 @@ network is still the first line of defense.
 ### Server-Side Setup
 
 The C++ server must be started with the `--gateway-upstream` flag specifying
-the address and port for the GatewayUpstream service. This port must match
-`upstream_port` in `sys.config`:
+the address and port for the GatewayUpstream service. This port must match the
+port of the `default_channel` endpoint in `{yuzu_gw, [{upstream_client, ...}]}` (see
+[The upstream client](#the-upstream-client); `upstream_port` is read by nothing):
 
 ```bash
 yuzu-server --gateway-upstream "0.0.0.0:50055"
@@ -1760,7 +1860,7 @@ agent build that re-registers by itself; released agents do not (see
 | gateway | WARN | `Register failed: registry_unavailable` | The agent was answered `INTERNAL` (13) "Registration failed: registry unavailable". The gateway's registry process could not be reached for this `Register`: its table is missing, a call timed out, or the registry restarted and lost the row (see the `Registration replay aborted: registry unavailable` row). This line no longer covers a superseded `Register` (see the next row). The agent registers again with its reconnect backoff (read from the agent code). A sustained run of lines is not expected: check `/readyz` and the registry process. |
 | gateway | INFO | `Register superseded by a newer registration` | Two `Register` calls of one agent id overlapped on one connection and the newer one committed first. The older one was answered `UNAVAILABLE` (14) and left no row; the registry is healthy. No action: the agent retries a non-OK `Register` with its reconnect backoff (read from the agent code). An occasional line is expected; a sustained run would mean an agent or forwarder keeps repeating `Register` for one agent id on one connection (INFERRED from the code, not observed). |
 | gateway | WARN | `gateway grpc handler <Method> failed: class=<class> at <frame>` | A service handler raised, and the call was answered `INTERNAL` (13). The line names only the method, the exception class and the top stack frame, never a request, headers or the exception term. At most one line is written per second per node (`{yuzu_gw, grpc_runner_warn_interval_ms}`, default 1000, `0` logs every failure, an invalid value reads as 1000 silently and one above 3600000 as 3600000); a line that follows suppressed ones ends `(N similar failures not logged since the last line)`. The number of failed calls is not in the log: it is in the status the calls were answered with. |
-| gateway | WARN | `Upstream channel default_channel: could not restart it with TCP_NODELAY` | At start the gateway could not restart its upstream channel with `upstream_tcp_nodelay` applied. It restored the channel with the endpoints as configured, so registration runs at the stock rate (see "Registration rate per gateway"). If a second WARN `could not restore it with the endpoints as configured either` follows, the node has no upstream channel (read from the code, not run). |
+| gateway | INFO | `Upstream channel <name> connection <n> down (<word>); retrying in <ms> ms` | One of the channel's connections to the server went down or could not be opened; the channel reopens it after the delay (100 ms doubling to 5 s, with up to 20% jitter). `<word>` is a socket error such as `econnrefused` or `closed`, a TLS alert name, or `bad_tls_options`. A call made while no connection is up fails at once with the last such word (see [The upstream client](#the-upstream-client)); the circuit breaker counts it. One line per failed attempt, so a server that is down for a minute writes a line per connection every 5 to 6 s once the delay has reached its cap. Expected while the server restarts; a persistent TLS alert word means the certificate, the CA or the hostname is wrong (see the runbooks in [Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization)). Read from the code, not run. |
 
 The server's `renew_leases ... unknown_session` warnings stop once the agent
 is known again. How long that takes depends on the gateway's upstream circuit
@@ -1973,7 +2073,8 @@ wired. Two cases replay a session the server already knows:
 
 - A verdict computed before a replay landed arrives after it. The guard stamp is
   taken when the replay is sent, and a stale verdict can arrive up to the 5 s
-  flush deadline (INFERRED: the vendored grpcbox client default) plus the replay
+  flush deadline (read from the code: neither the flush nor the replay call passes a
+  timeout, so the upstream client's default of 5000 ms applies) plus the replay
   RPC time later. Do not set `registration_replay_session_guard_ms` below 5000
   plus the expected replay RPC time; the default 10000 is safe (INFERRED).
 - A double replay. A verdict replay runs first (the server has no prior session,
@@ -2285,8 +2386,8 @@ eligible for the server's lease reaper, which runs about every 5 minutes
 (#4627; read from the server code and the ADR).
 
 **Registration rate per gateway.** Every `ProxyRegister` goes through the one
-`yuzu_gw_upstream` process, over one channel and one HTTP/2 connection, one call
-at a time, so the time of one upstream call sets how many agents a gateway can
+`yuzu_gw_upstream` process, one call at a time (the measurements below were taken
+when the channel was one HTTP/2 connection; see the update after the table), so the time of one upstream call sets how many agents a gateway can
 register per second. OBSERVED on a rig, on gateway commit `71ee2b02f` (which does
 not have the `upstream_tcp_nodelay` change; loopback, one box, debug-built
 server, plaintext, a C++ client with the agents' 30 s `Register` deadline and
@@ -2296,7 +2397,7 @@ from a running agent through the gateway): each upstream call took about 41 to
 registrations per second whatever the concurrency. The cause is INFERRED from
 switching nodelay on and off at three places (no packet capture was taken):
 Nagle's algorithm on the gateway-to-server socket meets the server's delayed
-ACK, because the HTTP/2 client library the gateway uses does not set TCP_NODELAY.
+ACK, because the HTTP/2 client library the gateway then used did not set TCP_NODELAY.
 The server's own handler time for a real-size `Register` was 1 to 2 ms, new
 enrollment included (derived from client-side latency, the server has no such
 metric). Bursts of simultaneous registrations, one connection per agent:
@@ -2322,6 +2423,18 @@ setting that the key applies was also measured earlier by writing it into the
 channel declaration by hand, on `71ee2b02f` and against an in-VM fake upstream
 only: 40 concurrent real-size registrations took 1,665 ms stock and 43 ms with it,
 and a serial call 42 ms and 1 ms.
+
+**Update (2026-10-11): the upstream client was replaced.** The runs above used grpcbox
+as the upstream client, which held one HTTP/2 connection (the new client's default too), and the K0 start log line
+`Upstream channel default_channel: TCP_NODELAY on` came from the code that restarted that
+channel. Neither exists now: the client is `yuzu_grpc_client` over gun with a channel of
+`pool_size` connections per endpoint (default 1, as before; see [The upstream client](#the-upstream-client)),
+TCP_NODELAY is set when each connection is opened, and the gateway logs no line about it.
+The calls of registration still run one at a time in `yuzu_gw_upstream`, so a larger
+pool would not raise the registration rate. The rate figures above were not
+re-measured with the new client. A single measurement on a live stack with TLS, reported by
+the author of the change and not repeated on the rig, put the `ProxyRegister` mean at
+about 3 ms with nodelay on and about 45 ms with it off.
 
 Three consequences. First, the agents give up on a `Register` after 30 s, and 24
 per second times 30 s is about 700, so a simultaneous burst of more than about
@@ -2373,9 +2486,14 @@ plus the call.
 bounded on one core replica. On several replicas it converges in one round only
 if a gateway's `BatchHeartbeat`, replay `ProxyRegister` and re-announced
 `NotifyStreamStatus` reach the same replica during the reconcile. The shipped
-gateway does this per connection (one grpcbox channel, one endpoint, one
-HTTP/2 connection) through a layer-4 VIP. A multi-endpoint node list (grpcbox
-round-robins per RPC) or a layer-7 per-RPC balancer breaks it. Convergence is
+gateway sends all of these calls through one channel and one endpoint, through a
+layer-4 VIP, and with the default `pool_size` of 1 that is one HTTP/2 connection, as it was
+with grpcbox: unchanged. **Warning:** a channel opens `pool_size` connections per endpoint
+and sends each call on the next live connection, round-robin, so with `pool_size` above 1
+each connection can land on a different replica and two consecutive calls of the
+reconcile can reach different replicas (read from `yuzu_grpc_client_channel`, not run on
+several replicas); keep `pool_size` at 1 where this matters. A multi-endpoint node list (the channel
+round-robins per call) or a layer-7 per-RPC balancer breaks it too. Convergence is
 then probabilistic, not bounded, and the per-session guard bounds the replay
 rate but not the number of rounds. No multi-replica run exists; this is
 inferred from the code. The durable cross-replica session lookup (WS-5,
@@ -2445,8 +2563,9 @@ env keys with defaults, which a reverted build ignores.
   `Register` runs inside the `yuzu_gw_upstream` process, so calls queue behind
   each other even with nodelay on, and a slow server still limits how fast a
   gateway registers agents (a call is as slow as the server's answer). The call
-  carries no deadline of its own (only the vendored grpcbox client's default 5 s
-  receive timeout applies; read from the code, not run); the caller waits `upstream_call_timeout_ms`
+  carries no deadline of its own (only the upstream client's default per-call timeout of
+  5 s, `yuzu_grpc_client`, applies, connection wait included; read from the code, not
+  run); the caller waits `upstream_call_timeout_ms`
   (30 s by default, the same as the agents' `Register` deadline). A queued
   `Register` or `Inventory` call whose requesting process has **exited** (the client
   reset the stream, its deadline passed or the connection closed, which stops the
@@ -2457,7 +2576,10 @@ env keys with defaults, which a reverted build ignores.
   nowhere. Calls from a process on another node count as alive. Planned follow-ups, with
   no issue numbers yet: run the proxy RPC outside the gen_server, and give the upstream
   call a deadline shorter than the agent's 30 s. The `upstream_pool_size` key in the
-  shipped `sys.config` files does nothing; there is no connection pool to size.
+  shipped `sys.config` files does nothing (nothing reads it); the connections per endpoint are
+  the channel's `pool_size` option (default 1, see [The upstream client](#the-upstream-client)),
+  and since the calls of registration and inventory run one at a time, a larger pool does not
+  speed them up.
 - **Queued upstream calls are not bounded per connection (accepted residual risk, part of
   the unauthenticated-port family).** The agent listener is unauthenticated by design, and
   a request is decoded in full before any handler sees it. A client that repeatedly sends
@@ -2740,14 +2862,14 @@ This starts the gateway with all applications loaded, useful for debugging.
 
 | Dependency | Version | Purpose |
 |---|---|---|
-| grpcbox | 0.17.1 | gRPC client for the upstream channel (the listeners are the gateway's own `yuzu_grpc*` layer) |
-| cowboy / ranch | 2.19.0 / 2.3.0 | HTTP/2 server and listener behind the gRPC layer |
+| cowboy / ranch | 2.19.0 / 2.3.0 | HTTP/2 server and listener behind the gateway's own gRPC layer (`yuzu_grpc*`) |
+| gun | 2.5.0 | HTTP/2 client behind the upstream gRPC client (`yuzu_grpc_client`); needs cowlib, which cowboy brings too |
+| ctx | 0.6.0 | The request-context type of the gRPC layer |
 | gpb | 4.21.7 | Protobuf compiler and runtime |
 | telemetry | 1.3.0 | Metrics event API |
 | prometheus | 4.11.0 | Prometheus exposition |
 | prometheus_httpd | 2.1.2 | HTTP endpoint for Prometheus scraping |
 | recon | 2.5.5 | Production introspection |
-| gproc | 1.0.0 | Extended process registry |
 
 Test-only dependencies (loaded in the `test` profile):
 
