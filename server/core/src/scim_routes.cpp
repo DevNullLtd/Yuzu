@@ -1349,7 +1349,9 @@ bool rename_flips_admin_group_match(const std::string& old_name, const std::stri
 /// The whole body is `try`/`catch(...)`: this is a diagnostic aid and must NEVER gate the
 /// recompute (a throwing logger, a failed format allocation). A missing default logger or a
 /// failure falls back to a bare stderr line, itself guarded (its text says the line "may not have
-/// been flushed" because a flush() that throws after a successful write lands here too).
+/// been written or flushed" because a failed write (a failing format or a sink write error, which
+/// throws before anything is written) and a flush() that throws after a successful write both
+/// land here).
 void log_removed_members_breadcrumb(const std::string& group_id,
                                     const std::vector<std::string>& old_members,
                                     const std::vector<std::string>& kept,
@@ -1391,7 +1393,7 @@ void log_removed_members_breadcrumb(const std::string& group_id,
     } catch (...) {
         try {
             std::fputs("SCIM: Group membership change committed; role recompute starting "
-                       "(the breadcrumb log line may not have been flushed)\n",
+                       "(the breadcrumb log line may not have been written or flushed)\n",
                        stderr);
         } catch (...) { // NOLINT(bugprone-empty-catch): a diagnostic must never gate the recompute
         }

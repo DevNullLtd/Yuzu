@@ -6008,11 +6008,14 @@ struct BreadcrumbProbe {
         spdlog::set_level(spdlog::level::trace);
     }
     /// Idempotent: the destructor does not re-install `prev` after an explicit stop(), which
-    /// would clobber a default logger some later scope installed in between.
+    /// would clobber a default logger some later scope installed in between. It also disarms
+    /// the sink callback first, so a throwing step or a failed REQUIRE in a test (which unwinds
+    /// to the destructor) cannot leave a closure over dead test locals armed.
     void stop() {
         if (stopped_)
             return;
         stopped_ = true;
+        sink->disarm();
         spdlog::set_default_logger(prev);
         spdlog::set_level(prev_level);
     }
@@ -6047,15 +6050,20 @@ TEST_CASE("ScimRoutes: the crash-breadcrumb flushes the logger right after its l
     std::optional<auth::Role> role_at_first_flush;
     probe.sink->callback_thread = std::this_thread::get_id();
     probe.sink->on_first_flush_after_breadcrumb = [&] {
-        probe.logger->set_level(spdlog::level::off);
+        // RAII: a throwing get_user must not leave the probe logger silenced.
+        struct LevelGuard {
+            spdlog::logger& l;
+            explicit LevelGuard(spdlog::logger& lg) : l(lg) { l.set_level(spdlog::level::off); }
+            ~LevelGuard() { l.set_level(spdlog::level::trace); }
+        } silence{*probe.logger};
         if (auto u = f.auth_db->get_user("fl_admin"))
             role_at_first_flush = u->role;
-        probe.logger->set_level(spdlog::level::trace);
     };
+    // probe.stop() (or the destructor, if the REQUIRE throws) disarms the callback before the
+    // closure's captures die.
     REQUIRE(f.put("/scim/v2/Groups/" + gid,
                   {{"displayName", "Yuzu-Admins"}, {"members", json::array()}})
                 ->status == 200);
-    probe.sink->disarm(); // the closure's captures die before the sink does
     probe.stop();
     CHECK(probe.sink->breadcrumb_attempts == 1);
     CHECK(probe.sink->flushes_after_breadcrumb >= 1);
