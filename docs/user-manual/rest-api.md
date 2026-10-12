@@ -9033,28 +9033,28 @@ outcome's granularity.
 
 ### Settings — OIDC Configuration
 
-**`POST /api/settings/oidc`** — Save OIDC / Entra ID SSO configuration.
+**`POST /api/settings/oidc`** — Save OIDC SSO configuration.
 
 - **Permission:** Admin only
 - **Request body (form-encoded):**
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `issuer` | string | Yes | OIDC issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`) |
+| `issuer` | string | Yes | OIDC issuer URL, exactly as the IdP's discovery document states it in `issuer` (e.g., Entra ID: `https://login.microsoftonline.com/<tenant-guid>/v2.0`, the tenant ID form; Keycloak: `https://<keycloak>/realms/<realm>`) |
 | `client_id` | string | Yes | Application (client) ID from Azure portal |
 | `client_secret` | string | No | Client secret value. If empty and a secret already exists, the existing secret is preserved. |
-| `redirect_uri` | string | No | Callback URL. If empty, auto-computed from web address/port. |
+| `redirect_uri` | string | No | Callback URL; set it, and register it at the IdP. An empty value is NOT auto-computed on this route (only the startup flag path fills in a localhost default): the provider then never fetches discovery and `GET /auth/oidc/start` answers `500` "OIDC redirect_uri not configured". |
 | `admin_group` | string | No | Entra group object ID for admin role mapping |
 | `skip_tls_verify` | string | No | `"true"` to disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
 - **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success.
 - **Effect:** Immediately reinitializes the OIDC provider with the new configuration - in THIS process only. The swap is NOT durable: the provider is rebuilt at the next startup from the command-line/environment value, not from the stored runtime config, so a restart reverts to that value. Rotating a credential durably requires updating `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET` as well - see [When a change takes effect](#when-a-change-takes-effect).
 
-**`POST /api/settings/oidc/test`** — Test OIDC discovery connectivity.
+**`POST /api/settings/oidc/test`** — Test OIDC discovery and signing-key connectivity.
 
 - **Permission:** Admin only
 - **Request body (form-encoded):** `issuer`, `skip_tls_verify`
-- **Response:** HTML feedback span — green on success, red on failure with specific error.
+- **Response:** HTML feedback span — green on success, red on failure with specific error. It fetches and validates the discovery document the way a sign-in does, then also fetches the `jwks_uri` and reports how many signing keys it found. It does not exercise the token endpoint, client secret, redirect URI, audience or group claims.
 
 #### `GET /api/v1/settings/oidc`
 
@@ -9074,7 +9074,7 @@ Audited (`settings.oidc.view`, non-blocking) — IdP/admin-group configuration c
 {
   "data": {
     "configured": true,
-    "issuer": "https://login.microsoftonline.com/{tenant}/v2.0",
+    "issuer": "https://login.microsoftonline.com/<tenant-guid>/v2.0",
     "client_id": "abcd-1234",
     "client_secret_configured": true,
     "redirect_uri": "https://yuzu.example.com/auth/callback",

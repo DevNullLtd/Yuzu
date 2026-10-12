@@ -759,7 +759,7 @@ Platform implementations:
 
 ## OIDC Hardening
 
-When using OIDC/Entra ID:
+When using OIDC (for example with Keycloak or Microsoft Entra ID):
 - Set `--oidc-admin-group` to restrict admin access to a specific group
 - Use `--session-timeout` to limit session duration
 - Configure the OIDC provider to require MFA
