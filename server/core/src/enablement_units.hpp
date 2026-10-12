@@ -6,8 +6,8 @@
  * Not a second catalogue. `build_unit_overlay` takes the SAME capability
  * fragment spans `CommandCapabilityRegistry` takes (command_capability.hpp)
  * and derives unit names from them: `<plugin>` and `<plugin>.<action>`. The
- * only data added here is per-OS applicability (`kUnitOs`), the requirement
- * edges (`kRequirements`) and the supplier edges (`kSuppliers`).
+ * only data added here is per-OS applicability (`kUnitOs`) and the requirement
+ * edges (`kRequirements`).
  *
  * Pure: no I/O, no clock, no globals beyond the constexpr tables below.
  *
@@ -104,13 +104,6 @@ struct RequirementEdge {
     std::string_view required;
 };
 
-/// Reserved for PM5.3 (attribute suppliers); empty until the first edge lands
-/// with its latch check.
-struct SupplierEdge {
-    std::string_view unit;
-    std::string_view supplier;
-};
-
 using ProtectivePredicate = bool (*)(std::string_view plugin, std::string_view action);
 
 // Requirement edges, per action. app_usage.summary and app_usage.last_used
@@ -121,8 +114,6 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
     {"app_usage.summary", "tar"},
     {"app_usage.last_used", "tar"},
 }};
-
-inline constexpr std::array<SupplierEdge, 0> kSuppliers{};
 
 // matrix: docs/os-capability-matrix.md generated block (2026-10-06), 229 rows.
 inline constexpr std::array<UnitOsRow, 229> kUnitOs{{
@@ -399,12 +390,6 @@ build_unit_overlay(std::initializer_list<std::span<const CommandCapability>> sou
                    std::span<const RequirementEdge> edges = kRequirements) {
     using Err = std::unexpected<std::string>;
 
-    for (std::size_t i = 0; i < os_rows.size(); ++i)
-        for (std::size_t j = i + 1; j < os_rows.size(); ++j)
-            if (os_rows[i].plugin == os_rows[j].plugin && os_rows[i].action == os_rows[j].action)
-                return Err("duplicate os row: " + std::string(os_rows[i].plugin) + "." +
-                           std::string(os_rows[i].action));
-
     std::vector<bool> os_used(os_rows.size(), false);
     UnitOverlay out;
     // Per plugin: OR of its action units' bits, and the reason of its first
@@ -463,7 +448,7 @@ build_unit_overlay(std::initializer_list<std::span<const CommandCapability>> sou
     }
     for (std::size_t i = 0; i < os_rows.size(); ++i)
         if (!os_used[i])
-            return Err("stale os row: " + std::string(os_rows[i].plugin) + "." +
+            return Err("unmatched os row (stale or duplicate): " + std::string(os_rows[i].plugin) + "." +
                        std::string(os_rows[i].action));
 
     for (const auto& p : plugins) {

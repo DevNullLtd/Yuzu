@@ -63,21 +63,13 @@
 
 namespace yuzu::server::enablement {
 
-enum class Provenance : std::uint8_t { Operator, CarriedOver, FromInstall, System };
+enum class Provenance : std::uint8_t { Operator, CarriedOver, System };
 
-/// The closed D13 reason list. This PR produces OffByRule / OffRequirement only.
+/// Reasons this resolver produces; the closed D13 list (ADR-3006) grows here
+/// with the code that produces each value.
 enum class Reason : std::uint8_t {
-    OnByDefault,
     OffByRule,
-    OffByStartingState,
     OffRequirement,
-    Undetermined,
-    NotCovered,
-    Unknown,
-    NotInstalled,
-    FailedToLoad,
-    NotApplicable,
-    AwaitingDecision,
 };
 
 struct Rule {

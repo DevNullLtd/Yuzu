@@ -194,7 +194,7 @@ TEST_CASE("enablement units: structural invariants", "[enablement][catalogue]") 
     }
 }
 
-TEST_CASE("enablement units: requirement edges and suppliers", "[enablement][catalogue]") {
+TEST_CASE("enablement units: requirement edges", "[enablement][catalogue]") {
     const auto ov = real_overlay();
     const std::vector<std::pair<std::string, std::string>> expected{
         {"app_usage.summary", "tar"}, {"app_usage.last_used", "tar"}};
@@ -204,8 +204,6 @@ TEST_CASE("enablement units: requirement edges and suppliers", "[enablement][cat
         CHECK(ov.find(u) != nullptr);
         CHECK(ov.find(req) != nullptr);
     }
-    // PM5.3 adds the first supplier edge (with its latch check) and this moves.
-    CHECK(kSuppliers.empty());
 }
 
 TEST_CASE("enablement units: a catalogue row with no os row fails the build, naming it",
