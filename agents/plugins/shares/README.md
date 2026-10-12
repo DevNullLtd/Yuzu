@@ -104,7 +104,7 @@ Every row is pipe-delimited; field 0 is the row kind, `-` is an absent value, an
 
 ## Sample output
 
-The Linux capture was taken in the Debian 13 agent build container with `samba-common` and `nfs-kernel-server` installed and NFS and Samba shares seeded under `/srv`; the stock package files (`/etc/exports`, `/etc/samba/smb.conf`) are the parser test fixtures.
+The Linux capture was taken in the Debian 13 agent build container with `samba-common` and `nfs-kernel-server` installed and NFS and Samba shares seeded under `/srv`; the stock package files (`/etc/exports`, `/etc/samba/smb.conf`) are the parser test fixtures (with trailing whitespace stripped).
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
 **macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-12 · euid 501 (jsmith) · leg-hash b71a64faa4b7
