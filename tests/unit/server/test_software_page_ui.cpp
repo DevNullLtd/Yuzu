@@ -663,7 +663,9 @@ TEST_CASE("software devices table: filter box, sentinel, rows_only and scoped ou
     for (const bool rows_only : {false, true}) {
         const auto h2 = render_software_devices_table({}, bad, rows_only);
         REQUIRE_FALSE(has(h2, "No host matches"));
-        REQUIRE(has(h2, "more may be in later pages"));
+        // The notice is first-page only: Load more swaps just its own row, so a continuation
+        // render carries the next Load-more row alone.
+        REQUIRE(has(h2, "more may be in later pages") == !rows_only);
         REQUIRE(has(h2, "data-act=\"dmore\""));
     }
 }

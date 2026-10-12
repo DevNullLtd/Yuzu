@@ -590,7 +590,8 @@ place, **Hardware** and **Software**, each its own page:
   - **Audit.** Every call is audited, not only the first page: `inventory.software.catalog`
     (title pages), `inventory.software.versions` and `inventory.software.query` (devices
     tables). A continuation page is tagged `page=continuation`; a degraded read is
-    `failure`; a refused caller is `denied`. See [Audit log](audit-log.md).
+    `failure`; a refused caller is `denied`, as is a devices page that drops devices through the
+    scope post-filter or names an `agent_id` outside the caller's scope. See [Audit log](audit-log.md).
   - **Degraded or refused.** A store that cannot answer shows an unavailable banner with
     a Retry button, never an empty table. A malformed filter in the URL shows a notice
     and reads nothing; use the **Clear all filters and reload** link, which drops the

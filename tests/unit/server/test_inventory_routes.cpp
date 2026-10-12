@@ -700,8 +700,7 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
         REQUIRE(contains(h.audit_details.back(), "rows=0"));
     }
     {   // Wider than the push-down bound: the route filters itself and no out-of-scope ROW is
-        // rendered. (The cursor token still names the last scanned row, which may be out of scope:
-        // a known gap, not pinned by this case.)
+        // rendered, and the arms below pin that no cursor token names a row outside the scope.
         InvHarness h;
         authz::VisibleSet big{std::unordered_set<std::string>{}};
         for (std::size_t i = 0; i <= swc::kScopePushdownMaxIds; ++i)
@@ -764,6 +763,20 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
         REQUIRE_FALSE(h.last_fleet_query->after); // re-anchored at the head
         REQUIRE(h.last_fleet_query->skip == 400);
         REQUIRE(contains(p2->body, "id=a450"));
+    }
+    {   // An explicit agent_id outside the scope: nothing served, one denied row naming why.
+        InvHarness h;
+        h.scope = ids({"a1"});
+        h.fleet_rows = {fleet_row("a2", "Chrome", "1")};
+        auto res = h.sink.Get(std::string(kDevices) + "?name=Chrome&agent_id=a2");
+        REQUIRE(res);
+        REQUIRE(contains(res->body, "No host matches."));
+        REQUIRE_FALSE(contains(res->body, "data-act=\"dmore\""));
+        REQUIRE(std::ranges::count(h.audits, "inventory.software.query|denied") == 1);
+        REQUIRE(h.audited("inventory.software.query|success"));
+        for (std::size_t i = 0; i < h.audits.size(); ++i)
+            if (h.audits[i] == "inventory.software.query|denied")
+                REQUIRE(h.audit_details[i] == "scope: agent_id outside the caller's scope");
     }
 }
 

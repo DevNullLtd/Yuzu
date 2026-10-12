@@ -841,9 +841,11 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
                 (r.entry.install_date.empty() ? dash() : esc(r.entry.install_date)) + "</td><td>" + synced +
                 "</td></tr>";
     }
-    if (t.rows->empty()) // a wide-scope page can be empty yet non-terminal: never claim "no match" then
+    // A wide-scope page can be empty yet non-terminal: never claim "no match" then. The notice is
+    // first-page only: Load more swaps just its own row, so a continuation notice would pile up.
+    if (t.rows->empty() && (!t.next_cursor || !rows_only))
         body += "<tr><td colspan=\"" + std::to_string(ncol) + "\" class=\"inv-empty\">" +
-                (t.next_cursor ? "No hosts on this page; more may be in later pages. Use Load more."
+                (t.next_cursor ? "No hosts on this page; more may be in later pages. Use the Load button below."
                                : "No host matches.") +
                 "</td></tr>";
     if (t.next_cursor) {
