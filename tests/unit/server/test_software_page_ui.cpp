@@ -658,6 +658,14 @@ TEST_CASE("software devices table: filter box, sentinel, rows_only and scoped ou
     REQUIRE_FALSE(has(degraded_rows, "<table"));
     bad.rows = std::vector<SoftwareFleetRow>{};
     REQUIRE(has(render_software_devices_table({}, bad, false), "No host matches."));
+    // Empty page but a cursor is offered (wide scope): never "No host matches", point at Load more.
+    bad.next_cursor = "tok";
+    for (const bool rows_only : {false, true}) {
+        const auto h2 = render_software_devices_table({}, bad, rows_only);
+        REQUIRE_FALSE(has(h2, "No host matches"));
+        REQUIRE(has(h2, "more may be in later pages"));
+        REQUIRE(has(h2, "data-act=\"dmore\""));
+    }
 }
 
 TEST_CASE("software devices table: hostile text is escaped everywhere it lands", "[inventory][ui]") {

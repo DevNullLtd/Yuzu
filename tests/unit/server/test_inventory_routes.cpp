@@ -755,7 +755,8 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
         auto p1 = h.sink.Get(url);
         REQUIRE(p1);
         REQUIRE_FALSE(h.last_fleet_query->agent_ids); // post-filter arm
-        REQUIRE(contains(p1->body, "No host matches."));
+        REQUIRE_FALSE(contains(p1->body, "No host matches"));
+        REQUIRE(contains(p1->body, "more may be in later pages"));
         REQUIRE(contains(p1->body, "data-act=\"dmore\""));
         REQUIRE_FALSE(contains(p1->body, "id=a0"));
         auto p2 = h.sink.Get(next_url(p1->body, "dmore"));
