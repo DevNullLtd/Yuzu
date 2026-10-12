@@ -5664,6 +5664,18 @@ TEST_CASE("#5459 held generation: identical pushes while a hung arm is outstandi
     REQUIRE(sibling_watched.size() == 1);
     REQUIRE(sib.watch_call_count() == 1);
     REQUIRE(sib.unwatch_completed_count() == 0);
+    // #4415: the forced Reapply below moves the sibling ONLY if the sibling is rebuilt, and the
+    // skip leaves a healthy, unchanged rule alone. r2 is a REGISTRY rule: on a host with no
+    // registry (Linux) it reads Unknown and is always rebuilt; on Windows it reads a verdict and
+    // is skipped. Wait for its first verdict, then expect the matching outcome on this host.
+    auto& rt5459 = r.runtime();
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            const auto st = rt5459.status_for_rule("r2");
+            return st.has_value() && (st->last_compliant.has_value() || st->in_unknown);
+        },
+        30s));
+    const int sibling_rebuilds = rt5459.status_for_rule("r2")->in_unknown ? 1 : 0;
 
     // Held: every identical push up to the budget is Suppressed. The Application survives
     // each one (pending 0 / failed 1), the mechanisms see nothing, nothing is acknowledged.
@@ -5694,12 +5706,13 @@ TEST_CASE("#5459 held generation: identical pushes while a hung arm is outstandi
     CHECK(r.f.mechanism->watch_call_count() == 1);
     CHECK(r.f.mechanism->unwatch_completed_count() == 0);
     CHECK(r.runtime().claim_queue_depth_for_test(r.key) == 1); // the very same claim
-    // The real Reapply is what moves the sibling: its teardown unwatches r2 and the re-arm
-    // watches it again (+1 each).
+    // The real Reapply moves the sibling only when it is rebuilt (an Unknown sibling, see above):
+    // its teardown unwatches r2 and the re-arm watches it again (+1 each). A healthy sibling is
+    // skipped and stays exactly as it was.
     REQUIRE(yuzu::test::spin_until(
         [&] {
-            return sib.unwatch_completed_count() == 1 && sib.watch_call_count() == 2 &&
-                   sib.watching_count() == 1;
+            return sib.unwatch_completed_count() == sibling_rebuilds &&
+                   sib.watch_call_count() == 1 + sibling_rebuilds && sib.watching_count() == 1;
         },
         10s));
     CHECK(sib.watched_snapshot() == sibling_watched); // r2 re-armed on its own key
@@ -5723,8 +5736,8 @@ TEST_CASE("#5459 held generation: identical pushes while a hung arm is outstandi
     // (suppressed_repush asserts no new Service watch() and no Service unwatch; the sibling is
     // checked here).
     r.suppressed_repush();
-    CHECK(sib.watch_call_count() == 2);
-    CHECK(sib.unwatch_completed_count() == 1);
+    CHECK(sib.watch_call_count() == 1 + sibling_rebuilds);
+    CHECK(sib.unwatch_completed_count() == sibling_rebuilds);
     CHECK(sib.watched_snapshot() == sibling_watched);
 
     // The claim was re-owned by the new Application (the rule is active again), so the hung
