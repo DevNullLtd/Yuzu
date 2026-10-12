@@ -26,6 +26,41 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
+## Behaviour change: the last administrator can no longer be deleted or demoted (#4966)
+
+**What changed.** Deleting (deactivating) an account and demoting a local `admin` account now go through
+one guarded write that refuses to remove the last member of a protected administrator population: the
+active local `role='admin'` accounts (with RBAC enforcement on or off) and, with enforcement on, the
+accounts that hold the `Administrator` grant. This covers the dashboard user delete and role change
+(`409`) and every SCIM deactivation, delete, `active:false` and group-derived demotion (`409`,
+`scimType` `mutability`). It is a recovery rule, not proof that anyone can sign in. The audit results
+and the new counters are listed in the changelog entry and in `docs/user-manual/rbac.md`,
+"Last-Administrator guard for account deactivation and demotion".
+
+**What to do.**
+
+- **Check before you upgrade or demote anyone.** `SELECT count(*) FROM auth.users WHERE role='admin' AND is_active;` should return at least 2, so no ordinary operation has to be refused.
+- **Drain old replicas first.** A replica running an older build does not enforce the rule, so during a
+  rolling upgrade drain the old replicas before relying on it. There is no schema change.
+- **A rollback to an older binary silently drops the guard.** Nothing in the database remembers it: the
+  older binary will delete or demote the last administrator without refusing.
+- A server with an authentication database but no RBAC store does not start (a boot self-check), and at
+  runtime the same condition fails closed. Fix the RBAC store before starting.
+- SCIM connectors: expect `409` on a deprovision of the fleet's last administrator and `503` with
+  `Retry-After: 2` when the guarded write times out. A refused deprovision leaves the person's account
+  active until an operator acts, and raises a critical analytics event. SCIM provisioning now reads the
+  RBAC store even when enforcement is off. **Behaviour change: `active:true` on a tombstone.** A SCIM
+  `PATCH`/`PUT` with `active:true` on a deactivated resource whose role is not `user`, or whose username
+  holds an `Administrator` grant, now answers `404` (audited `scim.user.provenance_denied`, counted on
+  `yuzu_scim_provenance_denied_total`) instead of reactivating the account. SCIM can deactivate the holder
+  of an `Administrator` grant but cannot reactivate it until the grant is removed (MCP
+  `unassign_rbac_role`); an elevated tombstone has its role cleared with
+  `UPDATE auth.users SET role = 'user' WHERE username = '<name>' AND NOT is_active;` (see `rbac.md`).
+  A Group request whose role recompute is incomplete (a refused or failed demotion, a
+  member whose read failed, or promotions skipped after a store failure) now records one
+  `scim.group.recompute_incomplete` audit row, and its success row says `recompute=incomplete`. Known
+  limits of the Group recompute are listed in the SCIM provisioning guide.
+
 ## Behaviour change: `POST /api/instructions/{id}/execute` now validates `params` against the stored schema
 
 **What changed.** The route checks the request's `params` against the definition's stored

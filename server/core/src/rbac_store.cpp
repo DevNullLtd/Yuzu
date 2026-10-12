@@ -464,7 +464,14 @@ std::string namespaced_group_name(const std::string& source, const std::string& 
 
 // ── Construction / teardown ──────────────────────────────────────────────────
 
-RbacStore::RbacStore(pg::PgPool& pool) : pool_(pool) {
+RbacStore::RbacStore(pg::PgPool& pool, std::chrono::milliseconds lifecycle_lock_timeout)
+    // Clamped into [1 ms, 60 s]: Postgres reads `lock_timeout = 0` as "no bound" (a stuck lock
+    // holder would then pin a pooled connection until the pool's own, much longer, timeout), a
+    // negative value is a statement error, and so is a value above 2^31-1 ms; either error would
+    // fail every guarded write. Production passes the 2000 ms default; only a test changes it.
+    : pool_(pool),
+      lifecycle_lock_timeout_(
+          std::clamp(lifecycle_lock_timeout, kMinLifecycleLockTimeout, kMaxLifecycleLockTimeout)) {
     auto lease = pool_.acquire();
     if (!lease) {
         spdlog::error("RbacStore: no database connection at construction ({}) — authorization "
@@ -2277,6 +2284,30 @@ std::expected<bool, std::string> RbacStore::provision_first_admin(const std::str
         return std::unexpected("internal error: applied provisioning missing its generation bump");
     apply_local_generation(*outcome.new_gen);
     return true;
+}
+
+// ── Account-lifecycle guard (#4966) ────────────────────────────────────────
+//
+// Thin delegations to `RbacAdminAuthorityOwner` (rbac_admin_authority_owner.cpp), the ADR-0012
+// §3 cross-schema query owner, constructed per call exactly as `unassign_role` does. None of
+// them changes a `principal_roles` / `rbac_meta` row, so none applies a local cache generation.
+
+AccountDeactivationResult RbacStore::deactivate_account(const std::string& username) {
+    if (!open_)
+        return {AccountDeactivationResult::Kind::kStoreFailure, std::string(kRbacErrStoreNotOpen)};
+    return RbacAdminAuthorityOwner{pool_, lifecycle_lock_timeout_}.deactivate_account(username);
+}
+
+LocalRoleChangeResult RbacStore::set_local_role(const std::string& username, auth::Role role) {
+    if (!open_)
+        return {LocalRoleChangeResult::Kind::kStoreFailure, std::string(kRbacErrStoreNotOpen)};
+    return RbacAdminAuthorityOwner{pool_, lifecycle_lock_timeout_}.set_local_role(username, role);
+}
+
+WouldStrandResult RbacStore::would_strand_last_administrator(const std::string& username) const {
+    if (!open_)
+        return {false, false, std::string(kRbacErrStoreNotOpen)};
+    return RbacAdminAuthorityOwner{pool_, lifecycle_lock_timeout_}.would_strand_last_administrator(username);
 }
 
 // ── Groups CRUD ──────────────────────────────────────────────────────────────
