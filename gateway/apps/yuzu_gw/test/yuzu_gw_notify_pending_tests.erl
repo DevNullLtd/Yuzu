@@ -246,19 +246,22 @@ probe_log_test_() ->
         fun killed_probe_warning_redacts_the_reason/0)
      ]}.
 
-%% The probe deadline (notify_probe_timeout_ms), here 100 ms: a probe whose worker
-%% never returns is killed by the gateway. Every wait is event driven (the
-%% deadline is the only timer), so the 100 ms is never a margin a test depends on.
+%% The probe deadline (notify_probe_timeout_ms) as a REAL 100 ms timer, end to
+%% end: nothing sends the timeout message here. The deadline can therefore fire
+%% at any moment after a probe starts (a stalled test process lets it fire before
+%% the next statement), so this group asserts only facts that hold whenever it
+%% fires and never reads or answers the probe while it is still alive: the probe
+%% is dead, its event is back in the store, the breaker is open with the doubled
+%% backoff, and the next half_open cycle sends a new probe. Every test that needs
+%% the probe alive at the time it reads state or answers it lives in the group
+%% below, where the deadline is the maximum and the timeout message is sent by
+%% hand.
 probe_timeout_test_() ->
     {foreach,
      fun() -> setup_logs(probe_env([{notify_probe_timeout_ms, 100}])) end,
      fun cleanup_logs/1,
      [
-      t("a probe that never returns is killed at the deadline, requeued, and the next half_open sends a new probe",
-        fun stuck_probe_is_killed_requeued_and_reprobed/0),
-      t("a newer event for the key of a probe that timed out supersedes the requeued probe event, counted",
-        fun newer_same_key_event_supersedes_a_timed_out_probe/0),
-      t("a probe that timed out logs one warning per half_open cycle naming the agent, never the payload",
+      t("a probe that never returns is killed by the real deadline: requeued, breaker reopened with the doubled backoff, a new probe next cycle, one warning per cycle naming the agent, never the payload",
         fun probe_timeout_is_logged_once_per_cycle/0)
      ]}.
 
@@ -282,7 +285,15 @@ probe_deadline_test_() ->
       t("a timeout message for a probe that already resolved leaves the state alone",
         fun stale_timeout_after_resolution_is_ignored/0),
       t("a result already in the mailbox wins over the deadline: no kill, no requeue",
-        fun result_in_the_mailbox_wins_over_the_deadline/0)
+        fun result_in_the_mailbox_wins_over_the_deadline/0),
+      t("a probe that never returns is killed at the deadline (sent by hand), requeued, and the next half_open sends a new probe",
+        fun stuck_probe_is_killed_requeued_and_reprobed/0),
+      t("a newer event for the key of a probe that timed out supersedes the requeued probe event, counted",
+        fun newer_same_key_event_supersedes_a_timed_out_probe/0),
+      t("a deadline that fires after a call path RPC closed the breaker requeues the event and sends it again at once",
+        fun deadline_after_call_path_close_sends_the_event_again/0),
+      t("a probe that cannot be encoded cancels its deadline timer",
+        fun probe_local_error_cancels_the_timer/0)
      ]}.
 
 %% A request that cannot be encoded never left the gateway, so it says nothing
@@ -1971,7 +1982,9 @@ probe_timeout_env_valid_is_kept() ->
 
 %% Three keys are held behind an open breaker and the head is sent as the probe,
 %% which parks in the mock and is never released: only the deadline can end it.
-%% Two cycles in a row, then a probe that is answered closes the breaker.
+%% The deadline is the maximum and is delivered by hand (fire_deadline/1), so the
+%% probe is alive for as long as the test reads it. Two cycles in a row, then a
+%% probe that is answered closes the breaker.
 stuck_probe_is_killed_requeued_and_reprobed() ->
     watch(),
     trip_breaker(),
@@ -1981,7 +1994,8 @@ stuck_probe_is_killed_requeued_and_reprobed() ->
     enter_half_open(),
     {Probe, ProbeReq} = await_entered(),
     ?assertEqual(agent(1), maps:get(agent_id, ProbeReq)),
-    %% Never released: the gateway kills it.
+    %% Never released: the deadline arrives and the gateway kills it.
+    fire_deadline(Probe),
     await_dead(Probe),
     await_until(fun() -> last_gauge() =:= {3, 0} end),
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
@@ -2000,6 +2014,7 @@ stuck_probe_is_killed_requeued_and_reprobed() ->
     ?assertEqual(agent(1), maps:get(agent_id, Again)),
     ?assertEqual(Probe2, maps:get(pid, up_get(notify_probe))),
     %% A second timeout behaves the same and doubles again.
+    fire_deadline(Probe2),
     await_dead(Probe2),
     await_until(fun() -> up_get(cb_cur_timeout) =:= 800000 andalso last_gauge() =:= {3, 0} end),
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
@@ -2020,7 +2035,8 @@ stuck_probe_is_killed_requeued_and_reprobed() ->
     ?assertEqual(5, length(entered_reqs())).
 
 %% The superseding of newer_same_key_event_supersedes_a_failed_probe, with the
-%% probe ended by the deadline instead of by an answer.
+%% probe ended by the deadline (sent by hand, so the probe is alive while the
+%% gauge is read) instead of by an answer.
 newer_same_key_event_supersedes_a_timed_out_probe() ->
     watch(),
     trip_breaker(),
@@ -2035,6 +2051,7 @@ newer_same_key_event_supersedes_a_timed_out_probe() ->
     ?assertEqual({1, 1}, last_gauge()),
     ?assertEqual(0, count(?EV_COALESCED)),
     %% The deadline fails the probe: its older event is superseded, counted.
+    fire_deadline(Probe),
     await_dead(Probe),
     await_until(fun() -> last_gauge() =:= {1, 0} end),
     ?assertEqual(1, count(?EV_COALESCED)),
@@ -2054,6 +2071,12 @@ probe_timeout_is_logged_once_per_cycle() ->
     await_dead(Probe),
     await_until(fun() -> last_gauge() =:= {1, 0} end),
     sync(),
+    %% Terminal facts only (they hold however late the test process ran): the
+    %% probe is gone, the breaker is open with one doubling, the event is back.
+    ?assertEqual(undefined, up_get(notify_probe)),
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(400000, up_get(cb_cur_timeout)),
+    ?assertEqual(1, pending_len()),
     Lines = [Text || {_, log, warning, Text} <- rows(),
                      string:find(Text, "did not answer within") =/= nomatch],
     ?assertMatch([_], Lines),
@@ -2068,10 +2091,17 @@ probe_timeout_is_logged_once_per_cycle() ->
                            string:find(T, "exited without a result") =/= nomatch]),
     enter_half_open(),
     {Probe2, _} = await_entered(),
+    ?assertNotEqual(Probe, Probe2),
     await_dead(Probe2),
     await_until(fun() -> length([x || {_, log, warning, T} <- rows(),
                                       string:find(T, "did not answer within") =/= nomatch]) =:= 2
-                  end).
+                  end),
+    %% The second cycle doubles again (the warning is logged before the state
+    %% moves, so wait for the requeue gauge).
+    await_until(fun() -> last_gauge() =:= {1, 0} end),
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(800000, up_get(cb_cur_timeout)),
+    ?assertEqual(undefined, up_get(notify_probe)).
 
 %% One key held, the probe out, the deadline far away: Resolve ends the probe
 %% and its timer must be gone (read_timer/1 is false for a cancelled timer).
@@ -2189,6 +2219,64 @@ result_in_the_mailbox_wins_over_the_deadline() ->
     await_until(fun() -> last_gauge() =:= {0, 0} end),
     ?assertEqual(1, length([x || R <- entered_reqs(), maps:get(agent_id, R) =:= agent(1)])).
 
+%% The probe is parked, a good call path RPC closes the breaker (the probe's
+%% generation is unchanged), then the deadline message arrives. The handler's
+%% resolve_probe/3 gives the event back without touching the breaker (it is no
+%% longer half_open), so only the drain/1 that follows sends it: without it the
+%% event would stay held, nothing in flight, until some unrelated trigger.
+deadline_after_call_path_close_sends_the_event_again() ->
+    watch(),
+    trip_breaker(),
+    cast_connected(agent(1)),
+    sync(),
+    enter_half_open(),
+    {Probe, _} = await_entered(),
+    mock(ok),
+    {ok, _} = yuzu_gw_upstream:proxy_register(#{info => #{}}),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    fire_deadline(Probe),
+    await_dead(Probe),
+    {_, Again} = await_entered(),
+    ?assertEqual(agent(1), maps:get(agent_id, Again)),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    ?assertEqual(undefined, up_get(notify_probe)),
+    await_until(fun() -> last_gauge() =:= {0, 1} end),
+    ?assertEqual(0, count(?EV_COALESCED)).
+
+%% A probe whose request cannot be encoded resolves through the local_error
+%% clause of resolve_probe/3, which must cancel the deadline timer like every
+%% other resolution. The worker answers at once, so there is no moment at which a
+%% test could read the timer from the state; instead the upstream is call traced
+%% and the timer is taken from the state handed to resolve_probe/3 (the probe is
+%% still recorded there), then read after the resolution. read_timer/1 is false
+%% for a cancelled timer; the deadline is the maximum, so a live one never fires
+%% inside the test and nothing here waits on a clock.
+probe_local_error_cancels_the_timer() ->
+    watch(),
+    trip_breaker(),
+    notify_status(<<255>>, <<"sess">>, connected, <<"peer">>, <<"home">>),
+    sync(),
+    Up = whereis(yuzu_gw_upstream),
+    ProbeIdx = up_index(notify_probe),
+    1 = erlang:trace_pattern({yuzu_gw_upstream, resolve_probe, 3}, true, [local]),
+    _ = erlang:trace(Up, true, [call, {tracer, self()}]),
+    try
+        enter_half_open(),
+        ?assertEqual({marshal_failed, <<255>>}, await_attempt()),
+        Timer = receive
+                    {trace, Up, call, {yuzu_gw_upstream, resolve_probe,
+                                       [_Gen, {local_error, _}, TracedState]}} ->
+                        #{timer := T} = element(ProbeIdx, TracedState),
+                        T
+                after ?AWAIT_MS -> erlang:error(resolve_probe_was_not_called)
+                end,
+        await_until(fun() -> up_get(notify_probe) =:= undefined end),
+        ?assertEqual(false, erlang:read_timer(Timer))
+    after
+        _ = erlang:trace(Up, false, [call]),
+        _ = erlang:trace_pattern({yuzu_gw_upstream, resolve_probe, 3}, false, [local])
+    end.
+
 %%%===================================================================
 %%% Helpers: driving the upstream
 %%%===================================================================
@@ -2253,6 +2341,14 @@ enter_half_open() ->
 %% Answer a parked worker with a transport error.
 fail_worker(W) ->
     W ! {release, {error, boom}},
+    ok.
+
+%% Deliver the probe deadline to the upstream by hand, exactly as the timer would
+%% (the message names the recorded probe's pid and generation). For groups whose
+%% real deadline is the maximum, so the probe's lifetime is the test's to decide.
+fire_deadline(Probe) ->
+    #{pid := Probe, gen := Gen} = up_get(notify_probe),
+    whereis(yuzu_gw_upstream) ! {notify_probe_timeout, Probe, Gen},
     ok.
 
 %% The breaker fields a stale probe result must not move.
