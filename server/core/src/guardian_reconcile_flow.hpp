@@ -152,8 +152,10 @@ public:
     // convergence, and the maintenance sweep bounds the rest. Nothing releases a claim
     // early: an agent whose push ends without sending (no session, or a failed send)
     // is admitted at most once per interval, however often it heartbeats. The cached
-    // generation (about 2 s old, the cache TTL plus the fetch time) only drives that decision; an ADMITTED push re-reads the
-    // generation fresh and labels the push with it.
+    // generation (about 2 s old while the entry is fresh; a caller that arrives while another
+    // thread is refreshing an expired entry is served the old value, which is older still,
+    // because the cache refreshes on demand and never on a timer) only drives that decision;
+    // an ADMITTED push re-reads the generation fresh and labels the push with it.
     void run(std::string_view agent_id_sv, std::uint64_t agent_gen) {
         if (!store_wired_())
             return;
