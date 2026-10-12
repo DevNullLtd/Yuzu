@@ -1048,9 +1048,9 @@ TEST_CASE("/fragments/results: a cut read that parses to zero lines still says i
 // `this:abort`, so a correction typed during a refused or slow response was never sent, and a
 // late sort/page response could land after another response's OOB swap had detached its issuer.
 // Every element whose hx-get targets /fragments/results (filter-bar controls, the View select,
-// th sort links, Prev/Next) carries the same `#filter-bar:replace`. The one deliberate exception
-// is the `#chart-deck-host` self-refresh (an unscoped request that carries no f_* params; see
-// #5669), which this count does not cover. The replacing semantics were verified in headless
+// th sort links, Prev/Next) carries the same `#filter-bar:replace`. The `#chart-deck-host`
+// self-refresh is emitted by the dispatch response, not by this fragment, and carries
+// `#filter-bar:queue last` instead (see its test below). The replacing semantics were verified in headless
 // Chromium during the #5623 review, not by this test: it pins the exact scope string and that
 // no element is left behind.
 namespace {
@@ -1279,14 +1279,17 @@ TEST_CASE("/fragments/results: sort headers and Prev/Next include the live filte
 // for every LATER key, so `htmx:abort` must be the LAST key, with showToast first on the issuer.
 namespace {
 struct ExecDispatchHarness {
-    // MEMBER ORDER IS LOAD-BEARING: `sink` last so it is destroyed first (see the other
-    // harnesses in this file).
+    // MEMBER ORDER IS LOAD-BEARING: `sink` (declared before `sent`) is destroyed after `sent`.
+    // `sent` is a trivial std::size_t only read by the dispatch lambda while post() runs, so
+    // that order is harmless; the rule that matters is that `routes` and `metrics`, which the
+    // registered handlers reference, outlive the sink's last dispatch (see the other harnesses
+    // in this file).
     yuzu::MetricsRegistry metrics;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
     std::size_t sent{2};
 
-    ExecDispatchHarness() {
+    explicit ExecDispatchHarness(InstructionStore* instruction_store = nullptr) {
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -1317,7 +1320,7 @@ struct ExecDispatchHarness {
             [](const std::string&) {
                 return std::pair<std::string, std::string>{"os_info", "os_version"};
             },
-            &metrics, /*instruction_store=*/nullptr);
+            &metrics, instruction_store);
         routes.set_capability_classify_fn(yuzu::test::real_classify_fn());
     }
 
@@ -1369,6 +1372,61 @@ TEST_CASE("dashboard execute: the HX-Trigger ends with an htmx:abort at the resu
     // not carry a `target` of its own.
     CHECK(j.size() == 2);
     CHECK_FALSE(j["showToast"].contains("target"));
+}
+
+// -- #5623 (Gate 7 fix round F): the chart-deck refresh queues behind the filter bar -------------
+// The `#chart-deck-host` self-refresh (one request, `load delay:2s`) carries no f_* params, so
+// unscoped it could land after a user filter change and overwrite the pager / summary /
+// Create-Group chrome with UNFILTERED content. It carries `hx-sync="#filter-bar:queue last"`:
+// queued behind the placeholder's own load request, dequeued after that request's swap,
+// re-resolved to the NEW form, abortable by a filter change or a second dispatch. Read from
+// the bundled htmx 2.0.4 (static_js_bundle.cpp), not run in a browser by this test. It depends on
+// the `#filter-bar` OOB PRECEDING the deck OOB in the response (the placeholder's load timer is
+// registered, and its request issued, first); reversed, the deck request would take the
+// placeholder's sync slot and the filter-bar request would queue behind it.
+TEST_CASE("dashboard execute: the chart-deck host queues behind the filter bar, which precedes it",
+          "[pg][server][dashboard][fragment][execute]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, fragment_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+
+    // The harness's resolve_fn maps every instruction to os_info / os_version; a definition for
+    // that pair with a result schema is what makes the dispatch emit a deck host with an hx-get.
+    InstructionDefinition def;
+    def.name = "deck-host-sync";
+    def.version = "1.0.0";
+    def.plugin = "os_info";
+    def.action = "os_version";
+    def.type = "question";
+    def.enabled = true;
+    def.result_schema = R"([{"name":"Name","type":"string"}])";
+    auto created = is.create_definition(def);
+    REQUIRE(created.has_value());
+
+    ExecDispatchHarness h(&is);
+    auto res = h.post("instruction=run&scope=__all__");
+    REQUIRE(res->status == 200);
+    const std::string& body = res->body;
+    INFO(body);
+
+    const auto deck_at = body.find("<div id=\"chart-deck-host\" hx-swap-oob=\"true\"");
+    const auto bar_at = body.find("<div id=\"filter-bar\" hx-swap-oob=\"true\"");
+    REQUIRE(deck_at != std::string::npos);
+    REQUIRE(bar_at != std::string::npos);
+    // Not vacuous: this is the refreshing host (an hx-get), not the bare clearing div.
+    const auto deck_close = body.find('>', deck_at);
+    REQUIRE(deck_close != std::string::npos);
+    const std::string deck_tag = body.substr(deck_at, deck_close - deck_at + 1);
+    INFO(deck_tag);
+    CHECK(contains(deck_tag, "hx-get=\"/fragments/results?command_id=cmd-exec-abort"));
+    CHECK(contains(deck_tag, "hx-trigger=\"load delay:2s\""));
+    CHECK(contains(deck_tag, "hx-sync=\"#filter-bar:queue last\""));
+    // Exactly one hx-sync on the host.
+    CHECK(deck_tag.find("hx-sync=", deck_tag.find("hx-sync=") + 1) == std::string::npos);
+
+    // The OOB order is load-bearing (see the banner above).
+    CHECK(bar_at < deck_at);
 }
 
 // -- #5623: authorization runs before the refusal, and a refusal is counted ---------------------
