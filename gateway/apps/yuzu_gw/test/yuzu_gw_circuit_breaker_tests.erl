@@ -27,15 +27,15 @@ circuit_breaker_test_() ->
       {"closes on successful probe", fun closes_on_probe_success/0},
       {"reopens on failed probe", fun reopens_on_probe_failure/0},
       {"answers that blame the request never open the breaker", fun request_faults_do_not_trip/0},
-      {"a request-fault answer from a half-open probe closes the breaker", fun request_fault_probe_closes/0},
-      {"a request-fault answer resets the run of failures", fun request_fault_resets_failures/0}
+      {"a request-fault answer from a half-open probe leaves the breaker half open", fun request_fault_probe_leaves_half_open/0},
+      {"a request-fault answer neither resets nor extends the run of failures", fun request_fault_leaves_the_run/0}
      ] ++
-     %% The set of healthy answers is closed and the default is to count: each of
+     %% The set of request faults is closed and the default is to count: each of
      %% these still opens the breaker. One entry each, so each gets a fresh process.
      [{"status " ++ binary_to_list(Status) ++ " still opens the breaker",
        fun() -> server_fault_trips(Status) end}
-      || Status <- [<<"1">>, <<"2">>, <<"4">>, <<"8">>, <<"10">>, <<"12">>, <<"13">>, <<"14">>,
-                    <<"15">>, <<"unparsed">>]]}.
+      || Status <- [<<"1">>, <<"2">>, <<"4">>, <<"8">>, <<"10">>, <<"7">>, <<"12">>, <<"13">>,
+                    <<"14">>, <<"15">>, <<"16">>, <<"unparsed">>]]}.
 
 setup() ->
     catch meck:unload(yuzu_grpc_client),
@@ -172,7 +172,7 @@ request_faults_do_not_trip() ->
          [?assertMatch({error, {Status, _}}, yuzu_gw_upstream:proxy_register(#{info => #{}}))
           || _ <- lists:seq(1, 8)],
          ?assertEqual(closed, yuzu_gw_upstream:circuit_state())
-     end || Status <- [<<"3">>, <<"5">>, <<"6">>, <<"7">>, <<"9">>, <<"11">>, <<"16">>]],
+     end || Status <- [<<"3">>, <<"5">>, <<"6">>, <<"9">>, <<"11">>]],
     ok.
 
 server_fault_trips(Status) ->
@@ -180,16 +180,19 @@ server_fault_trips(Status) ->
     [yuzu_gw_upstream:proxy_register(#{info => #{}}) || _ <- lists:seq(1, 3)],
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()).
 
-request_fault_probe_closes() ->
+%% The server answered, so the breaker neither reopens nor closes: it waits for
+%% an answer that says something about the upstream.
+request_fault_probe_leaves_half_open() ->
     trip_circuit(),
     ?assertEqual(half_open, await_state(half_open)),
     meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> {error, {<<"3">>, <<"bad">>}, #{}} end),
     ?assertMatch({error, {<<"3">>, _}}, yuzu_gw_upstream:proxy_register(#{info => #{}})),
-    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()).
+    ?assertEqual(half_open, yuzu_gw_upstream:circuit_state()).
 
-%% Two real failures, then a request-fault answer, then two more real failures:
-%% never three in a row, so it stays closed.
-request_fault_resets_failures() ->
+%% Two real failures, a request-fault answer, then one more real failure: the
+%% answer is not a success, so it does not reset the run, and the third failure
+%% opens the breaker (threshold 3).
+request_fault_leaves_the_run() ->
     Fail = fun() ->
                meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> {error, connection_refused} end),
                yuzu_gw_upstream:proxy_register(#{info => #{}})
@@ -198,5 +201,7 @@ request_fault_resets_failures() ->
                  meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> {error, {<<"3">>, <<"bad">>}, #{}} end),
                  yuzu_gw_upstream:proxy_register(#{info => #{}})
              end,
-    Fail(), Fail(), Answer(), Fail(), Fail(),
-    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()).
+    Fail(), Fail(), Answer(),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+    Fail(),
+    ?assertEqual(open, yuzu_gw_upstream:circuit_state()).

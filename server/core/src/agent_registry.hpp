@@ -519,12 +519,18 @@ struct PluginMeta {
 // the trio published together by set_gateway_route, M1 review fix +
 // #4324; an earlier revision wrote gateway_node under the registry mu_
 // instead, which both raced stream_mu's readers and contradicted this
-// comment) and the atomic last_activity_epoch_ms. (Governance G3
-// cpp-safety — keep it true.)
+// comment) and the atomic last_activity_epoch_ms. `session_id` is ALSO
+// rewritten in place after publication, by AgentRegistry::map_session under
+// AgentRegistry::mu_ (an exception to the identity-field rule above): read
+// it only through session_is()/session_id_of(), never through a
+// get_session()/find_by_session() pointer after the lock is released (#5684).
+// (Governance G3 cpp-safety — keep it true.)
 
 struct AgentSession {
     std::string agent_id;
-    std::string session_id; // Unique per connection — used to prevent stale cleanup races
+    // Unique per connection — used to prevent stale cleanup races. Rewritten in place by
+    // map_session under AgentRegistry::mu_: read only via session_is()/session_id_of().
+    std::string session_id;
     std::string hostname;
     std::string os;
     std::string arch;
@@ -1042,6 +1048,13 @@ public:
 
     // Get a session by agent_id (for scope evaluation).
     std::shared_ptr<AgentSession> get_session(const std::string& agent_id) const;
+
+    /// True iff the registry's current session for `agent_id` carries `session_id`.
+    /// Compares under `mu_` — reading `get_session(...)->session_id` after the lock is
+    /// released races the owner's session replacement.
+    [[nodiscard]] bool session_is(const std::string& agent_id, const std::string& session_id) const;
+    /// Copy of the current session id for `agent_id` (empty if none), read under `mu_`.
+    [[nodiscard]] std::string session_id_of(const std::string& agent_id) const;
 
     // #3424/#3511: ids POSITIVELY known to lack `plugin`, for
     // dispatch_confined_arms's plugin-presence filter. One locked pass over

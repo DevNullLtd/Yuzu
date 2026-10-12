@@ -84,7 +84,7 @@ struct VizHarness {
     VizRoutes routes;
 
     explicit VizHarness(std::vector<RawAgentSnapshot> seed = {}, bool with_store = true,
-                        bool fetcher_throws = false) {
+                        bool fetcher_throws = false, OfflineRosterFn offline = {}) {
         if (with_store) {
             auto fetcher = fetcher_throws ? throwing_fetcher() : fixed_fetcher(std::move(seed));
             store = std::make_unique<FleetTopologyStore>(
@@ -116,7 +116,7 @@ struct VizHarness {
         };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, with_store ? store.get() : nullptr,
-                               &metrics, &kill_switch);
+                               &metrics, &kill_switch, std::move(offline));
     }
 };
 
@@ -143,6 +143,8 @@ TEST_CASE("REST viz: GET JSON returns fleet_topology.v1 envelope", "[viz][routes
     REQUIRE(j.contains("machines"));
     REQUIRE(j["machines"].is_array());
     CHECK(j["machines"].size() == 2);
+    // Unwired roster closure = live-only legacy behaviour, never "degraded".
+    CHECK_FALSE(j.contains("offline_roster_degraded"));
 
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "viz.fleet_topology");
@@ -647,4 +649,56 @@ TEST_CASE("REST viz: host endpoint rejects a control-character agent_id before i
     CHECK(j["error"]["message"].get<std::string>().find("control characters") !=
           std::string::npos);
     CHECK(h.audit_log.empty());
+}
+
+// =============================================================================
+// #5531: a failed durable-roster read renders live-only, flagged + audited
+// =============================================================================
+
+// Kills: swallowing the typed error (no flag / no audit marker) or hard-failing the request.
+TEST_CASE("REST viz: a failed offline-roster read renders live-only with offline_roster_degraded",
+          "[viz][routes]") {
+    OfflineRosterFn failing = [](std::chrono::seconds) {
+        return std::expected<std::vector<OfflineEndpoint>, PresenceReadError>(
+            std::unexpected(PresenceReadError::DbError));
+    };
+    VizHarness h({mk_agent("a1", "host-1"), mk_agent("a2", "host-2")}, true, false, failing);
+
+    auto res = h.sink.Get("/api/v1/viz/fleet/topology");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = json::parse(res->body);
+    CHECK(j["machines"].size() == 2);
+    REQUIRE(j.contains("offline_roster_degraded"));
+    CHECK(j["offline_roster_degraded"].get<bool>() == true);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].detail.find("offline_roster_degraded=1") != std::string::npos);
+}
+
+// Kills: setting the flag on success, or not merging the closure's rows.
+TEST_CASE("REST viz: a healthy offline-roster read merges the stale cube with no degraded flag",
+          "[viz][routes]") {
+    OfflineRosterFn healthy = [](std::chrono::seconds) {
+        OfflineEndpoint ep;
+        ep.agent_id = "agent-off";
+        ep.hostname = "host-off";
+        ep.os = "linux";
+        return std::expected<std::vector<OfflineEndpoint>, PresenceReadError>(
+            std::vector<OfflineEndpoint>{ep});
+    };
+    VizHarness h({mk_agent("a1", "host-1")}, true, false, healthy);
+
+    auto res = h.sink.Get("/api/v1/viz/fleet/topology");
+    REQUIRE(res);
+    auto j = json::parse(res->body);
+    REQUIRE(j["machines"].size() == 2);
+    bool found_stale = false;
+    for (const auto& m : j["machines"])
+        if (m["agent_id"] == "agent-off" && m["stale"].get<bool>())
+            found_stale = true;
+    CHECK(found_stale);
+    CHECK_FALSE(j.contains("offline_roster_degraded"));
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].detail.find("offline_roster_degraded") == std::string::npos);
+    CHECK(h.metrics.counter("yuzu_viz_offline_hosts_total").value() == 1);
 }

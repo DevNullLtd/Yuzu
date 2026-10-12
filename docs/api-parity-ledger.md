@@ -110,6 +110,18 @@ document's generated block going stale relative to a fresh render. See
 unit-test half (RestApiV1's own `register_routes()` vs `openapi_spec()`,
 plus `$ref` validity) - the #842 companion to this whole-tree script.
 
+**REST-only exports (deliberate).** The software catalogue's exports - `format=csv` on
+`GET /api/v1/inventory/software/catalogue` and `format=csv|json` on
+`GET /api/v1/inventory/software` - have no MCP tool. An agent reads the same data page by page
+through the cursor on `query_software_catalogue` / `query_installed_software`; a bulk file
+download is a human/automation convenience, so the ledger rows for those routes are `twinned` on
+the paged shape and the export mode is recorded here rather than as a separate row. Tracked by `#5699` (revisit by 2026-11-07); the exception is recorded in `docs/adr/1005-headless-platform-use-case-engines.md`.
+
+**Known asymmetry on the raw-route pair.** The `q`, `kind`, `ecosystem` and `source` filters of
+`GET /api/v1/inventory/software` are REST-only: `query_installed_software` takes `name`, `agent_id`,
+`version`, `limit` and `cursor` only (an unknown argument name is ignored, as on the other read tools; only approval-gated tools validate argument names at dispatch). The row
+stays `twinned` on the paged shape; the gap is recorded here so it is not silent. Tracked by `#5699` (revisit by 2026-11-07), with the same ADR-1005 exception entry.
+
 ## Summary
 
 <!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; regenerate with `python3 scripts/ci/check-api-parity.py --render-doc` and splice between these markers -->
@@ -117,7 +129,7 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
 | devices | 14 | 9 | 5 |
-| inventory | 3 | 1 | 2 |
+| inventory | 3 | 3 | 0 |
 | dex | 26 | 18 | 8 |
 | guardian | 16 | 6 | 10 |
 | tar | 12 | 4 | 8 |
@@ -139,11 +151,11 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
 | other | 74 | 13 | 61 |
-| **Total** | **282** | **81** | **201** |
+| **Total** | **282** | **83** | **199** |
 
-Registered `/api/vN/*` routes: 244. OpenAPI `paths` entries: 243. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 184.
+Registered `/api/vN/*` routes: 246. OpenAPI `paths` entries: 245. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 186.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 201.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 199.
 
 <!-- END GENERATED -->
 

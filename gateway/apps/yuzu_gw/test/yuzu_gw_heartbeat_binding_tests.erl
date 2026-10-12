@@ -89,9 +89,11 @@ binding_test_() ->
       {"lookup_session/1 is local, live-checked and reports the key",
        fun lookup_session_contract/0},
       {"Register records the connection key in the pending row",
-       fun register_records_conn_key/0},
+       {timeout, 30, fun register_records_conn_key/0}},
       {"Register with an upstream answer that is not a map fails without raising",
-       fun register_non_map_upstream_response/0},
+       {timeout, 30, fun register_non_map_upstream_response/0}},
+      {"agent id and peer address are logged without raw control characters",
+       {timeout, 30, fun agent_text_is_logged_without_control_characters/0}},
       {"rejections produce a rate-limited summary log with no session id",
        fun rejection_log_is_rate_limited_and_id_free/0},
       {"Register and agent-connected info logs carry no session id",
@@ -615,6 +617,9 @@ register_non_map_upstream_response() ->
     [begin
          ok = meck:expect(yuzu_gw_upstream, proxy_register, fun(_) -> {ok, Bad} end),
          Result = yuzu_gw_agent_service:register(ctx_with(conn_a), Req),
+         %% The warning is limited to one per interval: start the capture with a
+         %% fresh limit.
+         yuzu_gw_safe_call:reset_limits(),
          Lines = capture_logs(fun() ->
              ?assertMatch({grpc_error, {?GRPC_STATUS_INTERNAL, _}},
                           yuzu_gw_agent_service:register(ctx_with(conn_a), Req))
@@ -627,6 +632,40 @@ register_non_map_upstream_response() ->
                                    binary:match(L, <<"not a response message">>) =/= nomatch])
      end || Bad <- [<<"body-marker">>, [<<"body-marker">>], undefined]],
     ok.
+
+%% removed in the Cowboy edge merge: Register no longer reads the peer address from the agent's :authority header
+
+%% A carriage return or line feed in an agent id or peer address must not start
+%% a second log line: the connect and register lines carry both through log_text.
+agent_text_is_logged_without_control_characters() ->
+    Uid = uid(<<"u">>),
+    A = <<"crlf-marker", 13, 10, "INJECTED-", Uid/binary>>,
+    Peer = <<"peer-marker", 13, 10, "INJECTED:1">>,
+    S = <<"reg-session-", A/binary>>,
+    Req = #{info => #{agent_id => A, hostname => <<"h">>}},
+    Lines = capture_logs(fun() ->
+        {ok, _, _} = yuzu_gw_agent_service:register(ctx_with(conn_a), Req),
+        Args = #{agent_id => A, session_id => S, stream_pid => self(),
+                 agent_info => #{agent_id => A}, peer_addr => Peer, conn_key => conn_a},
+        {ok, Agent} = yuzu_gw_agent:start_link(Args),
+        unlink(Agent),
+        Mon = erlang:monitor(process, Agent),
+        {ok, _} = yuzu_gw_agent:get_info(Agent),
+        yuzu_gw_agent:disconnect(Agent),
+        receive {'DOWN', Mon, process, Agent, _} -> ok
+        after 5000 -> erlang:error(agent_did_not_exit)
+        end
+    end),
+    Registered = [L || L <- Lines, binary:match(L, <<"registered, awaiting Subscribe">>) =/= nomatch,
+                       binary:match(L, <<"crlf-marker">>) =/= nomatch],
+    Connected = [L || L <- Lines, binary:match(L, <<"connected from">>) =/= nomatch,
+                      binary:match(L, <<"crlf-marker">>) =/= nomatch],
+    ?assertMatch([_], Registered),
+    ?assertMatch([_], Connected),
+    [?assertEqual(nomatch, binary:match(L, [<<13>>, <<10>>])) || L <- Registered ++ Connected],
+    ?assertNotEqual(nomatch, binary:match(hd(Connected), <<"peer-marker">>)).
+
+%% removed in the Cowboy edge merge: Register no longer reads the peer address from the agent's :authority header
 
 %%%===================================================================
 %%% Logging

@@ -177,7 +177,28 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # /fragments/inventory/{devices,device,find,find/results} rows are deleted along
 # with their routes (two `planned:#2146`, two `composed-of:`), so the count
 # falls 205 -> 201 -- the value the checker itself reported after the deletion.
-BASELINE_UNTWINNED = 201
+#
+# Software catalogue REST routes: get.fragments-inventory-software-versions
+# flips "planned:#2146" -> "twinned" (GET /api/v1/inventory/software/catalogue/versions;
+# MCP twin get_software_versions, added with the MCP twins) and the title-catalogue row
+# get.fragments-inventory-software is repointed at GET /api/v1/inventory/software/catalogue
+# (already "twinned", count unchanged). The catalogue route's format=csv titles export is REST-only by design: a CSV
+# body is a download for a person or a pipeline, not a structured tool result (the JSON route
+# is the structured surface; its MCP twin, query_software_catalogue, now exists, and the
+# remaining exception is recorded under ADR-1005 as #5699).
+# Measured post-flip at 204 (205 - 1), not hand-picked.
+#
+# Merge of the two changes above: 205 - 4 (legacy rows deleted) - 1 (versions row twinned)
+# = 200, the value the checker itself reported on the merged tree.
+#
+# MCP twins + raw-route exports (the second PR of the software catalogue): the
+# get.fragments-inventory-software-devices row flips "planned:#2146" -> "twinned" (GET
+# /api/v1/inventory/software + MCP query_installed_software, which gains version/cursor/source);
+# the title-catalogue row gains its MCP twin query_software_catalogue and the versions row
+# get_software_versions (both already "twinned", count unchanged). The raw route's
+# format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
+# same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
+BASELINE_UNTWINNED = 199
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

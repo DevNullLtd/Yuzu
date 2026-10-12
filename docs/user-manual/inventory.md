@@ -359,18 +359,23 @@ The **`query_installed_software`** MCP tool exposes the same data to agentic
 workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
 
 - Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan.
-- Returns up to `limit` rows (max 1000). When `result_truncated_by_cap` is
-  `true`, more rows exist past the cap (keyset pagination is a follow-up).
-- **A per-agent scope drop filter is applied** — out-of-scope devices are
-  dropped (and the omission audited), with the count returned as
-  `devices_omitted` (absent when zero). This confinement is **effective**: the
-  gate composes management-group visibility with the caller's service-scope tag
+- Returns up to `limit` rows (max 1000; any integer that fits int64 is clamped to 1..1000).
+  When `result_truncated_by_cap` is `true` more rows may exist: pass `next_cursor` back as
+  `cursor` to continue the keyset walk (the cursor is opaque and bound to the filter set).
+  Optional `version` filter; each row also carries `source`. A wrongly typed argument (a
+  non-string `agent_id`, `name`, `version` or `cursor`, or a non-integer `limit`) is refused
+  with `kInvalidParams`, never ignored or converted.
+- **The caller's scope is applied in SQL** — the gate composes management-group
+  visibility with the caller's service-scope tag
   (`meet(management-group, service-scope)`), so a management-group-confined
   operator and a correctly-confined service-scoped API token both get a real
   filtered result — a service-scoped token is no longer denied outright as it
-  was before #3290. When present, a positive `devices_omitted` means matching
-  software exists outside your scope — an empty or short result does
-  **not** mean the software is absent fleet-wide. This is distinct from the generic
+  was before #3290. `devices_omitted` is `0` under push-down (up to 10 000
+  visible devices), where the result is complete for the caller's own devices. Above that,
+  the rows are filtered after the read and `devices_omitted` is the count of distinct
+  out-of-scope devices within the scanned window(s), a bounded and audited signal that
+  out-of-scope matches exist. A page there can be empty with a non-null `next_cursor`: keep
+  paging until it is `null`. This is distinct from the generic
   `query_inventory` / `get_agent_inventory` tools, which read a *separate*
   generic blob store on `Infrastructure:Read` and do **not** surface this typed
   software data.
@@ -397,23 +402,31 @@ curl -H "Authorization: Bearer $TOKEN" \
   "$SERVER/api/v1/inventory/software?agent_id=<agent-id>"
 ```
 
-- Query params: `name` (exact), `agent_id` (exact), `limit` (max 1000). Omit both
-  `name` and `agent_id` for a fleet-wide scan.
+- Query params: `name` (exact), `agent_id` (exact), `version` (exact; present-empty
+  selects the empty-version rows), `q` (case-insensitive literal substring), `kind`,
+  `ecosystem`, `source` (exact), `limit` (max 1000; 10000 with `format`), `cursor` and `format` (`json` or
+  `csv`: an export). Omit `name` and `agent_id` for a fleet-wide scan. The full parameter
+  and error tables are in [rest-api.md](rest-api.md); `q`, `kind`, `ecosystem` and
+  `source` are REST-only (the MCP tool takes `name`, `agent_id`, `version`, `limit` and
+  `cursor`).
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, ...},
-  "meta": {"api_version": "v1"}}`. Each row is
-  `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
-  release, arch, signature_status, distro_id, distro_version}` — the v2 fields
-  are `""` where the ecosystem does not store them (see the availability matrix
-  above). The MCP tool's rows carry the identical field set.
-- **Carries the same per-agent scope drop filter as the MCP tool**
-  (out-of-scope devices dropped, omission audited, `devices_omitted` reports the
-  count) — the SAME `require_fleet_read` gate, so REST and MCP cannot observe a
-  different admit/filter decision for the same caller (see the MCP note above).
-  When present, a positive `devices_omitted` means matching software exists
-  outside your scope — an empty or short result does **not** mean the software
-  is absent fleet-wide.
-- `result_truncated_by_cap: true` (present only when set) means more rows exist past
-  `limit` (keyset pagination is a follow-up, #1634).
+  "meta": {"api_version": "v1"}}`. Each row has 14 fields: `{agent_id, name, version,
+  publisher, install_date, kind, ecosystem, epoch, release, arch, signature_status,
+  distro_id, distro_version, source}` — the v2 fields are `""` where the ecosystem does not
+  store them (see the availability matrix above), and `source` is the
+  `<plugin>.<action>` that produced the row. The MCP tool's rows carry the identical
+  field set.
+- **Carries the same scope push-down as the MCP tool** — the SAME
+  `require_fleet_read` gate, so REST and MCP cannot observe a different
+  admit/filter decision for the same caller (see the MCP note above). A positive
+  `devices_omitted` appears only on the wide-scope post-filter path and is
+  audited as `denied`; an explicit `agent_id` outside the caller's scope is also audited as
+  `denied`, with an empty page.
+- `result_truncated_by_cap: true` (present only when set) means more rows may exist; continue
+  with `next_cursor` (keyset pagination, opaque cursor bound to the filter set). A
+  `format=csv` export carries its continuation in the `X-Next-Cursor` response header, with
+  `X-Result-Truncated-By-Cap: true` and a trailing `# result_truncated_by_cap` record; a
+  wide-scope export can hold fewer than `limit` rows and still be capped.
 - **On store degradation** the endpoint returns **`503`** (an A4 error envelope with a
   `correlation_id`), **never** an empty `200` — so a vulnerability query cannot read a
   transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads).
@@ -424,15 +437,30 @@ curl -H "Authorization: Bearer $TOKEN" \
   degrade, not an authorization problem; retry once it clears (sre, governance run
   2026-08-20).
 
-**Narrow scope on a large fleet (applies to *both* the MCP tool and the REST
-endpoint).** The 1000-row cap is applied by the store *before* the management-group
-scope filter runs. So a narrow-scope operator querying a popular title across a large
-fleet can see `result_truncated_by_cap: true` together with few — or **zero** — of
-their own rows, because the cap was consumed by out-of-scope devices that sort ahead
-of yours. **That is "incomplete", not "absent in your scope."** Until keyset
-pagination lands (#1634), narrow the query: pass `agent_id` (`?agent_id=<id>` on REST,
-the `agent_id` arg on MCP) to read a specific device, or a more selective `name`
-filter, so your in-scope rows fit under the cap.
+**Scope is applied in SQL.** A confined caller's visible-device set is pushed into the query
+for up to 10 000 devices, so it gets **complete pages of its own devices** — the old
+"the cap was consumed by out-of-scope devices" short page no longer occurs, and
+`devices_omitted` is `0`. Only a scope wider than 10 000 devices falls back to the in-process
+post-filter, where `devices_omitted` is a distinct-device count within the scanned window(s)
+and still signals that out-of-scope matches exist. The page is refilled with at most four
+bounded reads, so it can be empty with a non-null `next_cursor`; that cursor re-anchors at
+the last row you were served and skips the rows already scanned (a row inserted or deleted inside
+that span, or a scope that widens between pages, can make a walk miss or repeat a row, the
+same class as the `install_id` churn noted for a concurrent resync). A continuation's skip is
+a position count, so a long run of out-of-scope rows costs proportionally more to resume, and
+a statement timeout there degrades the page to a 503 (tracked in #5698). Keep paging until
+`next_cursor` is `null`.
+
+### REST: software title catalogue
+
+`GET /api/v1/inventory/software/catalogue` returns one row per software title across the
+fleet with filtered `totals`, first-page KPIs, a keyset `next_cursor` and a `format=csv`
+export; `GET /api/v1/inventory/software/catalogue/versions` returns installs per version
+of one title. Unlike the raw route above, a management-group-confined caller gets `403` on
+the fleet view (pass `agent_id` for an in-scope device) and service-scoped tokens are
+denied. A degraded read is `503`, never an empty `200`; the fleet export and the unfiltered
+versions read are also `503` until the first catalogue refresh has landed. Parameters,
+responses and audit behaviour: [REST API](rest-api.md#get-apiv1inventorysoftwarecatalogue).
 
 ### Dashboard (`/inventory` → `/hardware` / `/software`)
 
@@ -552,17 +580,31 @@ the CI record's **Installed software** lens — the *authoritative* reads — sh
 explicit **"unavailable"** banner rather than an empty table, because an empty table
 would read as "installed nowhere", the fail-open the authoritative-read contract
 (ADR-0016 §7) forbids. The **Hardware list** itself (hostname/OS/status/last-seen/IP/
-DEX/version) is sourced from the deliberately *fail-soft* endpoint-state store, with the
+DEX/version) is sourced from the endpoint-state store (a failed read is reported as such, never shown as an empty roster), with the
 CI and Tags columns layered on top from a best-effort `DeviceInventoryStore`/tag-store
 read — a *whole-store* degrade there is now its own explicit "CI columns unavailable" /
 "Tags unavailable" banner (an improvement on the old Devices tab, where a
 `DeviceInventoryStore` degrade during the list render was indistinguishable from "not
-yet synced"); the dedicated "roster unavailable" banner appears only when the roster
-provider is not wired at all — a failed roster read currently renders as an empty table
-(tracked in #5531). The **per-device CI record's Overview
-lens**, by contrast, has always been an authoritative three-state read: found /
-genuinely-not-yet-synced ("no CI record synced yet") / degraded (an explicit "CI record
-unavailable" banner) are never conflated.
+yet synced"); a FAILED roster read (not only an unwired provider) shows a dedicated
+"roster unavailable" banner rather than an empty table, makes `GET /api/v1/hardware`
+answer `503` with `retry_after_ms`, and audits `result=failure` (see Troubleshooting
+for where to look). On the dashboard's CI record, an unreadable roster with no CI
+record to show reads "roster unreadable"; otherwise the record is shown with a note
+on the Overview lens that the device identity is unavailable. **REST:** `GET /api/v1/hardware/{id}`
+distinguishes "not found" (`404`) from "roster unreadable" (`503`, the device was not
+otherwise found: CI record readable-and-absent, no software, no tags) from a record
+served with a degraded identity (`identity_state: degraded`). **REST:** a degraded CI store
+alongside a degraded roster is a `200` carrying both `identity_state` and `ci_state` as
+`degraded`. The **per-device CI record's Overview lens**, by contrast, has always been
+an authoritative three-state read: found / genuinely-not-yet-synced ("no CI record
+synced yet") / degraded (an explicit "CI record unavailable" banner) are never
+conflated.
+
+The Hardware list and its KPI strip serve at most the 100,000 most recently seen
+endpoints within the 30-day window; a fleet above that sees a capped list without a
+warning (a truncation signal is tracked in #5712). The per-device record's offline
+identity fallback reads the same capped set, so an offline device outside it shows no
+identity and, with nothing else synced, reads as not found.
 
 ## Access control
 
@@ -840,6 +882,8 @@ from the other. Agents that do not emit the skip tag (older agents, or during a
 rollout) are not counted, so a zero there does not rule out a skipping collector.
 
 **A Windows device's software inventory stops updating although the agent is healthy.** Since the #4711 hardening, an Uninstall registry root that cannot be opened or enumerated to the end, or one application subkey whose open fails (access denied above all) or whose name exceeds 255 characters, makes `list_inventory` return rc 1 and the daily sync skips that cycle rather than committing a shorter inventory as authoritative; the device keeps its last good inventory and `last_seen` stops advancing. `list` and `query` return the `error|` row with rc 1 for the same condition. The agent log carries both halves: `installed_apps: Uninstall root <HKLM-64|HKLM-32|HKCU> could not be fully read -- the collection is degraded` and `sync: installed_apps.list_inventory rc=1 — skipping this cycle`. Fix the ACL (the agent runs as LocalSystem) and the next 24 h cycle re-collects. The only fleet-side signal is the indirect `yuzu_inventory_stale_agents{source="installed_software"}` gauge (two missed cycles; its alert `YuzuInventoryStaleAgents` ships disabled and a never-synced device is not counted); there is no direct skip counter yet.
+
+**The Hardware list shows "Hardware roster unavailable" (or `GET /api/v1/hardware` answers `503`).** The persisted device roster could not be read. Check `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`: `reason="store_unavailable"` means no database connection could be obtained (the pool wait is 0.5-2 s, plus up to 10 s to connect to an unreachable database; see `/readyz` `pg_reachable` and the Postgres pool alerts: `YuzuPgPoolSaturated` with `pg_reachable` green points at pool saturation), `reason="db_error"` means the query itself failed (detail in the server's `query_stale_within failed` warn line). The audit row is `inventory.devices` with `result=failure` and detail `hardware roster read failed`; the REST `503` message `hardware roster unavailable` tells it apart from the audit-persist `503` (`audit subsystem unavailable`), which shares the same `retry_after_ms`. The CI-record symptoms ("Device roster unreadable", "Device identity unavailable", the record `503`) share the counter but audit as `inventory.device.ci` / `inventory.device.software`. The banner clears on the next successful read; no restart is needed.
 
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many

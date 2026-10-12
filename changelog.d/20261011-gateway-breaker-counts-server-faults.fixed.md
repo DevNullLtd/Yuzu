@@ -1,1 +1,0 @@
-- The gateway's upstream circuit breaker no longer counts a gRPC answer that blames the request (`INVALID_ARGUMENT`, `NOT_FOUND`, `ALREADY_EXISTS`, `PERMISSION_DENIED`, `FAILED_PRECONDITION`, `OUT_OF_RANGE`, `UNAUTHENTICATED`) as a server failure; only connection errors, timeouts and server-fault statuses open it.

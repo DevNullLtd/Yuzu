@@ -7,7 +7,9 @@ agents emit the values; MCP `query_installed_software`, the OpenAPI description 
 Lane-3 predicate (`is_os_native`, cpe_normalize.hpp) routes them. This script checks,
 against the real tree, that:
 
-  1. every published surface equals the agreed vocabulary (EXPECTED_*);
+  1. every published surface equals the agreed vocabulary (EXPECTED_*) — the one prose
+     `kind (a|b)` enumeration per source file AND every JSON `enum` array the catalogue
+     twins publish for `kind`/`ecosystem` (MCP input schemas, OpenAPI parameters);
   2. the values the agents emit are exactly that vocabulary (emitted == published);
   3. every non-Lane-1 ecosystem and Lane-3 kind is named in `is_os_native`, and `pkg`
      is NOT a kind-level trigger (it is routed by its ecosystem).
@@ -71,6 +73,21 @@ def extract_enumeration(text, field):
     return set(found[0].split("|"))
 
 
+def extract_json_enums(text, field):
+    """Every JSON-schema `enum` array published for `<field>`, as a list of sets.
+
+    Two shapes: the MCP tool schemas' `"<field>": {... "enum": [...]}` property, and the OpenAPI
+    parameter `{"name": "<field>", ... "schema": {... "enum": [...]}}`. The span between the key
+    and its `enum` never crosses a closing brace, so a later field's enum is never attributed to
+    this one."""
+    patterns = (
+        rf'"{field}":\s*\{{[^{{}}]*?"enum":\s*\[([^\]]*)\]',
+        rf'"name":\s*"{field}"[^{{}}]*"schema":\s*\{{[^{{}}]*?"enum":\s*\[([^\]]*)\]',
+    )
+    return [set(re.findall(r'"([a-z_]+)"', m.group(1))) for pat in patterns
+            for m in re.finditer(pat, text)]
+
+
 def extract_table_row(text, field):
     """Backticked cell values of the manual's `| `<field>` |` row."""
     rows = [l for l in text.splitlines() if re.match(rf"\s*\| `{field}` \|", l)]
@@ -108,6 +125,23 @@ class VocabularyConsistency(unittest.TestCase):
         text = read(OPENAPI_SRC)
         self.assertEqual(extract_enumeration(text, "kind"), EXPECTED_KINDS)
         self.assertEqual(extract_enumeration(text, "ecosystem"), EXPECTED_ECOSYSTEMS)
+
+    def test_json_enum_arrays_equal_vocabulary(self):
+        # Anti-vacuous: each file must carry at least one `kind` and one `ecosystem` enum array
+        # (the catalogue twins' schemas); every one must equal the agreed vocabulary.
+        for rel in (MCP_SRC, OPENAPI_SRC):
+            text = read(rel)
+            # Other tools reuse the field name `kind` for unrelated enums (e.g. the orientation
+            # tool's fleet|agent|...): an array is a software-vocabulary array iff it shares a
+            # value with the vocabulary, so a drifted copy (a dropped value) is still caught.
+            kinds = [k for k in extract_json_enums(text, "kind") if k & EXPECTED_KINDS]
+            ecos = [e for e in extract_json_enums(text, "ecosystem") if e & EXPECTED_ECOSYSTEMS]
+            self.assertGreaterEqual(len(kinds), 1, f"{rel}: no JSON `kind` enum found")
+            self.assertGreaterEqual(len(ecos), 1, f"{rel}: no JSON `ecosystem` enum found")
+            for k in kinds:
+                self.assertEqual(k, EXPECTED_KINDS, rel)
+            for e in ecos:
+                self.assertEqual(e, EXPECTED_ECOSYSTEMS, rel)
 
     def test_manual_table(self):
         text = read(MANUAL)

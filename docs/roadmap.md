@@ -1597,7 +1597,7 @@ gateways against always at least two servers and a streaming-replication Postgre
 several upstream servers is the standard case. Open work, in priority order: explicit server-to-gateway
 backpressure (#5647), a per-endpoint circuit breaker with failover (#5648), the registration-reconcile
 decision for several replicas (#5649), herd jitter for hundreds of gateways (#5650), and multi-server
-defaults and guidance (#5651). Design record: ADR-2002 §7f.
+defaults and guidance (#5651). Design record: ADR-2002 §7g.
 
 ### Issue 14.3: Database Sharding (Response Partitioning)
 **Capability:** new | **Scope:** Server | **Status:** **Partial** (#292 closed NOT_PLANNED, 2026-07-14) — not implemented as designed below (no sharding/partitioning code exists); **obsoleted by the Postgres substrate migration**, which addresses the underlying scaling need differently

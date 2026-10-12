@@ -195,7 +195,7 @@ process_test_() ->
        {timeout, 30, fun serial_lane_follows_a_slow_rpc/0}},
       {"a busy process with an empty mailbox is not saturated",
        {timeout, 30, fun busy_alone_is_not_saturated/0}},
-      {"every notify slot held saturates the notify lane, and the next notification is dropped",
+      {"every notify slot held saturates the notify lane, and the next notification is held",
        {timeout, 30, fun notify_lane_saturates/0}},
       {"there is no snapshot when the process is not running",
        {timeout, 30, fun no_snapshot_without_a_process/0}},
@@ -265,32 +265,28 @@ busy_alone_is_not_saturated() ->
 
 notify_lane_saturates() ->
     _Up = start_upstream(),
-    HandlerId = {?MODULE, notify_dropped},
-    ok = telemetry:attach(HandlerId, [yuzu, gw, upstream, notify_dropped],
-                          fun(_E, M, Meta, _) -> sink() ! {dropped, M, Meta} end, none),
     Notify = fun(Id) ->
                  yuzu_gw_upstream:notify_stream_status(Id, <<"s">>, connected,
                                                        <<"127.0.0.1">>, <<"h">>)
              end,
-    try
-        [Notify(<<"a", (integer_to_binary(I))/binary>>) || I <- lists:seq(1, 10)],
-        %% each notification is an RPC in a process of its own, blocked in the mock
-        Workers = [receive {rpc, _, none, W} -> W after ?WAIT_MS -> error(no_notify_rpc) end
-                   || _ <- lists:seq(1, 10)],
-        await_snapshot(fun(#{notify_inflight := N}) -> N =:= 10 end),
-        ?assertEqual(sat([notify]), ?P:saturated(yuzu_gw_upstream:lane_snapshot())),
-        %% the serial lane is not involved: the process itself is idle
-        ?assertMatch(#{in_rpc := false}, yuzu_gw_upstream:lane_snapshot()),
-        Notify(<<"eleventh">>),
-        receive {dropped, #{count := 1}, #{reason := <<"at_capacity">>}} -> ok
-        after ?WAIT_MS -> error(not_dropped)
-        end,
-        [W ! go || W <- Workers],
-        await_snapshot(fun(#{notify_inflight := N}) -> N =:= 0 end),
-        ?assertEqual(none(), ?P:saturated(yuzu_gw_upstream:lane_snapshot()))
-    after
-        telemetry:detach(HandlerId)
-    end.
+    [Notify(<<"a", (integer_to_binary(I))/binary>>) || I <- lists:seq(1, 10)],
+    %% each notification is an RPC in a process of its own, blocked in the mock
+    Workers = [receive {rpc, _, none, W} -> W after ?WAIT_MS -> error(no_notify_rpc) end
+               || _ <- lists:seq(1, 10)],
+    await_snapshot(fun(#{notify_inflight := N}) -> N =:= 10 end),
+    ?assertEqual(sat([notify]), ?P:saturated(yuzu_gw_upstream:lane_snapshot())),
+    %% the serial lane is not involved: the process itself is idle
+    ?assertMatch(#{in_rpc := false}, yuzu_gw_upstream:lane_snapshot()),
+    %% the eleventh is held, not sent: no slot is free, and nothing is dropped
+    Notify(<<"eleventh">>),
+    ?assertMatch(#{notify_inflight := 10}, yuzu_gw_upstream:lane_snapshot()),
+    receive {rpc, _, none, _} -> error(sent_without_a_free_slot) after 100 -> ok end,
+    %% freeing the slots sends it
+    [W ! go || W <- Workers],
+    Last = receive {rpc, _, none, W11} -> W11 after ?WAIT_MS -> error(held_notification_not_sent) end,
+    Last ! go,
+    await_snapshot(fun(#{notify_inflight := N}) -> N =:= 0 end),
+    ?assertEqual(none(), ?P:saturated(yuzu_gw_upstream:lane_snapshot())).
 
 no_snapshot_without_a_process() ->
     ?assertEqual(undefined, yuzu_gw_upstream:lane_snapshot()).

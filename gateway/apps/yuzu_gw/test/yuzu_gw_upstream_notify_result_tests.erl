@@ -121,10 +121,10 @@ a_grpc_status_error_counts_too() ->
     ?assertEqual(ok, wait_until(fun() -> yuzu_gw_upstream:circuit_state() =:= open end)).
 
 a_refusal_of_the_request_does_not_count() ->
-    %% PERMISSION_DENIED (7): the server answered, correctly, that the request
+    %% INVALID_ARGUMENT (3): the server answered, correctly, that the request
     %% is wrong. That is not a failing server (the breaker counts only server
     %% faults), however many are sent.
-    server_answers(fun(<<"NotifyStreamStatus">>) -> {status_error, <<"7">>};
+    server_answers(fun(<<"NotifyStreamStatus">>) -> {status_error, <<"3">>};
                       (_) -> ok
                    end),
     [ok = notify(connected, I) || I <- lists:seq(1, ?THRESHOLD * 2)],

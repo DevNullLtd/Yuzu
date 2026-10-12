@@ -555,6 +555,41 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        reset (#5342, #5274)"; wire reference: `docs/user-manual/rest-api.md`
        (`POST /api/v1/users/me/password`).
 
+   - **2026-10-07 — software title catalogue (`GET /api/v1/inventory/software/catalogue`,
+     `GET /api/v1/inventory/software/catalogue/versions`) and its MCP twins
+     (`query_software_catalogue`, `get_software_versions`).**
+     The REST routes merged first and REST-only, a "no" on Decision 1/4's
+     both-surfaces requirement that was recorded rather than fixed pre-merge;
+     the MCP twins then landed over the same pure model, so both surfaces exist
+     now. What stays an exception:
+     - **A build-order gap that has closed, not a boundary.** The catalogue read
+       surface (shared pure model, totals, cursors, CSV export) landed first so
+       the MCP tools are a thin transport over the same model
+       (`docs/api-twin-recipe.md` Rule 1) instead of a second shaper. The
+       `titles` CSV export is REST-only by design (a download, not a structured
+       tool result).
+     - **#3988's remaining disposition is a decision, not this change's merge.**
+       The open P1 issue #3988 ("Inventory catalogue-grain read ... has no
+       REST/MCP twin") is answered on the twin half by the tools above; its
+       confinement criterion is superseded by the refuse-to-confined ruling.
+       **Revisit by 2026-11-07.**
+     - **The raw route's export is REST-only (`#5699`).**
+       `GET /api/v1/inventory/software?format=csv|json` has no MCP tool: an
+       agent pages the same rows through the cursor on `query_installed_software`,
+       and a bulk file is a human/automation convenience. **Revisit by
+       2026-11-07.**
+     - **The raw route's `q`, `kind`, `ecosystem` and `source` filters are
+       REST-only (`#5699`).** `query_installed_software` takes `name`,
+       `agent_id`, `version`, `limit` and `cursor` only; the parity ledger row
+       stays `twinned` on the paged shape and the gap is recorded in
+       `docs/api-parity-ledger.md`. **Revisit by 2026-11-07.**
+     - **The exception relaxes no control.** The fleet view is gated on a
+       global `Inventory:Read` (the per-device view is admitted in scope),
+       denies service-scoped tokens on the catalogue fleet view (the raw route
+       admits them, confined), audits every
+       served page or file, and answers a degraded read with `503`, never an
+       empty `200`; wire reference: `docs/user-manual/rest-api.md`.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

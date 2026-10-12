@@ -1195,7 +1195,8 @@ jobs:
         # cpu_count() (this runner's job is genuinely confined to execute on 16
         # logical CPUs via cgroup, "Self-hosted runner topology" in
         # docs/ci-architecture.md, but meson's own pool sizing ignores that) — so
-        # the ~10 server pg shards ran CONCURRENTLY inside this one job, sharing
+        # the server pg shards (~10 when this was diagnosed; 14 now) ran
+        # CONCURRENTLY inside this one job, sharing
         # those 16 CPUs AND the one ensure-postgres.sh container this job got.
         # Proved via back-computed shard start times (printed-timestamp minus
         # elapsed) landing within ~0.01s of each other across every pg shard in a
@@ -1434,7 +1435,7 @@ jobs:
             python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite server-pg
 
       # #3443 Phase 2: the 3 non-primary Linux push legs (pg_mode=smoke) run
-      # this small tagged subset INSTEAD of the 12-shard server-pg suite
+      # this small tagged subset INSTEAD of the 14-shard server-pg suite
       # above — see tests/meson.build's 'server pg smoke' entry for the full
       # rationale (tag membership, why --allow-running-no-tests is REQUIRED
       # here unlike Correction 1's original "no flag" wording, why it's a

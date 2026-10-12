@@ -12,7 +12,8 @@
 %%%             message waits in its mailbox. The process runs one RPC at a time,
 %%%             so everything that arrives during one waits behind it.
 %%%   notify    all of the stream-status notification slots are held (10): the
-%%%             next notification would be dropped.
+%%%             next notification is held until a slot frees (and is dropped
+%%%             only when the held store itself is full).
 %%%   guardian  all of the Guardian forward slots are held (50): the next one
 %%%             would be dropped.
 %%%
