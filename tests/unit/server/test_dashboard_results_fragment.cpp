@@ -1420,12 +1420,13 @@ TEST_CASE("/fragments/results: the Create Group button percent-encodes the filte
 namespace {
 struct ExecDispatchHarness {
     // `routes` and `metrics`, which the registered handlers reference, must outlive the sink's
-    // last dispatch (see the other harnesses in this file). `sent` is a trivial std::size_t only
-    // read by the dispatch lambda while post() runs, so its destruction order does not matter.
+    // last dispatch (see the other harnesses in this file). `sent` is a trivial int
+    // (ConfinedDispatchOutcome::sent is an int) only read by the dispatch lambda while post()
+    // runs, so its destruction order does not matter.
     yuzu::MetricsRegistry metrics;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
-    std::size_t sent{2};
+    int sent{2};
 
     explicit ExecDispatchHarness(InstructionStore* instruction_store = nullptr) {
         auto auth_fn = [](const httplib::Request&,
