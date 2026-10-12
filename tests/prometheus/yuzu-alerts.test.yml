@@ -3595,6 +3595,8 @@ tests:
             value: 1
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamTlsHandshakeFailures", alertstate="firing"}'
         eval_time: 30m
+        exp_samples: []
+
   # YuzuGatewayUpstreamEncodeErrors (#4632 rounds 4 and 5)
   #
   # A systematic local encode failure (every Register answered INTERNAL, breaker
