@@ -189,8 +189,8 @@ enum class StabilityBand { Excellent, Good, Fair, Poor };
 /// bands excellent. `e` is NOT checked here (this stays a plain band function):
 /// compute_stability_score refuses unusable edges, a direct caller checks
 /// stability_edges_valid first.
-[[nodiscard]] inline StabilityBand stability_band(double score,
-                                                  const StabilityBandEdges& e = kStabilityBandEdges) {
+[[nodiscard]] inline StabilityBand stability_band(
+    double score, const StabilityBandEdges& e = kStabilityBandEdges) {
     const double shown = stability_display_score(score);
     if (shown >= e.excellent)
         return StabilityBand::Excellent;

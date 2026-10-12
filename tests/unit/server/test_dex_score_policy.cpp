@@ -128,7 +128,7 @@ TEST_CASE("policy: the default validates and reproduces the stability score bit-
         mk(5, 1, 1),  // below the floor
         mk(10, 11, 0) // inconsistent
     };
-    // Values, not only plumbing: the precedent's known answers.
+    // Values, not only plumbing: the stability score's known answers.
     {
         const auto exact = dex_score_under_policy(mk(10, 0, 0), kFloor, eff);
         REQUIRE(exact.score.has_value());
@@ -567,6 +567,22 @@ TEST_CASE("policy: overrides and unmatched applications inherit a customised glo
     o.breadth = 40.0;
     p.overrides.push_back(o);
     REQUIRE_FALSE(dex_score_policy_fault(p).has_value());
+
+    // Each override is validated against the customised global, not the
+    // shipped defaults: both partial overrides below are valid merged onto
+    // 90/75/60 and 60/20/8/12, and invalid merged onto this global.
+    {
+        auto q = p;
+        auto edge = ov("edge.exe");
+        edge.excellent = 78.0; // below the inherited good edge of 80
+        q.overrides = {edge};
+        require_fault(q, DexPolicyFault::EdgesNotDescending, 0);
+
+        auto weight = ov("weight.exe");
+        weight.breadth = 60.0; // 60 + 25 + 10 + 10 = 105
+        q.overrides = {weight};
+        require_fault(q, DexPolicyFault::WeightSumAboveMaximum, 0);
+    }
 
     // The override sets two fields and inherits the other nine.
     const auto ovr = resolve_dex_score_policy(p, "Partial.EXE");
