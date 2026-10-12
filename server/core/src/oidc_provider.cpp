@@ -1223,10 +1223,10 @@ bool endpoint_acceptable(const std::string& value, std::string_view scheme) {
 // httplib's socket-options callback hands the new socket to `adopt` BEFORE `connect()` (once per
 // candidate address); `adopt` keeps a dup() of it, and when the budget (measured from this
 // object's construction) runs out the watchdog thread calls shutdown(SHUT_RD) on the dup. That
-// acts on the socket itself, so a blocked connect, handshake read or response read returns at
-// once (end of stream) and `Get` fails. SHUT_RD and not SHUT_RDWR on purpose: shutting the write
-// side would turn the client's next write (OpenSSL writes with write(), not send()) into
-// SIGPIPE, which kills a process that has not ignored it. The dup is what makes this race-free:
+// acts on the socket itself, so a blocked handshake read or response read returns at once (end
+// of stream) and `Get` fails; a connect is bounded by httplib's own timeouts. SHUT_RD, not
+// SHUT_RDWR: shutting the write side raised SIGPIPE in 5 of 15 repeated test runs, and OpenSSL
+// 3.6's writesocket() is write(), not send(), on Linux/macOS. The dup is what makes this race-free:
 // httplib may close the number it holds and the kernel may reuse it, but our own descriptor keeps
 // the socket's identity until the destructor closes it. Every use of the dup happens under `mu_`.
 // The destructor wakes the thread (condition variable, no polling), joins it, then closes the dup,

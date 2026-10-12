@@ -2019,7 +2019,7 @@ std::size_t open_fd_count() {
 }
 } // namespace
 
-TEST_CASE("OIDC http_get_bounded: fifty fetches leak no descriptors and no watchdog thread",
+TEST_CASE("OIDC http_get_bounded: fifty fetches leave the open descriptor count unchanged",
           "[oidc][oidc_discovery]") {
     MockIdp idp;
     // One fetch first, so lazily opened descriptors (resolver, locale, TLS) are already open.
