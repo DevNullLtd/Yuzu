@@ -564,9 +564,10 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr0, StreamH
         %% HA WS-4 (#4324) — opaque id minted once per
         %% yuzu_gw_agent process instance and passed through
         %% verbatim here on both CONNECTED and DISCONNECTED,
-        %% so the server can fence a stale DISCONNECTED from
-        %% tearing down a newer re-home under the same
-        %% reused session id.
+        %% so the server can match a DISCONNECTED to the
+        %% stream home it tears down. One process owns a
+        %% session for its whole life today, so this is a
+        %% matching key, not a guard against a second home.
         stream_home_id => StreamHomeId
     },
     %% #4632: hold the notification instead of dropping it when no slot is free
