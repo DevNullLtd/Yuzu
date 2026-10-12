@@ -41,8 +41,11 @@
 #include <yuzu/metrics.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
+#include <latch>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1429,4 +1432,164 @@ TEST_CASE("QuarantineContainmentReconciler: tick() stops starting further agents
             ++applied_count;
     }
     CHECK(applied_count == 2);
+}
+
+// ── #5684: session ids are read under the registry lock ─────────────────────
+
+namespace {
+
+// Answers every dispatch with the response the reconciler is waiting for, so
+// a bounded tick loop (1 ms timing overrides) drives apply -> status ->
+// confirm without wall-clock sleeps.
+void auto_respond(MockDispatch& dispatch, ResponseStore& rs) {
+    dispatch.on_dispatch = [&dispatch, &rs] {
+        const auto& call = dispatch.calls.back();
+        store_status_response(
+            rs, "cmd-" + std::to_string(dispatch.calls.size()), call.agent_ids.front(),
+            call.action == "status" ? "state|active" : "status|quarantined|rules_applied|1");
+    };
+}
+
+std::int64_t last_confirmed_at(QuarantineStore& qstore, const std::string& agent_id) {
+    auto status = qstore.get_status(agent_id);
+    REQUIRE(status.has_value());
+    REQUIRE(status->has_value());
+    return (*status)->last_confirmed_at;
+}
+
+QuarantineContainmentReconciler::Deps fast_deps(QuarantineStore& qstore, ResponseStore& rstore,
+                                                AgentRegistry& registry,
+                                                yuzu::MetricsRegistry& metrics,
+                                                MockDispatch& dispatch) {
+    return QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = &rstore,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+        .min_reapply_interval_override = std::chrono::milliseconds(1),
+        .response_wait_override = std::chrono::milliseconds(60'000),
+        .verify_grace_override = std::chrono::milliseconds(1),
+    };
+}
+
+constexpr int kMaxTicksToConfirm = 5000;
+
+} // namespace
+
+// The writer re-maps the SAME session id, so every read the reconciler makes
+// (the churn check, the dispatch-time capture and the confirm-time compare)
+// races a real write while the sequential outcome stays fixed. The old
+// unlocked `get_session(...)->session_id` reads are a data race here that the
+// TSan legs report; a non-TSan build only checks the outcome.
+TEST_CASE("QuarantineContainmentReconciler: session id reads race-free against a concurrent "
+          "map_session for the same agent (#5684)",
+          "[pg][quarantine][reconciler][tsan]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    REQUIRE(qstore.quarantine_device("agent-1", "admin", "malware", "").has_value());
+
+    YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_recon_tpl);
+    PgPool rpool{{.conninfo = rdb.dsn(), .size = 4}};
+    ResponseStore rstore{rpool};
+    REQUIRE(rstore.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    REQUIRE(registry.register_agent(make_info("agent-1")).has_value());
+    registry.map_session("session-A", "agent-1");
+
+    MockDispatch dispatch;
+    auto_respond(dispatch, rstore);
+    QuarantineContainmentReconciler reconciler(
+        fast_deps(qstore, rstore, registry, metrics, dispatch));
+
+    std::latch writer_running{1};
+    std::jthread writer([&registry, &writer_running](std::stop_token stop) {
+        writer_running.count_down();
+        while (!stop.stop_requested())
+            registry.map_session("session-A", "agent-1");
+    });
+    writer_running.wait();
+
+    int ticks = 0;
+    while (ticks < kMaxTicksToConfirm && last_confirmed_at(qstore, "agent-1") == 0) {
+        reconciler.tick();
+        ++ticks;
+    }
+    for (int i = 0; i < 200; ++i)
+        reconciler.tick(); // confirmed + unchanged session: the churn check runs every tick
+    writer.request_stop();
+    writer.join();
+
+    REQUIRE(ticks < kMaxTicksToConfirm);
+    CHECK(last_confirmed_at(qstore, "agent-1") > 0);
+    REQUIRE(dispatch.calls.size() == 2); // apply then status, nothing after confirm
+    CHECK(dispatch.calls[0].action == "quarantine");
+    CHECK(dispatch.calls[1].action == "status");
+    for (const auto& call : dispatch.calls)
+        CHECK(call.agent_ids == std::vector<std::string>{"agent-1"});
+    CHECK(metrics
+              .gauge("yuzu_server_quarantine_endpoint_unconfirmed", {{"reachability", "connected"}})
+              .value() == 0);
+}
+
+// The churn check compares under the lock with `session_is`, which is false
+// for an absent session too: the separate presence check is what keeps an
+// offline, confirmed device from being misread as churn.
+TEST_CASE("QuarantineContainmentReconciler: a confirmed device that goes offline is not session "
+          "churn and re-verifies via status once it reconnects on a new session (#5684)",
+          "[pg][quarantine][reconciler]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    REQUIRE(qstore.quarantine_device("agent-1", "admin", "malware", "").has_value());
+
+    YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_recon_tpl);
+    PgPool rpool{{.conninfo = rdb.dsn(), .size = 4}};
+    ResponseStore rstore{rpool};
+    REQUIRE(rstore.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    REQUIRE(registry.register_agent(make_info("agent-1")).has_value());
+    registry.map_session("session-A", "agent-1");
+
+    MockDispatch dispatch;
+    auto_respond(dispatch, rstore);
+    QuarantineContainmentReconciler reconciler(
+        fast_deps(qstore, rstore, registry, metrics, dispatch));
+
+    int ticks = 0;
+    while (ticks < kMaxTicksToConfirm && last_confirmed_at(qstore, "agent-1") == 0) {
+        reconciler.tick();
+        ++ticks;
+    }
+    REQUIRE(ticks < kMaxTicksToConfirm);
+    REQUIRE(dispatch.calls.size() == 2);
+
+    registry.remove_agent("agent-1");
+    for (int i = 0; i < 50; ++i)
+        reconciler.tick();
+    CHECK(dispatch.calls.size() == 2);
+    CHECK(
+        metrics.gauge("yuzu_server_quarantine_endpoint_unconfirmed", {{"reachability", "offline"}})
+            .value() == 0);
+    CHECK(metrics
+              .gauge("yuzu_server_quarantine_endpoint_unconfirmed", {{"reachability", "connected"}})
+              .value() == 0);
+
+    REQUIRE(registry.register_agent(make_info("agent-1")).has_value());
+    registry.map_session("session-B", "agent-1");
+    for (int i = 0; i < kMaxTicksToConfirm && dispatch.calls.size() == 2; ++i)
+        reconciler.tick();
+    REQUIRE(dispatch.calls.size() == 3);
+    CHECK(dispatch.calls[2].action == "status"); // verify-first, never a blind re-apply
 }
