@@ -1043,6 +1043,13 @@ public:
     // Get a session by agent_id (for scope evaluation).
     std::shared_ptr<AgentSession> get_session(const std::string& agent_id) const;
 
+    /// True iff the registry's current session for `agent_id` carries `session_id`.
+    /// Compares under `mu_` — reading `get_session(...)->session_id` after the lock is
+    /// released races the owner's session replacement.
+    [[nodiscard]] bool session_is(const std::string& agent_id, const std::string& session_id) const;
+    /// Copy of the current session id for `agent_id` (empty if none), read under `mu_`.
+    [[nodiscard]] std::string session_id_of(const std::string& agent_id) const;
+
     // #3424/#3511: ids POSITIVELY known to lack `plugin`, for
     // dispatch_confined_arms's plugin-presence filter. One locked pass over
     // every session, same shape as all_ids() above. An agent with an EMPTY

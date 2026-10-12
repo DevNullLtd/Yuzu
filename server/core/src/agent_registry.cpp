@@ -1608,6 +1608,18 @@ std::shared_ptr<AgentSession> AgentRegistry::get_session(const std::string& agen
     return it != agents_.end() ? it->second : nullptr;
 }
 
+bool AgentRegistry::session_is(const std::string& agent_id, const std::string& session_id) const {
+    std::lock_guard lock(mu_);
+    auto it = agents_.find(agent_id);
+    return it != agents_.end() && it->second->session_id == session_id;
+}
+
+std::string AgentRegistry::session_id_of(const std::string& agent_id) const {
+    std::lock_guard lock(mu_);
+    auto it = agents_.find(agent_id);
+    return it != agents_.end() ? it->second->session_id : std::string{};
+}
+
 std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin) const {
     std::unordered_set<std::string> missing;
     std::lock_guard lock(mu_);
