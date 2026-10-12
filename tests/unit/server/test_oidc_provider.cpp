@@ -8,6 +8,8 @@
 #include "oidc_provider.hpp"
 #include "test_oidc_mock_idp.hpp"
 
+#include "../test_log_capture.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <nlohmann/json.hpp>
@@ -19,6 +21,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -32,9 +35,12 @@
 
 #ifndef _WIN32
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -1699,8 +1705,12 @@ TEST_CASE("OIDC discovery: a trickling discovery document is cut at the total bo
         CHECK(std::string(e.what()) == OidcProvider::kDiscoveryUnavailable);
     }
     const auto elapsed = std::chrono::steady_clock::now() - begin;
-    CHECK(elapsed >= std::chrono::milliseconds(450)); // it ran to the bound, not a quick error
+    // Nominal 500 ms. The floor is deliberately far below that: a mock handler starved for
+    // ~210 ms trips the 250 ms read timeout early, which is a slow runner and not a defect.
+    CHECK(elapsed >= std::chrono::milliseconds(100));
     CHECK(elapsed < std::chrono::milliseconds(2000)); // and was cut there, not at 4 s
+    // Cut mid-trickle (an event, not a clock): the document was never completed.
+    CHECK(idp.trickle_chunks_sent.load() < 100);
     CHECK(provider.pending_flow_count_for_test() == 0);
 }
 
@@ -1713,7 +1723,7 @@ TEST_CASE("OIDC discovery: a trickling JWKS is cut at the total bound",
     idp.with([](MockIdp& m) {
         m.trickle_jwks = true;
         m.trickle_interval_ms = 40;
-        m.trickle_chunks = 100;
+        m.trickle_chunks = 250; // 10 s per fetch if nothing cuts it
     });
     provider.set_http_timeouts_for_test(250);
     const auto begin = std::chrono::steady_clock::now();
@@ -1721,8 +1731,11 @@ TEST_CASE("OIDC discovery: a trickling JWKS is cut at the total bound",
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == OidcProvider::kJwksUnavailable);
-    CHECK(elapsed >= std::chrono::milliseconds(450));
-    CHECK(elapsed < std::chrono::milliseconds(2000));
+    // Two cut GETs (the empty-cache fetch, then the unknown-kid refetch): nominal 1000 ms. The
+    // floor is far below that (see the discovery case); the ceiling leaves 3x headroom.
+    CHECK(elapsed >= std::chrono::milliseconds(100));
+    CHECK(elapsed < std::chrono::milliseconds(3000));
+    CHECK(idp.trickle_chunks_sent.load() < 2 * 250); // neither GET ran to the end
 }
 
 TEST_CASE("OIDC discovery: a discovered endpoint with an absurd host is refused and the process "
@@ -1808,6 +1821,8 @@ TEST_CASE("OIDC http_get_bounded: a #fragment is never put on the request line",
     CHECK(idp.jwks_calls.load() == 1);
 }
 
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
 #ifndef _WIN32
 // ── The total bound covers the TLS handshake (#5692, Gate 8) ─────────────────
 //
@@ -1817,32 +1832,58 @@ TEST_CASE("OIDC http_get_bounded: a #fragment is never put on the request line",
 // certificate is needed: the handshake never completes) that sends a TLS record header declaring a
 // body that never finishes, then one byte per `interval_ms`. Pacing and shutdown are
 // condition-variable driven; the acceptor wakes on a self-pipe, so the destructor never waits out
-// an interval or an accept().
+// an interval or an accept(). It is a plain acceptor, not an httplib::Server, so (unlike
+// `MockIdp`, #438) it runs under ThreadSanitizer too: that is what puts the FIRED watchdog under
+// TSan.
+namespace {
+// Owns one descriptor, so a failing REQUIRE or an early return can never leak it.
+struct OwnedFd {
+    int fd{-1};
+    OwnedFd() = default;
+    explicit OwnedFd(int adopted) noexcept : fd(adopted) {}
+    ~OwnedFd() { reset(); }
+    OwnedFd(const OwnedFd&) = delete;
+    OwnedFd& operator=(const OwnedFd&) = delete;
+    void reset(int next = -1) noexcept {
+        if (fd >= 0)
+            ::close(fd);
+        fd = next;
+    }
+};
+} // namespace
+
 class TlsDripServer {
 public:
     explicit TlsDripServer(int interval_ms = 300) : interval_ms_(interval_ms) {
-        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        REQUIRE(listen_fd_ >= 0);
+        // The drip writes to a socket the client may already have shut down. Production gets
+        // SIGPIPE ignored from httplib::Server's constructor; a test process has no such
+        // guarantee (it depends on which case ran first), and OpenSSL's own writes use write(),
+        // not send(), so MSG_NOSIGNAL below does not cover them.
+        static const auto ignored = std::signal(SIGPIPE, SIG_IGN);
+        (void)ignored;
+        listen_.reset(::socket(AF_INET, SOCK_STREAM, 0));
+        REQUIRE(listen_.fd >= 0);
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = 0;
-        REQUIRE(::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
-        REQUIRE(::listen(listen_fd_, 8) == 0);
+        REQUIRE(::bind(listen_.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+        REQUIRE(::listen(listen_.fd, 8) == 0);
         socklen_t len = sizeof(addr);
-        REQUIRE(::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+        REQUIRE(::getsockname(listen_.fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
         port_ = ntohs(addr.sin_port);
-        REQUIRE(::pipe(wake_) == 0);
+        int pipe_fds[2] = {-1, -1};
+        REQUIRE(::pipe(pipe_fds) == 0);
+        wake_r_.reset(pipe_fds[0]);
+        wake_w_.reset(pipe_fds[1]);
         thread_ = std::thread([this] { run(); });
     }
     ~TlsDripServer() {
         release();
         const char b = 1;
-        (void)::write(wake_[1], &b, 1);
+        (void)::write(wake_w_.fd, &b, 1);
         thread_.join();
-        ::close(wake_[0]);
-        ::close(wake_[1]);
-        ::close(listen_fd_);
+        // The descriptors close as the members are destroyed, after the thread is gone.
     }
     TlsDripServer(const TlsDripServer&) = delete;
     TlsDripServer& operator=(const TlsDripServer&) = delete;
@@ -1863,19 +1904,18 @@ public:
 private:
     void run() {
         for (;;) {
-            pollfd fds[2] = {{listen_fd_, POLLIN, 0}, {wake_[0], POLLIN, 0}};
+            pollfd fds[2] = {{listen_.fd, POLLIN, 0}, {wake_r_.fd, POLLIN, 0}};
             if (::poll(fds, 2, -1) < 0 && errno != EINTR)
                 return;
             if (fds[1].revents != 0)
                 return;
             if ((fds[0].revents & POLLIN) == 0)
                 continue;
-            const int conn = ::accept(listen_fd_, nullptr, nullptr);
-            if (conn < 0)
+            OwnedFd conn(::accept(listen_.fd, nullptr, nullptr));
+            if (conn.fd < 0)
                 continue;
             accepted_.fetch_add(1);
-            drip(conn);
-            ::close(conn);
+            drip(conn.fd);
         }
     }
     // A TLS handshake record header (type 22, version 3.3) declaring 16 KiB, then one byte per
@@ -1905,14 +1945,15 @@ private:
     }
 
     const int interval_ms_;
-    int listen_fd_{-1};
-    int wake_[2]{-1, -1};
+    OwnedFd listen_;
+    OwnedFd wake_r_;
+    OwnedFd wake_w_;
     int port_{0};
     std::mutex mu_;
     std::condition_variable cv_;
     bool stop_{false};
     std::atomic<int> accepted_{0};
-    std::thread thread_;
+    std::thread thread_; // last: the thread starts in the constructor body, after the rest
 };
 
 namespace {
@@ -1992,6 +2033,116 @@ TEST_CASE("OIDC discovery: the JWKS fetch is bounded the same way against a drip
     CHECK(elapsed < std::chrono::seconds(3));
 }
 
+// ── Descriptor exhaustion fails closed (#5692, Gate 8 pass 2) ────────────────
+//
+// The watchdog needs one descriptor beyond the socket httplib opens. It reserves that descriptor
+// BEFORE the client exists, so exhaustion can never leave a socket running unwatched: with none
+// to spare the request is refused up front, and with one spare httplib's own socket() fails. Each
+// case runs in a forked child whose RLIMIT_NOFILE leaves exactly `spare` free descriptor numbers
+// (everything above stderr is closed first); the parent only reads the child's exit status, and
+// a SIGALRM kills a child that hangs, so a missing bound is a red test, not a stuck suite.
+// ThreadSanitizer refuses to fork a multi-threaded process, hence the guard.
+#ifndef YUZU_OIDC_MOCK_IDP_TSAN
+namespace {
+constexpr int kChildOk = 0;
+constexpr int kChildSetupFailed = 90;
+
+// Forks, limits the child to `spare` free descriptors, runs `body` there and returns its exit
+// status (or -signal when the child was killed).
+int run_in_fd_limited_child(int spare, const std::function<int()>& body) {
+    const pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        ::alarm(8); // a hung fetch dies here; the parent sees a signal, not an exit code
+        for (int fd = 0; fd < 3; ++fd) {
+            if (::fcntl(fd, F_GETFD) != -1)
+                continue;
+            const int n = ::open("/dev/null", O_RDWR);
+            if (n < 0)
+                ::_exit(kChildSetupFailed);
+            if (n != fd) {
+                ::dup2(n, fd);
+                ::close(n);
+            }
+        }
+        for (int fd = 3; fd < 3 + spare + 64; ++fd)
+            ::close(fd);
+        rlimit lim{};
+        if (::getrlimit(RLIMIT_NOFILE, &lim) != 0)
+            ::_exit(kChildSetupFailed);
+        lim.rlim_cur = static_cast<rlim_t>(3 + spare);
+        if (::setrlimit(RLIMIT_NOFILE, &lim) != 0)
+            ::_exit(kChildSetupFailed);
+        ::_exit(body());
+    }
+    int status = 0;
+    pid_t r;
+    do {
+        r = ::waitpid(pid, &status, 0);
+    } while (r < 0 && errno == EINTR);
+    REQUIRE(r == pid);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status);
+}
+
+// The fetch under test: against the dripping https server, the call must FAIL, and within
+// `limit_ms`. Returns kChildOk, or a distinct code for each way of getting it wrong.
+int fetch_must_fail_within(const std::string& base, int limit_ms, const char* required_error) {
+    const auto begin = std::chrono::steady_clock::now();
+    const auto doc = OidcProvider::fetch_discovery_document(base, true, 1000);
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    if (doc.has_value())
+        return 10;
+    if (elapsed >= std::chrono::milliseconds(limit_ms))
+        return 11;
+    if (required_error != nullptr && doc.error() != required_error)
+        return 12;
+    return kChildOk;
+}
+} // namespace
+
+TEST_CASE("OIDC http_get_bounded: with no descriptor to spare the request is refused before any "
+          "socket exists",
+          "[oidc][oidc_discovery][security]") {
+    TlsDripServer drip;
+    const auto base = drip.base();
+    const int rc = run_in_fd_limited_child(0, [&] {
+        return fetch_must_fail_within(base, 500, "request failed: no file descriptor available");
+    });
+    CHECK(rc == kChildOk); // 12 = another error text, 11 = slow, 10 = succeeded, negative = signal
+    CHECK(drip.accepted() == 0); // never connected
+}
+
+TEST_CASE("OIDC http_get_bounded: with one descriptor to spare the fetch still fails and returns "
+          "within the bound",
+          "[oidc][oidc_discovery][security]") {
+    TlsDripServer drip;
+    const auto base = drip.base();
+    // The one spare descriptor is the watchdog's reservation, so httplib's socket() fails. Before
+    // the reservation existed, socket() took the last descriptor, the watchdog's dup() failed and
+    // the drip held the call for as long as it liked (the child is then killed by SIGALRM). That
+    // red is not order-independent: libc's resolver sometimes re-reads /etc/resolv.conf inside
+    // the call and spends the one spare descriptor first, which fails the fetch early for an
+    // unrelated reason. The zero-spare case above is the order-independent pin.
+    const int rc =
+        run_in_fd_limited_child(1, [&] { return fetch_must_fail_within(base, 3000, nullptr); });
+    CHECK(rc == kChildOk);
+}
+
+TEST_CASE("OIDC http_get_bounded: with exactly the reservation and the socket to spare the drip is "
+          "still cut at the bound",
+          "[oidc][oidc_discovery][security]") {
+    TlsDripServer drip;
+    const auto base = drip.base();
+    // Control for the two cases above: nothing is left over for the watchdog to need, and the
+    // total bound (2 s here) must still hold. Anything else that wants a descriptor during the
+    // handshake would fail the fetch early, which is also a failure within the bound.
+    const int rc =
+        run_in_fd_limited_child(2, [&] { return fetch_must_fail_within(base, 3000, nullptr); });
+    CHECK(rc == kChildOk);
+}
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
+#ifndef YUZU_OIDC_MOCK_IDP_TSAN
 TEST_CASE("OIDC http_get_bounded: the watchdog does not cut a fast or a merely slow fetch",
           "[oidc][oidc_discovery]") {
     MockIdp idp;
@@ -2032,11 +2183,43 @@ TEST_CASE("OIDC http_get_bounded: fifty fetches leave the open descriptor count 
         CHECK_FALSE(OidcProvider::http_get_bounded("http://127.0.0.1:1/x", false, 2000));
         CHECK_FALSE(OidcProvider::http_get_bounded(idp.base() + "/nope", false, 2000));
     }
-    const auto after = open_fd_count();
-    CHECK(after == before);
+    // The mock's acceptor thread closes its end of the LAST connection when it notices the
+    // client has gone, which can land just after the call returned (the count is then one off,
+    // in either direction). Poll until it settles: a real leak is dozens of descriptors and
+    // never converges, so the 2 s ceiling is only ever spent on a failure.
+    auto after = open_fd_count();
+    const auto settle_by = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (after > before && std::chrono::steady_clock::now() < settle_by) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        after = open_fd_count();
+    }
+    CHECK(after <= before);
 }
 #endif // __linux__
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN
 #endif // !_WIN32
+
+#ifndef YUZU_OIDC_MOCK_IDP_TSAN
+TEST_CASE("OIDC discovery: a malformed JWKS reaches the log with the Unicode line breaks "
+          "neutralized",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    REQUIRE_NOTHROW(provider.start_auth_flow());
+    // An unterminated string holding NEL, U+2028 and U+2029: the parser's error text quotes the
+    // token it was reading ("last read"), so those bytes come back inside the message.
+    idp.with([](MockIdp& m) { m.jwks_body = "{\"keys\":[\"\xC2\x85\xE2\x80\xA8\xE2\x80\xA9"; });
+    yuzu::test::LogCapture cap;
+    auto r = provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1"));
+    cap.stop();
+    REQUIRE_FALSE(r.has_value());
+    const auto logs = cap.text();
+    CHECK(logs.find("JWKS parse error") != std::string::npos);
+    CHECK(logs.find("\xC2\x85") == std::string::npos);
+    CHECK(logs.find("\xE2\x80\xA8") == std::string::npos);
+    CHECK(logs.find("\xE2\x80\xA9") == std::string::npos);
+}
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
 
 TEST_CASE("OIDC discovery: a refused connection fails closed", "[oidc][oidc_discovery][security]") {
@@ -2141,6 +2324,9 @@ TEST_CASE("OIDC discovery: an endpoint authority must be a well-formed host[:por
     CHECK_FALSE(accepted("https://idp.test:99999999999/x")); // does not fit an int
     CHECK_FALSE(accepted("https://idp.test:65536/x"));
     CHECK_FALSE(accepted("https://idp.test:100000/x")); // six digits
+    // 2^32 + 80: more than five digits, and a value that wraps to 80 in 32 bits. A digit cap
+    // that let it through would hand httplib a port its std::stoi throws on.
+    CHECK_FALSE(accepted("https://idp.test:4294967376/x"));
     CHECK_FALSE(accepted("https://idp.test:/x"));       // empty port
     CHECK_FALSE(accepted("https://idp.test:80a/x"));
     CHECK_FALSE(accepted("https://idp.test:80:81/x"));
@@ -2151,6 +2337,8 @@ TEST_CASE("OIDC discovery: an endpoint authority must be a well-formed host[:por
     CHECK_FALSE(accepted("https://?x"));
     CHECK_FALSE(accepted("https://[::1/x")); // unterminated bracket
     CHECK_FALSE(accepted("https://[::1]x/x"));
+    CHECK_FALSE(accepted("https://[::1]x80/x")); // junk after the bracket that is not ":port"
+    CHECK_FALSE(accepted("https://a[b]c/x"));    // brackets belong to an IPv6 literal only
     CHECK_FALSE(accepted("https://[zz]/x"));
     CHECK_FALSE(accepted("https://[]/x"));
     // The bracketed form is hex digits and ':' only, as httplib's regex is: a dotted IPv4-mapped
@@ -2196,6 +2384,20 @@ TEST_CASE("OIDC discovery: an issuer that is too long or has no host is refused 
         CHECK_FALSE(OidcProvider::fetch_discovery_document(issuer, false));
         CHECK_FALSE(OidcProvider::parse_discovery_document(
             doc_with("jwks_uri", "https://idp.test/j"), issuer));
+    }
+}
+
+TEST_CASE("OIDC discovery: an issuer with a query or a fragment is refused before any request",
+          "[oidc][oidc_discovery][security]") {
+    // OIDC Discovery 3: an issuer has neither. Nothing listens anywhere; each must fail on the
+    // issuer alone (it used to be fetched at a different URL than the one it names).
+    for (const char* issuer :
+         {"https://idp.test/realms/a#f", "https://idp.test?x=1", "https://idp.test/realms/a?x=1",
+          "https://idp.test/realms/a?", "https://idp.test/realms/a#", "http://127.0.0.1:1/r#f"}) {
+        CAPTURE(issuer);
+        auto r = OidcProvider::fetch_discovery_document(issuer, false);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == "the issuer must not contain a query or fragment");
     }
 }
 
@@ -2295,7 +2497,7 @@ TEST_CASE("OIDC discovery: the Unicode line breaks NEL, U+2028 and U+2029 make a
                 doc_with(field, std::string("https://idp.test/p") + sep + "q"), iss));
         }
     }
-    // Neighbouring code points that are NOT line breaks stay legal (U+00E9, U+2027, U+202A).
+    // Neighboring code points that are NOT line breaks stay legal (U+00E9, U+2027, U+202A).
     for (const char* ok : {"\xC3\xA9", "\xE2\x80\xA7", "\xE2\x80\xAA", "\xC2\x84"}) {
         CAPTURE(ok);
         CHECK(OidcProvider::parse_discovery_document(

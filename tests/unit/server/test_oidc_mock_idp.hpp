@@ -14,6 +14,8 @@
 // Trickle knobs (`trickle_discovery`, `trickle_jwks`): the answer is a CHUNKED body of one byte
 // per `trickle_interval_ms`, `trickle_chunks` times, paced by a condition variable that the
 // destructor signals, so a trickle a test has abandoned ends at once instead of running out.
+// `trickle_chunks_sent` counts the bytes written, so a test can tell "cut mid-trickle" from "never
+// started" without a clock. `jwks_body` serves a chosen (malformed) JWKS verbatim.
 // `hold_discovery` / `release_discovery` keep a discovery fetch in flight on a latch.
 
 #include "oidc_provider.hpp"
@@ -81,6 +83,8 @@ struct MockIdp {
     bool trickle_jwks{false};      ///< answer GET /jwks as a slow chunked body
     int trickle_interval_ms{40};
     int trickle_chunks{100};
+    std::string jwks_body; ///< non-empty = GET /jwks serves this verbatim (a malformed JWKS)
+    std::atomic<int> trickle_chunks_sent{0}; ///< bytes a trickle has written so far (all GETs)
     std::string last_discovery_path; ///< the request path of the last discovery GET
     std::mutex trickle_mu;
     std::condition_variable trickle_cv;
@@ -153,7 +157,7 @@ struct MockIdp {
         });
         svr.Get("/jwks", [this](const httplib::Request&, httplib::Response& res) {
             jwks_calls.fetch_add(1);
-            std::string kid;
+            std::string kid, raw;
             int status, key_count;
             bool trickle;
             {
@@ -162,13 +166,14 @@ struct MockIdp {
                 status = jwks_status;
                 key_count = jwks_key_count;
                 trickle = trickle_jwks;
+                raw = jwks_body;
             }
             if (trickle) {
                 start_trickle(res);
                 return;
             }
             res.status = status;
-            res.set_content(jwks_json_n(kid, key_count), "application/json");
+            res.set_content(raw.empty() ? jwks_json_n(kid, key_count) : raw, "application/json");
         });
         svr.Get("/authorize", [this](const httplib::Request& req, httplib::Response& res) {
             authorize_calls.fetch_add(1);
@@ -240,6 +245,7 @@ struct MockIdp {
                     return true;
                 }
                 ++*sent;
+                trickle_chunks_sent.fetch_add(1);
                 return sink.write("a", 1);
             });
     }
