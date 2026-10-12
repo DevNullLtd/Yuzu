@@ -10,6 +10,10 @@
 //
 // A real httplib acceptor thread crashes the ThreadSanitizer build (#438), so a test that uses
 // `MockIdp` is wrapped in `#ifndef YUZU_OIDC_MOCK_IDP_TSAN`.
+//
+// Trickle knobs (`trickle_discovery`, `trickle_jwks`): the answer is a CHUNKED body of one byte
+// per `trickle_interval_ms`, `trickle_chunks` times, paced by a condition variable that the
+// destructor signals, so a trickle a test has abandoned ends at once instead of running out.
 
 #include "oidc_provider.hpp"
 
@@ -23,6 +27,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -45,6 +50,9 @@ namespace yuzu::server::test {
 
 // Defined below; MockIdp's handlers need them.
 inline std::string jwks_json(const std::string& kid);
+inline std::string jwks_json_n(const std::string& kid, int count);
+struct SharedRsaKey;
+inline const SharedRsaKey& shared_rsa_key();
 inline std::string rs256_sign(const std::string& kid, const std::string& payload_json);
 inline std::string id_token_payload(const oidc::OidcConfig& cfg, const std::string& nonce,
                                     const std::string& sub);
@@ -67,20 +75,34 @@ struct MockIdp {
     std::size_t discovery_pad{0};        ///< extra bytes in the document (oversize-body knob)
     int discovery_delay_ms{0};
     int jwks_status{200};
+    int jwks_key_count{1};         ///< keys in the served JWKS (0 = an empty key set)
+    bool trickle_discovery{false}; ///< answer GET /.well-known/... as a slow chunked body
+    bool trickle_jwks{false};      ///< answer GET /jwks as a slow chunked body
+    int trickle_interval_ms{40};
+    int trickle_chunks{100};
+    std::string last_discovery_path; ///< the request path of the last discovery GET
+    std::mutex trickle_mu;
+    std::condition_variable trickle_cv;
+    bool trickle_stop{false};
     std::atomic<int> token_calls{0};
     std::atomic<int> discovery_calls{0};
     std::atomic<int> jwks_calls{0};
     std::atomic<int> authorize_calls{0};
 
     MockIdp() {
-        svr.Get("/.well-known/openid-configuration",
-                [this](const httplib::Request&, httplib::Response& res) {
+        // A regex route so an issuer with a path prefix (/realms/x, /<tenant>/v2.0) is served;
+        // the exact path each request used is recorded for the tests that pin URL building.
+        svr.Get(R"(.*/\.well-known/openid-configuration)",
+                [this](const httplib::Request& req, httplib::Response& res) {
                     discovery_calls.fetch_add(1);
                     std::string body, redirect, issuer;
                     int status, delay;
                     std::size_t pad;
+                    bool trickle;
                     {
                         std::lock_guard lk(mu);
+                        last_discovery_path = req.path;
+                        trickle = trickle_discovery;
                         body = discovery_body;
                         redirect = discovery_redirect;
                         issuer = discovery_issuer.empty() ? base() : discovery_issuer;
@@ -90,6 +112,10 @@ struct MockIdp {
                     }
                     if (delay > 0)
                         std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                    if (trickle) {
+                        start_trickle(res);
+                        return;
+                    }
                     if (!redirect.empty()) {
                         res.set_redirect(redirect);
                         return;
@@ -108,14 +134,21 @@ struct MockIdp {
         svr.Get("/jwks", [this](const httplib::Request&, httplib::Response& res) {
             jwks_calls.fetch_add(1);
             std::string kid;
-            int status;
+            int status, key_count;
+            bool trickle;
             {
                 std::lock_guard lk(mu);
                 kid = token_kid;
                 status = jwks_status;
+                key_count = jwks_key_count;
+                trickle = trickle_jwks;
+            }
+            if (trickle) {
+                start_trickle(res);
+                return;
             }
             res.status = status;
-            res.set_content(jwks_json(kid), "application/json");
+            res.set_content(jwks_json_n(kid, key_count), "application/json");
         });
         svr.Get("/authorize", [this](const httplib::Request& req, httplib::Response& res) {
             authorize_calls.fetch_add(1);
@@ -142,18 +175,60 @@ struct MockIdp {
             res.set_content(R"({"id_token":")" + tok + R"(","token_type":"Bearer"})",
                             "application/json");
         });
+        // Generate the shared key here, on the test thread: the first call may otherwise run on
+        // a handler thread (and REQUIRE is not safe there).
+        (void)shared_rsa_key();
         port = svr.bind_to_any_port("127.0.0.1");
         REQUIRE(port > 0);
         thread = std::thread([this] { svr.listen_after_bind(); });
         svr.wait_until_ready();
     }
     ~MockIdp() {
+        {
+            std::lock_guard lk(trickle_mu);
+            trickle_stop = true;
+        }
+        trickle_cv.notify_all();
         svr.stop();
         if (thread.joinable())
             thread.join();
     }
     MockIdp(const MockIdp&) = delete;
     MockIdp& operator=(const MockIdp&) = delete;
+
+    /// Answer `res` with a chunked body of `trickle_chunks` bytes, one per `trickle_interval_ms`
+    /// (the provider's per-operation timeouts see steady progress; only a TOTAL bound cuts it).
+    void start_trickle(httplib::Response& res) {
+        int interval, chunks;
+        {
+            std::lock_guard lk(mu);
+            interval = trickle_interval_ms;
+            chunks = trickle_chunks;
+        }
+        auto sent = std::make_shared<int>(0);
+        // Not a compressible type: a gzip compressor would hold the bytes back until the end and
+        // the client would see silence, not a trickle.
+        res.set_chunked_content_provider(
+            "application/octet-stream",
+            [this, sent, interval, chunks](std::size_t, httplib::DataSink& sink) {
+                std::unique_lock lk(trickle_mu);
+                const bool stopped = trickle_cv.wait_for(lk, std::chrono::milliseconds(interval),
+                                                         [this] { return trickle_stop; });
+                lk.unlock();
+                if (stopped || *sent >= chunks) {
+                    sink.done();
+                    return true;
+                }
+                ++*sent;
+                return sink.write("a", 1);
+            });
+    }
+
+    /// The request path of the last discovery GET.
+    std::string discovery_path() {
+        std::lock_guard lk(mu);
+        return last_discovery_path;
+    }
 
     /// `http://127.0.0.1:<port>`: also the issuer a provider under test is configured with.
     std::string base() const { return "http://127.0.0.1:" + std::to_string(port); }
@@ -215,6 +290,22 @@ inline std::string jwks_json(const std::string& kid) {
     const auto& key = shared_rsa_key();
     return R"({"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":")" + kid + R"(","n":")" +
            key.n_b64 + R"(","e":")" + key.e_b64 + R"("}]})";
+}
+
+/// A JWKS with `count` keys (the shared public key under `kid`, `kid-2`, ...); 0 = no keys.
+inline std::string jwks_json_n(const std::string& kid, int count) {
+    if (count == 1)
+        return jwks_json(kid);
+    const auto& key = shared_rsa_key();
+    std::string out = R"({"keys":[)";
+    for (int i = 0; i < count; ++i) {
+        if (i > 0)
+            out += ",";
+        out += R"({"kty":"RSA","use":"sig","alg":"RS256","kid":")" + kid +
+               (i == 0 ? "" : "-" + std::to_string(i + 1)) + R"(","n":")" + key.n_b64 +
+               R"(","e":")" + key.e_b64 + R"("})";
+    }
+    return out + "]}";
 }
 
 /// A genuinely RS256-signed JWT over `payload_json` under `kid` ("" on any failure).

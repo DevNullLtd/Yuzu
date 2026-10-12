@@ -23,9 +23,9 @@
  * NULL case above is defensive only, since server.cpp constructs the store
  * unconditionally. Two reviewers asked for that case; it is not here yet.
  *
- * No OidcProvider mocking is needed: the handler populates authorization_endpoint in
- * both branches, so the provider ctor returns at its pre-configured-endpoints guard
- * without any network I/O.
+ * No OidcProvider mocking is needed for the persist cases: the provider constructor does no
+ * network I/O (endpoints are discovered lazily on the first login), so a save never contacts
+ * the IdP. The discovery cases at the end use the loopback MockIdp.
  */
 
 #include "settings_routes.hpp"
@@ -35,6 +35,7 @@
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
 #include "runtime_config_store.hpp"
+#include "test_oidc_mock_idp.hpp"
 #include "test_route_sink.hpp"
 #include "../test_helpers.hpp"
 #include "test_runtime_config_helpers.hpp"
@@ -338,3 +339,98 @@ TEST_CASE("Settings OIDC: an EXACT placeholder still means unchanged, and report
     CHECK(res->body.find("could NOT be saved") == std::string::npos);
     CHECK(decrypt_for_test(*h.runtime_config, "oidc_client_secret") == "real-secret");
 }
+
+// ── Discovery wiring (#5692) ─────────────────────────────────────────────────
+
+#ifndef YUZU_OIDC_MOCK_IDP_TSAN
+namespace {
+using yuzu::server::test::MockIdp;
+
+std::string discovery_form(const MockIdp& idp, const std::string& issuer = {}) {
+    return "issuer=" + (issuer.empty() ? idp.base() : issuer) +
+           "&client_id=yuzu-test-client&client_secret=s"
+           "&redirect_uri=http://localhost:8443/auth/callback&admin_group=&skip_tls_verify=false";
+}
+} // namespace
+
+TEST_CASE("Settings OIDC: a saved issuer is discovered lazily, the first login reaches the IdP's "
+          "own authorization endpoint",
+          "[settings][oidc][oidc_discovery]") {
+    // The hot-reload site used to derive `{issuer}/authorize` and pre-set it, so discovery never
+    // ran. Now the save contacts nothing and the provider discovers on its first login.
+    MockIdp idp;
+    idp.with([](MockIdp& m) { m.discovery_issuer = m.base(); });
+    OidcHarness h{"", /*open_store=*/false};
+    auto res =
+        h.sink.Post("/api/settings/oidc", discovery_form(idp), "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    REQUIRE(h.oidc_provider != nullptr);
+    CHECK(idp.discovery_calls.load() == 0); // saving does no network I/O
+    const auto flow = h.oidc_provider->start_auth_flow();
+    CHECK(flow.url.starts_with(idp.base() + "/authorize?"));
+    CHECK(idp.discovery_calls.load() == 1);
+}
+
+TEST_CASE("Settings OIDC test connection: reports what a login will find",
+          "[settings][oidc][oidc_discovery]") {
+    MockIdp idp;
+    OidcHarness h{"", /*open_store=*/false};
+    const auto test = [&](const std::string& issuer = {}) {
+        auto r = h.sink.Post("/api/settings/oidc/test",
+                             "issuer=" + (issuer.empty() ? idp.base() : issuer),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        return r->body;
+    };
+
+    SECTION("a healthy IdP: discovery and one signing key") {
+        const auto body = test();
+        CHECK(body.find("feedback-ok") != std::string::npos);
+        CHECK(body.find("1 signing key<") != std::string::npos); // singular
+        CHECK(idp.discovery_calls.load() == 1);
+        CHECK(idp.jwks_calls.load() == 1);
+        REQUIRE_FALSE(h.audited.empty());
+        CHECK(h.audited.front().find("oidc.test|attempt|") == 0);
+    }
+    SECTION("several keys are counted in the plural") {
+        idp.with([](MockIdp& m) { m.jwks_key_count = 3; });
+        CHECK(test().find("3 signing keys<") != std::string::npos);
+    }
+    SECTION("a discovery failure is named") {
+        idp.with([](MockIdp& m) { m.discovery_status = 500; });
+        const auto body = test();
+        CHECK(body.find("Discovery failed: HTTP 500") != std::string::npos);
+        CHECK(idp.jwks_calls.load() == 0);
+    }
+    SECTION("a JWKS failure is named, after discovery succeeded") {
+        idp.with([](MockIdp& m) { m.jwks_status = 500; });
+        CHECK(test().find("the JWKS could not be fetched: HTTP 500") != std::string::npos);
+    }
+    SECTION("an empty key set is not a pass") {
+        idp.with([](MockIdp& m) { m.jwks_key_count = 0; });
+        const auto body = test();
+        CHECK(body.find("feedback-error") != std::string::npos);
+        CHECK(body.find("no usable signing keys") != std::string::npos);
+    }
+    SECTION("IdP-controlled text in the answer is HTML-escaped") {
+        idp.with([](MockIdp& m) { m.discovery_issuer = "<script>alert(1)</script>"; });
+        const auto body = test();
+        CHECK(body.find("<script>") == std::string::npos);
+        CHECK(body.find("&lt;script&gt;") != std::string::npos);
+    }
+    SECTION("a blank issuer asks for one without any request") {
+        auto r =
+            h.sink.Post("/api/settings/oidc/test", "issuer=", "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->body.find("Enter an Issuer URL first") != std::string::npos);
+        CHECK(idp.discovery_calls.load() == 0);
+    }
+    SECTION("a blank form issuer falls back to the saved one") {
+        h.cfg.oidc_issuer = idp.base();
+        auto r =
+            h.sink.Post("/api/settings/oidc/test", "issuer=", "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->body.find("feedback-ok") != std::string::npos);
+    }
+}
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN

@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <nlohmann/json.hpp>
 #include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/rsa.h> // EVP_RSA_gen
@@ -22,6 +23,7 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1449,22 +1451,6 @@ TEST_CASE("OIDC discovery: a failing JWKS refetch keeps the keys already cached"
     CHECK(idp.jwks_calls.load() == 2);
 }
 
-TEST_CASE("OIDC discovery: a refused connection fails closed",
-          "[oidc][oidc_discovery][security]") {
-    OidcConfig cfg;
-    cfg.issuer = "http://127.0.0.1:1"; // connection refused, instantly
-    cfg.client_id = "c";
-    cfg.redirect_uri = "http://localhost/cb";
-    OidcProvider provider(cfg);
-    try {
-        (void)provider.start_auth_flow();
-        FAIL("start_auth_flow must throw");
-    } catch (const std::runtime_error& e) {
-        CHECK(std::string(e.what()) == OidcProvider::kDiscoveryUnavailable);
-    }
-    CHECK(provider.pending_flow_count_for_test() == 0);
-}
-
 TEST_CASE("OIDC discovery: a failed attempt is remembered, two logins inside the window cost ONE GET",
           "[oidc][oidc_discovery]") {
     MockIdp idp;
@@ -1498,18 +1484,72 @@ TEST_CASE("OIDC discovery: concurrent logins share ONE discovery fetch (single-f
     constexpr int kThreads = 8;
     std::atomic<int> ready{0};
     std::atomic<int> ok{0};
-    std::vector<std::thread> threads;
-    for (int i = 0; i < kThreads; ++i)
-        threads.emplace_back([&] {
-            ready.fetch_add(1);
-            while (ready.load() < kThreads)
-                std::this_thread::yield();
-            if (provider.verify_jwt_signature(jwt).has_value())
-                ok.fetch_add(1);
-        });
-    for (auto& t : threads)
-        t.join();
-    CHECK(ok.load() == kThreads);
+    std::atomic<int> refused{0};
+    {
+        std::vector<std::jthread> threads;
+        for (int i = 0; i < kThreads; ++i)
+            threads.emplace_back([&](std::stop_token st) {
+                ready.fetch_add(1);
+                // Abortable barrier: a failed spawn in this scope must not strand a waiter.
+                while (ready.load() < kThreads && !st.stop_requested())
+                    std::this_thread::yield();
+                if (st.stop_requested())
+                    return;
+                auto r = provider.verify_jwt_signature(jwt);
+                if (r.has_value())
+                    ok.fetch_add(1);
+                else if (r.error() == OidcProvider::kJwksUnavailable)
+                    refused.fetch_add(1);
+            });
+        // Join explicitly: a jthread's destructor requests a stop first, which would abort
+        // workers that have not yet run. The stop path is only for an exception unwinding here.
+        for (auto& t : threads)
+            t.join();
+    }
+    // Exactly one fetch ran. A caller that arrived while it was in flight was refused with the
+    // fixed token (it does not queue behind the fetch); the one that fetched succeeded.
+    CHECK(idp.discovery_calls.load() == 1);
+    CHECK(ok.load() >= 1);
+    CHECK(ok.load() + refused.load() == kThreads);
+    // Once the fetch is done the result is cached: every later caller succeeds, no new GET.
+    CHECK(provider.verify_jwt_signature(jwt).has_value());
+    CHECK(idp.discovery_calls.load() == 1);
+}
+
+TEST_CASE("OIDC discovery: a caller arriving mid-fetch fails fast instead of waiting for it",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    idp.with([](MockIdp& m) { m.discovery_delay_ms = 500; }); // the first fetch stays in flight
+    OidcProvider provider(discovery_cfg(idp));
+
+    std::atomic<bool> first_done{false};
+    std::atomic<bool> first_ok{false};
+    std::jthread first([&] {
+        try {
+            first_ok.store(!provider.start_auth_flow().url.empty());
+        } catch (const std::exception&) {}
+        first_done.store(true);
+    });
+    // The mock counts a discovery GET the moment it arrives, so this is the in-flight signal.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (idp.discovery_calls.load() < 1 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    REQUIRE(idp.discovery_calls.load() == 1);
+
+    try {
+        (void)provider.start_auth_flow();
+        FAIL("a caller arriving mid-fetch must be refused");
+    } catch (const std::runtime_error& e) {
+        CHECK(std::string(e.what()) == OidcProvider::kDiscoveryUnavailable);
+    }
+    // Refused while the first fetch was STILL running (had it waited, the first would be done),
+    // without starting a second GET.
+    CHECK_FALSE(first_done.load());
+    CHECK(idp.discovery_calls.load() == 1);
+    first.join();
+    CHECK(first_ok.load());
+    // The refusal did not start a retry window: the next call sees the cached result.
+    CHECK_NOTHROW(provider.start_auth_flow());
     CHECK(idp.discovery_calls.load() == 1);
 }
 
@@ -1575,8 +1615,374 @@ TEST_CASE("OIDC discovery: discovery down at the callback is the fixed token and
     CHECK(r.error() == OidcProvider::kDiscoveryUnavailable);
     CHECK(verified);
     CHECK(idp.token_calls.load() == 0);
+    CHECK(provider.pending_flow_count_for_test() == 0); // the flow is spent
+}
+
+TEST_CASE("OIDC discovery: a JWKS that cannot be fetched at the callback is the fixed jwks token",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    const auto flow = provider.start_auth_flow();
+    REQUIRE_FALSE(idp.follow_authorize(flow.url).empty());
+    idp.with([](MockIdp& m) { m.jwks_status = 500; });
+    auto r = provider.handle_callback(
+        "the-code", yuzu::server::test::url_query_param(flow.url, "state"), flow.binding_secret);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == OidcProvider::kJwksUnavailable);
+    CHECK(idp.token_calls.load() == 1); // the code was exchanged; the signature check failed closed
+}
+
+// A server that sends one byte just inside every per-operation timeout defeats connect/read/write
+// timeouts alone. Each GET also has a TOTAL bound of twice the per-operation timeout, so the
+// answer is bounded however slowly the body arrives.
+TEST_CASE("OIDC discovery: a trickling discovery document is cut at the total bound",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    idp.with([](MockIdp& m) {
+        m.trickle_discovery = true;
+        m.trickle_interval_ms = 40; // well inside the 250 ms read timeout below
+        m.trickle_chunks = 100;     // 4 s of trickle if nothing cuts it
+    });
+    OidcProvider provider(discovery_cfg(idp));
+    provider.set_http_timeouts_for_test(250); // so the total bound is 500 ms
+    const auto begin = std::chrono::steady_clock::now();
+    try {
+        (void)provider.start_auth_flow();
+        FAIL("a trickled document must not yield an authorization URL");
+    } catch (const std::runtime_error& e) {
+        CHECK(std::string(e.what()) == OidcProvider::kDiscoveryUnavailable);
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    CHECK(elapsed >= std::chrono::milliseconds(450)); // it ran to the bound, not a quick error
+    CHECK(elapsed < std::chrono::milliseconds(2000)); // and was cut there, not at 4 s
+    CHECK(provider.pending_flow_count_for_test() == 0);
+}
+
+TEST_CASE("OIDC discovery: a trickling JWKS is cut at the total bound",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    REQUIRE_NOTHROW(provider.start_auth_flow()); // discovery cached with the normal timeouts
+    idp.with([](MockIdp& m) {
+        m.trickle_jwks = true;
+        m.trickle_interval_ms = 40;
+        m.trickle_chunks = 100;
+    });
+    provider.set_http_timeouts_for_test(250);
+    const auto begin = std::chrono::steady_clock::now();
+    auto r = provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1"));
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == OidcProvider::kJwksUnavailable);
+    CHECK(elapsed >= std::chrono::milliseconds(450));
+    CHECK(elapsed < std::chrono::milliseconds(2000));
+}
+
+TEST_CASE("OIDC discovery: a discovered endpoint with an absurd host is refused and the process "
+          "survives",
+          "[oidc][oidc_discovery][security]") {
+    // 200 KB of host in each endpoint, served by a real IdP: the document fits the body cap, and
+    // reaching httplib::Client's constructor with it would overflow the stack in its URL regex.
+    const std::string huge(200 * 1024, 'a');
+    for (const char* field : {"authorization_endpoint", "token_endpoint", "jwks_uri"}) {
+        CAPTURE(field);
+        MockIdp idp;
+        idp.with([&](MockIdp& m) {
+            nlohmann::json doc = {{"issuer", m.base()},
+                                  {"authorization_endpoint", m.base() + "/authorize"},
+                                  {"token_endpoint", m.base() + "/token"},
+                                  {"jwks_uri", m.base() + "/jwks"}};
+            doc[field] = "http://" + huge + "/x";
+            m.discovery_body = doc.dump();
+        });
+        OidcProvider provider(discovery_cfg(idp));
+        CHECK_THROWS_AS(provider.start_auth_flow(), std::runtime_error);
+        auto r = provider.verify_jwt_signature(signed_token(discovery_cfg(idp), "mock-kid-1"));
+        CHECK_FALSE(r.has_value());
+        CHECK(idp.jwks_calls.load() == 0);
+    }
+}
+
+TEST_CASE("OIDC discovery: an issuer with a trailing slash builds one slash into the URL and "
+          "matches a slash-bearing document issuer",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    idp.with([](MockIdp& m) { m.discovery_issuer = m.base() + "/"; });
+    auto cfg = discovery_cfg(idp);
+    cfg.issuer = idp.base() + "/";
+    OidcProvider provider(cfg);
+    const auto flow = provider.start_auth_flow();
+    CHECK(flow.url.starts_with(idp.base() + "/authorize?"));
+    CHECK(idp.discovery_calls.load() == 1);
+    CHECK(idp.discovery_path() == "/.well-known/openid-configuration"); // no double slash
+
+    // The configured issuer must equal the document's byte for byte: without the slash it does not.
+    OidcProvider other(discovery_cfg(idp)); // issuer WITHOUT the slash
+    CHECK_THROWS_AS(other.start_auth_flow(), std::runtime_error);
+}
+
+TEST_CASE("OIDC discovery: an issuer with a path prefix is fetched under that prefix",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    for (const char* prefix : {"/realms/yuzu", "/72f988bf-86f1-41af-91ab-2d7cd011db47/v2.0"}) {
+        CAPTURE(prefix);
+        const std::string issuer = idp.base() + prefix;
+        idp.with([&](MockIdp& m) { m.discovery_issuer = issuer; });
+        auto doc = OidcProvider::fetch_discovery_document(issuer, false);
+        REQUIRE(doc.has_value());
+        CHECK(idp.discovery_path() == std::string(prefix) + "/.well-known/openid-configuration");
+        CHECK(doc->jwks_uri == idp.base() + "/jwks");
+    }
+}
+
+TEST_CASE("OIDC http_get_bounded: a query on a bare-host URL is part of the path, not the host",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    // `http://127.0.0.1:<port>?x=1` is the authority `127.0.0.1:<port>` and the path "/?x=1"; the
+    // IdP answers 404 for it, which proves the request reached the IdP at all.
+    auto r = OidcProvider::http_get_bounded(idp.base() + "?x=1", false);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == "HTTP 404");
 }
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
+TEST_CASE("OIDC discovery: a refused connection fails closed", "[oidc][oidc_discovery][security]") {
+    OidcConfig cfg;
+    cfg.issuer = "http://127.0.0.1:1"; // connection refused, instantly
+    cfg.client_id = "c";
+    cfg.redirect_uri = "http://localhost/cb";
+    OidcProvider provider(cfg);
+    try {
+        (void)provider.start_auth_flow();
+        FAIL("start_auth_flow must throw");
+    } catch (const std::runtime_error& e) {
+        CHECK(std::string(e.what()) == OidcProvider::kDiscoveryUnavailable);
+    }
+    CHECK(provider.pending_flow_count_for_test() == 0);
+}
+
+// These need no acceptor (a refused loopback port, or no network at all), so they also run under
+// ThreadSanitizer, which is where the locking around the lazy discovery is exercised.
+TEST_CASE("OIDC discovery: concurrent starts, signature checks and seam calls against a dead IdP "
+          "all get the fixed errors",
+          "[oidc][oidc_discovery][security]") {
+    OidcConfig cfg;
+    cfg.issuer = "http://127.0.0.1:1"; // connection refused, instantly
+    cfg.client_id = "c";
+    cfg.redirect_uri = "http://localhost/cb";
+    OidcProvider provider(cfg);
+    provider.set_discovery_negative_cache_for_test(0); // every call really tries
+    const auto header = OidcProvider::base64url_encode(std::vector<uint8_t>{
+        '{', '"', 'a', 'l', 'g', '"', ':', '"', 'R', 'S', '2', '5', '6', '"', '}'});
+    const std::string jwt = header + ".e30.c2ln";
+
+    constexpr int kThreads = 8;
+    constexpr int kRounds = 20;
+    std::atomic<int> ready{0};
+    std::atomic<int> bad{0};
+    {
+        std::vector<std::jthread> threads;
+        for (int i = 0; i < kThreads; ++i)
+            threads.emplace_back([&, i](std::stop_token st) {
+                ready.fetch_add(1);
+                while (ready.load() < kThreads && !st.stop_requested())
+                    std::this_thread::yield();
+                for (int round = 0; round < kRounds && !st.stop_requested(); ++round) {
+                    try {
+                        (void)provider.start_auth_flow();
+                        bad.fetch_add(1); // must have thrown
+                    } catch (const std::runtime_error& e) {
+                        if (std::string(e.what()) != OidcProvider::kDiscoveryUnavailable)
+                            bad.fetch_add(1);
+                    }
+                    auto r = provider.verify_jwt_signature(jwt);
+                    if (r.has_value() || r.error() != OidcProvider::kJwksUnavailable)
+                        bad.fetch_add(1);
+                    // The seams take the same locks the calls above do.
+                    if (i % 2 == 0) {
+                        provider.set_discovery_negative_cache_for_test(0);
+                        provider.set_http_timeouts_for_test(500 + round);
+                    }
+                    (void)provider.pending_flow_count_for_test();
+                }
+            });
+        for (auto& t : threads)
+            t.join(); // explicit: ~jthread would request a stop before joining
+    }
+    CHECK(bad.load() == 0);
+    CHECK(provider.pending_flow_count_for_test() == 0);
+}
+
+namespace {
+// A discovery document for issuer `https://idp.test` with one endpoint replaced.
+std::string doc_with(const char* field, const std::string& value) {
+    nlohmann::json doc = {{"issuer", "https://idp.test"},
+                          {"authorization_endpoint", "https://idp.test/a"},
+                          {"token_endpoint", "https://idp.test/t"},
+                          {"jwks_uri", "https://idp.test/j"}};
+    doc[field] = value;
+    return doc.dump();
+}
+} // namespace
+
+TEST_CASE("OIDC discovery: an endpoint authority must be a well-formed host[:port]",
+          "[oidc][oidc_discovery][security]") {
+    const std::string iss = "https://idp.test";
+    const auto accepted = [&](const std::string& value) {
+        return OidcProvider::parse_discovery_document(doc_with("jwks_uri", value), iss).has_value();
+    };
+    const std::string huge(200 * 1024, 'a'); // a host this long overflows httplib's URL regex
+    for (const char* field : {"authorization_endpoint", "token_endpoint", "jwks_uri"}) {
+        CAPTURE(field);
+        CHECK_FALSE(
+            OidcProvider::parse_discovery_document(doc_with(field, "https://" + huge + "/x"), iss));
+        CHECK_FALSE(OidcProvider::parse_discovery_document(
+            doc_with(field, "https://" + std::string(254, 'a') + "/x"), iss)); // host > 253
+    }
+    CHECK(accepted("https://" + std::string(253, 'a') + "/x"));
+    CHECK(accepted("https://idp.test:65535/x"));
+    CHECK(accepted("https://idp.test:1/x"));
+    CHECK(accepted("https://[::1]:8443/x"));
+    CHECK(accepted("https://[2001:db8::1]/x"));
+    CHECK(accepted("https://idp.test?x=1")); // authority ends at '?': the path is "/?x=1"
+    CHECK(accepted("https://idp.test#frag"));
+    CHECK_FALSE(accepted("https://idp.test:99999999999/x")); // does not fit an int
+    CHECK_FALSE(accepted("https://idp.test:65536/x"));
+    CHECK_FALSE(accepted("https://idp.test:100000/x")); // six digits
+    CHECK_FALSE(accepted("https://idp.test:/x"));       // empty port
+    CHECK_FALSE(accepted("https://idp.test:80a/x"));
+    CHECK_FALSE(accepted("https://idp.test:80:81/x"));
+    CHECK_FALSE(accepted("https://user:pw@idp.test/x")); // userinfo
+    CHECK_FALSE(accepted("https://idp.test@evil.test/x"));
+    CHECK_FALSE(accepted("https://idp.test\\evil.test/x")); // backslash
+    CHECK_FALSE(accepted("https://:443/x"));                // empty host
+    CHECK_FALSE(accepted("https://?x"));
+    CHECK_FALSE(accepted("https://[::1/x")); // unterminated bracket
+    CHECK_FALSE(accepted("https://[::1]x/x"));
+    CHECK_FALSE(accepted("https://[zz]/x"));
+    CHECK_FALSE(accepted("https://[]/x"));
+}
+
+TEST_CASE("OIDC discovery: an endpoint over 2048 bytes is refused, 2048 is accepted",
+          "[oidc][oidc_discovery][security]") {
+    const std::string iss = "https://idp.test";
+    const std::string prefix = "https://idp.test/";
+    const auto accepted = [&](std::size_t total) {
+        return OidcProvider::parse_discovery_document(
+                   doc_with("jwks_uri", prefix + std::string(total - prefix.size(), 'p')), iss)
+            .has_value();
+    };
+    CHECK(accepted(2048));
+    CHECK_FALSE(accepted(2049));
+    CHECK_FALSE(accepted(4096));
+}
+
+TEST_CASE("OIDC discovery: an issuer that is too long or has no host is refused before any "
+          "request",
+          "[oidc][oidc_discovery][security]") {
+    // Nothing listens anywhere: these must fail on the issuer alone, and never reach the client.
+    CHECK_FALSE(
+        OidcProvider::fetch_discovery_document("https://" + std::string(50000, 'a'), false));
+    const auto too_long = "https://" + std::string(2048 - 8 + 1, 'a');
+    REQUIRE(too_long.size() == 2049);
+    auto r = OidcProvider::fetch_discovery_document(too_long, false);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("2048") != std::string::npos);
+    for (const char* issuer : {"https://", "http://", "https:///x", "https://?x", "https://:443",
+                               "https://user@idp.test"}) {
+        CAPTURE(issuer);
+        CHECK_FALSE(OidcProvider::fetch_discovery_document(issuer, false));
+        CHECK_FALSE(OidcProvider::parse_discovery_document(
+            doc_with("jwks_uri", "https://idp.test/j"), issuer));
+    }
+}
+
+TEST_CASE("OIDC discovery: a URL with an absurd authority never reaches the HTTP client",
+          "[oidc][oidc_discovery][security]") {
+    const auto r =
+        OidcProvider::http_get_bounded("https://" + std::string(200 * 1024, 'a') + "/x", false);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == "not an http or https URL");
+    CHECK_FALSE(OidcProvider::http_get_bounded("https://h:99999999999/x", false));
+}
+
+#ifndef _WIN32
+// Windows posts the token request through WinHTTP, which has no httplib URL regex to overflow.
+TEST_CASE("OIDC token exchange: a configured token endpoint with an impossible port is a failed "
+          "callback, not a throw",
+          "[oidc][oidc_discovery][security]") {
+    for (const char* endpoint : {"https://idp.test:99999999999/token",
+                                 "https://user@idp.test/token", "ftp://idp.test/t"}) {
+        CAPTURE(endpoint);
+        OidcConfig cfg;
+        cfg.issuer = "https://idp.test";
+        cfg.client_id = "c";
+        cfg.redirect_uri = "http://localhost/cb";
+        cfg.authorization_endpoint = "https://idp.test/authorize"; // the start needs no network
+        cfg.token_endpoint = endpoint;
+        OidcProvider provider(cfg);
+        const auto flow = provider.start_auth_flow();
+        auto r = provider.handle_callback(
+            "code", yuzu::server::test::url_query_param(flow.url, "state"), flow.binding_secret);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("token endpoint") != std::string::npos);
+    }
+}
+#endif
+
+TEST_CASE("OIDC discovery: the discovery document's body-level defects are named and bounded",
+          "[oidc][oidc_discovery][security]") {
+    const std::string iss = "https://idp.test";
+    const auto err = [&](const std::string& body) {
+        auto r = OidcProvider::parse_discovery_document(body, iss);
+        REQUIRE_FALSE(r.has_value());
+        return r.error();
+    };
+    CHECK(err("").find("not valid JSON") != std::string::npos);
+    CHECK(err("not json").find("not valid JSON") != std::string::npos);
+    CHECK(err("[]").find("not a JSON object") != std::string::npos);
+    CHECK(err("\"x\"").find("not a JSON object") != std::string::npos);
+    CHECK(err("5").find("not a JSON object") != std::string::npos);
+    CHECK(err(R"({"issuer":5})").find("issuer mismatch") != std::string::npos);
+    CHECK(err(R"({"authorization_endpoint":"https://idp.test/a"})").find("issuer mismatch") !=
+          std::string::npos); // no issuer at all
+    nlohmann::json numeric = {{"issuer", iss},
+                              {"authorization_endpoint", "https://idp.test/a"},
+                              {"token_endpoint", "https://idp.test/t"},
+                              {"jwks_uri", 5}};
+    CHECK(err(numeric.dump()).find("no jwks_uri") != std::string::npos);
+
+    SECTION("a 10 KB issuer with control bytes is bounded and neutralized in the error") {
+        const std::string hostile = std::string("evil\r\nX: y\x01") + std::string(10 * 1024, 'z');
+        nlohmann::json doc = {{"issuer", hostile}};
+        const auto e = err(doc.dump());
+        CHECK(e.size() < 400);
+        for (const unsigned char c : e)
+            CHECK((c >= 0x20 && c != 0x7f));
+        // CR, LF, the space and the SOH byte each became '_': nothing raw reached the text.
+        CHECK(e.find("evil__X:_y_") != std::string::npos);
+    }
+    SECTION("the cut never splits a UTF-8 sequence") {
+        // 199 ASCII bytes then 2-byte characters: a byte cut at 200 would end mid-character.
+        const std::string issuer = std::string(199, 'a') + "\xC3\xA9\xC3\xA9\xC3\xA9";
+        nlohmann::json doc = {{"issuer", issuer}};
+        const auto e = err(doc.dump());
+        CHECK(e.find(std::string(199, 'a') + "\"") != std::string::npos); // cut before the first
+        CHECK(e.find('\xC3') == std::string::npos);
+    }
+}
+
+TEST_CASE("OIDC discovery: a control byte alone makes an endpoint unacceptable",
+          "[oidc][oidc_discovery][security]") {
+    const std::string iss = "https://idp.test";
+    for (const char c : {'\r', '\n', '\t', '\x7f', '\x01', ' '}) {
+        CAPTURE(static_cast<int>(c));
+        CHECK_FALSE(OidcProvider::parse_discovery_document(
+            doc_with("token_endpoint", std::string("https://idp.test/t") + c + "x"), iss));
+    }
+}
 
 // The scheme rules for an HTTPS issuer cannot be driven through a loopback MockIdp (it has no
 // TLS), so the validation half of discovery is pinned directly on a document body.
@@ -1600,7 +2006,7 @@ TEST_CASE("OIDC discovery: endpoints must be absolute and carry the issuer's own
     for (const char* bad : {"/a", "", "idp.test/a", "https:///a", "HTTPS://idp.test/a",
                             "https://idp.test/a b", "https://idp.test/a\\r\\nX: y"})
         CHECK_FALSE(OidcProvider::parse_discovery_document(doc(https, bad), https));
-    // The issuer itself must be http or https (HTTPS:// is not recognised: byte-exact on purpose).
+    // The issuer itself must be http or https (HTTPS:// is not recognized: byte-exact on purpose).
     CHECK_FALSE(OidcProvider::parse_discovery_document(doc("HTTPS://idp.test", "HTTPS://idp.test/a"),
                                                        "HTTPS://idp.test"));
 }
