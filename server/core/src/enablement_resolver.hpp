@@ -32,9 +32,9 @@
  *    are off;
  *  - a rule naming a non-unit (protective, reserved) has no effect but still
  *    appears in matched_rules;
- *  - an unknown agent OS yields an empty off-set (no unit applicable) and the
- *    matched rules are still listed. A caller must treat that as a fault and
- *    never as "all on".
+ *  - an unknown agent OS is a fault, not an answer: resolve() returns an error
+ *    naming the OS before any rule is evaluated, so "nothing is off" can never
+ *    also mean "could not tell".
  *
  * from_result_set:<id> is excluded from enablement selectors at authoring
  * (durable_attribute_kinds): a saved result set is owner-scoped and expiring,
@@ -49,12 +49,14 @@
 #include <cstdint>
 #include <expected>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <span>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "dispatch_target_shape.hpp"
@@ -107,21 +109,30 @@ struct Resolution {
 /// must start with the text before '<' and carry a non-empty key. Any other
 /// kind matches exactly. Synthetic LEN/STARTSWITH forms are decoded first.
 [[nodiscard]] inline std::expected<void, std::string>
-validate_selector_attributes(const scope::Expression& expr, std::span<const std::string_view> kinds) {
+validate_selector_attributes(const scope::Expression& expr,
+                             std::span<const std::string_view> kinds) {
     if (const auto* cond = std::get_if<scope::Condition>(&expr)) {
         const std::string_view real = scope::classify_synthetic(cond->attribute).real;
+        bool known = false;
         for (const auto kind : kinds) {
             const auto lt = kind.find('<');
             if (lt == std::string_view::npos) {
-                if (real == kind)
-                    return {};
+                known = real == kind;
             } else {
                 const auto prefix = kind.substr(0, lt);
-                if (real.size() > prefix.size() && real.starts_with(prefix))
-                    return {};
+                known = real.size() > prefix.size() && real.starts_with(prefix);
             }
+            if (known)
+                break;
         }
-        return std::unexpected("unknown selector attribute: " + std::string(real));
+        if (!known)
+            return std::unexpected("unknown selector attribute: " + std::string(real));
+        // An unrunnable MATCHES pattern evaluates false forever: a durable rule
+        // that silently never matches. Refuse it here.
+        if (cond->op == scope::CompOp::Matches)
+            if (auto re = scope::validate_regex(cond->value); !re)
+                return std::unexpected("selector " + std::string(real) + ": " + re.error());
+        return {};
     }
     if (const auto* comb = std::get_if<std::unique_ptr<scope::Combinator>>(&expr)) {
         if (*comb)
@@ -154,15 +165,14 @@ make_rule(std::string id, std::vector<std::string> units, std::string_view selec
         if (!overlay.find(name) && !overlay.find_non_unit(name))
             return Err("unknown unit: " + name);
 
-    const auto first = selector_text.find_first_not_of(" \t\r\n");
-    if (first == std::string_view::npos)
+    if (selector_text.find_first_not_of(" \t\r\n") == std::string_view::npos)
         return Err("empty selector; use __all__ for every endpoint");
-    const auto last = selector_text.find_last_not_of(" \t\r\n");
-    const auto text = selector_text.substr(first, last - first + 1);
 
+    // Compared untrimmed, exactly as dispatch does (classify_dispatch_arm): a
+    // padded `__all__` is not fleet-wide here either; it fails to parse.
     Rule rule{std::move(id), std::move(units), std::nullopt, provenance};
-    if (text != kBroadcastScope) {
-        auto parsed = scope::parse(text);
+    if (selector_text != kBroadcastScope) {
+        auto parsed = scope::parse(selector_text);
         if (!parsed)
             return Err("selector: " + parsed.error());
         if (auto ok = validate_selector_attributes(*parsed, kinds); !ok)
@@ -174,16 +184,20 @@ make_rule(std::string id, std::vector<std::string> units, std::string_view selec
 
 // -- Resolution ---------------------------------------------------------------
 
-[[nodiscard]] inline Resolution resolve(std::span<const Rule> rules, const UnitOverlay& overlay,
-                                        std::string_view agent_os,
-                                        const scope::AttributeResolver& view) {
+/// Error iff `agent_os` is outside the closed vocabulary (a fault: the caller
+/// must not treat it as an empty off-set).
+[[nodiscard]] inline std::expected<Resolution, std::string>
+resolve(std::span<const Rule> rules, const UnitOverlay& overlay, std::string_view agent_os,
+        const scope::AttributeResolver& view) {
     struct Mark {
         bool direct{false};
         std::set<Match> matches;
         std::set<std::string> required_off;
     };
-    Resolution res;
     const auto os = os_bit(agent_os);
+    if (!os)
+        return std::unexpected("unknown agent OS: " + std::string(agent_os));
+    Resolution res;
     std::map<std::string, Mark> marks;
 
     // Mark `unit` (and, for a plugin unit, its applicable actions). True if

@@ -389,6 +389,8 @@ build_unit_overlay(std::initializer_list<std::span<const CommandCapability>> sou
                    std::span<const UnitOsRow> os_rows = kUnitOs,
                    std::span<const RequirementEdge> edges = kRequirements) {
     using Err = std::unexpected<std::string>;
+    if (!protective)
+        return Err("protective predicate required");
 
     std::vector<bool> os_used(os_rows.size(), false);
     UnitOverlay out;
@@ -439,7 +441,11 @@ build_unit_overlay(std::initializer_list<std::span<const CommandCapability>> sou
                 continue;
             }
             if (!hit)
-                return Err("catalogue unit has no kUnitOs row: " + name);
+                return Err("catalogue unit has no kUnitOs row: " + name +
+                           " - add it to kUnitOs in server/core/src/enablement_units.hpp (mask "
+                           "from the docs/os-capability-matrix.md generated block)");
+            if (const auto bits = os_rows[*hit].os; bits == 0 || (bits & ~kAllOs) != 0)
+                return Err("os row has no valid OS bits: " + name);
             out.units.push_back({name, std::string(row.plugin), std::string(row.action),
                                  UnitKind::Action, os_rows[*hit].os});
             acc.os |= os_rows[*hit].os;
@@ -448,8 +454,8 @@ build_unit_overlay(std::initializer_list<std::span<const CommandCapability>> sou
     }
     for (std::size_t i = 0; i < os_rows.size(); ++i)
         if (!os_used[i])
-            return Err("unmatched os row (stale or duplicate): " + std::string(os_rows[i].plugin) + "." +
-                       std::string(os_rows[i].action));
+            return Err("unmatched os row (stale or duplicate): " +
+                       std::string(os_rows[i].plugin) + "." + std::string(os_rows[i].action));
 
     for (const auto& p : plugins) {
         if (p.unit_actions > 0)

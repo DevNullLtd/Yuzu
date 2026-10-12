@@ -700,7 +700,7 @@ bool eval_condition(const Condition& cond, const AttributeResolver& resolver) {
     case CompOp::Like:
         return wildcard_match(cond.value, resolved);
     case CompOp::Matches: {
-        if (cond.value.size() > 256)
+        if (cond.value.size() > kMaxRegexPattern)
             return false;
         // RE2 guarantees linear-time matching — immune to ReDoS (G2-SEC-D2-001)
         RE2::Options opts;
@@ -779,6 +779,17 @@ std::expected<void, std::string> validate(std::string_view input) {
     if (result)
         return {};
     return std::unexpected(result.error());
+}
+
+std::expected<void, std::string> validate_regex(std::string_view pattern) {
+    if (pattern.size() > kMaxRegexPattern)
+        return std::unexpected(std::format("regex longer than {} characters", kMaxRegexPattern));
+    RE2::Options opts;
+    opts.set_case_sensitive(false);
+    const RE2 re(pattern, opts);
+    if (!re.ok())
+        return std::unexpected("invalid regex: " + re.error());
+    return {};
 }
 
 std::string_view operator_token(CompOp op) {

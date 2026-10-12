@@ -76,6 +76,16 @@ bool evaluate(const Expression& expr, const AttributeResolver& resolver);
 /// Check if an expression is syntactically valid (convenience).
 std::expected<void, std::string> validate(std::string_view input);
 
+/// Longest `MATCHES` pattern the evaluator will compile; a longer one
+/// evaluates false (the ReDoS bound, G2-SEC-D2-001).
+inline constexpr std::size_t kMaxRegexPattern = 256;
+
+/// Whether `evaluate` can run `pattern` as a `MATCHES` operand: within
+/// `kMaxRegexPattern` and accepted by RE2. `parse` checks syntax only, so a
+/// caller that persists a selector (a durable rule that would otherwise sit
+/// inert, evaluating false forever) asks here.
+std::expected<void, std::string> validate_regex(std::string_view pattern);
+
 /// Synthetic condition attributes: `LEN(x) …` parses to attribute `__len:x`
 /// and `STARTSWITH(x, p)` to `__startswith:x` (see parse()).
 /// `classify_synthetic` is the SINGLE decoder for these encodings —

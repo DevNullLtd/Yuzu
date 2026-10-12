@@ -63,13 +63,25 @@ class EnablementOsApplicability(unittest.TestCase):
 
     def test_every_matrix_pair_has_a_row_and_vice_versa(self):
         h, m = set(header_rows()), set(matrix_rows())
-        self.assertEqual(sorted(m - h), [], "matrix pair with no kUnitOs row")
-        self.assertEqual(sorted(h - m), [], "kUnitOs row with no matrix pair")
+        self.assertEqual(
+            sorted(m - h), [],
+            "matrix pair with no kUnitOs row - add it to kUnitOs in "
+            "server/core/src/enablement_units.hpp (mask from the matrix generated block)",
+        )
+        self.assertEqual(
+            sorted(h - m), [],
+            "kUnitOs row with no matrix pair - remove or fix it in kUnitOs in "
+            "server/core/src/enablement_units.hpp",
+        )
 
     def test_masks_match_the_matrix(self):
         h, m = header_rows(), matrix_rows()
         bad = {f"{p}.{a}": (h[(p, a)], m[(p, a)]) for (p, a) in h if (p, a) in m and h[(p, a)] != m[(p, a)]}
-        self.assertEqual(bad, {}, "kUnitOs mask != matrix applicable set (header, matrix)")
+        self.assertEqual(
+            bad, {},
+            "kUnitOs mask != matrix applicable set (header, matrix) - fix the row in kUnitOs in "
+            "server/core/src/enablement_units.hpp from the matrix generated block",
+        )
 
     def test_control_channel_rows_are_in_neither(self):
         self.assertEqual(NOT_UNITS & set(header_rows()), set())

@@ -107,7 +107,17 @@ Resolution resolve_all_for(const UnitOverlay& ov, std::string unit) {
     REQUIRE(rule.has_value());
     std::vector<Rule> rules;
     rules.push_back(std::move(*rule));
-    return resolve(rules, ov, "linux", [](std::string_view) { return std::string{}; });
+    auto res = resolve(rules, ov, "linux", [](std::string_view) { return std::string{}; });
+    REQUIRE(res.has_value());
+    return std::move(*res);
+}
+
+// A predicate that is not the quarantine one: every `zz` action is protective.
+bool zz_is_protective(std::string_view plugin, std::string_view) { return plugin == "zz"; }
+
+constexpr CommandCapability cap(std::string_view plugin, std::string_view action) {
+    return CommandCapability{.plugin = plugin, .action = action,
+                             .execute_gate = ExecuteGate::None};
 }
 
 } // namespace
@@ -214,12 +224,96 @@ TEST_CASE("enablement units: a catalogue row with no os row fails the build, nam
                                 &is_quarantine_control_plugin);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().find("zz.new") != std::string::npos);
+    CHECK(r.error().find("enablement_units.hpp") != std::string::npos);
 }
 
-TEST_CASE("enablement units: a stale os row fails the build, naming it", "[enablement][catalogue]") {
+TEST_CASE("enablement units: a stale os row fails the build, naming it",
+          "[enablement][catalogue]") {
     std::vector<UnitOsRow> rows(kUnitOs.begin(), kUnitOs.end());
     rows.push_back({"zz", "gone", kAllOs});
     auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, &is_quarantine_control_plugin, rows);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().find("zz.gone") != std::string::npos);
+}
+
+TEST_CASE("enablement units: the protective predicate is the caller's, not a hard-coded set",
+          "[enablement][catalogue]") {
+    const std::array<CommandCapability, 2> frag{cap("zz", "a"), cap("zz", "b")};
+    const std::array<UnitOsRow, 2> os{{{"zz", "a", kAllOs}, {"zz", "b", kWin}}};
+    const std::span<const CommandCapability> src{frag};
+
+    SECTION("a predicate marking zz protective records actions and plugin as non-units") {
+        auto r = build_unit_overlay({src}, &zz_is_protective, os, {});
+        REQUIRE(r.has_value());
+        CHECK(r->units.empty());
+        for (const auto* name : {"zz", "zz.a", "zz.b"}) {
+            INFO(name);
+            const auto* n = r->find_non_unit(name);
+            REQUIRE(n != nullptr);
+            CHECK(n->reason == NonUnitReason::Protective);
+            CHECK(r->find(name) == nullptr);
+        }
+    }
+    SECTION("the quarantine predicate leaves the same fragment switchable") {
+        auto r = build_unit_overlay({src}, &is_quarantine_control_plugin, os, {});
+        REQUIRE(r.has_value());
+        CHECK(r->non_units.empty());
+        for (const auto* name : {"zz", "zz.a", "zz.b"})
+            CHECK(r->find(name) != nullptr);
+    }
+}
+
+TEST_CASE("enablement units: build_unit_overlay refuses malformed inputs, naming them",
+          "[enablement][catalogue]") {
+    struct Case {
+        const char* what;
+        std::vector<CommandCapability> rows;
+        std::vector<UnitOsRow> os;
+        std::vector<RequirementEdge> edges;
+        ProtectivePredicate protective;
+        std::string needle;
+    };
+    const auto ok_rows = std::vector<CommandCapability>{cap("zz", "a"), cap("zz", "b")};
+    const std::vector<UnitOsRow> ok_os{{"zz", "a", kAllOs}, {"zz", "b", kAllOs}};
+    auto pred = &is_quarantine_control_plugin;
+    const std::vector<Case> cases{
+        {"duplicate catalogue pair",
+         {cap("zz", "a"), cap("zz", "a")},
+         {{"zz", "a", kAllOs}},
+         {},
+         pred,
+         "duplicate catalogue pair: zz.a"},
+        {"duplicate os row for an existing pair",
+         ok_rows,
+         {{"zz", "a", kAllOs}, {"zz", "b", kAllOs}, {"zz", "a", kAllOs}},
+         {},
+         pred,
+         "zz.a"},
+        {"edge whose unit end is unknown", ok_rows, ok_os, {{"zz.nope", "zz.a"}}, pred, "zz.nope"},
+        {"edge whose required end is unknown", ok_rows, ok_os, {{"zz.a", "zz.nope"}}, pred,
+         "zz.nope"},
+        {"null protective predicate", ok_rows, ok_os, {}, nullptr, "protective predicate required"},
+        {"os row with mask 0",
+         ok_rows,
+         {{"zz", "a", 0}, {"zz", "b", kAllOs}},
+         {},
+         pred,
+         "zz.a"},
+        {"os row with bits above kAllOs",
+         ok_rows,
+         {{"zz", "a", kAllOs}, {"zz", "b", static_cast<std::uint8_t>(kWin | 0x80)}},
+         {},
+         pred,
+         "zz.b"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.what);
+        auto r = build_unit_overlay({std::span<const CommandCapability>{c.rows}}, c.protective,
+                                    c.os, c.edges);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find(c.needle) != std::string::npos);
+    }
+    // The table's base rows are valid: only the named defect fails each case.
+    CHECK(build_unit_overlay({std::span<const CommandCapability>{ok_rows}}, pred, ok_os, {})
+              .has_value());
 }

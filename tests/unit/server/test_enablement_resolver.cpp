@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <expected>
 #include <numeric>
 #include <random>
 #include <string>
@@ -34,7 +35,7 @@ constexpr CommandCapability row(std::string_view plugin, std::string_view action
                              .execute_gate = ExecuteGate::None};
 }
 
-constexpr std::array<CommandCapability, 10> kFixtureRows{{
+constexpr std::array<CommandCapability, 12> kFixtureRows{{
     row("p", "x"),
     row("p", "y"),
     row("p", "z"),
@@ -44,10 +45,12 @@ constexpr std::array<CommandCapability, 10> kFixtureRows{{
     row("t", "b"),
     row("t", "c"),
     row("r", "w"),
+    row("s", "m"),
+    row("s", "n"),
     row("quarantine", "unquarantine"),
 }};
 
-constexpr std::array<UnitOsRow, 9> kFixtureOs{{
+constexpr std::array<UnitOsRow, 11> kFixtureOs{{
     {"p", "x", kAllOs},
     {"p", "y", kAllOs},
     {"p", "z", kAllOs},
@@ -57,15 +60,18 @@ constexpr std::array<UnitOsRow, 9> kFixtureOs{{
     {"t", "b", kAllOs},
     {"t", "c", kAllOs},
     {"r", "w", kWin},
+    {"s", "m", kWin}, // heterogeneous masks under one plugin: s.m win-only, s.n everywhere
+    {"s", "n", kAllOs},
 }};
 
-// Diamond q.b -> {p, r}; chain t.c -> t.b -> t.a.
+// Diamond q.b -> {p, r}; chain t.c -> t.b -> t.a, listed dependent-first so a
+// single pass over the edges cannot reach the fixpoint.
 constexpr std::array<RequirementEdge, 5> kFixtureEdges{{
     {"q.a", "p"},
     {"q.b", "p"},
     {"q.b", "r"},
-    {"t.b", "t.a"},
     {"t.c", "t.b"},
+    {"t.b", "t.a"},
 }};
 
 const UnitOverlay& overlay() {
@@ -112,11 +118,19 @@ std::vector<std::size_t> identity(std::size_t n) {
 
 using Attrs = std::unordered_map<std::string, std::string>;
 
-Resolution run_rules(const std::vector<Rule>& rules, std::string_view os, const Attrs& attrs) {
+std::expected<Resolution, std::string> try_run_rules(const std::vector<Rule>& rules,
+                                                     std::string_view os, const Attrs& attrs) {
     return resolve(rules, overlay(), os, [&attrs](std::string_view k) {
         auto it = attrs.find(std::string(k));
         return it == attrs.end() ? std::string{} : it->second;
     });
+}
+
+Resolution run_rules(const std::vector<Rule>& rules, std::string_view os, const Attrs& attrs) {
+    auto r = try_run_rules(rules, os, attrs);
+    INFO(os << ": " << (r ? "" : r.error()));
+    REQUIRE(r.has_value());
+    return std::move(*r);
 }
 
 Resolution run(const std::vector<Spec>& specs, std::string_view os, const Attrs& attrs = {}) {
@@ -211,7 +225,8 @@ TEST_CASE("enablement resolver: off wins and lists every matching rule", "[enabl
     CHECK(r.matched_rules == Matches{{"m1", Op}, {"m2", Op}, {"m3", Op}});
 }
 
-TEST_CASE("enablement resolver: provenance keys the match, not the id alone", "[enablement][scope]") {
+TEST_CASE("enablement resolver: provenance keys the match, not the id alone",
+          "[enablement][scope]") {
     SECTION("a rule naming only a non-unit still appears in matched_rules") {
         const auto r = run({{"only-non", {"quarantine"}, "__all__"}}, "linux");
         CHECK(r.off.empty());
@@ -262,14 +277,35 @@ TEST_CASE("enablement resolver: authoring validates attributes against the real 
         CHECK(make_rule("r", {"p.x"}, ok, Op, overlay(), kinds()).has_value());
     }
     for (const char* bad : {R"(colour == "red")", R"(tags:x == "1")", R"(tag: == "1")",
-                            R"(from_result_set:abc == "1")", R"(ostype == "linux" AND colour == "r")",
-                            R"(ostype ==)", R"(group:x)"}) {
+                            R"(from_result_set:abc == "1")",
+                            R"(ostype == "linux" AND colour == "r")", R"(ostype ==)",
+                            R"(group:x)"}) {
         INFO(bad);
         CHECK_FALSE(make_rule("r", {"p.x"}, bad, Op, overlay(), kinds()).has_value());
     }
     const auto err = make_rule("r", {"p.x"}, R"(colour == "red")", Op, overlay(), kinds());
     REQUIRE_FALSE(err.has_value());
     CHECK(err.error().find("colour") != std::string::npos);
+}
+
+TEST_CASE("enablement resolver: a MATCHES pattern the evaluator cannot run is refused",
+          "[enablement][scope]") {
+    // scope::evaluate answers false for an over-cap or RE2-rejected pattern, so a
+    // durable rule built on one would never match and say nothing.
+    CHECK(make_rule("r", {"p.x"}, R"(hostname MATCHES "^lin[0-9]+$")", Op, overlay(), kinds())
+              .has_value());
+    const std::string at_cap(yuzu::scope::kMaxRegexPattern, 'a');
+    CHECK(make_rule("r", {"p.x"}, "hostname MATCHES \"" + at_cap + "\"", Op, overlay(), kinds())
+              .has_value());
+    const std::string over_cap(yuzu::scope::kMaxRegexPattern + 1, 'a');
+    const auto too_long =
+        make_rule("r", {"p.x"}, "hostname MATCHES \"" + over_cap + "\"", Op, overlay(), kinds());
+    REQUIRE_FALSE(too_long.has_value());
+    CHECK(too_long.error().find("hostname") != std::string::npos);
+    const auto unparseable =
+        make_rule("r", {"p.x"}, R"(hostname MATCHES "([")", Op, overlay(), kinds());
+    REQUIRE_FALSE(unparseable.has_value());
+    CHECK(unparseable.error().find("invalid regex") != std::string::npos);
 }
 
 TEST_CASE("enablement resolver: fleet-wide is __all__ by name; empty never means everyone",
@@ -281,13 +317,17 @@ TEST_CASE("enablement resolver: fleet-wide is __all__ by name; empty never means
         CHECK(find_off(run({{"r", {"p.x"}, "__all__"}}, os), "p.x") != nullptr);
     CHECK_FALSE(make_rule("r", {"p.x"}, "", Op, overlay(), kinds()).has_value());
     CHECK_FALSE(make_rule("r", {"p.x"}, "  \t", Op, overlay(), kinds()).has_value());
+    // Compared exactly as dispatch does: padding never makes it fleet-wide.
+    CHECK_FALSE(make_rule("r", {"p.x"}, " __all__ ", Op, overlay(), kinds()).has_value());
+    CHECK_FALSE(make_rule("r", {"p.x"}, "__all__\n", Op, overlay(), kinds()).has_value());
 }
 
 TEST_CASE("enablement resolver: make_rule validates the unit names", "[enablement][scope]") {
     CHECK_FALSE(make_rule("r", {"nope.x"}, "__all__", Op, overlay(), kinds()).has_value());
     CHECK_FALSE(make_rule("r", {"p.nope"}, "__all__", Op, overlay(), kinds()).has_value());
     CHECK_FALSE(make_rule("r", {}, "__all__", Op, overlay(), kinds()).has_value());
-    CHECK(make_rule("r", {"quarantine.unquarantine"}, "__all__", Op, overlay(), kinds()).has_value());
+    CHECK(make_rule("r", {"quarantine.unquarantine"}, "__all__", Op, overlay(), kinds())
+              .has_value());
     CHECK(make_rule("r", {"quarantine"}, "__all__", Op, overlay(), kinds()).has_value());
 }
 
@@ -310,13 +350,39 @@ TEST_CASE("enablement resolver: a plugin unit contains its actions", "[enablemen
     CHECK(off_names(action) == Names{"p.x"});
 }
 
+TEST_CASE("enablement resolver: plugin fan-out skips actions not applicable on the OS",
+          "[enablement][scope]") {
+    // s.m is windows-only, s.n runs everywhere, plugin s is applicable wherever
+    // either is. Fan-out must apply each action's own mask.
+    const std::vector<Spec> specs{{"r", {"s"}, "__all__"}};
+    CHECK(off_names(run(specs, "linux")) == Names{"s", "s.n"});
+    CHECK(off_names(run(specs, "darwin")) == Names{"s", "s.n"});
+    CHECK(off_names(run(specs, "windows")) == Names{"s", "s.m", "s.n"});
+    // Naming the inapplicable action directly is a no-op on linux but still matches.
+    const auto direct = run({{"d", {"s.m"}, "__all__"}}, "linux");
+    CHECK(direct.off.empty());
+    CHECK(direct.matched_rules == Matches{{"d", Op}});
+}
+
 TEST_CASE("enablement resolver: per-OS applicability and unknown OS", "[enablement][scope]") {
     const std::vector<Spec> specs{{"r", {"r.w"}, "__all__"}};
     CHECK(off_names(run(specs, "windows")) == Names{"r.w"});
     CHECK(run(specs, "linux").off.empty());
-    const auto unknown = run(specs, "plan9");
-    CHECK(unknown.off.empty());
-    CHECK(unknown.matched_rules == Matches{{"r", Op}});
+    CHECK(off_names(run(specs, "darwin")).empty());
+}
+
+TEST_CASE("enablement resolver: an unknown agent OS is a fault, not an empty off-set",
+          "[enablement][scope]") {
+    const auto rules = build_all({{"r", {"r.w"}, "__all__"}}, {0});
+    for (const char* os : {"plan9", "", "Linux"}) {
+        INFO(os);
+        const auto r = try_run_rules(rules, os, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("unknown agent OS") != std::string::npos);
+        CHECK(r.error().find(os) != std::string::npos);
+    }
+    // No rules at all is still an error: the OS, not the rules, is the fault.
+    CHECK_FALSE(try_run_rules({}, "plan9", {}).has_value());
 }
 
 TEST_CASE("enablement resolver: requirement closure", "[enablement][scope]") {
@@ -353,6 +419,21 @@ TEST_CASE("enablement resolver: requirement closure", "[enablement][scope]") {
         const auto r = run({{"A", {"q"}, "__all__"}}, "linux");
         CHECK(find_off(r, "q.a")->reason == Reason::OffByRule);
         CHECK(find_off(r, "q.b")->reason == Reason::OffByRule);
+    }
+    SECTION("a dependent-first chain needs a second pass: both dependents inherit the leaf") {
+        const auto r = run({{"L", {"t.a"}, "__all__"}}, "linux");
+        CHECK(off_names(r) == Names{"t.a", "t.b", "t.c"});
+        const auto* ta = find_off(r, "t.a");
+        const auto* tb = find_off(r, "t.b");
+        const auto* tc = find_off(r, "t.c");
+        REQUIRE((ta && tb && tc));
+        CHECK(ta->reason == Reason::OffByRule);
+        CHECK(tb->reason == Reason::OffRequirement);
+        CHECK(tc->reason == Reason::OffRequirement);
+        CHECK(tb->required_off == Names{"t.a"});
+        CHECK(tc->required_off == Names{"t.b"});
+        CHECK(tb->matches == Matches{{"L", Op}});
+        CHECK(tc->matches == Matches{{"L", Op}});
     }
     SECTION("a chain resolves identically in every rule order") {
         const std::vector<Spec> specs{{"X", {"t.a"}, "__all__"},
