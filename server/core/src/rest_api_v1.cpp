@@ -1318,13 +1318,13 @@ const std::string& openapi_spec() {
         // Fresh literal split (MSVC C2026 16,380-byte cap) before the DEX block.
         R"json(,
     "/dex/signals": {
-      "get": {"summary": "DEX catalogue rollup — every signal in the window", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Machine-readable equivalent of the DEX dashboard catalogue: each entry is one observation type (obs_type) present in the window, with its event count, blast radius (distinct_devices) and last_seen. Fleet aggregate — NOT audited. The window query parameter is one of 24h/7d/30d/all (default 7d; any other value resolves to 7d).", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}, "description": "Narrow the rollup to one OS's own signals; all (or omitted) = every OS (matches the dashboard catalogue OS filter)."}], "responses": {"200": {"description": "Per-signal rollup array (data[].obs_type, count, distinct_devices, last_seen)"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "DEX catalogue rollup — every signal in the window", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Machine-readable equivalent of the DEX dashboard catalogue: each entry is one observation type (obs_type) present in the window, with its event count, blast radius (distinct_devices) and last_seen. Fleet aggregate — NOT audited. The window query parameter is one of 24h/7d/30d/all (default 7d, also used when empty; any other value is a 400).", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}, "description": "Narrow the rollup to one OS's own signals; all (or omitted) = every OS (matches the dashboard catalogue OS filter)."}], "responses": {"200": {"description": "Per-signal rollup array (data[].obs_type, count, distinct_devices, last_seen)"}, "400": {"description": "invalid window (expected 24h|7d|30d|all)"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/scope": {
-      "get": {"summary": "DEX per-OS signal coverage", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. How many distinct obs_types each platform reports in the window, with total event count — the live cross-OS coverage the dashboard derives. Fleet aggregate — NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-OS scope array (data[].platform, distinct_types, total_events)"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "DEX per-OS signal coverage", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. How many distinct obs_types each platform reports in the window, with total event count — the live cross-OS coverage the dashboard derives. Fleet aggregate — NOT audited. An empty window is the 7d default; any other value outside 24h/7d/30d/all is a 400.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-OS scope array (data[].platform, distinct_types, total_events)"}, "400": {"description": "invalid window (expected 24h|7d|30d|all)"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/signals/{obs_type}": {
-      "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays. A service-scoped API token is denied outright (403) — the devices[] list is fleet-wide with no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.signal.view audit row cannot persist, so the device list is never served without durable evidence.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}, "description": "Scope subjects[]/devices[]/by_day[] to one OS; all (or omitted) = every OS. by_os[] stays cross-OS (it IS the split). The applied os is echoed in the response."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, os, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.signal.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+      "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays. A service-scoped API token is denied outright (403) — the devices[] list is fleet-wide with no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.signal.view audit row cannot persist, so the device list is never served without durable evidence.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}, "description": "Scope subjects[]/devices[]/by_day[] to one OS; all (or omitted) = every OS. by_os[] stays cross-OS (it IS the split). The applied os is echoed in the response."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, os, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type, limit or window"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.signal.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/devices/{id}": {
       "get": {"summary": "Per-device DEX read model", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group (parity with the dashboard device DEX lens). Returns this device's DEX experience score (0-100; -1 = n/a) and its signal summary for the window. Individual-identifying behavioral data, so every call emits a dex.device.view audit event. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist, so the device's behavioural data is never served without durable evidence. #4855: a DEGRADED signal-summary read (store closed / pool-acquire timeout / query error) also 503s (retry_after_ms 2000, no Sec-Audit-Failed) rather than rendering a fabricated healthy 100 with no signals. The window query parameter is one of 24h/7d/30d/all (default 7d).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-device DEX object (agent_id, window, score, signals[].obs_type/count/distinct_devices/last_seen)"}, "400": {"description": "invalid window (expected 24h|7d|30d|all)"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "Service unavailable, the dex.device.view audit row could not persist (Sec-Audit-Failed: true), OR the DEX signal-summary store read degraded (#4855; retryable, retry_after_ms 2000).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
@@ -11410,16 +11410,12 @@ void RestApiV1::register_routes(
                                       "application/json");
                                   return;
                               }
-                              auto field_str = [&c](const char* key) -> std::string {
-                                  return (c.contains(key) && c[key].is_string())
-                                             ? c[key].get<std::string>()
-                                             : "";
-                              };
                               InventoryCondition cond;
-                              cond.plugin = field_str("plugin");
-                              cond.field = field_str("field");
-                              cond.op = field_str("op");
-                              cond.value = field_str("value");
+                              if (const auto bad = parse_inventory_condition(c, cond)) {
+                                  res.status = 400;
+                                  res.set_content(detail::a4_error(res, *bad), "application/json");
+                                  return;
+                              }
                               eval_req.conditions.push_back(std::move(cond));
                           }
                       }
@@ -12500,16 +12496,11 @@ void RestApiV1::register_routes(
                                   rs_err(res, 400, "each condition must be a JSON object");
                                   return;
                               }
-                              auto field_str = [&c](const char* key) -> std::string {
-                                  return (c.contains(key) && c[key].is_string())
-                                             ? c[key].get<std::string>()
-                                             : "";
-                              };
                               InventoryCondition cond;
-                              cond.plugin = field_str("plugin");
-                              cond.field = field_str("field");
-                              cond.op = field_str("op");
-                              cond.value = field_str("value");
+                              if (const auto bad = parse_inventory_condition(c, cond)) {
+                                  rs_err(res, 400, *bad);
+                                  return;
+                              }
                               eval_req.conditions.push_back(std::move(cond));
                           }
                       }
@@ -15529,7 +15520,18 @@ void RestApiV1::register_routes(
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
-        const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
+        // An absent or empty window is the 7d default; any other value must be one of the four
+        // tokens (#4644: junk, `30` or `90d` used to resolve to 7d under a label saying otherwise).
+        const std::string window =
+            req.has_param("window") && !req.get_param_value("window").empty()
+                ? req.get_param_value("window")
+                : "7d";
+        if (!dex_window_is_valid(window)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid window (expected 24h|7d|30d|all)"),
+                            "application/json");
+            return;
+        }
         // A1 parity: `os=windows|linux|macos` narrows the rollup to one OS's own
         // signals (anything else = all-OS), matching the dashboard catalogue's
         // OS filter so the machine surface can never drift from what the page shows.
@@ -15927,7 +15929,16 @@ void RestApiV1::register_routes(
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
-        const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
+        const std::string window =
+            req.has_param("window") && !req.get_param_value("window").empty()
+                ? req.get_param_value("window")
+                : "7d";
+        if (!dex_window_is_valid(window)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid window (expected 24h|7d|30d|all)"),
+                            "application/json");
+            return;
+        }
         auto rows = dex_api->scope(window);
         JArr arr;
         for (const auto& r : rows) {
@@ -15994,7 +16005,16 @@ void RestApiV1::register_routes(
                      return;
                  }
                  const std::string window =
-                     req.has_param("window") ? req.get_param_value("window") : "7d";
+                     req.has_param("window") && !req.get_param_value("window").empty()
+                         ? req.get_param_value("window")
+                         : "7d";
+                 if (!dex_window_is_valid(window)) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::a4_error(res, "invalid window (expected 24h|7d|30d|all)"),
+                         "application/json");
+                     return;
+                 }
                  int limit = 50;
                  if (req.has_param("limit")) {
                      // Strict full-consumption parse: `10abc` is a 400, not 10 (#4644).

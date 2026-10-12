@@ -270,7 +270,8 @@ Routes that parse strictly (the response routes are listed in
 | Instructions, product packs, workflows | `GET /api/instructions`, `GET /api/v1/instructions`, `GET /api/v1/product-packs`, `GET /api/product-packs`, `GET /api/workflows`, `GET /api/v1/workflows`: `limit` |
 | Compliance | `GET /api/policy-fragments`, `GET /api/policies`, `GET /api/v1/policy-fragments`, `GET /api/v1/policies`: `limit`. On the two legacy routes (`/api/policy-fragments`, `/api/policies`) a negative `limit` is `400` too: it used to reach Postgres as `LIMIT -1`, fail, and answer `503`. The `/api/v1/` routes clamp `limit` to 1..1000 as before |
 | Patches | `GET /api/patches`, `GET /api/patches/deployments`: `limit` (a malformed value used to be ignored; a negative `limit` is `400` too, where the store answered an empty `200`) |
-| Inventory | `GET /api/v1/inventory/software`: `limit` (trailing characters were read as their numeric prefix) |
+| Inventory | `GET /api/v1/inventory/software`: `limit` (trailing characters were read as their numeric prefix); `conditions[].value` on `POST /api/v1/inventory/evaluate` and `POST /api/v1/result-sets/from-inventory-query` (a JSON number became the empty string, see the condition table under `inventory/evaluate`) |
+| DEX window | `GET /api/v1/dex/signals`, `/dex/scope` and `/dex/signals/{obs_type}`: `window` must be `24h`, `7d`, `30d` or `all` (omitted or empty = `7d`); `90d`, `30` or `junk` used to be answered with 7 days of data. The other DEX routes already refused it |
 | Fleet visualization | `GET /api/v1/viz/fleet/topology`: `machines_max` |
 | Verification | the app-performance compare route: `window` (a malformed value used to fall back to 7 days). This dashboard fragment keeps its own rejection style: an honest `200` note ("The window must be a whole number of days."), because the dashboard's htmx config drops `4xx` bodies; nothing is computed or audited. The other dashboard fragments in this table (results, inventory, hardware, DEX perf, network quality) still answer a JSON `400` that an operator in the dashboard never sees: that is a known UX gap, tracked in issue #5637, not a deliberate inconsistency |
 | Dashboard fragments | `GET /fragments/results`: `page`, `per_page`; the software inventory fragments (`/fragments/inventory/software`, `/software/devices`): `limit`; the DEX perf devices fragment and the network quality devices fragment: `limit`; the hardware list fragment and `GET /api/v1/hardware`: `offset`, `limit` (a negative value is refused too, it used to be clamped to `0`); the hardware sync poll: `await_since` (a malformed freshness bound used to read as "no bound", so a stale snapshot could be served as fresh); `GET /fragments/tar/process-tree/detail`: `node` (`stoul` read `-1` as the largest node id and `5x` as `5`) |
@@ -6742,7 +6743,7 @@ re-eval, unchanged.
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent set; or missing `sql` / `instruction_id`. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
-| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"tar_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too; it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"tar_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too, and so is a column matcher (no `kind`) whose `column`, `op` or `value` is present but not a string or whose `value_set` is present but not an array (`{"column":5,"op":"eq"}` used to qualify every responder; a stored one now matches no device, while a MISSING key keeps the accept-all default so a typo cannot silently empty the set); it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
 | 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-tar-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
@@ -6829,7 +6830,7 @@ Each condition object:
 | `plugin` | string | Plugin name to query |
 | `field` | string | JSON field path within the inventory data |
 | `op` | string | Operator: `eq`, `neq`, `gt`, `lt`, `gte`, `lte`, `contains` |
-| `value` | string | Value to compare against |
+| `value` | string | Value to compare against. A JSON number is accepted with a comparison operator (`==`, `!=`, `>`, `>=`, `<`, `<=`) and compared as its decimal text, and a boolean with `==` or `!=` (`true` / `false`). Any other type, or a number or boolean with another operator, is `400` (`conditions[].value must be a JSON string ...`); a non-string `plugin`, `field` or `op` is `400` too (#4644). A numeric `5` used to become the empty string, and with `>` that selected every device that had the field. The same rule holds on `POST /api/v1/result-sets/from-inventory-query` and the MCP tool `create_result_set_from_inventory_query` (`-32602`) |
 
 **Response:**
 
@@ -8701,7 +8702,7 @@ The DEX aggregation endpoints are the machine-readable equivalent of the [DEX da
 Whole-catalogue rollup — every observation type present in the window.
 
 - **Permission:** `GuaranteedState:Read`
-- **Query parameters:** `window`; `os` (`windows`/`linux`/`macos` narrows the rollup to that OS's own signals; omitted = every OS).
+- **Query parameters:** `window` (`24h`, `7d`, `30d` or `all`; omitted or empty = `7d`; anything else is `400`, where `90d` or `30` used to be answered with 7 days of data); `os` (`windows`/`linux`/`macos` narrows the rollup to that OS's own signals; omitted = every OS).
 - **Response:** `data[]` of `{obs_type, count, distinct_devices, last_seen}`. `obs_type` is the stable machine key (e.g. `process.crashed`, `os.boot`); map your own labels. Not audited.
 
 #### `GET /api/v1/dex/scope`
@@ -8709,7 +8710,7 @@ Whole-catalogue rollup — every observation type present in the window.
 Per-OS signal coverage — how many distinct observation types each platform reports, with total event count (the live cross-OS coverage the dashboard derives).
 
 - **Permission:** `GuaranteedState:Read`
-- **Query parameters:** `window`.
+- **Query parameters:** `window` (`24h`, `7d`, `30d` or `all`; omitted or empty = `7d`; anything else is `400`).
 - **Response:** `data[]` of `{platform, distinct_types, total_events}`. Not audited.
 
 #### `GET /api/v1/dex/signals/{obs_type}`
@@ -8718,7 +8719,7 @@ One signal type's drill-down.
 
 - **Permission:** `GuaranteedState:Read`
 - **Path parameter:** `obs_type` — must match `[A-Za-z0-9._-]{1,64}`.
-- **Query parameters:** `window`; `os` (`windows`/`linux`/`macos` scopes `subjects[]`, `devices[]` and `by_day[]` to that OS; `by_os[]` stays cross-OS since it IS the split; omitted = every OS); `limit` (caps `subjects[]` and `devices[]`, default 50, clamped to 500).
+- **Query parameters:** `window` (`24h`, `7d`, `30d` or `all`; omitted or empty = `7d`; anything else is `400`, refused before the `dex.signal.view` audit row is written); `os` (`windows`/`linux`/`macos` scopes `subjects[]`, `devices[]` and `by_day[]` to that OS; `by_os[]` stays cross-OS since it IS the split; omitted = every OS); `limit` (caps `subjects[]` and `devices[]`, default 50, clamped to 500).
 - **Response (`200`):** an object `{obs_type, os, subjects[], by_os[], devices[], by_day[]}` where `os` echoes the applied filter (`all` when unscoped), `subjects[]` is `{subject, count, distinct_devices, last_seen}`, `by_os[]` is `{platform, count, distinct_devices}`, `devices[]` is `{agent_id, count, last_seen}`, and `by_day[]` is `{day, count}`. A well-formed `obs_type` with no observations in the window returns `200` with empty arrays (it is a read-model query, not an entity lookup).
 - **4xx:** `400` on a malformed `obs_type` or a non-integer / negative `limit`. `403` if a service-scoped API token queries this route — the `devices[]` array is fleet-wide (every agent exhibiting this signal), with no single agent to confine a per-target check against, so a service-scoped token is denied outright (the bare permission gate alone checks only the token's ITServiceOwner role, never its own service-tag scope).
 - **Audit (behavioral PII):** the `devices[]` array names the `agent_id`s exhibiting this signal, so the endpoint emits **`dex.signal.view`** (`target_type=ObsType`, `target_id=<obs_type>`) before serving — see the audit boundary note above. A denied service-scoped token also emits `dex.signal.view` (`result=denied`, `target_id=` empty) so a rejected probe still leaves a trace. **Fail-closed:** if the audit row cannot persist, returns `503` + `Sec-Audit-Failed: true` and serves no device list (parity with `GET /api/v1/dex/devices/{id}`).

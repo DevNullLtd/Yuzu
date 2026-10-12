@@ -9,6 +9,7 @@
 #include "inventory_eval.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <string>
 #include <utility>
@@ -1047,4 +1048,59 @@ TEST_CASE("InventoryEval: empty records returns empty", "[inventory_eval][edge]"
 
     auto results = evaluate_inventory(req, records);
     CHECK(results.empty());
+}
+
+// ============================================================================
+// parse_inventory_condition: the one conditions[] element parser (#4644)
+// ============================================================================
+
+TEST_CASE("InventoryEval: parse_inventory_condition renders a numeric operand for comparison ops",
+          "[inventory_eval][numeric_params]") {
+    using nlohmann::json;
+    auto parse = [](const json& c, InventoryCondition& out) {
+        return parse_inventory_condition(c, out);
+    };
+    InventoryCondition c;
+    // Strings pass through untouched, including the empty string and an absent value.
+    CHECK_FALSE(parse(json{{"plugin", "p"}, {"field", "f"}, {"op", ">"}, {"value", "7"}}, c));
+    CHECK(c.plugin == "p");
+    CHECK(c.field == "f");
+    CHECK(c.op == ">");
+    CHECK(c.value == "7");
+    c = {};
+    CHECK_FALSE(parse(json{{"op", "exists"}}, c));
+    CHECK(c.value.empty());
+
+    // Numbers render with dump() (the evaluator's own rendering of a stored number).
+    struct Case { const char* op; const char* json_value; const char* expect; };
+    for (const auto& k : {Case{">", "5", "5"}, Case{">=", "-1", "-1"}, Case{"<", "5.5", "5.5"},
+                          Case{"<=", "1e3", "1000.0"}, Case{"==", "4294967297", "4294967297"},
+                          Case{"!=", "18446744073709551615", "18446744073709551615"},
+                          Case{"==", "true", "true"}, Case{"!=", "false", "false"}}) {
+        INFO(k.op << " " << k.json_value);
+        c = {};
+        const auto doc = json::parse(std::string(R"({"op":")") + k.op + R"(","value":)" +
+                                     k.json_value + "}");
+        CHECK_FALSE(parse(doc, c));
+        CHECK(c.value == k.expect);
+    }
+}
+
+TEST_CASE("InventoryEval: parse_inventory_condition refuses what used to become the empty string",
+          "[inventory_eval][numeric_params]") {
+    using nlohmann::json;
+    for (const char* bad :
+         {R"({"op":">","value":null})", R"({"op":">","value":[]})", R"({"op":">","value":{}})",
+          R"({"op":">","value":true})", R"({"op":"<=","value":false})",
+          R"({"op":"contains","value":5})", R"({"op":"exists","value":5})",
+          R"({"op":"version_gte","value":5})", R"({"value":5})", R"({"op":5,"value":"x"})",
+          R"({"op":null})", R"({"plugin":5})", R"({"field":["f"]})", R"({"field":{}})"}) {
+        INFO(bad);
+        InventoryCondition c;
+        const auto err = parse_inventory_condition(json::parse(bad), c);
+        REQUIRE(err.has_value());
+        CHECK(err->find("conditions[]") != std::string::npos);
+    }
+    InventoryCondition c;
+    CHECK(parse_inventory_condition(json::parse("5"), c).has_value());
 }

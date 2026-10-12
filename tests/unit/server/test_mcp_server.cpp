@@ -7774,6 +7774,56 @@ TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without a
         CHECK(a.find("dex.signal.view") == std::string::npos);
 }
 
+// #4644: `window` on the three DEX reads that did not validate it silently resolved junk to 7d,
+// so a caller asking for `90d`, `30` or a number got 7 days of data under a window it never named.
+TEST_CASE("MCP DEX: list_dex_signals / get_dex_signal_scope / get_dex_signal_detail refuse a "
+          "window outside 24h|7d|30d|all, an absent or empty one keeps the default (#4644)",
+          "[pg][mcp][integration][dex][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+
+    int call_id = 100;
+    auto call = [&](const char* tool, const std::string& window_member) {
+        std::string args = std::string(R"({"obs_type":"process.crashed")") + window_member + "}";
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                       std::to_string(call_id++) + R"(,"params":{"name":")" + tool +
+                       R"(","arguments":)" + args + "}}");
+    };
+    for (const char* tool : {"list_dex_signals", "get_dex_signal_scope", "get_dex_signal_detail"}) {
+        for (const char* bad : {R"(,"window":"90d")", R"(,"window":"7D")", R"(,"window":"30")",
+                                R"(,"window":5)", R"(,"window":null)", R"(,"window":["7d"])",
+                                R"(,"window":true)"}) {
+            INFO(tool << " " << bad);
+            auto res = call(tool, bad);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>().find("invalid window") !=
+                  std::string::npos);
+        }
+        for (const char* ok : {"", R"(,"window":"")", R"(,"window":"24h")", R"(,"window":"7d")",
+                               R"(,"window":"30d")", R"(,"window":"all")"}) {
+            INFO(tool << " " << ok);
+            auto res = call(tool, ok);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            CHECK(body.contains("result"));
+        }
+    }
+    // A refused window leaves no behavioural-view audit row for a read that never ran; the
+    // accepted get_dex_signal_detail calls above wrote exactly one per call (6).
+    int views = 0;
+    for (const auto& a : ts.audit_log)
+        if (a.find("dex.signal.view") != std::string::npos)
+            ++views;
+    CHECK(views == 6);
+}
+
 // WS-A4 PR-1 Gate 7 fix round: this tool reverted off `fleet_read_fn_`/real RBAC composition
 // back onto `perm_fn` + `deny_fleet_wide_service_scoped`, so the two rounds'
 // worth of fleet-read-gate coverage this test replaced (a fixture-faked
@@ -28766,8 +28816,8 @@ TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
         CHECK(body["error"]["code"] == kInvalidParams);
     }
 
-    SECTION("create_result_set_from_inventory_query: a condition field with the wrong JSON type "
-            "(e.g. a number instead of a string) is treated as absent, never an uncaught "
+    SECTION("create_result_set_from_inventory_query: a numeric condition value under a "
+            "comparison operator is accepted (rendered as text), never an uncaught "
             "nlohmann::json::type_error") {
         ts.start();
         auto res = ts.call(
@@ -28777,6 +28827,34 @@ TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
         // than crashing - proves the type-mismatched "value" field was safely defaulted, not
         // thrown on, before the store call.
         CHECK(res->status != 500);
+    }
+
+    SECTION("create_result_set_from_inventory_query: a condition operand that cannot be read "
+            "as the declared type is -32602, never the empty string (#4644: value 5 under `>` "
+            "became \"\" and selected every device that had the field)") {
+        ts.start();
+        int call_id = 60;
+        for (const char* cond :
+             {R"({"plugin":"p","field":"f","op":">","value":null})",
+              R"({"plugin":"p","field":"f","op":">","value":[5]})",
+              R"({"plugin":"p","field":"f","op":">","value":{"n":5}})",
+              R"({"plugin":"p","field":"f","op":">","value":true})",
+              R"({"plugin":"p","field":"f","op":"contains","value":5})",
+              R"({"plugin":"p","field":"f","op":5,"value":"5"})",
+              R"({"plugin":["p"],"field":"f","op":">","value":"5"})"}) {
+            const std::string req =
+                R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id++) +
+                R"(,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[)" +
+                cond + R"(]}}})";
+            INFO(req);
+            auto res = ts.call(req);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>().find("conditions[]") !=
+                  std::string::npos);
+        }
     }
 }
 
@@ -28926,7 +29004,9 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
         }
         // A PRESENT matcher that is not a JSON object, or whose kind is not a string, used to be
         // dropped silently ("accept every responder"): -32602 now.
-        for (const char* m : {"\"x\"", "5", "[]", "null", "true", "{\"kind\":1}", "{\"kind\":null}"}) {
+        for (const char* m : {"\"x\"", "5", "[]", "null", "true", "{\"kind\":1}", "{\"kind\":null}",
+                              "{\"column\":5,\"op\":\"eq\"}", "{\"column\":\"c\",\"op\":[]}",
+                              "{\"column\":\"c\",\"op\":\"eq\",\"value\":5}"}) {
             const std::string req =
                 R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id++) +
                 R"(,"params":{"name":"create_result_set_from_instruction_result","arguments":{)"

@@ -199,3 +199,34 @@ TEST_CASE("matcher: validate_matcher accepts only an integer n of at least 1 (#4
         CHECK(validate_matcher(bad).has_value());
     }
 }
+
+// A PRESENT but wrong-typed column / op / value / value_set used to fall through the "unrecognised
+// shape" default and admit every responder; a MISSING key keeps that documented default.
+TEST_CASE("matcher: a present wrong-typed column/op/value matches nobody and is refused at admission",
+          "[result_set][matcher][numeric_params]") {
+    const std::string out = "__schema__|c\nv\n__total__|1";
+    for (const char* bad :
+         {R"({"column":5,"op":"eq","value":"v"})", R"({"column":"c","op":5,"value":"v"})",
+          R"({"column":null,"op":"exists"})", R"({"column":["c"],"op":"exists"})",
+          R"({"column":"c","op":{},"value":"v"})", R"({"column":"c","op":"eq","value":5})",
+          R"({"column":"c","op":"exists","value":true})",
+          R"({"column":"c","op":"in","value_set":"v"})", R"({"column":"c","op":"in","value_set":{}})",
+          R"({"column":5})", R"({"op":5})"}) {
+        INFO(bad);
+        bool r = true;
+        REQUIRE_NOTHROW(r = response_matches(bad, kOk, out));
+        CHECK_FALSE(r);
+        CHECK(validate_matcher(bad).has_value());
+    }
+
+    // A MISSING key is unchanged: the unrecognised-shape default still admits the responder.
+    for (const char* missing : {R"({"column":"c"})", R"({"op":"eq"})", R"({"foo":"bar"})"}) {
+        INFO(missing);
+        CHECK(response_matches(missing, kOk, out));
+        CHECK_FALSE(validate_matcher(missing).has_value());
+    }
+    // Well-formed column matchers are unaffected.
+    CHECK(response_matches(R"({"column":"c","op":"eq","value":"v"})", kOk, out));
+    CHECK(response_matches(R"({"column":"c","op":"in","value_set":["v"]})", kOk, out));
+    CHECK_FALSE(validate_matcher(R"({"column":"c","op":"in","value_set":["v"]})").has_value());
+}

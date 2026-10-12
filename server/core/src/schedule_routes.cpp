@@ -18,10 +18,10 @@ namespace yuzu::server::schedule {
 
 namespace {
 
-/// Upper bound of `interval_minutes`: floor(INT32_MAX / 60). `ScheduleEngine::advance_schedule`
-/// computes `GREATEST(interval_minutes, 1) * 60` as Postgres int4 arithmetic, which overflows
-/// (SQLSTATE 22003) above this and would leave the schedule re-firing on every poller tick.
-constexpr std::int64_t kMaxIntervalMinutes = 35791394;
+/// Upper bound of `interval_minutes`: the engine's own create-time ceiling
+/// (`kMaxScheduleIntervalMinutes`, floor(INT32_MAX / 60)), so the route 400s before the engine
+/// would refuse the same value.
+constexpr std::int64_t kMaxIntervalMinutes = kMaxScheduleIntervalMinutes;
 
 /// Strict schedule integer (#4644): ABSENT keeps `def`; a PRESENT key must be one JSON integer
 /// inside [lo, hi]. `body.value(k, int)` is a plain static_cast, so 4294967297 became 1 (an

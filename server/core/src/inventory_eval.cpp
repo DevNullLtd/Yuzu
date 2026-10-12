@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <charconv>
 #include <string_view>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -180,6 +181,42 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
 constexpr std::size_t kMaxLoggedExclusionsPerCause = 10;
 
 } // namespace
+
+std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
+                                                     InventoryCondition& out) {
+    if (!c.is_object())
+        return "each condition must be a JSON object";
+    for (const auto& [key, dest] :
+         {std::pair<const char*, std::string*>{"plugin", &out.plugin},
+          {"field", &out.field},
+          {"op", &out.op}}) {
+        if (!c.contains(key))
+            continue;
+        if (!c[key].is_string())
+            return std::string("conditions[].") + key + " must be a JSON string";
+        *dest = c[key].get<std::string>();
+    }
+    if (!c.contains("value"))
+        return std::nullopt;
+    const auto& v = c["value"];
+    if (v.is_string()) {
+        out.value = v.get<std::string>();
+        return std::nullopt;
+    }
+    const bool comparison = out.op == "==" || out.op == "!=" || out.op == ">" || out.op == ">=" ||
+                            out.op == "<" || out.op == "<=";
+    const bool equality = out.op == "==" || out.op == "!=";
+    if (v.is_number() && comparison) {
+        out.value = v.dump();
+        return std::nullopt;
+    }
+    if (v.is_boolean() && equality) {
+        out.value = v.get<bool>() ? "true" : "false";
+        return std::nullopt;
+    }
+    return "conditions[].value must be a JSON string (a number is accepted with ==, !=, >, >=, <, "
+           "<=; a boolean with == or !=)";
+}
 
 std::vector<InventoryEvalResult> evaluate_inventory(
     const InventoryEvalRequest& req,

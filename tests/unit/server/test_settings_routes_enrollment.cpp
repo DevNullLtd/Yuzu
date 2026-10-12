@@ -578,3 +578,91 @@ TEST_CASE("settings auto-approve: an ip_subnet rule with a malformed address or 
     CHECK(glob->status == 200);
     CHECK(h.auto_approve.list_rules().size() == 2);
 }
+
+TEST_CASE("settings auto-approve: every mutation records exactly one audit row (set-and-proceed)",
+          "[settings_routes][auto_approve][audit]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+
+    // add: success row carries the CANONICAL type as target_id and neutralised value/label.
+    REQUIRE(h.sink.Post("/api/settings/auto-approve",
+                        "type=ip_subnet&label=lan&value=10.0.0.0%2F8", kForm)
+                ->status == 200);
+    auto row = h.only("settings.auto_approve.rule_added");
+    CHECK(row.result == "success");
+    CHECK(row.target_type == "AutoApproveRule");
+    CHECK(row.target_id == "ip_subnet");
+    CHECK(row.detail == "value=10.0.0.0/8 label=lan enabled=true");
+
+    // An unknown type string audits the type that was ACTUALLY stored, never the raw input; a
+    // hostile label cannot forge an adjacent k=v field.
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Post("/api/settings/auto-approve",
+                        "type=bogus&label=a%20enabled%3Dfalse&value=*.example.com", kForm)
+                ->status == 200);
+    row = h.only("settings.auto_approve.rule_added");
+    CHECK(row.target_id == "hostname_glob");
+    CHECK(row.detail == "value=*.example.com label=a_enabled_false enabled=true");
+
+    // mode: canonical value, not the raw string.
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Post("/api/settings/auto-approve/mode", "mode=all", kForm)->status == 200);
+    row = h.only("settings.auto_approve.mode_changed");
+    CHECK(row.result == "success");
+    CHECK(row.target_id == "mode");
+    CHECK(row.detail == "mode=all");
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Post("/api/settings/auto-approve/mode", "mode=junk%0D%0A", kForm)->status ==
+            200);
+    CHECK(h.only("settings.auto_approve.mode_changed").detail == "mode=any");
+
+    // toggle: success names the rule and its NEW state; an out-of-range index is an audited
+    // denied no-op.
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Post("/api/settings/auto-approve/0/toggle", "", kForm)->status == 200);
+    row = h.only("settings.auto_approve.rule_toggled");
+    CHECK(row.result == "success");
+    CHECK(row.target_id == "0");
+    CHECK(row.detail == "type=ip_subnet value=10.0.0.0/8 enabled=false");
+    CHECK_FALSE(h.auto_approve.list_rules()[0].enabled);
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Post("/api/settings/auto-approve/99/toggle", "", kForm)->status == 200);
+    row = h.only("settings.auto_approve.rule_toggled");
+    CHECK(row.result == "denied");
+    CHECK(row.detail == "rule_not_found");
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Post("/api/settings/auto-approve/99999999999999999999999/toggle", "", kForm)
+                ->status == 404);
+    CHECK(h.only("settings.auto_approve.rule_toggled").detail == "invalid_index");
+
+    // remove: success row names WHAT was removed; missing index is denied; the rule is gone.
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Delete("/api/settings/auto-approve/1")->status == 200);
+    row = h.only("settings.auto_approve.rule_removed");
+    CHECK(row.result == "success");
+    CHECK(row.target_id == "1");
+    CHECK(row.detail == "type=hostname_glob value=*.example.com");
+    CHECK(h.auto_approve.list_rules().size() == 1);
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Delete("/api/settings/auto-approve/1")->status == 200);
+    row = h.only("settings.auto_approve.rule_removed");
+    CHECK(row.result == "denied");
+    CHECK(row.detail == "rule_not_found");
+    CHECK(h.auto_approve.list_rules().size() == 1);
+    h.audit_calls.clear();
+    REQUIRE(h.sink.Delete("/api/settings/auto-approve/99999999999999999999999")->status == 404);
+    CHECK(h.only("settings.auto_approve.rule_removed").detail == "invalid_index");
+}
+
+TEST_CASE("settings auto-approve: a malformed ip_subnet 400 records a denied row and stores nothing",
+          "[settings_routes][auto_approve][audit]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    auto res = h.sink.Post("/api/settings/auto-approve",
+                           "type=ip_subnet&label=x&value=10.0.0.0%2F33", kForm);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto row = h.only("settings.auto_approve.rule_added");
+    CHECK(row.result == "denied");
+    CHECK(row.target_id == "ip_subnet");
+    CHECK(row.detail == "invalid_ip_subnet value=10.0.0.0/33");
+    CHECK(h.auto_approve.list_rules().empty());
+}

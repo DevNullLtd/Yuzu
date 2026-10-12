@@ -25,6 +25,13 @@ namespace yuzu::server {
 /// count (0 = "all"). Pair with `dex_iso_since` to get the ISO-8601 UTC cutoff.
 int dex_window_to_days(const std::string& window);
 
+/// True iff `window` is one of the four tokens `dex_window_to_days` understands ("24h", "7d",
+/// "30d", "all"). The resolver above still maps anything else to 7 days (its dashboard callers
+/// only ever pass a fixed set); a MACHINE route must call this first and refuse the rest, or a
+/// caller asking for `30` or `90d` silently gets 7 days of data under a label that says otherwise
+/// (#4644). An absent or empty `window` is the caller's default and never reaches this.
+bool dex_window_is_valid(const std::string& window);
+
 /// Turns a resolved day count into an ISO-8601 UTC cutoff ("" when days<=0 =
 /// "all") — the day-count half of the shared window vocabulary.
 std::string dex_iso_since(int days);

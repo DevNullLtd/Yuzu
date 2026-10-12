@@ -1,5 +1,7 @@
 #pragma once
 
+#include <nlohmann/json_fwd.hpp>
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -13,6 +15,21 @@ struct InventoryCondition {
     std::string op;    // "==", "!=", ">=", "<=", ">", "<", "contains", "exists", "version_gte", "version_lte"
     std::string value;
 };
+
+/// Build one InventoryCondition from a caller's `conditions[]` element (#4644). The ONE copy for
+/// REST `POST /api/v1/inventory/evaluate`, REST `POST /api/v1/result-sets/from-inventory-query`
+/// and MCP `create_result_set_from_inventory_query`; a second copy is how the three drifted.
+///
+/// ABSENT keys keep the empty default. A PRESENT `plugin` / `field` / `op` must be a JSON string.
+/// A PRESENT `value` is the string itself, or, for a comparison operator (`==`, `!=`, `>`, `>=`,
+/// `<`, `<=`), a JSON number rendered with `dump()` (the SAME text the evaluator renders a stored
+/// number with, so `==` compares like with like), or a boolean as `true` / `false` for `==` / `!=`
+/// only. Anything else (null, array, object, a number under another operator) is refused. It used
+/// to become "": `{"op":">","value":5}` then selected EVERY device that had the field, because the
+/// evaluator falls back to a lexicographic compare against the empty string.
+/// Returns the 400 / -32602 message, or nullopt when accepted (`out` is then filled in).
+[[nodiscard]] std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
+                                                                   InventoryCondition& out);
 
 struct InventoryEvalRequest {
     std::string agent_id;

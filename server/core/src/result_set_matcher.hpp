@@ -25,6 +25,9 @@
 //                                     (N: JSON integer ≥ 1, default 1; a malformed N, or N < 1,
 //                                     matches nobody)
 //   a present `kind` that is not a string matches nobody (admission refuses it)
+//   a kind-less matcher whose `column`/`op`/`value` is present but not a string, or whose
+//     `value_set` is present but not an array, matches nobody (admission refuses it); a MISSING
+//     key keeps the default so a typo cannot silently empty the set
 //   {"column":C,"op":O,"value":V}        ─┐ SUCCESS AND at least one parsed
 //   {"column":C,"op":O,"value_set":[..]} ─┘ output row's column C satisfies O
 //
@@ -44,7 +47,8 @@ inline constexpr int kStatusSuccess = 1;
 bool response_matches(std::string_view matcher_json, int status, std::string_view output);
 
 /// Admission check for a caller-supplied matcher (#4644): nullopt when acceptable, else the 400
-/// message. A present `kind` must be a string. Only `tar_rows_ge` has a numeric field: its `n`
+/// message. A present `kind` must be a string; on a kind-less matcher a present `column`, `op`
+/// or `value` must be a string and a present `value_set` an array. Only `tar_rows_ge` has a numeric field: its `n`
 /// (absent = 1) must be one JSON integer in 1..2147483647. `response_matches` independently fails
 /// CLOSED on a malformed `n` or `kind` already stored (including n < 1), so a bad value can never
 /// throw out of the maintenance tick nor admit every responder. A matcher that is present but not

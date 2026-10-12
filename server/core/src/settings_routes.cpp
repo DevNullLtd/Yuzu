@@ -124,6 +124,28 @@ std::string url_encode(const std::string& s) {
     return out;
 }
 
+// Auto-approve audit vocabulary: the CANONICAL rule-type name (never the caller's raw `type`
+// field, which falls back to hostname_glob for anything unknown) and a CWE-117-neutralised,
+// length-capped form of a caller-supplied rule value/label for the structured `k=v` detail.
+const char* auto_approve_type_name(auth::AutoApproveRuleType t) {
+    switch (t) {
+    case auth::AutoApproveRuleType::trusted_ca:
+        return "trusted_ca";
+    case auth::AutoApproveRuleType::hostname_glob:
+        return "hostname_glob";
+    case auth::AutoApproveRuleType::ip_subnet:
+        return "ip_subnet";
+    case auth::AutoApproveRuleType::cloud_provider:
+        return "cloud_provider";
+    }
+    return "unknown";
+}
+
+std::string auto_approve_audit_value(const std::string& s) {
+    constexpr std::size_t kMax = 256;
+    return audit_token(std::string_view(s).substr(0, kMax));
+}
+
 std::string highlight_yaml_value(const std::string& val) {
     if (val.empty())
         return {};
@@ -6101,8 +6123,17 @@ void SettingsRoutes::register_routes(
 
                   // A subnet rule must be a bare IPv4 address or a/b/c/d/N with N in 0..32: a
                   // malformed prefix used to be stored and then threw out of Register (#4644).
+                  // Audit posture (#4644 sweep): an auto-approve rule decides which UNKNOWN agents
+                  // are enrolled without the approval queue, so every mutation writes a row. Like
+                  // every dashboard settings mutation in this file (enrollment.*, user.*, ...) the
+                  // hook is `SettingsRoutes::AuditFn`, which is void: set-and-proceed, a dropped
+                  // row is logged by the sink but does not fail the operator action.
+                  const std::string type_name = auto_approve_type_name(type);
                   if (type == auth::AutoApproveRuleType::ip_subnet &&
                       !auth::AutoApproveEngine::is_valid_ip_subnet_value(value)) {
+                      audit_fn_(req, "settings.auto_approve.rule_added", "denied",
+                                "AutoApproveRule", type_name,
+                                "invalid_ip_subnet value=" + auto_approve_audit_value(value));
                       res.status = 400;
                       // The dashboard drops 4xx bodies (swap:false): the toast is what the operator sees.
                       res.set_header("HX-Trigger",
@@ -6114,6 +6145,10 @@ void SettingsRoutes::register_routes(
                   }
 
                   auto_approve_->add_rule({type, value, label, true});
+                  audit_fn_(req, "settings.auto_approve.rule_added", "success", "AutoApproveRule",
+                            type_name,
+                            "value=" + auto_approve_audit_value(value) +
+                                " label=" + auto_approve_audit_value(label) + " enabled=true");
                   spdlog::info("Auto-approve rule added: {}:{} ({})", type_s, value, label);
                   res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
               });
@@ -6125,6 +6160,10 @@ void SettingsRoutes::register_routes(
                   auto mode = extract_form_value(req.body, "mode");
                   auto_approve_->set_require_all(mode == "all");
                   auto_approve_->save();
+                  // Canonical value, not the caller's raw `mode` (anything but "all" means "any").
+                  audit_fn_(req, "settings.auto_approve.mode_changed", "success",
+                            "AutoApproveRule", "mode",
+                            std::string("mode=") + (mode == "all" ? "all" : "any"));
                   spdlog::info("Auto-approve mode changed to {}", mode);
                   res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
               });
@@ -6136,6 +6175,8 @@ void SettingsRoutes::register_routes(
                   // `(\d+)` also matches a 21-digit index that `stoul` rejects by throwing (500).
                   const auto idx_parsed = yuzu::server::parse_query_int<long long>(req.matches[1].str());
                   if (!idx_parsed || *idx_parsed < 0) {
+                      audit_fn_(req, "settings.auto_approve.rule_toggled", "denied",
+                                "AutoApproveRule", "", "invalid_index");
                       res.status = 404;
                       res.set_content(detail::a4_error(res, "rule not found"), "application/json");
                       return;
@@ -6144,6 +6185,14 @@ void SettingsRoutes::register_routes(
                   auto rules = auto_approve_->list_rules();
                   if (idx < rules.size()) {
                       auto_approve_->set_enabled(idx, !rules[idx].enabled);
+                      audit_fn_(req, "settings.auto_approve.rule_toggled", "success",
+                                "AutoApproveRule", std::to_string(idx),
+                                "type=" + std::string(auto_approve_type_name(rules[idx].type)) +
+                                    " value=" + auto_approve_audit_value(rules[idx].value) +
+                                    " enabled=" + (rules[idx].enabled ? "false" : "true"));
+                  } else {
+                      audit_fn_(req, "settings.auto_approve.rule_toggled", "denied",
+                                "AutoApproveRule", std::to_string(idx), "rule_not_found");
                   }
                   res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
               });
@@ -6155,12 +6204,27 @@ void SettingsRoutes::register_routes(
                     const auto idx_parsed =
                         yuzu::server::parse_query_int<long long>(req.matches[1].str());
                     if (!idx_parsed || *idx_parsed < 0) {
+                        audit_fn_(req, "settings.auto_approve.rule_removed", "denied",
+                                  "AutoApproveRule", "", "invalid_index");
                         res.status = 404;
                         res.set_content(detail::a4_error(res, "rule not found"), "application/json");
                         return;
                     }
                     auto idx = static_cast<size_t>(*idx_parsed);
+                    // Snapshot the rule first so the row names WHAT was removed (the index alone
+                    // is meaningless once the list shifts). An out-of-range index is an audited
+                    // no-op, never a silent success.
+                    const auto rules = auto_approve_->list_rules();
                     auto_approve_->remove_rule(idx);
+                    if (idx < rules.size()) {
+                        audit_fn_(req, "settings.auto_approve.rule_removed", "success",
+                                  "AutoApproveRule", std::to_string(idx),
+                                  "type=" + std::string(auto_approve_type_name(rules[idx].type)) +
+                                      " value=" + auto_approve_audit_value(rules[idx].value));
+                    } else {
+                        audit_fn_(req, "settings.auto_approve.rule_removed", "denied",
+                                  "AutoApproveRule", std::to_string(idx), "rule_not_found");
+                    }
                     spdlog::info("Auto-approve rule {} removed", idx);
                     res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
                 });

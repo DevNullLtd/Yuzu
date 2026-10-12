@@ -162,6 +162,23 @@ std::optional<int> read_row_threshold(const nlohmann::json& m) {
     return v.get<int>();
 }
 
+// A kind-less (column-shape) matcher whose column / op / value / value_set is PRESENT with the
+// wrong JSON type, e.g. {"column":5,"op":"eq"}. A MISSING key is the documented "a typo cannot
+// silently empty the set" fallthrough and is NOT a defect here; a present wrong-typed one used to
+// fall through the same way and admit every responder, the fail-open shape the `kind` and `n`
+// checks above already closed. Shared by admission and evaluation so they cannot drift.
+std::optional<std::string> column_shape_defect(const nlohmann::json& m) {
+    if (m.contains("column") && !m["column"].is_string())
+        return "matcher.column must be a string";
+    if (m.contains("op") && !m["op"].is_string())
+        return "matcher.op must be a string";
+    if (m.contains("value") && !m["value"].is_string())
+        return "matcher.value must be a string";
+    if (m.contains("value_set") && !m["value_set"].is_array())
+        return "matcher.value_set must be an array";
+    return std::nullopt;
+}
+
 } // namespace
 
 std::optional<std::string> validate_matcher(std::string_view matcher_json) {
@@ -172,7 +189,9 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
         return std::nullopt; // the unrecognised-shape default is unchanged
     if (m.contains("kind") && !m["kind"].is_string())
         return "matcher.kind must be a string";
-    if (!m.contains("kind") || m["kind"].get<std::string>() != "tar_rows_ge")
+    if (!m.contains("kind"))
+        return column_shape_defect(m);
+    if (m["kind"].get<std::string>() != "tar_rows_ge")
         return std::nullopt;
     const auto n = read_row_threshold(m);
     if (!n || *n < 1)
@@ -235,6 +254,11 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
         return false; // unknown kind → conservatively exclude
     }
 
+    // A PRESENT but wrong-typed column / op / value / value_set is malformed, not absent: nobody
+    // qualifies (admission refuses it; this covers a row stored before that refusal).
+    if (column_shape_defect(m))
+        return false;
+
     if (m.contains("column") && m["column"].is_string() && m.contains("op") && m["op"].is_string()) {
         const auto column = m["column"].get<std::string>();
         const auto op = m["op"].get<std::string>();
@@ -243,8 +267,8 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
         return tar_column_match(output, column, op, m) || json_column_match(output, column, op, m);
     }
 
-    // Matcher present but not a recognised shape → fall back to default so a
-    // typo can't silently empty the set; the operator still gets responders.
+    // Matcher present but a recognised key is MISSING (or no recognised key at all) → fall back to
+    // default so a typo can't silently empty the set; the operator still gets responders.
     return true;
 }
 

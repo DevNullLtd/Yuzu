@@ -254,6 +254,26 @@ std::string param_str(const nlohmann::json& params, const char* key, const char*
     return def;
 }
 
+/// DEX `window` argument (#4644): ABSENT or "" is the default 7d; a PRESENT value must be a JSON
+/// string naming one of 24h|7d|30d|all. `param_str` alone turned `5`, `null` and `"90d"` into
+/// the default, so the answer covered 7 days under a window the caller never asked for. Returns
+/// the -32602 message, or nullopt when `out` holds the resolved token.
+[[nodiscard]] std::optional<std::string> dex_window_arg(const nlohmann::json& args,
+                                                        std::string& out) {
+    out = "7d";
+    if (!args.contains("window"))
+        return std::nullopt;
+    if (!args["window"].is_string())
+        return std::string("invalid window (expected a string: 24h|7d|30d|all)");
+    const auto w = args["window"].get<std::string>();
+    if (w.empty())
+        return std::nullopt;
+    if (!dex_window_is_valid(w))
+        return std::string("invalid window (expected 24h|7d|30d|all)");
+    out = w;
+    return std::nullopt;
+}
+
 /// Lenient integer read: a present-but-wrong-type value yields `def` (callers that
 /// must reject it use `param_int_strict` below). The one thing this must NOT do is
 /// alias a value to a DIFFERENT, valid-looking one: nlohmann reports
@@ -1479,7 +1499,7 @@ static const ToolDef kTools[] = {
      "event count, blast radius (distinct devices) and last-seen time. Fleet aggregate; a "
      "well-formed window with no observations returns an empty array. Mirrors GET "
      "/api/v1/dex/signals. Requires GuaranteedState:Read.",
-     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Time window (any other value resolves to 7d)"},)j"
+     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Time window (an absent or empty value is 7d; any other value is rejected)"},)j"
      R"j("os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all","description":"Narrow to one OS's own signals (all = every OS)"}}})j",
      R"j({"type":"object","properties":{"signals":{"type":"array","items":{"type":"object","properties":{"obs_type":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["obs_type","count","distinct_devices","last_seen"]}}},"required":["signals"]})j"}, // annotations generated (2g PR 2)
 
@@ -12580,16 +12600,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                             return;
                         }
-                        auto field_str = [&c](const char* key) -> std::string {
-                            return (c.contains(key) && c[key].is_string())
-                                       ? c[key].get<std::string>()
-                                       : "";
-                        };
                         yuzu::server::InventoryCondition cond;
-                        cond.plugin = field_str("plugin");
-                        cond.field = field_str("field");
-                        cond.op = field_str("op");
-                        cond.value = field_str("value");
+                        if (const auto bad = yuzu::server::parse_inventory_condition(c, cond)) {
+                            res.set_content(error_response(id, kInvalidParams, *bad),
+                                            "application/json");
+                            return;
+                        }
                         // #4353 follow-up: this tool is never approval-gated
                         // (Inventory:Read, via fleet_read_fn_ above), so the
                         // schema's maxLength was pure advice until now.
@@ -15168,9 +15184,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 // OS filter: `os` narrows the rollup to one OS (all = every OS).
                 // Routed through the DexApi seam (ADR-0031 WS-A4) — the SAME
                 // instance the REST twin uses, so the shapes cannot drift.
+                std::string window;
+                if (const auto bad = dex_window_arg(args, window)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& r : dex_api_->signals(param_str(args, "window", "7d"),
-                                                       param_str(args, "os", ""))) {
+                for (const auto& r : dex_api_->signals(window, param_str(args, "os", ""))) {
                     arr.add(JObj()
                                 .add("obs_type", r.obs_type)
                                 .add("count", r.count)
@@ -15202,8 +15222,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                std::string window;
+                if (const auto bad = dex_window_arg(args, window)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& r : dex_api_->scope(param_str(args, "window", "7d"))) {
+                for (const auto& r : dex_api_->scope(window)) {
                     arr.add(JObj()
                                 .add("platform", r.platform)
                                 .add("distinct_types", r.distinct_types)
@@ -15264,6 +15289,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const int limit = std::clamp(param_int32(args, "limit", 50), 0, 500);
+                // Refused ahead of the audit below, like obs_type: a request that reads nothing
+                // leaves no trace of a behavioral view that never happened.
+                std::string window;
+                if (const auto bad = dex_window_arg(args, window)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json");
+                    return;
+                }
                 // A1 parity with GET /api/v1/dex/signals/{obs_type} + the dashboard
                 // drilldown: `os` scopes subjects/devices/by_day to one OS (all =
                 // every OS). by_os stays cross-OS — it IS the split.
@@ -15286,7 +15318,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Routed through the DexApi seam (ADR-0031 WS-A4) — the four raw
                 // reads the REST twin also bundles, same obs_type/window/os/limit.
                 const auto detail = dex_api_->signal_detail(
-                    obs_type, param_str(args, "window", "7d"), param_str(args, "os", ""), limit);
+                    obs_type, window, param_str(args, "os", ""), limit);
                 JArr subjects;
                 for (const auto& s : detail.subjects) {
                     subjects.add(JObj()

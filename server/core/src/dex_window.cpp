@@ -28,6 +28,10 @@ int dex_window_to_days(const std::string& window) {
     return 7; // "7d" / default
 }
 
+bool dex_window_is_valid(const std::string& window) {
+    return window == "24h" || window == "7d" || window == "30d" || window == "all";
+}
+
 // ISO-8601 UTC cutoff for "N days ago"; "" for days<=0 (the "all" window, where a
 // per-device-days rate is ill-defined). Mirrors guardian_ingest's ts_to_iso8601.
 std::string dex_iso_since(int days) {

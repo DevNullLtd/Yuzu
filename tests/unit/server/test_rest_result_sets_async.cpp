@@ -1081,7 +1081,9 @@ TEST_CASE("from-instruction-result: a malformed matcher n is refused with 400 an
     }
     // A PRESENT matcher that is not a JSON object, or whose kind is not a string, used to be
     // dropped silently, i.e. "accept every responder". Both are refused now.
-    for (const char* m : {"\"x\"", "5", "[]", "null", "true", "{\"kind\":1}", "{\"kind\":null}"}) {
+    for (const char* m : {"\"x\"", "5", "[]", "null", "true", "{\"kind\":1}", "{\"kind\":null}",
+                          "{\"column\":5,\"op\":\"eq\"}", "{\"column\":\"c\",\"op\":[]}",
+                          "{\"column\":\"c\",\"op\":\"eq\",\"value\":5}"}) {
         const std::string body =
             R"({"instruction_id":")" + iid + R"(","matcher":)" + m + "}";
         INFO(body);
@@ -2461,6 +2463,59 @@ TEST_CASE("from-inventory-query: matched membership is confined to the caller's 
     // device_count would be 2. The fix narrows the candidate records to the
     // gate's scope BEFORE evaluation, so only "agent-visible" can ever match.
     CHECK(body["data"]["device_count"] == 1);
+}
+
+// #4644: a numeric `conditions[].value` used to become "" and, with `>`, the evaluator's
+// lexicographic fallback (`val > ""`) selected EVERY device that had the field.
+TEST_CASE("from-inventory-query: a numeric condition value is compared as a number, and a value "
+          "that cannot be one is a 400 (#4644)",
+          "[pg][result_set][async][inventory][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        for (const auto& [agent, ram] : {std::pair<const char*, const char*>{"agent-big", "32"},
+                                         {"agent-small", "3"}}) {
+            auto seeded = yuzu::server::pg::exec_params(
+                lease.get(),
+                "INSERT INTO inventory_store.inventory_data "
+                "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+                std::vector<std::string>{agent, std::string(R"({"ram":)") + ram + "}"});
+            REQUIRE(seeded.status() == PGRES_COMMAND_OK);
+        }
+    }
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto ok = h.post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"name":"big","conditions":[{"plugin":"custom","field":"ram","op":">","value":5}]})",
+        status);
+    REQUIRE(status == 201);
+    CHECK(ok["data"]["device_count"] == 1); // was 2: value 5 became "" and `>` matched both
+
+    for (const char* cond :
+         {R"({"plugin":"custom","field":"ram","op":">","value":null})",
+          R"({"plugin":"custom","field":"ram","op":">","value":[5]})",
+          R"({"plugin":"custom","field":"ram","op":">","value":{"n":5}})",
+          R"({"plugin":"custom","field":"ram","op":">","value":true})",
+          R"({"plugin":"custom","field":"ram","op":"contains","value":5})",
+          R"({"plugin":"custom","field":"ram","op":5,"value":"5"})",
+          R"({"plugin":7,"field":"ram","op":">","value":"5"})"}) {
+        const std::string body = std::string(R"({"name":"refused","conditions":[)") + cond + "]}";
+        INFO(body);
+        int st = 0;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", body, st);
+        CHECK(st == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("conditions[]") != std::string::npos);
+    }
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).size() == 1);
 }
 
 TEST_CASE("from-inventory-query: a supplied parent_id is persisted as scope_input_id "

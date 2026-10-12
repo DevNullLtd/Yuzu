@@ -173,6 +173,8 @@ Supported modes:
 | `any` | First matching enabled rule auto-approves the agent (default) |
 | `all` | All enabled rules must match for auto-approval |
 
+Every rule change (add, mode change, toggle, delete) writes an audit row, `settings.auto_approve.*`, naming the rule type and value that changed (see [Audit Log](audit-log.md)); a rejected subnet and an index that matches no rule are audited as `denied`.
+
 Note: Auto-approval only applies when rules exist and are enabled. When no rules are configured, all agents enter the pending queue regardless of mode. To disable auto-approval entirely, remove or disable all rules.
 
 **Toggle a rule on/off:**

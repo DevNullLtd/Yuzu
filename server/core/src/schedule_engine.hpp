@@ -38,6 +38,11 @@ class PgPool;
 
 namespace yuzu::server {
 
+/// Upper bound of `interval_minutes`: floor(INT32_MAX / 60), about 68 years. The one value the
+/// REST route (`schedule_routes.cpp`) and `ScheduleEngine::create_schedule` both enforce, so a
+/// non-route caller cannot store a larger interval than the route would have accepted.
+inline constexpr long long kMaxScheduleIntervalMinutes = 35791394;
+
 class ScheduleEngine {
 public:
     explicit ScheduleEngine(pg::PgPool& pool);
