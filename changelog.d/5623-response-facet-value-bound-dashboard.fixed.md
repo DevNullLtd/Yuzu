@@ -1,0 +1,5 @@
+- **Dashboard results page: a late or dropped request no longer leaves the wrong table (#5623).**
+  - Every request from the filter bar, the sort headers and the pagination now shares one replacing request scope, so a correction typed or a View switch made while a request is in flight is no longer dropped, and a late sort or page response no longer leaves rows under an empty header.
+  - Sending a command aborts a results request still in flight, so a late response for the previous command can no longer replace the new command's table. The built-in `help` command and a TAR SQL query do not abort one yet (#5677).
+  - The sort headers and Prev/Next buttons use the filter values currently shown instead of those of the last render.
+  - The chart-deck refresh fired 2 seconds after a command now queues behind the filter bar, so it can no longer overwrite the pager, summary and Create Group button of a filtered view with unfiltered ones.

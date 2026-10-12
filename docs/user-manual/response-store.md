@@ -356,18 +356,24 @@ operator-visible notes:
     (about 2.7 KB decoded) or several individually legal values can still hit that limit (#5668).
   - **Dashboard refresh while a filter is applied.** The chart deck is refreshed ONCE, by a
     request fired 2 seconds after a command is dispatched (not polling). That request carries no
-    filter state, so it can overwrite the pager and summary of a filtered view with unfiltered ones
-    (#5669). Closed: a column-header sort or a pagination click now reads the live filter bar
-    (they no longer re-send the filters of the last render), and sending a command now aborts a
-    results request still in flight, so a late response for the previous command cannot swap its
-    rows or its Create Group button over the new command's table. Still open (#5677): for about
-    2 seconds after a command is sent the filter bar is an empty placeholder and the header
-    refresh fires on the same delay; in a browser check the header had no sort links and the page
-    no Prev or Next controls in that window, so nothing could be clicked (a sort link pointing at
-    the empty bar would answer `400`, which htmx does not display); the built-in `help` command and a TAR SQL
-    query clear the results area without aborting a request in flight; and the hardware list
-    keeps the older `this:abort` sync. An open Create Static Group form is not cleared by a valid
-    filter change and keeps its old filters and count (#5669).
+    filter state, so unscoped it could land after a filter change and overwrite the pager,
+    summary and Create Group button of a filtered view with unfiltered ones. Closed: the request
+    now queues behind the filter bar's own first load (`hx-sync` `queue last`, not `replace`),
+    runs only once the filter bar has rendered, and is then cancelled by a later filter change or
+    a second command; a column-header sort or a pagination click reads the live filter bar (they
+    no longer re-send the filters of the last render); and sending a command aborts a results
+    request still in flight, so a late response for the previous command cannot swap its rows or
+    its Create Group button over the new command's table. Residual: a second command sent while
+    that first filter bar load is still in flight releases the queued deck request just before
+    the new response replaces it, so the previous command's deck request can still land (it
+    carries the previous command's id). For about 2 seconds after a command is sent the filter
+    bar is an empty placeholder and the header refresh fires on the same delay; this is not a
+    defect, because in a browser check the header had no sort links and the page no Prev or Next
+    controls in that window, so nothing could be clicked. Still open: an open Create Static
+    Group form is not cleared by a valid filter change and keeps its old filters and count
+    (#5669); and the built-in `help` command and a TAR SQL query clear the results area without
+    aborting a request in flight, and the hardware list keeps the older `this:abort` sync
+    (#5677).
   - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column,
     then value, so a rare value can be cut. The symptom is an agent missing from a facet filter or
     preview while its response still shows in the results.

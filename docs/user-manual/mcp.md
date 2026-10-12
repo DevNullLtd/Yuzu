@@ -775,7 +775,9 @@ for the tool to execute.
 > handler with `-32602` (A4 `error.data`) instead of answering `agent_count: 0`. Invalid UTF-8 (a bad
 > byte, or a lone surrogate escape such as `\ud800`) never reaches the handler: it fails the JSON parse
 > of the request itself, answered as `-32700` with a null `id` and no A4 `error.data`. Such a value can
-> never equal a stored facet: this version does not index a facet value over 2048 bytes (older servers indexed values that fit the database index tuple limit (about 2.7 KB for an incompressible value, less the instruction id length; a compressible value could be larger); those rows age out with retention), ingest rewrites each NUL or invalid-UTF-8 byte to
+> never equal a stored facet: this version does not index a facet value over 2048 bytes (older servers indexed longer
+> values, up to the database index tuple limit of about 2.7 KB, and those rows age out with
+> retention), ingest rewrites each NUL or invalid-UTF-8 byte to
 > U+FFFD, and it splits the output into lines on every line feed. The check runs on the raw values
 > before key resolution, so a value under a key that matches no column is refused too, rather than
 > answered as `0`. The error says the exact-match filter is not supported and the request was not
