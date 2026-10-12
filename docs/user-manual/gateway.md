@@ -2378,10 +2378,9 @@ env keys with defaults, which a reverted build ignores.
   0 for a value that is not a binary). That is the server's own bound
   (`server/core/src/gateway_service_impl.cpp`, `kMaxAgentIdLength` in
   `auth.hpp`), so an agent sees the same status class as before, only earlier and
-  without an upstream call. Before this change the gateway forwarded such a
-  request verbatim, the server answered `INVALID_ARGUMENT`, and the gateway
-  counted that answer as an upstream failure, so enough of them opened the
-  breaker; the problem pre-dates this change. As defence in depth the server
+  without an upstream call. Before this change the gateway counted a request the
+  server refused as wrong as an upstream failure, which could open the breaker;
+  the problem pre-dates this change. As defence in depth the server
   statuses `INVALID_ARGUMENT` (3), `NOT_FOUND` (5), `ALREADY_EXISTS` (6),
   `FAILED_PRECONDITION` (9) and `OUT_OF_RANGE` (11) are a request-fault set that
   leaves the breaker unchanged on the call path and on the replay path: not a
