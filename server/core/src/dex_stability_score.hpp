@@ -100,10 +100,11 @@
  * - The string vocabulary is closed and wire-stable: withheld reasons
  *   (no_population, invalid_weights, invalid_edges, inconsistent,
  *   below_floor), deduction names (breadth, crashes, hangs, regression) and
- *   band labels (excellent, good, fair, poor). Renaming one is a contract break. `name` and
- *   `withheld` are always string literals (static storage), never owned,
- *   never freed; compare them by content (std::string_view(x) == "...",
- *   strcmp), never by applying == to the raw pointer, which compares addresses.
+ *   band labels (excellent, good, fair, poor). Renaming one is a contract
+ *   break. `name` and `withheld` are always string literals (static storage),
+ *   never owned, never freed; compare them by content (std::string_view(x) ==
+ *   "...", strcmp), never by applying == to the raw pointer, which compares
+ *   addresses.
  * - Identity: 100 - sum(points) equals score, to within a few ulp in floating
  *   point, while the weights sum to at most 100 (each term lies in [0, 1] of
  *   its weight for N below 2^53; above that a term can exceed its weight by one

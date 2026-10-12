@@ -45,16 +45,16 @@
  *      (OverrideKeyDuplicate); then the EFFECTIVE tiers and weights (the
  *      override merged onto the global policy) pass the same edge, name and
  *      weight checks, reported at index i. A partial edge that conflicts with
- *      an inherited one is therefore refused, and is reported at that
- *      override's index also when the conflict arises from a later change to a
- *      global edge: a writer edits the override or the global.
+ *      an inherited one is therefore refused, reported at that override's
+ *      index, including when the conflict comes from a later change to a global
+ *      edge; the writer then edits either the override or the global.
  * Names and keys are printable ASCII in this cut; widening to UTF-8 later
  * relaxes the validator and never invalidates a stored document. Lowercasing is
- * the ASCII-only fold (A-Z); a writer lowercases keys with that same fold
- * before validating.
+ * the ASCII-only fold (A-Z to a-z, no locale); a writer folds keys the same
+ * way before validating.
  * Round-to-nearest floating-point mode is assumed: display exactness and the
- * weight-sum tolerance are stated under it; another mode can only refuse,
- * never accept wrongly.
+ * weight-sum tolerance are specified under it only; another mode may accept or
+ * refuse different doubles.
  *
  * Resolver precondition: the policy passed dex_score_policy_fault. The
  * resolver never re-validates. Profile "default" means no per-application
@@ -82,9 +82,9 @@
  *    validator is not an escaper, every sink escapes.
  *  - A ranking check calls
  *    stability_rank_flip(apps, floor, perturbed.weights, current.weights),
- *    where both are effective policies for the same page: ranking compares
- *    every application under ONE weight set (the global's), and per-application
- *    overrides never enter a ranking.
+ *    where both are the global policy's weights (the current and the proposed
+ *    ones): ranking compares every application under that ONE weight set, and
+ *    per-application overrides never enter a ranking.
  *  - The display, count and vocabulary rules in dex_stability_score.hpp's
  *    banner apply unchanged.
  */
@@ -365,6 +365,9 @@ struct DexEffectivePolicy {
 /// policy that passed dex_score_policy_fault.
 [[nodiscard]] inline DexEffectivePolicy resolve_dex_score_policy(const DexScorePolicy& p,
                                                                  std::string_view image) {
+    // No valid key is longer (key_valid), so a longer query cannot match: skip the fold.
+    if (image.size() > kDexPolicyMaxKeyBytes)
+        return {p.tiers, p.weights, DexPolicyProfile::Default};
     const std::string key = dex_score_policy_detail::ascii_lower(image);
     // Known ceiling: linear scan over <=200 overrides, per-application lookups
     // on a page of a few hundred apps; upgrade to a map if a profile ever shows it.
@@ -382,13 +385,17 @@ struct DexEffectivePolicy {
     return t.names[static_cast<std::size_t>(b)];
 }
 /// A temporary (resolve_dex_score_policy(p, img).tiers), const or not, would
-/// leave the reference dangling after the full expression.
+/// leave the reference dangling after the full expression, as would a reference
+/// bound to a temporary's .names[i].
 const std::string& dex_tier_name(DexTierPolicy&&, StabilityBand) = delete;
 const std::string& dex_tier_name(const DexTierPolicy&&, StabilityBand) = delete;
 
 /// Scores under ONE effective policy: its weights and its edges together. The
 /// one spelling a consumer uses; compute_stability_score's defaulted edges
 /// would otherwise let a caller drop them or take them from another policy.
+/// It does not re-validate: `eff` must come from a policy that passed
+/// dex_score_policy_fault. The scorer's own refusals (invalid_edges,
+/// invalid_weights) are structural only and do not stand in for that check.
 [[nodiscard]] inline StabilityScore dex_score_under_policy(const StabilityInputs& in,
                                                            std::int64_t floor,
                                                            const DexEffectivePolicy& eff) {

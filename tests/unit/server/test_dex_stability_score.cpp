@@ -237,7 +237,7 @@ TEST_CASE("stability: edge contract", "[dex][stability]") {
     // Unusual but structurally valid edges are scored, never withheld.
     require_scored(under({99.9, 0.2, 0.1}), 80.8, StabilityBand::Good);
 
-    // Each shape that used to band silently is now withheld.
+    // Unusable edges are withheld as invalid_edges, never banded.
     const struct {
         const char* name;
         double StabilityBandEdges::*slot;
@@ -252,7 +252,7 @@ TEST_CASE("stability: edge contract", "[dex][stability]") {
             require_withheld(under(e), "invalid_edges");
         }
     }
-    // A failing app (12.0) read "excellent" under all-negative edges.
+    // A failing app (12.0) must not band "excellent" under all-negative edges.
     require_withheld(under({-5.0, -10.0, -20.0}, mk(1000, 1000, 5000, 5000)), "invalid_edges");
     // Equal neighbours, unordered, and the ends of the open interval (0, 100).
     const StabilityBandEdges shapes[] = {{90, 90, 60},  {90, 75, 75},  {75, 75, 75}, {60, 75, 90},
@@ -261,6 +261,15 @@ TEST_CASE("stability: edge contract", "[dex][stability]") {
         INFO("edges " << e.excellent << " / " << e.good << " / " << e.fair);
         require_withheld(under(e), "invalid_edges");
     }
+
+    // The public predicate, asserted directly.
+    CHECK(stability_edges_valid(kStabilityBandEdges));
+    CHECK(stability_edges_valid({99.9, 0.2, 0.1}));
+    CHECK_FALSE(stability_edges_valid({100, 75, 60}));
+    CHECK_FALSE(stability_edges_valid({90, 90, 60}));
+    CHECK_FALSE(stability_edges_valid({90, 75, 0}));
+    CHECK_FALSE(stability_edges_valid({90, kNaN, 60}));
+    CHECK_FALSE(stability_edges_valid({60, 75, 90}));
 
     // Precedence: after no_population and invalid_weights, before inconsistent and below_floor.
     const StabilityBandEdges bad{60, 75, 90};
