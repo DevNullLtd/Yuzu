@@ -360,7 +360,7 @@ is correct as-is - `persist_lifecycle_journal_locked`, `ack_ledger_->retire()`, 
 `stop_all_guards_locked()` all need it, and PR-2 already removed the one thing that
 could make that hold backend-arm-bounded (a hung device/OS call); what remains under
 the lock is synchronous, rule-count-scaled local work - `apply_rules()`'s full_sync KV
-sweep + `detach_all()` + per-rule reconcile loop + unbounded journal persist on scope
+sweep + `detach_rules_except()` (`detach_all()` before #4415) + per-rule reconcile loop + unbounded journal persist on scope
 exit, and unconditionally the boot-time `start_local()`/`wire_spark_engine()` calls -
 plus `journal_maintenance_tick()`'s own periodic drain+persist when `prefer_spark_` is
 true (it no-ops immediately under the lock otherwise, which is production's default
@@ -475,7 +475,9 @@ flip, with a red-first test each:
   pre-existing raw-API-level tests could usefully assert `prior_state_preserved`'s value directly
   for extra regression-locking. Separately, #4415 tracks the pre-existing (not introduced by this
   PR) full-ruleset teardown-storm architecture this governance run's unhappy-path review
-  surfaced, confirmed a modest net improvement here rather than a regression.
+  surfaced, confirmed a modest net improvement here rather than a regression. (Update: the
+  PR that fixes #4415 skips a healthy, unchanged rule on a re-push instead of tearing it down;
+  see AC-18.)
 - **up-3, direct compensating-disarm fallback** (`on_arm_complete`'s `run_compensating_disarm`):
   on a non-timeout executor refusal the disarm runs direct on the worker, holding no quota;
   wedged direct calls accumulate alive workers to the per-instance ceiling and the instance
@@ -1101,9 +1103,10 @@ flip, with a red-first test each:
     applies the same service-scoped refusal and its tier gate. The `scope` parameter is a scope
     expression (`docs/user-manual/scope-engine.md`, section 2, for example
     `hostname == "web-prod-01"`).
-    **Cost to others:** any full push re-applies (every rule torn down and re-armed, the
-    AC-9/AC-10 baseline-recapture and AC-16 same-type effects) every in-scope agent that has
-    no suppress-eligible hold, because `decide_retry()` answers Reapply for every push except
+    **Cost to others:** any full push re-applies every in-scope agent that has
+    no suppress-eligible hold (a rule that is changed, not yet healthy, or whose key is faulted
+    or wedged is torn down and re-armed, with the AC-9/AC-10 baseline-recapture and AC-16
+    same-type effects; a healthy, unchanged rule is skipped, AC-18), because `decide_retry()` answers Reapply for every push except
     an identical retry of an open application whose unresolved work is still Pending,
     Committed or an outstanding wedge; this is true of a full push sent for any reason, and
     the Re-deploy sends one to every agent and also publishes every other staged member edit on
@@ -1152,11 +1155,13 @@ flip, with a red-first test each:
     teardown or re-arm), so the per-rule kv puts, lifecycle journal records and
     compliant-edge events of a re-arm are not produced. In a pure retained-wedge hold only
     the safety valve's forced Reapply (one push in eleven, about every 330 s at the 30 s
-    heartbeat) pays the full
-    teardown and re-arm, which at R=100 rules is R kv puts, about 2R lifecycle journal
-    records and R compliant-edge events (unmeasured). If the push also holds a healthy
-    rule of the hung call's mechanism type, only the FIRST forced Reapply is on that
-    cadence: after it, every push is a Reapply and pays this cost (AC-16, AC-12). The lifecycle journal on the
+    heartbeat) applies the push. Before #4415 it paid the full
+    teardown and re-arm of every rule, which at R=100 rules is R kv puts, about 2R lifecycle journal
+    records and R compliant-edge events (unmeasured); since #4415 a healthy, unchanged rule
+    pays none of that (AC-18), and those figures describe only the rules that are rebuilt. If the
+    push also holds a healthy rule of the hung call's mechanism type, the forced Reapply used to
+    withdraw it and every later push was a Reapply (AC-16, AC-12); since #4415 it is skipped
+    like any healthy rule (`[5459fu10]`, on a fake mechanism). The lifecycle journal on the
     endpoint keeps evidence within `kMaxJournalBatches`=1000 / 32 MiB / 7 days and evicts
     the oldest first (the evictions are counted:
     `yuzu.guardian_journal_evicted_sent_unacked`,
@@ -1215,19 +1220,23 @@ flip, with a red-first test each:
     (eleven pushes); a 25 s heartbeat gives about 275 s (later if jitter delays a push to the
     next heartbeat) and other intervals scale. That
     cadence holds only while every counted failure is a retained wedge: if the push also
-    holds a healthy rule of the hung call's mechanism type, only the first forced Reapply
+    holds a healthy rule of the hung call's mechanism type that the push changes, or
+    that is otherwise not skip-eligible (AC-18), only the first forced Reapply
     is on it and every later push is a Reapply (AC-16). The Reapply re-arms every
-    rule in the push but does NOT unstick the wedged claim (an identical re-observation
+    rule in the push that is not healthy and unchanged (AC-18; before #4415, every rule)
+    but does NOT unstick the wedged claim (an identical re-observation
     returns the existing claim), so it buys nothing against a genuinely hung arm; it only
     bounds the dependence on the suppress classification (it is not a recovery guarantee
     against a classifier that misidentifies a dead claim). The counter resets only in
-    `begin_application()`/`retire()`. Because it re-arms every rule in the push, the forced
+    `begin_application()`/`retire()`. Because it re-arms each rule that is not skipped, the forced
     Reapply (a) can recapture a Spark-first `FileHashEquals` baseline that was lost,
-    never written or overwritten (#4045, AC-10) and (b) while a same-type mechanism call
-    is hung, can withdraw healthy same-type siblings, after which every later push is a
+    never written or overwritten (#4045, AC-10: such a rule is rebuilt, since its pushed
+    baseline hash is empty or differs from the live one) and (b) while a same-type mechanism call
+    is hung, can withdraw a same-type sibling that it rebuilds, after which every later push is a
     Reapply (AC-16). If the budget is already spent when a retained wedge's late success
-    is adopted, the next identical push is a forced Reapply of the just-armed rule: one
-    wasted teardown, never an acknowledgment.
+    is adopted, the next identical push is a forced Reapply that skips the just-armed rule
+    (no teardown) and acknowledges the held generation inline (`[5459valve]`); before #4415
+    it tore that rule down and re-armed it, and never acknowledged on that push.
   - (AC-10) **#4045 baseline relaunder, narrow.** Persisted baselines are re-seeded on
     every arm (`guardian_engine.cpp`, the arm-time re-seed), `apply_rules` writes the
     staged, not-yet-persisted Spark captures within its pass budget before it tears down
@@ -1263,7 +1272,9 @@ flip, with a red-first test each:
     more at shutdown before the final flush, so this is a window only until a retry
     succeeds; a crash or hard kill in it loses the capture (case 1), a shutdown whose own
     retry also fails loses it (logged), and a re-push in it (a delta push, which retries
-    twice, or a full_sync, which withdraws every rule first and retries once) recaptures
+    twice, or a full_sync, which used to withdraw every rule first and retry once; since #4415
+    it withdraws only the rules the push omits, and a rule it keeps and rebuilds goes through
+    the same attach path as a delta push) recaptures
     only if every retry also fails, in which case the new arm captures whatever the file
     then holds (counted, once per failed attempt); the same happens when a retry succeeds
     but the copy of the staged hash back fails, where the saved record keeps the original
@@ -1276,7 +1287,8 @@ flip, with a red-first test each:
     sustained outage; (6) the refused window: the arm-time read of the record failed
     while a valid record existed, so the live rule is judged against freshly captured
     content (possibly already drifted) and reports compliant until its next re-arm or
-    restart; the record stays intact (the overwrite guard refuses the write), and the
+    restart (an identical re-push is such a re-arm: the baseline the push carries is empty or
+    differs from the live one, so the rule is rebuilt, never skipped, AC-18); the record stays intact (the overwrite guard refuses the write), and the
     refusal is counted by an agent-side diagnostic accessor only; (7) a record found
     malformed (bad JSON, an unknown schema number, an invalid hash) is discarded at arm
     and overwritten at persist, which predates #4045 (#4021) and applies to both paths;
@@ -1302,7 +1314,9 @@ flip, with a red-first test each:
     Baseline stays armed or wedged until a full push. Follow-up FU-12 (#5547).
   - (AC-12) **A push mixing a wedge with any non-wedge failure** (a congestion expiry, a
     refusal) is a Reapply every time: the suppression applies only when every unresolved
-    item is an outstanding wedge (or a Pending/Committed sibling).
+    item is an outstanding wedge (or a Pending/Committed sibling). Each such Reapply still
+    re-attempts the failing rule, but since #4415 it no longer tears down and re-arms the
+    healthy, unchanged rules beside it (AC-18); `decide_retry()` itself is unchanged.
   - (AC-13) **Recovery needs a live connection and a generation-tracking server.** The
     maintenance tick runs on the per-connection heartbeat thread, and the retry owner is
     the server's `full_sync` re-push. Agent restart gap: the boot Application opens at the
@@ -1354,17 +1368,21 @@ flip, with a red-first test each:
     latched on unwind before the flip); and a boot `begin_application()` throw leaves no
     boot application, so late boot receipts are not tracked (synchronous failures are
     still caught). An acknowledgment persisted by the old waiver is not revoked.
-  - (AC-14) **Content identity (#5512).** A re-observation of a wedged claim matches
-    `rule_id` and spec only (the content-identity bug); recorded, not fixed here. Operator
-    consequence: a wedged rule edited without changing its spec (its expected value, for
-    example) is re-observed, not rebuilt (`attach_core()` constructs nothing new on that
-    path), so a late success arms the content the claim was created with, not the edit. The watch
+  - (AC-14) **Content identity (#5512).** Before the #4415 PR, a re-observation of a wedged
+    claim matched `rule_id` and spec only (the content-identity bug): a wedged rule edited
+    without changing its spec (its expected value, for example) was re-observed, not rebuilt,
+    so a late success armed the content the claim was created with, not the edit, and the
+    generation was acknowledged on it (`can_advance()` does not compare content). Since that
+    PR a re-observation also requires identical content (an immutable content id kept on the
+    claim, plus the pushed expected hash); changed content over the rule's own wedge queues as a
+    follower behind the wedge, replacing the rule's older claim, and the late success commits the
+    follower's content (`[4415prA]` runtime cases, on a fake backend; none uses a real Windows
+    mechanism). One desired incarnation per rule on a key: a push of the old content while the
+    new-content follower is queued re-observes the wedge and withdraws the follower. The watch
     target that re-keys a rule is the path (File), the service name (Service) or the hive and
     key (Registry), per `spark_key()`; a registry rule's value name and expected value are not
-    part of that target and do not re-key it. When that late success is adopted on the re-observed
-    claim the generation is acknowledged (`can_advance()` does not compare content) and the
-    server stops re-pushing, so the stale content stays until the next push that carries a new
-    generation.
+    part of that target and do not re-key it, which is why a content change over a wedge reaches
+    this path rather than a new key.
   - (AC-15) **A wedge that is adopted or settles before the agent has retained it costs one
     avoidable Reapply (accepted by the operator; follow-up FU-14, #5548).**
     `drain_locked()` retains a wedge in `failed_receipts` only if it still reads
@@ -1377,51 +1395,50 @@ flip, with a red-first test each:
     pending loop of `decide_retry()` treats it as outstanding while it still reads
     wedge-eligible or compensation-pending, and answers Reapply once it has been adopted or
     has settled (a settled `Wedged` receipt that is no longer outstanding). Either way
-    the Reapply is a teardown and re-arm of a rule that has just armed. Safe direction: it
-    never acknowledges, and the new application re-observes the true state. The
+    the Reapply used to be a teardown and re-arm of a rule that has just armed; since #4415
+    that rule is committed, healthy and unchanged, so the Reapply skips it (AC-18, shown for
+    the valve-spent shape by `[5459valve]`). Safe direction: the new application re-observes
+    the true state (a skipped rule registers no receipt, so nothing is left pending and the push
+    can acknowledge the held generation inline). The
     suppression statements for `Recovered`/`WedgeEligible` apply to RETAINED entries only.
-  - (AC-16) **A forced Reapply during a hung same-type mechanism call can withdraw healthy
-    same-type siblings.** `SparkEngine` serialises `watch()`/`unwatch()` per mechanism type
-    (`mech_ops_mu_by_type_`); while one call of a type is hung, the Disarm of a healthy
-    armed rule of that type queues behind it, so its detection is logically off at once and
-    its re-arm may expire as `CongestionExpired` (the AC-12 class). Not new: before #5459
-    every Reapply did the same. **Option D does not bound this to every 330 s when the
-    pushed set holds a healthy same-type sibling; it only delays the onset.** The first
-    forced Reapply (about 330 s into the hold at the 30 s default heartbeat) withdraws the
-    sibling; its re-arm queues behind the hung call and expires `CongestionExpired`, a
+  - (AC-16) **A forced Reapply during a hung same-type mechanism call can withdraw a
+    same-type sibling that it rebuilds; since #4415 it no longer withdraws a healthy,
+    unchanged one (AC-18).** `SparkEngine` serialises `watch()`/`unwatch()` per mechanism type
+    (`mech_ops_mu_by_type_`); while one call of a type is hung, the Disarm of an armed rule of
+    that type queues behind it, so its detection is logically off at once and its re-arm may
+    expire as `CongestionExpired` (the AC-12 class). Not new: before #5459 every Reapply did
+    the same, and before #4415 every Reapply withdrew every rule in the push, so a healthy
+    same-type sibling was always hit. Before #4415, **option D did not bound this to every 330 s
+    when the pushed set held a healthy same-type sibling; it only delayed the onset**: the first
+    forced Reapply (about 330 s into the hold at the 30 s default heartbeat) withdrew the
+    sibling; its re-arm queued behind the hung call and expired `CongestionExpired`, a
     counted failure that is not a retained wedge (in production the re-arm claim's 5 s
-    backend deadline passes well before the next push, a code-read; `[5459fu10]` uses a
-    synthetic clock). After that `resolved_failed != failed_receipts.size()`, so
-    `decide_retry()` answers Reapply on EVERY later push (AC-12), about one per heartbeat
-    for as long as the hang lasts. Only the first forced Reapply queues the sibling's disarm;
-    each later Reapply queues a new re-arm behind that same still-pending disarm (the key's
-    queue depth stays 2 in `[5459fu10]`), and each carries the AC-10 baseline exposure. Only a hold with no healthy same-type sibling in
-    the push stays on the valve's cadence (an AC-15 Reapply, a `full_sync=false` push or
-    an exit push adds Reapplies on top of it). Its severity depends on `prefer_spark_` staying off in production (it
+    backend deadline passes well before the next push, a code-read), after which
+    `resolved_failed != failed_receipts.size()` and `decide_retry()` answered Reapply on every
+    later push (AC-12). Since #4415 the sibling is skipped, so that sequence does not start for
+    it. **What remains:** a same-type sibling the push CHANGES, or that is not skip-eligible
+    (in an Unknown episode, on a key the mechanism reported faulted, with a baseline hash that
+    differs from the live one, or with an empty baseline seed), is still rebuilt, and its disarm
+    and re-arm queue behind the hung call exactly as above; and a truly stuck key still gets its
+    Reapply at the valve. Its severity depends on `prefer_spark_` staying off in production (it
     defaults to `false` and no production code passes `true`; a code-read condition, not an
     executed one). **Flip
     precondition:** the journal-eviction measurement (FU-1) executed, with the two tests
     below passing; the same-type sibling test (FU-10) and the late-subscription test (FU-11)
     now exist, in `tests/unit/test_guardian_engine_spark_reconcile.cpp`, on a fake
-    mechanism with a synthetic clock. `[5459fu10]` ("#5459 FU-10 (AC-16): ...") hangs one of
-    two same-type (Service) `watch()` calls and, with the valve budget spent, asserts that:
-    the next identical push withdraws the other, healthy rule (the armed-rule count is 0
-    straight after the push); its teardown and re-arm do not reach the mechanism while the
-    hang lasts (no `unwatch()` completes and no further `watch()` starts, across a bounded
-    number of maintenance ticks; its disarm worker is alive and its key holds two claims,
-    the disarm and the re-arm behind it); once the re-arm claim is aged on the synthetic
-    clock it is abandoned (the key's queue loses exactly that claim, the runtime classes it
-    CongestionExpired, and the application then counts it as a failure beside the wedge;
-    the status name is in the log line, not in an assertion); the generation stays
-    unacknowledged in memory and on disk throughout; and after the hang is released the
-    release alone does NOT bring the sibling back (its teardown runs, its re-arm claim is
-    gone, the generation stays held), the next identical push re-arms both rules, and the
-    generation is acknowledged only once both are live. It also pins the churn above: after
-    the sibling's re-arm has expired, an identical push is a real Reapply (the application
-    fence moves by one, a new application begins with no counted failure, the sibling's
-    re-arm is queued again behind its pending teardown), not a Suppress. `[5459fu11]` is described under
-    FU-11 in §3a. Neither test uses a real Service mechanism, a real clock, or measures a
-    push rate. The same lock is why exits (b) and (c) of AC-1
+    mechanism with a synthetic clock. `[5459fu10]` ("#5459 FU-10 (AC-16): ...") was rewritten
+    for #4415. It hangs one of two same-type (Service) `watch()` calls and, with the valve
+    budget spent, asserts that the next identical push is a real Reapply (the detach epoch
+    moves by one) that leaves the other, healthy rule alone: the armed-rule count stays 1,
+    its key has no pending disarm and no queued re-arm, the only backend worker is the hung
+    call, no `unwatch()` completes and no further `watch()` starts across a bounded number of
+    maintenance ticks, and aging the synthetic clock expires no claim; the application counts
+    the wedge as its one failure (it counted two before #4415); the generation stays
+    unacknowledged in memory and on disk while the hang lasts; the next identical push is a
+    Suppress again (before #4415 it was a Reapply); and once the hang is released the late
+    success alone acknowledges the generation with both rules live and no replacement arm.
+    `[5459fu11]` is described under FU-11 in §3a. Neither test uses a real Service mechanism, a
+    real clock, or measures a push rate. The same lock is why exits (b) and (c) of AC-1
     carry the same-type condition: the new application's own same-type arms queue behind the
     hung call exactly as a forced Reapply's re-arms do.
   - (AC-17) **Flip-time documentation sweep (a flip precondition; follow-up FU-15, #5549).** Several statements in the operator pages are true only while `prefer_spark` is
@@ -1457,6 +1474,54 @@ flip, with a red-first test each:
     (about a hundred lines match today, most unrelated) and judge each hit. Re-grep for each
     phrase at the flip; a statement not in this list that depends on `prefer_spark=false` is
     also in scope.
+  - (AC-18) **A re-push skips a healthy, unchanged rule (#4415); what that costs.** Not a flip
+    precondition on its own: it changes what AC-9, AC-10, AC-12, AC-15 and AC-16 describe, which
+    were written for a Reapply that tore down and re-armed every rule in the push. The skip is
+    inside the per-rule chokepoint (`reconcile_rule_locked` -> `attach_rule` -> `attach_core`,
+    `reuse_existing_locked`), so a full_sync and a delta push take the same decision. Like the rest of this section it applies on the Spark path, which production does not enable (`prefer_spark_` is false); the `rule:` row change below runs on both paths. A rule is
+    skipped only if ALL hold: it is attached, committed and active; its key and spec are
+    unchanged; its key holds no claim (the one exception is the same rule's own identical,
+    still-in-flight arm, which is re-observed instead of withdrawn and requeued); its content
+    id (kind, name, debounce, expected value and the other fields that change what it enforces)
+    is equal; it is not in an Unknown episode; its key has not been reported faulted by the
+    mechanism; the index still owns it; and, for `FileHashEquals`, the pushed (post-seed) hash
+    is non-empty and equals the live effective baseline. Any term false rebuilds the rule as
+    before. A skipped rule gets no new incarnation, no lifecycle record, no receipt and no
+    `guard.armed` re-emit; the detach epoch still moves on every full_sync. A full_sync now
+    detaches only the rules the push omits (`detach_rules_except`; the global wedge-candidate
+    sweep and the unconditional epoch bump are unchanged) plus any kept rule whose key the
+    mechanism reported faulted, so that a shared faulted key is rebuilt rather than rejoined.
+    The persisted `rule:` rows follow the same shape: a full_sync deletes only the rows the
+    push omits, and an unchanged row is not rewritten (a row that cannot be read, or that
+    differs, is written); every existing hold on a failed scan or delete is unchanged. Accepted
+    losses (operator decision, 2026-10-12): (1) an identical re-push no longer re-emits
+    `guard.compliant` for a skipped rule, so it no longer repairs a lost recovery event by
+    accident; (2) it no longer restarts the `pending_initial` demotion clock; (3) a crash after
+    the absent-row sweep and before the per-rule rewrites leaves the previous rows for kept
+    rules until the next push (a restart then re-arms those); (4) a faulted shared key is
+    repaired by a full_sync only, not by an identical delta push, which rebuilds each rule on it
+    individually and so rejoins the same watcher; (5) if an earlier rule's KV persist fails
+    mid-push, apply_rules returns early (generation held, failure latched), and a kept rule
+    that this push would have disabled or changed keeps enforcing its OLD content until the
+    retry, because the carried-rule teardown and rebuild have not run for it yet. That
+    over-enforces rather than under-enforces, and the Spark path is dormant while `prefer_spark_`
+    is false. The keep-set (`full_sync_ids`) is now built before the first rule is persisted
+    rather than inside the rule loop; the baseline (`45f727420`) already inserted into the same
+    `std::set` after `begin_application()` with no catch, so this moves that existing exposure
+    earlier in the push and adds no new class (the unlatched post-`begin_application()` throw
+    is AC-13's). The full_sync log line is emitted once per push that reaches the end of its
+    rule loop and is best-effort under allocation failure; a push that returns early on a
+    persist failure emits none. A skipped rule whose identical arm is still in flight is named
+    in a separate `pending_reused` list on that line, not in the preserved list, because it has
+    not confirmed: `fullsync_blackout_diag.py` keeps waiting for its own `arm committed` line
+    and functional event instead of counting it as accounted for. Not changed: `decide_retry()` and the valve,
+    so a forced Reapply still happens at the valve cadence and still rebuilds every rule that
+    fails a term above, including a stuck key's own rule. The server's re-push cadence (#5612)
+    and the delta-omission obligation loss (#5547, AC-11) are untouched. Evidence is the
+    `[4415prA]` tests (`test_guardian_spark_reapply_skip_engine.cpp`,
+    `test_guardian_spark_reapply_skip_runtime.cpp`) and the rewritten `[5459fu10]`,
+    `[5459fu11]`, `[5459valve]`, `[5459kv]`, on fake mechanisms; no sanitizer, Windows or macOS
+    run is recorded for them here.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
@@ -1483,22 +1548,22 @@ flip, with a red-first test each:
   group message and the appended failure-count text read as two parenthesised phrases in
   a row, and the "was"/"were" wording differs between groups. No production code changes
   with this entry.
-- **Follow-ups added by the #5459 option D governance run (FU-12 is #5547; FU-13 is tracked on #5504; FU-14 is #5548; FU-15 is #5549; FU-16 is #5550; FU-17 is #5551).** FU-10: a test that a forced Reapply during a hung same-type mechanism call
-  withdraws healthy same-type siblings and that the re-arm outcome is as AC-16 states (a flip
-  precondition). Now covered by `[5459fu10]`; what it asserts is listed under AC-16, and the
-  journal-eviction measurement (FU-1), which no test covers, still gates the flip. It also pins
-  that, once the sibling's re-arm has expired, each further identical push is a Reapply. FU-11: a
+- **Follow-ups added by the #5459 option D governance run (FU-12 is #5547; FU-13 is tracked on #5504; FU-14 is #5548; FU-15 is #5549; FU-16 is #5550; FU-17 is #5551).** FU-10: a test of what a forced Reapply during a hung same-type mechanism call
+  does to a healthy same-type sibling and of the outcome AC-16 states (a flip
+  precondition). Covered by `[5459fu10]`, rewritten for #4415 (the sibling is now left alone
+  instead of withdrawn); what it asserts is listed under AC-16, and the
+  journal-eviction measurement (FU-1), which no test covers, still gates the flip. FU-11: a
   test that a subscription armed late (a wedged arm whose late
   success is adopted) stays live across the next identical push and the following
   acknowledgment (a flip precondition). Now covered by `[5459fu11]`, on a fake mechanism: with
   the valve budget unspent, an identical push between the adoption and the next maintenance
   tick is suppressed (the same application survives, no new `watch()`, no `unwatch()`, the
   subscription stays live); the following ticks acknowledge on the original subscription;
-  and an identical push after the acknowledgment is a real Reapply that tears the
-  subscription down and re-arms it to exactly one live subscription for the right key
-  (two `watch()` calls and one `unwatch()` in all), with the generation still acknowledged
-  and durably stored. The test pins that outcome, so "stays live" holds across the first
-  push but not as "never torn down" across the later one. The valve-spent case of the same
+  and an identical push after the acknowledgment is a real Reapply (the detach epoch moves)
+  that, since #4415, leaves the healthy rule alone: exactly one live subscription for the right
+  key from the ORIGINAL `watch()` (one `watch()` call and no `unwatch()` in all), with the
+  generation still acknowledged and durably stored (before #4415 it was torn down and
+  re-armed, two `watch()` calls and one `unwatch()`). The valve-spent case of the same
   push is `[5459valve]`'s. Still unmeasured for both: any real Service mechanism. FU-12 (#5547): the delta-omission obligation loss (AC-11):
   a partial push that omits a still-unresolved rule drops its retry obligation. FU-13 (tracked on #5504, design input posted as a comment: https://github.com/DevNullLtd/Yuzu/issues/5504#issuecomment-6034180683; #5504's third acceptance criterion already asks for the per-agent back-off decision): an
   escalating server back-off for held agents (AC-1), reset on policy change, weighed
@@ -1656,7 +1721,8 @@ that is stated explicitly rather than inferred or invented.
   triaged, not assumed unchanged. **A second, distinct compounding finding (2026-09-06,
   criterion 5's own governance review, see §2)**: because a no-`expected`-value hash rule
   captures the CURRENT target content as its baseline on every arm, and `#3990`'s `full_sync`
-  re-arms every rule unconditionally on any unrelated mutation, a genuinely-still-drifted such
+  re-arms every rule unconditionally on any unrelated mutation (on the Spark path, since #4415, a healthy
+  unchanged rule is skipped, AC-18), a genuinely-still-drifted such
   rule can be silently reclassified as compliant with no remediation having happened - filed
   as **#4021**, also not risk-accepted here. See the new **#3990** entry immediately below for
   the ruling-13 diagnostic this package's own milestone re-weighing should be read alongside.
@@ -2685,10 +2751,11 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   host and the agent log is the only per-host evidence, so an operator who cannot identify the
   affected hosts is left with the same push over a wider scope, at the cost below. Avoid the
   fleet-wide route (a
-  Baseline deploy issues a fleet-wide `full_sync`, `guardian_routes.cpp`): a `full_sync` tears
-  down and re-arms every rule on every in-scope agent (R5.7 (g)(1); its cost is the #3990
-  blackout, `docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md`) and re-classifies any
-  host still in an episode. No further runbook exists: R5.7 (g)(1) and the operator manual say
+  Baseline deploy issues a fleet-wide `full_sync`, `guardian_routes.cpp`): a `full_sync` reaches
+  every in-scope agent: before #4415 it tore down and re-armed every rule there (R5.7 (g)(1);
+  its cost is the #3990 blackout, `docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md`,
+  measured before #4415); since #4415 a rule that is healthy and unchanged is skipped (AC-18)
+  and the rest are rebuilt. It also re-classifies any host still in an episode. No further runbook exists: R5.7 (g)(1) and the operator manual say
   only that the rules stay disarmed until the next reconcile or an agent restart.
 - Compensating control: `prefer_spark_` is false in production, so the Unsupported placement
   cannot occur today. `agent.cpp` constructs `GuardianEngine` with the two-argument form, so

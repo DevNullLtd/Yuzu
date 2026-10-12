@@ -2649,8 +2649,10 @@ Guardian ladder must check these.
   prior generation whose capture could not be staged (an allocation failure,
   `RuleGeneration::baseline_unstaged`) has its committed hash staged first, on the
   same path, so the lookup finds it; and every withdrawal (`detach_rule`, and
-  `detach_all`, which a full_sync push runs before it re-arms anything, leaving
-  attach_core no prior generation to read) stages it before the generation is
+  `detach_all` / `detach_rules_except`, which a full_sync push runs before it re-arms
+  anything, leaving attach_core no prior generation to read for a rule the push omits; since
+  #4415 a rule the push keeps is not detached there, and attach_core either skips it or
+  replaces its prior generation as a delta push does) stages it before the generation is
   dropped (`salvage_unstaged_baseline_locked`).
   (b) `reconcile_rule_locked` holds the persister's `persist_mu_`
   (`hold_seed_fence()`) from a baseline-on-arm rule's seed read to the end of the

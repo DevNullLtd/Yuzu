@@ -64,6 +64,33 @@ arm to commit. This round adds:
     bounded functional-validity polling, and an offline `selftest` subcommand (run BEFORE any
     server login) covering the fence logic end to end.
 
+#4415 (scoped detach): an agent built with the #4415 skip no longer tears down a healthy,
+unchanged rule on a full_sync, so there is no blackout to measure for it, and three of this
+tool's assumptions stop holding. (1) `detach_all complete` still prints, in the same shape, but
+`detached_rules` now counts only the rules the push OMITTED (plus kept rules on a key the
+mechanism reported faulted), not every rule the runtime holds. (2) The T0 line is
+`Guardian: full_sync removed N prior rule(s) absent from the push`, logged only when at least
+one stored row was removed, so an identical or add-only push has none; `run --scoped-detach`
+falls back to the observed push command as T0 for that case. (3) A skipped rule emits no
+`arm committed` (T2) line and no `guard.compliant` event.
+The agent names the skipped rules instead: once per full_sync, after the rule loop, it logs
+`Guardian: full_sync preserved N rule(s) (skipped re-arm) ids=[a,b,...] more=M` (once per
+full_sync that reaches the end of its rule loop, N may be 0, best-effort under allocation
+failure; ids are sanitised, capped at 128 entries / 4096 bytes, and M counts those not listed).
+When a skipped rule's identical arm is still IN FLIGHT (not yet committed) the same line continues
+with ` pending_reused P ids=[c,d,...] more=Q`. Those rules are NOT accounted for: they stay in
+the expected set until their own `arm committed` line arrives (a below-floor `callback-*` commit
+of a named rule is accepted, since it belongs to the earlier push's arm), else they are
+`arm_never_confirmed`, and they are still polled for their functional event.
+`classify_t2` accounts for every expected rule exactly: re-armed (a T2 line), preserved (named
+in the line, committed) or neither. A rule in neither set is `missing` and, after the end-of-run sweep,
+`arm_never_confirmed` (genuine), so a kept rule that failed to re-arm cannot hide behind a
+count. A line with M > 0 cannot name every skipped rule, so a rule unaccounted for under it is
+voided `preserved_list_truncated` (instrument) rather than called failed. An agent without the
+line (pre-#4415) never has a rule classified preserved. Without `--scoped-detach` behaviour is
+otherwise unchanged and measures a pre-#4415 binary. With it, an attempt that re-arms nothing
+is voided `no_rearm_all_preserved` (instrument class: nothing was torn down, so C is undefined).
+
 KNOWN BUG, FIXED THIS ROUND: `cmd_report`'s grouping previously could not distinguish rows from
 two different `run` invocations sharing the same label. Every row now carries `run_id` and
 `comparison_id`; grouping and the printed report key on both.
@@ -119,7 +146,14 @@ PROTECTED_BASELINE_NAMES = {"DGRHP File Drift Test"}
 LOG_TS_RE = re.compile(
     r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\] \[(\w+)\] \[(\d+)\] (.*)$"
 )
-T0_RE = re.compile(r"Guardian: full_sync cleared (\d+) prior rule\(s\)")
+T0_RE = re.compile(r"Guardian: full_sync (?:cleared|removed) (\d+) prior rule\(s\)")
+# #4415: one line per full_sync from GuardianEngine::apply_rules, naming the rules the skip left
+# in place (guardian_preserved_tally.hpp owns the format). ids are log_id_token()-sanitised, so
+# ',' cannot occur inside one; `more` > 0 means the list is incomplete.
+PRESERVED_RE = re.compile(
+    r"Guardian: full_sync preserved (\d+) rule\(s\) \(skipped re-arm\) ids=\[(.*?)\] more=(\d+)"
+    r"(?: pending_reused (\d+) ids=\[(.*?)\] more=(\d+))?$"
+)
 T0_FALLBACK_RE = re.compile(r"Received command: plugin=__guard__, action=push_rules")
 PUSH_CMD_RE = T0_FALLBACK_RE  # same line; R5.7 role: an OBSERVED push command, not a T0
 T1_RE = re.compile(
@@ -157,6 +191,7 @@ INSTRUMENT_INVALID_REASONS = frozenset({
     "t0_not_found", "t0d_not_found", "t1_not_found", "t2_incomplete", "t2_late",
     "log_rotated_mid_window", "trigger_not_created", "repush_confound",
     "applied_ne_total", "double_full_sync", "cohort_composition", "teardown_size_mismatch",
+    "no_rearm_all_preserved", "preserved_list_truncated",
 })
 GENUINE_FAILURE_REASONS = frozenset({
     "failed_gt_0", "arm_never_confirmed", "functional_invalid", "fence_violation",
@@ -748,11 +783,20 @@ def classify_t2(events, epoch, floor, expected_rule_ids, own_push_raw, backend, 
     push_lines[event,...] (excluding the trigger's own line), missing[rid,...],
     legacy_before_t0d[raw,...], next_t0d_ts (the next application's T0d
     timestamp if one appears, else None - `double_full_sync` by EVENT, never
-    by a bare timestamp comparison)."""
+    by a bare timestamp comparison), preserved[rid,...] (#4415, spark only: the
+    expected rules the agent's `full_sync preserved` line names that have no T2
+    line of their own; they are not in `missing`), preserved_truncated (the line
+    reported more=M>0 AND some expected rule is still unaccounted for, so that
+    rule cannot be called failed), pending_reused[rid,...] (the expected rules the line names
+    as re-observed while their arm was still in flight: NOT removed from `missing`, and a
+    below-floor callback commit of one is selected, not rejected) and preserved_line (the parsed
+    line or None)."""
     remaining = set(expected_rule_ids)
     selected, rejected, adopt_lines, push_lines, legacy_before_t0d = {}, [], [], [], []
     next_t0d_ts = None
     own_excluded = False
+    preserved_line = None
+    fence_pending = []
     for p in sorted(events, key=lambda p: p["ts"]):
         if p["ts"] < t0_ts:
             continue
@@ -772,6 +816,18 @@ def classify_t2(events, epoch, floor, expected_rule_ids, own_push_raw, backend, 
                 continue
             push_lines.append(p)
             continue
+        mpres = PRESERVED_RE.match(p["msg"])
+        if mpres:
+            # Emitted after the rule loop of the application that logged this T0d, so the first
+            # one at or after T0d (and before the next application's T0d, cut off above) is ours.
+            if backend == "spark" and preserved_line is None and p["ts"] >= t0d_ts:
+                ids = [i for i in mpres.group(2).split(",") if i]
+                pids = [i for i in (mpres.group(5) or "").split(",") if i]
+                preserved_line = {"count": int(mpres.group(1)), "ids": ids,
+                                  "more": int(mpres.group(3)),
+                                  "pending_count": int(mpres.group(4) or 0), "pending_ids": pids,
+                                  "pending_more": int(mpres.group(6) or 0)}
+            continue
         if backend == "spark":
             m2 = T2_RE.match(p["msg"])
             if not m2:
@@ -788,7 +844,10 @@ def classify_t2(events, epoch, floor, expected_rule_ids, own_push_raw, backend, 
                 adopt_lines.append({"rule_id": rid, "ts": p["ts"], "incarnation": inc_v,
                                      "type": typ, "attach_to_commit_ms": ms_v})
             if inc_v <= floor and via != "callback-adopt":
-                rejected.append({"line": p["raw"], "reason": "fence_violation_below_floor"})
+                # The preserved line is logged AFTER the rule loop, so it may sort after this
+                # commit: decide once the whole window is read (a pending-reused rule's commit
+                # belongs to the earlier push's still-in-flight arm).
+                fence_pending.append((p, rid, inc_v, typ, via, ms_v))
                 continue
             if rid in selected:
                 rejected.append({"line": p["raw"], "reason": "duplicate_rule"})
@@ -809,14 +868,37 @@ def classify_t2(events, epoch, floor, expected_rule_ids, own_push_raw, backend, 
                 continue
             selected[rid] = {"ts": p["ts"]}
             remaining.discard(rid)
+    pending_reused = set(preserved_line["pending_ids"]) if preserved_line is not None else set()
+    for p, rid, inc_v, typ, via, ms_v in fence_pending:
+        if rid in pending_reused and via.startswith("callback-") and rid not in selected:
+            selected[rid] = {"ts": p["ts"], "incarnation": inc_v, "type": typ, "via": via,
+                              "attach_to_commit_ms": ms_v, "reobserved_adopt": False,
+                              "pending_reused": True}
+            remaining.discard(rid)
+        else:
+            rejected.append({"line": p["raw"], "reason": "fence_violation_below_floor"})
+    preserved = []
+    if preserved_line is not None:
+        listed = set(preserved_line["ids"])
+        preserved = sorted(rid for rid in remaining if rid in listed)
+        remaining -= set(preserved)
     return {
         "selected": selected, "rejected": rejected, "adopt_lines": adopt_lines,
         "push_lines": push_lines, "legacy_before_t0d": legacy_before_t0d,
-        "missing": sorted(remaining), "next_t0d_ts": next_t0d_ts,
+        "missing": sorted(remaining), "preserved": preserved, "next_t0d_ts": next_t0d_ts,
+        "preserved_truncated": bool(
+            preserved_line and (preserved_line["more"] > 0 or preserved_line["pending_more"] > 0)
+            and remaining - pending_reused),
+        "pending_reused": sorted(pending_reused & set(expected_rule_ids)),
+        "preserved_line": preserved_line,
     }
 
 
-def check_teardown_size(t0d, backend, expected_n):
+def check_teardown_size(t0d, backend, expected_n, scoped_detach=False):
+    if scoped_detach and backend == "spark":
+        # #4415: detached_rules counts only the rules the push omitted, so anything from 0 up
+        # to the whole cohort is legal; more than the cohort is not.
+        return "teardown_size_mismatch" if t0d["detached_rules"] > expected_n else None
     expected_detached = expected_n if backend == "spark" else 0
     return "teardown_size_mismatch" if t0d["detached_rules"] != expected_detached else None
 
@@ -1004,7 +1086,10 @@ def resolve_collect_t2_reason(result):
     if result["next_t0d_ts"] is not None:
         return "double_full_sync"
     if result["missing"]:
-        return "t2_incomplete"
+        # #4415: a truncated preserved list cannot tell "skipped" from "failed" for the rules it
+        # did not name, so that is an instrument limit, not a t2_incomplete the sweep would turn
+        # into arm_never_confirmed.
+        return "preserved_list_truncated" if result.get("preserved_truncated") else "t2_incomplete"
     if result["push_lines"]:
         return "repush_confound"
     return None
@@ -1296,7 +1381,7 @@ def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=5.0):
 
 
 def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repeat_idx,
-                trigger_id_cache, run_id, comparison_id):
+                trigger_id_cache, run_id, comparison_id, scoped_detach=False):
     """One trigger-and-observe cycle. Always returns a row dict, built up
     incrementally from S0 onward, with as much evidence populated as was
     actually observed before any void - R5.7 §2.2 item 7 (evidence retained
@@ -1352,7 +1437,9 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
             return row
     row["trigger_http_status"] = http_status
 
-    allow_fallback_t0 = False  # R5.7: B/B2 never accept the fallback T0 (round-2 correction)
+    # R5.7: B/B2 never accept the fallback T0 (round-2 correction). #4415 scoped-detach mode is the
+    # one exception: an agent with the skip logs no T0 line when the push removes no stored row.
+    allow_fallback_t0 = bool(scoped_detach)
     # Governance (unhappy-path UP-2, ported): observe_t0 polls over SSH for up to
     # ROOT_CAUSED_T0_TIMEOUT seconds; an uncaught subprocess.TimeoutExpired or SSH
     # control-socket failure from ssh_ps() (via _fetch_window/agent_log_size) used to
@@ -1399,7 +1486,7 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
         if reason:
             row.update(void_class=void_class_for(reason), void_reason=reason)
             return row
-        size_reason = check_teardown_size(t0d, backend, len(exp_rule_ids))
+        size_reason = check_teardown_size(t0d, backend, len(exp_rule_ids), scoped_detach)
         if size_reason:
             row.update(void_class=void_class_for(size_reason), void_reason=size_reason)
             return row
@@ -1485,6 +1572,11 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     row["t2_selected"] = {rid: {**v, "ts": v["ts"].isoformat()} for rid, v in result["selected"].items()}
     row["t2_rejected"] = result["rejected"]
     row["missing_rule_ids"] = result["missing"]
+    # #4415: rules the agent's `full_sync preserved` line names (never re-armed, so no T2 line).
+    row["preserved_rule_ids"] = result["preserved"]
+    row["n_preserved"] = len(result["preserved"])
+    row["pending_reused_rule_ids"] = result["pending_reused"]
+    row["preserved_line"] = result["preserved_line"]
     row["push_cmd_lines_in_window"] = [p["raw"] for p in result["push_lines"]]
     row["legacy_lines_before_t0d"] = result["legacy_before_t0d"]
     row["n_reobserved_adopt"] = sum(1 for v in result["selected"].values() if v.get("reobserved_adopt"))
@@ -1502,6 +1594,12 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
         row.update(void_class=void_class, void_reason=void_reason)
         return row
 
+    if not result["selected"]:
+        # #4415: nothing was torn down (every rule preserved), so there is no re-arm to time and
+        # C is undefined. compute_window_math needs at least one T2 line.
+        row.update(void_class=void_class_for("no_rearm_all_preserved"),
+                   void_reason="no_rearm_all_preserved")
+        return row
     wm = compute_window_math(t0["ts"], t0d["ts"], t1["ts"], result["selected"])
     row.update(wm)
 
@@ -1545,7 +1643,12 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     # pre-existing void_reason to preserve at this point in this branch's flow (every earlier
     # void condition above already returns immediately), unlike v1's flatter structure.
     try:
-        d_by_rule, cohort_never_fetched = cohort_events_d(op, cohort_ids, t0["ts"], deadline_ms)
+        # #4415: a preserved rule emits no guard.compliant event, so it is not polled (it would
+        # read "not_observed", which resolve_cohort_void reports as a genuine functional_invalid).
+        preserved_set = set(result["preserved"])
+        d_by_rule, cohort_never_fetched = cohort_events_d(
+            op, [rid for rid in cohort_ids if rid not in preserved_set], t0["ts"], deadline_ms)
+        d_by_rule.update({rid: "preserved" for rid in cohort_ids if rid in preserved_set})
     except Exception as e:  # noqa: BLE001
         row.update(void_class="instrument",
                     void_reason=f"cohort_events_failed:{type(e).__name__}:{str(e)[:200]}")
@@ -1562,7 +1665,8 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     return row
 
 
-def cmd_run(op, phase, backend, trigger_kind, repeats, gap, label, out_path, comparison_id):
+def cmd_run(op, phase, backend, trigger_kind, repeats, gap, label, out_path, comparison_id,
+            scoped_detach=False):
     if phase in ("B", "B2") and not comparison_id:
         print("[run] --comparison is required for phase B/B2", file=sys.stderr)
         return 1
@@ -1595,7 +1699,7 @@ def cmd_run(op, phase, backend, trigger_kind, repeats, gap, label, out_path, com
     while valid < repeats and attempts < max(max_attempts, 10):
         attempts += 1
         r = run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, attempts,
-                       trigger_id_cache, run_id, comparison_id)
+                       trigger_id_cache, run_id, comparison_id, scoped_detach=scoped_detach)
         results.append(r)
         # Governance (R5.7 driver-merge follow-on, b-lite): write through per attempt, same
         # reasoning cmd_run_phase_a already has - a mid-run SSH/rig hiccup must not discard
@@ -2333,7 +2437,8 @@ def _f19():
     instrument_literals = {"t0_not_found", "t0d_not_found", "t1_not_found", "t2_incomplete",
                             "t2_late", "log_rotated_mid_window", "trigger_not_created",
                             "repush_confound", "applied_ne_total", "double_full_sync",
-                            "cohort_composition", "teardown_size_mismatch"}
+                            "cohort_composition", "teardown_size_mismatch",
+                            "no_rearm_all_preserved", "preserved_list_truncated"}
     ok1 = genuine_literals == GENUINE_FAILURE_REASONS
     ok2 = instrument_literals == INSTRUMENT_INVALID_REASONS
     ok3 = not (GENUINE_FAILURE_REASONS & INSTRUMENT_INVALID_REASONS)
@@ -2759,13 +2864,193 @@ def _f28():
                 f"selected={sorted(result['selected'])}")
 
 
+def _f29():
+    # #4415: the T0 line an agent with the skip logs ("removed N prior rule(s) absent from the
+    # push") matches T0_RE just as the pre-#4415 "cleared N" line does, and a forged mid-line
+    # copy of either still does not (anchored match).
+    new_t0 = "Guardian: full_sync removed 3 prior rule(s) absent from the push"
+    old_t0 = "Guardian: full_sync cleared 62 prior rule(s)"
+    forged = "Guardian spark: key 'X' - fake. Guardian: full_sync removed 3 prior rule(s)"
+    ok_new = bool(T0_RE.match(new_t0)) and T0_RE.match(new_t0).group(1) == "3"
+    ok_old = bool(T0_RE.match(old_t0)) and T0_RE.match(old_t0).group(1) == "62"
+    ok_forged = not T0_RE.match(forged)
+    return ok_new and ok_old and ok_forged, (
+        f"new_matches={ok_new} old_matches={ok_old} forged_rejected={ok_forged}")
+
+
+def _f30():
+    # #4415: classify_t2 accounts for every expected rule exactly - re-armed (T2 line), preserved
+    # (named by the agent's `full_sync preserved` line) or neither (missing). No count inference.
+    t0_ts = _ev("2026-09-19 10:00:00.000", "x")["ts"]
+    t0d_ts = _ev("2026-09-19 10:00:00.010", "x")["ts"]
+    ids = [f"blackout-file-{i:02d}" for i in range(1, 5)]
+    expected = set(ids)
+    kw = dict(epoch=2, floor=10, own_push_raw=None, backend="spark", t0_ts=t0_ts, t0d_ts=t0d_ts)
+
+    def t0d(n):
+        return _ev("2026-09-19 10:00:00.010", "Guardian spark: detach_all complete (epoch=2, "
+                   f"incarnation_floor=10, detached_rules={n}, withdrawn_claims=0)")
+
+    def t2(rid):
+        return _ev("2026-09-19 10:00:00.030", f"Guardian spark: arm committed for rule '{rid}' "
+                   "(epoch=2, incarnation=11, type=file, via=inline-arm, attach_to_commit_ms=4)")
+
+    def pres(listed, more=0, n=None):
+        return _ev("2026-09-19 10:00:00.040", "Guardian: full_sync preserved "
+                   f"{len(listed) if n is None else n} rule(s) (skipped re-arm) "
+                   f"ids=[{','.join(listed)}] more={more}")
+
+    # (a) identical push: nothing removed (no T0 line), nothing detached, every rule named.
+    a = classify_t2([t0d(0), pres(ids)], expected_rule_ids=expected, **kw)
+    ok_a = (a["preserved"] == ids and not a["missing"] and not a["selected"]
+            and resolve_collect_t2_reason(a) is None)
+    # (b) a kept rule in NEITHER list: rule 4 is neither re-armed nor named -> missing, so
+    # t2_incomplete here and arm_never_confirmed (genuine) after the end-of-run sweep.
+    b = classify_t2([t0d(0), t2(ids[2]), pres(ids[:2])], expected_rule_ids=expected, **kw)
+    ok_b = (b["missing"] == [ids[3]] and b["preserved"] == ids[:2]
+            and sorted(b["selected"]) == [ids[2]]
+            and resolve_collect_t2_reason(b) == "t2_incomplete"
+            and resolve_sweep_reclassification(False, b["missing"])
+            == ("genuine", "arm_never_confirmed"))
+    # (c) a changed rule is rebuilt (T2 line) and is not named; the others are preserved.
+    c = classify_t2([t0d(0), t2(ids[1]), pres([ids[0], ids[2], ids[3]])],
+                    expected_rule_ids=expected, **kw)
+    ok_c = (sorted(c["selected"]) == [ids[1]] and c["preserved"] == [ids[0], ids[2], ids[3]]
+            and not c["missing"] and resolve_collect_t2_reason(c) is None)
+    # (d) a rule the push omitted is detached (T0d counts it) and is not in the cohort; a stray
+    # id the line names that is not expected is ignored, not preserved.
+    d = classify_t2([t0d(1), pres(ids[:3] + ["blackout-file-99"])],
+                    expected_rule_ids=set(ids[:3]), **kw)
+    ok_d = d["preserved"] == ids[:3] and not d["missing"] and not d["rejected"]
+    # (e) an agent without the line (pre-#4415): nothing is ever classified preserved.
+    e = classify_t2([t0d(0)], expected_rule_ids=expected, **kw)
+    ok_e = e["preserved"] == [] and e["missing"] == ids and e["preserved_line"] is None
+    ok = ok_a and ok_b and ok_c and ok_d and ok_e
+    return ok, (f"all_preserved={ok_a} kept_in_neither_fails={ok_b} changed_rebuilt={ok_c} "
+                f"absent_removed={ok_d} no_line_no_inference={ok_e}")
+
+
+def _f31():
+    # #4415: the preserved line parser and its guards. A truncated list (more>0) voids as an
+    # instrument limit instead of calling the unnamed rule failed; a line from the PREVIOUS
+    # application (before this T0d) and a forged mid-message copy are both ignored; the teardown
+    # size check accepts any detached count up to the cohort under --scoped-detach.
+    t0_ts = _ev("2026-09-19 10:00:00.000", "x")["ts"]
+    t0d_ts = _ev("2026-09-19 10:00:00.010", "x")["ts"]
+    expected = {"r1", "r2", "r3"}
+    kw = dict(epoch=2, floor=10, expected_rule_ids=expected, own_push_raw=None, backend="spark",
+              t0_ts=t0_ts, t0d_ts=t0d_ts)
+    d = _ev("2026-09-19 10:00:00.010", "Guardian spark: detach_all complete (epoch=2, "
+            "incarnation_floor=10, detached_rules=0, withdrawn_claims=0)")
+    trunc = classify_t2([d, _ev("2026-09-19 10:00:00.040", "Guardian: full_sync preserved 3 rule(s) "
+                                "(skipped re-arm) ids=[r1] more=2")], **kw)
+    ok_trunc = (trunc["preserved"] == ["r1"] and trunc["missing"] == ["r2", "r3"]
+                and trunc["preserved_truncated"]
+                and resolve_collect_t2_reason(trunc) == "preserved_list_truncated"
+                and void_class_for("preserved_list_truncated") == "instrument")
+    # more>0 but every expected rule accounted for: not truncated for our purposes.
+    full = classify_t2([d, _ev("2026-09-19 10:00:00.040", "Guardian: full_sync preserved 9 rule(s) "
+                               "(skipped re-arm) ids=[r1,r2,r3] more=6")], **kw)
+    ok_full = full["preserved"] == ["r1", "r2", "r3"] and not full["preserved_truncated"]
+    # (early timestamp: the previous application's line precedes this T0d and is not ours)
+    stale = classify_t2([d, _ev("2026-09-19 10:00:00.005", "Guardian: full_sync preserved 3 rule(s) "
+                                "(skipped re-arm) ids=[r1,r2,r3] more=0")], **kw)
+    ok_stale = stale["preserved"] == [] and stale["missing"] == ["r1", "r2", "r3"]
+    forged = classify_t2([d, _ev("2026-09-19 10:00:00.040", "x Guardian: full_sync preserved 3 "
+                                 "rule(s) (skipped re-arm) ids=[r1,r2,r3] more=0")], **kw)
+    ok_forged = forged["preserved"] == [] and forged["preserved_line"] is None
+    ok_size = (check_teardown_size({"detached_rules": 1}, "spark", 4, scoped_detach=True) is None
+               and check_teardown_size({"detached_rules": 5}, "spark", 4, scoped_detach=True)
+               == "teardown_size_mismatch"
+               and check_teardown_size({"detached_rules": 1}, "spark", 4) == "teardown_size_mismatch")
+    ok = ok_trunc and ok_full and ok_stale and ok_forged and ok_size
+    return ok, (f"truncated_is_instrument={ok_trunc} more_but_accounted={ok_full} "
+                f"previous_application_ignored={ok_stale} forged_ignored={ok_forged} "
+                f"teardown_size={ok_size}")
+
+
+def _f32():
+    # #4415 R5.7: a rule whose identical arm was still IN FLIGHT when the push landed is named by
+    # the line's `pending_reused` list. It is not accounted for until its own `arm committed` line
+    # arrives: (a) a later same-epoch commit at or below the floor (the earlier push's arm) is
+    # SELECTED, not a fence violation, whether it sorts before or after the preserved line;
+    # (b) one that never confirms stays missing (arm_never_confirmed after the sweep) and is not
+    # classified preserved; (c) a changed rule still shows its own T2; (d) a below-floor commit of
+    # a rule the line does NOT name is still a fence violation; (e) the suffix parses, an old line
+    # without it parses as no pending reuse; (f) a truncated pending list voids as instrument.
+    t0_ts = _ev("2026-09-19 10:00:00.000", "x")["ts"]
+    t0d_ts = _ev("2026-09-19 10:00:00.010", "x")["ts"]
+    ids = ["r1", "r2", "r3", "r4"]
+    expected = set(ids)
+    kw = dict(epoch=2, floor=10, own_push_raw=None, backend="spark", t0_ts=t0_ts, t0d_ts=t0d_ts)
+    d = _ev("2026-09-19 10:00:00.010", "Guardian spark: detach_all complete (epoch=2, "
+            "incarnation_floor=10, detached_rules=0, withdrawn_claims=0)")
+
+    def commit(rid, ts, inc, via):
+        return _ev(ts, f"Guardian spark: arm committed for rule '{rid}' (epoch=2, "
+                   f"incarnation={inc}, type=file, via={via}, attach_to_commit_ms=4)")
+
+    def line(committed, pending, more=0, pmore=0):
+        return _ev("2026-09-19 10:00:00.040", "Guardian: full_sync preserved "
+                   f"{len(committed)} rule(s) (skipped re-arm) ids=[{','.join(committed)}] "
+                   f"more={more} pending_reused {len(pending)} ids=[{','.join(pending)}] "
+                   f"more={pmore}")
+
+    base = line(ids[:3], [ids[3]])
+    # (a) commits after the line, and before it (the commit sorts first)
+    a1 = classify_t2([d, base, commit(ids[3], "2026-09-19 10:00:00.050", 7, "callback-arm")],
+                     expected_rule_ids=expected, **kw)
+    a2 = classify_t2([d, commit(ids[3], "2026-09-19 10:00:00.035", 7, "callback-arm"), base],
+                     expected_rule_ids=expected, **kw)
+    ok_a = all(r["preserved"] == ids[:3] and sorted(r["selected"]) == [ids[3]]
+               and not r["missing"] and not r["rejected"]
+               and resolve_collect_t2_reason(r) is None for r in (a1, a2))
+    # (b) never confirms
+    b = classify_t2([d, base], expected_rule_ids=expected, **kw)
+    ok_b = (b["missing"] == [ids[3]] and b["preserved"] == ids[:3]
+            and b["pending_reused"] == [ids[3]] and not b["preserved_truncated"]
+            and resolve_collect_t2_reason(b) == "t2_incomplete"
+            and resolve_sweep_reclassification(False, b["missing"])
+            == ("genuine", "arm_never_confirmed"))
+    # (c) pending-reused plus a changed rule that re-armed normally
+    c = classify_t2([d, commit(ids[0], "2026-09-19 10:00:00.030", 11, "inline-arm"),
+                     line(ids[1:3], [ids[3]]),
+                     commit(ids[3], "2026-09-19 10:00:00.050", 7, "callback-arm")],
+                    expected_rule_ids=expected, **kw)
+    ok_c = (sorted(c["selected"]) == [ids[0], ids[3]] and c["preserved"] == ids[1:3]
+            and not c["missing"] and not c["rejected"] and resolve_collect_t2_reason(c) is None)
+    # (d) a below-floor commit of a rule the line does not name is a fence violation
+    dd = classify_t2([d, base, commit(ids[0], "2026-09-19 10:00:00.050", 7, "callback-arm")],
+                     expected_rule_ids=expected, **kw)
+    ok_d = (dd["rejected"] and dd["rejected"][0]["reason"] == "fence_violation_below_floor"
+            and resolve_collect_t2_reason(dd) == "fence_violation")
+    # (e) parse: new suffix, and the old line (no suffix) means no pending reuse
+    m = PRESERVED_RE.match("Guardian: full_sync preserved 2 rule(s) (skipped re-arm) ids=[a,b] "
+                           "more=0 pending_reused 1 ids=[c] more=0")
+    mo = PRESERVED_RE.match("Guardian: full_sync preserved 2 rule(s) (skipped re-arm) ids=[a,b] more=0")
+    e = classify_t2([d, _ev("2026-09-19 10:00:00.040", "Guardian: full_sync preserved 4 rule(s) "
+                            "(skipped re-arm) ids=[r1,r2,r3,r4] more=0")],
+                    expected_rule_ids=expected, **kw)
+    ok_e = (bool(m) and m.group(5) == "c" and bool(mo) and mo.group(4) is None
+            and e["pending_reused"] == [] and e["preserved"] == ids)
+    # (f) the pending list is truncated and an expected rule is in neither list
+    f = classify_t2([d, line(ids[:2], [ids[2]], pmore=1)], expected_rule_ids=expected, **kw)
+    ok_f = (f["missing"] == [ids[2], ids[3]] and f["preserved_truncated"]
+            and resolve_collect_t2_reason(f) == "preserved_list_truncated")
+    ok = ok_a and ok_b and ok_c and ok_d and ok_e and ok_f
+    return ok, (f"pending_commit_accepted={ok_a} pending_never_confirms_genuine={ok_b} "
+                f"changed_plus_pending={ok_c} unnamed_below_floor_still_fence={ok_d} "
+                f"suffix_parse={ok_e} pending_truncated_instrument={ok_f}")
+
+
 def cmd_selftest():
     fixtures = [
         ("F1", _f1), ("F2", _f2), ("F3", _f3), ("F4", _f4), ("F5", _f5), ("F6", _f6),
         ("F7", _f7), ("F8", _f8), ("F9", _f9), ("F10", _f10), ("F11", _f11), ("F12", _f12),
         ("F13", _f13), ("F14", _f14), ("F15", _f15), ("F16", _f16), ("F17", _f17), ("F18", _f18),
         ("F19", _f19), ("F20", _f20), ("F21", _f21), ("F22", _f22), ("F23", _f23), ("F24", _f24),
-        ("F25", _f25), ("F26", _f26), ("F27", _f27), ("F28", _f28),
+        ("F25", _f25), ("F26", _f26), ("F27", _f27), ("F28", _f28), ("F29", _f29),
+        ("F30", _f30), ("F31", _f31), ("F32", _f32),
     ]
     failures = 0
     for name, fn in fixtures:
@@ -2810,6 +3095,11 @@ def main():
     p.add_argument("--comparison", default=None,
                    help="required for phase B/B2 - groups the 4 invocations of one "
                         "legacy/spark x B/B2 comparison together in `report`")
+    p.add_argument("--scoped-detach", action="store_true",
+                   help="the agent carries the #4415 skip: a healthy, unchanged rule is not torn "
+                        "down on a full_sync, so rules without a T2 line must be named by the "
+                        "agent's `full_sync preserved` line (see the module docstring); omit it "
+                        "for a pre-#4415 binary")
     p.add_argument("--out", default=os.path.join(SCRATCH_DIR, "results.jsonl"))
 
     p = sub.add_parser("report")
@@ -2841,7 +3131,7 @@ def main():
         if args.phase == "A":
             return cmd_run_phase_a(op, args.backend, args.label, args.out)
         return cmd_run(op, args.phase, args.backend, args.trigger, args.repeats, args.gap,
-                       args.label, args.out, args.comparison)
+                       args.label, args.out, args.comparison, scoped_detach=args.scoped_detach)
     if args.cmd == "report":
         return cmd_report(args.in_path, args.out)
     return 1
