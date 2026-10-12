@@ -34,9 +34,9 @@
 %% under the "agent_id length bound" comment; kMaxAgentIdLength = 256 in
 %% server/core/include/yuzu/server/auth.hpp). Bytes, not characters. The gateway
 %% forwards the agent's RegisterRequest as it is, so without the same bound here
-%% a request the server refuses would be forwarded and answered INVALID_ARGUMENT
-%% each time, and each answer would count against the circuit breaker. A change
-%% to the server's constant must change this one.
+%% a request the server refuses as wrong would be forwarded, and a request fault
+%% must not count against the circuit breaker. A change to the server's constant
+%% must change this one.
 -define(MAX_AGENT_ID_BYTES, 256).
 
 %%--------------------------------------------------------------------

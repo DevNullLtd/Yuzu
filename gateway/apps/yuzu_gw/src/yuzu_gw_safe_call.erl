@@ -22,11 +22,10 @@
 %%% per-request line with the fixed atom.
 %%%
 %%% warn_limited/3 is the same limit for a warning of a named kind that a
-%%% registration can provoke once per request (a
-%%% refused agent id, a replaced peer address, a failed upstream call): at most
-%%% one line per second per kind, and the line that follows a quiet interval
-%%% carries the number of lines that were suppressed since the previous one. The
-%%% first occurrence always logs.
+%%% registration can provoke once per request (a refused agent id, a replaced
+%%% peer address, a failed upstream call): at most one line per second per kind,
+%%% and the line that follows a quiet interval carries the number of lines that
+%%% were suppressed since the previous one. The first occurrence always logs.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_safe_call).

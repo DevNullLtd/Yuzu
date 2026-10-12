@@ -562,7 +562,10 @@ runs are marked below.)
   newer notification for a key that is already held replaces the held one and
   keeps its place in the queue, so a `CONNECTED` followed by a `DISCONNECTED` for
   one session sends only the `DISCONNECTED`, and an identical repeated
-  `CONNECTED` is sent once. Two sessions of one agent are two keys and both are
+  `CONNECTED` is sent once. The exception is the key of a half open probe that is
+  out: that key is no longer held, so a newer notification for it is held in the
+  probe's reserved slot and supersedes the probe's older notification if the probe
+  fails (see Probe and Cap). Two sessions of one agent are two keys and both are
   kept. Replacements are counted in `yuzu_gw_upstream_notify_coalesced_total`.
 - **Probe.** While the breaker is half open exactly one held notification is
   sent, as the probe, and nothing else is sent from the store while it is out.
@@ -571,15 +574,20 @@ runs are marked below.)
   the code). If the probe succeeds the breaker closes, the registration replay of
   every agent the node holds starts (OBSERVED on a rig), and the rest drain first
   in first out; if it fails the breaker opens again with a doubled backoff and the
-  probe's notification goes back to the head of the queue, unless a newer notification for the same key is held by then: the newer one supersedes it (counted in `yuzu_gw_upstream_notify_coalesced_total`). The one exception is
+  probe's notification goes back to the head of the queue, unless a newer
+  notification for the same key is held by then: the newer one supersedes it
+  (counted in `yuzu_gw_upstream_notify_coalesced_total`). The one exception is
   a probe whose request cannot be encoded inside the gateway: that does not
   move the breaker, and the notification is evicted instead of requeued (see
-  Known limits). A successful probe
-  proves only the notification path, which on the server is an in-memory session
-  lookup: a server whose registration path is failing can still accept the probe
-  (INFERRED from the code, not run). A probe result that
-  arrives after the breaker has moved on to a later half-open period does not
-  change the breaker. Without the probe, held notifications could sit
+  Known limits). A successful probe proves only the notification path, which on
+  the server is an in-memory session lookup: a server whose registration path is
+  failing can still accept the probe (INFERRED from the code, not run). A probe
+  result that arrives after the breaker has moved on to a later half-open period
+  does not change the breaker. Known limit: the probe is bounded only by the
+  vendored client's own defaults (connect 5000 ms, response 5000 ms; 5 to 10
+  seconds per half-open cycle was observed against an unresponsive upstream), the
+  gateway sets no deadline of its own, and the entry is requeued when the probe
+  fails. Without the probe, held notifications could sit
   indefinitely after the server recovers, because a disconnected session produces
   no heartbeat to trigger a replay. A probe that timed out may still have reached
   the server, and its notification is sent again after the requeue, so delivery of
@@ -1547,7 +1555,7 @@ feeds the breaker. If the breaker keeps reopening, look at the server: a
 `Failed to notify stream status` line means the server is still failing, and
 restarting the gateway does not help. A repeating `Upstream RPC NotifyStreamStatus
 raised` line against a healthy server points at the gateway's own encoder, not
-at the server: a restart does not help, and the runbook rows say to roll back.
+at the server: a restart does not help, and the runbook row says to fix the sender or the build first, because a rollback is itself a gateway restart and brings back the earlier behaviours.
 
 **Replaying a session the server already knows is not free.** The server's adopt
 decision calls `register_agent` for every replayed session, including one it
@@ -2703,7 +2711,7 @@ that are actually emitted are listed.
 | `yuzu_gw_heartbeat_verdict_dropped_total` | counter | Session ids named by a heartbeat verdict that were not queued for replay (label `reason`, closed set: `malformed` = not a usable session id, `not_local` = this node does not hold the session, `circuit_open` = the upstream circuit breaker is open, `queue_full` = the replay queue is at its cap, or the upstream process already holds more than 100 unhandled messages so the ids were not handed to it; the cap bounds only verdict appends, so while a breaker-seeded snapshot of that size or larger drains, every verdict id for an agent not already queued counts here). Every reason is created at 0 at start. Ids already queued, or replayed within the session guard window, are not counted. |
 | `yuzu_gw_heartbeat_buffer_dropped_total` | counter | Heartbeat state the gateway's heartbeat buffer dropped instead of sending (label `reason`, closed set of six, all created at 0 at start: `buffer_full` = a heartbeat of a new session was dropped because the buffer held `max_heartbeat_buffer` sessions, or the oldest whole session was dropped because the buffer was still over `max_heartbeat_buffer_bytes` with no snapshot left to drop; `snapshot_oversize` = a single heartbeat larger than about 3 MiB was sent without its snapshot; `snapshot_evicted` = a retained snapshot was dropped, oldest first, because the buffer was over `max_heartbeat_buffer_bytes`; `heartbeat_oversize` = a heartbeat still larger than about 3 MiB after its snapshot was removed, or with more than 512 status tags, or with a status tag key or value over about 64 KiB or more than about 256 KiB of tag bytes in total (checked before the UTF-8 repair), was forwarded without its status tags; `heartbeat_invalid` = a heartbeat with a status tag that is not valid UTF-8 was forwarded with the invalid bytes replaced by replacement characters (the reason also counts tags removed because a tag was not a binary, and a heartbeat dropped for a bad or empty session id; see Heartbeat Batching); `chunk_rejected` = a single heartbeat the server rejected with a non-transient status was dropped). What is lost is older heartbeat state; for `heartbeat_oversize` the status tags of one heartbeat, for `heartbeat_invalid` only the invalid bytes, and for `chunk_rejected` one whole heartbeat. See [Heartbeat Batching](#heartbeat-batching). |
 | `yuzu_gw_heartbeat_coalesced_total` | counter | Buffered heartbeats replaced by a newer heartbeat of the same session (unlabelled). Expected to rise while the server is unreachable. While a backlog is coalesced, the server's `yuzu_heartbeats_received_total{via="gateway"}` under-counts, because it counts the heartbeats the server received. |
-| `yuzu_gw_upstream_notify_pending` | gauge | Stream-status notifications held because the in-flight limit is reached or the upstream circuit breaker is not closed; drained first in first out (0 = nothing held). The key of a half open probe in flight is not counted here (it is counted by `yuzu_gw_upstream_notify_inflight`), unless a newer notification for the same key has since been held, and it still counts toward the `notify_pending_max` cap. The gauge can equal `notify_pending_max` without any loss, so do not alert on that; alert on `increase(yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}[5m]) > 0`. Label `node`, created at 0 at start. Counts the current upstream client process only |
+| `yuzu_gw_upstream_notify_pending` | gauge | Stream-status notifications held because the in-flight limit is reached or the upstream circuit breaker is not closed; drained first in first out (0 = nothing held). The key of a half open probe in flight is not counted here (it is counted by `yuzu_gw_upstream_notify_inflight`), unless a newer notification for the same key has since been held, and the key still counts toward the `notify_pending_max` cap. The gauge can equal `notify_pending_max` without any loss, so do not alert on that; alert on `increase(yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}[5m]) > 0`. Label `node`, created at 0 at start. Counts the current upstream client process only |
 | `yuzu_gw_upstream_notify_inflight` | gauge | NotifyStreamStatus workers tracked by this gateway process (at most 10). Label `node`, created at 0 at start. Counts the current upstream client process only: workers of a previous process after an upstream client restart are not counted |
 | `yuzu_gw_upstream_notify_coalesced_total` | counter | Held stream-status notifications replaced by a newer event for the same agent session and stream home, or a failed probe notification superseded by one. Unlabelled, created at 0 at start. It measures suppression, not delivery: an identical repeated `CONNECTED` also counts |
 | `yuzu_gw_upstream_notify_dropped_total` | counter | Stream-status notifications lost at admission because the pending store was at its cap: a new key is admitted only while the held keys plus the key of a half open probe in flight stay below `notify_pending_max` (label `reason`, closed set `at_capacity` and `unknown`, both created at 0 at start; `unknown` catches an unexpected value and is not emitted today). The value `circuit_open` is retired: a notification that arrives while the breaker is not closed is held, and only an older gateway still exports it. It does not count delivery loss after admission (a failed or killed worker, a gateway stop) |

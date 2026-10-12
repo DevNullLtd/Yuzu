@@ -46,15 +46,15 @@
 %%%   can take. A held notification that is the probe and fails that way can
 %%%   never encode, so it is evicted with a warning (not requeued) and the next
 %%%   head is probed at once; every other failure still requeues it.
-%%%   The same rule covers a server ANSWER that is about the request, not about the
-%%%   upstream (INVALID_ARGUMENT, NOT_FOUND, ALREADY_EXISTS, FAILED_PRECONDITION,
-%%%   OUT_OF_RANGE: the gRPC statuses for a wrong request; the server returns the
-%%%   first and the fourth on these RPCs today): on a live call it neither fails
-%%%   nor recovers the breaker, because counting it as a failure would open the
-%%%   breaker on a request that says nothing about the upstream, and counting it
-%%%   as a recovery would reset real failures. A probe answered that way is retired, not
-%%%   requeued (requeueing would be answered the same way by every probe, for
-%%%   ever). The one exception is a registration REPLAY answered
+%%%   The same rule covers a server ANSWER that is about the request, not about
+%%%   the upstream (INVALID_ARGUMENT, NOT_FOUND, ALREADY_EXISTS,
+%%%   FAILED_PRECONDITION, OUT_OF_RANGE: the gRPC statuses for a wrong request;
+%%%   the server returns the first and the fourth on these RPCs today): on a
+%%%   live call it neither fails nor recovers the breaker, because counting it
+%%%   as a failure would open the breaker on a request that says nothing about
+%%%   the upstream, and counting it as a recovery would reset real failures. A
+%%%   probe answered that way is retired, not requeued (requeueing would be
+%%%   answered the same way by every probe, for ever). The one exception is a registration REPLAY answered
 %%%   FAILED_PRECONDITION: that is the server's authoritative answer that the
 %%%   presented session was superseded, and do_replay_one counts it as a breaker
 %%%   SUCCESS (record_result_no_replay({ok, superseded}, State)), so a run of
@@ -82,9 +82,9 @@
 %%%   half_open) it was sent under.
 %%%     - The event is retired on ok. On error it goes back to the head of the
 %%%       store, unless a newer event for the same key was held meanwhile: that
-%%%       one wins and the old one is dropped (counted as notify_coalesced). One slot is held
-%%%       back from the cap while a probe is out, so that the give-back always
-%%%       fits. On a local encode exception the event is evicted instead (a
+%%%       one wins and the old one is dropped (counted as notify_coalesced). One
+%%%       slot is held back from the cap while a probe is out, so that the
+%%%       give-back always fits. On a local encode exception the event is evicted instead (a
 %%%       warning names the agent and the reason), it is neither retired as sent
 %%%       nor given back, and the breaker is not touched.
 %%%     - The breaker is moved only when it is still half_open under the SAME

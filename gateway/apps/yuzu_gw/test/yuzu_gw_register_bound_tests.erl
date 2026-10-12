@@ -2,11 +2,10 @@
 %%% @doc EUnit tests for the registration bound at the gateway edge and the
 %%% classification of server statuses by the circuit breaker (#4632).
 %%%
-%%% Found by review: the gateway forwards an agent's RegisterRequest as it is
-%%% and applied no bound to the agent id. The server answers INVALID_ARGUMENT
-%%% for an id outside 1 to 256 bytes, the gateway counted that answer as a
-%%% failure of the upstream, and such answers could open the breaker. Two
-%%% closures are pinned here:
+%%% Found by review: the gateway forwarded the agent's RegisterRequest as it is
+%%% and applied no bound to the agent id, and a request the server refused as
+%%% wrong counted as an upstream failure of the breaker. Two closures are pinned
+%%% here:
 %%%   - the edge refuses an empty, missing, non-binary or over-long agent id
 %%%     itself, before any reservation and before any upstream call;
 %%%   - the breaker treats the server statuses that say "this request was wrong"

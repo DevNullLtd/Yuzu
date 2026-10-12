@@ -165,8 +165,8 @@ groups:
             gateway log names the entry).
 
       # #4632: a request the gateway could not encode never leaves it, so the
-      # server never sees it and the circuit breaker is not touched (a client
-      # fault must not open it for the fleet). The consequence is that a
+      # server never sees it and the circuit breaker is not touched (request
+      # faults do not count against the breaker). The consequence is that a
       # SYSTEMATIC local encode failure (every Register answered INTERNAL)
       # leaves the breaker closed and /readyz ready, and this counter is the
       # signal for it. The series is pre-seeded at 0 for the RPC names that can
