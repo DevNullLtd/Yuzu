@@ -2263,6 +2263,21 @@ TEST_CASE("#4415 PR-A (CH-5): a re-enabled rule behind a retained disarm is driv
 
     r.dispatch(push_bytes({x}, kGen));
     REQUIRE(r.wait_armed(1));
+    // x must be a Service rule (same mechanism type as h, so its calls queue behind the hang) and
+    // must be SKIPPED by the next push so that h's arm takes the hang. On a host with no system
+    // bus (macOS, a bare container) a Service rule reads Unknown and is rebuilt instead, so x's
+    // own watch would take the hang: wait for x's first verdict and SKIP the case on such a host.
+    {
+        auto& rt = r.rt(); // once, outside the poll
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                const auto st = rt.status_for_rule("x");
+                return st.has_value() && (st->last_compliant.has_value() || st->in_unknown);
+            },
+            30s));
+        if (rt.status_for_rule("x")->in_unknown)
+            SKIP("this host reads the Service rule Unknown (no system bus), so it is never skipped");
+    }
     r.sm->hang_next_watch();
     r.dispatch(push_bytes({x, h}, kGen));
     REQUIRE(r.sm->wait_entered_hang(10s));
