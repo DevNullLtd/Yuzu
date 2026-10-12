@@ -812,7 +812,7 @@ bool identical_push_rebuilds(Rig& rig, const SparkSpec& spec, const std::string&
     INFO("identical re-push: " << (again ? "ok" : again.error().message));
     REQUIRE(again.has_value());
     REQUIRE(yuzu::test::spin_until([&] { return rig.rt->claim_queue_depth_for_test(key) == 0; }, 10s));
-    return again->kind != RT::ArmOutcomeKind::Armed && rig.backend->arm_entries.load() == 2 &&
+    return !again->skipped && rig.backend->arm_entries.load() == 2 &&
            rig.backend->disarm_entries.load() == 1;
 }
 } // namespace
@@ -867,7 +867,7 @@ TEST_CASE("#4415 PR-A F1c: a fresh watcher that joins an engine key which is sti
     const auto disarms_before = rig.backend->disarm_entries.load();
     auto again = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, file_exists_rule("r1"), true);
     REQUIRE(again.has_value());
-    CHECK(again->kind != RT::ArmOutcomeKind::Armed);
+    CHECK(!again->skipped);
     REQUIRE(yuzu::test::spin_until([&] {
         return rig.rt->claim_queue_depth_for_test(spark_key(spec)) == 0;
     }, 10s));
@@ -889,7 +889,7 @@ TEST_CASE("#4415 PR-A F1d: a healthy key is still skipped, and a Dead one is reb
     rig.backend->set_health(rig.backend->armed_ids().front(), SubscriptionHealth::Dead);
     auto dead = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, file_exists_rule("r1"), true);
     REQUIRE(dead.has_value());
-    CHECK(dead->kind != RT::ArmOutcomeKind::Armed);
+    CHECK(!dead->skipped);
     REQUIRE(yuzu::test::spin_until([&] {
         return rig.rt->claim_queue_depth_for_test(spark_key(spec)) == 0;
     }, 10s));
@@ -920,7 +920,7 @@ TEST_CASE("#4415 PR-A F1e: the health sweep sets the faulted bit and never clear
     rig.rt->revalidate_subscriptions();
     auto stale = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, file_exists_rule("r1"), true);
     REQUIRE(stale.has_value());
-    CHECK(stale->kind != RT::ArmOutcomeKind::Armed);
+    CHECK(!stale->skipped);
     REQUIRE(yuzu::test::spin_until([&] {
         return rig.rt->claim_queue_depth_for_test(spark_key(spec)) == 0;
     }, 10s));
@@ -983,10 +983,10 @@ bool field_change_rebuilds(const SparkSpec& spec, const RuleAssertion& base,
     // Control: the unchanged push IS a skip, so a "rebuild" below is caused by the change.
     auto same = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, base, base_emit);
     REQUIRE(same.has_value());
-    REQUIRE(same->kind == RT::ArmOutcomeKind::Armed);
+    REQUIRE(same->skipped);
     auto out = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, changed, changed_emit);
     REQUIRE(out.has_value());
-    const bool rebuilt = out->kind != RT::ArmOutcomeKind::Armed;
+    const bool rebuilt = !out->skipped;
     REQUIRE(yuzu::test::spin_until([&] {
         return rig.rt->claim_queue_depth_for_test(spark_key(spec)) == 0;
     }, 10s));
@@ -1023,12 +1023,14 @@ TEST_CASE("#4415 PR-A content identity: a change to any single RuleAssertion fie
         CHECK(field_change_rebuilds(fspec, fbase, m, true, true));
     }
     CHECK(field_change_rebuilds(fspec, fbase, fbase, /*base_emit=*/true, /*changed_emit=*/false));
-    // Split collisions: the same concatenation of adjacent fields split at a different point must
-    // still differ. Mutation: drop the length prefix AND the ':' separator from
-    // assertion_content_id's put() and both of these report "not rebuilt".
+    // Split collisions: the same concatenation of ADJACENT fields (the order in
+    // assertion_content_id is rule_name, debounce_ms, ..., expected_value, value_name) split at a
+    // different point must still differ. Mutation: drop the length prefix AND the ':' separator
+    // from assertion_content_id's put() and both of these report "not rebuilt" (the first
+    // concatenates to "a10" either way; verified on a scratch copy of the id function).
     {
-        auto b = fbase; b.rule_name = "a"; b.expected_value = "b";
-        auto m = fbase; m.rule_name = "ab"; m.expected_value = "";
+        auto b = fbase; b.rule_name = "a1"; b.debounce_ms = 0;
+        auto m = fbase; m.rule_name = "a"; m.debounce_ms = 10;
         CHECK(field_change_rebuilds(fspec, b, m, true, true));
     }
     {
@@ -1095,6 +1097,13 @@ struct Joiner {
                 t.join();
     }
 };
+
+/// Clears the backend's health hook on scope exit. Declare it AFTER the stack locals the hook
+/// captures by reference, so it runs BEFORE they die and the hook never outlives them.
+struct HookReset {
+    Rig& rig;
+    ~HookReset() { rig.backend->set_health_hook({}); }
+};
 } // namespace
 
 // Two rules share ONE key whose subscription the backend reports Dead while its Lost event has
@@ -1156,6 +1165,29 @@ TEST_CASE("#4415 PR-A F1h: a throwing health query does not stop the scoped deta
     CHECK(rig.rt->invariant_violations_for_test().empty());
 }
 
+// The poll backstop (report_dead=true) with a backend whose health query throws for one key: the
+// exception does not escape, the unknown-health key is NOT reported lost (unknown is not dead),
+// and the sweep still reaches the next key, whose Dead answer is reported as before.
+// Mutation: remove the try/catch around the backend call in sweep_key_health (the throw escapes).
+TEST_CASE("#4415 PR-A F1k: a throwing health query does not stop the poll backstop",
+          "[spark][runtime][4415prA]") {
+    Rig rig;
+    REQUIRE(rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true).has_value());
+    REQUIRE(rig.rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true).has_value());
+    const auto ids = rig.backend->armed_ids();
+    REQUIRE(ids.size() == 2);
+    const std::uint64_t throwing = ids[0], dead = ids[1];
+    rig.backend->set_health(dead, SubscriptionHealth::Dead);
+    rig.backend->set_health_hook([throwing](std::uint64_t id) {
+        if (id == throwing)
+            throw std::runtime_error("health");
+    });
+    CHECK_NOTHROW(rig.rt->revalidate_subscriptions());
+    CHECK(rig.rt->status_for_rule("r1").has_value()); // unknown health: left attached
+    CHECK_FALSE(rig.rt->status_for_rule("r2").has_value()); // Dead: reported lost, detached
+    CHECK(rig.rt->invariant_violations_for_test().empty());
+}
+
 // registry_mu_ is not held while the backend answers (probe and sweep): from INSIDE the backend's
 // health call another thread reads the registry. If the lock were held across the call that
 // thread could not finish while the call is still running.
@@ -1168,8 +1200,9 @@ TEST_CASE("#4415 PR-A F1i: the registry lock is not held across the backend heal
     REQUIRE(rig.rt->attach_rule("r1", spec_a, file_exists_rule("r1"), true).has_value());
     REQUIRE(rig.rt->attach_rule("r2", spec_b, file_exists_rule("r2"), true).has_value());
     const auto key = spark_key(spec_a);
-    Joiner joiner; // destroyed first: joins after the hook has returned
+    Joiner joiner; // joins the hook's helper threads (each already finished: the hook awaits it)
     std::atomic<int> reentered{0}, blocked{0};
+    HookReset hook_reset{rig}; // after the captured locals: resets the hook before they die
     rig.backend->set_health_hook([&](std::uint64_t) {
         auto done = std::make_shared<std::atomic<bool>>(false);
         joiner.add(std::thread([&rig, key, done] {
@@ -1184,9 +1217,12 @@ TEST_CASE("#4415 PR-A F1i: the registry lock is not held across the backend heal
     });
     auto again = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec_a, file_exists_rule("r1"), true);
     REQUIRE(again.has_value());
-    CHECK(again->kind == RT::ArmOutcomeKind::Armed); // the probe ran (and the rule is skipped)
-    rig.rt->detach_rules_except({"r1", "r2"});       // the sweep asks once per armed key
-    CHECK(reentered.load() == 3);
+    CHECK(again->skipped);                // the probe ran (and the rule is skipped)
+    const int after_probe = reentered.load();
+    CHECK(after_probe >= 1);              // the probe call site re-entered the registry
+    rig.rt->detach_rules_except({"r1", "r2"});       // the sweep asks for each armed key
+    CHECK(reentered.load() - after_probe >= 1);      // the sweep call site did too (not an exact
+                                                     // count: that is an implementation detail)
     CHECK(blocked.load() == 0);
 }
 
@@ -1216,16 +1252,17 @@ TEST_CASE("#4415 PR-A F1j: a subscription replaced between the probe and the rel
         released = true;
         cv.notify_all();
     };
-    std::optional<RT::ArmOutcomeKind> kind;
+    std::optional<bool> skipped;
     Joiner joiner;
     struct Releaser {
         std::function<void()> fn;
         ~Releaser() { fn(); }
     } releaser{release}; // runs before the joiner on every exit path
+    HookReset hook_reset{rig}; // declared last: resets the hook before the captured locals die
     joiner.add(std::thread([&] {
         auto out = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, file_exists_rule("r1"), true);
         if (out.has_value())
-            kind = out->kind;
+            skipped = out->skipped;
     }));
     {
         std::unique_lock<std::mutex> lk{mu};
@@ -1236,8 +1273,8 @@ TEST_CASE("#4415 PR-A F1j: a subscription replaced between the probe and the rel
     REQUIRE(rig.backend->armed_ids().size() == 2); // the replacement subscription
     release();
     joiner.threads.front().join();
-    REQUIRE(kind.has_value());
-    CHECK(*kind != RT::ArmOutcomeKind::Armed);
+    REQUIRE(skipped.has_value());
+    CHECK(!*skipped);
     REQUIRE(yuzu::test::spin_until([&] {
         return rig.rt->claim_queue_depth_for_test(spark_key(spec)) == 0;
     }, 10s));
@@ -1260,6 +1297,6 @@ TEST_CASE("#4415 PR-A a rule in an Unknown evaluation episode is rebuilt by an i
     REQUIRE(st->in_unknown);
     auto again = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, file_exists_rule("r1"), true);
     REQUIRE(again.has_value());
-    CHECK(again->kind != RT::ArmOutcomeKind::Armed);
+    CHECK(!again->skipped);
     REQUIRE(yuzu::test::spin_until([&] { return rig.rt->claim_queue_depth_for_test(key) == 0; }, 10s));
 }

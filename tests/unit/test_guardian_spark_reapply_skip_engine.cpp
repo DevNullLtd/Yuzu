@@ -2176,7 +2176,8 @@ TEST_CASE("#4415 PR-A KV (10): a failed rule-row write mid-push holds the genera
 //       Boot re-arms exactly the surviving rows (the omitted rule stays gone, the kept ones carry
 //       their OLD content), the generation is the old one, and a re-push converges.
 //       Mutation: skip the absent-row delete (the freeze never arms, the push completes before the
-//       "crash", and the pre-restart row image check goes red). An empty keep-set stays green here.
+//       "crash", and the pre-restart row image check goes red). An empty keep-set stays green here:
+//       the KV rows alone drive the boot re-arm, and the keep-set is pinned by KV-10 and 7b.
 // -------------------------------------------------------------------------------------------------
 TEST_CASE("#4415 PR-A KV (11): a restart in the window after the absent-row sweep re-arms exactly "
           "the surviving rows at the old generation, and a re-push converges",
@@ -2273,6 +2274,7 @@ TEST_CASE("#4415 PR-A (CH-5): a re-enabled rule behind a retained disarm is driv
     // h's hung arm becomes a retained wedge and x's stuck disarm a retained disarm.
     REQUIRE(r.rt().expire_overdue_claims_at_for_test(std::chrono::steady_clock::now() + 2h) == 2);
     r.dispatch(push_bytes({h, x}, kGen)); // identical: re-observes, drives nothing itself
+    CHECK(r.rt().claim_queue_depth_for_test(xk) == 2); // premise: [Disarm, Arm] still queued
     r.sm->release_hang();
     CHECK(yuzu::test::spin_until(
         [&] {
@@ -2292,7 +2294,7 @@ TEST_CASE("#4415 PR-A (CH-5): a re-enabled rule behind a retained disarm is driv
 //       (the server's re-push cadence) repairs the rule. The case pins that state, so a change to
 //       it is noticed, and pins that the repair works.
 // -------------------------------------------------------------------------------------------------
-TEST_CASE("#4415 PR-A (CH-7): a re-observed arm that a delta then leaves untracked and that later "
+TEST_CASE("#4415 PR-A (CH-7, #5547): a re-observed arm that a delta then leaves untracked and that later "
           "refuses is a known silent loss (AC-11) that the next full_sync repairs",
           "[spark][guardian][reconcile][4415prA]") {
     Rig r;
@@ -2310,6 +2312,7 @@ TEST_CASE("#4415 PR-A (CH-7): a re-observed arm that a delta then leaves untrack
     REQUIRE(r.wait_armed(1));
     r.dispatch(bytes); // identical full_sync: h's in-flight arm is re-observed
     CHECK(r.sm->watch_calls(hk) == 1);
+    REQUIRE(r.engine->policy_generation() != kGen); // premise: not yet acknowledged
     r.dispatch(push_bytes({s0}, kGen, /*full_sync=*/false)); // a delta that does not name h
     r.sm->set_late_refuse();
     r.sm->release_hang();

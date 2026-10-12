@@ -2411,8 +2411,8 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             ++reconcile_failures;
             arm_failures_.fetch_add(1, std::memory_order_relaxed);
             try {
-                spdlog::error("Guardian: reconcile threw for rule '{}' - persisted; its previous "
-                              "arm, if any, is unchanged",
+                spdlog::error("Guardian: reconcile threw for rule '{}' - persisted; whether its "
+                              "previous arm survives is not guaranteed",
                               log_id_token(rule.rule_id()));
             } catch (...) {
             }

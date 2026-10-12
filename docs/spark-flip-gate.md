@@ -1311,7 +1311,10 @@ flip, with a red-first test each:
     `push_guardian_rules` tool in `mcp_server.cpp` and the `guardian_push_fn_` fan-out in
     `server.cpp` all build the push from the deployed set.)
     A `full_sync=false` push is also additive on the agent: a rule removed from the
-    Baseline stays armed or wedged until a full push. Follow-up FU-12 (#5547).
+    Baseline stays armed or wedged until a full push. Follow-up FU-12 (#5547). The engine
+    case `(CH-7, #5547)` pins this loss for an arm re-observed by an identical full_sync (the
+    rule ends unarmed, no failed receipt is recorded, the generation is acknowledged, and the
+    next full_sync repairs it).
   - (AC-12) **A push mixing a wedge with any non-wedge failure** (a congestion expiry, a
     refusal) is a Reapply every time: the suppression applies only when every unresolved
     item is an outstanding wedge (or a Pending/Committed sibling). Each such Reapply still
@@ -1445,7 +1448,10 @@ flip, with a red-first test each:
     hung call exactly as a forced Reapply's re-arms do.
   - (AC-17) **Flip-time documentation sweep (a flip precondition; follow-up FU-15, #5549).** Several statements in the operator pages are true only while `prefer_spark` is
     off, and once Spark enforcement is live they would conceal that it is. The flip PR must
-    sweep them and add its own `docs/user-manual/upgrading.md` "Behaviour change" entry.
+    sweep them and add its own `docs/user-manual/upgrading.md` "Behaviour change" entry, which
+    must carry the AC-18 loss set. The sweep also covers the time-bound sentence in
+    `guaranteed-state.md` ("What a full push does on the agent"), which says the Spark path is
+    not enabled in production today.
     Known sites (quoted text, checked to exist when this row was written): in
     `upgrading.md`'s claim-lifecycle telemetry entry, "No agent enables the Spark path
     today", "Nothing about Guard detection or enforcement changes" (line-wrapped in the file
@@ -1511,9 +1517,12 @@ flip, with a red-first test each:
     differs, is written); every existing hold on a failed scan or delete is unchanged. Accepted
     losses (operator decision, 2026-10-12): (1) an identical re-push no longer re-emits
     `guard.compliant` for a skipped rule, so it no longer repairs a lost recovery event by
-    accident; (2) it no longer restarts the `pending_initial` demotion clock; (3) a crash after
-    the absent-row sweep and before the per-rule rewrites leaves the previous rows for kept
-    rules until the next push (a restart then re-arms those); (4) a faulted or dead shared
+    accident, and server-state loss (a Postgres restore, an outbox drop) no longer self-heals by
+    re-push; an explicit census resync mechanism is a flip precondition to be owned (issue to
+    be filed); (2) it no longer restarts the `pending_initial` demotion clock; (3) a crash after
+    the absent-row sweep and before the per-rule rewrites leaves the previous rows for carried
+    rules, i.e. OLD content, including a rule the push disabled or changed, until the next push
+    (a restart then re-arms those); this window is live on the legacy path too; (4) a faulted or dead shared
     key is repaired by a full_sync only, not by an identical delta push, which rebuilds each
     rule on it individually and so rejoins the same watcher; (5) if an earlier rule's KV persist fails
     mid-push, apply_rules returns early (generation held, failure latched), and a kept rule
@@ -1527,10 +1536,10 @@ flip, with a red-first test each:
     side effect; it is found only by the convergence lanes, so its staleness is bounded by the
     lane cadence (service and registry 60 s, file 600 s) and by nothing the push does, and a
     mechanism must call `fault()` for a deaf watch, per the mechanism contract
-    (`spark_mechanism.hpp`). An identical arm that sits behind a retained, queued disarm is
-    re-observed rather than driven, so it waits for the redrive of retained disarms (about 5 s)
-    at the latest; the engine case `(CH-5)` pins that it is driven within 10 s once the hang is
-    released, not that the redrive is what drives it. The keep-set (`full_sync_ids`) is now built
+    (`spark_mechanism.hpp`); (7) an identical arm that sits behind a retained, queued disarm is
+    re-observed rather than driven, so it waits at worst about 5 s (`redrive_retained_disarms`);
+    the 10 s bound the engine case `(CH-5)` pins is the `release_hang` bound, and it pins that
+    the arm is driven, not that the redrive is what drives it. The keep-set (`full_sync_ids`) is now built
     before the first rule is persisted
     rather than inside the rule loop; the baseline (`45f727420`) already inserted into the same
     `std::set` after `begin_application()` with no catch, so this moves that existing exposure
@@ -1547,8 +1556,17 @@ flip, with a red-first test each:
     and the delta-omission obligation loss (#5547, AC-11) are untouched. Evidence is the
     `[4415prA]` tests (`test_guardian_spark_reapply_skip_engine.cpp`,
     `test_guardian_spark_reapply_skip_runtime.cpp`) and the rewritten `[5459fu10]`,
-    `[5459fu11]`, `[5459valve]`, `[5459kv]`, on fake mechanisms; no sanitizer, Windows or macOS
-    run is recorded for them here.
+    `[5459fu11]`, `[5459valve]`, `[5459kv]`, on fake mechanisms. TSan and ASan/UBSan ran clean
+    at `0d9b8dfd7` (Linux debug; the round-3 test edits were not re-run under sanitizers);
+    Windows and macOS are not built.
+    **Flip preconditions beside AC-18** (none is done): (a) enable the `yuzu-fleet-spark`
+    `armed_faulted > 0` alert (its group in `docs/prometheus/yuzu-alerts.yml` is commented out);
+    (b) a bounded per-rule rebuild-reason INFO log and, optionally, a skip counter (the
+    unhappy-path SRE-1 finding: with the skip, an operator cannot tell from the agent log why a
+    given rule was or was not rebuilt); (c) a release-build measurement of the full_sync cost
+    (scenarios S0 and S5) at R=1000 and R=5000 rules on a quiet box, with a shared-faulted-key
+    cell and the engine `mtx_` hold time recorded directly (the harness is uncommitted, in
+    `/home/dgr/yuzu-4415-measure`); the per-push probe cost above is an estimate only.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
