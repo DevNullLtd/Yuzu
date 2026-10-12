@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <compare>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -109,9 +111,11 @@ std::string json_value_to_string(const nlohmann::json& val) {
 }
 
 /// True when `s` has the plain decimal shape every platform's parser agrees on: an optional '-',
-/// then a digit or '.', and no 'x' / 'X'. This keeps the std::stod fallback (Apple Clang) from
-/// accepting what std::from_chars refuses (leading whitespace, '+', hex, inf, nan), so a stored
-/// string means the same on every OS. Applied on all platforms.
+/// then a digit or '.', and no 'x' / 'X'. std::from_chars refuses leading whitespace, '+' and a
+/// "0x" prefix but DOES accept "inf" and "nan" (and "infinity"), and the std::stod fallback
+/// (Apple Clang) is more lenient still; the shape check rejects all of those up front (a first
+/// character that is not a digit or '.', and any 'x'), so a stored string means the same on every
+/// OS. Applied on all platforms.
 bool plain_decimal_shape(const std::string& s) {
     std::size_t i = (!s.empty() && s[0] == '-') ? 1 : 0;
     if (i >= s.size() || !((s[i] >= '0' && s[i] <= '9') || s[i] == '.'))
@@ -206,6 +210,88 @@ bool numbers_equal(const Number& a, const Number& b) {
         a, b);
 }
 
+/// Exact integer-vs-double ordering. A NaN is unordered; a double outside the integer's type range
+/// orders by its sign/magnitude; inside the range the double splits into an integral part (which
+/// compares as an integer, so nothing rounds through 2^53) and a fraction that breaks a tie.
+std::partial_ordering order_int_double(std::int64_t i, double d) {
+    if (std::isnan(d))
+        return std::partial_ordering::unordered;
+    if (d >= 9223372036854775808.0)
+        return std::partial_ordering::less;
+    if (d < -9223372036854775808.0)
+        return std::partial_ordering::greater;
+    const double t = std::trunc(d);
+    if (const auto c = i <=> static_cast<std::int64_t>(t); c != 0)
+        return c;
+    const double frac = d - t;
+    return frac > 0.0 ? std::partial_ordering::less
+                      : (frac < 0.0 ? std::partial_ordering::greater
+                                    : std::partial_ordering::equivalent);
+}
+std::partial_ordering order_uint_double(std::uint64_t u, double d) {
+    if (std::isnan(d))
+        return std::partial_ordering::unordered;
+    if (d >= 18446744073709551616.0)
+        return std::partial_ordering::less;
+    if (d < 0.0)
+        return std::partial_ordering::greater;
+    const double t = std::trunc(d);
+    if (const auto c = u <=> static_cast<std::uint64_t>(t); c != 0)
+        return c;
+    const double frac = d - t;
+    return frac > 0.0 ? std::partial_ordering::less
+                      : (frac < 0.0 ? std::partial_ordering::greater
+                                    : std::partial_ordering::equivalent);
+}
+
+/// Three-way compare of two numbers, exact across int64 / uint64 / double (mirrors numbers_equal):
+/// `unordered` only when a double is NaN. `-0` and `0` are equivalent.
+std::partial_ordering compare_numbers(const Number& a, const Number& b) {
+    return std::visit(
+        [](const auto& x, const auto& y) -> std::partial_ordering {
+            using X = std::decay_t<decltype(x)>;
+            using Y = std::decay_t<decltype(y)>;
+            if constexpr (std::is_same_v<X, Y>) {
+                return x <=> y;
+            } else if constexpr (std::is_same_v<X, double>) {
+                const auto r = compare_numbers(y, x);
+                if (r == std::partial_ordering::less)
+                    return std::partial_ordering::greater;
+                if (r == std::partial_ordering::greater)
+                    return std::partial_ordering::less;
+                return r;
+            } else if constexpr (std::is_same_v<Y, double>) {
+                if constexpr (std::is_same_v<X, std::int64_t>)
+                    return order_int_double(x, y);
+                else
+                    return order_uint_double(x, y);
+            } else if constexpr (std::is_same_v<X, std::int64_t>) {
+                return x < 0 ? std::partial_ordering::less
+                             : static_cast<std::uint64_t>(x) <=> y;
+            } else {
+                return y < 0 ? std::partial_ordering::greater
+                             : x <=> static_cast<std::uint64_t>(y);
+            }
+        },
+        a, b);
+}
+
+/// `>` / `>=` / `<` / `<=` for a condition whose operand was a JSON number: the RAW stored value
+/// (a number, or a string that parses as a number in full) against the parsed operand, exactly.
+/// A stored value that is not a number, or an unordered (NaN) pair, never satisfies the operator.
+bool numeric_order(const nlohmann::json& stored, const InventoryCondition& cond) {
+    const auto n = stored_number(stored);
+    if (!n.has_value())
+        return false;
+    const auto ord = compare_numbers(*n, cond.numeric_value);
+    if (ord == std::partial_ordering::unordered)
+        return false;
+    if (cond.op == ">") return ord > 0;
+    if (cond.op == ">=") return ord >= 0;
+    if (cond.op == "<") return ord < 0;
+    return ord <= 0;
+}
+
 /// `==` / `!=` for a condition whose operand was a JSON number: compares the RAW stored value
 /// against the parsed operand (never a rendered text, which loses digits).
 bool numeric_equal(const nlohmann::json& stored, const InventoryCondition& cond) {
@@ -244,6 +330,11 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
     // Version comparisons
     if (cond.op == "version_gte") return compare_versions(val_str, cond.value) >= 0;
     if (cond.op == "version_lte") return compare_versions(val_str, cond.value) <= 0;
+
+    // A JSON-number operand: exact numeric ordering on the raw stored value, never lexical.
+    if (cond.numeric_operand &&
+        (cond.op == ">" || cond.op == ">=" || cond.op == "<" || cond.op == "<="))
+        return numeric_order(*val, cond);
 
     // Numeric comparisons — attempt to parse both sides as numbers
     double lhs = 0.0;

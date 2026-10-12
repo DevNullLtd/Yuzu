@@ -16,13 +16,16 @@ struct InventoryCondition {
     std::string op;    // "==", "!=", ">=", "<=", ">", "<", "contains", "exists", "version_gte", "version_lte"
     std::string value;
     /// True only when the caller's JSON `value` was a number (set by parse_inventory_condition).
-    /// `==` / `!=` then compare the stored value against `numeric_value`, the operand as the caller
-    /// sent it, never against `value` (the `dump()` text, kept for display): two integers compare
-    /// exactly (signed and unsigned mixed correctly, no rounding through a double), anything else
-    /// compares as an exact double equality (`0.1 + 0.2` is not `0.3`, `-0` equals `0`). A stored
-    /// string that parses in full as a number counts as that number (stored "1.10" equals operand
-    /// 1.1); any other stored value (non-numeric string, boolean) is never equal. A string operand
-    /// keeps the exact lexical compare, so version strings such as "1.10" and "1.1" stay different.
+    /// `==` / `!=` / `>` / `>=` / `<` / `<=` then compare the RAW stored value against
+    /// `numeric_value`, the operand as the caller sent it, never against `value` (the `dump()` text,
+    /// kept for display): two integers compare exactly (signed and unsigned mixed correctly), an
+    /// integer against a double compares exactly with no rounding through 2^53, and two doubles
+    /// compare as doubles (`0.1 + 0.2` is not `0.3`, `-0` equals `0`). A stored string that parses
+    /// in full as a number counts as that number (stored "1.10" equals operand 1.1, stored "10" is
+    /// greater than operand 9); any other stored value (non-numeric string such as "5 GB" or "N/A",
+    /// boolean, array) is never equal and never satisfies an ordering operator. A string operand
+    /// keeps the exact lexical `==` / `!=` (so "1.10" and "1.1" stay different) and the evaluator's
+    /// original ordering behaviour.
     bool numeric_operand = false;
     /// The parsed operand; meaningful only when `numeric_operand` is set.
     std::variant<std::int64_t, std::uint64_t, double> numeric_value = std::int64_t{0};
@@ -35,9 +38,10 @@ struct InventoryCondition {
 /// ABSENT keys keep the empty default. A PRESENT `plugin` / `field` / `op` must be a JSON string.
 /// A PRESENT `value` is the string itself, or, for a comparison operator (`==`, `!=`, `>`, `>=`,
 /// `<`, `<=`), a JSON number kept as its `dump()` text plus the parsed number in `numeric_value`,
-/// with `numeric_operand` set (so `==` / `!=` compare it numerically, exact for integers and exact
-/// double equality otherwise, and `>` `>=` `<` `<=` use the evaluator's existing numeric path), or
-/// a boolean as `true` / `false` for `==` / `!=` only. Anything else (null, array, object, a number under another operator) is refused. It used
+/// with `numeric_operand` set (so all six operators compare it numerically against the raw stored
+/// value, exact for integers and for integer vs double), or a boolean as `true` / `false` for
+/// `==` / `!=` only. Anything else (null, array, object, a number under another operator) is
+/// refused. It used
 /// to become "": `{"op":">","value":5}` then selected EVERY device that had the field, because the
 /// evaluator falls back to a lexicographic compare against the empty string.
 /// Returns the 400 / -32602 message, or nullopt when accepted (`out` is then filled in).

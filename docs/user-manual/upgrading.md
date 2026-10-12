@@ -261,9 +261,11 @@ Security-gating numbers in JSON request bodies are strict too. **Before / after:
 
 Three more inputs that used to be read as something else are refused (`400` on REST, `-32602` on MCP), and one stored value is repaired:
 a `conditions[].value` on the inventory evaluate and result-set routes that is a JSON number is
-accepted with `==`, `!=`, `>`, `>=`, `<`, `<=` (and a boolean with `==` or `!=`); `==` and `!=` compare it
-as a number (exact for integers, exact double equality otherwise, a stored numeric string counting as
-that number), and any other type is refused (a number used to become the empty string, so `{"op":">","value":5}`
+accepted with `==`, `!=`, `>`, `>=`, `<`, `<=` (and a boolean with `==` or `!=`); all six compare it
+as a number against the raw stored value (exact for integers and for integer against decimal, a stored
+numeric string counting as that number), so **behaviour change:** a stored value that is not a number,
+such as `"5 GB"` or `"N/A"`, no longer satisfies `>`, `>=`, `<` or `<=` against a numeric operand (it was read as `5`
+or compared as text), and any other operand type is refused (a number used to become the empty string, so `{"op":">","value":5}`
 selected every device that had the field); a result-set matcher whose `column`, `op` or `value` is
 present with the wrong type no longer qualifies every responder; the DEX `window` on
 `GET /api/v1/dex/signals`, `/dex/scope`, `/dex/signals/{obs_type}` and their MCP tools must be

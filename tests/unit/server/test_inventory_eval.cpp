@@ -1178,6 +1178,30 @@ TEST_CASE("InventoryEval: numeric == and != compare the raw stored number, not a
         CHECK_FALSE(matches(text, "==", "5"));
         CHECK(matches(text, "!=", "5"));
     }
+    // A negative integer against a double: exact, integral and in range.
+    CHECK(matches("-5", "==", "-5.0"));
+    CHECK_FALSE(matches("-5", "==", "-5.5"));
+    CHECK(matches("-9223372036854775808", "==", "-9223372036854775808.0"));
+    CHECK_FALSE(matches("-9223372036854775808", "==", "-9223372036854777856.0"));
+    // A stored string that parses as an int64 against a double operand.
+    CHECK(matches(R"("5")", "==", "5.0"));
+    CHECK_FALSE(matches(R"("9007199254740993")", "==", "9007199254740992.0"));
+    // The 2^63 and 2^64 range guards: the double one past the type's max never equals its max.
+    CHECK_FALSE(matches("18446744073709551615", "==", "18446744073709551616.0"));
+    CHECK_FALSE(matches("9223372036854775807", "==", "9223372036854775808.0"));
+    CHECK(matches("9223372036854775808", "==", "9223372036854775808.0"));
+    // Stored strings: sign, leading '.', leading zeros, and an out-of-range exponent.
+    CHECK(matches(R"("-1")", "==", "-1"));
+    CHECK(matches(R"(".5")", "==", "0.5"));
+    CHECK(matches(R"("007")", "==", "7"));
+    CHECK_FALSE(matches(R"("1e400")", "==", "1e308"));
+    CHECK_FALSE(matches(R"("1e400")", "==", "0"));
+    CHECK(matches(R"("1e400")", "!=", "1e308"));
+    // An operand of -0 or 0.0 equals a stored zero in every spelling.
+    CHECK(matches("0", "==", "-0"));
+    CHECK(matches("0", "==", "0.0"));
+    CHECK(matches("-0.0", "==", "0.0"));
+    CHECK(matches(R"("0")", "==", "-0.0"));
     // A stored null is "no value": neither == nor != selects it (unchanged).
     CHECK_FALSE(matches("null", "==", "0"));
     CHECK_FALSE(matches("null", "!=", "0"));
@@ -1187,6 +1211,86 @@ TEST_CASE("InventoryEval: numeric == and != compare the raw stored number, not a
         InventoryEvalRequest req;
         req.conditions = {{"p", "v", "==", "1.1"}};
         CHECK(evaluate_inventory(req, records).empty());
+    }
+}
+
+TEST_CASE("InventoryEval: numeric > >= < <= compare the raw stored number exactly",
+          "[inventory_eval][numeric_params]") {
+    using nlohmann::json;
+    auto matches = [](const char* stored_json, const char* op, const char* operand_json) {
+        Records records = {{"agent-a|p", std::string(R"({"v": )") + stored_json + "}"}};
+        InventoryEvalRequest req;
+        InventoryCondition c;
+        const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
+                                     R"(","value":)" + operand_json + "}");
+        REQUIRE_FALSE(parse_inventory_condition(doc, c));
+        req.conditions.push_back(c);
+        return !evaluate_inventory(req, records).empty();
+    };
+    // Digits a 6-decimal rendering used to drop.
+    CHECK_FALSE(matches("0.1234567", ">", "0.1234567"));
+    CHECK(matches("0.1234567", ">=", "0.1234567"));
+    CHECK(matches("0.1234567", "<=", "0.1234567"));
+    CHECK_FALSE(matches("0.1234567", "<", "0.1234567"));
+    CHECK(matches("3e-7", ">", "2e-7"));
+    CHECK_FALSE(matches("3e-7", "<", "2e-7"));
+    CHECK(matches("1e-7", ">", "0"));
+    // Unsigned above INT64_MAX no longer wraps negative.
+    CHECK(matches("18446744073709551615", ">", "9223372036854775807"));
+    CHECK(matches("18446744073709551615", ">", "-1"));
+    CHECK_FALSE(matches("18446744073709551615", "<", "9223372036854775807"));
+    CHECK(matches("18446744073709551615", ">=", "18446744073709551615"));
+    CHECK_FALSE(matches("18446744073709551615", ">", "18446744073709551615"));
+    CHECK(matches("-1", "<", "18446744073709551615"));
+    CHECK_FALSE(matches("-1", ">", "18446744073709551615"));
+    // Integers above 2^53 order exactly, against integer and double operands.
+    CHECK(matches("9007199254740993", ">", "9007199254740992"));
+    CHECK(matches("9007199254740993", ">", "9007199254740992.0"));
+    CHECK_FALSE(matches("9007199254740993", "<=", "9007199254740992.0"));
+    CHECK(matches("9007199254740992", "<", "9007199254740993"));
+    CHECK(matches("9007199254740992.0", "<", "9007199254740993"));
+    // Integer vs double, fraction and range guards.
+    CHECK(matches("5", "<", "5.5"));
+    CHECK(matches("5", ">", "4.5"));
+    CHECK(matches("-5", ">", "-5.5"));
+    CHECK(matches("-5", "<", "-4.5"));
+    CHECK(matches("18446744073709551615", "<", "18446744073709551616.0"));
+    CHECK(matches("9223372036854775807", "<", "9223372036854775808.0"));
+    CHECK(matches("-9223372036854775808", ">", "-9223372036854777856.0"));
+    CHECK_FALSE(matches("18446744073709551615", ">", "1e300"));
+    CHECK(matches("5", ">", "-1e300"));
+    CHECK(matches("0", ">", "-0.5"));
+    // Negative numbers and zero spellings.
+    CHECK(matches("-3", "<", "-2"));
+    CHECK(matches("-3.5", "<", "-3"));
+    CHECK(matches("-0.0", ">=", "0"));
+    CHECK(matches("-0.0", "<=", "0"));
+    CHECK_FALSE(matches("-0.0", ">", "0"));
+    CHECK_FALSE(matches("0", "<", "-0"));
+    // A stored numeric string orders as a number, not as text ("10" > 9 is true).
+    CHECK(matches(R"("10")", ">", "9"));
+    CHECK_FALSE(matches(R"("10")", "<", "9"));
+    CHECK(matches(R"("1.5")", "<", "10"));
+    // A stored value that is not a number never satisfies an ordering against a numeric operand.
+    for (const char* op : {">", ">=", "<", "<="}) {
+        INFO(op);
+        CHECK_FALSE(matches(R"("5 GB")", op, "4"));
+        CHECK_FALSE(matches(R"("N/A")", op, "5"));
+        CHECK_FALSE(matches(R"("")", op, "5"));
+        CHECK_FALSE(matches(R"(" 5")", op, "4"));
+        CHECK_FALSE(matches(R"("nan")", op, "5"));
+        CHECK_FALSE(matches(R"("1e400")", op, "5"));
+        CHECK_FALSE(matches("true", op, "0"));
+        CHECK_FALSE(matches("false", op, "-1"));
+        CHECK_FALSE(matches("[5]", op, "4"));
+        CHECK_FALSE(matches("null", op, "4"));
+    }
+    // A string operand keeps today's lexical / existing numeric behaviour (not numeric_operand).
+    {
+        Records records = {{"agent-a|p", R"({"v": "N/A"})"}};
+        InventoryEvalRequest req;
+        req.conditions = {{"p", "v", ">", "5"}};
+        CHECK(evaluate_inventory(req, records).size() == 1);
     }
 }
 
