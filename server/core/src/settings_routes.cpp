@@ -6182,14 +6182,14 @@ void SettingsRoutes::register_routes(
                       return;
                   }
                   auto idx = static_cast<size_t>(*idx_parsed);
-                  auto rules = auto_approve_->list_rules();
-                  if (idx < rules.size()) {
-                      auto_approve_->set_enabled(idx, !rules[idx].enabled);
+                  // The engine returns the rule as flipped, so the row names the state that was
+                  // actually stored even if another request toggles or deletes concurrently.
+                  if (const auto toggled = auto_approve_->toggle_enabled(idx)) {
                       audit_fn_(req, "settings.auto_approve.rule_toggled", "success",
                                 "AutoApproveRule", std::to_string(idx),
-                                "type=" + std::string(auto_approve_type_name(rules[idx].type)) +
-                                    " value=" + auto_approve_audit_value(rules[idx].value) +
-                                    " enabled=" + (rules[idx].enabled ? "false" : "true"));
+                                "type=" + std::string(auto_approve_type_name(toggled->type)) +
+                                    " value=" + auto_approve_audit_value(toggled->value) +
+                                    " enabled=" + (toggled->enabled ? "true" : "false"));
                   } else {
                       audit_fn_(req, "settings.auto_approve.rule_toggled", "denied",
                                 "AutoApproveRule", std::to_string(idx), "rule_not_found");
@@ -6211,16 +6211,15 @@ void SettingsRoutes::register_routes(
                         return;
                     }
                     auto idx = static_cast<size_t>(*idx_parsed);
-                    // Snapshot the rule first so the row names WHAT was removed (the index alone
-                    // is meaningless once the list shifts). An out-of-range index is an audited
-                    // no-op, never a silent success.
-                    const auto rules = auto_approve_->list_rules();
-                    auto_approve_->remove_rule(idx);
-                    if (idx < rules.size()) {
+                    // remove_rule returns the rule it deleted, so the row names WHAT was removed
+                    // (the index alone is meaningless once the list shifts) even under a
+                    // concurrent change. An out-of-range index is an audited no-op, never a
+                    // silent success.
+                    if (const auto removed = auto_approve_->remove_rule(idx)) {
                         audit_fn_(req, "settings.auto_approve.rule_removed", "success",
                                   "AutoApproveRule", std::to_string(idx),
-                                  "type=" + std::string(auto_approve_type_name(rules[idx].type)) +
-                                      " value=" + auto_approve_audit_value(rules[idx].value));
+                                  "type=" + std::string(auto_approve_type_name(removed->type)) +
+                                      " value=" + auto_approve_audit_value(removed->value));
                     } else {
                         audit_fn_(req, "settings.auto_approve.rule_removed", "denied",
                                   "AutoApproveRule", std::to_string(idx), "rule_not_found");

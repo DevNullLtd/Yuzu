@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1071,7 +1072,8 @@ TEST_CASE("InventoryEval: parse_inventory_condition renders a numeric operand fo
     CHECK_FALSE(parse(json{{"op", "exists"}}, c));
     CHECK(c.value.empty());
 
-    // Numbers render with dump() (the evaluator's own rendering of a stored number).
+    // Numbers keep their dump() text and set numeric_operand, so ==/!= compare numerically
+    // (a string operand leaves the flag clear and stays lexical).
     struct Case { const char* op; const char* json_value; const char* expect; };
     for (const auto& k : {Case{">", "5", "5"}, Case{">=", "-1", "-1"}, Case{"<", "5.5", "5.5"},
                           Case{"<=", "1e3", "1000.0"}, Case{"==", "4294967297", "4294967297"},
@@ -1083,7 +1085,70 @@ TEST_CASE("InventoryEval: parse_inventory_condition renders a numeric operand fo
                                      k.json_value + "}");
         CHECK_FALSE(parse(doc, c));
         CHECK(c.value == k.expect);
+        CHECK(c.numeric_operand == (std::string(k.json_value) != "true" &&
+                                    std::string(k.json_value) != "false"));
     }
+}
+
+TEST_CASE("InventoryEval: a JSON-number operand compares numerically under == and !=",
+          "[inventory_eval][numeric_params]") {
+    using nlohmann::json;
+    // Stored side: a float, an int, a non-numeric string, a boolean, a numeric-looking string.
+    Records records = {
+        {"agent-f|p", R"({"v": 5.5})"},    {"agent-i|p", R"({"v": 5})"},
+        {"agent-k|p", R"({"v": 1000})"},   {"agent-s|p", R"({"v": "abc"})"},
+        {"agent-b|p", R"({"v": true})"},   {"agent-n|p", R"({"v": "5.50"})"},
+    };
+    // Build the condition through the real parser, exactly as the three producers do.
+    auto matching = [&](const char* op, const char* operand_json) {
+        InventoryEvalRequest req;
+        InventoryCondition c;
+        const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
+                                     R"(","value":)" + operand_json + "}");
+        REQUIRE_FALSE(parse_inventory_condition(doc, c));
+        req.conditions.push_back(c);
+        std::vector<std::string> ids;
+        for (const auto& r : evaluate_inventory(req, records))
+            ids.push_back(r.agent_id);
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    };
+    using Ids = std::vector<std::string>;
+    // 5.5 == stored float 5.5 (and the numeric-looking string "5.50"); never the others.
+    CHECK(matching("==", "5.5") == Ids{"agent-f", "agent-n"});
+    // != 5.5 excludes those, and selects the int, the non-numeric string and the boolean.
+    CHECK(matching("!=", "5.5") == Ids{"agent-b", "agent-i", "agent-k", "agent-s"});
+    // 5.0 equals stored int 5 (and 1000 matches 1e3 below).
+    CHECK(matching("==", "5.0") == Ids{"agent-i"});
+    CHECK(matching("==", "1e3") == Ids{"agent-k"});
+    CHECK(matching("!=", "1e3") == Ids{"agent-b", "agent-f", "agent-i", "agent-n", "agent-s"});
+    CHECK(matching("==", "5") == Ids{"agent-i"});
+    // A non-numeric stored value is never equal to a numeric operand.
+    CHECK(matching("==", "0") == Ids{});
+}
+
+TEST_CASE("InventoryEval: a string operand keeps the exact lexical == and !=",
+          "[inventory_eval][numeric_params]") {
+    Records records = {
+        {"agent-a|p", R"({"v": "1.10"})"},
+        {"agent-b|p", R"({"v": "1.1"})"},
+        {"agent-c|p", R"({"v": 5.5})"},
+    };
+    auto run = [&](const char* op, const char* operand) {
+        InventoryEvalRequest req;
+        req.conditions = {{"p", "v", op, operand}};
+        std::vector<std::string> ids;
+        for (const auto& r : evaluate_inventory(req, records))
+            ids.push_back(r.agent_id);
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    };
+    using Ids = std::vector<std::string>;
+    CHECK(run("==", "1.1") == Ids{"agent-b"});
+    CHECK(run("==", "1.10") == Ids{"agent-a"});
+    CHECK(run("!=", "1.1") == Ids{"agent-a", "agent-c"});
+    // A string operand is NOT numeric: "5.5" does not equal the stored float's "5.500000".
+    CHECK(run("==", "5.5") == Ids{});
 }
 
 TEST_CASE("InventoryEval: parse_inventory_condition refuses what used to become the empty string",

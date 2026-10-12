@@ -2929,6 +2929,68 @@ TEST_CASE("POST /api/v1/inventory/evaluate: no poisoned record present -- "
     CHECK_FALSE(body.contains("results_excluded_by_poison"));
 }
 
+// #4644: the same numeric-operand rule on the third caller. Reverting only this route's
+// parse_inventory_condition call must turn this red.
+TEST_CASE("POST /api/v1/inventory/evaluate: a numeric condition value is compared numerically, "
+          "and a value or key of the wrong type is a 400 (#4644)",
+          "[pg][result_set][inventory][inventory_eval][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        for (const auto& [agent, ram] : {std::pair<const char*, const char*>{"agent-big", "32"},
+                                         {"agent-small", "3"},
+                                         {"agent-half", "5.5"}}) {
+            auto seeded = yuzu::server::pg::exec_params(
+                lease.get(),
+                "INSERT INTO inventory_store.inventory_data "
+                "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+                std::vector<std::string>{agent, std::string(R"({"ram":)") + ram + "}"});
+            REQUIRE(seeded.status() == PGRES_COMMAND_OK);
+        }
+    }
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    auto agents_for = [&](const char* op, const char* value) {
+        int status = 0;
+        auto body = h.post("/api/v1/inventory/evaluate",
+                           std::string(R"({"conditions":[{"plugin":"custom","field":"ram","op":")") +
+                               op + R"(","value":)" + value + "}]}",
+                           status);
+        REQUIRE(status == 200);
+        std::vector<std::string> ids;
+        for (const auto& r : body["data"])
+            ids.push_back(r["agent_id"].get<std::string>());
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    };
+    using Ids = std::vector<std::string>;
+    CHECK(agents_for(">", "5") == Ids{"agent-big", "agent-half"}); // was all three: 5 became ""
+    CHECK(agents_for("==", "5.5") == Ids{"agent-half"});
+    CHECK(agents_for("!=", "5.5") == Ids{"agent-big", "agent-small"});
+    CHECK(agents_for("==", "32.0") == Ids{"agent-big"});
+
+    for (const char* cond :
+         {R"({"plugin":"custom","field":"ram","op":">","value":null})",
+          R"({"plugin":"custom","field":"ram","op":">","value":[5]})",
+          R"({"plugin":"custom","field":"ram","op":">","value":true})",
+          R"({"plugin":"custom","field":"ram","op":"contains","value":5})",
+          R"({"plugin":"custom","field":"ram","op":5,"value":"5"})",
+          R"({"plugin":7,"field":"ram","op":">","value":"5"})"}) {
+        const std::string body = std::string(R"({"conditions":[)") + cond + "]}";
+        INFO(body);
+        int st = 0;
+        auto j = h.post("/api/v1/inventory/evaluate", body, st);
+        CHECK(st == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("conditions[]") != std::string::npos);
+    }
+}
+
 // #4496 follow-up: the sibling of the two `results_excluded_by_poison` tests
 // above, for the OTHER exclusion cause -- a genuine JSON parse error.
 TEST_CASE("POST /api/v1/inventory/evaluate: a malformed record is flagged via "

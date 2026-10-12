@@ -284,12 +284,23 @@ void AutoApproveEngine::add_rule(const AutoApproveRule& rule) {
     save_locked();
 }
 
-void AutoApproveEngine::remove_rule(size_t index) {
+std::optional<AutoApproveRule> AutoApproveEngine::remove_rule(size_t index) {
     std::lock_guard lock(mu_);
-    if (index < rules_.size()) {
-        rules_.erase(rules_.begin() + static_cast<std::ptrdiff_t>(index));
-        save_locked();
-    }
+    if (index >= rules_.size())
+        return std::nullopt;
+    auto removed = rules_[index];
+    rules_.erase(rules_.begin() + static_cast<std::ptrdiff_t>(index));
+    save_locked();
+    return removed;
+}
+
+std::optional<AutoApproveRule> AutoApproveEngine::toggle_enabled(size_t index) {
+    std::lock_guard lock(mu_);
+    if (index >= rules_.size())
+        return std::nullopt;
+    rules_[index].enabled = !rules_[index].enabled;
+    save_locked();
+    return rules_[index];
 }
 
 void AutoApproveEngine::set_enabled(size_t index, bool enabled) {

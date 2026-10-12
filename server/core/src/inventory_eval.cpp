@@ -104,6 +104,30 @@ std::string json_value_to_string(const nlohmann::json& val) {
     return val.dump();
 }
 
+/// Parse a whole string as a double; false when empty, partly consumed or out of range.
+bool parse_double_full(const std::string& s, double& out) {
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+    const auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
+    return ec == std::errc{} && p == s.data() + s.size();
+#else
+    try {
+        size_t pos = 0;
+        out = std::stod(s, &pos);
+        return pos == s.size();
+    } catch (...) {
+        return false;
+    }
+#endif
+}
+
+/// `==` / `!=` for a condition whose operand was a JSON number: equal iff BOTH sides parse in full
+/// and compare equal as doubles (a non-numeric stored value is never equal).
+bool numeric_equal(const std::string& stored, const std::string& operand) {
+    double a = 0.0;
+    double b = 0.0;
+    return parse_double_full(stored, a) && parse_double_full(operand, b) && a == b;
+}
+
 /// Evaluate a single condition against parsed JSON data.
 bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
                     std::string& matched_value_out) {
@@ -125,8 +149,11 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
     auto val_str = json_value_to_string(*val);
     matched_value_out = val_str;
 
-    if (cond.op == "==" ) return val_str == cond.value;
-    if (cond.op == "!=" ) return val_str != cond.value;
+    if (cond.op == "==" || cond.op == "!=") {
+        const bool eq = cond.numeric_operand ? numeric_equal(val_str, cond.value)
+                                             : val_str == cond.value;
+        return cond.op == "==" ? eq : !eq;
+    }
     if (cond.op == "contains") return val_str.find(cond.value) != std::string::npos;
 
     // Version comparisons
@@ -208,6 +235,7 @@ std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
     const bool equality = out.op == "==" || out.op == "!=";
     if (v.is_number() && comparison) {
         out.value = v.dump();
+        out.numeric_operand = true;
         return std::nullopt;
     }
     if (v.is_boolean() && equality) {

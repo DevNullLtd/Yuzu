@@ -28823,10 +28823,14 @@ TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
         auto res = ts.call(
             R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[{"plugin":"os_info","field":"platform","op":"==","value":123}]}}})");
         REQUIRE(res);
-        // Reaches the store-unavailable branch in this fixture (no InventoryStore wired) rather
-        // than crashing - proves the type-mismatched "value" field was safely defaulted, not
-        // thrown on, before the store call.
-        CHECK(res->status != 500);
+        REQUIRE(res->status == 200);
+        // This fixture wires no result-set / inventory store, so the call ends at the
+        // store-unavailable gate with kInternalError. kInvalidParams here would mean the numeric
+        // operand was refused at the conditions parse, the defect this section guards.
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInternalError);
+        CHECK(body["error"]["code"] != kInvalidParams);
     }
 
     SECTION("create_result_set_from_inventory_query: a condition operand that cannot be read "

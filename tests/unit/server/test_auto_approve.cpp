@@ -196,6 +196,28 @@ TEST_CASE("set_enabled toggles rule", "[auto_approve][crud]") {
     REQUIRE_FALSE(engine->evaluate(make_ctx("host")).empty());
 }
 
+TEST_CASE("remove_rule and toggle_enabled return the rule they changed, nullopt out of range",
+          "[auto_approve][crud]") {
+    auto engine = make_engine();
+    engine->add_rule({AutoApproveRuleType::hostname_glob, "a", "first"});
+    engine->add_rule({AutoApproveRuleType::hostname_glob, "b", "second"});
+
+    const auto off = engine->toggle_enabled(1);
+    REQUIRE(off.has_value());
+    CHECK(off->value == "b");
+    CHECK_FALSE(off->enabled);
+    const auto on = engine->toggle_enabled(1);
+    REQUIRE(on.has_value());
+    CHECK(on->enabled);
+    CHECK_FALSE(engine->toggle_enabled(2).has_value());
+
+    const auto removed = engine->remove_rule(0);
+    REQUIRE(removed.has_value());
+    CHECK(removed->value == "a");
+    CHECK_FALSE(engine->remove_rule(1).has_value());
+    CHECK(engine->list_rules().size() == 1);
+}
+
 // ── Config Persistence ───────────────────────────────────────────────────────
 
 TEST_CASE("save and reload auto-approve config", "[auto_approve][config]") {

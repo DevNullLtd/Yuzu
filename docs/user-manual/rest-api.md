@@ -6820,8 +6820,8 @@ Evaluate inventory conditions across agents. Returns agents whose inventory data
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `agent_id` | string | No | Scope to a single agent |
-| `combine` | string | No | `"and"` (default) or `"or"` — how to combine multiple conditions |
-| `conditions` | array | Yes | List of condition objects |
+| `combine` | string | No | `"all"` (default) or `"any"`: how to combine multiple conditions; any other value means all |
+| `conditions` | array | Yes | List of condition objects (at most 500; more is `400`) |
 
 Each condition object:
 
@@ -6829,8 +6829,8 @@ Each condition object:
 |---|---|---|
 | `plugin` | string | Plugin name to query |
 | `field` | string | JSON field path within the inventory data |
-| `op` | string | Operator: `eq`, `neq`, `gt`, `lt`, `gte`, `lte`, `contains` |
-| `value` | string | Value to compare against. A JSON number is accepted with a comparison operator (`==`, `!=`, `>`, `>=`, `<`, `<=`) and compared as its decimal text, and a boolean with `==` or `!=` (`true` / `false`). Any other type, or a number or boolean with another operator, is `400` (`conditions[].value must be a JSON string ...`); a non-string `plugin`, `field` or `op` is `400` too (#4644). A numeric `5` used to become the empty string, and with `>` that selected every device that had the field. The same rule holds on `POST /api/v1/result-sets/from-inventory-query` and the MCP tool `create_result_set_from_inventory_query` (`-32602`) |
+| `op` | string | Operator: `==`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `exists`, `version_gte`, `version_lte`. An unrecognised operator matches nothing |
+| `value` | string | Value to compare against. A JSON number is accepted with a comparison operator (`==`, `!=`, `>`, `>=`, `<`, `<=`) and a boolean with `==` or `!=` (`true` / `false`). With `==` and `!=` a number is compared numerically, so `5.5` matches a stored `5.5` and `1e3` a stored `1000`, and a stored value that is not a number never equals it; a string operand stays an exact text compare (`"1.10"` and `"1.1"` differ). Any other type, or a number or boolean with another operator, is `400` (`conditions[].value must be a JSON string ...`); a non-string `plugin`, `field` or `op` is `400` too (#4644). A numeric `5` used to become the empty string, and with `>` that selected every device that had the field. The same rule holds on `POST /api/v1/result-sets/from-inventory-query` and the MCP tool `create_result_set_from_inventory_query` (`-32602`) |
 
 **Response:**
 

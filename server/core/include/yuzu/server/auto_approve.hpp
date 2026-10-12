@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -53,8 +54,14 @@ public:
 
     /// CRUD for rules
     void add_rule(const AutoApproveRule& rule);
-    void remove_rule(size_t index);
+    /// Returns the rule that was removed, or nullopt for an out-of-range index. The removal and
+    /// the returned copy happen under one lock, so an audit row built from it names exactly the
+    /// rule that was deleted.
+    std::optional<AutoApproveRule> remove_rule(size_t index);
     void set_enabled(size_t index, bool enabled);
+    /// Flip a rule's enabled flag. Returns the rule as it is AFTER the flip, or nullopt for an
+    /// out-of-range index; the read, the flip and the returned copy are one critical section.
+    std::optional<AutoApproveRule> toggle_enabled(size_t index);
 
     /// Get all rules (for admin UI).
     std::vector<AutoApproveRule> list_rules() const;

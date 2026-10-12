@@ -14,6 +14,12 @@ struct InventoryCondition {
     std::string field;
     std::string op;    // "==", "!=", ">=", "<=", ">", "<", "contains", "exists", "version_gte", "version_lte"
     std::string value;
+    /// True only when the caller's JSON `value` was a number (set by parse_inventory_condition).
+    /// `==` / `!=` then compare NUMERICALLY (the stored side must parse as a number in full), because
+    /// the operand text (`dump()`: "5.5", "1e3") and the evaluator's rendering of a stored number
+    /// ("5.500000", "1000") differ. A string operand keeps the exact lexical compare, so version
+    /// strings such as "1.10" and "1.1" stay different.
+    bool numeric_operand = false;
 };
 
 /// Build one InventoryCondition from a caller's `conditions[]` element (#4644). The ONE copy for
@@ -22,8 +28,9 @@ struct InventoryCondition {
 ///
 /// ABSENT keys keep the empty default. A PRESENT `plugin` / `field` / `op` must be a JSON string.
 /// A PRESENT `value` is the string itself, or, for a comparison operator (`==`, `!=`, `>`, `>=`,
-/// `<`, `<=`), a JSON number rendered with `dump()` (the SAME text the evaluator renders a stored
-/// number with, so `==` compares like with like), or a boolean as `true` / `false` for `==` / `!=`
+/// `<`, `<=`), a JSON number kept as its `dump()` text with `numeric_operand` set (so `==` / `!=`
+/// compare it numerically against a stored number, and `>` `>=` `<` `<=` use the evaluator's
+/// existing numeric path), or a boolean as `true` / `false` for `==` / `!=`
 /// only. Anything else (null, array, object, a number under another operator) is refused. It used
 /// to become "": `{"op":">","value":5}` then selected EVERY device that had the field, because the
 /// evaluator falls back to a lexicographic compare against the empty string.
