@@ -2193,7 +2193,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   re-arm, compliant-edge test (#5676); (c) the row timestamp is agent-asserted with no
   server clamp (`guardian_ingest.cpp:293`) and a `>=` tie rule
   (`guaranteed_state_store.cpp:833-835`), so clock skew or a same-second tie across the
-  lifecycle and compliance lanes can leave a false compliant (no issue; tracked here; live today
+  lifecycle and compliance lanes can leave a false compliant (#5690; live today
   for guard.unhealthy); (d) the census is absent from the decommission cascade, so
   REST/MCP errored_rules and the dashboard can disagree after a decommission (#5675).
 - **Journal-quarantine finding (enterprise-readiness Gate 6) - FOUND AND FIXED IN PR-2d
