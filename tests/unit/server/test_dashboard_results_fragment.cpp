@@ -346,6 +346,18 @@ TEST_CASE("/fragments/results: admitted + unfiltered (TOP) gate shows every agen
     CHECK(contains(res->body, "output a"));
     CHECK(contains(res->body, "output b"));
     CHECK(contains(res->body, "2 agents"));
+    // #5669: every results response clears an open Create Static Group form, which would
+    // otherwise keep the filters and agent count of the render that opened it.
+    CHECK(contains(res->body, "<div id=\"group-form-slot\" hx-swap-oob=\"innerHTML\"></div>"));
+
+    // A text-filtered response clears it too (a filter change is the case that matters).
+    auto filtered = h.get("/fragments/results?command_id=" + command_id +
+                          "&plugin=registry&q=output+a");
+    REQUIRE(filtered);
+    CHECK(contains(filtered->body, "output a"));
+    CHECK_FALSE(contains(filtered->body, "output b"));
+    CHECK(contains(filtered->body,
+                   "<div id=\"group-form-slot\" hx-swap-oob=\"innerHTML\"></div>"));
 }
 
 // Gate 6 enterprise-readiness finding (this round): "Create Group from N

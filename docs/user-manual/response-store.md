@@ -363,15 +363,15 @@ operator-visible notes:
     command; a column-header sort or a pagination click reads the live filter bar (they
     no longer re-send the filters of the last render); and sending a command aborts a results
     request still in flight, so a late response for the previous command cannot swap its rows or
-    its Create Group button over the new command's table. For about 2 seconds after a command is
+    its Create Group button over the new command's table; every results response also closes an
+    open Create Static Group form, so it cannot keep the filters and count of an earlier render.
+    For about 2 seconds after a command is
     sent the filter bar is an empty placeholder and the header refresh fires on the same delay;
     this is not a
     defect, because in a browser check the header had no sort links and the page no Prev or Next
     controls in that window, so nothing could be clicked. Still open: an operator whose only
     `Response:Read` grant is scoped to a management group is refused at the filter bar, so
-    gets no chart deck, pager or summary after a command (#5688); an open Create Static
-    Group form is not cleared by a valid filter change and keeps its old filters and count
-    (#5669); and the built-in `help` command and a TAR SQL query clear the results area without
+    gets no chart deck, pager or summary after a command (#5688); and the built-in `help` command and a TAR SQL query clear the results area without
     aborting a request in flight, and the hardware list keeps the older `this:abort` sync
     (#5677).
   - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column,

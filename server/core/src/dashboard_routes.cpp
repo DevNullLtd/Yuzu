@@ -2702,6 +2702,12 @@ std::string DashboardRoutes::render_results(
     }
     html += "</div>";
 
+    // An open Create Static Group form carries the filters and agent count of the render that
+    // opened it. Every results response re-renders the summary, so clear the slot with it
+    // (the refusal path does the same): otherwise submitting the stale form builds a durable
+    // group from filters no longer on screen (#5669).
+    html += "<div id=\"group-form-slot\" hx-swap-oob=\"innerHTML\"></div>";
+
     // Issue #587 — OOB chart deck. When the dispatched command came from an
     // InstructionDefinition that has a `spec.visualization`, populate
     // #chart-deck-host with one chart-card div per configured chart.
