@@ -424,9 +424,9 @@ public:
     /// reconcile (attach_rule), which either skips it as healthy and unchanged or rebuilds
     /// it. The epoch bump and the GLOBAL wedge-candidate sweep still cover every rule, kept
     /// ones included: a kept rule that still holds a retained wedge regains its candidacy
-    /// when attach_rule re-observes it. A kept rule whose key the mechanism reported faulted is
-    /// detached as well, so a key shared by several rules is torn down and re-armed rather than
-    /// rejoined by each of them.
+    /// when attach_rule re-observes it. A kept rule whose key is faulted (reported, or found so
+    /// by the backend health check) or dead is detached as well, so a key shared by several rules
+    /// is torn down and re-armed rather than rejoined by each of them.
     void detach_rules_except(const std::set<std::string, std::less<>>& keep);
 
     /// The queued-handler body: resolve `ev.key` to its rules and run one
@@ -464,10 +464,10 @@ public:
     ///       than instant.
     /// Intended to be driven off GuardianConvergenceScheduler's existing ~5s priority
     /// lane - no new thread. Only a Dead subscription is acted on (reported like a Lost).
-    /// A Faulted or Healthy answer only refreshes PerKey::faulted (#4415), which a missed
-    /// Faulted/Recovered event would otherwise leave stale: an identical re-push consults the
-    /// live health itself (attach_core), so this refresh is the backstop for the full_sync
-    /// scoped detach and for the bit's own accuracy, not the skip decision's only source.
+    /// A Faulted answer also sets PerKey::faulted (#4415), which a missed Faulted event would
+    /// otherwise leave clear: an identical re-push consults the live health itself
+    /// (attach_core), so this is the backstop for the full_sync scoped detach, not the skip
+    /// decision's only source. It never clears the bit (a Recovered event does).
     void revalidate_subscriptions();
 
     /// Drain buffered emits through `send`. `send(const OutboxEntry&) -> SendResult`.
@@ -1268,7 +1268,7 @@ private:
         std::map<std::string, PendingState> pending_initial;
         /// #4415: the mechanism reported this key's subscription faulted and has not yet
         /// reported it recovered (registry_mu_-guarded; set and cleared in
-        /// on_subscription_faulted, and refreshed from the backend's own health by
+        /// on_subscription_faulted, and SET (never cleared) from the backend's own health by
         /// sweep_key_health and the skip probe, since an event can be lost). Read by
         /// reuse_existing_locked and detach_rules_except. A key torn down and re-armed gets a
         /// fresh PerKey that starts clear: the skip decision does not rely on the bit alone.
@@ -2007,9 +2007,12 @@ private:
     [[nodiscard]] std::optional<KeyHealthProbe>
     probe_key_health(const std::string& key, const std::string& rule_id);
 
-    /// Refresh PerKey::faulted for every armed key from the backend (registry_mu_ released while
-    /// asking). With `report_dead`, a Dead subscription is reported like a Lost (the poll
-    /// backstop). A write is dropped if the key was re-armed meanwhile (subscription id differs).
+    /// Set PerKey::faulted for every armed key the backend finds Faulted (registry_mu_ released
+    /// while asking; set-only, so an event delivered meanwhile is never overwritten). With
+    /// `report_dead`, a Dead subscription is reported like a Lost (the poll backstop); without
+    /// it (the scoped detach) a Dead one, and one whose health could not be read, set the bit
+    /// too so the key is rebuilt. A backend throw never escapes. A write is dropped if the key
+    /// was re-armed meanwhile (subscription id differs).
     void sweep_key_health(bool report_dead);
 
     /// #4415: the skip decision, called from attach_core() under registry_mu_ and before
@@ -2019,9 +2022,10 @@ private:
     /// caller rebuilds as before. A skip is a claim that the rule is healthy, so a rule that is
     /// in an Unknown episode, whose key the mechanism reported faulted (the recorded bit, or
     /// `probe` not Healthy or taken against another subscription), whose key still has any claim
-    /// other than this rule's own identical live arm (the Reobserved case), whose baseline differs, or that has a retained wedge never reaches it (the wedge
-    /// has its own Reobserved path in attach_core). `probe` is required for the Armed skip: a
-    /// null one means health is unknown, which is not healthy. Reads only; may not throw.
+    /// other than this rule's own identical live arm (the Reobserved case), whose baseline
+    /// differs, or that has a retained wedge never reaches it (the wedge has its own
+    /// Reobserved path in attach_core). `probe` is required for the Armed skip: a null one
+    /// means health is unknown, which is not healthy. Reads only; may not throw.
     [[nodiscard]] std::optional<AttachCoreResult>
     reuse_existing_locked(const std::string& key, const std::string& rule_id,
                           const SparkSpec& spec, const RuleGeneration& pushed,

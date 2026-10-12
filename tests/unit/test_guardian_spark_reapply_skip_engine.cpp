@@ -1,9 +1,9 @@
 // test_guardian_spark_reapply_skip_engine.cpp - #4415 PR-A, ENGINE level, RED-FIRST.
 //
-// What this pins. Today every full_sync push tears down and re-arms EVERY Spark rule
-// (GuardianSparkRuntime::detach_all() then a fresh attach per rule), so one stuck key makes the
-// whole ruleset pay a teardown + re-arm per Reapply, and an identical healthy re-push is not free
-// either. PR-A replaces that with a per-rule skip (a rule that is already healthy and unchanged is
+// What this pins. Before #4415 every full_sync push tore down and re-armed EVERY Spark rule
+// (GuardianSparkRuntime::detach_all() then a fresh attach per rule), so one stuck key made the
+// whole ruleset pay a teardown + re-arm per Reapply, and an identical healthy re-push was not free
+// either. PR-A replaced that with a per-rule skip (a rule that is already healthy and unchanged is
 // left alone) and a full_sync detach scoped to the rules ABSENT from the push. These cases drive
 // the REAL GuardianEngine (prefer_spark=true) + REAL SparkEngine + the real runtime / ack ledger /
 // io executor with a counting fake ISparkMechanism, and assert EFFECT SETS (per-key watch/unwatch
@@ -23,7 +23,8 @@
 //
 // MUTATION TARGETS (each case is built to go red under at least one): delete the skip branch; delete
 // the scoped full_sync filter; drop the content term; drop the claims-empty term; drop the faulted
-// bit. See each case's `Mutations:` line.
+// bit; drop the backend-health term (the probe in attach_core, the sweep in detach_rules_except).
+// See each case's `Mutations:` line.
 //
 // Effect assertions are CHECK, never REQUIRE, so a red case runs to its end and reports every
 // mismatch; REQUIRE is reserved for SETUP PREMISES. No sleeps: every wait is spin_until on an
@@ -316,6 +317,7 @@ struct Rig {
     std::unique_ptr<GuardianEngine> engine;
     std::mutex sent_mu;
     std::vector<OutboxEntry> sent;
+    bool prefer_spark{true}; ///< false = the production configuration (legacy guards detect)
 
     Rig() {
         fs::create_directories(dir.path);
@@ -345,7 +347,7 @@ struct Rig {
             std::lock_guard<std::mutex> lk{sent_mu};
             sent.clear();
         }
-        engine = std::make_unique<GuardianEngine>(kv.get(), "agent-4415", /*prefer_spark=*/true);
+        engine = std::make_unique<GuardianEngine>(kv.get(), "agent-4415", prefer_spark);
         engine->set_spark_backend_op_deadline_for_test(std::chrono::hours(1));
         if (rearm_hook)
             engine->set_rearm_fault_hook_for_test(std::move(rearm_hook));
@@ -356,7 +358,8 @@ struct Rig {
                                       return SendResult::Sent;
                                   });
         REQUIRE(engine->start_local().has_value());
-        REQUIRE(engine->spark_availability() == GuardianEngine::SparkAvailability::Available);
+        if (prefer_spark)
+            REQUIRE(engine->spark_availability() == GuardianEngine::SparkAvailability::Available);
     }
 
     /// Releases every gate FIRST (a parked worker would otherwise outlive the engine that owns its
@@ -1952,8 +1955,11 @@ TEST_CASE("#4415 PR-A (10c): a rule whose identical arm is still in flight is re
 // A re-observed in-flight arm must not launder a failure: when its late result is a REFUSAL the
 // generation stays held (the re-observation was not an acknowledgement), and the next differing
 // push rebuilds ONLY that rule while every committed sibling is still untouched.
-// Pins: the generation hold and the single-rule rebuild after a refused re-observed arm (not
-// mutation-checked: no seam makes apply_rules report a pending arm as committed).
+// Pins: the generation hold and the single-rule rebuild after a refused re-observed arm.
+// Not mutation-checked by a seam. The recipe, applied by hand: make the re-observed claim report
+// Armed (not Accepted) from attach_core, or skip registering its receipt with the application;
+// either leaves the ledger nothing to fail and the generation reaches kGen, so the hold CHECK
+// below goes red.
 TEST_CASE("#4415 PR-A (10e): a re-observed in-flight arm that then refuses holds the generation, "
           "and the next push rebuilds only that rule",
           "[spark][guardian][reconcile][4415prA]") {
@@ -2052,4 +2058,272 @@ TEST_CASE("#4415 PR-A (10b): the preserved tally is bounded and sanitised - ids 
     CHECK(hostile.find('\n') == std::string::npos);
     CHECK(t.ids().size() == 1);
     CHECK(t.ids()[0].find_first_of(" \n=,") == std::string::npos);
+}
+
+// -------------------------------------------------------------------------------------------------
+// KV-9. The PRODUCTION configuration (prefer_spark=false): the rule rows follow the same shape on
+//       the legacy detection path, which is the path that is live today. An identical full_sync
+//       re-push writes and deletes nothing; omitting one rule deletes exactly that row.
+//       Mutation: remove the equal-bytes skip in put_rule_locked (the writes CHECKs go red).
+// -------------------------------------------------------------------------------------------------
+TEST_CASE("#4415 PR-A KV (9): on the legacy path an identical full_sync writes and deletes no rule "
+          "row, and omitting one rule deletes exactly its row",
+          "[spark][guardian][reconcile][4415prA][4415kv]") {
+    constexpr int R = 4;
+    KvRig k;
+    k.r.prefer_spark = false;
+    k.start();
+    const auto s = make_kv_rules(k.r, R);
+    const std::string bytes = push_bytes(s.rules, kGen);
+    k.probe.clear();
+    k.r.dispatch(bytes);
+    REQUIRE(k.r.wait_generation(kGen));
+    REQUIRE(k.probe.writes() == sorted(s.row_keys)); // premise: the probe sees every first write
+    const auto rows_before = k.rule_rows();
+
+    k.probe.clear();
+    k.r.dispatch(bytes); // byte-identical re-push
+    CHECK(k.probe.deletes().empty());
+    CHECK(k.probe.writes().empty());
+    CHECK(k.rule_rows() == rows_before);
+    CHECK(k.r.engine->policy_generation() == kGen);
+
+    const std::vector<gpb::GuaranteedStateRule> kept{s.rules[0], s.rules[1], s.rules[3]};
+    k.probe.clear();
+    k.r.dispatch(push_bytes(kept, kGen));
+    CHECK(k.probe.deletes() == std::vector<std::string>{"rule:r2"});
+    CHECK(k.probe.writes().empty());
+    auto expected = rows_before;
+    expected.erase("rule:r2");
+    CHECK(k.rule_rows() == expected);
+}
+
+// -------------------------------------------------------------------------------------------------
+// KV-10 (CH-2a). A rule-row write fails mid-push, after the absent-row sweep: the omitted rule's
+//       row is gone and its rule is detached, the generation is held (memory and disk), the kept
+//       rules KEEP ENFORCING their old content (AC-18 loss 5: the loop returned before reaching
+//       them, so none was rebuilt), no preserved-line is recorded for the aborted push, and the
+//       server's retry after the fault clears converges. The abort is a trigger on the engine's
+//       own table (PRAGMA max_page_count does not reach the engine's connection).
+//       Mutations (each goes red): pass an empty keep-set to detach_rules_except in apply_rules
+//       (every kept rule is torn down, so the untouched-watch checks fail); skip the absent-row
+//       delete (r7's row survives).
+// -------------------------------------------------------------------------------------------------
+TEST_CASE("#4415 PR-A KV (10): a failed rule-row write mid-push holds the generation, leaves the "
+          "kept rules enforcing their old content and converges on the retry",
+          "[spark][guardian][reconcile][4415prA][4415kv]") {
+    constexpr int R = 10;
+    constexpr std::uint64_t kNext = kGen + 1;
+    KvRig k;
+    k.start();
+    const auto s = make_kv_rules(k.r, R);
+    first_push(k, s, push_bytes(s.rules, kGen));
+    const auto rows_before = k.rule_rows();
+    const std::string line_before = k.r.engine->last_full_sync_preserved_line_for_test();
+
+    k.probe.exec("CREATE TRIGGER yuzu_test_kv_veto_ins BEFORE INSERT ON kv_store"
+                 " WHEN NEW.plugin = '__guardian__' AND NEW.key = 'rule:r3'"
+                 " BEGIN SELECT RAISE(ABORT, 'yuzu_test injected rule write failure'); END;"
+                 "CREATE TRIGGER yuzu_test_kv_veto_upd BEFORE UPDATE ON kv_store"
+                 " WHEN NEW.plugin = '__guardian__' AND NEW.key = 'rule:r3'"
+                 " BEGIN SELECT RAISE(ABORT, 'yuzu_test injected rule write failure'); END;");
+    std::vector<gpb::GuaranteedStateRule> next;
+    for (int i = 0; i < R; ++i) {
+        if (i == 7)
+            continue; // omitted
+        next.push_back(i == 3 ? file_rule("r3", s.paths[3], "r3-renamed") : s.rules[i]);
+    }
+    const std::string bytes = push_bytes(next, kNext);
+    k.probe.clear();
+    (void)yuzu::agent::guardian_dispatch_push_bytes_for_test(*k.r.engine, bytes); // fails: r3
+    CHECK(k.r.settle());
+
+    CHECK(k.r.engine->policy_generation() == kGen); // HELD in memory...
+    REQUIRE(k.r.persisted_generation().has_value());
+    CHECK(*k.r.persisted_generation() == kGen); // ...and on disk
+    CHECK(k.probe.deletes() == std::vector<std::string>{"rule:r7"}); // the sweep ran first
+    CHECK_FALSE(k.r.kv->get(kKvNs, "rule:r7").has_value());
+    CHECK(k.r.fm->unwatch_calls(s.spark_keys[7]) == 1); // the omitted rule is detached...
+    for (int i = 0; i < R; ++i) {
+        if (i != 7)
+            check_untouched(*k.r.fm, "kept rule " + s.ids[i], s.spark_keys[i]); // ...kept ones are not
+    }
+    CHECK(k.r.engine->spark_armed_rule_count() == R - 1);
+    auto expected = rows_before;
+    expected.erase("rule:r7");
+    CHECK(k.rule_rows() == expected); // r3's row still carries its OLD bytes
+    CHECK(k.r.engine->last_full_sync_preserved_line_for_test() == line_before); // none recorded
+
+    k.probe.exec("DROP TRIGGER yuzu_test_kv_veto_ins; DROP TRIGGER yuzu_test_kv_veto_upd;");
+    k.r.dispatch(bytes); // the server's retry
+    CHECK(k.r.settle());
+    CHECK(k.r.wait_generation(kNext));
+    const auto rows_after = k.rule_rows();
+    CHECK(rows_after.size() == static_cast<std::size_t>(R - 1));
+    CHECK(rows_after.count("rule:r7") == 0);
+    CHECK(rows_after.at("rule:r3") != rows_before.at("rule:r3")); // the change landed
+    check_rebuilt_once(*k.r.fm, "r3 (changed)", s.spark_keys[3]);
+    for (int i = 0; i < R; ++i) {
+        if (i != 7 && i != 3)
+            check_untouched(*k.r.fm, "r" + std::to_string(i), s.spark_keys[i]);
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// KV-11 (CH-2b). The crash window after the absent-row sweep and before any rewrite. The KV image
+//       is FROZEN there by triggers (the delete of r7's row arms a flag, and every later write,
+//       generation included, is vetoed), then the engine is closed and reopened on the same db.
+//       Boot re-arms exactly the surviving rows (the omitted rule stays gone, the kept ones carry
+//       their OLD content), the generation is the old one, and a re-push converges.
+//       Mutation: skip the absent-row delete (the freeze never arms, the push completes before the
+//       "crash", and the pre-restart row image check goes red). An empty keep-set stays green here.
+// -------------------------------------------------------------------------------------------------
+TEST_CASE("#4415 PR-A KV (11): a restart in the window after the absent-row sweep re-arms exactly "
+          "the surviving rows at the old generation, and a re-push converges",
+          "[spark][guardian][reconcile][4415prA][4415kv]") {
+    constexpr int R = 6;
+    constexpr std::uint64_t kNext = kGen + 1;
+    KvRig k;
+    k.start();
+    const auto s = make_kv_rules(k.r, R);
+    first_push(k, s, push_bytes(s.rules, kGen));
+    const auto rows_before = k.rule_rows();
+
+    k.probe.exec("CREATE TABLE yuzu_test_freeze(x INTEGER);"
+                 "CREATE TRIGGER yuzu_test_freeze_arm AFTER DELETE ON kv_store"
+                 " WHEN OLD.plugin = '__guardian__' AND OLD.key = 'rule:r4'"
+                 " BEGIN INSERT INTO yuzu_test_freeze VALUES(1); END;"
+                 "CREATE TRIGGER yuzu_test_freeze_ins BEFORE INSERT ON kv_store"
+                 " WHEN NEW.plugin = '__guardian__' AND EXISTS(SELECT 1 FROM yuzu_test_freeze)"
+                 " BEGIN SELECT RAISE(ABORT, 'yuzu_test frozen image'); END;"
+                 "CREATE TRIGGER yuzu_test_freeze_upd BEFORE UPDATE ON kv_store"
+                 " WHEN NEW.plugin = '__guardian__' AND EXISTS(SELECT 1 FROM yuzu_test_freeze)"
+                 " BEGIN SELECT RAISE(ABORT, 'yuzu_test frozen image'); END;"
+                 "CREATE TRIGGER yuzu_test_freeze_del BEFORE DELETE ON kv_store"
+                 " WHEN OLD.plugin = '__guardian__' AND EXISTS(SELECT 1 FROM yuzu_test_freeze)"
+                 " BEGIN SELECT RAISE(ABORT, 'yuzu_test frozen image'); END;");
+    std::vector<gpb::GuaranteedStateRule> next;
+    for (int i = 0; i < R; ++i) {
+        if (i == 4)
+            continue; // omitted
+        next.push_back(i == 1 ? file_rule("r1", s.paths[1], "r1-renamed") : s.rules[i]);
+    }
+    const std::string bytes = push_bytes(next, kNext);
+    (void)yuzu::agent::guardian_dispatch_push_bytes_for_test(*k.r.engine, bytes);
+    CHECK(k.r.settle());
+    k.r.close(); // the "crash"
+
+    k.probe.exec("DROP TRIGGER yuzu_test_freeze_arm; DROP TRIGGER yuzu_test_freeze_ins;"
+                 "DROP TRIGGER yuzu_test_freeze_upd; DROP TRIGGER yuzu_test_freeze_del;"
+                 "DROP TABLE yuzu_test_freeze;");
+    auto expected = rows_before;
+    expected.erase("rule:r4");
+    k.r.open();
+    CHECK(k.rule_rows() == expected); // the image the crash left: r4 gone, r1 with OLD bytes
+    REQUIRE(k.r.wait_armed(R - 1));
+    CHECK(k.r.engine->policy_generation() == kGen);
+    std::set<std::string> live;
+    for (int i = 0; i < R; ++i)
+        if (i != 4)
+            live.insert(s.spark_keys[i]);
+    CHECK(k.r.fm->watched_snapshot() == live);
+    CHECK(k.r.fm->watch_calls(s.spark_keys[4]) == 0);
+
+    k.r.dispatch(bytes); // the server re-pushes: it never saw the new generation acknowledged
+    CHECK(k.r.settle());
+    CHECK(k.r.wait_generation(kNext));
+    const auto rows_after = k.rule_rows();
+    CHECK(rows_after.size() == static_cast<std::size_t>(R - 1));
+    CHECK(rows_after.at("rule:r1") != rows_before.at("rule:r1"));
+    check_rebuilt_once(*k.r.fm, "r1 (changed)", s.spark_keys[1]);
+    CHECK(k.r.fm->watched_snapshot() == live);
+}
+
+// -------------------------------------------------------------------------------------------------
+// CH-5. A disable then a re-enable of a rule whose Disarm is stuck behind a hung call of the same
+//       mechanism type queues [Disarm, Arm] on its key; once the disarm is abandoned (retained) an
+//       identical push re-observes the queued Arm and drives nothing itself. The arm must still be
+//       driven once the hang is released, within a 10 s cap here (the redrive cadence is about 5 s
+//       in production). Observed: it is driven without waiting for the redrive: making
+//       redrive_retained_disarms() return 0 leaves this case green, so it pins the outcome, not the
+//       redrive mechanism, and the "waits for the redrive" wording of UP-8 is a worst-case bound.
+// -------------------------------------------------------------------------------------------------
+TEST_CASE("#4415 PR-A (CH-5): a re-enabled rule behind a retained disarm is driven once the hang "
+          "is released, after an identical push re-observes it",
+          "[spark][guardian][reconcile][4415prA]") {
+    Rig r;
+    r.open();
+    const std::string svc_h = "yuzu-4415-ch5h", svc_x = "yuzu-4415-ch5x";
+    const auto h = service_rule("h", svc_h);
+    const auto x = service_rule("x", svc_x);
+    auto x_off = x;
+    x_off.set_enabled(false);
+    const std::string hk = service_key(svc_h), xk = service_key(svc_x);
+
+    r.dispatch(push_bytes({x}, kGen));
+    REQUIRE(r.wait_armed(1));
+    r.sm->hang_next_watch();
+    r.dispatch(push_bytes({x, h}, kGen));
+    REQUIRE(r.sm->wait_entered_hang(10s));
+    REQUIRE(r.sm->hung_key() == hk);
+    r.dispatch(push_bytes({h, x_off}, kGen)); // x disabled: its disarm waits behind the hung call
+    REQUIRE(yuzu::test::spin_until([&] { return r.rt().claim_queue_depth_for_test(xk) == 1; }, 10s));
+    r.dispatch(push_bytes({h, x}, kGen)); // re-enabled: the arm queues behind the disarm
+    REQUIRE(yuzu::test::spin_until([&] { return r.rt().claim_queue_depth_for_test(xk) == 2; }, 10s));
+    // h's hung arm becomes a retained wedge and x's stuck disarm a retained disarm.
+    REQUIRE(r.rt().expire_overdue_claims_at_for_test(std::chrono::steady_clock::now() + 2h) == 2);
+    r.dispatch(push_bytes({h, x}, kGen)); // identical: re-observes, drives nothing itself
+    r.sm->release_hang();
+    CHECK(yuzu::test::spin_until(
+        [&] {
+            r.engine->journal_maintenance_tick();
+            return r.rt().claim_queue_depth_for_test(xk) == 0 && r.sm->watched_snapshot().count(xk) == 1;
+        },
+        10s));
+    CHECK(r.sm->watched_snapshot().count(xk) == 1); // x is enforcing again
+}
+
+// -------------------------------------------------------------------------------------------------
+// CH-7. An arm re-observed by an identical full_sync, then followed by a DELTA that does not name
+//       the rule (a delta has no teardown, so nothing withdraws it, but it opens a new application
+//       that does not track the rule's receipt), which finally REFUSES. KNOWN LOSS, not new in
+//       #4415 (AC-11, #5547, the delta-omission obligation loss): the refusal is NOT visible in the
+//       ledger and the delta already acknowledged the generation, so only the next full_sync
+//       (the server's re-push cadence) repairs the rule. The case pins that state, so a change to
+//       it is noticed, and pins that the repair works.
+// -------------------------------------------------------------------------------------------------
+TEST_CASE("#4415 PR-A (CH-7): a re-observed arm that a delta then leaves untracked and that later "
+          "refuses is a known silent loss (AC-11) that the next full_sync repairs",
+          "[spark][guardian][reconcile][4415prA]") {
+    Rig r;
+    r.open();
+    const auto p0 = r.make_file("s0");
+    const std::string svc = "yuzu-4415-ch7";
+    const std::string hk = service_key(svc);
+    const auto h = service_rule("h", svc);
+    const auto s0 = file_rule("s0", p0);
+    const std::string bytes = push_bytes({h, s0}, kGen);
+
+    r.sm->hang_next_watch();
+    r.dispatch(bytes);
+    REQUIRE(r.sm->wait_entered_hang(10s));
+    REQUIRE(r.wait_armed(1));
+    r.dispatch(bytes); // identical full_sync: h's in-flight arm is re-observed
+    CHECK(r.sm->watch_calls(hk) == 1);
+    r.dispatch(push_bytes({s0}, kGen, /*full_sync=*/false)); // a delta that does not name h
+    r.sm->set_late_refuse();
+    r.sm->release_hang();
+    await_late_result_landed(r, hk);
+    for (int i = 0; i < 20; ++i)
+        r.engine->journal_maintenance_tick();
+    // The loss: h is not armed, no failed receipt is recorded, and the generation was acknowledged.
+    CHECK(r.engine->spark_armed_rule_count() == 1);
+    CHECK(r.engine->ack_failed_receipt_count_for_test() == 0);
+    CHECK(r.engine->policy_generation() == kGen);
+
+    r.dispatch(bytes); // the next full_sync repairs it
+    CHECK(r.settle());
+    CHECK(r.sm->watch_calls(hk) == 2);
+    CHECK(r.engine->spark_armed_rule_count() == 2);
+    check_untouched(*r.fm, "s0 (healthy sibling)", file_key(p0));
 }

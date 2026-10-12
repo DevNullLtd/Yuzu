@@ -1418,8 +1418,9 @@ flip, with a red-first test each:
     `resolved_failed != failed_receipts.size()` and `decide_retry()` answered Reapply on every
     later push (AC-12). Since #4415 the sibling is skipped, so that sequence does not start for
     it. **What remains:** a same-type sibling the push CHANGES, or that is not skip-eligible
-    (in an Unknown episode, on a key the mechanism reported faulted, with a baseline hash that
-    differs from the live one, or with an empty baseline seed), is still rebuilt, and its disarm
+    (in an Unknown episode, on a faulted key (reported, or found so by the backend health
+    check), with a baseline hash that differs from the live one, or with an empty baseline
+    seed), is still rebuilt, and its disarm
     and re-arm queue behind the hung call exactly as above; and a truly stuck key still gets its
     Reapply at the valve. Its severity depends on `prefer_spark_` staying off in production (it
     defaults to `false` and no production code passes `true`; a code-read condition, not an
@@ -1479,27 +1480,32 @@ flip, with a red-first test each:
     precondition on its own: it changes what AC-9, AC-10, AC-12, AC-15 and AC-16 describe, which
     were written for a Reapply that tore down and re-armed every rule in the push. The skip is
     inside the per-rule chokepoint (`reconcile_rule_locked` -> `attach_rule` -> `attach_core`,
-    `reuse_existing_locked`), so a full_sync and a delta push take the same decision. Like the rest of this section it applies on the Spark path, which production does not enable (`prefer_spark_` is false); the `rule:` row change below runs on both paths. A rule is
+    `reuse_existing_locked`), so a full_sync and a delta push take the same decision. Like the
+    rest of this section it applies on the Spark path, which production does not enable
+    (`prefer_spark_` is false); the `rule:` row change below runs on both paths. A rule is
     skipped only if ALL hold: it is attached, committed and active; its key and spec are
     unchanged; its key holds no claim (the one exception is the same rule's own identical,
     still-in-flight arm, which is re-observed instead of withdrawn and requeued); its content
     id (kind, name, debounce, expected value and the other fields that change what it enforces)
-    is equal; it is not in an Unknown episode; its key is not faulted, meaning neither the
-    recorded bit nor the backend's own health for the key's subscription, asked at decision time
-    with the registry lock released, says so (a `Faulted` event can be lost to a full queued
-    channel or arrive before the key is recorded, so the skip never relies on delivery alone,
-    and an unreadable health is not healthy); the index still owns it; and, for `FileHashEquals`, the pushed (post-seed) hash
-    is non-empty and equals the live effective baseline. Any term false rebuilds the rule as
+    is equal; it is not in an Unknown episode; its key is not faulted or dead, meaning neither
+    the recorded bit nor the backend's own health for the key's subscription, asked at decision
+    time with the registry lock released, says so (a `Faulted` event can be lost to a full
+    queued channel or arrive before the key is recorded, so the skip never relies on delivery
+    alone, and an unreadable health is not healthy); the index still owns it; and, for
+    `FileHashEquals`, the pushed (post-seed) hash is non-empty and equals the live effective
+    baseline. Any term false rebuilds the rule as
     before. A committed, healthy skipped rule gets no new incarnation, no lifecycle record, no
     receipt and no `guard.armed` re-emit (an identical in-flight arm that is re-observed
     registers its existing claim's receipt and stays pending, and is named separately in the
     full_sync line); the detach epoch still moves on every full_sync. A full_sync now
     detaches only the rules the push omits (`detach_rules_except`; the global wedge-candidate
-    sweep and the unconditional epoch bump are unchanged) plus any kept rule whose key is faulted (the
-    recorded bit, refreshed from the backend first), so that a shared faulted key is rebuilt
-    rather than rejoined. The health read costs each re-pushed rule one extra short registry
-    lock and one lock-only backend lookup, a few microseconds, so about a few milliseconds
-    per 1000-rule push (an estimate, not measured).
+    sweep and the unconditional epoch bump are unchanged) plus any kept rule whose key is
+    faulted or dead (the recorded bit, set first from the backend's own health; a health that
+    cannot be read counts as unhealthy), so that a shared faulted or dead key is rebuilt rather
+    than rejoined by each of its rules. The health read costs one registry lock and one
+    lock-only backend lookup per re-pushed rule, plus, on a full_sync, one lock and one lookup
+    per armed key for the pre-detach health refresh; microseconds each (an estimate, not
+    measured).
     The persisted `rule:` rows follow the same shape: a full_sync deletes only the rows the
     push omits, and an unchanged row is not rewritten (a row that cannot be read, or that
     differs, is written); every existing hold on a failed scan or delete is unchanged. Accepted
@@ -1507,14 +1513,25 @@ flip, with a red-first test each:
     `guard.compliant` for a skipped rule, so it no longer repairs a lost recovery event by
     accident; (2) it no longer restarts the `pending_initial` demotion clock; (3) a crash after
     the absent-row sweep and before the per-rule rewrites leaves the previous rows for kept
-    rules until the next push (a restart then re-arms those); (4) a faulted shared key is
-    repaired by a full_sync only, not by an identical delta push, which rebuilds each rule on it
-    individually and so rejoins the same watcher; (5) if an earlier rule's KV persist fails
+    rules until the next push (a restart then re-arms those); (4) a faulted or dead shared
+    key is repaired by a full_sync only, not by an identical delta push, which rebuilds each
+    rule on it individually and so rejoins the same watcher; (5) if an earlier rule's KV persist fails
     mid-push, apply_rules returns early (generation held, failure latched), and a kept rule
     that this push would have disabled or changed keeps enforcing its OLD content until the
     retry, because the carried-rule teardown and rebuild have not run for it yet. That
     over-enforces rather than under-enforces, and the Spark path is dormant while `prefer_spark_`
-    is false. The keep-set (`full_sync_ids`) is now built before the first rule is persisted
+    is false; (6) added by the governance round, not part of the 2026-10-12 operator decision
+    and awaiting its ratification: a watch that the backend reports Healthy but that is deaf
+    without ever calling `fault()` (a watched directory deleted and recreated, a stale OS
+    handle) is no longer healed by an identical re-push, which before #4415 rebuilt it as a
+    side effect; it is found only by the convergence lanes, so its staleness is bounded by the
+    lane cadence (service and registry 60 s, file 600 s) and by nothing the push does, and a
+    mechanism must call `fault()` for a deaf watch, per the mechanism contract
+    (`spark_mechanism.hpp`). An identical arm that sits behind a retained, queued disarm is
+    re-observed rather than driven, so it waits for the redrive of retained disarms (about 5 s)
+    at the latest; the engine case `(CH-5)` pins that it is driven within 10 s once the hang is
+    released, not that the redrive is what drives it. The keep-set (`full_sync_ids`) is now built
+    before the first rule is persisted
     rather than inside the rule loop; the baseline (`45f727420`) already inserted into the same
     `std::set` after `begin_application()` with no catch, so this moves that existing exposure
     earlier in the push and adds no new class (the unlatched post-`begin_application()` throw
@@ -1523,7 +1540,8 @@ flip, with a red-first test each:
     persist failure emits none. A skipped rule whose identical arm is still in flight is named
     in a separate `pending_reused` list on that line, not in the preserved list, because it has
     not confirmed: `fullsync_blackout_diag.py` keeps waiting for its own `arm committed` line
-    and functional event instead of counting it as accounted for. Not changed: `decide_retry()` and the valve,
+    and functional event instead of counting it as accounted for. Not changed: `decide_retry()`
+    and the valve,
     so a forced Reapply still happens at the valve cadence and still rebuilds every rule that
     fails a term above, including a stuck key's own rule. The server's re-push cadence (#5612)
     and the delta-omission obligation loss (#5547, AC-11) are untouched. Evidence is the

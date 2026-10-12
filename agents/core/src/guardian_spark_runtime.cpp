@@ -3028,29 +3028,44 @@ GuardianSparkRuntime::probe_key_health(const std::string& key, const std::string
 
 void GuardianSparkRuntime::sweep_key_health(bool report_dead) {
     std::vector<std::pair<std::string, std::uint64_t>> snapshot;
-    {
+    try {
         std::lock_guard<std::mutex> lk{registry_mu_};
         if (stopping_)
             return;
         snapshot.reserve(keys_.size());
         for (const auto& [key, pk] : keys_)
             snapshot.emplace_back(key, pk->subscription);
+    } catch (...) {
+        return; // best-effort: the caller's teardown must still run (same posture as the probe)
     }
     for (const auto& [key, subscription_id] : snapshot) {
-        const SubscriptionHealth health = backend_->subscription_health(subscription_id);
-        if (health == SubscriptionHealth::Dead) {
-            if (report_dead)
-                on_subscription_lost(key, subscription_id,
-                                     "detected dead by the poll backstop "
-                                     "(revalidate_subscriptions) - no push notification ever "
-                                     "confirmed, or one was silently dropped");
+        std::optional<SubscriptionHealth> health;
+        try {
+            health = backend_->subscription_health(subscription_id);
+        } catch (...) {
+            // unknown health is not healthy; the loop goes on to the other keys
+        }
+        if (report_dead && health == SubscriptionHealth::Dead) {
+            on_subscription_lost(key, subscription_id,
+                                 "detected dead by the poll backstop "
+                                 "(revalidate_subscriptions) - no push notification ever "
+                                 "confirmed, or one was silently dropped");
             continue;
         }
-        // #4415: refresh the recorded bit. A write naming a superseded subscription is dropped.
+        // #4415: the scoped detach tears a key down when this marks it, so a Dead or unknown
+        // answer counts there exactly as a Faulted one does: a key shared by kept rules must not
+        // be rejoined by each of them (revalidate reports a Dead one itself, above). The write is
+        // SET-ONLY: a Faulted event delivered between the read above and this write must not be
+        // overwritten by the older answer. A stale set bit costs one rebuild of the key, whose
+        // fresh PerKey starts clear; a Recovered event clears it earlier.
+        const bool unhealthy = health == SubscriptionHealth::Faulted ||
+                               (!report_dead && (!health || *health == SubscriptionHealth::Dead));
+        if (!unhealthy)
+            continue;
         std::lock_guard<std::mutex> lk{registry_mu_};
         if (const auto kit = keys_.find(key);
             kit != keys_.end() && kit->second->subscription == subscription_id)
-            kit->second->faulted = health == SubscriptionHealth::Faulted;
+            kit->second->faulted = true; // a write naming a superseded subscription is dropped
     }
 }
 

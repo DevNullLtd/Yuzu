@@ -2915,8 +2915,8 @@ possible prior acceptance (acceptance is unknowable; there is no ack) — until 
 ages out of retention. A local gRPC `Write()` returning true is never delivery
 confirmation. **Retention eviction and quarantine are the only deletion paths, and
 every removal is counted.** Storage: `kv_store.db`, namespace `__guardian_journal__`
-(`guardian_journal_format.hpp`), distinct from `__guardian__` so it survives
-`full_sync`'s namespace clear. Owned by `GuardianEngine`, not the runtime — the
+(`guardian_journal_format.hpp`), distinct from `__guardian__` so a `full_sync`'s
+rewrite of that namespace never touches it. Owned by `GuardianEngine`, not the runtime — the
 runtime is the object built to survive the agent via a detached `SparkEngine`
 handler, so a borrowed `KvStore` there would be a dormant use-after-free.
 

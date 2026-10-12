@@ -2411,7 +2411,8 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             ++reconcile_failures;
             arm_failures_.fetch_add(1, std::memory_order_relaxed);
             try {
-                spdlog::error("Guardian: reconcile threw for rule '{}' - persisted but not armed",
+                spdlog::error("Guardian: reconcile threw for rule '{}' - persisted; its previous "
+                              "arm, if any, is unchanged",
                               log_id_token(rule.rule_id()));
             } catch (...) {
             }
@@ -2459,8 +2460,8 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         } catch (...) {
         }
         // F7: a rule_id that was Unsupported before this full_sync but is absent from
-        // the new push is no longer part of the active rule set at all (kv_ was
-        // cleared above; only push.rules() gets re-persisted) - forget it, or it
+        // the new push is no longer part of the active rule set at all (the omitted rows
+        // were deleted above; only push.rules() gets re-persisted) - forget it, or it
         // reports a phantom count forever. Rule_ids retained in the new push were
         // already updated in place by the loop above (erase-if-not-Unsupported /
         // insert-if-Unsupported inside reconcile_rule_locked), so this only removes
