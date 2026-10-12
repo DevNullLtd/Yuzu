@@ -29,8 +29,11 @@
 ///     currently held entry's, so a read that started long ago and finishes last cannot
 ///     overwrite a newer one (two `get_fresh()` calls, or a `get_fresh()` racing a `get()`).
 ///   - SINGLE FLIGHT. At most one thread runs the fetch at a time. While one is in
-///     flight, a concurrent caller returns the previously cached SUCCESS (stale by at
-///     most ttl plus the fetch time) if the last outcome was a success. If there is no
+///     flight, a concurrent caller returns the previously cached SUCCESS if the last
+///     outcome was a success. That value is stale by `ttl` plus the idle gap (nothing
+///     starts a refresh at expiry: the fetch begins when the first caller arrives after
+///     the entry expired, so an entry nobody asked for stays cached however old it is)
+///     plus the fetch time, not by `ttl` plus the fetch time alone. If there is no
 ///     value, or the last outcome was an error, the caller waits on the in-flight fetch
 ///     through a `std::shared_future` for at most `max_wait` and receives its result, or
 ///     an error naming the timeout (the loader thread is unaffected; a blackholed store

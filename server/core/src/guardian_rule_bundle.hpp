@@ -47,6 +47,16 @@
 /// to it. So on a missed bump the memo recovers within `max_age`, but the already-served
 /// agents recover only at the next bump.
 ///
+/// A reconcile that is ALREADY RUNNING when the hook invalidates is a third case. `get()` hands
+/// a load that `invalidate()` detached to its own caller and to the waiters that had joined it
+/// (see SHAPE), so that result can predate an edit whose bump failed while the generation label
+/// the caller holds did not move. `epoch()` is the signal: `GuardianReconcileFlow` reads it
+/// before the fresh generation read and compares it just before the send, and sends NOTHING
+/// when it advanced (see guardian_reconcile_flow.hpp). That closes the same-replica case and
+/// no more: it does not see an edit that has committed but whose hook has not yet run, an
+/// invalidation that lands between the comparison and the send, another replica's edit, or an
+/// agent that converged before the edit.
+///
 /// SHAPE.
 ///   - ONE bundle is held (the most recently loaded). A request for a different
 ///     generation reloads and replaces it, including a LOWER generation (a store reset
