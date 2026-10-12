@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <limits>
 #include <map>
-#include <set>
 #include <string>
 #include <vector>
 #include <string_view>
@@ -412,12 +411,11 @@ bool app_perf_canon_version_less(std::string_view a, std::string_view b) {
 std::vector<std::string> app_perf_newest_versions(const std::vector<AppPerfTrendPoint>& points,
                                                   bool& truncated) {
     std::vector<std::string> versions;
-    {
-        std::set<std::string> distinct; // tree: agent-controlled keys
-        for (const auto& p : points)
-            distinct.insert(p.version);
-        versions.assign(distinct.begin(), distinct.end());
-    }
+    versions.reserve(points.size());
+    for (const auto& p : points)
+        versions.push_back(p.version);
+    // The final tie-break is byte order, so comparator-equal means byte-equal and
+    // duplicates are adjacent after the sort.
     std::sort(versions.begin(), versions.end(), [](const std::string& x, const std::string& y) {
         if (app_perf_canon_version_less(y, x))
             return true;
@@ -425,6 +423,7 @@ std::vector<std::string> app_perf_newest_versions(const std::vector<AppPerfTrend
             return false;
         return x < y;
     });
+    versions.erase(std::unique(versions.begin(), versions.end()), versions.end());
     truncated = versions.size() > kAppPerfVersionJoinCap;
     if (truncated)
         versions.resize(kAppPerfVersionJoinCap);
