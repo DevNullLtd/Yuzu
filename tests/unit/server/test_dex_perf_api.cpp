@@ -652,7 +652,8 @@ TEST_CASE("DexAppVersionFailuresOwner degrades when no connection can be had",
           "[pg][dex_perf_api]") {
     // A saturated pool clamps the owner's bounded acquire to the pool's fast-fail
     // (pg_pool.hpp, Options::saturated_fast_fail), so the outcome is fixed while the
-    // test holds the only lease: no sleep, no elapsed-time assertion.
+    // test holds the only lease: no sleep, no elapsed-time assertion; the read costs up to 0.5 s
+    // waiting out that fast-fail.
     YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 1}};
     REQUIRE(pool.valid());
@@ -731,6 +732,10 @@ TEST_CASE("DexPerfApi app_fleet_report() passes the clamped window into the fail
     DexAppVersionFailuresOwner owner{pool, 7};
     auto api = make_local_dex_perf_api({}, &b2, &b1, nullptr, nullptr, nullptr, &owner);
     auto rep = api->app_fleet_report("app.exe", "");
+    // The production read takes its own clock: if the UTC day is unchanged after it, the read
+    // and the seeding shared a day and the cut is exact; otherwise decline, do not assert.
+    if (today_utc() != today)
+        SKIP("UTC midnight passed between seeding and the read: the cut cannot be asserted");
     REQUIRE(rep.has_value());
     CHECK(rep->failure_window_days == 7);
     REQUIRE(rep->versions.size() == 1);

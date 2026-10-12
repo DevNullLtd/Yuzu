@@ -9846,14 +9846,59 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
                 schema = &t["outputSchema"];
         REQUIRE(schema != nullptr);
         const auto& props = (*schema)["properties"];
-        CHECK(props.contains("versions"));
-        CHECK(props.contains("versions_truncated"));
-        CHECK(props.contains("failure_window_days"));
-        const auto& item = props["versions"]["items"]["properties"];
-        CHECK(item["exposure_devices"]["type"] == nlohmann::json::array({"integer", "null"}));
-        CHECK(item["failure_rate_ratio"]["properties"]["upper"]["type"] ==
-              nlohmann::json::array({"number", "null"}));
-        CHECK(item["failure_rate_ratio"]["properties"].contains("unbounded"));
+        CHECK(props["versions_truncated"] == nlohmann::json{{"type", "boolean"}});
+        CHECK(props["failure_window_days"] == nlohmann::json{{"type", "integer"}});
+        CHECK(props["exposure_basis"] == nlohmann::json{{"type", "string"}});
+        CHECK(props["stat_failures"] == nlohmann::json{{"type", "integer"}});
+        CHECK((*schema)["required"] ==
+              nlohmann::json::array({"app", "version", "points", "versions", "versions_truncated",
+                                     "failure_window_days", "exposure_basis", "stat_failures"}));
+        // The whole per-version item contract, written out from the advertised shape.
+        const nlohmann::json integer_or_null = {{"type", nlohmann::json::array({"integer", "null"})}};
+        const nlohmann::json number_or_null = {{"type", nlohmann::json::array({"number", "null"})}};
+        const nlohmann::json rate = {
+            {"type", nlohmann::json::array({"object", "null"})},
+            {"properties",
+             {{"estimate", {{"type", "number"}}},
+              {"lower", {{"type", "number"}}},
+              {"upper", {{"type", "number"}}},
+              {"reliable", {{"type", "boolean"}}}}}};
+        const nlohmann::json ratio = {
+            {"type", nlohmann::json::array({"object", "null"})},
+            {"properties",
+             {{"estimate", number_or_null},
+              {"lower", {{"type", "number"}}},
+              {"upper", number_or_null},
+              {"unbounded", {{"type", "boolean"}}},
+              {"reliable", {{"type", "boolean"}}}}}};
+        const nlohmann::json versions_items = {
+            {"type", "object"},
+            {"properties",
+             {{"version", {{"type", "string"}}},
+              {"latest_day", {{"type", "integer"}}},
+              {"day_count", {{"type", "integer"}}},
+              {"device_count", {{"type", "integer"}}},
+              {"suppressed", {{"type", "boolean"}}},
+              {"affected_devices", {{"type", "integer"}}},
+              {"below_floor", {{"type", "boolean"}}},
+              {"crashes",
+               {{"type", "integer"}, {"description", "Omitted when below_floor is true"}}},
+              {"hangs",
+               {{"type", "integer"}, {"description", "Omitted when below_floor is true"}}},
+              {"exposure_devices",
+               {{"type", nlohmann::json::array({"integer", "null"})},
+                {"description",
+                 "Devices with retained resource-significant samples; null = unknown, never "
+                 "zero"}}},
+              {"exposure_below_floor", {{"type", "boolean"}}},
+              {"exposed_crashes", integer_or_null},
+              {"exposed_hangs", integer_or_null},
+              {"failure_rate", rate},
+              {"previous_version", {{"type", nlohmann::json::array({"string", "null"})}}},
+              {"failure_rate_ratio", ratio}}},
+            {"required", nlohmann::json::array({"version", "affected_devices", "below_floor",
+                                                "exposure_devices", "exposure_below_floor"})}};
+        CHECK(props["versions"]["items"] == versions_items);
     }
 
     auto group = mcp_tool_payload(

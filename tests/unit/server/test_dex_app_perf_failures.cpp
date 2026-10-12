@@ -4,7 +4,7 @@
  * rules, the rate and rate-ratio wiring, the 20-version cap, and the shared
  * versions[] serializer. No store, no PG, no I/O.
  *
- * Hand-computed anchors (Python, plain double bisection on the exact Poisson and
+ * Hand-computed anchors (plain double bisection on the exact Poisson and
  * binomial CDFs, independent of dex_stats.hpp, 2026-10-12):
  *   12 events over 15 devices        -> rate 0.8,  95% [0.4133717, 1.3974390]
  *   5 events over 12 devices         -> rate 5/12
