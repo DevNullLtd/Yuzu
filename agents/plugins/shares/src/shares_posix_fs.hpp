@@ -14,8 +14,10 @@
 
 #include "shares_legs.hpp"
 
+#include <posix_dir_walk.hpp>
 #include <posix_secure_read.hpp>
 
+#include <algorithm>
 #include <cerrno>
 #include <dirent.h>
 #include <memory>
@@ -36,28 +38,28 @@ inline constexpr std::size_t kFileCap = 256 * 1024;
 inline constexpr std::size_t kMaxExportsFiles = 64;
 inline constexpr std::size_t kMaxDirEntries = 4096; ///< entries examined in exports.d
 
+// ReadErr mirrors yuzu::shared::ReadError enumerator-for-enumerator, so one cast maps it; an
+// unknown value would land in classify_read's `unknown` failed arm, never a silent success.
+static_assert(static_cast<int>(ReadErr::none) == static_cast<int>(yuzu::shared::ReadError::none));
+static_assert(static_cast<int>(ReadErr::symlink_refused) ==
+              static_cast<int>(yuzu::shared::ReadError::symlink_refused));
+static_assert(static_cast<int>(ReadErr::not_regular) ==
+              static_cast<int>(yuzu::shared::ReadError::not_regular));
+static_assert(static_cast<int>(ReadErr::oversized) ==
+              static_cast<int>(yuzu::shared::ReadError::oversized));
+static_assert(static_cast<int>(ReadErr::io) == static_cast<int>(yuzu::shared::ReadError::io));
+
 inline FileReadLike to_read_like(yuzu::shared::FileRead&& r) {
     FileReadLike out;
     out.data = std::move(r.data);
     out.err = r.err;
-    switch (r.error) {
-    case yuzu::shared::ReadError::none:
-        out.error = ReadErr::none;
-        break;
-    case yuzu::shared::ReadError::symlink_refused:
-        out.error = ReadErr::symlink_refused;
-        break;
-    case yuzu::shared::ReadError::not_regular:
-        out.error = ReadErr::not_regular;
-        break;
-    case yuzu::shared::ReadError::oversized:
-        out.error = ReadErr::oversized;
-        break;
-    case yuzu::shared::ReadError::io:
-        out.error = ReadErr::io;
-        break;
-    }
+    out.error = static_cast<ReadErr>(r.error);
     return out;
+}
+
+/// Bounded no-follow read of one regular file (the LinuxFs / list_macos `read` boundary).
+inline FileReadLike read_no_follow(const std::string& path) {
+    return to_read_like(yuzu::shared::read_file_no_follow(path, kFileCap));
 }
 
 inline LinuxFs make_posix_fs(const Paths& p) {
@@ -67,9 +69,7 @@ inline LinuxFs make_posix_fs(const Paths& p) {
     fs.exports_path = p.exports;
     fs.smb_conf_path = p.smb_conf;
     fs.usershares_default = p.usershares_default;
-    fs.read = [](const std::string& path) {
-        return to_read_like(yuzu::shared::read_file_no_follow(path, kFileCap));
-    };
+    fs.read = &read_no_follow;
     fs.list_exports_d = [dir, path = p.exports_d](std::vector<std::string>& names, bool& too_many) {
         *dir = yuzu::shared::open_dir_no_follow(path);
         if (!dir->opened()) {
@@ -77,34 +77,24 @@ inline LinuxFs make_posix_fs(const Paths& p) {
             const int e = dir->err == ELOOP ? ENOTDIR : dir->err;
             return e != 0 ? e : EIO;
         }
-        std::size_t examined = 0;
-        for (;;) {
-            errno = 0;
-            const dirent* e = ::readdir(dir->dir.get());
-            if (e == nullptr) {
-                if (errno != 0) {
-                    names.clear();
-                    return errno;
-                }
-                break;
-            }
-            if (++examined > kMaxDirEntries) {
-                too_many = true;
-                break;
-            }
+        const auto w = yuzu::shared::walk_dir_capped(dir->dir.get(), kMaxDirEntries, [&](const dirent* e) {
             if (is_exports_name(e->d_name))
                 names.emplace_back(e->d_name);
+            return true;
+        });
+        if (w.enumeration_error) {
+            names.clear();
+            return EIO;
         }
-        finalize_names(names, kMaxExportsFiles, too_many);
+        too_many = w.truncated;
+        std::ranges::sort(names);
+        if (names.size() > kMaxExportsFiles) {
+            names.resize(kMaxExportsFiles);
+            too_many = true;
+        }
         return 0;
     };
     fs.read_exports_d_file = [dir](const std::string& name) {
-        if (!dir->opened()) {
-            FileReadLike r;
-            r.error = ReadErr::io;
-            r.err = EBADF;
-            return r;
-        }
         return to_read_like(yuzu::shared::read_file_no_follow_at(dir->dir.fd(), name.c_str(), kFileCap));
     };
     fs.dir_exists = [](const std::string& path) {

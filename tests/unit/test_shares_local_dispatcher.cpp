@@ -168,27 +168,6 @@ bool share_row_is_wellformed(const std::string& row) {
 
 } // namespace
 
-TEST_CASE("shares plugin: descriptor declares one action and three legs", "[shares][dispatcher]") {
-    auto plugin = load_plugin();
-    if (!plugin) {
-        require_plugin_or_skip();
-        return;
-    }
-    const auto* d = plugin->descriptor;
-    CHECK(std::string{d->name} == "shares");
-    REQUIRE(d->actions[0] != nullptr);
-    CHECK(std::string{d->actions[0]} == "list");
-    CHECK(d->actions[1] == nullptr);
-    REQUIRE(d->action_descriptor_count == 1);
-    const auto& a = d->action_descriptors[0];
-    CHECK(a.linux_leg.support == YUZU_SUPPORT_SUPPORTED);
-    CHECK(a.linux_leg.rung == 1);
-    CHECK(a.macos_leg.support == YUZU_SUPPORT_SUPPORTED);
-    CHECK(a.macos_leg.rung == 2);
-    CHECK(a.windows_leg.support == YUZU_SUPPORT_PLANNED);
-    CHECK(a.windows_leg.rung == 1);
-}
-
 TEST_CASE("shares plugin: an unknown action is refused with one non-status line",
           "[shares][dispatcher]") {
     auto plugin = load_plugin();

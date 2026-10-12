@@ -48,12 +48,18 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
 };
 
+// This build's leg and its exception token, defined together.
 #if defined(_WIN32)
+constexpr yuzu::shares::LegFn kLeg = &yuzu::shares::run_windows;
 constexpr const char* kLegExceptionToken = "windows:leg:exception";
 #elif defined(__linux__)
+constexpr yuzu::shares::LegFn kLeg = &yuzu::shares::run_linux;
 constexpr const char* kLegExceptionToken = "linux:leg:exception";
-#else
+#elif defined(__APPLE__)
+constexpr yuzu::shares::LegFn kLeg = &yuzu::shares::run_macos;
 constexpr const char* kLegExceptionToken = "macos:leg:exception";
+#else
+#error "shares: unsupported platform"
 #endif
 
 } // namespace
@@ -87,17 +93,7 @@ public:
         // Every failure-token literal matches ^(windows|macos|linux|subprocess_runner):[a-z0-9_]+
         // (:[a-z0-9_]+)*$ (subprocess_runner:* come from the shared runner classifier); the body
         // is execute_list.
-#if defined(_WIN32)
-        return yuzu::shares::execute_list(ctx, action, &yuzu::shares::run_windows,
-                                          kLegExceptionToken);
-#elif defined(__linux__)
-        return yuzu::shares::execute_list(ctx, action, &yuzu::shares::run_linux,
-                                          kLegExceptionToken);
-#elif defined(__APPLE__)
-        return yuzu::shares::execute_list(ctx, action, &yuzu::shares::run_macos,
-                                          kLegExceptionToken);
-#endif
-        return 1; // unreachable on a supported build
+        return yuzu::shares::execute_list(ctx, action, kLeg, kLegExceptionToken);
     }
 };
 

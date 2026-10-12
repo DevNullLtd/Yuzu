@@ -97,15 +97,6 @@ inline void report_list(yuzu::CommandContext& ctx, const std::vector<std::string
     }
 }
 
-inline constexpr const char* kWindowsPlannedToken = "windows:planned";
-
-/// A leg that reads nothing: ONE `unsupported` status row and UNAVAILABLE/UNKNOWN carrying
-/// the same token, routed through report_list (the sole status-row owner). Callers: the
-/// Windows placeholder and execute_list's catch arm (`<os>:leg:exception`).
-inline void report_unavailable(yuzu::CommandContext& ctx, std::string_view token) {
-    report_list(ctx, {}, StatusState::unsupported, token);
-}
-
 /// What a leg decided: the status, its reason token(s), and the data rows.
 struct Listing {
     StatusState status = StatusState::supported;
@@ -113,6 +104,9 @@ struct Listing {
     std::vector<std::string> rows;
 };
 
+/// A leg that reads nothing reports `{StatusState::unsupported, <token>, {}}`: ONE
+/// `unsupported` status row and UNAVAILABLE/UNKNOWN carrying the same token. Callers: the
+/// Windows placeholder and execute_list's catch arm (`<os>:leg:exception`).
 inline void report_list(yuzu::CommandContext& ctx, const Listing& p) {
     report_list(ctx, p.rows, p.status, p.reason);
 }
@@ -138,7 +132,7 @@ inline int execute_list(yuzu::CommandContext& ctx, std::string_view action, LegF
         return leg(ctx);
     } catch (...) {
         try {
-            report_unavailable(ctx, leg_exception_token);
+            report_list(ctx, Listing{StatusState::unsupported, std::string{leg_exception_token}, {}});
         } catch (...) {
             return 1;
         }
@@ -245,7 +239,9 @@ struct Tally {
         }
     }
 
-    void take(ExportsParse& p) {
+    /// Merges any parse result carrying `shares`, `truncated` and `field_oversized`.
+    template <class P>
+    void take(P& p) {
         truncated = truncated || p.truncated;
         field_oversized = field_oversized || p.field_oversized;
         for (auto& s : p.shares)
@@ -347,17 +343,12 @@ inline Listing list_linux(const LinuxFs& fs) {
             if (rank(s) > rank(st))
                 st = s;
         };
-        if (err == ENOENT) {
-            st = SourceState::absent;
-        } else if (err == ENOTDIR) {
+        if (err == ENOTDIR) {
             st = SourceState::failed;
             t.acc.add_failure("linux:shares:exports_d:not_a_directory");
         } else if (err != 0) {
-            const SrcOutcome lo = refused(err)
-                                      ? SrcOutcome{SourceState::refused,
-                                                   src_token("linux", "exports_d", "permission_denied")}
-                                      : SrcOutcome{SourceState::failed,
-                                                   src_token("linux", "exports_d", errno_token(err))};
+            // ENOENT -> absent (no token), EACCES/EPERM -> refused, anything else -> failed.
+            const SrcOutcome lo = classify_read(FileReadLike{{}, ReadErr::io, err}, "linux", "exports_d");
             st = lo.state;
             t.note(lo);
         } else {
@@ -393,8 +384,6 @@ inline Listing list_linux(const LinuxFs& fs) {
     if (o.state == SourceState::read) {
         auto conf = parse_smb_conf(r.data, t.budget);
         n_smb = conf.shares.size();
-        t.truncated = t.truncated || conf.truncated;
-        t.field_oversized = t.field_oversized || conf.field_oversized;
         if (conf.registry_backend)
             t.acc.add_failure("linux:shares:smb_conf:registry_backend");
         if (conf.include_present)
@@ -408,8 +397,7 @@ inline Listing list_linux(const LinuxFs& fs) {
                                          : fs.usershares_default;
         if (fs.dir_exists(us_path) || conf.usershares_configured)
             t.acc.add_failure("linux:shares:smb_conf:usershares_not_read");
-        for (auto& s : conf.shares)
-            t.shares.push_back(std::move(s));
+        t.take(conf);
     }
     t.note(o);
     source_rows.push_back(source_row("smb_conf", o.state, count_if_read(o.state, n_smb)));
@@ -472,13 +460,10 @@ inline Listing list_macos(const RunFn& run, const ReadFn& read, const std::strin
             sharing = {SourceState::failed, src_token("macos", "sharing", "unrecognised_output")};
         } else {
             n_sharing = sp.shares.size();
-            t.truncated = t.truncated || sp.truncated;
-            t.field_oversized = t.field_oversized || sp.field_oversized;
             if (sp.malformed_records > 0)
                 t.acc.add_failure(src_token("macos", "sharing",
                                             "malformed_records:" + std::to_string(sp.malformed_records)));
-            for (auto& s : sp.shares)
-                t.shares.push_back(std::move(s));
+            t.take(sp);
         }
     }
     t.note(sharing);

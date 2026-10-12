@@ -16,13 +16,12 @@
 namespace yuzu::shares {
 
 int run_macos(yuzu::CommandContext& ctx) {
-    const auto fs = make_posix_fs(Paths{"/etc/exports", "", "", ""});
     report_list(ctx, list_macos(
                          [](const auto& argv, const auto& opts) {
                              // sink: shares/run_macos#1 -- /usr/sbin/sharing -l -f json (rung 2 argv; no public API for share-point records, the sharepoints dslocal node is not a permitted read)
                              return yuzu::agent::run_bounded_subprocess(argv, opts);
                          },
-                         fs.read, fs.exports_path));
+                         &read_no_follow, "/etc/exports"));
     return 0;
 }
 

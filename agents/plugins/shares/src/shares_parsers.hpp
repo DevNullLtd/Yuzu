@@ -91,15 +91,6 @@ namespace detail {
 
 inline bool is_ws(char c) { return c == ' ' || c == '\t' || c == '\v' || c == '\f'; }
 
-inline std::string trim(std::string_view s) {
-    std::size_t b = 0, e = s.size();
-    while (b < e && (is_ws(s[b]) || s[b] == '\r' || s[b] == '\n'))
-        ++b;
-    while (e > b && (is_ws(s[e - 1]) || s[e - 1] == '\r' || s[e - 1] == '\n'))
-        --e;
-    return std::string(s.substr(b, e - b));
-}
-
 inline std::string lower(std::string_view s) {
     std::string out(s);
     std::ranges::transform(out, out.begin(),
@@ -138,7 +129,7 @@ inline bool charge_share(yuzu::shared::RowByteBudget& b, std::size_t name_len, s
 }
 
 inline std::optional<bool> parse_bool(std::string_view v) {
-    const std::string l = lower(trim(v));
+    const std::string l = lower(v);
     if (l == "yes" || l == "true" || l == "1")
         return true;
     if (l == "no" || l == "false" || l == "0")
@@ -260,16 +251,47 @@ struct ExportDefaults {
     bool no_root_squash = false;
 };
 
+/// Applies one export option to `d`; true when it set the access (rw / ro).
+inline bool apply_opt(std::string_view o, ExportDefaults& d) {
+    if (o == "rw") {
+        d.access = Access::rw;
+        return true;
+    }
+    if (o == "ro") {
+        d.access = Access::ro;
+        return true;
+    }
+    if (o == "no_root_squash")
+        d.no_root_squash = true;
+    return false;
+}
+
 /// Applies a comma-separated option list to defaults (a line-default `-opts` token).
 inline void apply_default_opts(std::string_view csv, ExportDefaults& d) {
-    for (const auto o : split(csv, ',')) {
-        if (o == "rw")
-            d.access = Access::rw;
-        else if (o == "ro")
-            d.access = Access::ro;
-        else if (o == "no_root_squash")
-            d.no_root_squash = true;
+    for (const auto o : split(csv, ','))
+        apply_opt(o, d);
+}
+
+/// Charges then materialises one NFS share. The budget is charged BEFORE the (cut) path is
+/// built, so nothing past the budget is ever materialised. false => budget refused:
+/// `out.truncated` is set and the caller stops iterating.
+inline bool emit_nfs_share(ExportsParse& out, yuzu::shared::RowByteBudget& budget,
+                           std::string_view source, std::string_view path, Access access,
+                           bool anonymous, std::vector<std::string> flags) {
+    if (!charge_share(budget, 1, path.size(), flags_bytes(flags))) {
+        out.truncated = true;
+        return false;
     }
+    Share s;
+    s.proto = Proto::nfs;
+    s.name = "-";
+    s.source = std::string(source);
+    s.path = cut(path, out.field_oversized);
+    s.access = access;
+    s.anonymous = anonymous;
+    s.flags = std::move(flags);
+    out.shares.push_back(std::move(s));
+    return true;
 }
 
 struct SpecResult {
@@ -308,14 +330,8 @@ inline SpecResult parse_spec(std::string_view tok, const ExportDefaults& default
             seen_sec = true;
             cur = defaults;
             explicit_access = false;
-        } else if (o == "rw") {
-            cur.access = Access::rw;
-            explicit_access = true;
-        } else if (o == "ro") {
-            cur.access = Access::ro;
-            explicit_access = true;
-        } else if (o == "no_root_squash") {
-            cur.no_root_squash = true;
+        } else {
+            explicit_access = apply_opt(o, cur) || explicit_access;
         }
     }
     push();
@@ -355,10 +371,6 @@ inline void parse_exports(std::string_view text, std::string_view source,
             else
                 specs.push_back(detail::parse_spec(t.text, defaults));
         }
-        Share s;
-        s.proto = Proto::nfs;
-        s.name = "-";
-        s.source = std::string(source);
         bool nrs = false;
         bool anon = specs.empty();
         Access access = specs.empty() ? defaults.access : Access::unknown;
@@ -368,18 +380,11 @@ inline void parse_exports(std::string_view text, std::string_view source,
             anon = anon || sp.anonymous;
             nrs = nrs || sp.no_root_squash;
         }
+        std::vector<std::string> flags;
         if (nrs)
-            s.flags.emplace_back("no_root_squash");
-        s.flags.emplace_back("clients_" + std::to_string(specs.size()));
-        if (!detail::charge_share(budget, 1, path.text.size(), detail::flags_bytes(s.flags))) {
-            out.truncated = true;
-            return false;
-        }
-        s.path = detail::cut(path.text, out.field_oversized);
-        s.access = access;
-        s.anonymous = anon;
-        out.shares.push_back(std::move(s));
-        return true;
+            flags.emplace_back("no_root_squash");
+        flags.emplace_back("clients_" + std::to_string(specs.size()));
+        return detail::emit_nfs_share(out, budget, source, path.text, access, anon, std::move(flags));
     });
 }
 
@@ -435,21 +440,13 @@ inline void parse_bsd_exports(std::string_view text, std::string_view source,
             }
         }
         for (const auto& p : paths) {
-            Share s;
-            s.proto = Proto::nfs;
-            s.name = "-";
-            s.source = std::string(source);
+            std::vector<std::string> flags;
             if (offline)
-                s.flags.emplace_back("unavailable");
-            s.flags.emplace_back("clients_" + std::to_string(clients));
-            if (!detail::charge_share(budget, 1, p.size(), detail::flags_bytes(s.flags))) {
-                out.truncated = true;
+                flags.emplace_back("unavailable");
+            flags.emplace_back("clients_" + std::to_string(clients));
+            if (!detail::emit_nfs_share(out, budget, source, p, ro ? Access::ro : Access::rw,
+                                        clients == 0, std::move(flags)))
                 return false;
-            }
-            s.path = detail::cut(p, out.field_oversized);
-            s.access = ro ? Access::ro : Access::rw;
-            s.anonymous = clients == 0;
-            out.shares.push_back(std::move(s));
         }
         return true;
     });
@@ -548,7 +545,7 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
     if (const auto* v = detail::find_kv(global, "registryshares"))
         out.registry_backend = out.registry_backend || detail::parse_bool(*v).value_or(false);
     if (const auto* v = detail::find_kv(global, "usersharemaxshares")) {
-        const auto t = detail::trim(*v);
+        const std::string& t = *v; // parse_ini values arrive trimmed
         if (!t.empty() && std::ranges::all_of(t, [](unsigned char c) { return std::isdigit(c); }) &&
             t.find_first_not_of('0') != std::string::npos)
             out.usershares_configured = true;
@@ -571,7 +568,7 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
             const auto* cp = detail::find_kv(*cur, "copy");
             if (cp == nullptr)
                 break;
-            const auto l = detail::lower(detail::trim(*cp));
+            const auto l = detail::lower(*cp);
             const auto it = by_lower.find(l);
             if (it == by_lower.end() || depth >= kMaxCopyDepth ||
                 std::ranges::find(visited, l) != visited.end()) {
@@ -647,7 +644,7 @@ inline std::optional<long long> json_flag(const nlohmann::json& rec, const char*
 /// is counted in malformed_records and skipped (valid siblings are still emitted).
 inline SharingParse parse_sharing_json(std::string_view text, yuzu::shared::RowByteBudget& budget) {
     SharingParse out;
-    if (detail::trim(text).empty()) {
+    if (text.find_first_not_of(" \t\r\n") == std::string_view::npos) {
         out.recognised = true;
         return out;
     }
@@ -738,16 +735,6 @@ inline SharingParse parse_sharing_json(std::string_view text, yuzu::shared::RowB
     r += '|';
     r += count ? std::to_string(*count) : std::string{"-"};
     return r;
-}
-
-/// Sort byte-wise and cut a directory listing to `cap` names; `too_many` is set when names
-/// were dropped (the finalize shape of mgmt_posture's snippet listing).
-inline void finalize_names(std::vector<std::string>& names, std::size_t cap, bool& too_many) {
-    std::ranges::sort(names);
-    if (names.size() > cap) {
-        names.resize(cap);
-        too_many = true;
-    }
 }
 
 /// `*.exports`, not a dotfile, a single path component.
