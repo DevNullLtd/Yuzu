@@ -390,6 +390,9 @@ TEST_CASE("HeartbeatIngestion: a batch skips presence upserts after a failure ex
             ingestion.ingest(make_hb("", false), "yuzu_test_hb_batch_" + std::to_string(i),
                              "gateway", "sess-batch", &batch);
         CHECK(batch.store_failed);
+        // Entry 2 was the second consecutive failure, so the spacing doubled
+        // from 1 to 2: this pins the F1 schedule (a pre-F1 build probed later).
+        CHECK(batch.next_probe == 2);
         CHECK(batch.failed == 2);  // entries 1 and 2 (the probe right after the first failure)
         CHECK(batch.skipped == 1); // entry 3
         CHECK(failed() == 2);
@@ -558,7 +561,9 @@ TEST_CASE("HeartbeatIngestion: total presence saturation makes at most floor(log
     auto held = pool.acquire();
     REQUIRE(held);
     constexpr int kN = 40;
-    constexpr std::size_t kBound = 7; // documented ceiling; the schedule makes floor(log2 40)+1 = 6
+    // The exact schedule gives floor(log2 40)+1 = 6 (asserted below); kBound is
+    // the looser pre-F1 ceil(log2 40)+1 ceiling.
+    constexpr std::size_t kBound = 7;
     HeartbeatIngestion::PresenceBatch batch;
     for (int i = 0; i < kN; ++i)
         ingestion.ingest(make_hb("", false), "yuzu_test_hb_sat_" + std::to_string(i), "gateway",

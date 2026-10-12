@@ -313,9 +313,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "upsert at 250 ms. After a failed presence upsert later upserts in that batch are "
             "skipped EXCEPT probes: the entry right after the first failure is attempted and "
             "the spacing doubles on each further consecutive failure, so under total "
-            "saturation (every attempt fails) a batch waits at most floor(log2 N)+1 times "
-            "250 ms on a failing presence store (N = batch size); a success resets the "
-            "spacing. A batch "
+            "saturation (every attempt fails) a batch makes at most floor(log2 N)+1 attempts "
+            "(N = batch size), each waiting at most its 250 ms pool acquire (an attempt "
+            "stalled on a row lock is bounded by the pool lock_timeout instead); a "
+            "success resets the spacing. A batch "
             "that waited out one or both 500 ms acquires lands just above 0.5 s or 1 s.",
             "histogram");
         for (const char* outcome : {"ok", "degraded"})
@@ -330,8 +331,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "yuzu_server_agent_presence_store_failed_total{op=\"upsert\"}). The heartbeat is "
             "still acknowledged and its lease renewed; once the presence store recovers (a "
             "later probe in the same batch or the next batch then refreshes the row) the row "
-            "is current again. Under total saturation (every attempt fails) a batch waits at "
-            "most floor(log2 N)+1 times 250 ms; a success resets the spacing.",
+            "is current again. Under total saturation (every attempt fails) a batch makes at "
+            "most floor(log2 N)+1 attempts, each waiting at most its 250 ms pool acquire (an "
+            "attempt stalled on a row lock is bounded by the pool lock_timeout instead); a "
+            "success resets the spacing.",
             "counter");
         metrics_->counter("yuzu_server_agent_presence_upsert_skipped_total");
         metrics_->describe(
