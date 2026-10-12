@@ -38,6 +38,8 @@ notify_result_test_() ->
         fun successful_notifications_replay_nothing/0),
       t("a failed notification for a gRPC status error counts the same as a transport error",
         fun a_grpc_status_error_counts_too/0),
+      t("a notification the server refuses as a bad request does not open the breaker",
+        fun a_refusal_of_the_request_does_not_count/0),
       t("a result that no tracked worker sent is ignored",
         fun a_result_from_a_stranger_is_ignored/0)]}.
 
@@ -117,6 +119,18 @@ a_grpc_status_error_counts_too() ->
                    end),
     [ok = notify(disconnected, I) || I <- lists:seq(1, ?THRESHOLD)],
     ?assertEqual(ok, wait_until(fun() -> yuzu_gw_upstream:circuit_state() =:= open end)).
+
+a_refusal_of_the_request_does_not_count() ->
+    %% PERMISSION_DENIED (7): the server answered, correctly, that the request
+    %% is wrong. That is not a failing server (the breaker counts only server
+    %% faults), however many are sent.
+    server_answers(fun(<<"NotifyStreamStatus">>) -> {status_error, <<"7">>};
+                      (_) -> ok
+                   end),
+    [ok = notify(connected, I) || I <- lists:seq(1, ?THRESHOLD * 2)],
+    ok = wait_until(fun() -> notify_count() =:= ?THRESHOLD * 2 end),
+    ok = wait_until(fun notifications_settled/0),
+    ?assertEqual(closed, yuzu_gw_upstream:circuit_state()).
 
 a_result_from_a_stranger_is_ignored() ->
     %% Only a worker this process started speaks for the upstream.

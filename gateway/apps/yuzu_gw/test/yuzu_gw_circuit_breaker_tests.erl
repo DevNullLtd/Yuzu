@@ -168,7 +168,7 @@ reopens_on_probe_failure() ->
 %% that blames the request: the breaker must stay closed.
 request_faults_do_not_trip() ->
     [begin
-         meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) -> {error, {Status, <<"no">>}, #{}} end),
+         meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> {error, {Status, <<"no">>}, #{}} end),
          [?assertMatch({error, {Status, _}}, yuzu_gw_upstream:proxy_register(#{info => #{}}))
           || _ <- lists:seq(1, 8)],
          ?assertEqual(closed, yuzu_gw_upstream:circuit_state())
@@ -176,14 +176,14 @@ request_faults_do_not_trip() ->
     ok.
 
 server_fault_trips(Status) ->
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) -> {error, {Status, <<"x">>}, #{}} end),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> {error, {Status, <<"x">>}, #{}} end),
     [yuzu_gw_upstream:proxy_register(#{info => #{}}) || _ <- lists:seq(1, 3)],
     ?assertEqual(open, yuzu_gw_upstream:circuit_state()).
 
 request_fault_probe_closes() ->
     trip_circuit(),
     ?assertEqual(half_open, await_state(half_open)),
-    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) -> {error, {<<"3">>, <<"bad">>}, #{}} end),
+    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> {error, {<<"3">>, <<"bad">>}, #{}} end),
     ?assertMatch({error, {<<"3">>, _}}, yuzu_gw_upstream:proxy_register(#{info => #{}})),
     ?assertEqual(closed, yuzu_gw_upstream:circuit_state()).
 
@@ -191,11 +191,11 @@ request_fault_probe_closes() ->
 %% never three in a row, so it stays closed.
 request_fault_resets_failures() ->
     Fail = fun() ->
-               meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) -> {error, connection_refused} end),
+               meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> {error, connection_refused} end),
                yuzu_gw_upstream:proxy_register(#{info => #{}})
            end,
     Answer = fun() ->
-                 meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) -> {error, {<<"3">>, <<"bad">>}, #{}} end),
+                 meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) -> {error, {<<"3">>, <<"bad">>}, #{}} end),
                  yuzu_gw_upstream:proxy_register(#{info => #{}})
              end,
     Fail(), Fail(), Answer(), Fail(), Fail(),

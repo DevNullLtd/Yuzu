@@ -997,13 +997,13 @@ on_failure_of(_Result, State) ->
 %% backpressure the gateway can act on (it is a back-off signal, not a fault,
 %% but counting it is the only brake there is today).
 -spec answered_by_a_healthy_server(binary()) -> boolean().
-answered_by_a_healthy_server(?GRPC_STATUS_INVALID_ARGUMENT)    -> true;
-answered_by_a_healthy_server(?GRPC_STATUS_NOT_FOUND)           -> true;
-answered_by_a_healthy_server(?GRPC_STATUS_ALREADY_EXISTS)      -> true;
-answered_by_a_healthy_server(?GRPC_STATUS_PERMISSION_DENIED)   -> true;
-answered_by_a_healthy_server(?GRPC_STATUS_FAILED_PRECONDITION) -> true;
-answered_by_a_healthy_server(?GRPC_STATUS_OUT_OF_RANGE)        -> true;
-answered_by_a_healthy_server(?GRPC_STATUS_UNAUTHENTICATED)     -> true;
+answered_by_a_healthy_server(?GRPC_STATUS_BIN_INVALID_ARGUMENT)    -> true;
+answered_by_a_healthy_server(?GRPC_STATUS_BIN_NOT_FOUND)           -> true;
+answered_by_a_healthy_server(?GRPC_STATUS_BIN_ALREADY_EXISTS)      -> true;
+answered_by_a_healthy_server(?GRPC_STATUS_BIN_PERMISSION_DENIED)   -> true;
+answered_by_a_healthy_server(?GRPC_STATUS_BIN_FAILED_PRECONDITION) -> true;
+answered_by_a_healthy_server(?GRPC_STATUS_BIN_OUT_OF_RANGE)        -> true;
+answered_by_a_healthy_server(?GRPC_STATUS_BIN_UNAUTHENTICATED)     -> true;
 answered_by_a_healthy_server(_)                                -> false.
 
 %% @doc Returns {NewState, replay | noop}. `replay' means an RPC just
