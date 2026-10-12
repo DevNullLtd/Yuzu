@@ -16,12 +16,14 @@
 #include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/rsa.h> // EVP_RSA_gen
+#include <openssl/ssl.h>
 
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -30,14 +32,17 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #ifndef _WIN32
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <spawn.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -2033,60 +2038,46 @@ TEST_CASE("OIDC discovery: the JWKS fetch is bounded the same way against a drip
     CHECK(elapsed < std::chrono::seconds(3));
 }
 
-// ── Descriptor exhaustion fails closed (#5692, Gate 8 pass 2) ────────────────
+// ── Descriptor exhaustion fails closed (#5692, Gate 8 passes 2 and 4) ────────
 //
 // The watchdog needs one descriptor beyond the socket httplib opens. It reserves that descriptor
 // BEFORE the client exists, so exhaustion can never leave a socket running unwatched: with none
-// to spare the request is refused up front, and with one spare httplib's own socket() fails. Each
-// case runs in a forked child whose RLIMIT_NOFILE leaves exactly `spare` free descriptor numbers
-// (everything above stderr is closed first); the parent only reads the child's exit status, and
-// a SIGALRM kills a child that hangs, so a missing bound is a red test, not a stuck suite.
-// ThreadSanitizer refuses to fork a multi-threaded process, hence the guard.
-#ifndef YUZU_OIDC_MOCK_IDP_TSAN
+// to spare the request is refused up front, and with one spare httplib's own socket() fails.
+//
+// Each case runs the scenario in a FRESH process: the parent posix_spawn()s this very test
+// binary (/proc/self/exe) with a hidden Catch case and an environment variable naming the
+// scenario. The helper case resets the fatal signals to their default action FIRST (so no Catch2
+// handler or listener can run in it), leaves exactly `spare` free descriptor numbers (everything
+// above stderr is closed, then RLIMIT_NOFILE is lowered), runs the fetch, and ends with _exit():
+// it never reaches Catch2's run-end listeners, so it cannot touch the shared Postgres template
+// databases the parent is using. The parent reads only the exit status. Success is the non-zero
+// sentinel kLowFdOk, never 0, so a helper that dies silently with status 0 (a sanitizer runtime
+// that cannot start a thread) can not read as a pass; an alarm turns a hung fetch into a signal.
+//
+// An earlier form fork()ed in the multi-threaded test process. That crashed on macOS (SIGSEGV in
+// the child, which then ran Catch2's teardown and dropped the parent's templates) and, under
+// AddressSanitizer, passed without running its body. Linux only, and not under ASan: the ASan
+// runtime's own pipe() during pthread_create gets EMFILE with 0-2 spare descriptors and the
+// helper cannot run its scenario. ThreadSanitizer keeps the guard of the mock IdP above.
+#if defined(__SANITIZE_ADDRESS__)
+#define YUZU_OIDC_TEST_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define YUZU_OIDC_TEST_ASAN 1
+#endif
+#endif
+#if defined(__linux__) && !defined(YUZU_OIDC_MOCK_IDP_TSAN) && !defined(YUZU_OIDC_TEST_ASAN)
+extern char** environ;
+#define YUZU_OIDC_LOWFD_HELPER_CASE "OIDC low-descriptor helper process"
 namespace {
-constexpr int kChildOk = 0;
-constexpr int kChildSetupFailed = 90;
-
-// Forks, limits the child to `spare` free descriptors, runs `body` there and returns its exit
-// status (or -signal when the child was killed).
-int run_in_fd_limited_child(int spare, const std::function<int()>& body) {
-    const pid_t pid = ::fork();
-    REQUIRE(pid >= 0);
-    if (pid == 0) {
-        ::alarm(8); // a hung fetch dies here; the parent sees a signal, not an exit code
-        for (int fd = 0; fd < 3; ++fd) {
-            if (::fcntl(fd, F_GETFD) != -1)
-                continue;
-            const int n = ::open("/dev/null", O_RDWR);
-            if (n < 0)
-                ::_exit(kChildSetupFailed);
-            if (n != fd) {
-                ::dup2(n, fd);
-                ::close(n);
-            }
-        }
-        for (int fd = 3; fd < 3 + spare + 64; ++fd)
-            ::close(fd);
-        rlimit lim{};
-        if (::getrlimit(RLIMIT_NOFILE, &lim) != 0)
-            ::_exit(kChildSetupFailed);
-        lim.rlim_cur = static_cast<rlim_t>(3 + spare);
-        if (::setrlimit(RLIMIT_NOFILE, &lim) != 0)
-            ::_exit(kChildSetupFailed);
-        ::_exit(body());
-    }
-    int status = 0;
-    pid_t r;
-    do {
-        r = ::waitpid(pid, &status, 0);
-    } while (r < 0 && errno == EINTR);
-    REQUIRE(r == pid);
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status);
-}
+constexpr int kLowFdOk = 42;
+constexpr int kLowFdSetupFailed = 90;
+constexpr const char* kLowFdEnvPrefix = "YUZU_TEST_OIDC_LOWFD_";
 
 // The fetch under test: against the dripping https server, the call must FAIL, and within
-// `limit_ms`. Returns kChildOk, or a distinct code for each way of getting it wrong.
-int fetch_must_fail_within(const std::string& base, int limit_ms, const char* required_error) {
+// `limit_ms`. Returns kLowFdOk, or a distinct code for each way of getting it wrong.
+int fetch_must_fail_within(const std::string& base, int limit_ms,
+                           const std::string& required_error) {
     const auto begin = std::chrono::steady_clock::now();
     const auto doc = OidcProvider::fetch_discovery_document(base, true, 1000);
     const auto elapsed = std::chrono::steady_clock::now() - begin;
@@ -2094,21 +2085,114 @@ int fetch_must_fail_within(const std::string& base, int limit_ms, const char* re
         return 10;
     if (elapsed >= std::chrono::milliseconds(limit_ms))
         return 11;
-    if (required_error != nullptr && doc.error() != required_error)
+    if (!required_error.empty() && doc.error() != required_error)
         return 12;
-    return kChildOk;
+    return kLowFdOk;
+}
+
+// Spawns this binary to run the scenario; returns the helper's exit status (-signal when it was
+// killed, -1000 when it could not be started).
+int run_in_fd_limited_process(int spare, const std::string& base, int limit_ms,
+                              const std::string& required_error) {
+    std::vector<std::string> env_store;
+    for (char** e = environ; e != nullptr && *e != nullptr; ++e) {
+        if (std::string_view(*e).substr(0, std::string_view(kLowFdEnvPrefix).size()) !=
+            kLowFdEnvPrefix)
+            env_store.emplace_back(*e);
+    }
+    const std::string prefix = kLowFdEnvPrefix;
+    env_store.push_back(prefix + "SPARE=" + std::to_string(spare));
+    env_store.push_back(prefix + "BASE=" + base);
+    env_store.push_back(prefix + "LIMIT_MS=" + std::to_string(limit_ms));
+    env_store.push_back(prefix + "ERROR=" + required_error);
+    std::vector<char*> envp;
+    for (auto& s : env_store)
+        envp.push_back(s.data());
+    envp.push_back(nullptr);
+
+    char self[] = "/proc/self/exe";
+    char name[] = YUZU_OIDC_LOWFD_HELPER_CASE;
+    char* argv[] = {self, name, nullptr};
+    pid_t pid = -1;
+    if (::posix_spawn(&pid, self, nullptr, nullptr, argv, envp.data()) != 0)
+        return -1000;
+    int status = 0;
+    pid_t r;
+    do {
+        r = ::waitpid(pid, &status, 0);
+    } while (r < 0 && errno == EINTR);
+    if (r != pid)
+        return -1000;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status);
 }
 } // namespace
+
+// Runs ONLY in the process the cases below spawn (the SPARE variable is the real gate; the hidden
+// tag alone is not trusted under a non-empty filter). In a normal sweep it does nothing.
+TEST_CASE(YUZU_OIDC_LOWFD_HELPER_CASE, "[.][oidc_lowfd_helper]") {
+    const char* spare_env = std::getenv("YUZU_TEST_OIDC_LOWFD_SPARE");
+    if (spare_env == nullptr) {
+        SUCCEED("not spawned by a low-descriptor case: nothing to run");
+        return;
+    }
+    // First thing: no Catch2 fatal-signal handler may run here (it would print a bogus failure
+    // block and run the listeners' run-end teardown). A crash or the alarm is a plain signal.
+    for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGALRM, SIGTERM, SIGINT}) {
+        struct sigaction sa{};
+        sa.sa_handler = SIG_DFL;
+        ::sigemptyset(&sa.sa_mask);
+        ::sigaction(sig, &sa, nullptr);
+    }
+    ::alarm(8); // a hung fetch dies here; the parent sees a signal, not an exit code
+    const int spare = std::atoi(spare_env);
+    const char* base = std::getenv("YUZU_TEST_OIDC_LOWFD_BASE");
+    const char* limit = std::getenv("YUZU_TEST_OIDC_LOWFD_LIMIT_MS");
+    const char* error = std::getenv("YUZU_TEST_OIDC_LOWFD_ERROR");
+    if (base == nullptr || limit == nullptr || error == nullptr)
+        ::_exit(kLowFdSetupFailed);
+
+    // Warm up what the fetch initializes lazily and would otherwise spend the spare descriptors
+    // on (OpenSSL's config file, the resolver), so the numbers below mean what they say.
+    OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, nullptr);
+    if (SSL_CTX* ctx = SSL_CTX_new(TLS_client_method()))
+        SSL_CTX_free(ctx);
+    {
+        addrinfo hints{};
+        hints.ai_socktype = SOCK_STREAM;
+        addrinfo* res = nullptr;
+        if (::getaddrinfo("127.0.0.1", "443", &hints, &res) == 0)
+            ::freeaddrinfo(res);
+    }
+
+    for (int fd = 0; fd < 3; ++fd) {
+        if (::fcntl(fd, F_GETFD) != -1)
+            continue;
+        const int n = ::open("/dev/null", O_RDWR);
+        if (n < 0)
+            ::_exit(kLowFdSetupFailed);
+        if (n != fd) {
+            ::dup2(n, fd);
+            ::close(n);
+        }
+    }
+    for (int fd = 3; fd < 3 + spare + 64; ++fd)
+        ::close(fd);
+    rlimit lim{};
+    if (::getrlimit(RLIMIT_NOFILE, &lim) != 0)
+        ::_exit(kLowFdSetupFailed);
+    lim.rlim_cur = static_cast<rlim_t>(3 + spare);
+    if (::setrlimit(RLIMIT_NOFILE, &lim) != 0)
+        ::_exit(kLowFdSetupFailed);
+    ::_exit(fetch_must_fail_within(base, std::atoi(limit), error));
+}
 
 TEST_CASE("OIDC http_get_bounded: with no descriptor to spare the request is refused before any "
           "socket exists",
           "[oidc][oidc_discovery][security]") {
     TlsDripServer drip;
-    const auto base = drip.base();
-    const int rc = run_in_fd_limited_child(0, [&] {
-        return fetch_must_fail_within(base, 500, "request failed: no file descriptor available");
-    });
-    CHECK(rc == kChildOk); // 12 = another error text, 11 = slow, 10 = succeeded, negative = signal
+    const int rc = run_in_fd_limited_process(0, drip.base(), 500,
+                                             "request failed: no file descriptor available");
+    CHECK(rc == kLowFdOk); // 12 = another error text, 11 = slow, 10 = succeeded, negative = signal
     CHECK(drip.accepted() == 0); // never connected
 }
 
@@ -2116,31 +2200,27 @@ TEST_CASE("OIDC http_get_bounded: with one descriptor to spare the fetch still f
           "within the bound",
           "[oidc][oidc_discovery][security]") {
     TlsDripServer drip;
-    const auto base = drip.base();
     // The one spare descriptor is the watchdog's reservation, so httplib's socket() fails. Before
     // the reservation existed, socket() took the last descriptor, the watchdog's dup() failed and
-    // the drip held the call for as long as it liked (the child is then killed by SIGALRM). That
+    // the drip held the call for as long as it liked (the helper is then killed by SIGALRM). That
     // red is not order-independent: libc's resolver sometimes re-reads /etc/resolv.conf inside
     // the call and spends the one spare descriptor first, which fails the fetch early for an
     // unrelated reason. The zero-spare case above is the order-independent pin.
-    const int rc =
-        run_in_fd_limited_child(1, [&] { return fetch_must_fail_within(base, 3000, nullptr); });
-    CHECK(rc == kChildOk);
+    const int rc = run_in_fd_limited_process(1, drip.base(), 3000, "");
+    CHECK(rc == kLowFdOk);
 }
 
 TEST_CASE("OIDC http_get_bounded: with exactly the reservation and the socket to spare the drip is "
           "still cut at the bound",
           "[oidc][oidc_discovery][security]") {
     TlsDripServer drip;
-    const auto base = drip.base();
     // Control for the two cases above: nothing is left over for the watchdog to need, and the
     // total bound (2 s here) must still hold. Anything else that wants a descriptor during the
     // handshake would fail the fetch early, which is also a failure within the bound.
-    const int rc =
-        run_in_fd_limited_child(2, [&] { return fetch_must_fail_within(base, 3000, nullptr); });
-    CHECK(rc == kChildOk);
+    const int rc = run_in_fd_limited_process(2, drip.base(), 3000, "");
+    CHECK(rc == kLowFdOk);
 }
-#endif // !YUZU_OIDC_MOCK_IDP_TSAN
+#endif // __linux__ && !TSan && !ASan
 
 #ifndef YUZU_OIDC_MOCK_IDP_TSAN
 TEST_CASE("OIDC http_get_bounded: the watchdog does not cut a fast or a merely slow fetch",
@@ -2219,6 +2299,144 @@ TEST_CASE("OIDC discovery: a malformed JWKS reaches the log with the Unicode lin
     CHECK(logs.find("\xC2\x85") == std::string::npos);
     CHECK(logs.find("\xE2\x80\xA8") == std::string::npos);
     CHECK(logs.find("\xE2\x80\xA9") == std::string::npos);
+}
+
+namespace {
+// NEL, U+2028 and U+2029 in UTF-8: the three line breaks a control-byte check (< 0x20, DEL) lets by
+// and a log reader splits on.
+constexpr const char* kUnicodeBreaks = "\xC2\x85\xE2\x80\xA8\xE2\x80\xA9";
+
+void check_no_unicode_breaks(const std::string& text) {
+    CHECK(text.find("\xC2\x85") == std::string::npos);
+    CHECK(text.find("\xE2\x80\xA8") == std::string::npos);
+    CHECK(text.find("\xE2\x80\xA9") == std::string::npos);
+}
+} // namespace
+
+TEST_CASE("OIDC: IdP-controlled JWT header values reach the log and the error with the Unicode "
+          "line breaks neutralized",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    REQUIRE_NOTHROW(provider.start_auth_flow());
+    yuzu::test::LogCapture cap;
+
+    SECTION("a kid that matches no JWKS key") {
+        // A non-empty cache falls back to its first key whatever the kid, so the error is only
+        // reachable when the served key set is empty.
+        idp.with([](MockIdp& m) { m.jwks_key_count = 0; });
+        const std::string kid = std::string("k") + kUnicodeBreaks + "x";
+        auto r = provider.verify_jwt_signature(signed_token(cfg, kid));
+        cap.stop();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().starts_with("no matching JWKS key found for kid=k"));
+        check_no_unicode_breaks(r.error());
+        const auto logs = cap.text();
+        CHECK(logs.find("not in cache, re-fetching JWKS") != std::string::npos);
+        check_no_unicode_breaks(logs);
+    }
+    SECTION("the kid of a JWK that does not parse") {
+        idp.with([](MockIdp& m) {
+            m.jwks_body = std::string(R"({"keys":[{"kty":"EC","use":"sig","kid":"k)") +
+                          kUnicodeBreaks + R"("}]})";
+        });
+        auto r = provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1"));
+        cap.stop();
+        REQUIRE_FALSE(r.has_value());
+        const auto logs = cap.text();
+        CHECK(logs.find("failed to parse JWK kid=k") != std::string::npos);
+        check_no_unicode_breaks(logs);
+        check_no_unicode_breaks(r.error());
+    }
+    SECTION("an unsupported algorithm") {
+        const auto b64 = [](const std::string& str) {
+            return OidcProvider::base64url_encode(std::vector<uint8_t>(str.begin(), str.end()));
+        };
+        const std::string header =
+            std::string(R"({"alg":"X)") + kUnicodeBreaks + R"(","kid":"mock-kid-1"})";
+        auto r = provider.verify_jwt_signature(b64(header) + ".e30.c2ln");
+        cap.stop();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().starts_with("unsupported JWT algorithm: X"));
+        check_no_unicode_breaks(r.error());
+        check_no_unicode_breaks(cap.text());
+    }
+}
+
+TEST_CASE("OIDC: claim mismatch errors name the claim with the Unicode line breaks neutralized",
+          "[oidc][security]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.sub = "user-123";
+    claims.nonce = "n";
+    claims.exp = std::chrono::duration_cast<std::chrono::seconds>(
+                     std::chrono::system_clock::now().time_since_epoch())
+                     .count() +
+                 3600;
+
+    SECTION("iss") {
+        claims.iss = std::string("https://evil") + kUnicodeBreaks;
+        auto r = provider.validate_claims(claims, "n");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().starts_with("iss mismatch: got 'https://evil"));
+        check_no_unicode_breaks(r.error());
+    }
+    SECTION("aud") {
+        claims.aud = std::string("other") + kUnicodeBreaks;
+        auto r = provider.validate_claims(claims, "n");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().starts_with("aud mismatch: got 'other"));
+        check_no_unicode_breaks(r.error());
+    }
+}
+
+TEST_CASE("OIDC: a callback whose claims carry the Unicode line breaks logs them neutralized",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    const auto flow = provider.start_auth_flow();
+    const auto nonce = yuzu::server::test::url_query_param(flow.url, "nonce");
+    const auto state = yuzu::server::test::url_query_param(flow.url, "state");
+    REQUIRE_FALSE(nonce.empty());
+
+    nlohmann::json payload =
+        nlohmann::json::parse(yuzu::server::test::id_token_payload(cfg, nonce, "alice-sub"));
+    const std::string breaks = kUnicodeBreaks;
+
+    SECTION("sub, email and name of a successful login") {
+        payload["sub"] = "alice" + breaks;
+        payload["email"] = "alice" + breaks + "@example.test";
+        payload["name"] = "Alice" + breaks;
+    }
+    SECTION("iss and aud of a token for another issuer") {
+        payload["iss"] = cfg.issuer + breaks;
+        payload["aud"] = "other" + breaks;
+    }
+    idp.with([&](MockIdp& m) {
+        m.id_token = yuzu::server::test::rs256_sign(m.token_kid, payload.dump());
+    });
+
+    yuzu::test::LogCapture cap;
+    auto claims = provider.handle_callback("the-code", state, flow.binding_secret);
+    cap.stop();
+    const auto logs = cap.text();
+    CHECK(logs.find("OIDC handle_callback: parsed claims") != std::string::npos);
+    check_no_unicode_breaks(logs);
+    if (claims.has_value()) {
+        CHECK(logs.find("OIDC auth succeeded") != std::string::npos);
+        CHECK(claims->sub == "alice" + breaks); // the VALUE used for logic is never folded
+    } else {
+        CHECK(claims.error().starts_with("iss mismatch"));
+        check_no_unicode_breaks(claims.error());
+    }
 }
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
 
@@ -2510,7 +2728,7 @@ TEST_CASE("OIDC discovery: a configured issuer with a space or control byte is r
           "request",
           "[oidc][oidc_discovery][security]") {
     // Nothing listens anywhere: each must fail on the issuer's bytes alone.
-    for (const std::string issuer :
+    for (const std::string& issuer :
          {std::string("https://idp.test\nX-Evil: 1"), std::string("https://idp.test\r\nx"),
           std::string("https://idp .test"), std::string("https://idp.test\x7f"),
           std::string("https://idp.test/realm\xE2\x80\xA8"),
