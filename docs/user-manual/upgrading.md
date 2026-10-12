@@ -188,7 +188,15 @@ otherwise): `create_offload_target` `batch_size` must be 1 to 10000 (the declare
 enforced), `mint_upload_grant` `declared_max_size` must be a JSON integer that fits a signed 64-bit
 value, and `create_guardian_rule` `version` must be 1 to 2147483647. `mint_engine_credential`
 `ttl_days` of the wrong JSON type is `-32602` too (nothing is minted; it used to fall back to the
-90-day maximum). The two bounds now hold
+90-day maximum). Security-gating MCP arguments are strict too: `issue_code_signing_cert` `validity_days` must be a
+JSON integer from 1 to 730 (`4294967297` wrapped to a 1-day certificate; a string, float or `null` took the
+365-day default), `mint_upload_grant` `ttl_secs` must be a JSON integer of at least 1 (a wrong type, `0` or a
+negative value minted the 900 s maximum; larger values still clamp), `create_api_token` `expires_at` must be `0`
+or a future epoch (a negative value minted a token that never expires), and `activate_platform_license`
+`seat_count` and `expires_at` must be integers of at least 0 (a negative `expires_at` was perpetual); each is
+`-32602` and creates nothing. A wrong-typed boolean on `create_guardian_rule`/`update_guardian_rule` `enabled`,
+`push_guardian_rules` `full_sync` and the engine-principal `include_revoked` is `-32602` instead of a bare
+HTTP 500, and `create_offload_target` now neutralises the name it writes to audit rows. The two bounds now hold
 at the REST twins and in the stores, so no writer bypasses them: `POST /api/v1/offload-targets`
 reads `batch_size` as a 64-bit value and answers `400` outside 1 to 10000 (an oversized number is
 rejected, not wrapped) and for a float, string, boolean or `null` (a float such as `5.5` used to be

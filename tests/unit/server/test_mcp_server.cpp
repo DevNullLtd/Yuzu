@@ -33334,3 +33334,357 @@ TEST_CASE("MCP execution statistics tools: a degraded tracker read is a retryabl
         CHECK(body.find("retry_after_ms") != std::string::npos);
     }
 }
+
+// ── #4644 sweep batch 2: strict numeric / boolean arguments on the MCP security-gating tools ──
+//
+// The probes every numeric site is held to: a value that wraps or saturates into a different VALID
+// value, a wrong JSON type, null, and the boundary integers. A rejected call must answer -32602
+// AND leave nothing behind.
+
+namespace {
+constexpr const char* kStrictProbes[] = {"4294967297",           "9223372036854775808",
+                                         "18446744073709551615", "-1",
+                                         "0",                    "5.5",
+                                         "\"7\"",                "null",
+                                         "true"};
+
+nlohmann::json sweep_call(McpTestServer& ts, int rpc_id, const std::string& tool,
+                          const std::string& args_json) {
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(rpc_id) +
+                       R"(,"params":{"name":")" + tool + R"(","arguments":)" + args_json + "}}");
+    REQUIRE(res);
+    return nlohmann::json::parse(res->body);
+}
+} // namespace
+
+TEST_CASE("MCP #4644: issue_code_signing_cert validity_days is a strict integer in 1..730, "
+          "range-checked before narrowing",
+          "[pg][mcp][integration][pki][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    int calls = 0;
+    std::optional<int> seen;
+    ts.issue_code_signing_fn_for_test =
+        [&](const std::string&, const std::string&, std::optional<int> validity_days,
+            const std::string&) -> std::expected<yuzu::server::CodeSigningIssuance, std::string> {
+        ++calls;
+        seen = validity_days;
+        return yuzu::server::CodeSigningIssuance{.certificate_pem = "leaf",
+                                                 .chain_pem = "root",
+                                                 .serial_hex = "C0FFEE",
+                                                 .not_after = "2027-01-01T00:00:00Z"};
+    };
+    // Untiered session: the generic supervised-tier schema gate is not in the path, so this
+    // exercises the handler's own validation (what an operator-tier or RBAC caller reaches).
+    ts.start();
+
+    int rpc = 0;
+    auto issue = [&](const std::string& days_json) {
+        std::string args = R"({"csr_pem":"csr","label":"signer-1")";
+        if (!days_json.empty())
+            args += R"(,"validity_days":)" + days_json;
+        args += "}";
+        return sweep_call(ts, ++rpc, "issue_code_signing_cert", args);
+    };
+
+    // 4294967297 wrapped to a 1-day certificate through get<int>(); 0 and 731 sit outside 1..730.
+    std::vector<std::string> bad(std::begin(kStrictProbes), std::end(kStrictProbes));
+    bad.push_back("731");
+    bad.push_back("1e3");
+    for (const auto& probe : bad) {
+        INFO("validity_days=" << probe);
+        auto b = issue(probe);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(b["error"]["message"].get<std::string>().find("validity_days") != std::string::npos);
+    }
+    CHECK(calls == 0); // no certificate was issued for any rejected value
+
+    // ABSENT keeps the documented default (the issuer's own); the bounds are inclusive.
+    auto absent = issue("");
+    CHECK(absent.contains("result"));
+    CHECK(calls == 1);
+    CHECK_FALSE(seen.has_value());
+    CHECK(issue("1").contains("result"));
+    CHECK(seen == 1);
+    CHECK(issue("730").contains("result"));
+    CHECK(seen == 730);
+    CHECK(calls == 3);
+}
+
+TEST_CASE("MCP #4644: mint_upload_grant ttl_secs is a strict integer >= 1 that still clamps "
+          "to the maximum",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    int rpc = 0;
+    auto mint = [&](const std::string& ttl_json) {
+        std::string args = R"({"agent_id":"agent-ttl","declared_max_size":4096)";
+        if (!ttl_json.empty())
+            args += R"(,"ttl_secs":)" + ttl_json;
+        args += "}";
+        return sweep_call(ts, ++rpc, "mint_upload_grant", args);
+    };
+
+    // A wrong type, 0 or a negative value used to be ignored and fall to the default, which is
+    // also the MAXIMUM: a caller asking for a short grant got the longest one.
+    std::vector<std::string> bad;
+    for (const char* p : kStrictProbes)
+        if (std::string_view(p) != "4294967297") // a huge int is valid and clamps, below
+            bad.push_back(p);
+    for (const auto& probe : bad) {
+        INFO("ttl_secs=" << probe);
+        auto b = mint(probe);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(b["error"]["message"].get<std::string>().find("ttl_secs") != std::string::npos);
+    }
+    auto none = store.list_for_agent("agent-ttl");
+    REQUIRE(none.has_value());
+    CHECK(none->empty()); // nothing was minted for any rejected value
+
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    for (const auto& [ttl_json, expect_secs] :
+         std::vector<std::pair<std::string, int64_t>>{{"60", 60},
+                                                      {"4294967297", 900},
+                                                      {"", 900}}) {
+        INFO("ttl_secs=" << ttl_json);
+        auto b = mint(ttl_json);
+        REQUIRE(b.contains("result"));
+        auto payload = nlohmann::json::parse(b["result"]["content"][0]["text"].get<std::string>());
+        const int64_t lifetime = payload["expires_at"].get<int64_t>() - now;
+        CHECK(lifetime >= expect_secs - 5);
+        CHECK(lifetime <= expect_secs + 5);
+    }
+    auto three = store.list_for_agent("agent-ttl");
+    REQUIRE(three.has_value());
+    CHECK(three->size() == 3);
+}
+
+TEST_CASE("MCP #4644: create_api_token expires_at is 0 or a future epoch, never negative or "
+          "past, and nothing is minted for a rejected value",
+          "[mcp][pg][token]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    int rpc = 0;
+    // Supervised tier: ApiToken:Write is approval-gated, so a value the tool schema accepts
+    // reaches the handler only on RECALL. Drive the whole ticket round trip and return the
+    // final body (a schema rejection ends at the mint call, before any ticket exists).
+    auto create = [&](const std::string& expires_json) {
+        const std::string tail =
+            expires_json.empty() ? std::string{} : R"(,"expires_at":)" + expires_json;
+        auto mint = sweep_call(ts, ++rpc, "create_api_token",
+                               R"({"name":"sweep-key")" + tail + "}");
+        if (!mint.contains("error") ||
+            mint["error"]["code"] != yuzu::server::mcp::kApprovalRequired)
+            return mint;
+        const std::string approval_id = mint["error"]["data"]["approval_id"].get<std::string>();
+        REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+        return sweep_call(ts, ++rpc, "create_api_token",
+                          R"({"name":"sweep-key")" + tail + R"(,"approval_id":")" + approval_id +
+                              R"("})");
+    };
+
+    std::vector<std::string> bad;
+    for (const char* p : kStrictProbes)
+        if (std::string_view(p) != "4294967297" && std::string_view(p) != "0") // valid, below
+            bad.push_back(p);
+    bad.push_back("1");      // a past epoch
+    bad.push_back("-86400"); // a "relative" time computed the wrong way round
+    for (const auto& probe : bad) {
+        INFO("expires_at=" << probe);
+        auto b = create(probe);
+        REQUIRE(b.contains("error"));
+        CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    auto none = store.list_tokens("test-user");
+    REQUIRE(none.has_value());
+    CHECK(none->empty()); // a negative or past expiry used to mint a PERMANENT token
+
+    // 0 / absent keep the documented "never expires"; 4294967297 is a valid future epoch (2106).
+    for (const char* ok : {"", "0", "4294967297"}) {
+        INFO("expires_at=" << ok);
+        CHECK(create(ok).contains("result"));
+    }
+    auto three = store.list_tokens("test-user");
+    REQUIRE(three.has_value());
+    CHECK(three->size() == 3);
+}
+
+TEST_CASE("MCP #4644: activate_platform_license seat_count and expires_at reject a negative, "
+          "non-integer or overflowing value and store nothing",
+          "[pg][mcp][integration][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_b5_license_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::LicenseStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.license_store_for_test = &store;
+    ts.start();
+
+    int rpc = 0;
+    auto activate = [&](const char* field, const std::string& value_json) {
+        const std::string key = "KEY-" + std::to_string(rpc + 1);
+        std::string args = R"({"organization":"Org","license_key":")" + key + "\"";
+        if (!value_json.empty())
+            args += std::string(R"(,")") + field + R"(":)" + value_json;
+        args += "}";
+        return sweep_call(ts, ++rpc, "activate_platform_license", args);
+    };
+
+    // A negative expires_at was stored and read back as PERPETUAL by every expiry reader.
+    std::vector<std::string> bad;
+    for (const char* p : kStrictProbes)
+        if (std::string_view(p) != "4294967297" && std::string_view(p) != "0") // valid, below
+            bad.push_back(p);
+    for (const char* field : {"seat_count", "expires_at"}) {
+        for (const auto& probe : bad) {
+            INFO(field << "=" << probe);
+            auto b = activate(field, probe);
+            REQUIRE(b.contains("error"));
+            CHECK(b["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(b["error"]["message"].get<std::string>().find(field) != std::string::npos);
+        }
+    }
+    auto none = store.list_licenses();
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+    CHECK(ts.audit_log.empty());
+
+    // 0 keeps its documented meaning (unlimited seats / perpetual); a large value is stored as is.
+    for (const char* field : {"seat_count", "expires_at"})
+        for (const char* ok : {"", "0", "4294967297"}) {
+            INFO(field << "=" << ok);
+            CHECK(activate(field, ok).contains("result"));
+        }
+    auto six = store.list_licenses();
+    REQUIRE(six.has_value());
+    CHECK(six->size() == 6);
+}
+
+TEST_CASE("MCP #4644: create_offload_target neutralises the caller-supplied name in every audit "
+          "row (CWE-117), like the REST twin",
+          "[pg][mcp][integration][b5][security]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+
+    // CR/LF would split the audit line, a space or '=' would forge a `k=v` field, ',' separates
+    // fields: each maps to '_' in what is recorded.
+    const std::string evil = "evil\r\nresult=success x,y";
+    const std::string neutral = "evil__result_success_x_y";
+
+    // Denied before the store call (unrecognized auth_type): the name is the audit target_id.
+    nlohmann::json denied = {{"name", evil},
+                             {"url", "https://example.com/hook"},
+                             {"auth_type", "bogus-type"}};
+    auto d = sweep_call(ts, 1, "create_offload_target", denied.dump());
+    REQUIRE(d.contains("error"));
+    REQUIRE_FALSE(ts.audit_target_ids.empty());
+    CHECK(ts.audit_log.back() == "offload_target.create|denied");
+    CHECK(ts.audit_target_ids.back() == neutral);
+
+    // Success: the name rides in the detail of the domain row (the target_id is the new row id).
+    // (The store itself refuses control bytes in a name, so the success and duplicate rows use
+    // the same shape without the CR/LF.)
+    const std::string evil_plain = "evil result=success x,y";
+    nlohmann::json ok = {{"name", evil_plain}, {"url", "https://example.com/hook"}};
+    auto s = sweep_call(ts, 2, "create_offload_target", ok.dump());
+    REQUIRE(s.contains("result"));
+    REQUIRE(ts.audit_log.size() >= 2);
+    const auto domain_row = ts.audit_log.size() - 2;
+    CHECK(ts.audit_log[domain_row] == "offload_target.create|success");
+    CHECK(ts.audit_details[domain_row] == "evil_result_success_x_y");
+
+    // A duplicate name (rejected by the store) records the neutralised name too.
+    auto dup = sweep_call(ts, 3, "create_offload_target", ok.dump());
+    REQUIRE(dup.contains("error"));
+    CHECK(ts.audit_log.back() == "offload_target.create|denied");
+    CHECK(ts.audit_target_ids.back() == "evil_result_success_x_y");
+}
+
+TEST_CASE("MCP #4644: query_inventory advertises its documented limit bounds (1..1000)",
+          "[mcp][integration][inventory]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "query_inventory") {
+            tool = &t;
+            break;
+        }
+    REQUIRE(tool != nullptr);
+    const auto& limit = (*tool)["inputSchema"]["properties"]["limit"];
+    CHECK(limit["minimum"] == 1);
+    CHECK(limit["maximum"] == 1000);
+    CHECK(limit["default"] == 100);
+    // The behaviour is saturating, not rejecting, and the description must say so.
+    CHECK(limit["description"].get<std::string>().find("clamped to 1000") != std::string::npos);
+}
+
+TEST_CASE("MCP #4644: a wrong-typed boolean on the Guardian rule tools is -32602, not a bare 500",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r-bool", "rule-bool");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("");
+
+    int rpc = 0;
+    for (const char* bad : {"\"false\"", "0", "null", "1.5"}) {
+        INFO("enabled=" << bad);
+        auto c = sweep_call(ts, ++rpc, "create_guardian_rule",
+                            std::string(R"({"rule_id":"r-new","name":"n","yaml_source":"# y\n",)"
+                                        R"("enabled":)") + bad + "}");
+        REQUIRE(c.contains("error"));
+        CHECK(c["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        auto u = sweep_call(ts, ++rpc, "update_guardian_rule",
+                            std::string(R"({"rule_id":"r-bool","enabled":)") + bad + "}");
+        REQUIRE(u.contains("error"));
+        CHECK(u["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        auto p = sweep_call(ts, ++rpc, "push_guardian_rules",
+                            std::string(R"({"full_sync":)") + bad + "}");
+        REQUIRE(p.contains("error"));
+        CHECK(p["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    auto none = store.get_rule("r-new");
+    REQUIRE(none.has_value());
+    CHECK_FALSE(none->has_value()); // the rejected create wrote nothing
+
+    // A real boolean still works.
+    auto ok = sweep_call(ts, ++rpc, "update_guardian_rule",
+                         R"({"rule_id":"r-bool","enabled":false})");
+    CHECK(ok.contains("result"));
+}

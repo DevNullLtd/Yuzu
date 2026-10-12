@@ -716,8 +716,9 @@ static const ToolDef kTools[] = {
     {"query_inventory",
      "Query GENERIC per-source inventory blobs across agents (filter by agent or plugin). For the "
      "typed installed-software inventory (name/version/publisher per device, fleet-queryable), use "
-     "query_installed_software instead.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"limit":{"type":"integer","default":100}}})",
+     "query_installed_software instead. `limit` is 1..1000 (default 100): a value above 1000 is "
+     "clamped to 1000 and a value below 1 falls back to the default.",
+     R"({"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size, 1..1000. Out of range does not error: above 1000 is clamped to 1000, below 1 uses the default"}}})",
      R"j({"type":"object","properties":{"records":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"data":{"type":"string"},"collected_at":{"type":"integer"}},"required":["agent_id","plugin","data","collected_at"]}},"result_truncated_by_cap":{"type":"boolean"}},"required":["records","result_truncated_by_cap"]})j"},
 
     {"list_inventory_tables", "List available inventory data types with agent counts.",
@@ -14383,7 +14384,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 row.version = *version_opt;
-                row.enabled = args.value("enabled", true);
+                // A wrong-typed enabled made args.value() throw out of the handler (a bare empty-body HTTP
+                // 500); reject it as -32602 instead (#4644).
+                const auto enabled_opt = param_bool_strict(args, "enabled", true);
+                if (!enabled_opt) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not a store/query fault.
+                        error_response(id, kInvalidParams, "enabled must be a JSON boolean"),
+                        "application/json");
+                    return;
+                }
+                row.enabled = *enabled_opt;
                 row.enforcement_mode = param_str(args, "enforcement_mode", "enforce");
                 row.severity = param_str(args, "severity", "medium");
                 row.os_target = param_str(args, "os_target", "");
@@ -14587,7 +14598,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 const GuaranteedStateRuleRow& existing_rule = **existing;
                 auto updated = existing_rule;
                 updated.name = param_str(args, "name", existing_rule.name.c_str());
-                updated.enabled = args.value("enabled", existing_rule.enabled);
+                // A wrong-typed enabled made args.value() throw out of the handler (a bare empty-body HTTP
+                // 500); reject it as -32602 instead (#4644).
+                const auto enabled_opt = param_bool_strict(args, "enabled", existing_rule.enabled);
+                if (!enabled_opt) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not a store/query fault.
+                        error_response(id, kInvalidParams, "enabled must be a JSON boolean"),
+                        "application/json");
+                    return;
+                }
+                updated.enabled = *enabled_opt;
                 // Mode (Watch/Enforce) is IMMUTABLE after creation — a different
                 // posture is a different Guard. Mirrors REST's PUT handler exactly.
                 if (args.contains("enforcement_mode") && args["enforcement_mode"].is_string() &&
@@ -14809,7 +14830,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::string scope = param_str(args, "scope");
-                const bool full_sync = args.value("full_sync", false);
+                // A wrong-typed full_sync made args.value() throw out of the handler (a bare empty-body HTTP
+                // 500); reject it as -32602 instead (#4644).
+                const auto full_sync_opt = param_bool_strict(args, "full_sync", false);
+                if (!full_sync_opt) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not a store/query fault.
+                        error_response(id, kInvalidParams, "full_sync must be a JSON boolean"),
+                        "application/json");
+                    return;
+                }
+                const bool full_sync = *full_sync_opt;
                 const auto rule_count = guaranteed_state_store->rule_count();
                 // Same log-injection defence as REST's push handler: strip control
                 // bytes and backslash-escape quotes before embedding in the audit
@@ -20107,9 +20138,27 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // ABSENT keeps the documented default; a PRESENT validity_days must be one JSON
+                // integer in 1..730 (#4644). It used to be read through get<int>(), which wraps
+                // (4294967297 became a 1-day certificate) and ignored a wrong type or null
+                // (silently the 365-day default). The range is checked on the int64 BEFORE
+                // narrowing. An explicit null is rejected here, unlike the REST twin which
+                // treats it as absent: every MCP strict reader in this file rejects null.
                 std::optional<int> validity_days;
-                if (args.contains("validity_days") && args["validity_days"].is_number_integer())
-                    validity_days = args["validity_days"].get<int>();
+                if (args.contains("validity_days")) {
+                    const auto days_opt = param_int_strict(args, "validity_days", 0);
+                    if (!days_opt || *days_opt < 1 || *days_opt > 730) {
+                        res.set_content(
+                            // retry-hint-exempt: caller-input type/range rejection, not a
+                            // store/query fault - resending the identical malformed
+                            // argument cannot succeed.
+                            error_response(id, kInvalidParams,
+                                           "validity_days must be a JSON integer from 1 to 730"),
+                            "application/json");
+                        return;
+                    }
+                    validity_days = static_cast<int>(*days_opt);
+                }
                 // session is already the auth_fn-resolved caller from the top of
                 // this handler (no need to re-derive it as the REST route does —
                 // MCP resolves it once, up front).
@@ -20959,8 +21008,25 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 params.declared_max_size = *declared_opt;
-                if (args.contains("ttl_secs") && args["ttl_secs"].is_number_integer())
-                    params.requested_ttl_secs = args["ttl_secs"].get<std::int64_t>();
+                // ABSENT keeps the server default; a PRESENT ttl_secs must be one JSON integer
+                // >= 1 (#4644, mirrors the REST twin). A wrong type, 0 or a negative value used
+                // to be ignored and fall to the default, which is also the MAXIMUM (900 s): a
+                // caller asking for a short grant got the longest one. A value above the
+                // maximum still clamps to it, as documented.
+                if (args.contains("ttl_secs")) {
+                    const auto ttl_opt = param_int_strict(args, "ttl_secs", 0);
+                    if (!ttl_opt || *ttl_opt < 1) {
+                        res.set_content(
+                            // retry-hint-exempt: caller-input type/range rejection, not a
+                            // store/query fault - resending the identical malformed
+                            // argument cannot succeed.
+                            error_response(id, kInvalidParams,
+                                           "ttl_secs must be a JSON integer of at least 1"),
+                            "application/json");
+                        return;
+                    }
+                    params.requested_ttl_secs = *ttl_opt;
+                }
                 auto minted = upload_grant_store_->mint(params, now_epoch());
                 if (!minted) {
                     (void)audit_fn(req, "upload_grant.mint", "failure", "UploadGrant",
@@ -21911,14 +21977,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // The caller-supplied name is audit-embedded below as target_id/detail: neutralise it
+                // (CWE-117) exactly as the REST twin does, so a CR/LF or `k=v` in a name cannot
+                // forge or split an audit line.
                 auto auth_type = offload_auth_type_from_string(auth_type_str);
                 if (offload_auth_type_to_string(auth_type) != auth_type_str) {
                     // Mirrors offload_routes.cpp's own round-trip check: the
                     // lenient from-string parser folds any unrecognized
                     // string to None, which would silently turn a typo into
                     // an unauthenticated target instead of rejecting it.
-                    audit_fn(req, "offload_target.create", "denied", "offload_target", name,
-                             "invalid_auth_type");
+                    audit_fn(req, "offload_target.create", "denied", "offload_target",
+                             audit_token(name), "invalid_auth_type");
                     res.set_content(a4_error(kInvalidParams, "unrecognized auth_type"),
                                     "application/json");
                     return;
@@ -21932,8 +22001,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (kInternalError + retry_after_ms) — distinct in the
                     // audit record even where the outcome collapses.
                     if (result.error() == OffloadWriteError::invalid_input) {
-                        audit_fn(req, "offload_target.create", "denied", "offload_target", name,
-                                 "validation_failed");
+                        audit_fn(req, "offload_target.create", "denied", "offload_target",
+                                 audit_token(name), "validation_failed");
                         res.set_content(
                             a4_error(kInvalidParams, "target rejected: invalid url, name, "
                                                      "batch_size, or duplicate name"),
@@ -21943,8 +22012,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             result.error() == OffloadWriteError::store_unavailable
                                 ? "store_unavailable"
                                 : "db_error";
-                        audit_fn(req, "offload_target.create", "denied", "offload_target", name,
-                                 detail);
+                        audit_fn(req, "offload_target.create", "denied", "offload_target",
+                                 audit_token(name), detail);
                         res.set_content(a4_error(kInternalError, "offload target store unavailable",
                                                  "retry once the server reports ready",
                                                  /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
@@ -21954,7 +22023,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const int64_t new_target_id = *result;
                 const bool audit_ok = audit_fn(req, "offload_target.create", "success",
-                                               "offload_target", std::to_string(new_target_id), name);
+                                               "offload_target", std::to_string(new_target_id),
+                                               audit_token(name));
                 nlohmann::json payload_j = {{"id", new_target_id}, {"status", "created"}};
                 if (!audit_ok)
                     payload_j["audit_persisted"] = false;
@@ -22375,23 +22445,29 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Both are non-negative integers (the schema minimum, #4644): 0 is the
+                // documented "unlimited"/"perpetual" sentinel. A negative expires_at used to be
+                // stored and read back as perpetual by every expiry reader
+                // (`expires_at > 0 && now > expires_at`), and a negative seat_count as-is.
                 const auto seat_count_opt = param_int_strict(args, "seat_count", 0);
-                if (!seat_count_opt) {
+                if (!seat_count_opt || *seat_count_opt < 0) {
                     res.set_content(
-                        // retry-hint-exempt: caller-input type rejection, not a
+                        // retry-hint-exempt: caller-input type/range rejection, not a
                         // store/query fault - resending the identical malformed
                         // argument cannot succeed.
-                        error_response(id, kInvalidParams, "seat_count must be a JSON integer"),
+                        error_response(id, kInvalidParams,
+                                       "seat_count must be a JSON integer of at least 0"),
                         "application/json");
                     return;
                 }
                 const auto expires_at_opt = param_int_strict(args, "expires_at", 0);
-                if (!expires_at_opt) {
+                if (!expires_at_opt || *expires_at_opt < 0) {
                     res.set_content(
-                        // retry-hint-exempt: caller-input type rejection, not a
+                        // retry-hint-exempt: caller-input type/range rejection, not a
                         // store/query fault - resending the identical malformed
                         // argument cannot succeed.
-                        error_response(id, kInvalidParams, "expires_at must be a JSON integer"),
+                        error_response(id, kInvalidParams,
+                                       "expires_at must be a JSON integer of at least 0"),
                         "application/json");
                     return;
                 }
@@ -23811,7 +23887,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const bool include_revoked = args.value("include_revoked", true);
+                // A wrong-typed include_revoked made args.value() throw out of the handler (a bare empty-body HTTP
+                // 500); reject it as -32602 instead (#4644).
+                const auto include_revoked_opt = param_bool_strict(args, "include_revoked", true);
+                if (!include_revoked_opt) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not a store/query fault.
+                        error_response(id, kInvalidParams, "include_revoked must be a JSON boolean"),
+                        "application/json");
+                    return;
+                }
+                const bool include_revoked = *include_revoked_opt;
                 auto principals = engine_principal_store_->list_all(include_revoked);
                 JArr arr;
                 for (const auto& p : principals) {
@@ -24987,7 +25073,21 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // 0 is the documented "never expires" sentinel; any other value must be a future
+                // epoch (#4644, mirrors POST /api/v1/tokens). A negative or past value used to be
+                // stored as-is, and every expiry reader tests `expires_at > 0 && now > expires_at`,
+                // so a caller computing a relative time wrongly minted a permanent token.
                 const int64_t expires_at = *expires_at_opt;
+                if (expires_at < 0 ||
+                    (expires_at > 0 && expires_at <= static_cast<int64_t>(std::time(nullptr)))) {
+                    // retry-hint-exempt: caller-input range rejection, not a store/query fault -
+                    // resending the identical value cannot succeed.
+                    res.set_content(a4_error(kInvalidParams,
+                                             "expires_at must be 0 (never expires) or a unix "
+                                             "epoch in the future"),
+                                    "application/json");
+                    return;
+                }
                 const auto scope_service = param_str(args, "scope_service");
                 const auto mcp_tier_arg = param_str(args, "mcp_tier");
                 if (!mcp_tier_arg.empty() && !mcp::is_valid_tier(mcp_tier_arg)) {
@@ -25334,7 +25434,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 // REST twin (GET /api/v1/engine-principals/audit/no-admin, which
                 // calls list_all() with its own all-inclusive default) — a revoked
                 // principal that still holds an admin grant must still be flagged.
-                const bool include_revoked = args.value("include_revoked", true);
+                // A wrong-typed include_revoked made args.value() throw out of the handler (a bare empty-body HTTP
+                // 500); reject it as -32602 instead (#4644).
+                const auto include_revoked_opt = param_bool_strict(args, "include_revoked", true);
+                if (!include_revoked_opt) {
+                    res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not a store/query fault.
+                        error_response(id, kInvalidParams, "include_revoked must be a JSON boolean"),
+                        "application/json");
+                    return;
+                }
+                const bool include_revoked = *include_revoked_opt;
                 auto principals = engine_principal_store_->list_all(include_revoked);
                 // Design doc §4.2 named PR-4.3/4.4 deliverable: "no admin, ever" and
                 // "no all-permissions toggle" are enforced at the write path
