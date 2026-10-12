@@ -1544,6 +1544,7 @@ if build_server
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_dex_stability_score.cpp', # pure application/version stability score (dex_stability_score.hpp) - no store, no PG
       'unit/server/test_dex_stats.cpp', # pure known-answer statistics (dex_stats.hpp): no store, no I/O, no [pg]
+      'unit/server/test_dex_score_policy.cpp', # pure DEX score policy + resolver (dex_score_policy.hpp): no store, no I/O, no [pg]
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
       'unit/server/test_verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
@@ -1698,7 +1699,7 @@ if build_server
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_software_catalog_rules.cpp',
-      'unit/server/test_software_catalogue_model.cpp',   # pure shared catalogue model
+      'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
       'unit/server/test_vuln_finding_store.cpp',
       'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_product_normalize.cpp',

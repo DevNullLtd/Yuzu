@@ -1001,6 +1001,10 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     }
     sql += " ORDER BY name, agent_id, install_id LIMIT $" + std::to_string(++p) + "::bigint";
     params.push_back(std::to_string(limit));
+    if (q.skip > 0) {
+        sql += " OFFSET $" + std::to_string(++p) + "::bigint";
+        params.push_back(std::to_string(q.skip));
+    }
 
     auto parse = [](const pg::PgResult& res) {
         std::vector<SoftwareFleetRow> out;
