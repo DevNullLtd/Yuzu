@@ -9,6 +9,7 @@
 #include <yuzu/metrics.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -38,8 +39,11 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
     // stores stay authoritative). Does not touch the executions-ladder
     // invariants (the command_id -> execution_id correlation / polchk-):
     // those live on the CommandResponse path, not here.
-    if (offline_store_ && presence_batch && presence_batch->store_failed) {
-        ++presence_batch->skipped; // #5686: the next heartbeat refreshes this row
+    // #5686: while the batch is tripped, skip this entry's upsert unless it is
+    // the exponentially spaced half-open probe (see PresenceBatch).
+    if (offline_store_ && presence_batch && presence_batch->store_failed &&
+        ++presence_batch->skips_since_fail < presence_batch->next_probe) {
+        ++presence_batch->skipped; // a later probe or the next batch refreshes this row
     } else if (offline_store_) {
         std::string hostname;
         std::string os;
@@ -71,10 +75,22 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         // agent_version/arch: a session-lookup miss above leaves both blank,
         // which upsert() treats as "preserve the last-known value" (round-3 v2
         // columns) rather than blanking a value this store already learned.
-        if (!offline_store_->upsert(agent_id_str, hostname, os, now_ms, /*agent_ts=*/0,
-                                    agent_version, arch, session_id) &&
-            presence_batch)
-            presence_batch->store_failed = true;
+        const bool upserted = offline_store_->upsert(agent_id_str, hostname, os, now_ms,
+                                                     /*agent_ts=*/0, agent_version, arch,
+                                                     session_id);
+        if (presence_batch) {
+            if (upserted) {
+                presence_batch->store_failed = false;
+                presence_batch->skips_since_fail = 0;
+                presence_batch->next_probe = 1;
+            } else {
+                presence_batch->store_failed = true;
+                ++presence_batch->failed;
+                presence_batch->skips_since_fail = 0;
+                presence_batch->next_probe =
+                    std::min(presence_batch->next_probe * 2, PresenceBatch::kMaxProbeSpacing);
+            }
+        }
     }
 
     // Guardian heartbeat reconcile (M5 / #1209): if the agent reported its applied

@@ -345,19 +345,26 @@ TEST_CASE("HeartbeatIngestion: resolved_session_id overrides the local session's
     }
 }
 
-// #5686: with a batch context, only the first presence upsert waits out the
-// saturated pool's bounded acquire; without one (the direct path) every
-// heartbeat still attempts its own.
-TEST_CASE("HeartbeatIngestion: a batch skips presence upserts after the first failure and the "
-          "direct path still attempts each one",
+// #5686: with a batch context, a failed presence upsert trips the batch and
+// later entries skip theirs EXCEPT exponentially spaced half-open probes; with
+// no batch context (the direct path) every heartbeat still attempts its own.
+//
+// Probe schedule with the store failing throughout: entry 1 is attempted (the
+// batch is not yet tripped) and fails -> next_probe=2; entry 2 is skipped;
+// entry 3 is the probe and fails -> next_probe=4; entries 4-6 are skipped;
+// entry 7 is the next probe. Attempts land on entries 1, 3, 7, 15, 31, ...
+TEST_CASE("HeartbeatIngestion: a batch skips presence upserts after a failure except spaced "
+          "probes and the direct path still attempts each one",
           "[heartbeat_ingestion][ws5][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    // Declared before the store: the store holds &metrics (set_metrics) and
+    // must not outlive it.
+    yuzu::MetricsRegistry metrics;
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
     REQUIRE(pool.valid());
     OfflineEndpointStore store{pool};
     REQUIRE(store.is_open());
 
-    yuzu::MetricsRegistry metrics;
     store.set_metrics(&metrics);
     EventBus bus;
     AgentRegistry registry{bus, metrics};
@@ -381,8 +388,9 @@ TEST_CASE("HeartbeatIngestion: a batch skips presence upserts after the first fa
             ingestion.ingest(make_hb("", false), "yuzu_test_hb_batch_" + std::to_string(i),
                              "gateway", "sess-batch", &batch);
         CHECK(batch.store_failed);
-        CHECK(batch.skipped == 2);
-        CHECK(failed() == 1);
+        CHECK(batch.failed == 2);  // entries 1 and 3 (the probe)
+        CHECK(batch.skipped == 1); // entry 2
+        CHECK(failed() == 2);
         CHECK(received("gateway") == 3); // the rest of ingest() still ran for every entry
     }
     SECTION("direct") {
@@ -392,4 +400,119 @@ TEST_CASE("HeartbeatIngestion: a batch skips presence upserts after the first fa
         CHECK(failed() == 2);
         CHECK(received("direct") == 2);
     }
+}
+
+// #5686 governance G-1: the trip is half-open, not sticky. A store that
+// recovers mid-batch is detected by the next probe and later entries are
+// written again.
+TEST_CASE("HeartbeatIngestion: a presence store that recovers mid-batch is detected by the "
+          "next probe and later entries are written",
+          "[heartbeat_ingestion][ws5][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_metrics(&metrics);
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics, &store};
+
+    auto present = [&](const std::string& agent) {
+        const auto roster = store.query_stale_within(std::chrono::hours(1));
+        REQUIRE(roster.has_value());
+        for (const auto& e : *roster)
+            if (e.agent_id == agent)
+                return true;
+        return false;
+    };
+    const auto name = [](int i) { return "yuzu_test_hb_recover_" + std::to_string(i); };
+
+    HeartbeatIngestion::PresenceBatch batch;
+    {
+        auto held = pool.acquire();
+        REQUIRE(held);
+        ingestion.ingest(make_hb("", false), name(0), "gateway", "sess-r", &batch); // fails
+    } // the store recovers here, between ingest() calls (no sleeps, no clocks)
+    REQUIRE(batch.store_failed);
+    REQUIRE(batch.failed == 1);
+
+    ingestion.ingest(make_hb("", false), name(1), "gateway", "sess-r", &batch); // skipped
+    CHECK(batch.skipped == 1);
+    CHECK(batch.store_failed);
+
+    ingestion.ingest(make_hb("", false), name(2), "gateway", "sess-r", &batch); // probe: succeeds
+    CHECK_FALSE(batch.store_failed);
+    CHECK(batch.next_probe == 1);
+    CHECK(batch.skips_since_fail == 0);
+
+    ingestion.ingest(make_hb("", false), name(3), "gateway", "sess-r", &batch); // written again
+    CHECK(batch.skipped == 1);
+    CHECK(batch.failed == 1); // history is kept: the caller still sees the batch hit trouble
+
+    CHECK_FALSE(present(name(0)));
+    CHECK_FALSE(present(name(1)));
+    CHECK(present(name(2)));
+    CHECK(present(name(3)));
+}
+
+// A failure on the LAST entry leaves nothing to skip, but `failed` still tells
+// the caller the batch hit presence trouble (store_failed alone is also set
+// here, but a recovered probe clears it, `failed` is never cleared).
+TEST_CASE("HeartbeatIngestion: a presence failure on the last entry is visible in "
+          "PresenceBatch::failed",
+          "[heartbeat_ingestion][ws5][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_metrics(&metrics);
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics, &store};
+
+    HeartbeatIngestion::PresenceBatch batch;
+    ingestion.ingest(make_hb("", false), "yuzu_test_hb_last_0", "gateway", "sess-l", &batch);
+    CHECK_FALSE(batch.store_failed);
+    {
+        auto held = pool.acquire();
+        REQUIRE(held);
+        ingestion.ingest(make_hb("", false), "yuzu_test_hb_last_1", "gateway", "sess-l", &batch);
+    }
+    CHECK(batch.failed == 1);
+    CHECK(batch.skipped == 0);
+}
+
+// Bound under TOTAL saturation: a batch of N makes at most ceil(log2 N)+1
+// attempted upserts (each a bounded 250 ms acquire), not N.
+TEST_CASE("HeartbeatIngestion: total presence saturation makes at most ceil(log2 N)+1 attempts "
+          "per batch",
+          "[heartbeat_ingestion][ws5][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_metrics(&metrics);
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics, &store};
+
+    auto held = pool.acquire();
+    REQUIRE(held);
+    constexpr int kN = 40;
+    constexpr std::size_t kBound = 7; // ceil(log2 40) + 1
+    HeartbeatIngestion::PresenceBatch batch;
+    for (int i = 0; i < kN; ++i)
+        ingestion.ingest(make_hb("", false), "yuzu_test_hb_sat_" + std::to_string(i), "gateway",
+                         "sess-sat", &batch);
+    CHECK(batch.failed >= 1);
+    CHECK(batch.failed <= kBound);
+    CHECK(batch.failed + batch.skipped == static_cast<std::size_t>(kN));
+    // Attempts land on entries 1, 3, 7, 15, 31 -> exactly 5 of 40.
+    CHECK(batch.failed == 5);
 }

@@ -309,8 +309,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "check to the response, by outcome. outcome=\"degraded\" means at least one "
             "Postgres-backed step of the batch degraded: the session_id directory read, the "
             "lease renewal, or a presence upsert; outcome=\"ok\" otherwise. The directory read "
-            "and the renewal each bound their pool acquire at 500 ms and the first failing "
-            "presence upsert at 250 ms (later upserts in that batch are skipped), so a batch "
+            "and the renewal each bound their pool acquire at 500 ms and a failing presence "
+            "upsert at 250 ms. After a failed presence upsert later upserts in that batch are "
+            "skipped EXCEPT exponentially spaced probes, so a batch waits at most "
+            "ceil(log2 N)+1 times 250 ms on a failing presence store (N = batch size). A batch "
             "that waited out one or both 500 ms acquires lands just above 0.5 s or 1 s.",
             "histogram");
         for (const char* outcome : {"ok", "degraded"})
@@ -319,9 +321,11 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         metrics_->describe(
             "yuzu_server_agent_presence_upsert_skipped_total",
             "#5686: BatchHeartbeat entries whose presence upsert was skipped because an earlier "
-            "presence upsert in the same batch had already failed (the first failure is counted "
-            "in yuzu_server_agent_presence_store_failed_total{op=\"upsert\"}). The heartbeat is "
-            "still acknowledged and its lease renewed; the next heartbeat refreshes the row.",
+            "presence upsert in the same batch had failed (skipped except for exponentially "
+            "spaced probes; attempts that fail are counted in "
+            "yuzu_server_agent_presence_store_failed_total{op=\"upsert\"}). The heartbeat is "
+            "still acknowledged and its lease renewed; the row is refreshed by a later probe "
+            "in the same batch or by the next batch.",
             "counter");
         metrics_->counter("yuzu_server_agent_presence_upsert_skipped_total");
         metrics_->describe(
@@ -1386,7 +1390,8 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
         resolution = resolve_sessions(ids);
     }
     bool store_degraded = resolution.degraded;
-    // #5686: one presence-store failure skips the rest of this batch's upserts.
+    // #5686: a failed presence upsert trips the batch; later upserts are skipped except
+    // for exponentially spaced half-open probes.
     HeartbeatIngestion::PresenceBatch presence_batch;
     for (const auto& hb : request->heartbeats()) {
         std::string agent_id;
@@ -1627,25 +1632,29 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
         record_directory_desync(metrics_, "batch_heartbeat", "malformed_session_id",
                                 static_cast<double>(malformed_session_ids));
     }
-    if (presence_batch.skipped > 0) {
-        if (metrics_) {
-            metrics_->counter("yuzu_server_agent_presence_upsert_skipped_total")
-                .increment(static_cast<double>(presence_batch.skipped));
-        }
-        if (warn_slot_due("presence_upsert_skipped")) {
-            spdlog::warn(
-                "[gateway] BatchHeartbeat: a presence upsert failed, so the remaining {} "
-                "in this batch were skipped; heartbeats are still acknowledged (logged "
-                "at most once per 5s; see yuzu_server_agent_presence_upsert_skipped_total)",
-                presence_batch.skipped);
-        }
+    if (presence_batch.skipped > 0 && metrics_) {
+        metrics_->counter("yuzu_server_agent_presence_upsert_skipped_total")
+            .increment(static_cast<double>(presence_batch.skipped));
+    }
+    // #5686: trigger on any failed attempt (not only a trip still open at the
+    // end), so a failure on the last entry, or one a later probe recovered
+    // from, is also logged.
+    if (presence_batch.failed > 0 && warn_slot_due("presence_upsert_skipped")) {
+        spdlog::warn("[gateway] BatchHeartbeat from node '{}': presence store degraded: {} of {} "
+                     "heartbeats not persisted this batch ({} upsert attempts failed, {} "
+                     "skipped); heartbeats still acked, leases renewed (logged at most once per "
+                     "5s; see yuzu_server_agent_presence_store_failed_total{{op=\"upsert\"}} and "
+                     "yuzu_server_agent_presence_upsert_skipped_total)",
+                     onbehalf::sanitize_for_log(request->gateway_node(), 64),
+                     presence_batch.failed + presence_batch.skipped, request->heartbeats_size(),
+                     presence_batch.failed, presence_batch.skipped);
     }
 
     response->set_acknowledged_count(acked);
     spdlog::debug("[gateway] BatchHeartbeat from node '{}': {}/{} acked", request->gateway_node(),
                   acked, request->heartbeats_size());
     if (metrics_) {
-        const bool degraded = store_degraded || presence_batch.store_failed;
+        const bool degraded = store_degraded || presence_batch.failed > 0;
         metrics_
             ->histogram("yuzu_server_gateway_batch_heartbeat_duration_seconds",
                         {{"outcome", degraded ? "degraded" : "ok"}})

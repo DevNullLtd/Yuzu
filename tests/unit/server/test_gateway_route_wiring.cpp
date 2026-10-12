@@ -3641,12 +3641,18 @@ TEST_CASE("WS-5 BatchHeartbeat: a non-owning replica keeps the last-known hostna
     }
 }
 
-// #5686: a saturated presence pool costs one bounded acquire wait per batch,
-// not one per heartbeat. The presence store has its own one-connection pool
-// whose only lease is held, so every upsert would time out; the route store's
-// pool is untouched, so acks and lease renewal must be unaffected.
-TEST_CASE("BatchHeartbeat: after the first presence upsert fails the rest of the batch skips "
-          "theirs while every entry is still acked and renewed (#5686)",
+// #5686: a saturated presence pool costs a handful of bounded acquire waits per
+// batch (at most ceil(log2 N)+1), not one per heartbeat. The presence store has
+// its own one-connection pool whose only lease is held, so every upsert would
+// time out; the route store's pool is untouched, so acks and lease renewal
+// must be unaffected.
+//
+// Probe schedule for the 4 sessions with the store failing throughout: entry 1
+// is attempted and fails; entry 2 is skipped; entry 3 is the half-open probe
+// and fails; entry 4 is skipped (the next probe would be entry 7). So
+// failed==2, skipped==2.
+TEST_CASE("BatchHeartbeat: after a presence upsert fails the batch skips theirs except "
+          "spaced probes while every entry is still acked and renewed (#5686)",
           "[pg][gateway_route_wiring][ws5]") {
     YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
     BatchHbFixture f(db.dsn());
@@ -3702,8 +3708,8 @@ TEST_CASE("BatchHeartbeat: after the first presence upsert fails the rest of the
         auto resp = batch_hb(f.svc, sids);
         CHECK(resp.acknowledged_count() == 4);
         CHECK(listed_unknown(resp).empty());
-        CHECK(presence_failed() == 1);
-        CHECK(skipped() == 3);
+        CHECK(presence_failed() == 2);
+        CHECK(skipped() == 2);
         CHECK(f.metrics.counter("yuzu_heartbeats_received_total", {{"via", "gateway"}}).value() ==
               4);
         CHECK(batches("degraded") == 1);
@@ -3719,8 +3725,67 @@ TEST_CASE("BatchHeartbeat: after the first presence upsert fails the rest of the
     CHECK(resp.acknowledged_count() == 4);
     for (const auto& a : agents)
         CHECK(offline_row_present(offline, a));
-    CHECK(presence_failed() == 1);
-    CHECK(skipped() == 3);
+    CHECK(presence_failed() == 2);
+    CHECK(skipped() == 2);
     CHECK(batches("ok") == 1);
     CHECK(batches("degraded") == 1);
+}
+
+// #5686 governance G-1: a presence failure on the LAST entry of a batch leaves
+// nothing to skip (and a probe is not even reached), but the batch is still
+// labelled degraded and counts the failed attempt.
+TEST_CASE("BatchHeartbeat: a presence failure on the last entry still labels the batch "
+          "degraded (#5686)",
+          "[pg][gateway_route_wiring][ws5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+    PgPool presence_pool{{.conninfo = db.dsn(), .size = 1}};
+    yuzu::server::OfflineEndpointStore offline{presence_pool};
+    REQUIRE(offline.is_open());
+    offline.set_metrics(&f.metrics);
+    yuzu::server::HeartbeatIngestion ingestion{f.registry, nullptr, nullptr, &f.metrics, &offline};
+    f.svc.set_heartbeat_ingestion(&ingestion);
+
+    // One-entry batch: the only (= last) upsert fails.
+    const std::string agent = "yuzu_test_5686_last_agent";
+    const std::string sid = f.register_live(agent);
+    REQUIRE(f.store.announce_connected(agent, sid, "zone", "node", 90).has_value());
+
+    auto histo = [&](const char* outcome) {
+        return f.metrics
+            .histogram("yuzu_server_gateway_batch_heartbeat_duration_seconds",
+                       {{"outcome", outcome}})
+            .snapshot()
+            .count;
+    };
+    {
+        auto held = presence_pool.acquire();
+        REQUIRE(held);
+        auto resp = batch_hb(f.svc, {sid});
+        CHECK(resp.acknowledged_count() == 1);
+    }
+    CHECK(f.metrics
+              .counter("yuzu_server_agent_presence_store_failed_total",
+                       {{"op", "upsert"}, {"reason", "store_unavailable"}})
+              .value() == 1);
+    CHECK(f.metrics.counter("yuzu_server_agent_presence_upsert_skipped_total").value() == 0);
+    CHECK(histo("degraded") == 1);
+    CHECK(histo("ok") == 0);
+}
+
+// #5686: the new series are pre-seeded at construction (a rate() over a series
+// that does not exist yet is silent) and carry the corrected HELP text.
+TEST_CASE("GatewayUpstreamServiceImpl: the #5686 series and HELP lines exist before any batch",
+          "[pg][gateway_route_wiring][ws5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+    const std::string text = f.metrics.serialize();
+    auto has = [&](std::string_view needle) { return text.find(needle) != std::string::npos; };
+    CHECK(has("# HELP yuzu_server_gateway_batch_heartbeat_duration_seconds "));
+    CHECK(has("# HELP yuzu_server_agent_presence_upsert_skipped_total "));
+    CHECK(has("exponentially spaced probes"));
+    CHECK(has("yuzu_server_gateway_batch_heartbeat_duration_seconds_count{outcome=\"ok\"} 0"));
+    CHECK(has("yuzu_server_gateway_batch_heartbeat_duration_seconds_count{outcome=\"degraded\"} "
+              "0"));
+    CHECK(has("\nyuzu_server_agent_presence_upsert_skipped_total 0\n"));
 }
