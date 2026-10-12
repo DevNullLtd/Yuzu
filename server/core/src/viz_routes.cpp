@@ -106,17 +106,17 @@ void VizRoutes::register_routes(httplib::Server& svr, AuthFn /*auth_fn*/, PermFn
                                 AuditFn audit_fn, FleetTopologyStore* store,
                                 yuzu::MetricsRegistry* metrics,
                                 const std::atomic<bool>* kill_switch,
-                                OfflineEndpointStore* offline_store) {
+                                OfflineRosterFn offline_roster_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, AuthFn{}, std::move(perm_fn), std::move(audit_fn), store, metrics,
-                    kill_switch, offline_store);
+                    kill_switch, std::move(offline_roster_fn));
 }
 
 void VizRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/, PermFn perm_fn,
                                 AuditFn audit_fn, FleetTopologyStore* store,
                                 yuzu::MetricsRegistry* metrics,
                                 const std::atomic<bool>* kill_switch,
-                                OfflineEndpointStore* offline_store) {
+                                OfflineRosterFn offline_roster_fn) {
     // auth_fn is accepted in the signature for parity with sibling
     // register_routes overloads but never invoked here -- require_permission
     // (which the perm_fn lambda wraps) calls require_auth internally, so a
@@ -127,7 +127,7 @@ void VizRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/, PermFn 
     store_ = store;
     metrics_ = metrics;
     kill_switch_ = kill_switch;
-    offline_store_ = offline_store;
+    offline_roster_fn_ = std::move(offline_roster_fn);
 
     sink.Get("/api/v1/viz/fleet/topology",
              [this](const httplib::Request& req, httplib::Response& res) {
@@ -261,18 +261,24 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     // (fleet_topology_store.{hpp,cpp}) is the SHARED pure transform the MCP
     // get_fleet_topology tool also calls (api-twin-recipe.md Rule 1) — the
     // copy-on-write / online-set-dedup rule cannot drift between the two
-    // surfaces. Null store (tests, or a legacy binary) = exactly the prior
-    // behavior (no query, snap unchanged). Done BEFORE the DoS gate so the
+    // surfaces. An empty roster closure (tests, or a legacy binary) = exactly
+    // the prior behavior (no query, snap unchanged). Done BEFORE the DoS gate so the
     // machines_max cap counts the merged total.
-    if (offline_store_) {
-        auto persisted =
-            offline_store_->query_stale_within(std::chrono::seconds(kOfflineStaleWindowSecs));
-        const auto before = snap->machines.size();
-        snap = merge_offline_topology(std::move(snap), persisted);
-        const auto merged_count = snap->machines.size() - before;
-        if (merged_count > 0 && metrics_)
-            metrics_->counter("yuzu_viz_offline_hosts_total")
-                .increment(static_cast<double>(merged_count));
+    // #5531: a FAILED read renders live-only (never hard-fails the request) and
+    // is flagged `offline_roster_degraded` in the envelope + audit detail.
+    bool offline_degraded = false;
+    if (offline_roster_fn_) {
+        auto persisted = offline_roster_fn_(std::chrono::seconds(kOfflineStaleWindowSecs));
+        if (persisted) {
+            const auto before = snap->machines.size();
+            snap = merge_offline_topology(std::move(snap), *persisted);
+            const auto merged_count = snap->machines.size() - before;
+            if (merged_count > 0 && metrics_)
+                metrics_->counter("yuzu_viz_offline_hosts_total")
+                    .increment(static_cast<double>(merged_count));
+        } else {
+            offline_degraded = true;
+        }
     }
 
     // ── 7. machines_max DoS gate (M-1) ────────────────────────────────────
@@ -292,6 +298,8 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
 
     // ── 8. Serialise + respond ───────────────────────────────────────────
     nlohmann::json j = *snap;
+    if (offline_degraded)
+        j["offline_roster_degraded"] = true;
     // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): dump_topology_safe()
     // (fleet_topology_types.hpp) substitutes U+FFFD instead of throwing on a
     // byte-clamped multi-byte codepoint - clamp_field() truncates by byte
@@ -324,7 +332,8 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
         audit_fn_(req, "viz.fleet_topology", "success", "FleetTopology", "",
                   "machines=" + std::to_string(snap->machines.size()) +
                       " include_vuln=" + (include_vuln ? "1" : "0") + (fresh ? " fresh=1" : "") +
-                      (as_fragment ? " fragment=1" : ""));
+                      (as_fragment ? " fragment=1" : "") +
+                      (offline_degraded ? " offline_roster_degraded=1" : ""));
     }
 
     if (metrics_) {
