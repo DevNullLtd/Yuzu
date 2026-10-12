@@ -244,3 +244,5 @@ d28935c662758c2d3b4687892f71a6cbc498f6a4 dc0063b23a8350b619ef5709e6eaa18b800ea67
 922f936124d5152cd5550400fae1f5174d1d95be 48b7ed8da174d753a4a29f22e628818aeafb928c
 1a8028190473ed9a5b3b9a8f178202d47e1a55a5 d0be68da4f527327a311d0cd480f7c1f2d121d85
 ```
+
+Commits after `d0be68da4f527327a311d0cd480f7c1f2d121d85` were rewritten as well; the SHAs that the ledger and the evidence record cite for them are the current ones, and no map is kept for their earlier SHAs, which are cited nowhere. Structured ledger fields, authors, dates and trailers are unchanged.
