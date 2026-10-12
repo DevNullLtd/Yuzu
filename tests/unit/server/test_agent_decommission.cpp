@@ -597,6 +597,7 @@ TEST_CASE("OfflineEndpointStore::delete_agent erases regardless of session and i
     CHECK(presence.delete_agent("agent-blank"));
     CHECK_FALSE(presence_row_exists(presence, "agent-blank"));
 
+    CHECK(presence_live(presence, "agent-live")); // positive control for the CHECK_FALSE below
     CHECK(presence.delete_agent("agent-live"));
     CHECK_FALSE(presence_row_exists(presence, "agent-live"));
     CHECK_FALSE(presence_live(presence, "agent-live"));
@@ -646,6 +647,71 @@ TEST_CASE("AgentDecommission reports a degraded presence store as Failed then er
     REQUIRE(oe2 != nullptr);
     CHECK(oe2->outcome == DecommissionOutcome::Deleted);
     CHECK_FALSE(presence_row_exists(presence, "agent-del"));
+}
+
+// I3: when the pool cannot lease a connection in time, delete_agent must answer
+// false — and the cascade Failed — never true/Deleted for an erasure that did
+// not happen. Kills: the no-lease arm of delete_agent returning true. Costs one
+// bounded kQueryAcquireTimeout wait, hence [slow].
+TEST_CASE("AgentDecommission reports an exhausted presence pool as Failed then erases on retry",
+          "[pg][decommission][offline][slow]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, decommission_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    yuzu::server::OfflineEndpointStore presence{pool};
+    REQUIRE(presence.is_open());
+    REQUIRE(presence.upsert("agent-del", "host-del", "linux", now_ms(), 0, "", "", "sess-del"));
+
+    AgentDecommission cascade{AgentDecommissionStores{.offline_endpoint = &presence}};
+
+    {
+        auto held = pool.acquire(); // exhaust the single-connection pool
+        REQUIRE(static_cast<bool>(held));
+
+        const auto start_ms = now_ms();
+        CHECK_FALSE(presence.delete_agent("agent-del"));
+        const auto degraded = cascade.decommission("agent-del");
+        CHECK(now_ms() - start_ms < 60'000); // bounded, not a hang
+
+        CHECK_FALSE(degraded.ok());
+        CHECK(degraded.failed == 1);
+        CHECK(degraded.deleted == 0);
+        const auto* oe = find_store(degraded, "offline_endpoint");
+        REQUIRE(oe != nullptr);
+        CHECK(oe->outcome == DecommissionOutcome::Failed);
+    } // lease released
+
+    CHECK(presence_row_exists(presence, "agent-del")); // the failed delete did not happen
+
+    const auto retried = cascade.decommission("agent-del");
+    CHECK(retried.ok());
+    CHECK(retried.deleted == 1);
+    const auto* oe2 = find_store(retried, "offline_endpoint");
+    REQUIRE(oe2 != nullptr);
+    CHECK(oe2->outcome == DecommissionOutcome::Deleted);
+    CHECK_FALSE(presence_row_exists(presence, "agent-del"));
+}
+
+// I3: a store that never opened must answer false (cascade Failed), never
+// true/Deleted. Kills: the !open_ guard of delete_agent returning true. No
+// live database needed — a malformed conninfo never connects (PgPool::valid()
+// is false), mirroring test_access_review_store.cpp's unreachable-pool case.
+TEST_CASE("AgentDecommission reports a closed presence store as Failed", "[decommission][offline]") {
+    yuzu::server::pg::PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+    REQUIRE_FALSE(pool.valid());
+    yuzu::server::OfflineEndpointStore presence{pool};
+    REQUIRE_FALSE(presence.is_open());
+
+    CHECK_FALSE(presence.delete_agent("x"));
+
+    AgentDecommission cascade{AgentDecommissionStores{.offline_endpoint = &presence}};
+    const auto result = cascade.decommission("x");
+    CHECK_FALSE(result.ok());
+    CHECK(result.failed == 1);
+    CHECK(result.deleted == 0);
+    const auto* oe = find_store(result, "offline_endpoint");
+    REQUIRE(oe != nullptr);
+    CHECK(oe->outcome == DecommissionOutcome::Failed);
 }
 
 // ─────────────────────────── DRIFT GUARD (the root cause) ───────────────────────
