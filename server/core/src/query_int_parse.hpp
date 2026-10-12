@@ -149,7 +149,9 @@ template <typename Json>
 /// yields `def`. A PRESENT key must be one JSON integer in signed 64-bit range: a string, float,
 /// bool, null, or a value above INT64_MAX yields nullopt (the caller answers 400), never a
 /// truncation, a thrown type error, or a wrap to a different valid value. Range rules stay with
-/// the caller.
+/// the caller. A `body` that is not a JSON object also yields `def`: a caller whose body is not
+/// optional must reject a discarded or non-object document BEFORE calling (the engine-credential
+/// mint does).
 template <typename Json>
 [[nodiscard]] std::optional<std::int64_t> read_json_int_strict(const Json& body, const char* key,
                                                                 std::int64_t def) {

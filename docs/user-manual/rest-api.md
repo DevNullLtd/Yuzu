@@ -1273,7 +1273,7 @@ Mint the **first** credential for an engine principal. The raw secret is returne
 { "ttl_days": 90 }
 ```
 
-`ttl_days` defaults to `90` only when it is omitted. It must be a JSON integer between `1` and `90` (`400` otherwise, including a string, float, boolean or `null` — the engine-credential ceiling matches the tiered-token 90-day cap elsewhere on this surface).
+The body is optional only when it is empty or whitespace-only (the credential then lasts 90 days). Any other body must be a JSON object: a truncated document, an array, a string, a number or `null` is `400` and mints nothing. Within an object, `ttl_days` defaults to `90` only when it is omitted. It must be a JSON integer between `1` and `90` (`400` otherwise, including a string, float, boolean or `null` — the engine-credential ceiling matches the tiered-token 90-day cap elsewhere on this surface).
 
 **Response (201):** headers carry `Cache-Control: no-store, no-cache, must-revalidate` and `Pragma: no-cache` so a shared proxy or browser history never retains the secret.
 
@@ -1286,7 +1286,7 @@ Mint the **first** credential for an engine principal. The raw secret is returne
 
 `token` is the raw secret (shown once); `token_id` and `expires_at` let a pure-REST caller correlate the credential it just minted without a follow-up `GET`.
 
-**Errors:** `404` — engine principal not found. `409` — engine principal is not active (revoked), **or** the principal already has an active credential (mint is single-shot; use `credentials/rotate` instead). `400` — `ttl_days` out of range. `503` — CSPRNG failure or any other store failure (a CSPRNG failure also sets `Retry-After: 5` and increments `yuzu_secure_random_failure_total{reason="prng_failure",site="engine_principal"}`). `503` + `Sec-Audit-Failed: true` — the mint audit row could not persist: the credential was created but its **one-time secret is withheld** (never in the body), so the credential exists but is unusable — see *Audit-persist failure* above for recovery.
+**Errors:** `404` — engine principal not found. `409` — engine principal is not active (revoked), **or** the principal already has an active credential (mint is single-shot; use `credentials/rotate` instead). `400` — `ttl_days` wrong type or out of range, or a non-empty body that is not a JSON object. `503` — CSPRNG failure or any other store failure (a CSPRNG failure also sets `Retry-After: 5` and increments `yuzu_secure_random_failure_total{reason="prng_failure",site="engine_principal"}`). `503` + `Sec-Audit-Failed: true` — the mint audit row could not persist: the credential was created but its **one-time secret is withheld** (never in the body), so the credential exists but is unusable — see *Audit-persist failure* above for recovery.
 
 ---
 

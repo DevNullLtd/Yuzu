@@ -5156,7 +5156,7 @@ management-group-confined principal, or rate-limit the export routes at the prox
 pool-acquire timeout on a response read surfaces as `503` `response store degraded`.
 
 **Malformed filters.** `yuzu_server_response_param_rejected_total{surface}` counts requests refused
-for a malformed numeric parameter on the response routes and MCP `query_responses` only. A steady
+for a malformed numeric parameter on the response routes, MCP `query_responses` and MCP `list_issued_certs` only (both MCP tools count under `surface="mcp"`). A steady
 non-zero rate on one surface is a client sending fractional timestamps, `null`s or trailing
 characters; it is not a server fault. The same strict parsing now answers `400` (or `-32602` on
 MCP) on about a dozen other route families and on MCP `query_audit_log`, and those rejections have

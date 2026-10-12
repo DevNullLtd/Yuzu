@@ -53,6 +53,8 @@
 #include <libpq-fe.h>
 
 #include <chrono>
+#include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -1282,11 +1284,45 @@ TEST_CASE("Engine-principal REST: mint reads ttl_days strictly, the default appl
         CHECK(h.token_store->list_active_for_principal(pid).empty());
     }
 
-    // The ABSENT paths keep working: an empty object, and an in-range integer.
+    // A non-empty body that is not a JSON object is NOT "no ttl_days": a truncated document, an
+    // array, a number, a string and null each answer 400 and mint nothing, instead of silently
+    // minting the default 90-day credential.
+    for (const char* bad : {R"({"ttl_days":7)", "[]", "5", R"("x")", "null", "not json"}) {
+        INFO(bad);
+        const auto pid = fresh_principal("ttl-strict-body-" + std::to_string(n++));
+        auto res = post_mint(pid, bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(nlohmann::json::parse(res->body)["error"]["message"].get<std::string>().find(
+                  "JSON object") != std::string::npos);
+        CHECK(h.token_store->list_active_for_principal(pid).empty());
+    }
+
+    // The ABSENT paths keep working: an empty body, a whitespace-only body and an empty object
+    // each mint the 90-day default, and an in-range integer is honoured.
+    const auto expect_days = [&h](const std::string& pid, int64_t days, int64_t t0) {
+        const auto rows = h.token_store->list_active_for_principal(pid);
+        REQUIRE(rows.size() == 1);
+        const int64_t t1 = static_cast<int64_t>(std::time(nullptr));
+        CHECK(rows[0].expires_at >= t0 + days * 24 * 3600);
+        CHECK(rows[0].expires_at <= t1 + days * 24 * 3600);
+    };
+    for (const char* blank : {"", "  \r\n\t "}) {
+        INFO("blank body size " << std::strlen(blank));
+        const auto pid = fresh_principal("ttl-strict-blank-" + std::to_string(n++));
+        const int64_t t0 = static_cast<int64_t>(std::time(nullptr));
+        auto res = post_mint(pid, blank);
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        expect_days(pid, 90, t0);
+    }
+
     const auto absent = fresh_principal("ttl-strict-absent");
+    const int64_t t0_absent = static_cast<int64_t>(std::time(nullptr));
     auto res_absent = post_mint(absent, "{}");
     REQUIRE(res_absent);
     CHECK(res_absent->status == 201);
+    expect_days(absent, 90, t0_absent);
 
     const auto seven = fresh_principal("ttl-strict-seven");
     auto res_seven = post_mint(seven, R"({"ttl_days":7})");
