@@ -161,7 +161,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 # HTTPS with OIDC SSO
 ./yuzu-server --https-cert /etc/yuzu/server.crt \
   --https-key /etc/yuzu/server.key \
-  --oidc-issuer "https://login.microsoftonline.com/YOUR_TENANT/v2.0" \
+  --oidc-issuer "https://login.microsoftonline.com/<tenant-guid>/v2.0" \
   --oidc-client-id "YOUR_CLIENT_ID" \
   --oidc-client-secret "YOUR_SECRET" \
   --oidc-redirect-uri "https://yuzu.example.com:8443/auth/callback"
