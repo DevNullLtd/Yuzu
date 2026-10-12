@@ -92,8 +92,9 @@ struct DashboardResultsColumnsTestAccess {
                                      /*filters=*/{}, /*text_query=*/"", definition_id);
     }
     std::string render_filter_bar(const std::string& command_id, const std::string& plugin,
-                                   const std::string& username = {}) {
-        return routes.render_filter_bar(command_id, plugin, /*definition_id=*/{},
+                                   const std::string& username = {},
+                                   const std::string& definition_id = {}) {
+        return routes.render_filter_bar(command_id, plugin, definition_id,
                                         /*template_id=*/{}, username);
     }
     // #1712 / #3290 Phase 2 — the fleet-read gate's composed
@@ -807,6 +808,38 @@ TEST_CASE("render_filter_bar route: a JIT-elevated session sees every agent's "
     CHECK(res->status == 200);
     CHECK(contains(res->body, "value=\"loaded\""));
     CHECK(contains(res->body, "value=\"unloaded\""));
+}
+
+// -- #5623 (Gate 7 fix round G): the chart-deck / pager refresh starts from the filter bar --------
+// A deck request on the dispatch response's host could not be synced safely against the placeholder
+// the filter-bar swap discards (a real browser showed the queued request was never sent). The
+// trigger is a hidden `load` element INSIDE the form: it fires once the new form exists, includes
+// the live form values, and shares the replacing sync scope so a filter change or a second dispatch
+// aborts it. Without a definition id there is no deck, so no trigger.
+TEST_CASE("render_filter_bar: the deck refresh is a load trigger inside the form, only with a "
+          "definition id",
+          "[server][dashboard][render_filter_bar]") {
+    DashboardResultsColumnsTestAccess acc;
+    const std::string with_def = acc.render_filter_bar("cmd-deck", "registry", "", "def-1");
+    const auto span_at = with_def.find("<span class=\"deck-refresh\"");
+    REQUIRE(span_at != std::string::npos);
+    const auto span_close = with_def.find('>', span_at);
+    REQUIRE(span_close != std::string::npos);
+    const std::string span = with_def.substr(span_at, span_close - span_at + 1);
+    INFO(span);
+    CHECK(contains(span, "hx-get=\"/fragments/results\""));
+    CHECK(contains(span, "hx-trigger=\"load\""));
+    CHECK(contains(span, "hx-swap=\"none\""));
+    CHECK(contains(span, "hx-include=\"#filter-bar\""));
+    CHECK(contains(span, "hx-sync=\"#filter-bar:replace\""));
+    // Exactly one hx-sync and it is inside the form.
+    CHECK(span.find("hx-sync=", span.find("hx-sync=") + 1) == std::string::npos);
+    CHECK(span_at < with_def.rfind("</form>"));
+    // The form's own hidden inputs supply command_id / plugin / definition_id to the request.
+    CHECK(contains(with_def, "name=\"definition_id\" value=\"def-1\""));
+
+    const std::string without_def = acc.render_filter_bar("cmd-deck", "registry");
+    CHECK_FALSE(contains(without_def, "deck-refresh"));
 }
 
 } // namespace yuzu::server

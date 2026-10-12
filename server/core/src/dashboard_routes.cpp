@@ -1388,38 +1388,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // the whole element (outerHTML) so the new hx-get /
                  // hx-trigger attributes attach; `innerHTML` would lose
                  // them.
-                 // hx-sync="#filter-bar:queue last" (#5623, Gate 7 fix round F): this
-                 // refresh carries no f_* params and `hx-include` cannot help (the
-                 // filter bar is still the empty placeholder when the request would be
-                 // issued), so unscoped it could land after a user filter change and
-                 // overwrite the pager / summary / Create-Group chrome with UNFILTERED
-                 // content. `queue last` (NOT `replace`, which would abort the
-                 // placeholder's own load request) holds it behind the placeholder's
-                 // request; htmx dequeues it after that request's outerHTML swap
-                 // (xhr onload: handle response, then m()), re-resolves `#filter-bar` to
-                 // the NEW form, and from then on a filter change (the scope is
-                 // `replace`) or a second dispatch (the HX-Trigger htmx:abort below)
-                 // aborts it. The filter-bar fragment renders the deck itself.
-                 // ORDER IS LOAD-BEARING: the #filter-bar OOB above MUST precede this
-                 // one, so the placeholder's `load delay:2s` timer is registered, and
-                 // its request issued, first; reversed, the deck request would claim
-                 // the placeholder's sync slot and the filter-bar request would queue.
-                 // Pinned by a test. Read from the bundled htmx 2.0.4, not run here.
-                 // Residual: a second dispatch while the placeholder request is in
-                 // flight aborts it, which dequeues this request before the response's
-                 // OOB replaces the host; that old-command deck request is then no
-                 // longer reachable by any abort.
-                 if (!def_id.empty()) {
-                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\""
-                             " hx-get=\"/fragments/results?command_id=" +
-                             html_escape(command_id) + "&amp;plugin=" + html_escape(plugin) +
-                             "&amp;definition_id=" + html_escape(def_id) +
-                             "\" hx-sync=\"#filter-bar:queue last\""
-                             " hx-trigger=\"load delay:2s\" hx-swap=\"none\"></div>";
-                 } else {
-                     // Clear any deck left over from a prior command.
-                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\"></div>";
-                 }
+                 // (#5623, Gate 7 fix round G) The deck refresh is no longer fired from
+                 // here: a request on this host would race the user's filter changes
+                 // (its response carries pager / summary / Create-Group chrome) and could
+                 // not be synced safely against the placeholder, which the filter-bar
+                 // swap discards. The filter-bar fragment now carries the trigger, so it
+                 // fires once the new form exists (render_filter_bar). Here the host is
+                 // only cleared, which also drops any deck left over from a prior command.
+                 html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\"></div>";
 
                  // OOB: clear pagination and summary
                  html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>";
@@ -2905,6 +2881,23 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
             " hx-include=\"#filter-bar\" hx-indicator=\"#results-loading\""
             " hx-trigger=\"input changed delay:300ms\""
             " hx-sync=\"" + std::string(kResultsSyncScope) + "\">";
+
+    // Chart-deck / pager refresh (#5623, Gate 7 fix round G). It lives INSIDE this
+    // form so its `load` trigger fires only once the new form is in the DOM: the
+    // request includes the form's live values (command_id, plugin, definition_id and
+    // every filter) and registers on THIS form's hx-sync slot, so a later filter
+    // change (scope `replace`) or a second dispatch (HX-Trigger htmx:abort on
+    // #filter-bar) aborts it, and its late response cannot overwrite the filtered
+    // pager / summary / Create-Group chrome with unfiltered content. Round F put
+    // this request on the dispatch response's chart-deck-host, queued behind the
+    // placeholder (`queue last`); a real browser showed htmx discards the
+    // placeholder's queue when its outerHTML swap removes it, so the request was
+    // never sent.
+    if (!definition_id.empty()) {
+        html += "<span class=\"deck-refresh\" hidden hx-get=\"/fragments/results\""
+                " hx-trigger=\"load\" hx-swap=\"none\" hx-include=\"#filter-bar\""
+                " hx-sync=\"" + std::string(kResultsSyncScope) + "\"></span>";
+    }
 
     html += "</form>";
     return html;

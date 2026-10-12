@@ -1048,9 +1048,9 @@ TEST_CASE("/fragments/results: a cut read that parses to zero lines still says i
 // `this:abort`, so a correction typed during a refused or slow response was never sent, and a
 // late sort/page response could land after another response's OOB swap had detached its issuer.
 // Every element whose hx-get targets /fragments/results (filter-bar controls, the View select,
-// th sort links, Prev/Next) carries the same `#filter-bar:replace`. The `#chart-deck-host`
-// self-refresh is emitted by the dispatch response, not by this fragment, and carries
-// `#filter-bar:queue last` instead (see its test below). The replacing semantics were verified in headless
+// th sort links, Prev/Next) carries the same `#filter-bar:replace`. The deck refresh trigger lives in
+// the filter-bar form (render_filter_bar, see its test in test_dashboard_results_columns.cpp). The
+// replacing semantics were verified in headless
 // Chromium during the #5623 review, not by this test: it pins the exact scope string and that
 // no element is left behind.
 namespace {
@@ -1120,14 +1120,15 @@ TEST_CASE("/fragments/results: filter bar, sort headers and pagination share one
             return {true, std::nullopt};
         });
 
-    // Filter bar, high cardinality: View select + text input + free-text search.
+    // Filter bar, high cardinality: View select + text input + free-text search + the hidden
+    // deck-refresh trigger (a fourth /fragments/results request, on the same scope).
     auto many_bar = h.get("/fragments/results/filter-bar?command_id=cmd-sync-many&plugin=registry"
                           "&definition_id=" + def_id);
     REQUIRE(many_bar);
     CHECK(contains(many_bar->body, "<select name=\"template_id\""));
     CHECK(contains(many_bar->body, "<input type=\"text\" name=\"f_output\""));
     CHECK(contains(many_bar->body, "<input type=\"search\" name=\"q\""));
-    CHECK(count_results_requests_sharing_scope(many_bar->body) == 3);
+    CHECK(count_results_requests_sharing_scope(many_bar->body) == 4);
     CHECK(contains(many_bar->body,
                    std::string("<form id=\"filter-bar\" class=\"filter-bar\" hx-sync=\"") +
                        kResultsSyncScope + "\">"));
@@ -1138,7 +1139,7 @@ TEST_CASE("/fragments/results: filter bar, sort headers and pagination share one
     REQUIRE(few_bar);
     CHECK(contains(few_bar->body, "<select name=\"f_output\""));
     CHECK_FALSE(contains(few_bar->body, "<input type=\"text\" name=\"f_output\""));
-    CHECK(count_results_requests_sharing_scope(few_bar->body) == 3);
+    CHECK(count_results_requests_sharing_scope(few_bar->body) == 4);
 
     // Results page 2 of 3: Agent + Output sort headers, Prev and Next.
     auto page = h.get("/fragments/results?command_id=cmd-sync-many&plugin=registry&per_page=10"
@@ -1374,17 +1375,13 @@ TEST_CASE("dashboard execute: the HX-Trigger ends with an htmx:abort at the resu
     CHECK_FALSE(j["showToast"].contains("target"));
 }
 
-// -- #5623 (Gate 7 fix round F): the chart-deck refresh queues behind the filter bar -------------
-// The `#chart-deck-host` self-refresh (one request, `load delay:2s`) carries no f_* params, so
-// unscoped it could land after a user filter change and overwrite the pager / summary /
-// Create-Group chrome with UNFILTERED content. It carries `hx-sync="#filter-bar:queue last"`:
-// queued behind the placeholder's own load request, dequeued after that request's swap,
-// re-resolved to the NEW form, abortable by a filter change or a second dispatch. Read from
-// the bundled htmx 2.0.4 (static_js_bundle.cpp), not run in a browser by this test. It depends on
-// the `#filter-bar` OOB PRECEDING the deck OOB in the response (the placeholder's load timer is
-// registered, and its request issued, first); reversed, the deck request would take the
-// placeholder's sync slot and the filter-bar request would queue behind it.
-TEST_CASE("dashboard execute: the chart-deck host queues behind the filter bar, which precedes it",
+// -- #5623 (Gate 7 fix round G): the dispatch response only CLEARS the chart-deck host ----------
+// The deck refresh (one request, no polling) used to be emitted here as a `load delay:2s` host
+// queued behind the placeholder (`queue last`); a real browser showed htmx discards the
+// placeholder's queue when its outerHTML swap removes it, so the request was never sent. The
+// trigger now lives in the filter-bar form (render_filter_bar). This response must not carry an
+// hx-get on the host again.
+TEST_CASE("dashboard execute: the chart-deck host is cleared, never a refresh request",
           "[pg][server][dashboard][fragment][execute]") {
     YUZU_REQUIRE_PG_DB_TPL(db_instr, fragment_instr_tpl);
     PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
@@ -1392,9 +1389,10 @@ TEST_CASE("dashboard execute: the chart-deck host queues behind the filter bar, 
     REQUIRE(is.is_open());
 
     // The harness's resolve_fn maps every instruction to os_info / os_version; a definition for
-    // that pair with a result schema is what makes the dispatch emit a deck host with an hx-get.
+    // that pair with a result schema is what used to make the dispatch emit a deck host with an
+    // hx-get, so this is not vacuous.
     InstructionDefinition def;
-    def.name = "deck-host-sync";
+    def.name = "deck-host-cleared";
     def.version = "1.0.0";
     def.plugin = "os_info";
     def.action = "os_version";
@@ -1410,23 +1408,16 @@ TEST_CASE("dashboard execute: the chart-deck host queues behind the filter bar, 
     const std::string& body = res->body;
     INFO(body);
 
-    const auto deck_at = body.find("<div id=\"chart-deck-host\" hx-swap-oob=\"true\"");
-    const auto bar_at = body.find("<div id=\"filter-bar\" hx-swap-oob=\"true\"");
+    // The filter-bar placeholder still carries the definition id (the form fetched from it renders
+    // the deck trigger), and the deck host is the bare clearing div.
+    CHECK(contains(body, "<div id=\"filter-bar\" hx-swap-oob=\"true\" hx-get=\"/fragments/results/filter-bar?"));
+    CHECK(contains(body, "definition_id="));
+    CHECK(contains(body, "<div id=\"chart-deck-host\" hx-swap-oob=\"true\"></div>"));
+    const auto deck_at = body.find("id=\"chart-deck-host\"");
     REQUIRE(deck_at != std::string::npos);
-    REQUIRE(bar_at != std::string::npos);
-    // Not vacuous: this is the refreshing host (an hx-get), not the bare clearing div.
     const auto deck_close = body.find('>', deck_at);
     REQUIRE(deck_close != std::string::npos);
-    const std::string deck_tag = body.substr(deck_at, deck_close - deck_at + 1);
-    INFO(deck_tag);
-    CHECK(contains(deck_tag, "hx-get=\"/fragments/results?command_id=cmd-exec-abort"));
-    CHECK(contains(deck_tag, "hx-trigger=\"load delay:2s\""));
-    CHECK(contains(deck_tag, "hx-sync=\"#filter-bar:queue last\""));
-    // Exactly one hx-sync on the host.
-    CHECK(deck_tag.find("hx-sync=", deck_tag.find("hx-sync=") + 1) == std::string::npos);
-
-    // The OOB order is load-bearing (see the banner above).
-    CHECK(bar_at < deck_at);
+    CHECK_FALSE(contains(body.substr(deck_at, deck_close - deck_at), "hx-get"));
 }
 
 // -- #5623: authorization runs before the refusal, and a refusal is counted ---------------------

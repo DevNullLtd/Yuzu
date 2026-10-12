@@ -67,16 +67,14 @@ class EventBus;
 //    links or Prev / Next controls rendered in that window, so nothing is clickable; a sort
 //    link pointing at the empty bar would send no command_id and answer 400, which htmx does
 //    not display.
-// The `#chart-deck-host` refresh (dashboard_routes.cpp; ONE request fired 2 seconds after a
-// dispatch, not polling) carries no f_* params, so unscoped its out-of-band swap could overwrite
-// the pager / summary / Create-Group chrome with UNFILTERED content after a filter change
-// (confirmed in a browser). It therefore carries `hx-sync="#filter-bar:queue last"`: it is
-// queued behind the placeholder's own load request (not `replace`, which would abort that
-// request), dequeues after the placeholder's swap, re-resolves `#filter-bar` to the new form,
-// and is then aborted by a filter change (this scope's `replace`) or a second dispatch (the
-// htmx:abort above). That depends on the dispatch response emitting the `#filter-bar` OOB
-// BEFORE the deck OOB (pinned by a test). Residual: a second dispatch while the placeholder
-// request is in flight dequeues the deck request before the OOB replaces the host.
+// The chart-deck / pager refresh (ONE request, not polling) is a hidden `load` trigger rendered
+// INSIDE the filter-bar form by render_filter_bar, so it fires only once the new form is in the DOM,
+// includes the form's live values, and registers on this same scope: a filter change (`replace`) or
+// a second dispatch (the htmx:abort above) aborts it, and a late response cannot overwrite the
+// pager / summary / Create-Group chrome of a filtered view with unfiltered content (#5623).
+// An earlier shape queued a request on the dispatch response's `#chart-deck-host` behind the
+// placeholder (`queue last`); a browser run showed htmx discards the placeholder's queue when its
+// swap removes it, so that request was never sent.
 inline constexpr const char* kResultsSyncScope = "#filter-bar:replace";
 
 class DashboardRoutes {

@@ -358,15 +358,12 @@ operator-visible notes:
     request fired 2 seconds after a command is dispatched (not polling). That request carries no
     filter state, so unscoped it could land after a filter change and overwrite the pager,
     summary and Create Group button of a filtered view with unfiltered ones. Closed: the request
-    now queues behind the filter bar's own first load (`hx-sync` `queue last`, not `replace`),
-    runs only once the filter bar has rendered, and is then cancelled by a later filter change or
-    a second command; a column-header sort or a pagination click reads the live filter bar (they
+    is now started by the filter bar itself, so it is sent only once the filter bar has rendered,
+    carries the filter values shown, and is cancelled by a later filter change or a second
+    command; a column-header sort or a pagination click reads the live filter bar (they
     no longer re-send the filters of the last render); and sending a command aborts a results
     request still in flight, so a late response for the previous command cannot swap its rows or
-    its Create Group button over the new command's table. Residual: a second command sent while
-    that first filter bar load is still in flight releases the queued deck request just before
-    the new response replaces it, so the previous command's deck request can still land (it
-    carries the previous command's id). For about 2 seconds after a command is sent the filter
+    its Create Group button over the new command's table. For about 2 seconds after a command is sent the filter
     bar is an empty placeholder and the header refresh fires on the same delay; this is not a
     defect, because in a browser check the header had no sort links and the page no Prev or Next
     controls in that window, so nothing could be clicked. Still open: an open Create Static
