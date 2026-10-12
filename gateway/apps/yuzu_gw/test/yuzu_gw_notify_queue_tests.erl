@@ -37,8 +37,8 @@ drain(Q) ->
 
 %%--------------------------------------------------------------------
 %% Spec examples: readable documentation of the contract. The randomized
-%% comparison below is the enforcement (it kills every mutant of the queue
-%% module on its own); these seven are kept so the contract reads as examples.
+%% comparison below is the enforcement (the mutant sweep killed all four
+%% mutants tried); these seven are kept so the contract reads as examples.
 %%--------------------------------------------------------------------
 
 spec_test_() ->

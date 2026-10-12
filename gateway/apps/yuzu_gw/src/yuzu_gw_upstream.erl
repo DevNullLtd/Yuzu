@@ -12,7 +12,9 @@
 %%%   not dropped, while the in-flight limit is reached and while the circuit
 %%%   breaker is open or half_open. The store key is {AgentId, SessionId,
 %%%   StreamHomeId}: a newer event for a held key replaces the held one (it
-%%%   keeps its place in the queue; counted as notify_coalesced), so a
+%%%   keeps its place in the queue; counted as notify_coalesced; the one
+%%%   exception is the key of a half_open probe in flight, which is no longer
+%%%   held: a newer event for it is held at the tail of the queue), so a
 %%%   CONNECTED followed by a DISCONNECTED for one session sends only the
 %%%   DISCONNECTED, while two sessions of one agent are both kept. The cap
 %%%   notify_pending_max counts keys, not agents, and the key of a half_open probe
@@ -79,8 +81,8 @@
 %%%   carries the breaker generation (cb_gen, bumped on every entry into
 %%%   half_open) it was sent under.
 %%%     - The event is retired on ok. On error it goes back to the head of the
-%%%       store (a newer event for the same key that arrived meanwhile wins and
-%%%       the old one is dropped, counted as notify_coalesced). One slot is held
+%%%       store, unless a newer event for the same key was held meanwhile: that
+%%%       one wins and the old one is dropped (counted as notify_coalesced). One slot is held
 %%%       back from the cap while a probe is out, so that the give-back always
 %%%       fits. On a local encode exception the event is evicted instead (a
 %%%       warning names the agent and the reason), it is neither retired as sent
@@ -550,9 +552,11 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr0, StreamH
     %% but its slot is already the one reserved above, so a newer event for that
     %% key is a replacement of a held key and must not be charged a second slot
     %% (else at a full store the newer event is dropped and the stale probe event
-    %% is requeued). If the probe fails, push_front/3 then finds the newer event
-    %% held and supersedes the old one; if it succeeds, the newer one is sent
-    %% later. Either way the store stays within notify_pending_max.
+    %% is requeued). If the probe fails, push_front/3 finds the newer event still
+    %% held (if a call path RPC closed the breaker meanwhile, the drain may
+    %% already have sent it, and the old event is then given back and sent after
+    %% it) and supersedes the old one; if the probe succeeds, the newer one is
+    %% sent later. Either way the store stays within notify_pending_max.
     Reserved = case Probe of
                    undefined         -> 0;
                    #{key := Key}     -> 0;

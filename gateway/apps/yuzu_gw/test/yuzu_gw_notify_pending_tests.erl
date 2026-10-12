@@ -17,7 +17,7 @@
 %%%   - one slot is held back while a registration replay is active
 %%%   - the [yuzu,gw,upstream,notify_queue] gauge events
 %%%   - format_status shows a count, never the held events
-%%%   - an untrappable worker death, an upstream restart, terminate/2
+%%%   - an untrappable worker death and an upstream restart
 %%%   - notify_pending_max validation and a 1000 agent burst
 %%%
 %%% The mock of grpcbox_client:unary/5 parks every NotifyStreamStatus worker in

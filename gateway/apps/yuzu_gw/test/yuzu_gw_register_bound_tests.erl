@@ -23,7 +23,7 @@
 %%% grpcbox does, then answers like the server: INVALID_ARGUMENT for a bad
 %%% agent id, RESOURCE_EXHAUSTED for a message over the 4 MiB receive limit of
 %%% a stock gRPC server, OK otherwise. The upstream and the registry are real.
-%%% Waits: none, every call here is synchronous.
+%%% Waits: none beyond the bounded receives in the concurrent burst test.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_register_bound_tests).
