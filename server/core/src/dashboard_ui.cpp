@@ -1443,6 +1443,34 @@ extern const char* const kDashboardIndexHtml =
         alert('MFA step-up request failed — please try the action again.');
       });
     });
+    /* #5623: a request target over the server's 8192-byte limit is answered 414 by the HTTP
+       layer before any handler runs, with an empty body, and htmx does not swap a 4xx. The
+       previous results table, pager and Create Group button would then stay on screen as if
+       they matched the filter just typed. Show the refusal in the table instead, built with
+       textContent only. */
+    document.body.addEventListener('htmx:responseError', function(evt) {
+      var xhr = evt.detail.xhr;
+      if (!xhr || xhr.status !== 414) return;
+      var info = evt.detail.pathInfo || {};
+      if ((info.requestPath || '').split('?')[0] !== '/fragments/results') return;
+      var tb = document.getElementById('results-tbody');
+      if (!tb) return;
+      tb.textContent = '';
+      var tr = document.createElement('tr');
+      var td = document.createElement('td');
+      td.className = 'empty-state filter-refused';
+      td.colSpan = 99;
+      td.setAttribute('data-filter-refused', 'true');
+      td.textContent = 'This request is too long to send (over 8 KB), so it was not evaluated. ' +
+                       'Shorten the filter value or clear the filter.';
+      tr.appendChild(td);
+      tb.appendChild(tr);
+      ['results-thead', 'result-pagination', 'result-summary', 'chart-deck-host',
+       'group-form-slot'].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.textContent = '';
+      });
+    });
   </script>
   <div id="toast-container" class="toast-container"></div>
 </body>

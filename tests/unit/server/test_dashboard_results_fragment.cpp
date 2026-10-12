@@ -468,6 +468,31 @@ static void check_results_chrome_cleared(const std::string& body) {
 
 // The cell class above is only useful if the served dashboard stylesheet overrides the generic
 // `tbody td` clipping for it (specificity: td.filter-refused beats tbody td).
+// A request target over httplib's 8192-byte limit gets an empty-body 414 before any handler runs,
+// and htmx does not swap a 4xx, so the stale table would stay on screen (#5668). The served
+// dashboard carries a client-side listener that shows the same refusal row instead. The listener
+// itself was verified in a browser; this pins that it is served and what it touches.
+TEST_CASE("dashboard script: a 414 on /fragments/results shows a refusal row, built with textContent",
+          "[server][dashboard][fragment]") {
+    const std::string html = kDashboardIndexHtml;
+    const auto at = html.find("xhr.status !== 414");
+    REQUIRE(at != std::string::npos);
+    const auto end = html.find("</script>", at);
+    REQUIRE(end != std::string::npos);
+    const std::string body = html.substr(at, end - at);
+    CHECK(contains(body, "split('?')[0] !== '/fragments/results'"));
+    CHECK(contains(body, "td.className = 'empty-state filter-refused'"));
+    CHECK(contains(body, "data-filter-refused"));
+    for (const char* id : {"results-thead", "result-pagination", "result-summary",
+                           "chart-deck-host", "group-form-slot"}) {
+        INFO(id);
+        CHECK(contains(body, std::string("'") + id + "'"));
+    }
+    // No innerHTML with dynamic data: the message is a literal set through textContent.
+    CHECK_FALSE(contains(body, "innerHTML"));
+    CHECK_FALSE(contains(body, "hx-on"));
+}
+
 TEST_CASE("dashboard stylesheet: the facet refusal cell is allowed to wrap and use the row width",
           "[server][dashboard][fragment]") {
     const std::string css = kDashboardIndexHtml;

@@ -353,7 +353,10 @@ operator-visible notes:
     other `4xx` errors.
   - **Request size.** The refusal bounds a single value. The transport answers a bare `414` for a
     request target over 8192 bytes before any handler runs, so a heavily percent-encoded value
-    (about 2.7 KB decoded) or several individually legal values can still hit that limit (#5668).
+    (about 2.7 KB decoded) or several individually legal values can still hit that limit. On the
+    dashboard results page that `414` now shows a refusal row ("too long to send ... shorten the
+    filter value or clear the filter") instead of leaving the previous table on screen; REST callers
+    still get the bare `414` without an error envelope (#5668).
   - **Dashboard refresh while a filter is applied.** The chart deck is refreshed ONCE, by a
     request fired 2 seconds after a command is dispatched (not polling). That request used to carry
     no filter state, so it could land after a filter change and overwrite the pager,
