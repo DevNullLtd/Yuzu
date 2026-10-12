@@ -1042,14 +1042,15 @@ TEST_CASE("/api/command: a body nested past the depth limit is rejected before d
 
 // #4644: `stagger` and `delay` were read with `extract_json_int`, which wrapped 4294967297 to 1
 // and read a float, string or null as 0 -- so a command held for a delay dispatched IMMEDIATELY.
-// Both are now strict JSON integers in 0..INT32_MAX (the wire fields are int32); anything else is
-// a 400 and nothing is built or sent.
+// Both are now strict JSON integers in 0..300 (the agent caps both at 300 s, so a larger value
+// would run after five minutes while the caller believed it was held longer); anything else is a
+// 400 and nothing is built or sent.
 TEST_CASE("/api/command: stagger and delay are strict integers; a bad value dispatches nothing "
           "(#4644)",
           "[command_routes][numeric_params]") {
     CommandHarness h;
     const std::vector<std::string> bad = {
-        "4294967297", "2147483648", "9223372036854775808", "18446744073709551615", "-1",
+        "4294967297", "2147483648", "301",    "9223372036854775808", "18446744073709551615", "-1",
         "1e3",        "5.5",        "\"7\"",                "\"\"",                 "null",
         "true",       "[]",         "{}"};
     for (const char* key : {"stagger", "delay"}) {
@@ -1077,11 +1078,11 @@ TEST_CASE("/api/command: stagger and delay are strict integers; a bad value disp
     // Documented values still dispatch and reach the builder unchanged; absent keeps 0.
     auto ok = h.sink.Post(
         "/api/command",
-        R"({"plugin":"noop","action":"run","agent_ids":["dev-A"],"stagger":30,"delay":2147483647})");
+        R"({"plugin":"noop","action":"run","agent_ids":["dev-A"],"stagger":30,"delay":300})");
     REQUIRE(ok);
     CHECK(ok->status == 200);
     CHECK(h.last_stagger == 30);
-    CHECK(h.last_delay == 2147483647);
+    CHECK(h.last_delay == 300); // the agent-side cap is the ceiling
     auto zero = h.sink.Post("/api/command",
                             R"({"plugin":"noop","action":"run","agent_ids":["dev-A"],"delay":0})");
     REQUIRE(zero);

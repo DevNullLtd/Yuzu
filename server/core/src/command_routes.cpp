@@ -527,17 +527,20 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         // Stagger/delay (#4644): strict, validated BEFORE anything is minted or sent. The old
         // `extract_json_int` read 4294967297 as 1 and read a float, string or null as 0, so a
         // held command dispatched immediately. ABSENT keeps the documented 0 (no stagger / no
-        // delay); a PRESENT key must be one JSON integer in 0..INT32_MAX (the wire field is int32).
+        // delay); a PRESENT key must be one JSON integer in 0..300: the agent caps both at 300 s
+        // (agents/core/src/agent.cpp execute_command_task), so a larger value would run after five
+        // minutes while the caller believed it was held longer. Refuse it instead of lying.
         // Placed after the destructive block so its 403-before-400 ordering is unchanged.
+        constexpr std::int64_t kMaxWaitSeconds = 300; // mirrors the agent-side cap
         const auto read_wait = [&](const char* key) -> std::optional<std::int32_t> {
             const auto v = yuzu::server::read_json_int_strict(body, key, 0);
-            if (v && *v >= 0 && *v <= std::numeric_limits<std::int32_t>::max())
+            if (v && *v >= 0 && *v <= kMaxWaitSeconds)
                 return static_cast<std::int32_t>(*v);
             res.status = 400;
             nlohmann::json err{
                 {"error",
                  {{"code", 400},
-                  {"message", std::string(key) + " must be a JSON integer between 0 and 2147483647"}}},
+                  {"message", std::string(key) + " must be a JSON integer between 0 and 300 (the agent caps it at 300 seconds)"}}},
                 {"meta", {{"api_version", "v1"}}}};
             res.set_content(err.dump(), "application/json");
             return std::nullopt;
