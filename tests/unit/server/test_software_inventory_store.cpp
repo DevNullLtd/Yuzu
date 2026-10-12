@@ -2719,3 +2719,145 @@ TEST_CASE("migration v8 reshapes a v7-era rollup schema and re-runs idempotently
         CHECK(PQntuples(old_read.get()) == n_titles);
     }
 }
+
+// ── software_catalog_totals ────────────────────────────────────────
+
+TEST_CASE("catalogue totals: unfiltered totals equal the refreshed meta", "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    const auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    const auto t = store.software_catalog_totals({});
+    REQUIRE(t.has_value());
+    CHECK(t->titles == meta->total_titles);
+    CHECK(t->installs == meta->total_installs);
+    // d1 carries two titles, so installs (4) exceeds distinct devices (3): sums per title.
+    CHECK(t->titles == 2);
+    CHECK(t->installs == 4);
+}
+
+TEST_CASE("catalogue totals: filtered totals equal the page-walk over the same filters",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    for (const SoftwareCatalogQuery& base :
+         {SoftwareCatalogQuery{.q = "git"}, SoftwareCatalogQuery{.ecosystem = "brew"},
+          SoftwareCatalogQuery{.source = kSrcApps},
+          SoftwareCatalogQuery{.kind = "package", .versions_min = 2},
+          // host path: the same predicate, one device
+          SoftwareCatalogQuery{.agent_id = "d1"},
+          SoftwareCatalogQuery{.kind = "package", .agent_id = "d1"},
+          SoftwareCatalogQuery{.ecosystem = "brew", .agent_id = "d1"},
+          SoftwareCatalogQuery{.source = kSrcApps, .agent_id = "d1"},
+          SoftwareCatalogQuery{.q = "chrom", .agent_id = "d1"}, SoftwareCatalogQuery{}}) {
+        std::int64_t titles = 0, installs = 0;
+        std::optional<SoftwareCatalogCursor> after;
+        for (int page = 0; page < 10; ++page) {
+            auto q = base;
+            q.limit = 1;
+            q.after = after;
+            auto rows = store.software_catalog(q);
+            REQUIRE(rows.has_value());
+            if (rows->empty())
+                break;
+            titles += static_cast<std::int64_t>(rows->size());
+            for (const auto& r : *rows)
+                installs += r.device_count;
+            after = SoftwareCatalogCursor{rows->back().device_count, rows->back().name};
+        }
+        CAPTURE(base.q, base.ecosystem, base.kind, base.source, base.agent_id, base.versions_min);
+        REQUIRE(titles > 0); // a zero == zero comparison would pass for any totals bug
+        const auto t = store.software_catalog_totals(base);
+        REQUIRE(t.has_value());
+        CHECK(t->titles == titles);
+        CHECK(t->installs == installs);
+        // limit/after are ignored by totals
+        auto paged = base;
+        paged.limit = 1;
+        paged.after = SoftwareCatalogCursor{1, "zzz"};
+        CHECK(store.software_catalog_totals(paged)->titles == titles);
+    }
+    // The filter really narrows: ecosystem=brew drops the rpm-only/macos-only cases.
+    CHECK(store.software_catalog_totals({.ecosystem = "brew"})->installs == 2);
+    CHECK(store.software_catalog_totals({.q = "git"})->installs == 3);
+    // source=installed_apps.list_inventory: git's pkgutil copy (d1) + Chrome (d1).
+    CHECK(store.software_catalog_totals({.source = kSrcApps})->installs == 2);
+    CHECK(store.software_catalog_totals({.source = kSrcApps, .agent_id = "d1"})->titles == 2);
+    CHECK(store.software_catalog_totals({.source = kSrcPkg, .agent_id = "d1"})->titles == 1);
+}
+
+TEST_CASE("catalogue totals + host keyset walk (host `after` lives in HAVING)",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    seed_grain_fixture(store);
+    SoftwareCatalogQuery q;
+    q.agent_id = "d1";
+    const auto t = store.software_catalog_totals(q);
+    REQUIRE(t.has_value());
+    CHECK(t->titles == 2);
+    CHECK(t->installs == 2); // one device: installs == titles by construction
+
+    std::vector<std::string> walked;
+    std::optional<SoftwareCatalogCursor> after;
+    for (int page = 0; page < 5; ++page) {
+        auto pq = q;
+        pq.limit = 1;
+        pq.after = after;
+        auto rows = store.software_catalog(pq);
+        REQUIRE(rows.has_value());
+        if (rows->empty())
+            break;
+        walked.push_back(rows->front().name);
+        after = SoftwareCatalogCursor{rows->front().device_count, rows->front().name};
+    }
+    CHECK(walked == std::vector<std::string>{"Chrome", "git"}); // no duplicate, no skip
+
+    q.versions_min = 2; // d1 carries one version of each title
+    CHECK(store.software_catalog_totals(q)->titles == 0);
+    q.versions_min = 0;
+    q.agent_id = "nobody";
+    CHECK(store.software_catalog_totals(q)->titles == 0);
+}
+
+TEST_CASE("catalogue totals degrade to nullopt and never a zero", "[pg][software_inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    SECTION("schema dropped under an open store") {
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        SoftwareInventoryStore store{pool};
+        REQUIRE(store.is_open());
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        CHECK_FALSE(store.software_catalog_totals({}).has_value());
+    }
+    SECTION("pool starved (the only lease is held)") {
+        PgPool one{{.conninfo = db.dsn(), .size = 1}};
+        REQUIRE(one.valid());
+        SoftwareInventoryStore store{one};
+        REQUIRE(store.is_open());
+        auto held = one.acquire();
+        CHECK_FALSE(store.software_catalog_totals({}).has_value());
+    }
+    SECTION("store not open") {
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(),
+                                    "DELETE FROM public.schema_meta WHERE store = "
+                                    "'software_inventory_store'",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        SoftwareInventoryStore store{pool}; // the v1 re-run over live tables fails the open
+        REQUIRE_FALSE(store.is_open());
+        CHECK_FALSE(store.software_catalog_totals({}).has_value());
+        CHECK_FALSE(store.software_catalog_totals({.agent_id = "d1"}).has_value());
+    }
+}

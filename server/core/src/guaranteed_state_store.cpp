@@ -187,9 +187,18 @@ std::string format_conflict(std::string_view detail) {
 }
 
 // Map a Guardian event_type to the compliance state it implies for the per-(agent,
-// rule) status table, or nullptr if the event carries no compliance signal (e.g.
-// guard.armed is a lifecycle marker, not a verdict). guard.compliant (Slice B) and a
-// successful drift.remediated both mean the watched state is now at expected.
+// rule) status table, or nullptr if the event carries no compliance signal.
+// guard.compliant (Slice B) and a successful drift.remediated both mean the watched
+// state is now at expected. guard.errored is the #2818 spark subscription-death detach
+// (agents/core/src/guardian_spark_runtime.cpp on_subscription_lost): the rule is no
+// longer watched, so it is an errored verdict like guard.unhealthy. Only the spark
+// detection backend produces it, so it is dormant until the agent's prefer_spark
+// default flips. guard.armed, guard.disarmed and guard.healthy are deliberately NOT
+// mapped: they are lifecycle or recovery markers, not verdicts.
+// Ordering: upsert_rule_status keeps a row when the new updated_at is >= the stored
+// one. Event timestamps have one-second resolution, so two distinct events in the same
+// second tie and the later arrival wins; an exact redelivery of one event_id exits at
+// insert_event_classified (Redelivered/Conflict) before the census write is reached.
 const char* event_state_from_type(const std::string& t) {
     if (t == "guard.compliant" || t == "drift.remediated")
         return "compliant";
@@ -198,7 +207,7 @@ const char* event_state_from_type(const std::string& t) {
     // Slice-B collapse (deliberate): guardian-mvp-contract.md §4/decision-5 lists
     // `remediation_failed` as a state DISTINCT from `errored`, but the Slice-B census
     // exposes only compliant/drifted/errored and both render red in the worst-of badge.
-    if (t == "remediation.failed" || t == "guard.unhealthy")
+    if (t == "remediation.failed" || t == "guard.unhealthy" || t == "guard.errored")
         return "errored";
     return nullptr; // guard.armed, resilience.escalated, … — no census change
 }
