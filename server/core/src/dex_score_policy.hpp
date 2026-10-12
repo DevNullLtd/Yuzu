@@ -31,7 +31,9 @@
  *   2. global names: 1 to 24 bytes, printable ASCII 0x20-0x7E, none of < > & "
  *      (NameInvalid).
  *   3. global weights: finite and non-negative (WeightInvalid), sum at most
- *      100 so the decomposition identity holds (WeightSumAboveMaximum).
+ *      100 plus kDexPolicyWeightSumTolerance (1e-12, the binary representation
+ *      error of decimal weights, so {99.37, 0.33, 0.26, 0.04} validates) so the
+ *      decomposition identity holds (WeightSumAboveMaximum).
  *   4. at most 200 overrides (TooManyOverrides).
  *   5. per override i: key non-empty and byte-identical to its ASCII lowercase
  *      (OverrideKeyInvalid); key not equal to an earlier key
@@ -41,6 +43,9 @@
  *      an inherited one is therefore refused.
  * Names are ASCII-only in this cut; widening to UTF-8 later relaxes the
  * validator and never invalidates a stored document.
+ * Round-to-nearest floating-point mode is assumed: display exactness and the
+ * weight-sum tolerance are stated under it; another mode can only refuse,
+ * never accept wrongly.
  *
  * Resolver precondition: the policy passed dex_score_policy_fault. The
  * resolver never re-validates.
@@ -79,6 +84,18 @@ inline constexpr std::size_t kDexPolicyMaxOverrides = 200;
 inline constexpr std::int64_t kDexPolicyMinTierGapTenths = 10;
 inline constexpr std::size_t kDexPolicyMaxNameBytes = 24;
 inline constexpr double kDexPolicyWeightSumMax = 100.0;
+/// Absolute slack on the weight-sum check. A decimal such as 99.37 is not a
+/// double: each of the four weights (each at most 100) is off by at most half
+/// an ulp of 100 (2^-47, 7.1e-15) and each of the three additions rounds by at
+/// most the same, so a decimal set totalling exactly 100 reads at most
+/// 100 + 7 * 2^-47 (5e-14, 3.5 ulp) under round-to-nearest; {99.37, 0.33,
+/// 0.26, 0.04} reads 100.00000000000001. 1e-12 is about 70 ulp, twenty times
+/// that bound, and below any difference a decimal with fewer than twelve places
+/// can express, so a set over 100 by 0.01 or more is still refused. It is
+/// absolute because the sum is pinned at 100, and a larger slack would stretch
+/// the decomposition identity (100 - sum(points) == score) by as much; the
+/// score clamps at 0, so this overshoot is absorbed there.
+inline constexpr double kDexPolicyWeightSumTolerance = 1e-12;
 /// override_index of a fault in the global policy.
 inline constexpr std::size_t kDexPolicyGlobalIndex = (std::numeric_limits<std::size_t>::max)();
 
@@ -252,7 +269,8 @@ struct Merged {
 [[nodiscard]] inline std::optional<DexPolicyFault> weight_fault(const StabilityWeights& w) {
     if (!stability_weights_valid(w))
         return DexPolicyFault::WeightInvalid;
-    if (w.breadth + w.crashes + w.hangs + w.regression > kDexPolicyWeightSumMax)
+    if (w.breadth + w.crashes + w.hangs + w.regression >
+        kDexPolicyWeightSumMax + kDexPolicyWeightSumTolerance)
         return DexPolicyFault::WeightSumAboveMaximum;
     return std::nullopt;
 }

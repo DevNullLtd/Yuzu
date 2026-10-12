@@ -298,6 +298,12 @@ TEST_CASE("policy: every invalid shape is refused whole with its typed fault and
         auto p = defaults();
         p.weights = {60.0, 20.0, 8.0, 12.5};
         require_fault(p, DexPolicyFault::WeightSumAboveMaximum);
+        // Just over 100 in decimal, and a sum over by 1e-11, ten times the
+        // tolerance: both still refused.
+        p.weights = {99.38, 0.33, 0.26, 0.04};
+        require_fault(p, DexPolicyFault::WeightSumAboveMaximum);
+        p.weights = {100.0, 0.0, 0.0, 1e-11};
+        require_fault(p, DexPolicyFault::WeightSumAboveMaximum);
     }
     SECTION("override keys and count") {
         auto p = defaults();
@@ -357,6 +363,10 @@ TEST_CASE("policy: the acceptance boundaries validate", "[dex][policy]") {
 
     p = defaults();
     p.weights = {25.0, 25.0, 25.0, 25.0};
+    CHECK_FALSE(dex_score_policy_fault(p).has_value());
+
+    // Sums to exactly 100 in decimal, reads 100.00000000000001 as doubles.
+    p.weights = {99.37, 0.33, 0.26, 0.04};
     CHECK_FALSE(dex_score_policy_fault(p).has_value());
 
     // A gap of exactly 10 tenths (1.0 point).

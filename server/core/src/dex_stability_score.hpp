@@ -63,7 +63,8 @@
  *   precision is one decimal (kStabilityScoreScale) and the rounding rule is
  *   stability_display_score(): round half away from zero at one decimal on
  *   the computed double (an IEEE multiply by 10, then std::round; it can differ
- *   from printf of the raw double on near-ties). Consumers display and
+ *   from printf of the raw double on near-ties). Round-to-nearest
+ *   floating-point mode is assumed. Consumers display and
  *   serialise stability_display_score(*score) formatted at one decimal, never
  *   printf of the raw double, and never the raw score beside the band (JSON
  *   carrying 89.96 with band "excellent" would contradict itself). The band is
