@@ -475,8 +475,8 @@ Decision numbers are stable, since other documents cite them.
     There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
     `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`
-    conjunction (Decision 9) — because this fan-out reaches the `Inventory`-securable
-    stores and the `GuaranteedState`-governed `AppPerfDailyStore`, not only the licensing
+    conjunction (Decision 9) (superseded, see the note above) — because this fan-out reaches the formerly `Inventory`-securable
+    stores and the formerly `GuaranteedState`-governed `AppPerfDailyStore`, not only the licensing
     one. The effective mode is **centrally verifiable**: the
     stable effective-mode value rides the canonical blob as a config-stable record
     (verifiable fleet-wide from stored state, including for offline agents), while
