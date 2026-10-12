@@ -383,7 +383,9 @@ operator-visible notes:
     preview while its response still shows in the results.
   - **Lost facets are not recoverable.** A response whose facets were lost (`batch_failed`, or cut
     by `cap`) has no facets re-derived afterwards, and nothing marks such a response as affected
-    (#5630). The workaround is to run the command again. See
+    (#5630). The workaround is to run the command again and to recreate any static group built from
+    the affected response, because running the command again does not repair a group that already
+    exists. See
     `yuzu_server_response_facets_dropped_total` in [metrics.md](metrics.md).
   - **Audit and counting.** A refusal is counted once in
     `yuzu_server_response_facet_filter_refused_total{surface}` (`dashboard`, `rest` or `mcp`) at the
