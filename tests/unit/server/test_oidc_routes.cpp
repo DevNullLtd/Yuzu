@@ -6,10 +6,8 @@
  * (The binding tests at the end of this file DO have a loopback IdP: test_oidc_mock_idp.hpp.)
  *
  * `OidcProvider::handle_callback`'s success path exchanges the auth code for
- * tokens over HTTP/subprocess (`exchange_script`) and fetches JWKS from the
- * IdP — there is no mock-IdP harness in this codebase (test_oidc_provider.cpp
- * covers only the pure-function/parsing layer), so this file covers what IS
- * reachable without a live IdP: the callback's early-exit failure paths
+ * tokens over HTTP and fetches JWKS from the IdP. The early cases in this
+ * file need no IdP and cover the callback's early-exit failure paths
  * (IdP error response, missing code/state, unknown PKCE state — none of
  * which touch the network) and the resulting
  * `yuzu_auth_oidc_login_total{result=error}` counter (#1828.2). The
@@ -336,8 +334,11 @@ oidc::OidcConfig flow_cfg(const std::string& token_endpoint) {
     c.issuer = "https://idp.example.test";
     c.client_id = "yuzu-test-client";
     c.redirect_uri = "https://yuzu.example.test/auth/callback";
-    c.authorization_endpoint = c.issuer + "/authorize"; // skips discovery (no network)
+    c.authorization_endpoint = c.issuer + "/authorize"; // explicit: no discovery (no network)
     c.token_endpoint = token_endpoint;
+    // Explicit and refused instantly: were the per-field rule to regress, a flow fails here
+    // instead of reaching a real discovery fetch.
+    c.jwks_uri = "http://127.0.0.1:1/jwks";
     return c;
 }
 
@@ -611,6 +612,100 @@ TEST_CASE("OIDC binding route: the IdP's GET callback is not subject to a same-o
                                    "application/json", h);
     REQUIRE(r != nullptr);
     CHECK(r->get_header_value("Location") == "/");
+}
+
+// ---------------------------------------------------------------------------
+// Discovery (#5692): the routes against an IdP whose endpoints and JWKS come ONLY from its
+// discovery document (no explicit endpoint, no add_test_jwks_key).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct DiscoveryRig {
+    yuzu::server::test::MockIdp idp;
+    OidcRoutesFixture fix;
+    oidc::OidcConfig cfg;
+
+    explicit DiscoveryRig(bool explicit_authorize = false) {
+        cfg.issuer = idp.base();
+        cfg.client_id = "yuzu-test-client";
+        cfg.redirect_uri = "https://yuzu.example.test/auth/callback";
+        if (explicit_authorize)
+            cfg.authorization_endpoint = idp.base() + "/authorize";
+        fix.oidc_provider = std::make_unique<oidc::OidcProvider>(cfg);
+        fix.cfg.oidc_redirect_uri = cfg.redirect_uri;
+    }
+
+    std::unique_ptr<httplib::Response> get(Browser& b, const std::string& path) {
+        auto r = fix.sink.dispatch("GET", path, {}, "application/json", b.headers());
+        REQUIRE(r != nullptr);
+        b.absorb(*r);
+        return r;
+    }
+
+    /// The callback request the IdP would send the browser to for the flow `start` began.
+    std::string callback_path(const httplib::Response& start) {
+        const auto back = idp.follow_authorize(start.get_header_value("Location"));
+        REQUIRE(back.starts_with(cfg.redirect_uri + "?"));
+        return "/auth/callback" + back.substr(cfg.redirect_uri.size());
+    }
+};
+
+} // namespace
+
+TEST_CASE("OIDC discovery route: a full login works with endpoints and JWKS from discovery alone",
+          "[pg][oidc][oidc_discovery][auth_routes]") {
+    DiscoveryRig rig;
+    Browser a;
+    auto start = rig.get(a, "/auth/oidc/start");
+    REQUIRE(start->status == 302);
+    CHECK(start->get_header_value("Location").starts_with(rig.idp.base() + "/authorize?"));
+    CHECK(a.jar.count("__Host-yuzu_oidc_bind") == 1);
+
+    auto cb = rig.get(a, rig.callback_path(*start));
+    CHECK(cb->status == 302);
+    CHECK(cb->get_header_value("Location") == "/");
+    CHECK(has_cookie_named(*cb, "yuzu_session="));
+    const auto events = rig.fix.audit_events(1);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login");
+    CHECK(events.front().result == "ok");
+    CHECK(rig.idp.discovery_calls.load() == 1);
+    CHECK(rig.idp.jwks_calls.load() == 1);
+}
+
+TEST_CASE("OIDC discovery route: discovery down at login start answers 500 with no cookie, no "
+          "redirect and no stored flow",
+          "[pg][oidc][oidc_discovery][auth_routes]") {
+    DiscoveryRig rig;
+    rig.idp.with([](yuzu::server::test::MockIdp& m) { m.discovery_status = 500; });
+    Browser a;
+    auto r = rig.get(a, "/auth/oidc/start");
+    CHECK(r->status == 500);
+    CHECK(r->get_header_value("Location").empty());
+    CHECK(set_cookies(*r).empty());
+    CHECK(rig.fix.oidc_provider->pending_flow_count_for_test() == 0);
+    const auto body = nlohmann::json::parse(r->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"].value("code", 0) == 500);
+}
+
+TEST_CASE("OIDC discovery route: discovery down at the callback is a refused sign-in, audited as a "
+          "failure, with no session",
+          "[pg][oidc][oidc_discovery][auth_routes]") {
+    DiscoveryRig rig(/*explicit_authorize=*/true); // the start needs no discovery
+    rig.idp.with([](yuzu::server::test::MockIdp& m) { m.discovery_status = 500; });
+    Browser a;
+    auto start = rig.get(a, "/auth/oidc/start");
+    REQUIRE(start->status == 302);
+    auto cb = rig.get(a, rig.callback_path(*start));
+    CHECK(cb->get_header_value("Location") == "/login?error=sso_failed");
+    CHECK_FALSE(has_cookie_named(*cb, "yuzu_session="));
+    CHECK(rig.idp.token_calls.load() == 0); // never got as far as the token endpoint
+    const auto events = rig.fix.audit_events(1);
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login_failed");
+    CHECK(events.front().result == "failure");
 }
 
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN

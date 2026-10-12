@@ -1,13 +1,12 @@
 #pragma once
 
-// test_oidc_mock_idp.hpp -- a loopback OIDC token endpoint plus RS256 signing, so a test can
-// drive `OidcProvider::handle_callback` and `/auth/callback` through their SUCCESS path with no
-// network and no live IdP (OIDC browser-binding tests).
-//
-// What is real: the provider's own `exchange_code` (an httplib POST to `token_endpoint`), JWT
-// parsing, signature verification through `add_test_jwks_key` (the same jwk_to_pkey + EVP path as
-// production) and claim validation. What is a stand-in: the IdP itself, which is this loopback
-// httplib server returning `{"id_token": <jwt>}` for POST /token.
+// test_oidc_mock_idp.hpp -- a loopback OIDC IdP plus RS256 signing, so a test can drive
+// `OidcProvider::handle_callback` and `/auth/callback` through their SUCCESS path with no network
+// and no live IdP. Real: the provider's discovery fetch, `fetch_jwks`, `exchange_code`, JWT
+// verification and claim validation. Stand-in: the IdP, a loopback httplib server serving
+// /.well-known/openid-configuration (knobs below), /jwks (the shared key under a swappable kid),
+// /authorize (302 back with code and state, remembering the nonce) and POST /token (the
+// `set_id_token` value, else a token signed for the last authorize nonce).
 //
 // A real httplib acceptor thread crashes the ThreadSanitizer build (#438), so a test that uses
 // `MockIdp` is wrapped in `#ifndef YUZU_OIDC_MOCK_IDP_TSAN`.
@@ -44,23 +43,101 @@ namespace yuzu::server::test {
 
 #ifndef YUZU_OIDC_MOCK_IDP_TSAN
 
-/// A loopback token endpoint. `set_id_token` chooses what POST /token returns; `token_calls`
-/// counts the exchanges the provider attempted (a refused callback must leave it at 0).
+// Defined below; MockIdp's handlers need them.
+inline std::string jwks_json(const std::string& kid);
+inline std::string rs256_sign(const std::string& kid, const std::string& payload_json);
+inline std::string id_token_payload(const oidc::OidcConfig& cfg, const std::string& nonce,
+                                    const std::string& sub);
+
+/// A loopback IdP. Every knob is guarded by `mu`; every counter is atomic and counts the
+/// requests the provider actually made (an offline-by-design case asserts it stays 0).
 struct MockIdp {
     httplib::Server svr;
     std::thread thread;
     int port{0};
     std::mutex mu;
-    std::string id_token;
+    std::string id_token;                ///< POST /token returns this when non-empty ...
+    std::string last_nonce;              ///< ... else a token signed for this (set by GET /authorize)
+    std::string token_client_id{"yuzu-test-client"}; ///< `aud` of a signed token
+    std::string token_kid{"mock-kid-1"};             ///< the kid a signed token and GET /jwks use
+    std::string discovery_issuer;        ///< "" = this server's own base URL
+    std::string discovery_body;          ///< non-empty = served verbatim instead of the document
+    std::string discovery_redirect;      ///< non-empty = 302 to this instead of answering
+    int discovery_status{200};
+    std::size_t discovery_pad{0};        ///< extra bytes in the document (oversize-body knob)
+    int discovery_delay_ms{0};
+    int jwks_status{200};
     std::atomic<int> token_calls{0};
+    std::atomic<int> discovery_calls{0};
+    std::atomic<int> jwks_calls{0};
+    std::atomic<int> authorize_calls{0};
 
     MockIdp() {
+        svr.Get("/.well-known/openid-configuration",
+                [this](const httplib::Request&, httplib::Response& res) {
+                    discovery_calls.fetch_add(1);
+                    std::string body, redirect, issuer;
+                    int status, delay;
+                    std::size_t pad;
+                    {
+                        std::lock_guard lk(mu);
+                        body = discovery_body;
+                        redirect = discovery_redirect;
+                        issuer = discovery_issuer.empty() ? base() : discovery_issuer;
+                        status = discovery_status;
+                        pad = discovery_pad;
+                        delay = discovery_delay_ms;
+                    }
+                    if (delay > 0)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                    if (!redirect.empty()) {
+                        res.set_redirect(redirect);
+                        return;
+                    }
+                    if (body.empty()) {
+                        body = R"({"issuer":")" + issuer + R"(","authorization_endpoint":")" +
+                               base() + R"(/authorize","token_endpoint":")" + base() +
+                               R"(/token","jwks_uri":")" + base() + R"(/jwks")";
+                        if (pad > 0)
+                            body += R"(,"x":")" + std::string(pad, 'a') + "\"";
+                        body += "}";
+                    }
+                    res.status = status;
+                    res.set_content(body, "application/json");
+                });
+        svr.Get("/jwks", [this](const httplib::Request&, httplib::Response& res) {
+            jwks_calls.fetch_add(1);
+            std::string kid;
+            int status;
+            {
+                std::lock_guard lk(mu);
+                kid = token_kid;
+                status = jwks_status;
+            }
+            res.status = status;
+            res.set_content(jwks_json(kid), "application/json");
+        });
+        svr.Get("/authorize", [this](const httplib::Request& req, httplib::Response& res) {
+            authorize_calls.fetch_add(1);
+            {
+                std::lock_guard lk(mu);
+                last_nonce = req.get_param_value("nonce");
+            }
+            res.set_redirect(req.get_param_value("redirect_uri") + "?code=the-code&state=" +
+                             req.get_param_value("state"));
+        });
         svr.Post("/token", [this](const httplib::Request&, httplib::Response& res) {
             token_calls.fetch_add(1);
             std::string tok;
             {
                 std::lock_guard lk(mu);
                 tok = id_token;
+                if (tok.empty()) {
+                    oidc::OidcConfig c;
+                    c.issuer = discovery_issuer.empty() ? base() : discovery_issuer;
+                    c.client_id = token_client_id;
+                    tok = rs256_sign(token_kid, id_token_payload(c, last_nonce, "alice-sub"));
+                }
             }
             res.set_content(R"({"id_token":")" + tok + R"(","token_type":"Bearer"})",
                             "application/json");
@@ -78,10 +155,28 @@ struct MockIdp {
     MockIdp(const MockIdp&) = delete;
     MockIdp& operator=(const MockIdp&) = delete;
 
-    std::string token_endpoint() const { return "http://127.0.0.1:" + std::to_string(port) + "/token"; }
+    /// `http://127.0.0.1:<port>`: also the issuer a provider under test is configured with.
+    std::string base() const { return "http://127.0.0.1:" + std::to_string(port); }
+    std::string token_endpoint() const { return base() + "/token"; }
     void set_id_token(std::string t) {
         std::lock_guard lk(mu);
         id_token = std::move(t);
+    }
+    /// Change a knob under the lock: `idp.with([](MockIdp& m) { m.discovery_status = 500; });`
+    template <class F> void with(F&& f) {
+        std::lock_guard lk(mu);
+        f(*this);
+    }
+
+    /// What a browser does after the provider's authorization URL: GET it from this IdP and
+    /// return the redirect target (redirect_uri with code and state), "" on any failure.
+    std::string follow_authorize(const std::string& authorization_url) {
+        const auto prefix = base();
+        if (!authorization_url.starts_with(prefix))
+            return {};
+        httplib::Client cli(prefix);
+        auto r = cli.Get(authorization_url.substr(prefix.size()));
+        return (r && r->status == 302) ? r->get_header_value("Location") : std::string{};
     }
 };
 
@@ -115,14 +210,16 @@ inline const SharedRsaKey& shared_rsa_key() {
     return key;
 }
 
-/// Register the shared public key in `provider` under `kid` and return a genuinely RS256-signed
-/// JWT over `payload_json` (drives the SAME jwk_to_pkey + EVP verify path as production).
-/// "" on any failure (callers REQUIRE non-empty).
-inline std::string sign_and_register_rs256(oidc::OidcProvider& provider, const std::string& kid,
-                                           const std::string& payload_json) {
+/// The JWKS document a loopback IdP serves: the shared public key under `kid`.
+inline std::string jwks_json(const std::string& kid) {
     const auto& key = shared_rsa_key();
-    if (!provider.add_test_jwks_key(kid, key.n_b64, key.e_b64))
-        return "";
+    return R"({"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":")" + kid + R"(","n":")" +
+           key.n_b64 + R"(","e":")" + key.e_b64 + R"("}]})";
+}
+
+/// A genuinely RS256-signed JWT over `payload_json` under `kid` ("" on any failure).
+inline std::string rs256_sign(const std::string& kid, const std::string& payload_json) {
+    const auto& key = shared_rsa_key();
     auto b64 = [](const std::string& s) {
         return oidc::OidcProvider::base64url_encode(std::vector<uint8_t>(s.begin(), s.end()));
     };
@@ -140,6 +237,16 @@ inline std::string sign_and_register_rs256(oidc::OidcProvider& provider, const s
         return "";
     sig.resize(sig_len);
     return signing_input + "." + oidc::OidcProvider::base64url_encode(sig);
+}
+
+/// Register the shared public key in `provider` under `kid` and return a signed JWT over
+/// `payload_json` (drives the SAME jwk_to_pkey + EVP verify path as production).
+inline std::string sign_and_register_rs256(oidc::OidcProvider& provider, const std::string& kid,
+                                           const std::string& payload_json) {
+    const auto& key = shared_rsa_key();
+    if (!provider.add_test_jwks_key(kid, key.n_b64, key.e_b64))
+        return "";
+    return rs256_sign(kid, payload_json);
 }
 
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN

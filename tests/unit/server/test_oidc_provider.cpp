@@ -14,13 +14,16 @@
 #include <openssl/evp.h>
 #include <openssl/rsa.h> // EVP_RSA_gen
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace yuzu::server::oidc;
@@ -887,7 +890,7 @@ TEST_CASE("OIDC: verify_jwt_signature fails closed when no signing key is availa
     OidcConfig cfg;
     cfg.issuer = "https://issuer";
     cfg.client_id = "my-client";
-    // No jwks_uri, no redirect_uri → construction skips discovery/fetch.
+    // No jwks_uri, no redirect_uri → validate-only: nothing is ever discovered or fetched.
     OidcProvider provider(std::move(cfg));
 
     auto jwt = make_jwt_with_header(R"({"alg":"RS256","kid":"nope","typ":"JWT"})",
@@ -895,7 +898,7 @@ TEST_CASE("OIDC: verify_jwt_signature fails closed when no signing key is availa
 
     auto result = provider.verify_jwt_signature(jwt);
     REQUIRE_FALSE(result.has_value()); // MUST NOT fail open
-    CHECK(result.error().find("JWKS key") != std::string::npos);
+    CHECK(result.error() == OidcProvider::kJwksUnavailable);
 }
 
 TEST_CASE("OIDC: verify_jwt_signature rejects alg:none", "[oidc][jwt][security]") {
@@ -1030,8 +1033,11 @@ OidcConfig binding_cfg(const std::string& token_endpoint = "http://127.0.0.1:1/t
     cfg.issuer = "https://idp.example.test";
     cfg.client_id = "yuzu-test-client";
     cfg.redirect_uri = "http://localhost:8443/auth/callback";
-    cfg.authorization_endpoint = cfg.issuer + "/authorize"; // skips discovery
+    cfg.authorization_endpoint = cfg.issuer + "/authorize";
     cfg.token_endpoint = token_endpoint;                    // :1 = connection refused, instantly
+    // Explicit, and refused instantly: were the per-field rule ever to regress, the flow fails
+    // here instead of reaching a real discovery fetch.
+    cfg.jwks_uri = "http://127.0.0.1:1/jwks";
     return cfg;
 }
 
@@ -1241,15 +1247,294 @@ TEST_CASE("OIDC binding: end to end against a loopback IdP, a refusal never reac
 }
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
 
-TEST_CASE("OIDC test seams: no production file references set_binding_digest_failure_for_test or "
-          "add_test_pending_flow (source pin)",
+// ── Discovery (#5692) ────────────────────────────────────────────────────────
+//
+// The provider reads the authorization/token/JWKS endpoints from the issuer's discovery document
+// the first time a login needs them. Each case drives the real provider against a loopback
+// MockIdp and counts the requests the IdP actually saw. Under ThreadSanitizer they are compiled
+// out with the other cases that need an httplib acceptor thread (#438).
+
+#ifndef YUZU_OIDC_MOCK_IDP_TSAN
+namespace {
+
+using yuzu::server::test::MockIdp;
+
+OidcConfig discovery_cfg(const MockIdp& idp) {
+    OidcConfig cfg;
+    cfg.issuer = idp.base();
+    cfg.client_id = "yuzu-test-client";
+    cfg.redirect_uri = "http://localhost:8443/auth/callback";
+    return cfg; // NO endpoints: every one comes from the discovery document
+}
+
+std::string signed_token(const OidcConfig& cfg, const std::string& kid,
+                         const std::string& nonce = "n") {
+    return yuzu::server::test::rs256_sign(kid,
+                                          yuzu::server::test::id_token_payload(cfg, nonce));
+}
+
+} // namespace
+
+TEST_CASE("OIDC discovery: all three endpoints come from the document and a full login works",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    CHECK(idp.discovery_calls.load() == 0); // construction does no network
+
+    const auto flow = provider.start_auth_flow();
+    CHECK(flow.url.starts_with(idp.base() + "/authorize?"));
+    const auto redirect = idp.follow_authorize(flow.url);
+    REQUIRE(redirect.starts_with(cfg.redirect_uri + "?code=the-code&state="));
+
+    auto claims = provider.handle_callback("the-code", yuzu::server::test::url_query_param(flow.url, "state"),
+                                           flow.binding_secret);
+    REQUIRE(claims.has_value()); // token endpoint AND jwks_uri were discovered
+    CHECK(claims->sub == "alice-sub");
+    CHECK(idp.discovery_calls.load() == 1); // one document, shared by all three needs
+    CHECK(idp.token_calls.load() == 1);
+    CHECK(idp.jwks_calls.load() == 1);
+}
+
+TEST_CASE("OIDC discovery: an explicitly configured field is authoritative and is never discovered",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    auto cfg = discovery_cfg(idp);
+    cfg.authorization_endpoint = idp.base() + "/explicit-authorize";
+    cfg.token_endpoint = idp.token_endpoint();
+    cfg.jwks_uri = idp.base() + "/jwks";
+    OidcProvider provider(cfg);
+
+    const auto flow = provider.start_auth_flow();
+    CHECK(flow.url.starts_with(idp.base() + "/explicit-authorize?"));
+    auto jwt = signed_token(cfg, "mock-kid-1");
+    REQUIRE(provider.verify_jwt_signature(jwt).has_value());
+    CHECK(idp.discovery_calls.load() == 0); // zero GETs for the document
+
+    SECTION("a partly explicit config discovers only the fields it lacks") {
+        auto partial = discovery_cfg(idp);
+        partial.authorization_endpoint = idp.base() + "/explicit-authorize";
+        OidcProvider p2(partial);
+        (void)p2.start_auth_flow();
+        CHECK(idp.discovery_calls.load() == 0); // the one field the start needs was explicit
+        REQUIRE(p2.verify_jwt_signature(jwt).has_value());
+        CHECK(idp.discovery_calls.load() == 1); // jwks_uri was not
+        CHECK(p2.start_auth_flow().url.starts_with(idp.base() + "/explicit-authorize?"));
+    }
+}
+
+TEST_CASE("OIDC discovery: a validate-only provider (no redirect_uri) never touches the network",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    auto cfg = discovery_cfg(idp);
+    cfg.redirect_uri.clear();
+    OidcProvider provider(cfg);
+    auto r = provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1"));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == OidcProvider::kJwksUnavailable);
+    CHECK_THROWS_AS(provider.start_auth_flow(), std::runtime_error);
+    CHECK(idp.discovery_calls.load() == 0);
+    CHECK(idp.jwks_calls.load() == 0);
+}
+
+TEST_CASE("OIDC discovery: every defective document fails closed at start with the fixed token "
+          "and stores no flow",
+          "[oidc][oidc_discovery][security]") {
+    struct Case {
+        const char* name;
+        std::function<void(MockIdp&)> knob;
+        const char* detail; // a fragment of the operator-facing reason
+    };
+    const std::string big_doc_issuer = "https://elsewhere.example.test";
+    const Case cases[] = {
+        {"issuer mismatch", [&](MockIdp& m) { m.discovery_issuer = big_doc_issuer; },
+         "issuer mismatch"},
+        {"404", [](MockIdp& m) { m.discovery_status = 404; }, "HTTP 404"},
+        {"500", [](MockIdp& m) { m.discovery_status = 500; }, "HTTP 500"},
+        {"oversize body", [](MockIdp& m) { m.discovery_pad = 300 * 1024; }, "request failed"},
+        {"redirect", [](MockIdp& m) { m.discovery_redirect = "/elsewhere"; }, "HTTP 302"},
+        {"missing jwks_uri",
+         [](MockIdp& m) {
+             m.discovery_body = R"({"issuer":"ISS","authorization_endpoint":"ISS/a","token_endpoint":"ISS/t"})";
+         },
+         "no jwks_uri"},
+        {"https endpoints under an http issuer",
+         [](MockIdp& m) {
+             m.discovery_body = R"({"issuer":"ISS","authorization_endpoint":"https://x.test/a","token_endpoint":"ISS/t","jwks_uri":"ISS/j"})";
+         },
+         "authorization_endpoint is not an absolute http URL"},
+        {"relative endpoint",
+         [](MockIdp& m) {
+             m.discovery_body = R"({"issuer":"ISS","authorization_endpoint":"/a","token_endpoint":"ISS/t","jwks_uri":"ISS/j"})";
+         },
+         "authorization_endpoint is not an absolute http URL"},
+    };
+    for (const auto& c : cases) {
+        CAPTURE(c.name);
+        MockIdp idp;
+        idp.with([&](MockIdp& m) {
+            c.knob(m);
+            // The placeholder ISS stands for this server's own base URL (known only after bind).
+            for (std::size_t at; (at = m.discovery_body.find("ISS")) != std::string::npos;)
+                m.discovery_body.replace(at, 3, m.base());
+        });
+        // The operator-facing validator (also behind Test Connection) says why.
+        auto doc = OidcProvider::fetch_discovery_document(idp.base(), false);
+        REQUIRE_FALSE(doc.has_value());
+        CHECK(doc.error().find(c.detail) != std::string::npos);
+        // The login path gives only the fixed token, and stores nothing.
+        OidcProvider provider(discovery_cfg(idp));
+        try {
+            (void)provider.start_auth_flow();
+            FAIL("start_auth_flow must throw");
+        } catch (const std::runtime_error& e) {
+            CHECK(std::string(e.what()) == OidcProvider::kDiscoveryUnavailable);
+        }
+        CHECK(provider.pending_flow_count_for_test() == 0);
+    }
+}
+
+TEST_CASE("OIDC discovery: a refused connection fails closed",
+          "[oidc][oidc_discovery][security]") {
+    OidcConfig cfg;
+    cfg.issuer = "http://127.0.0.1:1"; // connection refused, instantly
+    cfg.client_id = "c";
+    cfg.redirect_uri = "http://localhost/cb";
+    OidcProvider provider(cfg);
+    try {
+        (void)provider.start_auth_flow();
+        FAIL("start_auth_flow must throw");
+    } catch (const std::runtime_error& e) {
+        CHECK(std::string(e.what()) == OidcProvider::kDiscoveryUnavailable);
+    }
+    CHECK(provider.pending_flow_count_for_test() == 0);
+}
+
+TEST_CASE("OIDC discovery: a failed attempt is remembered, two logins inside the window cost ONE GET",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    idp.with([](MockIdp& m) { m.discovery_status = 500; });
+    OidcProvider provider(discovery_cfg(idp));
+    CHECK_THROWS_AS(provider.start_auth_flow(), std::runtime_error);
+    CHECK_THROWS_AS(provider.start_auth_flow(), std::runtime_error);
+    CHECK(idp.discovery_calls.load() == 1);
+}
+
+TEST_CASE("OIDC discovery: a slow IdP is cut off by the timeout seam, not a real 5 s wait",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    idp.with([](MockIdp& m) { m.discovery_delay_ms = 150; });
+    OidcProvider provider(discovery_cfg(idp));
+    provider.set_http_timeouts_for_test(30);
+    CHECK_THROWS_AS(provider.start_auth_flow(), std::runtime_error);
+    CHECK(provider.pending_flow_count_for_test() == 0);
+}
+
+TEST_CASE("OIDC discovery: concurrent logins share ONE discovery fetch (single-flight)",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    idp.with([](MockIdp& m) { m.discovery_delay_ms = 60; }); // keep the first fetch in flight
+    auto cfg = discovery_cfg(idp);
+    cfg.authorization_endpoint = idp.base() + "/authorize"; // only jwks_uri is discovered
+    cfg.token_endpoint = idp.token_endpoint();
+    OidcProvider provider(cfg);
+    const auto jwt = signed_token(cfg, "mock-kid-1");
+
+    constexpr int kThreads = 8;
+    std::atomic<int> ready{0};
+    std::atomic<int> ok{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kThreads; ++i)
+        threads.emplace_back([&] {
+            ready.fetch_add(1);
+            while (ready.load() < kThreads)
+                std::this_thread::yield();
+            if (provider.verify_jwt_signature(jwt).has_value())
+                ok.fetch_add(1);
+        });
+    for (auto& t : threads)
+        t.join();
+    CHECK(ok.load() == kThreads);
+    CHECK(idp.discovery_calls.load() == 1);
+}
+
+TEST_CASE("OIDC discovery: signature checks use the discovered JWKS - an unknown kid refetches once, "
+          "and a rotated kid then verifies",
+          "[oidc][oidc_discovery][jwt]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+
+    REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    CHECK(idp.jwks_calls.load() == 1);
+
+    // A kid the IdP never published costs exactly ONE refetch. (Whether such a token is then
+    // refused is #1901's front()-fallback question and is deliberately not pinned here.)
+    (void)provider.verify_jwt_signature(signed_token(cfg, "never-published"));
+    CHECK(idp.jwks_calls.load() == 2);
+
+    // Rotation: the IdP now publishes kid-2; the first token under it triggers ONE refetch.
+    idp.with([](MockIdp& m) { m.token_kid = "mock-kid-2"; });
+    REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-2")).has_value());
+    CHECK(idp.jwks_calls.load() == 3);
+    CHECK(idp.discovery_calls.load() == 1);
+}
+
+TEST_CASE("OIDC discovery: a JWKS that cannot be fetched is the fixed jwks token, never a pass",
+          "[oidc][oidc_discovery][jwt][security]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    idp.with([](MockIdp& m) { m.jwks_status = 500; });
+    auto r = provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1"));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == OidcProvider::kJwksUnavailable);
+}
+
+TEST_CASE("OIDC discovery: a token for another audience is refused after a discovered login",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    idp.with([](MockIdp& m) { m.token_client_id = "some-other-client"; });
+    OidcProvider provider(cfg);
+    const auto flow = provider.start_auth_flow();
+    REQUIRE_FALSE(idp.follow_authorize(flow.url).empty());
+    auto r = provider.handle_callback("the-code", yuzu::server::test::url_query_param(flow.url, "state"),
+                                      flow.binding_secret);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("aud mismatch") != std::string::npos);
+}
+
+TEST_CASE("OIDC discovery: discovery down at the callback is the fixed token and the flow is spent",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    auto cfg = discovery_cfg(idp);
+    cfg.authorization_endpoint = idp.base() + "/authorize"; // the start does not need discovery
+    idp.with([](MockIdp& m) { m.discovery_status = 503; });
+    OidcProvider provider(cfg);
+    const auto flow = provider.start_auth_flow();
+    bool verified = false;
+    auto r = provider.handle_callback("the-code", yuzu::server::test::url_query_param(flow.url, "state"),
+                                      flow.binding_secret, &verified);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == OidcProvider::kDiscoveryUnavailable);
+    CHECK(verified);
+    CHECK(idp.token_calls.load() == 0);
+}
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
+TEST_CASE("OIDC test seams: no production file references set_binding_digest_failure_for_test, "
+          "add_test_pending_flow, set_http_timeouts_for_test or pending_flow_count_for_test "
+          "(source pin)",
           "[oidc][oidc_binding][source_pin]") {
     // The seams are public members of the production class and the first makes the binding
     // digest fail. Their only legitimate callers are tests; any file under server/core/src other
     // than the provider's own two that names them fails this pin.
     namespace fs = std::filesystem;
     static constexpr const char* kSeams[] = {"set_binding_digest_failure_for_test",
-                                             "add_test_pending_flow"};
+                                             "add_test_pending_flow",
+                                             "set_http_timeouts_for_test",
+                                             "pending_flow_count_for_test"};
     std::size_t scanned = 0;
     const fs::path src_dir = fs::path(YUZU_SERVER_SRC_DIR);
     // The public headers live beside src/ (server/core/include/yuzu/server/).

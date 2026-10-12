@@ -4397,33 +4397,8 @@ public:
             if (cfg_.oidc_skip_tls_verify)
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
-            // Fallback endpoints for Entra ID — OidcProvider constructor will
-            // override from the OIDC discovery document if reachable.
-            // Entra v2.0 pattern: issuer is .../v2.0, endpoints are .../oauth2/v2.0/...
-            auto issuer = cfg_.oidc_issuer;
-            auto v2_pos = issuer.rfind("/v2.0");
-            if (v2_pos != std::string::npos) {
-                auto base = issuer.substr(0, v2_pos);
-                oidc_cfg.authorization_endpoint = base + "/oauth2/v2.0/authorize";
-                oidc_cfg.token_endpoint = base + "/oauth2/v2.0/token";
-            } else {
-                oidc_cfg.authorization_endpoint = issuer + "/authorize";
-                oidc_cfg.token_endpoint = issuer + "/token";
-            }
-            // Token exchange helper script (Python subprocess workaround for
-            // httplib OpenSSL client issues on Windows)
-            auto script_dir =
-                std::filesystem::path(cfg_.auth_config_path).parent_path().parent_path() /
-                "scripts" / "oidc_token_exchange.py";
-            // Try source tree location first (development), then installed location
-            auto src_script =
-                std::filesystem::current_path() / "scripts" / "oidc_token_exchange.py";
-            if (std::filesystem::exists(src_script))
-                oidc_cfg.exchange_script = src_script.string();
-            else if (std::filesystem::exists(script_dir))
-                oidc_cfg.exchange_script = script_dir.string();
-            spdlog::info("OIDC exchange script: {}", oidc_cfg.exchange_script);
-
+            // Endpoints and jwks_uri are NOT derived here: OidcProvider reads them from the
+            // issuer's discovery document on first use (#5692).
             oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         }
 

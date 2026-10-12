@@ -2,9 +2,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <expected>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,10 +31,16 @@ struct OidcConfig {
     std::string client_id;
     std::string client_secret; // Required for web platform (Entra confidential client)
     std::string redirect_uri;
+    // The three endpoints normally stay EMPTY and are read from the issuer's OIDC Discovery
+    // document the first time a login needs them (see OidcProvider::ensure_discovered). A
+    // non-empty value is authoritative for that ONE field: it is used as given and discovery is
+    // not consulted for it. Today that is a test seam; it is also the hook for a future operator
+    // override flag (e.g. --oidc-jwks-uri). Production construction sites must NOT derive these
+    // from the issuer: an IdP whose endpoints are not the derived ones then 404s, and a
+    // pre-set authorization_endpoint used to skip discovery and leave jwks_uri empty (#5692).
     std::string authorization_endpoint;
     std::string token_endpoint;
     std::string jwks_uri;        // JWKS endpoint for JWT signature verification
-    std::string exchange_script; // Path to oidc_token_exchange.py
     std::string admin_group_id;  // Entra group ID that maps to admin role
     bool skip_tls_verify{false}; // Disable TLS cert verification (insecure, dev only)
     // ADR-2001 §1 — which claim `validate_claims` treats as the SCIM link
@@ -139,6 +147,15 @@ public:
     /// already consumed, or swept). A FIXED token.
     static constexpr const char* kUnknownState = "unknown or expired state parameter";
 
+    /// The error `handle_callback` returns when the IdP's discovery document could not be fetched
+    /// or failed validation (issuer mismatch, a relative or scheme-downgraded endpoint, a
+    /// missing field). A FIXED token; the cause is in the server log, never in the answer.
+    static constexpr const char* kDiscoveryUnavailable = "OIDC discovery unavailable";
+
+    /// The error `handle_callback` returns when no signing key could be obtained because the
+    /// JWKS fetch failed. A FIXED token.
+    static constexpr const char* kJwksUnavailable = "JWKS signing keys unavailable";
+
     /// What `start_auth_flow` hands the route: the IdP redirect and the initiating-browser
     /// binding secret. The route sets the secret as a cookie on the SAME response and requires
     /// it back at the callback; the provider retains only its SHA-256, so the secret is never
@@ -150,7 +167,9 @@ public:
 
     /// Generate PKCE params and a browser-binding secret, store them, return the
     /// authorization URL and the secret. THROWS (std::runtime_error) if the platform CSPRNG
-    /// or SHA-256 fails; nothing is stored in that case.
+    /// or SHA-256 fails, or if the authorization endpoint cannot be discovered
+    /// (`kDiscoveryUnavailable`; there is NO fallback to a derived URL); nothing is stored in
+    /// either case.
     /// @param request_redirect_uri If non-empty, overrides the configured redirect_uri
     ///        (derived from the request Host header for multi-origin support).
     AuthFlowStart start_auth_flow(const std::string& request_redirect_uri = {});
@@ -195,6 +214,11 @@ public:
     /// references them.
     void set_binding_digest_failure_for_test(bool fail);
     void add_test_pending_flow(const std::string& state, std::string binding_hash);
+    /// Test-only seam: replaces the 5 s connect/read/write timeouts of every IdP GET this
+    /// instance makes, so a slow-IdP test never waits for a real timeout. Same source-scan pin.
+    void set_http_timeouts_for_test(int ms);
+    /// Test-only seam: how many authorization flows are pending (a failed start must leave 0).
+    std::size_t pending_flow_count_for_test() const;
 
     /// Test-only seam (#1856): inject an RSA verifying key into the JWKS cache
     /// directly, bypassing the network fetch, so verify_jwt_signature can be
@@ -211,7 +235,49 @@ public:
     /// Verify JWT signature against cached JWKS keys. Returns error string on failure.
     std::expected<void, std::string> verify_jwt_signature(const std::string& jwt);
 
+    /// The three endpoints of a validated discovery document.
+    struct DiscoveryDocument {
+        std::string authorization_endpoint;
+        std::string token_endpoint;
+        std::string jwks_uri;
+    };
+
+    /// Fetch `{issuer}/.well-known/openid-configuration` (one trailing slash on `issuer` is
+    /// tolerated) and validate it: `issuer` must equal the argument byte for byte (OIDC Discovery
+    /// 4.3, the mix-up defence); all three endpoints must be present, absolute, free of control
+    /// characters and carry the ISSUER'S scheme (an https issuer can never be downgraded to http
+    /// endpoints). No host restriction: Google serves jwks_uri from another host. The error text
+    /// is for the operator-facing Test Connection and the log, not for the login answer.
+    /// Shared by the login path (ensure_discovered) and Test Connection so the button validates
+    /// exactly what a login will.
+    [[nodiscard]] static std::expected<DiscoveryDocument, std::string>
+    fetch_discovery_document(const std::string& issuer, bool skip_tls_verify, int timeout_ms = 5000);
+
+    /// The one bounded GET used for discovery, the JWKS and Test Connection: 5 s (default)
+    /// connect/read/write, a 256 KiB body cap, redirects NOT followed (a 3xx is a failure), TLS
+    /// verification honoured. Returns the body of a 200 response.
+    [[nodiscard]] static std::expected<std::string, std::string>
+    http_get_bounded(const std::string& url, bool skip_tls_verify, int timeout_ms = 5000);
+
+    /// Parse a JWKS document into verifying keys (RSA, `use` absent or "sig"; others skipped).
+    [[nodiscard]] static std::expected<std::vector<CachedJwk>, std::string>
+    parse_jwks(const std::string& body);
+
 private:
+    /// Which endpoint a caller needs from `ensure_discovered`.
+    enum class Need { Authorize, Token, Jwks };
+
+    /// The endpoint for `need`, BY VALUE. A non-empty OidcConfig field is authoritative and
+    /// returned as is (no network). Otherwise the discovery document is fetched once and cached
+    /// for the provider's lifetime (a Settings save or a restart rebuilds the provider, so an IdP
+    /// that moves jwks_uri needs one of those); concurrent callers share ONE fetch (the mutex is
+    /// held across it) and a failed attempt is remembered for 30 s so a dead IdP is not
+    /// hammered. Validate-only providers (empty redirect_uri) never fetch. Fails CLOSED with
+    /// `kDiscoveryUnavailable`; there is no fallback to derived endpoints. Nothing reads the
+    /// config_ endpoint fields except through here. Lock order: `discovery_mu_` is never taken
+    /// while holding `mu_` or `jwks_mu_`.
+    std::expected<std::string, std::string> ensure_discovered(Need need);
+
     static std::string url_encode(const std::string& value);
 
     std::expected<std::string, std::string> exchange_code(const std::string& code,
@@ -224,12 +290,20 @@ private:
     /// Cleanup expired pending challenges (must hold mu_).
     void cleanup_expired_states_locked();
 
-    /// Fetch and cache JWKS from the IdP's jwks_uri endpoint.
-    void fetch_jwks();
+    /// Fetch and cache JWKS from the IdP's jwks_uri endpoint. True when a key set was stored.
+    /// Stamps `jwks_fetched_at_` on EVERY attempt, so a failing IdP is retried at most once per
+    /// cache TTL on the no-kid path rather than once per login (#1900).
+    bool fetch_jwks();
 
     OidcConfig config_;
-    std::string exchange_script_path_;
+    std::atomic<int> http_timeout_ms_{5000}; // test seam only
     mutable std::mutex mu_;
+
+    // Lazy discovery (ensure_discovered). Guards the two members below.
+    std::mutex discovery_mu_;
+    std::optional<DiscoveryDocument> discovered_;
+    std::chrono::steady_clock::time_point discovery_retry_after_{};
+    static constexpr auto kDiscoveryRetryAfterFailure = std::chrono::seconds(30);
     std::unordered_map<std::string, PkceChallenge> pending_challenges_;
     std::atomic<bool> binding_digest_forced_failure_{false}; // test seam only
 

@@ -4685,21 +4685,6 @@ void SettingsRoutes::register_routes(
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
 
-            auto v2_pos = issuer.rfind("/v2.0");
-            if (v2_pos != std::string::npos) {
-                auto base = issuer.substr(0, v2_pos);
-                oidc_cfg.authorization_endpoint = base + "/oauth2/v2.0/authorize";
-                oidc_cfg.token_endpoint = base + "/oauth2/v2.0/token";
-            } else {
-                oidc_cfg.authorization_endpoint = issuer + "/authorize";
-                oidc_cfg.token_endpoint = issuer + "/token";
-            }
-
-            auto src_script =
-                std::filesystem::current_path() / "scripts" / "oidc_token_exchange.py";
-            if (std::filesystem::exists(src_script))
-                oidc_cfg.exchange_script = src_script.string();
-
             new_provider = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         } catch (const std::exception& e) {
             spdlog::error("OIDC provider reinit failed: {}", e.what());
@@ -4812,86 +4797,36 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto discovery_url = issuer;
-        if (!discovery_url.ends_with("/"))
-            discovery_url += "/";
-        discovery_url += ".well-known/openid-configuration";
-
         audit_fn_(req, "oidc.test", "attempt", "OidcConfig", issuer, "");
 
-        try {
-            std::string url = discovery_url;
-            std::string scheme;
-            if (url.starts_with("https://")) {
-                scheme = "https://";
-                url = url.substr(8);
-            } else if (url.starts_with("http://")) {
-                scheme = "http://";
-                url = url.substr(7);
-            } else {
-                res.set_content("<span class=\"feedback-error\">Invalid issuer URL scheme (must be "
-                                "http or https).</span>",
-                                "text/html; charset=utf-8");
-                return;
-            }
-            auto slash = url.find('/');
-            auto host = (slash != std::string::npos) ? url.substr(0, slash) : url;
-            auto path = (slash != std::string::npos) ? url.substr(slash) : "/";
-
-            auto client = std::make_unique<httplib::Client>(scheme + host);
-            client->set_connection_timeout(10);
-            client->set_read_timeout(10);
-            client->set_write_timeout(10);
-            client->enable_server_certificate_verification(!skip_tls);
-
-            auto result = client->Get(path);
-
-            int status_code = result ? result->status : 0;
-            std::string body_copy = result ? result->body : "";
-            std::string err_str = result ? "" : httplib::to_string(result.error());
-            client.reset();
-
-            if (status_code == 200) {
-                auto j = nlohmann::json::parse(body_copy);
-                std::string auth_ep = j.value("authorization_endpoint", "");
-                std::string token_ep = j.value("token_endpoint", "");
-                if (!auth_ep.empty() && !token_ep.empty()) {
-                    res.set_content(
-                        "<span class=\"feedback-ok\" style=\"color:#3fb950;font-size:0.8rem\">"
-                        "Connected &#x2014; discovered authorization and token endpoints</span>",
-                        "text/html; charset=utf-8");
-                } else {
-                    res.set_content(
-                        "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
-                        "Discovery succeeded but missing authorization/token endpoints.</span>",
-                        "text/html; charset=utf-8");
-                }
-            } else if (status_code == 0) {
-                res.set_content(
-                    "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
-                    "Discovery failed: " +
-                        html_escape(err_str) + "</span>",
-                    "text/html; charset=utf-8");
-            } else {
-                res.set_content(
-                    "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
-                    "Discovery failed: HTTP " +
-                        std::to_string(status_code) + "</span>",
-                    "text/html; charset=utf-8");
-            }
-        } catch (const nlohmann::json::exception& e) {
-            res.set_content(
-                "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
-                "Discovery response is not valid JSON: " +
-                    html_escape(e.what()) + "</span>",
-                "text/html; charset=utf-8");
-        } catch (const std::exception& e) {
-            res.set_content(
-                "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
-                "Discovery failed: " +
-                    html_escape(e.what()) + "</span>",
-                "text/html; charset=utf-8");
+        // The login's own path: the same bounded GET and the same document validation
+        // (issuer match, absolute endpoints on the issuer's scheme) a login applies.
+        const auto fail = [&res](const std::string& what) {
+            res.set_content("<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">" +
+                                html_escape(what) + "</span>",
+                            "text/html; charset=utf-8");
+        };
+        auto doc = oidc::OidcProvider::fetch_discovery_document(issuer, skip_tls);
+        if (!doc) {
+            fail("Discovery failed: " + doc.error());
+            return;
         }
+        auto jwks_body = oidc::OidcProvider::http_get_bounded(doc->jwks_uri, skip_tls);
+        if (!jwks_body) {
+            fail("Discovery succeeded but the JWKS could not be fetched: " + jwks_body.error());
+            return;
+        }
+        auto keys = oidc::OidcProvider::parse_jwks(*jwks_body);
+        if (!keys || keys->empty()) {
+            fail("Discovery succeeded but the JWKS has no usable signing keys" +
+                 (keys ? std::string{} : ": " + keys.error()));
+            return;
+        }
+        res.set_content("<span class=\"feedback-ok\" style=\"color:#3fb950;font-size:0.8rem\">"
+                        "Connected &#x2014; discovered authorization, token and JWKS endpoints; " +
+                            std::to_string(keys->size()) + " signing key" +
+                            (keys->size() == 1 ? "" : "s") + "</span>",
+                        "text/html; charset=utf-8");
     });
 
     // -- Settings API: User management (admin only, HTMX) ----------------------

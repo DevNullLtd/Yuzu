@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
+#include <utility>
 
 // OpenSSL is an unconditional server dependency on every platform (vcpkg.json;
 // server/core/meson.build). RSA JWKS parsing and JWT signature verification use
@@ -652,6 +654,10 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
 std::expected<std::string, std::string>
 OidcProvider::exchange_code(const std::string& code, const std::string& code_verifier,
                             const std::string& redirect_uri) {
+    auto token_endpoint = ensure_discovered(Need::Token);
+    if (!token_endpoint)
+        return std::unexpected(token_endpoint.error());
+
     std::string form_body = "grant_type=authorization_code"
                             "&code=" +
                             url_encode(code) + "&redirect_uri=" + url_encode(redirect_uri) +
@@ -669,21 +675,21 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
         form_body += "&client_id=" + url_encode(config_.client_id);
     }
 
-    spdlog::info("OIDC token exchange: endpoint={} redirect_uri={}", config_.token_endpoint,
+    spdlog::info("OIDC token exchange: endpoint={} redirect_uri={}", *token_endpoint,
                  redirect_uri);
 
     std::string response_body;
 
 #ifdef _WIN32
     // Use WinHTTP on Windows — httplib's OpenSSL client fails from handler threads.
-    response_body = winhttp_post(config_.token_endpoint, form_body, auth_header);
+    response_body = winhttp_post(*token_endpoint, form_body, auth_header);
     if (response_body.empty()) {
         spdlog::error("OIDC token exchange: WinHTTP POST failed");
         return std::unexpected("token endpoint request failed (WinHTTP)");
     }
 #else
     // Parse URL for httplib
-    auto url = config_.token_endpoint;
+    auto url = *token_endpoint;
     std::string scheme, host, path;
     if (url.starts_with("https://")) {
         scheme = "https://";
@@ -829,60 +835,13 @@ static std::shared_ptr<EVP_PKEY> jwk_to_pkey(const nlohmann::json& jwk) {
     return std::shared_ptr<EVP_PKEY>(pkey, EVP_PKEY_free);
 }
 
-void OidcProvider::fetch_jwks() {
-    if (config_.jwks_uri.empty()) {
-        spdlog::warn("OidcProvider: no jwks_uri configured, cannot fetch signing keys");
-        return;
-    }
-
-    spdlog::info("OidcProvider: fetching JWKS from {}", config_.jwks_uri);
-
-    std::string response_body;
+std::expected<std::vector<CachedJwk>, std::string> OidcProvider::parse_jwks(const std::string& body) {
     try {
-        auto url = config_.jwks_uri;
-        std::string scheme;
-        if (url.starts_with("https://")) {
-            scheme = "https://";
-            url = url.substr(8);
-        } else if (url.starts_with("http://")) {
-            scheme = "http://";
-            url = url.substr(7);
-        } else {
-            spdlog::error("OidcProvider: invalid jwks_uri scheme");
-            return;
-        }
-        auto slash = url.find('/');
-        auto host = (slash != std::string::npos) ? url.substr(0, slash) : url;
-        auto path = (slash != std::string::npos) ? url.substr(slash) : "/";
+        auto j = nlohmann::json::parse(body);
+        if (!j.is_object() || !j.contains("keys") || !j["keys"].is_array())
+            return std::unexpected("JWKS response missing 'keys' array");
 
-        auto client = std::make_unique<httplib::Client>(scheme + host);
-        client->set_connection_timeout(5);
-        client->set_read_timeout(5);
-        client->set_write_timeout(5);
-        client->enable_server_certificate_verification(!config_.skip_tls_verify);
-
-        auto result = client->Get(path);
-        int status = result ? result->status : 0;
-        response_body = result ? result->body : "";
-        client.reset();
-
-        if (status != 200) {
-            spdlog::error("OidcProvider: JWKS fetch failed (status={})", status);
-            return;
-        }
-    } catch (const std::exception& e) {
-        spdlog::error("OidcProvider: JWKS fetch exception: {}", e.what());
-        return;
-    }
-
-    try {
-        auto j = nlohmann::json::parse(response_body);
-        if (!j.contains("keys") || !j["keys"].is_array()) {
-            spdlog::error("OidcProvider: JWKS response missing 'keys' array");
-            return;
-        }
-
-        std::vector<CachedJwk> new_keys;
+        std::vector<CachedJwk> keys;
         for (const auto& key : j["keys"]) {
             auto use = key.value("use", "sig");
             if (use != "sig")
@@ -897,16 +856,42 @@ void OidcProvider::fetch_jwks() {
                 spdlog::warn("OidcProvider: failed to parse JWK kid={}", cached.kid);
                 continue;
             }
-            new_keys.push_back(std::move(cached));
+            keys.push_back(std::move(cached));
         }
-
-        std::lock_guard lock(jwks_mu_);
-        jwks_cache_ = std::move(new_keys);
-        jwks_fetched_at_ = std::chrono::steady_clock::now();
-        spdlog::info("OidcProvider: cached {} JWKS signing keys", jwks_cache_.size());
+        return keys;
     } catch (const std::exception& e) {
-        spdlog::error("OidcProvider: JWKS parse error: {}", e.what());
+        return std::unexpected(std::string("JWKS parse error: ") + e.what());
     }
+}
+
+bool OidcProvider::fetch_jwks() {
+    {
+        // Stamp every attempt, success or not (#1900): the no-kid path re-fetches on age.
+        std::lock_guard lock(jwks_mu_);
+        jwks_fetched_at_ = std::chrono::steady_clock::now();
+    }
+    auto jwks_uri = ensure_discovered(Need::Jwks);
+    if (!jwks_uri) {
+        spdlog::warn("OidcProvider: no jwks_uri available, cannot fetch signing keys");
+        return false;
+    }
+
+    spdlog::info("OidcProvider: fetching JWKS from {}", *jwks_uri);
+    auto body = http_get_bounded(*jwks_uri, config_.skip_tls_verify, http_timeout_ms_.load());
+    if (!body) {
+        spdlog::error("OidcProvider: JWKS fetch failed: {}", body.error());
+        return false;
+    }
+    auto keys = parse_jwks(*body);
+    if (!keys) {
+        spdlog::error("OidcProvider: {}", keys.error());
+        return false;
+    }
+    std::lock_guard lock(jwks_mu_);
+    jwks_cache_ = std::move(*keys);
+    jwks_fetched_at_ = std::chrono::steady_clock::now();
+    spdlog::info("OidcProvider: cached {} JWKS signing keys", jwks_cache_.size());
+    return true;
 }
 
 std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::string& jwt) {
@@ -940,6 +925,7 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
         return std::unexpected("unsupported JWT algorithm: " + alg);
 
     // Ensure JWKS is cached and fresh
+    bool fetch_failed = false;
     {
         std::lock_guard lock(jwks_mu_);
         auto age = std::chrono::steady_clock::now() - jwks_fetched_at_;
@@ -949,7 +935,7 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
             goto find_key; // cache is fresh, skip fetch
         }
     }
-    fetch_jwks();
+    fetch_failed = !fetch_jwks();
 
 find_key:;
     // Find the key matching kid
@@ -966,7 +952,7 @@ find_key:;
     // If kid didn't match, re-fetch JWKS once (key rotation)
     if (!pkey && !kid.empty()) {
         spdlog::info("OidcProvider: kid={} not in cache, re-fetching JWKS", kid);
-        fetch_jwks();
+        fetch_failed = !fetch_jwks();
         std::lock_guard lock(jwks_mu_);
         for (const auto& k : jwks_cache_) {
             if (k.kid == kid) {
@@ -981,8 +967,11 @@ find_key:;
         if (!jwks_cache_.empty())
             pkey = jwks_cache_.front().pkey;
     }
-    if (!pkey)
+    if (!pkey) {
+        if (fetch_failed)
+            return std::unexpected(std::string(kJwksUnavailable));
         return std::unexpected("no matching JWKS key found for kid=" + kid);
+    }
 
     // The signing input is "header.payload" (first two base64url segments verbatim)
     auto signing_input = jwt.substr(0, dot2);
@@ -1049,81 +1038,187 @@ bool OidcProvider::add_test_jwks_key(const std::string& kid, const std::string& 
     return true;
 }
 
-// ── OidcProvider ─────────────────────────────────────────────────────────────
+// ── Discovery (#5692) ────────────────────────────────────────────────────────
 
-OidcProvider::OidcProvider(OidcConfig config)
-    : config_(std::move(config)), exchange_script_path_(config_.exchange_script) {
-    // Skip discovery if endpoints are already configured (common for Entra
-    // where we derive endpoints from the issuer pattern).
-    if (!config_.authorization_endpoint.empty()) {
-        spdlog::info("OidcProvider: using pre-configured endpoints, skipping discovery");
-        spdlog::info("OidcProvider: issuer={} client_id={}", config_.issuer, config_.client_id);
-        return;
+namespace {
+
+constexpr std::size_t kHttpMaxBody = 256 * 1024; // a discovery document or JWKS is a few KiB
+
+// Splits "http(s)://host[:port]/path" into the `scheme://host[:port]` a httplib::Client wants and
+// the request path. False for anything that is not an http(s) URL with a non-empty host.
+bool split_http_url(const std::string& url, std::string& origin, std::string& path) {
+    std::string_view rest;
+    std::string_view scheme;
+    if (url.starts_with("https://")) {
+        scheme = "https://";
+    } else if (url.starts_with("http://")) {
+        scheme = "http://";
+    } else {
+        return false;
     }
-    // Skip discovery for validate-only usage (unit tests that only call
-    // validate_claims / parse_id_token — no redirect_uri means no flow).
-    if (config_.redirect_uri.empty()) {
-        spdlog::info("OidcProvider: no redirect_uri configured, skipping discovery (validate-only)");
-        spdlog::info("OidcProvider: issuer={} client_id={}", config_.issuer, config_.client_id);
-        return;
-    }
+    rest = std::string_view(url).substr(scheme.size());
+    const auto slash = rest.find('/');
+    const auto host = rest.substr(0, slash);
+    if (host.empty())
+        return false;
+    origin = std::string(scheme) + std::string(host);
+    path = slash == std::string_view::npos ? "/" : std::string(rest.substr(slash));
+    return true;
+}
 
-    auto discovery_url = config_.issuer + "/.well-known/openid-configuration";
-    spdlog::info("OidcProvider: fetching discovery from {}", discovery_url);
+// An endpoint from the discovery document: absolute, the issuer's scheme, a host, and no byte
+// that could split the request line it will be sent in.
+bool endpoint_acceptable(const std::string& value, std::string_view issuer_scheme) {
+    if (!value.starts_with(issuer_scheme) || value.size() == issuer_scheme.size() ||
+        value[issuer_scheme.size()] == '/')
+        return false;
+    for (const unsigned char c : value)
+        if (c <= 0x20 || c == 0x7f)
+            return false;
+    return true;
+}
 
+} // namespace
+
+std::expected<std::string, std::string>
+OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify, int timeout_ms) {
+    std::string origin, path;
+    if (!split_http_url(url, origin, path))
+        return std::unexpected("not an http or https URL");
     try {
-        // Parse host and path from discovery URL
-        std::string disc_url = discovery_url;
-        std::string scheme;
-        if (disc_url.starts_with("https://")) {
-            scheme = "https://";
-            disc_url = disc_url.substr(8);
-        } else if (disc_url.starts_with("http://")) {
-            scheme = "http://";
-            disc_url = disc_url.substr(7);
-        }
-        auto slash = disc_url.find('/');
-        auto host = disc_url.substr(0, slash);
-        auto path = disc_url.substr(slash);
-
-        // Use a heap-allocated client to control destruction order and
-        // avoid a crash in httplib::SSLClient::~SSLClient when the SSL
-        // context is left in a partially-initialised state after a failed
-        // connection to a non-routable host (observed with httplib 0.37.1).
-        auto client = std::make_unique<httplib::Client>(scheme + host);
-        client->set_connection_timeout(5);
-        client->set_read_timeout(5);
-        client->set_write_timeout(5);
-        client->enable_server_certificate_verification(!config_.skip_tls_verify);
+        // Heap-allocated with an explicit reset: httplib 0.37.1's SSLClient destructor can crash
+        // after a failed connection to a non-routable host.
+        auto client = std::make_unique<httplib::Client>(origin);
+        const auto t = std::chrono::milliseconds(timeout_ms);
+        client->set_connection_timeout(t);
+        client->set_read_timeout(t);
+        client->set_write_timeout(t);
+        client->set_payload_max_length(kHttpMaxBody);
+        client->set_follow_location(false);
+        client->enable_server_certificate_verification(!skip_tls_verify);
 
         auto result = client->Get(path);
-
-        // Explicitly destroy the client before touching config_ to ensure
-        // any SSL resources are freed while the stack is still valid.
+        const int status = result ? result->status : 0;
+        std::string body = result ? std::move(result->body) : std::string{};
+        const std::string err = result ? std::string{} : httplib::to_string(result.error());
         client.reset();
 
-        if (result && result->status == 200) {
-            auto j = nlohmann::json::parse(result->body);
-            if (j.contains("authorization_endpoint"))
-                config_.authorization_endpoint = j["authorization_endpoint"].get<std::string>();
-            if (j.contains("token_endpoint"))
-                config_.token_endpoint = j["token_endpoint"].get<std::string>();
-            if (j.contains("jwks_uri"))
-                config_.jwks_uri = j["jwks_uri"].get<std::string>();
-            spdlog::info("OidcProvider: authorize={}", config_.authorization_endpoint);
-            spdlog::info("OidcProvider: token={}", config_.token_endpoint);
-            spdlog::info("OidcProvider: jwks_uri={}", config_.jwks_uri);
-        } else {
-            spdlog::warn("OidcProvider: discovery fetch failed (status={}), using fallback endpoints",
-                         result ? result->status : 0);
-        }
+        if (status == 0)
+            return std::unexpected("request failed: " + err);
+        if (status != 200)
+            return std::unexpected("HTTP " + std::to_string(status));
+        return body;
     } catch (const std::exception& e) {
-        spdlog::warn("OidcProvider: discovery fetch exception: {}, using fallback endpoints",
-                     e.what());
-    } catch (...) {
-        spdlog::warn("OidcProvider: discovery fetch failed, using fallback endpoints");
+        return std::unexpected(std::string("request exception: ") + e.what());
     }
+}
 
+std::expected<OidcProvider::DiscoveryDocument, std::string>
+OidcProvider::fetch_discovery_document(const std::string& issuer, bool skip_tls_verify,
+                                       int timeout_ms) {
+    std::string_view scheme;
+    if (issuer.starts_with("https://"))
+        scheme = "https://";
+    else if (issuer.starts_with("http://"))
+        scheme = "http://";
+    else
+        return std::unexpected("the issuer must be an http or https URL");
+
+    auto url = issuer;
+    if (url.ends_with('/'))
+        url.pop_back();
+    url += "/.well-known/openid-configuration";
+
+    auto body = http_get_bounded(url, skip_tls_verify, timeout_ms);
+    if (!body)
+        return std::unexpected(body.error());
+
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(*body);
+    } catch (const std::exception& e) {
+        return std::unexpected(std::string("discovery response is not valid JSON: ") + e.what());
+    }
+    if (!j.is_object())
+        return std::unexpected("discovery response is not a JSON object");
+
+    const auto str = [&j](const char* key) -> std::string {
+        const auto it = j.find(key);
+        return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string{};
+    };
+    // OIDC Discovery 4.3: the document's issuer MUST equal the issuer it was fetched for.
+    if (str("issuer") != issuer)
+        return std::unexpected("issuer mismatch: the discovery document names \"" +
+                               str("issuer").substr(0, 200) + "\"");
+
+    DiscoveryDocument doc{str("authorization_endpoint"), str("token_endpoint"), str("jwks_uri")};
+    const std::pair<const char*, const std::string*> fields[] = {
+        {"authorization_endpoint", &doc.authorization_endpoint},
+        {"token_endpoint", &doc.token_endpoint},
+        {"jwks_uri", &doc.jwks_uri}};
+    for (const auto& [name, value] : fields) {
+        if (value->empty())
+            return std::unexpected(std::string("discovery document has no ") + name);
+        if (!endpoint_acceptable(*value, scheme))
+            return std::unexpected(std::string(name) + " is not an absolute " +
+                                   std::string(scheme.substr(0, scheme.size() - 3)) +
+                                   " URL on the issuer's scheme");
+    }
+    return doc;
+}
+
+std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need need) {
+    const auto pick = [need](const auto& src) -> const std::string& {
+        switch (need) {
+        case Need::Authorize:
+            return src.authorization_endpoint;
+        case Need::Token:
+            return src.token_endpoint;
+        default:
+            return src.jwks_uri;
+        }
+    };
+    // config_ is immutable after construction, so this read needs no lock.
+    if (const auto& explicit_ep = pick(config_); !explicit_ep.empty())
+        return explicit_ep;
+    // Validate-only providers (no redirect_uri, so no flow) never touch the network.
+    if (config_.redirect_uri.empty())
+        return std::unexpected(std::string(kDiscoveryUnavailable));
+
+    std::lock_guard lock(discovery_mu_);
+    if (!discovered_) {
+        if (std::chrono::steady_clock::now() < discovery_retry_after_)
+            return std::unexpected(std::string(kDiscoveryUnavailable));
+        spdlog::info("OidcProvider: fetching discovery for issuer {}", config_.issuer);
+        auto doc =
+            fetch_discovery_document(config_.issuer, config_.skip_tls_verify, http_timeout_ms_.load());
+        if (!doc) {
+            spdlog::error("OidcProvider: discovery failed for issuer {}: {}", config_.issuer,
+                          doc.error());
+            discovery_retry_after_ = std::chrono::steady_clock::now() + kDiscoveryRetryAfterFailure;
+            return std::unexpected(std::string(kDiscoveryUnavailable));
+        }
+        spdlog::info("OidcProvider: authorize={} token={} jwks_uri={}", doc->authorization_endpoint,
+                     doc->token_endpoint, doc->jwks_uri);
+        discovered_ = std::move(*doc);
+    }
+    return pick(*discovered_);
+}
+
+void OidcProvider::set_http_timeouts_for_test(int ms) {
+    http_timeout_ms_.store(ms);
+}
+
+std::size_t OidcProvider::pending_flow_count_for_test() const {
+    std::lock_guard lock(mu_);
+    return pending_challenges_.size();
+}
+
+// ── OidcProvider ─────────────────────────────────────────────────────────────
+
+OidcProvider::OidcProvider(OidcConfig config) : config_(std::move(config)) {
+    // No network here: endpoints are discovered lazily by ensure_discovered, so a provider can be
+    // built (and a Settings save can succeed) while the IdP is briefly unreachable.
     spdlog::info("OidcProvider: issuer={} client_id={}", config_.issuer, config_.client_id);
 }
 
@@ -1132,6 +1227,12 @@ bool OidcProvider::is_enabled() const {
 }
 
 OidcProvider::AuthFlowStart OidcProvider::start_auth_flow(const std::string& request_redirect_uri) {
+    // Resolve the endpoint first: a flow whose authorization URL cannot be built must leave no
+    // pending challenge behind (and the route then sets no binding cookie).
+    auto authorization_endpoint = ensure_discovered(Need::Authorize);
+    if (!authorization_endpoint)
+        throw std::runtime_error(authorization_endpoint.error());
+
     auto verifier = generate_code_verifier();
     auto challenge = compute_code_challenge(verifier);
     auto state = bytes_to_hex(random_bytes(32));
@@ -1170,7 +1271,7 @@ OidcProvider::AuthFlowStart OidcProvider::start_auth_flow(const std::string& req
         pending_challenges_[state] = std::move(pkce);
     }
 
-    auto url = config_.authorization_endpoint + "?client_id=" + url_encode(config_.client_id) +
+    auto url = *authorization_endpoint + "?client_id=" + url_encode(config_.client_id) +
                "&response_type=code" + "&scope=" + url_encode("openid profile email") +
                "&redirect_uri=" + url_encode(redirect_uri) + "&state=" + url_encode(state) +
                "&nonce=" + url_encode(nonce) + "&code_challenge=" + url_encode(challenge) +
@@ -1250,6 +1351,8 @@ std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(
     if (!sig_check) {
         spdlog::error("OIDC handle_callback: JWT signature verification failed: {}",
                        sig_check.error());
+        if (sig_check.error() == kJwksUnavailable)
+            return std::unexpected(std::string(kJwksUnavailable)); // fixed token, no prefix
         return std::unexpected("JWT signature verification failed: " + sig_check.error());
     }
 
