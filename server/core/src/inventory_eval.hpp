@@ -23,19 +23,23 @@ struct InventoryCondition {
     /// compare as doubles (`0.1 + 0.2` is not `0.3`, `-0` equals `0`). A stored string that parses
     /// in full as a number counts as that number (stored "1.10" equals operand 1.1, stored "10" is
     /// greater than operand 9); any other stored value (non-numeric string such as "5 GB" or "N/A",
-    /// boolean, array) is never equal and never satisfies an ordering operator. A string operand
+    /// boolean, array) is never equal and never satisfies an ordering operator: a JSON number
+    /// operand is strict, with no numeric-prefix tolerance. A string operand
     /// keeps the exact lexical `==` / `!=` (so "1.10" and "1.1" stay different); for the ordering
     /// operators see `ordering_numeric`.
     bool numeric_operand = false;
     /// True when the caller's `value` was a STRING that is a plain decimal number in full (optional
     /// '-', a digit or '.', no 'x'; exponent forms such as "2e-7" count; set by
-    /// parse_inventory_condition, ordering operators `>` `>=` `<` `<=` only). The ordering
-    /// operators then take the same exact numeric path as a JSON-number operand: a stored value
-    /// that is neither a number nor a fully numeric string never satisfies them, never a lexical
-    /// compare and never a numeric prefix ("5 GB" is not 5). `==` / `!=` are unaffected (exact
-    /// text compare). A string operand that is not a plain decimal number ("abc", "1.2.3", "v2",
-    /// " 5", "5 GB") keeps the legacy numeric-prefix-then-lexical ordering, so version-like text
-    /// still works; `version_gte` / `version_lte` are untouched.
+    /// parse_inventory_condition, ordering operators `>` `>=` `<` `<=` only). Against a stored
+    /// number or fully numeric string the ordering operators compare exactly, like a JSON-number
+    /// operand. Unlike a JSON-number operand this one tolerates the legacy leading-number read of a
+    /// stored STRING that merely starts with a number (dotted version "1.2.3" reads as 1.2,
+    /// "5 GB" as 5), so devices that matched before keep matching; any other stored value (no
+    /// numeric start such as "N/A", "" or "v2.1", boolean, array, object) never satisfies the
+    /// operators, never a lexical compare. Dotted versions belong with `version_gte` /
+    /// `version_lte`. `==` / `!=` are unaffected (exact text compare). A string operand that is not
+    /// a plain decimal number ("abc", "1.2.3", "v2", " 5", "5 GB") keeps the legacy
+    /// numeric-prefix-then-lexical ordering.
     bool ordering_numeric = false;
     /// The parsed operand; meaningful only when `numeric_operand` or `ordering_numeric` is set.
     std::variant<std::int64_t, std::uint64_t, double> numeric_value = std::int64_t{0};

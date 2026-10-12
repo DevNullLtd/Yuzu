@@ -1304,8 +1304,21 @@ TEST_CASE("InventoryEval: a plain-decimal string operand orders exactly like the
     };
     auto quoted = [](const char* n) { return std::string("\"") + n + "\""; };
 
-    // Stored "5 GB" is not 5: it used to read as a numeric prefix and beat operand "4".
-    CHECK_FALSE(matches(R"("5 GB")", ">", quoted("4")));
+    // A stored STRING that merely starts with a number keeps the legacy leading-number read
+    // (a JSON number operand is strict instead; see the JSON-4 line below).
+    CHECK(matches(R"("5 GB")", ">", quoted("4")));
+    CHECK_FALSE(matches(R"("5 GB")", "<", quoted("4")));
+    CHECK_FALSE(matches(R"("5 GB")", ">", "4"));
+    CHECK(matches(R"("1.2.3")", "<", quoted("2.0")));
+    CHECK_FALSE(matches(R"("1.2.3")", ">", quoted("2.0")));
+    CHECK(matches(R"("10.0.19045")", ">=", quoted("10")));
+    // No numeric start (or not a string): never matches, never lexical.
+    CHECK_FALSE(matches(R"("N/A")", ">", quoted("5")));
+    CHECK_FALSE(matches(R"("")", ">", quoted("5")));
+    CHECK_FALSE(matches(R"("v2.1")", ">", quoted("5")));
+    CHECK_FALSE(matches(R"("info")", ">", quoted("5")));
+    CHECK_FALSE(matches("[5]", ">", quoted("4")));
+    CHECK_FALSE(matches(R"({"a":9})", ">", quoted("4")));
     // Digits a 6-decimal rendering used to drop.
     CHECK_FALSE(matches("0.1234567", ">", quoted("0.1234567")));
     CHECK(matches("0.1234567", ">=", quoted("0.1234567")));
@@ -1319,7 +1332,6 @@ TEST_CASE("InventoryEval: a plain-decimal string operand orders exactly like the
     for (const char* op : {">", ">=", "<", "<="}) {
         INFO(op);
         CHECK_FALSE(matches(R"("N/A")", op, quoted("5")));
-        CHECK_FALSE(matches(R"("123\n")", op, quoted("5")));
         CHECK_FALSE(matches(R"(" 5")", op, quoted("4")));
         CHECK_FALSE(matches("true", op, quoted("0")));
     }
@@ -1333,7 +1345,6 @@ TEST_CASE("InventoryEval: a plain-decimal string operand orders exactly like the
         {"agent-lowfloat", R"({"v": 3.5})"},
         {"agent-numstr", R"({"v": "10"})"},
         {"agent-lownumstr", R"({"v": "2"})"},
-        {"agent-text", R"({"v": "5 GB"})"},
         {"agent-bool", R"({"v": true})"},
         {"agent-na", R"({"v": "N/A"})"},
     };
@@ -1356,6 +1367,23 @@ TEST_CASE("InventoryEval: a plain-decimal string operand orders exactly like the
     for (const char* op : {">", ">=", "<", "<="}) {
         INFO(op);
         CHECK(run(op, "4") == run(op, "\"4\""));
+    }
+    // The one deliberate difference: a stored string that only STARTS with a number is read by
+    // the string operand (legacy prefix) and refused by the JSON number operand.
+    {
+        Records prefixed = {{"agent-gb|p", R"({"v": "5 GB"})"}};
+        auto count = [&](const char* operand_json) {
+            InventoryEvalRequest req;
+            InventoryCondition c;
+            REQUIRE_FALSE(parse_inventory_condition(
+                json::parse(std::string(R"({"plugin":"p","field":"v","op":">","value":)") +
+                            operand_json + "}"),
+                c));
+            req.conditions.push_back(c);
+            return evaluate_inventory(req, prefixed).size();
+        };
+        CHECK(count("\"4\"") == 1);
+        CHECK(count("4") == 0);
     }
     using Ids = std::vector<std::string>;
     CHECK(run(">", "\"4\"") == Ids{"agent-float", "agent-int", "agent-numstr"});

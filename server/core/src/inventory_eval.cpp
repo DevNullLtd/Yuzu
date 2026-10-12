@@ -339,11 +339,29 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
     if (cond.op == "version_gte") return compare_versions(val_str, cond.value) >= 0;
     if (cond.op == "version_lte") return compare_versions(val_str, cond.value) <= 0;
 
-    // A JSON-number operand, or a string operand that is a plain decimal number: exact numeric
-    // ordering on the raw stored value, never lexical.
-    if ((cond.numeric_operand || cond.ordering_numeric) &&
-        (cond.op == ">" || cond.op == ">=" || cond.op == "<" || cond.op == "<="))
+    const bool ordering_op =
+        cond.op == ">" || cond.op == ">=" || cond.op == "<" || cond.op == "<=";
+
+    // A JSON-number operand is strict: exact numeric ordering on the raw stored value; a stored
+    // value that is not a number (or a fully numeric string) never matches, never lexical and
+    // never a numeric prefix.
+    if (cond.numeric_operand && ordering_op)
         return numeric_order(*val, cond);
+
+    // A string operand that is a plain decimal number is exact against a stored number or fully
+    // numeric string. A stored STRING that merely starts with a number ("1.2.3", "10.0.19045",
+    // "5 GB") keeps the legacy leading-number read below (the same from_chars prefix compare as
+    // before the exact path existed); anything else (no numeric start, bool, array, object) never
+    // matches, never lexical.
+    const bool prefix_tolerant = cond.ordering_numeric && !cond.numeric_operand && ordering_op;
+    if (prefix_tolerant) {
+        if (stored_number(*val).has_value())
+            return numeric_order(*val, cond);
+        std::size_t start = (!val_str.empty() && val_str[0] == '-') ? 1 : 0;
+        if (!val->is_string() || start >= val_str.size() ||
+            !((val_str[start] >= '0' && val_str[start] <= '9') || val_str[start] == '.'))
+            return false;
+    }
 
     // Numeric comparisons — attempt to parse both sides as numbers
     double lhs = 0.0;
@@ -361,6 +379,8 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
 #endif
 
     if (!lhs_ok || !rhs_ok) {
+        if (prefix_tolerant)
+            return false; // never lexical for a plain-decimal string operand
         // Fall back to lexicographic comparison for non-numeric values
         if (cond.op == ">=" ) return val_str >= cond.value;
         if (cond.op == "<=" ) return val_str <= cond.value;
@@ -413,8 +433,9 @@ std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
     const auto& v = c["value"];
     if (v.is_string()) {
         out.value = v.get<std::string>();
-        // A string operand that is a plain decimal number orders numerically (exact, same path as
-        // a JSON-number operand) under > >= < <= only; == / != keep the exact text compare.
+        // A string operand that is a plain decimal number orders numerically under > >= < <= only
+        // (exact against a stored number; a stored string that merely starts with a number keeps
+        // the legacy prefix read, see eval_condition); == / != keep the exact text compare.
         if (out.op == ">" || out.op == ">=" || out.op == "<" || out.op == "<=") {
             if (const auto n = parse_number_string(out.value)) {
                 out.ordering_numeric = true;
