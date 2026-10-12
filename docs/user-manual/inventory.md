@@ -587,7 +587,7 @@ conflated.
 
 The Hardware list and its KPI strip serve at most the 100,000 most recently seen
 endpoints within the 30-day window; a fleet above that sees a capped list without a
-warning (a truncation signal is a tracked follow-up). The per-device record's offline
+warning (a truncation signal is tracked in #5712). The per-device record's offline
 identity fallback reads the same capped set, so an offline device outside it shows no
 identity and, with nothing else synced, reads as not found.
 
