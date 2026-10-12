@@ -16,7 +16,8 @@
 %%%   - yuzu_gw_upstream: the guardian forward lines (circuit open, at capacity,
 %%%     failed); the notification lines (pending store full, peer address
 %%%     replaced, failed to notify from a closed-state worker and from the
-%%%     half_open probe, probe worker exited, evicted held notification); the
+%%%     half_open probe, probe worker exited, probe killed at its deadline, evicted
+%%%     held notification); the
 %%%     replay line for a request that could not be encoded; and "Upstream RPC
 %%%     failed" with a server message (the request-fault branch and the other)
 %%%
@@ -42,7 +43,8 @@
 -define(ENV_KEYS, [circuit_breaker_failure_threshold,
                    circuit_breaker_reset_timeout_ms,
                    circuit_breaker_max_reset_timeout_ms,
-                   notify_pending_max]).
+                   notify_pending_max,
+                   notify_probe_timeout_ms]).
 %% The tag of the exception yuzu_gw_upstream:encode_request/2 raises for a request
 %% that cannot be encoded here (?LOCAL_ENCODE_FAILED in that module).
 -define(LOCAL_ENCODE_FAILED, yuzu_gw_local_encode_failed).
@@ -347,6 +349,16 @@ notify_test_() ->
         fun rpc_failed_other_line/0)
      ]}.
 
+%% The probe deadline, 100 ms: the probe worker parks in the mock for ever.
+notify_probe_timeout_test_() ->
+    {foreach,
+     fun() -> setup_notify([{notify_probe_timeout_ms, 100}]) end,
+     fun cleanup_notify/1,
+     [
+      t("a half_open probe worker killed at its deadline",
+        fun notify_probe_killed_at_deadline_line/0)
+     ]}.
+
 %% Cap 1: one held key fills the store.
 notify_cap_test_() ->
     {foreach,
@@ -457,6 +469,29 @@ notify_probe_worker_exited_line() ->
         exit(Probe, kill)
     end),
     assert_clean(Line, <<"notify-exited">>).
+
+%% The probe worker parks inside the mocked client and is never released: only
+%% the deadline ends it, and its line names the agent.
+notify_probe_killed_at_deadline_line() ->
+    Id = control_id(<<"notify-deadline">>),
+    Test = self(),
+    trip_breaker(),
+    notify(Id, <<"peer">>),
+    ok = meck:expect(grpcbox_client, unary,
+                     fun(_Ctx, _Path, _Req, _Def, _Opts) ->
+                         true = ets:insert(?BLOCKED, {self()}),
+                         Test ! {probe_entered, self()},
+                         receive release_probe -> {error, econnrefused}
+                         after 60000 -> {error, econnrefused}
+                         end
+                     end),
+    Line = capture_line(<<"did not answer within">>, fun() ->
+        enter_half_open(),
+        receive {probe_entered, _} -> ok
+        after ?AWAIT_MS -> erlang:error(probe_worker_not_entered)
+        end
+    end),
+    assert_clean(Line, <<"notify-deadline">>).
 
 %% The probe's request cannot be encoded here: the held entry is evicted.
 notify_evicted_line() ->

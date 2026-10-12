@@ -27,6 +27,15 @@
 %%%   replay RPC runs inside this process. While a registration replay is active
 %%%   one of the ten slots is held back, so a backlog that refills every freed
 %%%   slot cannot keep the replay drip waiting until the backlog is empty.
+%%%   The half_open probe has a deadline owned by this process,
+%%%   notify_probe_timeout_ms (default 15000, valid 100 to 300000): a probe worker
+%%%   that has not reported by then is killed and the probe fails like any failed
+%%%   probe (the event is given back, the breaker reopens with the longer backoff,
+%%%   the next half_open cycle sends a new probe). The vendored client's own
+%%%   bounds (connect, handshake, response) are library defaults an endpoint
+%%%   setting can remove; this deadline does not depend on them. It covers the
+%%%   probe only: a ProxyRegister, ProxyInventory or replay RPC runs inside this
+%%%   process and is bounded by the client alone.
 %%%
 %%% Standing invariant (#4632): the head held notification is the breaker probe.
 %%%   A notification that fails deterministically for its own payload would block
@@ -211,6 +220,15 @@
 -define(MAX_REPLAY_QUEUE_MAX, 1000000).
 -define(DEFAULT_NOTIFY_PENDING_MAX, 10000).
 -define(MAX_NOTIFY_PENDING_MAX, 1000000).
+%% The deadline the gateway itself puts on a half_open notify probe (#4632): after
+%% this long without a result the probe worker is killed and the probe fails like
+%% any other failed probe. The default is of the order of the vendored client's own
+%% bounds for one call (connect 5 s, handshake 4.5 s, response 5 s, which the
+%% gateway does not control); 100 ms to 5 min is the range of the sibling
+%% upstream_call_timeout_ms.
+-define(DEFAULT_NOTIFY_PROBE_TIMEOUT_MS, 15000).
+-define(MIN_NOTIFY_PROBE_TIMEOUT_MS, 100).
+-define(MAX_NOTIFY_PROBE_TIMEOUT_MS, 300000).
 %% Most session ids one replay_sessions cast may name. The same bound as
 %% ?MAX_VERDICT_IDS in yuzu_gw_heartbeat_buffer, which applies it before the
 %% cast; keep the two equal.
@@ -257,6 +275,9 @@
 
 -type notify_probe() :: #{pid   := pid(),
                           mref  := reference(),
+                          %% The deadline timer: a {notify_probe_timeout, Pid, Gen}
+                          %% message to this process, cancelled when the probe resolves.
+                          timer := reference(),
                           gen   := non_neg_integer(),
                           key   := yuzu_gw_notify_queue:key(),
                           event := yuzu_gw_notify_queue:event()}.
@@ -267,6 +288,8 @@
     %% breaker is closed. Volatile: it does not outlive this process.
     notify_pending  :: yuzu_gw_notify_queue:t(),
     notify_pending_max :: pos_integer(),
+    %% How long a half_open notify probe may run before it is killed (ms).
+    notify_probe_timeout_ms :: pos_integer(),
     %% Circuit breaker state
     cb_state        :: closed | open | half_open,
     cb_failures     :: non_neg_integer(),
@@ -431,12 +454,16 @@ init_state(ClusterId) ->
     NotifyPendingMax = yuzu_gw_env:env_int(notify_pending_max,
                                            ?DEFAULT_NOTIFY_PENDING_MAX, 1,
                                            ?MAX_NOTIFY_PENDING_MAX),
+    ProbeTimeout = yuzu_gw_env:env_int(notify_probe_timeout_ms,
+                                       ?DEFAULT_NOTIFY_PROBE_TIMEOUT_MS,
+                                       ?MIN_NOTIFY_PROBE_TIMEOUT_MS,
+                                       ?MAX_NOTIFY_PROBE_TIMEOUT_MS),
 
     logger:info("Upstream client started (circuit breaker: threshold=~b, base_timeout=~bms, "
                 "replay_spacing=~bms, replay_session_guard=~bms, replay_queue_max=~b, "
-                "notify_pending_max=~b, cluster_id=~ts)",
+                "notify_pending_max=~b, notify_probe_timeout=~bms, cluster_id=~ts)",
                 [Threshold, BaseTimeout, ReplaySpacing, SessionGuard, QueueMax,
-                 NotifyPendingMax, ClusterId]),
+                 NotifyPendingMax, ProbeTimeout, ClusterId]),
 
     %% A restarted instance counts only its own workers, so the gauges start
     %% from zero here (workers of an earlier instance are unlinked and uncounted).
@@ -446,6 +473,7 @@ init_state(ClusterId) ->
         notify_pids     = #{},
         notify_pending  = yuzu_gw_notify_queue:new(NotifyPendingMax),
         notify_pending_max = NotifyPendingMax,
+        notify_probe_timeout_ms = ProbeTimeout,
         cb_state        = closed,
         cb_failures     = 0,
         cb_threshold    = Threshold,
@@ -831,6 +859,34 @@ handle_info({'DOWN', MonRef, process, Pid, Reason},
     Before = notify_counts(State),
     State1 = resolve_probe(Gen, {error, worker_down}, State),
     {noreply, report_notify_counts(Before, drain(State1))};
+
+%% The probe's deadline (notify_probe_timeout_ms), the gateway's own bound on how
+%% long a half_open probe can hold the held store: the worker is killed and the
+%% probe fails as any failed probe does (the event is given back, the breaker
+%% reopens with the longer backoff, the next half_open cycle sends a new probe).
+%% Only the probe currently recorded, under its own generation, is acted on: the
+%% timer is cancelled when the probe resolves, but a message already delivered by
+%% then (or one for an earlier probe) is ignored. A result that is already in the
+%% mailbox wins over the deadline, so a probe that answered just in time is not
+%% requeued; a result sent after this check is ignored like any result of a
+%% probe that is no longer recorded (the event is then sent a second time).
+handle_info({notify_probe_timeout, Pid, Gen},
+            #state{notify_probe = #{pid := Pid, gen := Gen, event := {AgentId, _}},
+                   notify_probe_timeout_ms = Timeout} = State) ->
+    receive
+        {notify_probe_result, Pid, _ResultGen, _Result} = Reported ->
+            handle_info(Reported, State)
+    after 0 ->
+        exit(Pid, kill),
+        logger:warning("Notify probe worker for ~s did not answer within ~bms and was "
+                       "killed; the notification is held again",
+                       [yuzu_gw_env:log_text(AgentId), Timeout]),
+        Before = notify_counts(State),
+        State1 = resolve_probe(Gen, {error, probe_timeout}, State),
+        {noreply, report_notify_counts(Before, drain(State1))}
+    end;
+handle_info({notify_probe_timeout, _Pid, _Gen}, State) ->
+    {noreply, State};
 
 handle_info({'DOWN', _MonRef, process, Pid, _Reason},
             #state{notify_pids = Pids, guardian_pids = GPids} = State) ->
@@ -1260,7 +1316,8 @@ drain(#state{cb_state = closed, notify_pids = Pids, notify_pending = Pending,
             end
     end;
 drain(#state{cb_state = half_open, notify_probe = undefined, notify_pids = Pids,
-             notify_pending = Pending, cb_gen = Gen} = State)
+             notify_pending = Pending, cb_gen = Gen,
+             notify_probe_timeout_ms = ProbeTimeout} = State)
         when map_size(Pids) < ?MAX_NOTIFY_INFLIGHT ->
     case yuzu_gw_notify_queue:take(Pending) of
         empty ->
@@ -1284,17 +1341,21 @@ drain(#state{cb_state = half_open, notify_probe = undefined, notify_pids = Pids,
                 end,
                 Server ! {notify_probe_result, self(), Gen, Result}
             end),
+            %% The gateway's own deadline for the probe (the client's bounds are
+            %% library defaults an endpoint setting can remove): resolved or
+            %% cancelled with the probe, see handle_info({notify_probe_timeout, ...}).
+            Timer = erlang:send_after(ProbeTimeout, Server, {notify_probe_timeout, Pid, Gen}),
             State#state{notify_pending = Pending1,
                         notify_pids = Pids#{Pid => true},
-                        notify_probe = #{pid => Pid, mref => MonRef, gen => Gen,
-                                         key => Key, event => Event}}
+                        notify_probe = #{pid => Pid, mref => MonRef, timer => Timer,
+                                         gen => Gen, key => Key, event => Event}}
     end;
 drain(State) ->
     State.
 
 %% @doc Retire the probe attempt: clear the record and free its slot, decide the
 %% event, then (separately) decide the breaker. Called once per probe, by the
-%% first of its result and its 'DOWN'.
+%% first of its result, its 'DOWN' and its deadline (which kills the worker).
 %%
 %% The event: ok retires it; an error gives it back at the head of the store
 %% (the reserved slot guarantees it fits; a newer event for the same key wins and
@@ -1309,35 +1370,37 @@ drain(State) ->
 %% not touched, and on_success/on_failure have no clause for an open breaker.
 -spec resolve_probe(non_neg_integer(), rpc_result(), #state{}) -> #state{}.
 resolve_probe(_Gen, {local_error, {Class, Why}},
-              #state{notify_probe = #{pid := Pid, mref := MonRef, event := {AgentId, _}},
+              #state{notify_probe = #{pid := Pid, mref := MonRef, timer := Timer,
+                                      event := {AgentId, _}},
                      notify_pids = Pids} = State) ->
     %% The head held entry could not be encoded here, and the same payload fails
     %% the same way on every probe: requeueing it would reopen the breaker for
     %% ever. Evict it, once, and leave the breaker alone (it is not a fact about
     %% the upstream); the caller's drain/1 then probes the next head at once. The
     %% failure is already counted by rpc_errors_total{code="encode"}.
-    erlang:demonitor(MonRef, [flush]),
+    retire_probe(MonRef, Timer),
     logger:warning("Evicted held stream status notification for ~s: it cannot be "
                    "encoded (~p:~p); the circuit breaker is not affected",
                    [yuzu_gw_env:log_text(AgentId), Class, Why]),
     State#state{notify_probe = undefined,
                 notify_pids = maps:remove(Pid, Pids)};
 resolve_probe(_Gen, {error, {Status, _Message}},
-              #state{notify_probe = #{pid := Pid, mref := MonRef},
+              #state{notify_probe = #{pid := Pid, mref := MonRef, timer := Timer},
                      notify_pids = Pids} = State) when ?IS_REQUEST_FAULT(Status) ->
     %% The server answered that this notification itself was wrong. Requeueing it
     %% would be answered the same way by every probe, for ever (the breaker is
     %% not touched by such an answer, so nothing would slow the loop), so it is
     %% retired like an answered event. The worker already logged the failure; the
     %% breaker is left as it is, as for a local encode exception.
-    erlang:demonitor(MonRef, [flush]),
+    retire_probe(MonRef, Timer),
     State#state{notify_probe = undefined,
                 notify_pids = maps:remove(Pid, Pids)};
 resolve_probe(Gen, Result,
-              #state{notify_probe = #{pid := Pid, mref := MonRef, key := Key, event := Event},
+              #state{notify_probe = #{pid := Pid, mref := MonRef, timer := Timer,
+                                      key := Key, event := Event},
                      notify_pids = Pids, notify_pending = Pending,
                      cb_state = CbState, cb_gen = CbGen} = State) ->
-    erlang:demonitor(MonRef, [flush]),
+    retire_probe(MonRef, Timer),
     Pending1 =
         case Result of
             {ok, _} ->
@@ -1359,6 +1422,15 @@ resolve_probe(Gen, Result,
         true  -> record_result(Result, State1);
         false -> State1
     end.
+
+%% @doc The probe is over: drop its monitor (and any 'DOWN' already delivered)
+%% and its deadline timer. A timeout message that was already delivered is
+%% harmless: it names a probe that is no longer recorded.
+-spec retire_probe(reference(), reference()) -> ok.
+retire_probe(MonRef, Timer) ->
+    erlang:demonitor(MonRef, [flush]),
+    _ = erlang:cancel_timer(Timer),
+    ok.
 
 %% @doc How many notify workers drain/1 may have in flight. While a registration
 %% replay is active one slot is held back: the replay drip waits for fewer than
