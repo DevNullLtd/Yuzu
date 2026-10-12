@@ -39,8 +39,9 @@
 
 namespace yuzu::test {
 
-/// ONE bound for every "wait until a backend is lock-blocked" poll in the #4966 tests (this
-/// header and `test_rbac_account_lifecycle_guard.cpp`), so the two cannot drift apart. The poll is
+/// The deadline and poll interval shared by the "wait until a backend is lock-blocked" polls in
+/// the #4966 tests (this header and `test_rbac_account_lifecycle_guard.cpp`). Only these values
+/// are shared: the two pollers read `pg_stat_activity` through different queries. The poll is
 /// event-style (there is no event to wait on in a different backend); the deadline only bounds a
 /// failing test.
 inline constexpr std::chrono::milliseconds kLockWaitDeadline{10000};
@@ -195,10 +196,17 @@ private:
         if (!open_)
             return;
         open_ = false;
-        yuzu::server::pg::PgResult r =
-            yuzu::server::pg::exec_params(lease_.get(), sql, std::vector<std::string>{});
-        if (r.status() != PGRES_COMMAND_OK)
-            std::fprintf(stderr, "UncommittedScimRowGate: %s failed\n", sql);
+        // Same shape as `PrincipalLockGate::release`: the argument vector allocates and this runs
+        // from the implicitly noexcept destructor and from the `Workers` pre-join callback, so a
+        // throw would terminate.
+        try {
+            yuzu::server::pg::PgResult r =
+                yuzu::server::pg::exec_params(lease_.get(), sql, std::vector<std::string>{});
+            if (r.status() != PGRES_COMMAND_OK)
+                std::fprintf(stderr, "UncommittedScimRowGate: %s failed\n", sql);
+        } catch (...) {
+            std::fprintf(stderr, "UncommittedScimRowGate: %s threw\n", sql);
+        }
     }
 
     yuzu::server::pg::PgPool& pool_;

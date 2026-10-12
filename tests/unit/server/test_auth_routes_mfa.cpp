@@ -98,11 +98,13 @@ struct TmpDirGuard {
 struct AuthRoutesHarness {
     TmpDirGuard tmp;
     Config cfg{};
-    auth::AuthManager auth_mgr{};
     yuzu::test::AuthDbPg auth_db;
     // #4966: the last-Administrator guard AuthManager::remove_user/update_role now require (fail
     // closed without it), built on the same pool: the production composition.
     std::unique_ptr<yuzu::server::RbacStore> rbac_guard;
+    // Declared AFTER auth_db and rbac_guard on purpose: it borrows both, so it must be destroyed
+    // first (members are destroyed in reverse order of declaration).
+    auth::AuthManager auth_mgr{};
     // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
     // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
     // api_tokens removed (PR 4.1 review #3): this fixture never calls a token

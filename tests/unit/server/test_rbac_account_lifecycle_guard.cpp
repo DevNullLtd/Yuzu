@@ -14,8 +14,12 @@
  * pool, the production shape) and SKIPs green without YUZU_TEST_POSTGRES_DSN, so a run is
  * only evidence once the PG case count is non-zero. Interleavings are made deterministic by
  * holding a row lock from a raw connection and polling pg_stat_activity for the blocked
- * backends (never a sleep-and-hope); the one wall-clock bound in the file is the
- * lock-timeout case, which waits out the production constant (2 s) once.
+ * backends (never a sleep-and-hope). The wall-clock assertions are few and each separates a
+ * bounded wait from a 10 s pool default: the lock-timeout case waits out the production
+ * constant (2 s) once and asserts 1.5 s <= elapsed < 8 s; the zero-clamp section asserts
+ * < 3 s; the would_strand_last_administrator lock-free case asserts < 2 s. The
+ * mu_-not-held-across-the-owner-call case carries no timing bound (it checks that both
+ * backends are still lock-blocked when has_users() returns).
  *
  * Tags: [pg][auth_db][lifecycle_guard]. `[auth_db]` keeps these in the catch-all PG shard
  * (the shard partition lists exclude by tag; a new tag lands there too, but [rbac_store] is
@@ -410,33 +414,53 @@ TEST_CASE("lifecycle guard: a grant that commits between the counted-set lock an
 TEST_CASE("lifecycle guard: unassign_role vs deactivate_account of the last two grant holders "
           "never leaves zero (both orders of the lock queue)",
           "[pg][auth_db][lifecycle_guard]") {
-    LIFECYCLE_FIXTURE(store, auth_db);
-    build_world(auth_db, store, /*rbac_on=*/true, {{"gA", Role::user, true}, {"gB", Role::user, true}});
+    // Both calls park on the counted-set lock held here: unassign (its lock query) and
+    // deactivate (its step 2). The lock queue is FIFO, so starting one call and waiting until its
+    // backend is blocked BEFORE starting the other makes the queue order deterministic; the loop
+    // runs both orders. Their result is order-dependent, the invariant is not.
+    for (const bool unassign_queued_first : {true, false}) {
+        INFO((unassign_queued_first ? "unassign queued first" : "deactivation queued first"));
+        {
+            LIFECYCLE_FIXTURE(store, auth_db);
+            build_world(auth_db, store, /*rbac_on=*/true,
+                        {{"gA", Role::user, true}, {"gB", Role::user, true}});
 
-    // Park BOTH calls on the counted-set lock held here: unassign (its lock query) and
-    // deactivate (its step 2). Their result is order-dependent, the invariant is not.
-    HeldLocks hold(auth_db.pool());
-    hold.lock_counted_grants();
-    std::expected<bool, std::string> unassigned = false;
-    AccountDeactivationResult deactivated;
-    Workers workers([&] { hold.rollback(); });
-    workers.add([&] { unassigned = store.unassign_role("user", "gB", "Administrator"); });
-    workers.add([&] { deactivated = store.deactivate_account("gA"); });
-    REQUIRE(wait_for_blocked_backends(auth_db.dsn(), hold.pid(), 2).size() >= 2);
-    hold.rollback();
-    workers.join_all();
+            HeldLocks hold(auth_db.pool());
+            hold.lock_counted_grants();
+            std::expected<bool, std::string> unassigned = false;
+            AccountDeactivationResult deactivated;
+            const auto start_unassign = [&] {
+                unassigned = store.unassign_role("user", "gB", "Administrator");
+            };
+            const auto start_deactivate = [&] { deactivated = store.deactivate_account("gA"); };
+            Workers workers([&] { hold.rollback(); });
+            if (unassign_queued_first) {
+                workers.add(start_unassign);
+                REQUIRE(wait_for_blocked_backends(auth_db.dsn(), hold.pid(), 1).size() >= 1);
+                workers.add(start_deactivate);
+            } else {
+                workers.add(start_deactivate);
+                REQUIRE(wait_for_blocked_backends(auth_db.dsn(), hold.pid(), 1).size() >= 1);
+                workers.add(start_unassign);
+            }
+            REQUIRE(wait_for_blocked_backends(auth_db.dsn(), hold.pid(), 2).size() >= 2);
+            hold.rollback();
+            workers.join_all();
 
-    const bool unassign_ok = unassigned.has_value();
-    const bool deactivate_ok = (deactivated.kind == DKind::kDeactivated);
-    // Exactly one wins; the loser is the typed last-Administrator refusal, never a store fault.
-    CHECK(unassign_ok != deactivate_ok);
-    if (!unassign_ok) {
-        CHECK(is_rbac_last_admin_refusal(unassigned.error()));
+            const bool unassign_ok = unassigned.has_value();
+            const bool deactivate_ok = (deactivated.kind == DKind::kDeactivated);
+            // Exactly one wins; the loser is the typed last-Administrator refusal, never a store
+            // fault.
+            CHECK(unassign_ok != deactivate_ok);
+            if (!unassign_ok) {
+                CHECK(is_rbac_last_admin_refusal(unassigned.error()));
+            }
+            if (!deactivate_ok) {
+                CHECK(deactivated.kind == DKind::kLastAdministratorRefused);
+            }
+            CHECK(counted_grant_holders(auth_db.pool()).size() == 1);
+        }
     }
-    if (!deactivate_ok) {
-        CHECK(deactivated.kind == DKind::kLastAdministratorRefused);
-    }
-    CHECK(counted_grant_holders(auth_db.pool()).size() == 1);
 }
 
 TEST_CASE("lifecycle guard: set_enforcement vs deactivation of the sole grant holder never ends "
@@ -674,26 +698,43 @@ TEST_CASE("lifecycle guard: set_local_role classification (not found, unchanged,
 }
 
 TEST_CASE("lifecycle guard: a demotion racing a deactivation of the last two column admins leaves "
-          "exactly one (deterministic)",
+          "exactly one (both orders of the lock queue)",
           "[pg][auth_db][lifecycle_guard]") {
-    LIFECYCLE_FIXTURE(store, auth_db);
-    build_world(auth_db, store, /*rbac_on=*/false, {{"m1", Role::admin}, {"m2", Role::admin}});
+    // Starting one call and waiting until its backend is blocked before starting the other makes
+    // the FIFO lock-queue order deterministic; the loop runs both orders.
+    for (const bool demotion_queued_first : {true, false}) {
+        INFO((demotion_queued_first ? "demotion queued first" : "deactivation queued first"));
+        {
+            LIFECYCLE_FIXTURE(store, auth_db);
+            build_world(auth_db, store, /*rbac_on=*/false,
+                        {{"m1", Role::admin}, {"m2", Role::admin}});
 
-    HeldLocks hold(auth_db.pool());
-    hold.lock_rbac_enabled();
-    LocalRoleChangeResult demoted;
-    AccountDeactivationResult deactivated;
-    Workers workers([&] { hold.rollback(); });
-    workers.add([&] { demoted = store.set_local_role("m1", Role::user); });
-    workers.add([&] { deactivated = store.deactivate_account("m2"); });
-    REQUIRE(wait_for_blocked_backends(auth_db.dsn(), hold.pid(), 2).size() >= 2);
-    hold.rollback();
-    workers.join_all();
+            HeldLocks hold(auth_db.pool());
+            hold.lock_rbac_enabled();
+            LocalRoleChangeResult demoted;
+            AccountDeactivationResult deactivated;
+            const auto start_demote = [&] { demoted = store.set_local_role("m1", Role::user); };
+            const auto start_deactivate = [&] { deactivated = store.deactivate_account("m2"); };
+            Workers workers([&] { hold.rollback(); });
+            if (demotion_queued_first) {
+                workers.add(start_demote);
+                REQUIRE(wait_for_blocked_backends(auth_db.dsn(), hold.pid(), 1).size() >= 1);
+                workers.add(start_deactivate);
+            } else {
+                workers.add(start_deactivate);
+                REQUIRE(wait_for_blocked_backends(auth_db.dsn(), hold.pid(), 1).size() >= 1);
+                workers.add(start_demote);
+            }
+            REQUIRE(wait_for_blocked_backends(auth_db.dsn(), hold.pid(), 2).size() >= 2);
+            hold.rollback();
+            workers.join_all();
 
-    const bool demote_ok = (demoted.kind == RKind::kChanged);
-    const bool deactivate_ok = (deactivated.kind == DKind::kDeactivated);
-    CHECK(demote_ok != deactivate_ok);
-    CHECK(active_column_admins(auth_db.pool()).size() == 1);
+            const bool demote_ok = (demoted.kind == RKind::kChanged);
+            const bool deactivate_ok = (deactivated.kind == DKind::kDeactivated);
+            CHECK(demote_ok != deactivate_ok);
+            CHECK(active_column_admins(auth_db.pool()).size() == 1);
+        }
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
@@ -914,12 +955,13 @@ TEST_CASE("AuthManager lifecycle guard: a store failure inside the guard is Stor
 
     // Both workers are INSIDE the owner call right now. An AuthManager accessor that takes
     // mu_ must still answer at once; had remove_user_checked held mu_ across the call (the
-    // deadlock shape with recheck_role_after_credential_check), these would wait out the
-    // lock_timeout (800 ms here), and a login-path reader would be stalled behind an admin's lock
-    // wait.
-    const auto t0 = std::chrono::steady_clock::now();
+    // deadlock shape with recheck_role_after_credential_check), this call would wait until the
+    // workers' lock_timeout (800 ms here) expired and they released it, and a login-path reader
+    // would be stalled behind an admin's lock wait. No wall-clock bound: the proof is that both
+    // backends are STILL lock-blocked when the call returns (a held mu_ could only have been
+    // released after the workers' waits ended).
     (void)f.mgr.has_users(); // takes mu_ shared; a held unique mu_ would block it here
-    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(400));
+    CHECK(wait_for_blocked_backends(f.db.dsn(), hold.pid(), 2).size() >= 2);
 
     workers.join_all(); // both wait out the (shortened) transaction-local lock_timeout together
     CHECK(removed == RemoveUserOutcome::StoreFailure);

@@ -353,7 +353,7 @@ TEST_CASE("remove_user still succeeds and clears sessions on a warm cache",
     // #4966: update_role/remove_user fail closed without the last-Administrator guard.
     yuzu::server::RbacStore rbac_guard{auth_db.pool()};
     REQUIRE(rbac_guard.is_open());
-    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // A second active admin so the cases that demote/remove "dana" exercise the write path, not
     // the last-Administrator refusal.
     REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
@@ -445,7 +445,7 @@ TEST_CASE("update_role still succeeds and clears sessions on a warm cache",
     // #4966: update_role/remove_user fail closed without the last-Administrator guard.
     yuzu::server::RbacStore rbac_guard{auth_db.pool()};
     REQUIRE(rbac_guard.is_open());
-    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // A second active admin so the cases that demote/remove "dana" exercise the write path, not
     // the last-Administrator refusal.
     REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
@@ -1268,7 +1268,7 @@ TEST_CASE("post_mint_role_recheck denies a login when a demote lands strictly "
     // #4966: update_role/remove_user fail closed without the last-Administrator guard.
     yuzu::server::RbacStore rbac_guard{auth_db.pool()};
     REQUIRE(rbac_guard.is_open());
-    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // A second active admin so the cases that demote/remove "dana" exercise the write path, not
     // the last-Administrator refusal.
     REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 

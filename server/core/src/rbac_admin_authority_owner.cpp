@@ -139,19 +139,6 @@ std::optional<std::vector<std::string>> list_active_local_admin_accounts(PGconn*
     return names;
 }
 
-// Bound on EVERY lock wait inside `deactivate_account` and `set_local_role` (the `rbac_enabled`
-// row, the counted grant set, the target's grant row, the target's `auth.users` row), installed as
-// the FIRST statement of each transaction. #4966 installs 2000 ms (`kDefaultLifecycleLockTimeout`
-// in rbac_store.hpp; `RbacStore`'s constructor parameter lets a test shorten it, production never
-// does). `rbac_sql::kWriteTimeout`
-// (4000 ms) bounds only the pool ACQUIRE and the pool's own `lock_timeout` defaults to 10000 ms
-// (and is not injected at all when the DSN or `PGOPTIONS` carries its own), so without this a
-// stuck lock holder could pin a pooled connection for 10 s per lock or unbounded. There is no
-// ordering constraint on the value against `AuthDB::recheck_role_locked` (2000 ms) or
-// `CredentialChangeOwner` (1500 ms): those wait on the `auth.users` row this owner takes LAST
-// and holds only across lock-free recounts and the COMMIT, and this owner never waits on a lock
-// either of them holds while holding the `auth.users` row, so no chain of waits forms.
-
 // The longest a LIFECYCLE guard transaction (`deactivate_account` and `set_local_role`, the two
 // that call `set_txn_timeouts`) may sit idle BETWEEN statements. The first lock each of them takes
 // is the fleet-wide `rbac_enabled` row lock, so a holder whose client died without closing the
@@ -164,7 +151,20 @@ std::optional<std::vector<std::string>> list_active_local_admin_accounts(PGconn*
 // 15 s for these two transactions.
 constexpr std::chrono::milliseconds kLifecycleIdleInTxnTimeout{15000};
 
-// "SELECT set_config('lock_timeout', $1, true)" and the idle-in-transaction bound: both
+// Installs the bound on EVERY lock wait inside `deactivate_account` and `set_local_role` (the
+// `rbac_enabled` row, the counted grant set, the target's grant row, the target's `auth.users`
+// row) as the FIRST statement of each transaction, plus the idle-in-transaction bound above.
+// #4966 installs 2000 ms (`kDefaultLifecycleLockTimeout` in rbac_store.hpp; `RbacStore`'s
+// constructor parameter lets a test shorten it, production never does). `rbac_sql::kWriteTimeout`
+// (4000 ms) bounds only the pool ACQUIRE and the pool's own `lock_timeout` defaults to 10000 ms
+// (and is not injected at all when the DSN or `PGOPTIONS` carries its own), so without this a
+// stuck lock holder could pin a pooled connection for 10 s per lock or unbounded. There is no
+// ordering constraint on the value against `AuthDB::recheck_role_locked` (2000 ms) or
+// `CredentialChangeOwner` (1500 ms): those wait on the `auth.users` row this owner takes LAST
+// and holds only across lock-free recounts and the COMMIT, and this owner never waits on a lock
+// either of them holds while holding the `auth.users` row, so no chain of waits forms.
+//
+// SQL: "SELECT set_config('lock_timeout', $1, true)" and the idle-in-transaction setting: both
 // transaction-local (never leak to the pooled connection), bound parameters, the same shape
 // `AuthDB`'s own transaction-scoped bound uses.
 bool set_txn_timeouts(PGconn* c, std::chrono::milliseconds lock_timeout, std::string& err) {

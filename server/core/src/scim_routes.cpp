@@ -954,6 +954,16 @@ enum class RecomputeResult {
     SkippedPromotion
 };
 
+/// What `recompute_scim_user_role` returns: the result plus, for every value that a per-member
+/// loop reports by name (everything but `Applied`), the member to name (the username, or
+/// `scim_id:<id>` when the resource could not be resolved). Empty for `Applied`.
+struct RecomputeOutcome {
+    RecomputeResult result;
+    std::string member;
+
+    RecomputeOutcome(RecomputeResult r, std::string m = {}) : result(r), member(std::move(m)) {}
+};
+
 /// ⚠️ SECURITY-CRITICAL (#2021 slice 2) — the SCIM-group->Yuzu-role
 /// application core. Re-derives `user_scim_id`'s role from its CURRENT SCIM
 /// group memberships and applies the change if it differs from the
@@ -1032,29 +1042,23 @@ enum class RecomputeResult {
 ///
 /// DIRECTION (#4966): a DEMOTION is a member whose current role is admin and whose resolved role
 /// is not; every other change is a PROMOTION. With `skip_promotions` set a promotion is not
-/// attempted (`SkippedPromotion`, the member's username in `*skipped_username`); a demotion is
+/// attempted (`SkippedPromotion`, the member is named in the outcome); a demotion is
 /// ALWAYS attempted, because skipping one would leave an IdP-removed administrator holding the
 /// role with a 2xx and no evidence. A failed or refused demotion is escalated (critical log line,
 /// critical analytics event).
-RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr,
+RecomputeOutcome recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr,
                                          AuditStore* audit_store,
                                          AnalyticsEventStore* analytics_store,
                                          const httplib::Request& req,
                                          const std::string& user_scim_id,
                                          const std::string& scim_admin_group,
                                          const std::string& trigger_detail,
-                                         bool skip_promotions = false,
-                                         std::string* named = nullptr) {
+                                         bool skip_promotions = false) {
     if (!scim_store || !auth_mgr)
         return RecomputeResult::Applied;
 
     static std::mutex kRecomputeMu;
     std::lock_guard<std::mutex> recompute_lock(kRecomputeMu);
-
-    const auto name_member = [named](const std::string& name) {
-        if (named)
-            *named = name;
-    };
 
     // Step 1: user_scim_id must resolve to a live SCIM User resource. `get_by_scim_id` collapses
     // "no such resource" and "the read failed" into one nullopt, so ask the tri-state existence
@@ -1067,8 +1071,7 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
         spdlog::warn("SCIM: recompute_scim_user_role: could not resolve scim_id={} (store read "
                      "failed); the member is UNDETERMINED, its role is untouched",
                      user_scim_id);
-        name_member("scim_id:" + user_scim_id);
-        return RecomputeResult::Undetermined;
+        return {RecomputeResult::Undetermined, "scim_id:" + user_scim_id};
     }
 
     AuthDB* db = auth_mgr->auth_db_ptr();
@@ -1084,8 +1087,7 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
         spdlog::warn("SCIM: recompute_scim_user_role: could not read the provisioning source of "
                      "'{}' (scim_id={}); the member is UNDETERMINED, its role is untouched",
                      ::yuzu::log_token(resource->username), user_scim_id);
-        name_member(resource->username);
-        return RecomputeResult::Undetermined;
+        return {RecomputeResult::Undetermined, resource->username};
     }
     if (!source || *source != kProvisioningSourceScim) {
         spdlog::warn("SCIM: recompute_scim_user_role refusing to touch '{}' (scim_id={}) — "
@@ -1116,8 +1118,7 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
                      "membership for '{}' (scim_id={}); the member is UNDETERMINED, its role is "
                      "untouched (fail-closed)",
                      ::yuzu::log_token(resource->username), user_scim_id);
-        name_member(resource->username);
-        return RecomputeResult::Undetermined;
+        return {RecomputeResult::Undetermined, resource->username};
     }
     auth::Role resolved = auth::resolve_role_from_groups(*groups, scim_admin_group);
 
@@ -1142,8 +1143,7 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
                     "current role for '{}' (scim_id={}); the member is UNDETERMINED, its role is "
                     "untouched (fail-closed)",
                     ::yuzu::log_token(resource->username), user_scim_id);
-        name_member(resource->username);
-        return RecomputeResult::Undetermined;
+        return {RecomputeResult::Undetermined, resource->username};
     }
 
     // Step 5: apply only on an actual change.
@@ -1154,8 +1154,7 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
     // be skipped; a demotion is always attempted.
     const bool demotion = *current == auth::Role::admin && resolved != auth::Role::admin;
     if (skip_promotions && !demotion) {
-        name_member(resource->username);
-        return RecomputeResult::SkippedPromotion;
+        return {RecomputeResult::SkippedPromotion, resource->username};
     }
 
     std::string old_role_str = auth::role_to_string(*current);
@@ -1192,8 +1191,7 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
                                   {"group_derived_demotion", true},
                                   {"role_unchanged", true},
                                   {"detail", refusal_detail}});
-        name_member(resource->username);
-        return RecomputeResult::Refused;
+        return {RecomputeResult::Refused, resource->username};
     }
     if (outcome != auth::UpdateRoleOutcome::Updated) {
         const bool role_applied = outcome == auth::UpdateRoleOutcome::UpdatedSessionWipeFailed;
@@ -1242,9 +1240,9 @@ RecomputeResult recompute_scim_user_role(ScimStore* scim_store, auth::AuthManage
         // repeat for the next PROMOTION too: tell the loop to stop attempting promotions rather
         // than pay a lock wait per remaining member. Demotions are still attempted (see
         // `recompute_members`). UpdatedSessionWipeFailed and the rest are per-user failures.
-        name_member(resource->username);
-        return outcome == auth::UpdateRoleOutcome::StoreFailure ? RecomputeResult::StoreFailure
-                                                                 : RecomputeResult::Failed;
+        return {outcome == auth::UpdateRoleOutcome::StoreFailure ? RecomputeResult::StoreFailure
+                                                                  : RecomputeResult::Failed,
+                resource->username};
     }
     spdlog::info("SCIM: recompute_scim_user_role — '{}' (scim_id={}) role changed {} -> {} "
                 "via group membership",
@@ -1432,10 +1430,9 @@ bool recompute_members(ScimStore* scim_store, auth::AuthManager* auth_mgr, Audit
     bool store_failed = false;
     NamedMembers refused, failed, undetermined, skipped_promotions;
     for (std::size_t i = 0; i < user_scim_ids.size(); ++i) {
-        std::string named;
-        const auto r = recompute_scim_user_role(scim_store, auth_mgr, audit_store, analytics_store,
-                                                req, user_scim_ids[i], scim_admin_group,
-                                                trigger_detail, store_failed, &named);
+        const auto [r, named] = recompute_scim_user_role(
+            scim_store, auth_mgr, audit_store, analytics_store, req, user_scim_ids[i],
+            scim_admin_group, trigger_detail, store_failed);
         switch (r) {
         case RecomputeResult::Applied:
             break;

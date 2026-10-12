@@ -22,7 +22,7 @@ public:
     using Clock = std::chrono::steady_clock;
 
     explicit RefusalLogThrottle(std::chrono::seconds interval = std::chrono::seconds(60),
-                                std::size_t max_keys = 1024) noexcept
+                                std::size_t max_keys = 1024)
         : interval_(interval), max_keys_(max_keys) {}
 
     /// True when the caller should log `key` at warn level now (the first sighting, or the first

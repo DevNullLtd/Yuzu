@@ -69,6 +69,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -4969,6 +4970,10 @@ TEST_CASE("ScimRoutes: a hostile group displayName is neutralised in the demotio
     json remove_body{
         {"Operations",
          json::array({{{"op", "remove"}, {"path", "members[value eq \"" + user_id + "\"]"}}})}};
+    // The refusal's WARN text is written through the process-wide `refusal_log_throttle()` (one
+    // warn per username per 60 s, shared by every Fixture in this process): this case sees the
+    // warn only because no other case refuses 'gus_log' first. Keep the username unique to this
+    // case, or assert on the throttle-independent audit detail instead.
     yuzu::test::LogCapture capture;
     auto res = f.patch("/scim/v2/Groups/" + group_id, remove_body);
     capture.stop(); // quiesce before reading the captured text
@@ -6095,6 +6100,200 @@ TEST_CASE("ScimRoutes: a logger that throws on the crash-breadcrumb does not ski
     // The recompute loop still ran: the removed member was demoted and the request says complete.
     CHECK(f.auth_mgr.get_user_role("th_admin").value() == auth::Role::user);
     CHECK(only_detail(f, "scim.group.updated", gid) == "recompute=complete");
+}
+
+TEST_CASE("ScimRoutes: replacing the ONLY administrator in ONE Group change keeps the old one "
+          "(the guard refuses, the recompute is incomplete) while the new one is promoted; the "
+          "same replacement as TWO changes demotes the old one completely (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][replace]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto old_id = json::parse(f.post("/scim/v2/Users", {{"userName", "hpa"}})->body)["id"]
+                            .get<std::string>();
+    const auto new_id = json::parse(f.post("/scim/v2/Users", {{"userName", "hpb"}})->body)["id"]
+                            .get<std::string>();
+    auto created = f.post("/scim/v2/Groups",
+                          {{"displayName", "Yuzu-Admins"},
+                           {"members", json::array({{{"value", old_id}}})}});
+    REQUIRE(created->status == 201);
+    const auto gid = json::parse(created->body)["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.get_user_role("hpa").value() == auth::Role::admin);
+    // hpa is now the ONLY active local admin account: no other administrator exists to take over.
+    REQUIRE(f.auth_mgr.update_role_checked("spare_admin", auth::Role::user) ==
+            auth::UpdateRoleOutcome::Updated);
+    const auto replace_ops = json{{"Operations",
+                                   json::array({{{"op", "remove"},
+                                                 {"path", "members[value eq \"" + old_id + "\"]"}},
+                                                {{"op", "add"},
+                                                 {"path", "members"},
+                                                 {"value", json::array({{{"value", new_id}}})}}})}};
+
+    SECTION("ONE change removes hpa and adds hpb (PUT)") {
+        REQUIRE(f.put("/scim/v2/Groups/" + gid,
+                      {{"displayName", "Yuzu-Admins"},
+                       {"members", json::array({{{"value", new_id}}})}})->status == 200);
+    }
+    SECTION("ONE change removes hpa and adds hpb (PATCH)") {
+        REQUIRE(f.patch("/scim/v2/Groups/" + gid, replace_ops)->status == 200);
+    }
+    // Removed members are recomputed first: hpa's demotion ran while hpb was still a plain user,
+    // so the guard refused it; hpb was promoted afterwards. Both end up administrators, loudly.
+    CHECK(f.auth_mgr.get_user_role("hpa").value() == auth::Role::admin);
+    CHECK(f.auth_mgr.get_user_role("hpb").value() == auth::Role::admin);
+    const auto refused = audit_rows(f, kRefusedAction, old_id);
+    REQUIRE(refused.size() == 1);
+    CHECK(scim_refused(f) == 1.0);
+    CHECK(only_detail(f, "scim.group.updated", gid) == "recompute=incomplete");
+    const auto summary = only_detail(f, "scim.group.recompute_incomplete", gid);
+    CHECK(detail_field(summary, "refused") == "1");
+    CHECK(detail_field(summary, "refused_users") == "hpa");
+    CHECK(detail_field(summary, "failed").empty());
+    CHECK(events_of(f, kRefusedAction).size() == 1);
+}
+
+TEST_CASE("ScimRoutes: replacing the ONLY administrator as TWO Group changes (add the new one, "
+          "then remove the old one) demotes the old one and says recompute=complete both times "
+          "(#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][replace]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    const auto old_id = json::parse(f.post("/scim/v2/Users", {{"userName", "hpc"}})->body)["id"]
+                            .get<std::string>();
+    const auto new_id = json::parse(f.post("/scim/v2/Users", {{"userName", "hpd"}})->body)["id"]
+                            .get<std::string>();
+    auto created = f.post("/scim/v2/Groups",
+                          {{"displayName", "Yuzu-Admins"},
+                           {"members", json::array({{{"value", old_id}}})}});
+    REQUIRE(created->status == 201);
+    const auto gid = json::parse(created->body)["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.update_role_checked("spare_admin", auth::Role::user) ==
+            auth::UpdateRoleOutcome::Updated); // hpc is the ONLY active administrator
+
+    const json add_new{{"Operations",
+                        json::array({{{"op", "add"},
+                                      {"path", "members"},
+                                      {"value", json::array({{{"value", new_id}}})}}})}};
+    REQUIRE(f.patch("/scim/v2/Groups/" + gid, add_new)->status == 200);
+    CHECK(f.auth_mgr.get_user_role("hpd").value() == auth::Role::admin);
+    CHECK(f.auth_mgr.get_user_role("hpc").value() == auth::Role::admin);
+
+    const json remove_old{
+        {"Operations",
+         json::array({{{"op", "remove"}, {"path", "members[value eq \"" + old_id + "\"]"}}})}};
+    REQUIRE(f.patch("/scim/v2/Groups/" + gid, remove_old)->status == 200);
+    CHECK(f.auth_mgr.get_user_role("hpc").value() == auth::Role::user);
+    CHECK(f.auth_mgr.get_user_role("hpd").value() == auth::Role::admin);
+
+    const auto updated = audit_rows(f, "scim.group.updated", gid);
+    REQUIRE(updated.size() == 2);
+    for (const auto& r : updated)
+        CHECK(r.detail == "recompute=complete");
+    CHECK(audit_rows(f, "scim.group.recompute_incomplete", gid).empty());
+    CHECK(audit_rows(f, kRefusedAction, old_id).empty());
+    CHECK(scim_refused(f) == 0.0);
+}
+
+TEST_CASE("ScimRoutes: a Group DELETE whose demotion lands but whose durable session wipe fails "
+          "is reported incomplete, with the role applied and the escalation saying so (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][wipefailed]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    f.use_session_store();
+    const auto uid = json::parse(f.post("/scim/v2/Users", {{"userName", "wgd"}})->body)["id"]
+                         .get<std::string>();
+    auto created = f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"},
+                                              {"members", json::array({{{"value", uid}}})}});
+    REQUIRE(created->status == 201);
+    const auto gid = json::parse(created->body)["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.get_user_role("wgd").value() == auth::Role::admin);
+    // The member holds a live (durable) session: the demotion must wipe it.
+    REQUIRE_FALSE(f.auth_mgr.create_local_session_for_test("wgd", auth::Role::admin, false).empty());
+
+    yuzu::test::LogCapture capture;
+    f.wipe_fault.arm();
+    const auto res = f.del("/scim/v2/Groups/" + gid);
+    f.wipe_fault.repair();
+    capture.stop();
+    REQUIRE(res);
+    CHECK(res->status == 204); // the Group DELETE itself committed
+
+    // The role change DID commit; only the durable session wipe failed.
+    CHECK(f.auth_mgr.get_user_role("wgd").value() == auth::Role::user);
+    const auto summary = only_detail(f, "scim.group.recompute_incomplete", gid);
+    CHECK(detail_field(summary, "failed") == "1");
+    CHECK(detail_field(summary, "failed_users") == "wgd");
+    CHECK(only_detail(f, "scim.group.deleted", gid) == "recompute=incomplete");
+    CHECK(f.metrics.counter("yuzu_scim_role_change_failures_total").value() == 1.0);
+
+    std::vector<AuditEvent> fail_rows;
+    for (const auto& r : audit_rows(f, "scim.user.role_changed", uid))
+        if (r.result == "failure")
+            fail_rows.push_back(r);
+    REQUIRE(fail_rows.size() == 1);
+    CHECK(fail_rows[0].detail.find(" role_changed=true session_wipe_failed=true") !=
+          std::string::npos);
+
+    const auto crit = events_of(f, "scim.user.role_demotion_incomplete");
+    REQUIRE(crit.size() == 1);
+    CHECK(crit[0].severity == Severity::kCritical);
+    REQUIRE(crit[0].attributes.contains("role_applied"));
+    CHECK(crit[0].attributes["role_applied"] == true);
+    CHECK(crit[0].attributes["session_wipe_failed"] == true);
+    CHECK(capture.text().find("was applied but the durable session wipe failed") !=
+          std::string::npos);
+    CHECK(capture.text().find("the role IS changed but its durable session wipe failed") !=
+          std::string::npos);
+    CHECK(capture.text().find("did NOT complete") == std::string::npos);
+}
+
+TEST_CASE("ScimRoutes: the Group summary row names at most 20 members per class and counts the "
+          "rest exactly (#4966)",
+          "[pg][scim][routes][lastadmin][groups][recompute][undetermined]") {
+    Fixture f{/*broken_audit=*/false, /*scim_admin_group=*/"Yuzu-Admins"};
+    constexpr std::size_t kMembers = 22; // two more than the 20 that are named
+    json members = json::array();
+    std::set<std::string> ids;
+    for (std::size_t i = 0; i < kMembers; ++i) {
+        auto u = json::parse(
+            f.post("/scim/v2/Users", {{"userName", "cap" + std::to_string(i)}})->body);
+        ids.insert(u["id"].get<std::string>());
+        members.push_back({{"value", u["id"]}});
+    }
+    auto created = f.post("/scim/v2/Groups", {{"displayName", "Yuzu-Admins"}, {"members", members}});
+    REQUIRE(created->status == 201);
+    const auto gid = json::parse(created->body)["id"].get<std::string>();
+
+    // Every member's SCIM resource read fails, so each is UNDETERMINED and named `scim_id:<id>`.
+    std::unique_ptr<httplib::Response> res;
+    {
+        ScimResourcesFault fault(f.auth_db.pool());
+        fault.arm();
+        res = f.del("/scim/v2/Groups/" + gid);
+        fault.repair();
+    }
+    REQUIRE(res);
+    CHECK(res->status == 204);
+
+    const auto summary = only_detail(f, "scim.group.recompute_incomplete", gid);
+    const std::string head = "members=22 undetermined=22 undetermined_users=";
+    const std::string tail = ",+2 more";
+    REQUIRE(summary.rfind(head, 0) == 0);
+    const auto tail_pos = summary.find(tail);
+    REQUIRE(tail_pos != std::string::npos);
+    // Exactly 20 distinct names, every one a real member, then the exact remainder.
+    const std::string listed = summary.substr(head.size(), tail_pos - head.size());
+    std::set<std::string> named;
+    for (std::size_t start = 0; start <= listed.size();) {
+        const auto comma = listed.find(',', start);
+        const auto end = comma == std::string::npos ? listed.size() : comma;
+        named.insert(listed.substr(start, end - start));
+        start = end + 1;
+    }
+    CHECK(named.size() == 20);
+    for (const auto& n : named) {
+        INFO(n);
+        CHECK(n.rfind("scim_id:", 0) == 0);
+        CHECK(ids.count(n.substr(std::string("scim_id:").size())) == 1);
+    }
+    CHECK(recompute_skipped(f, "undetermined") == 22.0);
+    CHECK(only_detail(f, "scim.group.deleted", gid) == "recompute=incomplete");
 }
 
 TEST_CASE("RefusalLogThrottle: one warn per key per interval, bounded memory, clock-injected "
