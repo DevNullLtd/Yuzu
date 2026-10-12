@@ -180,8 +180,11 @@ public:
             .store_wired = [this] { return store_wired; },
             .list_rules = [this]() -> std::expected<std::vector<GuaranteedStateRuleRow>,
                                                     std::string> {
-                ++list_calls;
-                note("list_rules");
+                {
+                    std::lock_guard lk(fx_mu);
+                    ++list_calls;
+                    note("list_rules");
+                }
                 if (list_hook)
                     list_hook();
                 if (rules_throw)
@@ -192,13 +195,17 @@ public:
             },
             .deployed_ids = [this]() -> std::expected<std::unordered_set<std::string>,
                                                       std::string> {
-                ++deployed_calls;
-                note("deployed_ids");
+                {
+                    std::lock_guard lk(fx_mu);
+                    ++deployed_calls;
+                    note("deployed_ids");
+                }
                 if (deployed_error)
                     return std::unexpected(*deployed_error);
                 return deployed;
             },
             .session_os = [this](const std::string& agent_id) -> std::optional<std::string> {
+                std::lock_guard lk(fx_mu);
                 note("session");
                 session_agents.push_back(agent_id);
                 return session_os;
@@ -206,9 +213,12 @@ public:
             .eval_scope = [this](const std::string& agent_id,
                                  const yuzu::scope::Expression& expr)
                 -> std::expected<bool, ScopeEvalError> {
-                ++eval_calls;
-                note("eval_scope");
-                eval_agents.push_back(agent_id);
+                {
+                    std::lock_guard lk(fx_mu);
+                    ++eval_calls;
+                    note("eval_scope");
+                    eval_agents.push_back(agent_id);
+                }
                 if (eval_hook)
                     eval_hook();
                 const auto* cond = std::get_if<yuzu::scope::Condition>(&expr);
@@ -229,6 +239,7 @@ public:
             },
             .send_push = [this](const std::string& agent_id, const std::string& command_id,
                                 const std::string& bytes) {
+                std::lock_guard lk(fx_mu);
                 note("send_push");
                 sent.push_back({agent_id, command_id, bytes});
                 return send_result;
@@ -240,7 +251,10 @@ public:
                 note("audit");
                 audits.push_back(ev);
             },
-            .random_suffix = [this] { return "sfx" + std::to_string(suffix_base + ++suffix_calls); },
+            .random_suffix = [this] {
+                std::lock_guard lk(fx_mu);
+                return "sfx" + std::to_string(suffix_base + ++suffix_calls);
+            },
             .now = shed_clock.fn()};
     }
 
@@ -299,7 +313,9 @@ public:
     std::function<void()> list_hook;
     std::function<void()> eval_hook;
     std::function<void()> bundle_clock_hook;
-    std::recursive_mutex fx_mu;  // guards trace/inflight_at/audits against two concurrent flows
+    // Guards every recorded effect below against two concurrent flows (the two-thread test).
+    // Never held across a hook, so a flow blocked in list_hook cannot stall the other one.
+    std::recursive_mutex fx_mu;
 
     // ---- recorded effects ----
     // Every stub call, in order, with the gate's in-flight count as the stub saw it.
@@ -326,10 +342,14 @@ public:
 
 private:
     GuardianGenerationCache::Result fetch_generation() {
-        ++fetch_calls;
-        note("generation_read#" + std::to_string(fetch_calls));
+        int n = 0;
+        {
+            std::lock_guard lk(fx_mu);
+            n = ++fetch_calls;
+            note("generation_read#" + std::to_string(n));
+        }
         if (on_fetch)
-            return on_fetch(fetch_calls);
+            return on_fetch(n);
         if (!gen_error.empty())
             return std::unexpected(gen_error);
         return store_generation;
@@ -1028,6 +1048,8 @@ TEST_CASE("GuardianReconcileFlow: C1, the owner of a detached load and a waiter 
     bool release = false;
     std::promise<void> entered;
     auto entered_f = entered.get_future();
+    std::promise<void> joined;
+    auto joined_f = joined.get_future();
     std::atomic<std::thread::id> waiter_thread{};
     int waiter_clock_calls = 0;  // touched only by the waiter thread
     // Only the owner runs the loader.
@@ -1038,16 +1060,13 @@ TEST_CASE("GuardianReconcileFlow: C1, the owner of a detached load and a waiter 
         cv.wait_for(lk, 10s, [&] { return release; });
     };
     // The waiter's SECOND bundle-cache clock read is the one taken right after it joined the
-    // flight and before it blocks: invalidate there, then release the owner.
+    // flight and before it blocks. The hook only signals it: the cache must not be re-entered
+    // from its own clock, so the test thread does the invalidate.
     rig.bundle_clock_hook = [&] {
         if (std::this_thread::get_id() != waiter_thread.load())
             return;
-        if (++waiter_clock_calls == 2) {
-            rig.bundle_cache.invalidate();
-            std::lock_guard lk(m);
-            release = true;
-            cv.notify_all();
-        }
+        if (++waiter_clock_calls == 2)
+            joined.set_value();
     };
 
     std::jthread owner([&] { rig.run("agent-owner", 0); });
@@ -1056,6 +1075,13 @@ TEST_CASE("GuardianReconcileFlow: C1, the owner of a detached load and a waiter 
         waiter_thread.store(std::this_thread::get_id());
         rig.run("agent-waiter", 0);
     });
+    REQUIRE(joined_f.wait_for(10s) == std::future_status::ready);
+    rig.bundle_cache.invalidate();  // the waiter has joined the owner's flight and is about to block
+    {
+        std::lock_guard lk(m);
+        release = true;
+    }
+    cv.notify_all();
     waiter.join();
     owner.join();
 
