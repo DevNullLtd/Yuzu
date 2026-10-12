@@ -5,8 +5,9 @@
  * unit-tested under a TempDir on Linux AND macOS.
  *
  * Reads are bounded (kFileCap) and never follow a symlink leaf; the exports.d directory is
- * opened once with O_NOFOLLOW|O_DIRECTORY and every snippet is then read through THAT
- * descriptor (dir-fd confinement), never through a re-resolved path join.
+ * opened per listing with O_NOFOLLOW|O_DIRECTORY and every snippet is then read through THAT
+ * descriptor (dir-fd confinement), never through a re-resolved path join. One LinuxFs per
+ * execute(): it holds that descriptor, so it is not thread-safe and not for sharing.
  */
 #pragma once
 
@@ -27,16 +28,17 @@
 
 namespace yuzu::shares {
 
+inline constexpr std::size_t kFileCap = 256 * 1024;
+inline constexpr std::size_t kMaxExportsFiles = 64;
+inline constexpr std::size_t kMaxDirEntries = 4096; ///< entries examined in exports.d
+
 struct Paths {
     std::string exports;
     std::string exports_d;
     std::string smb_conf;
     std::string usershares_default;
+    std::size_t max_dir_entries = kMaxDirEntries; ///< injectable so a test need not make 4097 files
 };
-
-inline constexpr std::size_t kFileCap = 256 * 1024;
-inline constexpr std::size_t kMaxExportsFiles = 64;
-inline constexpr std::size_t kMaxDirEntries = 4096; ///< entries examined in exports.d
 
 // ReadErr mirrors yuzu::shared::ReadError enumerator-for-enumerator, so one cast maps it; an
 // unknown value would land in classify_read's `unknown` failed arm, never a silent success.
@@ -70,14 +72,14 @@ inline LinuxFs make_posix_fs(const Paths& p) {
     fs.smb_conf_path = p.smb_conf;
     fs.usershares_default = p.usershares_default;
     fs.read = &read_no_follow;
-    fs.list_exports_d = [dir, path = p.exports_d](std::vector<std::string>& names, bool& too_many) {
+    fs.list_exports_d = [dir, path = p.exports_d,
+                         cap = p.max_dir_entries](std::vector<std::string>& names, bool& too_many) {
         *dir = yuzu::shared::open_dir_no_follow(path);
         if (!dir->opened()) {
-            // A symlinked exports.d answers ENOTDIR on Linux and ELOOP on macOS: one contract.
-            const int e = dir->err == ELOOP ? ENOTDIR : dir->err;
-            return e != 0 ? e : EIO;
+            // A symlinked exports.d answers ENOTDIR on both Linux and macOS.
+            return dir->err != 0 ? dir->err : EIO;
         }
-        const auto w = yuzu::shared::walk_dir_capped(dir->dir.get(), kMaxDirEntries, [&](const dirent* e) {
+        const auto w = yuzu::shared::walk_dir_capped(dir->dir.get(), cap, [&](const dirent* e) {
             if (is_exports_name(e->d_name))
                 names.emplace_back(e->d_name);
             return true;
@@ -97,9 +99,11 @@ inline LinuxFs make_posix_fs(const Paths& p) {
     fs.read_exports_d_file = [dir](const std::string& name) {
         return to_read_like(yuzu::shared::read_file_no_follow_at(dir->dir.fd(), name.c_str(), kFileCap));
     };
-    fs.dir_exists = [](const std::string& path) {
+    fs.dir_probe = [](const std::string& path) -> int {
         struct stat st{};
-        return ::lstat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+        if (::lstat(path.c_str(), &st) != 0)
+            return errno;
+        return S_ISDIR(st.st_mode) ? 0 : ENOTDIR;
     };
     return fs;
 }

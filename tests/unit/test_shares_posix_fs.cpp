@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -26,6 +27,11 @@
 
 namespace fs = std::filesystem;
 using namespace yuzu::shares;
+
+// The README states these three limits; pin them once so a drift fails the build.
+static_assert(kFileCap == 256 * 1024);
+static_assert(kMaxExportsFiles == 64);
+static_assert(kMaxDirEntries == 4096);
 
 namespace {
 
@@ -153,18 +159,79 @@ TEST_CASE("shares posix fs: snippets are read through the retained directory des
     CHECK(fsb.read_exports_d_file("../elsewhere").error == ReadErr::io); // not a single component
 }
 
-TEST_CASE("shares posix fs: dir_exists is an lstat", "[shares][posix_fs]") {
+TEST_CASE("shares posix fs: exports.d entry cap is injectable and reports too_many",
+          "[shares][posix_fs]") {
+    // The readdir-error arm of the listing has no portable trigger on a TempDir, so it is not
+    // exercised here; the cap arm is, with a small injected cap instead of 4097 files.
+    Tree t;
+    fs::create_directory(t.at("exports.d"));
+    for (int i = 0; i < 7; ++i)
+        t.write(t.at("exports.d") / ("s" + std::to_string(i) + ".exports"), "/srv/x h\n");
+    auto p = t.paths();
+    p.max_dir_entries = 5;
+    const auto fsb = make_posix_fs(p);
+    std::vector<std::string> names;
+    bool too_many = false;
+    REQUIRE(fsb.list_exports_d(names, too_many) == 0);
+    CHECK(too_many);
+    CHECK(names.size() == 5);
+}
+
+TEST_CASE("shares posix fs: relisting leaks no descriptor and a read without a directory is EBADF",
+          "[shares][posix_fs]") {
+    Tree t;
+    fs::create_directory(t.at("exports.d"));
+    t.write(t.at("exports.d") / "a.exports", "/srv/a h\n");
+    const auto fsb = make_posix_fs(t.paths());
+    std::vector<std::string> names;
+    bool too_many = false;
+    const auto open_fds = [] {
+        int n = 0;
+        for (int fd = 0; fd < 256; ++fd)
+            n += ::fcntl(fd, F_GETFD) != -1 ? 1 : 0;
+        return n;
+    };
+    REQUIRE(fsb.list_exports_d(names, too_many) == 0);
+    const int before = open_fds(); // one descriptor: the retained exports.d
+    for (int i = 0; i < 200; ++i) {
+        names.clear();
+        REQUIRE(fsb.list_exports_d(names, too_many) == 0);
+    }
+    CHECK(open_fds() == before); // each relist released the previous directory
+
+    // Relist onto a plain file: the listing fails and the retained directory is released, so a
+    // snippet read has no descriptor and reports io/EBADF, never a read through a stale one.
+    fs::remove_all(t.at("exports.d"));
+    t.write(t.at("exports.d"), "x");
+    names.clear();
+    CHECK(fsb.list_exports_d(names, too_many) == ENOTDIR);
+    const auto r = fsb.read_exports_d_file("a.exports");
+    CHECK(r.error == ReadErr::io);
+    CHECK(r.err == EBADF);
+    CHECK(open_fds() == before - 1); // the stale directory was closed, not kept
+
+    // A read before any listing is the same io/EBADF.
+    const auto fresh = make_posix_fs(t.paths());
+    CHECK(fresh.read_exports_d_file("a.exports").err == EBADF);
+}
+
+TEST_CASE("shares posix fs: dir_probe is a tri-state lstat", "[shares][posix_fs]") {
     Tree t;
     fs::create_directory(t.at("usershares"));
     fs::create_directory(t.at("real_dir"));
     fs::create_directory_symlink(t.at("real_dir"), t.at("link_dir"));
+    t.write(t.at("plain_file"), "x");
     fs::create_directory(t.at("locked"));
+    fs::create_directory(t.at("locked") / "child");
     REQUIRE(::chmod(t.at("locked").c_str(), 0) == 0);
     const auto fsb = make_posix_fs(t.paths());
-    CHECK(fsb.dir_exists(t.at("usershares").string()));
-    CHECK_FALSE(fsb.dir_exists(t.at("link_dir").string())); // a symlink is not followed
-    CHECK_FALSE(fsb.dir_exists(t.at("absent").string()));
-    CHECK(fsb.dir_exists(t.at("locked").string())); // lstat needs no read permission
+    CHECK(fsb.dir_probe(t.at("usershares").string()) == 0);
+    CHECK(fsb.dir_probe(t.at("link_dir").string()) == ENOTDIR); // a symlink is not followed
+    CHECK(fsb.dir_probe(t.at("plain_file").string()) == ENOTDIR);
+    CHECK(fsb.dir_probe(t.at("absent").string()) == ENOENT);
+    CHECK(fsb.dir_probe(t.at("locked").string()) == 0); // lstat needs no read permission
+    if (::geteuid() != 0) // root passes every permission check
+        CHECK(fsb.dir_probe((t.at("locked") / "child").string()) == EACCES); // could not tell
     ::chmod(t.at("locked").c_str(), 0700);
 }
 

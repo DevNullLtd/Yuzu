@@ -224,7 +224,7 @@ TEST_CASE("shares plugin: status row first, source rows next, then well-formed s
     CHECK(result.result_provenance == "windows:planned");
 #else
 #if defined(__APPLE__)
-    // Two source rows on every arm except a tool that could not start, which still names both.
+    // Both source rows appear on every arm, including a `sharing` that could not start.
     REQUIRE(rows.size() >= 3);
     CHECK(starts_with(rows[1], "source|exports|"));
     CHECK(starts_with(rows[2], "source|sharing|"));

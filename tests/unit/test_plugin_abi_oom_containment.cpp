@@ -6,6 +6,7 @@
  *   A. yuzu::browser_policy::run_guarded
  *   B. yuzu::update_source_trust::execute_sources
  *   C. yuzu::mgmt_posture::execute_posture
+ *   D. yuzu::shares::execute_list
  * Their catch arms must build a token, write a status row and set the typed
  * status without letting a second bad_alloc escape. The SDK export wrapper
  * (plugin.hpp) and the test-side LocalDispatcher::run (agent.cpp) do not catch, so an
@@ -36,10 +37,11 @@
  * surviving signal. The healthy-allocator behaviour (full `:bad_alloc` token)
  * is pinned by the two local-dispatcher tests and is not duplicated here.
  *
- * SEAM C differs in two respects. Its recovery writes the status ROW before it sets the typed
- * status, so under sustained failure the row build throws first and the surviving signal is
- * rc 1 (the double-throw arm), not a typed status. And its token (`<os>:leg:exception`)
- * carries no `:bad_alloc` suffix, so the provenance-shape check above does not apply to it.
+ * SEAMS C and D differ in two respects. Their recovery writes the status ROW before it sets
+ * the typed status, so under sustained failure the row build throws first and the surviving
+ * signal is rc 1 (the double-throw arm), not a typed status. And their token
+ * (`<os>:leg:exception`) carries no `:bad_alloc` suffix, so the provenance-shape check above
+ * does not apply to them.
  */
 
 #include "browser_policy_legs.hpp"

@@ -84,12 +84,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_4
         type: string
-        description: 'share: ro, rw, mixed (clients or security flavours disagree) or "-" when unknown. Not used by the other kinds.'
+        description: 'share: ro, rw, mixed (clients, security flavours or a Samba read/write list disagree with the share default) or "-" when unknown. Not used by the other kinds.'
         example: rw
         platforms: [linux, darwin]
       - name: field_5
         type: string
-        description: 'share: true when anonymous (guest or world) access is allowed, false when not, "-" when unknown. Not used by the other kinds.'
+        description: 'share: true when any client may use it (guest, `*`, a wildcard made only of `*`/`?`, or an all-zero network), false when not, "-" when unknown. Not used by the other kinds.'
         example: 'false'
         platforms: [linux, darwin]
       - name: field_6

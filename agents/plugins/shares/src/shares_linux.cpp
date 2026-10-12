@@ -14,13 +14,11 @@
 
 namespace yuzu::shares {
 
-namespace {
-const Paths kPaths{"/etc/exports", "/etc/exports.d", "/etc/samba/smb.conf",
-                   "/var/lib/samba/usershares"};
-} // namespace
-
 int run_linux(yuzu::CommandContext& ctx) {
-    report_list(ctx, list_linux(make_posix_fs(kPaths)));
+    // Built per call, inside execute_list's containment, not as a dlopen-time global.
+    const Paths paths{"/etc/exports", "/etc/exports.d", "/etc/samba/smb.conf",
+                      "/var/lib/samba/usershares"};
+    report_list(ctx, list_linux(make_posix_fs(paths)));
     return 0;
 }
 

@@ -298,8 +298,9 @@ struct LinuxFs {
     std::function<int(std::vector<std::string>& names, bool& too_many)> list_exports_d;
     /// Reads one listed snippet by name, confined to the directory the listing opened.
     std::function<FileReadLike(const std::string& name)> read_exports_d_file;
-    /// lstat-based "is a directory" probe: never lists, never follows.
-    std::function<bool(const std::string& path)> dir_exists;
+    /// lstat-based directory probe: never lists, never follows. 0 = a directory; ENOENT or
+    /// ENOTDIR (a symlink or other non-directory) = absent; any other errno = could not tell.
+    std::function<int(const std::string& path)> dir_probe;
 };
 
 inline Listing list_linux(const LinuxFs& fs) {
@@ -390,13 +391,19 @@ inline Listing list_linux(const LinuxFs& fs) {
             t.acc.add_failure("linux:shares:smb_conf:include_unresolved");
         if (conf.copy_unresolved)
             t.acc.add_failure("linux:shares:smb_conf:copy_unresolved");
-        // The usershares directory is detected by lstat and never listed; a Debian build's
-        // compiled-in default is invisible in the file, so the directory is the evidence.
-        const std::string& us_path = (!conf.usershare_path.empty() && conf.usershare_path[0] == '/')
-                                         ? conf.usershare_path
-                                         : fs.usershares_default;
-        if (fs.dir_exists(us_path) || conf.usershares_configured)
+        // Usershares are never listed. Configured in the file -> token, no probe; explicitly
+        // disabled (`usershare max shares = 0`) -> neither. Otherwise a Debian build's
+        // compiled-in default is invisible in the file, so the default directory is the
+        // evidence, and a probe that could not tell is reported, never read as absent.
+        if (conf.usershares_configured) {
             t.acc.add_failure("linux:shares:smb_conf:usershares_not_read");
+        } else if (!conf.usershares_off) {
+            const int pe = fs.dir_probe(fs.usershares_default);
+            if (pe == 0)
+                t.acc.add_failure("linux:shares:smb_conf:usershares_not_read");
+            else if (pe != ENOENT && pe != ENOTDIR)
+                t.acc.add_failure("linux:shares:smb_conf:usershares_unreadable");
+        }
         t.take(conf);
     }
     t.note(o);
@@ -437,7 +444,8 @@ inline Listing list_macos(const RunFn& run, const ReadFn& read, const std::strin
         sharing = {SourceState::failed, f->provenance};
     } else if (r.output_truncated) {
         sharing = {SourceState::failed, src_token("macos", "sharing", "output_truncated")};
-    } else if (r.exit_code != 0) {
+    } else if (r.exit_code != 0 && yuzu::shared::ini_trim(r.output) != kNoSharePoints) {
+        // The tool's zero-share text is not a failure whatever its exit code.
         sharing = {SourceState::failed, src_token("macos", "sharing", "exit_nonzero")};
     }
 

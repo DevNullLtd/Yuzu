@@ -4,9 +4,11 @@
 // `key = value` configuration (sssd.conf, smb.conf). Zero-dependency leaf: std only,
 // no I/O, never throws on malformed input.
 
+#include <cstddef>
 #include <map>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::shared {
@@ -22,9 +24,8 @@ struct IniDoc {
 /// last-occurrence-wins.
 using KvCanon = void (*)(std::string& key, std::string& value);
 
-namespace ini_detail {
-
-inline std::string trim(std::string_view s) {
+/// Trims blanks, tabs and CR/LF from both ends.
+inline std::string ini_trim(std::string_view s) {
     constexpr std::string_view ws = " \t\r\n";
     const auto b = s.find_first_not_of(ws);
     if (b == std::string_view::npos)
@@ -32,8 +33,6 @@ inline std::string trim(std::string_view s) {
     const auto e = s.find_last_not_of(ws);
     return std::string(s.substr(b, e - b + 1));
 }
-
-} // namespace ini_detail
 
 /// `[section]` headers, `key = value` (trimmed), `#` / `;` comment lines and blank
 /// lines skipped, CRLF tolerated, never throws. LAST value wins for a repeated
@@ -44,12 +43,12 @@ inline IniDoc parse_ini(std::string_view text, KvCanon canon = nullptr) {
     IniDoc doc;
     std::string current;
     bool in_section = false;
-    size_t pos = 0;
+    std::size_t pos = 0;
     while (pos <= text.size()) {
         auto nl = text.find('\n', pos);
         if (nl == std::string_view::npos)
             nl = text.size();
-        const std::string line = ini_detail::trim(text.substr(pos, nl - pos));
+        const std::string line = ini_trim(text.substr(pos, nl - pos));
         pos = nl + 1;
         if (line.empty() || line[0] == '#' || line[0] == ';')
             continue;
@@ -59,7 +58,7 @@ inline IniDoc parse_ini(std::string_view text, KvCanon canon = nullptr) {
                 in_section = false; // malformed header: ignore its keys
                 continue;
             }
-            current = ini_detail::trim(std::string_view(line).substr(1, close - 1));
+            current = ini_trim(std::string_view(line).substr(1, close - 1));
             in_section = true;
             if (!doc.sections.contains(current))
                 doc.section_order.push_back(current);
@@ -69,10 +68,10 @@ inline IniDoc parse_ini(std::string_view text, KvCanon canon = nullptr) {
         const auto eq = line.find('=');
         if (!in_section || eq == std::string::npos)
             continue;
-        std::string key = ini_detail::trim(std::string_view(line).substr(0, eq));
+        std::string key = ini_trim(std::string_view(line).substr(0, eq));
         if (key.empty())
             continue;
-        std::string value = ini_detail::trim(std::string_view(line).substr(eq + 1));
+        std::string value = ini_trim(std::string_view(line).substr(eq + 1));
         if (canon != nullptr) {
             canon(key, value);
             if (key.empty())

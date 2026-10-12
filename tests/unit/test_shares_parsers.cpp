@@ -9,6 +9,9 @@
  *                       /etc/samba/smb.conf (samba-common 2:4.22.11+dfsg-0+deb13u1) from a
  *                       Debian GNU/Linux 13 (trixie) aarch64 container, 2026-10-12, verbatim except that
  *                       trailing whitespace is stripped (the parsers trim it; the repo lints it).
+ *   SEEDED INPUT     -- the three files the Linux sample was captured from (see
+ *                       kSeeded*): written by the capture script into the same container,
+ *                       2026-10-12, and kept here verbatim so the sample's rows are asserted.
  *   RECONSTRUCTION   -- every other specimen (populated exports lines, Samba synonym / copy= /
  *                       registry / include / usershare cases, BSD exports lines), rebuilt from
  *                       exports(5), smb.conf(5) and the macOS `man exports` examples. None is
@@ -322,6 +325,26 @@ constexpr const char* kStockSmb = R"SMB(#
 
 )SMB";
 
+// SEEDED INPUT 2026-10-12 container -- produced docs/samples/linux.txt (verbatim from the
+// capture script's heredocs).
+constexpr const char* kSeededExports =
+    "# /etc/exports: the access control list for filesystems which may be exported to NFS clients\n"
+    "/srv/nfs/public    *(ro,sync,no_subtree_check)\n"
+    "/srv/nfs/projects  192.168.10.0/24(rw,sync,no_root_squash) 10.0.0.5(ro)\n";
+constexpr const char* kSeededExportsD = "/srv/nfs/archive   *(ro,all_squash)\n";
+constexpr const char* kSeededSmb = R"SMB([global]
+   workgroup = WORKGROUP
+   server role = standalone server
+   read only = yes
+[public]
+   path = /srv/samba/public
+   guest ok = yes
+[projects]
+   path = /srv/samba/projects
+   writable = yes
+   browseable = no
+)SMB";
+
 std::size_t unescaped_pipes(const std::string& s) {
     std::size_t n = 0;
     for (std::size_t i = 0; i < s.size(); ++i)
@@ -447,6 +470,73 @@ TEST_CASE("shares exports: an oversized path is cut and flagged", "[shares]") {
     CHECK(p.field_oversized);
 }
 
+TEST_CASE("shares exports: every world-equivalent client reads anonymous", "[shares]") {
+    // One row per spelling; each is a client that admits everyone.
+    for (const char* spec : {"*(rw)", "(rw)", "?*(rw)", "**(rw)", "0.0.0.0/0(rw)", "::/0(rw)", "0/0(rw)",
+                             "0.0.0.0/0.0.0.0(rw)", "0:0:0:0:0:0:0:0/0(rw)"}) {
+        const auto p = lin(std::string("/srv/w ") + spec + "\n");
+        REQUIRE(p.shares.size() == 1);
+        INFO(spec);
+        CHECK(p.shares[0].anonymous == true);
+        CHECK(flags_of(p.shares[0]) == "clients_1"); // still counted as one client
+    }
+    // Not the world: a real network, a single zero host, a partial wildcard, a netgroup.
+    for (const char* spec : {"10.0.0.0/8(rw)", "0.0.0.0(rw)", "0.0.0.0/8(rw)", "*.corp(rw)", "?x(rw)",
+                             "@trusted(rw)", "gss/krb5i(rw)"}) {
+        const auto p = lin(std::string("/srv/w ") + spec + "\n");
+        REQUIRE(p.shares.size() == 1);
+        INFO(spec);
+        CHECK(p.shares[0].anonymous == false);
+    }
+}
+
+TEST_CASE("shares exports: no_root_squash honours squash options as nfs-utils applies them in order",
+          "[shares]") {
+    const auto flags = [](const char* opts) {
+        const auto p = lin(std::string("/srv/r host(") + opts + ")\n");
+        REQUIRE(p.shares.size() == 1);
+        return flags_of(p.shares[0]);
+    };
+    CHECK(flags("rw,no_root_squash") == "no_root_squash,clients_1");
+    CHECK(flags("rw,root_squash") == "clients_1");
+    CHECK(flags("no_root_squash,root_squash") == "clients_1");        // last wins
+    CHECK(flags("no_root_squash,all_squash") == "clients_1");         // all_squash squashes root
+    CHECK(flags("all_squash,no_all_squash,no_root_squash") == "no_root_squash,clients_1");
+    CHECK(flags("all_squash") == "clients_1");
+    // A line default is overridden by the spec's own option, in either direction.
+    const auto d = lin("/srv/d -no_root_squash host(root_squash)\n");
+    REQUIRE(d.shares.size() == 1);
+    CHECK(flags_of(d.shares[0]) == "clients_1");
+    const auto e = lin("/srv/e -no_root_squash host\n");
+    REQUIRE(e.shares.size() == 1);
+    CHECK(flags_of(e.shares[0]) == "no_root_squash,clients_1");
+}
+
+TEST_CASE("shares exports: a quoted non-absolute path is skipped like an unquoted one", "[shares]") {
+    const auto p = lin("\"foo\" *(rw)\n\"/ok path\" host\n");
+    REQUIRE(p.shares.size() == 1);
+    CHECK(p.shares[0].path == "/ok path");
+}
+
+TEST_CASE("shares exports: SEEDED INPUT reproduces the captured Linux sample rows", "[shares]") {
+    auto b = fresh_budget();
+    ExportsParse e;
+    parse_exports(kSeededExports, "exports", b, e);
+    ExportsParse d;
+    parse_exports(kSeededExportsD, "exports_d", b, d);
+    const auto c = smb(kSeededSmb);
+    REQUIRE(e.shares.size() == 2);
+    REQUIRE(d.shares.size() == 1);
+    REQUIRE(c.shares.size() == 2);
+    // docs/samples/linux.txt, byte for byte (the five `share` rows).
+    CHECK(share_row(e.shares[0]) == "share|nfs|-|/srv/nfs/public|ro|true|clients_1|exports");
+    CHECK(share_row(e.shares[1]) ==
+          "share|nfs|-|/srv/nfs/projects|mixed|false|no_root_squash,clients_2|exports");
+    CHECK(share_row(d.shares[0]) == "share|nfs|-|/srv/nfs/archive|ro|true|clients_1|exports_d");
+    CHECK(share_row(c.shares[0]) == "share|smb|public|/srv/samba/public|ro|true|-|smb_conf");
+    CHECK(share_row(c.shares[1]) == "share|smb|projects|/srv/samba/projects|rw|false|hidden|smb_conf");
+}
+
 // ---------------------------------------------------------------------------
 // BSD / macOS exports(5)
 // ---------------------------------------------------------------------------
@@ -468,7 +558,7 @@ TEST_CASE("shares bsd exports: the man page examples", "[shares]") {
     REQUIRE(p.shares.size() == 10); // /usr + /usr/local share one line
     CHECK(p.shares[0].path == "/usr");
     CHECK(p.shares[1].path == "/usr/local");
-    CHECK(flags_of(p.shares[0]) == "clients_1");
+    CHECK(flags_of(p.shares[0]) == "no_root_squash,clients_1"); // -maproot=0:10
     CHECK(p.shares[0].access == Access::rw);
     CHECK(p.shares[0].anonymous == false);
     CHECK(flags_of(p.shares[2]) == "clients_2"); // two hosts
@@ -478,6 +568,7 @@ TEST_CASE("shares bsd exports: the man page examples", "[shares]") {
     CHECK(flags_of(p.shares[4]) == "clients_1"); // -network net -mask mask is one client
     CHECK(p.shares[4].path == "/u");
     CHECK(p.shares[7].path == "/u2");            // the -network/-mask values are not hosts
+    CHECK(flags_of(p.shares[6]) == "no_root_squash,clients_1"); // -maproot=root
     CHECK(flags_of(p.shares[7]) == "clients_1");
     CHECK(p.shares[9].access == Access::ro);
     for (const auto& s : p.shares)
@@ -533,6 +624,61 @@ TEST_CASE("shares bsd exports: over-long line and budget exhaustion", "[shares]"
     const auto p = bsd(text, 100);
     CHECK(p.shares.size() == 100);
     CHECK(p.truncated);
+}
+
+TEST_CASE("shares bsd exports: a world network reads anonymous, a real one does not", "[shares]") {
+    const auto anon = [](const char* line) {
+        const auto p = bsd(std::string(line) + "\n");
+        REQUIRE(p.shares.size() == 1);
+        return *p.shares[0].anonymous;
+    };
+    CHECK(anon("/x -network 0.0.0.0 -mask 0.0.0.0"));
+    CHECK(anon("/x -network 0.0.0.0"));       // zero network, no mask
+    CHECK(anon("/x -network 0.0.0.0/0"));
+    CHECK(anon("/x -network=:: -mask=::"));
+    CHECK(anon("/x -mask 0.0.0.0 -network 0.0.0.0")); // mask first
+    CHECK(anon("/x -network 10.0.0.0 -mask 255.0.0.0 -network 0.0.0.0")); // a later world network
+    CHECK_FALSE(anon("/x -network 10.0.0.0 -mask 255.0.0.0"));
+    CHECK_FALSE(anon("/x -network 0.0.0.0 -mask 255.0.0.0")); // the zero network, a real mask
+    CHECK_FALSE(anon("/x -network 10.0.0.0"));
+    CHECK_FALSE(anon("/x host"));
+    const auto p = bsd("/x -network 0.0.0.0 -mask 0.0.0.0\n");
+    CHECK(flags_of(p.shares[0]) == "clients_1"); // still counted as a client
+}
+
+TEST_CASE("shares bsd exports: maproot and mapall naming root raise no_root_squash", "[shares]") {
+    const auto flags = [](const char* line) {
+        const auto p = bsd(std::string(line) + "\n");
+        REQUIRE(p.shares.size() == 1);
+        return flags_of(p.shares[0]);
+    };
+    CHECK(flags("/x -maproot=root host") == "no_root_squash,clients_1");
+    CHECK(flags("/x -maproot=0 host") == "no_root_squash,clients_1");
+    CHECK(flags("/x -maproot=0:10 host") == "no_root_squash,clients_1");
+    CHECK(flags("/x -mapall=root host") == "no_root_squash,clients_1");
+    CHECK(flags("/x -offline -maproot=root host") == "unavailable,no_root_squash,clients_1");
+    CHECK(flags("/x -maproot=nobody host") == "clients_1");
+    CHECK(flags("/x -maproot=bin: host") == "clients_1");
+    CHECK(flags("/x -mapall=nobody host") == "clients_1");
+    CHECK(flags("/x host") == "clients_1");
+}
+
+TEST_CASE("shares bsd exports: a non-absolute quoted path is not a share and -network needs a value",
+          "[shares]") {
+    // The path list stops at the first token that is not absolute; the share keeps its paths.
+    const auto k = bsd("/k \"unterminated\n");
+    REQUIRE(k.shares.size() == 1);
+    CHECK(k.shares[0].path == "/k");
+    CHECK(bsd("\"foo\" *(rw)\n").shares.empty());
+    CHECK(bsd("\"unterminated\n").shares.empty());
+    // `-network` with nothing after it is not a client.
+    const auto n = bsd("/n host -network\n");
+    REQUIRE(n.shares.size() == 1);
+    CHECK(flags_of(n.shares[0]) == "clients_1");
+    const auto e = bsd("/n -network=\n");
+    REQUIRE(e.shares.size() == 1);
+    CHECK(flags_of(e.shares[0]) == "clients_0");
+    CHECK(*e.shares[0].anonymous);
 }
 
 // ---------------------------------------------------------------------------
@@ -632,16 +778,98 @@ TEST_CASE("shares smb.conf: copy chains, unresolved targets and cycles", "[share
     CHECK_FALSE(clean.copy_unresolved);
 }
 
+TEST_CASE("shares smb.conf: Samba's built-in read only = yes applies when nothing sets it",
+          "[shares]") {
+    const auto c = smb("[a]\npath=/a\n");
+    CHECK(by_name(c, "a").access == Access::ro);
+    const auto g = smb("[global]\nworkgroup = W\n[a]\npath=/a\n");
+    CHECK(by_name(g, "a").access == Access::ro);
+}
+
+TEST_CASE("shares smb.conf: a read or write list only matters when it contradicts the default",
+          "[shares]") {
+    const auto c = smb("[ro_plain]\npath=/a\n"
+                       "[ro_wl]\npath=/b\nwrite list = alice, @staff\n"
+                       "[ro_rl]\npath=/c\nread list = bob\n"
+                       "[rw_plain]\npath=/d\nread only = no\n"
+                       "[rw_wl]\npath=/e\nread only = no\nwrite list = alice\n"
+                       "[rw_rl]\npath=/f\nread only = no\nread list = bob\n"
+                       "[ro_empty]\npath=/g\nwrite list =\n"
+                       "[rw_empty]\npath=/h\nread only = no\nread list =\n");
+    CHECK(by_name(c, "ro_plain").access == Access::ro);
+    CHECK(by_name(c, "ro_wl").access == Access::mixed);   // ro, but alice can write
+    CHECK(by_name(c, "ro_rl").access == Access::ro);      // a read list narrows nothing here
+    CHECK(by_name(c, "rw_plain").access == Access::rw);
+    CHECK(by_name(c, "rw_wl").access == Access::rw);      // a write list narrows nothing here
+    CHECK(by_name(c, "rw_rl").access == Access::mixed);   // rw, but bob is read-only
+    CHECK(by_name(c, "ro_empty").access == Access::ro);
+    CHECK(by_name(c, "rw_empty").access == Access::rw);
+    // Names are never emitted.
+    for (const auto& s : c.shares)
+        CHECK(share_row(s).find("alice") == std::string::npos);
+}
+
+TEST_CASE("shares smb.conf: a list is inherited through copy = and [global]", "[shares]") {
+    const auto c = smb("[global]\nwrite list = root\n"
+                       "[base]\npath=/srv/base\nread only = no\nread list = bob\n"
+                       "[viacopy]\ncopy = base\n"
+                       "[viaglobal]\npath=/srv/g\n"
+                       "[override]\npath=/srv/o\nwrite list =\n");
+    CHECK(by_name(c, "viacopy").access == Access::mixed);   // rw + inherited read list
+    CHECK(by_name(c, "viaglobal").access == Access::mixed); // ro + inherited write list
+    CHECK(by_name(c, "override").access == Access::ro);     // an empty local list clears it
+}
+
+TEST_CASE("shares smb.conf: lines before the first header are [global]", "[shares]") {
+    const auto c = smb("guest ok = yes\nconfig backend = registry\nusershare max shares = 0\n"
+                       "[a]\npath=/a\n");
+    CHECK(by_name(c, "a").anonymous == true); // inherited from the headerless preamble
+    CHECK(c.registry_backend);
+    CHECK(c.usershares_off);
+    CHECK_FALSE(c.usershares_configured);
+    CHECK(smb("include = /etc/samba/x.conf\n").include_present);
+    CHECK(smb("[global]\nconfig file = /etc/samba/%m.conf\n").include_present);
+    CHECK_FALSE(smb("[a]\nconfig file = /x\n").include_present); // only [global] redirects
+}
+
+TEST_CASE("shares smb.conf: an empty section name is not a share", "[shares]") {
+    CHECK(smb("[]\npath=/x\n[ ]\npath=/y\n").shares.empty());
+    const auto c = smb("[]\npath=/x\n[a]\npath=/a\n");
+    REQUIRE(c.shares.size() == 1);
+    CHECK(c.shares[0].name == "a");
+}
+
+TEST_CASE("shares smb.conf: an over-long copy target is unresolved without a lookup", "[shares]") {
+    const auto c = smb("[a]\npath=/a\ncopy = " + std::string(300, 'x') + "\n[b]\ncopy = a\n");
+    CHECK(c.copy_unresolved);
+    CHECK(by_name(c, "a").path == "/a");
+    CHECK(by_name(c, "b").path == "/a");
+}
+
+TEST_CASE("shares smb.conf: a hostile section name still yields a well-formed row", "[shares]") {
+    const auto c = smb("[a\xC0\xAF|b]\npath=/x\n");
+    REQUIRE(c.shares.size() == 1);
+    const std::string row = share_row(c.shares[0]);
+    CHECK(unescaped_pipes(row) == 7); // 8 fields: the name's pipe is escaped
+    CHECK(yuzu::shared::count_invalid_wire_bytes(row) == 0);
+    CHECK(row.find('\0') == std::string::npos);
+}
+
 TEST_CASE("shares smb.conf: registry backend, include and usershares are detected", "[shares]") {
     CHECK(smb("[global]\nconfig backend = registry\n").registry_backend);
     CHECK(smb("[global]\nregistry shares = yes\n").registry_backend);
     CHECK_FALSE(smb("[global]\nregistry shares = no\n").registry_backend);
     CHECK(smb("[global]\ninclude = /etc/samba/shares.conf\n").include_present);
     CHECK(smb("[global]\nusershare max shares = 100\n").usershares_configured);
-    CHECK_FALSE(smb("[global]\nusershare max shares = 0\n").usershares_configured);
+    CHECK_FALSE(smb("[global]\nusershare max shares = 100\n").usershares_off);
+    const auto off = smb("[global]\nusershare max shares = 0\n");
+    CHECK_FALSE(off.usershares_configured);
+    CHECK(off.usershares_off); // an explicit disable
+    CHECK(smb("[global]\nusershare max shares = 000\n").usershares_off);
+    CHECK_FALSE(smb("[global]\nusershare max shares = many\n").usershares_off); // not a number
+    CHECK_FALSE(smb("[a]\npath=/a\n").usershares_off); // unset is not off
     const auto p = smb("[global]\nusershare path = /var/lib/samba/us\n");
     CHECK(p.usershares_configured);
-    CHECK(p.usershare_path == "/var/lib/samba/us");
 }
 
 TEST_CASE("shares smb.conf: continuation, macros kept verbatim, available = no", "[shares]") {
@@ -703,14 +931,33 @@ TEST_CASE("shares sharing json: real capture", "[shares]") {
     CHECK(share_row(s) == "share|smb|Shared Folder|/Users/jsmith/Public|rw|true|-|sharing");
 }
 
+TEST_CASE("shares sharing json: a hostile smb_name still yields a well-formed row", "[shares]") {
+    // nlohmann rejects raw ill-formed UTF-8, so what reaches a name is NUL (\u0000), pipes,
+    // backslashes and line breaks; the wire scrub covers the rest (see the formatter case).
+    auto b = fresh_budget();
+    const auto p = parse_sharing_json(
+        R"({"k":{"path":"/p","smb_name":"a\u0000|b\\c\r\nd"}})", b);
+    REQUIRE(p.shares.size() == 1);
+    const std::string row = share_row(p.shares[0]);
+    CHECK(unescaped_pipes(row) == 7);
+    CHECK(row.find('\0') == std::string::npos);
+    CHECK(row.find('\n') == std::string::npos);
+    CHECK(yuzu::shared::count_invalid_wire_bytes(row) == 0);
+}
+
 TEST_CASE("shares sharing json: empty, unrecognised, flags, malformed records", "[shares]") {
     auto b = fresh_budget();
-    CHECK(parse_sharing_json("{}", b).recognised);
+    CHECK(parse_sharing_json("{}", b).recognised); // SYNTHETIC JSON, never observed live
     CHECK(parse_sharing_json("{}", b).shares.empty());
     const auto ws = parse_sharing_json("  \n ", b);
     CHECK(ws.recognised);
     CHECK(ws.shares.empty());
     CHECK_FALSE(parse_sharing_json("List of Share Points\n", b).recognised);
+    // The tool's zero-share text (from the binary's string table): an empty list, not junk.
+    const auto none = parse_sharing_json("\nNo share point records.\n", b);
+    CHECK(none.recognised);
+    CHECK(none.shares.empty());
+    CHECK_FALSE(parse_sharing_json("No share point records. Extra\n", b).recognised);
     CHECK_FALSE(parse_sharing_json("[1,2]", b).recognised);
 
     const auto f = parse_sharing_json(

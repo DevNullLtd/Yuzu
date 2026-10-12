@@ -873,8 +873,9 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"shares.list",
          "Shares this host serves over SMB/NFS as configured: name, path, ro/rw, anonymous access "
          "and a few flags, never ACLs or NFS client host lists; configured exports, not the "
-         "mapping/session observations tar mapdrive records; Linux reads /etc/exports and "
-         "/etc/samba/smb.conf, macOS runs one bounded argv and reads /etc/exports; read-only"},
+         "mapping/session observations tar mapdrive records; Linux reads /etc/exports, "
+         "/etc/exports.d and /etc/samba/smb.conf, macOS runs one bounded argv and reads "
+         "/etc/exports; read-only"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},

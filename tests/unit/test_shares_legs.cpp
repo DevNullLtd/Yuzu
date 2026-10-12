@@ -3,7 +3,8 @@
  * boundary is a canned fake (no disk, no spawn, no uid dependence).
  *
  * Provenance: the `sharing -l -f json` text is a REAL capture (macOS 26.6.2, 2026-10-12,
- * anonymised); every other specimen is a RECONSTRUCTION built from the documented layouts.
+ * anonymised); the zero-share text comes from the tool's string table; every other specimen is
+ * a RECONSTRUCTION built from the documented layouts.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -11,7 +12,6 @@
 
 #include <algorithm>
 #include <map>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -40,7 +40,7 @@ struct FakeFs {
     std::vector<std::string> names;
     bool too_many = false;
     std::map<std::string, FileReadLike> snippets;
-    std::set<std::string> dirs;
+    std::map<std::string, int> dirs; ///< probe result per path (0 = a directory); default ENOENT
     std::vector<std::string> reads, snippet_reads, dir_probes;
 
     Listing run() {
@@ -63,9 +63,10 @@ struct FakeFs {
             const auto it = snippets.find(n);
             return it == snippets.end() ? io(ENOENT) : it->second;
         };
-        fs.dir_exists = [this](const std::string& p) {
+        fs.dir_probe = [this](const std::string& p) {
             dir_probes.push_back(p);
-            return dirs.contains(p);
+            const auto it = dirs.find(p);
+            return it == dirs.end() ? ENOENT : it->second;
         };
         return list_linux(fs);
     }
@@ -247,25 +248,66 @@ TEST_CASE("shares linux: declared unreached scope tokens", "[shares]") {
     us.files[kSmb] = ok("[global]\nusershare max shares = 100\n");
     CHECK(reason_has(us.run(), "linux:shares:smb_conf:usershares_not_read"));
 
+    FakeFs cfg; // configured in the file: a token, and the directory is never probed
+    cfg.files[kSmb] = ok("[global]\nusershare path = /srv/us\n");
+    CHECK(reason_has(cfg.run(), "linux:shares:smb_conf:usershares_not_read"));
+    CHECK(cfg.dir_probes.empty());
+
+    FakeFs absent; // no smb.conf: the usershares directory is not probed
+    absent.dirs[kUsershares] = 0;
+    absent.run();
+    CHECK(absent.dir_probes.empty());
+}
+
+TEST_CASE("shares linux: usershares probe is tri-state and honours an explicit disable",
+          "[shares]") {
     // The directory alone is evidence (a Debian build's compiled-in default is invisible).
     FakeFs dir;
     dir.files[kSmb] = ok("[a]\npath=/a\n");
-    dir.dirs.insert(kUsershares);
-    const auto l = dir.run();
+    dir.dirs[kUsershares] = 0;
+    auto l = dir.run();
     CHECK(reason_has(l, "linux:shares:smb_conf:usershares_not_read"));
-    REQUIRE(dir.dir_probes.size() == 1);
-    CHECK(dir.dir_probes[0] == kUsershares);
+    CHECK(dir.dir_probes == std::vector<std::string>{kUsershares}); // the default dir only
 
-    FakeFs custom;
-    custom.files[kSmb] = ok("[global]\nusershare path = /srv/us\n");
-    custom.run();
-    REQUIRE(custom.dir_probes.size() == 1);
-    CHECK(custom.dir_probes[0] == "/srv/us");
+    FakeFs off; // `usershare max shares = 0` disables them: no token and no probe at all
+    off.files[kSmb] = ok("[global]\nusershare max shares = 0\n");
+    off.dirs[kUsershares] = 0;
+    l = off.run();
+    CHECK(l.status == StatusState::supported);
+    CHECK(l.reason.empty());
+    CHECK(off.dir_probes.empty());
 
-    FakeFs absent; // no smb.conf: the usershares directory is not probed
-    absent.dirs.insert(kUsershares);
-    absent.run();
-    CHECK(absent.dir_probes.empty());
+    for (const int absent_err : {ENOENT, ENOTDIR}) { // not a directory (a symlink) is absent
+        FakeFs none;
+        none.files[kSmb] = ok("[a]\npath=/a\n");
+        none.dirs[kUsershares] = absent_err;
+        l = none.run();
+        CHECK(l.status == StatusState::supported);
+        CHECK(l.reason.empty());
+    }
+
+    FakeFs denied; // could not tell: constrained and named, never read as absent
+    denied.files[kSmb] = ok("[a]\npath=/a\n");
+    denied.dirs[kUsershares] = EACCES;
+    l = denied.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "linux:shares:smb_conf:usershares_unreadable"));
+    CHECK_FALSE(reason_has(l, "usershares_not_read"));
+
+    FakeFs io_err; // any errno other than ENOENT/ENOTDIR
+    io_err.files[kSmb] = ok("[a]\npath=/a\n");
+    io_err.dirs[kUsershares] = EIO;
+    CHECK(reason_has(io_err.run(), "linux:shares:smb_conf:usershares_unreadable"));
+}
+
+TEST_CASE("shares linux: smb.conf preamble and config file redirect", "[shares]") {
+    FakeFs reg; // lines before the first header are [global], as in Samba
+    reg.files[kSmb] = ok("config backend = registry\n");
+    CHECK(reason_has(reg.run(), "linux:shares:smb_conf:registry_backend"));
+
+    FakeFs redirect;
+    redirect.files[kSmb] = ok("[global]\nconfig file = /etc/samba/%m.conf\n");
+    CHECK(reason_has(redirect.run(), "linux:shares:smb_conf:include_unresolved"));
 }
 
 TEST_CASE("shares linux: one budget spans every source", "[shares]") {
@@ -388,7 +430,7 @@ TEST_CASE("shares macos: exit, truncation and unrecognised output", "[shares]") 
 }
 
 TEST_CASE("shares macos: empty list, real capture and a malformed record", "[shares]") {
-    auto empty = exited(0, "{}");
+    auto empty = exited(0, "{}"); // SYNTHETIC JSON: the tool's real zero-share output is the next case
     auto l = empty.run();
     CHECK(l.status == StatusState::supported);
     CHECK(has(l, "source|sharing|read|0"));
@@ -406,6 +448,21 @@ TEST_CASE("shares macos: empty list, real capture and a malformed record", "[sha
     CHECK(l.status == StatusState::constrained);
     CHECK(reason_has(l, "macos:shares:sharing:malformed_records:1"));
     CHECK(has(l, "source|sharing|read|1")); // the valid sibling is still emitted
+}
+
+TEST_CASE("shares macos: the tool's zero-share text is an empty list at any exit code",
+          "[shares]") {
+    // The text is from the binary's string table (strings /usr/sbin/sharing), not a live run, so
+    // neither the exit code nor stray whitespace may decide the outcome.
+    for (const int code : {0, 1}) {
+        auto none = exited(code, "\nNo share point records.\n");
+        const auto l = none.run();
+        CHECK(l.status == StatusState::supported);
+        CHECK(has(l, "source|sharing|read|0"));
+        CHECK(count_prefix(l, "share|") == 0);
+    }
+    auto bad = exited(1, "No share point records. And more.\n"); // anything else stays a failure
+    CHECK(reason_has(bad.run(), "macos:shares:sharing:exit_nonzero"));
 }
 
 TEST_CASE("shares macos: /etc/exports states ride alongside the sharing row", "[shares]") {

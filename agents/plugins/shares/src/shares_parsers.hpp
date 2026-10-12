@@ -45,6 +45,9 @@ inline constexpr std::size_t kMaxFieldBytes = 4096;
 /// Fixed per-share cost charged on top of the field bytes, so a flood of empty shares is
 /// bounded by the byte budget as well as the row budget.
 inline constexpr std::size_t kRowOverhead = 64;
+/// What `sharing -l -f json` prints (not JSON) when no share point exists. Taken from the
+/// binary's string table, not a live run.
+inline constexpr std::string_view kNoSharePoints = "No share point records.";
 
 struct Share {
     Proto proto = Proto::nfs;
@@ -151,9 +154,31 @@ inline std::size_t flags_bytes(const std::vector<std::string>& f) {
     return n;
 }
 
+/// True for an address made only of `0`, `.` and `:` with at least one `0` or `:`
+/// (`0`, `0.0.0.0`, `::`, `0:0:0:0:0:0:0:0`).
+inline bool is_zero_addr(std::string_view a) {
+    return a.find_first_not_of("0.:") == std::string_view::npos &&
+           a.find_first_of("0:") != std::string_view::npos;
+}
+
+/// A client spec that admits everyone: empty, made only of `*`/`?`, or an all-zero address
+/// with a `/0` prefix or an all-zero dotted mask (`0.0.0.0/0`, `::/0`, `0/0`,
+/// `0.0.0.0/0.0.0.0`). A bare zero address is one host, not the world.
+inline bool is_world_client(std::string_view c) {
+    if (c.empty() || c.find_first_not_of("*?") == std::string_view::npos)
+        return true;
+    const auto slash = c.find('/');
+    if (slash == std::string_view::npos)
+        return false;
+    const auto pfx = c.substr(slash + 1);
+    return is_zero_addr(c.substr(0, slash)) && pfx.find_first_not_of("0.") == std::string_view::npos &&
+           pfx.find('0') != std::string_view::npos;
+}
+
 /// Calls fn(logical_line) for each logical line: CR stripped, backslash-newline joined.
-/// A physical line that begins (after blanks) with `#` or `;` is a comment and never
-/// continues, so a trailing backslash in a comment cannot swallow the next entry.
+/// The first physical line of a logical line that begins (after blanks) with `#` or `;` is a
+/// comment and never continues, so a trailing backslash in a comment cannot swallow the next
+/// entry.
 /// fn returns false to stop; nothing past that line is touched.
 template <class Fn>
 void for_each_logical_line(std::string_view text, Fn&& fn) {
@@ -247,17 +272,28 @@ namespace detail {
 
 struct ExportDefaults {
     Access access = Access::ro; // exports(5): ro unless rw is given
-    bool no_root_squash = false;
+    bool root_squash = true;
+    bool all_squash = false;
+    /// all_squash maps every uid (root included) to anon, so root is exposed only when
+    /// neither squash is in effect.
+    [[nodiscard]] bool root_exposed() const { return !root_squash && !all_squash; }
 };
 
-/// Applies one export option to `d`.
+/// Applies one export option to `d`; as nfs-utils applies options in order, the last of a
+/// set/clear pair wins.
 inline void apply_opt(std::string_view o, ExportDefaults& d) {
     if (o == "rw")
         d.access = Access::rw;
     else if (o == "ro")
         d.access = Access::ro;
+    else if (o == "root_squash")
+        d.root_squash = true;
     else if (o == "no_root_squash")
-        d.no_root_squash = true;
+        d.root_squash = false;
+    else if (o == "all_squash")
+        d.all_squash = true;
+    else if (o == "no_all_squash")
+        d.all_squash = false;
 }
 
 /// Applies a comma-separated option list to defaults (a line-default `-opts` token).
@@ -303,7 +339,7 @@ inline SpecResult parse_spec(std::string_view tok, const ExportDefaults& default
     SpecResult r;
     const auto paren = tok.find('(');
     const std::string_view client = tok.substr(0, paren);
-    r.anonymous = client.empty() || client == "*";
+    r.anonymous = is_world_client(client);
     std::string_view opts;
     if (paren != std::string_view::npos) {
         opts = tok.substr(paren + 1);
@@ -313,10 +349,10 @@ inline SpecResult parse_spec(std::string_view tok, const ExportDefaults& default
     ExportDefaults cur = defaults;
     bool seen_sec = false;
     Access merged = Access::unknown;
-    bool nrs = defaults.no_root_squash;
+    bool nrs = false;
     const auto push = [&] {
         merged = merge_access(merged, cur.access);
-        nrs = nrs || cur.no_root_squash;
+        nrs = nrs || cur.root_exposed();
     };
     for (const auto o : split(opts, ',')) {
         if (o.starts_with("sec=")) {
@@ -338,7 +374,8 @@ inline SpecResult parse_spec(std::string_view tok, const ExportDefaults& default
 /// Linux exports(5): `<path> [-opts] <client>[(opts)] ...`, `#` comments, backslash
 /// continuation, quoted paths, octal escapes. A token starting with `-` is a line-default
 /// option list applied to every LATER spec on the line. A spec with an empty or `*` client
-/// is anonymous (so `host (rw)` yields host plus a world spec, the exports(5) footgun).
+/// is anonymous (so `host (rw)` yields host plus a world spec, the exports(5) footgun), as
+/// does any other world-equivalent client (see is_world_client).
 /// `source` is the wire source name ("exports" / "exports_d").
 inline void parse_exports(std::string_view text, std::string_view source,
                           yuzu::shared::RowByteBudget& budget, ExportsParse& out) {
@@ -349,7 +386,7 @@ inline void parse_exports(std::string_view text, std::string_view source,
             return true;
         const auto path = detail::next_token(line, i);
         // nfsd export points are absolute: a pathless or option-first line is skipped.
-        if (path.text.empty() || (!path.quoted && path.text[0] != '/'))
+        if (path.text.empty() || path.text[0] != '/')
             return true;
         detail::ExportDefaults defaults;
         std::vector<detail::SpecResult> specs;
@@ -368,7 +405,7 @@ inline void parse_exports(std::string_view text, std::string_view source,
         bool nrs = false;
         bool anon = specs.empty();
         Access access = specs.empty() ? defaults.access : Access::unknown;
-        nrs = specs.empty() && defaults.no_root_squash;
+        nrs = specs.empty() && defaults.root_exposed();
         for (const auto& sp : specs) {
             access = detail::merge_access(access, sp.access);
             anon = anon || sp.anonymous;
@@ -390,9 +427,11 @@ inline void parse_exports(std::string_view text, std::string_view source,
 /// [hosts | -network net [-mask mask]]`. Leading tokens that start with `/` or a quote are
 /// the exported paths (one share each); `-ro`/`-o` is read-only (default rw), `-offline`
 /// flags the share unavailable, `-network`/`-mask` take the next token unless written
-/// `-network=...`; every other `-option` (maproot, mapall, alldirs, sec, ...) is ignored;
-/// remaining tokens are hosts or netgroups and are only COUNTED. No host and no network
-/// means the share is exported to the world (anonymous).
+/// `-network=...` (a `-network` with no value is not a client), `-maproot=`/`-mapall=` naming
+/// `root` or `0` raises `no_root_squash`; every other `-option` (alldirs, sec, ...) is
+/// ignored; remaining tokens are hosts or netgroups and are only COUNTED. No host and no
+/// network, or a zero network with no mask or a zero mask, means the share is exported to the
+/// world (anonymous).
 inline void parse_bsd_exports(std::string_view text, std::string_view source,
                               yuzu::shared::RowByteBudget& budget, ExportsParse& out) {
     detail::for_each_logical_line(text, [&](std::string_view line) {
@@ -402,12 +441,28 @@ inline void parse_bsd_exports(std::string_view text, std::string_view source,
             detail::skip_ws(line, i);
             if (i >= line.size() || (line[i] != '/' && line[i] != '"' && line[i] != '\''))
                 break;
-            paths.push_back(detail::next_token(line, i).text);
+            auto p = detail::next_token(line, i).text;
+            if (p.empty() || p[0] != '/') // exported paths are absolute: stop the path list
+                break;
+            paths.push_back(std::move(p));
         }
         if (paths.empty())
             return true;
-        bool ro = false, offline = false;
+        bool ro = false, offline = false, root = false, world = false;
         std::size_t clients = 0;
+        std::string network, mask;
+        const auto flush_network = [&] { // judges the network (and its mask) read so far
+            if (network.empty())
+                return;
+            std::string spec = network;
+            if (!mask.empty() && !detail::is_zero_addr(mask))
+                spec += '/' + mask;
+            else if (detail::is_zero_addr(network))
+                spec += "/0"; // a zero network with no mask or a zero mask is the world
+            world = world || detail::is_world_client(spec);
+            network.clear();
+            mask.clear();
+        };
         for (;;) {
             detail::skip_ws(line, i);
             if (i >= line.size() || line[i] == '#')
@@ -420,26 +475,47 @@ inline void parse_bsd_exports(std::string_view text, std::string_view source,
                     ro = true;
                 } else if (name == "offline") {
                     offline = true;
+                } else if (name == "maproot" || name == "mapall") {
+                    // `-maproot=user[:group]`: naming root (or uid 0) leaves root unsquashed;
+                    // `-mapall=root` makes every client root.
+                    if (eq != std::string::npos) {
+                        const auto v = std::string_view{t.text}.substr(eq + 1);
+                        const auto user = v.substr(0, v.find(':'));
+                        root = root || user == "root" || user == "0";
+                    }
                 } else if (name == "network" || name == "mask") {
-                    if (name == "network")
-                        ++clients;
-                    if (eq == std::string::npos) { // value is the next token
+                    std::string v; // the value: `=...` or the next token
+                    if (eq != std::string::npos) {
+                        v = t.text.substr(eq + 1);
+                    } else {
                         detail::skip_ws(line, i);
                         if (i < line.size())
-                            (void)detail::next_token(line, i);
+                            v = detail::next_token(line, i).text;
+                    }
+                    if (name == "network") {
+                        flush_network();
+                        if (!v.empty()) {
+                            ++clients; // a client only when a value was read
+                            network = std::move(v);
+                        }
+                    } else {
+                        mask = std::move(v);
                     }
                 }
             } else if (!t.text.empty()) {
                 ++clients;
             }
         }
+        flush_network();
         for (const auto& p : paths) {
             std::vector<std::string> flags;
             if (offline)
                 flags.emplace_back("unavailable");
+            if (root)
+                flags.emplace_back("no_root_squash");
             flags.emplace_back("clients_" + std::to_string(clients));
             if (!detail::emit_nfs_share(out, budget, source, p, ro ? Access::ro : Access::rw,
-                                        clients == 0, std::move(flags)))
+                                        clients == 0 || world, std::move(flags)))
                 return false;
         }
         return true;
@@ -453,12 +529,12 @@ inline void parse_bsd_exports(std::string_view text, std::string_view source,
 struct SmbConf {
     std::vector<Share> shares;
     bool registry_backend = false;      ///< `config backend = registry` / `registry shares = yes`
-    bool include_present = false;       ///< any live `include =`
+    bool include_present = false;       ///< any live `include =` or a global `config file =`
     bool usershares_configured = false; ///< global `usershare max shares` > 0 or `usershare path`
-    bool copy_unresolved = false;       ///< a `copy =` target missing, cyclic or too deep
+    bool usershares_off = false;        ///< global `usershare max shares` present and all zero
+    bool copy_unresolved = false;       ///< a `copy =` target missing, cyclic, too long or too deep
     bool truncated = false;
     bool field_oversized = false;
-    std::string usershare_path; ///< the global `usershare path` value, if any
 };
 
 namespace detail {
@@ -518,11 +594,11 @@ inline std::string fold_section_headers(const std::string& text,
         auto nl = text.find('\n', pos);
         if (nl == std::string::npos)
             nl = text.size();
-        const std::string line = yuzu::shared::ini_detail::trim(std::string_view(text).substr(pos, nl - pos));
+        const std::string line = yuzu::shared::ini_trim(std::string_view(text).substr(pos, nl - pos));
         pos = nl + 1;
         const auto close = line.find(']');
         if (!line.empty() && line.front() == '[' && close != std::string::npos) {
-            const auto name = yuzu::shared::ini_detail::trim(std::string_view(line).substr(1, close - 1));
+            const auto name = yuzu::shared::ini_trim(std::string_view(line).substr(1, close - 1));
             const auto l = lower(name);
             display.emplace(l, name);
             out += '[' + l + "]\n";
@@ -539,16 +615,17 @@ inline std::string fold_section_headers(const std::string& text,
 /// Parses smb.conf into shares. Lookup chain per parameter: own section, then the `copy =`
 /// target chain (depth <= 8, cycle-safe; unresolved sets copy_unresolved), then [global],
 /// then Samba's built-in default (read only = yes, guest ok = no, browseable = yes,
-/// available = yes). Registry backend, `include =` and usershares are DETECTED, never read.
+/// available = yes). Lines before the first `[header]` belong to [global], as in Samba.
+/// Registry backend, `include =` / `config file =` and usershares are DETECTED, never read.
+/// A `write list` / `read list` is only checked for presence (its names are never read): it
+/// makes access `mixed` when it contradicts the share default.
 inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget& budget) {
     SmbConf out;
     std::map<std::string, std::string> display; // lowercase section name -> first spelling
     const auto doc = yuzu::shared::parse_ini(
-        detail::fold_section_headers(detail::join_continuations(text), display), &detail::smb_canon);
-
-    static const detail::KvMap kNone;
-    const auto g = doc.sections.find("global");
-    const auto& global = g == doc.sections.end() ? kNone : g->second;
+        "[global]\n" + detail::fold_section_headers(detail::join_continuations(text), display),
+        &detail::smb_canon);
+    const auto& global = doc.sections.at("global"); // always present: see the prefix above
 
     if (const auto* v = detail::find_kv(global, "configbackend"); v && detail::lower(*v) == "registry")
         out.registry_backend = true;
@@ -556,14 +633,17 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
         out.registry_backend = out.registry_backend || detail::parse_bool(*v).value_or(false);
     if (const auto* v = detail::find_kv(global, "usersharemaxshares")) {
         const std::string& t = *v; // parse_ini values arrive trimmed
-        if (!t.empty() && std::ranges::all_of(t, [](unsigned char c) { return std::isdigit(c); }) &&
-            t.find_first_not_of('0') != std::string::npos)
-            out.usershares_configured = true;
+        if (!t.empty() && std::ranges::all_of(t, [](unsigned char c) { return std::isdigit(c); })) {
+            if (t.find_first_not_of('0') != std::string::npos)
+                out.usershares_configured = true;
+            else
+                out.usershares_off = true;
+        }
     }
-    if (const auto* v = detail::find_kv(global, "usersharepath"); v && !v->empty()) {
+    if (const auto* v = detail::find_kv(global, "usersharepath"); v && !v->empty())
         out.usershares_configured = true;
-        out.usershare_path = detail::cut(*v, out.field_oversized);
-    }
+    if (detail::find_kv(global, "configfile")) // a redirect of the same shape as `include =`
+        out.include_present = true;
     for (const auto& sec : doc.sections)
         if (sec.second.contains("include"))
             out.include_present = true;
@@ -578,6 +658,10 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
             const auto* cp = detail::find_kv(*cur, "copy");
             if (cp == nullptr)
                 break;
+            if (cp->size() > 255) { // not a section name: stop before lower-casing it per step
+                out.copy_unresolved = true;
+                break;
+            }
             const auto l = detail::lower(*cp);
             const auto it = doc.sections.find(l);
             if (it == doc.sections.end() || depth >= kMaxCopyDepth ||
@@ -592,13 +676,15 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
     };
 
     for (const auto& l : doc.section_order) {
-        if (l == "global")
+        if (l == "global" || l.empty())
             continue;
         Share s;
         s.proto = Proto::smb;
         s.source = "smb_conf";
         const auto* path = lookup(l, "path");
         const auto* ro = lookup(l, "readonly");
+        const auto* wlist = lookup(l, "writelist");
+        const auto* rlist = lookup(l, "readlist");
         const auto* guest = lookup(l, "guestok");
         const auto* browse = lookup(l, "browseable");
         const auto* avail = lookup(l, "available");
@@ -615,7 +701,11 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
         }
         s.name = detail::cut(display.at(l), out.field_oversized);
         s.path = path ? detail::cut(*path, out.field_oversized) : "-";
-        s.access = (ro && !detail::parse_bool(*ro).value_or(true)) ? Access::rw : Access::ro;
+        const bool rw = ro && !detail::parse_bool(*ro).value_or(true);
+        s.access = rw ? Access::rw : Access::ro;
+        // A list only matters when it contradicts the default: ro + write list, rw + read list.
+        if (const auto* list = rw ? rlist : wlist; list && !list->empty())
+            s.access = Access::mixed;
         s.anonymous = guest ? detail::parse_bool(*guest).value_or(false) : false;
         out.shares.push_back(std::move(s));
     }
@@ -649,12 +739,13 @@ inline std::optional<long long> json_flag(const nlohmann::json& rec, const char*
 
 } // namespace detail
 
-/// Whitespace-only text or `{}` is a recognised empty list; anything that is not a JSON
-/// object is unrecognised. Each entry must be an object carrying a string `path`, else it
+/// Whitespace-only text, `No share point records.` (what the tool prints when none exists) or
+/// `{}` is a recognised empty list; anything else that is not a JSON object is unrecognised. Each entry must be an object carrying a string `path`, else it
 /// is counted in malformed_records and skipped (valid siblings are still emitted).
 inline SharingParse parse_sharing_json(std::string_view text, yuzu::shared::RowByteBudget& budget) {
     SharingParse out;
-    if (text.find_first_not_of(" \t\r\n") == std::string_view::npos) {
+    if (text.find_first_not_of(" \t\r\n") == std::string_view::npos ||
+        yuzu::shared::ini_trim(text) == kNoSharePoints) {
         out.recognised = true;
         return out;
     }
