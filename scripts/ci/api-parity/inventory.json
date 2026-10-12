@@ -5,7 +5,7 @@
     "capability_id": "get.fragments-inventory-software",
     "rest_v1_twin": {
       "method": "GET",
-      "path": "/api/v1/inventory/software"
+      "path": "/api/v1/inventory/software/catalogue"
     },
     "mcp_twin": null,
     "status": "twinned"
@@ -22,8 +22,11 @@
     "method": "GET",
     "path": "/fragments/inventory/software/versions",
     "capability_id": "get.fragments-inventory-software-versions",
-    "rest_v1_twin": null,
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/inventory/software/catalogue/versions"
+    },
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "twinned"
   }
 ]
