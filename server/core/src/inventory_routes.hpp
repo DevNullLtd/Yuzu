@@ -86,7 +86,7 @@ struct InventoryDeviceRow {
     /// offline row, not a degrade: there is no durable IP source today (round-3
     /// item 10; a device-CI blob field is the tracked follow-up).
     std::vector<std::string> ips;
-    /// Key-sorted tags (TagStore, bulk-preloaded once per roster build — never a
+    /// Tags (TagStore, bulk-preloaded once per roster build — never a
     /// per-row store read). Empty is a genuine "no tags", not a degrade; see
     /// InventoryDevicesResult::tags_degraded for the degrade case.
     std::vector<std::pair<std::string, std::string>> tags;
@@ -105,8 +105,8 @@ struct InventoryDeviceRow {
 /// columns on `rows` are blank rather than genuinely absent — the Hardware list's
 /// "CI columns unavailable" banner and the REST `ci_degraded` field read this bit so a
 /// partial read is never shown as genuinely-empty columns (#1785 review HIGH-1). The
-/// `inventory.devices` audit row is emitted as `success` regardless; this bit does not
-/// gate it.
+/// `inventory.devices` audit row is `success` unless `roster_degraded` is set, which
+/// audits `failure`; `ci_degraded` alone does not change it.
 struct InventoryDevicesResult {
     std::vector<InventoryDeviceRow> rows;
     bool ci_degraded = false;
@@ -114,6 +114,9 @@ struct InventoryDevicesResult {
     /// row's `tags` is then genuinely empty-because-degraded, not empty-because-
     /// no-tags; the Tags column renders an honest note instead of a blank column.
     bool tags_degraded = false;
+    /// True when the durable roster read itself failed (#5531): `rows` is then
+    /// empty-because-unread, never empty-because-no-devices.
+    bool roster_degraded = false;
 };
 
 // ── PURE renderers (implemented in inventory_ui.cpp) ─────────────────────────────

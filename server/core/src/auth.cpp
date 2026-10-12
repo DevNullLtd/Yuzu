@@ -6,6 +6,7 @@
 #include "saml_principal.hpp" // saml_principal_id — ADR-2001 PR4a single principal-string builder
 #include "password_policy.hpp" // #5342 — the ONE local password length policy
 #include "session_store.hpp"  // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
+#include "rbac_store.hpp"                // #4966: the last-Administrator guard (deactivate_account / set_local_role)
 #include "credential_change_owner.hpp" // #5342 — the one-transaction credential change
 
 #include <spdlog/spdlog.h>
@@ -780,8 +781,9 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
         // Invoked while AuthDB holds this row's lock - see the header doc.
         // Lock ORDERING invariant (cpp-expert Gate 8 catch): this is the
         // first place in this file mu_ is acquired from INSIDE an open
-        // AuthDB transaction. Safe only because every AuthDB write this file
-        // makes (update_role/reactivate_user/remove_user) completes its own
+        // AuthDB transaction. Safe only because every DB write this file
+        // makes (update_role_checked/reactivate_user/remove_user_checked, the first and
+        // last through the #4966 owner's guarded transactions) completes its own
         // DB call BEFORE ever touching mu_ (the file-wide "never hold mu_
         // across a DB call" discipline, stated where each of those calls
         // takes mu_) - so no code path can be holding mu_ while ALSO
@@ -812,9 +814,10 @@ AuthManager::recheck_role_after_credential_check(const std::string& username, Ro
         }
         // else: the entry vanished from the cache mid-recheck. Provably
         // unreachable today (cpp-expert Gate 8 verified this by tracing):
-        // the only eraser of a specific username is remove_user(), whose own
-        // DB write takes this SAME row lock, so its cache-erase (which runs
-        // strictly after its own DB commit) cannot land before a callback
+        // the only eraser of a specific username is remove_user_checked(),
+        // whose DB write (the owner's `deactivate_account`, the guarded soft
+        // delete, #4966) takes this SAME row lock, so its cache-erase (which
+        // runs strictly after that commit) cannot land before a callback
         // that already observed the row as active. Not a silent bypass if
         // this invariant is ever broken by a future change - `result` still
         // gets set to the DB-confirmed role either way, which is the
@@ -884,7 +887,8 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
     // COMMITTED (so this session's durable row is visible to every later
     // statement, on any connection, under READ COMMITTED on single-primary
     // Postgres). Every writer this check races takes the SAME `auth.users`
-    // row lock for its whole transaction (update_role's UPDATE;
+    // row lock for its whole transaction (the owner's `set_local_role` and
+    // `deactivate_account` (#4966), which `update_role_checked` / `remove_user_checked` call;
     // CredentialChangeOwner's `SELECT ... FOR UPDATE` → UPDATE → DELETE of the
     // account's sessions → COMMIT). For a credential change W, exactly one of:
     //   (1) W committed before this FOR UPDATE ran → this read sees the new
@@ -897,7 +901,7 @@ bool AuthManager::post_mint_role_recheck(const std::string& username, Role minte
     //   (3) W has not yet taken the row lock → this read sees the old hash and
     //       admits; W's later DELETE runs after this session's INSERT
     //       committed and therefore sweeps it.
-    // The same three cases cover a demotion (update_role takes the row lock,
+    // The same three cases cover a demotion (`set_local_role` takes the row lock,
     // and its own in-memory sweep runs after its commit). The wait in (2) is
     // bounded by recheck_role_locked's txn-scoped lock_timeout; a timeout is
     // a store error → deny + revoke (fail closed). This reasoning assumes
@@ -1945,12 +1949,14 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     // mode, so a failed durable delete would leave the old-role session live.
     //
     // RETRY-SAFETY CAVEAT (security-guardian Gate 8, LOW/latent): unlike
-    // update_role/remove_user — which re-attempt the wipe unconditionally on a
-    // retry — this path recomputes `role_changed` against the NOW-mutated in-memory
-    // role, so a retry after a wipe failure sees role_changed=false and skips the
-    // wipe. That is safe today ONLY because no production path demotes via
-    // upsert_user (dashboard create 409s on a dup username; role edits route
-    // through update_role; SCIM upserts at a fixed Role::user). A future
+    // update_role_checked (whose repeat call also takes the `Unchanged` branch and so
+    // re-runs the wipe; no route-level retry is promised, see
+    // `UpdateRoleOutcome::UpdatedSessionWipeFailed`), this path recomputes `role_changed`
+    // against the NOW-mutated in-memory role, so a retry after a wipe failure sees
+    // role_changed=false and skips the wipe. That is safe today ONLY because no
+    // production path demotes via upsert_user (dashboard create 409s on a dup
+    // username; role edits route through update_role_checked; SCIM upserts at a
+    // fixed Role::user). A future
     // demote-via-upsert MUST recompute role_changed against the durable/DB row (or
     // wipe unconditionally) before relying on retry to converge.
     if (role_changed && !wipe_user_sessions_durable(username))
@@ -1963,20 +1969,70 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     return true;
 }
 
-bool AuthManager::remove_user(const std::string& username) {
-    if (auth_db_) {
-        auto result = auth_db_->remove_user(username);
-        if (!result) {
-            spdlog::error("AuthDB remove_user failed for '{}'", username);
-            return false;
-        }
+void AuthManager::note_lifecycle_store_failure(const char* op) const {
+    if (metrics_)
+        metrics_->counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}})
+            .increment();
+}
 
-        // In-memory cache/session cleanup is a best-effort side effect only —
-        // it must NOT gate the return value. On a cold-booted server users_
-        // may never have been warmed for this username even though the DB row
-        // existed and was just soft-deleted; returning the cache-erase result
-        // in that case falsely reports failure (SCIM deprovision fail-closed
-        // 500 loop on restart). The DB write is authoritative.
+void AuthManager::evict_target_after_indeterminate_write(const std::string& username) {
+    // The guarded write answered StoreFailure: the row MAY have committed (a lost COMMIT ack),
+    // so neither the `users_` entry (a possibly stale role / active flag) nor any session of the
+    // TARGET may keep being served. Fail toward re-authentication, never toward a stale grant:
+    // this evicts only the target's own in-memory state, then makes the durable wipe attempt
+    // (best effort here: the caller already answers StoreFailure, and a retry repeats it).
+    // mu_ is taken only after the owner call returned, never across it.
+    {
+        std::unique_lock lock(mu_);
+        users_.erase(username);
+        std::erase_if(sessions_,
+                      [&](const auto& pair) { return pair.second.username == username; });
+    }
+    if (!wipe_user_sessions_durable(username))
+        spdlog::warn("AuthManager: durable session wipe for '{}' after an indeterminate "
+                     "lifecycle write also failed; a durable session may survive until the "
+                     "operation is retried",
+                     username);
+}
+
+RemoveUserOutcome AuthManager::remove_user_checked(const std::string& username) {
+    if (auth_db_) {
+        // FAIL CLOSED (#4966): an AuthDB without the guard must never reach the unguarded
+        // `AuthDB::remove_user`; server.cpp refuses to boot in this state, so this arm is the
+        // belt for a mis-wired embedder or test.
+        if (lifecycle_guard_unwired(true, rbac_store_ != nullptr)) {
+            spdlog::error("AuthManager::remove_user_checked('{}'): the last-Administrator guard "
+                          "is not wired (no RbacStore) - refusing to deactivate without it",
+                          username);
+            note_lifecycle_store_failure("deactivate");
+            return RemoveUserOutcome::StoreFailure; // nothing was attempted: no eviction
+        }
+        // The guarded write FIRST, with no lock held: mu_ is never held across it (the
+        // file-wide "never hold mu_ across a DB call" discipline, which
+        // recheck_role_after_credential_check's mu_-inside-row-lock acquisition relies on to
+        // stay deadlock-free against the owner's `auth.users` row lock).
+        const auto res = rbac_store_->deactivate_account(username);
+        using Kind = AccountDeactivationResult::Kind;
+        if (res.kind == Kind::kLastAdministratorRefused)
+            return RemoveUserOutcome::LastAdministratorRefused; // nothing changed: no cleanup
+        if (res.kind == Kind::kStoreFailure) {
+            spdlog::error("AuthManager::remove_user_checked: guarded deactivation of '{}' failed: {}",
+                          username, res.err);
+            note_lifecycle_store_failure("deactivate");
+            // The row may or may not be deactivated (a lost COMMIT ack). The target is the
+            // account being removed and its credentials are already revoked at every caller, so
+            // fail toward re-authentication; the answer is still StoreFailure, never success.
+            evict_target_after_indeterminate_write(username);
+            return RemoveUserOutcome::StoreFailure;
+        }
+        const bool deactivated = (res.kind == Kind::kDeactivated);
+
+        // In-memory cache/session cleanup is a best-effort side effect only for the RETURN
+        // VALUE of the cache erase: on a cold-booted server users_ may never have been warmed
+        // for this username even though the DB row existed and was just soft-deleted, and
+        // reporting that as failure would turn a SCIM deprovision into a fail-closed 500 loop
+        // on restart. The DB write is authoritative. It also runs for NotFound, so a repeat after a
+        // failed durable wipe (the row is then already inactive) re-runs the session wipe.
         std::unique_lock lock(mu_);
         users_.erase(username);
         // Invalidate all active sessions belonging to this user
@@ -1984,13 +2040,18 @@ bool AuthManager::remove_user(const std::string& username) {
         std::erase_if(sessions_,
                       [&](const auto& pair) { return pair.second.username == username; });
         lock.unlock();
-        // Fail closed on a durable-wipe error (see wipe_user_sessions_durable):
-        // a removed user's sessions must not survive because the durable delete
-        // was lost — the operator retries (invalidate_user is idempotent).
-        if (!wipe_user_sessions_durable(username))
-            return false;
-
-        return *result;
+        // Fail closed on a durable-wipe error (see wipe_user_sessions_durable): a removed
+        // user's sessions must not survive because the durable delete was lost; the operator
+        // retries (invalidate_user is idempotent). The answer says whether THIS call removed
+        // the row, so the caller never reports an uncommitted removal.
+        if (!wipe_user_sessions_durable(username)) {
+            spdlog::error("AuthManager::remove_user_checked: durable session wipe for '{}' "
+                          "failed ({})",
+                          username, deactivated ? "the account IS deactivated" : "row was already inactive");
+            return deactivated ? RemoveUserOutcome::RemovedSessionWipeFailed
+                               : RemoveUserOutcome::StoreFailure;
+        }
+        return deactivated ? RemoveUserOutcome::Removed : RemoveUserOutcome::NotFound;
     }
 
     std::unique_lock lock(mu_);
@@ -2004,10 +2065,40 @@ bool AuthManager::remove_user(const std::string& username) {
 
     lock.unlock();
     if (erased && !wipe_user_sessions_durable(username)) // no-op (true) w/o store
-        return false;
+        return RemoveUserOutcome::RemovedSessionWipeFailed;
     save_config();
 
-    return erased;
+    return erased ? RemoveUserOutcome::Removed : RemoveUserOutcome::NotFound;
+}
+
+std::optional<bool> AuthManager::would_strand_last_administrator(const std::string& username) const {
+    if (!auth_db_ || !rbac_store_)
+        return std::nullopt;
+    const auto r = rbac_store_->would_strand_last_administrator(username);
+    if (!r.ok) {
+        spdlog::warn("AuthManager::would_strand_last_administrator('{}'): advisory read failed: {}",
+                     username, r.err);
+        note_lifecycle_store_failure("would_strand");
+        return std::nullopt;
+    }
+    return r.would_strand;
+}
+
+std::optional<bool> AuthManager::holds_administrator_grant(const std::string& username) const {
+    if (!rbac_store_)
+        return std::nullopt;
+    const auto roles = rbac_store_->get_principal_roles_checked("user", username);
+    if (!roles) {
+        spdlog::warn("AuthManager::holds_administrator_grant('{}'): grant read failed: {}",
+                     username, roles.error());
+        note_lifecycle_store_failure("grant_read");
+        return std::nullopt;
+    }
+    return std::ranges::any_of(*roles, [](const auto& pr) { return pr.role_name == "Administrator"; });
+}
+
+bool AuthManager::remove_user(const std::string& username) {
+    return remove_user_checked(username) == RemoveUserOutcome::Removed;
 }
 
 bool AuthManager::reactivate_user(const std::string& username) {
@@ -2233,21 +2324,48 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
     return it->second.role;
 }
 
-bool AuthManager::update_role(const std::string& username, Role new_role) {
+UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, Role new_role) {
     if (auth_db_) {
-        auto result = auth_db_->update_role(username, new_role);
-        if (!result) {
-            spdlog::error("AuthDB update_role failed for '{}'", username);
-            return false;
+        // FAIL CLOSED, same as remove_user_checked: never the unguarded AuthDB::update_role.
+        if (lifecycle_guard_unwired(true, rbac_store_ != nullptr)) {
+            spdlog::error("AuthManager::update_role_checked('{}'): the last-Administrator guard "
+                          "is not wired (no RbacStore) - refusing to change the role without it",
+                          username);
+            note_lifecycle_store_failure("set_role");
+            return UpdateRoleOutcome::StoreFailure; // nothing was attempted: no eviction
+        }
+        // The guarded write FIRST, with no lock held (see remove_user_checked).
+        const auto res = rbac_store_->set_local_role(username, new_role);
+        using Kind = LocalRoleChangeResult::Kind;
+        switch (res.kind) {
+        case Kind::kNotFound:
+            spdlog::warn("update_role: user not found: '{}'", username);
+            return UpdateRoleOutcome::NotFound;
+        case Kind::kLastAdministratorRefused:
+            return UpdateRoleOutcome::LastAdministratorRefused; // nothing changed
+        case Kind::kInactivePromotionRefused:
+            spdlog::warn("update_role: refusing to promote inactive account '{}'", username);
+            return UpdateRoleOutcome::InactivePromotionRefused;
+        case Kind::kStoreFailure:
+            spdlog::error("AuthManager::update_role_checked: guarded role write for '{}' failed: {}",
+                          username, res.err);
+            note_lifecycle_store_failure("set_role");
+            // The write MAY have committed (a lost COMMIT ack): do not keep serving the cached
+            // role or a session minted at the old one. Fail toward re-authentication.
+            evict_target_after_indeterminate_write(username);
+            return UpdateRoleOutcome::StoreFailure;
+        case Kind::kChanged:
+        case Kind::kUnchanged:
+            break; // the row now holds new_role: refresh caches and sessions below
         }
 
-        // In-memory cache/session cleanup is a best-effort side effect only —
-        // it must NOT gate the return value. On a cold-booted server users_
-        // may never have been warmed for this username even though the DB row
-        // existed and was just updated; returning the cache-lookup result in
-        // that case falsely reports failure (e.g. an unaudited SCIM role
-        // recompute after restart). The DB write is authoritative — same
-        // pattern as remove_user.
+        // In-memory cache/session cleanup is a best-effort side effect only for the cache
+        // lookup's return value: on a cold-booted server users_ may never have been warmed for
+        // this username even though the DB row existed and was just updated, and reporting that
+        // as failure would be false (e.g. an unaudited SCIM role recompute after restart). The
+        // DB write is authoritative - same pattern as remove_user_checked. Also runs for
+        // Unchanged, so a repeat call re-runs the session wipe (no route-level retry is promised:
+        // see `UpdateRoleOutcome::UpdatedSessionWipeFailed`).
         std::unique_lock lock(mu_);
         auto it = users_.find(username);
         if (it != users_.end()) {
@@ -2260,18 +2378,21 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
         std::erase_if(sessions_,
                       [&](const auto& pair) { return pair.second.username == username; });
         lock.unlock();
-        // Fail closed on a durable-wipe error — a demoted user's higher-role
-        // session must not survive a lost durable delete (see the helper).
-        if (!wipe_user_sessions_durable(username))
-            return false;
-
-        return true;
+        // Fail closed on a durable-wipe error: a demoted user's higher-role session must not
+        // survive a lost durable delete (see the helper). The role IS changed by now.
+        if (!wipe_user_sessions_durable(username)) {
+            spdlog::error("AuthManager::update_role_checked: durable session wipe for '{}' failed "
+                          "(the role IS changed)",
+                          username);
+            return UpdateRoleOutcome::UpdatedSessionWipeFailed;
+        }
+        return UpdateRoleOutcome::Updated;
     }
 
     std::unique_lock lock(mu_);
     auto it = users_.find(username);
     if (it == users_.end()) {
-        return false;
+        return UpdateRoleOutcome::NotFound;
     }
     it->second.role = new_role;
     it->second.role_version = next_role_version_(); // keeps .role/.role_version paired, same as the AuthDB-backed branch above
@@ -2282,10 +2403,14 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
 
     lock.unlock();
     if (!wipe_user_sessions_durable(username)) // no-op (true) w/o store
-        return false;
+        return UpdateRoleOutcome::UpdatedSessionWipeFailed;
     save_config();
 
-    return true;
+    return UpdateRoleOutcome::Updated;
+}
+
+bool AuthManager::update_role(const std::string& username, Role new_role) {
+    return update_role_checked(username, new_role) == UpdateRoleOutcome::Updated;
 }
 
 // ── Shared group→role resolution ────────────────────────────────────────────
