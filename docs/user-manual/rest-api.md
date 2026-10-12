@@ -6926,6 +6926,94 @@ Results carry a **per-agent scope drop filter** — the `require_fleet_read` gat
 
 On a `503` the store (or the confinement check itself) could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
 
+#### `GET /api/v1/inventory/software/catalogue`
+
+The **fleet software title catalogue**: one row per title rolled up across the whole fleet from the precomputed catalogue rollup (refreshed hourly), ordered by installs descending then name.
+
+**Permission:** a **global** `Inventory:Read` (via `require_fleet_read`). The rollup is fleet-wide and cannot be scoped, so a management-group-confined caller gets `403` (`permission: "Inventory:Read"`, audited `denied`) on the fleet view — but may pass `agent_id` for a per-device view of an in-scope device (see below). **Service-scoped API tokens are denied** (`403`, no `permission` field — no grant would admit them), unlike the raw `GET /api/v1/inventory/software` above, which keeps admitting them confined: the asymmetry is deliberate.
+
+**Query parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `q` | string | Case-insensitive literal substring over title name, publisher, ecosystems and sources (clamped to 128 bytes) |
+| `kind`, `ecosystem` | string | Exact filters (closed vocabulary — see [inventory.md](inventory.md)); empty means no filter |
+| `source` | string | Exact source filter (open set, `<plugin>.<action>`); empty means no filter |
+| `agent_id` | string | Per-device view: that device's titles (installs are `1`) |
+| `versions_min` | integer | Only titles with at least this many distinct versions (0–100000) |
+| `limit` | integer | Page size (default 100, 1–1000, clamped); with `format=csv` it is the **total** export cap (default and max 10000) |
+| `cursor` | string | Opaque `next_cursor` from the previous page |
+| `format` | `json` \| `csv` | `csv` exports the titles (REST-only) |
+
+A repeated parameter, a parameter that is not valid UTF-8 or contains a NUL byte, a `kind`/`ecosystem`/`source`/`agent_id` over 256 bytes, a non-integer `limit`/`versions_min`, an unknown `format`, a cursor over 2048 bytes, or a `cursor` sent with `format=csv` (an export is one whole walk and takes no continuation) is a `400`. An empty `kind`/`ecosystem`/`source` means "no filter", so those values cannot be selected as `''`.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "titles": [
+      {"name": "git", "publisher": "Git SCM", "installs": 3, "versions": 3,
+       "ecosystems": ["brew", "macos_pkgutil", "rpm"], "kinds": ["package", "pkg"],
+       "newest_version": "2.41"}
+    ],
+    "count": 1,
+    "next_cursor": "c1:9a1c0e5d7b3f2a68:1790000000:Mx9naXQ",
+    "totals": {"titles": 2, "installs": 4},
+    "kpis": {
+      "titles": 2, "publishers": 2, "installs": 4,
+      "installs_by_os": {"windows": 0, "macos": 3, "linux": 1, "other": 0},
+      "os_pct": {"windows": 0, "macos": 75, "linux": 25, "other": 0},
+      "stay_current": {"current_installs": 2, "total_installs": 4, "titles": 2, "pct": 50},
+      "sprawl": {"titles": 1, "pct": 50.0},
+      "rpm": {"total": 1, "unsigned": 0},
+      "coverage": {"reporting": 3, "connected": 5, "stale": 0},
+      "avg_installs_per_device": 1,
+      "refreshed_at": 1790000000,
+      "building": false
+    },
+    "devices_omitted": 0
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+- `totals{titles,installs}` cover **every row matching the filters**, not just this page (same predicate as the rows), so a client can say "N of M". `installs` sums each title's exact distinct-device count (a device carrying two matching titles counts twice); unfiltered, it equals `kpis.installs`.
+- `kpis` is present on the **first fleet page only** — it is `null` on continuation pages and on the per-device view. The headline numbers come from the hourly refresh; percentages are derived (`os_pct` of installs, rounded; `stay_current.pct` is `null` when no title has a known version; `sprawl.pct` to one decimal). `coverage` is **counts**, not a ratio: `reporting` = devices with stored inventory, `connected` = devices currently connected (a registry read, `null` when unavailable), `stale` = devices not seen in 48 hours (`null` when that bounded count is unavailable). There is deliberately no coverage percentage — no honest denominator exists. `building: true` with zero counts means the rollup has never been computed: the JSON page is still a `200` (the page must render), but the fleet `format=csv` export is a `503` until the first refresh lands, because an empty file would read as "no titles" (the per-device export's rows and counts do not depend on the rollup and it still answers `200`; its `newest_version` column is blank until the first refresh). If the `503` persists past one hourly refresh the catalogue is not building but failing (a fleet above the ~6,000-endpoint refresh ceiling, #5545, or a database role without `TEMPORARY`): see [inventory.md](inventory.md) "Scale ceiling" and `yuzu_inventory_catalog_rollup_total{outcome="error"}`, and do not retry in a loop.
+- **Cursor.** `next_cursor` is non-null when the page is full. It is bound to the filter set **and to the catalogue refresh generation** (`kpis.refreshed_at`, 1-second granularity — two refreshes inside one second share a generation). A malformed cursor, a cursor from a different filter set, or one issued **before the latest refresh** is a `400` (`invalid cursor` / `cursor was issued for a different filter set` / `cursor predates the current catalogue refresh; restart from the first page`) — a client holding a stale cursor restarts from the first page. If a refresh lands *during* a first-page read the server re-reads once; a second move is a `503`.
+- **Per-device view** (`agent_id`): admitted for an in-scope device. For a confined caller `newest_version` is blank and `newest_omitted: true` (the newest version is a fleet-wide fact). A device outside the caller's scope returns an empty page with `devices_omitted: 1` and a `denied` audit row (no oracle on whether the device exists).
+- **Export** (`format=csv`): `text/csv; charset=utf-8`, `Content-Disposition: attachment; filename="software-titles.csv"`, header `name,publisher,installs,versions,ecosystems,kinds,newest_version` (lists `;`-joined). `limit` is the total cap (default and max 10000); `X-Result-Truncated-By-Cap: true` when the walk reached the cap (rows may have been left behind). A cell starting with `=`, `+`, `-`, `@`, tab or CR is prefixed with `'` (spreadsheet formula neutralisation), so a CSV `name` may need that prefix stripped before it is passed to the versions route. Audited as `inventory.software.export` (`rows=` is the number of titles written). **Set-and-proceed:** `Sec-Audit-Failed: true` is set, and the export is still served, when the export audit row did not persist (also set when only the paired `denied` row failed to persist) (machine-scope data, not behavioural PII).
+- **Audit.** Every call that serves a page writes `inventory.software.catalog` `success` — first **and** continuation pages (the latter tagged `page=continuation`) — with detail `titles=N totals=T/I`. An out-of-scope per-device read writes `denied` only (on `format=csv`, `denied` plus an empty-file `inventory.software.export` `success`). A `400` writes nothing; a confined or service-scoped refusal writes `denied`; the `Inventory:Read` gate's own refusal is audited as `auth.fleet_read_required`. See [audit-log.md](audit-log.md) for the SIEM keying. `audit_persisted: false` is added when the row could not be persisted, including the `denied` row.
+
+**Error responses** (A4 envelope with `correlation_id`):
+
+| Status | Condition |
+|---|---|
+| 400 | Repeated/malformed parameter, unknown `format`, a `cursor` with `format=csv`, or a refused cursor (see above) |
+| 401 | Unauthenticated |
+| 403 | Confined caller on the fleet view (`permission: "Inventory:Read"`), or a service-scoped token |
+| 503 | A degraded rows, totals or refresh-metadata read, or (fleet `format=csv`) a catalogue not yet built — `retry_after_ms: 5000`; **never an empty 200**. A degraded totals read fails the whole page. An absent store or an unwired gate (server misconfiguration) is a `503` **without** `retry_after_ms` |
+
+#### `GET /api/v1/inventory/software/catalogue/versions`
+
+Installs per version for one title: distinct devices per version, most-installed first.
+
+**Permission and posture:** identical to the catalogue — a global `Inventory:Read` for the fleet view (`403` for a confined caller), the per-device view for an in-scope device (`newest` is `false` on every row and `newest_omitted: true` for a confined caller; an out-of-scope device returns an empty list with `devices_omitted: 1` and a `denied` audit row), service-scoped tokens denied.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `name` | string | **Required** exact title name, at most 1024 bytes (`400 name is required`) |
+| `kind`, `ecosystem`, `source`, `agent_id` | string | Same filters as the catalogue |
+| `limit` | integer | Default 200, 1–1000 (clamped) |
+
+```json
+{"data": {"name": "git", "versions": [{"version": "2.40", "installs": 1, "newest": false},
+                                      {"version": "2.41", "installs": 1, "newest": true}],
+          "count": 2, "truncated": false, "devices_omitted": 0}, "meta": {"api_version": "v1"}}
+```
+
+`newest` marks the title's fleet-wide newest version; `truncated` is `true` when the limit was reached; `devices_omitted` is `1` when the per-device view named a device outside the caller's scope (the empty list is then "hidden", not "no installs"), else `0`. Every call that serves a page is audited as `inventory.software.versions` (`success`); an out-of-scope per-device read writes a `denied` row only, a `400` writes none, a confined or service-scoped refusal writes `denied`, and the `Inventory:Read` gate's own refusal is audited as `auth.fleet_read_required`. The **unfiltered** read (no `kind`, `ecosystem`, `source` or `agent_id`) serves the precomputed version rollup, so before the first catalogue refresh it is a `503` with `retry_after_ms` and a `failure` audit row rather than an empty list; filtered and per-device reads do not depend on the rollup for their rows and counts (`newest` is `false` until the first refresh). Errors: `400` (missing `name`, repeated parameter, an over-long value, invalid UTF-8 or a NUL byte), `401`, `403`, `503` (`retry_after_ms: 5000` on a degraded or not-yet-built read, never an empty `200`; no hint where the store or gate is absent).
+
 ---
 
 ### Result Sets
@@ -11370,11 +11458,11 @@ Destroy the current session. Clears the `yuzu_session` cookie.
 
 #### `GET /auth/oidc/start`
 
-Begin the OIDC SSO login flow. Redirects to the configured identity provider.
+Begin the OIDC SSO login flow. Sets the short-lived browser-binding cookie (`__Host-yuzu_oidc_bind`, or `yuzu_oidc_bind` on plain HTTP) and redirects to the configured identity provider. Answers `500` with no cookie and no redirect if the server cannot start the flow.
 
 #### `GET /auth/callback`
 
-OIDC callback endpoint. The identity provider redirects here after authentication. Exchanges the authorization code for tokens and creates a local session.
+OIDC callback endpoint. The identity provider redirects here after authentication. Requires the browser-binding cookie set by `GET /auth/oidc/start`; a request without the matching cookie is refused with the generic `/login?error=sso_failed` redirect. Otherwise exchanges the authorization code for tokens and creates a local session. See [OIDC Login Flow](authentication.md#oidc-login-flow).
 
 #### `GET /auth/saml/start`
 

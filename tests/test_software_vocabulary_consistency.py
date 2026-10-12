@@ -7,7 +7,9 @@ agents emit the values; MCP `query_installed_software`, the OpenAPI description 
 Lane-3 predicate (`is_os_native`, cpe_normalize.hpp) routes them. This script checks,
 against the real tree, that:
 
-  1. every published surface equals the agreed vocabulary (EXPECTED_*);
+  1. every published surface equals the agreed vocabulary (EXPECTED_*) — the one prose
+     `kind (a|b)` enumeration per source file AND every JSON `enum` array the catalogue
+     routes publish for `kind`/`ecosystem` (OpenAPI parameters);
   2. the values the agents emit are exactly that vocabulary (emitted == published);
   3. every non-Lane-1 ecosystem and Lane-3 kind is named in `is_os_native`, and `pkg`
      is NOT a kind-level trigger (it is routed by its ecosystem).
@@ -71,6 +73,16 @@ def extract_enumeration(text, field):
     return set(found[0].split("|"))
 
 
+def extract_json_enums(text, field):
+    """Every OpenAPI parameter `enum` array published for `<field>`, as a list of sets.
+
+    Matches `{"name": "<field>", ... "schema": {... "enum": [...]}}`; the span between the name
+    and its `enum` never crosses a closing brace, so a later field's enum is never attributed to
+    this one."""
+    pat = rf'"name":\s*"{field}"[^{{}}]*"schema":\s*\{{[^{{}}]*?"enum":\s*\[([^\]]*)\]'
+    return [set(re.findall(r'"([a-z_]+)"', m.group(1))) for m in re.finditer(pat, text)]
+
+
 def extract_table_row(text, field):
     """Backticked cell values of the manual's `| `<field>` |` row."""
     rows = [l for l in text.splitlines() if re.match(rf"\s*\| `{field}` \|", l)]
@@ -108,6 +120,22 @@ class VocabularyConsistency(unittest.TestCase):
         text = read(OPENAPI_SRC)
         self.assertEqual(extract_enumeration(text, "kind"), EXPECTED_KINDS)
         self.assertEqual(extract_enumeration(text, "ecosystem"), EXPECTED_ECOSYSTEMS)
+
+    def test_json_enum_arrays_equal_vocabulary(self):
+        # Anti-vacuous: the file must carry at least one `kind` and one `ecosystem` enum array
+        # (the catalogue routes' parameters); every one must equal the agreed vocabulary.
+        text = read(OPENAPI_SRC)
+        # Other routes reuse the field name `kind` for unrelated enums: an array is a
+        # software-vocabulary array iff it shares a value with the vocabulary, so a drifted copy
+        # (a dropped value) is still caught.
+        kinds = [k for k in extract_json_enums(text, "kind") if k & EXPECTED_KINDS]
+        ecos = [e for e in extract_json_enums(text, "ecosystem") if e & EXPECTED_ECOSYSTEMS]
+        self.assertGreaterEqual(len(kinds), 1, f"{OPENAPI_SRC}: no JSON `kind` enum found")
+        self.assertGreaterEqual(len(ecos), 1, f"{OPENAPI_SRC}: no JSON `ecosystem` enum found")
+        for k in kinds:
+            self.assertEqual(k, EXPECTED_KINDS, OPENAPI_SRC)
+        for e in ecos:
+            self.assertEqual(e, EXPECTED_ECOSYSTEMS, OPENAPI_SRC)
 
     def test_manual_table(self):
         text = read(MANUAL)

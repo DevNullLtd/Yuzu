@@ -360,7 +360,8 @@ workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
 
 - Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan.
 - Returns up to `limit` rows (max 1000). When `result_truncated_by_cap` is
-  `true`, more rows exist past the cap (keyset pagination is a follow-up).
+  `true`, more rows exist past the cap (this raw rows route has no keyset pagination; the title
+  catalogue routes below do).
 - **A per-agent scope drop filter is applied** — out-of-scope devices are
   dropped (and the omission audited), with the count returned as
   `devices_omitted` (absent when zero). This confinement is **effective**: the
@@ -413,7 +414,8 @@ curl -H "Authorization: Bearer $TOKEN" \
   outside your scope — an empty or short result does **not** mean the software
   is absent fleet-wide.
 - `result_truncated_by_cap: true` (present only when set) means more rows exist past
-  `limit` (keyset pagination is a follow-up, #1634).
+  `limit` (this raw rows route has no keyset pagination, #1634; the title catalogue routes
+  below are keyset-paginated).
 - **On store degradation** the endpoint returns **`503`** (an A4 error envelope with a
   `correlation_id`), **never** an empty `200` — so a vulnerability query cannot read a
   transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads).
@@ -430,9 +432,20 @@ scope filter runs. So a narrow-scope operator querying a popular title across a 
 fleet can see `result_truncated_by_cap: true` together with few — or **zero** — of
 their own rows, because the cap was consumed by out-of-scope devices that sort ahead
 of yours. **That is "incomplete", not "absent in your scope."** Until keyset
-pagination lands (#1634), narrow the query: pass `agent_id` (`?agent_id=<id>` on REST,
+pagination lands on this route (#1634), narrow the query: pass `agent_id` (`?agent_id=<id>` on REST,
 the `agent_id` arg on MCP) to read a specific device, or a more selective `name`
 filter, so your in-scope rows fit under the cap.
+
+### REST: software title catalogue
+
+`GET /api/v1/inventory/software/catalogue` returns one row per software title across the
+fleet with filtered `totals`, first-page KPIs, a keyset `next_cursor` and a `format=csv`
+export; `GET /api/v1/inventory/software/catalogue/versions` returns installs per version
+of one title. Unlike the raw route above, a management-group-confined caller gets `403` on
+the fleet view (pass `agent_id` for an in-scope device) and service-scoped tokens are
+denied. A degraded read is `503`, never an empty `200`; the fleet export and the unfiltered
+versions read are also `503` until the first catalogue refresh has landed. Parameters,
+responses and audit behaviour: [REST API](rest-api.md#get-apiv1inventorysoftwarecatalogue).
 
 ### Dashboard (`/inventory` → `/hardware` / `/software`)
 

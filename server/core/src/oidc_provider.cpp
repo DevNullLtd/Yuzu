@@ -1,5 +1,8 @@
 #include "oidc_provider.hpp"
 
+#include "evp_raii.hpp"
+#include "sha256_steps.hpp"
+
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -7,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <sstream>
+#include <stdexcept>
 
 // OpenSSL is an unconditional server dependency on every platform (vcpkg.json;
 // server/core/meson.build). RSA JWKS parsing and JWT signature verification use
@@ -14,6 +18,7 @@
 // the OpenSSL headers before <windows.h> so OpenSSL's X509_NAME type is declared
 // before wincrypt.h (pulled by windows.h) redefines X509_NAME as a macro.
 #include <openssl/bn.h>
+#include <openssl/crypto.h> // CRYPTO_memcmp: constant-time binding-hash compare
 #include <openssl/evp.h>
 #include <openssl/rand.h> // RAND_bytes — non-Windows random_bytes() only (Windows uses BCryptGenRandom)
 #include <openssl/rsa.h>
@@ -78,26 +83,127 @@ static std::string bytes_to_hex(const std::vector<uint8_t>& v) {
     return out;
 }
 
-static std::vector<uint8_t> sha256_raw(const std::string& input) {
-    std::vector<uint8_t> hash(32);
 #ifdef _WIN32
-    BCRYPT_ALG_HANDLE hAlg = nullptr;
-    BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-    BCRYPT_HASH_HANDLE hHash = nullptr;
-    BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
-    BCryptHashData(hHash, reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())),
-                   static_cast<ULONG>(input.size()), 0);
-    BCryptFinishHash(hHash, hash.data(), static_cast<ULONG>(hash.size()), 0);
-    BCryptDestroyHash(hHash);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-#else
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
-    EVP_DigestUpdate(ctx, input.data(), input.size());
-    EVP_DigestFinal_ex(ctx, hash.data(), nullptr);
-    EVP_MD_CTX_free(ctx);
+namespace {
+// File-local RAII owners for the two CNG handles CngSha256Ops opens: one owner per handle,
+// released exactly once on every path including a throw.
+class BcryptAlgHandle {
+public:
+    BcryptAlgHandle() = default;
+    BcryptAlgHandle(const BcryptAlgHandle&) = delete;
+    BcryptAlgHandle& operator=(const BcryptAlgHandle&) = delete;
+    ~BcryptAlgHandle() {
+        if (h_)
+            BCryptCloseAlgorithmProvider(h_, 0);
+    }
+    BCRYPT_ALG_HANDLE* out() { return &h_; }
+    BCRYPT_ALG_HANDLE get() const { return h_; }
+
+private:
+    BCRYPT_ALG_HANDLE h_ = nullptr;
+};
+
+class BcryptHashHandle {
+public:
+    BcryptHashHandle() = default;
+    BcryptHashHandle(const BcryptHashHandle&) = delete;
+    BcryptHashHandle& operator=(const BcryptHashHandle&) = delete;
+    ~BcryptHashHandle() {
+        if (h_)
+            BCryptDestroyHash(h_);
+    }
+    BCRYPT_HASH_HANDLE* out() { return &h_; }
+    BCRYPT_HASH_HANDLE get() const { return h_; }
+
+private:
+    BCRYPT_HASH_HANDLE h_ = nullptr;
+};
+} // namespace
 #endif
-    return hash;
+
+namespace {
+#ifdef _WIN32
+// CNG stages for sha256_via_ops. `alg_` is declared before `hh_`, so the hash handle is
+// destroyed first and the provider handle last, on success and on a throw alike.
+class CngSha256Ops {
+public:
+    bool open() {
+        return BCRYPT_SUCCESS(
+            BCryptOpenAlgorithmProvider(alg_.out(), BCRYPT_SHA256_ALGORITHM, nullptr, 0));
+    }
+    bool create() {
+        return BCRYPT_SUCCESS(BCryptCreateHash(alg_.get(), hh_.out(), nullptr, 0, nullptr, 0, 0));
+    }
+    bool update(const std::string& input) {
+        // PUCHAR is a signature artefact: BCryptHashData only reads the input buffer.
+        return BCRYPT_SUCCESS(
+            BCryptHashData(hh_.get(), reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())),
+                           static_cast<ULONG>(input.size()), 0));
+    }
+    bool finish(std::vector<uint8_t>& out) {
+        return BCRYPT_SUCCESS(
+            BCryptFinishHash(hh_.get(), out.data(), static_cast<ULONG>(out.size()), 0));
+    }
+
+private:
+    BcryptAlgHandle alg_;
+    BcryptHashHandle hh_;
+};
+#else
+// OpenSSL EVP stages for sha256_via_ops. `ctx_` is the single owner of the digest context.
+class OpenSslSha256Ops {
+public:
+    bool open() {
+        ctx_.reset(EVP_MD_CTX_new());
+        return ctx_ != nullptr;
+    }
+    bool create() { return EVP_DigestInit_ex(ctx_.get(), EVP_sha256(), nullptr) == 1; }
+    bool update(const std::string& input) {
+        return EVP_DigestUpdate(ctx_.get(), input.data(), input.size()) == 1;
+    }
+    bool finish(std::vector<uint8_t>& out) {
+        return EVP_DigestFinal_ex(ctx_.get(), out.data(), nullptr) == 1;
+    }
+
+private:
+    EvpMdCtxPtr ctx_;
+};
+#endif
+} // namespace
+
+/// SHA-256 of `input`. THROWS (std::runtime_error, like `random_bytes` above) on ANY provider
+/// failure, so a failed digest is reported, never returned as a value. The stage sequencing and
+/// the throw live in `detail::sha256_via_ops` (sha256_steps.hpp), which a unit test drives with a
+/// fake `Ops`.
+static std::vector<uint8_t> sha256_raw(const std::string& input) {
+#ifdef _WIN32
+    CngSha256Ops ops;
+#else
+    OpenSslSha256Ops ops;
+#endif
+    return detail::sha256_via_ops(ops, input);
+}
+
+std::string OidcProvider::binding_digest(const std::string& secret) const {
+    if (binding_digest_forced_failure_.load()) // test seam: the branch a provider failure takes
+        throw std::runtime_error("SHA-256 failed");
+    return bytes_to_hex(sha256_raw(secret));
+}
+
+void OidcProvider::set_binding_digest_failure_for_test(bool fail) {
+    binding_digest_forced_failure_.store(fail);
+}
+
+void OidcProvider::add_test_pending_flow(const std::string& state, std::string binding_hash) {
+    PkceChallenge pkce;
+    pkce.code_verifier = "test-verifier";
+    pkce.state = state;
+    pkce.nonce = "test-nonce";
+    pkce.binding_hash = std::move(binding_hash);
+    pkce.redirect_uri = config_.redirect_uri;
+    pkce.expires_at = std::chrono::steady_clock::now() + kChallengeTtl;
+    std::lock_guard lock(mu_);
+    pending_challenges_[state] = std::move(pkce);
 }
 
 // ── Base64URL ────────────────────────────────────────────────────────────────
@@ -1025,11 +1131,16 @@ bool OidcProvider::is_enabled() const {
     return config_.is_enabled();
 }
 
-std::string OidcProvider::start_auth_flow(const std::string& request_redirect_uri) {
+OidcProvider::AuthFlowStart OidcProvider::start_auth_flow(const std::string& request_redirect_uri) {
     auto verifier = generate_code_verifier();
     auto challenge = compute_code_challenge(verifier);
     auto state = bytes_to_hex(random_bytes(32));
     auto nonce = bytes_to_hex(random_bytes(16));
+    // The initiating-browser binding secret. Independent of state/nonce/verifier (which travel
+    // through the IdP and the URL); only its hash is kept. Hashed before anything is stored, so
+    // a digest failure leaves no pending flow behind.
+    auto binding_secret = bytes_to_hex(random_bytes(32));
+    auto binding_hash = binding_digest(binding_secret);
 
     // Use the request-derived redirect URI if provided, otherwise fall back to config
     auto redirect_uri = request_redirect_uri.empty() ? config_.redirect_uri : request_redirect_uri;
@@ -1039,6 +1150,7 @@ std::string OidcProvider::start_auth_flow(const std::string& request_redirect_ur
     pkce.code_challenge = challenge;
     pkce.state = state;
     pkce.nonce = nonce;
+    pkce.binding_hash = std::move(binding_hash);
     pkce.redirect_uri = redirect_uri;
     pkce.expires_at = std::chrono::steady_clock::now() + kChallengeTtl;
 
@@ -1066,12 +1178,25 @@ std::string OidcProvider::start_auth_flow(const std::string& request_redirect_ur
 
     spdlog::debug("OIDC auth flow started: state={} redirect_uri={}", state.substr(0, 8),
                   redirect_uri);
-    return url;
+    return AuthFlowStart{std::move(url), std::move(binding_secret)};
 }
 
-std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(const std::string& code,
-                                                                        const std::string& state) {
+std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(
+    const std::string& code, const std::string& state, const std::string& binding_secret,
+    bool* binding_verified) {
+    if (binding_verified)
+        *binding_verified = false;
     spdlog::info("OIDC handle_callback: state={} code_len={}", state.substr(0, 8), code.size());
+
+    // Hash the presented secret before taking the lock. FAIL CLOSED: a digest failure is a
+    // refusal that leaves the pending flow untouched, never an unbound pass.
+    std::string provided_hash;
+    try {
+        provided_hash = binding_digest(binding_secret);
+    } catch (const std::exception& e) {
+        spdlog::error("OIDC handle_callback: binding hash failed ({}), login refused", e.what());
+        return std::unexpected(std::string(kBrowserBindingUnavailable));
+    }
 
     PkceChallenge challenge;
     {
@@ -1080,7 +1205,7 @@ std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(const st
         auto it = pending_challenges_.find(state);
         if (it == pending_challenges_.end()) {
             spdlog::error("OIDC handle_callback: state not found in pending challenges");
-            return std::unexpected("unknown or expired state parameter");
+            return std::unexpected(std::string(kUnknownState));
         }
 
         if (std::chrono::steady_clock::now() > it->second.expires_at) {
@@ -1088,6 +1213,22 @@ std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(const st
             spdlog::error("OIDC handle_callback: PKCE challenge expired");
             return std::unexpected("PKCE challenge expired");
         }
+
+        // Browser binding: the callback must come from the browser that started the flow.
+        // Constant-time on the hash, and decided BEFORE the entry is consumed: a refusal leaves
+        // the legitimate flow completable. An empty stored hash (never produced by
+        // start_auth_flow) is never honoured.
+        const auto& stored_hash = it->second.binding_hash;
+        const bool bound = !stored_hash.empty() && provided_hash.size() == stored_hash.size() &&
+                           CRYPTO_memcmp(provided_hash.data(), stored_hash.data(),
+                                         stored_hash.size()) == 0;
+        if (!bound) {
+            spdlog::error("OIDC handle_callback: browser binding mismatch (state={})",
+                          state.substr(0, 8));
+            return std::unexpected(std::string(kBrowserBindingMismatch));
+        }
+        if (binding_verified)
+            *binding_verified = true;
 
         challenge = std::move(it->second);
         pending_challenges_.erase(it); // single-use
