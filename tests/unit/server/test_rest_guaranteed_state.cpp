@@ -948,7 +948,12 @@ TEST_CASE("REST gs.rules: create bounds version to 1..2147483647 with a denied a
           "[pg][rest][guaranteed_state][create]") {
     RestGsHarness h;
     int n = 0;
-    for (const char* bad : {"0", "-1", "2147483648", "9223372036854775807"}) {
+    // The last group is the #4644 strict-read probes: a float (5.5 was truncated to 5, 1e3 to
+    // 1000), a string, bool, null or array threw out of `body.value` (a bare 500), and a value
+    // above INT64_MAX wrapped.
+    for (const char* bad : {"0", "-1", "2147483648", "9223372036854775807", "4294967297",
+                            "9223372036854775808", "18446744073709551615", "5.5", "1e3", "\"7\"",
+                            "\"\"", "null", "true", "[]"}) {
         INFO("version=" << bad);
         auto body = nlohmann::json::parse(
             RestGsHarness::make_rule_body("r-v" + std::to_string(++n), "name-v" + std::to_string(n)));

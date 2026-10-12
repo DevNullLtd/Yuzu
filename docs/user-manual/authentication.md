@@ -653,11 +653,11 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
   -H "Content-Type: application/json" \
   -d '{
     "name": "ci-pipeline",
-    "expires_at": 1750185000
+    "expires_at": 1893456000
   }'
 ```
 
-The `expires_at` field is a Unix epoch timestamp in seconds. Pass `0` or omit it for a non-expiring token.
+The `expires_at` field is a Unix epoch timestamp in seconds and must be in the future (the example value is 1 January 2030; use your own). Pass `0` or omit it for a non-expiring token. A negative, past or non-integer value is `400`.
 
 ```json
 {
@@ -752,7 +752,7 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
   -d '{
     "name": "finance-svc-token",
     "scope_service": "finance",
-    "expires_at": 1750185000
+    "expires_at": 1893456000
   }'
 ```
 
@@ -1152,7 +1152,7 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
   -d '{
     "name": "claude-desktop-readonly",
     "mcp_tier": "readonly",
-    "expires_at": 1750185000
+    "expires_at": 1893456000
   }'
 ```
 

@@ -529,6 +529,37 @@ static std::string access_review_str_field(const nlohmann::json& body, const cha
     return def;
 }
 
+// The OPTIONAL `overlap_secs` of the two credential-rotate routes (#4644), shared so the human
+// token and engine-principal routes cannot drift. A blank (empty or whitespace-only) body keeps
+// `overlap_secs` at the caller's default; any other body must be a JSON object, and a PRESENT
+// `overlap_secs` must be one JSON integer (a string, float, bool, null or a value above INT64_MAX
+// is refused: `body.value` threw on the first four, a float was truncated, the last wrapped). The
+// store still enforces the 24h..10y range. Returns false after writing the A4 400 (nothing has
+// been rotated yet); true with `overlap_secs` set otherwise.
+static bool read_rotate_overlap_secs(const httplib::Request& req, httplib::Response& res,
+                                     int64_t& overlap_secs) {
+    const bool blank = std::all_of(req.body.begin(), req.body.end(),
+                                   [](unsigned char c) { return std::isspace(c) != 0; });
+    if (blank)
+        return true;
+    const auto body = nlohmann::json::parse(req.body, nullptr, false);
+    if (body.is_discarded() || !body.is_object()) {
+        res.status = 400;
+        res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                        "application/json");
+        return false;
+    }
+    const auto v = read_json_int_strict(body, "overlap_secs", overlap_secs);
+    if (!v) {
+        res.status = 400;
+        res.set_content(detail::a4_error(res, "overlap_secs must be an integer (seconds)"),
+                        "application/json");
+        return false;
+    }
+    overlap_secs = *v;
+    return true;
+}
+
 // Render a live plugin output into the JSON `data` object for /dex/devices/{id}/live.
 // The wire-format parsing (kind table + field extraction) is shared with the
 // dashboard HTML path via live_kinds.hpp so the two cannot drift (governance S2);
@@ -937,7 +968,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Mint the first credential for an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"ttl_days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 90}}}}}}, "responses": {"201": {"description": "Minted; {token, token_id, expires_at} — token is the raw secret, shown once (Cache-Control: no-store)"}, "400": {"description": "ttl_days present but of the wrong type (string, float, boolean, null) or out of range (1-90), or a non-empty body that is not a JSON object (malformed, array, string, number, null); nothing is minted. An empty or whitespace-only body still mints the 90-day default"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "409": {"description": "Engine principal is not active, or an active credential already exists — rotate instead of minting a second one"}, "503": {"description": "Store unavailable, or CSPRNG failure"}}}
     },
     "/engine-principals/{id}/credentials/rotate": {
-      "post": {"summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent)"}}}
+      "post": {"summary": "Overlap-pair rotation of an engine principal's credential (design §7)", "tags": ["Security"], "description": "Mints a successor credential alongside the still-valid predecessor for the overlap window. A retry within the grace window by the SAME operator re-serves the identical raw secret (idempotent); step-up is re-validated on every call, including a re-serve.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days. A non-empty body must be a JSON object and overlap_secs a JSON integer (400 otherwise)"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires Security:Write"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint if genuinely absent)"}}}
     },
     "/engine-principals/{id}/credentials/confirm": {
       "post": {"summary": "Confirm receipt of a rotated credential's successor secret (design §7 maker-checker)", "tags": ["Security"], "description": "Pass the successor token_id the rotate response returned (pins the confirm to that exact rotation; a stale or mismatched id is rejected with no state change) AND the raw successor secret (proof of possession, #3015). Confirm revokes the predecessor only after the presented secret verifies against the stored hash.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["token_id", "secret"], "properties": {"token_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "minLength": 24, "maxLength": 24, "description": "Successor token_id returned by the rotate call (24 lowercase hex) — pins the exact rotation being confirmed"}, "secret": {"type": "string", "minLength": 1, "maxLength": 512, "description": "The raw successor secret the rotate call returned — proof of possession (#3015), verified constant-time against the stored hash; checked only after every other admission gate. Missing/empty is 400; wrong is 403"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor credential revoked"}, "400": {"description": "token_id or secret missing, empty, or not a string; more than two active credentials; or a non-engine active credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write, or the presented secret does not verify against the pending successor (#3015)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry): token_id does not match the pending successor; the rotation was already confirmed or otherwise resolved by cutover/sweep/revoke; the sole active credential has unresolved rotation metadata; the grace window elapsed; or the rotation was initiated by a different operator"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, a confirm/revoke/clear persistence failure, or no in-flight rotation to confirm - the last covers zero active credentials (ambiguous with a transient read failure) and an unrecognized two-credential pair; rotate first if genuinely absent"}}}
@@ -955,13 +986,13 @@ const std::string& openapi_spec() {
         R"json(,
     "/tokens": {
       "get": {"summary": "List API tokens for current user", "tags": ["API Tokens"], "description": "Owner-scoped to the caller. An item includes rotation_group/supersedes_token_id/overlap_expires_at/confirmed_at only while a rotation is (or was) in flight for that token.", "responses": {"200": {"description": "List of API tokens"}, "503": {"description": "Token store unavailable (service unavailable)"}}},
-      "post": {"summary": "Create a new API token", "tags": ["API Tokens"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "expires_at": {"type": "integer"}, "scope_service": {"type": "string"}}}}}}, "responses": {"201": {"description": "Token created, includes plaintext token (shown once)"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
+      "post": {"summary": "Create a new API token", "tags": ["API Tokens"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "expires_at": {"type": "integer", "description": "Unix epoch seconds in the future, or 0/omitted for never expires. A string, float, bool, null, negative or past value, or one above INT64_MAX, is 400"}, "scope_service": {"type": "string"}}}}}}, "responses": {"201": {"description": "Token created, includes plaintext token (shown once)"}, "400": {"description": "Body is not a JSON object, or a field has the wrong type, or expires_at is not 0 or a future epoch integer"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
     },
     "/tokens/{token_id}": {
       "delete": {"summary": "Revoke an API token", "tags": ["API Tokens"], "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Token revoked"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
     },
     "/tokens/{token_id}/rotate": {
-      "post": {"summary": "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3)", "tags": ["API Tokens"], "description": "Mints a successor token alongside the still-valid predecessor for the overlap window; requires ApiToken:Rotate and step-up on EVERY call (including an idempotent re-serve within the grace window). Self-service only — the caller must own the token; no admin override. Reachable by any non-admin owner under the default RBAC-off config (#2963 legacy self-service allowlist) — ownership, not role, is the actual gate. A caller holding NO standing mcp_tier/scope_service (a plain cookie session) may rotate ANY of its own tokens regardless of that token's own tier/scope (#2963); any other caller's tier/scope must equal the predecessor's exactly. The successor always inherits the predecessor's expires_at AND mcp_tier/scope_service verbatim (rotation is lifetime-neutral and never mints broader authority) — a token within 24h of its own expiry cannot be rotated (see 400).", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The token_id of the token being rotated (the predecessor)"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token/token_id/expires_at describe the successor (found structurally, scoped to THIS predecessor's token_id); overlap_expires_at describes the PREDECESSOR (echoed for convenience — the epoch it is auto-revoked). token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs present but not an integer, overlap_secs outside the 24h-10y bounds, more than 2 active credentials in an unrecognized shape, the overlap window would exceed the predecessor's (or successor's) expiry — by design, a token within 24h of expiry cannot be rotated; mint a new one instead — or the caller's tier/scope does not match the predecessor's and the caller holds some standing tier/scope of its own (a caller holding no standing tier/scope at all is instead admitted, #2963; folded into the same store-level 'no such token to rotate' wording as absent/not-owned so this is not an authority-probing oracle)"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, no active credential to rotate (ambiguous with a transient store read failure — retry, or mint a new token if genuinely absent), or the rotation succeeded but the successor could not be read back for the response (fails closed rather than return an uncorrelatable secret)"}}}
+      "post": {"summary": "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3)", "tags": ["API Tokens"], "description": "Mints a successor token alongside the still-valid predecessor for the overlap window; requires ApiToken:Rotate and step-up on EVERY call (including an idempotent re-serve within the grace window). Self-service only — the caller must own the token; no admin override. Reachable by any non-admin owner under the default RBAC-off config (#2963 legacy self-service allowlist) — ownership, not role, is the actual gate. A caller holding NO standing mcp_tier/scope_service (a plain cookie session) may rotate ANY of its own tokens regardless of that token's own tier/scope (#2963); any other caller's tier/scope must equal the predecessor's exactly. The successor always inherits the predecessor's expires_at AND mcp_tier/scope_service verbatim (rotation is lifetime-neutral and never mints broader authority) — a token within 24h of its own expiry cannot be rotated (see 400).", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The token_id of the token being rotated (the predecessor)"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days. A non-empty body must be a JSON object and overlap_secs a JSON integer (400 otherwise)"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token/token_id/expires_at describe the successor (found structurally, scoped to THIS predecessor's token_id); overlap_expires_at describes the PREDECESSOR (echoed for convenience — the epoch it is auto-revoked). token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs present but not an integer, overlap_secs outside the 24h-10y bounds, more than 2 active credentials in an unrecognized shape, the overlap window would exceed the predecessor's (or successor's) expiry — by design, a token within 24h of expiry cannot be rotated; mint a new one instead — or the caller's tier/scope does not match the predecessor's and the caller holds some standing tier/scope of its own (a caller holding no standing tier/scope at all is instead admitted, #2963; folded into the same store-level 'no such token to rotate' wording as absent/not-owned so this is not an authority-probing oracle)"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, no active credential to rotate (ambiguous with a transient store read failure — retry, or mint a new token if genuinely absent), or the rotation succeeded but the successor could not be read back for the response (fails closed rather than return an uncorrelatable secret)"}}}
     },
     "/tokens/{token_id}/confirm": {
       "post": {"summary": "Confirm receipt of a rotated API token's successor secret (P2 #11 maker-checker)", "tags": ["API Tokens"], "description": "token_id in the path is the SUCCESSOR token_id the rotate response returned. The request body MUST carry the raw successor secret (proof of possession, #3015), verified against the stored hash before the predecessor is revoked. Requires ApiToken:Rotate and step-up. Self-service only; reachable by any non-admin owner under the default RBAC-off config (#2963). Any caller who OWNS the token and presents the raw successor secret may confirm — not necessarily the same session that called rotate — provided the caller's CURRENT mcp_tier/scope_service equals the successor's own (or the caller holds no standing tier/scope at all, #2963), or the mismatch check below refuses it. Ownership + the proof-of-possession secret are the actual gates on who may confirm; the tier/scope re-check is defense in depth, not a same-session pin.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The successor token_id returned by the rotate call"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["secret"], "properties": {"secret": {"type": "string", "minLength": 1, "maxLength": 512, "description": "The raw successor secret the rotate call returned — proof of possession (#3015), verified constant-time against the stored hash; checked only after ownership/step-up. Missing/empty is 400; wrong is 403"}}}}}}, "responses": {"200": {"description": "Confirmed; predecessor token revoked"}, "400": {"description": "Missing or empty secret (#3015); or terminal client-state conditions the store classifies ClientValidation: the caller's (mcp_tier, scope_service) does not equal the predecessor's (unless the caller holds no standing tier/scope at all, #2963), more than two active credentials share the rotation_group, or the token is not a human-owned credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires ApiToken:Rotate, or the presented secret does not verify (#3015)"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry)"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, or the deliberately-ambiguous no-in-flight-rotation read (a swallowed query failure and a genuinely empty active set are indistinguishable, so it stays retryable). A MALFORMED pair found after a positive two-row read is terminal 409, not this (#2943)."}}}
@@ -1184,7 +1215,7 @@ const std::string& openapi_spec() {
         R"json(,
     "/guaranteed-state/rules": {
       "get": {"summary": "List Guaranteed State rules", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "responses": {"200": {"description": "List of rules", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}}, "403": {"description": "Service-scoped API token — the rule catalogue isn't owned by any one IT service, so this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Guaranteed-state store degraded, retryable (A4 envelope, retry_after_ms: 5000)"}}},
-      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+. Structured authoring: pass spark/assertion/remediation {type, params} blocks; remediation.params resilience policy is validated (mode persist|backoff|bounded + bounds). Validation failures use the A4 error envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields, invalid JSON, or invalid resilience params"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Service-scoped API token — rule authoring cannot be confined to the token's service."}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
+      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+. Structured authoring: pass spark/assertion/remediation {type, params} blocks; remediation.params resilience policy is validated (mode persist|backoff|bounded + bounds). Validation failures use the A4 error envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields, invalid JSON, invalid resilience params, or version not a JSON integer from 1 to 2147483647"}, "401": {"description": "MFA step-up required (stale/absent proof) — see meta.challenge_url"}, "403": {"description": "Service-scoped API token — rule authoring cannot be confined to the token's service."}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
     },
     "/guaranteed-state/schemas": {
       "get": {"summary": "Guard authoring schema registry", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Static catalog of spark/assertion/remediation types with per-type JSON Schemas (discriminated subschemas for value-dependent formats; resilience policy subschema for remediation). Cacheable via ETag/If-None-Match (304).", "responses": {"200": {"description": "Schema catalog"}, "304": {"description": "Not modified (ETag matched)"}}}
@@ -1459,7 +1490,7 @@ const std::string& openapi_spec() {
         // above sat 12 bytes under it. Upload-grant + chunked-receive paths.
         R"json(
     "/upload-grants": {
-      "post": {"summary": "Mint a one-time upload-grant credential", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Write. Authorises ONE agent to push ONE file back to the server (CC-06 authenticated chunked-receive protocol, docs/adr/3004-artifact-blob-storage.md). grant_secret is returned EXACTLY ONCE in this response — only its digest is persisted. destination_key is SERVER-DERIVED from retention_class + the freshly-minted grant_id only; source_path is stored as informational metadata and never influences it.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}, "source_path": {"type": "string", "description": "Informational only; never used to derive the destination key"}, "expected_sha256": {"type": "string"}, "retention_class": {"type": "string", "enum": ["standard", "extended", "transient"], "default": "standard"}, "declared_max_size": {"type": "integer"}, "ttl_secs": {"type": "integer"}}}}}}, "responses": {"201": {"description": "{grant_id, grant_secret, expires_at, destination_key}"}, "400": {"description": "Invalid input (empty agent_id, non-positive declared_max_size, unrecognized retention_class)"}, "503": {"description": "Upload grant store unavailable, or a CSPRNG/digest failure"}}},
+      "post": {"summary": "Mint a one-time upload-grant credential", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Write. Authorises ONE agent to push ONE file back to the server (CC-06 authenticated chunked-receive protocol, docs/adr/3004-artifact-blob-storage.md). grant_secret is returned EXACTLY ONCE in this response — only its digest is persisted. destination_key is SERVER-DERIVED from retention_class + the freshly-minted grant_id only; source_path is stored as informational metadata and never influences it.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}, "source_path": {"type": "string", "description": "Informational only; never used to derive the destination key"}, "expected_sha256": {"type": "string"}, "retention_class": {"type": "string", "enum": ["standard", "extended", "transient"], "default": "standard"}, "declared_max_size": {"type": "integer"}, "ttl_secs": {"type": "integer", "minimum": 1, "description": "A JSON integer of at least 1, clamped to the 900 s maximum; omit for the default"}}}}}}, "responses": {"201": {"description": "{grant_id, grant_secret, expires_at, destination_key}"}, "400": {"description": "Invalid input (empty agent_id, non-positive declared_max_size, unrecognized retention_class, ttl_secs not a JSON integer of at least 1)"}, "503": {"description": "Upload grant store unavailable, or a CSPRNG/digest failure"}}},
       "get": {"summary": "List upload grants", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Read, routed through the ADR-0017 admit-then-filter list gate: AdmitAll lists every grant; a management-group-confined grant lists only grants for agents in the caller's visible set. No client-selected agent_id filter exists on this surface — the frozen protocol forbids one on every path. A service-scoped API token is refused with 403 whoever minted it (audit action upload_grant.list.access_denied), since the list gate would otherwise evaluate the minter's own grants. Never returns a grant secret or its hash.", "responses": {"200": {"description": "{data: [{grant_id, agent_id, source_path, declared_max_size, expected_sha256, retention_class, destination_key, state, minted_by, created_at, expires_at}]}"}, "403": {"description": "No grant anywhere for UploadGrant:Read, or the caller is a service-scoped API token (refused whoever minted it)"}, "503": {"description": "Upload grant store unavailable"}}}
     },
     "/upload-grants/{grant_id}": {
@@ -4047,9 +4078,45 @@ void RestApiV1::register_routes(
         if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/tokens"))
             return;
 
+        // The body must be one JSON object: a truncated document or a non-object (array,
+        // string, number, null, empty) used to throw out of `body.value` (a bare 500). Within
+        // the object, a present `name`/`scope_service`/`mcp_tier` must be a string, and a present
+        // `expires_at` one JSON integer (#4644): `-1` and a value above INT64_MAX (which wrapped
+        // to -1) minted a token that NEVER expires, and `1e3` minted one already expired.
         auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object()) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                            "application/json");
+            return;
+        }
+        for (const char* key : {"name", "scope_service", "mcp_tier"}) {
+            if (body.contains(key) && !body[key].is_string()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, std::string(key) + " must be a string"),
+                                "application/json");
+                return;
+            }
+        }
+        const int64_t now = static_cast<int64_t>(std::time(nullptr));
+        const auto expires_at_opt = read_json_int_strict(body, "expires_at", 0);
+        if (!expires_at_opt) {
+            res.status = 400;
+            res.set_content(
+                detail::a4_error(res, "expires_at must be a JSON integer (unix epoch seconds)"),
+                "application/json");
+            return;
+        }
+        // 0 (or omitted) is the documented "never expires"; anything else must be in the future.
+        if (*expires_at_opt < 0 || (*expires_at_opt > 0 && *expires_at_opt <= now)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "expires_at must be 0 (never expires) or a unix "
+                                                  "epoch second in the future"),
+                            "application/json");
+            return;
+        }
+        const int64_t expires_at = *expires_at_opt;
         auto name = body.value("name", "");
-        auto expires_at = body.value("expires_at", int64_t{0});
         auto scope_service = body.value("scope_service", "");
         // MCP tier (#289 follow-up): create_token already accepts this — the
         // handler had silently dropped it, so a documented `mcp_tier` in the body
@@ -4084,7 +4151,6 @@ void RestApiV1::register_routes(
                 return;
             }
             if (!mcp_tier.empty()) {
-                const int64_t now = static_cast<int64_t>(std::time(nullptr));
                 if (expires_at - now > 90LL * 24 * 3600) {
                     res.status = 400;
                     res.set_content(detail::a4_error(res, "MCP token TTL cannot exceed 90 days"),
@@ -4413,18 +4479,9 @@ void RestApiV1::register_routes(
             // `.value()` call would surface as a bare httplib 500 with no A4
             // envelope on a route whose OpenAPI promises 400 (round-3 review
             // finding).
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
             int64_t overlap_secs = 7 * 24 * 3600; // 7-day default overlap window
-            if (!body.is_discarded() && body.is_object() && body.contains("overlap_secs")) {
-                if (!body["overlap_secs"].is_number_integer()) {
-                    res.status = 400;
-                    res.set_content(
-                        detail::a4_error(res, "overlap_secs must be an integer (seconds)"),
-                        "application/json");
-                    return;
-                }
-                overlap_secs = body["overlap_secs"].get<int64_t>();
-            }
+            if (!read_rotate_overlap_secs(req, res, overlap_secs))
+                return;
 
             const int64_t now = static_cast<int64_t>(std::time(nullptr));
             // requesting_user is the AUTHENTICATED session's own username —
@@ -5190,10 +5247,9 @@ void RestApiV1::register_routes(
                 return;
 
             auto principal_id = req.matches[1].str();
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
             int64_t overlap_secs = 7 * 24 * 3600; // 7-day default overlap window
-            if (!body.is_discarded() && body.is_object() && body.contains("overlap_secs"))
-                overlap_secs = body.value("overlap_secs", overlap_secs);
+            if (!read_rotate_overlap_secs(req, res, overlap_secs))
+                return;
 
             const int64_t now = static_cast<int64_t>(std::time(nullptr));
             // G7: requesting_user threads through to ApiTokenStore so the
@@ -14598,11 +14654,15 @@ void RestApiV1::register_routes(
         GuaranteedStateRuleRow row;
         row.rule_id = body.value("rule_id", "");
         row.name = body.value("name", "");
-        row.version = body.value("version", int64_t{1});
+        // ABSENT defaults to 1; a PRESENT version must be one JSON integer (a string, float,
+        // bool, null or a value above INT64_MAX is nullopt: the old `body.value` threw on the
+        // first four and wrapped the last).
+        const auto version_opt = read_json_int_strict(body, "version", 1);
+        row.version = version_opt.value_or(0);
         // An update bumps the stored version by one and the agent push casts it to uint64,
         // so the accepted range is bounded here (and again in create_rule) the same way the
         // MCP create tool bounds it.
-        if (!rule_version_in_range(row.version)) {
+        if (!version_opt || !rule_version_in_range(row.version)) {
             res.status = 400;
             res.set_content(detail::error_json_a4(400, "version must be an integer from 1 to 2147483647",
                                                   cid, "omit version (it defaults to 1) or send 1..2147483647"),

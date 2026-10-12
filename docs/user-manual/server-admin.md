@@ -4940,7 +4940,7 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 |---|---|---|
 | `GET` | `/fragments/settings/tokens` | Render the enrollment tokens fragment (HTMX). |
 | `POST` | `/api/settings/enrollment-tokens` | Generate a new enrollment token. Body: `{ "expiry", "max_uses" }`. |
-| `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. Body: `{ "label", "count", "max_uses", "ttl_hours" }`. Defaults when a field is empty or omitted: `count` 10 (allowed 1 to 10000), `max_uses` 1, `ttl_hours` 0 (no expiry). A malformed or negative number, or a `count` outside 1 to 10000, is a `400` and nothing is minted. |
+| `POST` | `/api/settings/enrollment-tokens/batch` | Generate multiple tokens in one call. Body: `{ "label", "count", "max_uses", "ttl_hours" }`. Defaults when a field is empty or omitted: `count` 10 (allowed 1 to 10000), `max_uses` 1, `ttl_hours` 0 (no expiry). Each number may be a JSON integer or a numeric string. A malformed, fractional, boolean, `null` or negative number, one outside the 32-bit range, a `count` outside 1 to 10000, or a body that is not one JSON object, is a `400` and nothing is minted. |
 | `DELETE` | `/api/settings/enrollment-tokens/{id}` | Revoke a token by ID. |
 
 ### Pending Agents

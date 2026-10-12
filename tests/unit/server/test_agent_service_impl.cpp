@@ -2592,6 +2592,31 @@ TEST_CASE("Register: signer returning nullopt leaves the agent accepted but cert
     REQUIRE(resp.issued_ca_chain().empty());
 }
 
+TEST_CASE("Register: a malformed ip_subnet auto-approve rule does not throw out of Register and "
+          "approves nothing (#4644)",
+          "[pg][agent_service][auto_approve][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    // `std::stoi` on the prefix threw std::invalid_argument out of evaluate(), and Register has
+    // no try/catch, so every new-agent registration that reached the auto-approve tier failed
+    // (a persisted rule survived restart). A malformed rule now never matches: the agent lands in
+    // the pending queue exactly as if no rule matched.
+    h.auto_approve.add_rule({yuzu::server::auth::AutoApproveRuleType::ip_subnet, "10.0.0.0/abc",
+                             "bad prefix", /*enabled=*/true});
+    h.auto_approve.add_rule({yuzu::server::auth::AutoApproveRuleType::ip_subnet, "10.0.0.0/33",
+                             "wide prefix", /*enabled=*/true});
+
+    grpc::ServerContext ctx;
+    auto req = make_register("agent-badrule", "A-CSR");
+    apb::RegisterResponse resp;
+    grpc::Status st;
+    REQUIRE_NOTHROW(st = h.svc.Register(&ctx, &req, &resp));
+    REQUIRE(st.ok());
+    REQUIRE_FALSE(resp.accepted());
+    REQUIRE(resp.enrollment_status() == "pending");
+}
+
 TEST_CASE("Register: a pending (unapproved) enrollment never reaches the CSR signer (B-2)",
           "[pg][agent_service][pki][pr3][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

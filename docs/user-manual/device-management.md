@@ -104,6 +104,8 @@ Response:
 }
 ```
 
+`count`, `max_uses` and `ttl_hours` may each be a JSON integer or a numeric string (`"count": "10"`); an empty string or an omitted key keeps the default (`count` 10, `max_uses` 1, `ttl_hours` 0 = no expiry). A float, boolean, `null`, a number outside the 32-bit range, a negative `ttl_hours` or `max_uses`, a `count` outside 1 to 10000, or a body that is not one JSON object is `400` and mints nothing. Before this check a JSON number was silently ignored, so the example above minted single-use tokens that never expired.
+
 **Agent side:**
 
 ```bash
@@ -154,7 +156,7 @@ curl -s -X POST http://localhost:8080/api/settings/auto-approve \
 
 This rule automatically approves any agent whose hostname matches the glob pattern `web-*.example.com`.
 
-Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`.
+Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`. An `ip_subnet` value must be an IPv4 address or `a.b.c.d/N` with `N` from 0 to 32 (IPv6 is not supported); anything else is `400` and the rule is not stored. A malformed rule that is already in the rule file never matches, so it never approves an agent.
 
 **Set the auto-approve match mode:**
 

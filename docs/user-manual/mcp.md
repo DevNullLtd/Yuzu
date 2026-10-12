@@ -72,7 +72,7 @@ curl -s -b cookies.txt -X POST https://localhost:8080/api/v1/tokens \
   -d '{
     "name": "Claude Desktop - readonly",
     "mcp_tier": "readonly",
-    "expires_at": 1750000000
+    "expires_at": 1893456000
   }'
 ```
 
@@ -329,7 +329,7 @@ curl -s -b cookies.txt -X POST https://localhost:8080/api/v1/tokens \
   -d '{
     "name": "AI Fleet Monitor",
     "mcp_tier": "readonly",
-    "expires_at": 1750000000
+    "expires_at": 1893456000
   }'
 ```
 

@@ -12,6 +12,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
+#include <fstream>
 #include <memory>
 
 namespace fs = std::filesystem;
@@ -231,4 +232,72 @@ TEST_CASE("save and reload auto-approve config", "[auto_approve][config]") {
         REQUIRE(rules[1].value == "10.0.0.0/8");
         REQUIRE(rules[1].enabled == false);
     }
+}
+
+// ── Malformed ip_subnet rule values (#4644) ──────────────────────────────────
+
+// `std::stoi` on the prefix threw out of evaluate() (so out of Register/ProxyRegister), read
+// `1e3` as /1, and a prefix above 32 made the mask shift undefined. A malformed rule must never
+// throw and never match (fail closed): nothing is auto-approved because of it.
+static const char* const kMalformedSubnets[] = {
+    "10.0.0.0/abc",        "10.0.0.0/",          "10.0.0.0/33",       "10.0.0.0/-1",
+    "10.0.0.0/1e3",        "10.0.0.0/+8",        "10.0.0.0/8x",       "10.0.0.0/ 8",
+    "10.0.0.0/0x8",        "10.0.0.0/99999999999", "10.0.0.0/4294967297",
+    "10.0.0.0/18446744073709551615", "10.0.0.0/8/8", "/8", "garbage/8", "10.0.0/8", "1.2.3.4.5/8",
+};
+
+TEST_CASE("ip_subnet: a malformed prefix or address never throws and never matches",
+          "[auto_approve][cidr][numeric_params]") {
+    for (const char* bad : kMalformedSubnets) {
+        INFO(bad);
+        AutoApproveEngine engine;
+        engine.add_rule({AutoApproveRuleType::ip_subnet, bad, "bad"});
+        for (const char* ip : {"10.1.2.3", "0.0.0.1", "255.255.255.255", "", "not-an-ip"}) {
+            INFO(ip);
+            REQUIRE_NOTHROW(engine.evaluate(make_ctx("host", ip)));
+            CHECK(engine.evaluate(make_ctx("host", ip)).empty());
+        }
+    }
+}
+
+TEST_CASE("ip_subnet: a malformed rule blocks require-all mode and does not shadow a valid rule "
+          "in any-mode",
+          "[auto_approve][cidr][numeric_params]") {
+    AutoApproveEngine all;
+    all.set_require_all(true);
+    all.add_rule({AutoApproveRuleType::ip_subnet, "10.0.0.0/8", "good"});
+    CHECK_FALSE(all.evaluate(make_ctx("host", "10.1.2.3")).empty());
+    all.add_rule({AutoApproveRuleType::ip_subnet, "10.0.0.0/abc", "bad"});
+    CHECK(all.evaluate(make_ctx("host", "10.1.2.3")).empty());
+
+    AutoApproveEngine any;
+    any.add_rule({AutoApproveRuleType::ip_subnet, "10.0.0.0/abc", "bad"});
+    any.add_rule({AutoApproveRuleType::ip_subnet, "10.0.0.0/8", "good"});
+    CHECK(any.evaluate(make_ctx("host", "10.1.2.3")) == "good");
+}
+
+TEST_CASE("ip_subnet: a malformed rule loaded from the config file does not throw on evaluate",
+          "[auto_approve][cidr][config][numeric_params]") {
+    yuzu::test::TempDbFile cfg{"yuzu_test_auto_approve_bad-"};
+    {
+        std::ofstream f(cfg.path);
+        f << "mode:any\n"
+          << "ip_subnet:10.0.0.0/abc:bad:1\n"
+          << "ip_subnet:10.0.0.0/33:toolong:1\n";
+    }
+    AutoApproveEngine engine;
+    REQUIRE(engine.load(cfg.path));
+    REQUIRE(engine.list_rules().size() == 2);
+    REQUIRE_NOTHROW(engine.evaluate(make_ctx("host", "10.1.2.3")));
+    CHECK(engine.evaluate(make_ctx("host", "10.1.2.3")).empty());
+}
+
+TEST_CASE("ip_subnet: is_valid_ip_subnet_value accepts exactly what the matcher can match",
+          "[auto_approve][cidr][numeric_params]") {
+    for (const char* ok : {"10.0.0.0/8", "10.0.0.0/0", "10.0.0.1/32", "192.168.1.5", "10.0.0.0/08"})
+        CHECK(AutoApproveEngine::is_valid_ip_subnet_value(ok));
+    for (const char* bad : kMalformedSubnets)
+        CHECK_FALSE(AutoApproveEngine::is_valid_ip_subnet_value(bad));
+    for (const char* bad : {"", "::1", "2001:db8::/32", "10.0.0.256", "host.example.com"})
+        CHECK_FALSE(AutoApproveEngine::is_valid_ip_subnet_value(bad));
 }

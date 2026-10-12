@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -234,6 +235,29 @@ std::string highlight_yaml_kv(const std::string& line) {
 
 // extract_json_string moved to json_extract.hpp (#2557) — SettingsRoutes
 // lives in namespace yuzu::server, so this unqualified name still resolves.
+
+// One OPTIONAL number of the batch enrollment-token body (#4644): `out` keeps its default when
+// the key is absent or an EMPTY string (the documented "empty or omitted" default). A JSON
+// integer and a numeric string are both accepted (the shipped curl example sends numbers,
+// scripts/ci/qa-stack.sh and the form-style callers send strings); a float, bool, null, array,
+// object, a non-numeric string and anything outside the `int` range throw std::invalid_argument
+// (the caller's single `invalid_numeric_parameter` branch). Before this, a JSON number was
+// silently ignored, so the documented example minted single-use tokens that never expire.
+void read_enrollment_int(const nlohmann::json& body, const char* key, int& out) {
+    if (!body.contains(key))
+        return;
+    const auto& v = body[key];
+    if (v.is_string()) {
+        const auto s = v.get<std::string>();
+        if (!s.empty())
+            out = yuzu::server::strict_stoi(s);
+        return;
+    }
+    const auto wide = yuzu::server::read_json_int_strict(body, key, 0);
+    if (!wide || *wide < std::numeric_limits<int>::min() || *wide > std::numeric_limits<int>::max())
+        throw std::invalid_argument("not an integer");
+    out = static_cast<int>(*wide);
+}
 
 // #4028 — success-envelope wrapper matching rest_api_v1.cpp's ok_json() wire
 // shape ({"data":...,"meta":{"api_version":"v1"}}) exactly. ok_json() itself
@@ -5502,22 +5526,35 @@ void SettingsRoutes::register_routes(
                                                               httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
-        auto label = extract_json_string(req.body, "label");
-        auto count_s = extract_json_string(req.body, "count");
-        auto max_uses_s = extract_json_string(req.body, "max_uses");
-        auto ttl_s = extract_json_string(req.body, "ttl_hours");
+        // A blank body keeps every default; any other body must be one JSON object (a truncated
+        // document used to mint the default 10 single-use tokens with no expiry).
+        nlohmann::json batch_body = nlohmann::json::object();
+        const bool body_blank =
+            std::all_of(req.body.begin(), req.body.end(),
+                        [](unsigned char c) { return std::isspace(c) != 0; });
+        if (!body_blank) {
+            batch_body = nlohmann::json::parse(req.body, nullptr, /*allow_exceptions=*/false);
+            if (batch_body.is_discarded() || !batch_body.is_object()) {
+                audit_fn_(req, "enrollment.bulk_token_create", "denied", "EnrollmentToken", "",
+                          "invalid_body");
+                res.status = 400;
+                res.set_header("HX-Trigger",
+                               R"({"showToast":{"message":"Request body must be a JSON object - nothing was created","level":"error"}})");
+                res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                                "application/json");
+                return;
+            }
+        }
+        auto label = extract_json_string(batch_body, "label");
 
         int count = 10;
         int max_uses = 1;
         int ttl_hours = 0;
         try {
             // Strict (see the single-token route): a malformed limit must never read as 0.
-            if (!count_s.empty())
-                count = yuzu::server::strict_stoi(count_s);
-            if (!max_uses_s.empty())
-                max_uses = yuzu::server::strict_stoi(max_uses_s);
-            if (!ttl_s.empty())
-                ttl_hours = yuzu::server::strict_stoi(ttl_s);
+            read_enrollment_int(batch_body, "count", count);
+            read_enrollment_int(batch_body, "max_uses", max_uses);
+            read_enrollment_int(batch_body, "ttl_hours", ttl_hours);
             // A negative TTL computes `ttl_hours > 0 ? ... : 0` and 0 means NEVER EXPIRES, so a
             // typed `-1` used to mint a credential with no expiry. Refuse it. (`-0` and `00`
             // parse to a literal 0 and keep the documented meaning.)
@@ -6061,6 +6098,20 @@ void SettingsRoutes::register_routes(
                       type = auth::AutoApproveRuleType::cloud_provider;
                   else
                       type = auth::AutoApproveRuleType::hostname_glob;
+
+                  // A subnet rule must be a bare IPv4 address or a/b/c/d/N with N in 0..32: a
+                  // malformed prefix used to be stored and then threw out of Register (#4644).
+                  if (type == auth::AutoApproveRuleType::ip_subnet &&
+                      !auth::AutoApproveEngine::is_valid_ip_subnet_value(value)) {
+                      res.status = 400;
+                      // The dashboard drops 4xx bodies (swap:false): the toast is what the operator sees.
+                      res.set_header("HX-Trigger",
+                                     R"({"showToast":{"message":"Invalid IP subnet (use a.b.c.d or a.b.c.d/0-32) - rule not added","level":"error"}})");
+                      res.set_content(detail::a4_error(res, "invalid ip_subnet value: use an IPv4 "
+                                                            "address or a.b.c.d/N with N 0 to 32"),
+                                      "application/json");
+                      return;
+                  }
 
                   auto_approve_->add_rule({type, value, label, true});
                   spdlog::info("Auto-approve rule added: {}:{} ({})", type_s, value, label);

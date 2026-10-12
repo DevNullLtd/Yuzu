@@ -277,6 +277,7 @@ Routes that parse strictly (the response routes are listed in
 | Delivery and list routes | `GET /api/notifications`: `limit`, `offset` (a negative value is `400` too, where the store answered an empty `200`); `GET /api/webhooks/{id}/deliveries` and `GET /api/v1/offload-targets/{id}/deliveries`: `limit`; `GET /api/v1/ca/issued`: `limit`, `offset`; `GET /api/v1/preflight/runs`: `limit`; the pre-flight run form: `min_gib` and `window` (a malformed value is `400`; a negative `min_gib` is `400` too; see [Pre-flight readiness checks](preflight.md)); `GET /api/v1/result-sets` and `GET /api/v1/result-sets/{id}/members`: `limit` (trailing characters are `400`, not their numeric prefix; an integer outside the route's page range still uses the default page size); `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices` and `GET /api/v1/network/devices`: `limit`; `GET /api/v1/guaranteed-state/events`: `limit` and `offset` (a negative value is `400` too; both are parsed before the `dex.device.view` audit row is written, so a `400` leaves no access row) |
 | Event streams | `GET /api/v1/events`: `since` (a non-negative integer; a malformed value is `400`, answered before the stream budget is touched). A malformed `Last-Event-ID` **header** on `GET /api/v1/events` or the workflow execution stream is served **live only**: nothing buffered is replayed (never the whole ring buffer) and it is not a `400`, because the header is browser-supplied inference and a `400` would fail a reconnect. The cursor is parsed strictly, so `-1` and `5abc` are never accepted as a position (`5abc` used to replay from position 5; `-1` wrapped past every event and also replayed nothing, so that input's outcome is unchanged); valid ids replay exactly as before. A rejected `?since` leaves no success audit row, because it is parsed before the audit write |
 | Settings forms | `POST /api/settings/dex-alerts/blast` (`min_devices`, `window_seconds`, `cooldown_seconds`): a malformed value is `400` and nothing is saved (it used to persist the clamped minimum); `POST /api/settings/enrollment-tokens` and `/batch` (`max_uses`, `ttl_hours`, `count`): `0x5` used to read as `0`, and `max_uses` `0` means unlimited, so a mistyped limit minted an unlimited token (only an **empty** field, or a value that parses to a literal `0` such as `0`, `-0` or `00`, means unlimited or no expiry now; on `/batch` an empty `max_uses` defaults to `1`, not unlimited; a **negative** `ttl_hours` is refused with `400` because it would compute `0`, a token that never expires); the API-token create form `ttl_hours` (the same `0x5` read as a token that never expires; it is refused with the form's usual `200` feedback span, `Invalid TTL value.`, a negative value too, and nothing is minted); the OTA package `rollout_pct` on upload and on the rollout route (an out-of-range integer on upload is clamped to 0..100 as before): a malformed value used to become `100`, a full-fleet rollout. **Behaviour change on the rollout change route only:** an empty `rollout_pct` and a value above `100` are also `400` there (an empty value used to mean `100` and a larger one was clamped to `100`), while a negative value still clamps to `0` (the least exposure); the upload route is unchanged. Each enrollment and OTA `400` also sets an error toast (`HX-Trigger`), because the dashboard drops `4xx` bodies |
+| JSON request bodies (security-gating numbers) | `POST /api/v1/tokens` `expires_at` (a negative value or one above 9223372036854775807 minted a token that never expires, `5.5` or `1e3` an already-expired one, and a wrong type threw a bare `500`; now `400`, and `0` or omitted still means never expires); `POST /api/v1/tokens/{id}/rotate` and `POST /api/v1/engine-principals/{id}/credentials/rotate` `overlap_secs` (a truncated or non-object body used to rotate with the 7-day default; now `400`, and an empty body still takes the default); `POST /api/v1/guaranteed-state/rules` `version` (`5.5` was stored as `5` and a wrong type threw; now `400`); `POST /api/v1/upload-grants` `ttl_secs` (a wrong type, `0` or a negative value was ignored and the grant got the 900 s maximum; now `400`); `POST /api/settings/enrollment-tokens/batch` `count`, `max_uses`, `ttl_hours` (a JSON number was silently ignored, so the documented example minted single-use tokens that never expire; now a JSON integer **and** a numeric string are both read, an empty string keeps the default, and a float, boolean, `null`, overflow or a truncated or non-object body is `400` and mints nothing). The `ip_subnet` auto-approve rule value is validated when it is added (`POST /api/settings/auto-approve`, `400` for anything but an IPv4 address or `a.b.c.d/0` to `/32`) |
 
 On the query-parameter routes in the table above, a parameter that is **present but empty** (`?limit=`) is malformed, not absent (`GET /api/v1/audit` `limit` included). The auth-sample export is the exception: a present but empty `from` or `to` on `GET /api/v1/audit/auth-sample` is accepted as unbounded on that side. The admin forms are different: an EMPTY form field means that field's default.
 
@@ -963,7 +964,7 @@ Create a new API token. The raw token is returned in the response and is never s
 ```json
 {
   "name": "CI Pipeline Token",
-  "expires_at": 1742385600,
+  "expires_at": 1893456000,
   "mcp_tier": "readonly"
 }
 ```
@@ -971,7 +972,7 @@ Create a new API token. The raw token is returned in the response and is never s
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | Yes | Human-readable label |
-| `expires_at` | integer | No | Unix epoch seconds. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). |
+| `expires_at` | integer | No | Unix epoch seconds, in the future. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). Must be one JSON integer: a string, float, boolean, `null`, a negative or past value, or one above 9223372036854775807 is `400` and mints nothing. |
 | `mcp_tier` | string | No | MCP authorization tier: `"readonly"`, `"operator"`, or `"supervised"`. Omit for standard API tokens. When set, `expires_at` is mandatory. |
 
 `mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at` within the 90-day cap. Setting `scope_service` requires RBAC to be enabled and either a global `ManagementGroup:Write` grant or `ITServiceOwner` on the `"Service: <scope_service>"` management group — see [Service-Scoped Tokens](authentication.md#service-scoped-tokens).
@@ -983,6 +984,9 @@ Create a new API token. The raw token is returned in the response and is never s
 | `mcp_tier` is not one of `readonly` / `operator` / `supervised` | `400` — `invalid mcp_tier: must be one of readonly, operator, supervised (or omitted)` |
 | `mcp_tier` set (or `scope_service` set) but `expires_at` omitted / `≤ 0` | `400` — `expires_at is required for an MCP-tier or service-scoped token` |
 | `mcp_tier` set and `expires_at` is more than 90 days out | `400` — `MCP token TTL cannot exceed 90 days` |
+| The body is not a JSON object (truncated, empty, array, string, number, `null`), or `name`, `scope_service` or `mcp_tier` is not a string | `400`: `request body must be a JSON object` / `<field> must be a string` |
+| `expires_at` is not a JSON integer (`"7"`, `5.5`, `1e3`, `true`, `null`, `18446744073709551615`) | `400`: `expires_at must be a JSON integer (unix epoch seconds)` |
+| `expires_at` is negative, or a positive epoch that is not in the future | `400`: `expires_at must be 0 (never expires) or a unix epoch second in the future` |
 
 **Response (201):**
 
@@ -1077,7 +1081,8 @@ Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6
 |---|---|
 | No such token, or the token exists but is not owned by the caller | `404` — `token not found` (identical body; not an enumeration oracle) |
 | The token exists and IS owned by the caller, but the caller's OWN current `mcp_tier`/`scope_service` (from their authenticated session) does not equal the token's own (the authority-inheritance guard), AND the caller holds SOME non-empty `mcp_tier`/`scope_service` of its own — a caller holding NO standing tier/scope at all (an untiered dashboard/cookie session) is instead admitted regardless of the token's own tier/scope (#2963; the successor still inherits the token's own tier/scope, never the caller's) | `400` — `no such token to rotate` (store-level; distinct from the route's own `404` pre-check above, and worded identically to the absent/not-owned case on purpose, so this is not an authority-probing oracle either — see [Rotating a Token](authentication.md#rotating-a-token) for the operator-facing explanation) |
-| `overlap_secs` present in the body but not an integer (e.g. a string) | `400` — `overlap_secs must be an integer (seconds)` |
+| `overlap_secs` present in the body but not a JSON integer (a string, float, boolean, `null`, or a value above 9223372036854775807) | `400`: `overlap_secs must be an integer (seconds)` |
+| A non-blank body that is not a JSON object (truncated, array, string, number, `null`); an empty or whitespace-only body keeps the default | `400`: `request body must be a JSON object` |
 | Overlap window below the 24h floor, or above the 10-year ceiling | `400` |
 | Overlap window would outlive the predecessor's or the successor's own expiry — by design, a token within 24h of its own expiry cannot be rotated (rotation is lifetime-neutral, so there is no way to shrink the overlap below the 24h floor to fit); mint a new token instead | `400` |
 | The token is not a human-owned credential (an engine-principal credential somehow reached this route) | `400` — `token is not a human-owned credential` |
@@ -1302,7 +1307,7 @@ Overlap-pair rotation (design doc §7): mints a successor credential while the e
 { "overlap_secs": 604800 }
 ```
 
-`overlap_secs` defaults to 7 days (`604800`). The overlap window has a **24-hour floor** and a 10-year ceiling — a value below the floor (or above the ceiling) is rejected outright (`400`), never silently truncated up to the floor.
+`overlap_secs` defaults to 7 days (`604800`). The overlap window has a **24-hour floor** and a 10-year ceiling — a value below the floor (or above the ceiling) is rejected outright (`400`), never silently truncated up to the floor. `overlap_secs` must be a JSON integer when present, and a non-blank body must be a JSON object: a string, float, boolean or `null` value, or a truncated or non-object body, is `400` and rotates nothing (an empty or whitespace-only body keeps the default).
 
 **Grace-window re-serve:** a same-caller retry within a ~120-second grace window after the original mint re-serves the **same** successor secret (rather than erroring or minting a second successor). Each successful return — the original reveal or a grace-window re-serve — is independently recorded under its own `engine_principal.credential.reveal` audit row, since every time the raw secret leaves the server is independently on the audit chain, whether or not the bytes are new. Once the grace window lapses, a further rotate call while a rotation is already in flight errors — the caller must fall back to `credentials/confirm` (below) or the principal-level revoke-and-replace runbook, never an indefinite retry loop.
 
@@ -8362,7 +8367,7 @@ Mint a one-time upload grant for an agent. Operator-facing.
 | `source_path` | string | No | Informational only — never used to derive the destination key |
 | `expected_sha256` | string | No | Optional expected content hash, 64 lowercase hex characters |
 | `retention_class` | string | No | `standard` (default), `extended`, or `transient` |
-| `ttl_secs` | integer | No | Grant expiry override; server default applies when omitted (<= 15 min) |
+| `ttl_secs` | integer | No | Grant expiry override; server default applies when omitted (<= 15 min). When present it must be a JSON integer of at least `1` (a string, float, boolean, `null`, `0` or a negative value is `400` and mints nothing); a larger value is clamped to the 15-minute maximum. |
 
 **Response (`201`):**
 
@@ -8457,7 +8462,7 @@ A rule may be authored **structured** (the agent-enforceable form) or **legacy**
 | `assertion` | object | Structured | `{type, params}` desired-state block, e.g. `registry-value-equals`, `file-exists`, `file-hash-equals`. |
 | `remediation` | object | No | `{type, params}` — `alert-only` (default) or `enforce`. `params` carries the **resilience policy** (`mode`, `max_attempts`, `backoff_*`, …) and `event_debounce_ms`. |
 | `yaml_source` | string | Legacy | Full rule YAML; required only when no structured `spark`+`assertion` is given. The server generates `yaml_source` from the structured form otherwise. |
-| `version` | integer | No | Starting version (default `1`). Must be `1`..`2147483647` (`400` otherwise): an update adds one to the stored version and the agent push casts it to an unsigned 64-bit value, so a value near the 64-bit maximum would overflow. |
+| `version` | integer | No | Starting version (default `1`). Must be a JSON integer in `1`..`2147483647` (`400` otherwise, including a string, float, boolean or `null`): an update adds one to the stored version and the agent push casts it to an unsigned 64-bit value, so a value near the 64-bit maximum would overflow. |
 | `enabled` | boolean | No | Default `true`. |
 | `enforcement_mode` | string | No | `enforce` (default) or `audit`. **Set once at creation — immutable on update** (see PUT below). |
 | `severity` | string | No | `low` / `medium` (default) / `high` / `critical`. |

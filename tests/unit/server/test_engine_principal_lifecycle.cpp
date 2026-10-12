@@ -771,6 +771,48 @@ TEST_CASE("Engine-principal REST: rotate with an overlap window under the 24h "
     CHECK(res->body.find("24h floor") != std::string::npos);
 }
 
+TEST_CASE("Engine-principal REST: rotate reads overlap_secs strictly and rejects a malformed or "
+          "non-object body, the default applies only to a blank body or an absent key (#4644)",
+          "[pg][rest][engine_principal][rotation]") {
+    RestEngineHarness h;
+    int n = 0;
+    // Every probe is a 400 and rotates nothing: the principal keeps exactly its one credential
+    // (a rotation would add a second, overlapping one). Before, a wrong type threw (bare 500), a
+    // float was truncated, 4294967297 / 18446744073709551615 wrapped, and a truncated or
+    // non-object body silently rotated with the 7-day default.
+    for (const char* bad :
+         {R"({"overlap_secs":"86400"})", R"({"overlap_secs":86400.5})", R"({"overlap_secs":1e5})",
+          R"({"overlap_secs":true})", R"({"overlap_secs":null})", R"({"overlap_secs":[]})",
+          R"({"overlap_secs":4294967297})", R"({"overlap_secs":9223372036854775808})",
+          R"({"overlap_secs":18446744073709551615})", R"({"overlap_secs":-1})",
+          R"({"overlap_secs":0})", R"({"overlap_secs":86400)", "[]", "5", R"("x")", "null",
+          "not json"}) {
+        INFO(bad);
+        auto [principal_id, raw] = h.create_and_mint("rotate-strict-" + std::to_string(n++));
+        (void)raw;
+        auto res = h.sink.Post("/api/v1/engine-principals/" + principal_id +
+                                    "/credentials/rotate",
+                                bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.token_store->list_active_for_principal(principal_id).size() == 1);
+    }
+
+    // The default still applies to a blank body and to an object without the key; an in-range
+    // integer is honoured (the existing happy-path cases cover 86400).
+    for (const char* ok : {"", "  \r\n\t ", "{}"}) {
+        INFO("body size " << std::strlen(ok));
+        auto [principal_id, raw] = h.create_and_mint("rotate-default-" + std::to_string(n++));
+        (void)raw;
+        auto res = h.sink.Post("/api/v1/engine-principals/" + principal_id +
+                                    "/credentials/rotate",
+                                ok);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.token_store->list_active_for_principal(principal_id).size() == 2);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // No-admin auditor query (§4.2).
 // ═══════════════════════════════════════════════════════════════════════════

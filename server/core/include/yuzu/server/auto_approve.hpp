@@ -44,6 +44,12 @@ public:
     /// Returns the label of the matching rule, or empty string if no match.
     std::string evaluate(const ApprovalContext& ctx) const;
 
+    /// True iff `value` is an `ip_subnet` rule value this engine can ever match: a bare IPv4
+    /// literal or `a.b.c.d/N` with N one base-10 integer in 0..32. IPv4 only on purpose: the rule
+    /// file is `type:value:label:enabled` and splits on ':', so an IPv6 value could not survive a
+    /// restart. The admin route refuses anything else (#4644); the matcher treats it as no match.
+    [[nodiscard]] static bool is_valid_ip_subnet_value(const std::string& value);
+
     /// CRUD for rules
     void add_rule(const AutoApproveRule& rule);
     void remove_rule(size_t index);

@@ -1,5 +1,7 @@
 #include <yuzu/server/auto_approve.hpp>
 
+#include "query_int_parse.hpp" // parse_query_int (#4644)
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -8,6 +10,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
 
 #ifdef _WIN32
 // clang-format off
@@ -216,6 +219,18 @@ bool AutoApproveEngine::match_hostname_glob(const std::string& pattern,
 
 // ── CIDR subnet matching ─────────────────────────────────────────────────────
 
+bool AutoApproveEngine::is_valid_ip_subnet_value(const std::string& value) {
+    const auto slash = value.find('/');
+    const auto net_str = value.substr(0, slash);
+    struct in_addr net_addr{};
+    if (inet_pton(AF_INET, net_str.c_str(), &net_addr) != 1)
+        return false;
+    if (slash == std::string::npos)
+        return true;
+    const auto prefix = parse_query_int<int>(std::string_view(value).substr(slash + 1));
+    return prefix && *prefix >= 0 && *prefix <= 32;
+}
+
 bool AutoApproveEngine::match_ip_subnet(const std::string& cidr, const std::string& ip) const {
     // Parse CIDR: "10.0.0.0/8"
     auto slash = cidr.find('/');
@@ -225,7 +240,13 @@ bool AutoApproveEngine::match_ip_subnet(const std::string& cidr, const std::stri
     }
 
     auto net_str = cidr.substr(0, slash);
-    int prefix_len = std::stoi(cidr.substr(slash + 1));
+    // Strict prefix (#4644): `std::stoi` threw out of Register/ProxyRegister on a malformed
+    // prefix, read `1e3` as /1, and a prefix above 32 made the mask shift undefined. A malformed
+    // rule never matches, so it never auto-approves (fail closed; in `all` mode it blocks).
+    const auto prefix = parse_query_int<int>(std::string_view(cidr).substr(slash + 1));
+    if (!prefix || *prefix < 0 || *prefix > 32)
+        return false;
+    const int prefix_len = *prefix;
 
     // Parse both IPs as IPv4
     struct in_addr net_addr{}, ip_addr{};

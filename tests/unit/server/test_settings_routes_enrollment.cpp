@@ -43,6 +43,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -428,6 +429,107 @@ TEST_CASE("settings enrollment: an empty or literal-zero limit still means unlim
     }
 }
 
+TEST_CASE("settings enrollment: the batch route honours JSON numbers AND numeric strings "
+          "(the documented curl example mints what it says, #4644)",
+          "[pg][settings_routes][enrollment][numeric_params]") {
+    using std::chrono::hours;
+    using std::chrono::system_clock;
+    const auto near_hours = [](system_clock::time_point tp, int h) {
+        const auto want = system_clock::now() + hours(h);
+        return tp > want - std::chrono::minutes(2) && tp < want + std::chrono::minutes(2);
+    };
+
+    SECTION("JSON numbers (the documented example shape)") {
+        EnrollRoutesHarness h;
+        auto res = h.sink.Post("/api/settings/enrollment-tokens/batch",
+                               R"({"label":"site-deploy","count":3,"max_uses":50,"ttl_hours":24})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto tokens = h.auth_mgr.list_enrollment_tokens().value();
+        REQUIRE(tokens.size() == 3);
+        for (const auto& t : tokens) {
+            CHECK(t.max_uses == 50);
+            CHECK(near_hours(t.expires_at, 24));
+        }
+    }
+    SECTION("numeric strings (qa-stack.sh and the unit-test shape), and a mix") {
+        EnrollRoutesHarness h;
+        auto res = h.sink.Post("/api/settings/enrollment-tokens/batch",
+                               R"({"count":"2","max_uses":7,"ttl_hours":"2"})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto tokens = h.auth_mgr.list_enrollment_tokens().value();
+        REQUIRE(tokens.size() == 2);
+        for (const auto& t : tokens) {
+            CHECK(t.max_uses == 7);
+            CHECK(near_hours(t.expires_at, 2));
+        }
+    }
+    SECTION("an empty string or an absent key keeps the documented default") {
+        EnrollRoutesHarness h;
+        auto res = h.sink.Post("/api/settings/enrollment-tokens/batch",
+                               R"({"count":2,"max_uses":"","ttl_hours":""})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto tokens = h.auth_mgr.list_enrollment_tokens().value();
+        REQUIRE(tokens.size() == 2);
+        for (const auto& t : tokens) {
+            CHECK(t.max_uses == 1);
+            CHECK(t.expires_at == system_clock::time_point::max());
+        }
+    }
+    SECTION("a blank body keeps every default (10 single-use tokens)") {
+        EnrollRoutesHarness h;
+        auto res = h.sink.Post("/api/settings/enrollment-tokens/batch", "");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.auth_mgr.list_enrollment_tokens().value().size() == 10);
+    }
+}
+
+TEST_CASE("settings enrollment: the batch route refuses every non-integer, out-of-range or "
+          "wrapped number and a bad body, and mints nothing (#4644)",
+          "[pg][settings_routes][enrollment][numeric_params]") {
+    EnrollRoutesHarness h;
+    const auto expect_refused = [&h](const std::string& body) {
+        INFO(body);
+        h.audit_calls.clear();
+        auto res = h.sink.Post("/api/settings/enrollment-tokens/batch", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.auth_mgr.list_enrollment_tokens().value().empty());
+        CHECK(h.only("enrollment.bulk_token_create").result == "denied");
+    };
+
+    // The same probe set for each key. A numeric string and a JSON integer in range are valid
+    // (previous test), so only values no reading can make valid appear here. 0 is valid for
+    // max_uses (unlimited) and ttl_hours (no expiry), so it is only a probe for count.
+    const std::vector<std::string> common = {
+        "4294967297", "9223372036854775808", "18446744073709551615", "1e3", "5.5", "true",
+        "null", "[]", "{}", R"("7x")", R"("0x1")", R"("1e1")", R"("5.5")", R"("+3")", R"(" 3")"};
+    for (const char* key : {"count", "max_uses", "ttl_hours"}) {
+        for (const auto& v : common) {
+            nlohmann::json j = {{"count", 2}};
+            j[key] = nlohmann::json::parse(v); // replaces the base value when key == "count"
+            expect_refused(j.dump());
+        }
+    }
+    // A negative TTL computes 0 = never expires; a negative max_uses and a count outside
+    // 1..10000 are refused by the existing rules, now for numbers as well as strings.
+    for (const char* v : {"-1", R"("-1")"}) {
+        expect_refused(std::string(R"({"count":2,"ttl_hours":)") + v + "}");
+        expect_refused(std::string(R"({"count":2,"max_uses":)") + v + "}");
+        expect_refused(std::string(R"({"count":)") + v + "}");
+    }
+    for (const char* v : {"0", R"("0")", "10001"})
+        expect_refused(std::string(R"({"count":)") + v + "}");
+
+    // A body that is not one JSON object is not "all defaults": it used to mint 10 single-use
+    // tokens that never expire.
+    for (const char* bad : {R"({"count":2)", "[]", "5", R"("x")", "null", "not json"})
+        expect_refused(bad);
+}
+
 TEST_CASE("settings enrollment: the batch route refuses a malformed count or limit too",
           "[pg][settings_routes][enrollment][numeric_params]") {
     for (const char* body : {R"({"count":"3x"})", R"({"count":"2","max_uses":"0x1"})",
@@ -441,4 +543,31 @@ TEST_CASE("settings enrollment: the batch route refuses a malformed count or lim
         CHECK(res->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
         CHECK(h.auth_mgr.list_enrollment_tokens().value().empty());
     }
+}
+
+TEST_CASE("settings auto-approve: an ip_subnet rule with a malformed address or prefix is a 400 "
+          "that stores nothing (#4644)",
+          "[settings_routes][auto_approve][numeric_params]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    for (const char* bad : {"10.0.0.0%2Fabc", "10.0.0.0%2F33", "10.0.0.0%2F-1", "10.0.0.0%2F1e3",
+                            "10.0.0.0%2F", "10.0.0.0%2F4294967297", "not-an-ip%2F8", "::1", ""}) {
+        INFO(bad);
+        auto res = h.sink.Post("/api/settings/auto-approve",
+                               std::string("type=ip_subnet&label=x&value=") + bad, kForm);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
+        CHECK(h.auto_approve.list_rules().empty());
+    }
+
+    // A valid subnet and a non-subnet rule type are unaffected.
+    auto ok = h.sink.Post("/api/settings/auto-approve",
+                          "type=ip_subnet&label=lan&value=10.0.0.0%2F8", kForm);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    auto glob = h.sink.Post("/api/settings/auto-approve",
+                            "type=hostname_glob&label=g&value=*.prod.example.com", kForm);
+    REQUIRE(glob);
+    CHECK(glob->status == 200);
+    CHECK(h.auto_approve.list_rules().size() == 2);
 }
