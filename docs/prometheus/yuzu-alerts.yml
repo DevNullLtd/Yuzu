@@ -289,6 +289,18 @@ groups:
             Gateway routing directory section. INITIAL threshold, not yet tuned
             against real fleet data.
 
+      # #5686: no alert on yuzu_server_gateway_batch_heartbeat_duration_seconds
+      # or yuzu_server_agent_presence_upsert_skipped_total, by decision: a
+      # threshold needs fleet data (the #913 lesson above). NOT covered by
+      # YuzuGatewayRouteWriteFailed: presence-store failures
+      # (yuzu_server_agent_presence_store_failed_total{op="upsert"}) have no
+      # rule, and a presence upsert gives up at 250 ms against 500 ms for the
+      # route-directory ops, so milder pool saturation or a presence-only
+      # db_error degrades batches without moving that rule. YuzuPgPoolSaturated
+      # and YuzuPgAcquireWaitHigh are the covering pool-level signals. A
+      # presence-refresh ratio rule is a deferred follow-up. Revisit with fleet
+      # data.
+
       # HA WS-4 4.2b Task D's `route_unreadable` — a degraded batched
       # GatewayRouteStore read during confined dispatch (store_unavailable/
       # db_error), the closest available signal to `#4246` item #8's

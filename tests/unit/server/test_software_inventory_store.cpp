@@ -976,6 +976,56 @@ TEST_CASE("query_software keyset paging walks to an empty page in (name, agent_i
     CHECK(bravo.size() == 3);
 }
 
+TEST_CASE("query_software skip passes over rows after the keyset position, in SQL",
+          "[pg][software_inventory][extended_row]") {
+    SWINV_SHARED(store, pool);
+    auto mk = [](const char* name) {
+        SoftwareEntry e;
+        e.name = name;
+        e.version = "1";
+        e.source = "installed_apps.list_inventory";
+        return e;
+    };
+    for (const char* agent : {"agent-a", "agent-b", "agent-c", "agent-d"})
+        REQUIRE(store.apply_installed_software(
+                    agent, "", std::vector<SoftwareEntry>{mk("alpha"), mk("bravo")}, 1000) ==
+                InventoryIngestOutcome::kStored);
+    // order: alpha a b c d, bravo a b c d (8 rows)
+    auto ids = [&](const SoftwareFleetQuery& q) {
+        auto page = store.query_software(q);
+        REQUIRE(page.has_value());
+        std::vector<std::string> out;
+        for (const auto& r : *page)
+            out.push_back(r.entry.name + "/" + r.agent_id);
+        return out;
+    };
+    SoftwareFleetQuery q;
+    q.limit = 2;
+    q.skip = 3; // from the start: pass alpha a, b, c
+    CHECK(ids(q) == std::vector<std::string>{"alpha/agent-d", "bravo/agent-a"});
+
+    auto first = store.query_software(SoftwareFleetQuery{.limit = 1});
+    REQUIRE(first.has_value());
+    REQUIRE(first->size() == 1);
+    const auto& a1 = first->front();
+    q.after = SoftwareCursor{a1.entry.name, a1.agent_id, a1.install_id}; // after alpha/agent-a
+    q.skip = 2;                                                           // pass b, c
+    CHECK(ids(q) == std::vector<std::string>{"alpha/agent-d", "bravo/agent-a"});
+
+    q.skip = 100; // past the end: an empty page, not an error
+    CHECK(ids(q).empty());
+
+    q.skip = 1; // composes with the scope push-down: skip counts rows of the filtered set
+    q.agent_ids = std::vector<std::string>{"agent-b", "agent-d"};
+    CHECK(ids(q) == std::vector<std::string>{"alpha/agent-d", "bravo/agent-b"});
+
+    q.agent_ids.reset(); // ...and with the bounded q arm
+    q.q = "bravo";
+    q.after.reset();
+    q.skip = 3;
+    CHECK(ids(q) == std::vector<std::string>{"bravo/agent-d"});
+}
+
 TEST_CASE("migration v7 backfills '' + install_id into pre-existing rows and re-runs "
           "idempotently",
           "[pg][software_inventory][extended_row]") {
