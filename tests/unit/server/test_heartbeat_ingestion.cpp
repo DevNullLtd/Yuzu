@@ -344,3 +344,52 @@ TEST_CASE("HeartbeatIngestion: resolved_session_id overrides the local session's
         CHECK(store.remove_if_session("yuzu_test_hb_local", "sess-store-says"));
     }
 }
+
+// #5686: with a batch context, only the first presence upsert waits out the
+// saturated pool's bounded acquire; without one (the direct path) every
+// heartbeat still attempts its own.
+TEST_CASE("HeartbeatIngestion: a batch skips presence upserts after the first failure and the "
+          "direct path still attempts each one",
+          "[heartbeat_ingestion][ws5][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics, &store};
+
+    auto held = pool.acquire(); // the pool's only connection: every upsert times out
+    REQUIRE(held);
+    auto failed = [&] {
+        return metrics
+            .counter("yuzu_server_agent_presence_store_failed_total",
+                     {{"op", "upsert"}, {"reason", "store_unavailable"}})
+            .value();
+    };
+    auto received = [&](const char* via) {
+        return metrics.counter("yuzu_heartbeats_received_total", {{"via", via}}).value();
+    };
+
+    SECTION("batched") {
+        HeartbeatIngestion::PresenceBatch batch;
+        for (int i = 0; i < 3; ++i)
+            ingestion.ingest(make_hb("", false), "yuzu_test_hb_batch_" + std::to_string(i),
+                             "gateway", "sess-batch", &batch);
+        CHECK(batch.store_failed);
+        CHECK(batch.skipped == 2);
+        CHECK(failed() == 1);
+        CHECK(received("gateway") == 3); // the rest of ingest() still ran for every entry
+    }
+    SECTION("direct") {
+        for (int i = 0; i < 2; ++i)
+            ingestion.ingest(make_hb("", false), "yuzu_test_hb_direct_" + std::to_string(i),
+                             "direct");
+        CHECK(failed() == 2);
+        CHECK(received("direct") == 2);
+    }
+}

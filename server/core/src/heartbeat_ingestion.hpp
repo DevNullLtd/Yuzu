@@ -21,6 +21,7 @@
  * between the direct and gateway paths.
  */
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -83,8 +84,19 @@ public:
     /// durable presence row records as `session_id`, so a heartbeat ingested
     /// on a non-owning replica cannot blank it (the other presence columns
     /// blank-preserve in `OfflineEndpointStore::upsert`).
+    ///
+    /// `presence_batch` (#5686): per-RPC state for a batched caller. Once one
+    /// presence upsert in the batch has failed, later entries skip theirs
+    /// (each would wait out its own bounded acquire on the same degraded
+    /// store) and are counted in `skipped`; everything else in ingest() still
+    /// runs. Null (the direct path) = attempt every upsert, as before.
+    struct PresenceBatch {
+        bool store_failed{false};
+        std::size_t skipped{0};
+    };
     void ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb, std::string_view agent_id,
-                std::string_view via, std::string_view resolved_session_id = {});
+                std::string_view via, std::string_view resolved_session_id = {},
+                PresenceBatch* presence_batch = nullptr);
 
     /// Guardian heartbeat reconcile (M5 / #1209). Invoked once per heartbeat that
     /// carries the `yuzu.guardian_generation` tag, with the agent's applied policy

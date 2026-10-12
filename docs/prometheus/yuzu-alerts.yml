@@ -289,6 +289,13 @@ groups:
             Gateway routing directory section. INITIAL threshold, not yet tuned
             against real fleet data.
 
+      # #5686: no latency alert on
+      # yuzu_server_gateway_batch_heartbeat_duration_seconds, by decision. A
+      # threshold needs real fleet latency data, which no multi-replica
+      # deployment has produced yet (the #913 lesson above), and the store
+      # failures that make a batch slow (op="session_lookup"/"renew_leases")
+      # already fire YuzuGatewayRouteWriteFailed. Revisit with fleet data.
+
       # HA WS-4 4.2b Task D's `route_unreadable` — a degraded batched
       # GatewayRouteStore read during confined dispatch (store_unavailable/
       # db_error), the closest available signal to `#4246` item #8's

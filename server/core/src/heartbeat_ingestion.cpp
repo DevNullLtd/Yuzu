@@ -18,7 +18,8 @@ namespace yuzu::server {
 
 void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
                                 std::string_view agent_id, std::string_view via,
-                                std::string_view resolved_session_id) {
+                                std::string_view resolved_session_id,
+                                PresenceBatch* presence_batch) {
     const std::string agent_id_str(agent_id);
     const std::string via_str(via);
 
@@ -37,7 +38,9 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
     // stores stay authoritative). Does not touch the executions-ladder
     // invariants (the command_id -> execution_id correlation / polchk-):
     // those live on the CommandResponse path, not here.
-    if (offline_store_) {
+    if (offline_store_ && presence_batch && presence_batch->store_failed) {
+        ++presence_batch->skipped; // #5686: the next heartbeat refreshes this row
+    } else if (offline_store_) {
         std::string hostname;
         std::string os;
         std::string agent_version;
@@ -68,8 +71,10 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         // agent_version/arch: a session-lookup miss above leaves both blank,
         // which upsert() treats as "preserve the last-known value" (round-3 v2
         // columns) rather than blanking a value this store already learned.
-        offline_store_->upsert(agent_id_str, hostname, os, now_ms, /*agent_ts=*/0, agent_version,
-                               arch, session_id);
+        if (!offline_store_->upsert(agent_id_str, hostname, os, now_ms, /*agent_ts=*/0,
+                                    agent_version, arch, session_id) &&
+            presence_batch)
+            presence_batch->store_failed = true;
     }
 
     // Guardian heartbeat reconcile (M5 / #1209): if the agent reported its applied

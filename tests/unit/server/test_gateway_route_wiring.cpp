@@ -3640,3 +3640,87 @@ TEST_CASE("WS-5 BatchHeartbeat: a non-owning replica keeps the last-known hostna
         CHECK(listed_unknown(resp2) == std::vector<std::string>{sid});
     }
 }
+
+// #5686: a saturated presence pool costs one bounded acquire wait per batch,
+// not one per heartbeat. The presence store has its own one-connection pool
+// whose only lease is held, so every upsert would time out; the route store's
+// pool is untouched, so acks and lease renewal must be unaffected.
+TEST_CASE("BatchHeartbeat: after the first presence upsert fails the rest of the batch skips "
+          "theirs while every entry is still acked and renewed (#5686)",
+          "[pg][gateway_route_wiring][ws5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+    PgPool presence_pool{{.conninfo = db.dsn(), .size = 1}};
+    yuzu::server::OfflineEndpointStore offline{presence_pool};
+    REQUIRE(offline.is_open());
+    offline.set_metrics(&f.metrics);
+    yuzu::server::HeartbeatIngestion ingestion{f.registry, nullptr, nullptr, &f.metrics, &offline};
+    f.svc.set_heartbeat_ingestion(&ingestion);
+
+    std::vector<std::string> agents;
+    std::vector<std::string> sids;
+    for (int i = 0; i < 4; ++i) {
+        agents.push_back("yuzu_test_5686_agent_" + std::to_string(i));
+        sids.push_back(f.register_live(agents.back()));
+        REQUIRE(
+            f.store.announce_connected(agents.back(), sids.back(), "zone", "node", 90).has_value());
+    }
+    // Expire every lease so a renewal is visible without waiting on the clock.
+    raw_exec(db.dsn(), "UPDATE gateway_route_store.agent_routes SET lease_until = now() - "
+                       "interval '1 hour' WHERE agent_id LIKE 'yuzu_test_5686_agent_%'");
+    auto lease_of = [&](const std::string& agent) {
+        auto r = f.store.lookup_route(agent);
+        REQUIRE(r.has_value());
+        REQUIRE(r->has_value());
+        REQUIRE((*r)->lease_until_ms.has_value());
+        return *(*r)->lease_until_ms;
+    };
+    std::vector<std::int64_t> expired;
+    for (const auto& a : agents)
+        expired.push_back(lease_of(a));
+
+    auto presence_failed = [&] {
+        return f.metrics
+            .counter("yuzu_server_agent_presence_store_failed_total",
+                     {{"op", "upsert"}, {"reason", "store_unavailable"}})
+            .value();
+    };
+    auto skipped = [&] {
+        return f.metrics.counter("yuzu_server_agent_presence_upsert_skipped_total").value();
+    };
+    auto batches = [&](const char* outcome) {
+        return f.metrics
+            .histogram("yuzu_server_gateway_batch_heartbeat_duration_seconds",
+                       {{"outcome", outcome}})
+            .snapshot()
+            .count;
+    };
+
+    {
+        auto held = presence_pool.acquire();
+        REQUIRE(held);
+        auto resp = batch_hb(f.svc, sids);
+        CHECK(resp.acknowledged_count() == 4);
+        CHECK(listed_unknown(resp).empty());
+        CHECK(presence_failed() == 1);
+        CHECK(skipped() == 3);
+        CHECK(f.metrics.counter("yuzu_heartbeats_received_total", {{"via", "gateway"}}).value() ==
+              4);
+        CHECK(batches("degraded") == 1);
+        CHECK(batches("ok") == 0);
+    }
+    for (std::size_t i = 0; i < agents.size(); ++i) {
+        CHECK(lease_of(agents[i]) > expired[i]);
+        CHECK_FALSE(offline_row_present(offline, agents[i]));
+    }
+
+    // Per batch, not sticky: the next batch on a healthy pool writes every row.
+    auto resp = batch_hb(f.svc, sids);
+    CHECK(resp.acknowledged_count() == 4);
+    for (const auto& a : agents)
+        CHECK(offline_row_present(offline, a));
+    CHECK(presence_failed() == 1);
+    CHECK(skipped() == 3);
+    CHECK(batches("ok") == 1);
+    CHECK(batches("degraded") == 1);
+}
