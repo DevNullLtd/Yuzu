@@ -373,9 +373,12 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
     lhs_ok = (le == std::errc{});
     rhs_ok = (re == std::errc{});
 #else
-    // Apple Clang fallback: std::from_chars for double may not be available
-    try { size_t pos = 0; lhs = std::stod(val_str, &pos); lhs_ok = (pos == val_str.size()); } catch (...) {}
-    try { size_t pos = 0; rhs = std::stod(cond.value, &pos); rhs_ok = (pos == cond.value.size()); } catch (...) {}
+    // Apple Clang fallback: std::from_chars for double may not be available. The from_chars
+    // branch above reads a LEADING number (it checks only that parsing started, not that the
+    // whole string was consumed), so accept a prefix here too (pos > 0): the two platforms
+    // must agree on "1.2.3" < "2.0" and "5 GB" > "4" (the legacy leading-number read).
+    try { size_t pos = 0; lhs = std::stod(val_str, &pos); lhs_ok = (pos > 0); } catch (...) {}
+    try { size_t pos = 0; rhs = std::stod(cond.value, &pos); rhs_ok = (pos > 0); } catch (...) {}
 #endif
 
     if (!lhs_ok || !rhs_ok) {
