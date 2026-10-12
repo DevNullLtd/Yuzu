@@ -75,8 +75,16 @@ public:
     /// Ingest one heartbeat. `agent_id` is the session-resolved agent id
     /// (already validated by the caller). `via` is "direct" or "gateway"
     /// — the only label that varies between the two ingestion paths.
+    ///
+    /// `resolved_session_id` (HA WS-5): the session id the caller resolved
+    /// `agent_id` from — for the gateway path, the directory-resolved
+    /// session, which may belong to a gateway-fronted agent this replica
+    /// holds no local `AgentSession` for. When non-empty it is what the
+    /// durable presence row records as `session_id`, so a heartbeat ingested
+    /// on a non-owning replica cannot blank it (the other presence columns
+    /// blank-preserve in `OfflineEndpointStore::upsert`).
     void ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb, std::string_view agent_id,
-                std::string_view via);
+                std::string_view via, std::string_view resolved_session_id = {});
 
     /// Guardian heartbeat reconcile (M5 / #1209). Invoked once per heartbeat that
     /// carries the `yuzu.guardian_generation` tag, with the agent's applied policy

@@ -247,9 +247,13 @@
 /// the RPC-handler's `stream_home_id` wiring + `AgentRegistry` in-memory
 /// fence — see the SCOPE OF "CLOSED" note above for the check-then-act
 /// residual 4.3/4.4 must still close) and its known-session check is
-/// per-replica in-memory; re-announce refreshes the lease, not cluster/node; and
-/// a stale-lease reaper plus the fail-open->fail-closed flip must land before 4.2
-/// trusts this directory for routing.
+/// per-replica in-memory; re-announce refreshes the lease, not cluster/node.
+/// The stale-lease reaper (`reap_stale_routes`) has since landed, and the write
+/// posture is settled PER SITE rather than pending a uniform flip:
+/// `register_fresh` and the replay-ADOPT decision's renew/reclaim calls are
+/// fail-CLOSED; every other writer stays fail-OPEN by design, with the
+/// reader's `routable` predicate as the integrity backstop (see
+/// `record_route_store_failure` in gateway_service_impl.cpp).
 ///
 /// SLICE 4.2a — `deregister` TOMBSTONES instead of deleting. This closes the
 /// late-CONNECTED RESURRECTION direction (#5 in the 4.2 design doc): a late
@@ -435,6 +439,13 @@ struct AnnounceResult {
     /// the in-memory registry), never merely logged as a desync. Mutually
     /// exclusive with `matched` (a violation never also matches).
     bool cluster_affinity_violation{false};
+};
+
+/// Outcome of `reclaim_tombstoned_session`; a degraded store is the error channel.
+enum class ReclaimOutcome {
+    adopted,             ///< the caller's row was absent or tombstoned and is now armed
+    superseded,          ///< the caller's own row holds a live session (see the reclaim doc)
+    held_by_other_agent, ///< another agent's row already holds the presented session id
 };
 
 /// Outcome of `deregister`.
@@ -700,10 +711,17 @@ public:
     /// circuit-recovery replay whose presented session this replica no longer
     /// recognizes in memory (a core restart / replica failover / post-
     /// DISCONNECT eviction) but which was never superseded by a genuinely
-    /// newer connection. Returns `true` (won) iff the row was tombstoned
-    /// (`session_id IS NULL`) or absent; `false` (lost) iff a DIFFERENT,
-    /// LIVE (non-NULL) session already holds the row — that is a genuine
-    /// stale/zombie replay and the caller MUST NOT install anything.
+    /// newer connection. Returns `adopted` iff the row was tombstoned
+    /// (`session_id IS NULL`) or absent and no other agent's row holds
+    /// `session_id`; `superseded` when a LIVE (non-NULL) session already holds
+    /// the caller's own row — normally a DIFFERENT one, a genuine stale/zombie
+    /// replay (a concurrent reclaim that already re-armed the row with this
+    /// SAME id also lands here, because the guard needs `session_id IS NULL`);
+    /// `held_by_other_agent` iff another agent's row already carries
+    /// `session_id` (a forged or colliding id). For either refusal the caller
+    /// MUST NOT install anything. The cross-agent guard is a same-statement
+    /// NOT EXISTS and is best-effort: `session_id` has no UNIQUE index, so two
+    /// concurrent reclaims of one unheld id under READ COMMITTED can both win.
     ///
     /// Deliberately does NOT mint a fresh `connection_epoch` (unlike
     /// `register_fresh`): this is not a new connection racing for the row,
@@ -724,7 +742,7 @@ public:
     /// placement; this slice's gateway-side fix (re-sending the process's
     /// own CONNECTED after a successful reclaim) is what converges them,
     /// not this call.
-    [[nodiscard]] std::expected<bool, GatewayRouteStoreError>
+    [[nodiscard]] std::expected<ReclaimOutcome, GatewayRouteStoreError>
     reclaim_tombstoned_session(std::string_view agent_id, std::string_view session_id,
                                int lease_ttl_secs);
 
@@ -754,6 +772,28 @@ public:
     /// `RoutableRoute` for the `routable` computation.
     [[nodiscard]] std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
     lookup_routes(std::span<const std::string> agent_ids);
+
+    /// Batched SESSION-keyed read (WS-5, #4246 #3): every row whose
+    /// `session_id` is in `session_ids`. Empty ids and ids longer than 64
+    /// bytes are dropped before the query (returned as absent; the caller
+    /// counts them malformed) and duplicate ids are collapsed, so a repeat can
+    /// never come back twice. The rest are read in ceil(n/1024) statements
+    /// (`session_id = ANY($1)`, served by `agent_routes_session_id_idx`, each
+    /// `ORDER BY agent_id`) on ONE lease: `kHotReadTimeout` (500 ms) bounds
+    /// only the lease ACQUISITION, each statement is bounded by the pool's
+    /// `statement_timeout`, and there is no aggregate deadline.
+    /// `RoutableRoute::route.session_id` is the matched id and
+    /// `route.agent_id` the owning agent; `routable` is computed IN-SQL on the
+    /// DB clock exactly as in `lookup_routes`. A session with no row is simply
+    /// absent. **`session_id` is NOT unique** (`register_fresh` guards only
+    /// the caller's own row and `reclaim_tombstoned_session`'s cross-agent
+    /// guard is best-effort), so one id can legitimately come back on SEVERAL
+    /// rows — the CALLER must treat more than one row per id as ambiguous and
+    /// refuse to resolve it; this method deliberately returns every match
+    /// rather than picking one. Use `lookup_route(agent_id)` (PK, unambiguous)
+    /// whenever the agent_id is already known.
+    [[nodiscard]] std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
+    lookup_by_sessions(std::span<const std::string> session_ids);
 
     /// Directory-hygiene reaper (4.2a, #7 in the ADR-2002 §7 "4.2 design
     /// obligations" list). CLOCK-GUARDED-RETENTION ADOPTION RECORD (routed
