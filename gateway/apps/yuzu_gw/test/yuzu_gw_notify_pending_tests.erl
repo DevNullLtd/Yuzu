@@ -1625,9 +1625,9 @@ format_status_hides_the_probe_event() ->
     ?assertEqual(nomatch, string:find(Text, "marker-home")).
 
 %% A local encode exception (the request never left the gateway) is neither a
-%% success nor a failure of the upstream. Found by review: a Register whose
-%% request carried text that is not valid UTF-8 raised in the real encoder and
-%% was counted, so a handful of them opened the breaker for the whole fleet.
+%% success nor a failure of the upstream. Found by review: a request that the
+%% real encoder rejected was counted as an upstream failure and could open the
+%% breaker.
 register_encode_exception_never_feeds_the_breaker() ->
     mock(encode),
     Threshold = up_get(cb_threshold),

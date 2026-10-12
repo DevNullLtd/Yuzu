@@ -22,7 +22,7 @@
 %%% per-request line with the fixed atom.
 %%%
 %%% warn_limited/3 is the same limit for a warning of a named kind that a
-%%% malformed or unauthenticated registration can provoke once per request (a
+%%% registration can provoke once per request (a
 %%% refused agent id, a replaced peer address, a failed upstream call): at most
 %%% one line per second per kind, and the line that follows a quiet interval
 %%% carries the number of lines that were suppressed since the previous one. The
@@ -40,7 +40,7 @@
 %% application start by init_limits/0.
 -define(SERVERS, [yuzu_gw_upstream, yuzu_gw_registry, yuzu_gw_agent_sup, yuzu_gw_router]).
 %% The warning kinds warn_limited/3 limits: one stamp each, created at
-%% application start too. Each is a line an unauthenticated registration can make
+%% application start too. Each is a line a registration can make
 %% the gateway write once per request.
 -define(KINDS, [register_refused, register_peer_addr, register_failed, inventory_failed,
                 rpc_raised, rpc_answered_error]).

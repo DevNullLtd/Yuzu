@@ -4,10 +4,9 @@
 %%%
 %%% Found by review: the gateway forwards an agent's RegisterRequest as it is
 %%% and applied no bound to the agent id. The server answers INVALID_ARGUMENT
-%%% for an empty id or one over 256 bytes, the gateway counted that answer as a
-%%% failure of the upstream, and a handful of such Registers (the edge needs no
-%%% client certificate on the one-way TLS listener) opened the breaker for the
-%%% whole fleet. Two closures are pinned here:
+%%% for an id outside 1 to 256 bytes, the gateway counted that answer as a
+%%% failure of the upstream, and such answers could open the breaker. Two
+%%% closures are pinned here:
 %%%   - the edge refuses an empty, missing, non-binary or over-long agent id
 %%%     itself, before any reservation and before any upstream call;
 %%%   - the breaker treats the server statuses that say "this request was wrong"
@@ -90,7 +89,7 @@ edge_test_() ->
         fun agent_id_bound_matches_the_server/0)
      ]}.
 
-%%% The warnings a malformed registration can provoke are limited (#4632): the
+%%% The warnings a refused registration can provoke are limited (#4632): the
 %%% first occurrence logs, the rest of the interval is counted, and the next line
 %%% carries the count. Each kind is driven the way a caller would provoke it.
 limit_test_() ->
@@ -108,7 +107,7 @@ limit_test_() ->
         fun request_fault_warnings_are_limited/0),
       t("a failure that says the upstream is unhealthy is not limited",
         fun unhealthy_status_warning_is_not_limited/0),
-      t("a burst of concurrent malformed Registers writes a small bounded number of lines",
+      t("a burst of concurrent refused Registers writes a small bounded number of lines",
         fun concurrent_burst_is_bounded/0)
      ]}.
 

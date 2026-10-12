@@ -50,9 +50,9 @@
 %%%   upstream (INVALID_ARGUMENT, NOT_FOUND, ALREADY_EXISTS, FAILED_PRECONDITION,
 %%%   OUT_OF_RANGE: the gRPC statuses for a wrong request; the server returns the
 %%%   first and the fourth on these RPCs today): on a live call it neither fails
-%%%   nor recovers the breaker, because a caller that can make the server say so
-%%%   would otherwise open the breaker for every agent, and a recovery on such an
-%%%   answer would reset real failures. A probe answered that way is retired, not
+%%%   nor recovers the breaker, because counting it as a failure would open the
+%%%   breaker on a request that says nothing about the upstream, and counting it
+%%%   as a recovery would reset real failures. A probe answered that way is retired, not
 %%%   requeued (requeueing would be answered the same way by every probe, for
 %%%   ever). The one exception is a registration REPLAY answered
 %%%   FAILED_PRECONDITION: that is the server's authoritative answer that the
@@ -1109,8 +1109,8 @@ record_result({ok, _}, State) ->
     end;
 record_result({error, {Status, _Message}}, State) when ?IS_REQUEST_FAULT(Status) ->
     %% The server answered that the request itself was wrong: a fact about the
-    %% request, not about the upstream. Neither a failure (a caller that sends
-    %% such requests would open the breaker for everyone) nor a success (it would
+    %% request, not about the upstream. Neither a failure (it would open the
+    %% breaker on a request that says nothing about the upstream) nor a success (it would
     %% reset real failures, and a closed breaker's success after failures
     %% triggers a replay): the state is untouched.
     State;

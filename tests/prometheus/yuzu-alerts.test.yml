@@ -3603,7 +3603,7 @@ tests:
   # closed, /readyz ready) is visible ONLY as
   # yuzu_gw_upstream_rpc_errors_total{code="encode"}, pre-seeded at 0
   # (yuzu_gw_telemetry:declare_metrics/0) so increase() has a baseline. The
-  # threshold is about ten in 10 minutes: one malformed Register or oversized
+  # threshold is about ten in 10 minutes: one rejected request or oversized
   # batch must stay quiet. Each case steps the counter at minute 6 (1m samples,
   # left-open 10m window): a 10m window sees the old value through minute 14, a
   # 5m window stops seeing it at minute 10, a 20m window keeps it until minute 24.

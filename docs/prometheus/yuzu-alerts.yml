@@ -175,16 +175,16 @@ groups:
       # batch_heartbeat marshal failures are counted as code="exception", which
       # this alert does not cover.
       # Threshold: increase() >= 10 over 10m, i.e. about ten increases. One
-      # malformed Register from an
-      # unauthenticated peer, or one oversized daily-sync batch, counts once and
-      # must not warn; a systematic encoder fault (every Register failing)
+      # request that fails to encode, or one oversized daily-sync batch, counts
+      # once and must not warn; a systematic encoder fault (every Register failing)
       # reaches 10 on a gateway fronting about 5 or more agents (one agent
       # retries about 2.3 times per 10m at its steady 256 s backoff). A small
       # gateway, or a low-rate RPC (inventory, notify_stream, guardian: the
       # series is per rpc_name, there is no sum), can fault without reaching it:
       # for those use the log line "Upstream RPC ... raised" and
-      # yuzu_gw_agents_current. A determined peer can also reach 10 in 10m, which
-      # is a flood worth a warning. Read the rate, not the existence.
+      # yuzu_gw_agents_current. A sustained burst of rejected requests can also
+      # reach 10 in 10m, which is worth a warning. Read the rate, not the
+      # existence.
       # increase() extrapolates to the window edges, so on a counter already
       # above zero a burst of nine inside one 10m window can read as 10 and fire.
       # The promtool cases pin this at their 1m sample spacing; at the shipped
@@ -204,7 +204,7 @@ groups:
             the circuit breaker closed and /readyz ready, so this alert is the
             signal for a systematic local encode fault (every Register of one
             kind answered INTERNAL). A lone failure is most likely a single
-            malformed request and does not reach this alert, which needs about
+            rejected request and does not reach this alert, which needs about
             10 in 10 minutes (increase() extrapolates, so nine can reach it):
             read the rate, not the existence. The
             gateway log line "Upstream RPC ... raised" names the RPC and the
