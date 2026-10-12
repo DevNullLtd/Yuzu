@@ -2003,17 +2003,11 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         registry_.clear_stream_if_session(agent_id, session_id);
         const bool removed_current_session =
             registry_.remove_agent_if_session(agent_id, session_id);
-        // Fleet-topology parity with the direct path (agent_service_impl.cpp,
-        // which evicts the pushed snapshot on every Subscribe teardown): without
-        // this a departed gateway-fronted agent's cached cube stays on /viz/fleet
-        // (stale-flagged, never removed). Gated on removed_current_session
-        // because a gateway DISCONNECTED can be stale or reordered (#4324 fence
-        // above) and must not drop a live re-registered agent's cube. Placed
-        // BEFORE the presence DB write so no DB wait sits between the registry
-        // decision and the in-memory evict. Residual: an S2 that registered and
-        // pushed inside that gap loses its slot until its next heartbeat
-        // re-pushes it (heartbeat_ingestion.cpp pushes on every heartbeat with a
-        // fleet snapshot); the direct path carries the same residual ungated.
+        // Parity with the direct path's evict_pushed (agent_service_impl.cpp), but
+        // gated: a gateway DISCONNECTED can be stale/reordered (#4324 fence above).
+        // Before the presence DB write so no DB wait sits between the registry
+        // decision and the evict. Residual: an S2 that pushed in that gap loses
+        // its slot until its next heartbeat re-pushes (same on the direct path).
         if (removed_current_session && fleet_topology_store_)
             fleet_topology_store_->evict_pushed(agent_id);
         // HA WS-5 (ADR-2002 §7a): same session-guarded presence mirror as the

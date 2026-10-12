@@ -2,21 +2,13 @@
 
 // The ONE departure -> durable-presence mirror shared by both disconnect paths
 // (direct Subscribe teardown in agent_service_impl.cpp and the gateway
-// DISCONNECTED handler in gateway_service_impl.cpp). Pure: no I/O, templated
-// on the store so a unit test drives it with a fake.
+// DISCONNECTED handler in gateway_service_impl.cpp). Pure, templated on the
+// store so a unit test drives it with a fake.
 //
-// HA WS-5 (ADR-2002 §7a) + #5678: a graceful disconnect CLEARS the durable
-// row's session_id (OfflineEndpointStore::remove_if_session) so the agent
-// drops out of scope-evaluation presence, while the row itself stays for the
-// offline-inclusive /hardware roster.
-//
-// Gated on `removed_current_session` (the return of
-// AgentRegistry::remove_agent_if_session): the durable row's session_id is
-// heartbeat-driven, not registration-driven, so on an ordinary same-replica
-// reconnect (S1 superseded locally by an S2 that has not heartbeated yet) the
-// row can still read S1's session_id. An ungated clear would drop a LIVE
-// agent from presence. A false gate means this disconnect notice is stale and
-// must not touch the durable row at all.
+// A graceful disconnect clears the durable row's session_id
+// (OfflineEndpointStore::remove_if_session); the row stays for the offline
+// /hardware roster (#5678). Gate rationale: AgentRegistry::remove_agent_if_session
+// doc, agent_registry.hpp.
 
 #include <string_view>
 

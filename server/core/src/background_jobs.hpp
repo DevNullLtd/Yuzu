@@ -173,11 +173,7 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"deployment_run_store.run_retention_prune", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory lock (WS-10 10.2); piggybacks the preflight thread"},
     {"offline_endpoint_store.run_retention_prune", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
-     "clock-guarded + pg_try_advisory_xact_lock via pg::run_clock_guarded_prune (#5678 / #1545 UP-4); "
-     "piggybacks the preflight thread beside the two WS-10 prunes so a contended pass never shares "
-     "health_recompute_thread_'s revocation-sweep budget; last_heartbeat_ms is replica-authored, cutoff is "
-     "PG now() - same clock-domain split reap_stuck_running_executions records; bounded by would-wipe + "
-     "1000/pass cap per replica"},
+     "clock-guarded + advisory lock (#5678 / #1545 UP-4); piggybacks the preflight thread"},
 
     // ---- policy_eval_thread_ (10s tick) — tick() SPLITS into two passes (PR #4134) ----
     {"policy_evaluator.collect_ready", "policy_eval_thread_", BackgroundJobClass::ReplicaSafe,

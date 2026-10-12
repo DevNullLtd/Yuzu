@@ -283,13 +283,10 @@ TEST_CASE("OfflineEndpointStore HA WS-5 presence", "[pg][offline]") {
     }
 }
 
-// #5678 / #1545 UP-4: pure prune-window arithmetic. No PG, no timing.
-TEST_CASE("OfflineEndpointStore prune window is roster window plus margin", "[offline][prune-spec]") {
+// #5678 / #1545 UP-4: pure prune constants. No PG, no timing.
+TEST_CASE("OfflineEndpointStore prune margin and cap", "[offline][prune-spec]") {
     using std::chrono::hours;
-    using std::chrono::seconds;
-    CHECK(OfflineEndpointStore::prune_retention_window(hours(24 * 30)) == hours(24 * 37));
-    for (const auto w : {seconds(0), seconds(3600), seconds(24 * 30 * 3600)})
-        CHECK(OfflineEndpointStore::prune_retention_window(w) > w);
+    CHECK(OfflineEndpointStore::kPruneMargin == hours(24 * 7));
     // A zero cap would turn every prune pass into a silent no-op.
     CHECK(OfflineEndpointStore::kPruneCapPerPass > 0);
 }

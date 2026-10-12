@@ -279,21 +279,12 @@ bool OfflineEndpointStore::remove_if_session(std::string_view agent_id,
 int OfflineEndpointStore::run_retention_prune(std::chrono::seconds roster_window) {
     if (!open_)
         return -1;
-    // #5678 / #1545 UP-4: clock-guarded, single-writer, capped retention for
-    // the endpoint roster. Part-6 missing-anchor decision = Decline: a device's
-    // last-seen evidence is non-regenerable, so a from-boot skewed clock must
-    // not silently delete it (preflight_run_store's answer).
-    // Clock domains: last_heartbeat_ms is authored by the REPLICA clock at
-    // ingest (heartbeat_ingestion.cpp) while the cutoff is PG now() — the same
-    // split reap_stuck_running_executions records; bounded by the would-wipe
-    // guard + the per-pass cap, and by kPruneMargin keeping the cutoff past
-    // anything the roster still shows.
-    // The capped DELETE is unordered (ctid-subselect LIMIT, no ORDER BY —
-    // pg_retention_guard.cpp): correct here because every row it can touch is
-    // already >= kPruneMargin past the roster window, so which expired rows go
-    // first is immaterial. The cap is per replica per pass.
+    // #5678 / #1545 UP-4: clock-guarded capped retention. Missing-anchor =
+    // Decline: a device's last-seen evidence is non-regenerable, so a
+    // from-boot skewed clock must not delete it (preflight_run_store's answer).
+    // Window, clock domains and cadence: docs/clock-guarded-retention.md register row.
     const auto window_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(prune_retention_window(roster_window))
+        std::chrono::duration_cast<std::chrono::milliseconds>(roster_window + kPruneMargin)
             .count();
     const pg::ClockGuardedPruneSpec spec{
         .store_label = kStoreName,

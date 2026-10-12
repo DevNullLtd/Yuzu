@@ -117,10 +117,6 @@ public:
     static constexpr std::chrono::hours kPruneMargin{24 * 7};
     /// Per-replica, per-pass delete cap (must stay > 0 or every pass is a no-op).
     static constexpr int kPruneCapPerPass = 1000;
-    [[nodiscard]] static constexpr std::chrono::seconds
-    prune_retention_window(std::chrono::seconds roster_window) noexcept {
-        return roster_window + kPruneMargin;
-    }
 
     /// Borrows the shared pool and runs the `endpoint_state` schema migration
     /// on a pinned lease. `is_open()` is false if the lease was empty or the
@@ -224,7 +220,7 @@ public:
     bool remove_if_session(std::string_view agent_id, std::string_view session_id);
 
     /// #5678 / #1545 UP-4: clock-guarded, capped delete of rows unseen for
-    /// `prune_retention_window(roster_window)`. Returns rows deleted; 0 on
+    /// `roster_window + kPruneMargin`. Returns rows deleted; 0 on
     /// decline / lock-skip / nothing to do; -1 on error or a store that is not
     /// open (the preflight_run_store contract).
     int run_retention_prune(std::chrono::seconds roster_window);
