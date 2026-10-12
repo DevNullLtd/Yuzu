@@ -1563,8 +1563,9 @@ one core replica a server-only restart now recovers through the replay described
 **Update (2026-10-06, #4632 - the gateway holds stream-status notifications instead of dropping them).**
 `yuzu_gw_upstream` no longer drops a `CONNECTED` or `DISCONNECTED` notification when 10 are already in
 flight or the circuit breaker is not closed. It holds it in a bounded, memory-only store keyed by
-`{agent, session, stream home}` (a newer event for a held key replaces it in place; `notify_pending_max`,
-default 10000, caps the keys) and sends the held entries first in first out, at most 10 at a time. The
+`{agent, session, stream home}` (a newer event for a held key replaces the held one and keeps its place, except that a newer event for the
+half open probe's own key is held at the tail and supersedes the probe's older event if the probe fails;
+`notify_pending_max`, default 10000, caps the keys) and sends the held entries first in first out, at most 10 at a time. The
 earlier text of this section is left as written; the points below say what it no longer describes.
 - **Emission is at most once per session; delivery is not.** The "AT MOST ONE `CONNECTED(S)` and one
   `DISCONNECTED(S)` per session" statement in the 4.4 status paragraph above describes what
@@ -1578,8 +1579,10 @@ earlier text of this section is left as written; the points below say what it no
   update's statement that an open breaker "drops stream-status notifications", no longer hold: such a
   notification is held and delivered when the probe succeeds. What is still lost is a notification for a
   new key when the store is full (counted as `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`),
-  one whose worker failed after taking it (not counted, not retried), and everything held when the upstream
-  client process or the gateway stops (the store is volatile). A lost `DISCONNECTED` still leaves the agent
+  one whose worker failed after taking it (not counted, not retried), a held probe that is evicted because it cannot
+  be encoded or is retired by a server status that means the request itself was wrong (a WARN is logged; see
+  the Known limits in `docs/user-manual/gateway.md`), and everything held when the upstream client process or the
+  gateway stops (the store is volatile). A lost `DISCONNECTED` still leaves the agent
   listed as online in the server's registry and its route row routable until the lease expires, as before.
 - **Superseded pointer.** "The in-flight notification limit behind it is tracked in #4632" (the "What it does
   not promise" bullet above) is closed by this change; the series still has no agent label and an agent

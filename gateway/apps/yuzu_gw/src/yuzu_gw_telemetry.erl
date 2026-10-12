@@ -736,8 +736,9 @@ declare_metrics() ->
         {help, "Stream-status notifications held because the in-flight limit is "
                "reached or the upstream circuit breaker is not closed; drained "
                "first in first out (0 = nothing held). The key of a half_open "
-               "probe in flight is not counted here but still counts toward "
-               "the notify_pending_max cap"}]),
+               "probe in flight is not counted here, unless a newer "
+               "notification for the same key has since been held, and it "
+               "still counts toward the notify_pending_max cap"}]),
     prometheus_gauge:declare([
         {name, yuzu_gw_upstream_notify_inflight},
         {labels, [node]},
