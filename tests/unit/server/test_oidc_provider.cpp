@@ -16,19 +16,58 @@
 #include <openssl/rsa.h> // EVP_RSA_gen
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <thread>
 #include <vector>
 
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 using namespace yuzu::server::oidc;
+
+namespace {
+// Joins its threads on scope exit after setting `abort` first, so a worker spinning on a
+// barrier that a failed spawn (or a failing REQUIRE) left short cannot strand the join. Stands
+// in for std::jthread/std::stop_token, which Apple Clang 15 (the documented floor) lacks.
+class ScopedThreads {
+public:
+    ScopedThreads() = default;
+    ScopedThreads(const ScopedThreads&) = delete;
+    ScopedThreads& operator=(const ScopedThreads&) = delete;
+    ~ScopedThreads() {
+        abort_.store(true);
+        join_all();
+    }
+    template <class F> void spawn(F&& f) { threads_.emplace_back(std::forward<F>(f)); }
+    /// The flag a worker's barrier checks (`while (ready < n && !aborted())`).
+    bool aborted() const { return abort_.load(); }
+    /// The normal path: wait for every worker WITHOUT aborting any.
+    void join_all() {
+        for (auto& t : threads_)
+            if (t.joinable())
+                t.join();
+    }
+
+private:
+    std::atomic<bool> abort_{false};
+    std::vector<std::thread> threads_;
+};
+} // namespace
 
 // ── Base64URL ────────────────────────────────────────────────────────────────
 
@@ -1486,14 +1525,14 @@ TEST_CASE("OIDC discovery: concurrent logins share ONE discovery fetch (single-f
     std::atomic<int> ok{0};
     std::atomic<int> refused{0};
     {
-        std::vector<std::jthread> threads;
+        ScopedThreads threads;
         for (int i = 0; i < kThreads; ++i)
-            threads.emplace_back([&](std::stop_token st) {
+            threads.spawn([&] {
                 ready.fetch_add(1);
                 // Abortable barrier: a failed spawn in this scope must not strand a waiter.
-                while (ready.load() < kThreads && !st.stop_requested())
+                while (ready.load() < kThreads && !threads.aborted())
                     std::this_thread::yield();
-                if (st.stop_requested())
+                if (threads.aborted())
                     return;
                 auto r = provider.verify_jwt_signature(jwt);
                 if (r.has_value())
@@ -1501,10 +1540,8 @@ TEST_CASE("OIDC discovery: concurrent logins share ONE discovery fetch (single-f
                 else if (r.error() == OidcProvider::kJwksUnavailable)
                     refused.fetch_add(1);
             });
-        // Join explicitly: a jthread's destructor requests a stop first, which would abort
-        // workers that have not yet run. The stop path is only for an exception unwinding here.
-        for (auto& t : threads)
-            t.join();
+        // Join before the guard's abort: the abort path is only for an exception unwinding here.
+        threads.join_all();
     }
     // Exactly one fetch ran. A caller that arrived while it was in flight was refused with the
     // fixed token (it does not queue behind the fetch); the one that fetched succeeded.
@@ -1519,12 +1556,19 @@ TEST_CASE("OIDC discovery: concurrent logins share ONE discovery fetch (single-f
 TEST_CASE("OIDC discovery: a caller arriving mid-fetch fails fast instead of waiting for it",
           "[oidc][oidc_discovery]") {
     MockIdp idp;
-    idp.with([](MockIdp& m) { m.discovery_delay_ms = 500; }); // the first fetch stays in flight
+    idp.hold_discovery(); // the first fetch stays in flight until THIS thread releases it
     OidcProvider provider(discovery_cfg(idp));
 
     std::atomic<bool> first_done{false};
     std::atomic<bool> first_ok{false};
-    std::jthread first([&] {
+    ScopedThreads threads;
+    // Declared after `threads`, so it runs first on any exit: a failing REQUIRE must not leave
+    // the held fetch blocking the join.
+    struct ReleaseOnExit {
+        MockIdp& idp;
+        ~ReleaseOnExit() { idp.release_discovery(); }
+    } release_on_exit{idp};
+    threads.spawn([&] {
         try {
             first_ok.store(!provider.start_auth_flow().url.empty());
         } catch (const std::exception&) {}
@@ -1542,11 +1586,12 @@ TEST_CASE("OIDC discovery: a caller arriving mid-fetch fails fast instead of wai
     } catch (const std::runtime_error& e) {
         CHECK(std::string(e.what()) == OidcProvider::kDiscoveryUnavailable);
     }
-    // Refused while the first fetch was STILL running (had it waited, the first would be done),
-    // without starting a second GET.
+    // Refused while the first fetch was STILL running: the latch holds it, so it cannot have
+    // finished however the threads were scheduled. No second GET was started.
     CHECK_FALSE(first_done.load());
     CHECK(idp.discovery_calls.load() == 1);
-    first.join();
+    idp.release_discovery();
+    threads.join_all();
     CHECK(first_ok.load());
     // The refusal did not start a retry window: the next call sees the cached result.
     CHECK_NOTHROW(provider.start_auth_flow());
@@ -1740,12 +1785,258 @@ TEST_CASE("OIDC discovery: an issuer with a path prefix is fetched under that pr
 TEST_CASE("OIDC http_get_bounded: a query on a bare-host URL is part of the path, not the host",
           "[oidc][oidc_discovery]") {
     MockIdp idp;
-    // `http://127.0.0.1:<port>?x=1` is the authority `127.0.0.1:<port>` and the path "/?x=1"; the
-    // IdP answers 404 for it, which proves the request reached the IdP at all.
+    // `http://127.0.0.1:<port>?x=1` is the authority `127.0.0.1:<port>` and the path "/?x=1".
     auto r = OidcProvider::http_get_bounded(idp.base() + "?x=1", false);
-    REQUIRE_FALSE(r.has_value());
-    CHECK(r.error() == "HTTP 404");
+    REQUIRE(r.has_value());
+    CHECK(*r == "root");
+    CHECK(idp.root_target() == "/?x=1");
 }
+
+TEST_CASE("OIDC http_get_bounded: a #fragment is never put on the request line",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    // RFC 3986 3.5: the fragment is client-side only. A bare host with a fragment is the origin
+    // and the path "/"; a path with a query and a fragment keeps the query only.
+    auto bare = OidcProvider::http_get_bounded(idp.base() + "#frag", false);
+    REQUIRE(bare.has_value());
+    CHECK(idp.root_target() == "/");
+    auto with_query = OidcProvider::http_get_bounded(idp.base() + "?a=b#frag?c", false);
+    REQUIRE(with_query.has_value());
+    CHECK(idp.root_target() == "/?a=b");
+    auto jwks = OidcProvider::http_get_bounded(idp.base() + "/jwks#x", false);
+    REQUIRE(jwks.has_value()); // the route is "/jwks": "/jwks#x" would not match it
+    CHECK(idp.jwks_calls.load() == 1);
+}
+
+#ifndef _WIN32
+// ── The total bound covers the TLS handshake (#5692, Gate 8) ─────────────────
+//
+// httplib's set_max_timeout only guards reads and writes on an established stream, so a server
+// that accepts the TCP connection and drips TLS handshake bytes, each inside the per-operation
+// timeout, used to hold a fetch for as long as it liked. `TlsDripServer` is a raw TCP acceptor (no
+// certificate is needed: the handshake never completes) that sends a TLS record header declaring a
+// body that never finishes, then one byte per `interval_ms`. Pacing and shutdown are
+// condition-variable driven; the acceptor wakes on a self-pipe, so the destructor never waits out
+// an interval or an accept().
+class TlsDripServer {
+public:
+    explicit TlsDripServer(int interval_ms = 300) : interval_ms_(interval_ms) {
+        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(listen_fd_ >= 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        REQUIRE(::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+        REQUIRE(::listen(listen_fd_, 8) == 0);
+        socklen_t len = sizeof(addr);
+        REQUIRE(::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+        port_ = ntohs(addr.sin_port);
+        REQUIRE(::pipe(wake_) == 0);
+        thread_ = std::thread([this] { run(); });
+    }
+    ~TlsDripServer() {
+        release();
+        const char b = 1;
+        (void)::write(wake_[1], &b, 1);
+        thread_.join();
+        ::close(wake_[0]);
+        ::close(wake_[1]);
+        ::close(listen_fd_);
+    }
+    TlsDripServer(const TlsDripServer&) = delete;
+    TlsDripServer& operator=(const TlsDripServer&) = delete;
+
+    /// Stop dripping and hang up on the current connection (so a stuck client sees EOF).
+    void release() {
+        {
+            std::lock_guard lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    int port() const { return port_; }
+    std::string base() const { return "https://127.0.0.1:" + std::to_string(port_); }
+    int accepted() const { return accepted_.load(); }
+
+private:
+    void run() {
+        for (;;) {
+            pollfd fds[2] = {{listen_fd_, POLLIN, 0}, {wake_[0], POLLIN, 0}};
+            if (::poll(fds, 2, -1) < 0 && errno != EINTR)
+                return;
+            if (fds[1].revents != 0)
+                return;
+            if ((fds[0].revents & POLLIN) == 0)
+                continue;
+            const int conn = ::accept(listen_fd_, nullptr, nullptr);
+            if (conn < 0)
+                continue;
+            accepted_.fetch_add(1);
+            drip(conn);
+            ::close(conn);
+        }
+    }
+    // A TLS handshake record header (type 22, version 3.3) declaring 16 KiB, then one byte per
+    // interval until the client hangs up or the server stops.
+    void drip(int conn) {
+#ifdef SO_NOSIGPIPE
+        const int one = 1;
+        ::setsockopt(conn, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+#ifdef MSG_NOSIGNAL
+        constexpr int kFlags = MSG_NOSIGNAL;
+#else
+        constexpr int kFlags = 0;
+#endif
+        static constexpr unsigned char header[5] = {0x16, 0x03, 0x03, 0x40, 0x00};
+        if (::send(conn, header, sizeof(header), kFlags) < 0)
+            return;
+        for (;;) {
+            std::unique_lock lk(mu_);
+            if (cv_.wait_for(lk, std::chrono::milliseconds(interval_ms_), [this] { return stop_; }))
+                return;
+            lk.unlock();
+            const unsigned char b = 0;
+            if (::send(conn, &b, 1, kFlags) < 0)
+                return;
+        }
+    }
+
+    const int interval_ms_;
+    int listen_fd_{-1};
+    int wake_[2]{-1, -1};
+    int port_{0};
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool stop_{false};
+    std::atomic<int> accepted_{0};
+    std::thread thread_;
+};
+
+namespace {
+// Runs `fn` on its own thread and waits for it for at most `limit`. If it overruns, the test
+// fails (the red evidence on a build without the bound) instead of hanging the suite; `stop` is
+// then called to release whatever `fn` is stuck on, and the thread is joined.
+template <class Fn, class Stop>
+bool finished_within(std::chrono::milliseconds limit, Fn&& fn, Stop&& stop) {
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+    std::thread t([&] {
+        fn();
+        {
+            std::lock_guard lk(m);
+            done = true;
+        }
+        cv.notify_all();
+    });
+    bool finished;
+    {
+        std::unique_lock lk(m);
+        finished = cv.wait_for(lk, limit, [&] { return done; });
+    }
+    if (!finished)
+        stop();
+    t.join();
+    return finished;
+}
+} // namespace
+
+TEST_CASE("OIDC discovery: an https server dripping TLS handshake bytes cannot hold a fetch past "
+          "the total bound",
+          "[oidc][oidc_discovery][security]") {
+    TlsDripServer drip;
+    // The per-operation timeout is 1 s and the drip is one byte per 300 ms, so the handshake
+    // never trips a read timeout: only the total bound (2 s) can end it.
+    std::expected<OidcProvider::DiscoveryDocument, std::string> doc;
+    const auto begin = std::chrono::steady_clock::now();
+    const bool in_time = finished_within(
+        std::chrono::seconds(8),
+        [&] { doc = OidcProvider::fetch_discovery_document(drip.base(), true, 1000); },
+        [&] { drip.release(); });
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    CHECK(in_time); // false = the fetch outlived the bound by 6 s: the unbounded handshake
+    CHECK_FALSE(doc.has_value());
+    CHECK(elapsed >= std::chrono::seconds(1));
+    CHECK(elapsed < std::chrono::seconds(3));
+    CHECK(drip.accepted() >= 1);
+}
+
+TEST_CASE("OIDC discovery: the JWKS fetch is bounded the same way against a dripping https server",
+          "[oidc][oidc_discovery][security]") {
+    TlsDripServer drip;
+    OidcConfig cfg;
+    cfg.issuer = drip.base();
+    cfg.client_id = "c";
+    cfg.redirect_uri = "http://localhost/cb";
+    cfg.jwks_uri = drip.base() + "/jwks"; // explicit: the JWKS fetch is the one under test
+    cfg.skip_tls_verify = true;
+    OidcProvider provider(cfg);
+    provider.set_http_timeouts_for_test(1000);
+    const auto header = OidcProvider::base64url_encode(std::vector<uint8_t>{
+        '{', '"', 'a', 'l', 'g', '"', ':', '"', 'R', 'S', '2', '5', '6', '"', '}'});
+    const std::string jwt = header + ".e30.c2ln";
+
+    std::expected<void, std::string> verdict;
+    const auto begin = std::chrono::steady_clock::now();
+    const bool in_time = finished_within(
+        std::chrono::seconds(8), [&] { verdict = provider.verify_jwt_signature(jwt); },
+        [&] { drip.release(); });
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    CHECK(in_time);
+    REQUIRE_FALSE(verdict.has_value());
+    CHECK(verdict.error() == OidcProvider::kJwksUnavailable);
+    CHECK(elapsed >= std::chrono::seconds(1));
+    CHECK(elapsed < std::chrono::seconds(3));
+}
+
+TEST_CASE("OIDC http_get_bounded: the watchdog does not cut a fast or a merely slow fetch",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    SECTION("a fast fetch succeeds, and returns at once (the watchdog is woken, not waited for)") {
+        const auto begin = std::chrono::steady_clock::now();
+        auto r = OidcProvider::http_get_bounded(idp.base() + "/jwks", false, 5000);
+        const auto elapsed = std::chrono::steady_clock::now() - begin;
+        REQUIRE(r.has_value());
+        CHECK(elapsed < std::chrono::seconds(2)); // the bound here is 10 s
+    }
+    SECTION("a response that takes a third of the per-operation timeout is not shut down") {
+        idp.with([](MockIdp& m) { m.discovery_delay_ms = 300; });
+        auto doc = OidcProvider::fetch_discovery_document(idp.base(), false, 1000);
+        REQUIRE(doc.has_value());
+    }
+}
+
+#ifdef __linux__
+namespace {
+std::size_t open_fd_count() {
+    std::size_t n = 0;
+    for ([[maybe_unused]] const auto& e : std::filesystem::directory_iterator("/proc/self/fd"))
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("OIDC http_get_bounded: fifty fetches leak no descriptors and no watchdog thread",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    // One fetch first, so lazily opened descriptors (resolver, locale, TLS) are already open.
+    REQUIRE(OidcProvider::http_get_bounded(idp.base() + "/jwks", false, 2000).has_value());
+    const auto before = open_fd_count();
+    for (int i = 0; i < 50; ++i)
+        REQUIRE(OidcProvider::http_get_bounded(idp.base() + "/jwks", false, 2000).has_value());
+    // A refused connection and a failed (404) answer take the early-exit paths.
+    for (int i = 0; i < 10; ++i) {
+        CHECK_FALSE(OidcProvider::http_get_bounded("http://127.0.0.1:1/x", false, 2000));
+        CHECK_FALSE(OidcProvider::http_get_bounded(idp.base() + "/nope", false, 2000));
+    }
+    const auto after = open_fd_count();
+    CHECK(after == before);
+}
+#endif // __linux__
+#endif // !_WIN32
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
 
 TEST_CASE("OIDC discovery: a refused connection fails closed", "[oidc][oidc_discovery][security]") {
@@ -1783,13 +2074,13 @@ TEST_CASE("OIDC discovery: concurrent starts, signature checks and seam calls ag
     std::atomic<int> ready{0};
     std::atomic<int> bad{0};
     {
-        std::vector<std::jthread> threads;
+        ScopedThreads threads;
         for (int i = 0; i < kThreads; ++i)
-            threads.emplace_back([&, i](std::stop_token st) {
+            threads.spawn([&, i] {
                 ready.fetch_add(1);
-                while (ready.load() < kThreads && !st.stop_requested())
+                while (ready.load() < kThreads && !threads.aborted())
                     std::this_thread::yield();
-                for (int round = 0; round < kRounds && !st.stop_requested(); ++round) {
+                for (int round = 0; round < kRounds && !threads.aborted(); ++round) {
                     try {
                         (void)provider.start_auth_flow();
                         bad.fetch_add(1); // must have thrown
@@ -1808,8 +2099,7 @@ TEST_CASE("OIDC discovery: concurrent starts, signature checks and seam calls ag
                     (void)provider.pending_flow_count_for_test();
                 }
             });
-        for (auto& t : threads)
-            t.join(); // explicit: ~jthread would request a stop before joining
+        threads.join_all(); // before the guard's abort, which is only for an unwinding exception
     }
     CHECK(bad.load() == 0);
     CHECK(provider.pending_flow_count_for_test() == 0);
@@ -1863,6 +2153,16 @@ TEST_CASE("OIDC discovery: an endpoint authority must be a well-formed host[:por
     CHECK_FALSE(accepted("https://[::1]x/x"));
     CHECK_FALSE(accepted("https://[zz]/x"));
     CHECK_FALSE(accepted("https://[]/x"));
+    // The bracketed form is hex digits and ':' only, as httplib's regex is: a dotted IPv4-mapped
+    // form would pass here and then be treated as a plain-http host name by httplib.
+    CHECK_FALSE(accepted("https://[::ffff:1.2.3.4]/x"));
+    CHECK_FALSE(accepted("https://[::ffff:1.2.3.4]:8443/x"));
+    CHECK(accepted("https://[::ffff:102:304]/x"));
+    // Port 0 names no listener; "00000" is the same value.
+    CHECK_FALSE(accepted("https://idp.test:0/x"));
+    CHECK_FALSE(accepted("https://idp.test:00000/x"));
+    CHECK_FALSE(accepted("https://[::1]:0/x"));
+    CHECK(accepted("https://idp.test:00080/x")); // leading zeros, still 80
 }
 
 TEST_CASE("OIDC discovery: an endpoint over 2048 bytes is refused, 2048 is accepted",
@@ -1984,6 +2284,64 @@ TEST_CASE("OIDC discovery: a control byte alone makes an endpoint unacceptable",
     }
 }
 
+TEST_CASE("OIDC discovery: the Unicode line breaks NEL, U+2028 and U+2029 make an endpoint "
+          "unacceptable",
+          "[oidc][oidc_discovery][security]") {
+    const std::string iss = "https://idp.test";
+    for (const char* sep : {"\xC2\x85", "\xE2\x80\xA8", "\xE2\x80\xA9"}) {
+        for (const char* field : {"authorization_endpoint", "token_endpoint", "jwks_uri"}) {
+            CAPTURE(field, sep);
+            CHECK_FALSE(OidcProvider::parse_discovery_document(
+                doc_with(field, std::string("https://idp.test/p") + sep + "q"), iss));
+        }
+    }
+    // Neighbouring code points that are NOT line breaks stay legal (U+00E9, U+2027, U+202A).
+    for (const char* ok : {"\xC3\xA9", "\xE2\x80\xA7", "\xE2\x80\xAA", "\xC2\x84"}) {
+        CAPTURE(ok);
+        CHECK(OidcProvider::parse_discovery_document(
+                  doc_with("jwks_uri", std::string("https://idp.test/p") + ok + "q"), iss)
+                  .has_value());
+    }
+}
+
+TEST_CASE("OIDC discovery: a configured issuer with a space or control byte is refused before any "
+          "request",
+          "[oidc][oidc_discovery][security]") {
+    // Nothing listens anywhere: each must fail on the issuer's bytes alone.
+    for (const std::string issuer :
+         {std::string("https://idp.test\nX-Evil: 1"), std::string("https://idp.test\r\nx"),
+          std::string("https://idp .test"), std::string("https://idp.test\x7f"),
+          std::string("https://idp.test/realm\xE2\x80\xA8"),
+          std::string("https://idp.test/realm\xC2\x85"),
+          std::string("https://idp.test/realm\xE2\x80\xA9")}) {
+        CAPTURE(issuer);
+        auto r = OidcProvider::fetch_discovery_document(issuer, false);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("space or control") != std::string::npos);
+    }
+}
+
+TEST_CASE("OIDC discovery: a configured endpoint with a space or control byte is refused, not sent",
+          "[oidc][oidc_discovery][security]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://idp.test";
+    cfg.client_id = "c";
+    cfg.redirect_uri = "http://localhost/cb";
+    cfg.authorization_endpoint = "https://idp.test/a b";
+    OidcProvider provider(cfg);
+    try {
+        (void)provider.start_auth_flow();
+        FAIL("a configured endpoint holding a space must be refused");
+    } catch (const std::runtime_error& e) {
+        CHECK(std::string(e.what()) == OidcProvider::kDiscoveryUnavailable);
+    }
+    CHECK(provider.pending_flow_count_for_test() == 0);
+
+    cfg.authorization_endpoint = "https://idp.test/a\xE2\x80\xA8";
+    OidcProvider separator(cfg);
+    CHECK_THROWS_AS(separator.start_auth_flow(), std::runtime_error);
+}
+
 // The scheme rules for an HTTPS issuer cannot be driven through a loopback MockIdp (it has no
 // TLS), so the validation half of discovery is pinned directly on a document body.
 TEST_CASE("OIDC discovery: endpoints must be absolute and carry the issuer's own scheme",
@@ -2059,4 +2417,38 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
         }
     }
     CHECK(scanned > 100); // non-vacuity
+}
+
+TEST_CASE("OIDC discovery: the in-flight mark is set once, cleared only by an RAII guard created "
+          "straight after it (source pin)",
+          "[oidc][oidc_discovery][source_pin]") {
+    // A throw between the mark and a manual clear (an allocation failure in a handler, say)
+    // would leave every later caller failing fast until a Settings save. The handler path cannot
+    // be driven from a test, so pin the shape that makes it safe by construction: ONE set, ONE
+    // clear, the clear inside the guard's destructor, the guard declared right after the set.
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "oidc_provider.cpp",
+                     std::ios::binary);
+    REQUIRE(in.is_open());
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    const auto text = ss.str();
+    const auto count = [&](const std::string& needle) {
+        std::size_t n = 0;
+        for (auto pos = text.find(needle); pos != std::string::npos;
+             pos = text.find(needle, pos + 1))
+            ++n;
+        return n;
+    };
+    CHECK(count("discovery_in_flight_ = true;") == 1);
+    CHECK(count("discovery_in_flight_ = false;") == 0); // the guard clears it through a reference
+    CHECK(count("flag = false;") == 1);
+    const auto set_at = text.find("discovery_in_flight_ = true;");
+    const auto guard_at = text.find("} in_flight_guard{lock, discovery_in_flight_};");
+    REQUIRE(set_at != std::string::npos);
+    REQUIRE(guard_at != std::string::npos);
+    CHECK(guard_at > set_at);
+    // Nothing that can throw between the set and the guard: only the guard's own definition.
+    const auto between = text.substr(set_at, guard_at - set_at);
+    CHECK(between.find("spdlog") == std::string::npos);
+    CHECK(between.find("fetch_") == std::string::npos);
 }

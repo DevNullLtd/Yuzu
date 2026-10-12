@@ -14,6 +14,7 @@
 // Trickle knobs (`trickle_discovery`, `trickle_jwks`): the answer is a CHUNKED body of one byte
 // per `trickle_interval_ms`, `trickle_chunks` times, paced by a condition variable that the
 // destructor signals, so a trickle a test has abandoned ends at once instead of running out.
+// `hold_discovery` / `release_discovery` keep a discovery fetch in flight on a latch.
 
 #include "oidc_provider.hpp"
 
@@ -84,10 +85,13 @@ struct MockIdp {
     std::mutex trickle_mu;
     std::condition_variable trickle_cv;
     bool trickle_stop{false};
+    bool discovery_hold{false}; ///< under trickle_mu: a discovery GET waits until released
     std::atomic<int> token_calls{0};
     std::atomic<int> discovery_calls{0};
     std::atomic<int> jwks_calls{0};
     std::atomic<int> authorize_calls{0};
+    std::atomic<int> root_calls{0};
+    std::string last_root_target; ///< under `mu`: the path (with query) of the last GET /
 
     MockIdp() {
         // A regex route so an issuer with a path prefix (/realms/x, /<tenant>/v2.0) is served;
@@ -112,6 +116,12 @@ struct MockIdp {
                     }
                     if (delay > 0)
                         std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                    {
+                        // Event-driven hold (hold_discovery / release_discovery); the
+                        // destructor's trickle_stop also ends it.
+                        std::unique_lock hold(trickle_mu);
+                        trickle_cv.wait(hold, [this] { return !discovery_hold || trickle_stop; });
+                    }
                     if (trickle) {
                         start_trickle(res);
                         return;
@@ -131,6 +141,16 @@ struct MockIdp {
                     res.status = status;
                     res.set_content(body, "application/json");
                 });
+        // GET / answers "root" and records the exact request target, so a test can pin what
+        // the provider put on the request line for a URL with a query or a fragment.
+        svr.Get("/", [this](const httplib::Request& req, httplib::Response& res) {
+            root_calls.fetch_add(1);
+            {
+                std::lock_guard lk(mu);
+                last_root_target = req.target;
+            }
+            res.set_content("root", "text/plain");
+        });
         svr.Get("/jwks", [this](const httplib::Request&, httplib::Response& res) {
             jwks_calls.fetch_add(1);
             std::string kid;
@@ -222,6 +242,26 @@ struct MockIdp {
                 ++*sent;
                 return sink.write("a", 1);
             });
+    }
+
+    /// Make every later discovery GET wait, after it is counted, until `release_discovery()`:
+    /// a fetch the test can keep in flight for exactly as long as it needs, with no sleep.
+    void hold_discovery() {
+        std::lock_guard lk(trickle_mu);
+        discovery_hold = true;
+    }
+    void release_discovery() {
+        {
+            std::lock_guard lk(trickle_mu);
+            discovery_hold = false;
+        }
+        trickle_cv.notify_all();
+    }
+
+    /// The request target of the last GET /.
+    std::string root_target() {
+        std::lock_guard lk(mu);
+        return last_root_target;
     }
 
     /// The request path of the last discovery GET.
