@@ -43,6 +43,8 @@ inline constexpr std::int64_t kVersionsMax = 1000;
 inline constexpr std::int64_t kExportCap = 10000;
 inline constexpr std::size_t kCursorMaxBytes = 2048; ///< longest cursor token accepted; a longer one is refused
 inline constexpr std::size_t kScopePushdownMaxIds = 10000;
+/// Most store reads one page (or export) makes on the wide post-filtered scope path.
+inline constexpr int kWideScopeMaxReads = 4;
 inline constexpr std::int64_t kStaleWindowSecs = 172800; ///< 48 h
 inline constexpr std::size_t kSourceMaxBytes = 256;
 /// Longest accepted `name` (the ingest-side field cap, inventory_ingestion.cpp kMaxFieldLen).
@@ -51,6 +53,7 @@ inline constexpr std::size_t kNameMaxBytes = 1024;
 inline constexpr std::string_view kInstallsCsvHeader =
     "agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,arch,"
     "signature_status,distro_id,distro_version,source";
+inline constexpr std::size_t kInstallsCsvColumns = 14; ///< the cells of kInstallsCsvHeader
 inline constexpr std::string_view kTitlesCsvHeader =
     "name,publisher,installs,versions,ecosystems,kinds,newest_version";
 
@@ -95,6 +98,13 @@ struct DevicesRequest {
 /// than clamped or ignored. nullopt = acceptable; otherwise the kInvalidParams message.
 [[nodiscard]] std::optional<std::string> strict_args_error(const nlohmann::json& args);
 
+/// The type-only check for the raw per-install MCP tool `query_installed_software`: agent_id,
+/// name, version and cursor must be JSON strings, `limit` a JSON integer that fits an int64 (a
+/// uint64 above INT64_MAX is refused, never wrapped). No length or range check: the
+/// parse_devices_params bounds and the legacy `limit` clamp still apply. Unknown argument names
+/// are ignored. nullopt = acceptable; otherwise the kInvalidParams message.
+[[nodiscard]] std::optional<std::string> installed_software_args_error(const nlohmann::json& args);
+
 // ── Audit targets ────────────────────────────────────────────────────────────
 
 [[nodiscard]] std::string audit_target(const SoftwareCatalogQuery& q);
@@ -120,11 +130,22 @@ enum class CursorError { kMalformed, kFilterMismatch, kStale };
 [[nodiscard]] std::expected<SoftwareCatalogCursor, CursorError>
 decode_catalogue_cursor(std::string_view token, std::string_view fp, std::int64_t refreshed_at);
 
-/// `d1:<fp16>:<b64url(name 0x1F agent_id 0x1F install_id)>` - no generation. The last SCANNED row,
-/// so a post-filtered page still advances.
-[[nodiscard]] std::string encode_devices_cursor(const SoftwareFleetRow& last, std::string_view fp);
+/// A raw-route continuation position: the keyset ANCHOR (the last in-scope row the caller was
+/// served, or the head `{"", "", 0}` before any) plus `skip`, the rows to pass over after it.
+/// `skip` is 0 except on the wide post-filtered scope path, where it counts the rows scanned and
+/// dropped since the anchor - a count, never a key, so the token carries no byte of an
+/// out-of-scope row.
+struct DevicesCursor {
+    SoftwareCursor after;
+    std::int64_t skip{0};
+};
+
+/// `d2:<fp16>:<b64url(length-prefixed {name, agent_id, install_id, skip})>` - no generation.
+/// Each field is `<len>:<bytes>` + 0x1F, so no byte inside a field (the separator included) can
+/// shift a boundary. Any other prefix (a `d1:` token) is malformed.
+[[nodiscard]] std::string encode_devices_cursor(const DevicesCursor& at, std::string_view fp);
 /// Refusal order: malformed -> filter mismatch (never kStale).
-[[nodiscard]] std::expected<SoftwareCursor, CursorError>
+[[nodiscard]] std::expected<DevicesCursor, CursorError>
 decode_devices_cursor(std::string_view token, std::string_view fp);
 
 // ── KPIs ─────────────────────────────────────────────────────────────────────
@@ -279,18 +300,28 @@ using DevicesReader =
 
 struct DevicesPage {
     std::vector<SoftwareFleetRow> rows;
-    std::string next_cursor;           ///< non-empty iff the SCANNED page hit the limit
-    bool hit_cap{false};               ///< rows scanned == the effective limit (before any post-filter)
-    std::int64_t devices_omitted{0};   ///< DISTINCT devices hidden by the post-filter (0 under push-down)
+    /// Non-empty iff more rows may exist: the read hit the limit (push-down/TOP) or, on the wide
+    /// path, the last read was full, the page filled early, or the read bound was reached.
+    std::string next_cursor;
+    bool hit_cap{false};               ///< the same condition as next_cursor being non-empty
+    /// DISTINCT devices hidden by the post-filter within the scanned window(s) (0 under push-down).
+    std::int64_t devices_omitted{0};
+    /// The request named an `agent_id` outside the caller's scope. Under push-down the SQL then
+    /// returns nothing and devices_omitted stays 0; the transports still audit it as a denial.
+    bool target_denied{false};
 };
 
 /// One raw per-install page: decode the cursor (bound to the filter set, never to the scope),
 /// push the caller's scope into the query, read, then post-filter. The scope: TOP -> unfiltered;
 /// engaged-empty -> agent_ids = {} (the store returns empty without SQL); engaged and
-/// <= kScopePushdownMaxIds -> agent_ids = the set (complete pages, nothing hidden); larger ->
-/// the rows are filtered here with authz::in_scope and `devices_omitted` counts the devices that
-/// dropped. The next cursor is the last SCANNED row, so a post-filtered page still advances.
-/// Error: nullopt = degraded (the read returned nullopt); a CursorError = the cursor was refused.
+/// <= kScopePushdownMaxIds -> agent_ids = the set (complete pages, nothing hidden; one read, the
+/// cursor is the last row); larger -> the rows are filtered here with authz::in_scope and
+/// `devices_omitted` counts the devices that dropped. That wide path refills the page with at
+/// most kWideScopeMaxReads store reads (each continues after the last SCANNED row, kept
+/// in-process), and its cursor is the last IN-SCOPE row served plus a count of the rows scanned
+/// since (the page can be empty with a non-empty cursor): no byte of a dropped row reaches the
+/// caller. Error: nullopt = degraded (a read returned nullopt); a CursorError = the cursor was
+/// refused.
 [[nodiscard]] std::expected<DevicesPage, std::optional<CursorError>>
 read_devices_page(const DevicesReader& read, const DevicesRequest& rq, const authz::VisibleSet& scope);
 

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cmath>
+#include <cstdint>
 #include <expected>
 #include <format>
 #include <initializer_list>
@@ -178,6 +179,33 @@ std::optional<std::int64_t> parse_nonneg(std::string_view s) {
     if (s.empty() || !std::ranges::all_of(s, [](char c) { return c >= '0' && c <= '9'; }))
         return std::nullopt;
     return parse_i64(s);
+}
+
+// Inverse of length_prefixed(): exactly `n` `<len>:<bytes>` + kSep fields, nothing before or
+// after. The length is a full-consume decimal and is checked against what remains before any
+// span is taken, so no field content (the separator included) can move a boundary.
+std::optional<std::vector<std::string_view>> read_length_prefixed(std::string_view in,
+                                                                  std::size_t n) {
+    std::vector<std::string_view> out;
+    std::size_t pos = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto colon = in.find(':', pos);
+        if (colon == std::string_view::npos)
+            return std::nullopt;
+        const auto len = parse_nonneg(in.substr(pos, colon - pos));
+        const std::size_t remaining = in.size() - (colon + 1);
+        // the field plus its trailing separator must fit
+        if (!len || static_cast<std::uint64_t>(*len) >= remaining)
+            return std::nullopt;
+        const auto end = colon + 1 + static_cast<std::size_t>(*len);
+        if (in[end] != kSep)
+            return std::nullopt;
+        out.push_back(in.substr(colon + 1, static_cast<std::size_t>(*len)));
+        pos = end + 1;
+    }
+    if (pos != in.size())
+        return std::nullopt;
+    return out;
 }
 
 // ── JSON/CSV helpers ─────────────────────────────────────────────────────────
@@ -394,6 +422,24 @@ std::optional<std::string> strict_args_error(const nlohmann::json& args) {
     return std::nullopt;
 }
 
+std::optional<std::string> installed_software_args_error(const nlohmann::json& args) {
+    if (!args.is_object())
+        return std::nullopt;
+    for (const char* key : {"agent_id", "name", "version", "cursor"})
+        if (args.contains(key) && !args[key].is_string())
+            return std::string(key) + " must be a JSON string";
+    if (args.contains("limit")) {
+        const auto& l = args["limit"];
+        // nlohmann stores every non-negative integer as unsigned: above INT64_MAX the later
+        // get<int64_t>() would wrap, so it is refused here rather than clamped.
+        if (!l.is_number_integer() ||
+            (l.is_number_unsigned() &&
+             l.get<std::uint64_t>() > static_cast<std::uint64_t>(INT64_MAX)))
+            return "limit must be a JSON integer";
+    }
+    return std::nullopt;
+}
+
 // ── Audit targets ────────────────────────────────────────────────────────────
 
 std::string audit_target(const SoftwareCatalogQuery& q) {
@@ -421,6 +467,8 @@ std::string audit_target(const SoftwareFleetQuery& q) {
     std::string out = !q.name.empty()       ? "name=" + ::yuzu::log_token(q.name)
                       : !q.agent_id.empty() ? "agent=" + ::yuzu::log_token(q.agent_id)
                                             : std::string("fleet");
+    if (!q.name.empty())
+        tail(out, "agent", q.agent_id); // a name query narrowed to one device names both
     if (q.version)
         out += ";version=" + ::yuzu::log_token(*q.version);
     tail(out, "q", q.q);
@@ -492,39 +540,36 @@ decode_catalogue_cursor(std::string_view token, std::string_view fp, std::int64_
     return SoftwareCatalogCursor{*installs, payload->substr(sep + 1)};
 }
 
-std::string encode_devices_cursor(const SoftwareFleetRow& last, std::string_view fp) {
-    std::string out = "d1:";
+std::string encode_devices_cursor(const DevicesCursor& at, std::string_view fp) {
+    const std::string id = std::to_string(at.after.install_id);
+    const std::string skip = std::to_string(at.skip);
+    std::string out = "d2:";
     out += fp;
     out += ':';
-    out += b64url_encode(last.entry.name + kSep + last.agent_id + kSep +
-                         std::to_string(last.install_id));
+    out += b64url_encode(length_prefixed({&at.after.name, &at.after.agent_id, &id, &skip}));
     return out;
 }
 
-std::expected<SoftwareCursor, CursorError> decode_devices_cursor(std::string_view token,
-                                                                 std::string_view fp) {
+std::expected<DevicesCursor, CursorError> decode_devices_cursor(std::string_view token,
+                                                                std::string_view fp) {
     const auto parts = split(token, ':');
-    if (parts.size() != 3 || parts[0] != "d1" || !is_lower_hex16(parts[1]))
+    if (parts.size() != 3 || parts[0] != "d2" || !is_lower_hex16(parts[1]))
         return std::unexpected(CursorError::kMalformed);
     const auto payload = b64url_decode(parts[2]);
     if (!payload)
         return std::unexpected(CursorError::kMalformed);
-    // name 0x1F agent_id 0x1F install_id: peel the two trailing fields from the right, so a
-    // name containing the separator still round-trips.
-    const auto last = payload->rfind(kSep);
-    if (last == std::string::npos || last == 0)
+    const auto fields = read_length_prefixed(*payload, 4);
+    if (!fields)
         return std::unexpected(CursorError::kMalformed);
-    const auto mid = payload->rfind(kSep, last - 1);
-    if (mid == std::string::npos)
-        return std::unexpected(CursorError::kMalformed);
-    const std::string_view view(*payload);
-    const auto id = parse_nonneg(view.substr(last + 1));
+    const auto id = parse_nonneg((*fields)[2]);
+    const auto skip = parse_nonneg((*fields)[3]);
     // The decoded text is bound as SQL parameters: strict UTF-8 and no NUL, like the parsers.
-    if (!id || !valid_text(view.substr(0, mid)) || !valid_text(view.substr(mid + 1, last - mid - 1)))
+    if (!id || !skip || !valid_text((*fields)[0]) || !valid_text((*fields)[1]))
         return std::unexpected(CursorError::kMalformed);
     if (parts[1] != fp)
         return std::unexpected(CursorError::kFilterMismatch);
-    return SoftwareCursor{payload->substr(0, mid), payload->substr(mid + 1, last - mid - 1), *id};
+    return DevicesCursor{SoftwareCursor{std::string((*fields)[0]), std::string((*fields)[1]), *id},
+                         *skip};
 }
 
 // ── KPIs ─────────────────────────────────────────────────────────────────────
@@ -882,38 +927,88 @@ read_devices_page(const DevicesReader& read, const DevicesRequest& rq,
     // The cursor is bound to the filter set (never to the scope: the scope only narrows what the
     // same keyset position yields).
     const std::string fp = devices_fingerprint(q);
+    DevicesCursor incoming; // the head: nothing served yet
     if (!rq.cursor.empty()) {
         auto cur = decode_devices_cursor(rq.cursor, fp);
         if (!cur)
             return std::unexpected(cur.error());
-        q.after = *cur;
+        incoming = std::move(*cur);
     }
+    const auto key_of = [](const SoftwareFleetRow& r) {
+        return SoftwareCursor{r.entry.name, r.agent_id, r.install_id};
+    };
+    // The head anchor is "from the start", whatever install_id the store hands out.
+    const auto& a = incoming.after;
+    if (!(a.name.empty() && a.agent_id.empty() && a.install_id == 0))
+        q.after = a;
+    DevicesPage out;
+    out.target_denied = !q.agent_id.empty() && !authz::in_scope(scope, q.agent_id);
     // TOP leaves the query alone; engaged-empty is agent_ids = {} (the store returns empty without
     // SQL); a bounded set is pushed into SQL; a wider one is post-filtered below.
     const bool filter = scope && scope->size() > kScopePushdownMaxIds;
     if (scope && !filter)
         q.agent_ids.emplace(scope->begin(), scope->end());
-    auto rows = read(q);
-    if (!rows)
-        return std::unexpected(std::nullopt);
-    DevicesPage out;
-    // Cap hit BEFORE any post-filtering: the next keyset position is the LAST SCANNED row.
-    out.hit_cap = rows->size() == static_cast<std::size_t>(q.limit);
-    if (out.hit_cap)
-        out.next_cursor = encode_devices_cursor(rows->back(), fp);
     if (!filter) {
+        // Every returned row is in scope, so the last one is a safe cursor. A skip is only ever
+        // minted by the wide path below; it has no meaning here and is ignored.
+        auto rows = read(q);
+        if (!rows)
+            return std::unexpected(std::nullopt);
+        out.hit_cap = !rows->empty() && rows->size() == static_cast<std::size_t>(q.limit);
+        if (out.hit_cap)
+            out.next_cursor = encode_devices_cursor({key_of(rows->back()), 0}, fp);
         out.rows = std::move(*rows);
         return out;
     }
+
+    // Wide scope: post-filter, refilling the page with at most kWideScopeMaxReads bounded reads.
+    // The cursor must never carry a dropped row's key, so it is the last IN-SCOPE row served
+    // (the incoming anchor if there is none) plus the number of rows scanned after it, which the
+    // next request passes over in SQL. Each refill read continues after the last row SCANNED,
+    // kept in-process only.
+    const auto limit = static_cast<std::size_t>(q.limit);
+    q.skip = incoming.skip;
+    std::int64_t since_anchor = incoming.skip;
     std::unordered_set<std::string> dropped;
-    out.rows.reserve(rows->size());
-    for (auto& r : *rows) {
-        if (authz::in_scope(scope, r.agent_id))
-            out.rows.push_back(std::move(r));
-        else
-            dropped.insert(r.agent_id); // each DISTINCT device counts once
+    bool more = false;
+    out.rows.reserve(limit);
+    for (int reads = 1;; ++reads) {
+        auto rows = read(q);
+        if (!rows)
+            return std::unexpected(std::nullopt);
+        const bool full = !rows->empty() && rows->size() == limit;
+        SoftwareCursor last_scanned;
+        if (full && reads < kWideScopeMaxReads)
+            last_scanned = key_of(rows->back());
+        std::size_t i = 0;
+        for (; i < rows->size() && out.rows.size() < limit; ++i) {
+            auto& r = (*rows)[i];
+            if (authz::in_scope(scope, r.agent_id)) {
+                out.rows.push_back(std::move(r));
+                since_anchor = 0;
+            } else {
+                dropped.insert(r.agent_id); // each DISTINCT device counts once
+                ++since_anchor;
+            }
+        }
+        if (out.rows.size() >= limit) { // page filled: rows may remain here or beyond
+            more = i < rows->size() || full;
+            break;
+        }
+        if (!full) // a short read is the end of the data
+            break;
+        if (reads >= kWideScopeMaxReads) { // bound reached: say there may be more
+            more = true;
+            break;
+        }
+        q.after = std::move(last_scanned);
+        q.skip = 0;
     }
     out.devices_omitted = static_cast<std::int64_t>(dropped.size());
+    out.hit_cap = more;
+    if (more)
+        out.next_cursor = encode_devices_cursor(
+            {out.rows.empty() ? incoming.after : key_of(out.rows.back()), since_anchor}, fp);
     return out;
 }
 

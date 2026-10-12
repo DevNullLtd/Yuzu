@@ -359,18 +359,23 @@ The **`query_installed_software`** MCP tool exposes the same data to agentic
 workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
 
 - Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan.
-- Returns up to `limit` rows (max 1000). When `result_truncated_by_cap` is
-  `true` the page is full: pass `next_cursor` back as `cursor` to continue the keyset walk
-  (the cursor is opaque and bound to the filter set). Optional `version` filter; each row
-  also carries `source`.
+- Returns up to `limit` rows (max 1000; an in-range integer above or below still clamps).
+  When `result_truncated_by_cap` is `true` more rows may exist: pass `next_cursor` back as
+  `cursor` to continue the keyset walk (the cursor is opaque and bound to the filter set).
+  Optional `version` filter; each row also carries `source`. A wrongly typed argument (a
+  non-string `agent_id`, `name`, `version` or `cursor`, or a non-integer `limit`) is refused
+  with `kInvalidParams`, never ignored or converted.
 - **The caller's scope is applied in SQL** — the gate composes management-group
   visibility with the caller's service-scope tag
   (`meet(management-group, service-scope)`), so a management-group-confined
   operator and a correctly-confined service-scoped API token both get a real
   filtered result — a service-scoped token is no longer denied outright as it
-  was before #3290. `devices_omitted` counts only the devices hidden by the
-  in-process post-filter used for a scope wider than 10 000 devices (`0` under
-  push-down, where the result is complete for the caller's own devices). This is distinct from the generic
+  was before #3290. `devices_omitted` is `0` under push-down (up to 10 000
+  visible devices), where the result is complete for the caller's own devices. Above that,
+  the rows are filtered after the read and `devices_omitted` is the count of distinct
+  out-of-scope devices within the scanned window(s), a bounded and audited signal that
+  out-of-scope matches exist. A page there can be empty with a non-null `next_cursor`: keep
+  paging until it is `null`. This is distinct from the generic
   `query_inventory` / `get_agent_inventory` tools, which read a *separate*
   generic blob store on `Infrastructure:Read` and do **not** surface this typed
   software data.
@@ -397,21 +402,31 @@ curl -H "Authorization: Bearer $TOKEN" \
   "$SERVER/api/v1/inventory/software?agent_id=<agent-id>"
 ```
 
-- Query params: `name` (exact), `agent_id` (exact), `limit` (max 1000). Omit both
-  `name` and `agent_id` for a fleet-wide scan.
+- Query params: `name` (exact), `agent_id` (exact), `version` (exact; present-empty
+  selects the empty-version rows), `q` (case-insensitive literal substring), `kind`,
+  `ecosystem`, `source` (exact), `limit` (max 1000), `cursor` and `format` (`json` or
+  `csv`: an export). Omit `name` and `agent_id` for a fleet-wide scan. The full parameter
+  and error tables are in [rest-api.md](rest-api.md); `q`, `kind`, `ecosystem` and
+  `source` are REST-only (the MCP tool takes `name`, `agent_id`, `version`, `limit` and
+  `cursor`).
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, ...},
-  "meta": {"api_version": "v1"}}`. Each row is
-  `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
-  release, arch, signature_status, distro_id, distro_version}` — the v2 fields
-  are `""` where the ecosystem does not store them (see the availability matrix
-  above). The MCP tool's rows carry the identical field set.
+  "meta": {"api_version": "v1"}}`. Each row has 14 fields: `{agent_id, name, version,
+  publisher, install_date, kind, ecosystem, epoch, release, arch, signature_status,
+  distro_id, distro_version, source}` — the v2 fields are `""` where the ecosystem does not
+  store them (see the availability matrix above), and `source` is the
+  `<plugin>.<action>` that produced the row. The MCP tool's rows carry the identical
+  field set.
 - **Carries the same scope push-down as the MCP tool** — the SAME
   `require_fleet_read` gate, so REST and MCP cannot observe a different
   admit/filter decision for the same caller (see the MCP note above). A positive
   `devices_omitted` appears only on the wide-scope post-filter path and is
-  audited as `denied`.
-- `result_truncated_by_cap: true` (present only when set) means the page is full; continue
-  with `next_cursor` (keyset pagination, opaque cursor bound to the filter set).
+  audited as `denied`; an explicit `agent_id` outside the caller's scope is also audited as
+  `denied`, with an empty page.
+- `result_truncated_by_cap: true` (present only when set) means more rows may exist; continue
+  with `next_cursor` (keyset pagination, opaque cursor bound to the filter set). A
+  `format=csv` export carries its continuation in the `X-Next-Cursor` response header, with
+  `X-Result-Truncated-By-Cap: true` and a trailing `# result_truncated_by_cap` record; a
+  wide-scope export can hold fewer than `limit` rows and still be capped.
 - **On store degradation** the endpoint returns **`503`** (an A4 error envelope with a
   `correlation_id`), **never** an empty `200` — so a vulnerability query cannot read a
   transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads).
@@ -426,8 +441,12 @@ curl -H "Authorization: Bearer $TOKEN" \
 for up to 10 000 devices, so it gets **complete pages of its own devices** — the old
 "the cap was consumed by out-of-scope devices" short page no longer occurs, and
 `devices_omitted` is `0`. Only a scope wider than 10 000 devices falls back to the in-process
-post-filter, where `devices_omitted` counts the hidden devices and `next_cursor` still advances
-from the last row scanned, so keep paging until `next_cursor` is `null`.
+post-filter, where `devices_omitted` is a distinct-device count within the scanned window(s)
+and still signals that out-of-scope matches exist. The page is refilled with at most four
+bounded reads, so it can be empty with a non-null `next_cursor`; that cursor re-anchors at
+the last row you were served and skips the rows already scanned (a row inserted inside that
+span during a walk can be missed or repeated, the same class as the `install_id` churn
+noted for a concurrent resync). Keep paging until `next_cursor` is `null`.
 
 ### REST: software title catalogue
 

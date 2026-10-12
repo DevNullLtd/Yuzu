@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <tuple>
 #include <unordered_set>
 #include <string>
 #include <vector>
@@ -289,22 +290,58 @@ DevicesRequest dreq(int limit, std::string cursor = {}) {
     return r;
 }
 
-// A fake store read: records the query it was handed and answers a fixed row set.
+// A fake store read: records the query it was handed and answers a fixed row set. With `keyset`
+// it behaves like the store: rows are sorted, `after` is strictly exclusive, `skip` passes over
+// rows and `limit` truncates, so a multi-read walk can be driven end to end.
 struct FakeDevices {
     std::vector<SoftwareFleetRow> rows;
     bool ok{true};
+    bool keyset{false};
     int reads{0};
-    SoftwareFleetQuery seen;
+    SoftwareFleetQuery seen;  ///< the LAST read's query
+    SoftwareFleetQuery first; ///< the first read's query
     DevicesReader reader() {
         return [this](const SoftwareFleetQuery& q) -> std::optional<std::vector<SoftwareFleetRow>> {
-            ++reads;
+            if (++reads == 1)
+                first = q;
             seen = q;
             if (!ok)
                 return std::nullopt;
-            return rows;
+            if (!keyset)
+                return rows;
+            std::vector<SoftwareFleetRow> out;
+            std::int64_t to_skip = q.skip;
+            for (const auto& r : rows) {
+                if (q.after && !(std::tie(r.entry.name, r.agent_id, r.install_id) >
+                                 std::tie(q.after->name, q.after->agent_id, q.after->install_id)))
+                    continue;
+                if (to_skip > 0) {
+                    --to_skip;
+                    continue;
+                }
+                if (static_cast<int>(out.size()) == q.limit)
+                    break;
+                out.push_back(r);
+            }
+            return out;
         };
     }
 };
+
+// The keyset position a minted cursor carries (the test's view of what a caller could read).
+DevicesCursor cursor_of(const DevicesPage& page, const DevicesRequest& rq) {
+    auto cur = decode_devices_cursor(page.next_cursor, devices_fingerprint(rq.query));
+    REQUIRE(cur);
+    return *cur;
+}
+
+// `n` rows of one device under one name, ids from `first`.
+std::vector<SoftwareFleetRow> run_of(const std::string& agent, std::int64_t first, int n) {
+    std::vector<SoftwareFleetRow> out;
+    for (int i = 0; i < n; ++i)
+        out.push_back(fleet_row("git", agent, first + i));
+    return out;
+}
 
 VisibleSet wide_scope(std::string in_scope_id) {
     std::unordered_set<std::string> big{std::move(in_scope_id)};
@@ -345,6 +382,7 @@ TEST_CASE("read_devices_page: scope push-down and the post-filter", "[server][so
         CHECK(page->devices_omitted == 0);
     }
     SECTION("beyond the bound the query stays wide and the rows are post-filtered") {
+        f.keyset = true;
         f.rows = {fleet_row("git", "a", 1), fleet_row("git", "b", 2), fleet_row("git", "b", 3)};
         auto page = read_devices_page(f.reader(), dreq(3), wide_scope("a"));
         REQUIRE(page);
@@ -352,13 +390,11 @@ TEST_CASE("read_devices_page: scope push-down and the post-filter", "[server][so
         REQUIRE(page->rows.size() == 1);
         CHECK(page->rows[0].agent_id == "a");
         CHECK(page->devices_omitted == 1); // the DISTINCT dropped device, counted once
-        // The cap was hit BEFORE filtering, and the cursor is the last SCANNED row (id 3, dropped)
-        // so the next page advances past it.
-        CHECK(page->hit_cap);
-        const auto cur = decode_devices_cursor(page->next_cursor, devices_fingerprint(dreq(3).query));
-        REQUIRE(cur);
-        CHECK(cur->install_id == 3);
-        CHECK(cur->agent_id == "b");
+        // The first read came back full, so the page was refilled once; that read was empty: the
+        // end of the data, so there is nothing to continue.
+        CHECK(f.reads == 2);
+        CHECK_FALSE(page->hit_cap);
+        CHECK(page->next_cursor.empty());
     }
 }
 
@@ -367,7 +403,7 @@ TEST_CASE("read_devices_page: cursor and degrade outcomes", "[server][software_c
     f.rows = {fleet_row("git", "a", 1)};
     SECTION("a continuation hands the decoded keyset position to the read") {
         const auto fp = devices_fingerprint(dreq(1).query);
-        const auto tok = encode_devices_cursor(fleet_row("git", "a", 1), fp);
+        const auto tok = encode_devices_cursor({SoftwareCursor{"git", "a", 1}, 0}, fp);
         auto page = read_devices_page(f.reader(), dreq(1, tok), std::nullopt);
         REQUIRE(page);
         REQUIRE(f.seen.after.has_value());
@@ -382,7 +418,8 @@ TEST_CASE("read_devices_page: cursor and degrade outcomes", "[server][software_c
         CHECK(bad.error() == CursorError::kMalformed);
         DevicesRequest other = dreq(1);
         other.query.kind = "app";
-        const auto tok = encode_devices_cursor(fleet_row("git", "a", 1), devices_fingerprint(other.query));
+        const auto tok =
+            encode_devices_cursor({SoftwareCursor{"git", "a", 1}, 0}, devices_fingerprint(other.query));
         auto mismatch = read_devices_page(f.reader(), dreq(1, tok), std::nullopt);
         REQUIRE_FALSE(mismatch);
         CHECK(mismatch.error() == CursorError::kFilterMismatch);
@@ -394,6 +431,166 @@ TEST_CASE("read_devices_page: cursor and degrade outcomes", "[server][software_c
         REQUIRE_FALSE(page);
         CHECK_FALSE(page.error());
     }
+}
+
+TEST_CASE("read_devices_page: a wide-scope cursor never carries a dropped row",
+          "[server][software_catalogue_model]") {
+    // The in-scope device is "m"; rows are kept in the store's (name, agent_id, install_id)
+    // order, so "b" rows sort before it and "z" rows after.
+    FakeDevices f;
+    f.keyset = true;
+    const auto scope = wide_scope("m");
+    const auto page_of = [&](int limit, std::string cursor = {}) {
+        return read_devices_page(f.reader(), dreq(limit, std::move(cursor)), scope);
+    };
+
+    SECTION("a page that fills mid-walk anchors at the last in-scope row, skip 0") {
+        f.rows = {fleet_row("git", "m", 1), fleet_row("git", "m", 2), fleet_row("git", "z", 3),
+                  fleet_row("git", "z", 4)};
+        auto page = page_of(2);
+        REQUIRE(page);
+        REQUIRE(page->rows.size() == 2);
+        CHECK(f.reads == 1);
+        CHECK(page->hit_cap);
+        const auto cur = cursor_of(*page, dreq(2));
+        CHECK(cur.after.agent_id == "m");
+        CHECK(cur.after.install_id == 2);
+        CHECK(cur.skip == 0);
+        // the continuation sees only dropped rows, finds the end and says so
+        auto next = page_of(2, page->next_cursor);
+        REQUIRE(next);
+        CHECK(next->rows.empty());
+        CHECK(next->next_cursor.empty());
+        CHECK(next->devices_omitted == 1);
+    }
+
+    SECTION("a dropped row never reaches the token: anchor m/1, skip as a count") {
+        f.rows = {fleet_row("git", "m", 1)};
+        for (int i = 2; i <= 9; ++i)
+            f.rows.push_back(fleet_row("git", "z", i));
+        // limit 3: reads {m1,z2,z3} {z4,z5,z6} {z7,z8,z9} {} -> the walk ends at the data's end
+        auto page = page_of(3);
+        REQUIRE(page);
+        CHECK(page->rows.size() == 1);
+        CHECK(f.reads == 4);
+        CHECK(page->next_cursor.empty());
+        CHECK(page->devices_omitted == 1);
+        // the same walk cut short by the read bound instead
+        f.reads = 0;
+        auto cut = page_of(2);
+        REQUIRE(cut);
+        REQUIRE(cut->rows.size() == 1);
+        CHECK(f.reads == kWideScopeMaxReads);
+        CHECK(cut->hit_cap);
+        const auto cur = cursor_of(*cut, dreq(2));
+        CHECK(cur.after.agent_id == "m");
+        CHECK(cur.after.install_id == 1);
+        CHECK(cur.skip == 7); // z2..z8 scanned after the anchor, as a count
+    }
+
+    SECTION("a page with no in-scope row keeps the incoming anchor and adds what it scanned") {
+        for (int i = 1; i <= 3; ++i)
+            f.rows.push_back(fleet_row("git", "b", i));
+        for (int i = 4; i <= 20; ++i)
+            f.rows.push_back(fleet_row("git", "c", i));
+        auto page = page_of(2);
+        REQUIRE(page);
+        CHECK(page->rows.empty());
+        CHECK(f.reads == kWideScopeMaxReads);
+        CHECK(page->devices_omitted == 2); // two DISTINCT dropped devices
+        REQUIRE_FALSE(page->next_cursor.empty());
+        auto cur = cursor_of(*page, dreq(2));
+        CHECK(cur.after.name.empty()); // the head anchor: no dropped key is named
+        CHECK(cur.after.agent_id.empty());
+        CHECK(cur.after.install_id == 0);
+        CHECK(cur.skip == kWideScopeMaxReads * 2); // 4 reads x limit 2, all dropped
+        // the head anchor reads from the start (nothing named), skipping the counted rows
+        f.reads = 0;
+        auto next = page_of(2, page->next_cursor);
+        REQUIRE(next);
+        CHECK_FALSE(f.first.after.has_value());
+        CHECK(f.first.skip == kWideScopeMaxReads * 2);
+        CHECK(f.reads == kWideScopeMaxReads);
+        CHECK(cursor_of(*next, dreq(2)).skip == 2 * kWideScopeMaxReads * 2);
+    }
+
+    SECTION("a refill finds the in-scope rows on read 2 and fills the page") {
+        f.rows = {fleet_row("git", "b", 1), fleet_row("git", "b", 2), fleet_row("git", "m", 3),
+                  fleet_row("git", "m", 4), fleet_row("git", "m", 5)};
+        auto page = page_of(2);
+        REQUIRE(page);
+        CHECK(f.reads == 2);
+        REQUIRE(page->rows.size() == 2);
+        CHECK(page->rows[0].install_id == 3);
+        CHECK(page->rows[1].install_id == 4);
+        CHECK(page->devices_omitted == 1);
+        const auto cur = cursor_of(*page, dreq(2));
+        CHECK(cur.after.install_id == 4); // m5 remains, so there is a continuation from m4
+        CHECK(cur.skip == 0);
+    }
+
+    SECTION("a continuation hands the anchor and the skip to the first read") {
+        const auto tok = encode_devices_cursor({SoftwareCursor{"git", "m", 1}, 5},
+                                               devices_fingerprint(dreq(2).query));
+        auto page = page_of(2, tok);
+        REQUIRE(page);
+        REQUIRE(f.first.after.has_value());
+        CHECK(f.first.after->agent_id == "m");
+        CHECK(f.first.after->install_id == 1);
+        CHECK(f.first.skip == 5);
+        CHECK(page->next_cursor.empty());
+    }
+
+    SECTION("a degraded refill read is a degrade, never a short page") {
+        f.rows = run_of("b", 1, 6);
+        int n = 0;
+        auto reader = [&](const SoftwareFleetQuery& q) -> std::optional<std::vector<SoftwareFleetRow>> {
+            if (++n == 2)
+                return std::nullopt;
+            return f.reader()(q);
+        };
+        auto page = read_devices_page(reader, dreq(2), scope);
+        REQUIRE_FALSE(page);
+        CHECK_FALSE(page.error());
+    }
+}
+
+TEST_CASE("read_devices_page: push-down and TOP read once and mint skip 0",
+          "[server][software_catalogue_model]") {
+    FakeDevices f;
+    f.keyset = true;
+    f.rows = run_of("a", 1, 3);
+    const auto tok =
+        encode_devices_cursor({SoftwareCursor{"git", "a", 1}, 9}, devices_fingerprint(dreq(1).query));
+    for (const VisibleSet& scope : {VisibleSet{std::nullopt}, VisibleSet{std::unordered_set<std::string>{"a"}}}) {
+        f.reads = 0;
+        auto page = read_devices_page(f.reader(), dreq(1, tok), scope);
+        REQUIRE(page);
+        CHECK(f.reads == 1);
+        CHECK(f.seen.skip == 0); // a skip only ever belongs to the wide path
+        CHECK(f.seen.after->install_id == 1);
+        CHECK(cursor_of(*page, dreq(1)).skip == 0);
+        CHECK(cursor_of(*page, dreq(1)).after.install_id == page->rows.back().install_id);
+    }
+}
+
+TEST_CASE("read_devices_page: an explicit agent_id outside the scope is flagged target_denied",
+          "[server][software_catalogue_model]") {
+    FakeDevices f;
+    f.rows = {fleet_row("git", "a", 1)};
+    DevicesRequest rq = dreq(5);
+    rq.query.agent_id = "z";
+    const std::unordered_set<std::string> only_a{"a"};
+    auto outside = read_devices_page(f.reader(), rq, VisibleSet{only_a});
+    REQUIRE(outside);
+    CHECK(outside->target_denied);
+    CHECK(outside->devices_omitted == 0); // push-down: the SQL answers nothing, nothing is "omitted"
+    CHECK(read_devices_page(f.reader(), rq, authz::deny_all())->target_denied);
+    CHECK(read_devices_page(f.reader(), rq, wide_scope("a"))->target_denied);
+    rq.query.agent_id = "a";
+    CHECK_FALSE(read_devices_page(f.reader(), rq, VisibleSet{only_a})->target_denied);
+    CHECK_FALSE(read_devices_page(f.reader(), rq, std::nullopt)->target_denied); // TOP sees all
+    CHECK_FALSE(read_devices_page(f.reader(), dreq(5), VisibleSet{only_a})->target_denied); // no target
 }
 
 TEST_CASE("read_devices_page: a scope of exactly kScopePushdownMaxIds is pushed down; one more is "
@@ -500,6 +697,71 @@ TEST_CASE("strict_args_error: MCP refuses what REST clamps", "[server][software_
         CHECK_FALSE(strict_args_error(json{{"ecosystem", eco}}));
 }
 
+TEST_CASE("strict_args_error: non-string and over-long text, and the exact boundaries",
+          "[server][software_catalogue_model]") {
+    using nlohmann::json;
+    for (const char* key : {"name", "agent_id", "source", "cursor", "q", "kind", "ecosystem"}) {
+        INFO(key);
+        CHECK(strict_args_error(json{{key, 5}}));
+        CHECK(strict_args_error(json{{key, nullptr}}));
+        CHECK(strict_args_error(json{{key, json::array()}}));
+    }
+    // name 1024 / agent_id 256 / source 256 / cursor 2048 / q 128: the last accepted length, then
+    // one more
+    struct Bound {
+        const char* key;
+        std::size_t max;
+    };
+    for (const Bound b : {Bound{"name", 1024}, Bound{"agent_id", 256}, Bound{"source", 256},
+                          Bound{"cursor", 2048}, Bound{"q", 128}}) {
+        INFO(b.key);
+        CHECK_FALSE(strict_args_error(json{{b.key, std::string(b.max, 'a')}}));
+        CHECK(strict_args_error(json{{b.key, std::string(b.max + 1, 'a')}}));
+    }
+    // kind / ecosystem are bounded before the vocabulary check: an over-long value is "too long"
+    CHECK(strict_args_error(json{{"kind", std::string(17, 'a')}}).value().ends_with("too long"));
+    CHECK(strict_args_error(json{{"ecosystem", std::string(33, 'a')}}).value().ends_with("too long"));
+    CHECK_FALSE(strict_args_error(json{{"versions_min", 100000}}));
+    CHECK_FALSE(strict_args_error(json{{"versions_min", 0}}));
+    CHECK_FALSE(strict_args_error(json{{"limit", 1}}));
+    CHECK_FALSE(strict_args_error(json{{"limit", 1000}}));
+    CHECK(strict_args_error(json{{"versions_min", 2.0}}));
+    CHECK(strict_args_error(json{{"limit", true}}));
+}
+
+TEST_CASE("installed_software_args_error: types only, never a range or a length",
+          "[server][software_catalogue_model]") {
+    using nlohmann::json;
+    CHECK_FALSE(installed_software_args_error(json::object()));
+    CHECK_FALSE(installed_software_args_error(json::array())); // not an object: nothing to check
+    CHECK_FALSE(installed_software_args_error(
+        json{{"agent_id", "a"}, {"name", "git"}, {"version", ""}, {"cursor", "c"}, {"limit", 5}}));
+    // unknown names are ignored whatever their type
+    CHECK_FALSE(installed_software_args_error(json{{"bogus", 1.5}, {"kind", 7}}));
+    // legacy clamping stays: an in-range integer of any size is the parser's to clamp
+    for (const std::int64_t n : {INT64_C(-3), INT64_C(0), INT64_C(50000), INT64_MAX})
+        CHECK_FALSE(installed_software_args_error(json{{"limit", n}}));
+    CHECK_FALSE(installed_software_args_error(json{{"limit", static_cast<std::uint64_t>(INT64_MAX)}}));
+    // the long strings are the parser's to refuse (its own 400 text), not this check's
+    CHECK_FALSE(installed_software_args_error(json{{"name", std::string(5000, 'a')}}));
+
+    for (const char* key : {"agent_id", "name", "version", "cursor"}) {
+        INFO(key);
+        for (const json& bad : {json(123), json(2.0), json(nullptr), json::array(), json::object(),
+                                json(true)}) {
+            const auto err = installed_software_args_error(json{{key, bad}});
+            REQUIRE(err);
+            CHECK(*err == std::string(key) + " must be a JSON string");
+        }
+    }
+    for (const json& bad : {json("abc"), json(2.5), json(nullptr), json(true), json::array(),
+                            json(static_cast<std::uint64_t>(INT64_MAX) + 1), json(UINT64_MAX)}) {
+        const auto err = installed_software_args_error(json{{"limit", bad}});
+        REQUIRE(err);
+        CHECK(*err == "limit must be a JSON integer");
+    }
+}
+
 TEST_CASE("read_versions: the rollup gate applies to the unfiltered fleet drill only",
           "[server][software_catalogue_model]") {
     struct Fake {
@@ -591,10 +853,13 @@ TEST_CASE("audit_target: fixed field order", "[server][software_catalogue_model]
     f.agent_id = "dev-1";
     CHECK(audit_target(f) == "agent=dev-1");
     f.name = "git";
+    CHECK(audit_target(f) == "name=git;agent=dev-1"); // a name query narrowed to one device
+    f.agent_id.clear();
     CHECK(audit_target(f) == "name=git");
+    f.agent_id = "dev-1";
     f.version = "";
     f.q = "x";
-    CHECK(audit_target(f) == "name=git;version=;q=x");
+    CHECK(audit_target(f) == "name=git;agent=dev-1;version=;q=x");
 }
 
 TEST_CASE("audit_target neutralises forged k=v fields in caller text",
@@ -696,8 +961,14 @@ TEST_CASE("worst-case cursors stay within kCursorMaxBytes", "[server][software_c
     const std::string agent(256, 'z');
     SoftwareCatalogRow r = row(name, INT64_MAX);
     CHECK(encode_catalogue_cursor(r, kHeadFp, INT64_MAX).size() <= kCursorMaxBytes);
-    SoftwareFleetRow f = fleet_row(name, agent, INT64_MAX);
-    CHECK(encode_devices_cursor(f, kHeadFp).size() <= kCursorMaxBytes);
+    // name, agent_id, install_id and skip all at their widest
+    const auto tok = encode_devices_cursor({SoftwareCursor{name, agent, INT64_MAX}, INT64_MAX}, kHeadFp);
+    CHECK(tok.size() <= kCursorMaxBytes);
+    // and a widest-valid-text token still decodes (the 0xFF name above is size-only)
+    const auto valid = encode_devices_cursor(
+        {SoftwareCursor{std::string(1024, 'n'), agent, INT64_MAX}, INT64_MAX}, kHeadFp);
+    CHECK(valid.size() == tok.size());
+    CHECK(decode_devices_cursor(valid, kHeadFp));
 }
 
 TEST_CASE("catalogue cursor decoder refusals", "[server][software_catalogue_model]") {
@@ -751,15 +1022,26 @@ TEST_CASE("catalogue cursor decoder refusals", "[server][software_catalogue_mode
     }
 }
 
+namespace {
+// Test-side encoder of the d2 payload, independent of the model's: `<len>:<bytes>` + 0x1F each.
+std::string d2_payload(std::initializer_list<std::string_view> fields) {
+    std::string out;
+    for (const auto f : fields)
+        out += std::to_string(f.size()) + ":" + std::string(f) + "\x1f";
+    return out;
+}
+} // namespace
+
 TEST_CASE("devices cursor round trip and refusals", "[server][software_catalogue_model]") {
     const std::string fp = devices_fingerprint({});
-    const auto row = fleet_row(std::string("na\x1f" "me"), "agent:1", 77);
-    const auto tok = encode_devices_cursor(row, fp);
+    const DevicesCursor at{SoftwareCursor{std::string("na\x1f" "me"), "agent:1", 77}, 12};
+    const auto tok = encode_devices_cursor(at, fp);
     auto cur = decode_devices_cursor(tok, fp);
     REQUIRE(cur);
-    CHECK(cur->name == row.entry.name);
-    CHECK(cur->agent_id == "agent:1");
-    CHECK(cur->install_id == 77);
+    CHECK(cur->after.name == at.after.name);
+    CHECK(cur->after.agent_id == "agent:1");
+    CHECK(cur->after.install_id == 77);
+    CHECK(cur->skip == 12);
 
     // A refusal is asserted behind a REQUIRE_FALSE: reading .error() of an engaged result would
     // abort the whole binary under libc++ hardening instead of failing this case.
@@ -768,36 +1050,81 @@ TEST_CASE("devices cursor round trip and refusals", "[server][software_catalogue
         REQUIRE_FALSE(r);
         CHECK(r.error() == expected);
     };
+    const auto d2 = [&](std::initializer_list<std::string_view> fields) {
+        return "d2:" + fp + ":" + b64url_of(d2_payload(fields));
+    };
     refuses(tok, "ffffffffffffffff", CursorError::kFilterMismatch);
     refuses("c1:" + fp + ":x", fp, CursorError::kMalformed);
-    refuses("d1:" + fp, fp, CursorError::kMalformed);
-    refuses("d1:" + fp + ":" + b64url_of("onlyone"), fp, CursorError::kMalformed);
-    refuses("d1:" + fp + ":" + b64url_of("n\x1f" "a\x1f" "x"), fp, CursorError::kMalformed);
-    refuses("d1:" + fp + ":" + b64url_of("n\x1f" "a\x1f" "1") + "=", fp, CursorError::kMalformed);
+    refuses("d2:" + fp, fp, CursorError::kMalformed);
+    // the superseded d1 shape (never shipped) is just another malformed prefix
+    refuses("d1:" + fp + ":" + b64url_of("n\x1f" "a\x1f" "1"), fp, CursorError::kMalformed);
+    refuses("d1:" + fp + ":" + b64url_of(d2_payload({"n", "a", "1", "0"})), fp,
+            CursorError::kMalformed);
+    refuses("d2:" + fp + ":" + b64url_of("onlyone"), fp, CursorError::kMalformed);
+    refuses(d2({"n", "a", "1"}), fp, CursorError::kMalformed);           // too few fields
+    refuses(d2({"n", "a", "1", "0", "0"}), fp, CursorError::kMalformed); // too many
+    refuses(d2({"n", "a", "x", "0"}), fp, CursorError::kMalformed);      // non-numeric id
+    refuses(d2({"n", "a", "1", "-1"}), fp, CursorError::kMalformed);     // negative skip
+    refuses(d2({"n", "a", "", "0"}), fp, CursorError::kMalformed);       // empty id
+    refuses(d2({"n", "a", "1", "99999999999999999999"}), fp, CursorError::kMalformed); // overflow
+    refuses("d2:" + fp + ":" + b64url_of(d2_payload({"n", "a", "1", "0"}) + "x"), fp,
+            CursorError::kMalformed); // a trailing byte after the last field
+    refuses("d2:" + fp + ":" + b64url_of(d2_payload({"n", "a", "1", "0"})) + "=", fp,
+            CursorError::kMalformed);
+    // length prefixes that lie: too long, too short (the separator is then not where it says),
+    // missing, non-decimal
+    refuses("d2:" + fp + ":" + b64url_of("9:n\x1f" "1:a\x1f" "1:1\x1f" "1:0\x1f"), fp,
+            CursorError::kMalformed);
+    refuses("d2:" + fp + ":" + b64url_of("1:nn\x1f" "1:a\x1f" "1:1\x1f" "1:0\x1f"), fp,
+            CursorError::kMalformed);
+    refuses("d2:" + fp + ":" + b64url_of("n\x1f" "1:a\x1f" "1:1\x1f" "1:0\x1f"), fp,
+            CursorError::kMalformed);
+    refuses("d2:" + fp + ":" + b64url_of("x:n\x1f" "1:a\x1f" "1:1\x1f" "1:0\x1f"), fp,
+            CursorError::kMalformed);
+    refuses("d2:" + fp + ":" + b64url_of("1:n1:a1:11:0"), fp, CursorError::kMalformed); // no separators
     // The decoded name and agent id are bound as SQL parameters: invalid UTF-8 or a NUL is
     // malformed, and is refused before the filter check.
     const std::string nul("a\0b", 3);
     for (const std::string& bad : {std::string("\xFF"), nul}) {
-        refuses("d1:" + fp + ":" + b64url_of(bad + "\x1f" "a\x1f" "1"), fp,
-                CursorError::kMalformed);
-        refuses("d1:" + fp + ":" + b64url_of("n\x1f" + bad + "\x1f" "1"), fp,
-                CursorError::kMalformed);
-        refuses("d1:" + fp + ":" + b64url_of(bad + "\x1f" "a\x1f" "1"), "ffffffffffffffff",
+        refuses(d2({bad, "a", "1", "0"}), fp, CursorError::kMalformed);
+        refuses(d2({"n", bad, "1", "0"}), fp, CursorError::kMalformed);
+        refuses("d2:" + fp + ":" + b64url_of(d2_payload({bad, "a", "1", "0"})), "ffffffffffffffff",
                 CursorError::kMalformed);
     }
-    // hand-made head: name "", agent "", id 0 - ACCEPTED (opaque, not authenticated)
-    CHECK(decode_devices_cursor("d1:" + fp + ":" + b64url_of(std::string("\x1f\x1f") + "0"), fp));
+    // hand-made head: name "", agent "", id 0, skip 0 - ACCEPTED (opaque, not authenticated)
+    CHECK(decode_devices_cursor(d2({"", "", "0", "0"}), fp));
 
-    // Known answer: the rest-api.md example token (0x1F separators, base64url of
-    // "git\x1fagent-002\x1f5"), so the documented example cannot drift from what the codec mints.
+    // Known answer: the rest-api.md example token, so the documented example cannot drift from
+    // what the codec mints.
     const std::string doc_fp = "0f3a9c1d5b7e2a64";
-    constexpr const char* kDocToken = "d1:0f3a9c1d5b7e2a64:Z2l0H2FnZW50LTAwMh81";
-    CHECK(encode_devices_cursor(fleet_row("git", "agent-002", 5), doc_fp) == kDocToken);
+    constexpr const char* kDocToken = "d2:0f3a9c1d5b7e2a64:MzpnaXQfOTphZ2VudC0wMDIfMTo1HzE6MB8";
+    CHECK(encode_devices_cursor({SoftwareCursor{"git", "agent-002", 5}, 0}, doc_fp) == kDocToken);
     auto doc = decode_devices_cursor(kDocToken, doc_fp);
     REQUIRE(doc);
-    CHECK(doc->name == "git");
-    CHECK(doc->agent_id == "agent-002");
-    CHECK(doc->install_id == 5);
+    CHECK(doc->after.name == "git");
+    CHECK(doc->after.agent_id == "agent-002");
+    CHECK(doc->after.install_id == 5);
+    CHECK(doc->skip == 0);
+}
+
+TEST_CASE("devices cursor: a separator inside any field cannot shift the split",
+          "[server][software_catalogue_model]") {
+    const std::string fp = devices_fingerprint({});
+    // 0x1F (and digits, colons) in agent_id and in name, in every position
+    const std::vector<std::string> awkward = {std::string("a\x1f" "b"), std::string("\x1f"),
+                                              std::string("\x1f\x1f"), std::string("3:x\x1f" "1"),
+                                              std::string("x\x1f"), std::string("\x1f" "x")};
+    for (const auto& agent : awkward)
+        for (const auto& name : awkward) {
+            INFO("name bytes " << name.size() << ", agent bytes " << agent.size());
+            const DevicesCursor at{SoftwareCursor{name, agent, 5}, 3};
+            auto back = decode_devices_cursor(encode_devices_cursor(at, fp), fp);
+            REQUIRE(back);
+            CHECK(back->after.name == name);
+            CHECK(back->after.agent_id == agent);
+            CHECK(back->after.install_id == 5);
+            CHECK(back->skip == 3);
+        }
 }
 
 TEST_CASE("derive_kpis maps every figure", "[server][software_catalogue_model]") {
@@ -924,6 +1251,30 @@ TEST_CASE("installs_csv", "[server][software_catalogue_model]") {
     CHECK(csv.find("'=cmd") != std::string::npos);    // formula neutralised
     CHECK(csv.find("\"Ac\"\"me\"") != std::string::npos);
     CHECK(installs_csv({}) == std::string(kInstallsCsvHeader) + "\n");
+}
+
+TEST_CASE("installs_csv: every cell lands under its header, neutralised and quoted per cell",
+          "[server][software_catalogue_model]") {
+    SoftwareFleetRow r;
+    r.agent_id = "=A";
+    r.entry.name = "+N";
+    r.entry.version = "-V";
+    r.entry.publisher = "@P";
+    r.entry.install_date = "\tD";
+    r.entry.kind = "\rK";
+    r.entry.ecosystem = "e\nco";
+    r.entry.epoch = "ep";
+    r.entry.release = "rel";
+    r.entry.arch = "ar";
+    r.entry.signature_status = "sig";
+    r.entry.distro_id = "di";
+    r.entry.distro_version = "dv";
+    r.entry.source = "so";
+    // header cells: agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,
+    // arch,signature_status,distro_id,distro_version,source
+    CHECK(installs_csv({r}) == std::string(kInstallsCsvHeader) +
+                                   "\n'=A,'+N,'-V,'@P,'\tD,\"'\rK\",\"e\nco\",ep,rel,ar,sig,di,dv,so\n");
+    CHECK(std::ranges::count(kInstallsCsvHeader, ',') + 1 == static_cast<long>(kInstallsCsvColumns));
 }
 
 TEST_CASE("titles_csv", "[server][software_catalogue_model]") {

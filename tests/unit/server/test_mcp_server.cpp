@@ -870,6 +870,9 @@ struct McpTestServer {
     // bookkeeping event still persists, or vice versa). Unset → every action
     // uses the uniform audit_succeeds_ bool above.
     std::function<bool(const std::string& action)> audit_succeeds_for_action_;
+    // Non-empty: only an audit row whose `result` equals this (e.g. "denied") reports a
+    // persistence failure; every other row persists.
+    std::string audit_fail_result_;
     bool audit_throws_{false};          // true → AuditFn throws (bad_alloc-class) (#1647)
     bool read_only_mode_{false};        // captured by ref by build_handler
     bool mcp_disabled_{false};          // captured by ref by build_handler
@@ -1485,6 +1488,8 @@ private:
             audit_target_types.push_back(target_type);
             if (audit_throws_)
                 throw std::runtime_error("audit DB write blew up"); // bad_alloc-class (#1647)
+            if (!audit_fail_result_.empty() && result == audit_fail_result_)
+                return false;
             if (audit_succeeds_for_action_)
                 return audit_succeeds_for_action_(action);
             return audit_succeeds_;
@@ -20631,6 +20636,198 @@ TEST_CASE("MCP query_installed_software: version; cursor walk and source; legacy
     CHECK(result.at("structuredContent").at("result_truncated_by_cap") == true);
     CHECK(result.at("next_cursor").is_string());
     CHECK(result.at("structuredContent").at("next_cursor") == result.at("next_cursor"));
+}
+
+TEST_CASE("MCP query_installed_software: a wrongly typed argument is refused, never dropped or "
+          "stringified",
+          "[mcp][inventory]") {
+    // No store is wired: the refusal comes from the argument check alone, before any read.
+    McpTestServer ts;
+    ts.start();
+    auto call = [&](const std::string& args) {
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
+                           R"("params":{"name":"query_installed_software","arguments":)" +
+                           args + "}}");
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body);
+    };
+    const auto refused = [&](const std::string& args, const std::string& message) {
+        INFO(args);
+        const auto r = call(args);
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(r["error"]["message"].get<std::string>() == message);
+    };
+    // each of the four text arguments: a number, a float, null, an array, an object
+    for (const char* key : {"agent_id", "name", "version", "cursor"}) {
+        for (const char* bad : {"123", "2.0", "null", "[]", "{}", "true"})
+            refused(std::string(R"({")") + key + R"(":)" + bad + "}",
+                    std::string(key) + " must be a JSON string");
+    }
+    for (const char* bad : {R"("abc")", "2.5", "null", "true", "[]", "18446744073709551615",
+                            "9223372036854775808"})
+        refused(std::string(R"({"limit":)") + bad + "}", "limit must be a JSON integer");
+    // well-typed input is not refused by the argument check (it reaches the next gate: no store)
+    for (const char* ok : {R"({"limit":50000})", R"({"limit":-3})", R"({"limit":9223372036854775807})",
+                           R"({"version":""})", R"({"bogus":2.5})"}) {
+        INFO(ok);
+        const auto r = call(ok);
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+}
+
+TEST_CASE("MCP query_installed_software: in-range limits still clamp; the empty version bucket "
+          "stays exact",
+          "[mcp][pg][inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    std::vector<yuzu::server::SoftwareEntry> rows = {{"A", "1.0", "", ""}, {"B", "", "", ""}};
+    REQUIRE(store.apply_installed_software(
+                "agent-1", yuzu::server::SoftwareInventoryStore::canonical_hash(rows), rows, 1000) ==
+            yuzu::server::InventoryIngestOutcome::kStored);
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.start();
+    auto software = [&](const std::string& args) {
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
+                           R"("params":{"name":"query_installed_software","arguments":)" +
+                           args + "}}");
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE_FALSE(body.contains("error"));
+        return body.at("result").at("structuredContent").at("software");
+    };
+    CHECK(software(R"({"limit":50000})").size() == 2); // clamped to the page max, not refused
+    CHECK(software(R"({"limit":-3})").size() == 1);    // clamped up to 1
+    const auto empty_bucket = software(R"({"version":""})");
+    REQUIRE(empty_bucket.size() == 1);
+    CHECK(empty_bucket[0]["name"] == "B");
+}
+
+TEST_CASE("MCP query_installed_software: a wide-scope cursor never names an out-of-scope device",
+          "[mcp][pg][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    std::vector<yuzu::server::SoftwareEntry> rows = {{"Common", "1", "", ""}};
+    for (const char* agent : {"agent-a", "agent-b", "agent-c", "agent-d", "agent-e", "agent-f",
+                              "agent-g"})
+        REQUIRE(store.apply_installed_software(
+                    agent, yuzu::server::SoftwareInventoryStore::canonical_hash(rows), rows, 1000) ==
+                yuzu::server::InventoryIngestOutcome::kStored);
+
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        std::unordered_set<std::string> ids{"agent-a"};
+        for (std::size_t i = 0; i <= yuzu::server::software_catalogue::kScopePushdownMaxIds; ++i)
+            ids.insert("pad-" + std::to_string(i));
+        return {true, std::move(ids)};
+    };
+    ts.start();
+    auto call = [&](const std::string& args) {
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
+                           R"("params":{"name":"query_installed_software","arguments":)" +
+                           args + "}}");
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE_FALSE(body.contains("error"));
+        return body.at("result");
+    };
+    namespace swc = yuzu::server::software_catalogue;
+    const auto decode = [](const std::string& token) {
+        auto cur = swc::decode_devices_cursor(token, swc::devices_fingerprint(yuzu::server::SoftwareFleetQuery{}));
+        REQUIRE(cur);
+        return *cur;
+    };
+
+    auto first = call(R"({"limit":1})");
+    const auto& kept = first.at("structuredContent").at("software");
+    REQUIRE(kept.size() == 1);
+    CHECK(kept[0]["agent_id"] == "agent-a"); // the in-scope device, not a dropped one
+    const auto c1 = decode(first.at("next_cursor").get<std::string>());
+    CHECK(c1.after.agent_id == "agent-a");
+    CHECK(c1.skip == 0);
+
+    // Four bounded windows of dropped rows: an EMPTY page that continues from the caller's own
+    // last row, naming nothing it was not served.
+    auto second = call(R"({"limit":1,"cursor":")" + first.at("next_cursor").get<std::string>() + R"("})");
+    CHECK(second.at("structuredContent").at("software").empty());
+    CHECK(second.at("devices_omitted") == swc::kWideScopeMaxReads);
+    CHECK(second.at("result_truncated_by_cap") == true);
+    const auto c2 = decode(second.at("next_cursor").get<std::string>());
+    CHECK(c2.after.agent_id == "agent-a");
+    CHECK(c2.skip == swc::kWideScopeMaxReads);
+    CHECK(second.dump().find("agent-b") == std::string::npos);
+
+    // only the denied row failing to persist flags the response (the success row persisted)
+    ts.audit_fail_result_ = "denied";
+    auto flagged = call(R"({"limit":1,"cursor":")" + first.at("next_cursor").get<std::string>() + R"("})");
+    CHECK(flagged.at("audit_persisted") == false);
+    CHECK(flagged.at("structuredContent").at("audit_persisted") == false);
+    auto unflagged = call(R"({"limit":1})"); // dropped nothing: no denied row, nothing to flag
+    CHECK_FALSE(unflagged.contains("audit_persisted"));
+}
+
+TEST_CASE("MCP query_installed_software: an explicit out-of-scope agent_id is audited as one denied "
+          "row",
+          "[mcp][pg][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    std::vector<yuzu::server::SoftwareEntry> rows = {{"Chrome", "119", "Google", ""}};
+    for (const char* agent : {"agent-in", "agent-out"})
+        REQUIRE(store.apply_installed_software(
+                    agent, yuzu::server::SoftwareInventoryStore::canonical_hash(rows), rows, 1000) ==
+                yuzu::server::InventoryIngestOutcome::kStored);
+
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::unordered_set<std::string>{"agent-in"}}; // push-down scope
+    };
+    ts.start();
+    auto call = [&](const std::string& args) {
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
+                           R"("params":{"name":"query_installed_software","arguments":)" +
+                           args + "}}");
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE_FALSE(body.contains("error"));
+        return body.at("result");
+    };
+    const auto denied = [&] { return mcp_audit_details(ts, "mcp.query_installed_software|denied"); };
+
+    auto out = call(R"({"agent_id":"agent-out"})");
+    CHECK(out.at("structuredContent").at("software").empty());
+    CHECK(out.at("devices_omitted") == 0); // the response bytes are unchanged
+    CHECK_FALSE(out.contains("audit_persisted"));
+    REQUIRE(denied().size() == 1);
+    CHECK(denied()[0].find("agent_id outside the caller's scope") != std::string::npos);
+    CHECK(mcp_audit_details(ts, "mcp.query_installed_software|success").size() == 1);
+
+    // an in-scope agent_id, or none, writes no denied row
+    CHECK(call(R"({"agent_id":"agent-in"})").at("structuredContent").at("software").size() == 1);
+    call("{}");
+    CHECK(denied().size() == 1);
+
+    // the denied row's own persistence failure alone reaches the flag
+    ts.audit_fail_result_ = "denied";
+    auto flagged = call(R"({"agent_id":"agent-out"})");
+    CHECK(flagged.at("audit_persisted") == false);
+    CHECK(flagged.at("structuredContent").at("audit_persisted") == false);
 }
 
 // require_fleet_read's own doc comment: unwired = misconfiguration, FAILS

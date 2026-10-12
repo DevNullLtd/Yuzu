@@ -127,6 +127,9 @@ struct InvHarness {
     // When false, audit_fn reports a persistence failure (returns false) so a test can
     // exercise the set-and-proceed `audit_persisted:false` honesty field.
     bool audit_ok{true};
+    // Non-empty: only an audit row with this `result` (e.g. "denied") reports a persistence
+    // failure; every other row persists. Isolates one row's contribution to audit_persisted.
+    std::string audit_fail_result;
     // When true, audit_fn THROWS (bad_alloc-class / locked audit DB) — exercises the
     // #1647 throw-safe kernel: the route must not 500, it must serve with
     // audit_persisted:false (gov chaos CH-3, parity with the MCP sibling).
@@ -156,7 +159,7 @@ struct InvHarness {
             if (audit_throws)
                 throw std::runtime_error("audit sink down");
             audit_log.push_back({action, result, target_id, detail});
-            return audit_ok;
+            return audit_ok && result != audit_fail_result;
         };
         RestApiV1::FleetReadFn fleet_read_fn;
         if (wire_fleet_read_fn) {
@@ -1036,7 +1039,7 @@ TEST_CASE("REST inventory/software: cursor refusals — tampered; wrong filter s
     const auto fp = software_catalogue::devices_fingerprint(SoftwareFleetQuery{});
     const auto before = count_audit(h, "inventory.software.query", "success", "page=continuation");
     auto forged = h.sink.Get("/api/v1/inventory/software?limit=1&cursor=" +
-                             software_catalogue::encode_devices_cursor(SoftwareFleetRow{}, fp));
+                             software_catalogue::encode_devices_cursor({}, fp));
     REQUIRE(forged);
     CHECK(forged->status == 200);
     CHECK(nlohmann::json::parse(forged->body).at("data").at("software")[0].at("name") == "A");
@@ -1088,11 +1091,8 @@ TEST_CASE("REST inventory/software: text a store cannot bind is a 400; never a r
     // A hand-minted cursor whose decoded agent id is not valid UTF-8 (well-formed otherwise, over
     // the matching fingerprint), so only the decoded-text refusal can answer 400.
     const auto fp = software_catalogue::devices_fingerprint(SoftwareFleetQuery{});
-    SoftwareFleetRow bad_agent = {};
-    bad_agent.entry.name = "A";
-    bad_agent.agent_id = "\xFF";
-    bad_agent.install_id = 1;
-    const std::string forged = software_catalogue::encode_devices_cursor(bad_agent, fp);
+    const std::string forged = software_catalogue::encode_devices_cursor(
+        {SoftwareCursor{"A", "\xFF", 1}, 0}, fp);
     // The handler has two 400 mappings (parameter parse and cursor decode); the model tests loop
     // every key and bound, so one query per mapping proves 400-not-503 here.
     for (const std::string& query : std::vector<std::string>{"agent_id=%FF", "cursor=" + forged}) {
@@ -1129,16 +1129,33 @@ TEST_CASE("REST inventory/software: exports — csv; truncation; json; bad forma
     CHECK(csv->body.starts_with(std::string(software_catalogue::kInstallsCsvHeader) + "\n"));
     CHECK(csv->get_header_value("X-Result-Truncated-By-Cap").empty());
 
+    // An uncapped export carries neither the continuation header nor the trailer.
+    CHECK(csv->get_header_value("X-Next-Cursor").empty());
+    CHECK(csv->body.find("# result_truncated_by_cap") == std::string::npos);
+
     auto cut = h.sink.Get("/api/v1/inventory/software?format=csv&limit=2");
     REQUIRE(cut);
     CHECK(cut->get_header_value("X-Result-Truncated-By-Cap") == "true");
-    CHECK(std::ranges::count(cut->body, '\n') == 3); // header + 2 rows
+    CHECK(std::ranges::count(cut->body, '\n') == 4); // header + 2 rows + the trailer record
+    CHECK(cut->body.ends_with("# result_truncated_by_cap cause=row_cap" + std::string(13, ',') +
+                              "\r\n"));
+    // The continuation is in X-Next-Cursor: feeding it back reads on, with no overlap.
+    const auto next_cursor = cut->get_header_value("X-Next-Cursor");
+    REQUIRE_FALSE(next_cursor.empty());
+    auto page2 = h.sink.Get("/api/v1/inventory/software?format=csv&limit=2&cursor=" + next_cursor);
+    REQUIRE(page2);
+    CHECK(page2->status == 200);
+    CHECK(page2->body.find("dev-a,C,") != std::string::npos);
+    CHECK(page2->body.find("dev-a,A,") == std::string::npos);
+    CHECK(page2->body.find("dev-a,B,") == std::string::npos);
+    CHECK(page2->get_header_value("X-Next-Cursor").empty()); // short page: the end
+    CHECK(page2->body.find("# result_truncated_by_cap") == std::string::npos);
 
     auto json = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software?format=json&limit=2")->body);
     CHECK(json.at("data").at("result_truncated_by_cap") == true);
 
     CHECK(h.sink.Get("/api/v1/inventory/software?format=xml")->status == 400);
-    CHECK(count_audit(h, "inventory.software.export", "success") == 3);
+    CHECK(count_audit(h, "inventory.software.export", "success") == 4);
     CHECK(count_audit(h, "inventory.software.export", "success", "truncated=true") == 2);
 
     // A dropped audit row is flagged on the csv (a body-less channel for the honesty flag);
@@ -1149,6 +1166,140 @@ TEST_CASE("REST inventory/software: exports — csv; truncation; json; bad forma
     REQUIRE(unaudited);
     CHECK(unaudited->status == 200);
     CHECK(unaudited->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+namespace {
+
+// The keyset position inside a minted cursor, decoded by the model's own codec (default filters).
+software_catalogue::DevicesCursor decode_cursor(const std::string& token) {
+    auto cur = software_catalogue::decode_devices_cursor(
+        token, software_catalogue::devices_fingerprint(SoftwareFleetQuery{}));
+    REQUIRE(cur);
+    return *cur;
+}
+
+// dev-a (in scope) sorts first, then six out-of-scope devices of the same name.
+void seed_wide_fixture(SoftwareInventoryStore& store) {
+    for (const char* a : {"dev-a", "dev-b", "dev-c", "dev-d", "dev-e", "dev-f", "dev-g"})
+        seed(store, a, {{"Common", "1", "", ""}});
+}
+
+} // namespace
+
+TEST_CASE("REST inventory/software: a wide-scope cursor never names an out-of-scope device",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_wide_fixture(store);
+
+    InvHarness h{&store};
+    h.fleet_scope = wide_scope({"dev-a"});
+
+    auto first = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software?limit=1")->body).at("data");
+    REQUIRE(first.at("software").size() == 1);
+    CHECK(first.at("software")[0].at("agent_id") == "dev-a");
+    const auto c1 = decode_cursor(first.at("next_cursor").get<std::string>());
+    CHECK(c1.after.agent_id == "dev-a");
+    CHECK(c1.skip == 0);
+
+    // Page 2 scans four dropped rows (one per bounded read) and finds nothing in scope: an EMPTY
+    // page that still continues, anchored where the caller already is, never at a dropped row.
+    auto second = nlohmann::json::parse(
+        h.sink.Get("/api/v1/inventory/software?limit=1&cursor=" + first.at("next_cursor").get<std::string>())
+            ->body).at("data");
+    CHECK(second.at("software").empty());
+    CHECK(second.at("devices_omitted") == software_catalogue::kWideScopeMaxReads);
+    CHECK(second.at("result_truncated_by_cap") == true);
+    REQUIRE(second.at("next_cursor").is_string());
+    const auto c2 = decode_cursor(second.at("next_cursor").get<std::string>());
+    CHECK(c2.after.agent_id == "dev-a");
+    CHECK(c2.after.install_id == c1.after.install_id);
+    CHECK(c2.skip == software_catalogue::kWideScopeMaxReads);
+    CHECK(second.dump().find("dev-b") == std::string::npos); // nothing out of scope is echoed
+
+    // The continuation passes the skipped rows in SQL and reaches the end: 7 - 1 - 4 = 2 left.
+    auto third = nlohmann::json::parse(
+        h.sink.Get("/api/v1/inventory/software?limit=1&cursor=" + second.at("next_cursor").get<std::string>())
+            ->body).at("data");
+    CHECK(third.at("software").empty());
+    CHECK(third.at("next_cursor").is_null());
+    CHECK(third.at("devices_omitted") == 2);
+
+    // A wide-scope csv page that read four windows and found nothing in scope still says it was
+    // cut: capped header, continuation header and the trailer, with no data row.
+    auto csv = h.sink.Get("/api/v1/inventory/software?format=csv&limit=1&cursor=" +
+                          first.at("next_cursor").get<std::string>());
+    REQUIRE(csv);
+    CHECK(csv->status == 200);
+    CHECK(csv->get_header_value("X-Result-Truncated-By-Cap") == "true");
+    CHECK(decode_cursor(csv->get_header_value("X-Next-Cursor")).skip ==
+          software_catalogue::kWideScopeMaxReads);
+    CHECK(std::ranges::count(csv->body, '\n') == 2); // header + the trailer record
+    CHECK(csv->body.find("dev-b") == std::string::npos);
+}
+
+TEST_CASE("REST inventory/software: an explicit out-of-scope agent_id is audited as one denied row",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"A", "1", "", ""}});
+    seed(store, "dev-z", {{"A", "1", "", ""}});
+
+    InvHarness h{&store};
+    h.fleet_scope = std::unordered_set<std::string>{"dev-a"}; // push-down: nothing is "omitted"
+
+    auto res = h.sink.Get("/api/v1/inventory/software?agent_id=dev-z");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto data = nlohmann::json::parse(res->body).at("data");
+    CHECK(data.at("software").empty());
+    CHECK(data.at("devices_omitted") == 0); // the response bytes are unchanged
+    CHECK_FALSE(data.contains("audit_persisted"));
+    CHECK(count_audit(h, "inventory.software.query", "denied", "agent_id outside the caller's scope") == 1);
+    CHECK(count_audit(h, "inventory.software.query", "success") == 1);
+
+    // exports write the same one denied row, under the export verb, whatever the format
+    auto csv = h.sink.Get("/api/v1/inventory/software?agent_id=dev-z&format=csv");
+    REQUIRE(csv);
+    CHECK(csv->get_header_value("Sec-Audit-Failed").empty());
+    auto json = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software?agent_id=dev-z&format=json")->body);
+    CHECK_FALSE(json.at("data").contains("audit_persisted"));
+    CHECK(count_audit(h, "inventory.software.export", "denied", "agent_id outside the caller's scope") == 2);
+    CHECK(count_audit(h, "inventory.software.query", "denied") == 1);
+
+    // an in-scope agent_id, or none, writes no denied row
+    CHECK(h.sink.Get("/api/v1/inventory/software?agent_id=dev-a")->status == 200);
+    CHECK(h.sink.Get("/api/v1/inventory/software")->status == 200);
+    CHECK(count_audit(h, "inventory.software.query", "denied") == 1);
+
+    // the denied row's own persistence failure alone reaches the honesty flags
+    h.audit_fail_result = "denied";
+    auto flagged = nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software?agent_id=dev-z")->body);
+    CHECK(flagged.at("data").at("audit_persisted") == false);
+    auto flagged_csv = h.sink.Get("/api/v1/inventory/software?agent_id=dev-z&format=csv");
+    REQUIRE(flagged_csv);
+    CHECK(flagged_csv->get_header_value("Sec-Audit-Failed") == "true");
+    // ...and a read that wrote no denied row is not flagged by a failing denied sink
+    CHECK_FALSE(nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software?agent_id=dev-a")->body)
+                    .at("data").contains("audit_persisted"));
+
+    // over a wide scope the filtered-N wording wins and there is still exactly one row
+    InvHarness wide{&store};
+    wide.fleet_scope = wide_scope({"dev-a"});
+    CHECK(wide.sink.Get("/api/v1/inventory/software?name=A")->status == 200);
+    CHECK(count_audit(wide, "inventory.software.query", "denied", "filtered 1 out-of-scope") == 1);
+    CHECK(count_audit(wide, "inventory.software.query", "denied") == 1);
+    CHECK(wide.sink.Get("/api/v1/inventory/software?name=A&agent_id=dev-z")->status == 200);
+    CHECK(count_audit(wide, "inventory.software.query", "denied") == 2);
+    wide.audit_fail_result = "denied"; // the post-filter's own denied row feeds the flag too
+    auto wide_flagged = nlohmann::json::parse(wide.sink.Get("/api/v1/inventory/software?name=A")->body);
+    CHECK(wide_flagged.at("data").at("audit_persisted") == false);
 }
 
 TEST_CASE("REST inventory/software: success audit target equals audit_target(query)",

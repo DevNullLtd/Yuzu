@@ -261,9 +261,10 @@ int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0
 }
 
 /// Builds the catalogue model's `Params` from the named MCP arguments (strings and integers
-/// only; any other JSON type is left out: the two catalogue twins refuse it earlier through
-/// `strict_args_error`, while `query_installed_software` runs no strict check and so ignores it,
-/// as the other read tools do), so MCP and REST parse through the one model.
+/// only; any other JSON type is left out, and an integer is stringified for every key). Every
+/// caller refuses a wrongly typed argument first, through `strict_args_error` (the two
+/// catalogue twins) or `installed_software_args_error` (query_installed_software), so nothing
+/// is silently dropped or stringified here. MCP and REST parse through the one model.
 software_catalogue::Params catalogue_params(const nlohmann::json& args,
                                             std::initializer_list<const char*> keys) {
     software_catalogue::Params p;
@@ -722,18 +723,23 @@ static const ToolDef kTools[] = {
      "admit-then-filter fleet-read gate). Results are scoped to the caller's management groups "
      "AND, for a service-scoped API token, to that token's service-tagged agents (the intersection "
      "of both when both apply): the scope is applied in SQL (up to 10000 visible devices), so a "
-     "confined caller gets COMPLETE pages of its own devices; devices_omitted counts only the "
-     "devices hidden by the in-process post-filter used for a scope wider than that bound (0 under "
-     "push-down — it is no longer an 'exists outside your scope' signal). A correctly-confined "
+     "confined caller gets COMPLETE pages of its own devices; devices_omitted is 0 there. Above "
+     "that bound the rows are filtered after the read: devices_omitted is then the count of "
+     "distinct out-of-scope devices within the scanned window(s), a bounded and audited signal "
+     "that out-of-scope matches exist, and a page can be EMPTY with a non-null next_cursor (keep "
+     "paging until it is null). A correctly-confined "
      "service-scoped token gets a real filtered read here rather than an outright denial. Rows "
      "also carry source (<plugin>.<action>, an open set). Optional `version` (an empty string "
-     "selects the empty-version rows). Returns up to `limit` rows (max 1000); when "
-     "result_truncated_by_cap is true the page is full and next_cursor (also non-null then) "
+     "selects the empty-version rows). Returns up to `limit` rows (max 1000; an in-range integer "
+     "above or below that still clamps); when "
+     "result_truncated_by_cap is true more rows may exist and next_cursor (also non-null then) "
      "resumes the keyset walk — pass it back as `cursor`; a malformed cursor or one issued for a "
-     "different filter set is refused with kInvalidParams. For the fleet title rollup use "
-     "query_software_catalogue.",
+     "different filter set is refused with kInvalidParams. A wrongly typed argument (a "
+     "non-string agent_id, name, version or cursor, or a non-integer or int64-overflowing limit) "
+     "is refused with kInvalidParams, never ignored. For the fleet title rollup use "
+     "query_software_catalogue; to list the devices carrying one title, filter here by `name`.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":1024,"description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","maxLength":256,"description":"Exact agent/device filter; omit for fleet-wide"},"version":{"type":"string","maxLength":1024,"description":"Exact version filter; an empty string selects the empty-version rows"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum rows returned"}}})j",
-     R"j({"type":"object","properties":{"software":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"},"kind":{"type":"string"},"ecosystem":{"type":"string"},"epoch":{"type":"string"},"release":{"type":"string"},"arch":{"type":"string"},"signature_status":{"type":"string"},"distro_id":{"type":"string"},"distro_version":{"type":"string"},"source":{"type":"string"}},"required":["agent_id","name","version","publisher","install_date","kind","ecosystem","epoch","release","arch","signature_status","distro_id","distro_version","source"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the page is full (more rows may exist)"},"devices_omitted":{"type":"integer","description":"Count of devices hidden by the in-process scope post-filter (0 under SQL push-down)"},"next_cursor":{"type":["string","null"],"description":"Pass back as cursor for the next page; null when the page is not full"}},"required":["software","devices_omitted","next_cursor"]})j"},
+     R"j({"type":"object","properties":{"software":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"},"kind":{"type":"string"},"ecosystem":{"type":"string"},"epoch":{"type":"string"},"release":{"type":"string"},"arch":{"type":"string"},"signature_status":{"type":"string"},"distro_id":{"type":"string"},"distro_version":{"type":"string"},"source":{"type":"string"}},"required":["agent_id","name","version","publisher","install_date","kind","ecosystem","epoch","release","arch","signature_status","distro_id","distro_version","source"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows may exist (the page is full or, on a wide scope, the read was cut short)"},"devices_omitted":{"type":"integer","description":"Distinct devices hidden by the in-process scope post-filter within the scanned window (0 under SQL push-down)"},"next_cursor":{"type":["string","null"],"description":"Pass back as cursor for the next page; null when no more rows may exist. A wide-scope page can be empty with a non-null next_cursor"}},"required":["software","devices_omitted","next_cursor"]})j"},
 
     {"get_tags", "Get all tags for a specific agent.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
@@ -3568,8 +3574,11 @@ static const ToolDef kTools[] = {
      "scoped), but may pass an in-scope agent_id (newest_version is then blank and "
      "newest_omitted true; an out-of-scope device returns an empty page with devices_omitted 1). "
      "Service-scoped API tokens are denied. Input is strict: an out-of-range limit or an unknown "
-     "kind/ecosystem is rejected rather than clamped (the REST twin clamps). A degraded store "
-     "read is a retryable error, never an empty result. Every call is audited (mcp.query_software_catalogue).",
+     "kind/ecosystem is rejected rather than clamped (the REST twin clamps); an empty kind or "
+     "ecosystem is refused too, so omit the key. To drill into one title pass its name to "
+     "get_software_versions, or to query_installed_software for the devices carrying it. A "
+     "degraded store read is a retryable error, never an empty result. Every call that reaches "
+     "the store is audited (mcp.query_software_catalogue).",
      R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
      R"j({"type":"object","properties":{"titles":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"publisher":{"type":"string"},"installs":{"type":"integer"},"versions":{"type":"integer"},"ecosystems":{"type":"array","items":{"type":"string"}},"kinds":{"type":"array","items":{"type":"string"}},"newest_version":{"type":"string"}},"required":["name","publisher","installs","versions","ecosystems","kinds","newest_version"]}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"totals":{"type":"object","properties":{"titles":{"type":"integer"},"installs":{"type":"integer"}},"required":["titles","installs"]},"kpis":{"type":["object","null"]},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["titles","count","next_cursor","totals","kpis","devices_omitted"]})j"},
 
@@ -3583,7 +3592,9 @@ static const ToolDef kTools[] = {
      "devices_omitted 1); service-scoped tokens are denied. A degraded store read, and the "
      "unfiltered fleet read while the catalogue is being built (never refreshed: normally until the "
      "first hourly refresh, PERMANENT when the refresh cannot complete - see "
-     "query_software_catalogue), are retryable errors, never an empty result. Audited as "
+     "query_software_catalogue), are retryable errors, never an empty result. An empty kind or "
+     "ecosystem is refused: omit the key. Take the title name from query_software_catalogue; "
+     "query_installed_software lists the devices carrying a version. Audited as "
      "mcp.get_software_versions.",
      R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
      R"j({"type":"object","properties":{"name":{"type":"string"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"installs":{"type":"integer"},"newest":{"type":"boolean"}},"required":["version","installs","newest"]}},"count":{"type":"integer"},"truncated":{"type":"boolean"},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["name","versions","count","truncated","devices_omitted"]})j"},
@@ -8949,13 +8960,20 @@ McpServer::HandlerFn McpServer::build_handler(
                             // envelope — the established convention every perm_fn(req,res,...)
                             // call in this file already follows, e.g. require_permission's own
                             // deny branches; cpp-expert confirmed this empirically, #3290 Gate 3)
+                namespace swc = software_catalogue;
+                // A wrongly typed argument is refused, never dropped (version:2.0 would read the
+                // whole fleet) or stringified (agent_id:123); unknown names stay ignored. Input
+                // is judged before the store is consulted.
+                if (const auto bad = swc::installed_software_args_error(args)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
                 if (!software_inventory_store) {
                     res.set_content(
                         error_response(id, kInternalError, "Software inventory store unavailable"),
                         "application/json");
                     return;
                 }
-                namespace swc = software_catalogue;
                 auto parsed = swc::parse_devices_params(
                     catalogue_params(args, {"agent_id", "name", "version", "limit", "cursor"}));
                 if (!parsed) {
@@ -8996,12 +9014,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 // audit_persisted. `success` is written on EVERY call (continuation pages
                 // tagged page=continuation): the cursor is opaque but unauthenticated.
                 bool denied_ok = true;
-                if (page.devices_omitted > 0)
+                if (page.devices_omitted > 0 || page.target_denied)
                     denied_ok = mcp_audit(
-                        "denied", "scope: filtered " + std::to_string(page.devices_omitted) +
-                                      " out-of-scope device(s) (management-group and/or "
-                                      "service-tag axis) for " +
-                                      audit_key);
+                        "denied",
+                        (page.devices_omitted > 0
+                             ? "scope: filtered " + std::to_string(page.devices_omitted) +
+                                   " out-of-scope device(s) (management-group and/or "
+                                   "service-tag axis)"
+                             : std::string("scope: agent_id outside the caller's scope")) +
+                            " for " + audit_key);
                 const bool audit_ok =
                     mcp_audit("success", audit_key + (continuation ? " page=continuation" : "")) &&
                     denied_ok;
