@@ -267,7 +267,19 @@ curl -s --cacert /etc/yuzu/ca.crt https://localhost:8443/api/v1/me \
 
 ## OIDC Single Sign-On
 
-Yuzu supports OpenID Connect with PKCE for browser-based SSO. This has been tested with Microsoft Entra ID (Azure AD) and should work with any compliant OIDC provider.
+Yuzu supports OpenID Connect with PKCE for browser-based SSO. This has been tested with Microsoft Entra ID (Azure AD) and works with any provider that serves OpenID Connect Discovery (`{issuer}/.well-known/openid-configuration`). Yuzu reads the authorization endpoint, token endpoint and `jwks_uri` from that document the first time a sign-in needs them; it never derives them from the issuer URL. The `issuer` value in the document must match the configured issuer byte for byte (so Entra's `common` and `organizations` endpoints are not supported: use your tenant-specific issuer), and every endpoint must be an absolute URL using the same scheme as the issuer. Click "Test Connection" in the Settings page to check exactly that path: it fetches and validates the document the way a sign-in does, then fetches the `jwks_uri` and reports how many signing keys it found.
+
+### Manual verification against a real IdP
+
+The unit tests run against a loopback IdP, not a real one. To check a real provider (Keycloak is the quickest to stand up locally):
+
+1. Run Keycloak, create a realm and a confidential client with the standard flow enabled and `https://<yuzu-host>/auth/callback` (or your `--oidc-redirect-uri`) as a valid redirect URI.
+2. Start the server with `--oidc-issuer https://<keycloak>/realms/<realm>`, the client id and secret, and an `--oidc-redirect-uri`. Keycloak's stock endpoints (`/protocol/openid-connect/auth`, `/token`, `/certs`) need no proxy or rewriting: they come from the discovery document.
+3. In Settings, click "Test Connection": it should report the three endpoints discovered and the number of signing keys.
+4. Open `/auth/oidc/start`, sign in at the IdP and confirm you land in the dashboard with the expected role. Then remove the user's membership in the admin group and confirm the next sign-in is not an admin session.
+5. Negative check: point the client's audience mapper at a different client id and confirm the sign-in is refused.
+
+The Keycloak rig used for development is local to the developers who built it and is not part of the repository.
 
 ### Server Configuration
 

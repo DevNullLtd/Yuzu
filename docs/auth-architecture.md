@@ -2821,7 +2821,7 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
 ## Granular RBAC (Phase 3)
 
 - 7 roles, 38 securable types, per-operation permissions, deny-override logic.
-- **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
+- **OIDC SSO**: Full PKCE flow, OIDC Discovery, JWT validation, group-to-role mapping. Endpoints and `jwks_uri` are never derived from the issuer: `OidcProvider::ensure_discovered` reads them lazily from the issuer's discovery document (an explicit `OidcConfig` field is authoritative for that one field), fails closed with no fallback, and applies one validation, shared with the Settings "Test Connection" button: `issuer` byte-equal to the configured issuer (OIDC Discovery 4.3, the mix-up defence) and every endpoint an absolute URL on the issuer's scheme. All IdP GETs go through one bounded primitive (5 s timeouts, 256 KiB body cap, redirects not followed). A failed attempt is remembered for 30 s; a success for the provider's lifetime.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
 ### `ProductPack` securable seeding fix (#4029)
