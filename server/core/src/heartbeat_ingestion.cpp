@@ -17,7 +17,8 @@
 namespace yuzu::server {
 
 void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
-                                std::string_view agent_id, std::string_view via) {
+                                std::string_view agent_id, std::string_view via,
+                                std::string_view resolved_session_id) {
     const std::string agent_id_str(agent_id);
     const std::string via_str(via);
 
@@ -41,17 +42,19 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         std::string os;
         std::string agent_version;
         std::string arch;
-        std::string session_id;
         if (auto sess = registry_.get_session(agent_id_str)) {
             hostname = sess->hostname;
             os = sess->os;
             agent_version = sess->agent_version;
             arch = sess->arch;
-            // HA WS-5: threaded through so a later graceful disconnect can
-            // session-guard its presence-row delete (remove_if_session) —
-            // see agent_service_impl.cpp / gateway_service_impl.cpp.
-            session_id = sess->session_id;
         }
+        // HA WS-5: threaded through so a later graceful disconnect can
+        // session-guard its presence-row delete (remove_if_session) — see
+        // agent_service_impl.cpp / gateway_service_impl.cpp. Read under the
+        // registry lock: map_session rewrites it in place.
+        const std::string session_id = resolved_session_id.empty()
+                                           ? registry_.session_id_of(agent_id_str)
+                                           : std::string(resolved_session_id);
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();
