@@ -127,7 +127,8 @@ claimed.
   first, then column, then value). Before, they were whichever the server happened to hold first.
 
 **Rolling upgrade.** The change is server-only: there is no agent, gateway, schema or configuration step,
-and the order in which replicas are upgraded does not matter. What differs during the rollout:
+the order in which replicas are upgraded does not matter, and rolling back is starting the previous
+server binary (nothing to undo; responses already ingested keep the facets they got). What differs during the rollout:
 
 - **Ingest decides the facets.** A facet is lost, or kept, on whichever replica ingested the response. An
   old replica that ingests a response carrying a value too long for the database index (about 2.7 KB for
