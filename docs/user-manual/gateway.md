@@ -583,11 +583,15 @@ runs are marked below.)
   the server is an in-memory session lookup: a server whose registration path is
   failing can still accept the probe (INFERRED from the code, not run). A probe
   result that arrives after the breaker has moved on to a later half-open period
-  does not change the breaker. Known limit: the probe is bounded only by the
-  vendored client's own defaults (connect 5000 ms, response 5000 ms; 5 to 10
-  seconds per half-open cycle was observed against an unresponsive upstream), the
-  gateway sets no deadline of its own, and the entry is requeued when the probe
-  fails. Without the probe, held notifications could sit
+  does not change the breaker. Known limit: the gateway sets no deadline of its own on
+  the probe. It is bounded only by the vendored client's defaults (connect 5000
+  ms, HTTP/2 handshake 4500 ms, response 5000 ms). 5 to 10 seconds per half-open
+  cycle was observed against an unresponsive upstream, and the serial waits sum
+  to about 20 to 25 seconds at most with default settings (a sum read from the
+  source, not measured). An endpoint `connect_timeout` set to `infinity` (no
+  shipped configuration does) removes the connect bound, and the probe can then
+  stay out, so the held store cannot drain until the connection fails. The entry
+  is requeued when the probe fails. Without the probe, held notifications could sit
   indefinitely after the server recovers, because a disconnected session produces
   no heartbeat to trigger a replay. A probe that timed out may still have reached
   the server, and its notification is sent again after the requeue, so delivery of
