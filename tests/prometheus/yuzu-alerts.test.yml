@@ -2985,6 +2985,110 @@ tests:
         eval_time: 15m
         exp_samples: []
 
+  # ── YuzuGatewaySessionAmbiguous (HA WS-5 slice 2, ADR-2002 §7f) ─────────
+  # Only the (session_lookup, ambiguous_session) pair pages; no `for:`.
+
+  # CASE — a single ambiguous_session increment fires immediately.
+  - interval: 1m
+    name: gateway session ambiguous - a single ambiguous_session increment fires
+    input_series:
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="session_lookup",outcome="ambiguous_session"}'
+        values: "0x5 1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewaySessionAmbiguous", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewaySessionAmbiguous", alertstate="firing", instance="s1", job="yuzu", op="session_lookup", outcome="ambiguous_session", severity="warning"}'
+            value: 1
+
+  # CASE — a flat zero-seeded counter stays quiet.
+  - interval: 1m
+    name: gateway session ambiguous - a flat zero-seeded counter stays quiet
+    input_series:
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="session_lookup",outcome="ambiguous_session"}'
+        values: "0x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewaySessionAmbiguous", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE — a different outcome under op="session_lookup" and
+  # outcome="ambiguous_session" under a different op do NOT fire: RED against
+  # loosening either label matcher (synthetic pairs; only the alerted pair is
+  # emitted today). The emitted unknown_session pairs, session_superseded and
+  # session_held_by_other_agent do not fire it either.
+  - interval: 1m
+    name: gateway session ambiguous - other outcomes and other ops do not fire
+    input_series:
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="session_lookup",outcome="unknown_session"}'
+        values: "0x5 50x20"
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="proxy_inventory",outcome="ambiguous_session"}'
+        values: "0x5 50x20"
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="proxy_inventory",outcome="unknown_session"}'
+        values: "0x5 50x20"
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="renew_leases",outcome="unknown_session"}'
+        values: "0x5 50x20"
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="proxy_register",outcome="session_superseded"}'
+        values: "0x5 50x20"
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="proxy_register",outcome="session_held_by_other_agent"}'
+        values: "0x5 50x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewaySessionAmbiguous", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+
+  # ── YuzuGatewaySessionHeldByOtherAgent (HA WS-5, ADR-2002 §7f) ──────────
+  # Only the (proxy_register, session_held_by_other_agent) pair pages; no `for:`.
+
+  # CASE — a single session_held_by_other_agent increment fires immediately.
+  - interval: 1m
+    name: gateway session held by other agent - a single increment fires
+    input_series:
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="proxy_register",outcome="session_held_by_other_agent"}'
+        values: "0x5 1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewaySessionHeldByOtherAgent", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewaySessionHeldByOtherAgent", alertstate="firing", instance="s1", job="yuzu", op="proxy_register", outcome="session_held_by_other_agent", severity="warning"}'
+            value: 1
+
+  # CASE — a flat zero-seeded counter stays quiet.
+  - interval: 1m
+    name: gateway session held by other agent - a flat zero-seeded counter stays quiet
+    input_series:
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="proxy_register",outcome="session_held_by_other_agent"}'
+        values: "0x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewaySessionHeldByOtherAgent", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE — session_superseded (the routine stale/zombie replay refusal, which
+  # has a low expected background rate after a reconnect storm), the other
+  # proxy_register outcome, the unknown_session pairs, ambiguous_session and a
+  # synthetic held_by_other_agent under another op do NOT fire: RED against
+  # loosening either label matcher.
+  - interval: 1m
+    name: gateway session held by other agent - superseded and other pairs do not fire
+    input_series:
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="proxy_register",outcome="session_superseded"}'
+        values: "0x5 50x20"
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="proxy_register",outcome="malformed_session_id"}'
+        values: "0x5 50x20"
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="proxy_inventory",outcome="unknown_session"}'
+        values: "0x5 50x20"
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="renew_leases",outcome="unknown_session"}'
+        values: "0x5 50x20"
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="session_lookup",outcome="ambiguous_session"}'
+        values: "0x5 50x20"
+      - series: 'yuzu_server_gateway_route_desync_total{job="yuzu",instance="s1",op="session_lookup",outcome="session_held_by_other_agent"}'
+        values: "0x5 50x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewaySessionHeldByOtherAgent", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+
   # ── YuzuInventoryGenericBlobRejectedDepth (json-dump-depth-guard fix) ────
   #
   # This alert deliberately has no proportion/rate-floor guard, unlike
@@ -3595,4 +3699,116 @@ tests:
             value: 1
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamTlsHandshakeFailures", alertstate="firing"}'
         eval_time: 30m
+        exp_samples: []
+
+  # YuzuGatewayUpstreamEncodeErrors (#4632 rounds 4 and 5)
+  #
+  # A systematic local encode failure (every Register answered INTERNAL, breaker
+  # closed, /readyz ready) is visible ONLY as
+  # yuzu_gw_upstream_rpc_errors_total{code="encode"}, pre-seeded at 0
+  # (yuzu_gw_telemetry:declare_metrics/0) so increase() has a baseline. The
+  # threshold is about ten in 10 minutes: one rejected request or oversized
+  # batch must stay quiet. Each case steps the counter at minute 6 (1m samples,
+  # left-open 10m window): a 10m window sees the old value through minute 14, a
+  # 5m window stops seeing it at minute 10, a 20m window keeps it until minute 24.
+
+  # CASE: one encode failure stays quiet (kills a `> 0` threshold).
+  - interval: 1m
+    name: gateway upstream encode errors - a single encode failure stays quiet
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="register",code="encode"}'
+        values: "0x5 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 12m
+        exp_samples: []
+
+  # CASE: nine in the window stay quiet (kills `>= 9`).
+  - interval: 1m
+    name: gateway upstream encode errors - nine encode failures stay quiet
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="register",code="encode"}'
+        values: "0x5 9x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 12m
+        exp_samples: []
+
+  # CASE: ten in the window fire, no `for:` (kills `>= 11` and `> 10`), for as
+  # long as the 10m window still holds the sample before the step (kills `[5m]`
+  # at minute 12), and resolve once it does not (kills `[20m]` at minute 17).
+  - interval: 1m
+    name: gateway upstream encode errors - ten encode failures fire for exactly the 10m window
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="register",code="encode"}'
+        values: "0x5 10x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing", code="encode", instance="g1", job="yuzu-gateway", rpc_name="register", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing", code="encode", instance="g1", job="yuzu-gateway", rpc_name="register", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing", code="encode", instance="g1", job="yuzu-gateway", rpc_name="register", severity="warning"}'
+            value: 1
+      # The sample before the step has left the 10m window: it resolves. A 20m
+      # window would still hold it here.
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 17m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE: the zero-baseline cases above are the special case where increase() does
+  # not extrapolate. On a counter already at 5, a burst of nine (5 -> 14) is
+  # extrapolated by 10m / 9m and reads as 10, so it FIRES; a burst of eight reads
+  # as 8.9 and stays quiet: the threshold is about ten, not exactly ten. This
+  # holds at the 1m spacing used here; at the shipped 15 s scrape nine reads about
+  # 9.2 and stays quiet.
+  - interval: 1m
+    name: gateway upstream encode errors - on a non-zero counter nine extrapolate to the threshold and eight do not
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="register",code="encode"}'
+        values: "5x5 14x30"
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="inventory",code="encode"}'
+        values: "5x5 13x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors", alertstate="firing", code="encode", instance="g1", job="yuzu-gateway", rpc_name="register", severity="warning"}'
+            value: 1
+
+  # CASE: the healthy shape: pre-seeded at 0 and flat stays silent, and a
+  # rising counter of ANOTHER code (a server answer, an exception) does not fire
+  # this alert (those are the breaker's business and YuzuGatewayUpstreamErrors').
+  - interval: 1m
+    name: gateway upstream encode errors - flat zero-seeded encode series and other codes stay quiet
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="register",code="encode"}'
+        values: "0x30"
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="register",code="exception"}'
+        values: "0+1x30"
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="inventory",code="14"}'
+        values: "0+1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
+        eval_time: 29m
         exp_samples: []

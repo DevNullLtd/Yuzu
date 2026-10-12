@@ -340,6 +340,12 @@ public:
     /// has already succeeded at the call site).
     void touch_last_login(const std::string& username);
 
+    /// UNGUARDED fixture primitive: production must use AuthManager::remove_user_checked (#4966).
+    /// This writes the soft delete WITHOUT the last-Administrator guard. tests/test_rbac_query_owner_seam.py
+    /// scans server/core/src and server/core/include for calls through a receiver whose name
+    /// contains `db` (or a `(*...)` dereference) outside auth_db.cpp; it is a textual tripwire
+    /// for those spellings, not a proof that no other path reaches this method.
+    ///
     /// Soft-delete a user (sets is_active = false), clears MFA enrollment
     /// state (SOC 2 CC6.8 credential revocation on termination). Does NOT
     /// touch sessions (no session surface on this class — see file header;
@@ -350,6 +356,10 @@ public:
     /// Check if a user exists (active only).
     std::expected<bool, AuthDBError> user_exists(const std::string& username);
 
+    /// UNGUARDED fixture primitive: production must use AuthManager::update_role_checked (#4966).
+    /// This writes the role column WITHOUT the last-Administrator guard; the same seam test scans
+    /// for calls through those receiver spellings (a textual tripwire, not a proof).
+    ///
     /// Change a user's role. ONLY updates the role column — never touches
     /// password_hash or salt_hex. This is critical for security: role changes
     /// must never overwrite credentials (C1 fix, Red Team finding).
@@ -474,6 +484,13 @@ public:
     /// for malformed input.
     std::expected<std::string, AuthDBError>
     get_provisioning_source(const std::string& username);
+
+    /// Read a user's role column REGARDLESS of `is_active` (soft-deleted rows included). SCIM's
+    /// revive path (#4966) reads the tombstone's role BEFORE `reactivate_user`, so an
+    /// out-of-band-elevated account is refused without ever being made active again. UserNotFound
+    /// only when no row (active or not) matched; InvalidUsername for malformed input; QueryFailed
+    /// on a lease/query failure (callers fail closed).
+    std::expected<auth::Role, AuthDBError> get_role_including_inactive(const std::string& username);
 
     /// Set the `identity_source` marker (auth.db migration v6, carried
     /// unchanged into `auth.users`) directly — distinct from

@@ -13,6 +13,10 @@
 
 #include "agent_registry.hpp"
 #include "event_bus.hpp"
+#include "offline_endpoint_store.hpp"
+#include "pg/pg_pool.hpp"
+
+#include "../test_helpers.hpp"
 
 #include "agent.pb.h"
 
@@ -31,6 +35,8 @@
 #include <vector>
 
 using yuzu::server::HeartbeatIngestion;
+using yuzu::server::OfflineEndpoint;
+using yuzu::server::OfflineEndpointStore;
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::EventBus;
 
@@ -48,6 +54,15 @@ struct ReconcileCapture {
         (*hb.mutable_status_tags())["yuzu.guardian_generation"] = gen_value;
     return hb;
 }
+
+// Same key + identical setup as test_offline_endpoint_store.cpp's template
+// (shared pre-migrated template; replay-verified per docs/postgres-store-playbook.md).
+yuzu::test::PgTestTemplate offline_tpl{"offline", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    OfflineEndpointStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("offline template: store failed to migrate");
+}};
 
 } // namespace
 
@@ -251,4 +266,81 @@ TEST_CASE("HeartbeatIngestion: set_quarantine_reconcile_fn(nullptr) blocks until
     ingest_thread.join();
     set_thread.join();
     CHECK(set_returned.load()); // now it has returned — the barrier held
+}
+
+// HA WS-5: on a replica holding no local AgentSession for a gateway-fronted
+// agent, the caller resolves the session id from the route store and threads
+// it into ingest() so the durable presence row carries the session id (needed
+// by the session-guarded remove_if_session on a later graceful disconnect).
+TEST_CASE("HeartbeatIngestion: resolved_session_id is recorded on the presence row when the "
+          "registry has no session",
+          "[heartbeat_ingestion][ws5][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics, &store};
+
+    // Seed what the OWNING replica wrote earlier: a known hostname/os.
+    REQUIRE(store.upsert("yuzu_test_hb_nonowner", "known-host", "linux", 1, 0, "1.0.0", "arm64",
+                         "sess-owner"));
+
+    ingestion.ingest(make_hb("", /*set_tag=*/false), "yuzu_test_hb_nonowner", "gateway",
+                     "sess-resolved");
+
+    // Hostname/os are blank on this replica (no local session) -> preserved.
+    const auto roster = store.query_stale_within(std::chrono::hours(1));
+    REQUIRE(roster.has_value()); // #5531: the read is typed
+    const OfflineEndpoint* row = nullptr;
+    for (const auto& e : *roster)
+        if (e.agent_id == "yuzu_test_hb_nonowner")
+            row = &e;
+    REQUIRE(row != nullptr);
+    CHECK(row->hostname == "known-host");
+    CHECK(row->os == "linux");
+
+    // The presence row now carries the RESOLVED session id: the old session
+    // no longer matches, the resolved one does (and the delete is consumed).
+    CHECK_FALSE(store.remove_if_session("yuzu_test_hb_nonowner", "sess-owner"));
+    CHECK(store.remove_if_session("yuzu_test_hb_nonowner", "sess-resolved"));
+}
+
+TEST_CASE("HeartbeatIngestion: resolved_session_id overrides the local session's id; blank "
+          "falls back to it",
+          "[heartbeat_ingestion][ws5][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics, &store};
+
+    ::yuzu::agent::v1::AgentInfo info;
+    info.set_agent_id("yuzu_test_hb_local");
+    info.set_hostname("local-host");
+    auto sess = registry.register_agent(info);
+    REQUIRE(sess.has_value());
+    // The session id is assigned by the Subscribe path via map_session().
+    const std::string local_sid = "yuzu_test_hb_local_sess";
+    registry.map_session(local_sid, "yuzu_test_hb_local");
+    REQUIRE((*sess)->session_id == local_sid);
+
+    SECTION("blank resolved id -> local session id is recorded (unchanged behaviour)") {
+        ingestion.ingest(make_hb("", false), "yuzu_test_hb_local", "direct");
+        CHECK(store.remove_if_session("yuzu_test_hb_local", local_sid));
+    }
+    SECTION("non-empty resolved id wins over the local session id") {
+        ingestion.ingest(make_hb("", false), "yuzu_test_hb_local", "gateway", "sess-store-says");
+        CHECK_FALSE(store.remove_if_session("yuzu_test_hb_local", local_sid));
+        CHECK(store.remove_if_session("yuzu_test_hb_local", "sess-store-says"));
+    }
 }

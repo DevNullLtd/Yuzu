@@ -55,7 +55,7 @@ const std::vector<pg::PgMigration>& migrations() {
         // teardown can't clobber a newer re-registration's row; `last_seen_at`
         // is a PG-authored (`now()` in-SQL) liveness clock, separate from the
         // pre-existing `last_heartbeat_ms` replica-clock column (which stays
-        // exactly as-is for the viz path — see query_stale_within).
+        // exactly as-is for the roster path — see query_stale_within).
         {3,
          "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS session_id TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL "
@@ -132,8 +132,11 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
     // step status (no sqlite3_changes()-style mutate-and-count race, #1033).
     // agent_version/arch/os: a blank incoming value preserves the existing
     // column (CASE ... THEN endpoints.x) — see the header doc comment — while
-    // hostname/last_heartbeat_ms/agent_ts stay an unconditional EXCLUDED
-    // write (pre-v2 behaviour, unchanged). os blank-preserves (#5294): the
+    // last_heartbeat_ms/agent_ts stay an unconditional EXCLUDED write
+    // (pre-v2 behaviour, unchanged). hostname blank-preserves too (HA WS-5): a
+    // replica holding no local AgentSession for a gateway-fronted agent
+    // ingests its heartbeat with a blank hostname, which must not erase the
+    // owning replica's value. os blank-preserves (#5294): the
     // per-OS kill-switch filter reads it for remote ids, and a heartbeat that
     // missed the session lookup must not erase a known OS. session_id (HA WS-5) is likewise
     // unconditional EXCLUDED — an empty incoming value (a heartbeat that raced
@@ -152,7 +155,8 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
         "last_seen_at) "
         "VALUES ($1, $2, $3, $4::bigint, $5::bigint, $6, $7, $8, now()) "
         "ON CONFLICT (agent_id) DO UPDATE SET "
-        "  hostname = EXCLUDED.hostname, "
+        "  hostname = CASE WHEN EXCLUDED.hostname = '' THEN endpoints.hostname "
+        "                  ELSE EXCLUDED.hostname END, "
         "  os = CASE WHEN EXCLUDED.os = '' THEN endpoints.os ELSE EXCLUDED.os END, "
         "  last_heartbeat_ms = EXCLUDED.last_heartbeat_ms, agent_ts = EXCLUDED.agent_ts, "
         "  agent_version = CASE WHEN EXCLUDED.agent_version = '' THEN endpoints.agent_version "
@@ -259,15 +263,17 @@ bool OfflineEndpointStore::remove_if_session(std::string_view agent_id,
     return PQntuples(res.get()) > 0;
 }
 
-std::vector<OfflineEndpoint> OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {
+std::expected<std::vector<OfflineEndpoint>, PresenceReadError>
+OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {
     std::vector<OfflineEndpoint> out;
     if (!open_)
-        return out;
+        return std::unexpected(PresenceReadError::StoreUnavailable);
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
-        spdlog::debug("OfflineEndpointStore: query skipped, no connection in time ({})",
-                      pool_.last_error());
-        return out;
+        spdlog::warn("OfflineEndpointStore: query_stale_within failed, no connection in time ({})",
+                     pool_.last_error());
+        record_presence_store_failure(metrics_, "query_stale_within", /*had_lease=*/false);
+        return std::unexpected(PresenceReadError::StoreUnavailable);
     }
     const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::system_clock::now().time_since_epoch())
@@ -287,8 +293,10 @@ std::vector<OfflineEndpoint> OfflineEndpointStore::query_stale_within(std::chron
         "LIMIT $2::bigint",
         std::vector<std::string>{std::to_string(since), std::to_string(kQueryRowCap)});
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::debug("OfflineEndpointStore: query failed: {}", PQerrorMessage(lease.get()));
-        return out;
+        spdlog::warn("OfflineEndpointStore: query_stale_within failed: {}",
+                     PQerrorMessage(lease.get()));
+        record_presence_store_failure(metrics_, "query_stale_within", /*had_lease=*/true);
+        return std::unexpected(PresenceReadError::DbError);
     }
     const int rows = PQntuples(res.get());
     out.reserve(static_cast<std::size_t>(rows));
