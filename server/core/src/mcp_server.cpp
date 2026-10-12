@@ -254,8 +254,8 @@ std::string param_str(const nlohmann::json& params, const char* key, const char*
     return def;
 }
 
-/// DEX `window` argument (#4644): ABSENT or "" is the default 7d; a PRESENT value must be a JSON
-/// string naming one of 24h|7d|30d|all. `param_str` alone turned `5`, `null` and `"90d"` into
+/// DEX `window` argument (#4644): ABSENT is the default 7d; a PRESENT value (including "") must be
+/// a JSON string naming one of 24h|7d|30d|all. `param_str` alone turned `5`, `null` and `"90d"` into
 /// the default, so the answer covered 7 days under a window the caller never asked for. Returns
 /// the -32602 message, or nullopt when `out` holds the resolved token.
 [[nodiscard]] std::optional<std::string> dex_window_arg(const nlohmann::json& args,
@@ -266,8 +266,6 @@ std::string param_str(const nlohmann::json& params, const char* key, const char*
     if (!args["window"].is_string())
         return std::string("invalid window (expected a string: 24h|7d|30d|all)");
     const auto w = args["window"].get<std::string>();
-    if (w.empty())
-        return std::nullopt;
     if (!dex_window_is_valid(w))
         return std::string("invalid window (expected 24h|7d|30d|all)");
     out = w;
@@ -1128,7 +1126,7 @@ static const ToolDef kTools[] = {
      "follow-up for the parse-error cause; each cause is its own distinctly-named refusal "
      "reason - query_truncated/poison_excluded/parse_error_excluded). REST v1 twin: "
      "POST /api/v1/result-sets/from-inventory-query.",
-     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512,"description":"Declared as a string because the in-house schema compiler (mcp_input_schema.cpp) supports a single type per node. The handler also accepts a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically) and a boolean for == and != only. Under > >= < <= a string that is a plain decimal number (e.g. \"4\", \"2e-7\") is compared exactly against a stored number or fully numeric string; a stored string that merely starts with a number (a dotted version, \"5 GB\") keeps the legacy leading-number read (use version_gte or version_lte for dotted versions) and any other stored value never matches, whereas a JSON number operand never matches a non-numeric stored string; == and != with a string stay an exact text compare. Null, an array, an object, or a number/boolean under another op is -32602. maxLength bounds the string form."}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512,"description":"Declared as a string because the in-house schema compiler (mcp_input_schema.cpp) supports a single type per node. The handler also accepts a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically) and a boolean for == and != only. Under > >= < <= a string that is a plain decimal number (e.g. \"4\", \"2e-7\") is compared exactly against a stored number or fully numeric string; a stored string that merely starts with a number (a dotted version, \"5 GB\") keeps the legacy leading-number read (use version_gte or version_lte for dotted versions) and any other stored value never matches, whereas a JSON number operand never matches a non-numeric stored string; == and != with a string stay an exact text compare. A decimal operand with a fraction or an exponent and a magnitude of 2^53 or more is -32602 (write a whole number as an integer or as digits). Null, an array, an object, or a number/boolean under another op is -32602. maxLength bounds the string form."}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
@@ -1499,7 +1497,7 @@ static const ToolDef kTools[] = {
      "event count, blast radius (distinct devices) and last-seen time. Fleet aggregate; a "
      "well-formed window with no observations returns an empty array. Mirrors GET "
      "/api/v1/dex/signals. Requires GuaranteedState:Read.",
-     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Time window (an absent or empty value is 7d; any other value is rejected)"},)j"
+     R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Time window (an absent value is 7d; an empty or any other value is rejected)"},)j"
      R"j("os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all","description":"Narrow to one OS's own signals (all = every OS)"}}})j",
      R"j({"type":"object","properties":{"signals":{"type":"array","items":{"type":"object","properties":{"obs_type":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["obs_type","count","distinct_devices","last_seen"]}}},"required":["signals"]})j"}, // annotations generated (2g PR 2)
 
@@ -13012,16 +13010,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     // anything is dispatched or stored, like the REST twin.
                     // A PRESENT matcher that is not a JSON object used to be dropped silently
                     // ("accept every responder"); it is refused now. Absent stays the default.
-                    if (args.contains("matcher") && !args["matcher"].is_object()) {
-                        res.set_content(
-                            error_response(id, kInvalidParams,
-                                           "RESULT_SET_BAD_REQUEST: matcher must be a JSON object"),
-                            "application/json");
-                        return;
-                    }
                     if (args.contains("matcher")) {
                         if (const auto bad =
-                                yuzu::server::rs_matcher::validate_matcher(args["matcher"].dump())) {
+                                yuzu::server::rs_matcher::validate_matcher_object(args["matcher"])) {
                             res.set_content(
                                 error_response(id, kInvalidParams,
                                                "RESULT_SET_BAD_REQUEST: " + *bad),

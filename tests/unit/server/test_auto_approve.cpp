@@ -324,3 +324,74 @@ TEST_CASE("ip_subnet: is_valid_ip_subnet_value accepts exactly what the matcher 
     for (const char* bad : {"", "::1", "2001:db8::/32", "10.0.0.256", "host.example.com"})
         CHECK_FALSE(AutoApproveEngine::is_valid_ip_subnet_value(bad));
 }
+
+// ── Rule text that would change meaning on reload ────────────────────────────
+
+// The file is `type:value:label:enabled`, one rule per line. ':' and any control character in a
+// value or label would reload as a different rule; add_rule refuses them for every rule type.
+TEST_CASE("is_valid_rule_text rejects ':' and control characters, nothing else",
+          "[auto_approve][config][numeric_params]") {
+    for (const char* ok : {"", "*.prod.example.com", "Prod (EU) #1", "10.0.0.0/8", "caf\xC3\xA9",
+                           "tab-free label", "ab12cd34"})
+        CHECK(AutoApproveEngine::is_valid_rule_text(ok));
+    for (const char* bad : {"a:b", ":", "a\nb", "a\rb", "a\tb", "a\x1f" "b", "a\x01" "b"})
+        CHECK_FALSE(AutoApproveEngine::is_valid_rule_text(bad));
+    CHECK_FALSE(AutoApproveEngine::is_valid_rule_text(std::string("a\0b", 3)));
+    // A NUL inside a subnet value is not read up to the NUL by inet_pton.
+    CHECK_FALSE(AutoApproveEngine::is_valid_ip_subnet_value(std::string("10.0.0.0\0junk", 13)));
+    CHECK_FALSE(AutoApproveEngine::is_valid_ip_subnet_value(std::string("10.0.0.0/8\0", 11)));
+}
+
+TEST_CASE("add_rule refuses a value or label that would reload as a different rule",
+          "[auto_approve][config][numeric_params]") {
+    AutoApproveEngine engine;
+    for (auto type : {AutoApproveRuleType::hostname_glob, AutoApproveRuleType::ip_subnet,
+                      AutoApproveRuleType::trusted_ca, AutoApproveRuleType::cloud_provider}) {
+        const std::string ok_value = type == AutoApproveRuleType::ip_subnet ? "10.0.0.0/8" : "ok";
+        CHECK_FALSE(engine.add_rule({type, ok_value, "x\nip_subnet:0.0.0.0/0:inj"}));
+        CHECK_FALSE(engine.add_rule({type, ok_value, "lab:el"}));
+        CHECK_FALSE(engine.add_rule({type, ok_value, std::string("a\0b", 3)}));
+        CHECK_FALSE(engine.add_rule({type, "a:b", "label"}));
+        CHECK_FALSE(engine.add_rule({type, "a\nb", "label"}));
+    }
+    CHECK(engine.list_rules().empty());
+    CHECK(engine.add_rule({AutoApproveRuleType::hostname_glob, "*.prod.com", "Prod (EU) #1"}));
+    CHECK(engine.list_rules().size() == 1);
+}
+
+// The saved-then-reloaded list must equal the audited (admitted) list after rejected injection
+// attempts: a label like `x\nip_subnet:0.0.0.0/0:inj` used to reload as a second, enabled
+// match-all rule, and `lab:el` as a disabled rule.
+TEST_CASE("auto-approve: rules reloaded from disk equal the admitted rules after rejected "
+          "injection attempts",
+          "[auto_approve][config][numeric_params]") {
+    yuzu::test::TempDir dir{"yuzu_test_auto_approve_rt-"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto file = dir.path / "auto-approve.conf";
+
+    AutoApproveEngine engine;
+    engine.load(file); // sets config_path_ (the file does not exist yet)
+    REQUIRE(engine.add_rule({AutoApproveRuleType::hostname_glob, "*.prod.com", "prod"}));
+    REQUIRE(engine.add_rule({AutoApproveRuleType::ip_subnet, "10.0.0.0/8", "lan", false}));
+    CHECK_FALSE(engine.add_rule(
+        {AutoApproveRuleType::hostname_glob, "*.evil.com", "x\nip_subnet:0.0.0.0/0:inj"}));
+    CHECK_FALSE(engine.add_rule({AutoApproveRuleType::cloud_provider, "aws", "lab:el"}));
+    CHECK_FALSE(engine.add_rule({AutoApproveRuleType::trusted_ca, "ab12", std::string("a\0b", 3)}));
+    REQUIRE(engine.add_rule({AutoApproveRuleType::cloud_provider, "aws", "Prod (EU) #1"}));
+    const auto admitted = engine.list_rules();
+    REQUIRE(admitted.size() == 3);
+
+    AutoApproveEngine reloaded;
+    REQUIRE(reloaded.load(file));
+    const auto after = reloaded.list_rules();
+    REQUIRE(after.size() == admitted.size());
+    for (std::size_t i = 0; i < admitted.size(); ++i) {
+        INFO(i);
+        CHECK(after[i].type == admitted[i].type);
+        CHECK(after[i].value == admitted[i].value);
+        CHECK(after[i].label == admitted[i].label);
+        CHECK(after[i].enabled == admitted[i].enabled);
+    }
+    // And nothing the attempts carried became a rule that matches everything.
+    CHECK(reloaded.evaluate(make_ctx("host.example.org", "192.0.2.1")).empty());
+}

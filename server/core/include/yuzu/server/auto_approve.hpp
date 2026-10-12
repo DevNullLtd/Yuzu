@@ -4,6 +4,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server::auth {
@@ -52,8 +53,16 @@ public:
     /// restart. The admin route refuses anything else (#4644); the matcher treats it as no match.
     [[nodiscard]] static bool is_valid_ip_subnet_value(const std::string& value);
 
+    /// True iff `text` can be a rule value or label without changing meaning on a reload: the
+    /// rules file is `type:value:label:enabled`, one rule per line, so a ':' or any control
+    /// character (NUL, CR, LF, ...) would split into a different rule or flip a field. The ONE
+    /// check for the admin route, `add_rule` and `is_valid_ip_subnet_value`; applies to every rule
+    /// type, to the value AND the label.
+    [[nodiscard]] static bool is_valid_rule_text(std::string_view text);
+
     /// CRUD for rules
-    void add_rule(const AutoApproveRule& rule);
+    /// Returns false, storing nothing, when the value or the label fails is_valid_rule_text.
+    bool add_rule(const AutoApproveRule& rule);
     /// Returns the rule that was removed, or nullopt for an out-of-range index. The removal and
     /// the returned copy happen under one lock, so an audit row built from it names exactly the
     /// rule that was deleted.

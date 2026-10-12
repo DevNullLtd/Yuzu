@@ -151,11 +151,24 @@ bool parse_int_full(const std::string& s, T& out) {
 
 using Number = std::variant<std::int64_t, std::uint64_t, double>;
 
+/// The integer digits of a whole-number decimal spelling: a '.', no exponent, nothing but '0'
+/// after the '.', and at least one digit before it ("9007199254740993.0" gives "9007199254740993",
+/// "-5.00" gives "-5"). False for everything else. The integer is exact where a double is not.
+bool integral_decimal_digits(const std::string& s, std::string& digits) {
+    const auto dot = s.find('.');
+    if (dot == std::string::npos || s.find_first_of("eE") != std::string::npos ||
+        s.find_first_not_of('0', dot + 1) != std::string::npos)
+        return false;
+    digits = s.substr(0, dot);
+    return digits.find_first_of("0123456789") != std::string::npos;
+}
+
 /// A string that is a plain decimal number in full (see plain_decimal_shape: optional '-', then a
 /// digit or '.', no 'x'; exponent forms such as "3e-7" count when the parse consumes them all):
-/// int64, else uint64, else double. nullopt for anything else ("5 GB", "1.2.3", "v2", " 5", "5\n",
-/// "+5", "inf", "nan", an out-of-range "1e400"). The ONE parse for a stored string and for a
-/// string operand of an ordering operator.
+/// int64, else uint64 (a whole-number spelling such as "9007199254740993.0" reads as the exact
+/// integer, not a rounded double), else double. nullopt for anything else ("5 GB", "1.2.3", "v2",
+/// " 5", "5\n", "+5", "inf", "nan", an out-of-range "1e400"). The ONE parse for a stored string
+/// and for a string operand of an ordering operator.
 std::optional<Number> parse_number_string(const std::string& s) {
     if (!plain_decimal_shape(s))
         return std::nullopt;
@@ -163,6 +176,12 @@ std::optional<Number> parse_number_string(const std::string& s) {
         return Number{i};
     if (std::uint64_t u = 0; parse_int_full(s, u))
         return Number{u};
+    if (std::string digits; integral_decimal_digits(s, digits)) {
+        if (std::int64_t i = 0; parse_int_full(digits, i))
+            return Number{i};
+        if (std::uint64_t u = 0; parse_int_full(digits, u))
+            return Number{u};
+    }
     if (double d = 0.0; parse_double_full(s, d))
         return Number{d};
     return std::nullopt;
@@ -307,6 +326,25 @@ bool numeric_equal(const nlohmann::json& stored, const InventoryCondition& cond)
     return n.has_value() && numbers_equal(*n, cond.numeric_value);
 }
 
+/// 2^53: below it every integer-valued double is exact and a decimal read as a double rounds by
+/// less than one unit; at or above it a double stands for a whole range of decimals.
+constexpr double kExactDoubleLimit = 9007199254740992.0;
+
+/// The 400 / -32602 text for an operand that would be rounded through a double (see
+/// operand_rounds_through_double).
+constexpr const char* kInexactOperandMessage =
+    "conditions[].value: a numeric operand must be an integer or a decimal that is exactly "
+    "representable; a decimal with a fraction or an exponent and a magnitude of 2^53 "
+    "(9007199254740992) or more is refused (write a whole number as an integer)";
+
+/// True for a parsed operand that is a double the exact comparator cannot trust: its magnitude is
+/// 2^53 or more (or infinite). A JSON float arrives already rounded (the lexeme is gone), and a
+/// decimal such as 9007199254740993.0 rounds to exactly 2^53 itself, so the boundary is refused too.
+bool operand_rounds_through_double(const Number& n) {
+    const double* d = std::get_if<double>(&n);
+    return d != nullptr && !(std::fabs(*d) < kExactDoubleLimit);
+}
+
 /// Evaluate a single condition against parsed JSON data.
 bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
                     std::string& matched_value_out) {
@@ -367,18 +405,31 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
     double lhs = 0.0;
     double rhs = 0.0;
     bool lhs_ok = false, rhs_ok = false;
+    // legacy_leading_number_text gives both branches the same text to read (see its comment).
+    const auto lhs_text = legacy_leading_number_text(val_str);
+    const auto rhs_text = legacy_leading_number_text(cond.value);
 #if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
-    [[maybe_unused]] auto [lp, le] = std::from_chars(val_str.data(), val_str.data() + val_str.size(), lhs);
-    [[maybe_unused]] auto [rp, re] = std::from_chars(cond.value.data(), cond.value.data() + cond.value.size(), rhs);
-    lhs_ok = (le == std::errc{});
-    rhs_ok = (re == std::errc{});
+    if (lhs_text) {
+        [[maybe_unused]] auto [lp, le] =
+            std::from_chars(lhs_text->data(), lhs_text->data() + lhs_text->size(), lhs);
+        lhs_ok = (le == std::errc{});
+    }
+    if (rhs_text) {
+        [[maybe_unused]] auto [rp, re] =
+            std::from_chars(rhs_text->data(), rhs_text->data() + rhs_text->size(), rhs);
+        rhs_ok = (re == std::errc{});
+    }
 #else
     // Apple Clang fallback: std::from_chars for double may not be available. The from_chars
     // branch above reads a LEADING number (it checks only that parsing started, not that the
     // whole string was consumed), so accept a prefix here too (pos > 0): the two platforms
     // must agree on "1.2.3" < "2.0" and "5 GB" > "4" (the legacy leading-number read).
-    try { size_t pos = 0; lhs = std::stod(val_str, &pos); lhs_ok = (pos > 0); } catch (...) {}
-    try { size_t pos = 0; rhs = std::stod(cond.value, &pos); rhs_ok = (pos > 0); } catch (...) {}
+    if (lhs_text) {
+        try { size_t pos = 0; lhs = std::stod(std::string(*lhs_text), &pos); lhs_ok = (pos > 0); } catch (...) {}
+    }
+    if (rhs_text) {
+        try { size_t pos = 0; rhs = std::stod(std::string(*rhs_text), &pos); rhs_ok = (pos > 0); } catch (...) {}
+    }
 #endif
 
     if (!lhs_ok || !rhs_ok) {
@@ -417,6 +468,15 @@ constexpr std::size_t kMaxLoggedExclusionsPerCause = 10;
 
 } // namespace
 
+std::optional<std::string_view> legacy_leading_number_text(std::string_view s) {
+    if (!s.empty() && (s.front() == ' ' || s.front() == '+' || (s.front() >= '\t' && s.front() <= '\r')))
+        return std::nullopt;
+    const std::size_t digits = (!s.empty() && s.front() == '-') ? 1 : 0;
+    if (s.size() >= digits + 2 && s[digits] == '0' && (s[digits + 1] == 'x' || s[digits + 1] == 'X'))
+        return s.substr(0, digits + 1);
+    return s;
+}
+
 std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
                                                      InventoryCondition& out) {
     if (!c.is_object())
@@ -441,6 +501,8 @@ std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
         // the legacy prefix read, see eval_condition); == / != keep the exact text compare.
         if (out.op == ">" || out.op == ">=" || out.op == "<" || out.op == "<=") {
             if (const auto n = parse_number_string(out.value)) {
+                if (operand_rounds_through_double(*n))
+                    return std::string(kInexactOperandMessage);
                 out.ordering_numeric = true;
                 out.numeric_value = *n;
             }
@@ -451,14 +513,18 @@ std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
                             out.op == "<" || out.op == "<=";
     const bool equality = out.op == "==" || out.op == "!=";
     if (v.is_number() && comparison) {
+        Number parsed;
+        if (v.is_number_unsigned())
+            parsed = v.get<std::uint64_t>();
+        else if (v.is_number_integer())
+            parsed = v.get<std::int64_t>();
+        else
+            parsed = v.get<double>();
+        if (operand_rounds_through_double(parsed))
+            return std::string(kInexactOperandMessage);
         out.value = v.dump();
         out.numeric_operand = true;
-        if (v.is_number_unsigned())
-            out.numeric_value = v.get<std::uint64_t>();
-        else if (v.is_number_integer())
-            out.numeric_value = v.get<std::int64_t>();
-        else
-            out.numeric_value = v.get<double>();
+        out.numeric_value = parsed;
         return std::nullopt;
     }
     if (v.is_boolean() && equality) {

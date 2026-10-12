@@ -7777,7 +7777,7 @@ TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without a
 // #4644: `window` on the three DEX reads that did not validate it silently resolved junk to 7d,
 // so a caller asking for `90d`, `30` or a number got 7 days of data under a window it never named.
 TEST_CASE("MCP DEX: list_dex_signals / get_dex_signal_scope / get_dex_signal_detail refuse a "
-          "window outside 24h|7d|30d|all, an absent or empty one keeps the default (#4644)",
+          "window outside 24h|7d|30d|all, an empty one included; only an absent one keeps the default (#4644)",
           "[pg][mcp][integration][dex][numeric_params]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -7796,7 +7796,7 @@ TEST_CASE("MCP DEX: list_dex_signals / get_dex_signal_scope / get_dex_signal_det
     for (const char* tool : {"list_dex_signals", "get_dex_signal_scope", "get_dex_signal_detail"}) {
         for (const char* bad : {R"(,"window":"90d")", R"(,"window":"7D")", R"(,"window":"30")",
                                 R"(,"window":5)", R"(,"window":null)", R"(,"window":["7d"])",
-                                R"(,"window":true)"}) {
+                                R"(,"window":true)", R"(,"window":"")"}) {
             INFO(tool << " " << bad);
             auto res = call(tool, bad);
             REQUIRE(res);
@@ -7806,7 +7806,7 @@ TEST_CASE("MCP DEX: list_dex_signals / get_dex_signal_scope / get_dex_signal_det
             CHECK(body["error"]["message"].get<std::string>().find("invalid window") !=
                   std::string::npos);
         }
-        for (const char* ok : {"", R"(,"window":"")", R"(,"window":"24h")", R"(,"window":"7d")",
+        for (const char* ok : {"", R"(,"window":"24h")", R"(,"window":"7d")",
                                R"(,"window":"30d")", R"(,"window":"all")"}) {
             INFO(tool << " " << ok);
             auto res = call(tool, ok);
@@ -7816,12 +7816,12 @@ TEST_CASE("MCP DEX: list_dex_signals / get_dex_signal_scope / get_dex_signal_det
         }
     }
     // A refused window leaves no behavioural-view audit row for a read that never ran; the
-    // accepted get_dex_signal_detail calls above wrote exactly one per call (6).
+    // accepted get_dex_signal_detail calls above wrote exactly one per call (5).
     int views = 0;
     for (const auto& a : ts.audit_log)
         if (a.find("dex.signal.view") != std::string::npos)
             ++views;
-    CHECK(views == 6);
+    CHECK(views == 5);
 }
 
 // WS-A4 PR-1 Gate 7 fix round: this tool reverted off `fleet_read_fn_`/real RBAC composition
@@ -28845,7 +28845,12 @@ TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
               R"({"plugin":"p","field":"f","op":">","value":true})",
               R"({"plugin":"p","field":"f","op":"contains","value":5})",
               R"({"plugin":"p","field":"f","op":5,"value":"5"})",
-              R"({"plugin":["p"],"field":"f","op":">","value":"5"})"}) {
+              R"({"plugin":["p"],"field":"f","op":">","value":"5"})",
+              // A decimal operand of 2^53 or more is rounded by a double, so it is refused
+              // (CDX-P1-01); a string is read only under the ordering operators.
+              R"({"plugin":"p","field":"f","op":">","value":9007199254740993.0})",
+              R"({"plugin":"p","field":"f","op":"==","value":1e300})",
+              R"({"plugin":"p","field":"f","op":"<=","value":"9007199254740993.5"})"}) {
             const std::string req =
                 R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id++) +
                 R"(,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[)" +

@@ -12,6 +12,7 @@
 #include "result_set_matcher.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <string>
 #include <vector>
@@ -197,6 +198,30 @@ TEST_CASE("matcher: validate_matcher accepts only an integer n of at least 1 (#4
           R"({"kind":{}})"}) {
         INFO(bad);
         CHECK(validate_matcher(bad).has_value());
+    }
+}
+
+// The admission check for a parsed caller `matcher`: a value that is not a JSON object is refused
+// here (it used to be dropped, i.e. accept-all), so a producer cannot admit accept-all by calling
+// only the validator.
+TEST_CASE("matcher: validate_matcher_object refuses a non-object and defers to validate_matcher",
+          "[result_set][matcher][numeric_params]") {
+    using nlohmann::json;
+    for (const char* bad : {"null", "[]", "[1]", "5", "5.5", "true", R"("x")", R"("{}")"}) {
+        INFO(bad);
+        const auto err = validate_matcher_object(json::parse(bad));
+        REQUIRE(err.has_value());
+        CHECK(err->find("JSON object") != std::string::npos);
+    }
+    for (const char* ok : {"{}", R"({"kind":"any_response"})", R"({"kind":"tar_rows_ge","n":3})",
+                           R"({"column":"c","op":"eq","value":"v"})"}) {
+        INFO(ok);
+        CHECK_FALSE(validate_matcher_object(json::parse(ok)).has_value());
+    }
+    for (const char* bad : {R"({"kind":"tar_rows_ge","n":0})", R"({"kind":1})",
+                            R"({"column":5,"op":"eq","value":"v"})"}) {
+        INFO(bad);
+        CHECK(validate_matcher_object(json::parse(bad)).has_value());
     }
 }
 

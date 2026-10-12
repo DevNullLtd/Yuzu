@@ -2514,6 +2514,20 @@ TEST_CASE("from-inventory-query: a numeric condition value is compared as a numb
         CHECK(st == 400);
         CHECK(j["error"]["message"].get<std::string>().find("conditions[]") != std::string::npos);
     }
+    // A decimal operand a double cannot hold (CDX-P1-01): 9007199254740993.0 is already
+    // 9007199254740992.0 once parsed, so stored 9007199254740993 `>` it used to match. Refused.
+    for (const char* cond :
+         {R"({"plugin":"custom","field":"ram","op":">","value":9007199254740993.0})",
+          R"({"plugin":"custom","field":"ram","op":"==","value":1e300})",
+          R"({"plugin":"custom","field":"ram","op":"<=","value":"9007199254740993.5"})"}) {
+        const std::string body = std::string(R"({"name":"refused","conditions":[)") + cond + "]}";
+        INFO(body);
+        int st = 0;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", body, st);
+        CHECK(st == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("exactly representable") !=
+              std::string::npos);
+    }
     std::string next;
     CHECK(h.store->list_by_owner("operator-1", "", 50, next).size() == 1);
 }
@@ -2993,6 +3007,22 @@ TEST_CASE("POST /api/v1/inventory/evaluate: a numeric condition value is compare
         CHECK(st == 400);
         CHECK(j["error"]["message"].get<std::string>().find("conditions[]") != std::string::npos);
     }
+    // A decimal operand of 2^53 or more is refused (CDX-P1-01); 2^53 itself, as an integer, is not.
+    for (const char* cond :
+         {R"({"plugin":"custom","field":"ram","op":">","value":9007199254740993.0})",
+          R"({"plugin":"custom","field":"ram","op":"==","value":9007199254740992.0})",
+          R"({"plugin":"custom","field":"ram","op":"<=","value":1e300})",
+          R"({"plugin":"custom","field":"ram","op":">=","value":"9007199254740993.5"})"}) {
+        const std::string body = std::string(R"({"conditions":[)") + cond + "]}";
+        INFO(body);
+        int st = 0;
+        auto j = h.post("/api/v1/inventory/evaluate", body, st);
+        CHECK(st == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("exactly representable") !=
+              std::string::npos);
+    }
+    CHECK(agents_for("==", "9007199254740992") == Ids{});
+    CHECK(agents_for(">=", R"("9007199254740993.0")") == Ids{});
 }
 
 // #4496 follow-up: the sibling of the two `results_excluded_by_poison` tests

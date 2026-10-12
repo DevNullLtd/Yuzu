@@ -5359,16 +5359,18 @@ TEST_CASE("REST gs.events (seam-bypass tripwire): answers via GuardianApi, not t
 
 // #4644: `window` on dex/signals, dex/scope and dex/signals/{obs_type} was passed raw to a
 // resolver that maps anything unknown to 7d, so `window=90d` or `window=30` answered with 7 days
-// of data under a label the caller never chose. The eleven sibling routes already 400 it.
+// of data under a label the caller never chose. The eleven sibling routes already 400 it, an empty
+// `?window=` included: only an ABSENT window keeps the 7d default.
 TEST_CASE("REST dex/signals, dex/scope and dex/signals/{obs_type}: a window outside "
-          "24h|7d|30d|all is a 400, an absent or empty one keeps the 7d default (#4644)",
+          "24h|7d|30d|all, an empty one included, is a 400; an absent one keeps the 7d default "
+          "(#4644)",
           "[pg][rest][dex][signals][numeric_params]") {
     RestGsHarness h;
     h.seed_obs("w1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
 
     for (const char* base : {"/api/v1/dex/signals", "/api/v1/dex/scope",
                              "/api/v1/dex/signals/process.crashed"}) {
-        for (const char* bad : {"90d", "7D", "30", "1y", "junk", "4294967297", "-1", "5.5",
+        for (const char* bad : {"", "90d", "7D", "30", "1y", "junk", "4294967297", "-1", "5.5",
                                 "24h%20", "7d%0A"}) {
             const std::string url = std::string(base) + "?window=" + bad;
             INFO(url);
@@ -5377,8 +5379,7 @@ TEST_CASE("REST dex/signals, dex/scope and dex/signals/{obs_type}: a window outs
             CHECK(res->status == 400);
             CHECK(res->body.find("invalid window") != std::string::npos);
         }
-        for (const char* ok : {"", "?window=", "?window=24h", "?window=7d", "?window=30d",
-                               "?window=all"}) {
+        for (const char* ok : {"", "?window=24h", "?window=7d", "?window=30d", "?window=all"}) {
             const std::string url = std::string(base) + ok;
             INFO(url);
             auto res = h.sink.Get(url);

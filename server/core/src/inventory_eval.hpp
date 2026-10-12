@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -18,9 +19,13 @@ struct InventoryCondition {
     /// True only when the caller's JSON `value` was a number (set by parse_inventory_condition).
     /// `==` / `!=` / `>` / `>=` / `<` / `<=` then compare the RAW stored value against
     /// `numeric_value`, the operand as the caller sent it, never against `value` (the `dump()` text,
-    /// kept for display): two integers compare exactly (signed and unsigned mixed correctly), an
-    /// integer against a double compares exactly with no rounding through 2^53, and two doubles
-    /// compare as doubles (`0.1 + 0.2` is not `0.3`, `-0` equals `0`). A stored string that parses
+    /// kept for display): two integers compare exactly (signed and unsigned mixed correctly), a
+    /// stored integer against a double operand compares exactly (the integer part as an integer,
+    /// then the fraction), and two doubles compare as doubles (`0.1 + 0.2` is not `0.3`, `-0` equals
+    /// `0`). A double OPERAND is only admitted below 2^53 in magnitude (see
+    /// parse_inventory_condition): a JSON float arrives already rounded, so a larger one could not
+    /// be compared exactly; a whole number of any size is sent as an integer. A STORED double above
+    /// 2^53 is whatever the agent reported. A stored string that parses
     /// in full as a number counts as that number (stored "1.10" equals operand 1.1, stored "10" is
     /// greater than operand 9); any other stored value (non-numeric string such as "5 GB" or "N/A",
     /// boolean, array) is never equal and never satisfies an ordering operator: a JSON number
@@ -55,12 +60,24 @@ struct InventoryCondition {
 /// with `numeric_operand` set (so all six operators compare it numerically against the raw stored
 /// value, exact for integers and for integer vs double), or a boolean as `true` / `false` for
 /// `==` / `!=` only. Anything else (null, array, object, a number under another operator) is
-/// refused. It used
-/// to become "": `{"op":">","value":5}` then selected EVERY device that had the field, because the
-/// evaluator falls back to a lexicographic compare against the empty string.
+/// refused. A number used to become "": `{"op":">","value":5}` then selected EVERY device that had the
+/// field, because the evaluator falls back to a lexicographic compare against the empty string.
+/// A decimal operand that a double cannot hold exactly is refused too: a JSON float, or a string
+/// under `>` `>=` `<` `<=`, with a fraction or an exponent and a magnitude of 2^53 or more (a JSON
+/// float arrives already rounded: 9007199254740993.0 is 2^53 by the time it is seen, so it would
+/// silently compare equal to 9007199254740992.0). A whole number is sent as an integer, or as a
+/// digit string, which reads as that exact integer (also with a zero fraction, "123.0").
 /// Returns the 400 / -32602 message, or nullopt when accepted (`out` is then filled in).
 [[nodiscard]] std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
                                                                    InventoryCondition& out);
+
+/// The text a legacy leading-number read (the ordering fallback for a non-plain-decimal string
+/// operand, see eval_condition) hands to the number parser, so the std::from_chars path and the
+/// std::stod fallback (Apple Clang) read the same number: nullopt when from_chars would refuse the
+/// first character (leading whitespace or '+'), the text up to and including the '0' for a "0x" /
+/// "0X" prefix (from_chars reads the zero and stops at the 'x'; stod would read hex), else the
+/// text unchanged. Applied on every platform, so it is testable on Linux.
+[[nodiscard]] std::optional<std::string_view> legacy_leading_number_text(std::string_view s);
 
 struct InventoryEvalRequest {
     std::string agent_id;

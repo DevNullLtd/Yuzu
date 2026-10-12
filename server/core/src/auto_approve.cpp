@@ -112,6 +112,10 @@ bool AutoApproveEngine::load(const std::filesystem::path& path) {
         rule.value = value;
         rule.label = label;
         rule.enabled = enabled_s.empty() || enabled_s == "1";
+        if (rule.type == AutoApproveRuleType::ip_subnet && !is_valid_ip_subnet_value(rule.value))
+            spdlog::warn("Auto-approve rule {} in {} is not a valid ip_subnet value and will "
+                         "never match",
+                         rules_.size(), path.string());
         rules_.push_back(std::move(rule));
     }
 
@@ -234,6 +238,8 @@ bool AutoApproveEngine::match_hostname_glob(const std::string& pattern,
 // ── CIDR subnet matching ─────────────────────────────────────────────────────
 
 bool AutoApproveEngine::is_valid_ip_subnet_value(const std::string& value) {
+    if (!is_valid_rule_text(value))
+        return false; // inet_pton would read only up to an embedded NUL
     const auto slash = value.find('/');
     const auto net_str = value.substr(0, slash);
     struct in_addr net_addr{};
@@ -278,10 +284,22 @@ bool AutoApproveEngine::match_ip_subnet(const std::string& cidr, const std::stri
 
 // ── CRUD ─────────────────────────────────────────────────────────────────────
 
-void AutoApproveEngine::add_rule(const AutoApproveRule& rule) {
+bool AutoApproveEngine::is_valid_rule_text(std::string_view text) {
+    return std::none_of(text.begin(), text.end(), [](char c) {
+        return c == ':' || static_cast<unsigned char>(c) < 0x20;
+    });
+}
+
+bool AutoApproveEngine::add_rule(const AutoApproveRule& rule) {
+    if (!is_valid_rule_text(rule.value) || !is_valid_rule_text(rule.label)) {
+        spdlog::warn("Refused an auto-approve rule whose value or label contains ':' or a "
+                     "control character");
+        return false;
+    }
     std::lock_guard lock(mu_);
     rules_.push_back(rule);
     save_locked();
+    return true;
 }
 
 std::optional<AutoApproveRule> AutoApproveEngine::remove_rule(size_t index) {

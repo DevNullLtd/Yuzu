@@ -1,5 +1,7 @@
 #pragma once
 
+#include <nlohmann/json_fwd.hpp>
+
 #include <optional>
 #include <string>
 #include <string_view>
@@ -52,8 +54,17 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
 /// (absent = 1) must be one JSON integer in 1..2147483647. `response_matches` independently fails
 /// CLOSED on a malformed `n` or `kind` already stored (including n < 1), so a bad value can never
 /// throw out of the maintenance tick nor admit every responder. A matcher that is present but not
-/// a JSON object is refused by the CALLER (the routes), not here: this takes the serialized text.
+/// a JSON object is accepted here as the unrecognised-shape default (the serialized text may be
+/// anything): a route holding the parsed value calls `validate_matcher_object` instead.
 std::optional<std::string> validate_matcher(std::string_view matcher_json);
+
+/// The admission check for a PRESENT caller `matcher` value (#4644): nullopt when acceptable,
+/// else the 400 / -32602 message. A value that is not a JSON object is refused ("matcher must be
+/// a JSON object"; it used to be dropped, which meant every responder qualified), then the
+/// object goes through `validate_matcher`. REST and MCP both call this ONE function, so a third
+/// producer cannot admit accept-all by calling only the text check. An ABSENT matcher is the
+/// caller's own default and is not passed here.
+std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher);
 
 /// Count the rows in a tar `tar.sql` response `output`. The tar plugin emits
 /// a `__schema__|col|col` header line, one `|`-joined line per row, then a

@@ -199,6 +199,12 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
     return std::nullopt;
 }
 
+std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher) {
+    if (!matcher.is_object())
+        return "matcher must be a JSON object";
+    return validate_matcher(matcher.dump());
+}
+
 int tar_row_count(std::string_view output) {
     if (output.starts_with("error|"))
         return 0;

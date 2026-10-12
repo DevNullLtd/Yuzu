@@ -103,8 +103,9 @@ struct ExecV1Harness {
 
     // wire_fleet_read=false leaves fleet_read_fn unwired (exercises the 503 guard).
     // real_fleet_read, when set, replaces the mocked gate with a production-shaped one.
+    // wire_tracker=false registers the routes with a null ExecutionTracker* (the 503 guard).
     explicit ExecV1Harness(pg::PgPool& pool, bool wire_fleet_read = true,
-                           RestApiV1::FleetReadFn real_fleet_read = {}) {
+                           RestApiV1::FleetReadFn real_fleet_read = {}, bool wire_tracker = true) {
         yuzu::server::seed_response_metrics(metrics);
         execution_tracker = std::make_unique<ExecutionTracker>(pool);
         REQUIRE(execution_tracker->is_open());
@@ -151,7 +152,8 @@ struct ExecV1Harness {
                             /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr, response_store.get(),
-                            instruction_store.get(), execution_tracker.get(),
+                            instruction_store.get(),
+                            wire_tracker ? execution_tracker.get() : nullptr,
                             /*schedule_engine=*/nullptr,
                             /*approval_manager=*/nullptr,
                             /*tag_store=*/nullptr,
@@ -785,6 +787,25 @@ TEST_CASE("GET /api/v1/execution-statistics/{agents|definitions}: a malformed si
     auto ok = h.sink.Get(route + "?" + good);
     REQUIRE(ok);
     CHECK(ok->status == 200);
+}
+
+// The three statistics routes (and /statistics) used to dereference the tracker unchecked, unlike
+// their siblings: an unwired tracker is a 503, never a null dereference.
+TEST_CASE("GET /api/v1/execution-statistics{,/agents,/definitions} and /statistics: an unwired "
+          "tracker is a 503 (#4644)",
+          "[pg][rest][executions][v1][statistics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool, /*wire_fleet_read=*/true, /*real_fleet_read=*/{}, /*wire_tracker=*/false);
+    for (const char* route : {"/api/v1/execution-statistics", "/api/v1/execution-statistics/agents",
+                              "/api/v1/execution-statistics/definitions", "/api/v1/statistics"}) {
+        INFO(route);
+        auto res = h.sink.Get(route);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(nlohmann::json::parse(res->body)["error"]["message"] ==
+              "execution tracker unavailable");
+    }
 }
 
 TEST_CASE("GET /api/v1/execution-statistics/{agents|definitions}: a limit below 1 is a 400 like "

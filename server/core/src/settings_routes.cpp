@@ -6129,22 +6129,43 @@ void SettingsRoutes::register_routes(
                   // hook is `SettingsRoutes::AuditFn`, which is void: set-and-proceed, a dropped
                   // row is logged by the sink but does not fail the operator action.
                   const std::string type_name = auto_approve_type_name(type);
+                  // The dashboard drops 4xx bodies (swap:false): the toast is what the operator sees.
+                  const auto refuse = [&](const std::string& audit_detail, const char* toast_json,
+                                          const char* message) {
+                      audit_fn_(req, "settings.auto_approve.rule_added", "denied",
+                                "AutoApproveRule", type_name, audit_detail);
+                      res.status = 400;
+                      res.set_header("HX-Trigger", toast_json);
+                      res.set_content(detail::a4_error(res, message), "application/json");
+                  };
+                  // The rules file is ':'-delimited, one rule per line: a ':' or a line break in
+                  // the value OR the label would persist as a different rule (a second, enabled
+                  // match-all; a flipped enabled flag) after the next restart, so neither is stored.
+                  const auto refuse_bad_text = [&] {
+                      refuse("invalid_rule_text value=" + auto_approve_audit_value(value) +
+                                 " label=" + auto_approve_audit_value(label),
+                             R"({"showToast":{"message":"Rule value and label must not contain ':' or control characters - rule not added","level":"error"}})",
+                             "invalid rule: value and label must not contain ':' or control "
+                             "characters");
+                  };
+                  if (!auth::AutoApproveEngine::is_valid_rule_text(value) ||
+                      !auth::AutoApproveEngine::is_valid_rule_text(label)) {
+                      refuse_bad_text();
+                      return;
+                  }
                   if (type == auth::AutoApproveRuleType::ip_subnet &&
                       !auth::AutoApproveEngine::is_valid_ip_subnet_value(value)) {
-                      audit_fn_(req, "settings.auto_approve.rule_added", "denied",
-                                "AutoApproveRule", type_name,
-                                "invalid_ip_subnet value=" + auto_approve_audit_value(value));
-                      res.status = 400;
-                      // The dashboard drops 4xx bodies (swap:false): the toast is what the operator sees.
-                      res.set_header("HX-Trigger",
-                                     R"({"showToast":{"message":"Invalid IP subnet (use a.b.c.d or a.b.c.d/0-32) - rule not added","level":"error"}})");
-                      res.set_content(detail::a4_error(res, "invalid ip_subnet value: use an IPv4 "
-                                                            "address or a.b.c.d/N with N 0 to 32"),
-                                      "application/json");
+                      refuse("invalid_ip_subnet value=" + auto_approve_audit_value(value),
+                             R"({"showToast":{"message":"Invalid IP subnet (use a.b.c.d or a.b.c.d/0-32) - rule not added","level":"error"}})",
+                             "invalid ip_subnet value: use an IPv4 address or a.b.c.d/N with N 0 "
+                             "to 32");
                       return;
                   }
 
-                  auto_approve_->add_rule({type, value, label, true});
+                  if (!auto_approve_->add_rule({type, value, label, true})) {
+                      refuse_bad_text(); // the engine's own backstop; the check above already ran
+                      return;
+                  }
                   audit_fn_(req, "settings.auto_approve.rule_added", "success", "AutoApproveRule",
                             type_name,
                             "value=" + auto_approve_audit_value(value) +
@@ -6220,11 +6241,11 @@ void SettingsRoutes::register_routes(
                                   "AutoApproveRule", std::to_string(idx),
                                   "type=" + std::string(auto_approve_type_name(removed->type)) +
                                       " value=" + auto_approve_audit_value(removed->value));
+                        spdlog::info("Auto-approve rule {} removed", idx);
                     } else {
                         audit_fn_(req, "settings.auto_approve.rule_removed", "denied",
                                   "AutoApproveRule", std::to_string(idx), "rule_not_found");
                     }
-                    spdlog::info("Auto-approve rule {} removed", idx);
                     res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
                 });
 

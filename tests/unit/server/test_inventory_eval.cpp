@@ -1151,7 +1151,7 @@ TEST_CASE("InventoryEval: numeric == and != compare the raw stored number, not a
     CHECK_FALSE(matches("9007199254740993", "==", "9007199254740992"));
     CHECK(matches("9007199254740993", "!=", "9007199254740992"));
     CHECK(matches("9007199254740993", "==", "9007199254740993"));
-    CHECK_FALSE(matches("9007199254740993", "==", "9007199254740992.0"));
+    CHECK_FALSE(matches("9007199254740992.0", "==", "9007199254740993"));
     // Int vs float spelling of the same value, and plain floats.
     CHECK(matches("5", "==", "5.0"));
     CHECK(matches("5.0", "==", "5"));
@@ -1181,22 +1181,22 @@ TEST_CASE("InventoryEval: numeric == and != compare the raw stored number, not a
     // A negative integer against a double: exact, integral and in range.
     CHECK(matches("-5", "==", "-5.0"));
     CHECK_FALSE(matches("-5", "==", "-5.5"));
-    CHECK(matches("-9223372036854775808", "==", "-9223372036854775808.0"));
-    CHECK_FALSE(matches("-9223372036854775808", "==", "-9223372036854777856.0"));
+    CHECK(matches("-9223372036854775808.0", "==", "-9223372036854775808"));
+    CHECK_FALSE(matches("-9223372036854777856.0", "==", "-9223372036854775808"));
     // A stored string that parses as an int64 against a double operand.
     CHECK(matches(R"("5")", "==", "5.0"));
-    CHECK_FALSE(matches(R"("9007199254740993")", "==", "9007199254740992.0"));
+    CHECK_FALSE(matches(R"("9007199254740992.0")", "==", "9007199254740993"));
     // The 2^63 and 2^64 range guards: the double one past the type's max never equals its max.
-    CHECK_FALSE(matches("18446744073709551615", "==", "18446744073709551616.0"));
-    CHECK_FALSE(matches("9223372036854775807", "==", "9223372036854775808.0"));
-    CHECK(matches("9223372036854775808", "==", "9223372036854775808.0"));
+    CHECK_FALSE(matches("18446744073709551616.0", "==", "18446744073709551615"));
+    CHECK_FALSE(matches("9223372036854775808.0", "==", "9223372036854775807"));
+    CHECK(matches("9223372036854775808.0", "==", "9223372036854775808"));
     // Stored strings: sign, leading '.', leading zeros, and an out-of-range exponent.
     CHECK(matches(R"("-1")", "==", "-1"));
     CHECK(matches(R"(".5")", "==", "0.5"));
     CHECK(matches(R"("007")", "==", "7"));
-    CHECK_FALSE(matches(R"("1e400")", "==", "1e308"));
+    CHECK_FALSE(matches(R"("1e400")", "==", "5"));
     CHECK_FALSE(matches(R"("1e400")", "==", "0"));
-    CHECK(matches(R"("1e400")", "!=", "1e308"));
+    CHECK(matches(R"("1e400")", "!=", "5"));
     // An operand of -0 or 0.0 equals a stored zero in every spelling.
     CHECK(matches("0", "==", "-0"));
     CHECK(matches("0", "==", "0.0"));
@@ -1245,8 +1245,8 @@ TEST_CASE("InventoryEval: numeric > >= < <= compare the raw stored number exactl
     CHECK_FALSE(matches("-1", ">", "18446744073709551615"));
     // Integers above 2^53 order exactly, against integer and double operands.
     CHECK(matches("9007199254740993", ">", "9007199254740992"));
-    CHECK(matches("9007199254740993", ">", "9007199254740992.0"));
-    CHECK_FALSE(matches("9007199254740993", "<=", "9007199254740992.0"));
+    CHECK(matches("9007199254740994.0", ">", "9007199254740993"));
+    CHECK_FALSE(matches("9007199254740992.0", ">=", "9007199254740993"));
     CHECK(matches("9007199254740992", "<", "9007199254740993"));
     CHECK(matches("9007199254740992.0", "<", "9007199254740993"));
     // Integer vs double, fraction and range guards.
@@ -1254,11 +1254,11 @@ TEST_CASE("InventoryEval: numeric > >= < <= compare the raw stored number exactl
     CHECK(matches("5", ">", "4.5"));
     CHECK(matches("-5", ">", "-5.5"));
     CHECK(matches("-5", "<", "-4.5"));
-    CHECK(matches("18446744073709551615", "<", "18446744073709551616.0"));
-    CHECK(matches("9223372036854775807", "<", "9223372036854775808.0"));
-    CHECK(matches("-9223372036854775808", ">", "-9223372036854777856.0"));
-    CHECK_FALSE(matches("18446744073709551615", ">", "1e300"));
-    CHECK(matches("5", ">", "-1e300"));
+    CHECK(matches("18446744073709551616.0", ">", "18446744073709551615"));
+    CHECK(matches("9223372036854775808.0", ">", "9223372036854775807"));
+    CHECK(matches("-9223372036854777856.0", "<", "-9223372036854775808"));
+    CHECK(matches("1e300", ">", "18446744073709551615"));
+    CHECK(matches("-1e300", "<", "5"));
     CHECK(matches("0", ">", "-0.5"));
     // Negative numbers and zero spellings.
     CHECK(matches("-3", "<", "-2"));
@@ -1480,4 +1480,125 @@ TEST_CASE("InventoryEval: parse_inventory_condition refuses what used to become 
     }
     InventoryCondition c;
     CHECK(parse_inventory_condition(json::parse("5"), c).has_value());
+}
+
+// A decimal operand a double cannot hold exactly (CDX-P1-01): a JSON float arrives already rounded
+// (9007199254740993.0 is 2^53 by the time the evaluator sees it), so stored 9007199254740993
+// `> 9007199254740993.0` matched while `==` / `<=` did not. Refused at admission instead.
+TEST_CASE("InventoryEval: a decimal operand of 2^53 or more is refused at admission",
+          "[inventory_eval][numeric_params]") {
+    using nlohmann::json;
+    const char* const ops[] = {"==", "!=", ">", ">=", "<", "<="};
+    auto admit = [](const char* op, const std::string& operand_json) {
+        InventoryCondition c;
+        return parse_inventory_condition(json::parse(std::string(R"({"plugin":"p","field":"v","op":")") +
+                                                     op + R"(","value":)" + operand_json + "}"),
+                                         c);
+    };
+    // JSON floats (the reproduced case first), and exponent forms and ns-scale values, every op.
+    for (const char* operand : {"9007199254740993.0", "9007199254740992.0", "-9007199254740993.0",
+                                "9.007199254740993e15", "1e16", "1e300", "-1e300",
+                                "1700000000000000000.5", "18446744073709551616.0",
+                                "100000000000000000000"}) {
+        for (const char* op : ops) {
+            INFO(op << " " << operand);
+            const auto err = admit(op, operand);
+            REQUIRE(err.has_value());
+            CHECK(err->find("exactly representable") != std::string::npos);
+        }
+    }
+    // A string operand is read only under the ordering operators; a fraction or exponent form of
+    // 2^53 or more is refused there too (== / != with a string stay an exact text compare).
+    for (const char* operand : {"\"9007199254740993.5\"", "\"9.007199254740993e15\"", "\"1e16\"",
+                                "\"1e300\"", "\"-9007199254740993.5\"",
+                                "\"18446744073709551616.0\"", "\"100000000000000000000\""}) {
+        for (const char* op : {">", ">=", "<", "<="}) {
+            INFO(op << " " << operand);
+            const auto err = admit(op, operand);
+            REQUIRE(err.has_value());
+            CHECK(err->find("exactly representable") != std::string::npos);
+        }
+        for (const char* op : {"==", "!="})
+            CHECK_FALSE(admit(op, operand).has_value());
+    }
+    // Accepted: 2^53 and larger WHOLE numbers as integers, small decimals, and exact fractions.
+    for (const char* operand : {"9007199254740992", "9007199254740993", "-9007199254740993",
+                                "18446744073709551615", "-9223372036854775808", "0.1234567", "5.5",
+                                "1e3", "-1e-7", "9007199254740991.0", "0", "-0.0"}) {
+        for (const char* op : ops) {
+            INFO(op << " " << operand);
+            CHECK_FALSE(admit(op, operand).has_value());
+        }
+    }
+    for (const char* operand : {"\"9007199254740992\"", "\"0.1234567\"", "\"5.5\"", "\"2e-7\"",
+                                "\"9007199254740991.0\""}) {
+        for (const char* op : {">", ">=", "<", "<="}) {
+            INFO(op << " " << operand);
+            CHECK_FALSE(admit(op, operand).has_value());
+        }
+    }
+}
+
+// A whole-number decimal string above 2^53 is read as the exact integer, so the comparison is
+// exact where the old double rounding was not.
+TEST_CASE("InventoryEval: a whole-number decimal string reads as the exact integer",
+          "[inventory_eval][numeric_params]") {
+    using nlohmann::json;
+    auto matches = [](const char* stored_json, const char* op, const char* operand_json) {
+        Records records = {{"agent-a|p", std::string(R"({"v": )") + stored_json + "}"}};
+        InventoryEvalRequest req;
+        InventoryCondition c;
+        const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
+                                     R"(","value":)" + operand_json + "}");
+        REQUIRE_FALSE(parse_inventory_condition(doc, c));
+        req.conditions.push_back(c);
+        return !evaluate_inventory(req, records).empty();
+    };
+    const char* const same = R"("9007199254740993.0")";
+    CHECK_FALSE(matches("9007199254740993", ">", same));
+    CHECK(matches("9007199254740993", ">=", same));
+    CHECK(matches("9007199254740993", "<=", same));
+    CHECK_FALSE(matches("9007199254740993", "<", same));
+    CHECK(matches("9007199254740994", ">", same));
+    CHECK(matches("9007199254740992", "<", same));
+    CHECK(matches("5", ">=", R"("5.00")"));
+    CHECK_FALSE(matches("5", ">", R"("5.00")"));
+    CHECK(matches("-5", "<=", R"("-5.0")"));
+    // A stored numeric string spelled with a zero fraction is the exact integer as well.
+    CHECK(matches(R"("9007199254740993.0")", ">=", "9007199254740993"));
+    CHECK_FALSE(matches(R"("9007199254740993.0")", ">", "9007199254740993"));
+    CHECK(matches(R"("9007199254740993.0")", ">", "9007199254740992"));
+}
+
+// legacy_leading_number_text is the shared guard in front of the std::stod fallback (Apple Clang),
+// which accepts leading whitespace and hex where std::from_chars does not (K2).
+TEST_CASE("InventoryEval: the legacy leading-number read refuses whitespace and hex like from_chars",
+          "[inventory_eval][numeric_params]") {
+    CHECK_FALSE(legacy_leading_number_text(" 10").has_value());
+    CHECK_FALSE(legacy_leading_number_text("\t10").has_value());
+    CHECK_FALSE(legacy_leading_number_text("\n10").has_value());
+    CHECK_FALSE(legacy_leading_number_text("+5").has_value());
+    CHECK(legacy_leading_number_text("0x10") == std::string_view("0"));
+    CHECK(legacy_leading_number_text("0X1F") == std::string_view("0"));
+    CHECK(legacy_leading_number_text("-0x10") == std::string_view("-0"));
+    CHECK(legacy_leading_number_text("0") == std::string_view("0"));
+    CHECK(legacy_leading_number_text("10") == std::string_view("10"));
+    CHECK(legacy_leading_number_text("1.2.3") == std::string_view("1.2.3"));
+    CHECK(legacy_leading_number_text("5 GB") == std::string_view("5 GB"));
+    CHECK(legacy_leading_number_text("5x") == std::string_view("5x"));
+    CHECK(legacy_leading_number_text("-") == std::string_view("-"));
+    CHECK(legacy_leading_number_text("").value() == std::string_view(""));
+
+    // End to end on the legacy ordering path (a non-plain-decimal string operand): the same answer
+    // on every platform. " 10" < " 9" is a TEXT compare (neither side starts a number) and
+    // "0x10" < "0x9" reads 0 against 0.
+    auto lt = [](const char* stored, const char* operand) {
+        Records records = {{"agent-a|p", std::string(R"({"v": ")") + stored + R"("})"}};
+        InventoryEvalRequest req;
+        req.conditions = {{"p", "v", "<", operand}};
+        return !evaluate_inventory(req, records).empty();
+    };
+    CHECK(lt(" 10", " 9"));
+    CHECK_FALSE(lt("0x10", "0x9"));
+    CHECK_FALSE(lt("0x9", "0x10"));
 }

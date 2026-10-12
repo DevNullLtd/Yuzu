@@ -666,3 +666,51 @@ TEST_CASE("settings auto-approve: a malformed ip_subnet 400 records a denied row
     CHECK(row.detail == "invalid_ip_subnet value=10.0.0.0/33");
     CHECK(h.auto_approve.list_rules().empty());
 }
+
+// The rules file is ':'-delimited, one rule per line. A label like `x\nip_subnet:0.0.0.0/0:inj`
+// persisted as written and reloaded as a SECOND, enabled match-all rule; `lab:el` reloaded as a
+// disabled rule. Neither the value nor the label may carry ':' or a control character, for any
+// rule type, and a refusal is an audited `denied` row that stores nothing.
+TEST_CASE("settings auto-approve: a value or label with ':' or a control character is a 400 that "
+          "stores nothing and records a denied row",
+          "[settings_routes][auto_approve][audit][numeric_params]") {
+    for (const char* type : {"hostname_glob", "ip_subnet", "trusted_ca", "cloud_provider"}) {
+        for (const char* label : {"x%0Aip_subnet%3A0.0.0.0%2F0%3Ainj", "lab%3Ael", "a%0Db", "a%00b",
+                                  "a%09b", "%3A"}) {
+            EnrollRoutesHarness h(/*with_store=*/false);
+            const std::string body =
+                std::string("type=") + type + "&label=" + label +
+                (std::string(type) == "ip_subnet" ? "&value=10.0.0.0%2F8" : "&value=ok");
+            INFO(body);
+            auto res = h.sink.Post("/api/settings/auto-approve", body, kForm);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(res->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
+            CHECK(h.auto_approve.list_rules().empty());
+            const auto row = h.only("settings.auto_approve.rule_added");
+            CHECK(row.result == "denied");
+            CHECK(row.target_id == type);
+            CHECK(row.detail.rfind("invalid_rule_text value=", 0) == 0);
+        }
+        // The same characters in the VALUE (every type; a NUL in a subnet is refused as well).
+        for (const char* value : {"a%3Ab", "a%0Ab", "a%0Db", "a%00b", "10.0.0.0%00junk"}) {
+            EnrollRoutesHarness h(/*with_store=*/false);
+            const std::string body =
+                std::string("type=") + type + "&label=ok&value=" + value;
+            INFO(body);
+            auto res = h.sink.Post("/api/settings/auto-approve", body, kForm);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(h.auto_approve.list_rules().empty());
+            CHECK(h.only("settings.auto_approve.rule_added").result == "denied");
+        }
+    }
+    // An ordinary label with spaces and punctuation other than ':' is unaffected.
+    EnrollRoutesHarness h(/*with_store=*/false);
+    REQUIRE(h.sink.Post("/api/settings/auto-approve",
+                        "type=hostname_glob&label=Prod%20(EU)%20%231&value=*.eu.example.com",
+                        kForm)
+                ->status == 200);
+    REQUIRE(h.auto_approve.list_rules().size() == 1);
+    CHECK(h.auto_approve.list_rules()[0].label == "Prod (EU) #1");
+}
