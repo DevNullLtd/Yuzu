@@ -22,6 +22,7 @@
  * which crashes under TSan with no TSan report (#438).
  */
 
+#include "rbac_store.hpp"
 #include "auth_routes.hpp"
 
 #include "analytics_event_store.hpp"
@@ -97,8 +98,13 @@ struct TmpDirGuard {
 struct AuthRoutesHarness {
     TmpDirGuard tmp;
     Config cfg{};
-    auth::AuthManager auth_mgr{};
     yuzu::test::AuthDbPg auth_db;
+    // #4966: the last-Administrator guard AuthManager::remove_user/update_role now require (fail
+    // closed without it), built on the same pool: the production composition.
+    std::unique_ptr<yuzu::server::RbacStore> rbac_guard;
+    // Declared AFTER auth_db and rbac_guard on purpose: it borrows both, so it must be destroyed
+    // first (members are destroyed in reverse order of declaration).
+    auth::AuthManager auth_mgr{};
     // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
     // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
     // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
@@ -150,6 +156,12 @@ struct AuthRoutesHarness {
         // Connect AuthDB to AuthManager so mfa_status / verify_password
         // / create_local_session can find each other.
         auth_mgr.set_auth_db(auth_db.get());
+        rbac_guard = std::make_unique<yuzu::server::RbacStore>(auth_db.pool());
+        REQUIRE(rbac_guard->is_open());
+        auth_mgr.set_rbac_store(rbac_guard.get());
+        // A second active admin: cases that demote/remove an admin test the write path, not the
+        // last-Administrator refusal (that has its own cases).
+        REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", auth::Role::admin).has_value());
 
         // Force AuthManager's in-memory users_ to use the DB-side salt
         // by re-loading "admin"/"alice" through upsert_user (which

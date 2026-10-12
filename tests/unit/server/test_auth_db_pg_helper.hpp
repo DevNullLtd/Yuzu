@@ -164,12 +164,19 @@ public:
     /// `encrypt()` call to fail deterministically (governance hardening
     /// round, quality SHOULD: mfa_init_enrollment's abort-on-encrypt-failure
     /// path was untested).
-    explicit AuthDbPg(int cleanup_interval_secs = 0, bool inject_encrypt_faults = false)
+    ///
+    /// `tpl` (default: the plain "authdbwire" template) selects the pre-migrated template database
+    /// the fixture clones. A fixture that ALSO constructs an `RbacStore` on the same pool passes
+    /// `&auth_db_rbac_pg_template` (test_auth_db_rbac_pg_template.hpp) so the clone already carries
+    /// the migrated, seeded `rbac_store` schema instead of re-running its four migrations and
+    /// default seeding per test (#4966).
+    explicit AuthDbPg(int cleanup_interval_secs = 0, bool inject_encrypt_faults = false,
+                      PgTestTemplate* tpl = nullptr)
         : cleanup_interval_secs_(cleanup_interval_secs) {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
-        db_.emplace(auth_db_pg_template);
+        db_.emplace(tpl != nullptr ? *tpl : auth_db_pg_template);
         INFO("[AuthDbPg] fixture status (blank == database came up OK): " << db_->error());
         REQUIRE(db_->available());
 
