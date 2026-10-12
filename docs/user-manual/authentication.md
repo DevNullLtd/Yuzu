@@ -267,19 +267,33 @@ curl -s --cacert /etc/yuzu/ca.crt https://localhost:8443/api/v1/me \
 
 ## OIDC Single Sign-On
 
-Yuzu supports OpenID Connect with PKCE for browser-based SSO. This has been tested with Microsoft Entra ID (Azure AD) and works with any provider that serves OpenID Connect Discovery (`{issuer}/.well-known/openid-configuration`). Yuzu reads the authorization endpoint, token endpoint and `jwks_uri` from that document the first time a sign-in needs them; it never derives them from the issuer URL. The `issuer` value in the document must match the configured issuer byte for byte (so Entra's `common` and `organizations` endpoints are not supported: use your tenant-specific issuer), and every endpoint must be an absolute URL using the same scheme as the issuer. Click "Test Connection" in the Settings page to check exactly that path: it fetches and validates the document the way a sign-in does, then fetches the `jwks_uri` and reports how many signing keys it found.
+Yuzu supports OpenID Connect with PKCE for browser-based SSO against a provider that serves OpenID Connect Discovery (`{issuer}/.well-known/openid-configuration`). Verified end to end against Keycloak 26.4.0. Microsoft Entra ID is supported by the standard (endpoints and keys come from its discovery document) but has not been verified end to end by the project; use the manual procedure below.
+
+Yuzu reads the authorization endpoint, token endpoint and `jwks_uri` from the discovery document the first time a sign-in needs them; it never derives them from the issuer URL.
+
+- **The issuer must match byte for byte.** The configured issuer must match the discovery document's `issuer` and the tokens' `iss` byte for byte, including any trailing slash. Copy it from the IdP's discovery document. (Yuzu removes one trailing slash only to build the discovery URL.)
+- **Endpoint rules.** Every endpoint in the document must be an absolute URL with the same scheme as the issuer, at most 2048 bytes, and a plain `host[:port]` authority (a host of at most 253 bytes, a port of at most 65535, no user info). The document must list all three of `authorization_endpoint`, `token_endpoint` and `jwks_uri`.
+- **Entra issuer.** Use the tenant-ID form, `https://login.microsoftonline.com/<tenant-guid>/v2.0`. A tenant domain name, `common` and `organizations` do not give an issuer that equals the document's, so they fail the exact issuer check.
+
+**Test Connection.** In Settings, "Test Connection" fetches and validates the discovery document the way a sign-in does, for the issuer typed in the form (the saved issuer when the field is blank), then fetches the `jwks_uri` and reports how many signing keys it found. It checks discovery and signing keys only: it does not exercise the token endpoint, the client secret, the redirect-URI registration, the audience or the group claims. Step 4 of the procedure below is the real sign-in test.
 
 ### Manual verification against a real IdP
 
-The unit tests run against a loopback IdP, not a real one. To check a real provider (Keycloak is the quickest to stand up locally):
+The unit tests run against a loopback IdP, not a real one. To check a real provider, use this procedure (Keycloak is the quickest to stand up locally). The sign-in itself was verified against Keycloak 26.4.0; the admin-console paths below follow that version's console and were not re-run when this text was written, so correct them if your console differs:
 
-1. Run Keycloak, create a realm and a confidential client with the standard flow enabled and `https://<yuzu-host>/auth/callback` (or your `--oidc-redirect-uri`) as a valid redirect URI.
-2. Start the server with `--oidc-issuer https://<keycloak>/realms/<realm>`, the client id and secret, and an `--oidc-redirect-uri`. Keycloak's stock endpoints (`/protocol/openid-connect/auth`, `/token`, `/certs`) need no proxy or rewriting: they come from the discovery document.
-3. In Settings, click "Test Connection": it should report the three endpoints discovered and the number of signing keys.
-4. Open `/auth/oidc/start`, sign in at the IdP and confirm you land in the dashboard with the expected role. Then remove the user's membership in the admin group and confirm the next sign-in is not an admin session.
-5. Negative check: point the client's audience mapper at a different client id and confirm the sign-in is refused.
+1. Run Keycloak and create a realm. Create a confidential client with the standard flow enabled and `https://<yuzu-host>/auth/callback` (or your `--oidc-redirect-uri`) as a valid redirect URI. For the admin mapping, add a Group Membership mapper to the client's dedicated scope (Clients > your client > Client scopes > the `-dedicated` scope > Add mapper > By configuration > Group Membership) with Token Claim Name `groups`, Full group path off and Add to ID token on, create a group (for example `yuzu-admins`) and add your test user to it.
+2. Start the server with `--oidc-issuer https://<keycloak>/realms/<realm>`, the client id and secret, `--oidc-redirect-uri` (set it explicitly: when omitted it defaults to `http(s)://localhost:<port>/auth/callback`) and `--oidc-admin-group yuzu-admins` (the value of the entry in the token's `groups` claim; with Full group path off that is the group's name). The issuer must equal the `issuer` in `https://<keycloak>/realms/<realm>/.well-known/openid-configuration`. Keycloak's stock endpoints (`/protocol/openid-connect/auth`, `/token`, `/certs`) need no proxy or rewriting: they come from the discovery document.
+3. In Settings, click "Test Connection": it should report that it discovered the authorization, token and JWKS endpoints and how many signing keys it found.
+4. Open `/auth/oidc/start`, sign in at the IdP and confirm you land in the dashboard as an administrator. Then remove the user from the group and confirm the next sign-in is not an admin session.
 
-The Keycloak rig used for development is local to the developers who built it and is not part of the repository.
+This procedure does not include a wrong-audience check: the refusal of a token minted for another client is covered by the unit tests (`test_oidc_provider.cpp`), not by a run against a real IdP.
+
+### Network and trust
+
+- **Direct egress.** The Yuzu server itself must reach the issuer host, and also the hosts in the document's `jwks_uri` and `token_endpoint`, which may differ from the issuer host (some providers serve `jwks_uri` from another host). Only the authorization endpoint is visited by the browser alone.
+- **No proxy.** No HTTP(S) proxy is used on the discovery and JWKS path (no proxy setting is applied and the proxy environment variables are not read), so the server needs a direct route to those hosts.
+- **TLS verification.** `--oidc-skip-tls-verify` now also governs the discovery and JWKS requests, as well as the token request on Linux and macOS. The Windows token request uses WinHTTP, which ignores it. A private CA is trusted through the server's operating-system trust store; there is no OIDC-specific CA setting.
+- **When the IdP is contacted.** Nothing contacts the IdP at server start or when you save the OIDC settings: the first sign-in after a restart (or after a save, which rebuilds the provider) pays one discovery round trip. Use "Test Connection" as the pre-flight check.
 
 ### Server Configuration
 
@@ -287,18 +301,18 @@ OIDC can be configured in two ways:
 
 **Option 1: Dashboard Settings** (convenient, but NOT durable on its own - see below; set Option 2 as well)
 
-Navigate to **Settings > Directory Integration / OIDC SSO** in the dashboard. Enter the issuer URL, client ID, client secret, and admin group ID. Click "Test Connection" to verify discovery, then "Save OIDC Configuration". Changes take effect immediately on the running server - but **only on the running server**. The provider is rebuilt at the next startup from the command-line or environment values, before the stored settings are read, and nothing rebuilds it afterwards. **If you configure OIDC only here, SSO stops working after the next restart** (the dashboard and `GET /api/config` will still show it as configured). Set the same values as CLI flags or environment variables per Option 2 as well, and see [Security hardening -> OIDC](security-hardening.md#oidc-hardening) before rotating a secret.
+Navigate to **Settings > Directory Integration / OIDC SSO** in the dashboard. Enter the issuer URL, client ID, client secret, and admin group ID. Click "Test Connection" to verify discovery and the signing keys, then "Save OIDC Configuration". Changes take effect immediately on the running server - but **only on the running server**. The provider is rebuilt at the next startup from the command-line or environment values, before the stored settings are read, and nothing rebuilds it afterwards. **If you configure OIDC only here, SSO stops working after the next restart** (the dashboard and `GET /api/config` will still show it as configured). Set the same values as CLI flags or environment variables per Option 2 as well, and see [Security hardening -> OIDC](security-hardening.md#oidc-hardening) before rotating a secret.
 
 **Option 2: CLI flags**
 
 | Flag | Description |
 |---|---|
-| `--oidc-issuer` | Issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`) |
+| `--oidc-issuer` | Issuer URL, exactly as the IdP's discovery document states it in `issuer` (e.g., Entra: `https://login.microsoftonline.com/<tenant-guid>/v2.0`; Keycloak: `https://<keycloak>/realms/<realm>`) |
 | `--oidc-client-id` | Application (client) ID from the IdP |
 | `--oidc-client-secret` | Client secret (required for Entra/Azure AD web apps) |
-| `--oidc-redirect-uri` | Callback URL (auto-computed from the request `Host` header if omitted; must match IdP registration if set explicitly) |
-| `--oidc-admin-group` | Entra group object ID that maps to the admin role (the value is trimmed automatically, same as `--saml-admin-group` — #1830) |
-| `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only) |
+| `--oidc-redirect-uri` | Callback URL. If omitted it defaults to a localhost URL derived from the listen port (`http(s)://localhost:<port>/auth/callback`); set it explicitly for any real IdP. It must match the IdP's registration. The request `Host` header is never used |
+| `--oidc-admin-group` | The value of the entry in the token's `groups` claim that maps to the admin role (the group object ID for Entra; the group name for Keycloak with Full group path off). The value is trimmed automatically, same as `--saml-admin-group` — #1830 |
+| `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC discovery, JWKS and (Linux/macOS) token requests (insecure, dev only). The Windows token request ignores it |
 
 Example startup:
 
@@ -323,7 +337,7 @@ Example startup:
 5. Server checks the binding cookie, exchanges the code for tokens, validates the ID token, extracts claims, and creates a local session.
 
 ```
-Browser           Yuzu Server               IdP (Entra ID)
+Browser           Yuzu Server               IdP
   |                    |                          |
   |-- GET /auth/oidc/start -->                    |
   |<-- 302 + Set-Cookie (binding) --|             |
@@ -334,6 +348,33 @@ Browser           Yuzu Server               IdP (Entra ID)
   |                    |<--- 302 /auth/callback --|
   |<-- Set-Cookie -----|                          |
 ```
+
+### OIDC sign-in fails
+
+Run "Test Connection" in Settings first: it reports the same discovery and signing-key failures a sign-in would hit. Then read the server log.
+
+| What you see | Log line (server log) | Meaning |
+|---|---|---|
+| `GET /auth/oidc/start` answers JSON `500` "could not start the SSO sign-in flow" | `OIDC auth flow could not start: OIDC discovery unavailable` | Discovery failed or is inside its 30 s no-retry window. The cause is on the earlier `OidcProvider: discovery failed for issuer <issuer>: <reason>` line. |
+| The browser lands on `/login?error=sso_failed` | `OIDC callback failed: OIDC discovery unavailable` | The token request needed discovery and it failed (same cause line as above). |
+| The browser lands on `/login?error=sso_failed` | `OIDC callback failed: JWKS signing keys unavailable` | The signing keys could not be fetched; look for `OidcProvider: JWKS fetch failed: <reason>` or `OidcProvider: no jwks_uri available, cannot fetch signing keys`. |
+
+The `<reason>` of a discovery failure is one of: `issuer mismatch: the discovery document names "<value>"` (the document's `issuer` is not the configured issuer); `discovery document has no <field>`; `<field> is not an absolute https URL on the issuer's scheme` (also shown for an endpoint that is over 2048 bytes, has user info or has a malformed `host[:port]`); `HTTP <status>` (for example `HTTP 404` when the issuer URL is wrong); `request failed: <detail>` (a refused or timed-out connection, a TLS failure, or a body over 256 KiB; a redirect is not followed and shows as `HTTP 302`); `discovery response is not valid JSON: ...` or `discovery response is not a JSON object`; `the issuer must be an http or https URL`, `the issuer is longer than 2048 bytes`, or `the issuer has no well-formed host`. Control characters in the reason are replaced by `_` in the log.
+
+- **Timing.** Each discovery or JWKS request has a per-operation timeout of 5 s and a total bound of 10 s, so a dead or very slow IdP can hold a sign-in for up to 10 s per request. A failed discovery is then not retried for 30 s: calls inside that window fail at once with `OIDC discovery unavailable` and the cause line is not repeated. The window applies to discovery only; a failed JWKS fetch is retried on the next sign-in. While one request is fetching discovery, any other sign-in that needs it fails at once rather than waiting.
+- **Audit and metrics.** A failed callback is audited as `auth.oidc_login_failed` (no detail) and counted in `yuzu_auth_oidc_login_total{result="error"}`. A discovery failure at `GET /auth/oidc/start` is logged only: it writes no audit row and increments no counter (tracked in #5704), so monitor the log for `OIDC auth flow could not start`.
+- **Keycloak hostname.** Keycloak builds the `issuer` in its document from its configured hostname (frontend URL). If the Yuzu server reaches Keycloak by an internal name but Keycloak's frontend URL is different, the configured issuer cannot be both reachable and equal to the document's issuer, and the log shows `issuer mismatch`. Configure the issuer as the URL Keycloak states in `issuer`, and make that URL reachable from the Yuzu server.
+- **A failed sign-in that "worked in Test Connection".** Test Connection does not exercise the token endpoint, client secret, redirect-URI registration, audience or group claims (see above); a failure there shows as `OIDC callback failed: ...` with the provider's own message.
+
+### Known limits
+
+- A sign-in can stall for up to the 10 s total bound per request while the IdP is dead or trickling, and a failed discovery is not retried for 30 s.
+- A successful discovery is cached for the life of the provider. If the IdP moves its endpoints or `jwks_uri`, save the OIDC settings again (which rebuilds the provider) or restart the server.
+- Cached signing keys are trusted until the next SUCCESSFUL JWKS fetch. While `jwks_uri` is unreachable, a key the IdP has retired keeps verifying. This is tracked under #1900/#1901 (a hard maximum key age).
+- There is no host restriction on discovered `jwks_uri` and `token_endpoint` beyond the scheme, length and authority rules above.
+- No proxy support on the discovery and JWKS path; the Windows token request ignores `--oidc-skip-tls-verify` (`winhttp_post`).
+- Windows: discovery and the JWKS fetch use the portable HTTP client from handler threads, which the code notes can fail for `https` issuers on Windows. The Windows unit tests cover only a plain-`http` loopback IdP, so test a real `https` sign-in on a Windows server before relying on it; a failure shows as the log lines above.
+- Deferred, tracked: #1900 and #1901 (JWKS refetch limits, key age), #5704 and #1902 (audit reason tokens, and the audit row and counter for a failed start).
 
 ### Browser binding
 
@@ -372,12 +413,14 @@ See the `auth.sso_group_provision` audit action (`docs/user-manual/audit-log.md`
 
 ### Entra ID Setup Checklist
 
+> Microsoft Entra ID is supported by the standard but has not been verified end to end by the project. Verify with the manual procedure above before relying on it.
+
 1. Register an application in Entra ID (Azure Portal > App registrations).
 2. Set the redirect URI to `https://yuzu.example.com:8443/auth/callback` (type: Web).
 3. Create a client secret under Certificates & secrets.
 4. Under Token configuration, add the `groups` optional claim to the ID token.
 5. Grant `openid`, `profile`, and `email` API permissions.
-6. Pass the tenant-specific issuer URL, client ID, secret, and admin group ID to the Yuzu server flags (`--oidc-issuer`, `--oidc-client-id`, `--oidc-client-secret`, `--oidc-admin-group`).
+6. Pass the tenant-ID issuer URL (`https://login.microsoftonline.com/<tenant-guid>/v2.0`), client ID, secret, and admin group ID to the Yuzu server flags (`--oidc-issuer`, `--oidc-client-id`, `--oidc-client-secret`, `--oidc-admin-group`).
 
 ## SAML 2.0 SSO
 

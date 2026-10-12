@@ -69,13 +69,13 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--cert-reload-interval` | `60` | Certificate reload polling interval in seconds. Minimum effective interval is 10 seconds. Env: `YUZU_CERT_RELOAD_INTERVAL`. |
 | `--metrics-no-auth` | off | Allow unauthenticated `/metrics` access from any IP. By default, remote clients must authenticate; localhost access is always unauthenticated. **Warning:** enabling this exposes fleet composition data (OS, architecture, version counts) — and, when the cohort metrics export is enabled, **operator tag values** as `cohort` labels — to any network client. See [Metrics Security](metrics.md#security-considerations). Env: `YUZU_METRICS_NO_AUTH`. |
 | `--csp-extra-sources` | *(none)* | Extra Content-Security-Policy source-list entries appended to `script-src`, `style-src`, `connect-src`, and `img-src`. Space-separated string of host/scheme expressions or whitelisted CSP keywords (`'self'`, `'none'`, `'sha256-...'`, `'sha384-...'`, `'sha512-...'`, `'nonce-...'`). The server **refuses to start** if the value contains control bytes, semicolons, commas, or unsafe CSP keywords like `'unsafe-eval'`. Use to whitelist customer CDNs, monitoring beacons, or analytics endpoints. See [HTTP Security Response Headers](security-hardening.md#http-security-response-headers). Env: `YUZU_CSP_EXTRA_SOURCES`. |
-| `--oidc-issuer` | *(none)* | OIDC identity provider issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`). Env: `YUZU_OIDC_ISSUER`. |
+| `--oidc-issuer` | *(none)* | OIDC identity provider issuer URL, exactly as the discovery document states it in `issuer` (e.g., Entra ID: `https://login.microsoftonline.com/<tenant-guid>/v2.0`). Env: `YUZU_OIDC_ISSUER`. |
 | `--oidc-client-id` | *(none)* | OIDC application (client) ID. Env: `YUZU_OIDC_CLIENT_ID`. |
 | `--oidc-client-secret` | *(none)* | OIDC client secret. Env: `YUZU_OIDC_CLIENT_SECRET`. |
 | `--oidc-client-secret-file` | *(none)* | Read the OIDC client secret from this file instead of `--oidc-client-secret`, keeping it off the command line. Same rules as `--postgres-dsn-file`; cannot be combined with `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET`. Env: `YUZU_OIDC_CLIENT_SECRET_FILE`. |
-| `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, auto-computed from the web address and port. Must match the registered redirect in your identity provider. Env: `YUZU_OIDC_REDIRECT_URI`. |
-| `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. Env: `YUZU_OIDC_ADMIN_GROUP`. (Value is trimmed automatically, same as `--saml-admin-group` — #1830.) |
-| `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
+| `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, it defaults to a localhost URL derived from the listen port (`http(s)://localhost:<port>/auth/callback`); set it explicitly for any real IdP. Must match the registered redirect in your identity provider. Env: `YUZU_OIDC_REDIRECT_URI`. |
+| `--oidc-admin-group` | *(none)* | The value of the entry in the token's `groups` claim that maps to the admin role (the group object ID for Entra ID; the group name for Keycloak with Full group path off). Users in this group are granted admin access on OIDC login. Env: `YUZU_OIDC_ADMIN_GROUP`. (Value is trimmed automatically, same as `--saml-admin-group` — #1830.) |
+| `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC discovery, JWKS and (Linux/macOS) token requests; the Windows token request ignores it. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
 | `--oidc-scim-link-claim` | `sub` | ADR-2001 (SCIM↔OIDC identity linkage, CC6.8). Which validated ID-token claim is compared against a SCIM resource's `externalId` to form the durable link a SCIM deprovision revokes API/MCP tokens across. Only `sub` and `oid` are accepted — the server **refuses to start** on any other value. Okta: leave as the default `sub`. Microsoft Entra ID: set `oid` — Entra's SCIM `externalId` rides the ID token as the `oid` claim, not `sub`. See `docs/user-manual/scim-provisioning.md` "SCIM ↔ OIDC identity linkage". Env: `YUZU_OIDC_SCIM_LINK_CLAIM`. |
 | `--saml-idp-entity-id` | *(none)* | **SAML 2.0 SP.** Entity ID URI of the IdP (must match what the IdP uses in its assertions). Required and validated at startup — omitting it (along with the other four `--saml-*` flags) leaves SAML disabled. Env: `YUZU_SAML_IDP_ENTITY_ID`. |
 | `--saml-idp-sso-url` | *(none)* | **SAML 2.0 SP.** IdP's HTTP-Redirect SSO endpoint URL. Env: `YUZU_SAML_IDP_SSO_URL`. |
@@ -3992,7 +3992,7 @@ Tag compliance data is also available via the REST API (`GET /api/v1/tag-complia
 
 ## OIDC SSO Configuration
 
-Yuzu supports OpenID Connect (OIDC) for single sign-on with external identity providers such as Microsoft Entra ID (Azure AD), Okta, or any OIDC-compliant provider.
+Yuzu supports OpenID Connect (OIDC) for single sign-on with an external identity provider that serves OpenID Connect Discovery. Verified end to end against Keycloak 26.4.0. Microsoft Entra ID is supported by the standard (endpoints and keys come from its discovery document) but has not been verified end to end by the project; see [Authentication](authentication.md#manual-verification-against-a-real-idp) for the manual procedure and the sign-in troubleshooting log lines.
 
 ### Configuration
 
@@ -4000,12 +4000,12 @@ OIDC can be configured via CLI flags at startup or through the Settings page:
 
 | Parameter | CLI Flag | Description |
 |---|---|---|
-| Issuer URL | `--oidc-issuer` | The OIDC discovery endpoint base URL. |
+| Issuer URL | `--oidc-issuer` | The issuer base URL. It must equal the `issuer` in the document at `{issuer}/.well-known/openid-configuration` and the tokens' `iss` byte for byte, including any trailing slash. The server fetches that document (and the JWKS) itself on the first sign-in. |
 | Client ID | `--oidc-client-id` | Application (client) ID from your identity provider. |
 | Client Secret | `--oidc-client-secret` | Client secret for the confidential client flow. |
-| Redirect URI | `--oidc-redirect-uri` | Callback URL registered with the identity provider. Must point to the Yuzu server's `/auth/callback` path. |
-| Admin Group | `--oidc-admin-group` | Entra ID group object ID that maps to the admin role. |
-| Skip TLS Verify | `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only). Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
+| Redirect URI | `--oidc-redirect-uri` | Callback URL registered with the identity provider. Must point to the Yuzu server's `/auth/callback` path. When omitted it defaults to a localhost URL derived from the listen port; set it explicitly for any real IdP. |
+| Admin Group | `--oidc-admin-group` | The value of the entry in the token's `groups` claim that maps to the admin role (the group object ID for Entra ID; the group name for Keycloak with Full group path off). |
+| Skip TLS Verify | `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC discovery, JWKS and (Linux/macOS) token requests (insecure, dev only); the Windows token request ignores it. Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
 | Link Claim | `--oidc-scim-link-claim` | ADR-2001 (SCIM↔OIDC identity linkage, CC6.8) — which validated ID-token claim (`sub` default, or `oid` for Entra) links a SCIM slug to its OIDC login identity so a SCIM deprovision can also revoke that identity's API/MCP tokens. **Not a Settings-page form field** — this page saves the OIDC config CLI/env already set for this value unchanged rather than resetting it to the struct default. See [SCIM ↔ OIDC identity linkage](scim-provisioning.md#scim--oidc-identity-linkage-federated-token-revocation). Env: `YUZU_OIDC_SCIM_LINK_CLAIM`. |
 
 ### Identity Provider Setup
@@ -4979,7 +4979,7 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 |---|---|---|
 | `GET` | `/fragments/settings/directory` | Render the OIDC/Directory configuration fragment (HTMX). |
 | `POST` | `/api/settings/oidc` | Save OIDC/Entra ID configuration (form-encoded). Persisted to runtime config. |
-| `POST` | `/api/settings/oidc/test` | Test OIDC discovery endpoint connectivity. |
+| `POST` | `/api/settings/oidc/test` | Test OIDC discovery for the form's issuer: fetches and validates the discovery document, then fetches the `jwks_uri` and counts the signing keys. It does not exercise the token endpoint, client secret, redirect URI, audience or group claims. |
 
 ### Users
 
