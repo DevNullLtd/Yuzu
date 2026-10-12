@@ -33,7 +33,7 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
     // null so the result reports it as Skipped. The lambdas bind the raw store
     // pointer by value (non-owning) and RETURN delete_agent's commit status
     // (true iff the delete committed). InventoryStore takes `const
-    // std::string&`; the four sibling PG stores take `std::string_view` — the
+    // std::string&`; the PG stores take `std::string_view` — the
     // adapter unifies them under one `bool(std::string_view)` deleter
     // signature.
     using Fn = std::function<bool(std::string_view)>;

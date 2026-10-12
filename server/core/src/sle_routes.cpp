@@ -249,7 +249,8 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
             // ONE scoped gate for the cascade's whole blast radius (ADR-0024
             // Decision 9, amended Wave 7 PR7.2). Keep this in lockstep with
             // AgentDecommissionStores (the drift guard in test_agent_decommission.cpp
-            // fails if a store is added without bumping kCascadeStoreCount).
+            // pins the COUNT of registered targets via kCascadeStoreCount; it does
+            // not verify that every member is wired).
             if (!scoped_perm_fn_(req, res, "Decommission", "Delete", agent_id))
                 return; // the gate wrote its own 401/403
             if (!decommission_fn_) {
