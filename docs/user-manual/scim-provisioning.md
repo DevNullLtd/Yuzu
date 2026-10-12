@@ -426,7 +426,9 @@ deactivated, and a retry of that request is not promised to repeat the wipe
 local admin account, the Group request still succeeds, the account keeps its
 role, the refusal is audited the same way and raises a critical analytics
 event (the IdP removed the person from the admin group and they keep admin: an
-operator has to act). A late refusal is audited with `result=partial` (the
+operator has to act). The audit action `scim.user.last_administrator_refused`
+and the counter are the signals that always fire; the critical analytics event
+is a no-op under `--no-analytics`. A late refusal is audited with `result=partial` (the
 credentials were revoked); an early refusal and a refused demotion are
 `denied`.
 
@@ -462,6 +464,14 @@ dropped silently:
   `recompute=incomplete`. The Group request keeps its status (its membership
   write committed) and the member may keep the role.
 
+To replace the ONLY administrator through the admin group, add the new
+administrator in one Group change and remove the old one in a second. A single
+change that does both demotes the old administrator first (removed members are
+recomputed first): the guard refuses, because the new administrator is not yet an
+administrator and no other exists. The old administrator keeps the role, the new
+one is promoted afterwards, the request says `recompute=incomplete`, and the old
+administrator has to be demoted by hand (see the remedy below).
+
 **Known limits of the Group role recompute.** These are real gaps, tracked in
 #5673. Until then they are documented rather than engineered
 around:
@@ -485,7 +495,8 @@ around:
    administrator account has to exist first and the call has to be made as that
    second administrator; see [`rbac.md`](rbac.md), "If the guard refuses an
    action you intend", for the steps and for the break-glass exit when no
-   administrator session can pass step-up. A later
+   administrator session can pass step-up (promote and arm the break-glass
+   account first, and revert it afterwards). A later
    change that names the user through another group they belong to also
    re-derives their role. A skipped **promotion** is the exception: a re-send
    of a `PUT` or `PATCH` retries it while the member is in the group, but a
@@ -544,7 +555,10 @@ around:
    until the role is corrected.
 6. `POST /Users` re-provisioning recomputes the one user but ignores an
    incomplete result. An undetermined result on that revive path leaves only a
-   log line: no audit row and no counter.
+   log line: no audit row and no counter. The other revive paths (`PATCH` and
+   `PUT` with `active:true`) do not recompute the group role at all, so an
+   inactive member added to the admin group stays `user` until the next Group
+   change (this predates the last-Administrator guard).
 7. A deactivation whose SCIM mirror write failed is not retried to convergence.
    The auth account is already deactivated, the request answers `500`, the SCIM
    resource still reads `active=true`, and the IdP's retry answers `404` (the
@@ -557,6 +571,15 @@ around:
    warning): it fires, and stays firing while the retries continue. There is no hand
    remedy today (no route and no SQL statement is documented for it) until #5214
    and #5673 land.
+
+**Pilot playbook.** No alert rule ships for the SCIM Group role recompute or for the
+last-Administrator refusals yet (tracked in #5673). Until it does, key your SIEM or log
+pipeline on these three audit actions, each of which means an operator has to look at an
+account: `scim.user.last_administrator_refused` (a person the IdP removed keeps
+administrator access, or a deprovision was refused), `scim.user.compensation_failed` (a
+half-finished create was not undone) and `scim.group.recompute_incomplete` (a Group
+change did not reach every member as intended). They are written whether or not
+`--no-analytics` is set.
 
 See
 [`rbac.md`](rbac.md#last-administrator-guard-for-account-deactivation-and-demotion).

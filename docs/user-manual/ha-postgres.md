@@ -8,6 +8,10 @@ Postgres** profile, which removes that single point of failure with automatic fa
 > HA-Postgres is the **storage** availability axis. It is independent of server-tier HA (running
 > multiple server replicas). You can run either without the other. See ADR-2002 for the whole
 > picture.
+>
+> SCIM Group mutations are serialized within one server process; when more than one server
+> replica runs, send SCIM provisioning traffic to a single replica (see
+> [`scim-provisioning.md`](scim-provisioning.md), Known limits).
 
 > ⚠️ **Before any customer-facing use, read [Production requirements](#production-requirements-read-before-deploying).**
 > The shipped Compose profile runs a **single etcd** and a **single HAProxy** — both single points of

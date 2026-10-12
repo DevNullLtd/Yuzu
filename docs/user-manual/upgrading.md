@@ -38,6 +38,7 @@ and the new counters are listed in the changelog entry and in `docs/user-manual/
 
 **What to do.**
 
+- **Check before you upgrade or demote anyone.** `SELECT count(*) FROM auth.users WHERE role='admin' AND is_active;` should return at least 2, so no ordinary operation has to be refused.
 - **Drain old replicas first.** A replica running an older build does not enforce the rule, so during a
   rolling upgrade drain the old replicas before relying on it. There is no schema change.
 - **A rollback to an older binary silently drops the guard.** Nothing in the database remembers it: the
