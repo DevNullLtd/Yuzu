@@ -39,6 +39,7 @@
 #include "agent_service_impl.hpp"
 #include "audit_store.hpp"
 #include "event_bus.hpp"
+#include "fleet_topology_store.hpp"
 #include "gateway_route_store.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "offline_endpoint_store.hpp"
@@ -2998,7 +2999,7 @@ TEST_CASE("WS-5 BatchHeartbeat: a non-owning replica threads the directory-resol
     auto resp = batch_hb(other.svc, {sid});
     CHECK(resp.acknowledged_count() == 1);
     // The presence row exists (this replica has no local session) and carries
-    // the resolved session id, so the session-guarded delete matches it.
+    // the resolved session id, so the session-guarded clear matches it.
     CHECK(offline_row_present(offline, agent));
     CHECK(offline.remove_if_session(agent, sid));
 }
@@ -3662,16 +3663,6 @@ TEST_CASE("WS-5 BatchHeartbeat: a non-owning replica keeps the last-known hostna
 
 // ── #5678: DISCONNECTED drives the shared presence-clear helper ─────────────
 
-namespace {
-
-std::int64_t wall_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-} // namespace
-
 TEST_CASE("NotifyStreamStatus DISCONNECTED for the CURRENT session clears presence but keeps the "
           "endpoint row (#5678)",
           "[pg][gateway_route_wiring][presence]") {
@@ -3691,6 +3682,11 @@ TEST_CASE("NotifyStreamStatus DISCONNECTED for the CURRENT session clears presen
     yuzu::server::HeartbeatIngestion hi{registry, nullptr, nullptr, &metrics, &offline_store};
     gateway_svc.set_gateway_route_store(&route_store);
     gateway_svc.set_heartbeat_ingestion(&hi);
+    // #5678 gateway evict_pushed parity: a real store so the evict is observable.
+    yuzu::server::FleetTopologyStore topo{[](std::chrono::milliseconds) {
+        return std::vector<yuzu::server::RawAgentSnapshot>{};
+    }};
+    gateway_svc.set_fleet_topology_store(&topo);
 
     auto req = make_gw_register(auth_mgr, "agent-presence-1");
     apb::RegisterResponse resp;
@@ -3706,10 +3702,19 @@ TEST_CASE("NotifyStreamStatus DISCONNECTED for the CURRENT session clears presen
     REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &conn, &conn_ack).ok());
     REQUIRE(conn_ack.acknowledged());
 
-    const auto t = wall_ms();
+    const auto t = now_ms();
     REQUIRE(offline_store.upsert("agent-presence-1", "host-presence", "linux", t, 0, "1.0.0",
                                  "x86_64", session));
     REQUIRE(live_present(offline_store, "agent-presence-1"));
+    {
+        yuzu::server::RawAgentSnapshot snap;
+        snap.agent_id = "agent-presence-1";
+        snap.hostname = "host-presence";
+        snap.os = "linux";
+        snap.local_ips = {"10.5.0.1"};
+        topo.push_snapshot(std::move(snap));
+    }
+    REQUIRE(topo.pushed_map_size() == 1);
 
     gw::StreamStatusNotification disc;
     disc.set_agent_id("agent-presence-1");
@@ -3721,6 +3726,8 @@ TEST_CASE("NotifyStreamStatus DISCONNECTED for the CURRENT session clears presen
     REQUIRE(disc_ack.acknowledged());
 
     CHECK_FALSE(live_present(offline_store, "agent-presence-1"));
+    // The CURRENT-session DISCONNECTED also evicts the pushed viz snapshot.
+    CHECK(topo.pushed_map_size() == 0);
     const auto roster = offline_store.query_stale_within(std::chrono::hours(1));
     const yuzu::server::OfflineEndpoint* row = nullptr;
     for (const auto& e : roster)
@@ -3750,6 +3757,11 @@ TEST_CASE("NotifyStreamStatus: a STALE DISCONNECTED (superseded session) leaves 
     yuzu::server::HeartbeatIngestion hi{registry, nullptr, nullptr, &metrics, &offline_store};
     gateway_svc.set_gateway_route_store(&route_store);
     gateway_svc.set_heartbeat_ingestion(&hi);
+    // #5678 gateway evict_pushed parity: a real store so the evict is observable.
+    yuzu::server::FleetTopologyStore topo{[](std::chrono::milliseconds) {
+        return std::vector<yuzu::server::RawAgentSnapshot>{};
+    }};
+    gateway_svc.set_fleet_topology_store(&topo);
 
     auto req1 = make_gw_register(auth_mgr, "agent-presence-2");
     apb::RegisterResponse resp1;
@@ -3769,8 +3781,17 @@ TEST_CASE("NotifyStreamStatus: a STALE DISCONNECTED (superseded session) leaves 
     gw::StreamStatusAck conn_ack;
     REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &conn, &conn_ack).ok());
 
-    REQUIRE(offline_store.upsert("agent-presence-2", "h", "linux", wall_ms(), 0, "", "", session2));
+    REQUIRE(offline_store.upsert("agent-presence-2", "h", "linux", now_ms(), 0, "", "", session2));
     REQUIRE(live_present(offline_store, "agent-presence-2"));
+    {
+        yuzu::server::RawAgentSnapshot snap;
+        snap.agent_id = "agent-presence-2";
+        snap.hostname = "h";
+        snap.os = "linux";
+        snap.local_ips = {"10.5.0.2"};
+        topo.push_snapshot(std::move(snap));
+    }
+    REQUIRE(topo.pushed_map_size() == 1);
 
     gw::StreamStatusNotification stale;
     stale.set_agent_id("agent-presence-2");
@@ -3782,5 +3803,7 @@ TEST_CASE("NotifyStreamStatus: a STALE DISCONNECTED (superseded session) leaves 
     // removed_current_session was false: presence untouched, and the stored
     // session_id is still session2 (a clear with session2 would now succeed).
     CHECK(live_present(offline_store, "agent-presence-2"));
+    // A stale DISCONNECTED must not evict a live re-registered agent's pushed slot.
+    CHECK(topo.pushed_map_size() == 1);
     CHECK(offline_store.remove_if_session("agent-presence-2", session2));
 }

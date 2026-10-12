@@ -1898,7 +1898,7 @@ is counted under route-store failure op `session_lookup`.
   directory verified at `ProxyRegister`, which is sound only for a single replica; see "Deferred, not
   silent"); otherwise it is refused and counted
   `notify_stream_status/connected_unverified`. DISCONNECTED proceeds on the local-map check when the
-  directory read fails (it is a teardown, not an admission), and its presence-row delete is gated on
+  directory read fails (it is a teardown, not an admission), and its presence-row delete (#5678: now a session clear; the row is kept for the roster) is gated on
   `removed_current_session || store_removed`. A CONNECTED on a replica with a directory row but no
   local `AgentSession` skips the registry `set_gateway_route`/unpublish (nothing local to update) and
   still announces.

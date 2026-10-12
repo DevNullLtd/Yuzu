@@ -324,14 +324,6 @@ TEST_CASE("OfflineEndpointStore HA WS-5 presence", "[pg][offline]") {
     }
 }
 
-// #5678 / #1545 UP-4: pure prune constants. No PG, no timing.
-TEST_CASE("OfflineEndpointStore prune margin and cap", "[offline][prune-spec]") {
-    using std::chrono::hours;
-    CHECK(OfflineEndpointStore::kPruneMargin == hours(24 * 7));
-    // A zero cap would turn every prune pass into a silent no-op.
-    CHECK(OfflineEndpointStore::kPruneCapPerPass > 0);
-}
-
 TEST_CASE("OfflineEndpointStore run_retention_prune deletes only rows past roster+margin",
           "[pg][offline][retention-guard]") {
     YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);

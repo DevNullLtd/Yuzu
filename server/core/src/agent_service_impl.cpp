@@ -1538,7 +1538,10 @@ grpc::Status AgentServiceImpl::Subscribe(
     // disconnect paths share — it carries the removed_current_session gate
     // and its false-negative rationale (a stale disconnect must not touch a
     // live agent's row).
-    mirror_departure_to_presence(removed_current_session, heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr, agent_id, session_id);
+    mirror_departure_to_presence(
+        removed_current_session,
+        heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr, agent_id,
+        session_id);
     // PR 10 hardening — evict pushed-snapshot slot too (sec-M4 / UP-5).
     // Without this, deregistered agents render as ghost cubes
     // indefinitely from the cached last-known-good snapshot.

@@ -16164,7 +16164,10 @@ private:
                 // health_recompute_thread_: the health tick's serial budget is shared
                 // with the revocation sweep, and this thread already hosts the two
                 // WS-10 prunes and nothing security-sensitive. ReplicaSafe — no
-                // leader_gate call. 30 d = the literal build_hw_roster reads with.
+                // leader_gate call. 30 d = the literal build_hw_roster reads with; the
+                // prune cutoff is that window + kPruneMargin, so widening any roster read
+                // past it must widen this too. Swap to kHardwareRosterWindow
+                // (hardware_list_model.hpp, #5717) once it lands.
                 if (offline_endpoint_store_ &&
                     tick % kOfflineEndpointPruneEveryNTicks == 0) {
                     try {

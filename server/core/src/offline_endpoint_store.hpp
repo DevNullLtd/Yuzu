@@ -117,6 +117,7 @@ public:
     static constexpr std::chrono::hours kPruneMargin{24 * 7};
     /// Per-replica, per-pass delete cap (must stay > 0 or every pass is a no-op).
     static constexpr int kPruneCapPerPass = 1000;
+    static_assert(kPruneCapPerPass > 0, "a zero cap makes every prune pass a silent no-op");
 
     /// Borrows the shared pool and runs the `endpoint_state` schema migration
     /// on a pinned lease. `is_open()` is false if the lease was empty or the
@@ -216,7 +217,11 @@ public:
     /// from pre-WS-5 behaviour. Returns true when the current session was
     /// cleared. Best-effort like `upsert()`: a failure just means the agent is
     /// counted present until last_seen_at ages past the TTL, which is always
-    /// safe (over-inclusion never grants dispatch authority).
+    /// safe (over-inclusion never grants dispatch authority). Residual: an
+    /// in-flight heartbeat that resolved the OLD session before the disconnect
+    /// but upserts after the clear re-sets `session_id`, so the agent reads
+    /// present again until last_seen_at ages past the TTL — same as the old
+    /// DELETE + reinsert, bounded by the TTL, and grants no dispatch authority.
     bool remove_if_session(std::string_view agent_id, std::string_view session_id);
 
     /// #5678 / #1545 UP-4: clock-guarded, capped delete of rows unseen for

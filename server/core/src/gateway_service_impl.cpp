@@ -2374,7 +2374,10 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // matching) — an ungated clear could drop a LIVE agent from presence on a
         // reconnect. A non-owning replica removes no local session, so the
         // directory result is its only proof.
-        mirror_departure_to_presence(removed_current_session || store_removed, heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr, agent_id, session_id);
+        mirror_departure_to_presence(
+            removed_current_session || store_removed,
+            heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr,
+            agent_id, session_id);
         {
             std::lock_guard lock(sessions_mu_);
             gateway_sessions_.erase(session_id);
