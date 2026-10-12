@@ -2675,11 +2675,17 @@ std::string DashboardRoutes::render_results(
         // the unscoped facet count/ids on submit.
         if (!filters.empty() && total_agent_count > 0 && !scope) {
             // Build filter params for the create-group-form URL
+            // Name each param from the PLUGIN's columns, the list parse_filters and
+            // render_create_group_form use. `col_names` is the definition-resolved display
+            // list and can name the same index differently (installed_apps: Key/Value vs the
+            // definition's columns): the form then parsed no filters, said "0 agents will be
+            // added" and its submit answered 422 with nothing shown (#5623).
+            const auto& filter_cols = columns_for_plugin(plugin);
             std::string filter_params;
             for (const auto& f : filters) {
-                if (f.col_idx >= 0 && f.col_idx + 1 < static_cast<int>(col_names.size())) {
+                if (f.col_idx >= 0 && f.col_idx + 1 < static_cast<int>(filter_cols.size())) {
                     std::string pname = "f_";
-                    for (char c : col_names[f.col_idx + 1]) {
+                    for (char c : filter_cols[f.col_idx + 1]) {
                         if (c == ' ' || c == '-') pname += '_';
                         else pname += static_cast<char>(std::tolower(c));
                     }

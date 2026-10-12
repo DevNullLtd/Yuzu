@@ -4,3 +4,4 @@
   - The sort headers and Prev/Next buttons use the filter values currently shown instead of those of the last render.
   - An open Create Static Group form is now closed by every results response, so it can no longer create a group from filters that are no longer on screen.
   - The chart-deck refresh after a command is now started by the filter bar and carries its filter values, so it can no longer overwrite the pager, summary and Create Group button of a filtered view with unfiltered ones. It needs the filter bar to load, so an operator whose only grant is scoped to a management group does not get the chart deck, pager and summary yet (#5688).
+  - Create Group from a result set of a definition whose columns are named differently from the plugin's now carries the filters on screen, instead of opening a form with no filters, "0 agents will be added" and a submit that answered 422 with nothing shown.

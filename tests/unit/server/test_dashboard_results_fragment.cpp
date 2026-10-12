@@ -1292,6 +1292,54 @@ TEST_CASE("/fragments/results: sort headers and Prev/Next include the live filte
     CHECK_FALSE(contains(cg_tag, "hx-include"));
 }
 
+// The Create Group button names its filter params from the plugin's columns (the list
+// parse_filters and the create-group form use), not from the definition-resolved display list. A
+// definition whose columns are named differently from the plugin's used to produce a button URL
+// the form could not parse: no filters, "0 agents will be added", and a submit that answered 422.
+TEST_CASE("/fragments/results: the Create Group button names filters by the plugin's columns, "
+          "not the definition's",
+          "[pg][server][dashboard][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, fragment_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+
+    StoredResponse r;
+    r.instruction_id = "cmd-cg-names";
+    r.agent_id = "agent-a";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.plugin = "registry";
+    r.output = "same\n";
+    rs.store(r);
+    // "Zeta" is not a column of the registry plugin, so the display list names index 0 "Zeta"
+    // while the filter parameter the page was requested with is the plugin's f_output.
+    const auto def_id = make_multi_filter_definition(is, "tpl-cg-names", {"Zeta"}, {});
+
+    FragmentResultsHarness h(&rs, &is);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    auto page = h.get("/fragments/results?command_id=cmd-cg-names&plugin=registry"
+                      "&definition_id=" + def_id + "&f_output=same");
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+    const auto cg = page->body.find("class=\"btn-create-group\"");
+    REQUIRE(cg != std::string::npos);
+    const auto cg_open = page->body.rfind('<', cg);
+    const auto cg_close = page->body.find('>', cg);
+    const std::string cg_tag = page->body.substr(cg_open, cg_close - cg_open + 1);
+    INFO(cg_tag);
+    CHECK(contains(cg_tag, "&amp;f_output=same"));
+    CHECK_FALSE(contains(cg_tag, "f_zeta"));
+}
+
 // -- #5623 (governance G8-3): a dispatch aborts any in-flight results request --------------------
 // The dispatch response replaces #filter-bar with a fresh element, discarding the hx-sync
 // registry attached to the OLD form / thead / pager. A /fragments/results request in flight at
