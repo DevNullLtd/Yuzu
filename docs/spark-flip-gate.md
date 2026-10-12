@@ -1560,8 +1560,8 @@ flip, with a red-first test each:
     `[5459fu11]`, `[5459valve]`, `[5459kv]`, on fake mechanisms. TSan and ASan/UBSan ran clean
     on the final test code (Linux debug; `[4415prA]` under TSan 8 runs per case, `[guardian]` and
     `[spark]` once). A first TSan re-run found a test-exit race (a detached worker committing after
-    the case ended); the test Rig now waits for the worker count to reach zero. Windows and macOS
-    are not built.
+    the case ended); the test Rig now waits for the worker count to reach zero. Windows (MSVC, weecolin) built and ran
+    `[4415prA]` 64/64, `[guardian]` and `[spark]` all green at `490c773fa`; macOS is not built.
     **Flip preconditions beside AC-18** (none is done): (a) enable the `yuzu-fleet-spark`
     `armed_faulted > 0` alert (its group in `docs/prometheus/yuzu-alerts.yml` is commented out);
     (b) a bounded per-rule rebuild-reason INFO log and, optionally, a skip counter (the
