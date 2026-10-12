@@ -170,8 +170,10 @@ public:
     /// or SHA-256 fails, or if the authorization endpoint cannot be discovered
     /// (`kDiscoveryUnavailable`; there is NO fallback to a derived URL); nothing is stored in
     /// either case.
-    /// @param request_redirect_uri If non-empty, overrides the configured redirect_uri
-    ///        (derived from the request Host header for multi-origin support).
+    /// @param request_redirect_uri If non-empty, overrides the configured redirect_uri. The
+    ///        production route passes the configured value (`cfg_.oidc_redirect_uri`) and never
+    ///        derives one from the request Host header; when the operator sets none, startup
+    ///        fills a `http(s)://localhost:<port>/auth/callback` default (main.cpp).
     AuthFlowStart start_auth_flow(const std::string& request_redirect_uri = {});
 
     /// Exchange authorization code for tokens, validate ID token, return claims.
@@ -252,10 +254,13 @@ public:
     /// Fetch `{issuer}/.well-known/openid-configuration` (one trailing slash on `issuer` is
     /// tolerated) and validate it: `issuer` must equal the argument byte for byte (OIDC Discovery
     /// 4.3, the mix-up defense); all three endpoints must be present (even the ones the current
-    /// caller does not need), absolute, free of control characters, at most 2048 bytes, with a
-    /// well-formed `host[:port]` authority (no userinfo, a port of at most 65535), and carry the
+    /// caller does not need), absolute, free of spaces, control characters and the Unicode line
+    /// breaks NEL/U+2028/U+2029, at most 2048 bytes, with a well-formed `host[:port]` authority
+    /// (no userinfo, a port of 1..65535, a bracketed IPv6 host of hex digits and ':' only), and
+    /// carry the
     /// ISSUER'S scheme (an https issuer can never be downgraded to http endpoints). An issuer
-    /// longer than 2048 bytes is refused before any request. No host restriction: Google serves
+    /// longer than 2048 bytes, or holding a space, control character or Unicode line break, is
+    /// refused before any request. No host restriction: Google serves
     /// jwks_uri from another host. The error text is for the operator-facing Test Connection and
     /// the log, not for the login answer; IdP-controlled text in it is neutralized for the log.
     /// Shared by the login path (ensure_discovered) and Test Connection so the button validates
@@ -269,12 +274,15 @@ public:
     [[nodiscard]] static std::expected<DiscoveryDocument, std::string>
     parse_discovery_document(const std::string& body, const std::string& issuer);
 
-    /// The one bounded GET used for discovery, the JWKS and Test Connection: 5 s (default)
-    /// connect/read/write PER OPERATION, plus a TOTAL wall-clock bound of twice that (10 s by
-    /// default) so a server that trickles bytes just inside the per-operation timeouts cannot
-    /// hold the caller indefinitely; a 256 KiB body cap, redirects NOT followed (a 3xx is a
-    /// failure), TLS verification honored. The URL's authority must be a well-formed
-    /// `host[:port]` (see `fetch_discovery_document`). Returns the body of a 200 response.
+    /// The one bounded GET used for discovery, the JWKS and Test Connection. `timeout_ms`
+    /// (5 s by default) is the connect/read/write timeout PER OPERATION. The whole request is
+    /// also bounded at TWICE that (10 s by default), measured from the start of the request and
+    /// covering the connect and the response; on Linux/macOS a deadline watchdog extends the same
+    /// bound to the TLS handshake, which httplib's own total bound does not cover (a server that
+    /// drips handshake bytes would otherwise hold the call). On Windows the handshake phase has
+    /// no total bound. A 256 KiB body cap, redirects NOT followed (a 3xx is a failure), TLS
+    /// verification honored. The URL's authority must be a well-formed `host[:port]` (see
+    /// `fetch_discovery_document`). Returns the body of a 200 response.
     [[nodiscard]] static std::expected<std::string, std::string>
     http_get_bounded(const std::string& url, bool skip_tls_verify, int timeout_ms = 5000);
 
@@ -295,12 +303,15 @@ private:
     /// `kDiscoveryUnavailable` (it neither waits for the fetch nor starts a second one, and it
     /// does not start the 30 s window; the next call after the fetch finishes sees the result).
     /// A failed attempt is remembered for 30 s so a dead IdP is not hammered. Validate-only
-    /// providers (empty redirect_uri) never fetch. Fails CLOSED with `kDiscoveryUnavailable`;
-    /// there is no fallback to derived endpoints. Nothing reads the config_ endpoint fields except
-    /// through here. Lock order: `discovery_mu_` is never taken while holding `mu_` or
-    /// `jwks_mu_` and is never held across network I/O. Future order, if the JWKS fetch is ever
-    /// made single-flight under its own mutex (#1900): that fetch mutex first, then
-    /// `discovery_mu_`.
+    /// providers (empty redirect_uri) never fetch. The in-flight mark is cleared by an RAII guard
+    /// on every exit (including an exception unwinding out of the fetch or its logging), in the
+    /// same critical section that stores the result. A configured endpoint holding a space,
+    /// control character or Unicode line break is refused like a discovered one. Fails CLOSED with
+    /// `kDiscoveryUnavailable`; there is no fallback to derived endpoints. Nothing reads the
+    /// config_ endpoint fields except through here. Lock order: `discovery_mu_` is never taken
+    /// while holding `mu_` or `jwks_mu_` and is never held across network I/O. Future order, if the
+    /// JWKS fetch is ever made single-flight under its own mutex (#1900): that fetch mutex first,
+    /// then `discovery_mu_`.
     std::expected<std::string, std::string> ensure_discovered(Need need);
 
     static std::string url_encode(const std::string& value);

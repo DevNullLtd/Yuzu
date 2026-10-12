@@ -9,14 +9,24 @@
 #include <yuzu/log_token.hpp>
 
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <utility>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 // OpenSSL is an unconditional server dependency on every platform (vcpkg.json;
 // server/core/meson.build). RSA JWKS parsing and JWT signature verification use
@@ -661,9 +671,12 @@ namespace {
 constexpr std::size_t kMaxIdpUrlBytes = 2048;
 
 // A well-formed `host[:port]` or `[ipv6][:port]` authority: no userinfo, no backslash, a host of
-// 1..253 bytes, a port of 1..5 digits and at most 65535. httplib::Client's constructor runs a
+// 1..253 bytes, a port of 1..5 digits in 1..65535. httplib::Client's constructor runs a
 // std::regex over the origin, which overflows the stack on a host of tens of thousands of bytes
-// and throws on a port that does not fit an int, so nothing reaches it without passing this.
+// and throws on a port that does not fit an int, so this keeps such values away from it. The
+// bracketed form takes hexadecimal digits and ':' only, the same class httplib's regex accepts
+// (a dotted IPv4-mapped form such as [::ffff:1.2.3.4] is refused here: httplib would otherwise
+// treat the whole string as a plain-http host name).
 bool authority_well_formed(std::string_view authority) {
     constexpr std::size_t kMaxHostBytes = 253;
     std::string_view host;
@@ -675,7 +688,7 @@ bool authority_well_formed(std::string_view authority) {
             return false;
         host = authority.substr(1, close - 1);
         for (const char c : host)
-            if (!std::isxdigit(static_cast<unsigned char>(c)) && c != ':' && c != '.')
+            if (!std::isxdigit(static_cast<unsigned char>(c)) && c != ':')
                 return false;
         const auto after = authority.substr(close + 1);
         if (!after.empty()) {
@@ -706,7 +719,7 @@ bool authority_well_formed(std::string_view authority) {
                 return false;
             value = value * 10 + static_cast<unsigned>(c - '0');
         }
-        if (value > 65535)
+        if (value == 0 || value > 65535)
             return false;
     }
     return true;
@@ -720,7 +733,9 @@ struct HttpUrl {
 
 // Splits "http(s)://authority[/path][?query][#fragment]" at the FIRST of '/', '?' or '#' after
 // the scheme, so `https://host?x` has the authority `host` and the path "/?x" (never a host of
-// "host?x"). nullopt for anything that is not an http(s) URL with a well-formed authority.
+// "host?x"). A #fragment is never sent (RFC 3986 3.5: it is client-side only), so the path ends
+// at the first '#': `https://host#f` has the path "/" and `https://h/jwks?a=b#x` has
+// "/jwks?a=b". nullopt for anything that is not an http(s) URL with a well-formed authority.
 std::optional<HttpUrl> split_http_url(const std::string& url) {
     std::string_view scheme;
     if (url.starts_with("https://")) {
@@ -737,13 +752,34 @@ std::optional<HttpUrl> split_http_url(const std::string& url) {
         return std::nullopt;
     HttpUrl out;
     out.origin = std::string(scheme) + std::string(authority);
-    if (end == std::string_view::npos)
+    if (end == std::string_view::npos || rest[end] == '#') {
         out.path = "/";
-    else if (rest[end] == '/')
-        out.path = std::string(rest.substr(end));
-    else
-        out.path = "/" + std::string(rest.substr(end));
+        return out;
+    }
+    auto tail = rest.substr(end);
+    tail = tail.substr(0, tail.find('#'));
+    out.path = (tail.front() == '/') ? std::string(tail) : "/" + std::string(tail);
     return out;
+}
+
+// True when `s` holds a byte that could split a request line or a log line: a control byte or
+// space (<= 0x20), DEL, or the UTF-8 form of NEL (U+0085), LINE SEPARATOR (U+2028) or PARAGRAPH
+// SEPARATOR (U+2029), which line-oriented log readers treat as line breaks. The one predicate for
+// every IdP-controlled or configured URL that is sent on the wire or logged.
+bool has_line_splitting_bytes(std::string_view s) {
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        if (c <= 0x20 || c == 0x7f)
+            return true;
+        const auto at = [&](std::size_t k) {
+            return k < s.size() ? static_cast<unsigned char>(s[k]) : 0u;
+        };
+        if (c == 0xC2 && at(i + 1) == 0x85)
+            return true;
+        if (c == 0xE2 && at(i + 1) == 0x80 && (at(i + 2) == 0xA8 || at(i + 2) == 0xA9))
+            return true;
+    }
+    return false;
 }
 
 // Cuts `s` to at most `max` bytes without splitting a UTF-8 sequence.
@@ -987,7 +1023,7 @@ bool OidcProvider::fetch_jwks() {
     }
     auto jwks_uri = ensure_discovered(Need::Jwks);
     if (!jwks_uri) {
-        spdlog::warn("OidcProvider: no jwks_uri available, cannot fetch signing keys");
+        spdlog::warn("OidcProvider: discovery is unavailable, cannot fetch signing keys");
         return false;
     }
 
@@ -1170,15 +1206,103 @@ std::string_view issuer_scheme(std::string_view issuer) {
 
 // An endpoint from the discovery document: absolute, at most 2048 bytes, the issuer's scheme, a
 // well-formed host[:port] authority, and no byte that could split the request line it will be
-// sent in.
+// sent in or the log line it is written to (`has_line_splitting_bytes`).
 bool endpoint_acceptable(const std::string& value, std::string_view scheme) {
     if (value.size() > kMaxIdpUrlBytes || !value.starts_with(scheme))
         return false;
-    for (const unsigned char c : value)
-        if (c <= 0x20 || c == 0x7f)
-            return false;
+    if (has_line_splitting_bytes(value))
+        return false;
     return split_http_url(value).has_value();
 }
+
+// A total-deadline watchdog for ONE httplib request. httplib's `set_max_timeout` is consulted only
+// while it waits to read or write an established stream, so a server that accepts the TCP
+// connection and then drips TLS handshake bytes (each inside the per-operation timeout) holds
+// `Client::Get` for as long as it likes: the handshake restarts a fresh per-timeout wait on every
+// step, and `Client::stop()` is a no-op until the socket is in flight. On POSIX this closes that:
+// httplib's socket-options callback hands the new socket to `adopt` BEFORE `connect()` (once per
+// candidate address); `adopt` keeps a dup() of it, and when the budget (measured from this
+// object's construction) runs out the watchdog thread calls shutdown(SHUT_RD) on the dup. That
+// acts on the socket itself, so a blocked connect, handshake read or response read returns at
+// once (end of stream) and `Get` fails. SHUT_RD and not SHUT_RDWR on purpose: shutting the write
+// side would turn the client's next write (OpenSSL writes with write(), not send()) into
+// SIGPIPE, which kills a process that has not ignored it. The dup is what makes this race-free:
+// httplib may close the number it holds and the kernel may reuse it, but our own descriptor keeps
+// the socket's identity until the destructor closes it. Every use of the dup happens under `mu_`.
+// The destructor wakes the thread (condition variable, no polling), joins it, then closes the dup,
+// so nothing outlives the request. If dup() fails (descriptor exhaustion) the socket is simply
+// unwatched and only httplib's own bounds apply. Windows: no watchdog (no WSADuplicateSocket); only
+// `set_max_timeout` applies there, so the TLS handshake phase is NOT covered by the total bound on
+// Windows.
+#ifndef _WIN32
+class RequestDeadlineWatchdog {
+public:
+    explicit RequestDeadlineWatchdog(std::chrono::milliseconds budget)
+        : deadline_(std::chrono::steady_clock::now() + budget), thread_([this] { run(); }) {}
+
+    ~RequestDeadlineWatchdog() {
+        {
+            std::lock_guard lock(mu_);
+            done_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+
+    RequestDeadlineWatchdog(const RequestDeadlineWatchdog&) = delete;
+    RequestDeadlineWatchdog& operator=(const RequestDeadlineWatchdog&) = delete;
+    RequestDeadlineWatchdog(RequestDeadlineWatchdog&&) = delete;
+    RequestDeadlineWatchdog& operator=(RequestDeadlineWatchdog&&) = delete;
+
+    // httplib::Client::set_socket_options callback: runs on the request thread, after socket()
+    // and before connect(). Replaces the dup of a candidate address that failed to connect.
+    void adopt(socket_t sock) noexcept {
+        const int copy = ::fcntl(sock, F_DUPFD_CLOEXEC, 0);
+        std::lock_guard lock(mu_);
+        dup_.reset(copy);
+        if (expired_ && copy >= 0)
+            ::shutdown(copy, SHUT_RD);
+    }
+
+private:
+    // Owns the one dup'd descriptor.
+    struct OwnedFd {
+        int fd{-1};
+        OwnedFd() = default;
+        ~OwnedFd() { reset(-1); }
+        OwnedFd(const OwnedFd&) = delete;
+        OwnedFd& operator=(const OwnedFd&) = delete;
+        void reset(int next) noexcept {
+            if (fd >= 0)
+                ::close(fd);
+            fd = next;
+        }
+    };
+
+    void run() {
+        std::unique_lock lock(mu_);
+        if (cv_.wait_until(lock, deadline_, [this] { return done_; }))
+            return; // the request finished first
+        expired_ = true;
+        if (dup_.fd >= 0)
+            ::shutdown(dup_.fd, SHUT_RD);
+    }
+
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool done_{false};
+    bool expired_{false};
+    OwnedFd dup_;
+    const std::chrono::steady_clock::time_point deadline_;
+    std::thread thread_; // last: starts running once every member above exists
+};
+#else
+class RequestDeadlineWatchdog {
+public:
+    explicit RequestDeadlineWatchdog(std::chrono::milliseconds) {}
+    void adopt(socket_t) noexcept {}
+};
+#endif
 
 } // namespace
 
@@ -1188,17 +1312,23 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify, int
     if (!target)
         return std::unexpected("not an http or https URL");
     try {
+        // Declared BEFORE the client so it is destroyed after it (the client holds a reference).
+        const auto t = std::chrono::milliseconds(timeout_ms);
+        RequestDeadlineWatchdog watchdog(2 * t);
         // Heap-allocated with an explicit reset: httplib 0.37.1's SSLClient destructor can crash
         // after a failed connection to a non-routable host.
         auto client = std::make_unique<httplib::Client>(target->origin);
-        const auto t = std::chrono::milliseconds(timeout_ms);
         client->set_connection_timeout(t);
         client->set_read_timeout(t);
         client->set_write_timeout(t);
         // Those three are per operation: a server that sends one byte just inside each read
-        // timeout would hold the GET for as long as it likes. This is the TOTAL wall-clock bound
-        // for the whole request, twice the per-operation timeout (10 s by default).
+        // timeout would hold the GET for as long as it likes. set_max_timeout bounds the
+        // connect and the response at twice the per-operation timeout (10 s by default),
+        // measured from the start of the request. It does NOT cover the TLS handshake, so on
+        // POSIX the watchdog shuts the socket down at the same deadline; on Windows the
+        // handshake phase has no total bound (see RequestDeadlineWatchdog).
         client->set_max_timeout(2 * t);
+        client->set_socket_options([&watchdog](socket_t sock) { watchdog.adopt(sock); });
         client->set_payload_max_length(kHttpMaxBody);
         client->set_follow_location(false);
         client->enable_server_certificate_verification(!skip_tls_verify);
@@ -1229,6 +1359,8 @@ OidcProvider::fetch_discovery_document(const std::string& issuer, bool skip_tls_
         return std::unexpected("the issuer must be an http or https URL");
     if (issuer.size() > kMaxIdpUrlBytes)
         return std::unexpected("the issuer is longer than 2048 bytes");
+    if (has_line_splitting_bytes(issuer))
+        return std::unexpected("the issuer contains a space or control character");
     if (!split_http_url(issuer))
         return std::unexpected("the issuer has no well-formed host");
 
@@ -1299,9 +1431,17 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
         }
         throw std::logic_error("OidcProvider::ensure_discovered: unhandled Need");
     };
-    // config_ is immutable after construction, so this read needs no lock.
-    if (const auto& explicit_ep = pick(config_); !explicit_ep.empty())
+    // config_ is immutable after construction, so this read needs no lock. A configured endpoint
+    // is authoritative but still goes on the wire and into logs: refuse one that could split a
+    // request or log line, as the discovered ones are.
+    if (const auto& explicit_ep = pick(config_); !explicit_ep.empty()) {
+        if (has_line_splitting_bytes(explicit_ep)) {
+            spdlog::error("OidcProvider: a configured endpoint contains a space or control "
+                          "character and is refused");
+            return std::unexpected(std::string(kDiscoveryUnavailable));
+        }
         return explicit_ep;
+    }
     // Validate-only providers (no redirect_uri, so no flow) never touch the network.
     if (config_.redirect_uri.empty())
         return std::unexpected(std::string(kDiscoveryUnavailable));
@@ -1315,10 +1455,27 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
         if (discovery_in_flight_)
             return std::unexpected(std::string(kDiscoveryUnavailable));
         discovery_in_flight_ = true;
+        // Clears the flag on EVERY exit from this block: a normal return, or an exception
+        // unwinding out of the fetch, the log calls or the result handling (an allocation
+        // failure, say). Created straight after the flag is set, and without a throwing step in
+        // between, so the flag can never be left set (every later caller would otherwise fail
+        // fast until a Settings save). It re-takes `lock` if the unwind left it released, and
+        // clears the flag while the lock is held, in the same critical section that commits the
+        // result, so single-flight holds: no second fetch can start between result and clear.
+        struct InFlightGuard {
+            std::unique_lock<std::mutex>& lock;
+            bool& flag;
+            ~InFlightGuard() {
+                if (!lock.owns_lock())
+                    lock.lock();
+                flag = false;
+            }
+        } in_flight_guard{lock, discovery_in_flight_};
         lock.unlock(); // the network round trip runs WITHOUT discovery_mu_
         auto doc = [&]() -> std::expected<DiscoveryDocument, std::string> {
             try {
-                spdlog::info("OidcProvider: fetching discovery for issuer {}", config_.issuer);
+                spdlog::info("OidcProvider: fetching discovery for issuer {}",
+                             ::yuzu::log_key_token(config_.issuer));
                 return fetch_discovery_document(config_.issuer, config_.skip_tls_verify,
                                                 http_timeout_ms_.load());
             } catch (const std::exception& e) {
@@ -1329,16 +1486,20 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
             }
         }();
         lock.lock();
-        discovery_in_flight_ = false;
         if (!doc) {
             // The reason can carry IdP-controlled text: neutralize control bytes for the log.
-            spdlog::error("OidcProvider: discovery failed for issuer {}: {}", config_.issuer,
+            spdlog::error("OidcProvider: discovery failed for issuer {}: {}",
+                          ::yuzu::log_key_token(config_.issuer),
                           ::yuzu::log_key_token(doc.error()));
             discovery_retry_after_ = std::chrono::steady_clock::now() + discovery_retry_window_;
             return std::unexpected(std::string(kDiscoveryUnavailable));
         }
-        spdlog::info("OidcProvider: authorize={} token={} jwks_uri={}", doc->authorization_endpoint,
-                     doc->token_endpoint, doc->jwks_uri);
+        // IdP-controlled values: neutralize control bytes and Unicode line breaks for the log
+        // even though endpoint_acceptable already refused them.
+        spdlog::info("OidcProvider: authorize={} token={} jwks_uri={}",
+                     ::yuzu::log_key_token(doc->authorization_endpoint),
+                     ::yuzu::log_key_token(doc->token_endpoint),
+                     ::yuzu::log_key_token(doc->jwks_uri));
         discovered_ = std::move(*doc);
     }
     return pick(*discovered_);
