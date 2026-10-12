@@ -6,9 +6,13 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -649,6 +653,111 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
 }
 #endif
 
+// ── IdP URL handling (#5692) ─────────────────────────────────────────────────
+
+namespace {
+
+// The longest endpoint (or issuer) accepted from an IdP document or the configuration.
+constexpr std::size_t kMaxIdpUrlBytes = 2048;
+
+// A well-formed `host[:port]` or `[ipv6][:port]` authority: no userinfo, no backslash, a host of
+// 1..253 bytes, a port of 1..5 digits and at most 65535. httplib::Client's constructor runs a
+// std::regex over the origin, which overflows the stack on a host of tens of thousands of bytes
+// and throws on a port that does not fit an int, so nothing reaches it without passing this.
+bool authority_well_formed(std::string_view authority) {
+    constexpr std::size_t kMaxHostBytes = 253;
+    std::string_view host;
+    std::string_view port;
+    bool has_port = false;
+    if (authority.starts_with('[')) {
+        const auto close = authority.find(']');
+        if (close == std::string_view::npos)
+            return false;
+        host = authority.substr(1, close - 1);
+        for (const char c : host)
+            if (!std::isxdigit(static_cast<unsigned char>(c)) && c != ':' && c != '.')
+                return false;
+        const auto after = authority.substr(close + 1);
+        if (!after.empty()) {
+            if (after.front() != ':')
+                return false;
+            port = after.substr(1);
+            has_port = true;
+        }
+    } else {
+        const auto colon = authority.find(':');
+        host = authority.substr(0, colon);
+        if (colon != std::string_view::npos) {
+            port = authority.substr(colon + 1);
+            has_port = true;
+        }
+        for (const char c : host)
+            if (c == '@' || c == '\\' || c == '[' || c == ']')
+                return false;
+    }
+    if (host.empty() || host.size() > kMaxHostBytes)
+        return false;
+    if (has_port) {
+        if (port.empty() || port.size() > 5)
+            return false;
+        unsigned value = 0;
+        for (const char c : port) {
+            if (c < '0' || c > '9')
+                return false;
+            value = value * 10 + static_cast<unsigned>(c - '0');
+        }
+        if (value > 65535)
+            return false;
+    }
+    return true;
+}
+
+// The `scheme://host[:port]` a httplib::Client wants and the request path (with its query).
+struct HttpUrl {
+    std::string origin;
+    std::string path;
+};
+
+// Splits "http(s)://authority[/path][?query][#fragment]" at the FIRST of '/', '?' or '#' after
+// the scheme, so `https://host?x` has the authority `host` and the path "/?x" (never a host of
+// "host?x"). nullopt for anything that is not an http(s) URL with a well-formed authority.
+std::optional<HttpUrl> split_http_url(const std::string& url) {
+    std::string_view scheme;
+    if (url.starts_with("https://")) {
+        scheme = "https://";
+    } else if (url.starts_with("http://")) {
+        scheme = "http://";
+    } else {
+        return std::nullopt;
+    }
+    const std::string_view rest = std::string_view(url).substr(scheme.size());
+    const auto end = rest.find_first_of("/?#");
+    const auto authority = rest.substr(0, end);
+    if (!authority_well_formed(authority))
+        return std::nullopt;
+    HttpUrl out;
+    out.origin = std::string(scheme) + std::string(authority);
+    if (end == std::string_view::npos)
+        out.path = "/";
+    else if (rest[end] == '/')
+        out.path = std::string(rest.substr(end));
+    else
+        out.path = "/" + std::string(rest.substr(end));
+    return out;
+}
+
+// Cuts `s` to at most `max` bytes without splitting a UTF-8 sequence.
+std::string_view truncate_utf8(std::string_view s, std::size_t max) {
+    if (s.size() <= max)
+        return s;
+    std::size_t cut = max;
+    while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80)
+        --cut;
+    return s.substr(0, cut);
+}
+
+} // namespace
+
 // ── Token exchange ───────────────────────────────────────────────────────────
 
 std::expected<std::string, std::string>
@@ -688,39 +797,39 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
         return std::unexpected("token endpoint request failed (WinHTTP)");
     }
 #else
-    // Parse URL for httplib
-    auto url = *token_endpoint;
-    std::string scheme, host, path;
-    if (url.starts_with("https://")) {
-        scheme = "https://";
-        url = url.substr(8);
-    } else if (url.starts_with("http://")) {
-        scheme = "http://";
-        url = url.substr(7);
-    } else
+    const auto target = split_http_url(*token_endpoint);
+    if (!target)
         return std::unexpected("invalid token endpoint URL");
-    auto slash = url.find('/');
-    host = (slash != std::string::npos) ? url.substr(0, slash) : url;
-    path = (slash != std::string::npos) ? url.substr(slash) : "/";
 
-    // Use heap-allocated client and explicit reset to work around httplib
-    // 0.37.1 SSLClient destructor crash (invalid free in OpenSSL context
-    // cleanup after HTTPS connections).
-    auto client = std::make_unique<httplib::Client>(scheme + host);
-    client->set_connection_timeout(10);
-    client->set_read_timeout(15);
-    client->set_write_timeout(15);
-    client->enable_server_certificate_verification(!config_.skip_tls_verify);
-    httplib::Headers headers;
-    if (!auth_header.empty())
-        headers.emplace("Authorization", "Basic " +
-            base64_encode(config_.client_id + ":" + config_.client_secret));
-    auto result = client->Post(path, headers, form_body, "application/x-www-form-urlencoded");
-    // Copy result data before destroying the client
-    int status_code = result ? result->status : 0;
-    std::string body_copy = result ? result->body : "";
-    std::string err_str = result ? "" : httplib::to_string(result.error());
-    client.reset(); // Explicit destroy before any return
+    // Construction and the request can throw (httplib's URL regex, allocation): fail closed to
+    // the same error a failed request gives rather than let it escape the callback route.
+    int status_code = 0;
+    std::string body_copy;
+    std::string err_str;
+    try {
+        // Use heap-allocated client and explicit reset to work around httplib
+        // 0.37.1 SSLClient destructor crash (invalid free in OpenSSL context
+        // cleanup after HTTPS connections).
+        auto client = std::make_unique<httplib::Client>(target->origin);
+        client->set_connection_timeout(10);
+        client->set_read_timeout(15);
+        client->set_write_timeout(15);
+        client->enable_server_certificate_verification(!config_.skip_tls_verify);
+        httplib::Headers headers;
+        if (!auth_header.empty())
+            headers.emplace("Authorization", "Basic " + base64_encode(config_.client_id + ":" +
+                                                                      config_.client_secret));
+        auto result =
+            client->Post(target->path, headers, form_body, "application/x-www-form-urlencoded");
+        // Copy result data before destroying the client
+        status_code = result ? result->status : 0;
+        body_copy = result ? result->body : "";
+        err_str = result ? "" : httplib::to_string(result.error());
+        client.reset(); // Explicit destroy before any return
+    } catch (const std::exception& e) {
+        status_code = 0;
+        err_str = std::string("exception: ") + ::yuzu::log_key_token(e.what());
+    }
 
     if (status_code == 0) {
         spdlog::error("OIDC token exchange: httplib failed: {}", err_str);
@@ -866,10 +975,13 @@ std::expected<std::vector<CachedJwk>, std::string> OidcProvider::parse_jwks(cons
 
 bool OidcProvider::fetch_jwks() {
     {
-        // Stamp every attempt, success or not (#1900): the no-kid path re-fetches on age.
-        // Trade-off, accepted: while the IdP is failing, already-cached keys live one more TTL
-        // (they stay usable, and a revoked key outlives its revocation by up to that long); the
-        // alternative is hammering a dead IdP on every request. #1900 refines this.
+        // Stamp every attempt, success or not (#1900): the no-kid path re-fetches on age, so
+        // while the cache holds keys a failing IdP is retried once per TTL, not once per login.
+        // An EMPTY cache and every kid miss still refetch on every call (#1900). Cached keys are
+        // trusted until the next SUCCESSFUL fetch replaces them (not "one more TTL": the failed
+        // fetch leaves the cache untouched, as it did before discovery), so a retired key keeps
+        // verifying while jwks_uri stays unreachable. Tracked under #1900/#1901 (a hard maximum
+        // key age); the alternative here is hammering a dead IdP on every request.
         std::lock_guard lock(jwks_mu_);
         jwks_fetched_at_ = std::chrono::steady_clock::now();
     }
@@ -1047,28 +1159,6 @@ namespace {
 
 constexpr std::size_t kHttpMaxBody = 256 * 1024; // a discovery document or JWKS is a few KiB
 
-// Splits "http(s)://host[:port]/path" into the `scheme://host[:port]` a httplib::Client wants and
-// the request path. False for anything that is not an http(s) URL with a non-empty host.
-bool split_http_url(const std::string& url, std::string& origin, std::string& path) {
-    std::string_view rest;
-    std::string_view scheme;
-    if (url.starts_with("https://")) {
-        scheme = "https://";
-    } else if (url.starts_with("http://")) {
-        scheme = "http://";
-    } else {
-        return false;
-    }
-    rest = std::string_view(url).substr(scheme.size());
-    const auto slash = rest.find('/');
-    const auto host = rest.substr(0, slash);
-    if (host.empty())
-        return false;
-    origin = std::string(scheme) + std::string(host);
-    path = slash == std::string_view::npos ? "/" : std::string(rest.substr(slash));
-    return true;
-}
-
 // The scheme prefix of an http(s) issuer ("" when it is neither); case-sensitive on purpose.
 std::string_view issuer_scheme(std::string_view issuer) {
     if (issuer.starts_with("https://"))
@@ -1078,37 +1168,42 @@ std::string_view issuer_scheme(std::string_view issuer) {
     return {};
 }
 
-// An endpoint from the discovery document: absolute, the issuer's scheme, a host, and no byte
-// that could split the request line it will be sent in.
+// An endpoint from the discovery document: absolute, at most 2048 bytes, the issuer's scheme, a
+// well-formed host[:port] authority, and no byte that could split the request line it will be
+// sent in.
 bool endpoint_acceptable(const std::string& value, std::string_view scheme) {
-    if (!value.starts_with(scheme) || value.size() == scheme.size() || value[scheme.size()] == '/')
+    if (value.size() > kMaxIdpUrlBytes || !value.starts_with(scheme))
         return false;
     for (const unsigned char c : value)
         if (c <= 0x20 || c == 0x7f)
             return false;
-    return true;
+    return split_http_url(value).has_value();
 }
 
 } // namespace
 
 std::expected<std::string, std::string>
 OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify, int timeout_ms) {
-    std::string origin, path;
-    if (!split_http_url(url, origin, path))
+    const auto target = split_http_url(url);
+    if (!target)
         return std::unexpected("not an http or https URL");
     try {
         // Heap-allocated with an explicit reset: httplib 0.37.1's SSLClient destructor can crash
         // after a failed connection to a non-routable host.
-        auto client = std::make_unique<httplib::Client>(origin);
+        auto client = std::make_unique<httplib::Client>(target->origin);
         const auto t = std::chrono::milliseconds(timeout_ms);
         client->set_connection_timeout(t);
         client->set_read_timeout(t);
         client->set_write_timeout(t);
+        // Those three are per operation: a server that sends one byte just inside each read
+        // timeout would hold the GET for as long as it likes. This is the TOTAL wall-clock bound
+        // for the whole request, twice the per-operation timeout (10 s by default).
+        client->set_max_timeout(2 * t);
         client->set_payload_max_length(kHttpMaxBody);
         client->set_follow_location(false);
         client->enable_server_certificate_verification(!skip_tls_verify);
 
-        auto result = client->Get(path);
+        auto result = client->Get(target->path);
         const int status = result ? result->status : 0;
         std::string body = result ? std::move(result->body) : std::string{};
         const std::string err = result ? std::string{} : httplib::to_string(result.error());
@@ -1120,7 +1215,10 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify, int
             return std::unexpected("HTTP " + std::to_string(status));
         return body;
     } catch (const std::exception& e) {
-        return std::unexpected(std::string("request exception: ") + e.what());
+        return std::unexpected(std::string("request exception: ") +
+                               ::yuzu::log_key_token(e.what()));
+    } catch (...) {
+        return std::unexpected("request failed");
     }
 }
 
@@ -1129,6 +1227,10 @@ OidcProvider::fetch_discovery_document(const std::string& issuer, bool skip_tls_
                                        int timeout_ms) {
     if (issuer_scheme(issuer).empty())
         return std::unexpected("the issuer must be an http or https URL");
+    if (issuer.size() > kMaxIdpUrlBytes)
+        return std::unexpected("the issuer is longer than 2048 bytes");
+    if (!split_http_url(issuer))
+        return std::unexpected("the issuer has no well-formed host");
 
     auto url = issuer;
     if (url.ends_with('/'))
@@ -1160,10 +1262,14 @@ OidcProvider::parse_discovery_document(const std::string& body, const std::strin
         const auto it = j.find(key);
         return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string{};
     };
-    // OIDC Discovery 4.3: the document's issuer MUST equal the issuer it was fetched for.
+    if (!split_http_url(issuer))
+        return std::unexpected("the issuer has no well-formed host");
+    // OIDC Discovery 4.3: the document's issuer MUST equal the issuer it was fetched for. The
+    // value is IdP-controlled text bound for the log and the Test Connection answer: cut it on a
+    // UTF-8 boundary and neutralize control bytes.
     if (str("issuer") != issuer)
         return std::unexpected("issuer mismatch: the discovery document names \"" +
-                               str("issuer").substr(0, 200) + "\"");
+                               ::yuzu::log_token(truncate_utf8(str("issuer"), 200)) + "\"");
 
     DiscoveryDocument doc{str("authorization_endpoint"), str("token_endpoint"), str("jwks_uri")};
     const std::pair<const char*, const std::string*> fields[] = {
@@ -1188,9 +1294,10 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
             return src.authorization_endpoint;
         case Need::Token:
             return src.token_endpoint;
-        default:
+        case Need::Jwks:
             return src.jwks_uri;
         }
+        throw std::logic_error("OidcProvider::ensure_discovered: unhandled Need");
     };
     // config_ is immutable after construction, so this read needs no lock.
     if (const auto& explicit_ep = pick(config_); !explicit_ep.empty())
@@ -1199,16 +1306,34 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
     if (config_.redirect_uri.empty())
         return std::unexpected(std::string(kDiscoveryUnavailable));
 
-    std::lock_guard lock(discovery_mu_);
+    std::unique_lock lock(discovery_mu_);
     if (!discovered_) {
         if (std::chrono::steady_clock::now() < discovery_retry_after_)
             return std::unexpected(std::string(kDiscoveryUnavailable));
-        spdlog::info("OidcProvider: fetching discovery for issuer {}", config_.issuer);
-        auto doc =
-            fetch_discovery_document(config_.issuer, config_.skip_tls_verify, http_timeout_ms_.load());
+        // Another thread is mid-fetch: fail fast rather than queue behind it (a blackholed IdP
+        // would otherwise stall every login for the whole bound) and never start a second fetch.
+        if (discovery_in_flight_)
+            return std::unexpected(std::string(kDiscoveryUnavailable));
+        discovery_in_flight_ = true;
+        lock.unlock(); // the network round trip runs WITHOUT discovery_mu_
+        auto doc = [&]() -> std::expected<DiscoveryDocument, std::string> {
+            try {
+                spdlog::info("OidcProvider: fetching discovery for issuer {}", config_.issuer);
+                return fetch_discovery_document(config_.issuer, config_.skip_tls_verify,
+                                                http_timeout_ms_.load());
+            } catch (const std::exception& e) {
+                return std::unexpected(std::string("discovery exception: ") +
+                                       ::yuzu::log_key_token(e.what()));
+            } catch (...) {
+                return std::unexpected("discovery exception");
+            }
+        }();
+        lock.lock();
+        discovery_in_flight_ = false;
         if (!doc) {
+            // The reason can carry IdP-controlled text: neutralize control bytes for the log.
             spdlog::error("OidcProvider: discovery failed for issuer {}: {}", config_.issuer,
-                          doc.error());
+                          ::yuzu::log_key_token(doc.error()));
             discovery_retry_after_ = std::chrono::steady_clock::now() + discovery_retry_window_;
             return std::unexpected(std::string(kDiscoveryUnavailable));
         }

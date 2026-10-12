@@ -4786,10 +4786,19 @@ void SettingsRoutes::register_routes(
 
         auto issuer = extract_form_value(req.body, "issuer");
         auto skip_tls_str = extract_form_value(req.body, "skip_tls_verify");
-        bool skip_tls = (skip_tls_str == "true") || cfg_->oidc_skip_tls_verify;
+        // Copy the two saved values under the shared lock (a save writes them under the unique
+        // lock); the network I/O below runs without it.
+        bool saved_skip_tls = false;
+        std::string saved_issuer;
+        {
+            std::shared_lock lock(*oidc_mu_);
+            saved_skip_tls = cfg_->oidc_skip_tls_verify;
+            saved_issuer = cfg_->oidc_issuer;
+        }
+        bool skip_tls = (skip_tls_str == "true") || saved_skip_tls;
 
         if (issuer.empty())
-            issuer = cfg_->oidc_issuer;
+            issuer = std::move(saved_issuer);
 
         if (issuer.empty()) {
             res.set_content("<span class=\"feedback-error\">Enter an Issuer URL first.</span>",

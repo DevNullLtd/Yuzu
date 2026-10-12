@@ -209,18 +209,22 @@ public:
     /// this instance's binding SHA-256 fail exactly as a broken crypto provider would;
     /// `add_test_pending_flow` plants a pending flow with a chosen binding hash (hex), bypassing
     /// `start_auth_flow`, so the stored-hash validation can be driven with a value no honest
-    /// flow stores. TEST-ONLY: neither has a production caller, and tests/unit/server/
+    /// flow stores. TEST-ONLY: none of the five test seams in this block (these two,
+    /// `set_http_timeouts_for_test`, `set_discovery_negative_cache_for_test` and
+    /// `pending_flow_count_for_test`) has a production caller, and tests/unit/server/
     /// test_oidc_provider.cpp pins (source scan) that no other file in server/core/src
     /// references them.
     void set_binding_digest_failure_for_test(bool fail);
     void add_test_pending_flow(const std::string& state, std::string binding_hash);
-    /// Test-only seam: replaces the 5 s connect/read/write timeouts of every IdP GET this
-    /// instance makes, so a slow-IdP test never waits for a real timeout. Same source-scan pin.
+    /// Test-only seam: replaces the 5 s per-operation connect/read/write timeouts of every IdP
+    /// GET this instance makes (and so the total bound, which is twice this value), so a
+    /// slow-IdP test never waits for a real timeout. Same source-scan pin.
     void set_http_timeouts_for_test(int ms);
     /// Test-only seam: replaces the 30 s window during which a failed discovery is not retried
     /// (0 = retry on the next call) and clears any window already running. Same source-scan pin.
     void set_discovery_negative_cache_for_test(int ms);
-    /// Test-only seam: how many authorization flows are pending (a failed start must leave 0).
+    /// Test-only seam: how many authorization flows are pending (a failed start must leave 0
+    /// and a refused callback leaves the count unchanged). Same source-scan pin.
     std::size_t pending_flow_count_for_test() const;
 
     /// Test-only seam (#1856): inject an RSA verifying key into the JWKS cache
@@ -247,14 +251,18 @@ public:
 
     /// Fetch `{issuer}/.well-known/openid-configuration` (one trailing slash on `issuer` is
     /// tolerated) and validate it: `issuer` must equal the argument byte for byte (OIDC Discovery
-    /// 4.3, the mix-up defence); all three endpoints must be present (even the ones the current
-    /// caller does not need), absolute, free of control characters and carry the ISSUER'S scheme
-    /// (an https issuer can never be downgraded to http endpoints). No host restriction: Google serves jwks_uri from another host. The error text
-    /// is for the operator-facing Test Connection and the log, not for the login answer.
+    /// 4.3, the mix-up defense); all three endpoints must be present (even the ones the current
+    /// caller does not need), absolute, free of control characters, at most 2048 bytes, with a
+    /// well-formed `host[:port]` authority (no userinfo, a port of at most 65535), and carry the
+    /// ISSUER'S scheme (an https issuer can never be downgraded to http endpoints). An issuer
+    /// longer than 2048 bytes is refused before any request. No host restriction: Google serves
+    /// jwks_uri from another host. The error text is for the operator-facing Test Connection and
+    /// the log, not for the login answer; IdP-controlled text in it is neutralized for the log.
     /// Shared by the login path (ensure_discovered) and Test Connection so the button validates
     /// exactly what a login will.
     [[nodiscard]] static std::expected<DiscoveryDocument, std::string>
-    fetch_discovery_document(const std::string& issuer, bool skip_tls_verify, int timeout_ms = 5000);
+    fetch_discovery_document(const std::string& issuer, bool skip_tls_verify,
+                             int timeout_ms = 5000);
 
     /// The validation half of `fetch_discovery_document`, on an already fetched body. Pure: no
     /// network. Public so the scheme rules can be pinned for an https issuer without a TLS IdP.
@@ -262,8 +270,11 @@ public:
     parse_discovery_document(const std::string& body, const std::string& issuer);
 
     /// The one bounded GET used for discovery, the JWKS and Test Connection: 5 s (default)
-    /// connect/read/write, a 256 KiB body cap, redirects NOT followed (a 3xx is a failure), TLS
-    /// verification honoured. Returns the body of a 200 response.
+    /// connect/read/write PER OPERATION, plus a TOTAL wall-clock bound of twice that (10 s by
+    /// default) so a server that trickles bytes just inside the per-operation timeouts cannot
+    /// hold the caller indefinitely; a 256 KiB body cap, redirects NOT followed (a 3xx is a
+    /// failure), TLS verification honored. The URL's authority must be a well-formed
+    /// `host[:port]` (see `fetch_discovery_document`). Returns the body of a 200 response.
     [[nodiscard]] static std::expected<std::string, std::string>
     http_get_bounded(const std::string& url, bool skip_tls_verify, int timeout_ms = 5000);
 
@@ -278,12 +289,18 @@ private:
     /// The endpoint for `need`, BY VALUE. A non-empty OidcConfig field is authoritative and
     /// returned as is (no network). Otherwise the discovery document is fetched once and cached
     /// for the provider's lifetime (a Settings save or a restart rebuilds the provider, so an IdP
-    /// that moves jwks_uri needs one of those); concurrent callers share ONE fetch (the mutex is
-    /// held across it) and a failed attempt is remembered for 30 s so a dead IdP is not
-    /// hammered. Validate-only providers (empty redirect_uri) never fetch. Fails CLOSED with
-    /// `kDiscoveryUnavailable`; there is no fallback to derived endpoints. Nothing reads the
-    /// config_ endpoint fields except through here. Lock order: `discovery_mu_` is never taken
-    /// while holding `mu_` or `jwks_mu_`.
+    /// that moves jwks_uri needs one of those). Exactly ONE thread fetches at a time: it marks the
+    /// fetch in flight under `discovery_mu_` and releases the mutex for the network round trip, so
+    /// every other caller that needs discovery while it runs fails FAST with
+    /// `kDiscoveryUnavailable` (it neither waits for the fetch nor starts a second one, and it
+    /// does not start the 30 s window; the next call after the fetch finishes sees the result).
+    /// A failed attempt is remembered for 30 s so a dead IdP is not hammered. Validate-only
+    /// providers (empty redirect_uri) never fetch. Fails CLOSED with `kDiscoveryUnavailable`;
+    /// there is no fallback to derived endpoints. Nothing reads the config_ endpoint fields except
+    /// through here. Lock order: `discovery_mu_` is never taken while holding `mu_` or
+    /// `jwks_mu_` and is never held across network I/O. Future order, if the JWKS fetch is ever
+    /// made single-flight under its own mutex (#1900): that fetch mutex first, then
+    /// `discovery_mu_`.
     std::expected<std::string, std::string> ensure_discovered(Need need);
 
     static std::string url_encode(const std::string& value);
@@ -299,19 +316,24 @@ private:
     void cleanup_expired_states_locked();
 
     /// Fetch and cache JWKS from the IdP's jwks_uri endpoint. True when a key set was stored.
-    /// Stamps `jwks_fetched_at_` on EVERY attempt, so a failing IdP is retried at most once per
-    /// cache TTL on the no-kid path rather than once per login (#1900).
+    /// Stamps `jwks_fetched_at_` on EVERY attempt, so while the cache holds keys a failing IdP is
+    /// retried once per cache TTL rather than once per login. An EMPTY cache and every kid miss
+    /// still refetch on every call (#1900). Cached keys are trusted until the next SUCCESSFUL
+    /// fetch replaces them (this was already so before discovery): a retired key therefore keeps
+    /// verifying while jwks_uri stays unreachable (tracked under #1900/#1901).
     bool fetch_jwks();
 
     OidcConfig config_;
     std::atomic<int> http_timeout_ms_{5000}; // test seam only
     mutable std::mutex mu_;
 
-    // Lazy discovery (ensure_discovered). Guards the three members below.
+    // Lazy discovery (ensure_discovered). Guards the four members below.
     std::mutex discovery_mu_;
     std::optional<DiscoveryDocument> discovered_;
+    bool discovery_in_flight_{false}; // one fetcher at a time; the others fail fast
     std::chrono::steady_clock::time_point discovery_retry_after_{};
-    std::chrono::milliseconds discovery_retry_window_{30000}; // 30 s; set_discovery_negative_cache_for_test
+    // 30 s; set_discovery_negative_cache_for_test
+    std::chrono::milliseconds discovery_retry_window_{30000};
     std::unordered_map<std::string, PkceChallenge> pending_challenges_;
     std::atomic<bool> binding_digest_forced_failure_{false}; // test seam only
 
