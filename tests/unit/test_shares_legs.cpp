@@ -213,6 +213,21 @@ TEST_CASE("shares linux: exports.d listing and snippet faults", "[shares]") {
     l = good.run();
     CHECK(l.status == StatusState::supported);
     CHECK(has(l, "source|exports_d|read|1"));
+
+    FakeFs empty; // a readable directory with nothing in it is a read of zero, never ambiguous
+    empty.list_err = 0;
+    l = empty.run();
+    CHECK(l.status == StatusState::supported);
+    CHECK(has(l, "source|exports_d|read|0"));
+}
+
+TEST_CASE("shares linux: an oversized field is cut and reported", "[shares]") {
+    FakeFs f;
+    f.files[kExports] = ok("/" + std::string(10000, 'p') + " h(rw)\n");
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "linux:shares:field_oversized"));
+    CHECK(count_prefix(l, "share|") == 1);
 }
 
 TEST_CASE("shares linux: declared unreached scope tokens", "[shares]") {
@@ -335,6 +350,21 @@ TEST_CASE("shares macos: a failed or unstartable tool still emits both source ro
         CHECK(has(l, "source|sharing|failed|-"));
         CHECK(has(l, "source|exports|absent|-"));
     }
+}
+
+TEST_CASE("shares macos: row cap and oversized field are reported", "[shares]") {
+    auto f = exited(0, kSharingJson);
+    std::string exp = "/" + std::string(10000, 'p') + " -ro\n"; // first, so the cap cannot hide it
+    for (int i = 0; i < 600; ++i)
+        exp += "/e" + std::to_string(i) + " -ro\n";
+    f.files[kExports] = ok(exp);
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(count_prefix(l, "share|") == 512);
+    CHECK(reason_has(l, "macos:shares:row_cap"));
+    CHECK(reason_has(l, "macos:shares:field_oversized"));
+    CHECK(count_prefix(l, "source|exports|") == 1);
+    CHECK(count_prefix(l, "source|sharing|") == 1);
 }
 
 TEST_CASE("shares macos: exit, truncation and unrecognised output", "[shares]") {

@@ -52,11 +52,10 @@ struct Share {
     std::string path;
     Access access = Access::unknown;
     std::optional<bool> anonymous;
-    std::vector<std::string> flags; ///< closed vocabulary, see flags_csv
+    std::vector<std::string> flags; ///< closed vocabulary: hidden, unavailable, special, sealed, no_root_squash, clients_<n>
     std::string source;
 };
 
-/// Closed flag vocabulary: hidden, unavailable, special, sealed, no_root_squash, clients_<n>.
 inline std::string_view proto_token(Proto p) { return p == Proto::nfs ? "nfs" : "smb"; }
 
 inline std::string_view access_token(Access a) {
@@ -251,19 +250,14 @@ struct ExportDefaults {
     bool no_root_squash = false;
 };
 
-/// Applies one export option to `d`; true when it set the access (rw / ro).
-inline bool apply_opt(std::string_view o, ExportDefaults& d) {
-    if (o == "rw") {
+/// Applies one export option to `d`.
+inline void apply_opt(std::string_view o, ExportDefaults& d) {
+    if (o == "rw")
         d.access = Access::rw;
-        return true;
-    }
-    if (o == "ro") {
+    else if (o == "ro")
         d.access = Access::ro;
-        return true;
-    }
-    if (o == "no_root_squash")
+    else if (o == "no_root_squash")
         d.no_root_squash = true;
-    return false;
 }
 
 /// Applies a comma-separated option list to defaults (a line-default `-opts` token).
@@ -301,9 +295,10 @@ struct SpecResult {
 };
 
 /// One client spec: `client`, `client(opts)` or `(opts)`. Options are scanned in order and
-/// each `sec=` starts a new segment that inherits the line defaults; the spec's access is
-/// the segments' common access, or `mixed` when they disagree. Options before the first
-/// `sec=` form a segment only when they set ro/rw themselves.
+/// each `sec=` after the first starts a new segment that inherits the running option state
+/// (nfs-utils: a flavour copies every ro/rw/squash option accumulated so far), so options
+/// before the first `sec=` apply to every flavour. The spec's access is the segments'
+/// common access, or `mixed` when they disagree.
 inline SpecResult parse_spec(std::string_view tok, const ExportDefaults& defaults) {
     SpecResult r;
     const auto paren = tok.find('(');
@@ -316,7 +311,7 @@ inline SpecResult parse_spec(std::string_view tok, const ExportDefaults& default
             opts = opts.substr(0, close);
     }
     ExportDefaults cur = defaults;
-    bool seen_sec = false, explicit_access = false;
+    bool seen_sec = false;
     Access merged = Access::unknown;
     bool nrs = defaults.no_root_squash;
     const auto push = [&] {
@@ -325,13 +320,11 @@ inline SpecResult parse_spec(std::string_view tok, const ExportDefaults& default
     };
     for (const auto o : split(opts, ',')) {
         if (o.starts_with("sec=")) {
-            if (seen_sec || explicit_access)
+            if (seen_sec)
                 push();
             seen_sec = true;
-            cur = defaults;
-            explicit_access = false;
         } else {
-            explicit_access = apply_opt(o, cur) || explicit_access;
+            apply_opt(o, cur);
         }
     }
     push();
@@ -355,7 +348,8 @@ inline void parse_exports(std::string_view text, std::string_view source,
         if (i >= line.size() || line[i] == '#')
             return true;
         const auto path = detail::next_token(line, i);
-        if (path.text.empty())
+        // nfsd export points are absolute: a pathless or option-first line is skipped.
+        if (path.text.empty() || (!path.quoted && path.text[0] != '/'))
             return true;
         detail::ExportDefaults defaults;
         std::vector<detail::SpecResult> specs;

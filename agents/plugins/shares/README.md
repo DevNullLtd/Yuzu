@@ -47,7 +47,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | n/a — the leg reads nothing (caveat 3) | n/a | n/a | n/a — the placeholder reports `unsupported` with `windows:planned` |
-| macOS | agent daemon, default account | None for `sharing -l -f json`, which lists share points to an unprivileged caller; `/etc/exports` is read with the agent's own permissions (not measured: the reference Mac has no such file) | `sharing` measured unprivileged (euid 501) on the reference Mac, 2026-10-12; `/etc/exports` is absent on that host, so the read is untested against a real file (caveat 4) | `CONSTRAINED` / partial with a `subprocess_runner:*` or `macos:shares:*` token; `PERMISSION_DENIED` / partial only when `/etc/exports` was refused and nothing was read; `UNAVAILABLE` / unknown with `subprocess_runner:spawn_error` when the tool could not be started |
+| macOS | agent daemon, default account | None for `sharing -l -f json`, which lists share points to an unprivileged caller; `/etc/exports` is read with the agent's own permissions (not measured: the reference Mac has no such file) | `sharing` measured unprivileged (euid 501) on the reference Mac, 2026-10-12; `/etc/exports` is absent on that host, so the read is untested against a real file (caveat 4) | `CONSTRAINED` / partial with a `subprocess_runner:*` token (`spawn_error` included: `/usr/sbin/sharing` could not be started, `/etc/exports` is still read) or a `macos:shares:*` token; `PERMISSION_DENIED` / partial only when `/etc/exports` was refused and nothing was read |
 | Linux | agent daemon, dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md`) | None: `/etc/exports`, `/etc/exports.d/*.exports` and `/etc/samba/smb.conf` are world-readable (0644) on stock packages. A site that tightens them can grant read access to the agent account, or accept the token | Not measured on the `yuzu` account; see Sample output for the capture | `PERMISSION_DENIED` / partial with `linux:shares:<source>:permission_denied` when a source was refused and none was read, `CONSTRAINED` when another source was read; the source row says `refused` |
 
 No shell interpreter and no network use. The macOS leg runs one fixed absolute argv through the bounded runner (sink `shares/run_macos#1`); both legs read files in process, never following a symlink, and probe the Samba usershares directory with one `lstat` (it is never listed).
@@ -62,7 +62,7 @@ The action takes no parameters.
 
 ### Outputs
 
-Every row is pipe-delimited; field 0 is the row kind, `-` is an absent value, and the first row is always `status|list|<supported\|constrained\|permission_denied\|unsupported>|<reason or ->`. A `source|<exports\|exports_d\|smb_conf\|sharing>|<read\|absent\|refused\|failed>|<share count or ->` row follows for every source the leg knows about (Linux three, macOS two: `exports` and `sharing`; `absent` is a state, not a failure). Each share is `share|<nfs\|smb>|<name or ->|<path or ->|<ro\|rw\|mixed\|->|<true\|false\|->|<flags or ->|<source>`: the name is the SMB share name and `-` for NFS (identified by path), `mixed` means clients or security flavours disagree, and the flags are a closed set: `hidden`, `unavailable`, `special` (Samba `[homes]`, `[printers]`, `[print$]`), `sealed`, `no_root_squash` and `clients_<n>`. Every free field is scrubbed of NUL and invalid UTF-8 and pipe-escaped.
+Every row is pipe-delimited; field 0 is the row kind, `-` is an absent value, and the first row is always `status|list|<supported\|constrained\|permission_denied\|unsupported>|<reason or ->`. A `source|<exports\|exports_d\|smb_conf\|sharing>|<read\|absent\|refused\|failed>|<share count or ->` row follows for every source the leg knows about (Linux three, macOS two: `exports` and `sharing`; `absent` is a state, not a failure). Each share is `share|<nfs\|smb>|<name or ->|<path or ->|<ro\|rw\|mixed\|->|<true\|false\|->|<flags or ->|<source>`: the name is the SMB share name and `-` for NFS (identified by path), `mixed` means clients or security flavours disagree, and the flags are a closed set: `hidden`, `unavailable` (Samba `available = no`, a macOS share point with `smb_shared` 0, or a BSD `-offline` export), `special` (Samba `[homes]`, `[printers]`, `[print$]`), `sealed`, `no_root_squash` and `clients_<n>`. Every free field is scrubbed of NUL and invalid UTF-8 and pipe-escaped.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.network.shares` — `row_kind|field_1|field_2|field_3|field_4|field_5|field_6|field_7`**
@@ -103,6 +103,8 @@ Every row is pipe-delimited; field 0 is the row kind, `-` is an absent value, an
 - **Siblings:** `tar` `mapdrive` (the mapped drives and sessions this host makes and receives, not the exports it offers) and `network_config`.
 
 ## Sample output
+
+The Linux capture was taken in the Debian 13 agent build container with `samba-common` and `nfs-kernel-server` installed and NFS and Samba shares seeded under `/srv`; the stock package files (`/etc/exports`, `/etc/samba/smb.conf`) are the parser test fixtures.
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
 **macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-12 · euid 501 (jsmith) · leg-hash b71a64faa4b7

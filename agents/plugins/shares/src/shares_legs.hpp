@@ -124,9 +124,9 @@ inline int execute_list(yuzu::CommandContext& ctx, std::string_view action, LegF
                         std::string_view leg_exception_token) {
     try {
         if (action != "list") {
-            ctx.write_output(std::string{"unknown action: "} +
-                             yuzu::util::safe_output_field(
-                                 yuzu::util::sanitize_utf8(std::string{action})));
+            std::string a{action};
+            yuzu::shared::scrub_wire_bytes(a);
+            ctx.write_output("unknown action: " + yuzu::util::safe_output_field(a));
             return 1;
         }
         return leg(ctx);

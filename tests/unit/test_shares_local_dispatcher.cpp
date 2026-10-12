@@ -271,8 +271,8 @@ TEST_CASE("shares execute seam: unknown action is escaped; a throwing leg is con
     REQUIRE(hrows.size() == 1);
     CHECK(hrows[0] == "unknown action: no\\|such/");
 
-    // Invalid UTF-8 bytes are replaced first; a valid sequence survives. sanitize_utf8 does
-    // not yet reject overlong or surrogate forms (#4864).
+    // Invalid UTF-8 bytes are replaced first (scrub_wire_bytes, which also rejects overlong
+    // and surrogate forms); a valid sequence survives.
     const auto binary = dispatcher.run(&throwing, "bad\xff!");
     CHECK(binary.rc == 1);
     const auto brows = captured_rows(binary.captured);

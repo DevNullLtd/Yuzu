@@ -171,7 +171,7 @@
       "definition_id": "crossplatform.network.shares"
     }
   ],
-  "outputs_note": "Every row is pipe-delimited; field 0 is the row kind, `-` is an absent value, and the first row is always `status|list|<supported\\|constrained\\|permission_denied\\|unsupported>|<reason or ->`. A `source|<exports\\|exports_d\\|smb_conf\\|sharing>|<read\\|absent\\|refused\\|failed>|<share count or ->` row follows for every source the leg knows about (Linux three, macOS two: `exports` and `sharing`; `absent` is a state, not a failure). Each share is `share|<nfs\\|smb>|<name or ->|<path or ->|<ro\\|rw\\|mixed\\|->|<true\\|false\\|->|<flags or ->|<source>`: the name is the SMB share name and `-` for NFS (identified by path), `mixed` means clients or security flavours disagree, and the flags are a closed set: `hidden`, `unavailable`, `special` (Samba `[homes]`, `[printers]`, `[print$]`), `sealed`, `no_root_squash` and `clients_<n>`. Every free field is scrubbed of NUL and invalid UTF-8 and pipe-escaped.",
+  "outputs_note": "Every row is pipe-delimited; field 0 is the row kind, `-` is an absent value, and the first row is always `status|list|<supported\\|constrained\\|permission_denied\\|unsupported>|<reason or ->`. A `source|<exports\\|exports_d\\|smb_conf\\|sharing>|<read\\|absent\\|refused\\|failed>|<share count or ->` row follows for every source the leg knows about (Linux three, macOS two: `exports` and `sharing`; `absent` is a state, not a failure). Each share is `share|<nfs\\|smb>|<name or ->|<path or ->|<ro\\|rw\\|mixed\\|->|<true\\|false\\|->|<flags or ->|<source>`: the name is the SMB share name and `-` for NFS (identified by path), `mixed` means clients or security flavours disagree, and the flags are a closed set: `hidden`, `unavailable` (Samba `available = no`, a macOS share point with `smb_shared` 0, or a BSD `-offline` export), `special` (Samba `[homes]`, `[printers]`, `[print$]`), `sealed`, `no_root_squash` and `clients_<n>`. Every free field is scrubbed of NUL and invalid UTF-8 and pipe-escaped.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -187,7 +187,7 @@
     },
     {
       "grant": "None for `sharing -l -f json`, which lists share points to an unprivileged caller; `/etc/exports` is read with the agent's own permissions (not measured: the reference Mac has no such file)",
-      "if_refused": "`CONSTRAINED` / partial with a `subprocess_runner:*` or `macos:shares:*` token; `PERMISSION_DENIED` / partial only when `/etc/exports` was refused and nothing was read; `UNAVAILABLE` / unknown with `subprocess_runner:spawn_error` when the tool could not be started",
+      "if_refused": "`CONSTRAINED` / partial with a `subprocess_runner:*` token (`spawn_error` included: `/usr/sbin/sharing` could not be started, `/etc/exports` is still read) or a `macos:shares:*` token; `PERMISSION_DENIED` / partial only when `/etc/exports` was refused and nothing was read",
       "measured": "`sharing` measured unprivileged (euid 501) on the reference Mac, 2026-10-12; `/etc/exports` is absent on that host, so the read is untested against a real file (caveat 4)",
       "os": "macOS",
       "runs_as": "agent daemon, default account"
