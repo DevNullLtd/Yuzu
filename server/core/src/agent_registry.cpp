@@ -2351,7 +2351,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::array<double, kNGuardianJournalAgeMetrics> gja_max{};
     std::array<bool, kNGuardianJournalAgeMetrics> gja_reported{};
     // Meta-signals ABOUT the rollup (guardian_journal_fleet_tags.hpp). Published
-    // unconditionally, including at 0, unlike the 32 - they are server-owned counts
+    // unconditionally, including at 0, unlike the 33 - they are server-owned counts
     // that always have a true value, so 0 is a measurement, not a fabricated zero.
     // `gj_reporting` is the coverage denominator absence otherwise hides; without it a
     // dark telemetry pipeline is indistinguishable from a healthy quiet fleet.
@@ -2362,7 +2362,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int gj_tag_rejected = 0;
     // std::string twins of the table's C-string tag keys: get_view takes
     // const std::string&, so passing the char* directly would heap-construct a
-    // temporary key per lookup - 32 per agent per sweep. Built once (same pattern,
+    // temporary key per lookup - 33 per agent per sweep. Built once (same pattern,
     // and the same governance finding, as spark_mech_metric_keys above). It IS
     // registered for static destruction (non-trivial destructor), which is safe only
     // because health_recompute_thread_ - the sole production reader - is joined in
@@ -2387,7 +2387,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::array<double, kNGuardianHealthMetrics> gh_sum{};
     std::array<bool, kNGuardianHealthMetrics> gh_reported{};
     // rung 9c PR-3: the arm-ledger pair (Decision 1). SUM accumulate - same
-    // mechanical shape as the 32-row journal counter family (gj_sum above)
+    // mechanical shape as the 33-row journal counter family (gj_sum above)
     // despite being RE-STATABLE gauges rather than monotonic counters on the
     // agent side: this reader only ever sees one CURRENT value per agent per
     // sweep either way, so "sum the current values" is correct regardless of
