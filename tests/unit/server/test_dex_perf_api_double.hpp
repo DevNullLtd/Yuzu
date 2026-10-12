@@ -150,16 +150,8 @@ public:
         auto points = app_fleet_trend(app, version);
         if (!points)
             return std::nullopt;
-        std::vector<std::string> versions;
-        for (const auto& p : *points)
-            versions.push_back(p.version);
-        std::sort(versions.begin(), versions.end(),
-                  [](const std::string& a, const std::string& b) {
-                      return yuzu::server::app_perf_canon_version_less(b, a);
-                  });
-        versions.erase(std::unique(versions.begin(), versions.end()), versions.end());
-        if (versions.size() > yuzu::server::kAppPerfVersionJoinCap)
-            versions.resize(yuzu::server::kAppPerfVersionJoinCap);
+        bool capped = false;
+        const auto versions = yuzu::server::app_perf_newest_versions(*points, capped);
         const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
                                      std::chrono::system_clock::now().time_since_epoch())
                                      .count();

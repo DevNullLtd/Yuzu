@@ -64,16 +64,8 @@ public:
         // The join keeps only the newest kAppPerfVersionJoinCap versions; ask the
         // failure read for exactly those so it never counts a version that is
         // dropped from the report.
-        std::vector<std::string> versions;
-        for (const auto& p : *points)
-            versions.push_back(p.version);
-        std::sort(versions.begin(), versions.end(),
-                  [](const std::string& a, const std::string& b) {
-                      return app_perf_canon_version_less(b, a); // newest first
-                  });
-        versions.erase(std::unique(versions.begin(), versions.end()), versions.end());
-        if (versions.size() > kAppPerfVersionJoinCap)
-            versions.resize(kAppPerfVersionJoinCap);
+        bool capped = false; // the report carries its own truncation flag
+        const auto versions = app_perf_newest_versions(*points, capped);
 
         // One cut for events and exposure: the UTC midnight `window` days back.
         const int window = failures_owner_->failure_window_days();

@@ -10,6 +10,9 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <set>
+#include <string>
+#include <vector>
 #include <string_view>
 #include <utility>
 
@@ -406,6 +409,28 @@ bool app_perf_canon_version_less(std::string_view a, std::string_view b) {
     return false;
 }
 
+std::vector<std::string> app_perf_newest_versions(const std::vector<AppPerfTrendPoint>& points,
+                                                  bool& truncated) {
+    std::vector<std::string> versions;
+    {
+        std::set<std::string> distinct; // tree: agent-controlled keys
+        for (const auto& p : points)
+            distinct.insert(p.version);
+        versions.assign(distinct.begin(), distinct.end());
+    }
+    std::sort(versions.begin(), versions.end(), [](const std::string& x, const std::string& y) {
+        if (app_perf_canon_version_less(y, x))
+            return true;
+        if (app_perf_canon_version_less(x, y))
+            return false;
+        return x < y;
+    });
+    truncated = versions.size() > kAppPerfVersionJoinCap;
+    if (truncated)
+        versions.resize(kAppPerfVersionJoinCap);
+    return versions;
+}
+
 AppPerfFleetReport app_perf_version_failure_join(std::vector<AppPerfTrendPoint> points,
                                                  const std::vector<AppPerfVersionFailureRow>& failures,
                                                  int failure_window_days) {
@@ -413,19 +438,17 @@ AppPerfFleetReport app_perf_version_failure_join(std::vector<AppPerfTrendPoint> 
     rep.failure_window_days = failure_window_days;
 
     auto summaries = app_perf_version_summaries(points);
-    // Newest canonical version first; the string breaks numeric ties so the order
-    // never depends on first-seen input order.
-    std::sort(summaries.begin(), summaries.end(),
-              [](const AppPerfVersionSummary& x, const AppPerfVersionSummary& y) {
-                  if (app_perf_canon_version_less(y.version, x.version))
-                      return true;
-                  if (app_perf_canon_version_less(x.version, y.version))
-                      return false;
-                  return x.version < y.version;
-              });
-    if (summaries.size() > kAppPerfVersionJoinCap) {
-        summaries.resize(kAppPerfVersionJoinCap);
-        rep.versions_truncated = true;
+    // Rows are emitted in the shared selection's order (newest first, capped).
+    const auto keep = app_perf_newest_versions(points, rep.versions_truncated);
+    std::map<std::string, std::size_t> summary_index; // tree: agent-controlled keys
+    for (std::size_t i = 0; i < summaries.size(); ++i)
+        summary_index.emplace(summaries[i].version, i);
+    {
+        std::vector<AppPerfVersionSummary> ordered;
+        ordered.reserve(keep.size());
+        for (const auto& v : keep)
+            ordered.push_back(std::move(summaries[summary_index.at(v)]));
+        summaries = std::move(ordered);
     }
     rep.points = std::move(points);
 

@@ -194,6 +194,15 @@ struct AppPerfFleetReport {
 /// every other version.
 [[nodiscard]] bool app_perf_canon_version_less(std::string_view a, std::string_view b);
 
+/// PURE: the distinct versions of `points`, newest first by canonical version
+/// (the string breaks numeric ties, so the order never depends on input order),
+/// capped at `kAppPerfVersionJoinCap`. `truncated` is set when more distinct
+/// versions existed than the cap. The ONE selection: the join keeps exactly these
+/// rows and the failure read is asked for exactly these versions, so a version
+/// dropped from the report is never counted.
+[[nodiscard]] std::vector<std::string>
+app_perf_newest_versions(const std::vector<AppPerfTrendPoint>& points, bool& truncated);
+
 /// PURE: build the report from the trend points and the failure rows. Versions
 /// are ordered newest first by canonical version and capped at
 /// `kAppPerfVersionJoinCap`; "" (unknown) is kept but never chains as a previous

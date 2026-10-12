@@ -15,6 +15,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -287,6 +288,37 @@ TEST_CASE("version join: 21 versions keep the 20 newest and say so", "[dex][app_
     CHECK(rep.versions.back().previous_version.empty());  // the 20th row has no previous
     CHECK(row_of(rep, "1.0.0.0") == nullptr);
     CHECK(rep.versions[18].previous_version == "2.0.0.0");
+}
+
+TEST_CASE("newest versions: the one selection the join and the failure read share",
+          "[dex][app_perf]") {
+    std::vector<AppPerfTrendPoint> pts;
+    for (int i = 1; i <= 21; ++i)
+        pts.push_back(point(std::to_string(i) + ".0.0.0", 100)); // inserted oldest first
+    pts.push_back(point("21.0.0.0", 101));                       // a repeat never duplicates
+    bool truncated = false;
+    const auto keep = app_perf_newest_versions(pts, truncated);
+    REQUIRE(keep.size() == kAppPerfVersionJoinCap);
+    CHECK(truncated);
+    CHECK(keep.front() == "21.0.0.0");
+    CHECK(keep.back() == "2.0.0.0");
+    CHECK(std::find(keep.begin(), keep.end(), "1.0.0.0") == keep.end());
+
+    // The join emits exactly these rows, in this order.
+    const auto rep = app_perf_version_failure_join(pts, {}, 30);
+    REQUIRE(rep.versions.size() == keep.size());
+    for (std::size_t i = 0; i < keep.size(); ++i)
+        CHECK(rep.versions[i].perf.version == keep[i]);
+    CHECK(rep.versions_truncated == truncated);
+}
+
+TEST_CASE("newest versions: exactly 20 distinct versions are not truncated", "[dex][app_perf]") {
+    std::vector<AppPerfTrendPoint> pts;
+    for (int i = 1; i <= 20; ++i)
+        pts.push_back(point(std::to_string(i) + ".0.0.0", 100));
+    bool truncated = true;
+    CHECK(app_perf_newest_versions(pts, truncated).size() == 20);
+    CHECK_FALSE(truncated);
 }
 
 TEST_CASE("version join: exactly 20 versions are not truncated", "[dex][app_perf]") {

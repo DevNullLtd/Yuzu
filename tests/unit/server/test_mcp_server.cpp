@@ -96,6 +96,7 @@
 
 #include <libpq-fe.h> // direct-SQL secret-row verification (M5 remediation)
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -9884,6 +9885,52 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
     auto tek_body = nlohmann::json::parse(tag_empty_key->body);
     REQUIRE(tek_body.contains("error"));
     CHECK(tek_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+TEST_CASE("MCP app-perf: the failure read is asked for exactly the versions the report keeps",
+          "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.fleet =
+        [](std::string_view, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        std::vector<yuzu::server::AppPerfFleetRow> rows;
+        for (int i = 1; i <= 21; ++i) { // oldest first; 21 > the 20-version cap
+            yuzu::server::AppPerfFleetRow r;
+            r.app_name = "chrome.exe";
+            r.version = std::to_string(i) + ".0.0.0";
+            r.day = 1'700'000'000;
+            r.device_count = 20;
+            r.cpu_sum = 100.0;
+            r.cpu_max = 9.0;
+            r.ws_sum = 2000;
+            r.ws_max = 200;
+            r.hist_version = yuzu::server::kAppPerfHistVersion;
+            r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+            r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+            rows.push_back(std::move(r));
+        }
+        return rows;
+    };
+    auto asked = std::make_shared<std::vector<std::string>>();
+    ts.app_perf_providers_for_test.failures =
+        [asked](std::string_view, const std::vector<std::string>& versions, std::int64_t,
+                std::int64_t, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfVersionFailureRow>> {
+        *asked = versions;
+        return std::vector<yuzu::server::AppPerfVersionFailureRow>{};
+    };
+    ts.start("readonly");
+
+    auto fleet = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":86,"params":{"name":"get_dex_app_perf","arguments":{"app":"chrome.exe"}}})")
+            ->body);
+    CHECK(fleet["versions_truncated"] == true);
+    REQUIRE(fleet["versions"].size() == yuzu::server::kAppPerfVersionJoinCap);
+    REQUIRE(asked->size() == fleet["versions"].size());
+    for (std::size_t i = 0; i < asked->size(); ++i)
+        CHECK((*asked)[i] == fleet["versions"][i]["version"].get<std::string>());
+    CHECK(std::find(asked->begin(), asked->end(), "1.0.0.0") == asked->end());
 }
 
 TEST_CASE("MCP get_dex_tag_app_perf: store degrade (wired provider returns nullopt) "
