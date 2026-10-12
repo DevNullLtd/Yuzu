@@ -181,9 +181,9 @@ enabling the SLE sources — deny-override wins).
   **within one 24 h cycle** for a syncing agent (an offline agent purges on reconnect).
   This knob-flip full-replace is the erasure path available today.
 - **Decommission cascade — live via `DELETE /api/v1/sle/agents/{id}`.** This release wires
-  the agent-decommission cascade to an audited REST route that clears **all five** of a
-  removed device's per-agent stores (inventory, installed-software, device-CI, app-perf
-  and detected-licence rows). Because it erases well beyond licences, it is gated on a
+  the agent-decommission cascade to an audited REST route that clears **all seven** of a
+  removed device's per-agent stores (inventory, installed-software, device-CI, app-perf,
+  detected-licence, app-usage and presence rows). Because it erases well beyond licences, it is gated on a
   **conjunction over every securable it destroys through** — the caller needs all of
   `SoftwareLicensing:Delete`, `Inventory:Delete` and `GuaranteedState:Delete`, each scoped
   to the device. (Administrator and ITServiceOwner hold all three by default; a custom role

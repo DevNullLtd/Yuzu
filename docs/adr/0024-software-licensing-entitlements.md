@@ -460,7 +460,12 @@ Decision numbers are stable, since other documents cite them.
     `SoftwareLicensingStore`) and removes **only agent-scoped rows/links**;
     `ProductRegistryStore` holds fleet-wide canonical identities shared across agents and
     is **never** in the cascade (decommission drops an agent's match links, never a shared
-    canonical product). There is **no row-level erasure API**, a stated gap. The cascade's
+    canonical product). *(Update 2026-10-12, #5682: the cascade now covers **seven** stores.
+    Wave 7 PR7.2 added `AppUsageStore`, and #5682 added `OfflineEndpointStore`, whose
+    `endpoint_state` presence row holds the device's last-known hostname, OS, agent version
+    and architecture. The authoritative list is `AgentDecommissionStores` in
+    `agent_decommission.hpp`, pinned by `kCascadeStoreCount` in `test_agent_decommission.cpp`.)*
+    There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
     `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`
     conjunction (Decision 9) — because this fan-out reaches the `Inventory`-securable

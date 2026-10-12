@@ -7244,7 +7244,7 @@ One device's per-executable last-used projection — the per-agent drill. Becaus
 | 503 + `Sec-Audit-Failed` | The per-open audit row could not persist — fail-closed, no data served |
 | 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
 
-Decommissioning the agent erases this store's rows too — see [Software Licensing (SLE)](#software-licensing-sle)'s `DELETE /api/v1/sle/agents/{agent_id}` (the six-store cascade).
+Decommissioning the agent erases this store's rows too — see [Software Licensing (SLE)](#software-licensing-sle)'s `DELETE /api/v1/sle/agents/{agent_id}` (the seven-store cascade).
 
 ---
 
@@ -7293,7 +7293,7 @@ A genuinely licence-free (or unknown) device is `200` with `count: 0`; a `503` m
 
 #### `DELETE /api/v1/sle/agents/{agent_id}`
 
-**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all six per-agent stores** (generic inventory, installed-software, device-CI, app-perf, detected-licence, and app-usage), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
+**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all seven per-agent stores** (generic inventory, installed-software, device-CI, app-perf, detected-licence, app-usage, and the `endpoint_state` presence row that holds the device's last-known hostname, OS, agent version and architecture), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
 
 **Permission:** a single **per-device-scoped `Decommission:Delete`** securable (ADR-0024 Decision 9, amended Wave 7 PR7.2) — one grant authorizing for the cascade's whole blast radius, replacing the earlier per-store conjunction. A role lacking it is `403`'d, naming `Decommission:Delete` (the seeded Administrator/ITServiceOwner roles hold it by default; a custom role that had assembled the old per-store `Delete` grants must be granted this securable too — the three old grants no longer suffice).
 
@@ -7308,8 +7308,9 @@ Two durable audit events: `sle.agent.decommission|attempt` is written **before**
     "decommissioned": true,
     "stores": {"inventory": "deleted", "software_inventory": "deleted",
                "app_perf_daily": "deleted", "device_inventory": "skipped",
-               "software_licensing": "deleted", "app_usage": "deleted"},
-    "deleted": 5,
+               "software_licensing": "deleted", "app_usage": "deleted",
+               "offline_endpoint": "deleted"},
+    "deleted": 6,
     "skipped": 1,
     "failed": 0
   },
@@ -7329,7 +7330,7 @@ Per-store outcomes: `deleted` (the DELETE **committed**), `skipped` (store not c
 | 503 + `Sec-Audit-Failed` | The attempt audit row could not persist — fail-closed, **nothing was erased** |
 | 503 | Scope gate or cascade not configured (A4 envelope) |
 
-A `200` with `decommissioned: true` is confirmed erasure across every configured store; deleting an unknown `agent_id` is a no-op `200` (nothing to erase). Erasure does not unenroll the agent — a still-enrolled device re-syncs on its next daily cycle, so decommission the device first. This guarantee is scoped to the stores the cascade actually fans across — a leftover legacy `inventory.db` on disk (only possible outside ADR-0009's "no fleet ever ran pre-Postgres" assumption) was never part of it: `InventoryStore::delete_agent()` stopped scrubbing that file when its one-time backfill was retired (#3623), since the erasure branch existed only to serve the backfill.
+A `200` with `decommissioned: true` is confirmed erasure across every configured store; deleting an unknown `agent_id` is a no-op `200` (nothing to erase). Erasure does not unenroll the agent — a still-enrolled device re-syncs on its next daily cycle, and re-creates its `offline_endpoint` presence row on its next heartbeat, so decommission the device first. This guarantee is scoped to the stores the cascade actually fans across — a leftover legacy `inventory.db` on disk (only possible outside ADR-0009's "no fleet ever ran pre-Postgres" assumption) was never part of it: `InventoryStore::delete_agent()` stopped scrubbing that file when its one-time backfill was retired (#3623), since the erasure branch existed only to serve the backfill.
 
 ---
 

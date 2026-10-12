@@ -1959,14 +1959,19 @@ is counted under route-store failure op `session_lookup`.
 - **Presence correctness (§7a).** `OfflineEndpointStore::upsert` blank-preserves `hostname`
   (newly; `os` has been blank-preserved since #5294, as were `agent_version`/`arch`): a blank incoming
   value never overwrites a known non-blank one. Consequence: a presence row's `hostname` is never
-  cleared by an upsert — it is reset only by deleting the row (`remove_if_session`). Recorded gap
-  (pre-existing, not introduced here): `OfflineEndpointStore` has no `delete_agent` and is not a
-  member of the decommission cascade (`AgentDecommissionStores`), so a decommissioned agent's
-  `endpoint_state.endpoints` row (including its `hostname`) persists indefinitely: there is no
-  age-out pass for that table (the only delete is the session-guarded `remove_if_session`, reached
-  from a DISCONNECTED the decommissioned agent never sends). Reads filter by TTL or stale window, so
-  the row is invisible to scope evaluation and `/viz` once stale, but it is not deleted; deletion
-  needs the decommission-cascade item (#5682). `HeartbeatIngestion::ingest`
+  cleared by an upsert — it is reset only by deleting the row (`remove_if_session`, or the
+  decommission cascade below). Gap recorded when this bullet was written (pre-existing, not
+  introduced by WS-5): `OfflineEndpointStore` had no `delete_agent` and was not a member of the
+  decommission cascade (`AgentDecommissionStores`), so a decommissioned agent's
+  `endpoint_state.endpoints` row (including its `hostname`) persisted indefinitely, because the only
+  delete was the session-guarded `remove_if_session`, reached from a DISCONNECTED the decommissioned
+  agent never sends. **Closed by #5682:** `OfflineEndpointStore::delete_agent` deletes the row
+  whatever its `session_id`, and it is the cascade's seventh member (`offline_endpoint`), so
+  `DELETE /api/v1/sle/agents/{id}` erases it on the shared Postgres, visible to every replica's next
+  presence read (the registry's 3 s `kPresenceCacheTtl` read cache aside). A still-enrolled agent
+  that heartbeats again re-creates the row, the same "erasure does not unenroll" posture as every
+  other cascade store. There is still no age-out pass for the table; the time-based prune stays
+  with #1545. `HeartbeatIngestion::ingest`
   takes the resolved session id, so a heartbeat on a non-owning replica (no local `AgentSession`)
   cannot blank the presence row's `session_id`.
 
