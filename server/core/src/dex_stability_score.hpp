@@ -47,10 +47,14 @@
  *   uncertainty. Every +infinity upper bound the sibling produces is labelled
  *   unreliable, so suppressing unreliable intervals would make the open upper
  *   bound unreachable.
- * - Bands: excellent >= 90, good >= 75, fair >= 60, else poor. These are the
- *   edges and labels of the fleet health-score band (build_dex_health_model,
- *   dex_read_model.cpp); the per-device buckets there (great / fair / poor at
- *   90 / 75) are a different scale. The rule differs: the health page bands
+ * - Bands: excellent >= 90, good >= 75, fair >= 60, else poor. These defaults
+ *   are the edges and labels of the fleet health-score band
+ *   (build_dex_health_model, dex_read_model.cpp); the per-device buckets there
+ *   (great / fair / poor at 90 / 75) are a different scale. The edges are a
+ *   parameter (StabilityBandEdges, defaulting to 90 / 75 / 60) and are applied
+ *   to the displayed value exactly as the defaults are. This module does not
+ *   validate edges: garbage edges band wrongly and never withhold; validation
+ *   lives in dex_score_policy.hpp. The rule differs: the health page bands
  *   the RAW double and prints it at zero decimals, while this module bands the
  *   one-decimal DISPLAY value, so 89.96 reads "good" there and "excellent"
  *   here. A page must not share one band expression across the two.
@@ -139,6 +143,16 @@ inline constexpr double kStabilityRegressionFullRatio = 3.0;
 inline constexpr double kStabilityBandExcellent = 90.0;
 inline constexpr double kStabilityBandGood = 75.0;
 inline constexpr double kStabilityBandFair = 60.0;
+
+/// Lower edges of the top three bands (poor is everything below `fair`).
+/// Not validated here; see dex_score_policy.hpp.
+struct StabilityBandEdges {
+    double excellent{kStabilityBandExcellent};
+    double good{kStabilityBandGood};
+    double fair{kStabilityBandFair};
+};
+
+inline constexpr StabilityBandEdges kStabilityBandEdges{};
 /// Display resolution: scores are shown at one decimal (10 steps per point).
 inline constexpr double kStabilityScoreScale = 10.0;
 
@@ -161,13 +175,14 @@ enum class StabilityBand { Excellent, Good, Fair, Poor };
 /// Band of the DISPLAYED score (see stability_display_score). Domain: s in
 /// [0, 100], as returned by compute_stability_score; NaN bands poor and +inf
 /// bands excellent.
-[[nodiscard]] inline StabilityBand stability_band(double score) {
+[[nodiscard]] inline StabilityBand stability_band(double score,
+                                                  const StabilityBandEdges& e = kStabilityBandEdges) {
     const double shown = stability_display_score(score);
-    if (shown >= kStabilityBandExcellent)
+    if (shown >= e.excellent)
         return StabilityBand::Excellent;
-    if (shown >= kStabilityBandGood)
+    if (shown >= e.good)
         return StabilityBand::Good;
-    if (shown >= kStabilityBandFair)
+    if (shown >= e.fair)
         return StabilityBand::Fair;
     return StabilityBand::Poor;
 }
@@ -231,7 +246,8 @@ namespace stability_detail {
 /// inconsistent, below_floor.
 [[nodiscard]] inline StabilityScore
 compute_stability_score(const StabilityInputs& in, std::int64_t floor,
-                        const StabilityWeights& w = kStabilityWeights) {
+                        const StabilityWeights& w = kStabilityWeights,
+                        const StabilityBandEdges& edges = kStabilityBandEdges) {
     const std::int64_t reporting = in.reporting_devices;
     const std::int64_t affected = in.devices_affected;
     const std::int64_t crash = in.crash_events;
@@ -282,7 +298,7 @@ compute_stability_score(const StabilityInputs& in, std::int64_t floor,
         total += d.points;
     const double s = std::clamp(100.0 - total, 0.0, 100.0);
     r.score = s;
-    r.band = stability_band(s);
+    r.band = stability_band(s, edges);
     return r;
 }
 
