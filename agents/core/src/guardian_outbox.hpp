@@ -74,6 +74,14 @@ struct OutboxEntry {
     std::string event_id;        ///< fixed at enqueue (wire idempotency)
     std::int64_t enqueued_ns{0}; ///< timestamp fixed at enqueue
 
+    /// #3972: position in the runtime's single cross-lane enqueue order (1-based, strictly
+    /// increasing across BOTH logs; 0 = unstamped). Stamped by GuardianSparkRuntime under
+    /// outbox_mu_ immediately before each enqueue; the logs below only carry it, and a
+    /// coalesce (whole-struct replace) carries the NEW entry's seq, so "enqueue order" for a
+    /// coalesced entry is its latest observation. NOT a wire field and NOT journalled:
+    /// guardian_outbox_entry_to_event and the journal format ignore it.
+    std::uint64_t seq{0};
+
     GuardDrift drift{};          ///< Compliance payload
 
     bool healthy{true};          ///< Health payload: true = recovered, false = unhealthy
@@ -243,6 +251,13 @@ public:
             return std::nullopt;
         return pending_.front();
     }
+    /// The head's seq without copying the entry (nullopt if empty; 0 if the head is
+    /// unstamped). Read by the runtime under outbox_mu_.
+    [[nodiscard]] std::optional<std::uint64_t> front_seq() const {
+        if (pending_.empty())
+            return std::nullopt;
+        return pending_.front().seq;
+    }
 
     /// Pop the head IFF it is STILL the entry with `event_id` - i.e. a coalesce (which
     /// replaces the node in place with a fresh event_id) or a drop_rule/purge_stale
@@ -253,32 +268,42 @@ public:
             return false;
         index_.erase(Key{pending_.front().domain, pending_.front().rule_id});
         pending_.pop_front();
+        if (pending_.empty())
+            ++empty_epoch_;
         return true;
     }
 
     /// Drop every pending entry for a rule (used on disable / withdraw).
     void drop_rule(const std::string& rule_id) {
+        bool removed = false;
         for (auto it = pending_.begin(); it != pending_.end();) {
             if (it->rule_id == rule_id) {
                 index_.erase(Key{it->domain, it->rule_id});
                 it = pending_.erase(it);
+                removed = true;
             } else {
                 ++it;
             }
         }
+        if (removed && pending_.empty())
+            ++empty_epoch_;
     }
 
     /// Drop pending entries for a rule that predate `active_generation` (a
     /// superseded generation must never send). Entries at or above it are kept.
     void purge_stale(const std::string& rule_id, std::uint64_t active_generation) {
+        bool removed = false;
         for (auto it = pending_.begin(); it != pending_.end();) {
             if (it->rule_id == rule_id && it->generation < active_generation) {
                 index_.erase(Key{it->domain, it->rule_id});
                 it = pending_.erase(it);
+                removed = true;
             } else {
                 ++it;
             }
         }
+        if (removed && pending_.empty())
+            ++empty_epoch_;
     }
 
     [[nodiscard]] std::size_t size() const { return pending_.size(); }
@@ -286,6 +311,12 @@ public:
     [[nodiscard]] std::size_t capacity() const { return capacity_; }
     /// Count of rejected enqueues (never-evicted backpressure), for telemetry.
     [[nodiscard]] std::uint64_t backpressure_drops() const { return backpressure_drops_; }
+    /// #3972: counts removals that left the list EMPTY (pop_front_if, drop_rule, purge_stale);
+    /// never bumped by enqueue/enqueue_all/coalesce. A reader that remembered the value when
+    /// it started waiting on this list can tell "the list emptied since" from "same head
+    /// still there" without keeping any per-entry state. The TEST-ONLY drain() above is not
+    /// a production removal path and does not bump it.
+    [[nodiscard]] std::uint64_t empty_epoch() const { return empty_epoch_; }
 
 private:
     struct Key {
@@ -304,6 +335,7 @@ private:
     std::list<OutboxEntry> pending_;
     std::unordered_map<Key, std::list<OutboxEntry>::iterator, KeyHash> index_;
     std::uint64_t backpressure_drops_{0};
+    std::uint64_t empty_epoch_{0};
 };
 
 /// APPEND-ONLY audit log for Lifecycle (guard.armed / guard.disarmed / guard.errored)
@@ -378,16 +410,27 @@ public:
             return std::nullopt;
         return pending_.front();
     }
+    /// The head's seq without copying the entry (see GuardianOutbox::front_seq).
+    [[nodiscard]] std::optional<std::uint64_t> front_seq() const {
+        if (pending_.empty())
+            return std::nullopt;
+        return pending_.front().seq;
+    }
     bool pop_front_if(std::string_view event_id) {
         if (pending_.empty() || pending_.front().event_id != event_id)
             return false;
         pending_.pop_front();
+        if (pending_.empty())
+            ++empty_epoch_;
         return true;
     }
 
     [[nodiscard]] std::size_t size() const { return pending_.size(); }
     [[nodiscard]] bool empty() const { return pending_.empty(); }
     [[nodiscard]] std::uint64_t backpressure_drops() const { return backpressure_drops_; }
+    /// #3972: counts pop_front_if removals that left the log EMPTY (the only removal this
+    /// append-only log has); never bumped by enqueue. See GuardianOutbox::empty_epoch.
+    [[nodiscard]] std::uint64_t empty_epoch() const { return empty_epoch_; }
 
     /// Journal-replay support (item 7 PR-Ag): is `event_id` already buffered? The loader
     /// scans the window to skip re-paging an entry already present (membership = window
@@ -456,6 +499,7 @@ private:
     std::size_t capacity_;
     std::list<OutboxEntry> pending_;
     std::uint64_t backpressure_drops_{0};
+    std::uint64_t empty_epoch_{0};
 };
 
 } // namespace yuzu::agent

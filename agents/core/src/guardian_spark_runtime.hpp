@@ -1063,6 +1063,17 @@ public:
     [[nodiscard]] std::size_t armed_key_count() const;
     [[nodiscard]] std::size_t rule_count() const;
     [[nodiscard]] std::size_t outbox_size() const;
+    /// #3972 cross-lane ordering read side (OutboxEntry::seq). Each takes outbox_mu_ ONLY
+    /// (a leaf) and releases it before returning, so a caller may read one lane and then the
+    /// other, or an executor's state, without ever nesting locks. The *_front_seq values are the
+    /// head's seq (nullopt: lane empty; 0: unstamped head). The *_empty_epoch values count
+    /// removals that left that lane EMPTY and never move on enqueue/coalesce. Nothing in
+    /// production consumes these yet. The "outbox" lane is compliance + health (outbox_size()'s
+    /// lane); "lifecycle" is the audit log.
+    [[nodiscard]] std::optional<std::uint64_t> lifecycle_front_seq() const;
+    [[nodiscard]] std::optional<std::uint64_t> outbox_front_seq() const;
+    [[nodiscard]] std::uint64_t lifecycle_empty_epoch() const;
+    [[nodiscard]] std::uint64_t outbox_empty_epoch() const;
     [[nodiscard]] std::uint64_t outbox_backpressure_drops() const;
     /// rung 9c PR-3 (Decision 3, Option B): THIS instance's io_executor_ - summed
     /// across IO classes - CeilingExhausted (R5.1's physical alive-worker ceiling)
@@ -3000,6 +3011,16 @@ private:
     mutable std::mutex outbox_mu_;
     GuardianOutbox outbox_;
     GuardianLifecycleLog lifecycle_log_; ///< capacity set in the ctor init list (see the .cpp)
+    /// #3972: last OutboxEntry::seq handed out; ONE counter for both logs so seq orders
+    /// entries across lanes. outbox_mu_-guarded (stamped at the same instant as the enqueue).
+    std::uint64_t outbox_seq_{0};
+    /// Stamp `e.seq = ++outbox_seq_`. Called (outbox_mu_ held) immediately before EVERY
+    /// production enqueue into outbox_ / lifecycle_log_: enqueue_lifecycle_locked (armed +
+    /// disarm), evaluate_key and on_subscription_faulted (enqueue_all, each element, in vector
+    /// order), try_page_batch (each element actually enqueued). A new enqueue site MUST call
+    /// it, or its entries are seq 0 = exempt from the ordering guarantee (the tripwire test
+    /// in test_guardian_spark_runtime.cpp covers the five existing sites).
+    void stamp_seq_locked(OutboxEntry& e) noexcept { e.seq = ++outbox_seq_; }
     /// Durable-journal staging: built + validated records awaiting persist. Bounded
     /// (kMaxPendingJournalRecords), reserved ONCE in the ctor, drop-oldest on overflow.
     /// outbox_mu_-guarded (co-located with lifecycle_log_). Mutated by the engine's

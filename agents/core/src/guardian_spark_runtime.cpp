@@ -4178,6 +4178,8 @@ void GuardianSparkRuntime::on_subscription_faulted(const std::string& key,
         }
         if (!entries.empty()) {
             std::lock_guard<std::mutex> ob{outbox_mu_};
+            for (auto& e : entries)
+                stamp_seq_locked(e);
             outbox_.enqueue_all(std::move(entries)); // best-effort, same posture as
                                                       // evaluate_key's own enqueue - a
                                                       // rejected (full) enqueue is dropped
@@ -4431,6 +4433,8 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
             bool accepted = true;
             if (had_entries) {
                 std::lock_guard<std::mutex> ob{outbox_mu_};
+                for (auto& e : entries)
+                    stamp_seq_locked(e);
                 accepted = outbox_.enqueue_all(std::move(entries)); // both-or-neither
             }
 
@@ -4647,6 +4651,7 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
         std::shared_ptr<JournalRecord> record =
             build_journal_record(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
         std::lock_guard<std::mutex> ob{outbox_mu_};
+        stamp_seq_locked(entry);
         const bool accepted = lifecycle_log_.enqueue(std::move(entry)); // throwing, rolls back arm
         // #2233 item 7: a capacity-rejected lifecycle entry previously counted
         // (lifecycle_backpressure_drops(), fleet-visible via the journal heartbeat) but
@@ -4695,6 +4700,7 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
     std::lock_guard<std::mutex> ob{outbox_mu_};
     stage_pending_locked(std::move(record)); // durable disarm staged first (noexcept)
     try {
+        stamp_seq_locked(entry);
         const bool accepted = lifecycle_log_.enqueue(std::move(entry)); // best-effort live window
         // #2233 item 7 (see the ARM-side twin above for the full rationale). Distinct
         // from THIS try's own catch just below: that one covers enqueue() itself
@@ -4979,6 +4985,7 @@ GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entries) {
     for (auto& e : entries) {
         if (want.erase(e.event_id) == 0) // already windowed, or an intra-batch duplicate
             continue;
+        stamp_seq_locked(e); // page-time stamp: a prior-boot entry sorts after live enqueues so far
         if (lifecycle_log_.enqueue(std::move(e)))
             ++out.added;
     }
@@ -5362,6 +5369,22 @@ std::size_t GuardianSparkRuntime::rule_count() const {
 std::size_t GuardianSparkRuntime::outbox_size() const {
     std::lock_guard<std::mutex> ob{outbox_mu_};
     return outbox_.size();
+}
+std::optional<std::uint64_t> GuardianSparkRuntime::lifecycle_front_seq() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return lifecycle_log_.front_seq();
+}
+std::optional<std::uint64_t> GuardianSparkRuntime::outbox_front_seq() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return outbox_.front_seq();
+}
+std::uint64_t GuardianSparkRuntime::lifecycle_empty_epoch() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return lifecycle_log_.empty_epoch();
+}
+std::uint64_t GuardianSparkRuntime::outbox_empty_epoch() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return outbox_.empty_epoch();
 }
 std::uint64_t GuardianSparkRuntime::outbox_backpressure_drops() const {
     std::lock_guard<std::mutex> ob{outbox_mu_};
