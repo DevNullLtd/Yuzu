@@ -362,8 +362,9 @@ operator-visible notes:
     results request still in flight, so a late response for the previous command cannot swap its
     rows or its Create Group button over the new command's table. Still open (#5677): for about
     2 seconds after a command is sent the filter bar is an empty placeholder and the header
-    refresh fires on the same delay, so a sort or pagination click in that gap sends no command
-    and answers `400`, which htmx does not display; the built-in `help` command and a TAR SQL
+    refresh fires on the same delay; in a browser check the header had no sort links and the page
+    no Prev or Next controls in that window, so nothing could be clicked (a sort link pointing at
+    the empty bar would answer `400`, which htmx does not display); the built-in `help` command and a TAR SQL
     query clear the results area without aborting a request in flight; and the hardware list
     keeps the older `this:abort` sync. An open Create Static Group form is not cleared by a valid
     filter change and keeps its old filters and count (#5669).

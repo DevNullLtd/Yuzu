@@ -63,8 +63,10 @@ class EventBus;
 //    its HX-Trigger ends with `"htmx:abort":{"target":"#filter-bar"}` (the selector half of
 //    this constant) to abort an in-flight results request first. It must stay the LAST key.
 //    Residual (tracked with #5677): after a dispatch `#filter-bar` is an empty placeholder for
-//    ~2 seconds and the thead refresh fires on the same delay, so a th / Prev / Next click in
-//    that gap sends no command_id and answers 400, which htmx does not display.
+//    ~2 seconds and the thead refresh fires on the same delay. A browser check found no sort
+//    links or Prev / Next controls rendered in that window, so nothing is clickable; a sort
+//    link pointing at the empty bar would send no command_id and answer 400, which htmx does
+//    not display.
 // Deliberate exclusion: the `#chart-deck-host` refresh (dashboard_routes.cpp; ONE request fired
 // 2 seconds after a dispatch, not polling) is NOT in this scope. It is an unscoped request that
 // carries no f_* params, so its out-of-band swap can overwrite the pager / summary /
