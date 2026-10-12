@@ -105,6 +105,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <thread>
 
@@ -183,8 +184,7 @@ inline constexpr std::chrono::milliseconds kGuardianSendOfferWait{200};
 inline constexpr std::chrono::milliseconds kGuardianSendRecheckInterval{200};
 
 /// #3972 cross-lane launch hold and its release allowance. Defaults for the
-/// GuardianMaintenanceConfig knobs below; CONSUMED BY THE NEXT COMMIT (the symmetric
-/// cross-lane hold in wrapped_send()) - nothing in this worker reads them yet.
+/// GuardianMaintenanceConfig knobs below, consumed by wrapped_send()'s symmetric hold.
 inline constexpr std::chrono::milliseconds kGuardianCrossLaneOrderHold{1'000};
 inline constexpr std::size_t kGuardianCrossLaneReleaseAllowance{64};
 
@@ -232,8 +232,9 @@ struct GuardianMaintenanceConfig {
     /// not the later-declared maint_).
     std::chrono::milliseconds send_stall_threshold{
         GuardianOutboxSendExecutor::kGuardianSendStallThreshold};
-    /// #3972: NOT consumed in this commit - read by the cross-lane hold that lands next. Added
-    /// here with the other executor knob so GuardianMaintenanceConfig changes once.
+    /// #3972: how long a lane's head may be held behind an OLDER entry (lower OutboxEntry::seq)
+    /// in the other lane before the lane is released to overtake it, and how many entries may
+    /// then overtake before a further hold is needed (see wrapped_send()).
     std::chrono::milliseconds cross_lane_order_hold{kGuardianCrossLaneOrderHold};
     std::size_t cross_lane_release_allowance{kGuardianCrossLaneReleaseAllowance};
 };
@@ -485,6 +486,29 @@ public:
         return last_computed_wait_ms_.load(std::memory_order_relaxed);
     }
 
+    /// #3972: fleet sum of both lanes' hold RELEASES (a lane waited out cross_lane_order_hold
+    /// behind an older entry in the other lane and was released to overtake up to
+    /// cross_lane_release_allowance entries). One increment per bounded reordering window
+    /// opened. Relaxed atomics, lock-free: safe to read from the heartbeat thread.
+    [[nodiscard]] std::uint64_t cross_lane_order_release_count() const noexcept {
+        return hold_[0].releases.load(std::memory_order_relaxed) +
+               hold_[1].releases.load(std::memory_order_relaxed);
+    }
+
+    /// Test-only per-lane hold diagnostics (relaxed atomics). `lane` is the lane of the HELD
+    /// entry (Health maps to Compliance, as in wrapped_send()). denials: launches actually
+    /// refused by the gate; last_blocker_seq: the seq of the older entry that held it most
+    /// recently; releases: hold expiries on that lane. No production caller.
+    [[nodiscard]] std::uint64_t denials_for_test(OutboxDomain lane) const noexcept {
+        return hold_[lane_of(lane)].denials.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t last_blocker_seq_for_test(OutboxDomain lane) const noexcept {
+        return hold_[lane_of(lane)].last_blocker_seq.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t releases_for_test(OutboxDomain lane) const noexcept {
+        return hold_[lane_of(lane)].releases.load(std::memory_order_relaxed);
+    }
+
     /// Test-only synchronization seam - see the call site in stop() for what race it
     /// exists to make deterministic (#3953 item 6). Production callers never set this.
     void set_stop_race_hook_for_test(std::function<void()> hook) {
@@ -527,26 +551,14 @@ private:
     /// worker's own thread. The same two-executor split also makes a same-pass
     /// cross-lane WIRE ORDERING residual reachable (#3953 item 5 / #3972) - see
     /// GuardianSparkRuntime::drain_bounded()'s own note for the mechanism.
-    [[nodiscard]] SendResult wrapped_send(const OutboxEntry& entry) {
-        // Enumerator-exhaustive, no `default` (#3953 item 4): a new OutboxDomain value
-        // added without updating this routing is at least a silent fall-through into
-        // `compliance_send_exec_` (the pre-switch default), never something crash-safe
-        // to ignore. On GCC/Clang this also warns via -Wswitch (part of warning_level=3,
-        // meson.build) - but this repo builds with werror=false project-wide, so that
-        // warning does not fail CI, and MSVC's equivalent (C4062) is off at this
-        // project's current warning level (no /w14062 or /Wall set anywhere) - governance
-        // Gate 3 cpp-expert finding: do not assume uniform compiler protection here.
-        GuardianOutboxSendExecutor* exec = &compliance_send_exec_;
-        switch (entry.domain) {
-        case OutboxDomain::Lifecycle:
-            exec = &lifecycle_send_exec_;
-            break;
-        case OutboxDomain::Compliance:
-        case OutboxDomain::Health:
-            break;
-        }
-        return exec->offer(entry, send_, kGuardianSendOfferWait).value_or(SendResult::Retain);
-    }
+    ///
+    /// #3972: the LAUNCH is additionally gated by a bounded, symmetric, seq-ordered hold. An entry
+    /// is held while the OTHER lane has an older entry (lower OutboxEntry::seq) either pending at
+    /// its head or running in its executor; seq == 0 on either side fails open. A lane's hold
+    /// clock (cross_lane_order_hold) runs across ACTUAL launch denials only; on expiry the lane
+    /// is released for cross_lane_release_allowance overtaking launches, cleared the moment the
+    /// lane next finds no blocker. Defined in the .cpp, with the full contract.
+    [[nodiscard]] SendResult wrapped_send(const OutboxEntry& entry);
     /// True once stop() has been requested. Lock-free and noexcept BY DESIGN: this is
     /// the one check loop() makes outside a try, and taking a mutex here would let
     /// std::system_error escape the bare worker thread and terminate the agent (the
@@ -557,6 +569,39 @@ private:
     /// One drain pass under the configured count / wall-clock / stop-predicate limits.
     /// `truncated` means entries remain and the loop should re-drain WITHOUT waiting.
     [[nodiscard]] GuardianSparkRuntime::DrainOutcome drain_bounded();
+
+    /// #3972 loop-tail rule, run once per cycle inside loop()'s tail firewall. Folds this pass's
+    /// denials into the next wait: skip_wait only if a denied lane's BLOCKING lane Sent >= 1 this
+    /// pass (real progress, so it cannot busy-loop on a link-down or throwing blocker); else a
+    /// WAIT clamp (never a wake source) of min(recheck, remaining hold) for a running blocker or
+    /// min(periodic, remaining hold) for a pending one that made no progress.
+    void apply_cross_lane_tail(std::optional<std::chrono::milliseconds>& clamp, bool& skip_wait);
+
+    /// The two drain lanes. Health shares the Compliance lane (see wrapped_send()).
+    enum Lane : std::size_t { kLifecycleLane = 0, kComplianceLane = 1 };
+    [[nodiscard]] static constexpr Lane lane_of(OutboxDomain d) noexcept {
+        return d == OutboxDomain::Lifecycle ? kLifecycleLane : kComplianceLane;
+    }
+    [[nodiscard]] GuardianOutboxSendExecutor& exec_of(Lane l) noexcept {
+        return l == kLifecycleLane ? lifecycle_send_exec_ : compliance_send_exec_;
+    }
+
+    /// Per-lane #3972 hold state. The non-atomic members are touched only on the drain thread
+    /// (wrapped_send() / the loop tail; a test may drive wrapped_send_for_test() instead of
+    /// start()ing, never both). The atomics are the diagnostics read from other threads.
+    struct LaneHold {
+        std::optional<std::chrono::steady_clock::time_point> held_since; ///< cumulative hold clock
+        std::size_t allowance{0};         ///< overtaking launches left after a release
+        std::uint64_t epoch_at_hold{0};   ///< this lane's empty_epoch when held_since was set
+        bool denied_this_pass{false};     ///< per-pass flags, reset in drain_bounded()
+        bool sent_this_pass{false};
+        bool blocker_running_this_pass{false};
+        bool logged_release{false};       ///< log-once latch
+        std::atomic<std::uint64_t> last_blocker_seq{0};
+        std::atomic<std::uint64_t> denials{0};
+        std::atomic<std::uint64_t> releases{0};
+    };
+    LaneHold hold_[2];
 
     /// Heap sync state shared by the worker thread AND the waker (a
     /// std::function copied into the runtime) - see the class doc for why a

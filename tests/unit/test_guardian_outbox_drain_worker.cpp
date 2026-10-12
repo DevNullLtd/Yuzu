@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1395,10 +1396,16 @@ TEST_CASE("a jammed lifecycle head plus live compliance traffic does not re-arm 
 
     // A 200 ms page cadence against a 2 ms wake bound: cadence alone allows ~5 pages/second,
     // while a per-cycle re-arm allows hundreds. That gap is what makes this load-bearing.
+    //
+    // H = 0 (#3972): the jammed lifecycle head is OLDER than every verdict below, so under the
+    // symmetric hold compliance would be held for the default 1 s - the whole test - and
+    // `drained` would stay 0 on every cycle, which is the "hollow test" this comment warns
+    // against. A zero hold releases on the next pass, keeping compliance draining each cycle.
     GuardianOutboxDrainWorker worker(*rig.rt, split_sink, /*periodic_bound_ms=*/2,
                                      {.journal = rig.journal,
                                       .page_interval = 200ms,
-                                      .prune_interval = 1h});
+                                      .prune_interval = 1h,
+                                      .cross_lane_order_hold = 0ms});
     worker.start();
     CHECK(spin_until([&] { return rig.journal->pages() >= 1; })); // boot page places both
 
@@ -1433,6 +1440,7 @@ TEST_CASE("a jammed lifecycle head plus live compliance traffic does not re-arm 
     // than the unbounded event-rate loop it was first reported as - the extra cycle runs
     // microseconds later, so there is nothing left for it to drain.
     CHECK(pages <= 7);
+    CHECK(compliance_sent.load() > 0); // not hollow: the buggy re-arm needs a non-empty drain
 }
 
 // ---------------------------------------------------------------------------
@@ -1739,7 +1747,11 @@ struct OrphanFixture {
 
     OrphanFixture()
         : worker(*rig.rt, std::ref(sink), kOrphanPeriodicMs,
-                 {.send_stall_threshold = kOrphanStallThreshold}) {
+                 // H = 0: these tests pin the #3980 probe/clamp rules in isolation. The `disarmed`
+                 // that detach_rule() enqueues would otherwise be HELD behind the running orphan
+                 // (#3972), and that hold's own recheck clamp would mask the rule under test; the
+                 // interaction of the two is #3972 T1.
+                 {.send_stall_threshold = kOrphanStallThreshold, .cross_lane_order_hold = 0ms}) {
         enqueue_drift("cmp");
         worker.start(); // last: nothing below can throw while a send is parked
     }
@@ -1888,71 +1900,702 @@ TEST_CASE("#3980: while the compliance lane still HAS a head, an uncounted in-fl
     CHECK(f.worker.send_stall_count() == 0);
 }
 
-TEST_CASE("item 4 regression: a stalled lifecycle send does not starve compliance delivery",
-          "[spark][guardian][drain][chaos]") {
-    // #3847/#2233 item 4, governance Gate 4 unhappy-path finding UP-1 (BLOCKING, found in
-    // this fix's first draft): GuardianOutboxDrainWorker used ONE shared
-    // GuardianOutboxSendExecutor across BOTH the lifecycle log and the compliance/health
-    // log. A slow-but-succeeding lifecycle send made the compliance drain_log_unlocked call
-    // hit the SAME executor's mismatch-orphan branch and return Retain WITHOUT EVER
-    // invoking the compliance send - silent, repeated starvation of an entire audit lane,
-    // not just the stalled entry. Exercises the real GuardianOutboxDrainWorker wiring
-    // (unlike test_guardian_outbox_send_executor.cpp's isolated single-lane coverage),
-    // since the bug lived in the TWO-CALL structure this class routes through, not in the
-    // executor class itself. Fixed by giving each lane its own executor instance.
-    //
-    // Lifecycle is stalled INDEFINITELY (CV-gated, not a fixed sleep): a bounded stall long
-    // enough to exceed kGuardianSendOfferWait once still lets compliance ship as soon as
-    // lifecycle's OWN send finally resolves and its single shared slot frees up - both the
-    // single-executor and two-executor designs would eventually satisfy that. The property
-    // that actually distinguishes them is compliance shipping WHILE lifecycle's send is
-    // STILL provably running - which the single-executor design can never do (the shared
-    // slot stays occupied for the send's whole duration, however long that is).
-    JournalRig rig;
+// ---------------------------------------------------------------------------
+// #3972: the bounded SYMMETRIC seq-ordered cross-lane launch hold.
+//
+// Every test here runs the real worker against a real GuardianSparkRuntime with H = 600 ms and
+// N = 2 (the production H is 1 s / N 64; tests override), and a sink that RECORDS the order and
+// time of every invocation. Sends are CV-gated per lane, so "this entry has not been invoked"
+// is an event, never a sleep. The direct tests (no start()) drive wrapped_send_for_test() with
+// hand-built entries: with no drain thread there is no probe either, which is what lets them
+// pin "running, not in_flight" and the seq == 0 fail-open deterministically.
+// ---------------------------------------------------------------------------
 
-    std::mutex lifecycle_mu;
-    std::condition_variable lifecycle_cv;
-    bool release_lifecycle{false};
-    std::atomic<int> lifecycle_invocations{0};
-    std::atomic<int> compliance_invocations{0};
-    auto send = [&](const OutboxEntry& e) -> SendResult {
-        if (e.domain == OutboxDomain::Lifecycle) {
-            lifecycle_invocations.fetch_add(1);
-            std::unique_lock<std::mutex> lk{lifecycle_mu};
-            lifecycle_cv.wait(lk, [&] { return release_lifecycle; });
-            return SendResult::Sent;
-        }
-        compliance_invocations.fetch_add(1);
-        return SendResult::Sent; // instant
+namespace {
+
+constexpr std::chrono::milliseconds kHold{600};
+constexpr std::size_t kAllowance = 2;
+constexpr std::size_t kLifecycleIdx = 0;
+constexpr std::size_t kComplianceIdx = 1;
+constexpr std::size_t lane_idx(OutboxDomain d) { return d == OutboxDomain::Lifecycle ? 0 : 1; }
+
+struct HoldSink {
+    struct Ev {
+        bool end{false};
+        OutboxDomain domain{OutboxDomain::Compliance};
+        std::uint64_t seq{0};
+        std::string rule;
+        std::string kind; ///< lifecycle_kind, or "verdict" for compliance
+        std::chrono::steady_clock::time_point at;
     };
+    std::mutex mu;
+    std::condition_variable cv;
+    int permits[2]{-1, -1};                 ///< per lane; -1 = open, 0 = park, n = let n through
+    std::chrono::milliseconds delay[2]{0ms, 0ms};
+    bool throws[2]{false, false};
+    bool link_up{true};                     ///< false: every send Retains (never logged as started)
+    std::size_t retained[2]{0, 0};
+    std::vector<Ev> log;
+    std::function<void(const OutboxEntry&)> on_compliance_start; ///< runs outside the lock
 
-    GuardianOutboxDrainWorker worker(*rig.rt, send, /*periodic_bound_ms=*/20);
-    worker.start();
-
-    // Lifecycle entry: attach_rule enqueues an "armed" lifecycle entry immediately.
-    rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
-    REQUIRE(spin_until([&] { return lifecycle_invocations.load() >= 1; }, 3s)); // now stuck
-
-    // Compliance entry: a real drift verdict on a SEPARATE rule, enqueued only AFTER
-    // lifecycle is confirmed stuck - a real drain pass has to run the compliance phase
-    // while lifecycle's slot is still occupied for this to prove anything.
-    REQUIRE(rig.rt->attach_rule("cmp", file_spec("/cmp"), file_exists_rule("cmp"), true));
-    rig.reader->file = read_known(FileSnapshot{.exists = false});
-    rig.rt->evaluate_key(spark_key(file_spec("/cmp")), EvalReason::Convergence);
-
-    // THE regression: compliance ships WHILE lifecycle is still parked (never released).
-    // Pre-fix (one shared executor) this times out - the compliance send is never even
-    // attempted while the shared slot is held by lifecycle's still-running worker.
-    CHECK(spin_until([&] { return compliance_invocations.load() >= 1; }, 3s));
-    CHECK(lifecycle_invocations.load() == 1); // lifecycle's send never resolved during that wait
-
-    {
-        std::lock_guard<std::mutex> lk{lifecycle_mu};
-        release_lifecycle = true;
+    SendResult operator()(const OutboxEntry& e) {
+        const auto ln = lane_idx(e.domain);
+        const auto make = [&](bool end) {
+            return Ev{end, e.domain, e.seq, e.rule_id,
+                      e.domain == OutboxDomain::Lifecycle ? e.lifecycle_kind : "verdict",
+                      std::chrono::steady_clock::now()};
+        };
+        {
+            std::lock_guard<std::mutex> lk{mu};
+            if (!link_up) {
+                ++retained[ln];
+                return SendResult::Retain;
+            }
+            log.push_back(make(false));
+        }
+        if (ln == kComplianceIdx && on_compliance_start)
+            on_compliance_start(e);
+        if (throws[ln])
+            throw std::runtime_error("hold test: injected send throw");
+        std::unique_lock<std::mutex> lk{mu};
+        cv.wait(lk, [&] { return permits[ln] != 0; });
+        if (permits[ln] > 0)
+            --permits[ln];
+        const auto d = delay[ln];
+        lk.unlock();
+        if (d.count() > 0)
+            std::this_thread::sleep_for(d);
+        lk.lock();
+        log.push_back(make(true));
+        return SendResult::Sent;
     }
-    lifecycle_cv.notify_all();
-    REQUIRE(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
-    worker.stop();
+    void set_permits(std::size_t ln, int n) {
+        {
+            std::lock_guard<std::mutex> lk{mu};
+            permits[ln] = n;
+        }
+        cv.notify_all();
+    }
+    void open_all() {
+        {
+            std::lock_guard<std::mutex> lk{mu};
+            permits[0] = permits[1] = -1;
+        }
+        cv.notify_all();
+    }
+    void set_link(bool up) {
+        std::lock_guard<std::mutex> lk{mu};
+        link_up = up;
+    }
+    std::vector<Ev> snapshot() {
+        std::lock_guard<std::mutex> lk{mu};
+        return log;
+    }
+    std::size_t n_started(OutboxDomain d) {
+        std::lock_guard<std::mutex> lk{mu};
+        std::size_t n = 0;
+        for (const auto& ev : log)
+            n += !ev.end && lane_idx(ev.domain) == lane_idx(d);
+        return n;
+    }
+    std::size_t n_ended(OutboxDomain d) {
+        std::lock_guard<std::mutex> lk{mu};
+        std::size_t n = 0;
+        for (const auto& ev : log)
+            n += ev.end && lane_idx(ev.domain) == lane_idx(d);
+        return n;
+    }
+    std::size_t n_retained(OutboxDomain d) {
+        std::lock_guard<std::mutex> lk{mu};
+        return retained[lane_idx(d)];
+    }
+    /// The nth (0-based) START event of a lane; nullopt if it has not happened.
+    std::optional<Ev> nth_start(OutboxDomain d, std::size_t nth) {
+        std::lock_guard<std::mutex> lk{mu};
+        for (const auto& ev : log)
+            if (!ev.end && lane_idx(ev.domain) == lane_idx(d) && nth-- == 0)
+                return ev;
+        return std::nullopt;
+    }
+    std::optional<Ev> nth_end(OutboxDomain d, std::size_t nth) {
+        std::lock_guard<std::mutex> lk{mu};
+        for (const auto& ev : log)
+            if (ev.end && lane_idx(ev.domain) == lane_idx(d) && nth-- == 0)
+                return ev;
+        return std::nullopt;
+    }
+};
+
+/// Index in `log` of the first (start|end) event matching domain + seq; log.size() if none.
+std::size_t ev_index(const std::vector<HoldSink::Ev>& log, bool end, OutboxDomain d, std::uint64_t seq) {
+    for (std::size_t i = 0; i < log.size(); ++i)
+        if (log[i].end == end && log[i].domain == d && log[i].seq == seq)
+            return i;
+    return log.size();
+}
+
+struct HoldRig {
+    std::shared_ptr<FakeReader> reader{std::make_shared<FakeReader>()};
+    std::shared_ptr<GuardianSparkRuntime> rt{
+        std::make_shared<GuardianSparkRuntime>(reader, std::make_shared<FakeBackend>())};
+    HoldSink sink;
+    std::unique_ptr<GuardianOutboxDrainWorker> worker;
+
+    explicit HoldRig(std::uint64_t periodic_ms = 20, std::chrono::milliseconds hold = kHold,
+                     std::size_t allowance = kAllowance,
+                     std::chrono::milliseconds drain_max_wall = kGuardianDrainMaxWall) {
+        GuardianMaintenanceConfig cfg;
+        cfg.drain_max_wall = drain_max_wall;
+        cfg.cross_lane_order_hold = hold;
+        cfg.cross_lane_release_allowance = allowance;
+        worker = std::make_unique<GuardianOutboxDrainWorker>(*rt, std::ref(sink), periodic_ms, cfg);
+    }
+    /// Scope-exit guard: stop admissions, open every gate, then wait the detached sends out so
+    /// a REQUIRE unwind can never leave a parked send referencing a destroyed sink.
+    ~HoldRig() {
+        worker->stop();
+        sink.open_all();
+        CHECK(spin_until([&] { return worker->active_send_workers() == 0; }, 5s));
+    }
+    HoldRig(const HoldRig&) = delete;
+    HoldRig& operator=(const HoldRig&) = delete;
+
+    void start() { worker->start(); }
+    /// Raw helpers (no Catch2 macros: T2b calls them from a detached send thread).
+    bool arm(const std::string& rule) {
+        reader->file = read_known(FileSnapshot{.exists = true}); // attaches compliant: no verdict
+        return rt->attach_rule(rule, file_spec("/" + rule), file_exists_rule(rule), true).has_value();
+    }
+    void verdict(const std::string& rule) { // a drift edge: one (younger) compliance entry
+        reader->file = read_known(FileSnapshot{.exists = false});
+        rt->evaluate_key(spark_key(file_spec("/" + rule)), EvalReason::Convergence);
+    }
+    /// One lifecycle `armed` and nothing else.
+    void lifecycle_only(const std::string& rule) { REQUIRE(arm(rule)); }
+    /// A lifecycle `armed`, then (younger) a compliance drift verdict on the same rule.
+    void drift(const std::string& rule) {
+        lifecycle_only(rule);
+        verdict(rule);
+    }
+    const GuardianOutboxSendExecutor& compliance() const { return worker->compliance_send_exec_for_test(); }
+    const GuardianOutboxSendExecutor& lifecycle() const { return worker->lifecycle_send_exec_for_test(); }
+};
+
+OutboxEntry hand_entry(OutboxDomain d, std::uint64_t seq, const std::string& id) {
+    OutboxEntry e;
+    e.domain = d;
+    e.seq = seq;
+    e.event_id = id;
+    e.rule_id = id;
+    e.lifecycle_kind = d == OutboxDomain::Lifecycle ? "armed" : "";
+    return e;
+}
+
+/// Wait until `until` (a duration IS the property under test in the few places this is used).
+bool wait_until_time(std::chrono::steady_clock::time_point until) {
+    return spin_until([&] { return std::chrono::steady_clock::now() >= until; }, 30s);
+}
+
+} // namespace
+
+TEST_CASE("#3972 T1: a lifecycle entry younger than a compliance ORPHAN is held until the "
+          "orphan's send returns",
+          "[spark][guardian][drain][order]") {
+    // The #5690 direction. detach_rule() withdraws the rule's verdict (the lane EMPTIES under a
+    // running send) and enqueues the rule's `disarmed`. Nothing is PENDING in the compliance
+    // lane - only the running term of the predicate can hold the younger lifecycle entry.
+    HoldRig f;
+    f.sink.set_permits(kComplianceIdx, 0);
+    f.drift("cmp");
+    f.start();
+    REQUIRE(spin_until([&] {
+        return f.sink.n_started(OutboxDomain::Compliance) == 1 && f.compliance().in_flight_snapshot().running;
+    }));
+    const auto verdict_seq = f.sink.nth_start(OutboxDomain::Compliance, 0)->seq;
+
+    f.rt->detach_rule("cmp");
+    REQUIRE(f.rt->outbox_size() == 0); // orphan: running, no longer pending
+    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Lifecycle) >= 1; }));
+    CHECK(f.worker->last_blocker_seq_for_test(OutboxDomain::Lifecycle) == verdict_seq);
+    CHECK(f.sink.n_started(OutboxDomain::Lifecycle) == 1); // only cmp's `armed`; `disarmed` is held
+    CHECK(f.worker->cross_lane_order_release_count() == 0);
+
+    f.sink.set_permits(kComplianceIdx, -1); // the orphan's send returns (well inside H)
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Lifecycle) == 2; }));
+    const auto log = f.sink.snapshot();
+    const auto disarmed_seq = f.sink.nth_start(OutboxDomain::Lifecycle, 1)->seq;
+    CHECK(f.sink.nth_start(OutboxDomain::Lifecycle, 1)->kind == "disarmed");
+    CHECK(ev_index(log, true, OutboxDomain::Compliance, verdict_seq) <
+          ev_index(log, false, OutboxDomain::Lifecycle, disarmed_seq));
+    CHECK(f.worker->cross_lane_order_release_count() == 0); // released by COMPLETION, not by H
+}
+
+TEST_CASE("#3972 T1b: the same held entry is released by H when the orphan never returns",
+          "[spark][guardian][drain][order]") {
+    HoldRig f;
+    f.sink.set_permits(kComplianceIdx, 0);
+    f.drift("cmp");
+    f.start();
+    REQUIRE(spin_until([&] {
+        return f.sink.n_started(OutboxDomain::Compliance) == 1 && f.compliance().in_flight_snapshot().running;
+    }));
+    const auto t0 = std::chrono::steady_clock::now(); // strictly before the first denial
+    f.rt->detach_rule("cmp");
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Lifecycle) == 2; }));
+    const auto released_at = f.sink.nth_start(OutboxDomain::Lifecycle, 1)->at;
+    CHECK(released_at - t0 >= kHold); // the clock starts at a denial that is after t0
+    CHECK(f.sink.n_ended(OutboxDomain::Compliance) == 0); // the orphan is STILL parked
+    CHECK(f.worker->releases_for_test(OutboxDomain::Lifecycle) == 1);
+    CHECK(f.worker->cross_lane_order_release_count() == 1);
+}
+
+TEST_CASE("#3972 T1c: a send that is done but not yet reclaimed no longer blocks (running, "
+          "not in_flight)",
+          "[spark][guardian][drain][order]") {
+    // No start(): no drain thread, so no probe, so the finished orphan stays in_flight.
+    HoldRig f(20, std::chrono::hours{1});
+    f.sink.set_permits(kComplianceIdx, 0);
+    const auto c = hand_entry(OutboxDomain::Compliance, 2, "c-1");
+    const auto l = hand_entry(OutboxDomain::Lifecycle, 3, "l-1");
+    CHECK(f.worker->wrapped_send_for_test(c) == SendResult::Retain); // parked past the 200 ms wait
+    REQUIRE(f.compliance().in_flight_snapshot().running);
+    CHECK(f.worker->wrapped_send_for_test(l) == SendResult::Retain);
+    CHECK(f.worker->denials_for_test(OutboxDomain::Lifecycle) == 1);
+    CHECK(f.sink.n_started(OutboxDomain::Lifecycle) == 0);
+
+    f.sink.set_permits(kComplianceIdx, -1);
+    REQUIRE(spin_until([&] { return !f.compliance().in_flight_snapshot().running; }));
+    CHECK(f.compliance().in_flight_snapshot().in_flight); // done, unconsumed, unreclaimed
+    CHECK(f.worker->wrapped_send_for_test(l) == SendResult::Sent);
+    CHECK(f.worker->denials_for_test(OutboxDomain::Lifecycle) == 1);
+}
+
+TEST_CASE("#3972 T2: a compliance entry waits for EVERY older lifecycle send (pending term), "
+          "and lifecycle order stays monotone",
+          "[spark][guardian][drain][order]") {
+    // The lifecycle backlog is larger than one drain_max_wall slice, so several passes run; the
+    // verdict is denied each time its lane is offered. Between two lifecycle sends the lifecycle
+    // executor is idle (nothing RUNNING) - only the pending term keeps the verdict back.
+    HoldRig f(20, kHold, kAllowance, /*drain_max_wall=*/60ms);
+    f.sink.delay[kLifecycleIdx] = 10ms;
+    for (int i = 0; i < 20; ++i)
+        f.lifecycle_only("lc" + std::to_string(i));
+    f.drift("cmp");
+    f.start();
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 1; }));
+    REQUIRE(spin_until([&] { return f.sink.n_ended(OutboxDomain::Lifecycle) >= 21; }));
+
+    const auto log = f.sink.snapshot();
+    const auto verdict_seq = f.sink.nth_start(OutboxDomain::Compliance, 0)->seq;
+    const auto verdict_start = ev_index(log, false, OutboxDomain::Compliance, verdict_seq);
+    std::uint64_t prev = 0;
+    for (std::size_t i = 0; i < log.size(); ++i) {
+        const auto& ev = log[i];
+        if (ev.domain != OutboxDomain::Lifecycle)
+            continue;
+        if (!ev.end) {
+            CHECK(ev.seq > prev); // lifecycle FIFO unchanged
+            prev = ev.seq;
+        }
+        if (ev.end && ev.seq < verdict_seq)
+            CHECK(i < verdict_start); // every older lifecycle send returned before the verdict
+    }
+    CHECK(f.worker->cross_lane_order_release_count() == 0); // ordered by the hold, not released
+}
+
+TEST_CASE("#3972 T2b: an arm and verdict injected from inside a compliance send still reach the "
+          "wire in enqueue order",
+          "[spark][guardian][drain][order]") {
+    // The injection runs on the detached send worker while that send sits inside its offer wait
+    // (it takes only registry_mu_/outbox_mu_, never the engine mtx_, so it is legal there). The
+    // new rule's `armed` (lifecycle, younger than the running verdict) must not overtake it.
+    HoldRig f;
+    f.sink.delay[kComplianceIdx] = 100ms;
+    std::atomic<bool> injected{false};
+    f.sink.on_compliance_start = [&](const OutboxEntry&) {
+        if (injected.exchange(true))
+            return;
+        f.arm("late");
+        f.verdict("late");
+    };
+    f.drift("cmp");
+    f.start();
+    REQUIRE(spin_until([&] { return f.sink.n_ended(OutboxDomain::Compliance) >= 2; }));
+
+    const auto log = f.sink.snapshot();
+    const auto cmp_verdict = f.sink.nth_start(OutboxDomain::Compliance, 0)->seq;
+    const auto late_verdict = f.sink.nth_start(OutboxDomain::Compliance, 1)->seq;
+    std::uint64_t late_armed = 0;
+    for (const auto& ev : log)
+        if (!ev.end && ev.domain == OutboxDomain::Lifecycle && ev.rule == "late")
+            late_armed = ev.seq;
+    REQUIRE(late_armed != 0);
+    CHECK(ev_index(log, true, OutboxDomain::Compliance, cmp_verdict) <
+          ev_index(log, false, OutboxDomain::Lifecycle, late_armed));
+    CHECK(ev_index(log, true, OutboxDomain::Lifecycle, late_armed) <
+          ev_index(log, false, OutboxDomain::Compliance, late_verdict));
+}
+
+TEST_CASE("#3972 T3: the hold clock is cumulative across changing blocker identities",
+          "[spark][guardian][drain][order]") {
+    // Three lifecycle sends, each parked until THIS test lets it go, and only once the
+    // compliance lane has been denied behind exactly that send (so each outlasted the 200 ms
+    // offer wait and was seen RUNNING). A per-send timer would restart at every new blocker and
+    // never reach H; the cumulative clock releases compliance H after the FIRST denial, while the
+    // third send is still parked.
+    HoldRig f;
+    f.sink.set_permits(kLifecycleIdx, 0);
+    for (int i = 0; i < 3; ++i)
+        f.lifecycle_only("lc" + std::to_string(i));
+    f.drift("cmp");
+    const auto t0 = std::chrono::steady_clock::now(); // before the first denial
+    f.start();
+
+    for (std::size_t k = 0; k < 2; ++k) {
+        REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Lifecycle) > k; }));
+        const auto seq = f.sink.nth_start(OutboxDomain::Lifecycle, k)->seq;
+        REQUIRE(spin_until([&] {
+            return f.worker->last_blocker_seq_for_test(OutboxDomain::Compliance) == seq;
+        }));
+        f.sink.set_permits(kLifecycleIdx, 1); // let exactly this one return
+    }
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Lifecycle) > 2; }));
+    const auto third = f.sink.nth_start(OutboxDomain::Lifecycle, 2)->seq;
+    REQUIRE(spin_until(
+        [&] { return f.worker->last_blocker_seq_for_test(OutboxDomain::Compliance) == third; }));
+    const auto third_denied_at = std::chrono::steady_clock::now(); // >= the denial itself
+    REQUIRE(f.worker->releases_for_test(OutboxDomain::Compliance) == 0);
+
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) == 1; }));
+    const auto released_at = f.sink.nth_start(OutboxDomain::Compliance, 0)->at;
+    CHECK(released_at - t0 >= kHold);                       // never before H of cumulative holding
+    CHECK(released_at - third_denied_at < kHold - 100ms * kSpinScale); // but not H from the THIRD
+    CHECK(f.sink.n_ended(OutboxDomain::Lifecycle) == 2);    // the third send is still parked
+    CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
+}
+
+TEST_CASE("#3972 T4: a release is an ALLOWANCE of N launches that persists across passes, then "
+          "a further H is needed",
+          "[spark][guardian][drain][order]") {
+    // Lifecycle parked forever (the blocker). Three compliance verdicts whose sends take 300 ms
+    // (> the 200 ms offer wait, so each spans pass boundaries). N = 2.
+    HoldRig f;
+    f.sink.set_permits(kLifecycleIdx, 0);
+    f.sink.delay[kComplianceIdx] = 300ms;
+    f.lifecycle_only("L");
+    f.drift("c1");
+    f.drift("c2");
+    f.drift("c3");
+    const auto t0 = std::chrono::steady_clock::now();
+    f.start();
+
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 1; }));
+    const auto c1 = f.sink.nth_start(OutboxDomain::Compliance, 0)->at;
+    CHECK(c1 - t0 >= kHold);
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 2; }));
+    const auto c2 = f.sink.nth_start(OutboxDomain::Compliance, 1)->at;
+    CHECK(c2 - c1 < kHold - 20ms * kSpinScale); // the allowance carried over: no second H
+    CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
+
+    REQUIRE(spin_until([&] { return f.sink.n_ended(OutboxDomain::Compliance) >= 2; }));
+    const auto c2_end = f.sink.nth_end(OutboxDomain::Compliance, 1)->at;
+    const auto d0 = f.worker->denials_for_test(OutboxDomain::Compliance);
+    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Compliance) > d0; }));
+    CHECK(f.sink.n_started(OutboxDomain::Compliance) == 2); // the third is held again
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 3; }));
+    CHECK(f.sink.nth_start(OutboxDomain::Compliance, 2)->at - c2_end >= kHold);
+    CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 2);
+}
+
+TEST_CASE("#3972 T4b: a leftover allowance is cleared when the lane next finds no blocker",
+          "[spark][guardian][drain][order]") {
+    // Release with N = 2, use ONE launch, let the blocker complete and the lane run unblocked,
+    // then introduce a NEW older lifecycle entry. The leftover unit must not pre-authorise an
+    // overtake of it: the verdict is denied and waits a fresh H.
+    HoldRig f;
+    f.sink.set_permits(kLifecycleIdx, 0);
+    f.lifecycle_only("L");
+    f.drift("c1");
+    f.start();
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) == 1; }));
+    REQUIRE(f.worker->releases_for_test(OutboxDomain::Compliance) == 1); // allowance 2 -> 1 left
+
+    f.sink.set_permits(kLifecycleIdx, -1); // the blocker completes, the lifecycle backlog drains
+    REQUIRE(spin_until([&] { return f.sink.n_ended(OutboxDomain::Lifecycle) >= 2; }));
+    f.lifecycle_only("c2"); // ships first, so c2's verdict is offered with NO blocker
+    REQUIRE(spin_until([&] { return f.sink.n_ended(OutboxDomain::Lifecycle) >= 3; }));
+    f.verdict("c2");
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) == 2; }));
+
+    f.sink.set_permits(kLifecycleIdx, 0); // a new older lifecycle entry that sticks
+    const auto t_pre = std::chrono::steady_clock::now();
+    f.lifecycle_only("c3");
+    REQUIRE(spin_until([&] {
+        return f.sink.n_started(OutboxDomain::Lifecycle) == 4 && f.lifecycle().in_flight_snapshot().running;
+    }));
+    f.verdict("c3"); // younger than the parked `armed`
+    const auto d0 = f.worker->denials_for_test(OutboxDomain::Compliance);
+    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Compliance) > d0; }));
+    CHECK(f.sink.n_started(OutboxDomain::Compliance) == 2); // no leftover unit let it through
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) == 3; }));
+    CHECK(f.sink.nth_start(OutboxDomain::Compliance, 2)->at - t_pre >= kHold);
+}
+
+TEST_CASE("#3972 T5: a lane that EMPTIES mid-episode restarts its hold clock",
+          "[spark][guardian][drain][order]") {
+    HoldRig f;
+    f.sink.set_permits(kLifecycleIdx, 0);
+    f.lifecycle_only("L");
+    f.drift("c1");
+    f.start();
+    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Compliance) >= 1; }));
+    // Let a good part of H pass on c1's clock (the duration IS the property here).
+    REQUIRE(wait_until_time(std::chrono::steady_clock::now() + 350ms));
+    REQUIRE(f.sink.n_started(OutboxDomain::Compliance) == 0);
+
+    f.rt->detach_rule("c1"); // the compliance lane empties
+    REQUIRE(f.rt->outbox_size() == 0);
+    const auto t_pre = std::chrono::steady_clock::now();
+    f.drift("c2"); // a different entry, a different episode
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) == 1; }));
+    CHECK(f.sink.nth_start(OutboxDomain::Compliance, 0)->at - t_pre >= kHold);
+}
+
+TEST_CASE("#3972 T5b: continuous coalescing of the held entry neither resets nor postpones "
+          "the clock",
+          "[spark][guardian][drain][order]") {
+    HoldRig f;
+    f.sink.set_permits(kLifecycleIdx, 0);
+    f.lifecycle_only("L");
+    f.drift("c1");
+    const auto t0 = std::chrono::steady_clock::now();
+    f.start();
+    // A fresh verdict edge on the SAME rule every ~40 ms: each coalesces over the pending entry
+    // (latest wins, new seq, same position), so the lane never empties.
+    int i = 0;
+    while (f.sink.n_started(OutboxDomain::Compliance) == 0 &&
+           std::chrono::steady_clock::now() - t0 < 10s) {
+        f.reader->file = read_known(FileSnapshot{.exists = (i++ % 2 == 1)});
+        f.rt->evaluate_key(spark_key(file_spec("/c1")), EvalReason::Convergence);
+        std::this_thread::sleep_for(40ms);
+    }
+    REQUIRE(f.sink.n_started(OutboxDomain::Compliance) >= 1);
+    const auto released_at = f.sink.nth_start(OutboxDomain::Compliance, 0)->at;
+    CHECK(released_at - t0 >= kHold);
+    CHECK(released_at - t0 < kHold + 1000ms * kSpinScale);
+    CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
+}
+
+TEST_CASE("item 4 regression: a stalled lifecycle send holds a YOUNGER compliance entry for "
+          "at most H, then compliance is released (#3972 T6a)",
+          "[spark][guardian][drain][chaos][order]") {
+    // #3847/#2233 item 4 (Gate 4 UP-1): a stalled lifecycle send must not starve compliance
+    // FOREVER - lifecycle and compliance have their own executors precisely so one lane's stuck
+    // send cannot silence the other. #3972 refines the property into a BOUNDED one: the verdict
+    // is YOUNGER than the stuck lifecycle entry, so compliance is held for H (never longer), then
+    // released while the lifecycle send is STILL running. (Before #3972 this test asserted the
+    // unbounded inverse - compliance ships immediately - which is exactly the cross-lane wire
+    // reordering #3972 closes for every case where the older send is not stuck.)
+    HoldRig f;
+    f.sink.set_permits(kLifecycleIdx, 0); // lifecycle is stalled INDEFINITELY (CV-gated)
+    f.start();
+
+    f.lifecycle_only("r1"); // OLDER: r1's `armed`, which now parks
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Lifecycle) >= 1; }));
+
+    const auto t_pre = std::chrono::steady_clock::now();
+    f.drift("cmp"); // YOUNGER: a real drift verdict on a separate rule
+    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Compliance) >= 1; }));
+    CHECK(f.sink.n_started(OutboxDomain::Compliance) == 0); // held: the older send is running
+
+    // Bounded: released after H with the lifecycle send STILL parked, never released early.
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 1; }));
+    CHECK(f.sink.nth_start(OutboxDomain::Compliance, 0)->at - t_pre >= kHold);
+    CHECK(f.sink.n_started(OutboxDomain::Lifecycle) == 1);
+    CHECK(f.sink.n_ended(OutboxDomain::Lifecycle) == 0);
+    CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
+}
+
+TEST_CASE("#3972 T6b: the hold is symmetric - a YOUNGER lifecycle entry is held behind a "
+          "stalled OLDER compliance send, for at most H",
+          "[spark][guardian][drain][order]") {
+    HoldRig f;
+    f.sink.set_permits(kComplianceIdx, 0);
+    f.drift("cmp"); // `armed` ships; the verdict (older than what follows) parks
+    f.start();
+    REQUIRE(spin_until([&] {
+        return f.sink.n_started(OutboxDomain::Compliance) == 1 && f.compliance().in_flight_snapshot().running;
+    }));
+    REQUIRE(f.sink.n_started(OutboxDomain::Lifecycle) == 1);
+
+    const auto t_pre = std::chrono::steady_clock::now();
+    f.lifecycle_only("r1"); // higher seq than the parked verdict
+    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Lifecycle) >= 1; }));
+    CHECK(f.sink.n_started(OutboxDomain::Lifecycle) == 1); // held
+
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Lifecycle) == 2; }));
+    CHECK(f.sink.nth_start(OutboxDomain::Lifecycle, 1)->at - t_pre >= kHold);
+    CHECK(f.sink.n_ended(OutboxDomain::Compliance) == 0); // compliance still parked
+    CHECK(f.worker->releases_for_test(OutboxDomain::Lifecycle) == 1);
+}
+
+TEST_CASE("#3972 T7: a permanently throwing lifecycle head holds compliance for H, then "
+          "compliance ships",
+          "[spark][guardian][drain][order]") {
+    HoldRig f;
+    f.sink.throws[kLifecycleIdx] = true;
+    f.drift("cmp"); // `armed` (throws every attempt), then the younger verdict
+    const auto t0 = std::chrono::steady_clock::now();
+    f.start();
+    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Compliance) >= 1; }));
+    CHECK(f.sink.n_started(OutboxDomain::Compliance) == 0);
+
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 1; }));
+    CHECK(f.sink.nth_start(OutboxDomain::Compliance, 0)->at - t0 >= kHold);
+    CHECK(f.rt->send_exception_count() >= 1); // the throws were counted, not swallowed
+    CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
+}
+
+TEST_CASE("#3972 T8: link down - nothing overtakes; link up - wire order is enqueue order",
+          "[spark][guardian][drain][order]") {
+    HoldRig f;
+    f.sink.set_link(false);
+    f.lifecycle_only("a");
+    f.drift("b");
+    f.drift("c"); // armed/verdict interleaved across both lanes
+    f.start();
+    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Compliance) >= 1; }));
+    REQUIRE(spin_until([&] { return f.sink.n_retained(OutboxDomain::Lifecycle) >= 1; }));
+    CHECK(f.sink.snapshot().empty()); // nothing reached the wire while the link was down
+
+    f.sink.set_link(true); // well inside H of the first denial
+    REQUIRE(spin_until([&] {
+        return f.sink.n_ended(OutboxDomain::Lifecycle) + f.sink.n_ended(OutboxDomain::Compliance) == 5;
+    }));
+    std::uint64_t prev = 0;
+    for (const auto& ev : f.sink.snapshot()) {
+        if (ev.end)
+            continue;
+        CHECK(ev.seq > prev);
+        prev = ev.seq;
+    }
+    CHECK(f.worker->cross_lane_order_release_count() == 0);
+}
+
+TEST_CASE("#3972 T9: interleaved L,C,L,C ship in one bounded burst off the loop-tail skip_wait "
+          "alone (periodic 1 h)",
+          "[spark][guardian][drain][order]") {
+    HoldRig f(/*periodic_ms=*/3'600'000);
+    f.drift("a"); // L1, C2
+    f.drift("b"); // L3, C4
+    f.start();
+    // Pass 1 ships L1, C2, L3 and DENIES C4 (L3 was pending); the blocking lane Sent, so the
+    // very next pass runs without waiting. Without that rule C4 would wait for the release
+    // clamp (~H) or the hour.
+    REQUIRE(spin_until(
+        [&] { return f.sink.n_ended(OutboxDomain::Lifecycle) + f.sink.n_ended(OutboxDomain::Compliance) == 4; },
+        std::chrono::milliseconds{kHold.count() * 2 / 3}));
+    std::uint64_t prev = 0;
+    for (const auto& ev : f.sink.snapshot()) {
+        if (ev.end)
+            continue;
+        CHECK(ev.seq > prev);
+        prev = ev.seq;
+    }
+    CHECK(f.worker->cross_lane_order_release_count() == 0);
+}
+
+TEST_CASE("#3972 T9b: a denial behind a blocker that makes no progress schedules ONE wake at "
+          "the release instant and does not spin",
+          "[spark][guardian][drain][order]") {
+    HoldRig f(/*periodic_ms=*/3'600'000);
+    f.sink.set_link(false); // the lifecycle head Retains forever: pending, no progress
+    f.drift("a");
+    f.start();
+    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Compliance) >= 1; }));
+    // The wait is the remaining hold, not the hour.
+    REQUIRE(spin_until([&] {
+        const auto w = f.worker->last_computed_wait_ms_for_test();
+        return w > 0 && w <= kHold.count();
+    }));
+    // The one justified sleep: a NEGATIVE assertion ("the loop does not spin") has no event to
+    // wait on. The window stays inside H, so no release cycle can fall in it.
+    const auto cycles = f.worker->loop_cycles_for_test();
+    std::this_thread::sleep_for(250ms);
+    CHECK(f.worker->loop_cycles_for_test() == cycles);
+
+    // ...and the scheduled wake does fire at the release instant (periodic is 1 h).
+    REQUIRE(spin_until([&] { return f.sink.n_retained(OutboxDomain::Compliance) >= 1; }));
+    CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
+}
+
+TEST_CASE("#3972 T10: an unstamped (seq == 0) entry is never held and never blocks",
+          "[spark][guardian][drain][order]") {
+    HoldRig f(20, std::chrono::hours{1});
+    f.sink.set_permits(kComplianceIdx, 0);
+    // Held side unstamped: a lifecycle entry with seq 0 launches past a running OLDER send.
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Compliance, 5, "c-5")) ==
+          SendResult::Retain);
+    REQUIRE(f.compliance().in_flight_snapshot().running);
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Lifecycle, 0, "l-0")) ==
+          SendResult::Sent);
+    CHECK(f.worker->denials_for_test(OutboxDomain::Lifecycle) == 0);
+    // ...and a stamped younger entry IS held by that stamped running send (control).
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Lifecycle, 9, "l-9")) ==
+          SendResult::Retain);
+    CHECK(f.worker->denials_for_test(OutboxDomain::Lifecycle) == 1);
+    f.sink.open_all();
+    REQUIRE(spin_until([&] { return !f.compliance().in_flight_snapshot().running; }));
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Compliance, 5, "c-5")) ==
+          SendResult::Sent);
+
+    // Blocking side unstamped: a seq 0 running send holds nothing.
+    f.sink.set_permits(kComplianceIdx, 0);
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Compliance, 0, "c-0")) ==
+          SendResult::Retain);
+    REQUIRE(f.compliance().in_flight_snapshot().running);
+    CHECK(f.compliance().in_flight_snapshot().seq == 0);
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Lifecycle, 12, "l-12")) ==
+          SendResult::Sent);
+    CHECK(f.worker->denials_for_test(OutboxDomain::Lifecycle) == 1); // unchanged
+}
+
+TEST_CASE("#3972 T11: denials are counted per lane and every release increments the fleet sum "
+          "once",
+          "[spark][guardian][drain][order]") {
+    // H = 0 so the SECOND call after a denial is the release: the state machine is driven call
+    // by call, with no clock in it.
+    HoldRig f(20, 0ms, kAllowance);
+    f.sink.set_permits(kComplianceIdx, 0);
+    const auto c = hand_entry(OutboxDomain::Compliance, 5, "c-5");
+    CHECK(f.worker->wrapped_send_for_test(c) == SendResult::Retain); // older compliance send parks
+
+    const auto l = hand_entry(OutboxDomain::Lifecycle, 7, "l-7");
+    CHECK(f.worker->wrapped_send_for_test(l) == SendResult::Retain); // denied
+    CHECK(f.worker->denials_for_test(OutboxDomain::Lifecycle) == 1);
+    CHECK(f.worker->last_blocker_seq_for_test(OutboxDomain::Lifecycle) == 5);
+    CHECK(f.worker->releases_for_test(OutboxDomain::Lifecycle) == 0);
+    CHECK(f.worker->cross_lane_order_release_count() == 0);
+    CHECK(f.worker->wrapped_send_for_test(l) == SendResult::Sent); // released: one overtake
+    CHECK(f.worker->releases_for_test(OutboxDomain::Lifecycle) == 1);
+    CHECK(f.worker->denials_for_test(OutboxDomain::Lifecycle) == 1);
+    CHECK(f.worker->cross_lane_order_release_count() == 1);
+
+    // Reverse direction. Finish the compliance send first so lifecycle sees no blocker (which
+    // also clears its leftover allowance), then park an OLDER lifecycle send.
+    f.sink.set_permits(kComplianceIdx, -1);
+    CHECK(f.worker->wrapped_send_for_test(c) == SendResult::Sent);
+    f.sink.set_permits(kLifecycleIdx, 0);
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Lifecycle, 20, "l-20")) ==
+          SendResult::Retain);
+    const auto c2 = hand_entry(OutboxDomain::Compliance, 25, "c-25");
+    CHECK(f.worker->wrapped_send_for_test(c2) == SendResult::Retain); // denied behind l-20
+    CHECK(f.worker->denials_for_test(OutboxDomain::Compliance) == 1);
+    CHECK(f.worker->last_blocker_seq_for_test(OutboxDomain::Compliance) == 20);
+    CHECK(f.worker->wrapped_send_for_test(c2) == SendResult::Sent); // released
+    CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
+    CHECK(f.worker->releases_for_test(OutboxDomain::Lifecycle) == 1);
+    CHECK(f.worker->cross_lane_order_release_count() == 2); // both lanes summed
 }
 
 // ---------------------------------------------------------------------------

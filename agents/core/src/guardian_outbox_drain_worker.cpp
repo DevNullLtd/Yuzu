@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -295,6 +296,10 @@ GuardianSparkRuntime::DrainOutcome GuardianOutboxDrainWorker::drain_bounded() {
     limits.max_wall = maint_.drain_max_wall;
     // Checked before EVERY send, not once per pass: a bounded pass is still a count bound.
     limits.should_stop = [this] { return stop_requested(); };
+    // #3972: the per-pass hold flags are the loop-tail rule's input; this wrapper is the single
+    // entry for every production pass.
+    for (auto& h : hold_)
+        h.denied_this_pass = h.sent_this_pass = h.blocker_running_this_pass = false;
     // Routed through wrapped_send(), not send_ directly (#2233 item 4): a stalled sink no
     // longer makes this pass - or GuardianEngine::stop()'s join waiting on it (#2298 Sol
     // review) - arbitrarily long. wrapped_send() bounds its own wait to
@@ -302,6 +307,136 @@ GuardianSparkRuntime::DrainOutcome GuardianOutboxDrainWorker::drain_bounded() {
     // the send itself keeps running detached (guardian_outbox_send_executor.hpp), covered by
     // the orphan-exit contract rather than by this pass's own limits.
     return rt_.drain_bounded([this](const OutboxEntry& e) { return wrapped_send(e); }, limits);
+}
+
+SendResult GuardianOutboxDrainWorker::wrapped_send(const OutboxEntry& entry) {
+    // Lifecycle -> lifecycle lane; Compliance and Health -> compliance lane (see lane_of()).
+    const Lane x = lane_of(entry.domain);
+    const Lane y = x == kLifecycleLane ? kComplianceLane : kLifecycleLane;
+    LaneHold& h = hold_[x];
+
+    // BLOCKER (#3972): the other lane holds an OLDER entry (lower seq), either pending at its head
+    // or running in its executor. The running term covers an orphan (head withdrawn by
+    // detach_rule, send still inside send()). seq == 0 on either side fails open. The reads are
+    // strictly sequential (outbox_mu_, then the other executor's mutex), never nested, and their
+    // staleness is one-directional: the other lane's head is popped only by this thread, a running
+    // send can only finish, a concurrent enqueue carries a higher seq. Any throw fails open.
+    bool blocked = false;
+    bool blocker_running = false;
+    std::uint64_t blocker_seq = 0;
+    if (entry.seq != 0) {
+        try {
+            const auto front = y == kLifecycleLane ? rt_.lifecycle_front_seq() : rt_.outbox_front_seq();
+            const auto snap = exec_of(y).in_flight_snapshot();
+            if (snap.running && snap.seq != 0 && snap.seq < entry.seq) {
+                blocked = blocker_running = true;
+                blocker_seq = snap.seq;
+            } else if (front && *front != 0 && *front < entry.seq) {
+                blocked = true;
+                blocker_seq = *front;
+            }
+        } catch (...) {
+            blocked = false;
+        }
+    }
+
+    // GATE. The hold clock starts only on an ACTUAL denial (trace below), so an orphan still
+    // running, a same-entry wait or a consume never arms it. A released lane keeps its allowance
+    // across passes; it is cleared the moment the lane next finds no blocker, so a leftover
+    // allowance can never pre-authorise an overtake of a FUTURE older entry.
+    bool permitted = true;
+    if (!blocked) {
+        h.held_since.reset();
+        h.allowance = 0;
+    } else if (h.allowance == 0) {
+        permitted = false;
+        if (h.held_since) {
+            try {
+                // The lane emptied during the episode: the clock measured a different set of
+                // entries, so start over. A coalesce never empties a lane, so it never resets it.
+                const auto epoch = x == kLifecycleLane ? rt_.lifecycle_empty_epoch() : rt_.outbox_empty_epoch();
+                if (epoch != h.epoch_at_hold)
+                    h.held_since.reset();
+            } catch (...) {
+                h.held_since.reset();
+            }
+        }
+        if (h.held_since && std::chrono::steady_clock::now() - *h.held_since >= maint_.cross_lane_order_hold) {
+            h.allowance = maint_.cross_lane_release_allowance;
+            h.releases.fetch_add(1, std::memory_order_relaxed);
+            h.held_since.reset();
+            permitted = true;
+            if (!h.logged_release) {
+                h.logged_release = true;
+                try {
+                    spdlog::warn("Guardian drain worker: {} lane launch hold released after {} ms behind an "
+                                 "older entry (blocker seq {}, held seq {}); up to {} entries may now "
+                                 "overtake it. Further releases counted only.",
+                                 x == kLifecycleLane ? "lifecycle" : "compliance",
+                                 maint_.cross_lane_order_hold.count(), blocker_seq, entry.seq,
+                                 maint_.cross_lane_release_allowance);
+                } catch (...) {
+                }
+            }
+        }
+    }
+
+    GuardianOutboxSendExecutor::OfferTrace trace;
+    // A throw from offer() is the completed send's own: account for the launch first, then
+    // re-throw it unchanged for drain_log_unlocked to count (send_exceptions_).
+    SendResult r = SendResult::Retain;
+    std::exception_ptr thrown;
+    try {
+        r = exec_of(x).offer(entry, send_, kGuardianSendOfferWait, permitted, &trace).value_or(SendResult::Retain);
+    } catch (...) {
+        thrown = std::current_exception();
+    }
+    if (trace.launch_denied) {
+        if (!h.held_since) {
+            h.held_since = std::chrono::steady_clock::now();
+            try {
+                h.epoch_at_hold = x == kLifecycleLane ? rt_.lifecycle_empty_epoch() : rt_.outbox_empty_epoch();
+            } catch (...) {
+            }
+        }
+        h.denied_this_pass = true;
+        h.blocker_running_this_pass = blocker_running;
+        h.denials.fetch_add(1, std::memory_order_relaxed);
+        h.last_blocker_seq.store(blocker_seq, std::memory_order_relaxed);
+    }
+    // An overtake consumed one unit; a launch with no blocker consumes none.
+    if (trace.launched && blocked && h.allowance > 0)
+        --h.allowance;
+    if (r == SendResult::Sent)
+        h.sent_this_pass = true;
+    if (thrown)
+        std::rethrow_exception(thrown);
+    return r;
+}
+
+void GuardianOutboxDrainWorker::apply_cross_lane_tail(std::optional<std::chrono::milliseconds>& clamp,
+                                                      bool& skip_wait) {
+    const auto now = std::chrono::steady_clock::now();
+    for (const Lane x : {kLifecycleLane, kComplianceLane}) {
+        const LaneHold& h = hold_[x];
+        if (!h.denied_this_pass)
+            continue;
+        if (hold_[x == kLifecycleLane ? kComplianceLane : kLifecycleLane].sent_this_pass) {
+            skip_wait = true; // the blocking lane made progress: go again now (local re-arm, no wake)
+            continue;
+        }
+        const auto hold = maint_.cross_lane_order_hold;
+        const auto remaining =
+            h.held_since ? (std::max)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          hold - (now - *h.held_since)),
+                                      std::chrono::milliseconds{1})
+                         : hold;
+        const auto c = (std::min)(h.blocker_running_this_pass
+                                      ? kGuardianSendRecheckInterval
+                                      : std::chrono::milliseconds(periodic_bound_ms_),
+                                  remaining);
+        clamp = clamp ? (std::min)(*clamp, c) : c;
+    }
 }
 
 GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMaintenanceOps ops) {
@@ -648,6 +783,7 @@ void GuardianOutboxDrainWorker::loop() {
             const auto compliance = compliance_send_exec_.probe_orphan(compliance_lane_empty);
             send_clamp = compute_wait_clamp(lifecycle_send_exec_.in_flight_snapshot(),
                                             compliance.snapshot, compliance_lane_empty);
+            apply_cross_lane_tail(send_clamp, skip_wait); // #3972: composes by MINIMUM
         } catch (...) {
             send_clamp.reset();
         }
