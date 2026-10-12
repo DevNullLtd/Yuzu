@@ -1566,6 +1566,60 @@ one core replica a server-only restart now recovers through the replay described
   are planned follow-ups with no issue numbers yet. Rig pass 6 (`c518edd93`, simulated agents, loopback) registered 1000, 2000 and 5000 agents in 1.89 s, 4.16 s and 12.08 s with the shipped setting. Detail:
   `docs/user-manual/gateway.md`, "Registration rate per gateway".
 
+**Update (2026-10-06, #4632 - the gateway holds stream-status notifications instead of dropping them).**
+`yuzu_gw_upstream` no longer drops a `CONNECTED` or `DISCONNECTED` notification when 10 are already in
+flight or the circuit breaker is not closed. It holds it in a bounded, memory-only store keyed by
+`{agent, session, stream home}` (a newer event for a held key replaces the held one and keeps its place, except that a newer event for the
+half open probe's own key is held at the tail and supersedes the probe's older event if the probe fails;
+`notify_pending_max`, default 10000, caps the keys) and sends the held entries first in first out, at most 10 at a time. The
+earlier text of this section is left as written; the points below say what it no longer describes.
+- **Emission is at most once per session; delivery is not.** The "AT MOST ONE `CONNECTED(S)` and one
+  `DISCONNECTED(S)` per session" statement in the 4.4 status paragraph above describes what
+  `yuzu_gw_agent` emits. While the breaker is half open exactly one held notification is sent as the probe
+  and a probe that times out may already have reached the server, so it is sent again after it goes back to
+  the head: probe delivery is at least once (OBSERVED on a rig: one `DISCONNECTED` reached the server 3 times
+  after two timed-out probes and 6 times after five; one `CONNECTED` used as the probe, twice; the server
+  handled every copy without error).
+- **Retired clause.** "a `DISCONNECTED(S)` that `yuzu_gw_upstream` drops (circuit-open, or the
+  `MAX_NOTIFY_INFLIGHT` inflight cap) leaves it to lease-expiry + the stale-lease reaper", and the #1197
+  update's statement that an open breaker "drops stream-status notifications", no longer hold: such a
+  notification is held and delivered when the probe succeeds. What is still lost is a notification for a
+  new key when the store is full (counted as `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`),
+  one whose worker failed after taking it (not counted, not retried), a held probe that is evicted because it cannot
+  be encoded or is retired by a server status that means the request itself was wrong (a WARN is logged; see
+  the Known limits in `docs/user-manual/gateway.md`), and everything held when the upstream client process or the
+  gateway stops (the store is volatile). A lost `DISCONNECTED` still leaves the agent
+  listed as online in the server's registry and its route row routable until the lease expires, as before.
+- **Superseded pointer.** "The in-flight notification limit behind it is tracked in #4632" (the "What it does
+  not promise" bullet above) is closed by this change; the series still has no agent label and an agent
+  whose `CONNECTED` was lost at the cap still stays acknowledged but unreachable until its next reconnect.
+- **New invariant.** The head held notification is the breaker probe, so a notification that fails
+  deterministically on its own payload would block the queue and keep the breaker cycling against a healthy
+  server. Fields that an agent controls are therefore sanitised at admission; the agent-supplied peer address
+  is the only one today (found in review: a value that is not valid UTF-8 cannot be encoded).
+- **Narrowed by the Gate 8 re-review (same update).** The invariant above is now enforced at one more layer:
+  a failure of the gateway's own request encoder (the request never left the gateway) is a local error that
+  feeds the breaker neither as a success nor as a failure, and a held notification whose probe ends that way is
+  evicted with a warning and the next head is probed at once, so such a notification no longer blocks the queue.
+  A server answer, a transport error and a killed probe worker still count as before. `cluster_id` is converted
+  with the unicode conversion and the gateway refuses to start when it cannot be represented. The peer address
+  stays sanitised so its notification is sent instead of evicted. Details: Known limits in
+  `docs/user-manual/gateway.md` and the evidence record.
+- **Narrowed again by the second re-review (2026-10-06, fix round 3).** The invariant now also covers a
+  server status that means the request itself was wrong. The gateway refuses an agent id outside 1 to
+  256 bytes at the edge (the same bound the server applies) before any upstream call, and server statuses
+  such as `INVALID_ARGUMENT` no longer count as breaker failures, so a registration the server refuses cannot
+  move the breaker; statuses that mean an unhealthy or unusable upstream still count. The `cluster_id`
+  environment text is interpreted in the VM's native name encoding (latin1 in the shipped images), because
+  the round above had assumed Unicode code points; the refusal to start for an unrepresentable value is
+  unchanged. Details: Known limits in `docs/user-manual/gateway.md` and the evidence record.
+- **Residuals** are the ones listed under Known limits in `docs/user-manual/gateway.md`, among them: a probe
+  success proves only the notification path, not registration; the synchronous RPCs still run inside the one
+  upstream process, so casts queue in its mailbox while one runs; retry or breaker feedback for an ordinary
+  notification worker that fails is a follow-up.
+The measured evidence (rig runs against the previous build and with TLS, the governance run and the
+adversarial review) is `docs/security-reviews/gateway-notify-pending-store-2026-10-05.md`.
+
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
 
 **Status: CLOSED.** The last named WS-4 4.3 gap: 4.3a (§ above) built INTRA-cluster routing (agent on a

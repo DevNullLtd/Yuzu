@@ -93,6 +93,22 @@ groups:
           summary: "Gateway upstream RPC errors"
           description: "Gateway is experiencing {{ $value }}/s upstream RPC errors."
 
+      # A request the gateway could not encode never reaches the server and never
+      # opens the circuit breaker, so a systematic local encode fault leaves the
+      # breaker closed. The rate rule above has no code filter and fires only
+      # above 0.1 errors/s for 5m, so a slow encode fault can stay under it.
+      # Threshold: increase() >= 10 over 10m (about ten: increase() extrapolates,
+      # so nine on a non-zero counter can reach it), so one rejected request does
+      # not warn. batch_heartbeat marshal failures are counted as
+      # code="exception" and are not covered here.
+      - alert: YuzuGatewayUpstreamEncodeErrors
+        expr: increase(yuzu_gw_upstream_rpc_errors_total{code="encode"}[10m]) >= 10
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway could not encode about 10 or more {{ $labels.rpc_name }} requests in 10m"
+          description: "Gateway could not encode about 10 or more {{ $labels.rpc_name }} requests in 10m. A systematic encode failure leaves the circuit breaker closed and /readyz ready; YuzuGatewayUpstreamErrors fires on any code only above 0.1 errors/s, so it can stay silent for a slow encode fault. A lone failure is most likely a single rejected request and does not reach this alert, which needs about 10 in 10 minutes (increase() extrapolates, so nine can reach it): read the rate, not the existence."
+
       # Gateway BEAM VM memory exceeds 4GB.
       - alert: YuzuGatewayMemoryHigh
         expr: yuzu_gw_beam_memory_bytes{type="total"} > 4294967296
