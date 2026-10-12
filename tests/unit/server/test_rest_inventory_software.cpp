@@ -292,6 +292,8 @@ TEST_CASE("REST inventory/software: path is in the OpenAPI spec (A1 discoverabil
     for (const char* header :
          {"Content-Disposition", "X-Result-Truncated-By-Cap", "Sec-Audit-Failed"})
         CHECK(ok["headers"].contains(header));
+    // ...and so is the export's media type (carried in the 200 description)
+    CHECK(ok["description"].get<std::string>().find("text/csv") != std::string::npos);
 }
 
 // ── Live-PG branches ─────────────────────────────────────────────────────────

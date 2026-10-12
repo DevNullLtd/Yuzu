@@ -14569,6 +14569,50 @@ TEST_CASE("#4353 field-bound schemas equal the handler constants", "[mcp][bounds
         CHECK(served == ecosystems);
     }
 
+    // Per-property JSON types: the handlers read every filter as a string and limit/versions_min
+    // as a strict JSON integer (strict_args_error), so a drifted `type` is a false advertisement.
+    const std::map<std::string, std::map<std::string, std::string>> software_types = {
+        {"query_installed_software",
+         {{"name", "string"}, {"agent_id", "string"}, {"version", "string"},
+          {"cursor", "string"}, {"limit", "integer"}}},
+        {"query_software_catalogue",
+         {{"q", "string"}, {"kind", "string"}, {"ecosystem", "string"}, {"source", "string"},
+          {"agent_id", "string"}, {"versions_min", "integer"}, {"limit", "integer"},
+          {"cursor", "string"}}},
+        {"get_software_versions",
+         {{"name", "string"}, {"kind", "string"}, {"ecosystem", "string"}, {"source", "string"},
+          {"agent_id", "string"}, {"limit", "integer"}}},
+    };
+    for (const auto& [tool, types] : software_types) {
+        for (const auto& [prop, type] : types) {
+            INFO("tool=" << tool << " property=" << prop);
+            const auto& p = schemas.at(tool).at("properties").at(prop);
+            REQUIRE(p.contains("type"));
+            CHECK(p.at("type") == type);
+        }
+    }
+
+    // Numeric floors/ceilings. limit's lower bound is read_limit/IntKey's 1 (its upper bound and
+    // defaults are pinned to the model constants above). versions_min's 0..100000 range has no
+    // model constant: it is the literal in strict_args_error's IntKey and parse_catalogue_params'
+    // clamp (software_catalogue_model.cpp), so the literals are mirrored here.
+    for (const char* tool :
+         {"query_installed_software", "query_software_catalogue", "get_software_versions"}) {
+        INFO("tool=" << tool);
+        CHECK(schemas.at(tool).at("properties").at("limit").at("minimum") == 1);
+    }
+    {
+        const auto& vm = schemas.at("query_software_catalogue").at("properties").at("versions_min");
+        CHECK(vm.at("minimum") == 0);
+        CHECK(vm.at("maximum") == 100000);
+    }
+
+    // `required`: only get_software_versions has a mandatory argument; the other two publish none.
+    CHECK(schemas.at("get_software_versions").at("required") == nlohmann::json::array({"name"}));
+    CHECK(schemas.at("get_software_versions").at("properties").at("name").at("minLength") == 1);
+    CHECK_FALSE(schemas.at("query_installed_software").contains("required"));
+    CHECK_FALSE(schemas.at("query_software_catalogue").contains("required"));
+
     // Every kFieldBoundTools entry appears at least once above - a tool
     // present in the array with zero checks here would mean its handler
     // enforces a bound the schema is never cross-checked against.
