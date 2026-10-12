@@ -294,9 +294,10 @@ TEST_CASE("HeartbeatIngestion: resolved_session_id is recorded on the presence r
                      "sess-resolved");
 
     // Hostname/os are blank on this replica (no local session) -> preserved.
-    auto rows = store.query_stale_within(std::chrono::hours(1));
+    const auto roster = store.query_stale_within(std::chrono::hours(1));
+    REQUIRE(roster.has_value()); // #5531: the read is typed
     const OfflineEndpoint* row = nullptr;
-    for (const auto& e : rows)
+    for (const auto& e : *roster)
         if (e.agent_id == "yuzu_test_hb_nonowner")
             row = &e;
     REQUIRE(row != nullptr);
