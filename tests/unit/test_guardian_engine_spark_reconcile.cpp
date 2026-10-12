@@ -5753,8 +5753,8 @@ TEST_CASE("#5459 held generation: identical pushes while a hung arm is outstandi
     CHECK(r.f.mechanism->watch_call_count() == 1); // r1 adopted its ORIGINAL arm, no replacement
     CHECK(r.f.mechanism->unwatch_completed_count() == 0);
     CHECK(r.f.mechanism->is_watching(r.key));
-    CHECK(sib.watch_call_count() == 2);
-    CHECK(sib.unwatch_completed_count() == 1);
+    CHECK(sib.watch_call_count() == 1 + sibling_rebuilds);
+    CHECK(sib.unwatch_completed_count() == sibling_rebuilds);
     r.require_acknowledged_after_arm();
 }
 
