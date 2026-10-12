@@ -969,8 +969,7 @@ Create a new API token. The raw token is returned in the response and is never s
 }
 ```
 
-The `expires_at` above is a placeholder epoch: with `mcp_tier` set it must be in the future and at most 90 days out, so compute it at call time, for example `$(date -d '+30 days' +%s)`.
-
+The `expires_at` above is a placeholder epoch: with `mcp_tier` set it must be in the future and at most 90 days out, so compute it at call time, for example `$(date -d '+30 days' +%s)` (macOS: `date -v+30d +%s`).
 
 | Field | Type | Required | Description |
 |---|---|---|---|
