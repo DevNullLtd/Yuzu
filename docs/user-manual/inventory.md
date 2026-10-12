@@ -359,7 +359,7 @@ The **`query_installed_software`** MCP tool exposes the same data to agentic
 workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
 
 - Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan.
-- Returns up to `limit` rows (max 1000; an in-range integer above or below still clamps).
+- Returns up to `limit` rows (max 1000; any integer that fits int64 is clamped to 1..1000).
   When `result_truncated_by_cap` is `true` more rows may exist: pass `next_cursor` back as
   `cursor` to continue the keyset walk (the cursor is opaque and bound to the filter set).
   Optional `version` filter; each row also carries `source`. A wrongly typed argument (a

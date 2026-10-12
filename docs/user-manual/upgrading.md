@@ -163,7 +163,7 @@ migration is needed. Two new counters report the effect:
 `yuzu_server_response_export_truncated_total{surface,cause}`
 ([Metrics](metrics.md#response-store-metrics)).
 
-## Behaviour change: the software installs read validates its inputs and audits an out-of-scope target (M.9)
+## Behaviour change: the software installs read validates its inputs and audits an out-of-scope target
 
 **Breaking for scripts that relied on a malformed value being tolerated.** `GET /api/v1/inventory/software` and MCP `query_installed_software` now share one parser with the catalogue routes:
 

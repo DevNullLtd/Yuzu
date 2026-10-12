@@ -1082,6 +1082,11 @@ TEST_CASE("devices cursor round trip and refusals", "[server][software_catalogue
     refuses("d2:" + fp + ":" + b64url_of("x:n\x1f" "1:a\x1f" "1:1\x1f" "1:0\x1f"), fp,
             CursorError::kMalformed);
     refuses("d2:" + fp + ":" + b64url_of("1:n1:a1:11:0"), fp, CursorError::kMalformed); // no separators
+    // length == bytes remaining, so the last field has no room for its separator; and a field
+    // followed by a byte that is not the separator (each pins one boundary check on its own)
+    refuses("d2:" + fp + ":" + b64url_of("1:n\x1f" "1:a\x1f" "1:1\x1f" "1:0"), fp,
+            CursorError::kMalformed);
+    refuses("d2:" + fp + ":" + b64url_of("1:nX1:aX1:1X1:0X"), fp, CursorError::kMalformed);
     // The decoded name and agent id are bound as SQL parameters: invalid UTF-8 or a NUL is
     // malformed, and is refused before the filter check.
     const std::string nul("a\0b", 3);
