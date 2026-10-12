@@ -156,7 +156,7 @@ curl -s -X POST http://localhost:8080/api/settings/auto-approve \
 
 This rule automatically approves any agent whose hostname matches the glob pattern `web-*.example.com`.
 
-Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`. An `ip_subnet` value must be an IPv4 address or `a.b.c.d/N` with `N` from 0 to 32 (IPv6 is not supported); anything else is `400` and the rule is not stored. A malformed rule that is already in the rule file never matches, so it never approves an agent.
+Supported rule types: `hostname_glob`, `trusted_ca`, `ip_subnet`, `cloud_provider`. An `ip_subnet` value must be an IPv4 address or `a.b.c.d/N` with `N` a whole number from 0 to 32 written in digits only (no sign, so `/-0` is refused; IPv6 is not supported); anything else is `400` and the rule is not stored. A malformed rule that is already in the rule file never matches, so it never approves an agent.
 
 **Set the auto-approve match mode:**
 

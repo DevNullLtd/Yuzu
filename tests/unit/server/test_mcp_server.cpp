@@ -28924,6 +28924,23 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
             CHECK(body["error"]["message"].get<std::string>().find("matcher.n") !=
                   std::string::npos);
         }
+        // A PRESENT matcher that is not a JSON object, or whose kind is not a string, used to be
+        // dropped silently ("accept every responder"): -32602 now.
+        for (const char* m : {"\"x\"", "5", "[]", "null", "true", "{\"kind\":1}", "{\"kind\":null}"}) {
+            const std::string req =
+                R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id++) +
+                R"(,"params":{"name":"create_result_set_from_instruction_result","arguments":{)"
+                R"("instruction_id":"x","matcher":)" +
+                m + R"(}}})";
+            INFO(req);
+            auto res = ts.call(req);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>().find("matcher") !=
+                  std::string::npos);
+        }
     }
 
     SECTION("create_result_set_from_instruction_result: oversized instruction_id, matcher "

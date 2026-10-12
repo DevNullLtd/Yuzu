@@ -491,14 +491,21 @@ TEST_CASE("settings enrollment: the batch route refuses every non-integer, out-o
           "wrapped number and a bad body, and mints nothing (#4644)",
           "[pg][settings_routes][enrollment][numeric_params]") {
     EnrollRoutesHarness h;
-    const auto expect_refused = [&h](const std::string& body) {
+    // `detail` is pinned because docs/user-manual/audit-log.md documents these strings as the
+    // SIEM-filterable contract; a prefix match covers the store-refusal row, whose detail carries
+    // the actor and counts after the token.
+    const auto expect_refused = [&h](const std::string& body,
+                                     const std::string& detail = "invalid_numeric_parameter") {
         INFO(body);
         h.audit_calls.clear();
         auto res = h.sink.Post("/api/settings/enrollment-tokens/batch", body);
         REQUIRE(res);
         CHECK(res->status == 400);
         CHECK(h.auth_mgr.list_enrollment_tokens().value().empty());
-        CHECK(h.only("enrollment.bulk_token_create").result == "denied");
+        const auto row = h.only("enrollment.bulk_token_create");
+        CHECK(row.result == "denied");
+        CHECK(row.detail.rfind(detail, 0) == 0);
+        CHECK((detail == "invalid_input" || row.detail == detail));
     };
 
     // The same probe set for each key. A numeric string and a JSON integer in range are valid
@@ -518,16 +525,16 @@ TEST_CASE("settings enrollment: the batch route refuses every non-integer, out-o
     // 1..10000 are refused by the existing rules, now for numbers as well as strings.
     for (const char* v : {"-1", R"("-1")"}) {
         expect_refused(std::string(R"({"count":2,"ttl_hours":)") + v + "}");
-        expect_refused(std::string(R"({"count":2,"max_uses":)") + v + "}");
-        expect_refused(std::string(R"({"count":)") + v + "}");
+        expect_refused(std::string(R"({"count":2,"max_uses":)") + v + "}", "invalid_input");
+        expect_refused(std::string(R"({"count":)") + v + "}", "count_out_of_range");
     }
     for (const char* v : {"0", R"("0")", "10001"})
-        expect_refused(std::string(R"({"count":)") + v + "}");
+        expect_refused(std::string(R"({"count":)") + v + "}", "count_out_of_range");
 
     // A body that is not one JSON object is not "all defaults": it used to mint 10 single-use
     // tokens that never expire.
     for (const char* bad : {R"({"count":2)", "[]", "5", R"("x")", "null", "not json"})
-        expect_refused(bad);
+        expect_refused(bad, "invalid_body");
 }
 
 TEST_CASE("settings enrollment: the batch route refuses a malformed count or limit too",

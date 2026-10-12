@@ -743,6 +743,7 @@ TEST_CASE("T2 REST: POST /api/v1/license rejects a wrapped, negative or wrong-ty
             auto res = post(fields);
             REQUIRE(res);
             CHECK(res->status == 400);
+            CHECK(res->body.find(key) != std::string::npos); // names the offending key
         }
     }
     // A truncated body and a non-object body.

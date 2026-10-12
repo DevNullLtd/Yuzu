@@ -45,7 +45,8 @@ public:
     std::string evaluate(const ApprovalContext& ctx) const;
 
     /// True iff `value` is an `ip_subnet` rule value this engine can ever match: a bare IPv4
-    /// literal or `a.b.c.d/N` with N one base-10 integer in 0..32. IPv4 only on purpose: the rule
+    /// literal or `a.b.c.d/N` with N one base-10 integer in 0..32 that starts with a digit (so no
+    /// leading '-', which would read `/-0` as a match-all /0, no '+', no whitespace). IPv4 only on purpose: the rule
     /// file is `type:value:label:enabled` and splits on ':', so an IPv6 value could not survive a
     /// restart. The admin route refuses anything else (#4644); the matcher treats it as no match.
     [[nodiscard]] static bool is_valid_ip_subnet_value(const std::string& value);

@@ -964,10 +964,13 @@ Create a new API token. The raw token is returned in the response and is never s
 ```json
 {
   "name": "CI Pipeline Token",
-  "expires_at": 1893456000,
+  "expires_at": 1794355200,
   "mcp_tier": "readonly"
 }
 ```
+
+The `expires_at` above is a placeholder epoch: with `mcp_tier` set it must be in the future and at most 90 days out, so compute it at call time, for example `$(date -d '+30 days' +%s)`.
+
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -982,7 +985,7 @@ Create a new API token. The raw token is returned in the response and is never s
 | Condition | Response |
 |---|---|
 | `mcp_tier` is not one of `readonly` / `operator` / `supervised` | `400` — `invalid mcp_tier: must be one of readonly, operator, supervised (or omitted)` |
-| `mcp_tier` set (or `scope_service` set) but `expires_at` omitted / `≤ 0` | `400` — `expires_at is required for an MCP-tier or service-scoped token` |
+| `mcp_tier` set (or `scope_service` set) but `expires_at` omitted or `0` | `400`: `expires_at is required for an MCP-tier or service-scoped token` |
 | `mcp_tier` set and `expires_at` is more than 90 days out | `400` — `MCP token TTL cannot exceed 90 days` |
 | The body is not a JSON object (truncated, empty, array, string, number, `null`), or `name`, `scope_service` or `mcp_tier` is not a string | `400`: `request body must be a JSON object` / `<field> must be a string` |
 | `expires_at` is not a JSON integer (`"7"`, `5.5`, `1e3`, `true`, `null`, `18446744073709551615`) | `400`: `expires_at must be a JSON integer (unix epoch seconds)` |
@@ -6740,7 +6743,7 @@ re-eval, unchanged.
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent set; or missing `sql` / `instruction_id`. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
-| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"tar_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` already stored that is malformed now matches no device). Nothing is dispatched (#4644) |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"tar_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too; it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
 | 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-tar-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
@@ -8022,7 +8025,7 @@ Activate a license.
 | Condition | Response |
 |---|---|
 | Malformed JSON body, or a body that is not a JSON object | `400` — `invalid JSON` |
-| `seat_count` or `expires_at` not a JSON integer of at least 0 | `400` — nothing activated (#4644) |
+| `seat_count` or `expires_at` not a JSON integer of at least 0 | `400`: nothing activated (#4644) |
 | `license_key` or `organization` empty | `400` |
 | `license_key` already activated on another license | `400` — `license key already activated` |
 | A genuine database write failure | `503` |
@@ -9918,7 +9921,7 @@ Create a recurring schedule for an instruction definition. Requires **both**
 primitive (empty `scope_expression` targets every agent; `requires_approval` defaults to
 `false`).
 
-`interval_minutes` (default `60`, `1` to `2147483647`), `day_of_week` (default `0`, `0` to `6`) and
+`interval_minutes` (default `60`, `1` to `35791394`, the largest value whose next-run arithmetic fits a 32-bit integer in the database), `day_of_week` (default `0`, `0` to `6`) and
 `day_of_month` (default `1`, `1` to `28`) must each be a JSON integer in range when present. A float,
 string, `null`, boolean, array, out-of-range value or a number that does not fit (`4294967297`
 minutes used to become an every-minute schedule) is `400` and nothing is created (#4644).
@@ -9935,8 +9938,8 @@ disabling) additionally requires `Execution:Execute`, since enabling arms the sc
 fire — an operator can always disable a schedule to stop it even without
 `Execution:Execute`.
 
-`enabled` is a JSON boolean, or the integer `0` (disable) or `1` (enable). An omitted key or an empty
-body enables, as before. A string (including the old `"true"` / `"false"` encoding), any other number,
+`enabled` is a JSON boolean, or the integer `0` (disable) or `1` (enable). An omitted key or a blank
+(empty or whitespace-only) body enables, as before. A string (including the old `"true"` / `"false"` encoding), any other number,
 `null`, an array or object, or a body that is truncated or not a JSON object is `400` and the schedule
 is neither armed nor changed: `{"enabled":0}` used to arm it (#4644).
 

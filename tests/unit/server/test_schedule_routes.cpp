@@ -898,6 +898,11 @@ TEST_CASE("parse_schedule_enabled: accepts real JSON booleans and the integers 0
     CHECK(schedule::parse_schedule_enabled(R"({"enabled":0})") == false); // used to ARM it
     CHECK(schedule::parse_schedule_enabled(R"({})") == true);  // missing key -> default
     CHECK(schedule::parse_schedule_enabled("") == true);       // no body -> default
+    // A whitespace-only body is blank too (like the rotate and enrollment readers), not a 400.
+    for (const char* blank : {"\n", "  ", " \t\r\n"}) {
+        INFO("blank body of " << std::string(blank).size() << " bytes");
+        CHECK(schedule::parse_schedule_enabled(blank) == true);
+    }
     // Everything else is refused (#4644), never inferred as "arm": strings (the legacy encoding
     // included), other numbers, null, containers, and a truncated or non-object document.
     for (const char* bad :
@@ -929,7 +934,8 @@ TEST_CASE("POST /api/schedules: interval_minutes, day_of_week and day_of_month a
         std::vector<std::string> extra_bad; ///< range violations specific to the field
     };
     const std::vector<Field> fields = {
-        {"interval_minutes", "interval", {"0", "2147483648"}},
+        // 35791394 = floor(INT32_MAX / 60) is the largest value the advance SQL can multiply by 60.
+        {"interval_minutes", "interval", {"0", "35791395", "2147483647", "2147483648"}},
         {"day_of_week", "weekly", {"7", "2147483648"}},
         {"day_of_month", "monthly", {"0", "29", "2147483648"}},
     };
@@ -950,6 +956,7 @@ TEST_CASE("POST /api/schedules: interval_minutes, day_of_week and day_of_month a
             auto res = h.sink.dispatch("POST", "/api/schedules", body, "application/json", headers);
             REQUIRE(res);
             CHECK(res->status == 400);
+            CHECK(res->body.find(f.key) != std::string::npos); // names the offending key
             CHECK(h.schedule_engine->query_schedules().empty());
         }
         // A truncated body is refused too.
@@ -966,7 +973,7 @@ TEST_CASE("POST /api/schedules: interval_minutes, day_of_week and day_of_month a
     // The documented values still create, including the boundaries.
     const std::vector<std::string> ok_bodies = {
         R"({"name":"a","definition_id":"d","frequency_type":"interval","interval_minutes":1})",
-        R"({"name":"b","definition_id":"d","frequency_type":"interval","interval_minutes":2147483647})",
+        R"({"name":"b","definition_id":"d","frequency_type":"interval","interval_minutes":35791394})",
         R"({"name":"c","definition_id":"d","frequency_type":"weekly","day_of_week":0})",
         R"({"name":"d","definition_id":"d","frequency_type":"weekly","day_of_week":6})",
         R"({"name":"e","definition_id":"d","frequency_type":"monthly","day_of_month":1})",
@@ -982,7 +989,7 @@ TEST_CASE("POST /api/schedules: interval_minutes, day_of_week and day_of_month a
     CHECK(scheds.size() == ok_bodies.size());
     for (const auto& sc : scheds) {
         if (sc.name == "b")
-            CHECK(sc.interval_minutes == 2147483647);
+            CHECK(sc.interval_minutes == 35791394);
         if (sc.name == "d")
             CHECK(sc.day_of_week == 6);
         if (sc.name == "f")
@@ -1056,6 +1063,19 @@ TEST_CASE("POST /api/schedules/:id/enable: enabled must be a boolean or the inte
         REQUIRE(res);
         CHECK(res->status == 200);
         CHECK(state(armed) == g.want);
+    }
+
+    // A whitespace-only body is blank (the bare enable action), like the rotate and enrollment
+    // readers, not a 400.
+    for (const char* blank : {"", "\n", "  "}) {
+        auto res = h.sink.dispatch("POST", "/api/schedules/" + disarmed + "/enable", blank,
+                                   "application/json", headers);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(state(disarmed) == true);
+        (void)h.sink.dispatch("POST", "/api/schedules/" + disarmed + "/enable",
+                              R"({"enabled":false})", "application/json", headers);
+        CHECK(state(disarmed) == false);
     }
 }
 

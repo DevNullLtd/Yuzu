@@ -1079,6 +1079,17 @@ TEST_CASE("from-instruction-result: a malformed matcher n is refused with 400 an
         CHECK(status == 400);
         CHECK(j["error"]["message"].get<std::string>().find("matcher.n") != std::string::npos);
     }
+    // A PRESENT matcher that is not a JSON object, or whose kind is not a string, used to be
+    // dropped silently, i.e. "accept every responder". Both are refused now.
+    for (const char* m : {"\"x\"", "5", "[]", "null", "true", "{\"kind\":1}", "{\"kind\":null}"}) {
+        const std::string body =
+            R"({"instruction_id":")" + iid + R"(","matcher":)" + m + "}";
+        INFO(body);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body, status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("matcher") != std::string::npos);
+    }
     CHECK(h.calls.empty());
     CHECK(h.store->list_pending().empty());
 

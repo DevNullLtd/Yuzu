@@ -965,6 +965,7 @@ TEST_CASE("REST gs.rules: create bounds version to 1..2147483647 with a denied a
         REQUIRE_FALSE(h.audit_log.empty());
         CHECK(h.audit_log.back().action == "guaranteed_state.rule.create");
         CHECK(h.audit_log.back().result == "denied");
+        CHECK(h.audit_log.back().detail == "version out of range"); // the documented SIEM string
     }
     CHECK(h.store->rule_count() == 0);
 

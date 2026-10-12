@@ -12994,11 +12994,22 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     // #4644: a malformed tar_rows_ge threshold (`n`) is refused here, before
                     // anything is dispatched or stored, like the REST twin.
-                    if (args.contains("matcher") && args["matcher"].is_object()) {
+                    // A PRESENT matcher that is not a JSON object used to be dropped silently
+                    // ("accept every responder"); it is refused now. Absent stays the default.
+                    if (args.contains("matcher") && !args["matcher"].is_object()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "RESULT_SET_BAD_REQUEST: matcher must be a JSON object"),
+                            "application/json");
+                        return;
+                    }
+                    if (args.contains("matcher")) {
                         if (const auto bad =
                                 yuzu::server::rs_matcher::validate_matcher(args["matcher"].dump())) {
-                            res.set_content(error_response(id, kInvalidParams, *bad),
-                                            "application/json");
+                            res.set_content(
+                                error_response(id, kInvalidParams,
+                                               "RESULT_SET_BAD_REQUEST: " + *bad),
+                                "application/json");
                             return;
                         }
                     }

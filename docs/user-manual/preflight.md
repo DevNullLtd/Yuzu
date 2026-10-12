@@ -48,7 +48,7 @@ reopen it from **Recent runs** to refresh.
 The run form reads **minimum free GiB** (`min_gib`) and the **window** (`window`, in minutes)
 strictly. Each must be empty or one whole base-10 number. Anything else (`10abc`, `0x10`, `1.5`,
 a leading `+`, whitespace, or a value too large for a signed 64-bit integer) is answered with
-`400`, an error toast ("Pre-flight thresholds must be whole numbers") and an A4 error body; no run
+`400`, an error toast ("Pre-flight thresholds must be whole numbers, and versions dotted numbers such as 4.2.0") and an A4 error body (`invalid threshold parameter`); no run
 is created and nothing is dispatched. A negative `min_gib` is refused the same way. An empty field
 keeps its default: a minimum of 0 GiB free, and a 30-minute window. A `window` of zero or below
 also uses the 30-minute default, and a larger value is clamped to 1 to 2880 minutes, clamped as a
@@ -61,7 +61,7 @@ dotted-decimal version such as `4.2.0`, `10.0.19045` or `5.5`, optionally follow
 build suffix of letters, digits and `-` / `+` with no dot (`4.2.0-beta`, `4.2.0-rc1`,
 `4.2.0+build5`); the suffix is accepted and ignored by the comparison. Anything else (`abc`,
 `v4.2.0`, `4.2.x`, `1..2`, `-1`, `4.2.0-beta.1`, a component longer than 15 digits) is answered with
-`400` and the same error toast, and no run is created. A malformed threshold used to read as version
+`400` with that same error toast (one message covers both the numeric and the version thresholds) and A4 error body, and no run is created. A malformed threshold used to read as version
 0, so a minimum of `abc` passed every device and the go/no-go gate that feeds Deploy failed open.
 
 ## Persistence and retention

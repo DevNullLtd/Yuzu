@@ -22,7 +22,9 @@
 //   ""  /  {}                       → default: SUCCESS responders only
 //   {"kind":"any_response"}         → every SUCCESS responder (include_empty)
 //   {"kind":"tar_rows_ge","n":N}    → SUCCESS AND the tar result carried ≥ N rows
-//                                     (N: JSON integer ≥ 1, default 1; a malformed N matches nobody)
+//                                     (N: JSON integer ≥ 1, default 1; a malformed N, or N < 1,
+//                                     matches nobody)
+//   a present `kind` that is not a string matches nobody (admission refuses it)
 //   {"column":C,"op":O,"value":V}        ─┐ SUCCESS AND at least one parsed
 //   {"column":C,"op":O,"value_set":[..]} ─┘ output row's column C satisfies O
 //
@@ -42,9 +44,11 @@ inline constexpr int kStatusSuccess = 1;
 bool response_matches(std::string_view matcher_json, int status, std::string_view output);
 
 /// Admission check for a caller-supplied matcher (#4644): nullopt when acceptable, else the 400
-/// message. Only `tar_rows_ge` has a numeric field: its `n` (absent = 1) must be one JSON integer
-/// in 1..2147483647. `response_matches` independently fails CLOSED on a malformed `n` already
-/// stored, so a bad value can never throw out of the maintenance tick.
+/// message. A present `kind` must be a string. Only `tar_rows_ge` has a numeric field: its `n`
+/// (absent = 1) must be one JSON integer in 1..2147483647. `response_matches` independently fails
+/// CLOSED on a malformed `n` or `kind` already stored (including n < 1), so a bad value can never
+/// throw out of the maintenance tick nor admit every responder. A matcher that is present but not
+/// a JSON object is refused by the CALLER (the routes), not here: this takes the serialized text.
 std::optional<std::string> validate_matcher(std::string_view matcher_json);
 
 /// Count the rows in a tar `tar.sql` response `output`. The tar plugin emits

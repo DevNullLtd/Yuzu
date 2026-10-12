@@ -8,14 +8,20 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
-#include <limits>
 #include <optional>
 #include <string>
 
 namespace yuzu::server::schedule {
 
 namespace {
+
+/// Upper bound of `interval_minutes`: floor(INT32_MAX / 60). `ScheduleEngine::advance_schedule`
+/// computes `GREATEST(interval_minutes, 1) * 60` as Postgres int4 arithmetic, which overflows
+/// (SQLSTATE 22003) above this and would leave the schedule re-firing on every poller tick.
+constexpr std::int64_t kMaxIntervalMinutes = 35791394;
 
 /// Strict schedule integer (#4644): ABSENT keeps `def`; a PRESENT key must be one JSON integer
 /// inside [lo, hi]. `body.value(k, int)` is a plain static_cast, so 4294967297 became 1 (an
@@ -135,8 +141,7 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
             // Strict integers with the documented ranges (#4644): a wrapped or fractional value
             // used to become a different, valid-looking schedule, and nothing is created on a 400.
             for (const auto& err :
-                 {read_schedule_int(j, "interval_minutes", 60, 1,
-                                    std::numeric_limits<std::int32_t>::max(),
+                 {read_schedule_int(j, "interval_minutes", 60, 1, kMaxIntervalMinutes,
                                     sched.interval_minutes),
                   read_schedule_int(j, "day_of_week", 0, 0, 6, sched.day_of_week),
                   read_schedule_int(j, "day_of_month", 1, 1, 28, sched.day_of_month)}) {
@@ -307,7 +312,10 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
 }
 
 std::optional<bool> parse_schedule_enabled(const std::string& body) {
-    if (body.empty())
+    // A blank (empty or whitespace-only) body is "no body" -- the same rule as the credential-
+    // rotate and enrollment-batch readers.
+    if (std::all_of(body.begin(), body.end(),
+                    [](unsigned char c) { return std::isspace(c) != 0; }))
         return true; // no body -- pre-existing default: enabling is the bare action
     const auto j = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded() || !j.is_object())

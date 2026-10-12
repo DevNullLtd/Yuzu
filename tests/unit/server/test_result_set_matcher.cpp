@@ -128,7 +128,10 @@ TEST_CASE("matcher: a malformed tar_rows_ge n never throws and matches nobody (#
           "[result_set][matcher][numeric_params]") {
     const std::vector<std::string> bad_n = {
         "\"2\"", "\"\"", "null", "true", "[]", "{}", "5.5", "1e3", "4294967297",
-        "-4294967295", "9223372036854775808", "18446744073709551615", "2147483648"};
+        "-4294967295", "9223372036854775808", "18446744073709551615", "2147483648",
+        // Below 1 parses as a valid int but is refused at admission; a row stored before that
+        // refusal must not read `count >= 0` as "every responder qualifies".
+        "0", "-1", "-2147483648"};
     for (const auto& n : bad_n) {
         const std::string m = R"({"kind":"tar_rows_ge","n":)" + n + "}";
         INFO(m);
@@ -151,6 +154,17 @@ TEST_CASE("matcher: a malformed tar_rows_ge n never throws and matches nobody (#
     CHECK_FALSE(member[0]);
     CHECK(member[1]);
     CHECK(member[2]);
+
+    // A PRESENT `kind` that is not a string is malformed, not absent: it must not fall through to
+    // the accept-all default (or to a column matcher) and so admit every responder.
+    for (const char* bad_kind :
+         {R"({"kind":1})", R"({"kind":null})", R"({"kind":true})", R"({"kind":["tar_rows_ge"]})",
+          R"({"kind":{}})", R"({"kind":1,"column":"sha256","op":"exists"})"}) {
+        INFO(bad_kind);
+        bool r = true;
+        REQUIRE_NOTHROW(r = response_matches(bad_kind, kOk, tar_rows(5)));
+        CHECK_FALSE(r);
+    }
 
     // Well-formed thresholds keep their meaning, including the INT_MAX boundary and an absent n.
     CHECK(response_matches(R"({"kind":"tar_rows_ge","n":2147483647})", kOk, tar_rows(3)) == false);
@@ -177,7 +191,10 @@ TEST_CASE("matcher: validate_matcher accepts only an integer n of at least 1 (#4
           R"({"kind":"tar_rows_ge","n":1e3})", R"({"kind":"tar_rows_ge","n":5.5})",
           R"({"kind":"tar_rows_ge","n":"7"})", R"({"kind":"tar_rows_ge","n":""})",
           R"({"kind":"tar_rows_ge","n":null})", R"({"kind":"tar_rows_ge","n":true})",
-          R"({"kind":"tar_rows_ge","n":[]})", R"({"kind":"tar_rows_ge","n":{}})"}) {
+          R"({"kind":"tar_rows_ge","n":[]})", R"({"kind":"tar_rows_ge","n":{}})",
+          // A present kind that is not a string would otherwise fall through to accept-all.
+          R"({"kind":1})", R"({"kind":null})", R"({"kind":true})", R"({"kind":[]})",
+          R"({"kind":{}})"}) {
         INFO(bad);
         CHECK(validate_matcher(bad).has_value());
     }

@@ -2617,6 +2617,37 @@ TEST_CASE("Register: a malformed ip_subnet auto-approve rule does not throw out 
     REQUIRE(resp.enrollment_status() == "pending");
 }
 
+// ProxyRegister calls AutoApproveEngine::evaluate separately from Register (the gateway path has
+// no peer IP, so ip_subnet is evaluated against an empty address), so it needs its own wiring
+// coverage: a malformed stored ip_subnet rule must not throw out of it either.
+TEST_CASE("ProxyRegister: a malformed ip_subnet auto-approve rule does not throw out of "
+          "ProxyRegister and approves nothing (#4644)",
+          "[pg][agent_service][auto_approve][numeric_params][gateway]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    for (const char* bad : {"10.0.0.0/abc", "10.0.0.0/33", "10.0.0.0/-0", "10.0.0.0/1e3"})
+        h.auto_approve.add_rule({yuzu::server::auth::AutoApproveRuleType::ip_subnet, bad,
+                                 "bad rule", /*enabled=*/true});
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("agent-badrule-gw");
+    req.mutable_info()->set_hostname("host-badrule-gw");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    req.mutable_info()->set_agent_version("0.0.0-test");
+
+    apb::RegisterResponse resp;
+    grpc::Status status;
+    REQUIRE_NOTHROW(status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp));
+    REQUIRE(status.ok());
+    CHECK_FALSE(resp.accepted());
+    CHECK(resp.enrollment_status() == "pending");
+}
+
 TEST_CASE("Register: a pending (unapproved) enrollment never reaches the CSR signer (B-2)",
           "[pg][agent_service][pki][pr3][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

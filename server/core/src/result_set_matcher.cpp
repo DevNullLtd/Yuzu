@@ -170,7 +170,9 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
     const auto m = nlohmann::json::parse(matcher_json, nullptr, false);
     if (m.is_discarded() || !m.is_object())
         return std::nullopt; // the unrecognised-shape default is unchanged
-    if (!m.contains("kind") || !m["kind"].is_string() || m["kind"].get<std::string>() != "tar_rows_ge")
+    if (m.contains("kind") && !m["kind"].is_string())
+        return "matcher.kind must be a string";
+    if (!m.contains("kind") || m["kind"].get<std::string>() != "tar_rows_ge")
         return std::nullopt;
     const auto n = read_row_threshold(m);
     if (!n || *n < 1)
@@ -213,15 +215,22 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
     if (m.is_discarded() || !m.is_object() || m.empty())
         return true;
 
-    if (m.contains("kind") && m["kind"].is_string()) {
+    // A PRESENT `kind` that is not a string is malformed, not absent: it must not fall through to
+    // the accept-all default below, so nobody qualifies (fail CLOSED, like an unknown kind).
+    if (m.contains("kind") && !m["kind"].is_string())
+        return false;
+
+    if (m.contains("kind")) {
         const auto kind = m["kind"].get<std::string>();
         if (kind == "any_response")
             return true;
         if (kind == "tar_rows_ge") {
             // A malformed threshold fails CLOSED, like an unknown kind: nobody qualifies, and the
-            // tick carries on to the next set instead of throwing.
+            // tick carries on to the next set instead of throwing. n < 1 is malformed too
+            // (admission refuses it; `count >= 0` would admit every responder, a row stored
+            // before that refusal included).
             const auto need = read_row_threshold(m);
-            return need && tar_row_count(output) >= *need;
+            return need && *need >= 1 && tar_row_count(output) >= *need;
         }
         return false; // unknown kind → conservatively exclude
     }

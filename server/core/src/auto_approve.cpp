@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdint>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -24,6 +25,19 @@
 namespace yuzu::server::auth {
 
 namespace {
+
+// The prefix length of an `a.b.c.d/N` rule: ONE base-10 integer in 0..32 whose first character is a
+// digit. `from_chars` accepts a leading '-', so `/-0` parsed as 0 and became a match-all /0;
+// '+', whitespace and any trailing text are rejected by the full-consumption parse itself.
+// Shared by the admission check and the matcher so the two cannot disagree.
+std::optional<int> parse_prefix_len(std::string_view text) {
+    if (text.empty() || text.front() < '0' || text.front() > '9')
+        return std::nullopt;
+    const auto v = parse_query_int<int>(text);
+    if (!v || *v < 0 || *v > 32)
+        return std::nullopt;
+    return v;
+}
 
 std::string rule_type_to_string(AutoApproveRuleType t) {
     switch (t) {
@@ -227,8 +241,7 @@ bool AutoApproveEngine::is_valid_ip_subnet_value(const std::string& value) {
         return false;
     if (slash == std::string::npos)
         return true;
-    const auto prefix = parse_query_int<int>(std::string_view(value).substr(slash + 1));
-    return prefix && *prefix >= 0 && *prefix <= 32;
+    return parse_prefix_len(std::string_view(value).substr(slash + 1)).has_value();
 }
 
 bool AutoApproveEngine::match_ip_subnet(const std::string& cidr, const std::string& ip) const {
@@ -243,8 +256,8 @@ bool AutoApproveEngine::match_ip_subnet(const std::string& cidr, const std::stri
     // Strict prefix (#4644): `std::stoi` threw out of Register/ProxyRegister on a malformed
     // prefix, read `1e3` as /1, and a prefix above 32 made the mask shift undefined. A malformed
     // rule never matches, so it never auto-approves (fail closed; in `all` mode it blocks).
-    const auto prefix = parse_query_int<int>(std::string_view(cidr).substr(slash + 1));
-    if (!prefix || *prefix < 0 || *prefix > 32)
+    const auto prefix = parse_prefix_len(std::string_view(cidr).substr(slash + 1));
+    if (!prefix)
         return false;
     const int prefix_len = *prefix;
 
