@@ -3642,15 +3642,15 @@ TEST_CASE("WS-5 BatchHeartbeat: a non-owning replica keeps the last-known hostna
 }
 
 // #5686: a saturated presence pool costs a handful of bounded acquire waits per
-// batch (at most ceil(log2 N)+1), not one per heartbeat. The presence store has
+// batch (at most floor(log2 N)+1), not one per heartbeat. The presence store has
 // its own one-connection pool whose only lease is held, so every upsert would
 // time out; the route store's pool is untouched, so acks and lease renewal
 // must be unaffected.
 //
 // Probe schedule for the 4 sessions with the store failing throughout: entry 1
-// is attempted and fails; entry 2 is skipped; entry 3 is the half-open probe
-// and fails; entry 4 is skipped (the next probe would be entry 7). So
-// failed==2, skipped==2.
+// is attempted and fails; entry 2 (right after the first failure) is the
+// half-open probe and fails; entry 3 is skipped; entry 4 is the next probe and
+// fails (the one after would be entry 8). So failed==3, skipped==1.
 TEST_CASE("BatchHeartbeat: after a presence upsert fails the batch skips theirs except "
           "spaced probes while every entry is still acked and renewed (#5686)",
           "[pg][gateway_route_wiring][ws5]") {
@@ -3708,8 +3708,8 @@ TEST_CASE("BatchHeartbeat: after a presence upsert fails the batch skips theirs 
         auto resp = batch_hb(f.svc, sids);
         CHECK(resp.acknowledged_count() == 4);
         CHECK(listed_unknown(resp).empty());
-        CHECK(presence_failed() == 2);
-        CHECK(skipped() == 2);
+        CHECK(presence_failed() == 3);
+        CHECK(skipped() == 1);
         CHECK(f.metrics.counter("yuzu_heartbeats_received_total", {{"via", "gateway"}}).value() ==
               4);
         CHECK(batches("degraded") == 1);
@@ -3725,8 +3725,8 @@ TEST_CASE("BatchHeartbeat: after a presence upsert fails the batch skips theirs 
     CHECK(resp.acknowledged_count() == 4);
     for (const auto& a : agents)
         CHECK(offline_row_present(offline, a));
-    CHECK(presence_failed() == 2);
-    CHECK(skipped() == 2);
+    CHECK(presence_failed() == 3);
+    CHECK(skipped() == 1);
     CHECK(batches("ok") == 1);
     CHECK(batches("degraded") == 1);
 }
@@ -3783,7 +3783,7 @@ TEST_CASE("GatewayUpstreamServiceImpl: the #5686 series and HELP lines exist bef
     auto has = [&](std::string_view needle) { return text.find(needle) != std::string::npos; };
     CHECK(has("# HELP yuzu_server_gateway_batch_heartbeat_duration_seconds "));
     CHECK(has("# HELP yuzu_server_agent_presence_upsert_skipped_total "));
-    CHECK(has("exponentially spaced probes"));
+    CHECK(has("the spacing doubles on each further consecutive failure"));
     CHECK(has("yuzu_server_gateway_batch_heartbeat_duration_seconds_count{outcome=\"ok\"} 0"));
     CHECK(has("yuzu_server_gateway_batch_heartbeat_duration_seconds_count{outcome=\"degraded\"} "
               "0"));

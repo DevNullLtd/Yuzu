@@ -88,15 +88,19 @@ public:
     /// `presence_batch` (#5686): per-RPC state for a batched caller. Once a
     /// presence upsert in the batch has failed, later entries skip theirs
     /// (each would wait out its own bounded acquire on the same degraded
-    /// store) EXCEPT exponentially spaced half-open probes: after the Nth
-    /// consecutive failure the next 2^N - 1 entries are skipped and the entry
-    /// after them attempts the upsert again. A probe that succeeds closes the
+    /// store) EXCEPT half-open probes: the entry right after the FIRST failure
+    /// is attempted (an isolated failure costs only itself), and the spacing
+    /// doubles on each further consecutive failure -- after the Nth
+    /// consecutive failure the next 2^(N-1) - 1 entries are skipped and the
+    /// entry after them attempts the upsert again (1st failure skips 0, 2nd
+    /// skips 1, 3rd skips 3, ...). Under total saturation the attempts land
+    /// on entries 1, 2, 4, 8, 16, 32, ... A probe that succeeds closes the
     /// trip (store_failed=false, spacing reset), so a store that recovers
     /// mid-batch is detected by the next probe and later entries are written
     /// again. Everything else in ingest() still runs for a skipped entry.
     ///
     /// Bound under TOTAL saturation (every attempt fails): at most
-    /// ceil(log2 N) + 1 upserts are attempted per batch of N, each bounded at
+    /// floor(log2 N) + 1 upserts are attempted per batch of N, each bounded at
     /// the store's 250 ms acquire, instead of N (82 s at N=330 before #5686).
     /// Under PARTIAL brownout the spacing resets on each success, so tail
     /// agents are not systematically starved of presence refresh.
@@ -120,7 +124,9 @@ public:
         /// Entries skipped since the last failed attempt (probe spacing).
         std::size_t skips_since_fail{0};
         /// Entries (counting the probe itself) between attempts while
-        /// tripped; doubles per failure, capped at kMaxProbeSpacing.
+        /// tripped. 1 after the first failure of a streak (the next entry is
+        /// the probe) and after any success; doubles on each further
+        /// consecutive failure, capped at kMaxProbeSpacing.
         std::size_t next_probe{1};
         static constexpr std::size_t kMaxProbeSpacing = std::size_t{1} << 16;
     };

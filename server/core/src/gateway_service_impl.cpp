@@ -311,9 +311,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "lease renewal, or a presence upsert; outcome=\"ok\" otherwise. The directory read "
             "and the renewal each bound their pool acquire at 500 ms and a failing presence "
             "upsert at 250 ms. After a failed presence upsert later upserts in that batch are "
-            "skipped EXCEPT exponentially spaced probes, so under total saturation (every "
-            "attempt fails) a batch waits at most ceil(log2 N)+1 times 250 ms on a failing "
-            "presence store (N = batch size); under partial brownout a success resets the "
+            "skipped EXCEPT probes: the entry right after the first failure is attempted and "
+            "the spacing doubles on each further consecutive failure, so under total "
+            "saturation (every attempt fails) a batch waits at most floor(log2 N)+1 times "
+            "250 ms on a failing presence store (N = batch size); a success resets the "
             "spacing. A batch "
             "that waited out one or both 500 ms acquires lands just above 0.5 s or 1 s.",
             "histogram");
@@ -323,14 +324,14 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         metrics_->describe(
             "yuzu_server_agent_presence_upsert_skipped_total",
             "#5686: BatchHeartbeat entries whose presence upsert was skipped because an earlier "
-            "presence upsert in the same batch had failed (skipped except for exponentially "
-            "spaced probes; attempts that fail are counted in "
+            "presence upsert in the same batch had failed (skipped except for probes: the entry "
+            "right after the first failure is attempted and the spacing doubles on each "
+            "further consecutive failure; attempts that fail are counted in "
             "yuzu_server_agent_presence_store_failed_total{op=\"upsert\"}). The heartbeat is "
             "still acknowledged and its lease renewed; once the presence store recovers (a "
             "later probe in the same batch or the next batch then refreshes the row) the row "
             "is current again. Under total saturation (every attempt fails) a batch waits at "
-            "most ceil(log2 N)+1 times 250 ms; under partial brownout a success resets the "
-            "spacing.",
+            "most floor(log2 N)+1 times 250 ms; a success resets the spacing.",
             "counter");
         metrics_->counter("yuzu_server_agent_presence_upsert_skipped_total");
         metrics_->describe(
@@ -1396,7 +1397,7 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
     }
     bool store_degraded = resolution.degraded;
     // #5686: a failed presence upsert trips the batch; later upserts are skipped except
-    // for exponentially spaced half-open probes.
+    // for half-open probes (the entry right after the first failure, then doubling spacing).
     HeartbeatIngestion::PresenceBatch presence_batch;
     for (const auto& hb : request->heartbeats()) {
         std::string agent_id;

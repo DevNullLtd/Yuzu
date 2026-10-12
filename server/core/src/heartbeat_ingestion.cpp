@@ -40,7 +40,7 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
     // invariants (the command_id -> execution_id correlation / polchk-):
     // those live on the CommandResponse path, not here.
     // #5686: while the batch is tripped, skip this entry's upsert unless it is
-    // the exponentially spaced half-open probe (see PresenceBatch).
+    // a half-open probe (see PresenceBatch).
     if (offline_store_ && presence_batch && presence_batch->store_failed &&
         ++presence_batch->skips_since_fail < presence_batch->next_probe) {
         ++presence_batch->skipped; // a later probe or the next batch refreshes this row
@@ -84,11 +84,17 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
                 presence_batch->skips_since_fail = 0;
                 presence_batch->next_probe = 1;
             } else {
+                // First failure of a streak: the very next entry is the probe
+                // (next_probe=1), so an isolated failure costs only itself.
+                // Each further consecutive failure doubles the spacing.
+                const bool was_tripped = presence_batch->store_failed;
                 presence_batch->store_failed = true;
                 ++presence_batch->failed;
                 presence_batch->skips_since_fail = 0;
                 presence_batch->next_probe =
-                    std::min(presence_batch->next_probe * 2, PresenceBatch::kMaxProbeSpacing);
+                    was_tripped ? std::min(presence_batch->next_probe * 2,
+                                           PresenceBatch::kMaxProbeSpacing)
+                                : 1;
             }
         }
     }
