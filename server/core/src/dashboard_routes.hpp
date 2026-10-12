@@ -67,10 +67,16 @@ class EventBus;
 //    links or Prev / Next controls rendered in that window, so nothing is clickable; a sort
 //    link pointing at the empty bar would send no command_id and answer 400, which htmx does
 //    not display.
-// Deliberate exclusion: the `#chart-deck-host` refresh (dashboard_routes.cpp; ONE request fired
-// 2 seconds after a dispatch, not polling) is NOT in this scope. It is an unscoped request that
-// carries no f_* params, so its out-of-band swap can overwrite the pager / summary /
-// Create-Group chrome with UNFILTERED content (confirmed in a browser; tracked in #5669).
+// The `#chart-deck-host` refresh (dashboard_routes.cpp; ONE request fired 2 seconds after a
+// dispatch, not polling) carries no f_* params, so unscoped its out-of-band swap could overwrite
+// the pager / summary / Create-Group chrome with UNFILTERED content after a filter change
+// (confirmed in a browser). It therefore carries `hx-sync="#filter-bar:queue last"`: it is
+// queued behind the placeholder's own load request (not `replace`, which would abort that
+// request), dequeues after the placeholder's swap, re-resolves `#filter-bar` to the new form,
+// and is then aborted by a filter change (this scope's `replace`) or a second dispatch (the
+// htmx:abort above). That depends on the dispatch response emitting the `#filter-bar` OOB
+// BEFORE the deck OOB (pinned by a test). Residual: a second dispatch while the placeholder
+// request is in flight dequeues the deck request before the OOB replaces the host.
 inline constexpr const char* kResultsSyncScope = "#filter-bar:replace";
 
 class DashboardRoutes {
@@ -340,8 +346,10 @@ private:
     ///
     /// Issue #254 (Phase 8.2) — when @p visible_columns is non-empty, only
     /// the listed plugin column names are rendered (the "Agent" pseudo-
-    /// column is always shown). @p template_id is propagated through pager
-    /// / sort URLs so that switching pages doesn't drop the chosen template.
+    /// column is always shown). The chosen template is NOT carried in the
+    /// pager / sort URLs: those carry only sort / dir / page / per_page, and
+    /// the View select inside #filter-bar is read at click time via
+    /// hx-include, so switching pages keeps the chosen template.
     /// @p scope — #1712 / #3290 Phase 2: the fleet-read gate's composed
     /// meet(management-group, service-scope) VisibleSet. nullopt (TOP) ⇒
     /// unfiltered — a global grant or RBAC-off, byte-identical to the
@@ -355,7 +363,6 @@ private:
                                const std::vector<FacetFilter>& filters,
                                const std::string& text_query,
                                const std::string& definition_id = {},
-                               const std::string& template_id = {},
                                const std::vector<std::string>& visible_columns = {},
                                const authz::VisibleSet& scope = std::nullopt);
 

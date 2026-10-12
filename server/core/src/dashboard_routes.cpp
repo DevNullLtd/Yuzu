@@ -471,8 +471,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                 auto html = render_results(command_id, plugin, sort_col, sort_dir,
                                            page, per_page, filters, text_query,
-                                           definition_id, template_id,
-                                           visible_columns, gate.scope);
+                                           definition_id, visible_columns, gate.scope);
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -1389,16 +1388,34 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // the whole element (outerHTML) so the new hx-get /
                  // hx-trigger attributes attach; `innerHTML` would lose
                  // them.
-                 // Deliberately NOT in kResultsSyncScope: this unscoped refresh
-                 // carries no f_* params, so its OOB can overwrite the pager /
-                 // summary / Create-Group chrome with UNFILTERED content while
-                 // a filter is applied (browser-confirmed; tracked in #5669).
+                 // hx-sync="#filter-bar:queue last" (#5623, Gate 7 fix round F): this
+                 // refresh carries no f_* params and `hx-include` cannot help (the
+                 // filter bar is still the empty placeholder when the request would be
+                 // issued), so unscoped it could land after a user filter change and
+                 // overwrite the pager / summary / Create-Group chrome with UNFILTERED
+                 // content. `queue last` (NOT `replace`, which would abort the
+                 // placeholder's own load request) holds it behind the placeholder's
+                 // request; htmx dequeues it after that request's outerHTML swap
+                 // (xhr onload: handle response, then m()), re-resolves `#filter-bar` to
+                 // the NEW form, and from then on a filter change (the scope is
+                 // `replace`) or a second dispatch (the HX-Trigger htmx:abort below)
+                 // aborts it. The filter-bar fragment renders the deck itself.
+                 // ORDER IS LOAD-BEARING: the #filter-bar OOB above MUST precede this
+                 // one, so the placeholder's `load delay:2s` timer is registered, and
+                 // its request issued, first; reversed, the deck request would claim
+                 // the placeholder's sync slot and the filter-bar request would queue.
+                 // Pinned by a test. Read from the bundled htmx 2.0.4, not run here.
+                 // Residual: a second dispatch while the placeholder request is in
+                 // flight aborts it, which dequeues this request before the response's
+                 // OOB replaces the host; that old-command deck request is then no
+                 // longer reachable by any abort.
                  if (!def_id.empty()) {
                      html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\""
                              " hx-get=\"/fragments/results?command_id=" +
                              html_escape(command_id) + "&amp;plugin=" + html_escape(plugin) +
                              "&amp;definition_id=" + html_escape(def_id) +
-                             "\" hx-trigger=\"load delay:2s\" hx-swap=\"none\"></div>";
+                             "\" hx-sync=\"#filter-bar:queue last\""
+                             " hx-trigger=\"load delay:2s\" hx-swap=\"none\"></div>";
                  } else {
                      // Clear any deck left over from a prior command.
                      html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\"></div>";
@@ -2339,7 +2356,6 @@ std::string DashboardRoutes::render_results(
     const std::vector<FacetFilter>& filters,
     const std::string& text_query,
     const std::string& definition_id,
-    const std::string& template_id,
     const std::vector<std::string>& visible_columns,
     const authz::VisibleSet& scope) {
 

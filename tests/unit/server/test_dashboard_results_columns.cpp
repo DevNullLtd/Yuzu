@@ -103,7 +103,7 @@ struct DashboardResultsColumnsTestAccess {
         return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, /*text_query=*/"", /*definition_id=*/"",
-                                     /*template_id=*/"", /*visible_columns=*/{}, scope);
+                                     /*visible_columns=*/{}, scope);
     }
 };
 
