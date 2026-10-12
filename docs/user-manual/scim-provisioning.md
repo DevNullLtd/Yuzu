@@ -407,7 +407,7 @@ your connector: a `409` does not prove an IdP will stop retrying, so expect the
 same request again on the next sync (every attempt is audited and counted and
 raises a critical analytics event; the server log line is limited to one
 warning per username per minute); and resolving it is an operator action, not
-an IdP one: grant the `Administrator` role to another active local account first (an SSO-only or inactive principal is not counted). Do this before the identity provider removes the member: once the refusal has fired, only direct SQL can add the grant (see [`rbac.md`](rbac.md), "If the guard refuses an action you intend"). Until then
+an IdP one: grant the `Administrator` role to another active local account first (a principal with no active `auth.users` row, or an inactive one, is not counted). Do this before the identity provider removes the member: once the refusal has fired, only direct SQL can add it for anyone but the member (see [`rbac.md`](rbac.md), "If the guard refuses an action you intend"). Until then
 the person the IdP terminated is still active here: after an early refusal
 their API tokens and sessions are live as well, and after a late one the
 account remains active in Yuzu, so any credential the IdP still accepts for it
@@ -1006,7 +1006,8 @@ with a **currently-active** account.
     [`rbac.md`](rbac.md), "If the guard refuses an action you intend", for that
     exit, and demote or remove the temporary local administrator afterwards from a
     permanent administrator account once one exists (it cannot demote or delete
-    itself: `403` `self_role_change_blocked`). A later
+    itself: `403`, audited as `self_role_change_blocked` for a demotion and
+    `self_delete_blocked` for a delete). A later
     change that names the user through another group also re-derives the role.
   - **Undetermined** (`undetermined=`): a read failed, so the role was left
     untouched and it is not known whether an administrator was kept. Check each
