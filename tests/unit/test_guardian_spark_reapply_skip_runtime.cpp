@@ -41,6 +41,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -238,7 +239,18 @@ struct Rig {
             return clk::time_point{} + std::chrono::milliseconds(tick.fetch_add(1000));
         });
     }
-    ~Rig() { backend->release_all_gates(); }
+    /// Releases every parked arm, then waits (bounded, event-driven) for every detached executor
+    /// worker to finish: a worker released here still runs on_arm_complete (which logs) after the
+    /// case returns, and one still running at process exit logs through a destroyed spdlog
+    /// registry (TSan heap-use-after-free). active_total is the PHYSICAL alive count, freed only
+    /// after the worker's completion callback has returned; a worker that dispatches a queued
+    /// claim does so before it exits, so the count cannot dip to zero with work still pending.
+    ~Rig() {
+        backend->release_all_gates();
+        if (!yuzu::test::spin_until([&] { return rt->io_executor_stats_for_test().active_total == 0; },
+                                    10s))
+            std::fputs("reapply_skip Rig: io_executor workers still alive after 10 s\n", stderr);
+    }
     Rig(const Rig&) = delete;
     Rig& operator=(const Rig&) = delete;
 };
@@ -926,7 +938,7 @@ TEST_CASE("#4415 PR-A F1e: the health sweep sets the faulted bit and never clear
     }, 10s));
     auto again = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, file_exists_rule("r1"), true);
     REQUIRE(again.has_value());
-    CHECK(again->kind == RT::ArmOutcomeKind::Armed);
+    CHECK(again->skipped); // a wrongly rebuilt arm that commits fast is also Armed: skipped is the proof
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1174,17 +1186,28 @@ TEST_CASE("#4415 PR-A F1k: a throwing health query does not stop the poll backst
     Rig rig;
     REQUIRE(rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true).has_value());
     REQUIRE(rig.rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true).has_value());
+    REQUIRE(rig.rt->attach_rule("r3", file_spec("/c"), file_exists_rule("r3"), true).has_value());
     const auto ids = rig.backend->armed_ids();
-    REQUIRE(ids.size() == 2);
-    const std::uint64_t throwing = ids[0], dead = ids[1];
-    rig.backend->set_health(dead, SubscriptionHealth::Dead);
-    rig.backend->set_health_hook([throwing](std::uint64_t id) {
-        if (id == throwing)
+    REQUIRE(ids.size() == 3);
+    // The sweep visits keys in unordered_map order, so the test must not depend on which key is
+    // visited first: every subscription is Dead and the hook throws on whichever is asked FIRST,
+    // so the other two are always visited after the throw.
+    for (const auto id : ids)
+        rig.backend->set_health(id, SubscriptionHealth::Dead);
+    std::atomic<bool> first{true};
+    std::atomic<int> thrown{0};
+    HookReset hook_reset{rig}; // after the captured locals: resets the hook before they die
+    rig.backend->set_health_hook([&first, &thrown](std::uint64_t) {
+        if (first.exchange(false)) {
+            thrown.fetch_add(1);
             throw std::runtime_error("health");
+        }
     });
     CHECK_NOTHROW(rig.rt->revalidate_subscriptions());
-    CHECK(rig.rt->status_for_rule("r1").has_value()); // unknown health: left attached
-    CHECK_FALSE(rig.rt->status_for_rule("r2").has_value()); // Dead: reported lost, detached
+    CHECK(thrown.load() == 1); // the hook really threw (else this proves nothing)
+    // The unknown-health key is left attached, the two Dead keys visited after it are reported
+    // lost and detached.
+    CHECK(rig.rt->rule_count() == 1);
     CHECK(rig.rt->invariant_violations_for_test().empty());
 }
 

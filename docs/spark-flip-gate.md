@@ -1557,8 +1557,10 @@ flip, with a red-first test each:
     `[4415prA]` tests (`test_guardian_spark_reapply_skip_engine.cpp`,
     `test_guardian_spark_reapply_skip_runtime.cpp`) and the rewritten `[5459fu10]`,
     `[5459fu11]`, `[5459valve]`, `[5459kv]`, on fake mechanisms. TSan and ASan/UBSan ran clean
-    at `0d9b8dfd7` (Linux debug; the round-3 test edits were not re-run under sanitizers);
-    Windows and macOS are not built.
+    on the final test code (Linux debug; `[4415prA]` under TSan 8 runs per case, `[guardian]` and
+    `[spark]` once). A first TSan re-run found a test-exit race (a detached worker committing after
+    the case ended); the test Rig now waits for the worker count to reach zero. Windows and macOS
+    are not built.
     **Flip preconditions beside AC-18** (none is done): (a) enable the `yuzu-fleet-spark`
     `armed_faulted > 0` alert (its group in `docs/prometheus/yuzu-alerts.yml` is commented out);
     (b) a bounded per-rule rebuild-reason INFO log and, optionally, a skip counter (the
@@ -1566,7 +1568,8 @@ flip, with a red-first test each:
     given rule was or was not rebuilt); (c) a release-build measurement of the full_sync cost
     (scenarios S0 and S5) at R=1000 and R=5000 rules on a quiet box, with a shared-faulted-key
     cell and the engine `mtx_` hold time recorded directly (the harness is uncommitted, in
-    `/home/dgr/yuzu-4415-measure`); the per-push probe cost above is an estimate only.
+    `/home/dgr/yuzu-4415-measure`); the per-push probe cost above is an estimate only; (d) an explicit census resync mechanism for
+    server-state loss (loss (1); issue to be filed).
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
