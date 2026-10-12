@@ -1518,8 +1518,7 @@ flip, with a red-first test each:
     losses (operator decision, 2026-10-12): (1) an identical re-push no longer re-emits
     `guard.compliant` for a skipped rule, so it no longer repairs a lost recovery event by
     accident, and server-state loss (a Postgres restore, an outbox drop) no longer self-heals by
-    re-push; an explicit census resync mechanism is a flip precondition to be owned (issue to
-    be filed); (2) it no longer restarts the `pending_initial` demotion clock; (3) a crash after
+    re-push; an explicit census resync mechanism is a flip precondition, tracked in #5718; (2) it no longer restarts the `pending_initial` demotion clock; (3) a crash after
     the absent-row sweep and before the per-rule rewrites leaves the previous rows for carried
     rules, i.e. OLD content, including a rule the push disabled or changed, until the next push
     (a restart then re-arms those); this window is live on the legacy path too; (4) a faulted or dead shared
@@ -1529,8 +1528,8 @@ flip, with a red-first test each:
     that this push would have disabled or changed keeps enforcing its OLD content until the
     retry, because the carried-rule teardown and rebuild have not run for it yet. That
     over-enforces rather than under-enforces, and the Spark path is dormant while `prefer_spark_`
-    is false; (6) added by the governance round, not part of the 2026-10-12 operator decision
-    and awaiting its ratification: a watch that the backend reports Healthy but that is deaf
+    is false; (6) added by the governance round and ratified by the operator on 2026-10-12 after an
+    architect review (accepted, with a per-mechanism deaf-watch test as flip precondition (e)): a watch that the backend reports Healthy but that is deaf
     without ever calling `fault()` (a watched directory deleted and recreated, a stale OS
     handle) is no longer healed by an identical re-push, which before #4415 rebuilt it as a
     side effect; it is found only by the convergence lanes, so its staleness is bounded by the
@@ -1569,7 +1568,9 @@ flip, with a red-first test each:
     (scenarios S0 and S5) at R=1000 and R=5000 rules on a quiet box, with a shared-faulted-key
     cell and the engine `mtx_` hold time recorded directly (the harness is uncommitted, in
     `/home/dgr/yuzu-4415-measure`); the per-push probe cost above is an estimate only; (d) an explicit census resync mechanism for
-    server-state loss (loss (1); issue to be filed).
+    server-state loss (loss (1); #5718); (e) a per-mechanism deaf-watch test (watched directory
+    deleted and recreated, stale handle) proving each shipped mechanism calls `fault()` (loss (6);
+    #5719); items (b) and (e) are tracked together in #5719.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
