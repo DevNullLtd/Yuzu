@@ -1548,10 +1548,20 @@ bool AgentRegistry::has_remote_presence(const std::vector<std::string>& ids) con
 void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl) {
     presence_store_ = store;
     presence_ttl_ = ttl;
+    if (store) {
+        presence_reader_ = [store](std::chrono::seconds t) { return store->query_live_ids(t); };
+    } else {
+        presence_reader_ = nullptr;
+    }
+}
+
+void AgentRegistry::configure_presence(PresenceReadFn reader, std::chrono::seconds ttl) {
+    presence_reader_ = std::move(reader);
+    presence_ttl_ = ttl;
 }
 
 std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::live_presence() const {
-    if (!presence_store_)
+    if (!presence_reader_)
         return std::vector<PresenceIdentity>{};
     std::lock_guard lock(presence_cache_mu_);
     const auto now = std::chrono::steady_clock::now();
@@ -1562,7 +1572,7 @@ std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::l
     // not just a success — so a sustained outage pays exactly one real query
     // per kPresenceCacheTtl window, not one per caller.
     if (now - presence_cache_at_ >= kPresenceCacheTtl) {
-        presence_cache_ = presence_store_->query_live_ids(presence_ttl_);
+        presence_cache_ = presence_reader_(presence_ttl_);
         presence_cache_at_ = now;
     }
     return presence_cache_; // copy out under the cache lock, never mu_
@@ -1620,8 +1630,13 @@ std::string AgentRegistry::session_id_of(const std::string& agent_id) const {
     return it != agents_.end() ? it->second->session_id : std::string{};
 }
 
-std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin) const {
+std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin,
+                                                                  std::string_view action) const {
     std::unordered_set<std::string> missing;
+    // PM0.1: protective actions are never withheld on inventory grounds (see
+    // the declaration); decided before taking mu_.
+    if (yuzu::protective::is_protective_action(plugin, action))
+        return missing;
     std::lock_guard lock(mu_);
     for (const auto& [id, s] : agents_) {
         if (s->plugin_names.empty())

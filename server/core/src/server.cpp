@@ -12492,8 +12492,9 @@ private:
     ///
     /// The quarantine plugin's OWN control channel is exempted WITHOUT
     /// touching `quarantine_store_` at all: `is_quarantine_control_plugin`
-    /// is pure, so a Postgres outage that fails every other dispatch closed
-    /// cannot also block the one action (release) that would end it.
+    /// (common/include/yuzu/protective_actions.hpp) is pure, so a Postgres
+    /// outage that fails every other dispatch closed cannot also block the one
+    /// action (release) that would end it.
     /// Keyed on the `(plugin, ACTION)` pair against a closed four-action set,
     /// NOT on the plugin name — a fifth action added later arrives gated
     /// rather than inheriting the bypass. See that predicate's own doc
@@ -16260,9 +16261,13 @@ private:
         // QuarantineContainmentReconciler (#3425) — re-applies endpoint
         // containment for an active quarantine record whose device has
         // reconnected. Same shared dispatch lambda as every other
-        // background engine; the #881 gate's is_quarantine_control_plugin
-        // exemption already lets the quarantine plugin's own actions
-        // through unmodified. Joined BEFORE the stores in stop().
+        // background engine. The shared protective predicate
+        // (yuzu::protective::is_protective_action, built on
+        // is_quarantine_control_plugin) lets the quarantine plugin's own
+        // actions through every gate unmodified: the #881 containment gate, the
+        // per-plugin/action kill switch (incl. a degraded store), the per-OS
+        // withhold and its presence read, and the plugin-presence filter.
+        // Joined BEFORE the stores in stop().
         quarantine_reconciler_ =
             std::make_unique<QuarantineContainmentReconciler>(QuarantineContainmentReconciler::Deps{
                 .quarantine_store = quarantine_store_.get(),
@@ -20735,7 +20740,8 @@ private:
         // #3424/#3511: same lifecycle as containment_gate — one registry read
         // for this dispatch. BR-009: `classified->wire().plugin()`, not the
         // raw `plugin` local — see the /api/command sibling site's comment.
-        const auto plugin_missing = registry_.ids_missing_plugin(classified->wire().plugin());
+        const auto plugin_missing = registry_.ids_missing_plugin(
+            classified->wire().plugin(), classified->wire().action());
         // #5294: per-OS kill-switch ids; a degraded presence read while a
         // per-OS switch is OFF refuses the dispatch (fail closed). A fail-closed
         // containment gate already withholds every id and is reported first

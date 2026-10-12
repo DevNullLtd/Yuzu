@@ -17,7 +17,8 @@
  *
  * Three things are bound, matching the #881 spec's own layering:
  *   1. `is_quarantine_control_plugin` — the pure, case-insensitive
- *      whole-plugin exemption predicate. No store, no ServerImpl.
+ *      closed four-action exemption predicate (now in
+ *      common/include/yuzu/protective_actions.hpp). No store, no ServerImpl.
  *   2. `evaluate_quarantine_degradation` — the pure bounded-staleness
  *      degradation policy, driven with a fake reader. No store, no
  *      ServerImpl, no Postgres — the VERIFICATION VERDICT for this spec

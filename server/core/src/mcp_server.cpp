@@ -3125,13 +3125,15 @@ static const ToolDef kTools[] = {
      "decision (PluginConfigStore::action_allowed collapses any store error to disabled, "
      "which this display accessor deliberately does not) — this is the inspection view an "
      "operator reads before deciding whether to flip it. Absence of a prior flip reads as "
-     "enabled=true with no reason/set_by. Without os this reports the all-OS layer only and "
+     "enabled=true with no reason/set_by. For a protective action (the quarantine plugin's "
+     "quarantine/unquarantine/status/whitelist and __guard__.push_rules) the state shown here is "
+     "informational only: enabled=false can be displayed while dispatch still proceeds. Without os this reports the all-OS layer only and "
      "never reflects a per-OS OFF row. Requires PluginConfig:Read.",
      // plugin maxLength is 68, not 64: parse_kill_switch_scope also accepts a
      // reserved-namespace plugin name (__<identifier>__, #3265), whose total
      // length can reach kMaxIdentifierBytes (64) + 4 sentinel bytes = 68 —
      // this schema must not reject an input the store would accept.
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS for a per-OS view; omit for the all-OS switch. With os, enabled is the EFFECTIVE state and reason/set_by/source name the row that produced it. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"}},"required":["plugin"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS for a per-OS view; omit for the all-OS switch. With os, enabled is the EFFECTIVE state of the switch row (which never gates a protective action) and reason/set_by/source name the row that produced it. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"}},"required":["plugin"]})j",
      R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"os":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"},"source":{"type":"string"}},"required":["plugin","action","enabled"]})j"},
 
     {"set_plugin_kill_switch",
@@ -3140,6 +3142,9 @@ static const ToolDef kTools[] = {
      "dispatch-gating caller that consults this switch fails CLOSED (treats disabled) on any "
      "store error, so throwing this switch is a reliable emergency stop for the named "
      "plugin/action — there is no separate 'force disable' escalation beyond this call. "
+     "Exception: a protective action (the quarantine plugin's quarantine/unquarantine/status/"
+     "whitelist and __guard__.push_rules) is never refused by this switch; a row for one is "
+     "stored and echoed but has no dispatch effect. "
      "The result echoes the row written, not the effective state. Requires "
      "PluginConfig:Write.",
      // plugin maxLength is 68 — see the identical note on get_plugin_kill_switch above.
@@ -18846,17 +18851,18 @@ McpServer::HandlerFn McpServer::build_handler(
                             -> std::pair<std::string, int> {
                             // ReapplyDispatchFn's narrower pair shape is deliberate --
                             // see its own doc comment. `is_quarantine_control_plugin`
-                            // exempts the quarantine plugin's own actions from the
-                            // CONTAINMENT gate only (dispatch_confined_arms.hpp's
-                            // `compose_containment_gate`) -- it does NOT exempt them
-                            // from #3511's plugin-presence filter, which is sourced
-                            // unconditionally from `AgentRegistry::ids_missing_plugin`.
-                            // A reapply to an agent genuinely missing the quarantine
-                            // plugin is still withheld (correctly -- it would fail
-                            // regardless), it just can't be DISCRIMINATED as such
-                            // through this narrower return shape; see the caller's
-                            // `agents_reached == 0` handling, which reads this as an
-                            // ordinary unreached/retry case, not a permanent one.
+                            // is the closed quarantine set inside the shared
+                            // protective predicate (yuzu::protective::
+                            // is_protective_action): these actions are exempt from
+                            // the CONTAINMENT gate, the kill switch, the per-OS
+                            // withhold and #3511's plugin-presence filter
+                            // (`AgentRegistry::ids_missing_plugin` returns nothing
+                            // for them). A reapply to an agent genuinely missing
+                            // the quarantine plugin is therefore delivered and the
+                            // agent answers with its own plugin-not-found; the
+                            // narrower return shape can't discriminate that, so see
+                            // the caller's `agents_reached == 0` handling, which
+                            // reads an unreached result as an ordinary retry case.
                             if (!dispatch_fn)
                                 return {};
                             const auto outcome = dispatch_fn("quarantine", "quarantine", {agent_id},

@@ -155,6 +155,18 @@ kill-switchable like any ordinary plugin.action — an operator can still explic
 `PUT /api/v1/plugin-config/__guard__/kill-switch` (`?action=push_rules`) or the MCP twin
 `set_plugin_kill_switch`, and that switch is honored exactly as for any other capability.
 
+### Update (2026-10-12, PM0.1) — `__guard__.push_rules` is protective
+
+The paragraph above is superseded for `__guard__.push_rules`. It stays kill-switch-ADDRESSABLE
+(a row can still be stored and read back, so #3265's reachability fix stands) but is no longer
+kill-switch-REFUSABLE: it joins the quarantine plugin's four actions as a protective action
+(`yuzu::protective::is_protective_action`, `common/include/yuzu/protective_actions.hpp`) that no
+plugin-enablement gate may refuse — the all-OS kill switch, the per-OS withhold and its presence
+read, the plugin-presence filter and a degraded store. A contained device must keep receiving the
+rules that make containment meaningful. The operator lever for stopping rule delivery is disabling
+or removing the rules. Refusing a kill-switch write for a protective pair is deferred to the
+write-surface cutover (PM3.2); until then a stored row is informational only.
+
 ### Update (2026-10-03, #5294) — per-OS kill-switch rows
 
 A kill switch can now be narrowed to one agent OS, so a new OS leg can ship off where the plugin

@@ -24,6 +24,7 @@
 #include <spdlog/spdlog.h>
 
 #include <yuzu/metrics.hpp>
+#include <yuzu/protective_actions.hpp>
 #include "agent.grpc.pb.h"
 #include "command_capability.hpp"
 #include "command_capability_parsers.hpp"
@@ -405,8 +406,19 @@ private:
 /// dimension — today `finalize_classified_command` and the MCP pre-dispatch
 /// dry run (server.cpp's `authorize_dispatch_fn_` production closure) — calls
 /// this directly rather than re-deriving the condition.
+///
+/// PM0.1: a PROTECTIVE action (`yuzu::protective::is_protective_action` — the
+/// quarantine plugin's four actions plus `__guard__.push_rules`) is never
+/// refused here: the callback is not consulted (so a degraded store's nullopt
+/// cannot refuse it) and the returned OS set is empty, which means no
+/// `ids_with_os` presence read and no send-time OS withhold downstream.
 [[nodiscard]] inline std::expected<std::unordered_set<std::string>, DispatchDenial>
 kill_switch_denial(const CommandCapability& cap, const KillSwitchFn& action_allowed) {
+    // PM0.1: a protective action is never refused by enablement. Decided before
+    // `action_allowed` is consulted so a switched-off row, a per-OS row and a
+    // degraded store (nullopt) all yield "allowed, no OS withheld".
+    if (yuzu::protective::is_protective_action(cap.plugin, cap.action))
+        return std::unordered_set<std::string>{};
     if (!action_allowed)
         return std::unordered_set<std::string>{};
     auto decision = action_allowed(cap.plugin, cap.action);
@@ -1028,6 +1040,12 @@ public:
     // pre-WS-5. Non-owning — the caller (ServerImpl) outlives this registry.
     void configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl);
 
+    /// Injectable presence read (the single `query_live_ids` seam). Tests feed
+    /// a stub; the store overload binds `store->query_live_ids`.
+    using PresenceReadFn = std::function<std::expected<std::vector<PresenceIdentity>, PresenceReadError>(std::chrono::seconds)>;
+    /// Test-facing overload: assigns the reader AND the TTL it is called with.
+    void configure_presence(PresenceReadFn reader, std::chrono::seconds ttl);
+
     // Look up the agent_id that was registered for a given Subscribe call.
     std::string find_agent_by_stream(
         grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) const;
@@ -1064,7 +1082,14 @@ public:
     // agent's self-reported inventory and never refreshed until the agent's
     // next re-register -- a plugin installed since is not visible here until
     // then; documented at the call site, not re-litigated per caller.
-    std::unordered_set<std::string> ids_missing_plugin(std::string_view plugin) const;
+    //
+    // PM0.1: a protective (plugin, action) pair (yuzu::protective) always
+    // yields the empty set -- the registration-time inventory is stale until
+    // reconnect, so it must never strand a quarantine/Guardian dispatch; a
+    // device that genuinely lacks the plugin answers "plugin not found"
+    // itself, which is observable, unlike a server-side withhold.
+    std::unordered_set<std::string> ids_missing_plugin(std::string_view plugin,
+                                                       std::string_view action) const;
 
     // #5294: ids whose KNOWN agent OS (local session `os`, else the
     // cross-replica presence row's `os`; local wins) is in `os_values` -- the
@@ -1191,6 +1216,8 @@ private:
     /// register_agent/send_to/evaluate_scope contend on) by all_ids() and
     /// evaluate_scope().
     OfflineEndpointStore* presence_store_{nullptr};
+    /// PM0.1: the one `query_live_ids` caller path (empty = unconfigured).
+    PresenceReadFn presence_reader_;
     std::chrono::seconds presence_ttl_{90};
 
     /// HA WS-5 governance hardening (Gate 3 performance + sre, 2026-09-22):
@@ -1209,7 +1236,7 @@ private:
     /// `presence_ttl_`, itself ~90s) — a few extra seconds of read staleness
     /// on top of that is a negligible relative addition, never a new
     /// correctness class. `live_presence()` is the ONLY caller of
-    /// `presence_store_->query_live_ids`; all_ids()/evaluate_scope() must
+    /// `query_live_ids` (via `presence_reader_`); all_ids()/evaluate_scope() must
     /// route through it, never call query_live_ids directly.
     ///
     /// #4981 PR-1 (Finding B2): the cache holds the `std::expected` itself,
