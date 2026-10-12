@@ -25,8 +25,6 @@ namespace sc = software_catalog;
 namespace {
 
 constexpr char kSep = '\x1f';
-// Longest accepted `name` (matches the ingest-side field cap, inventory_ingestion.cpp kMaxFieldLen).
-constexpr std::size_t kNameMaxBytes = 1024;
 
 // True for text Postgres can bind: strict UTF-8 and no NUL. Anything else would surface as a
 // store error (SQLSTATE 22021) and be reported as a retryable 503 instead of a caller 400.
@@ -381,7 +379,8 @@ std::optional<std::string> strict_args_error(const nlohmann::json& args) {
         const char* key;
         std::int64_t min, max;
     };
-    static_assert(kCataloguePageMax == kVersionsMax, "one `limit` bound serves both MCP tools below");
+    static_assert(kCataloguePageMax == kVersionsMax,
+                  "one `limit` bound serves both MCP tools below");
     for (const IntKey k : {IntKey{"limit", 1, kCataloguePageMax}, IntKey{"versions_min", 0, 100000}}) {
         if (!args.contains(k.key))
             continue;

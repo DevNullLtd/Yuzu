@@ -53,8 +53,8 @@
 #include "openapi_spec_access.hpp" // openapi_spec_json()
 #include "rbac_store.hpp"
 #include "response_store.hpp"
-#include "rest_api_v1.hpp"      // M.9 PR-2b: cross-transport cursor walk (REST raw route + MCP tool)
-#include "test_route_sink.hpp" // M.9 PR-2b: in-process sink for that REST half
+#include "rest_api_v1.hpp"      // M.9 PR-2b: cross-transport cursor walk (REST + MCP)
+#include "test_route_sink.hpp"  // M.9 PR-2b: in-process sink for that REST half
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 #include "test_compliance_api_double.hpp" // ADR-0031 WS-A4: FnComplianceApi
@@ -104,6 +104,7 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <set>
 #include <shared_mutex>
@@ -800,6 +801,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 #include "pg/pg_exec.hpp"               // exec_params — degrade the store in the [pg] degrade test
 #include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
 #include "software_catalogue_model.hpp"  // kScopePushdownMaxIds / the catalogue twins
+#include "software_catalog_rules.hpp"   // kSearchMaxBytes / kEcosystemFamilies (tool schema pins)
 #include "pg/pg_raii.hpp"               // PgResult
 #include "dex_app_perf_model.hpp"      // the app-perf read types
 #include "software_inventory_store.hpp"  // typed daily-sync store (ADR-0016)
@@ -14392,6 +14394,8 @@ TEST_CASE("execute_instruction schema bounds equal the handler constants", "[mcp
 // schema's maxLength equals the handler constant exactly.
 TEST_CASE("#4353 field-bound schemas equal the handler constants", "[mcp][bounds]") {
     using namespace yuzu::server::mcp;
+    namespace swc = yuzu::server::software_catalogue;
+    namespace sc = yuzu::server::software_catalog;
 
     INFO("adding a tool to kFieldBoundTools? update docs/user-manual/metrics.md and this count");
     CHECK(kFieldBoundTools.size() == 19);
@@ -14484,6 +14488,42 @@ TEST_CASE("#4353 field-bound schemas equal the handler constants", "[mcp][bounds
         {"unpin_result_set", nlohmann::json::json_pointer("/properties/id/maxLength"), kResultSetIdMaxLen},
         {"reevaluate_result_set", nlohmann::json::json_pointer("/properties/id/maxLength"), kResultSetIdMaxLen},
         {"delete_result_set", nlohmann::json::json_pointer("/properties/id/maxLength"), kResultSetIdMaxLen},
+        // M.9 software tools: not in kFieldBoundTools (the handler validates strictly itself), but
+        // their advertised bounds are pinned to the model's constants all the same
+        {"query_installed_software", nlohmann::json::json_pointer("/properties/name/maxLength"),
+         swc::kNameMaxBytes},
+        {"query_installed_software", nlohmann::json::json_pointer("/properties/version/maxLength"),
+         swc::kNameMaxBytes},
+        {"query_installed_software", nlohmann::json::json_pointer("/properties/agent_id/maxLength"),
+         swc::kSourceMaxBytes},
+        {"query_installed_software", nlohmann::json::json_pointer("/properties/cursor/maxLength"),
+         kMcpCursorMaxLen},
+        {"query_installed_software", nlohmann::json::json_pointer("/properties/limit/default"),
+         static_cast<std::size_t>(swc::kCatalogueDefaultLimit)},
+        {"query_installed_software", nlohmann::json::json_pointer("/properties/limit/maximum"),
+         static_cast<std::size_t>(swc::kCataloguePageMax)},
+        {"query_software_catalogue", nlohmann::json::json_pointer("/properties/q/maxLength"),
+         sc::kSearchMaxBytes},
+        {"query_software_catalogue", nlohmann::json::json_pointer("/properties/source/maxLength"),
+         swc::kSourceMaxBytes},
+        {"query_software_catalogue", nlohmann::json::json_pointer("/properties/agent_id/maxLength"),
+         swc::kSourceMaxBytes},
+        {"query_software_catalogue", nlohmann::json::json_pointer("/properties/cursor/maxLength"),
+         kMcpCursorMaxLen},
+        {"query_software_catalogue", nlohmann::json::json_pointer("/properties/limit/default"),
+         static_cast<std::size_t>(swc::kCatalogueDefaultLimit)},
+        {"query_software_catalogue", nlohmann::json::json_pointer("/properties/limit/maximum"),
+         static_cast<std::size_t>(swc::kCataloguePageMax)},
+        {"get_software_versions", nlohmann::json::json_pointer("/properties/name/maxLength"),
+         swc::kNameMaxBytes},
+        {"get_software_versions", nlohmann::json::json_pointer("/properties/source/maxLength"),
+         swc::kSourceMaxBytes},
+        {"get_software_versions", nlohmann::json::json_pointer("/properties/agent_id/maxLength"),
+         swc::kSourceMaxBytes},
+        {"get_software_versions", nlohmann::json::json_pointer("/properties/limit/default"),
+         static_cast<std::size_t>(swc::kVersionsDefaultLimit)},
+        {"get_software_versions", nlohmann::json::json_pointer("/properties/limit/maximum"),
+         static_cast<std::size_t>(swc::kVersionsMax)},
     };
 
     std::unordered_map<std::string, nlohmann::json> schemas;
@@ -14496,6 +14536,37 @@ TEST_CASE("#4353 field-bound schemas equal the handler constants", "[mcp][bounds
         REQUIRE(it != schemas.end());
         REQUIRE(it->second.contains(c.ptr));
         CHECK(it->second.at(c.ptr).get<std::size_t>() == c.expected);
+    }
+
+    // The three software tools' exact property key sets and published vocabulary enums (a dropped
+    // or renamed property, or a drifted enum, is an advertisement the handler no longer honours).
+    const std::map<std::string, std::set<std::string>> software_keys = {
+        {"query_installed_software", {"name", "agent_id", "version", "cursor", "limit"}},
+        {"query_software_catalogue",
+         {"q", "kind", "ecosystem", "source", "agent_id", "versions_min", "limit", "cursor"}},
+        {"get_software_versions", {"name", "kind", "ecosystem", "source", "agent_id", "limit"}},
+    };
+    for (const auto& [tool, expected_keys] : software_keys) {
+        INFO("tool=" << tool);
+        REQUIRE(schemas.contains(tool));
+        std::set<std::string> served;
+        for (const auto& [key, prop] : schemas.at(tool).at("properties").items()) {
+            served.insert(key);
+            INFO("property=" << key);
+            CHECK(prop.contains("description")); // A5 item 3
+        }
+        CHECK(served == expected_keys);
+    }
+    std::set<std::string> ecosystems;
+    for (const auto& e : sc::kEcosystemFamilies)
+        ecosystems.insert(std::string(e.ecosystem));
+    for (const char* tool : {"query_software_catalogue", "get_software_versions"}) {
+        INFO("tool=" << tool);
+        const auto& props = schemas.at(tool).at("properties");
+        CHECK(props.at("kind").at("enum") ==
+              nlohmann::json::array({"package", "app", "pkg", "feat"}));
+        const auto served = props.at("ecosystem").at("enum").get<std::set<std::string>>();
+        CHECK(served == ecosystems);
     }
 
     // Every kFieldBoundTools entry appears at least once above - a tool
@@ -20463,7 +20534,8 @@ TEST_CASE("MCP query_installed_software: version; cursor walk and source; legacy
     ts.start();
     auto call_on = [&](McpTestServer& server, const std::string& args) {
         auto res = server.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
-                               R"("params":{"name":"query_installed_software","arguments":)" + args + "}}");
+                               R"("params":{"name":"query_installed_software","arguments":)" +
+                               args + "}}");
         REQUIRE(res->status == 200);
         return nlohmann::json::parse(res->body);
     };
@@ -20507,7 +20579,8 @@ TEST_CASE("MCP query_installed_software: version; cursor walk and source; legacy
     const auto& result = full.at("result");
     CHECK(result.at("audit_persisted") == false);
     CHECK(result.at("structuredContent").at("audit_persisted") == false);
-    CHECK(nlohmann::json::parse(result.at("content").at(0).at("text").get<std::string>()).is_array());
+    CHECK(nlohmann::json::parse(result.at("content").at(0).at("text").get<std::string>())
+              .is_array());
     CHECK(result.at("devices_omitted").is_number_integer());
     CHECK(result.at("devices_omitted") == 0);
     CHECK(result.at("result_truncated_by_cap") == true);
@@ -20583,9 +20656,13 @@ TEST_CASE("MCP query_installed_software: a degraded store errors, never success+
     CHECK(res->body.find("Software inventory store degraded") != std::string::npos);
     CHECK(res->body.find("-32603") != std::string::npos);    // kInternalError, not kInvalidParams (gov QE)
     CHECK(res->body.find("\"result\"") == std::string::npos); // crucially NOT success+[]
-    // a retryable fault carries the same hint as the REST twin and the two catalogue tools
-    CHECK(nlohmann::json::parse(res->body)["error"]["data"]["retry_after_ms"] ==
-          yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    // the A4 envelope an agent reads, pinned exactly: the message, the remediation and the same
+    // retry hint as the REST twin and the two catalogue tools
+    const auto degraded = nlohmann::json::parse(res->body).at("error");
+    CHECK(degraded.at("message") == "Software inventory store degraded \xE2\x80\x94 query failed");
+    CHECK(degraded.at("data").at("remediation") == "retry the request");
+    CHECK(degraded.at("data").at("retry_after_ms") == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(degraded.at("data").contains("correlation_id"));
     // The degraded access is audited (gov compliance CC7.2): a CVE-triage caller under a
     // sustained outage still leaves a behavioural trail.
     bool saw_failure_audit = false;
@@ -21017,8 +21094,8 @@ TEST_CASE("MCP catalogue twins: a confined caller is denied BEFORE any store rea
     CHECK(mcp_audits(ts, "mcp.get_software_versions|denied") == 2);
 }
 
-TEST_CASE("MCP get_software_versions: a confined caller on a never-built rollup is denied, not told "
-          "building",
+TEST_CASE("MCP get_software_versions: a confined caller on a never-built rollup is denied rather "
+          "than told building",
           "[mcp][pg][inventory][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -21149,8 +21226,8 @@ TEST_CASE("query_installed_software: a cursor minted by the REST route or the MC
         return body.at("result").at("structuredContent");
     };
     auto cursor_arg = [](const nlohmann::json& page, const std::string& limit_and_filters = "") {
-        return R"({)" + limit_and_filters + R"("cursor":")" + page.at("next_cursor").get<std::string>() +
-               R"("})";
+        return R"({)" + limit_and_filters + R"("cursor":")" +
+               page.at("next_cursor").get<std::string>() + R"("})";
     };
 
     // 1. the same first page, byte-identical cursor, through both transports
@@ -21184,10 +21261,12 @@ TEST_CASE("query_installed_software: a cursor minted by the REST route or the MC
     const auto mcp_a = mcp_page(ts, R"({"name":"A","limit":1})");
     CHECK(rest_a.at("next_cursor") == mcp_a.at("next_cursor"));
     const auto mcp_a2 = mcp_page(ts, cursor_arg(rest_a, R"("name":"A","limit":1,)"));
-    const auto rest_a2 = rest_page("?name=A&limit=1&cursor=" + mcp_a.at("next_cursor").get<std::string>());
+    const auto rest_a2 =
+        rest_page("?name=A&limit=1&cursor=" + mcp_a.at("next_cursor").get<std::string>());
     CHECK(mcp_a2.at("software") == rest_a2.at("software"));
     CHECK(mcp_a2.at("software").size() == 1);
-    auto mcp_wrong = mcp_tool_call(ts, "query_installed_software", cursor_arg(rest_a, R"("limit":1,)"));
+    auto mcp_wrong =
+        mcp_tool_call(ts, "query_installed_software", cursor_arg(rest_a, R"("limit":1,)"));
     REQUIRE(mcp_wrong.contains("error"));
     CHECK(mcp_wrong["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(rest_status("?limit=1&cursor=" + mcp_a.at("next_cursor").get<std::string>()) == 400);
@@ -21216,6 +21295,10 @@ TEST_CASE("query_installed_software: a cursor minted by the REST route or the MC
     const auto narrow = rest_page("?limit=5&cursor=" + mcp1.at("next_cursor").get<std::string>());
     for (const auto& row : narrow.at("software"))
         CHECK(row.at("agent_id") == "agent-2");
+    // the continuation resumes at the keyset position under an engaged scope: neither an empty
+    // page nor a restart (which would lead with A/agent-2)
+    REQUIRE(narrow.at("software").size() == 1);
+    CHECK(narrow.at("software")[0].at("name") == "B");
 }
 
 // ── preview_management_group_agent_count (#4033, #2146 API-parity Batch A) ──

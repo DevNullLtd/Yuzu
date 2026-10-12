@@ -45,6 +45,8 @@ inline constexpr std::size_t kCursorMaxBytes = 2048; ///< longest cursor token a
 inline constexpr std::size_t kScopePushdownMaxIds = 10000;
 inline constexpr std::int64_t kStaleWindowSecs = 172800; ///< 48 h
 inline constexpr std::size_t kSourceMaxBytes = 256;
+/// Longest accepted `name` (the ingest-side field cap, inventory_ingestion.cpp kMaxFieldLen).
+inline constexpr std::size_t kNameMaxBytes = 1024;
 
 inline constexpr std::string_view kInstallsCsvHeader =
     "agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,arch,"

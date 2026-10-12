@@ -285,7 +285,13 @@ TEST_CASE("REST inventory/software: path is in the OpenAPI spec (A1 discoverabil
     REQUIRE_FALSE(spec.is_discarded());
     REQUIRE(spec.contains("paths"));
     REQUIRE(spec["paths"].contains("/inventory/software"));
-    CHECK(spec["paths"]["/inventory/software"].contains("get"));
+    REQUIRE(spec["paths"]["/inventory/software"].contains("get"));
+    // the csv export's response headers are discoverable: a client reads them off the spec
+    const auto& ok = spec["paths"]["/inventory/software"]["get"]["responses"]["200"];
+    REQUIRE(ok.contains("headers"));
+    for (const char* header :
+         {"Content-Disposition", "X-Result-Truncated-By-Cap", "Sec-Audit-Failed"})
+        CHECK(ok["headers"].contains(header));
 }
 
 // ── Live-PG branches ─────────────────────────────────────────────────────────
@@ -1018,8 +1024,10 @@ TEST_CASE("REST inventory/software: cursor refusals — tampered; wrong filter s
     const auto versioned =
         nlohmann::json::parse(h.sink.Get("/api/v1/inventory/software?limit=1&version=1")->body);
     const auto vcursor = versioned.at("data").at("next_cursor").get<std::string>();
-    CHECK(h.sink.Get("/api/v1/inventory/software?limit=1&version=1&cursor=" + vcursor)->status == 200);
-    CHECK(h.sink.Get("/api/v1/inventory/software?limit=1&version=2&cursor=" + vcursor)->status == 400);
+    CHECK(h.sink.Get("/api/v1/inventory/software?limit=1&version=1&cursor=" + vcursor)->status ==
+          200);
+    CHECK(h.sink.Get("/api/v1/inventory/software?limit=1&version=2&cursor=" + vcursor)->status ==
+          400);
 
     // A hand-made head cursor (name "", agent "", id 0) over the unfiltered query is accepted by
     // design — opaque is not authenticated — so the audit row is what keeps it from being silent.

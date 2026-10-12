@@ -416,14 +416,16 @@ TEST_CASE("read_devices_page: a scope of exactly kScopePushdownMaxIds is pushed 
     CHECK_FALSE(f.seen.agent_ids.has_value()); // wide query, rows post-filtered
 }
 
-TEST_CASE("read_devices_page: a cursor binds the filters, never the scope",
+TEST_CASE("read_devices_page: a cursor binds the filters and never the scope",
           "[server][software_catalogue_model]") {
     FakeDevices f;
     f.rows = {fleet_row("git", "a", 1), fleet_row("git", "a", 2)};
-    const std::vector<VisibleSet> scopes = {std::nullopt,
-                                            VisibleSet{std::unordered_set<std::string>{"a"}},
-                                            VisibleSet{std::unordered_set<std::string>{"a", "b", "c"}},
-                                            authz::deny_all(), wide_scope("a")};
+    const std::vector<VisibleSet> scopes = {
+        std::nullopt,
+        VisibleSet{std::unordered_set<std::string>{"a"}},
+        VisibleSet{std::unordered_set<std::string>{"a", "b", "c"}},
+        authz::deny_all(),
+        wide_scope("a")};
     // minted under each scope (the fake store answers its rows whatever the scope, so a cursor
     // exists for every one), read under every other scope, TOP and deny-all included
     for (std::size_t i = 0; i < scopes.size(); ++i) {
@@ -776,8 +778,10 @@ TEST_CASE("devices cursor round trip and refusals", "[server][software_catalogue
     // malformed, and is refused before the filter check.
     const std::string nul("a\0b", 3);
     for (const std::string& bad : {std::string("\xFF"), nul}) {
-        refuses("d1:" + fp + ":" + b64url_of(bad + "\x1f" "a\x1f" "1"), fp, CursorError::kMalformed);
-        refuses("d1:" + fp + ":" + b64url_of("n\x1f" + bad + "\x1f" "1"), fp, CursorError::kMalformed);
+        refuses("d1:" + fp + ":" + b64url_of(bad + "\x1f" "a\x1f" "1"), fp,
+                CursorError::kMalformed);
+        refuses("d1:" + fp + ":" + b64url_of("n\x1f" + bad + "\x1f" "1"), fp,
+                CursorError::kMalformed);
         refuses("d1:" + fp + ":" + b64url_of(bad + "\x1f" "a\x1f" "1"), "ffffffffffffffff",
                 CursorError::kMalformed);
     }

@@ -119,7 +119,7 @@ the paged shape and the export mode is recorded here rather than as a separate r
 
 **Known asymmetry on the raw-route pair.** The `q`, `kind`, `ecosystem` and `source` filters of
 `GET /api/v1/inventory/software` are REST-only: `query_installed_software` takes `name`, `agent_id`,
-`version`, `limit` and `cursor` only (an unknown argument name is ignored, as on every MCP tool). The row
+`version`, `limit` and `cursor` only (an unknown argument name is ignored, as on the other read tools; only approval-gated tools validate argument names at dispatch). The row
 stays `twinned` on the paged shape; the gap is recorded here so it is not silent.
 
 ## Summary
