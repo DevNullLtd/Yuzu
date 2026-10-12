@@ -1631,8 +1631,8 @@ std::string AgentRegistry::session_id_of(const std::string& agent_id) const {
 std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin,
                                                                   std::string_view action) const {
     std::unordered_set<std::string> missing;
-    // PM0.1: protective actions are never withheld on inventory grounds (see
-    // the declaration); decided before taking mu_.
+    // Protective-action exemption: protective actions are never withheld on
+    // inventory grounds (see the declaration); decided before taking mu_.
     if (yuzu::protective::is_protective_action(plugin, action))
         return missing;
     std::lock_guard lock(mu_);

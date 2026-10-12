@@ -1,5 +1,5 @@
 /**
- * test_protective_action_dispatch_gate.cpp — PM0.1: protective actions (the
+ * test_protective_action_dispatch_gate.cpp — protective actions (the
  * quarantine plugin's four actions plus `__guard__.push_rules`) are never
  * refused by plugin enablement. Mirrors test_os_kill_switch_dispatch_gate.cpp:
  * every gate is bound with a real `AgentRegistry` and the exact send set
@@ -19,16 +19,18 @@
 #include <algorithm>
 #include <chrono>
 #include <expected>
+#include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using yuzu::server::CommandCapability;
 using yuzu::server::ContainmentGate;
 using yuzu::server::DispatchClass;
 using yuzu::server::Mutability;
-using yuzu::server::OfflineEndpointStore;
 using yuzu::server::PresenceReadError;
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::ClassifiedCommand;
@@ -281,6 +283,31 @@ TEST_CASE("send_to: __guard__.push_rules reaches a device whose OS switch is off
     const auto control = finalize(kTarSql, os_off.fn());
     CHECK_FALSE(registry.send_to("dev-A", control));
     CHECK(drained(registry).empty());
+}
+
+TEST_CASE("send_to / send_to_all: __guard__.push_rules reaches its targets under a degraded store "
+          "and a >100k presence read",
+          "[server][dispatch][protective][security][registry]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.register_agent(make_info("dev-A", "windows"));
+    registry.register_agent(make_info("dev-B", "linux"));
+    route_via_gateway(registry, {"dev-A", "dev-B"});
+
+    PresenceStub stub; // Truncated: what query_live_ids returns past kQueryRowCap
+    registry.configure_presence(stub.fn(), kTtl);
+
+    // nullopt is the degraded-store answer; the Guardian push must not consult it.
+    CountingSwitch degraded{std::nullopt};
+    const auto push = finalize(protective_cap("__guard__", "push_rules", true), degraded.fn());
+
+    CHECK(registry.send_to("dev-A", push));
+    CHECK(drained(registry) == std::vector<std::string>{"dev-A"});
+    CHECK(registry.send_to_all(push) == 2);
+    CHECK(drained(registry) == (std::vector<std::string>{"dev-A", "dev-B"}));
+    CHECK(*degraded.calls == 0);
+    CHECK(*stub.calls == 0);
 }
 
 TEST_CASE("every other action is still refused at each gate (regression guard)",

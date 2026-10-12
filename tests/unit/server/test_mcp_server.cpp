@@ -1903,6 +1903,37 @@ TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness
     CHECK(family_tools == live);
 }
 
+// The kill-switch tools' published descriptions are decision-grade machine
+// metadata: an agentic worker reads them to decide whether a switch is a real
+// emergency stop. They must keep carrying the protective-action caveat (the
+// quarantine control actions and __guard__.push_rules are never refused by a
+// switch), or a stale "reliable emergency stop" claim can reappear unnoticed.
+TEST_CASE("MCP kill-switch tools advertise the protective-action caveat",
+          "[mcp][protective]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    nlohmann::json getter, setter;
+    for (const auto& t : tools) {
+        if (t["name"] == "get_plugin_kill_switch")
+            getter = t;
+        else if (t["name"] == "set_plugin_kill_switch")
+            setter = t;
+    }
+    REQUIRE_FALSE(getter.is_null());
+    REQUIRE_FALSE(setter.is_null());
+
+    const auto has = [](const nlohmann::json& j) {
+        return j.get<std::string>().find("protective") != std::string::npos;
+    };
+    CHECK(has(getter["description"]));
+    CHECK(has(getter["inputSchema"]["properties"]["os"]["description"]));
+    CHECK(has(setter["description"]));
+    CHECK(has(setter["inputSchema"]["properties"]["enabled"]["description"]));
+}
+
 // #2146 A2-R1 Gate 8 fix: a TARGETED regression for the specific defect
 // shape staleness tether B (above) cannot catch on its own -- a schema that
 // is valid JSON but has a property nested at the WRONG level. Round 1's own

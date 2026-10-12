@@ -22,13 +22,14 @@
 namespace yuzu::protective {
 
 namespace detail {
-/// Case-insensitive equality against a LOWERCASE literal `b` (only `a` is
-/// folded). The one comparison both predicates below share.
+/// Case-insensitive (ASCII-fold) equality. The one comparison both predicates
+/// below share.
 [[nodiscard]] inline bool iequals(std::string_view a, std::string_view b) {
     if (a.size() != b.size())
         return false;
     for (std::size_t i = 0; i < a.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(a[i])) != b[i])
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i])))
             return false;
     }
     return true;

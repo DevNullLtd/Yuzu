@@ -3127,7 +3127,8 @@ static const ToolDef kTools[] = {
      "operator reads before deciding whether to flip it. Absence of a prior flip reads as "
      "enabled=true with no reason/set_by. For a protective action (the quarantine plugin's "
      "quarantine/unquarantine/status/whitelist and __guard__.push_rules) the state shown here is "
-     "informational only: enabled=false can be displayed while dispatch still proceeds. Without os this reports the all-OS layer only and "
+     "informational only: enabled=false can be displayed while dispatch still proceeds. "
+     "Without os this reports the all-OS layer only and "
      "never reflects a per-OS OFF row. Requires PluginConfig:Read.",
      // plugin maxLength is 68, not 64: parse_kill_switch_scope also accepts a
      // reserved-namespace plugin name (__<identifier>__, #3265), whose total
@@ -3148,7 +3149,7 @@ static const ToolDef kTools[] = {
      "The result echoes the row written, not the effective state. Requires "
      "PluginConfig:Write.",
      // plugin maxLength is 68 — see the identical note on get_plugin_kill_switch above.
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS to narrow the switch to; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS to narrow the switch to; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed; for a protective action the row is stored but has no dispatch effect"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
      R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"},"os":{"type":"string"},"source":{"type":"string"}},"required":["plugin","action","enabled"]})j"},
 
     {"mint_upload_grant",

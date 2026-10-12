@@ -1,5 +1,5 @@
 // test_protective_actions.cpp -- pure tests of
-// common/include/yuzu/protective_actions.hpp (PM0.1): the ONE closed set of
+// common/include/yuzu/protective_actions.hpp (protective-action exemption): the ONE closed set of
 // (plugin, action) pairs plugin enablement must never refuse.
 
 #include <yuzu/protective_actions.hpp>

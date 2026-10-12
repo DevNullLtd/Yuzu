@@ -477,10 +477,11 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     // "share the one read across arms rather than skip it for small
     // dispatches" reasoning. Revisit if this shows up in profiling on a
     // large fleet under a high single-target dispatch rate.
-    const auto plugin_missing = registry.ids_missing_plugin(cmd.wire().plugin(), cmd.wire().action());
+    const auto plugin_missing =
+        registry.ids_missing_plugin(cmd.wire().plugin(), cmd.wire().action());
 
-    // PM0.1: a protective command carries an empty OS set (see
-    // `kill_switch_denial`), so no presence read can refuse it.
+    // Protective-action exemption: a protective command carries an empty OS
+    // set (see `kill_switch_denial`), so no presence read can refuse it.
     //
     // #5294: the per-OS kill-switch id set, computed BEFORE `claim_fn` exists so
     // a refusal here can never leak a claim. A degraded presence read with a

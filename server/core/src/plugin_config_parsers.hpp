@@ -195,8 +195,9 @@ struct KillSwitchScope {
 /// `__guard__.push_rules` have a kill-switch row addressed and stored (or left
 /// alone, which must mean "not killed" — see `PluginConfigStore::action_allowed`'s
 /// no-row default). That pair is PROTECTIVE (`yuzu/protective_actions.hpp`): a
-/// stored row is accepted and displayed but never refuses the push. It does NOT extend to `is_valid_identifier`/
-/// `parse_plugin_key`, which continue to gate ordinary config/secret rows.
+/// stored row is accepted and displayed but never refuses the push. It does NOT
+/// extend to `is_valid_identifier`/`parse_plugin_key`, which continue to gate
+/// ordinary config/secret rows.
 [[nodiscard]] inline std::optional<KillSwitchScope>
 parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw,
                         std::string_view os_raw = "") {
