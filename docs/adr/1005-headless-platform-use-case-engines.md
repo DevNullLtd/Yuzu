@@ -557,25 +557,25 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 
    - **2026-10-07 — software title catalogue REST routes
      (`GET /api/v1/inventory/software/catalogue`,
-     `GET /api/v1/inventory/software/catalogue/versions`, M.9 PR-2a).**
-     REST-only when PR-2a merged, no MCP twin yet — a "no" on Decision 1/4's
-     both-surfaces requirement, recorded rather than fixed pre-merge. **PR-2b
-     ships the MCP twins** (`query_software_catalogue` and
-     `get_software_versions`) over the same model; the `titles` CSV export
-     stays REST-only by design. Why the gap existed:
+     `GET /api/v1/inventory/software/catalogue/versions`).**
+     REST-only when these routes first merged, with no MCP twin — a "no" on
+     Decision 1/4's both-surfaces requirement, recorded rather than fixed
+     pre-merge. The MCP twins (`query_software_catalogue` and
+     `get_software_versions`) were then added over the same model; the `titles`
+     CSV export stays REST-only by design. Why the gap existed:
      - **A build-order gap, not a boundary.** The catalogue read surface
        (shared pure model, totals, cursors, CSV export) lands first so the
        MCP twins are a thin transport over the same model
        (`docs/api-twin-recipe.md` Rule 1) instead of a second shaper; the
-       MCP tools followed as PR-2b of the same programme. The `titles` CSV
+       MCP tools followed in a second change over the same model. The `titles` CSV
        export is REST-only by design (a download, not a structured tool
        result).
      - **Tracked by the open P1 issue #3988** ("Inventory catalogue-grain
-       read ... has no REST/MCP twin"); PR-2b closes the MCP-twin half only;
+       read ... has no REST/MCP twin"); that follow-up closes the MCP-twin half only;
        #3988's confinement criterion is superseded by the refuse-to-confined
-       ruling, so the issue's disposition is a decision, not this PR's merge.
-       **Revisit by 2026-11-07**; with PR-2b the parity ledger rows for
-       these routes name the two MCP tools as their `mcp_twin`.
+       ruling, so the issue's disposition is a decision, not this change's merge.
+       **Revisit by 2026-11-07**; the parity ledger rows for these routes name
+       the two MCP tools as their `mcp_twin`.
      - **The exception relaxes no control.** The fleet view is gated on a
        global `Inventory:Read` (the per-device view is admitted in scope),
        denies service-scoped tokens, audits every

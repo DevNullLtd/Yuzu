@@ -1018,11 +1018,21 @@ TEST_CASE("catalogue: a never-built rollup is a 503 'being built' on the CSV exp
         auto rpm = h.sink.Get(ver_url + "&ecosystem=rpm");
         REQUIRE(rpm);
         REQUIRE(rpm->status == 200);
-        REQUIRE(data_of(rpm).at("count") == 1);
-        for (const auto& row : data_of(rpm).at("versions"))
+        const auto rpm_d = data_of(rpm);
+        const auto eco_d = data_of(eco);
+        REQUIRE(rpm_d.at("count") == 1);
+        for (const auto& row : rpm_d.at("versions"))
             CHECK(row.at("newest") == false);
-        for (const auto& row : data_of(eco).at("versions"))
+        for (const auto& row : eco_d.at("versions"))
             CHECK(row.at("newest") == false);
+        // Each pre-check term is pinned alone: a drift that dropped kind or source from the
+        // "unfiltered" test would answer 503 'being built' here.
+        auto by_kind = h.sink.Get(ver_url + "&kind=package");
+        REQUIRE(by_kind);
+        CHECK(by_kind->status == 200);
+        auto by_source = h.sink.Get(ver_url + "&source=pkg_inventory.packages");
+        REQUIRE(by_source);
+        CHECK(by_source->status == 200);
         auto dev = h.sink.Get(ver_url + "&agent_id=d1");
         REQUIRE(dev);
         CHECK(dev->status == 200);
@@ -1039,6 +1049,36 @@ TEST_CASE("catalogue: a never-built rollup is a 503 'being built' on the CSV exp
         REQUIRE(page);
         CHECK(page->status == 200);
         CHECK(data_of(page).at("kpis").at("building") == true);
+    }
+    SECTION("a deleted meta row stays building and the refresh does not revive it") {
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(yuzu::server::pg::exec_params(
+                        lease.get(), "DELETE FROM software_inventory_store.catalog_rollup_meta",
+                        std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        CatHarness h{&store};
+        expect_building(h.sink.Get(csv_url));
+        expect_building(h.sink.Get(ver_url));
+        CHECK_FALSE(store.refresh_catalog_rollup());
+        expect_building(h.sink.Get(csv_url));
+        expect_building(h.sink.Get(ver_url));
+    }
+    SECTION("a confined caller is denied before the building check (403 + denied, never 503)") {
+        CatHarness h{&store};
+        h.fleet_scope = std::unordered_set<std::string>{"d1"};
+        for (const auto& url : {csv_url, ver_url}) {
+            auto r = h.sink.Get(url);
+            REQUIRE(r);
+            CHECK(r->status == 403);
+            CHECK(err_of(r).at("permission") == "Inventory:Read");
+        }
+        CHECK(h.audits("inventory.software.export", "denied") == 1);
+        CHECK(h.audits("inventory.software.versions", "denied") == 1);
+        for (const char* verb : {"inventory.software.export", "inventory.software.versions"})
+            CHECK(h.audits(verb, "failure") == 0);
     }
     SECTION("once the first refresh lands both arms serve") {
         REQUIRE(store.refresh_catalog_rollup());

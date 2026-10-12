@@ -32,7 +32,7 @@ separately as **#3849**.
 | Gate state | **OPEN** - 1 of 9 flip-green criteria evidenced |
 | Shipped posture today | `prefer_spark=false`: legacy `IGuard` is the sole live *detection/enforcement* path. Spark itself is **not** dormant - `SparkEngine` is constructed and runs observe-only from boot (`agent.cpp:1207/1225-1226`, logging "instantiated OBSERVE-ONLY"), attempting to register all three mechanisms (`:1222-1224`), though registration is platform-gated and silently no-ops off-platform (`spark_mechanism.hpp:25-31`): all three succeed on Windows, only Service succeeds on Linux-with-libsystemd, and none succeed on macOS or Linux without libsystemd. A Guardian consumer (`guardian-spark`) **is** registered with `SparkEngine` at every boot that instantiates it (not under `--spark-disable`, §6, nor after a boot-time construction failure), independent of `prefer_spark_` (`guardian_engine.cpp:1406`) - what's actually absent is any *armed* rule: `reconcile_rule_locked`'s `try_spark = prefer_spark_ && spark_availability_ == Available` gate (`guardian_engine.cpp:1244`) is always false in production, so the registered consumer's handler is never invoked. This is the fact that determines today's blast radius if `prefer_spark_` were ever flipped outside the documented process: the consumer plumbing is already live, so such a flip would take effect immediately with no additional wiring step in the way - not a safety margin. (Three pre-existing code sites - `agent.cpp:1194/1226`, `:3935-3936` - still say "no consumer at rung 1" in comments/log text; that's now stale relative to the corrected claim above, tracked as a separate doc/code drift, not fixed in this PR.) Nothing in this doc describes current production *enforcement* behavior - it is a readiness gate for a future flip (this document's own top-level PR-5, the flip PR itself - genuinely still not yet written as of this update. **Disambiguation (PR #4529 review round, 2026-09-18): this is NOT the same "PR-5" as §3a's async-arm-acknowledgment track's own internal fault-wiring sub-ladder**, which as of this update has 4 of its 5 pieces merged (5a-5d) and 5e open as PR #4529 - see §3a for that ladder's real status. This row's "not yet written" claim is about the flip PR itself, unaffected by §3a's progress). |
 | Evidence commit | _(placeholder - filled by PR-6, the evidence closeout PR)_ |
-| Sign-off | _(blank - filled by PR-6 once every §2 criterion is green **AND** every §3 row not at a terminal disposition (RULED closed / DONE with no residual / Moved to P3 / Fixed) is itself resolved or explicitly risk-accepted - §2 alone is not the whole gate. Row 4 (#3847) is now fully DONE (items 1/6 via #3884, item 4 via #3961) - superseded by its own residuals, **#3953** and **#3966**, both RESOLVED via `fix/3953-3966-outbox-hardening`, **merged as PR #3982** (`1e7a5346c`, 2026-09-05T18:09:10Z; verified 2026-09-06 via `gh pr view 3982`, not carried forward stale); five of #3953's six items fixed directly, item 5 filed separately as #3972 - **not** risk-accepted, see §5's entry for why. Row 3's #3816 residual is now DONE via **PR-2e** (`fix/3816-guardian-io-executor-abandonment-signal`, merged to `dev` ahead of PR #3982) - #3831, row 3's other residual, was already DONE via #3884. As of this PR the remaining gating items are #3972 plus the three PR-2d follow-up items recorded in §5's own register - `guard.errored` census recognition (C-1), the three sre observability gaps, and the `yuzu.guardian_backend` server-side-reader gap (compliance-officer), **plus two #4045 items recorded in §3a and §5: the fleet-visible baseline-persist signal (F14 precondition; #5605) and the real-File-mechanism run the operator required before merge (DONE 2026-10-08, passed: in-process harness, section 3a)** - row 9 (#3848/#2818) is fully DONE, both merged (PR-2c merged; PR-2d merged as **PR #4075**, `2026-09-07T13:41:24Z`, closing #2818 the same run - **corrected round, 2026-09-07, superseding this cell's own earlier "not yet pushed" wording**, verified live via `gh pr view 4075`/`gh issue view 2818`; see §3a) - checked here, not folded into a 10th criterion. **Non-gating but tracked** (pre-existing production defects unrelated to `prefer_spark`, named here so none exits this ledger by omission, per compliance-officer's Gate 6 finding): **#4020** (P0, `AuthManager` has no AuthDB fallback on a cache miss) and **#4021** (P0/security, Guardian's baseline-on-arm rebaselining silently reclassifies a still-drifted no-`expected` rule as compliant on any unrelated fleet mutation) - both found during this PR's own criterion-5 evidence-gathering (see §2 criterion 5). **#4252** (task, `guardian_enforced_on_platform()`/`StateRollup::total()` double-count a Linux Service rule's real status row against its `notimpl` bucket at BOTH `guardian_routes.cpp:421-423` and `:1699-1703` - not just the first site - live today via legacy, RULED non-gating - see §8's tenth-round paragraph) has a different provenance: split out of **#4044** in the tenth round below, not from criterion-5 work. **#4044 itself: RULED (2026-09-10).** Deliberate - (a), see §8's ruling paragraph. **Still open, not risk-accepted-away** - its own action item, the `guaranteed-state.md:15` doc edit, is deferred to PR-5 per the pre-existing Scope note (also now a named §7 checklist item, not just recorded here) rather than applied in this doc-only PR; its double-counting risk is CONFIRMED (not dormant) and now tracked independently as #4252, not gating #4044's own resolution. **Also gating, added with the #4472 fix and now narrowed:** the post-K late-failure recovery decision, #5459, is RESOLVED by option D (§3a; the ruling record is there). What still gates the flip from it is not an item of the §2 criteria or of the §3 table; it is the accepted-cost rows in §3a that carry a measurement or test precondition: AC-1 (the unbounded hold and the server's re-push rate, with the endpoint journal-eviction measurement during a held period, FU-1 / #5504), AC-9 to AC-14 (the safety valve and the known limits), and the rows added by the option D governance run, AC-15 to AC-17, with FU-10 and FU-11 (each now covered by a named test, `[5459fu10]` and `[5459fu11]`, which pin only what AC-16 and the §3a follow-up entries record them asserting; the journal-eviction measurement FU-1 and everything those fake-mechanism tests do not exercise stay unmeasured and still gate) and FU-15 (#5549) and FU-16 (#5550) (a flip precondition), and FU-17 (#5551) (a test gap)_ |
+| Sign-off | _(blank - filled by PR-6 once every §2 criterion is green **AND** every §3 row not at a terminal disposition (RULED closed / DONE with no residual / Moved to P3 / Fixed) is itself resolved or explicitly risk-accepted - §2 alone is not the whole gate. Row 4 (#3847) is now fully DONE (items 1/6 via #3884, item 4 via #3961) - superseded by its own residuals, **#3953** and **#3966**, both RESOLVED via `fix/3953-3966-outbox-hardening`, **merged as PR #3982** (`1e7a5346c`, 2026-09-05T18:09:10Z; verified 2026-09-06 via `gh pr view 3982`, not carried forward stale); five of #3953's six items fixed directly, item 5 filed separately as #3972 - **not** risk-accepted, see §5's entry for why. Row 3's #3816 residual is now DONE via **PR-2e** (`fix/3816-guardian-io-executor-abandonment-signal`, merged to `dev` ahead of PR #3982) - #3831, row 3's other residual, was already DONE via #3884. As of this PR the remaining gating items are #3972 plus two of the three PR-2d follow-up items recorded in §5's own register - the three sre observability gaps and the `yuzu.guardian_backend` server-side-reader gap (compliance-officer); the third, `guard.errored` census recognition (PR-2d follow-up C-1), is RESOLVED by the fix for #5667 (mapping and tests verified by the `[pg][guaranteed_state_store][census]` test case "guard.errored maps to the errored census state (C-1)" in `tests/unit/server/test_guaranteed_state_store.cpp`; residuals (a)-(d) recorded in the C-1 bullet of section 5, #5674/#5675/#5676, also gate), **plus two #4045 items recorded in §3a and §5: the fleet-visible baseline-persist signal (F14 precondition; #5605) and the real-File-mechanism run the operator required before merge (DONE 2026-10-08, passed: in-process harness, section 3a)** (the third #4045 item, the `stop()` deadline wall, #5604, is addressed by the stop busy budget (bounded in the measured cases; see the limits below); its slow-I/O residual, an fsync stall and, on Windows, SQLite's own file-I/O retries outside the busy handler, is a flip-gate item recorded in section 5; its journal-loss route needs, before the flip, either a fleet signal for journal records lost at stop or explicit risk acceptance by the F14 sign-off owner, section 5) - row 9 (#3848/#2818) is fully DONE, both merged (PR-2c merged; PR-2d merged as **PR #4075**, `2026-09-07T13:41:24Z`, closing #2818 the same run - **corrected round, 2026-09-07, superseding this cell's own earlier "not yet pushed" wording**, verified live via `gh pr view 4075`/`gh issue view 2818`; see §3a) - checked here, not folded into a 10th criterion. **Non-gating but tracked** (pre-existing production defects unrelated to `prefer_spark`, named here so none exits this ledger by omission, per compliance-officer's Gate 6 finding): **#4020** (P0, `AuthManager` has no AuthDB fallback on a cache miss) and **#4021** (P0/security, Guardian's baseline-on-arm rebaselining silently reclassifies a still-drifted no-`expected` rule as compliant on any unrelated fleet mutation) - both found during this PR's own criterion-5 evidence-gathering (see §2 criterion 5). **#4252** (task, `guardian_enforced_on_platform()`/`StateRollup::total()` double-count a Linux Service rule's real status row against its `notimpl` bucket at BOTH `guardian_routes.cpp:421-423` and `:1699-1703` - not just the first site - live today via legacy, RULED non-gating - see §8's tenth-round paragraph) has a different provenance: split out of **#4044** in the tenth round below, not from criterion-5 work. **#4044 itself: RULED (2026-09-10).** Deliberate - (a), see §8's ruling paragraph. **Still open, not risk-accepted-away** - its own action item, the `guaranteed-state.md:15` doc edit, is deferred to PR-5 per the pre-existing Scope note (also now a named §7 checklist item, not just recorded here) rather than applied in this doc-only PR; its double-counting risk is CONFIRMED (not dormant) and now tracked independently as #4252, not gating #4044's own resolution. **Also gating, added with the #4472 fix and now narrowed:** the post-K late-failure recovery decision, #5459, is RESOLVED by option D (§3a; the ruling record is there). What still gates the flip from it is not an item of the §2 criteria or of the §3 table; it is the accepted-cost rows in §3a that carry a measurement or test precondition: AC-1 (the unbounded hold and the server's re-push rate, with the endpoint journal-eviction measurement during a held period, FU-1 / #5504), AC-9 to AC-14 (the safety valve and the known limits), and the rows added by the option D governance run, AC-15 to AC-17, with FU-10 and FU-11 (each now covered by a named test, `[5459fu10]` and `[5459fu11]`, which pin only what AC-16 and the §3a follow-up entries record them asserting; the journal-eviction measurement FU-1 and everything those fake-mechanism tests do not exercise stay unmeasured and still gate) and FU-15 (#5549) and FU-16 (#5550) (a flip precondition), and FU-17 (#5551) (a test gap)_ |
 | This PR | PR-1 of 7: PR-1 (this doc) → **PR-2a (#2233 items 1/6/7 → #3847's original 1/6 slice + #2993; + #3831 batch) - DONE, merged as #3884, 2026-09-03** → **#2233 item 4, #3847 narrowed to this alone - DONE, merged as #3961, 2026-09-04T15:20:25Z - fixed the drain worker's stalled-sink hazard: `drain_bounded()`'s injected `send` now runs on a detached `GuardianOutboxSendExecutor` (guardian_outbox_send_executor.hpp) - one single-flight instance per lane (lifecycle, compliance/health) - instead of the worker's own joined thread, so a stalled sink no longer wedges journal maintenance or the next drain tick; covered by the orphan-exit contract (`GuardianEngine::active_io_workers()`), same as the existing state-reader/arm-disarm executors** → **PR-2c (fault-injection seams + item-9 TSan rerun, #3848) - DONE for #2815/#2833/#2839, merged to `dev`** → **PR-2d (the #2818 fix, `fix/2818-subscription-death-notification`) - DONE, see §5** → **PR-4 (promtool CH-2/CH-5-PROM) - DONE, merged as #3858, 2026-09-02T13:00:49Z** → **PR-2e (#3816's design PR) - `GuardianIoExecutor` abandonment-signal API, shared by `GuardianSparkRuntime` + `GuardianStateReader` - DONE, merged to `dev`** (filed 2026-09-01, predating this doc, missing from this doc's first draft and added only after a PR review caught the omission; see §3 row 3 for the fix itself) → **#3953/#3966's fix - DONE, merged as PR #3982 (`1e7a5346c`, 2026-09-05T18:09:10Z) - closes row 4's residuals, item 5 filed separately as #3972** → PR-5 (the flip) → PR-6 (evidence closeout). Sequencing note for §8: PR-4 landed independently of #3816 (neither blocked the other), so Rig A/B provisioning (which follows PR-2a/PR-2c per §8) was never delayed by #3816. PR-3 (#2233 item 8) was dropped before this doc was written - item 8 moved to the P3 lane (§3 row 8). PR-2b (item 5) is dropped by this doc (§3 row 5). |
 | Re-verified against | `origin/dev @ bd387afec` (2026-09-02); the kickoff plan's citations were pinned to `880900f1e1` - every file:line citation below was re-checked against the newer HEAD, not copied blind. Drift is called out inline where found. |
 | Last full re-verification | 2026-09-02, this PR, against `origin/dev @ e333b6cb2` post-rebase (no cited file changed between `bd387afec` and `e333b6cb2` - checked directly). Two later fix rounds (same date) added content re-verified against the same base: #3816 itself (§3 row 3, citing `guardian_spark_runtime.cpp:379-389`, `guardian_io_executor.hpp:376-388`, and `guardian_state_reader.cpp:59-71`), plus independent review nits folded into the same rounds (the "Shipped posture" rewrite citing `agent.cpp:1207/1222-1226`, `guardian_engine.cpp:1244/1406`, `spark_mechanism.hpp:25-31`; the §6 em-dash fix at `agent.cpp:1196`; the §5 "unbounded" addition at `spark_engine.hpp:540-543`). A third round, this PR's own PR-4-merged update, re-based this branch on `origin/dev` post-#3857-merge and re-verified its new citations (`tests/prometheus/yuzu-guardian-journal-extracted.test.yml`'s CH-2a/b/c and CH-5-PROM cases 1-6, `docs/prometheus/yuzu-alerts.yml`'s `TelemetryDark` rule expression) directly against `origin/dev` at that later point, not against `e333b6cb2`. A future reader should treat any citation as unverified past this point until re-run; there is no automated staleness check on this doc. A fourth round, this PR's own item-4 fix, re-based this branch on `origin/dev` post-#3884-merge (`c7febf76a`) and re-verified §3 rows 1/6/7 and row 3's #3831 sub-clause against #3884's actual merged content (`gh pr view 3884`, merge commit `282c3b58a`) rather than the peer-session summary that first reported it - directly, not by re-derivation from the earlier citations above. A fifth round, this PR's own governance fix-up (two BLOCKING concurrency defects found independently by two Gate 2/3 reviewers in the fix's first draft, both fixed; a new direct-coverage test file added), re-based this branch a SECOND time onto `origin/dev` at `e2f745606` (an unrelated ccache/CI PR, #3917, had merged in between) and re-verified every row-4 file:line citation against the post-fix-round tree directly. A sixth round, a fresh doc-only follow-up PR after #3961 merged (`acd83bd48`, 2026-09-04), fixed row 4's stale "awaiting merge" status, its `wrapped_send()` line-number drift (`:389`→`:408`), a self-contradiction where the row still stated a residual count the same PR's own synthesis doc claimed had been dropped, updated the §1 Sign-off row to point at #3953 and #3966 (superseding row 4/#3847 as the gating items, item 4 now DONE), and folded #3966 (a post-merge external adversarial review's admission-race finding, not fixed by anything in this branch) into row 4's own body text as well. This round went through its OWN governance (Gate 2 security-guardian+docs-writer, Gate 4 happy-path+unhappy-path+consistency-auditor, Gate 6 compliance-officer+sre+enterprise-readiness) after an earlier ungoverned push of the same PR was caught and corrected; that review found and fixed three more instances of the identical staleness class in locations the first pass missed - §1's "This PR" ladder row (still framed item 4 as in-flight), a §0 intro-paragraph clause with the same problem, and an overstated "same bounded-by-join reasoning" claim about #3966 relative to the row's other, dormancy-bounded residuals - plus a #3966/#3953 scope-conflation defect the first commit introduced and a markdown bold-span break caught before commit via a bold-marker-count check. Verified directly against `origin/dev @ acd83bd48` - the merge commit itself, not a peer-session summary. **Separately, PR-2e** (a later, distinct PR on branch `fix/3816-guardian-io-executor-abandonment-signal`, built off `origin/dev @ 6d40b3993`) re-verified and fixed row 3's stale `#3816` citations (`guardian_spark_runtime.cpp:379-389` had drifted to `:487-506` pre-fix; row 3's `guardian_io_executor.hpp:376-388`/`:386`/`:387` citations were rewritten to describe the post-fix code, which no longer has that structure) and shipped the fix those citations were tracking - see row 3's own closing paragraph. **Separately, PR-2c** (this PR, #3848, branch `test/3848-spark-fault-injection-matrix`) added §5's #2815/#2818/#2833/#2839 register in three rounds: an initial pass (`6dec4c379`) against the tree at that time; a correction (`792eab501`) after adversarial review (Kimi+Codex) found stale #2839 Windows-evidence wording; and this round (`1fcd82499` + this edit), after governance Gate 4 (consistency-auditor) found the §1 status ladder had fallen out of sync with §5's own PR-2d escalation, and Gate 6 (compliance-officer) found the #2839 entry's "4/4 stable" Windows-hardware sentence had narrowed in scope without being reworded, once two later commits (`1a2855e43`, `0cdd6bb2a`) added further Windows-only production code after it was written - closed with a second real DGRHP hardware round covering both, see the #2839 entry above. **Separately again, this doc-only follow-up** (branch `docs/spark-flip-gate-ch5-findings`, built off `origin/dev @ 57ec64433`, 2026-09-05): records the DGRHP exploratory CH-5-UAT pass (§4, §8) and its two production-defect findings, re-verified directly against this same base - `spark_registry.cpp`'s watcher-callback path and `guardian_spark_runtime.cpp`'s `build_entries()` for the event_id-timestamp semantics (§4), `agent.cpp:2269/:2643` for the Heartbeat deadline claim and its subsequent retraction via a live bounded repro on the DGRHP rig itself (not a citation-only check), and `spark_mechanism.hpp:25-31` for the BigColin platform-blocker citation (§8). Not a numbered PR-1..PR-6 slot - this is evidence toward the CH-5-UAT driver step in §4's own PR-sequence paragraph, which sits outside that ladder. **A seventh round, this same doc-only PR's own `/governance` pass** (Gate 2 security-guardian+docs-writer, a discretionary Gate 3 `authdb` review given the section's falsifiable AuthManager/AuthDB claims): corrected an already-wrong-once root-cause claim's remaining incompleteness (the "not against Postgres" framing omitted the post-password `is_active` check; filed **#4020** for a distinct, more serious cold-cache gap it surfaced), replaced an unresolved "arm-on-spark not independently confirmed" hedge with direct log evidence (`agent.log`'s `detection backend = spark` line, same restart, same second, verified against `agent.cpp`'s own comment that it shares the heartbeat tag's derivation function), connected the baseline-on-arm observation to the already-filed `#3990` and filed **#4021** for the compounding gap, corrected a wrong constant attribution for the ~5-minute periodic cadence (`kGuardianFileLaneCadenceMs`, not `errored_refresh_ms` - the latter structurally cannot re-fire on a persisting divergence), fixed a "twice" vs "three times" self-contradiction, and fixed a cross-reference claiming content was "recorded in §4/§8 below" that was never actually added there. Verified directly against `origin/dev @ a7b47ebda` (fetched and merged fresh into this branch before the review started). **An eighth round, Gate 4 of the same `/governance` pass** (happy-path+unhappy-path+consistency-auditor): found the dashboard-edge claim (`guardian_routes.cpp`'s `render_events_fragment`, `guardian_ui.cpp`'s `.et-drift_detected` class) was source-traced but never actually observed - fixed by fetching `GET /fragments/guardian/events` live against DGRHP and citing the real rendered response; found the "three times, in ONE arm window" header still contradicted the "two arm windows" summary after the seventh round's own fix (the header, not the summary, was wrong); found PR #3982 was cited as "not yet merged" in three places (§1 rows, §3 row 4) when `gh pr view 3982` shows it merged 2026-09-05T18:09:10Z as `1e7a5346c`, predating even the eighth round's own base; found a §3-vs-§4 cross-reference misattribution for the #3989 retraction; and found #4021 (but not #4020, judged out of this doc's own spark/guardian tracking scope) needed a §5 cross-reference next to the existing #3990 entry it compounds with. Verified directly against `origin/dev @ a7b47ebda`, same base as the seventh round - no new upstream commits landed during Gate 2-4's run. **A ninth round, a separate live Linux Service-type drift session on Rig B/BigColin** (branch re-based onto `origin/dev @ c926a171d`, 44 commits ahead of the eighth round's base by this point - the branch had gone stale again in the interim): added the sudoers-grant/Baseline-deploy/`guard.compliant` content in §8, re-verified directly against this new base - `guardian_engine.cpp`'s `attach_rule`/`emit_compliant_edge` call, `guardian_routes.cpp`'s "not deployed" badge and baseline create/deploy fragment routes, `docs/user-manual/guaranteed-state.md`'s Linux service compliant-edge limitation, `docs/os-capability-matrix.md`'s Linux service enforcement-deferred note. This round's own `/governance` pass (Gate 2/3 security-guardian+docs-writer+architect, Gate 4 happy-path+unhappy-path+consistency-auditor) found and fixed: an overclaim ("no error anywhere" - the dashboard actually shows a badge), an unfiled ADR-1005 gap (cross-referenced to the existing duplicate **#3266** instead of filing new), the `guard.compliant`-on-Linux discrepancy (filed **#4044**), a closing-summary overclaim implying dashboard-confirmation parity between DGRHP's and Rig B's evidence when DGRHP's own text disclaims catching its own rule's event, a citation-fidelity nit (a truncated quote), and this ledger row's own staleness (no ninth-round entry existed until this sentence). **Separately, PR-2d** (this PR, branch `fix/2818-subscription-death-notification`, built off `origin/dev` after both PR-2c/#3985 and #3982 had merged) fixed #2818 itself - see the #2818 entry above for the full shape - and updated this row's own §1 Sign-off/"This PR" ladder lines and Owner/Milestone/Revisit-trigger fields to reflect that all four issues in this register row are now resolved. Verified directly against the tree at that branch point, not a peer-session summary. **A tenth round, this PR** (branch `docs/4044-linux-compliant-edge-doc`, built off `origin/dev @ cf34e345a`): rules #4044 as (a) - deliberate - with fresh direct-code citations (`guardian_emit_decider.hpp`'s doc comment, `guardian_rule_eval.cpp:165-167`'s `eval_service` comment, and the introducing commit `97ece94d0`'s own message), independently confirming D4 in `docs/spark-legacy-delta-registry.md` rather than superseding it. Re-verified the Scope note immediately above still applies and left `guaranteed-state.md` untouched per it. Confirmed the Gate 6 `sre` double-counting finding in code (`guardian_push_builder.cpp:87`, `guardian_routes.cpp:260-261/398-424`) rather than treating it as still-dormant, and split it out as **#4252**. Verified directly against `origin/dev @ cf34e345a` - the merge commit itself. **An eleventh round, rung 9c PR-6 item 2** (branch `feat/3990-r57-t2-remeasure`, R5.7 T2 re-measurement, 2026-09-19): added this file's `#3990` R5.7 §5 sub-entry and the WAITING-attach-model qualifier on the `clean-v2` entry above it. Went through a genuine, independently-dispatched (not self-reviewed) full `/governance` pass on the whole branch diff - Gate 2 security-guardian+docs-writer, Gate 3 cpp-expert+cpp-safety+quality-engineer, Gate 4 happy-path+unhappy-path+consistency-auditor, Gate 6 compliance-officer+sre+enterprise-readiness, 11 agents total - which found and fixed one BLOCKING defect in the R5.7 measurement driver itself (a fence-violation classification bug in `sweep_incomplete()`, independently re-discovered by three of the eleven agents after two EARLIER self-review passes had incorrectly recorded it as fixed - see that finding's own superseded ledger rows), plus three more real correctness gaps in the same driver (a concurrent-writer content-blind race, a `run_id` second-granularity collision, a missing tail-truncation guard on the post-run reclassification sweep) and one exception-message truncation gap that kept the sensitive half of an SSH error string instead of discarding it. The one finding against this file (a margin→threshold fix in the new R5.7 §5 entry) is applied in this same commit; no pre-existing content was touched. Verified directly against `origin/dev @ 98b8bbe98` (this branch's own merge base at governance time). **A twelfth round, still this same branch**, covers three further rounds the eleventh round's own entry never recorded (consistency-auditor Gate-4 finding, PR #4614 full-mandatory-set review, 2026-09-19). Round-2 (`b81b29448`, Gate 8 re-review of the eleventh round's own fix) closed a second SSH-exception leak site `ssh_ps()`'s first fix had missed, a fixture-coverage gap in F22 (single-row-only, closed with a mixed-batch Case D), and a dropped residual-risk comment. Round-3 (`5fd6e3f33`, a further Gate 8 pass) fixed a self-contradiction in this entry's OWN eleventh-round text (the "no finding touched this file's own content directly" clause, corrected above) and narrowed an older changelog fragment's now-false "fixed via X" claim. Then PR #4614 (this branch's own push, `a1b6cbf94`..`4bea81a43`, 8 commits) responded to an external bot review ("Doomgoose") plus six further internal scoped-governance rounds (unhappy-path, docs-writer, cpp-safety+quality-engineer, then a full mandatory-set pass: security-guardian, cpp-expert, happy-path, consistency-auditor, compliance-officer, sre, enterprise-readiness) that together found and fixed: two real correctness gaps in the cohort-fetch fix itself (ever-succeeded vs. last-attempt fetch tracking; a single tainted rule voiding a whole cohort's genuine evidence, inverted from this file's own asymmetric-cost doctrine); a false-assurance gap in the new race test's own docstring (claimed protection against an in-lock-reordering regression no runtime test can detect - proven by a reproduced mutant passing 3000/3000 runs under a real TSan build); a missing RAII join guard and an under-specified error check on that same test; a literally-false persisted evidence label; a BLOCKING Resource Ledger policy-floor omission; and the governance-ledger completeness gap this very twelfth-round entry is itself evidence of correcting. No file:line citation in rows 1-11 above was touched by any twelfth-round finding - they all landed in `fullsync_blackout_diag.py`, `test_guardian_spark_runtime.cpp`, changelog fragments, and the governance ledger itself, not in this doc. Verified directly against the branch's own commit history. Not yet pushed as of this entry - 8 commits ahead of `origin/feat/3990-r57-t2-remeasure`. |
@@ -940,7 +940,9 @@ flip, with a red-first test each:
   the flip, ship that signal (a server table row with its pin test and an alert; ideally a
   current "unpersisted captures" gauge kept apart from a "captures lost" counter) or record
   an explicit risk acceptance in section 5. A server gauge is a deliberate non-goal of the
-  #4045 change itself. Tracking issue: #5605 (whether a stop ended by the shutdown watchdog gets any trace is decided in #5604, not there). The
+  #4045 change itself. Tracking issue: #5605 (a stop ended by the shutdown watchdog cannot be
+  traced at stop time: the #5604 decision, section 5; #5605 owns only the begin-of-stop
+  sentinel). The
   agent-side `baseline_persist_refusals` count (a refused write: a live rule possibly judged
   against re-captured content until its next re-arm, AC-10 case 6) has no tag either and is
   part of the same fleet-signal decision. A stop ended by the agent's own shutdown watchdog
@@ -1243,14 +1245,15 @@ flip, with a red-first test each:
     `yuzu.guardian_baseline_persist_failures`, a count that dies with the exiting process,
     and not tried again), or its one second of wall between writes ran out before every capture was
     written (a slow store, or more than roughly 2,000 to 3,000 waiting captures on a
-    healthy one; logged, not counted), or the flush was skipped, either because a write
-    that failed slowly ended at or after the start of that stop or because it could not
-    start within 15 s of it after an earlier shutdown step had run slow, taking at least
-    4.5 s (the busy timeout minus a 0.5 s timer-rounding slack; a step that failed quickly
-    is not such a sign; logged, not counted), or an allocation or lock failure cut the
-    flush, or the staging of captures the agent could not note, short (logged; any count
-    dies with the process), or the 20 s shutdown watchdog ended the
-    process while the stop was still running (`hard_exit(4)`: the flush and the later
+    healthy one; logged, not counted), or the flush was skipped because it could not
+    start within 18 s of the start of that stop after that stop had shown a slow store: an
+    earlier shutdown step that ran slow, taking at least 750 ms (the 1 s stop busy budget
+    minus a 250 ms measurement slack), or a persist pass whose failed write took that
+    long and ended during that stop (a step that failed quickly is not such a sign, and a
+    slow failure with an earlier start does not skip; logged, not counted), or an allocation
+    or lock failure cut the flush, or the staging of captures the agent could not note,
+    short (logged; any count dies with the process), or the 20 s shutdown watchdog ended
+    the process while the stop was still running (`hard_exit(4)`: the flush and the later
     shutdown steps are cut, a Windows service is restarted by the SCM, and no log line is
     written anywhere, so exit code 4 is the only evidence). A capture whose write is
     merely failing during normal operation is NOT lost to a re-arm, because the new arm
@@ -1303,8 +1306,54 @@ flip, with a red-first test each:
   - (AC-13) **Recovery needs a live connection and a generation-tracking server.** The
     maintenance tick runs on the per-connection heartbeat thread, and the retry owner is
     the server's `full_sync` re-push. Agent restart gap: the boot Application opens at the
-    loaded acknowledged generation with an empty `content_id`, and a failed boot re-arm is
-    never retried (#5513); an acknowledgment persisted by the old waiver is not revoked.
+    loaded acknowledged generation with an empty `content_id`. A failed boot re-arm is
+    resolved (#5513): the agent reports generation 0 (except while backing off between failed
+    catch-ups, when it reports its real generation) with the sparse companion tag
+    `yuzu.guardian_boot_rearm_unresolved` until a push applies cleanly, so the server's
+    existing reconcile catches it up, and the persisted generation is never rewritten. A
+    push that omits or disables the failed rule clears the flag too, because it is a clean
+    application; the omission hazard is AC-11 (FU-12, #5547). The evidence is the `[5513]`
+    and `[boot_rearm]` tests in `test_guardian_engine.cpp`,
+    `test_guardian_engine_spark_reconcile.cpp` (its `wire_first` fixture flag and
+    `BootRig5513` run the production boot order) and `test_guardian_journal_heartbeat.cpp`,
+    plus the server case in `test_heartbeat_ingestion.cpp`. The `[5513]` tests passed on
+    Linux (also under a TSan build, which exercises no cross-thread interleaving of the new
+    state, because the new tests drive the engine from a single thread, parked
+    fake-mechanism workers aside), Windows (MSVC) and macOS, and the mutation
+    checks were run when the tests were written. Detection today has three routes and no
+    per-agent metric: the agent log WARN (`N cached rule(s) failed to re-arm at boot`),
+    repeated `guaranteed_state.reconcile` audit rows reading `generation 0 -> N` for one
+    agent id, and the fleet-wide `yuzu_server_guardian_reconciles_total{result="sent"}`
+    rate. Fleet-wide detection of the tag and the alert decision are #5558. A persistently
+    failing rule is re-pushed with an agent-side back-off (after each failed catch-up the
+    agent reports its real generation for the next 1, 2, 4, 8, then 10 heartbeats before
+    reporting 0 again; about 60 s, 90 s, 150 s, 270 s, then 330 s apart at the default 30 s
+    heartbeat, and the cadence scales with the interval only for intervals of about 12.5 s
+    or more, because the server's own 25 s per-agent limit dominates shorter ones), one
+    audit row per push. The loop is closed for catch-ups that reach the apply_rules tail
+    with the persisted generation equal to the server's current generation. It is NOT
+    closed for: an agent whose persisted generation is behind the server's (or is 0), which
+    keeps being re-pushed at the server's 25 s limit because the held-back report is still
+    below the server's generation; a push that returns before the tail (a persistent KV
+    write failure on rule persist, a begin_application throw, the invalid-rule-id reject),
+    which earns no holdoff; and repeats suppressed under prefer_spark=true (an accepted
+    Spark arm still pending, or a wedge outstanding), which do not extend it. These are the
+    pre-existing held-generation retry, unchanged; a generic server-side per-agent back-off
+    for it is a follow-up, and #5504 stays the
+    Spark flip cost measurement, not the owner of this back-off. Residuals: a legacy guard that returns false at arm
+    (`ReconcileOutcome::Inert`) is the boot-path
+    analogue of #2797's `apply_rules` defect and is not covered, a server whose current
+    generation is 0 does not push, and the catch-up applies only where a legacy guard
+    actually arms (Windows; Linux with libsystemd and a reachable system bus, Service
+    rules only; macOS legacy guards are stubs, so it does not apply there). The
+    Spark-path parts (a boot arm that fails late or is drained as a failure, and the latch
+    on the boot application) are dormant while `prefer_spark_` is false and are covered by
+    those tests alone. Two further dormant-Spark residuals: with `prefer_spark_` true, an
+    `apply_rules` throw after `begin_application()` and before the tail leaves the new
+    application unlatched, so the tick's clear could clear the boot flag early (to be
+    latched on unwind before the flip); and a boot `begin_application()` throw leaves no
+    boot application, so late boot receipts are not tracked (synchronous failures are
+    still caught). An acknowledgment persisted by the old waiver is not revoked.
   - (AC-14) **Content identity (#5512).** A re-observation of a wedged claim matches
     `rule_id` and spec only (the content-identity bug); recorded, not fixed here. Operator
     consequence: a wedged rule edited without changing its spec (its expected value, for
@@ -1739,7 +1788,8 @@ tracked separately below)
     only via an UNRELATED rule/policy edit bumping the server generation, or an agent
     restart (whose boot re-arm calls `reconcile_rule_locked` unconditionally) - absent
     either, it can sit un-enforced for the deployment's lifetime with no proactive
-    operator signal beyond the "errored" audit entry itself. Tracked as a pre-PR-5
+    operator signal beyond the "errored" audit entry itself and, since #5667, the errored
+    census state. Tracked as a pre-PR-5
     hardening candidate (see the risk-accept register addendum below). **Scope residual
     (Gate 5 chaos-injector CH-7):** `Lost` is structurally reachable only from
     `drop_key_locked`'s sole call site - a brand-new key's FIRST watch failing. A
@@ -2109,22 +2159,46 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   delivery is covered. Health-only path, no state-machine risk, bounded blast radius -
   a genuine but small coverage gap, worth closing alongside any future work that already
   touches `guardian_spark_runtime.cpp` rather than its own PR.
-- **C-1, folded here rather than filed standalone** (consistency-auditor,
-  dormant-until-flip, PRE-PR-5 GATING) - `server/core/src/guaranteed_state_store.cpp`'s
-  `event_state_from_type` does not recognize the new `guard.errored` wire event (falls
-  through to "no census change", identically to the pre-existing `armed`/`disarmed`
-  events). A rule detached as errored keeps showing its LAST PRIOR compliance verdict
-  (e.g. "compliant") on the dashboard/REST census even though it is no longer armed or
-  evaluated - a real, customer-visible staleness gap once `prefer_spark_` flips, though
-  inert today. Not filed as its own issue (chaos-injector's recommendation): it lands
-  squarely on the Guardian routed-concern row (`security-guardian` + `docs-writer`
-  trigger on any `guaranteed_state*` change) regardless of when it's picked up, and
-  belongs with this doc's own pre-PR-5 checklist rather than a freestanding ticket that
-  could drift out of sync with it. **Must be resolved (or explicitly re-risk-accepted)
-  before PR-5's sign-off** - added to this doc's own gating surface, not merely noted.
+- **C-1 (PR-2d follow-up; RESOLVED 2026-10-11 by #5667, kept for history).** Folded here
+  rather than filed standalone (consistency-auditor, dormant-until-flip, PRE-PR-5 GATING).
+  `server/core/src/guaranteed_state_store.cpp`'s `event_state_from_type` did not recognize
+  the new `guard.errored` wire event (it fell through to "no census change", identically to
+  the pre-existing `armed`/`disarmed` events). A rule detached as errored kept showing its
+  LAST PRIOR compliance verdict (e.g. "compliant") on the dashboard/REST census even though
+  it was no longer armed or evaluated - a real, customer-visible staleness gap once
+  `prefer_spark_` flips, though inert today. It was not filed as its own issue
+  (chaos-injector's recommendation): it lands squarely on the Guardian routed-concern row
+  (`security-guardian` + `docs-writer` trigger on any `guaranteed_state*` change)
+  regardless of when it was picked up, and belongs with this doc's own pre-PR-5 checklist
+  rather than a freestanding ticket that could drift out of sync with it. It had to be
+  resolved (or explicitly re-risk-accepted) before the PR-6 sign-off, so it was added to
+  this doc's own gating surface, not merely noted.
+  **Resolution (#5667):** `event_state_from_type` now maps `guard.errored` to the census
+  state "errored" (one added line in the map, alongside `remediation.failed` and
+  `guard.unhealthy`); this specific gap no longer needs a risk-accept; the residuals at the end of this bullet
+  do. Deliberately unchanged:
+  `guard.disarmed`, `guard.armed` and `guard.healthy` still produce no census change;
+  `rule_activity`'s `unhealthy` 7-day column, which counts `event_type = 'guard.unhealthy'`
+  only, so a `guard.errored`-sourced errored row shows in the census but adds nothing to
+  that column; and the events-feed chip class (`event_type_class`), which still renders
+  `guard.errored` as generic. `guard.errored` remains dormant until `prefer_spark` ships.
+  RESOLVED means the state mapping and its tests are done; it is not "DONE with no
+  residual". Residuals to resolve or risk-accept before PR-6 sign-off (the Sign-off row's gate; the
+  "pre-PR-5" tags elsewhere in this section are the original tag, kept for history): (a) on the single-event
+  ingest path the census write is best-effort after the event commit and a Redelivered event returns before it
+  (`guaranteed_state_store.cpp:920-922`, `:962-968`), so a transient Postgres failure
+  leaves a detached rule showing its last verdict and mixed-version redelivery never
+  repairs it, and the failure is a `spdlog::warn` line with no counter (#5674); (b)
+  recovery after a spark re-arm is by code reading only, with no agent-level detach,
+  re-arm, compliant-edge test (#5676); (c) the row timestamp is agent-asserted with no
+  server clamp (`guardian_ingest.cpp:293`) and a `>=` tie rule
+  (`guaranteed_state_store.cpp:833-835`), so clock skew or a same-second tie across the
+  lifecycle and compliance lanes can leave a false compliant (#5690; live today
+  for guard.unhealthy); (d) the census is absent from the decommission cascade, so
+  REST/MCP errored_rules and the dashboard can disagree after a decommission (#5675).
 - **Journal-quarantine finding (enterprise-readiness Gate 6) - FOUND AND FIXED IN PR-2d
   ITSELF, not deferred.** `guardian_lifecycle_journal.cpp`'s replay-validation allowlist
-  only recognized `"armed"`/`"disarmed"` - the exact same class of gap as C-1 above, but
+  only recognized `"armed"`/`"disarmed"` - the exact same class of gap as C-1 above (C-1's census mapping is resolved by #5667, residuals open), but
   more severe: a `guard.errored` record surviving a crash/restart before it drained live
   would have been silently QUARANTINED as tampered, destroying the very audit record
   #2818 exists to produce, in the exact scenario (durability across a restart) it's meant
@@ -2148,8 +2222,12 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   this sweep specifically). (3) an errored rule has no age/duration gauge, breaking house
   convention (`GuardianJournalAgeStats`'s AGE-gauge pattern, flip item 6/#2364, is the
   established shape for "a single stuck instance is the fleet signal" and has no
-  equivalent here) - combined with C-1, an on-call engineer has zero signal short of
-  reading the per-agent lifecycle journal file directly.
+  equivalent here) - so a rule stuck errored has no age signal; C-1's census mapping is resolved (#5667), so
+  the errored state itself now shows on the `/guardian` overview and in the `errored_rules`
+  counts, but item (3) stays open: there is still no age or duration gauge for an errored
+  rule. A further gap, pre-flip and tracked in #5674 (sre-1): a census upsert failure
+  (`guaranteed_state_store.cpp:962-968`) is currently only a warn-level log line with no
+  counter.
 - **Dormant-claim verifiability (compliance-officer Gate 6), PRE-PR-5 GATING, cross-PR scope** -
   every "dormant while `prefer_spark_=false`" disposition in this row (and elsewhere in
   this doc) rests on a code-reading assertion, not an auditor-checkable per-deployment
@@ -2173,48 +2251,169 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   every check; section 3a carries the full record, what it covers and what it does not
   (not a `yuzu-agent.exe` restart; single local NTFS file; default drift debounce of about
   10 to 12 minutes).
-- **`GuardianEngine::stop()` has no remaining-deadline wall (#4045): partly addressed, the
-  rest recorded here.** `stop()` shares the 20 s `kShutdownDeadlineGrace` (armed at
-  `AgentImpl::stop()` entry, so it also covers the DEX, Spark engine and updater stops after
-  it; `run()`'s exit teardown is under a second, independent guard) with every later
-  shutdown step, and its earlier stages (two journal flushes, the loss-ledger write, the
-  worker join) are under no deadline of their own. #4045 took the stop mark before the
-  engine mutex and skips ITS pass when that pass would start 15 s or more after the stop
-  began AND an earlier stage of that stop ran slow, at least 4.5 s (the busy timeout minus
-  a 0.5 s timer-rounding slack; a stage that failed quickly is not evidence; a late start
-  with no slow stage runs, because a healthy pass takes well under a millisecond per
-  capture, though it can use its whole 1 s wall plus one write and so run into the
-  watchdog when it starts in the last second). What
-  remains: the pass's first write always runs (the wall is checked between tuples), so one
-  that starts just inside the cutoff can still spend a 5 s busy timeout, and a pass that
-  runs its full 1 s wall before the store turns BUSY ends about 6 s after it started; the
-  evidence is sampled by the earlier stages, so a store that turns BUSY only after them, or
-  whose stages each stay under the 4.5 s threshold, with the stop already 15 s late, still
-  gets the pass attempted and the watchdog may cut it (a reviewer reproduced 21.0 s for the
-  first shape and 20.11 s for the second; the capture is lost either way and the loss has
-  no log line); a worker baseline write in flight with a journal record pending measured 20
-  to 25 s (the in-flight write plus a second write when the worker's 5 s retry backoff ends
-  as journal flush 1 does); the delivery worker's non-baseline KV writes serialise on
-  `KvStore::mu_` and put their own busy timeout in front of every stage (21.5 to 28.2 s in
-  one review harness with 3 staged captures, 28.82 to 29.04 s in another with 5, against a
-  store that stays busy; arithmetic bound about 30 s); the 10.01 s and 15.01 s rows, the
-  no-journal in-flight row (at most 10.01 s; 7.51 to 9.71 s measured), one point of the
-  20 to 25 s row (24.72 s) and the sent-marker row were measured on the final code with 3
-  staged (10.008 s and 15.012 s by the implementer, the rest by a reviewer); the other
-  points came from the revision before the last one (the BUSY stages are slow under either
-  evidence rule), and the 28.82 to 29.04 s row was not re-run on the final code; and a
-  stop that reaches the watchdog exits with code 4 and writes no log line. Without #4045 the same
-  stops take 15 s (journal record pending), or 20 s and more with a worker sent-marker
-  write in flight. A remaining-deadline wall threaded through every stage was considered
-  and not done. Tracked in #5604 (decision).
+- **`GuardianEngine::stop()` has no remaining-deadline wall (#4045): addressed by the stop
+  busy budget (#5604; bounded in the measured cases, see the limits below); the slow-I/O
+  residual is a flip-gate item.** `stop()` shares the 20 s
+  `kShutdownDeadlineGrace` (armed at `AgentImpl::stop()` entry, so it also covers the DEX,
+  Spark engine and updater stops after it; `run()`'s exit teardown is under a second,
+  independent guard) with every later shutdown step. #4045 took the stop mark before the
+  engine mutex and skips its Stop pass when that pass would start late after a slow stage.
+  What bounded the time was the SQLite busy timeout, 5 s per write, and `stop()` has several
+  serial KV stages (journal flush 1, the worker join, the loss-ledger write, journal flush 2,
+  the Stop pass), so against a store that stays busy the worst cases reached 21 to 29 s
+  (earlier revisions, 3 and 5 staged captures; not re-run on the final #4045 code for the
+  top row), past the grace. **#5604 (decision: option 2, a shorter busy budget, applied to the
+  whole of `stop()` rather than the Stop pass alone)**: `KvStore` now installs a
+  `sqlite3_busy_handler` that reads an atomic budget instead of `sqlite3_busy_timeout`, and
+  `GuardianEngine::stop()` lowers that budget once, terminally, to `kKvStoreStopBusyTimeout`
+  (1 s) before it waits for the engine mutex. Lowering is lock-free and also cuts a write
+  that is already waiting (measured with a standalone probe against the vcpkg sqlite3 and
+  in the KvStore unit test: a write started under 2000 ms, the budget lowered to 200 ms
+  about 50 ms after the write began waiting, the write returned BUSY at about 200 ms;
+  `sqlite3_busy_timeout` called from another thread blocks behind the connection mutex the
+  waiting write holds and does not shorten it). Its consequences:
+  `kBaselineStopLatestStart` is now 18 s (grace less the Stop pass's 1 s wall and one 1 s
+  busy budget; it has no slack, and the retry-sleep overshoot lands on top), and
+  `kBaselineStopTroubleThreshold` is 750 ms (the stop budget less a 250 ms measurement slack).
+  The Stop pass is skipped only when it would start at or after 18 s AND this stop has shown
+  a slow store: an earlier stage (the two journal flushes, the loss-ledger write; not the
+  worker join, which is a thread join) that took at least the threshold, or a persist
+  pass whose failed write took at least the threshold and ended at or after the stop mark.
+  A slow failed worker write alone does not skip an early Stop pass (it used to: that
+  discarded the capture of a store that had healed after the worker's write was cut; the
+  regression test is `#5604 A1`, which fails against the code without the lateness gate).
+  A `static_assert` requires seven stop budgets to fit in half the grace (a margin rule, not
+  a derived bound; it does not count callers queued on `KvStore::mu_` behind the lowering).
+  **Target (AC1)**: at most seven stop budgets (7 s): six enumerated waits plus one budget
+  of allowance for sleep overshoot and a queued caller. The six are journal flush 1, the
+  loss-ledger write, journal flush 2, the Stop pass (its wall is checked only from the
+  second tuple on, so it can make two writes, a slow success followed by a failing one,
+  because the stop budget allows one failure) and an in-flight worker write. The
+  enumeration (3 + 2 + 1) is not enforced by any code and assumes WAL, the mode `open()`
+  always requests (in the rollback-journal fallback `del_keys`, `insert_if_absent` and
+  `rename_key` can each cost two waits: 1.81 s measured against a 1.0 s budget; `set` and
+  `clear` stay at one); the `static_assert` on seven stop budgets within half the 20 s
+  grace is the enforced margin. The largest figure measured is 6.03 s on
+  Linux (the real-write row B at its slowest alignment and the emulated row E; see the
+  measured rows below), inside the seven-budget target with a 0.97 s margin. On a Docker
+  agent service (stopped at 10 s) a 6 s contended stop leaves about 4 s for the DEX drain,
+  the Spark consumer join, the updater and log teardown.
+  **Cost per queued writer**: every other single-shot KV writer queued on `KvStore::mu_`
+  when `stop()` runs adds about one budget, because each of `stop()`'s serial stages queues
+  behind it. Measured on Linux, one run per point, with a journal record pending and a
+  non-baseline worker write in flight: 9.0 s with 3 extra writers and 10.98 s with 5.
+  Extrapolated, not run: about 20 s, the watchdog, at about 14 queued writers. At one extra
+  writer the measurement is about 7.0 to 7.1 s in the latest quiet reruns, which meets the
+  7 s target only to within sleep overshoot (cause likely, not isolated); earlier runs under
+  heavy load gave 7.12 s and 8.14 s, so the target is not met under load at one extra
+  writer. The allowance budget is spent twice if a Worker pass in
+  flight makes two failed writes and a writer is also queued. A writer that loops costs
+  more than one budget: in a standalone `KvStore` run of six serial 1 s stage writes, K
+  other threads looping `set()` with a 50 ms pause took 8.7 to 9.8 s for K=1 and 20.8, 20.8
+  and 23.8 s for K=3 over repeat runs, against 6.0 s with none; the cost is not linear in K
+  because `std::mutex` is unfair, and K=3 passes the 20 s grace. A writer that
+  loops with no pause at all can starve a `stop()` stage outright because `std::mutex` is
+  not fair (with one such writer a stage was still unserved after more than 3 minutes, and
+  the run was killed); no production caller that does this was identified. All of this
+  predates #5604 and is not fixed here (a pre-existing residual of the store's single
+  mutex); tracked as #5642.
+  **Trace decision (AC2)**: a watchdog-cut flush stays untraceable at stop time (decided by
+  the implementer, not accepted by a stakeholder; `hard_exit` forbids a log line, and a
+  KV marker would fail on the same store); the
+  evidence is exit code 4 plus the next boot's recapture lines. A recapture logs exactly
+  like a first arm, so an operator should treat `file-hash-equals` rules without an authored
+  `expected_hash` as possibly re-baselined after an exit-4 event. A begin-of-stop file
+  sentinel is #5605's design.
+  Measured under real SQLITE_BUSY (a second connection holding `BEGIN IMMEDIATE` through
+  the whole stop), production values (5 s lowered to 1 s), Linux debug build, `stop()` entry
+  to exit, with the busy handler of this change (count continuity, reset on entry to every
+  `KvStore` call) and the lateness gate; one run per point, except row B (eight runs for
+  each staged count) and row E (two runs): A, nothing pending, 3 or 5 staged captures,
+  2.01 s; B, a journal record pending and the worker idle, 4.02 to 6.03 s over 16 runs
+  (4.02 s seven times, 5.02 s six times, 6.03 s three times, with 3 and with 5 staged:
+  which of the worker's own writes line up with the stop decides how many of the six waits
+  occur, and a measurement with the handler before the final one showed the same spread);
+  C, a worker baseline write
+  in flight, 2.01 to 2.72 s across four alignments (the 2.01 s points include the worker's
+  retry write in flight); D, a worker non-baseline write in flight (emulated by a KV write
+  issued from the worker thread, 5 staged), 2.01 to 2.72 s; E, a journal record pending
+  with that emulated write in flight, 5.33 to 6.03 s (the two runs at each alignment
+  agreed within 3 ms). Rows A, C, D and E were measured again at the final handler:
+  unchanged within 11 ms (the largest paired delta is 10.6 ms, at matched
+  alignment; the row B runs printed as 4.02, 5.02 and 6.03 s span 4.016 to 4.020,
+  5.021 to 5.029 and 6.024 to 6.029 s). Where
+  the stall skipped the Stop pass on the code before the gate, rows C and E were shorter:
+  C 1.71, 1.01 and 1.01 s at its first three alignments (its fourth, 2.01 s, and row D did
+  not change), E 5.03, 4.74 and 4.33 s; row B took 4.02 s and 4.03 s there in one run each,
+  inside its spread above. The gate costs one or two more stop budgets when the store is
+  still locked (rows C and E). Linux only; the emulated rows are not the real sent-marker
+  write. Raw: the harness output for the code before the gate and for the final handler,
+  to be attached to the #5604 decision comment.
+  **Trade-off (journal-record loss is an F14 precondition, not yet accepted)**: an external
+  process that holds the kv store locked for 1 to 5 s at the shutdown instant now fails the
+  stop-time writes that a 5 s budget would have survived.
+  The cost is one recapture of the affected baselines at the next boot (a file that drifted
+  between a lost capture and that boot is accepted as the baseline), a stale (never
+  corrupt) loss ledger, and, with `prefer_spark_` true, **lifecycle-journal audit records
+  still pending after the last stop-time flush**: they are held only in memory and are
+  destroyed with the process (a count only; not recoverable). Each loss logs a line, the
+  journal one naming the pending count and the flush stage. Every user of the shared store
+  runs at the 1 s budget once `stop()` has lowered it, not only plugins' `shutdown()`
+  writes: plugin actions, the sync scheduler and the license scan too.
+  **F14 precondition (journal loss)**: the pending-journal ERROR line is agent-local only
+  (the heartbeat has already stopped; no metric, no server row; absent if the watchdog cuts
+  the stop; count and stage only, no rule ids). Before the Spark flip either extend the
+  #5605 fleet signal to journal records lost at stop, or record explicit risk acceptance by
+  the F14 sign-off owner. Owner: to be assigned by the F14 sign-off.
+  **Exposure split**: the baseline and lifecycle-journal benefits are Spark-gated and dormant
+  while `prefer_spark_` is false. The KvStore handler, the 1 s stop budget, the stop-time
+  loss-ledger write and the sync scheduler's, license scan's and plugin `shutdown()` writes at
+  that budget are LIVE in released agents.
+  **Residual (stands; a flip-gate item, to be tracked in #3756)**: the busy handler only bounds lock waits. An fsync or
+  other slow-I/O stall inside a write is not a lock event and no handler runs, so a stalled
+  disk still runs into the watchdog. On every platform SQLite's WAL-index retry sleeps run
+  outside the handler, so the bound is per statement step, not per call: a busy wait that
+  continues within one statement step shares one budget (measured on Linux with a
+  peer process holding the WAL index in recovery, a contrived trigger: a write under a 1000
+  ms budget returned after 1.74 s and 2.05 s in the first two phasings and after 1.06 to
+  2.32 s over six more; phasing dependent, up to about 2.3 s measured, not a cap). On
+  Windows SQLite's own
+  file-I/O retries (`winRetryIoerr`, about 1.45 s per failing file operation, derived from
+  the SQLite source and not measured here) add to that (five stages at two failing
+  operations per statement would be about 19.6 s by that derivation). The DEX observer
+  drain in `AgentImpl::stop()` and plugin `shutdown()` under the second guard stay
+  unbounded by this change. A stop
+  queued behind an `apply_rules` is not cut by the lowering for a Forced drain (up to two
+  failures of 1 s: its 2 s wall ends it) or a hung `watch()` (pre-existing). The stage
+  evidence is still sampled. The Stop pass runs once per engine: a second `stop()` call
+  (`run()`'s exit teardown, the destructor) returns before it, so a store that heals between
+  the two calls does not get back a capture the first call skipped or failed (pre-existing
+  from #4045; pinned by a test, not changed here; tracked as #5641).
+  Supervisor stop timeouts are implicit and may be shorter than the 20 s grace (Docker
+  agent services stop at 10 s, so exit code 4 never appears there; tracked as #5643). A remaining-deadline
+  wall threaded through every stage was considered and not done.
+  **Not done (diagnosability)**: no log line marks the moment the budget is lowered and no
+  end-of-stop line reports per-stage timings. An operator therefore cannot see that the 1 s
+  budget applied, how long each stage took, or a near miss (a stop that took 17 s). The
+  per-write failure lines, the loss-ledger warning, the incomplete-flush line and the
+  pending-journal line are the available evidence; the pending-journal line carries the
+  count and the flush stage but no cause (a budget cut and any other write failure read
+  the same). Deferred; related to #5605 and #3756.
+  Decision and implementation: #5604.
 - Owner: not assigned for any item above.
-- Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + three pre-PR-5 GATING items
-  (guard.errored census recognition; the three sre observability gaps; the
-  yuzu.guardian_backend server-side-reader gap; plus, from #4045, the fleet-visible
+- Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + two remaining pre-PR-5 GATING items
+  from the PR-2d follow-ups (the three sre observability gaps; the
+  yuzu.guardian_backend server-side-reader gap), plus two items from #4045 (the fleet-visible
   baseline-persist signal (F14 precondition, section 3a) and the missing
-  remaining-deadline wall in `stop()`) - no issue numbers, tracked here; those two #4045 items
-  are tracked in #5605 (fleet signal) and #5604 (the `stop()` deadline decision). The pre-merge real-File-mechanism
-  run is DONE (2026-10-08, passed; section 3a).
+  remaining-deadline wall in `stop()`); the third PR-2d follow-up, guard.errored census
+  recognition (C-1), is resolved by #5667 with residuals (a)-(d) carried in the C-1 bullet
+  of section 5 (#5674/#5675/#5676; the two still-open PR-2d follow-ups have no issue numbers of their
+  own, tracked here; residuals (a)-(d) also gate); those two #4045 items
+  are tracked in #5605 (fleet signal) and #5604 (the `stop()` deadline; the decision closes
+  with the stop busy budget, while the slow-I/O residual stays F14-gating, section 5, and
+  the lifecycle-journal records lost at stop are a further F14 precondition there: a fleet
+  signal or explicit risk acceptance by the F14 sign-off owner). The pre-merge
+  real-File-mechanism run is DONE (2026-10-08, passed; section 3a).
 - Revisit trigger: before PR-5's sign-off, everything above re-checked; #4051 specifically
   re-checked before any production fleet (dedup races become far more frequent under
   real load than in this PR's own governance testing).
