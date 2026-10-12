@@ -159,8 +159,17 @@ TEST_CASE("policy: random valid edges keep score, displayed value and band in ag
             CHECK(*r.band == stability_band(*r.score, e));
             CHECK(*r.band == hand_band(*r.score, e));
         }
-        for (int i = 0; i <= 10000; ++i) {
-            const double s = i / 100.0;
+        // Only scores within one display tick of an edge (and the range ends)
+        // can disagree under a moved comparison or a dropped display rounding;
+        // probe that neighbourhood at the 0.01 resolution of the score grid.
+        std::vector<double> probes = {0.0, 100.0};
+        for (const double edge : {e.excellent, e.good, e.fair}) {
+            const auto c = std::llround(edge * 100.0);
+            for (auto i = c - 10; i <= c + 10; ++i)
+                probes.push_back(static_cast<double>(i) / 100.0);
+        }
+        for (const double s : probes) {
+            INFO("score " << s);
             REQUIRE(stability_band(s, e) == hand_band(s, e));
         }
     }
