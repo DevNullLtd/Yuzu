@@ -91,7 +91,8 @@ inline constexpr std::size_t kAckDrainMaxPerTick = 1024;
 /// returns Reapply. A DECISION-count bound, not wall-clock: decide_retry() has one
 /// production caller (apply_rules(), driven by the server's push cadence), so at the
 /// 30 s heartbeat this is about 330 s (275 s at 25 s spacing). A forced Reapply
-/// re-arms every rule in the push (apply_rules persists staged Spark baseline captures
+/// re-arms every rule in the push that is not healthy and unchanged (#4415: those are
+/// skipped; apply_rules persists staged Spark baseline captures
 /// first, #4045, so only a capture that was lost or never written is exposed to a
 /// recapture; the flip gate's AC-10 lists the cases) but does NOT unstick the wedged
 /// claim - an identical re-observation returns the existing claim. It bounds the

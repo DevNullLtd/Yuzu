@@ -501,10 +501,10 @@ GuardianArmAckLedger::RetryDecision GuardianArmAckLedger::decide_retry(
         // policy-generation persist that failed last time (an empty `pending` used to
         // fall through to a vacuous Suppress and silently, permanently wedge the
         // reported generation below the server's value until restart). Reapply restores
-        // a full re-run - NOT free: a full_sync retry still pays the real teardown +
-        // re-arm cycle (attach_core() rebuilds eval state on every push, identical
-        // re-push included - there is no diff-skip); what this restores is that the
-        // retry runs AT ALL, not that it becomes cheap. With pending non-empty and
+        // a full re-run of apply_rules. Since #4415 that re-run no longer tears down a rule
+        // that is healthy and unchanged (attach_core() skips it), but it still rebuilds one
+        // that is not, so it is not free for those; what it restores is that the retry runs
+        // AT ALL. With pending non-empty and
         // every receipt Pending/Committed, an identical retry is a pure Suppress.
         return app.pending.empty() ? RetryDecision::Reapply : RetryDecision::Suppress;
     }
