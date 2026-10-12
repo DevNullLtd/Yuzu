@@ -14,6 +14,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <vector>
 
 using namespace yuzu::server::rs_matcher;
 
@@ -116,4 +117,68 @@ TEST_CASE("matcher: malformed column matcher falls back to default", "[result_se
     REQUIRE_FALSE(response_matches(R"({"column":"c","op":"eq"})", kOk, out));
     // A matcher object with neither kind nor column is treated as default.
     REQUIRE(response_matches(R"({"foo":"bar"})", kOk, out));
+}
+
+// #4644: `m.value("n", 1)` THREW on a wrong-typed n (string/null/array/object), and the
+// maintenance tick calls response_matches for every pending set without a try/catch, so one bad
+// stored matcher re-threw every 2 s and starved the GC and retention reaps behind it. A numeric n
+// outside int range also wrapped (4294967297 read as 1). Now a malformed n fails CLOSED like an
+// unknown kind: nobody qualifies, nothing throws.
+TEST_CASE("matcher: a malformed tar_rows_ge n never throws and matches nobody (#4644)",
+          "[result_set][matcher][numeric_params]") {
+    const std::vector<std::string> bad_n = {
+        "\"2\"", "\"\"", "null", "true", "[]", "{}", "5.5", "1e3", "4294967297",
+        "-4294967295", "9223372036854775808", "18446744073709551615", "2147483648"};
+    for (const auto& n : bad_n) {
+        const std::string m = R"({"kind":"tar_rows_ge","n":)" + n + "}";
+        INFO(m);
+        bool r = true;
+        REQUIRE_NOTHROW(r = response_matches(m, kOk, tar_rows(5)));
+        CHECK_FALSE(r);
+    }
+
+    // The maintenance tick walks every pending set in one loop: a bad set must not stop the
+    // sets after it (the old code threw out of the loop on the first one).
+    const std::vector<std::string> pending = {R"({"kind":"tar_rows_ge","n":"x"})",
+                                              R"({"kind":"tar_rows_ge","n":2})",
+                                              R"({"kind":"any_response"})"};
+    std::vector<bool> member;
+    REQUIRE_NOTHROW([&] {
+        for (const auto& m : pending)
+            member.push_back(response_matches(m, kOk, tar_rows(3)));
+    }());
+    REQUIRE(member.size() == 3);
+    CHECK_FALSE(member[0]);
+    CHECK(member[1]);
+    CHECK(member[2]);
+
+    // Well-formed thresholds keep their meaning, including the INT_MAX boundary and an absent n.
+    CHECK(response_matches(R"({"kind":"tar_rows_ge","n":2147483647})", kOk, tar_rows(3)) == false);
+    CHECK(response_matches(R"({"kind":"tar_rows_ge","n":3})", kOk, tar_rows(3)));
+    CHECK(response_matches(R"({"kind":"tar_rows_ge"})", kOk, tar_rows(1)));
+}
+
+TEST_CASE("matcher: validate_matcher accepts only an integer n of at least 1 (#4644)",
+          "[result_set][matcher][numeric_params]") {
+    for (const char* ok :
+         {"", "{}", R"({"kind":"any_response"})", R"({"kind":"tar_rows_ge"})",
+          R"({"kind":"tar_rows_ge","n":1})", R"({"kind":"tar_rows_ge","n":2147483647})",
+          R"({"column":"sha256","op":"eq","value":"x"})",
+          // n only means something for tar_rows_ge, and an unrecognised shape keeps its default.
+          R"({"kind":"any_response","n":"x"})", "not json", "[]"}) {
+        INFO(ok);
+        CHECK_FALSE(validate_matcher(ok).has_value());
+    }
+    for (const char* bad :
+         {R"({"kind":"tar_rows_ge","n":0})", R"({"kind":"tar_rows_ge","n":-1})",
+          R"({"kind":"tar_rows_ge","n":4294967297})",
+          R"({"kind":"tar_rows_ge","n":9223372036854775808})",
+          R"({"kind":"tar_rows_ge","n":18446744073709551615})", R"({"kind":"tar_rows_ge","n":2147483648})",
+          R"({"kind":"tar_rows_ge","n":1e3})", R"({"kind":"tar_rows_ge","n":5.5})",
+          R"({"kind":"tar_rows_ge","n":"7"})", R"({"kind":"tar_rows_ge","n":""})",
+          R"({"kind":"tar_rows_ge","n":null})", R"({"kind":"tar_rows_ge","n":true})",
+          R"({"kind":"tar_rows_ge","n":[]})", R"({"kind":"tar_rows_ge","n":{}})"}) {
+        INFO(bad);
+        CHECK(validate_matcher(bad).has_value());
+    }
 }

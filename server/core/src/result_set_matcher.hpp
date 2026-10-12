@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -21,6 +22,7 @@
 //   ""  /  {}                       → default: SUCCESS responders only
 //   {"kind":"any_response"}         → every SUCCESS responder (include_empty)
 //   {"kind":"tar_rows_ge","n":N}    → SUCCESS AND the tar result carried ≥ N rows
+//                                     (N: JSON integer ≥ 1, default 1; a malformed N matches nobody)
 //   {"column":C,"op":O,"value":V}        ─┐ SUCCESS AND at least one parsed
 //   {"column":C,"op":O,"value_set":[..]} ─┘ output row's column C satisfies O
 //
@@ -38,6 +40,12 @@ inline constexpr int kStatusSuccess = 1;
 /// True iff a responder with the given (status, output) qualifies for
 /// membership in a result set whose pending row carries `matcher_json`.
 bool response_matches(std::string_view matcher_json, int status, std::string_view output);
+
+/// Admission check for a caller-supplied matcher (#4644): nullopt when acceptable, else the 400
+/// message. Only `tar_rows_ge` has a numeric field: its `n` (absent = 1) must be one JSON integer
+/// in 1..2147483647. `response_matches` independently fails CLOSED on a malformed `n` already
+/// stored, so a bad value can never throw out of the maintenance tick.
+std::optional<std::string> validate_matcher(std::string_view matcher_json);
 
 /// Count the rows in a tar `tar.sql` response `output`. The tar plugin emits
 /// a `__schema__|col|col` header line, one `|`-joined line per row, then a

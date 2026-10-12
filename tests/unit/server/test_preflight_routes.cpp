@@ -389,6 +389,74 @@ TEST_CASE("preflight routes: /fragments/auto/run 400s on a malformed min_gib or 
     CHECK(dispatched == 5 * per_run);
 }
 
+// #4644: `cmp_version` read a malformed version threshold as 0, so an `app_min` of `abc` (or
+// `v4.2.0`, `4.2.x`) became "any version" and the go/no-go gate that feeds Deploy passed every
+// device. A non-empty threshold that is not a dotted-decimal version (optionally with a
+// pre-release suffix) is now a 400 and nothing is dispatched or saved; EMPTY still means unset.
+TEST_CASE("preflight routes: /fragments/auto/run 400s on a malformed version threshold and "
+          "dispatches nothing (#4644)",
+          "[pg][preflight][routes][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PreflightRunStore run_store{pool};
+    REQUIRE(run_store.is_open());
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto devices = [](const std::string&) {
+        DeviceRow d;
+        d.agent_id = "WS-1";
+        d.hostname = "WS-1-host";
+        d.os = "windows";
+        return std::vector<DeviceRow>{d};
+    };
+    int dispatched = 0;
+    auto dispatch = [&dispatched](const std::string&, const std::string&,
+                                  const std::vector<std::string>&, const std::string&,
+                                  const std::unordered_map<std::string, std::string>&,
+                                  const std::string&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatched;
+        return {.sent = 1, .command_id = "cmd-1"};
+    };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) -> bool {
+        return true;
+    };
+
+    PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, devices, /*groups_fn=*/{},
+                           /*group_members_fn=*/{}, dispatch, /*collect_fn=*/{}, audit, &run_store);
+
+    for (const char* field : {"app_min", "app_max", "os_min"}) {
+        for (const char* bad : {"abc", "v4.2.0", "4.2.x", "1..2", "-1", "4.2.0-", "4.2.0-beta.1",
+                                "1e3", "0x10", "null", "true", "[]", "4.2.0%20", "%204.2.0",
+                                "1000000000000000", "18446744073709551615"}) {
+            const std::string form = std::string("app_name=Acme&min_gib=20&") + field + "=" + bad;
+            INFO(form);
+            auto res = sink.Post("/fragments/auto/run", form, "application/x-www-form-urlencoded");
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+    }
+    CHECK(dispatched == 0);
+    CHECK(run_store.list_runs("", /*is_admin=*/true, /*limit=*/10).empty());
+
+    // Real versions, a pre-release suffix and the cleared inputs the form really sends still run.
+    for (const char* ok : {"app_name=Acme&app_min=4.2.0&app_max=4.9.99&os_min=10.0.19045",
+                           "app_name=Acme&app_min=4.2.0-beta&app_max=5.5&os_min=10.0.19045",
+                           "app_name=Acme&app_min=&app_max=&os_min=", "app_min=4294967297"}) {
+        INFO(ok);
+        auto res = sink.Post("/fragments/auto/run", ok, "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    CHECK(run_store.list_runs("", /*is_admin=*/true, /*limit=*/10).size() == 4);
+}
+
 // SEC-2/SEC-3 confinement-gap class (Gate 4 unhappy-path review, UP-1):
 // /fragments/auto (rail), /fragments/auto/result, and /fragments/auto/delete
 // all scope by session->username alone — but ApiToken::principal_id ("the

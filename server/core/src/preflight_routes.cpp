@@ -103,13 +103,20 @@ std::optional<std::int64_t> form_int(const httplib::Request& req, const char* ke
     return yuzu::server::parse_query_int<std::int64_t>(raw);
 }
 
-/// nullopt when `min_gib` is present but malformed or negative (the caller answers 400).
+/// nullopt when `min_gib` is present but malformed or negative, or when a version threshold
+/// (`app_min`, `app_max`, `os_min`) is non-empty and not a dotted-numeric version with an optional
+/// pre-release suffix (the caller answers 400). An EMPTY version field means "no threshold" (the
+/// form always submits it): a malformed one used to compare as version 0, so a floor of `abc`
+/// passed every device.
 std::optional<preflight::PreflightConfig> config_from_req(const httplib::Request& req) {
     preflight::PreflightConfig c;
     c.app_name = param(req, "app_name");
     c.app_min_version = param(req, "app_min");
     c.app_max_version = param(req, "app_max");
     c.os_min_version = param(req, "os_min");
+    for (const auto* v : {&c.app_min_version, &c.app_max_version, &c.os_min_version})
+        if (!v->empty() && !preflight::is_valid_version_threshold(*v))
+            return std::nullopt;
     c.req_arch = param(req, "arch");
     const auto min_gib = form_int(req, "min_gib", 0);
     if (!min_gib || *min_gib < 0)
@@ -427,15 +434,16 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                             "text/html; charset=utf-8");
             return;
         }
-        // A malformed (or, for the disk threshold, negative) number is a 400 with nothing
-        // dispatched: it used to read as 0, i.e. "no minimum free disk" / the default window.
+        // A malformed (or, for the disk threshold, negative) number, or a malformed version
+        // threshold, is a 400 with nothing dispatched: it used to read as 0, i.e. "no minimum
+        // free disk" / the default window / version 0 (every device passes).
         const auto parsed_cfg = config_from_req(req);
         const auto parsed_window = form_int(req, "window", 0);
         if (!parsed_cfg || !parsed_window) {
             res.status = 400;
             res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"Pre-flight thresholds must be whole numbers","level":"error"}})");
-            res.set_content(detail::a4_error(res, "invalid numeric parameter"),
+                           R"({"showToast":{"message":"Pre-flight thresholds must be whole numbers, and versions dotted numbers such as 4.2.0","level":"error"}})");
+            res.set_content(detail::a4_error(res, "invalid threshold parameter"),
                             "application/json");
             return;
         }

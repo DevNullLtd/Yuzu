@@ -55,6 +55,15 @@ also uses the 30-minute default, and a larger value is clamped to 1 to 2880 minu
 64-bit value so a huge number cannot wrap into a different window. Before this check a malformed
 `min_gib` read as 0, which let every device pass the free-disk check.
 
+The version thresholds (**minimum version** `app_min`, **maximum version** `app_max` and **minimum
+OS version** `os_min`) are checked the same way. Each must be empty (no threshold) or a
+dotted-decimal version such as `4.2.0`, `10.0.19045` or `5.5`, optionally followed by a pre-release or
+build suffix of letters, digits and `-` / `+` with no dot (`4.2.0-beta`, `4.2.0-rc1`,
+`4.2.0+build5`); the suffix is accepted and ignored by the comparison. Anything else (`abc`,
+`v4.2.0`, `4.2.x`, `1..2`, `-1`, `4.2.0-beta.1`, a component longer than 15 digits) is answered with
+`400` and the same error toast, and no run is created. A malformed threshold used to read as version
+0, so a minimum of `abc` passed every device and the go/no-go gate that feeds Deploy failed open.
+
 ## Persistence and retention
 
 Runs are **saved** and listed in the **Recent runs** rail; reopen one to revisit

@@ -3,6 +3,9 @@
 #include <nlohmann/json.hpp>
 
 #include <charconv>
+#include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -137,7 +140,43 @@ bool json_column_match(std::string_view output, const std::string& column, const
     return false;
 }
 
+// The `n` of a `tar_rows_ge` matcher (#4644). ABSENT is the documented default 1. A PRESENT `n`
+// must be one JSON integer that fits an int; anything else (string, null, float, array, bool,
+// 4294967297) is nullopt. `m.value("n", 1)` THREW on a wrong type -- out of the maintenance tick,
+// where it re-threw every 2 s and starved the GC and retention reaps behind it -- and wrapped an
+// out-of-range integer into a different threshold.
+std::optional<int> read_row_threshold(const nlohmann::json& m) {
+    if (!m.contains("n"))
+        return 1;
+    const auto& v = m["n"];
+    if (!v.is_number_integer())
+        return std::nullopt;
+    if (v.is_number_unsigned()) {
+        if (v.get<std::uint64_t>() > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+            return std::nullopt;
+    } else {
+        const auto w = v.get<std::int64_t>();
+        if (w < std::numeric_limits<int>::min() || w > std::numeric_limits<int>::max())
+            return std::nullopt;
+    }
+    return v.get<int>();
+}
+
 } // namespace
+
+std::optional<std::string> validate_matcher(std::string_view matcher_json) {
+    if (matcher_json.empty())
+        return std::nullopt;
+    const auto m = nlohmann::json::parse(matcher_json, nullptr, false);
+    if (m.is_discarded() || !m.is_object())
+        return std::nullopt; // the unrecognised-shape default is unchanged
+    if (!m.contains("kind") || !m["kind"].is_string() || m["kind"].get<std::string>() != "tar_rows_ge")
+        return std::nullopt;
+    const auto n = read_row_threshold(m);
+    if (!n || *n < 1)
+        return "matcher.n must be a JSON integer between 1 and 2147483647";
+    return std::nullopt;
+}
 
 int tar_row_count(std::string_view output) {
     if (output.starts_with("error|"))
@@ -179,8 +218,10 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
         if (kind == "any_response")
             return true;
         if (kind == "tar_rows_ge") {
-            int need = m.value("n", 1);
-            return tar_row_count(output) >= need;
+            // A malformed threshold fails CLOSED, like an unknown kind: nobody qualifies, and the
+            // tick carries on to the next set instead of throwing.
+            const auto need = read_row_threshold(m);
+            return need && tar_row_count(output) >= *need;
         }
         return false; // unknown kind → conservatively exclude
     }

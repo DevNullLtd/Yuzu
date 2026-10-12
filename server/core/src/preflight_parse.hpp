@@ -205,6 +205,48 @@ inline std::string format_gib(std::int64_t bytes) {
     return out;
 }
 
+/// Is `v` an acceptable version THRESHOLD for the go/no-go gate (#4644)? Dotted-decimal
+/// components (`4.2`, `10.0.19045`, `5.5`), each 1 to 15 digits so none can saturate the 64-bit
+/// compare, with an optional pre-release / build suffix of letters, digits, `-` and `+` that
+/// starts with `-` or `+` and has no dot (`4.2.0-beta`, `4.2.0-rc1`, `4.2.0+build5`). A dot in the
+/// suffix is refused because `cmp_version` would read it as one more numeric component. The
+/// suffix itself is ignored by the compare (the numeric core decides). EMPTY is not valid HERE:
+/// the caller treats an empty field as "no threshold" before calling. `cmp_version` reads any
+/// unparseable component as 0, so `abc` or `v4.2.0` as a floor passed every device (fail OPEN).
+[[nodiscard]] inline bool is_valid_version_threshold(std::string_view v) {
+    std::size_t i = 0;
+    const auto digits = [&]() {
+        const std::size_t start = i;
+        while (i < v.size() && v[i] >= '0' && v[i] <= '9')
+            ++i;
+        return i - start;
+    };
+    std::size_t n = digits();
+    if (n == 0 || n > 15)
+        return false;
+    while (i < v.size() && v[i] == '.') {
+        ++i;
+        n = digits();
+        if (n == 0 || n > 15)
+            return false;
+    }
+    if (i == v.size())
+        return true;
+    if (v[i] != '-' && v[i] != '+')
+        return false;
+    ++i;
+    if (i == v.size())
+        return false; // a bare trailing '-' / '+'
+    for (; i < v.size(); ++i) {
+        const char c = v[i];
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                        (c >= 'A' && c <= 'Z') || c == '-' || c == '+';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
 /// Dotted-numeric version compare: -1 (a<b) / 0 (a==b) / 1 (a>b). Per component
 /// numeric (leading digits; non-numeric suffix ignored), missing components = 0,
 /// so "10.0.22631" > "10.0.19045" and "4.2" == "4.2.0".

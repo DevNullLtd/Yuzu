@@ -147,3 +147,31 @@ TEST_CASE("parse_i64 / format_gib saturate, not overflow (operator input, UP-2)"
     REQUIRE_NOTHROW(format_gib(kMax));
     CHECK(format_gib(kMax).find(" GiB") != std::string::npos);
 }
+
+// #4644: `cmp_version` reads any component it cannot parse as 0, so a version FLOOR of `abc`,
+// `v4.2.0` or `4.2.x` was version 0 and every device passed the gate (fail OPEN). A threshold is
+// now validated before it is stored: dotted-decimal components with an optional pre-release or
+// build suffix. (An EMPTY field means "no threshold" and is handled by the route, not here.)
+TEST_CASE("is_valid_version_threshold: dotted-decimal with an optional pre-release suffix",
+          "[preflight][parse][numeric_params]") {
+    for (const char* ok : {"4", "4.2", "4.2.0", "10.0.19045", "5.5", "4.2.0.1234", "0", "007.1",
+                           "4294967297", "999999999999999", "4.2.0-beta", "4.2.0-rc1",
+                           "4.2.0+build5", "4.2.0-rc1+build5", "4.2-beta-2", "1-alpha"}) {
+        INFO(ok);
+        CHECK(is_valid_version_threshold(ok));
+    }
+    for (const char* bad :
+         {"", "abc", "v4.2.0", "4.2.x", "1..2", ".1", "1.", "-1", "+1", "4.2.0-", "4.2.0+",
+          "4.2.0-beta.1", "4.2.0 ", " 4.2.0", "4.2.0\n", "4,2", "1e3", "0x10", "null", "true", "[]",
+          "4.2.0_beta", "4.2.0-beta!", "1000000000000000", "99999999999999999999",
+          "18446744073709551615", "9223372036854775808", "4.2.0/../x"}) {
+        INFO(bad);
+        CHECK_FALSE(is_valid_version_threshold(bad));
+    }
+}
+
+TEST_CASE("cmp_version ignores a validated pre-release suffix", "[preflight][parse][numeric_params]") {
+    CHECK(cmp_version("4.2.0", "4.2.0-beta") == 0);
+    CHECK(cmp_version("4.2.1", "4.2.0-rc1") > 0);
+    CHECK(cmp_version("4.1.9", "4.2.0+build5") < 0);
+}

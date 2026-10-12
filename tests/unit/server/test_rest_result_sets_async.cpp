@@ -1057,6 +1057,42 @@ TEST_CASE("from-instruction-result: 202 pending with operator matcher persisted"
     REQUIRE(row->matcher.find("value_set") != std::string::npos);
 }
 
+// #4644: a tar_rows_ge matcher's `n` is stored on the pending row and read by the maintenance
+// tick. A wrong-typed n used to throw out of that tick on every pass; -1 admitted every responder.
+// It is now refused here, before anything is dispatched or stored.
+TEST_CASE("from-instruction-result: a malformed matcher n is refused with 400 and dispatches "
+          "nothing (#4644)",
+          "[pg][result_set][async][instruction][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    for (const char* n :
+         {"4294967297", "9223372036854775808", "18446744073709551615", "-1", "0", "1e3", "5.5",
+          "\"7\"", "\"\"", "null", "true", "[]", "{}"}) {
+        const std::string body = R"({"instruction_id":")" + iid +
+                                 R"(","matcher":{"kind":"tar_rows_ge","n":)" + n + "}}";
+        INFO(body);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body, status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("matcher.n") != std::string::npos);
+    }
+    CHECK(h.calls.empty());
+    CHECK(h.store->list_pending().empty());
+
+    // A well-formed threshold still admits and is stored verbatim.
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result",
+                    R"({"instruction_id":")" + iid + R"(","matcher":{"kind":"tar_rows_ge","n":2}})",
+                    status);
+    REQUIRE(status == 202);
+    CHECK(h.calls.size() == 1);
+    auto row = get_ok(*h.store, j["data"]["id"].get<std::string>());
+    CHECK(row->matcher.find("\"n\":2") != std::string::npos);
+}
+
 TEST_CASE("from-instruction-result: unknown instruction_id 404s",
           "[pg][result_set][async][instruction]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);

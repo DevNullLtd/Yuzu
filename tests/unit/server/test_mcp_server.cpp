@@ -28898,6 +28898,34 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
                   .value() == 1.0);
     }
 
+    SECTION("create_result_set_from_instruction_result: a malformed matcher n is -32602 and "
+            "nothing is dispatched (#4644)") {
+        YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+        yuzu::server::pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+        yuzu::server::InstructionStore instr(instr_pool);
+        REQUIRE(instr.is_open());
+        ts.instruction_store_for_test = &instr;
+        ts.start("operator");
+        int call_id = 40;
+        for (const char* n :
+             {"4294967297", "9223372036854775808", "18446744073709551615", "-1", "0", "1e3", "5.5",
+              "\"7\"", "\"\"", "null", "true", "[]", "{}"}) {
+            const std::string req =
+                R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id++) +
+                R"(,"params":{"name":"create_result_set_from_instruction_result","arguments":{)"
+                R"("instruction_id":"x","matcher":{"kind":"tar_rows_ge","n":)" +
+                n + R"(}}}})";
+            INFO(req);
+            auto res = ts.call(req);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>().find("matcher.n") !=
+                  std::string::npos);
+        }
+    }
+
     SECTION("create_result_set_from_instruction_result: oversized instruction_id, matcher "
             "fields, and an oversized params value are each rejected at operator tier - same "
             "documented gap as reevaluate_result_set above") {
