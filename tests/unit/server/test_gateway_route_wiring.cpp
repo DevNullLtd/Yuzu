@@ -40,6 +40,8 @@
 #include "audit_store.hpp"
 #include "event_bus.hpp"
 #include "gateway_route_store.hpp"
+#include "heartbeat_ingestion.hpp"
+#include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include <yuzu/metrics.hpp>
@@ -82,6 +84,16 @@ yuzu::test::PgTestTemplate gwroutewiring_tpl{"gwroutewiring", [](const std::stri
     GatewayRouteStore store{pool};
     if (!store.is_open())
         throw std::runtime_error("gwroutewiring template: store failed to migrate");
+}};
+
+// #5678: both GatewayRouteStore and OfflineEndpointStore migrated ONCE in the
+// template (no per-test DDL) for the DISCONNECTED -> presence-clear cases.
+yuzu::test::PgTestTemplate gwpresence_tpl{"gwpresence", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    GatewayRouteStore route_store{pool};
+    yuzu::server::OfflineEndpointStore offline_store{pool};
+    if (!route_store.is_open() || !offline_store.is_open())
+        throw std::runtime_error("gwpresence template: a store failed to migrate");
 }};
 
 /// An AuthManager wired to a PG-backed AuthDB (WS-6 6.2: enrollment/pending state
@@ -2777,4 +2789,138 @@ TEST_CASE("ProxyRegister: a concurrent FRESH registration completing between a R
     REQUIRE(row.has_value());
     REQUIRE(row->has_value());
     CHECK((*row)->session_id == session_new);
+}
+
+// ── #5678: DISCONNECTED drives the shared presence-clear helper ─────────────
+
+namespace {
+
+std::int64_t wall_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+bool present(yuzu::server::OfflineEndpointStore& s, const std::string& id) {
+    auto r = s.query_live_ids(std::chrono::hours(1));
+    REQUIRE(r.has_value());
+    for (const auto& p : *r)
+        if (p.agent_id == id)
+            return true;
+    return false;
+}
+
+} // namespace
+
+TEST_CASE("NotifyStreamStatus DISCONNECTED for the CURRENT session clears presence but keeps the "
+          "endpoint row (#5678)",
+          "[pg][gateway_route_wiring][presence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwpresence_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore route_store{pool};
+    yuzu::server::OfflineEndpointStore offline_store{pool};
+    REQUIRE(route_store.is_open());
+    REQUIRE(offline_store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    yuzu::server::HeartbeatIngestion hi{registry, nullptr, nullptr, &metrics, &offline_store};
+    gateway_svc.set_gateway_route_store(&route_store);
+    gateway_svc.set_heartbeat_ingestion(&hi);
+
+    auto req = make_gw_register(auth_mgr, "agent-presence-1");
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    const std::string session = resp.session_id();
+
+    gw::StreamStatusNotification conn;
+    conn.set_agent_id("agent-presence-1");
+    conn.set_session_id(session);
+    conn.set_event(gw::StreamStatusNotification::CONNECTED);
+    conn.set_stream_home_id("home-1");
+    gw::StreamStatusAck conn_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &conn, &conn_ack).ok());
+    REQUIRE(conn_ack.acknowledged());
+
+    const auto t = wall_ms();
+    REQUIRE(offline_store.upsert("agent-presence-1", "host-presence", "linux", t, 0, "1.0.0",
+                                 "x86_64", session));
+    REQUIRE(present(offline_store, "agent-presence-1"));
+
+    gw::StreamStatusNotification disc;
+    disc.set_agent_id("agent-presence-1");
+    disc.set_session_id(session);
+    disc.set_event(gw::StreamStatusNotification::DISCONNECTED);
+    disc.set_stream_home_id("home-1");
+    gw::StreamStatusAck disc_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &disc, &disc_ack).ok());
+    REQUIRE(disc_ack.acknowledged());
+
+    CHECK_FALSE(present(offline_store, "agent-presence-1"));
+    const auto roster = offline_store.query_stale_within(std::chrono::hours(1));
+    const yuzu::server::OfflineEndpoint* row = nullptr;
+    for (const auto& e : roster)
+        if (e.agent_id == "agent-presence-1")
+            row = &e;
+    REQUIRE(row != nullptr);
+    CHECK(row->hostname == "host-presence");
+    CHECK(row->last_heartbeat_ms == t);
+}
+
+TEST_CASE("NotifyStreamStatus: a STALE DISCONNECTED (superseded session) leaves the live "
+          "presence row untouched (#5678)",
+          "[pg][gateway_route_wiring][presence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwpresence_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore route_store{pool};
+    yuzu::server::OfflineEndpointStore offline_store{pool};
+    REQUIRE(route_store.is_open());
+    REQUIRE(offline_store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    yuzu::server::HeartbeatIngestion hi{registry, nullptr, nullptr, &metrics, &offline_store};
+    gateway_svc.set_gateway_route_store(&route_store);
+    gateway_svc.set_heartbeat_ingestion(&hi);
+
+    auto req1 = make_gw_register(auth_mgr, "agent-presence-2");
+    apb::RegisterResponse resp1;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req1, &resp1).ok());
+    const std::string session1 = resp1.session_id();
+    auto req2 = make_gw_register(auth_mgr, "agent-presence-2");
+    apb::RegisterResponse resp2;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req2, &resp2).ok());
+    const std::string session2 = resp2.session_id();
+    REQUIRE(session2 != session1);
+
+    gw::StreamStatusNotification conn;
+    conn.set_agent_id("agent-presence-2");
+    conn.set_session_id(session2);
+    conn.set_event(gw::StreamStatusNotification::CONNECTED);
+    conn.set_stream_home_id("home-2");
+    gw::StreamStatusAck conn_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &conn, &conn_ack).ok());
+
+    REQUIRE(offline_store.upsert("agent-presence-2", "h", "linux", wall_ms(), 0, "", "", session2));
+    REQUIRE(present(offline_store, "agent-presence-2"));
+
+    gw::StreamStatusNotification stale;
+    stale.set_agent_id("agent-presence-2");
+    stale.set_session_id(session1);
+    stale.set_event(gw::StreamStatusNotification::DISCONNECTED);
+    gw::StreamStatusAck stale_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &stale, &stale_ack).ok());
+
+    // removed_current_session was false: presence untouched, and the stored
+    // session_id is still session2 (a clear with session2 would now succeed).
+    CHECK(present(offline_store, "agent-presence-2"));
+    CHECK(offline_store.remove_if_session("agent-presence-2", session2));
 }

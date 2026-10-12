@@ -92,11 +92,12 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (45 passes). Verified against the source sweep
+/// The exhaustive inventory (46 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
 /// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
 /// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
-/// of `execution_tracker.reap_stuck_running_executions`, 2026-09-29); keep the count
+/// of `execution_tracker.reap_stuck_running_executions`, 2026-09-29, and the #5678
+/// addition of `offline_endpoint_store.run_retention_prune`, 2026-10-12); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -171,6 +172,12 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "clock-guarded + advisory lock (WS-10 10.2)"},
     {"deployment_run_store.run_retention_prune", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory lock (WS-10 10.2); piggybacks the preflight thread"},
+    {"offline_endpoint_store.run_retention_prune", "preflight_runner_thread_", BackgroundJobClass::ReplicaSafe,
+     "clock-guarded + pg_try_advisory_xact_lock via pg::run_clock_guarded_prune (#5678 / #1545 UP-4); "
+     "piggybacks the preflight thread beside the two WS-10 prunes so a contended pass never shares "
+     "health_recompute_thread_'s revocation-sweep budget; last_heartbeat_ms is replica-authored, cutoff is "
+     "PG now() - same clock-domain split reap_stuck_running_executions records; bounded by would-wipe + "
+     "1000/pass cap per replica"},
 
     // ---- policy_eval_thread_ (10s tick) — tick() SPLITS into two passes (PR #4134) ----
     {"policy_evaluator.collect_ready", "policy_eval_thread_", BackgroundJobClass::ReplicaSafe,

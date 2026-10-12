@@ -170,7 +170,7 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
 }
 
 // HA WS-5 (ADR-2002 §7a): cross-replica presence — query_live_ids's identity
-// projection and remove_if_session's session-guarded delete.
+// projection and remove_if_session's session-guarded presence clear (#5678).
 TEST_CASE("OfflineEndpointStore HA WS-5 presence", "[pg][offline]") {
     YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -199,7 +199,7 @@ TEST_CASE("OfflineEndpointStore HA WS-5 presence", "[pg][offline]") {
         // now()) is live — last_seen_at is the sole liveness authority,
         // exactly the #3715 precedent (never the replica's own clock, and
         // here not even the client-supplied last_heartbeat_ms).
-        REQUIRE(store.upsert("agent-freshseen", "h", "linux", t - 86'400'000, 0, "", "", ""));
+        REQUIRE(store.upsert("agent-freshseen", "h", "linux", t - 86'400'000, 0, "", "", "sess-fresh"));
         auto rows = live_ids_ok(store, std::chrono::seconds(60));
         CHECK(find_presence(rows, "agent-freshseen") != nullptr);
     }
@@ -216,14 +216,50 @@ TEST_CASE("OfflineEndpointStore HA WS-5 presence", "[pg][offline]") {
         REQUIRE(store.upsert("agent-guard", "h", "linux", t, 0, "", "", "sess-real"));
         CHECK_FALSE(store.remove_if_session("agent-guard", "sess-stale"));
         auto rows = live_ids_ok(store, std::chrono::hours(1));
-        CHECK(find_presence(rows, "agent-guard") != nullptr); // row survives
+        CHECK(find_presence(rows, "agent-guard") != nullptr); // still present
+        auto roster = store.query_stale_within(std::chrono::hours(1));
+        const auto* r = find(roster, "agent-guard");
+        REQUIRE(r != nullptr);
+        CHECK(r->last_heartbeat_ms == t); // row unchanged
     }
 
-    SECTION("remove_if_session deletes on a session match") {
-        REQUIRE(store.upsert("agent-guard2", "h", "linux", t, 0, "", "", "sess-real2"));
+    SECTION("remove_if_session clears presence but keeps the roster row (#5678)") {
+        REQUIRE(store.upsert("agent-guard2", "host-g2", "linux", t, 0, "1.0.0", "x86_64",
+                             "sess-real2"));
         CHECK(store.remove_if_session("agent-guard2", "sess-real2"));
         auto rows = live_ids_ok(store, std::chrono::hours(1));
         CHECK(find_presence(rows, "agent-guard2") == nullptr);
+        auto roster = store.query_stale_within(std::chrono::hours(1));
+        const auto* r = find(roster, "agent-guard2");
+        REQUIRE(r != nullptr);
+        CHECK(r->hostname == "host-g2");
+        CHECK(r->agent_version == "1.0.0");
+        CHECK(r->arch == "x86_64");
+        CHECK(r->last_heartbeat_ms == t); // the real last heartbeat survives
+    }
+
+    SECTION("a blank-session heartbeat does not drop a LIVE agent from presence") {
+        REQUIRE(store.upsert("agent-live", "h1", "linux", t - 1000, 0, "1.0.0", "x86_64",
+                             "sess-1"));
+        REQUIRE(store.upsert("agent-live", "h2", "linux", t, 0, "", "", ""));
+        auto rows = live_ids_ok(store, std::chrono::hours(1));
+        CHECK(find_presence(rows, "agent-live") != nullptr); // blank preserved sess-1
+        auto roster = store.query_stale_within(std::chrono::hours(1));
+        const auto* r = find(roster, "agent-live");
+        REQUIRE(r != nullptr);
+        CHECK(r->hostname == "h2");
+        CHECK(r->last_heartbeat_ms == t);
+    }
+
+    SECTION("a departed agent becomes present again on its next session-carrying heartbeat") {
+        REQUIRE(store.upsert("agent-back", "h", "linux", t, 0, "", "", "sess-1"));
+        REQUIRE(store.remove_if_session("agent-back", "sess-1"));
+        CHECK(find_presence(live_ids_ok(store, std::chrono::hours(1)), "agent-back") == nullptr);
+        REQUIRE(store.upsert("agent-back", "h", "linux", t, 0, "", "", "sess-2"));
+        CHECK(find_presence(live_ids_ok(store, std::chrono::hours(1)), "agent-back") != nullptr);
+        // A later blank-session heartbeat preserves sess-2.
+        REQUIRE(store.upsert("agent-back", "h", "linux", t, 0, "", "", ""));
+        CHECK(find_presence(live_ids_ok(store, std::chrono::hours(1)), "agent-back") != nullptr);
     }
 
     SECTION("remove_if_session rejects an empty session_id — never a bare agent_id delete") {
@@ -233,17 +269,54 @@ TEST_CASE("OfflineEndpointStore HA WS-5 presence", "[pg][offline]") {
         CHECK(find_presence(rows, "agent-guard3") != nullptr);
     }
 
-    SECTION("a blank session_id on upsert never matches a later remove_if_session") {
-        // The blank-session upsert path (a heartbeat that raced session
-        // lookup — see upsert()'s doc comment): the row's session_id column
-        // is blanked, and remove_if_session always requires a NON-empty
-        // caller-supplied value, so it can never match — the row simply
-        // waits out the TTL instead, which is always safe.
+    SECTION("blank-session upsert on a NEW row is not present (fail-closed) but is on the roster") {
+        // A heartbeat that raced session lookup for an agent with no stored
+        // session: the row exists for the roster, but presence requires a
+        // non-blank session_id, so the agent is NOT present until a
+        // session-carrying heartbeat. remove_if_session still refuses "".
         REQUIRE(store.upsert("agent-raced", "h", "linux", t, 0, "", "", ""));
         CHECK_FALSE(store.remove_if_session("agent-raced", ""));
         auto rows = live_ids_ok(store, std::chrono::hours(1));
-        CHECK(find_presence(rows, "agent-raced") != nullptr);
+        CHECK(find_presence(rows, "agent-raced") == nullptr);
+        auto roster = store.query_stale_within(std::chrono::hours(1));
+        CHECK(find(roster, "agent-raced") != nullptr);
     }
+}
+
+// #5678 / #1545 UP-4: pure prune-window arithmetic. No PG, no timing.
+TEST_CASE("OfflineEndpointStore prune window is roster window plus margin", "[offline][prune-spec]") {
+    using std::chrono::hours;
+    using std::chrono::seconds;
+    CHECK(OfflineEndpointStore::prune_retention_window(hours(24 * 30)) == hours(24 * 37));
+    for (const auto w : {seconds(0), seconds(3600), seconds(24 * 30 * 3600)})
+        CHECK(OfflineEndpointStore::prune_retention_window(w) > w);
+    // A zero cap would turn every prune pass into a silent no-op.
+    CHECK(OfflineEndpointStore::kPruneCapPerPass > 0);
+}
+
+TEST_CASE("OfflineEndpointStore run_retention_prune deletes only rows past roster+margin",
+          "[pg][offline][retention-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    constexpr std::int64_t kDayMs = 24LL * 3600 * 1000;
+    const auto t = now_ms();
+    REQUIRE(store.upsert("prune-a", "h", "linux", t - 40 * kDayMs, 0, "", "", "s")); // past 37 d
+    REQUIRE(store.upsert("prune-b", "h", "linux", t - 31 * kDayMs, 0, "", "", "s")); // in margin
+    REQUIRE(store.upsert("prune-c", "h", "linux", t - 10 * kDayMs, 0, "", "", "s"));
+
+    const auto window = std::chrono::hours(24 * 30);
+    // Part-6 Decline: the first pass on a store with data and no persisted
+    // anchor records the anchor + settled marker and deletes nothing.
+    CHECK(store.run_retention_prune(window) == 0);
+    CHECK(store.run_retention_prune(window) == 1);
+    auto rows = store.query_stale_within(std::chrono::hours(24 * 60));
+    CHECK(find(rows, "prune-a") == nullptr);
+    CHECK(find(rows, "prune-b") != nullptr);
+    CHECK(find(rows, "prune-c") != nullptr);
 }
 
 // gov fjarvis B1: a reachable database whose schema migration FAILS must leave
@@ -269,6 +342,7 @@ TEST_CASE("OfflineEndpointStore reports !is_open on a migration failure", "[pg][
     REQUIRE(pool.valid());
     OfflineEndpointStore store{pool};
     CHECK_FALSE(store.is_open()); // → server.cpp sets startup_failed_ = true
+    CHECK(store.run_retention_prune(std::chrono::hours(24 * 30)) == -1);
 
     // #4981 PR-1 (Finding B1): a store that never opened reports
     // PresenceReadError::StoreUnavailable on query_live_ids, never a silent
@@ -329,8 +403,9 @@ TEST_CASE("OfflineEndpointStore query_live_ids reports Truncated past kQueryRowC
 
     SECTION("exactly kQueryRowCap rows: succeeds, no Truncated") {
         std::string sql =
-            "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms) "
-            "SELECT 'cap-'||g, 'h', 'linux', 0 FROM generate_series(1, " +
+            "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms, "
+            "session_id) "
+            "SELECT 'cap-'||g, 'h', 'linux', 0, 's' FROM generate_series(1, " +
             std::to_string(OfflineEndpointStore::kQueryRowCap) + ") g";
         PgResult ins{PQexec(conn.get(), sql.c_str())};
         REQUIRE(ins.ok());
@@ -346,8 +421,9 @@ TEST_CASE("OfflineEndpointStore query_live_ids reports Truncated past kQueryRowC
 
     SECTION("kQueryRowCap + 1 rows: Truncated, never a silently-partial vector") {
         std::string sql =
-            "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms) "
-            "SELECT 'cap-'||g, 'h', 'linux', 0 FROM generate_series(1, " +
+            "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms, "
+            "session_id) "
+            "SELECT 'cap-'||g, 'h', 'linux', 0, 's' FROM generate_series(1, " +
             std::to_string(OfflineEndpointStore::kQueryRowCap + 1) + ") g";
         PgResult ins{PQexec(conn.get(), sql.c_str())};
         REQUIRE(ins.ok());

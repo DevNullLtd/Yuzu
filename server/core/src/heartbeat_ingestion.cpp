@@ -48,8 +48,9 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
             agent_version = sess->agent_version;
             arch = sess->arch;
             // HA WS-5: threaded through so a later graceful disconnect can
-            // session-guard its presence-row delete (remove_if_session) —
-            // see agent_service_impl.cpp / gateway_service_impl.cpp.
+            // session-guard its presence clear (remove_if_session via
+            // presence_departure.hpp) — see agent_service_impl.cpp /
+            // gateway_service_impl.cpp.
             session_id = sess->session_id;
         }
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
