@@ -14,9 +14,11 @@
  * per-application overrides of any of them. NOT customisable: the cohort
  * floor, the statistics, and the wire tokens (band labels, deduction names,
  * withheld reasons), which stay the closed vocabulary of dex_stability_score.hpp.
- * A display name is for people; a consumer keys on stability_band_label.
+ * A display name is for people; a consumer keys on stability_band_label. The
+ * withheld reason invalid_edges is the scorer's own refusal of a stored policy
+ * that reached it without passing this validator.
  *
- * Overrides are keyed by the exact lowercased image name, apply to every
+ * Overrides are keyed by the exact ASCII-lowercased image name, apply to every
  * version of that application, replace only the fields they set and inherit
  * the rest. There are no globs, tags or groups.
  *
@@ -30,38 +32,61 @@
  *      (EdgeGapBelowMinimum). Poor's edge is fixed at 0.
  *   2. global names: 1 to 24 bytes, printable ASCII 0x20-0x7E, none of < > & "
  *      (NameInvalid).
- *   3. global weights: finite and non-negative (WeightInvalid), sum at most
- *      100 plus kDexPolicyWeightSumTolerance (1e-12, the binary representation
- *      error of decimal weights, so {99.37, 0.33, 0.26, 0.04} validates) so the
- *      decomposition identity holds (WeightSumAboveMaximum).
+ *   3. global weights: finite, non-negative and not negative zero
+ *      (WeightInvalid), sum at most 100 plus kDexPolicyWeightSumTolerance
+ *      (1e-12, the binary representation error of decimal weights, so
+ *      {99.37, 0.33, 0.26, 0.04} validates) so the decomposition identity
+ *      holds (WeightSumAboveMaximum). All-zero weights are valid and score
+ *      every application 100.
  *   4. at most 200 overrides (TooManyOverrides).
- *   5. per override i: key non-empty and byte-identical to its ASCII lowercase
+ *   5. per override i: key 1 to kDexPolicyMaxKeyBytes (260) bytes of printable
+ *      ASCII 0x20-0x7E and byte-identical to its ASCII lowercase
  *      (OverrideKeyInvalid); key not equal to an earlier key
  *      (OverrideKeyDuplicate); then the EFFECTIVE tiers and weights (the
  *      override merged onto the global policy) pass the same edge, name and
  *      weight checks, reported at index i. A partial edge that conflicts with
- *      an inherited one is therefore refused.
- * Names are ASCII-only in this cut; widening to UTF-8 later relaxes the
- * validator and never invalidates a stored document.
+ *      an inherited one is therefore refused, and is reported at that
+ *      override's index also when the conflict arises from a later change to a
+ *      global edge: a writer edits the override or the global.
+ * Names and keys are printable ASCII in this cut; widening to UTF-8 later
+ * relaxes the validator and never invalidates a stored document. Lowercasing is
+ * the ASCII-only fold (A-Z); a writer lowercases keys with that same fold
+ * before validating.
  * Round-to-nearest floating-point mode is assumed: display exactness and the
  * weight-sum tolerance are stated under it; another mode can only refuse,
  * never accept wrongly.
  *
  * Resolver precondition: the policy passed dex_score_policy_fault. The
- * resolver never re-validates.
+ * resolver never re-validates. Profile "default" means no per-application
+ * override applied: the global policy, which may itself be customised. It does
+ * not mean the shipped default (dex_default_score_policy).
  *
- * CONSUMER DUTIES
+ * CONSUMER RULES
  *  - A writer validates before any write, stores only a document that
  *    validated whole, refuses with dex_policy_fault_label and the override
- *    index, and hands the resolver only validated documents. Mapping a stored
- *    document to DexScorePolicy and back is the writer's job; this header has
- *    no parse or serialise.
- *  - A reader scores with
- *    compute_stability_score(in, kDexCohortFloor, eff.weights, eff.edges) and
- *    never re-bands; shows dex_tier_name beside the unchanged wire token
- *    stability_band_label; serialises dex_policy_profile_label(eff.profile);
- *    and passes eff.weights to stability_rank_flip. The consumer duties in
- *    dex_stability_score.hpp apply unchanged.
+ *    index (kDexPolicyGlobalIndex means the global policy and is not an index
+ *    to print), audits each change under its own audit verb, and hands the
+ *    resolver only validated documents. Mapping a stored document to
+ *    DexScorePolicy and back is the writer's job; this header has no parse or
+ *    serialise.
+ *  - A reader validates on load. On any fault it serves
+ *    dex_default_score_policy() observably: the fault token and index are
+ *    logged, a counter is keyed by the fault token (never by override index),
+ *    and the fallback is surfaced apart from the profile label, which would
+ *    read "default".
+ *  - A reader scores with dex_score_under_policy(in, kDexCohortFloor, eff),
+ *    the one spelling that keeps weights and edges from one effective policy
+ *    together, and never re-bands; shows dex_tier_name beside the unchanged
+ *    wire token stability_band_label; and serialises
+ *    dex_policy_profile_label(eff.profile). Names are display text: this
+ *    validator is not an escaper, every sink escapes.
+ *  - A ranking check calls
+ *    stability_rank_flip(apps, floor, perturbed.weights, current.weights),
+ *    where both are effective policies for the same page: ranking compares
+ *    every application under ONE weight set (the global's), and per-application
+ *    overrides never enter a ranking.
+ *  - The display, count and vocabulary rules in dex_stability_score.hpp's
+ *    banner apply unchanged.
  */
 
 #include "dex_stability_score.hpp"
@@ -83,6 +108,8 @@ namespace yuzu::server {
 inline constexpr std::size_t kDexPolicyMaxOverrides = 200;
 inline constexpr std::int64_t kDexPolicyMinTierGapTenths = 10;
 inline constexpr std::size_t kDexPolicyMaxNameBytes = 24;
+/// Upper bound on an override key. A Windows image name never exceeds MAX_PATH.
+inline constexpr std::size_t kDexPolicyMaxKeyBytes = 260;
 inline constexpr double kDexPolicyWeightSumMax = 100.0;
 /// Absolute slack on the weight-sum check. A decimal such as 99.37 is not a
 /// double: each of the four weights (each at most 100) is off by at most half
@@ -103,7 +130,10 @@ inline constexpr std::size_t kDexPolicyGlobalIndex = (std::numeric_limits<std::s
 /// static_cast<std::size_t>(StabilityBand).
 struct DexTierPolicy {
     StabilityBandEdges edges;
-    std::array<std::string, 4> names{"excellent", "good", "fair", "poor"};
+    // The wire tokens, spelled once (stability_band_label).
+    std::array<std::string, 4> names{
+        stability_band_label(StabilityBand::Excellent), stability_band_label(StabilityBand::Good),
+        stability_band_label(StabilityBand::Fair), stability_band_label(StabilityBand::Poor)};
 };
 
 // dex_tier_name indexes names[] by the StabilityBand value, and DexScoreOverride
@@ -234,15 +264,29 @@ struct Merged {
     return std::nullopt;
 }
 
-[[nodiscard]] inline bool name_valid(const std::string& n) {
-    if (n.empty() || n.size() > kDexPolicyMaxNameBytes)
-        return false;
-    for (const char ch : n) {
+/// Every byte in 0x20-0x7E (so no NUL, control byte, DEL or byte >= 0x80).
+[[nodiscard]] inline bool printable_ascii(const std::string& s) {
+    for (const char ch : s) {
         const auto c = static_cast<unsigned char>(ch);
-        if (c < 0x20 || c > 0x7E || c == '<' || c == '>' || c == '&' || c == '"')
+        if (c < 0x20 || c > 0x7E)
             return false;
     }
     return true;
+}
+
+[[nodiscard]] inline bool name_valid(const std::string& n) {
+    if (n.empty() || n.size() > kDexPolicyMaxNameBytes || !printable_ascii(n))
+        return false;
+    for (const char c : n)
+        if (c == '<' || c == '>' || c == '&' || c == '"')
+            return false;
+    return true;
+}
+
+/// 1 to kDexPolicyMaxKeyBytes bytes of printable ASCII, already lowercased.
+[[nodiscard]] inline bool key_valid(const std::string& k) {
+    return !k.empty() && k.size() <= kDexPolicyMaxKeyBytes && printable_ascii(k) &&
+           ascii_lower(k) == k;
 }
 
 [[nodiscard]] inline std::optional<DexPolicyFault> tier_fault(const DexTierPolicy& t) {
@@ -267,7 +311,10 @@ struct Merged {
 }
 
 [[nodiscard]] inline std::optional<DexPolicyFault> weight_fault(const StabilityWeights& w) {
-    if (!stability_weights_valid(w))
+    // The scorer's check lets -0.0 through (-0.0 >= 0.0); here it would emit a
+    // "-0" deduction, so it is refused. A negative nonzero fails the first test.
+    if (!stability_weights_valid(w) || std::signbit(w.breadth) || std::signbit(w.crashes) ||
+        std::signbit(w.hangs) || std::signbit(w.regression))
         return DexPolicyFault::WeightInvalid;
     if (w.breadth + w.crashes + w.hangs + w.regression >
         kDexPolicyWeightSumMax + kDexPolicyWeightSumTolerance)
@@ -288,7 +335,7 @@ dex_score_policy_fault(const DexScorePolicy& p) {
         return DexPolicyRejection{DexPolicyFault::TooManyOverrides, kDexPolicyGlobalIndex};
     for (std::size_t i = 0; i < p.overrides.size(); ++i) {
         const auto& o = p.overrides[i];
-        if (o.image.empty() || dex_score_policy_detail::ascii_lower(o.image) != o.image)
+        if (!dex_score_policy_detail::key_valid(o.image))
             return DexPolicyRejection{DexPolicyFault::OverrideKeyInvalid, i};
         for (std::size_t j = 0; j < i; ++j)
             if (p.overrides[j].image == o.image)
@@ -330,8 +377,21 @@ struct DexEffectivePolicy {
     return {p.tiers, p.weights, DexPolicyProfile::Default};
 }
 
+/// The reference points into `t`: bind it only while `t` lives.
 [[nodiscard]] inline const std::string& dex_tier_name(const DexTierPolicy& t, StabilityBand b) {
     return t.names[static_cast<std::size_t>(b)];
+}
+/// A temporary (resolve_dex_score_policy(p, img).tiers) would leave the
+/// reference dangling after the full expression.
+const std::string& dex_tier_name(DexTierPolicy&&, StabilityBand) = delete;
+
+/// Scores under ONE effective policy: its weights and its edges together. The
+/// one spelling a consumer uses; compute_stability_score's defaulted edges
+/// would otherwise let a caller drop them or take them from another policy.
+[[nodiscard]] inline StabilityScore dex_score_under_policy(const StabilityInputs& in,
+                                                           std::int64_t floor,
+                                                           const DexEffectivePolicy& eff) {
+    return compute_stability_score(in, floor, eff.weights, eff.tiers.edges);
 }
 
 } // namespace yuzu::server

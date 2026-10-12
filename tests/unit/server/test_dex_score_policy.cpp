@@ -8,12 +8,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -66,12 +68,20 @@ DexScorePolicy with_edges(double ex, double good, double fair) {
 // `in` exactly as the stability score's own tests record.
 void require_default_answer(const StabilityInputs& in, double shown, StabilityBand band) {
     const auto eff = resolve_dex_score_policy(dex_default_score_policy(), "any.exe");
-    const auto r = compute_stability_score(in, kFloor, eff.weights, eff.tiers.edges);
+    const auto r = dex_score_under_policy(in, kFloor, eff);
     REQUIRE(r.score.has_value());
     REQUIRE(r.band.has_value());
     CHECK(stability_display_score(*r.score) == shown);
     CHECK(*r.band == band);
 }
+
+// dex_tier_name returns a reference into its argument: a temporary
+// (resolve_dex_score_policy(p, img).tiers) would leave it dangling after the
+// full expression. Compile-time lock, not a runtime witness.
+template <class T>
+concept TierNameOfTemporary = requires { dex_tier_name(T{}, StabilityBand::Poor); };
+static_assert(!TierNameOfTemporary<DexTierPolicy>,
+              "dex_tier_name must not accept a temporary: the returned reference would dangle");
 
 StabilityBand hand_band(double score, const StabilityBandEdges& e) {
     const double shown = stability_display_score(score);
@@ -120,8 +130,7 @@ TEST_CASE("policy: the default validates and reproduces the stability score bit-
     };
     // Values, not only plumbing: the precedent's known answers.
     {
-        const auto exact = compute_stability_score(mk(10, 0, 0), kFloor, eff.weights,
-                                                   eff.tiers.edges);
+        const auto exact = dex_score_under_policy(mk(10, 0, 0), kFloor, eff);
         REQUIRE(exact.score.has_value());
         CHECK(*exact.score == 100.0);
     }
@@ -131,7 +140,7 @@ TEST_CASE("policy: the default validates and reproduces the stability score bit-
     require_default_answer(mk(12, 6, 26, 10), 60.0, StabilityBand::Fair); // raw 59.999999999999993
     for (const auto& in : cases) {
         const auto a = compute_stability_score(in, kFloor);
-        const auto b = compute_stability_score(in, kFloor, eff.weights, eff.tiers.edges);
+        const auto b = dex_score_under_policy(in, kFloor, eff);
         CHECK(a.score == b.score);
         CHECK(a.band == b.band);
         CHECK(std::string(a.withheld) == b.withheld);
@@ -144,7 +153,7 @@ TEST_CASE("policy: the default validates and reproduces the stability score bit-
     }
 }
 
-TEST_CASE("policy: random valid edges keep score, displayed value and band in agreement",
+TEST_CASE("policy: random valid edges keep score and displayed value and band in agreement",
           "[dex][policy]") {
     // Cohorts built from integers: every consistent (N, A, crash, hang) shape.
     std::vector<StabilityInputs> cohorts;
@@ -179,9 +188,9 @@ TEST_CASE("policy: random valid edges keep score, displayed value and band in ag
         std::string first;
         for (const auto& in : cohorts) {
             const auto r = compute_stability_score(in, kFloor, kStabilityWeights, e);
-            if (!r.score)
-                continue;
-            if (!r.band || *r.band != stability_band(*r.score, e) ||
+            // Every cohort has N >= the floor and is consistent, so a validated
+            // policy's edges are never refused: a withheld result is a mismatch.
+            if (!r.score || !r.band || *r.band != stability_band(*r.score, e) ||
                 *r.band != hand_band(*r.score, e)) {
                 if (mismatches++ == 0)
                     first = "n=" + std::to_string(in.reporting_devices) +
@@ -217,6 +226,15 @@ TEST_CASE("policy: every invalid shape is refused whole with its typed fault and
             require_fault(with_edges(90.0, bad, 60.0), DexPolicyFault::EdgeOutOfRange);
             require_fault(with_edges(90.0, 75.0, bad), DexPolicyFault::EdgeOutOfRange);
         }
+    }
+    SECTION("finite and in range but not display exact, and a non-finite override field") {
+        // 5e-324 is positive and finite, yet rounds to 0.0 at one decimal.
+        require_fault(with_edges(90.0, 75.0, 5e-324), DexPolicyFault::EdgeNotDisplayExact);
+        auto p = defaults();
+        auto o = ov("nan.exe");
+        o.good = kNaN;
+        p.overrides = {ov("clean.exe"), o};
+        require_fault(p, DexPolicyFault::EdgeOutOfRange, 1);
     }
     SECTION("overlapping-invalid edges pin the check order") {
         require_fault(with_edges(100.04, 75.0, 60.0), DexPolicyFault::EdgeOutOfRange);
@@ -268,6 +286,26 @@ TEST_CASE("policy: every invalid shape is refused whole with its typed fault and
         p = with_edges(0.0, 75.0, 60.0);
         p.overrides = {conflict};
         require_fault(p, DexPolicyFault::EdgeOutOfRange);
+
+        // Within the effective policy of one override: tiers before weights.
+        auto both = ov("both.exe");
+        both.good = 95.0;    // above the inherited excellent edge
+        both.breadth = 70.0; // 70 + 20 + 8 + 12 = 110
+        p = defaults();
+        p.overrides = {both};
+        require_fault(p, DexPolicyFault::EdgesNotDescending, 0);
+
+        // Within the tiers: every edge fault before any name fault.
+        const std::pair<StabilityBandEdges, DexPolicyFault> edge_then_name[] = {
+            {{0.0, 75.0, 60.0}, DexPolicyFault::EdgeOutOfRange},
+            {{75.04, 75.0, 60.0}, DexPolicyFault::EdgeNotDisplayExact},
+            {{90.0, 90.0, 60.0}, DexPolicyFault::EdgesNotDescending},
+            {{75.0, 74.1, 60.0}, DexPolicyFault::EdgeGapBelowMinimum}};
+        for (const auto& [e, f] : edge_then_name) {
+            p = with_edges(e.excellent, e.good, e.fair);
+            p.tiers.names[0] = "";
+            require_fault(p, f);
+        }
     }
     SECTION("edges not strictly descending, gap below the minimum") {
         require_fault(with_edges(90.0, 90.0, 60.0), DexPolicyFault::EdgesNotDescending);
@@ -276,12 +314,18 @@ TEST_CASE("policy: every invalid shape is refused whole with its typed fault and
         require_fault(with_edges(75.0, 74.1, 60.0), DexPolicyFault::EdgeGapBelowMinimum);
     }
     SECTION("names") {
-        const std::string excluded[] = {"<", ">", "&", "\"", "\x7F", "\t", "\xC3\x89", "a\nb"};
+        const std::string excluded[] = {"<",  ">",    "&",
+                                        "\"", "\x7F", "\t",
+                                        "\x1F", std::string("\0", 1), "\xC3\x89",
+                                        "a\nb"};
         for (const auto& bad : excluded) {
             INFO("name byte sequence of length " << bad.size());
-            auto p = defaults();
-            p.tiers.names[2] = "x" + bad;
-            require_fault(p, DexPolicyFault::NameInvalid);
+            // Every one of the four slots is checked, the last included.
+            for (std::size_t slot = 0; slot < 4; ++slot) {
+                auto p = defaults();
+                p.tiers.names[slot] = "x" + bad;
+                require_fault(p, DexPolicyFault::NameInvalid);
+            }
         }
         for (const auto& bad : {std::string(), std::string(25, 'a'), std::string("<b>x")}) {
             auto p = defaults();
@@ -304,6 +348,26 @@ TEST_CASE("policy: every invalid shape is refused whole with its typed fault and
         require_fault(p, DexPolicyFault::WeightSumAboveMaximum);
         p.weights = {100.0, 0.0, 0.0, 1e-11};
         require_fault(p, DexPolicyFault::WeightSumAboveMaximum);
+        // Over by 2e-12: two tolerances, refused (a 5e-12 slack would accept it).
+        p.weights = {100.0, 2e-12, 0.0, 0.0};
+        require_fault(p, DexPolicyFault::WeightSumAboveMaximum);
+        // Each weight finite, the sum overflows to +inf.
+        p.weights = {DBL_MAX, DBL_MAX, 0.0, 0.0};
+        require_fault(p, DexPolicyFault::WeightSumAboveMaximum);
+    }
+    SECTION("negative zero weights, global and override") {
+        for (double StabilityWeights::*slot :
+             {&StabilityWeights::breadth, &StabilityWeights::crashes, &StabilityWeights::hangs,
+              &StabilityWeights::regression}) {
+            auto p = defaults();
+            p.weights.*slot = -0.0;
+            require_fault(p, DexPolicyFault::WeightInvalid);
+        }
+        auto p = defaults();
+        auto o = ov("z.exe");
+        o.crashes = -0.0;
+        p.overrides = {ov("clean.exe"), o};
+        require_fault(p, DexPolicyFault::WeightInvalid, 1);
     }
     SECTION("override keys and count") {
         auto p = defaults();
@@ -313,6 +377,28 @@ TEST_CASE("policy: every invalid shape is refused whole with its typed fault and
         require_fault(p, DexPolicyFault::OverrideKeyInvalid, 1);
         p.overrides = {ov("excel.exe"), ov("excel.exe")};
         require_fault(p, DexPolicyFault::OverrideKeyDuplicate, 1);
+        // Non-adjacent duplicates are found: first and last of six, and the
+        // 4th and 200th of a full set.
+        p.overrides.clear();
+        for (const char* k : {"k0", "k1", "k2", "k3", "k4", "k0"})
+            p.overrides.push_back(ov(k));
+        require_fault(p, DexPolicyFault::OverrideKeyDuplicate, 5);
+        p.overrides.clear();
+        for (int i = 0; i < 200; ++i)
+            p.overrides.push_back(ov("app" + std::to_string(i)));
+        p.overrides[199].image = "app3";
+        require_fault(p, DexPolicyFault::OverrideKeyDuplicate, 199);
+        // A key is refused for an embedded NUL, a control byte, a newline, DEL,
+        // any non-ASCII byte (lower or upper case) or more than 260 bytes.
+        const std::string bad_keys[] = {std::string("a\0b", 3), std::string("a\0", 2), "a\nb",
+                                        "a\x1F", "a\x7F", "\xC3\xA9.exe", "\xC3\x89.exe",
+                                        std::string(261, 'a')};
+        for (const auto& k : bad_keys) {
+            INFO("key of " << k.size() << " bytes");
+            p = defaults();
+            p.overrides = {ov("ok.exe"), ov(k)};
+            require_fault(p, DexPolicyFault::OverrideKeyInvalid, 1);
+        }
         p.overrides.clear();
         for (int i = 0; i < 201; ++i)
             p.overrides.push_back(ov("app" + std::to_string(i)));
@@ -371,6 +457,23 @@ TEST_CASE("policy: the acceptance boundaries validate", "[dex][policy]") {
 
     // A gap of exactly 10 tenths (1.0 point).
     CHECK_FALSE(dex_score_policy_fault(with_edges(76.0, 75.0, 74.0)).has_value());
+
+    // Sums to exactly 100 in decimal on a cent grid, reads 2.8e-14 over as doubles.
+    p.weights = {34.06, 33.27, 0.4, 32.27};
+    CHECK_FALSE(dex_score_policy_fault(p).has_value());
+    // All-zero weights are a valid choice (every application then scores 100).
+    p.weights = {0.0, 0.0, 0.0, 0.0};
+    CHECK_FALSE(dex_score_policy_fault(p).has_value());
+
+    // Printable ASCII ends: space (0x20) and tilde (0x7E) are valid name bytes.
+    p = defaults();
+    p.tiers.names = {" ", "~", "a b", "~ ~"};
+    CHECK_FALSE(dex_score_policy_fault(p).has_value());
+
+    // Keys: exactly 260 bytes, a space and '<' (printable, not escaped here).
+    p = defaults();
+    p.overrides = {ov(std::string(260, 'a')), ov("a b.exe"), ov("<x>")};
+    CHECK_FALSE(dex_score_policy_fault(p).has_value());
 
     p = defaults();
     for (int i = 0; i < 200; ++i)
@@ -435,8 +538,7 @@ TEST_CASE("policy: an override inherits unspecified fields and the resolver matc
     CHECK(all.weights.regression == 10.0);
     // 100 - 50 * 0.3 - 30 * 300 / 5000 = 83.2: good under the defaults, fair
     // under the resolved edges (85 > 83.2 >= 70).
-    const auto scored =
-        compute_stability_score(mk(1000, 300, 300), kFloor, all.weights, all.tiers.edges);
+    const auto scored = dex_score_under_policy(mk(1000, 300, 300), kFloor, all);
     REQUIRE(scored.score.has_value());
     REQUIRE(scored.band.has_value());
     CHECK(stability_display_score(*scored.score) == 83.2);
@@ -452,22 +554,99 @@ TEST_CASE("policy: an override inherits unspecified fields and the resolver matc
     CHECK(std::string(dex_policy_profile_label(DexPolicyProfile::Override)) == "override");
 }
 
-TEST_CASE("policy: the resolver's lowercase is ASCII-only and byte-exact", "[dex][policy]") {
+TEST_CASE("policy: overrides and unmatched applications inherit a customised global",
+          "[dex][policy]") {
+    // Every field differs from the compile-time default, so inheriting from the
+    // global is distinguishable from starting over from the defaults.
     auto p = defaults();
-    p.overrides.push_back(ov("\xC3\x89.exe")); // non-ASCII bytes are not folded
-    p.overrides.push_back(ov("excel.exe"));
+    p.tiers.edges = {95.0, 80.0, 65.0};
+    p.tiers.names = {"A", "B", "C", "D"};
+    p.weights = {50.0, 25.0, 10.0, 10.0};
+    auto o = ov("partial.exe");
+    o.names[0] = "Top";
+    o.breadth = 40.0;
+    p.overrides.push_back(o);
     REQUIRE_FALSE(dex_score_policy_fault(p).has_value());
 
-    CHECK(resolve_dex_score_policy(p, "\xC3\x89.exe").profile == DexPolicyProfile::Override);
-    CHECK(resolve_dex_score_policy(p, "\xC3\x89.EXE").profile == DexPolicyProfile::Override);
-    CHECK(resolve_dex_score_policy(p, "\xC3\xA9.exe").profile == DexPolicyProfile::Default);
-    // The validator and the resolver share one lowercase: a key it accepts is
-    // the key a mixed-case query reaches.
-    CHECK(resolve_dex_score_policy(p, "Excel.EXE").profile == DexPolicyProfile::Override);
-    // An uppercase non-ASCII-adjacent key is still refused as not lowercase.
-    auto bad = defaults();
-    bad.overrides.push_back(ov("\xC3\x89.Exe"));
-    require_fault(bad, DexPolicyFault::OverrideKeyInvalid, 0);
+    // The override sets two fields and inherits the other nine.
+    const auto ovr = resolve_dex_score_policy(p, "Partial.EXE");
+    CHECK(ovr.profile == DexPolicyProfile::Override);
+    CHECK(ovr.tiers.edges.excellent == 95.0);
+    CHECK(ovr.tiers.edges.good == 80.0);
+    CHECK(ovr.tiers.edges.fair == 65.0);
+    CHECK(ovr.tiers.names[0] == "Top");
+    CHECK(ovr.tiers.names[1] == "B");
+    CHECK(ovr.tiers.names[2] == "C");
+    CHECK(ovr.tiers.names[3] == "D");
+    CHECK(ovr.weights.breadth == 40.0);
+    CHECK(ovr.weights.crashes == 25.0);
+    CHECK(ovr.weights.hangs == 10.0);
+    CHECK(ovr.weights.regression == 10.0);
+
+    // An application with no override gets the whole customised global.
+    const auto glob = resolve_dex_score_policy(p, "other.exe");
+    CHECK(glob.profile == DexPolicyProfile::Default);
+    CHECK(glob.tiers.edges.excellent == 95.0);
+    CHECK(glob.tiers.edges.good == 80.0);
+    CHECK(glob.tiers.edges.fair == 65.0);
+    CHECK(glob.tiers.names[0] == "A");
+    CHECK(glob.tiers.names[1] == "B");
+    CHECK(glob.tiers.names[2] == "C");
+    CHECK(glob.tiers.names[3] == "D");
+    CHECK(glob.weights.breadth == 50.0);
+    CHECK(glob.weights.crashes == 25.0);
+    CHECK(glob.weights.hangs == 10.0);
+    CHECK(glob.weights.regression == 10.0);
+
+    // The inherited edges and weights drive a real score: 100 - 50 * 0.4 -
+    // 25 * 400 / 5000 = 78.0 is good under the shipped edges, fair under 95/80/65.
+    const auto scored = dex_score_under_policy(mk(1000, 400, 400), kFloor, glob);
+    REQUIRE(scored.score.has_value());
+    REQUIRE(scored.band.has_value());
+    CHECK(stability_display_score(*scored.score) == 78.0);
+    CHECK(*scored.band == StabilityBand::Fair);
+    CHECK(dex_tier_name(glob.tiers, *scored.band) == "C");
+}
+
+TEST_CASE("policy: the resolver matches the exact ASCII-lowercased key and nothing nearby",
+          "[dex][policy]") {
+    auto p = defaults();
+    p.overrides.push_back(ov("excel.exe"));
+    p.overrides.push_back(ov("ab"));
+    p.overrides.push_back(ov("@.exe")); // the bytes around 'A'..'Z' are not folded
+    p.overrides.push_back(ov("[x"));
+    p.overrides.push_back(ov("`"));
+    p.overrides.push_back(ov("{"));
+    REQUIRE_FALSE(dex_score_policy_fault(p).has_value());
+
+    const auto is_override = [&](std::string_view q) {
+        return resolve_dex_score_policy(p, q).profile == DexPolicyProfile::Override;
+    };
+    CHECK(is_override("excel.exe"));
+    CHECK(is_override("Excel.EXE"));
+    CHECK(is_override("AB"));
+    CHECK(is_override("@.exe"));
+    CHECK(is_override("[x"));
+    CHECK(is_override("`"));
+    CHECK(is_override("{"));
+    // Near misses resolve to the global policy: longer, shorter, prefixed,
+    // empty, and a query whose NUL-terminated prefix equals a key.
+    CHECK_FALSE(is_override("excel.exe2"));
+    CHECK_FALSE(is_override("xexcel.exe"));
+    CHECK_FALSE(is_override("excel"));
+    CHECK_FALSE(is_override(""));
+    CHECK_FALSE(is_override(std::string_view("excel.exe\0x", 11)));
+    CHECK_FALSE(is_override(std::string_view("excel.exe\0", 10)));
+    // The fold is ASCII-only: non-ASCII bytes are neither folded nor masked into
+    // ASCII, so they never reach a key (a valid key has no byte >= 0x80), and the
+    // resolver returns the uncorrupted global policy.
+    CHECK_FALSE(is_override("\xC3\x89.exe"));
+    CHECK_FALSE(is_override("\xE1\xE2"));
+    CHECK_FALSE(is_override("\xC1\xC2"));
+    const auto other = resolve_dex_score_policy(p, "\xC3\x89.exe");
+    CHECK(other.profile == DexPolicyProfile::Default);
+    CHECK(other.tiers.names[0] == "excellent");
+    CHECK(other.weights.breadth == 60.0);
 }
 
 TEST_CASE("policy: the rank-flip helper accepts the effective weights", "[dex][policy]") {
