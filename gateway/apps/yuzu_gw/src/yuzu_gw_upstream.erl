@@ -441,13 +441,18 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr, StreamHo
                         %% reused session id.
                         stream_home_id => StreamHomeId
                     },
+                    Upstream = self(),
                     {Pid, _MonRef} = spawn_monitor(fun() ->
-                        case do_rpc('NotifyStreamStatus', Notification, notify_stream) of
+                        Result = do_rpc('NotifyStreamStatus', Notification, notify_stream),
+                        case Result of
                             {ok, _} -> ok;
                             {error, Reason} ->
                                 logger:warning("Failed to notify stream status for ~s: ~p",
                                                [AgentId, Reason])
-                        end
+                        end,
+                        %% Sent before the worker exits, so it reaches the
+                        %% process ahead of the DOWN that frees the slot.
+                        Upstream ! {notify_result, self(), Result}
                     end),
                     NewPids = Pids#{Pid => true},
                     cell_put(?CELL_NOTIFY, map_size(NewPids)),
@@ -664,6 +669,22 @@ handle_info(circuit_half_open, State) ->
                       #{count => 1},
                       #{state => <<"half_open">>}),
     {noreply, State#state{cb_state = half_open, cb_timer = undefined}};
+
+%% What a stream-status notification worker got from the server. It counts
+%% against the breaker like a call made from this process: a notification
+%% that failed is an upstream that failed, and a success after failures is
+%% the upstream coming back, which replays the registrations (a CONNECTED
+%% lost to a server that bounced is put right by that replay).
+%%
+%% Only from a worker this process started and still tracks, and not while the
+%% circuit is open: the workers in flight when it opened answer into an open
+%% circuit, and the half-open probe, not a late answer, decides when it closes.
+handle_info({notify_result, Pid, Result},
+            #state{notify_pids = Pids, cb_state = CbState} = State)
+  when is_map_key(Pid, Pids), CbState =/= open ->
+    {noreply, record_result(Result, State)};
+handle_info({notify_result, _Pid, _Result}, State) ->
+    {noreply, State};
 
 handle_info({'DOWN', _MonRef, process, Pid, _Reason},
             #state{notify_pids = Pids, guardian_pids = GPids} = State) ->

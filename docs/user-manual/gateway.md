@@ -1090,7 +1090,7 @@ has an environment override, unlike the replay keys above):
 
 | Key | Environment override | Default | Meaning |
 |---|---|---|---|
-| `circuit_breaker_failure_threshold` | `YUZU_GW_CB_FAILURE_THRESHOLD` | 5 | Consecutive failed upstream calls that open the breaker |
+| `circuit_breaker_failure_threshold` | `YUZU_GW_CB_FAILURE_THRESHOLD` | 5 | Consecutive failed upstream calls that open the breaker. A failed stream-status notification (CONNECTED or DISCONNECTED) counts, like a failed `ProxyRegister` or `ProxyInventory`, and so does a success after failures: it replays the registrations. A Guardian forward and a heartbeat batch do not count. While the breaker is open the notifications are dropped (`yuzu_gw_upstream_notify_dropped_total{reason="circuit_open"}`) and an answer to one sent before it opened is ignored |
 | `circuit_breaker_reset_timeout_ms` | `YUZU_GW_CB_RESET_TIMEOUT_MS` | 10000 | How long the breaker stays open the first time before it goes half open and allows one probe RPC |
 | `circuit_breaker_max_reset_timeout_ms` | `YUZU_GW_CB_MAX_RESET_TIMEOUT_MS` | 300000 | Cap on the open duration, which doubles each time a trip or a failed probe reopens the breaker (10 s, 20 s, 40 s, 80 s and so on) and returns to the first value when a probe succeeds. This is the 300 s the recovery bounds in "What happens when the server restarts" cite |
 
