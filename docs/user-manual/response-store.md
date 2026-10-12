@@ -370,11 +370,9 @@ operator-visible notes:
     header had no sort links and the page no Prev or Next controls in that window, so nothing
     could be clicked. Still open: an operator whose only `Response:Read` grant is scoped to a
     management group is refused at the filter bar, so gets no chart deck, pager or summary after
-    a command (#5688); the Create Group button does not percent-encode a filter value, so a
-    value containing `+`, `&`, `%` or `#` reaches the form altered (`+` arrives as a space) and
-    the preview can show "0 agents", and the group is built from the column filters only, never
-    the text query, and a View default on a column beyond the plugin's own column list is left
-    off the button (#5700); and the built-in `help` command and a TAR SQL query clear the
+    a command (#5688); the Create Group button builds its group from the column filters only,
+    never the text query, and leaves a View default on a column beyond the plugin's own column
+    list off the button (#5700); and the built-in `help` command and a TAR SQL query clear the
     results area without aborting a request in flight, and the hardware list keeps the older
     `this:abort` sync (#5677).
   - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column,

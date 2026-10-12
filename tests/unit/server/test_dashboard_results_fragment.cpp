@@ -1340,6 +1340,48 @@ TEST_CASE("/fragments/results: the Create Group button names filters by the plug
     CHECK_FALSE(contains(cg_tag, "f_zeta"));
 }
 
+// The Create Group button puts the filter value in a query string. A value with `+`, `&`, `#`
+// or `%` (a package version, "Tom & Jerry") used to be only HTML-escaped, so `+` reached the form
+// as a space and `&` ended the value: the preview matched nothing ("0 agents"). It is now
+// percent-encoded; the HTML separators between parameters stay `&amp;`.
+TEST_CASE("/fragments/results: the Create Group button percent-encodes the filter value",
+          "[pg][server][dashboard][fragment]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+
+    const std::string value = "a+b&c#d%e f";
+    StoredResponse r;
+    r.instruction_id = "cmd-cg-encode";
+    r.agent_id = "agent-a";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.plugin = "registry";
+    r.output = value + "\n";
+    rs.store(r);
+
+    FragmentResultsHarness h(&rs);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    // The request carries the value percent-encoded, as the browser sends it.
+    auto page = h.get("/fragments/results?command_id=cmd-cg-encode&plugin=registry"
+                      "&f_output=a%2Bb%26c%23d%25e%20f");
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+    const auto cg = page->body.find("class=\"btn-create-group\"");
+    REQUIRE(cg != std::string::npos);
+    const auto cg_open = page->body.rfind('<', cg);
+    const auto cg_close = page->body.find('>', cg);
+    const std::string cg_tag = page->body.substr(cg_open, cg_close - cg_open + 1);
+    INFO(cg_tag);
+    CHECK(contains(cg_tag, "&amp;f_output=a%2Bb%26c%23d%25e%20f\""));
+    CHECK_FALSE(contains(cg_tag, "a+b"));
+}
+
 // -- #5623 (governance G8-3): a dispatch aborts any in-flight results request --------------------
 // The dispatch response replaces #filter-bar with a fresh element, discarding the hx-sync
 // registry attached to the OLD form / thead / pager. A /fragments/results request in flight at

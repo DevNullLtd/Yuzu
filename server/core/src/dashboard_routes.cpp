@@ -40,6 +40,30 @@ static int clamp(int val, int lo, int hi) {
     return std::max(lo, std::min(val, hi));
 }
 
+// -- Helper: percent-encode one URL query component (RFC 3986 unreserved kept) ---
+//
+// A facet value goes into the Create Group button's hx-get query string. html_escape alone
+// leaves `+` (read as a space), `&` (ends the value), `#` (starts a fragment) and `%` (starts an
+// escape) to mangle it on the way to the server (#5700).
+static std::string percent_encode_component(std::string_view in) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(in.size());
+    for (const unsigned char c : in) {
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' ||
+                                c == '~';
+        if (unreserved) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0x0F]);
+        }
+    }
+    return out;
+}
+
 // -- Helper: format epoch seconds as a coarse "Xd Yh ago" age -----------------
 //
 // Used by the TAR retention-paused list. Intentionally coarse: operators care
@@ -2689,7 +2713,7 @@ std::string DashboardRoutes::render_results(
                         if (c == ' ' || c == '-') pname += '_';
                         else pname += static_cast<char>(std::tolower(c));
                     }
-                    filter_params += "&amp;" + pname + "=" + html_escape(f.value);
+                    filter_params += "&amp;" + pname + "=" + percent_encode_component(f.value);
                 }
             }
             html += " <button class=\"btn-create-group\" hx-get=\"/fragments/create-group-form"
