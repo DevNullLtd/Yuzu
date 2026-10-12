@@ -867,6 +867,9 @@ std::expected<std::vector<CachedJwk>, std::string> OidcProvider::parse_jwks(cons
 bool OidcProvider::fetch_jwks() {
     {
         // Stamp every attempt, success or not (#1900): the no-kid path re-fetches on age.
+        // Trade-off, accepted: while the IdP is failing, already-cached keys live one more TTL
+        // (they stay usable, and a revoked key outlives its revocation by up to that long); the
+        // alternative is hammering a dead IdP on every request. #1900 refines this.
         std::lock_guard lock(jwks_mu_);
         jwks_fetched_at_ = std::chrono::steady_clock::now();
     }
@@ -1066,11 +1069,19 @@ bool split_http_url(const std::string& url, std::string& origin, std::string& pa
     return true;
 }
 
+// The scheme prefix of an http(s) issuer ("" when it is neither); case-sensitive on purpose.
+std::string_view issuer_scheme(std::string_view issuer) {
+    if (issuer.starts_with("https://"))
+        return "https://";
+    if (issuer.starts_with("http://"))
+        return "http://";
+    return {};
+}
+
 // An endpoint from the discovery document: absolute, the issuer's scheme, a host, and no byte
 // that could split the request line it will be sent in.
-bool endpoint_acceptable(const std::string& value, std::string_view issuer_scheme) {
-    if (!value.starts_with(issuer_scheme) || value.size() == issuer_scheme.size() ||
-        value[issuer_scheme.size()] == '/')
+bool endpoint_acceptable(const std::string& value, std::string_view scheme) {
+    if (!value.starts_with(scheme) || value.size() == scheme.size() || value[scheme.size()] == '/')
         return false;
     for (const unsigned char c : value)
         if (c <= 0x20 || c == 0x7f)
@@ -1116,12 +1127,7 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify, int
 std::expected<OidcProvider::DiscoveryDocument, std::string>
 OidcProvider::fetch_discovery_document(const std::string& issuer, bool skip_tls_verify,
                                        int timeout_ms) {
-    std::string_view scheme;
-    if (issuer.starts_with("https://"))
-        scheme = "https://";
-    else if (issuer.starts_with("http://"))
-        scheme = "http://";
-    else
+    if (issuer_scheme(issuer).empty())
         return std::unexpected("the issuer must be an http or https URL");
 
     auto url = issuer;
@@ -1132,10 +1138,18 @@ OidcProvider::fetch_discovery_document(const std::string& issuer, bool skip_tls_
     auto body = http_get_bounded(url, skip_tls_verify, timeout_ms);
     if (!body)
         return std::unexpected(body.error());
+    return parse_discovery_document(*body, issuer);
+}
+
+std::expected<OidcProvider::DiscoveryDocument, std::string>
+OidcProvider::parse_discovery_document(const std::string& body, const std::string& issuer) {
+    const auto scheme = issuer_scheme(issuer);
+    if (scheme.empty())
+        return std::unexpected("the issuer must be an http or https URL");
 
     nlohmann::json j;
     try {
-        j = nlohmann::json::parse(*body);
+        j = nlohmann::json::parse(body);
     } catch (const std::exception& e) {
         return std::unexpected(std::string("discovery response is not valid JSON: ") + e.what());
     }
@@ -1195,7 +1209,7 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
         if (!doc) {
             spdlog::error("OidcProvider: discovery failed for issuer {}: {}", config_.issuer,
                           doc.error());
-            discovery_retry_after_ = std::chrono::steady_clock::now() + kDiscoveryRetryAfterFailure;
+            discovery_retry_after_ = std::chrono::steady_clock::now() + discovery_retry_window_;
             return std::unexpected(std::string(kDiscoveryUnavailable));
         }
         spdlog::info("OidcProvider: authorize={} token={} jwks_uri={}", doc->authorization_endpoint,
@@ -1207,6 +1221,12 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
 
 void OidcProvider::set_http_timeouts_for_test(int ms) {
     http_timeout_ms_.store(ms);
+}
+
+void OidcProvider::set_discovery_negative_cache_for_test(int ms) {
+    std::lock_guard lock(discovery_mu_);
+    discovery_retry_window_ = std::chrono::milliseconds(ms);
+    discovery_retry_after_ = {};
 }
 
 std::size_t OidcProvider::pending_flow_count_for_test() const {

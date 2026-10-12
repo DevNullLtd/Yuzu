@@ -217,6 +217,9 @@ public:
     /// Test-only seam: replaces the 5 s connect/read/write timeouts of every IdP GET this
     /// instance makes, so a slow-IdP test never waits for a real timeout. Same source-scan pin.
     void set_http_timeouts_for_test(int ms);
+    /// Test-only seam: replaces the 30 s window during which a failed discovery is not retried
+    /// (0 = retry on the next call) and clears any window already running. Same source-scan pin.
+    void set_discovery_negative_cache_for_test(int ms);
     /// Test-only seam: how many authorization flows are pending (a failed start must leave 0).
     std::size_t pending_flow_count_for_test() const;
 
@@ -244,14 +247,19 @@ public:
 
     /// Fetch `{issuer}/.well-known/openid-configuration` (one trailing slash on `issuer` is
     /// tolerated) and validate it: `issuer` must equal the argument byte for byte (OIDC Discovery
-    /// 4.3, the mix-up defence); all three endpoints must be present, absolute, free of control
-    /// characters and carry the ISSUER'S scheme (an https issuer can never be downgraded to http
-    /// endpoints). No host restriction: Google serves jwks_uri from another host. The error text
+    /// 4.3, the mix-up defence); all three endpoints must be present (even the ones the current
+    /// caller does not need), absolute, free of control characters and carry the ISSUER'S scheme
+    /// (an https issuer can never be downgraded to http endpoints). No host restriction: Google serves jwks_uri from another host. The error text
     /// is for the operator-facing Test Connection and the log, not for the login answer.
     /// Shared by the login path (ensure_discovered) and Test Connection so the button validates
     /// exactly what a login will.
     [[nodiscard]] static std::expected<DiscoveryDocument, std::string>
     fetch_discovery_document(const std::string& issuer, bool skip_tls_verify, int timeout_ms = 5000);
+
+    /// The validation half of `fetch_discovery_document`, on an already fetched body. Pure: no
+    /// network. Public so the scheme rules can be pinned for an https issuer without a TLS IdP.
+    [[nodiscard]] static std::expected<DiscoveryDocument, std::string>
+    parse_discovery_document(const std::string& body, const std::string& issuer);
 
     /// The one bounded GET used for discovery, the JWKS and Test Connection: 5 s (default)
     /// connect/read/write, a 256 KiB body cap, redirects NOT followed (a 3xx is a failure), TLS
@@ -299,11 +307,11 @@ private:
     std::atomic<int> http_timeout_ms_{5000}; // test seam only
     mutable std::mutex mu_;
 
-    // Lazy discovery (ensure_discovered). Guards the two members below.
+    // Lazy discovery (ensure_discovered). Guards the three members below.
     std::mutex discovery_mu_;
     std::optional<DiscoveryDocument> discovered_;
     std::chrono::steady_clock::time_point discovery_retry_after_{};
-    static constexpr auto kDiscoveryRetryAfterFailure = std::chrono::seconds(30);
+    std::chrono::milliseconds discovery_retry_window_{30000}; // 30 s; set_discovery_negative_cache_for_test
     std::unordered_map<std::string, PkceChallenge> pending_challenges_;
     std::atomic<bool> binding_digest_forced_failure_{false}; // test seam only
 

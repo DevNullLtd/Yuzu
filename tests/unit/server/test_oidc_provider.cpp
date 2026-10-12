@@ -1358,6 +1358,11 @@ TEST_CASE("OIDC discovery: every defective document fails closed at start with t
              m.discovery_body = R"({"issuer":"ISS","authorization_endpoint":"ISS/a","token_endpoint":"ISS/t"})";
          },
          "no jwks_uri"},
+        {"missing token_endpoint (start only needs the authorization endpoint)",
+         [](MockIdp& m) {
+             m.discovery_body = R"({"issuer":"ISS","authorization_endpoint":"ISS/a","jwks_uri":"ISS/j"})";
+         },
+         "no token_endpoint"},
         {"https endpoints under an http issuer",
          [](MockIdp& m) {
              m.discovery_body = R"({"issuer":"ISS","authorization_endpoint":"https://x.test/a","token_endpoint":"ISS/t","jwks_uri":"ISS/j"})";
@@ -1392,6 +1397,56 @@ TEST_CASE("OIDC discovery: every defective document fails closed at start with t
         }
         CHECK(provider.pending_flow_count_for_test() == 0);
     }
+}
+
+TEST_CASE("OIDC discovery: a document missing a field this caller does not need is still refused",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    idp.with([](MockIdp& m) {
+        // jwks_uri is present and is all this caller needs; token_endpoint is missing.
+        m.discovery_body = R"({"issuer":"ISS","authorization_endpoint":"ISS/authorize","jwks_uri":"ISS/jwks"})";
+        for (std::size_t at; (at = m.discovery_body.find("ISS")) != std::string::npos;)
+            m.discovery_body.replace(at, 3, m.base());
+    });
+    auto cfg = discovery_cfg(idp);
+    cfg.authorization_endpoint = idp.base() + "/authorize";
+    OidcProvider provider(cfg);
+    auto r = provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1"));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == OidcProvider::kJwksUnavailable);
+    CHECK(idp.jwks_calls.load() == 0);
+}
+
+TEST_CASE("OIDC discovery: the negative cache expires - a failed attempt is retried once its window "
+          "ends, and a recovered IdP is then cached",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    idp.with([](MockIdp& m) { m.discovery_status = 500; });
+    OidcProvider provider(discovery_cfg(idp));
+    provider.set_discovery_negative_cache_for_test(0); // the window has already ended
+    CHECK_THROWS_AS(provider.start_auth_flow(), std::runtime_error);
+    CHECK_THROWS_AS(provider.start_auth_flow(), std::runtime_error);
+    CHECK(idp.discovery_calls.load() == 2);
+
+    idp.with([](MockIdp& m) { m.discovery_status = 200; }); // the IdP recovers
+    CHECK_NOTHROW(provider.start_auth_flow());
+    CHECK(idp.discovery_calls.load() == 3);
+    CHECK_NOTHROW(provider.start_auth_flow()); // the positive result is cached
+    CHECK(idp.discovery_calls.load() == 3);
+}
+
+TEST_CASE("OIDC discovery: a failing JWKS refetch keeps the keys already cached",
+          "[oidc][oidc_discovery][jwt]") {
+    MockIdp idp;
+    const auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    idp.with([](MockIdp& m) { m.jwks_status = 503; }); // an outage begins
+    (void)provider.verify_jwt_signature(signed_token(cfg, "never-published")); // failed refetch
+    CHECK(idp.jwks_calls.load() == 2);
+    // The failed attempt neither emptied the cache nor forces another fetch: known keys verify.
+    CHECK(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
+    CHECK(idp.jwks_calls.load() == 2);
 }
 
 TEST_CASE("OIDC discovery: a refused connection fails closed",
@@ -1523,8 +1578,36 @@ TEST_CASE("OIDC discovery: discovery down at the callback is the fixed token and
 }
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
 
+// The scheme rules for an HTTPS issuer cannot be driven through a loopback MockIdp (it has no
+// TLS), so the validation half of discovery is pinned directly on a document body.
+TEST_CASE("OIDC discovery: endpoints must be absolute and carry the issuer's own scheme",
+          "[oidc][oidc_discovery][security]") {
+    const auto doc = [](const std::string& iss, const std::string& auth) {
+        return R"({"issuer":")" + iss + R"(","authorization_endpoint":")" + auth +
+               R"(","token_endpoint":")" + iss + R"(/t","jwks_uri":")" + iss + R"(/j"})";
+    };
+    const std::string https = "https://idp.test/realm";
+    const std::string http = "http://idp.test/realm";
+    CHECK(OidcProvider::parse_discovery_document(doc(https, "https://idp.test/a"), https).has_value());
+    CHECK(OidcProvider::parse_discovery_document(doc(http, "http://idp.test/a"), http).has_value());
+    // Google-style: another host is fine, the scheme is what is pinned.
+    CHECK(OidcProvider::parse_discovery_document(doc(https, "https://auth.other.test/a"), https)
+              .has_value());
+    // A downgrade (https issuer, http endpoint) and an upgrade (http issuer, https endpoint).
+    CHECK_FALSE(OidcProvider::parse_discovery_document(doc(https, "http://idp.test/a"), https));
+    CHECK_FALSE(OidcProvider::parse_discovery_document(doc(http, "https://idp.test/a"), http));
+    // Relative, empty, scheme-less, no host, scheme in another case, embedded space/CR/LF.
+    for (const char* bad : {"/a", "", "idp.test/a", "https:///a", "HTTPS://idp.test/a",
+                            "https://idp.test/a b", "https://idp.test/a\\r\\nX: y"})
+        CHECK_FALSE(OidcProvider::parse_discovery_document(doc(https, bad), https));
+    // The issuer itself must be http or https (HTTPS:// is not recognised: byte-exact on purpose).
+    CHECK_FALSE(OidcProvider::parse_discovery_document(doc("HTTPS://idp.test", "HTTPS://idp.test/a"),
+                                                       "HTTPS://idp.test"));
+}
+
 TEST_CASE("OIDC test seams: no production file references set_binding_digest_failure_for_test, "
-          "add_test_pending_flow, set_http_timeouts_for_test or pending_flow_count_for_test "
+          "add_test_pending_flow, set_http_timeouts_for_test, "
+          "set_discovery_negative_cache_for_test or pending_flow_count_for_test "
           "(source pin)",
           "[oidc][oidc_binding][source_pin]") {
     // The seams are public members of the production class and the first makes the binding
@@ -1534,6 +1617,7 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
     static constexpr const char* kSeams[] = {"set_binding_digest_failure_for_test",
                                              "add_test_pending_flow",
                                              "set_http_timeouts_for_test",
+                                             "set_discovery_negative_cache_for_test",
                                              "pending_flow_count_for_test"};
     std::size_t scanned = 0;
     const fs::path src_dir = fs::path(YUZU_SERVER_SRC_DIR);
