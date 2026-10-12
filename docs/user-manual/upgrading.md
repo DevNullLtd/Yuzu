@@ -171,7 +171,7 @@ migration is needed. Two new counters report the effect:
 - `limit` must be one whole integer: `limit=12abc` is `400` (it was read as `12`), and an empty `limit=` now means the default (it was `400`).
 - **MCP only:** a wrongly typed argument is refused with `-32602` instead of being ignored or converted. `version: 2.0` used to be dropped and read the whole fleet unfiltered, `agent_id: 123` was read as `"123"`, and an unsigned `limit` above `9223372036854775807` wrapped. `agent_id`, `name`, `version` and `cursor` must be strings and `limit` an integer that fits an int64; an in-range `limit` (for example `50000`) still clamps as before, and unknown argument names are still ignored.
 
-**Audit trail addition.** A `denied` audit row (`inventory.software.query`, or `inventory.software.export` for an export; `mcp.query_installed_software` on MCP) is now also written when a request names an `agent_id` outside the caller's scope. The response is unchanged (an empty page, `devices_omitted` `0`). A SIEM rule that counted `denied` rows from these routes will see them for this case too.
+**Audit trail addition.** A `denied` audit row (`inventory.software.query`, or `inventory.software.export` for an export; `mcp.query_installed_software` on MCP) is now also written when a request names an `agent_id` outside the caller's scope. The response is unchanged (under push-down: an empty page, `devices_omitted` `0`). A SIEM rule that counted `denied` rows from these routes will see them for this case too.
 
 **Who is affected, and what to do.** Scripts that sent a malformed or over-long value, or a non-string MCP argument: send well-formed values. Scripts that retried a `503` on a NUL byte: it is a `400` now and will not succeed on retry.
 

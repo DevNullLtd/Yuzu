@@ -20715,12 +20715,17 @@ TEST_CASE("MCP query_installed_software: a wide-scope cursor never names an out-
     REQUIRE(pool.valid());
     yuzu::server::SoftwareInventoryStore store{pool};
     REQUIRE(store.is_open());
-    std::vector<yuzu::server::SoftwareEntry> rows = {{"Common", "1", "", ""}};
-    for (const char* agent : {"agent-a", "agent-b", "agent-c", "agent-d", "agent-e", "agent-f",
-                              "agent-g"})
+    // The dropped devices' software has a name and version no served row has.
+    for (const auto& [agent, name, version] :
+         {std::tuple{"agent-a", "Common", "1"}, {"agent-b", "Common-dropped", "9.9"},
+          {"agent-c", "Common-dropped", "9.9"}, {"agent-d", "Common-dropped", "9.9"},
+          {"agent-e", "Common-dropped", "9.9"}, {"agent-f", "Common-dropped", "9.9"},
+          {"agent-g", "Common-dropped", "9.9"}}) {
+        std::vector<yuzu::server::SoftwareEntry> rows = {{name, version, "", ""}};
         REQUIRE(store.apply_installed_software(
                     agent, yuzu::server::SoftwareInventoryStore::canonical_hash(rows), rows, 1000) ==
                 yuzu::server::InventoryIngestOutcome::kStored);
+    }
 
     McpTestServer ts;
     ts.software_inventory_store_for_test = &store;
@@ -20754,6 +20759,7 @@ TEST_CASE("MCP query_installed_software: a wide-scope cursor never names an out-
     REQUIRE(kept.size() == 1);
     CHECK(kept[0]["agent_id"] == "agent-a"); // the in-scope device, not a dropped one
     const auto c1 = decode(first.at("next_cursor").get<std::string>());
+    CHECK(c1.after.name == "Common");
     CHECK(c1.after.agent_id == "agent-a");
     CHECK(c1.skip == 0);
 
@@ -20764,9 +20770,12 @@ TEST_CASE("MCP query_installed_software: a wide-scope cursor never names an out-
     CHECK(second.at("devices_omitted") == swc::kWideScopeMaxReads);
     CHECK(second.at("result_truncated_by_cap") == true);
     const auto c2 = decode(second.at("next_cursor").get<std::string>());
+    CHECK(c2.after.name == "Common"); // the served row's name, not the last scanned row's
     CHECK(c2.after.agent_id == "agent-a");
     CHECK(c2.skip == swc::kWideScopeMaxReads);
     CHECK(second.dump().find("agent-b") == std::string::npos);
+    CHECK(second.dump().find("Common-dropped") == std::string::npos);
+    CHECK(second.dump().find("9.9") == std::string::npos);
 
     // only the denied row failing to persist flags the response (the success row persisted)
     ts.audit_fail_result_ = "denied";

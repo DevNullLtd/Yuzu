@@ -404,7 +404,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 - Query params: `name` (exact), `agent_id` (exact), `version` (exact; present-empty
   selects the empty-version rows), `q` (case-insensitive literal substring), `kind`,
-  `ecosystem`, `source` (exact), `limit` (max 1000), `cursor` and `format` (`json` or
+  `ecosystem`, `source` (exact), `limit` (max 1000; 10000 with `format`), `cursor` and `format` (`json` or
   `csv`: an export). Omit `name` and `agent_id` for a fleet-wide scan. The full parameter
   and error tables are in [rest-api.md](rest-api.md); `q`, `kind`, `ecosystem` and
   `source` are REST-only (the MCP tool takes `name`, `agent_id`, `version`, `limit` and

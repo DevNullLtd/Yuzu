@@ -38,11 +38,12 @@ SoftwareCatalogRow row(std::string name, std::int64_t installs, std::string newe
     return r;
 }
 
-SoftwareFleetRow fleet_row(std::string name, std::string agent, std::int64_t id) {
+SoftwareFleetRow fleet_row(std::string name, std::string agent, std::int64_t id,
+                           std::string version = "1.2") {
     SoftwareFleetRow r;
     r.agent_id = std::move(agent);
     r.entry.name = std::move(name);
-    r.entry.version = "1.2";
+    r.entry.version = std::move(version);
     r.entry.source = "installed_apps.list_inventory";
     r.install_id = id;
     return r;
@@ -465,9 +466,11 @@ TEST_CASE("read_devices_page: a wide-scope cursor never carries a dropped row",
     }
 
     SECTION("a dropped row never reaches the token: anchor m/1, skip as a count") {
+        // The dropped rows carry a name and version no served row has, so a token that borrowed
+        // either from a scanned row would show.
         f.rows = {fleet_row("git", "m", 1)};
         for (int i = 2; i <= 9; ++i)
-            f.rows.push_back(fleet_row("git", "z", i));
+            f.rows.push_back(fleet_row("hub", "z", i, "9.9"));
         // limit 3: reads {m1,z2,z3} {z4,z5,z6} {z7,z8,z9} {} -> the walk ends at the data's end
         auto page = page_of(3);
         REQUIRE(page);
@@ -483,16 +486,19 @@ TEST_CASE("read_devices_page: a wide-scope cursor never carries a dropped row",
         CHECK(f.reads == kWideScopeMaxReads);
         CHECK(cut->hit_cap);
         const auto cur = cursor_of(*cut, dreq(2));
+        CHECK(cur.after.name == "git"); // the served row's name, never the last SCANNED row's
         CHECK(cur.after.agent_id == "m");
         CHECK(cur.after.install_id == 1);
         CHECK(cur.skip == 7); // z2..z8 scanned after the anchor, as a count
+        CHECK(cut->rows[0].entry.name == "git");
+        CHECK(cut->rows[0].entry.version == "1.2");
     }
 
     SECTION("a page with no in-scope row keeps the incoming anchor and adds what it scanned") {
         for (int i = 1; i <= 3; ++i)
-            f.rows.push_back(fleet_row("git", "b", i));
+            f.rows.push_back(fleet_row("hub", "b", i, "9.9"));
         for (int i = 4; i <= 20; ++i)
-            f.rows.push_back(fleet_row("git", "c", i));
+            f.rows.push_back(fleet_row("hub", "c", i, "9.9"));
         auto page = page_of(2);
         REQUIRE(page);
         CHECK(page->rows.empty());

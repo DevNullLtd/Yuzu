@@ -1178,10 +1178,16 @@ software_catalogue::DevicesCursor decode_cursor(const std::string& token) {
     return *cur;
 }
 
-// dev-a (in scope) sorts first, then six out-of-scope devices of the same name.
+// dev-a (in scope) sorts first, then six out-of-scope devices whose software has a name and a
+// version no served row has, so any dropped-row byte in a response or token is detectable.
 void seed_wide_fixture(SoftwareInventoryStore& store) {
-    for (const char* a : {"dev-a", "dev-b", "dev-c", "dev-d", "dev-e", "dev-f", "dev-g"})
-        seed(store, a, {{"Common", "1", "", ""}});
+    seed(store, "dev-a", {{"Common", "1", "", ""}});
+    for (const char* a : {"dev-b", "dev-c", "dev-d", "dev-e", "dev-f", "dev-g"})
+        seed(store, a, {{"Common-dropped", "9.9", "", ""}});
+}
+
+bool leaks_dropped(const std::string& text) {
+    return text.find("Common-dropped") != std::string::npos || text.find("9.9") != std::string::npos;
 }
 
 } // namespace
@@ -1202,6 +1208,7 @@ TEST_CASE("REST inventory/software: a wide-scope cursor never names an out-of-sc
     REQUIRE(first.at("software").size() == 1);
     CHECK(first.at("software")[0].at("agent_id") == "dev-a");
     const auto c1 = decode_cursor(first.at("next_cursor").get<std::string>());
+    CHECK(c1.after.name == "Common");
     CHECK(c1.after.agent_id == "dev-a");
     CHECK(c1.skip == 0);
 
@@ -1215,10 +1222,12 @@ TEST_CASE("REST inventory/software: a wide-scope cursor never names an out-of-sc
     CHECK(second.at("result_truncated_by_cap") == true);
     REQUIRE(second.at("next_cursor").is_string());
     const auto c2 = decode_cursor(second.at("next_cursor").get<std::string>());
+    CHECK(c2.after.name == "Common"); // the served row's name, not the last scanned row's
     CHECK(c2.after.agent_id == "dev-a");
     CHECK(c2.after.install_id == c1.after.install_id);
     CHECK(c2.skip == software_catalogue::kWideScopeMaxReads);
     CHECK(second.dump().find("dev-b") == std::string::npos); // nothing out of scope is echoed
+    CHECK_FALSE(leaks_dropped(second.dump()));
 
     // The continuation passes the skipped rows in SQL and reaches the end: 7 - 1 - 4 = 2 left.
     auto third = nlohmann::json::parse(
@@ -1239,6 +1248,11 @@ TEST_CASE("REST inventory/software: a wide-scope cursor never names an out-of-sc
           software_catalogue::kWideScopeMaxReads);
     CHECK(std::ranges::count(csv->body, '\n') == 2); // header + the trailer record
     CHECK(csv->body.find("dev-b") == std::string::npos);
+    CHECK_FALSE(leaks_dropped(csv->body));
+    for (const auto& [name, value] : csv->headers)
+        CHECK_FALSE(leaks_dropped(name + ": " + value));
+    for (const auto& a : h.audit_log)
+        CHECK_FALSE(leaks_dropped(a.target_id + a.detail));
 }
 
 TEST_CASE("REST inventory/software: an explicit out-of-scope agent_id is audited as one denied row",

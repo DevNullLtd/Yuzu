@@ -585,7 +585,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `docs/api-parity-ledger.md`. **Revisit by 2026-11-07.**
      - **The exception relaxes no control.** The fleet view is gated on a
        global `Inventory:Read` (the per-device view is admitted in scope),
-       denies service-scoped tokens, audits every
+       denies service-scoped tokens on the catalogue fleet view (the raw route
+       admits them, confined), audits every
        served page or file, and answers a degraded read with `503`, never an
        empty `200`; wire reference: `docs/user-manual/rest-api.md`.
 
