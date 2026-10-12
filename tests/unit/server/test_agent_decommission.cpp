@@ -651,8 +651,9 @@ TEST_CASE("AgentDecommission reports a degraded presence store as Failed then er
 
 // I3: when the pool cannot lease a connection in time, delete_agent must answer
 // false — and the cascade Failed — never true/Deleted for an erasure that did
-// not happen. Kills: the no-lease arm of delete_agent returning true. Costs one
-// bounded kQueryAcquireTimeout wait, hence [slow].
+// not happen. Kills: the no-lease arm of delete_agent returning true. Two failing
+// acquires, each bounded by the pool's saturated fast-fail (default 500 ms, at most
+// kQueryAcquireTimeout), so ~1 s in total. [slow] is a label only.
 TEST_CASE("AgentDecommission reports an exhausted presence pool as Failed then erases on retry",
           "[pg][decommission][offline][slow]") {
     YUZU_REQUIRE_PG_DB_TPL(db, decommission_tpl);

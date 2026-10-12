@@ -469,7 +469,9 @@ Decision numbers are stable, since other documents cite them.
     Wave 7 PR7.2 added `AppUsageStore`, and #5682 added `OfflineEndpointStore`, whose
     `endpoint_state` presence row holds the device's last-known hostname, OS, agent version
     and architecture. The authoritative list is `AgentDecommissionStores` in
-    `agent_decommission.hpp`, whose registered-target count is pinned by `kCascadeStoreCount` in `test_agent_decommission.cpp`.)*
+    `agent_decommission.hpp`, whose registered-target count is pinned by `kCascadeStoreCount` in `test_agent_decommission.cpp`.
+    The conjunction named below as the cascade trigger's gate is superseded: the gate is the
+    single scoped `Decommission:Delete`, see the Decision 9 update note.)*
     There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
     `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`

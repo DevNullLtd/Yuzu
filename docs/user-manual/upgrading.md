@@ -4431,10 +4431,11 @@ If a migration fails:
 [REST API § Software Licensing (SLE)](rest-api.md#software-licensing-sle)) used to gate on a
 **three-securable conjunction**: `SoftwareLicensing:Delete` **and** `Inventory:Delete` **and**
 `GuaranteedState:Delete`, all required together. A companion Wave 7 PR7.2 package adds a sixth
-per-agent store (`app_usage`) to the cascade (and #5682 a seventh, `offline_endpoint`, for seven in total), and rather than grow the conjunction to a fourth
-securable, ADR-0024 Decision 9 was amended ahead of that landing to promote a single dedicated
-**`Decommission`** securable — the route now
-gates on **`Decommission:Delete` alone**, replacing the old conjunction outright (not adding to it).
+per-agent store (`app_usage`) to the cascade (and #5682 a seventh, `offline_endpoint`, for seven
+in total), and rather than grow the conjunction to a fourth securable, ADR-0024 Decision 9 was
+amended ahead of that landing to promote a single dedicated **`Decommission`** securable — the
+route now gates on **`Decommission:Delete` alone**, replacing the old conjunction outright (not
+adding to it).
 
 **Seeded roles are auto-preserved** — the same `INSERT OR IGNORE` role-default seeding as the SLE
 securable above runs on every boot, so `Administrator` (full CRUD via the generic per-securable
@@ -4481,7 +4482,9 @@ erasure cascade's gate moved.
 **Rolling upgrade (the seventh store, `offline_endpoint`).** During a rolling upgrade, a DELETE
 served by a replica that has not been upgraded runs the old cascade, returns `200`, and does not
 erase the presence row; a response whose `stores` map has no `offline_endpoint` key did not erase
-it. Re-issue the DELETE once every replica runs this version.
+it, and the `sle.agent.decommission` success audit row that replica writes lists its own stores
+(no `offline_endpoint`), so it is not evidence the presence row was erased. Re-issue the DELETE
+once every replica runs this version.
 
 ### vNEXT — Hardware CI list requires `Inventory:Read`, not the old Devices page's `Infrastructure:Read` (breaking for custom roles)
 
