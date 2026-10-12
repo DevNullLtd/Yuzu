@@ -500,11 +500,38 @@ inline std::string join_continuations(std::string_view text) {
 
 using KvMap = std::map<std::string, std::string>;
 
-inline const std::string* find_kv(const std::vector<const KvMap*>& secs, const std::string& key) {
-    for (auto it = secs.rbegin(); it != secs.rend(); ++it)
-        if (const auto f = (*it)->find(key); f != (*it)->end())
-            return &f->second;
-    return nullptr;
+inline const std::string* find_kv(const KvMap& sec, const std::string& key) {
+    const auto f = sec.find(key);
+    return f == sec.end() ? nullptr : &f->second;
+}
+
+/// Samba section names are case-insensitive and a re-opened section merges with last
+/// assignment winning. Rewrites every `[Header]` to its lowercase form so parse_ini merges
+/// all case variants into one map in source order, and records the FIRST spelling of each
+/// (what Samba keeps as the service name) in `display`.
+inline std::string fold_section_headers(const std::string& text,
+                                        std::map<std::string, std::string>& display) {
+    std::string out;
+    out.reserve(text.size());
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        auto nl = text.find('\n', pos);
+        if (nl == std::string::npos)
+            nl = text.size();
+        const std::string line = yuzu::shared::ini_detail::trim(std::string_view(text).substr(pos, nl - pos));
+        pos = nl + 1;
+        const auto close = line.find(']');
+        if (!line.empty() && line.front() == '[' && close != std::string::npos) {
+            const auto name = yuzu::shared::ini_detail::trim(std::string_view(line).substr(1, close - 1));
+            const auto l = lower(name);
+            display.emplace(l, name);
+            out += '[' + l + "]\n";
+        } else {
+            out += line;
+            out += '\n';
+        }
+    }
+    return out;
 }
 
 } // namespace detail
@@ -513,26 +540,15 @@ inline const std::string* find_kv(const std::vector<const KvMap*>& secs, const s
 /// target chain (depth <= 8, cycle-safe; unresolved sets copy_unresolved), then [global],
 /// then Samba's built-in default (read only = yes, guest ok = no, browseable = yes,
 /// available = yes). Registry backend, `include =` and usershares are DETECTED, never read.
-// ponytail: sections whose names differ only by case are merged in first-seen order; a
-// re-opened section under another case spelling is applied after the earlier ones even when
-// the file interleaves them. Upgrade to per-key source order if a real file needs it.
 inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget& budget) {
     SmbConf out;
-    const std::string joined = detail::join_continuations(text);
-    const auto doc = yuzu::shared::parse_ini(joined, &detail::smb_canon);
+    std::map<std::string, std::string> display; // lowercase section name -> first spelling
+    const auto doc = yuzu::shared::parse_ini(
+        detail::fold_section_headers(detail::join_continuations(text), display), &detail::smb_canon);
 
-    std::map<std::string, std::vector<const detail::KvMap*>> by_lower;
-    std::vector<std::pair<std::string, std::string>> order; // (lower, display)
-    for (const auto& name : doc.section_order) {
-        const auto l = detail::lower(name);
-        auto& v = by_lower[l];
-        if (v.empty())
-            order.emplace_back(l, name);
-        v.push_back(&doc.sections.at(name));
-    }
-    static const std::vector<const detail::KvMap*> kNone;
-    const auto g = by_lower.find("global");
-    const auto& global = g == by_lower.end() ? kNone : g->second;
+    static const detail::KvMap kNone;
+    const auto g = doc.sections.find("global");
+    const auto& global = g == doc.sections.end() ? kNone : g->second;
 
     if (const auto* v = detail::find_kv(global, "configbackend"); v && detail::lower(*v) == "registry")
         out.registry_backend = true;
@@ -555,7 +571,7 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
     constexpr int kMaxCopyDepth = 8;
     const auto lookup = [&](const std::string& own_lower, const std::string& key) -> const std::string* {
         std::vector<std::string> visited{own_lower};
-        const std::vector<const detail::KvMap*>* cur = &by_lower.at(own_lower);
+        const detail::KvMap* cur = &doc.sections.at(own_lower);
         for (int depth = 0; cur != nullptr; ++depth) {
             if (const auto* v = detail::find_kv(*cur, key))
                 return v;
@@ -563,8 +579,8 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
             if (cp == nullptr)
                 break;
             const auto l = detail::lower(*cp);
-            const auto it = by_lower.find(l);
-            if (it == by_lower.end() || depth >= kMaxCopyDepth ||
+            const auto it = doc.sections.find(l);
+            if (it == doc.sections.end() || depth >= kMaxCopyDepth ||
                 std::ranges::find(visited, l) != visited.end()) {
                 out.copy_unresolved = true;
                 break;
@@ -575,7 +591,7 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
         return detail::find_kv(global, key);
     };
 
-    for (const auto& [l, display] : order) {
+    for (const auto& l : doc.section_order) {
         if (l == "global")
             continue;
         Share s;
@@ -592,12 +608,12 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
             s.flags.emplace_back("unavailable");
         if (l == "homes" || l == "printers" || l == "print$")
             s.flags.emplace_back("special");
-        if (!detail::charge_share(budget, display.size(), path ? path->size() : 1,
+        if (!detail::charge_share(budget, display.at(l).size(), path ? path->size() : 1,
                                   detail::flags_bytes(s.flags))) {
             out.truncated = true;
             break;
         }
-        s.name = detail::cut(display, out.field_oversized);
+        s.name = detail::cut(display.at(l), out.field_oversized);
         s.path = path ? detail::cut(*path, out.field_oversized) : "-";
         s.access = (ro && !detail::parse_bool(*ro).value_or(true)) ? Access::rw : Access::ro;
         s.anonymous = guest ? detail::parse_bool(*guest).value_or(false) : false;

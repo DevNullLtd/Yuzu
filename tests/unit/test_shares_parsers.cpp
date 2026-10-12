@@ -67,7 +67,8 @@ std::string flags_of(const Share& s) {
 }
 
 // REAL CAPTURE: /etc/exports as installed by nfs-kernel-server 1:2.8.3-1 (comments only),
-// Debian GNU/Linux 13 (trixie) aarch64 container, 2026-10-12. Verbatim.
+// Debian GNU/Linux 13 (trixie) aarch64 container, 2026-10-12. Verbatim except stripped trailing
+// whitespace (see banner).
 constexpr const char* kStockExports = R"EXP(# /etc/exports: the access control list for filesystems which may be exported
 #		to NFS clients.  See exports(5).
 #
@@ -81,7 +82,8 @@ constexpr const char* kStockExports = R"EXP(# /etc/exports: the access control l
 )EXP";
 
 // REAL CAPTURE: /etc/samba/smb.conf as installed by samba-common 2:4.22.11+dfsg-0+deb13u1,
-// same container and date. Verbatim.
+// same container and date. Verbatim except stripped trailing whitespace (see
+// banner).
 constexpr const char* kStockSmb = R"SMB(#
 # Sample configuration file for the Samba suite for Debian GNU/Linux.
 #
@@ -580,6 +582,21 @@ TEST_CASE("shares smb.conf: a share-local synonym beats a global read only; last
     CHECK(by_name(c, "a").access == Access::rw);
     CHECK(by_name(c, "b").access == Access::rw);
     CHECK(by_name(c, "c").access == Access::ro);
+}
+
+TEST_CASE("shares smb.conf: case-variant section reopenings merge, last assignment wins",
+          "[shares]") {
+    const auto c = smb("[Global]\nguest ok = yes\n"
+                       "[Docs]\npath=/old\n[docs]\npath=/middle\n[Docs]\npath=/new\n"
+                       "[global]\nread only = no\n"
+                       "[Copy]\ncopy = DOCS\n");
+    CHECK(std::ranges::count_if(c.shares, [](const Share& s) { return s.name == "Docs"; }) == 1);
+    CHECK(c.shares.size() == 2);
+    CHECK(by_name(c, "Docs").path == "/new");
+    CHECK(by_name(c, "Docs").access == Access::rw); // later [global] spelling honoured
+    CHECK(by_name(c, "Docs").anonymous == true);
+    CHECK(by_name(c, "Copy").path == "/new");
+    CHECK_FALSE(c.copy_unresolved);
 }
 
 TEST_CASE("shares smb.conf: parameter synonyms and spelling normalise", "[shares]") {
