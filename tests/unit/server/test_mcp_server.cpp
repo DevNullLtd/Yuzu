@@ -28850,7 +28850,12 @@ TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
               // (CDX-P1-01); a string is read only under the ordering operators.
               R"({"plugin":"p","field":"f","op":">","value":9007199254740993.0})",
               R"({"plugin":"p","field":"f","op":"==","value":1e300})",
-              R"({"plugin":"p","field":"f","op":"<=","value":"9007199254740993.5"})"}) {
+              R"({"plugin":"p","field":"f","op":"<=","value":"9007199254740993.5"})",
+              // Under 2^53 but rounded by a double, and a plain decimal string out of the double
+              // range (Gate 8 round 13): all refused at the conditions parse.
+              R"({"plugin":"p","field":"f","op":">=","value":4503599627370497.3})",
+              R"({"plugin":"p","field":"f","op":">","value":"5.00000000000000001"})",
+              R"({"plugin":"p","field":"f","op":">","value":"1e400"})"}) {
             const std::string req =
                 R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id++) +
                 R"(,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[)" +

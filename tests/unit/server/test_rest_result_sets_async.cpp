@@ -2519,13 +2519,18 @@ TEST_CASE("from-inventory-query: a numeric condition value is compared as a numb
     for (const char* cond :
          {R"({"plugin":"custom","field":"ram","op":">","value":9007199254740993.0})",
           R"({"plugin":"custom","field":"ram","op":"==","value":1e300})",
-          R"({"plugin":"custom","field":"ram","op":"<=","value":"9007199254740993.5"})"}) {
+          R"({"plugin":"custom","field":"ram","op":"<=","value":"9007199254740993.5"})",
+          // Under 2^53 but rounded by a double (Gate 8 round 13): over 15 significant digits, and
+          // a plain decimal string out of the double range (it used to order lexically).
+          R"({"plugin":"custom","field":"ram","op":">=","value":4503599627370497.3})",
+          R"({"plugin":"custom","field":"ram","op":">","value":"5.00000000000000001"})",
+          R"({"plugin":"custom","field":"ram","op":">","value":"1e400"})"}) {
         const std::string body = std::string(R"({"name":"refused","conditions":[)") + cond + "]}";
         INFO(body);
         int st = 0;
         auto j = h.post("/api/v1/result-sets/from-inventory-query", body, st);
         CHECK(st == 400);
-        CHECK(j["error"]["message"].get<std::string>().find("exactly representable") !=
+        CHECK(j["error"]["message"].get<std::string>().find("15 significant digits") !=
               std::string::npos);
     }
     std::string next;
@@ -3012,13 +3017,18 @@ TEST_CASE("POST /api/v1/inventory/evaluate: a numeric condition value is compare
          {R"({"plugin":"custom","field":"ram","op":">","value":9007199254740993.0})",
           R"({"plugin":"custom","field":"ram","op":"==","value":9007199254740992.0})",
           R"({"plugin":"custom","field":"ram","op":"<=","value":1e300})",
-          R"({"plugin":"custom","field":"ram","op":">=","value":"9007199254740993.5"})"}) {
+          R"({"plugin":"custom","field":"ram","op":">=","value":"9007199254740993.5"})",
+          // Under 2^53 but rounded by a double (Gate 8 round 13): over 15 significant digits, and
+          // a plain decimal string out of the double range (it used to order lexically).
+          R"({"plugin":"custom","field":"ram","op":"<=","value":4503599627370497.5})",
+          R"({"plugin":"custom","field":"ram","op":">","value":"5.00000000000000001"})",
+          R"({"plugin":"custom","field":"ram","op":">","value":"1e400"})"}) {
         const std::string body = std::string(R"({"conditions":[)") + cond + "]}";
         INFO(body);
         int st = 0;
         auto j = h.post("/api/v1/inventory/evaluate", body, st);
         CHECK(st == 400);
-        CHECK(j["error"]["message"].get<std::string>().find("exactly representable") !=
+        CHECK(j["error"]["message"].get<std::string>().find("15 significant digits") !=
               std::string::npos);
     }
     CHECK(agents_for("==", "9007199254740992") == Ids{});

@@ -8,9 +8,11 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cerrno>
 #include <cmath>
 #include <compare>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <string_view>
 #include <type_traits>
@@ -326,23 +328,72 @@ bool numeric_equal(const nlohmann::json& stored, const InventoryCondition& cond)
     return n.has_value() && numbers_equal(*n, cond.numeric_value);
 }
 
-/// 2^53: below it every integer-valued double is exact and a decimal read as a double rounds by
-/// less than one unit; at or above it a double stands for a whole range of decimals.
+/// 2^53: below it every integer-valued double is exact; at or above it a double stands for a whole
+/// range of decimals. A decimal operand of this magnitude or more is refused outright (subsumed
+/// for a fraction by the digit rule below, kept so the 2^53 boundary stays explicit).
 constexpr double kExactDoubleLimit = 9007199254740992.0;
 
-/// The 400 / -32602 text for an operand that would be rounded through a double (see
-/// operand_rounds_through_double).
-constexpr const char* kInexactOperandMessage =
-    "conditions[].value: a numeric operand must be an integer or a decimal that is exactly "
-    "representable; a decimal with a fraction or an exponent and a magnitude of 2^53 "
-    "(9007199254740992) or more is refused (write a whole number as an integer)";
+/// DBL_DIG: a decimal of at most this many significant digits survives the round trip through a
+/// double, so the rounding cannot move it across a neighbouring integer or past the next stored
+/// value. A decimal of more digits ("5.00000000000000001", "4503599627370497.3") is rounded by the
+/// parse, and a comparison against a stored integer can then flip.
+constexpr std::size_t kMaxOperandSignificantDigits = 15;
 
-/// True for a parsed operand that is a double the exact comparator cannot trust: its magnitude is
-/// 2^53 or more (or infinite). A JSON float arrives already rounded (the lexeme is gone), and a
-/// decimal such as 9007199254740993.0 rounds to exactly 2^53 itself, so the boundary is refused too.
-bool operand_rounds_through_double(const Number& n) {
+/// The 400 / -32602 text for an operand the exact comparator cannot trust (see
+/// operand_is_refused); every clause is satisfiable by the caller.
+constexpr const char* kInexactOperandMessage =
+    "conditions[].value: a numeric operand must be an integer, or a decimal with at most 15 "
+    "significant digits, a magnitude below 9007199254740992 and a value within the range of a "
+    "double; an integer outside -9223372036854775808 to 18446744073709551615 cannot be compared "
+    "exactly";
+
+/// The significant digits of a decimal spelling: the digits of the mantissa (everything before an
+/// 'e' / 'E'), without leading zeros and without trailing zeros ("0.0123" is 3, "5.50" is 2,
+/// "1e3" is 1, "5.00000000000000001" is 18).
+std::size_t significant_digits(std::string_view lexeme) {
+    const auto mantissa = lexeme.substr(0, lexeme.find_first_of("eE"));
+    std::string digits;
+    for (const char ch : mantissa)
+        if (ch >= '0' && ch <= '9')
+            digits.push_back(ch);
+    const auto first = digits.find_first_not_of('0');
+    if (first == std::string::npos)
+        return 0;
+    const auto last = digits.find_last_not_of('0');
+    return last - first + 1;
+}
+
+/// True for a parsed operand that is a double the exact comparator cannot trust: a magnitude of
+/// 2^53 or more (or infinite), or a lexeme of more than 15 significant digits. `lexeme` is the
+/// operand text; for a JSON float the original text is gone, so it is the shortest round-trip
+/// text of the double (a value that needs 16 or 17 digits to round-trip is refused). Integers are
+/// exact and never refused here.
+bool operand_rounds_through_double(const Number& n, std::string_view lexeme) {
     const double* d = std::get_if<double>(&n);
-    return d != nullptr && !(std::fabs(*d) < kExactDoubleLimit);
+    if (d == nullptr)
+        return false;
+    return !(std::fabs(*d) < kExactDoubleLimit) ||
+           significant_digits(lexeme) > kMaxOperandSignificantDigits;
+}
+
+/// True when `s` has the plain decimal shape and a full-consumption double parse of it is out of
+/// range (overflow such as "1e400", or underflow such as "1e-400"). parse_number_string returns
+/// nullopt for it, and a string operand that fell out of the numeric path would silently compare
+/// lexically.
+bool plain_decimal_out_of_range(const std::string& s) {
+    if (!plain_decimal_shape(s))
+        return false;
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+    double d = 0.0;
+    const auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), d);
+    return ec == std::errc::result_out_of_range && p == s.data() + s.size();
+#else
+    // Apple Clang: no floating from_chars. strtod reports ERANGE and where it stopped.
+    errno = 0;
+    char* end = nullptr;
+    (void)std::strtod(s.c_str(), &end);
+    return errno == ERANGE && end == s.c_str() + s.size();
+#endif
 }
 
 /// Evaluate a single condition against parsed JSON data.
@@ -501,10 +552,14 @@ std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
         // the legacy prefix read, see eval_condition); == / != keep the exact text compare.
         if (out.op == ">" || out.op == ">=" || out.op == "<" || out.op == "<=") {
             if (const auto n = parse_number_string(out.value)) {
-                if (operand_rounds_through_double(*n))
+                if (operand_rounds_through_double(*n, out.value))
                     return std::string(kInexactOperandMessage);
                 out.ordering_numeric = true;
                 out.numeric_value = *n;
+            } else if (plain_decimal_out_of_range(out.value)) {
+                // "1e400", a 400-digit integer, "1e-400": not a number the evaluator can hold,
+                // and left as a string it would order lexically against a stored number.
+                return std::string(kInexactOperandMessage);
             }
         }
         return std::nullopt;
@@ -520,9 +575,9 @@ std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
             parsed = v.get<std::int64_t>();
         else
             parsed = v.get<double>();
-        if (operand_rounds_through_double(parsed))
-            return std::string(kInexactOperandMessage);
         out.value = v.dump();
+        if (operand_rounds_through_double(parsed, out.value))
+            return std::string(kInexactOperandMessage);
         out.numeric_operand = true;
         out.numeric_value = parsed;
         return std::nullopt;

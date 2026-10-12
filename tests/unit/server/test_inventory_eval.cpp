@@ -1409,7 +1409,7 @@ TEST_CASE("InventoryEval: a string operand that is not a plain decimal keeps the
         return c;
     };
     for (const char* operand : {"abc", "1.2.3", "v2", " 5", "5 GB", "+5", "inf", "nan", "0x10",
-                                "5\n", "1e400", "", "-", "."}) {
+                                "5\n", "", "-", "."}) { // "1e400" is refused at admission now
         INFO(operand);
         CHECK_FALSE(parsed(">", operand).ordering_numeric);
     }
@@ -1504,7 +1504,7 @@ TEST_CASE("InventoryEval: a decimal operand of 2^53 or more is refused at admiss
             INFO(op << " " << operand);
             const auto err = admit(op, operand);
             REQUIRE(err.has_value());
-            CHECK(err->find("exactly representable") != std::string::npos);
+            CHECK(err->find("15 significant digits") != std::string::npos);
         }
     }
     // A string operand is read only under the ordering operators; a fraction or exponent form of
@@ -1516,7 +1516,7 @@ TEST_CASE("InventoryEval: a decimal operand of 2^53 or more is refused at admiss
             INFO(op << " " << operand);
             const auto err = admit(op, operand);
             REQUIRE(err.has_value());
-            CHECK(err->find("exactly representable") != std::string::npos);
+            CHECK(err->find("15 significant digits") != std::string::npos);
         }
         for (const char* op : {"==", "!="})
             CHECK_FALSE(admit(op, operand).has_value());
@@ -1524,7 +1524,7 @@ TEST_CASE("InventoryEval: a decimal operand of 2^53 or more is refused at admiss
     // Accepted: 2^53 and larger WHOLE numbers as integers, small decimals, and exact fractions.
     for (const char* operand : {"9007199254740992", "9007199254740993", "-9007199254740993",
                                 "18446744073709551615", "-9223372036854775808", "0.1234567", "5.5",
-                                "1e3", "-1e-7", "9007199254740991.0", "0", "-0.0"}) {
+                                "1e3", "-1e-7", "0", "-0.0"}) {
         for (const char* op : ops) {
             INFO(op << " " << operand);
             CHECK_FALSE(admit(op, operand).has_value());
@@ -1536,6 +1536,120 @@ TEST_CASE("InventoryEval: a decimal operand of 2^53 or more is refused at admiss
             INFO(op << " " << operand);
             CHECK_FALSE(admit(op, operand).has_value());
         }
+    }
+}
+
+// Gate 8 round 13 (F1/F2): a decimal operand that is not reduced to an exact integer must survive
+// the round trip through a double, i.e. have at most 15 significant digits (DBL_DIG), or rounding
+// can move it across a stored neighbour even below 2^53; and a plain-decimal STRING outside the
+// double range must be refused, not left to a lexical compare (stored 5 satisfied > "1e400").
+TEST_CASE("InventoryEval: a decimal operand is admitted only with at most 15 significant digits "
+          "and within the double range",
+          "[inventory_eval][numeric_params]") {
+    using nlohmann::json;
+    const char* const ops[] = {"==", "!=", ">", ">=", "<", "<="};
+    const char* const ordering[] = {">", ">=", "<", "<="};
+    auto admit = [](const char* op, const std::string& operand_json, InventoryCondition& c) {
+        return parse_inventory_condition(
+            json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
+                        R"(","value":)" + operand_json + "}"),
+            c);
+    };
+    auto quoted = [](const std::string& s) { return "\"" + s + "\""; };
+    const std::string long_int(400, '9');
+    using Strs = std::vector<std::string>;
+
+    SECTION("a JSON float is refused when its shortest round-trip text has over 15 digits") {
+        for (const std::string& operand :
+             Strs{"123456789012345.6",  // 16 digits
+                  "1234567890123456.7", // 17 digits
+                  "0.1234567890123456", // 16 digits
+                  "4503599627370497.3", "4503599627370497.5", "0.30000000000000004",
+                  "9007199254740991.0"}) { // its text has 16 digits (a string spelling is exact)
+            for (const char* op : ops) {
+                INFO(op << " " << operand);
+                InventoryCondition c;
+                const auto err = admit(op, operand, c);
+                REQUIRE(err.has_value());
+                CHECK(err->find("15 significant digits") != std::string::npos);
+            }
+        }
+    }
+
+    SECTION("a string operand under an ordering operator: over-long or out-of-range is refused") {
+        for (const std::string& operand :
+             Strs{quoted("123456789012345.6"), quoted("1234567890123456.7"),
+                  quoted("5.00000000000000001"), quoted("0.1234567890123456"),
+                  quoted("4503599627370497.3"), quoted("4503599627370497.5"),
+                  quoted("1e400"), quoted("-1e400"), quoted("1e-400"), quoted("-1e-400"),
+                  quoted(long_int), quoted("-" + long_int), quoted(long_int + ".5"),
+                  quoted("18446744073709551616")}) {
+            for (const char* op : ordering) {
+                INFO(op << " " << operand.substr(0, 40));
+                InventoryCondition c;
+                const auto err = admit(op, operand, c);
+                REQUIRE(err.has_value());
+                CHECK(err->find("15 significant digits") != std::string::npos);
+            }
+            for (const char* op : {"==", "!="}) { // an exact text compare, never read as a number
+                InventoryCondition c;
+                CHECK_FALSE(admit(op, operand, c).has_value());
+            }
+        }
+        // The shape check is not widened: a non-plain-decimal string keeps the legacy read.
+        for (const std::string& operand : Strs{quoted("1e400x"), quoted("1.2.3"), quoted("5 GB")}) {
+            InventoryCondition c;
+            CHECK_FALSE(admit(">", operand, c).has_value());
+        }
+    }
+
+    SECTION("a JSON integer beyond uint64 names the integer range") {
+        InventoryCondition c;
+        const auto err = admit(">", "18446744073709551616", c);
+        REQUIRE(err.has_value());
+        CHECK(err->find("18446744073709551615") != std::string::npos);
+    }
+
+    SECTION("admitted: 15 digits or fewer, exact integers of any int64/uint64 size") {
+        for (const std::string& operand :
+             Strs{"12345678901234.5", "0.123456789012345", "0.1234567", "5.5", "0.1", "1e3",
+                  "-1e-7", "1.5e10", "-0.0", "0", "0.000000123456789012345",
+                  "9007199254740992", "9007199254740993", "-9007199254740993",
+                  "9223372036854775807", "-9223372036854775808", "18446744073709551615"}) {
+            for (const char* op : ops) {
+                INFO(op << " " << operand);
+                InventoryCondition c;
+                CHECK_FALSE(admit(op, operand, c).has_value());
+            }
+        }
+        for (const std::string& operand :
+             Strs{quoted("12345678901234.5"), quoted("0.123456789012345"), quoted("5.5"),
+                  quoted("1e3"), quoted("2e-7"), quoted("0.1"), quoted("9007199254740993"),
+                  quoted("18446744073709551615"),
+                  // a zero fraction is reduced to the exact integer BEFORE the digit rule
+                  quoted("9007199254740993.0"), quoted("-9007199254740993.00"),
+                  quoted("1234567890123456789.0")}) {
+            for (const char* op : ordering) {
+                INFO(op << " " << operand);
+                InventoryCondition c;
+                CHECK_FALSE(admit(op, operand, c).has_value());
+            }
+        }
+    }
+
+    SECTION("what is admitted is what is compared") {
+        InventoryCondition c;
+        REQUIRE_FALSE(admit(">", quoted("9007199254740993.0"), c).has_value());
+        CHECK(std::holds_alternative<std::int64_t>(c.numeric_value));
+        CHECK(std::get<std::int64_t>(c.numeric_value) == 9007199254740993LL);
+        InventoryCondition d;
+        REQUIRE_FALSE(admit(">", "1e3", d).has_value());
+        REQUIRE(std::holds_alternative<double>(d.numeric_value));
+        CHECK(std::get<double>(d.numeric_value) == 1000.0);
+        InventoryCondition e;
+        REQUIRE_FALSE(admit(">", quoted("1e3"), e).has_value());
+        REQUIRE(std::holds_alternative<double>(e.numeric_value));
+        CHECK(std::get<double>(e.numeric_value) == 1000.0);
     }
 }
 

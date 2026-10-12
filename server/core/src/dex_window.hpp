@@ -29,7 +29,8 @@ int dex_window_to_days(const std::string& window);
 /// "30d", "all"). The resolver above still maps anything else to 7 days (its dashboard callers
 /// only ever pass a fixed set); a MACHINE route must call this first and refuse the rest, or a
 /// caller asking for `30` or `90d` silently gets 7 days of data under a label that says otherwise
-/// (#4644). An absent or empty `window` is the caller's default and never reaches this.
+/// (#4644). An absent window is the caller's default and never reaches this; an empty one is
+/// refused here.
 bool dex_window_is_valid(const std::string& window);
 
 /// Turns a resolved day count into an ISO-8601 UTC cutoff ("" when days<=0 =

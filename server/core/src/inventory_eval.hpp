@@ -22,10 +22,11 @@ struct InventoryCondition {
     /// kept for display): two integers compare exactly (signed and unsigned mixed correctly), a
     /// stored integer against a double operand compares exactly (the integer part as an integer,
     /// then the fraction), and two doubles compare as doubles (`0.1 + 0.2` is not `0.3`, `-0` equals
-    /// `0`). A double OPERAND is only admitted below 2^53 in magnitude (see
-    /// parse_inventory_condition): a JSON float arrives already rounded, so a larger one could not
-    /// be compared exactly; a whole number of any size is sent as an integer. A STORED double above
-    /// 2^53 is whatever the agent reported. A stored string that parses
+    /// `0`). A double OPERAND is only admitted with at most 15 significant digits and a magnitude
+    /// below 2^53 (see parse_inventory_condition): a decimal of more digits is rounded by the parse,
+    /// and a JSON float arrives already rounded, so it could not be compared exactly; a whole
+    /// number up to the uint64 range is sent as an integer. A STORED double above 2^53 is whatever
+    /// the agent reported. A stored string that parses
     /// in full as a number counts as that number (stored "1.10" equals operand 1.1, stored "10" is
     /// greater than operand 9); any other stored value (non-numeric string such as "5 GB" or "N/A",
     /// boolean, array) is never equal and never satisfies an ordering operator: a JSON number
@@ -62,11 +63,14 @@ struct InventoryCondition {
 /// `==` / `!=` only. Anything else (null, array, object, a number under another operator) is
 /// refused. A number used to become "": `{"op":">","value":5}` then selected EVERY device that had the
 /// field, because the evaluator falls back to a lexicographic compare against the empty string.
-/// A decimal operand that a double cannot hold exactly is refused too: a JSON float, or a string
-/// under `>` `>=` `<` `<=`, with a fraction or an exponent and a magnitude of 2^53 or more (a JSON
-/// float arrives already rounded: 9007199254740993.0 is 2^53 by the time it is seen, so it would
-/// silently compare equal to 9007199254740992.0). A whole number is sent as an integer, or as a
-/// digit string, which reads as that exact integer (also with a zero fraction, "123.0").
+/// A decimal operand that would be rounded through a double is refused too: a JSON float, or a
+/// string under `>` `>=` `<` `<=`, that is not a whole number and has more than 15 significant
+/// digits (digits after leading zeros and trailing zeros; "5.00000000000000001" and
+/// 4503599627370497.3 round to a neighbour), or a magnitude of 2^53 or more, or a value outside the
+/// double range ("1e400", "1e-400", which would otherwise fall to a lexical compare). A JSON float's
+/// own text is gone, so its shortest round-trip text is counted (0.30000000000000004 is refused).
+/// A whole number is sent as an integer of any size up to the int64/uint64 range, or as a digit
+/// string, which reads as that exact integer (also with a zero fraction, "9007199254740993.0").
 /// Returns the 400 / -32602 message, or nullopt when accepted (`out` is then filled in).
 [[nodiscard]] std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
                                                                    InventoryCondition& out);

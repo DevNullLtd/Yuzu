@@ -265,7 +265,7 @@ static const char* const kMalformedSubnets[] = {
     "10.0.0.0/abc",        "10.0.0.0/",          "10.0.0.0/33",       "10.0.0.0/-1",
     "10.0.0.0/1e3",        "10.0.0.0/+8",        "10.0.0.0/8x",       "10.0.0.0/ 8",
     "10.0.0.0/0x8",        "10.0.0.0/99999999999", "10.0.0.0/4294967297",
-    "10.0.0.0/18446744073709551615", "10.0.0.0/-0", "10.0.0.0/-00", "10.0.0.0/+0", "10.0.0.0/\t8",
+    "10.0.0.0/18446744073709551615", "10.0.0.0/-0", "10.0.0.0/-00", "10.0.0.0/+0",
     "10.0.0.0/8/8", "/8", "garbage/8", "10.0.0/8", "1.2.3.4.5/8",
 };
 
@@ -357,6 +357,30 @@ TEST_CASE("add_rule refuses a value or label that would reload as a different ru
     CHECK(engine.list_rules().empty());
     CHECK(engine.add_rule({AutoApproveRuleType::hostname_glob, "*.prod.com", "Prod (EU) #1"}));
     CHECK(engine.list_rules().size() == 1);
+}
+
+// add_rule refuses a control character, so the shapes below cannot reach the engine that way. They
+// CAN arrive in a hand-edited file through load(), which keeps the rule: the whitespace refusal in
+// parse_prefix_len is what stops them matching, and this keeps a test behind it.
+TEST_CASE("ip_subnet: a control-character prefix loaded from a file never matches",
+          "[auto_approve][cidr][numeric_params]") {
+    yuzu::test::TempDir dir{"yuzu_test_auto_approve_ws-"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto file = dir.path / "auto-approve.conf";
+    {
+        std::ofstream out(file, std::ios::binary);
+        out << "ip_subnet:10.0.0.0/\t8:tab\n"
+            << "ip_subnet:10.0.0.0/\v8:vtab\n"
+            << "ip_subnet:10.0.0.0/8\t:trailing\n";
+    }
+    AutoApproveEngine engine;
+    REQUIRE(engine.load(file));
+    REQUIRE(engine.list_rules().size() == 3);
+    for (const char* ip : {"10.1.2.3", "0.0.0.1", "255.255.255.255"}) {
+        INFO(ip);
+        REQUIRE_NOTHROW(engine.evaluate(make_ctx("host", ip)));
+        CHECK(engine.evaluate(make_ctx("host", ip)).empty());
+    }
 }
 
 // The saved-then-reloaded list must equal the audited (admitted) list after rejected injection
