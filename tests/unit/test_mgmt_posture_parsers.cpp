@@ -77,6 +77,23 @@ TEST_CASE("mgmt_posture: parse_ini basics", "[mgmt_posture]") {
     CHECK(parse_ini("").sections.empty());
 }
 
+TEST_CASE("mgmt_posture: parse_ini canonicaliser hook", "[mgmt_posture]") {
+    // Lowercase every key; a key named "drop" is emptied so the line is discarded.
+    constexpr auto canon = [](std::string& key, std::string& /*value*/) {
+        for (auto& c : key)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (key == "drop")
+            key.clear();
+    };
+    const auto d = parse_ini("[a]\nKey = v\nDROP = x\nother = y\n", canon);
+    CHECK(d.sections.at("a").at("key") == "v");
+    CHECK(d.sections.at("a").at("other") == "y");
+    CHECK_FALSE(d.sections.at("a").contains("drop"));
+    CHECK_FALSE(d.sections.at("a").contains("Key"));
+    // Default (nullptr) hook is identity: case is preserved.
+    CHECK(parse_ini("[a]\nKey = v\n").sections.at("a").contains("Key"));
+}
+
 TEST_CASE("mgmt_posture: AD and IPA specimens", "[mgmt_posture]") {
     const auto ad = facts(kAdConf);
     CHECK(ad.active_domains == std::vector<std::string>{"example.com"});

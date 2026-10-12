@@ -44,6 +44,7 @@
 
 #include "browser_policy_legs.hpp"
 #include "mgmt_posture_legs.hpp"
+#include "shares_legs.hpp"
 #include "update_source_trust_legs.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -200,6 +201,27 @@ TEST_CASE("mgmt_posture execute_posture contains a leg that throws under sustain
     REQUIRE(g_injected > 0);
     // The host must still learn of the failure: rc 1 from the double-throw arm, or a typed
     // UNAVAILABLE/UNKNOWN status if the recovery managed to land.
+    CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
+                       g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
+}
+
+TEST_CASE("shares execute_list contains a leg that throws under sustained OOM",
+          "[plugin][abi][oom][shares]") {
+    yuzu::CommandContext ctx{nullptr};
+    reset_stubs();
+    bool escaped = false;
+    int rc = -1;
+    try {
+        rc = yuzu::shares::execute_list(ctx, "list", &oom_leg, "linux:leg:exception");
+    } catch (...) {
+        escaped = true;
+    }
+    g_fail_alloc = false;
+
+    REQUIRE_FALSE(escaped);
+    // The recovery's status row must have hit the failing allocator, or this case proves
+    // nothing on a stdlib whose containment is never exercised.
+    REQUIRE(g_injected > 0);
     CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
                        g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
 }

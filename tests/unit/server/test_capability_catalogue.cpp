@@ -44,6 +44,7 @@
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_shares.hpp"
 #include "command_capability.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -164,6 +165,7 @@ struct LabeledSpan {
         {"system_hardening", capdecls::plugin_action_catalogue_system_hardening(), false},
         {"pkg_inventory", capdecls::plugin_action_catalogue_pkg_inventory(), false},
         {"mgmt_posture", capdecls::plugin_action_catalogue_mgmt_posture(), false},
+        {"shares", capdecls::plugin_action_catalogue_shares(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -172,7 +174,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty-seven sources exactly as a live composition site would use.
+    // literally, twenty-eight sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -200,6 +202,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_system_hardening(),
         capdecls::plugin_action_catalogue_pkg_inventory(),
         capdecls::plugin_action_catalogue_mgmt_posture(),
+        capdecls::plugin_action_catalogue_shares(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -387,6 +390,25 @@ TEST_CASE("capability catalogue: mgmt_posture.posture pins its exact classificat
     CHECK(row.dispatch_class == DispatchClass::ReadOnly);
     CHECK(row.mutability == Mutability::None);
     CHECK(row.securable == "Inventory");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for `shares.list`. A read-only listing of what the host is configured to
+/// serve under `Infrastructure`:Read with no execute gate. Pinning it directly means a silent
+/// drift to a mutating class, a different securable, or a gate on a facts-only read fails here.
+TEST_CASE("capability catalogue: shares.list pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_shares();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows.front();
+    CHECK(row.plugin == "shares");
+    CHECK(row.action == "list");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Infrastructure");
     CHECK(row.operation == authz::Operation::Read);
     CHECK(row.risk_tier == authz::RiskTier::Low);
     CHECK(row.system_reserved == false);
