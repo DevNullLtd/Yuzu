@@ -11,7 +11,6 @@
 
 #include <spdlog/spdlog.h>
 
-#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -64,18 +63,17 @@ public:
         // The join keeps only the newest kAppPerfVersionJoinCap versions; ask the
         // failure read for exactly those so it never counts a version that is
         // dropped from the report.
-        bool capped = false; // the report carries its own truncation flag
-        const auto versions = app_perf_newest_versions(*points, capped);
+        const auto sel = app_perf_newest_versions(*points);
 
         // One cut for events and exposure: the UTC midnight `window` days back.
         const int window = failures_owner_->failure_window_days();
-        const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                                     std::chrono::system_clock::now().time_since_epoch())
-                                     .count();
-        const std::int64_t today = (now / 86400) * 86400;
-        const std::int64_t since_day = today - static_cast<std::int64_t>(window) * 86400;
+        const auto cut = dex_day_window(std::chrono::duration_cast<std::chrono::seconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count(),
+                                        window);
         // A second, separate bounded read — the B2 lease is already released.
-        auto failures = failures_owner_->read(app, versions, since_day, today, dex_iso_at(since_day));
+        auto failures =
+            failures_owner_->read(app, sel.versions, cut.since_day, cut.end_day, cut.since_iso);
         if (!failures)
             return std::nullopt; // AUTHORITATIVE degrade — the failure read failed
         auto report = app_perf_version_failure_join(std::move(*points), *failures, window);

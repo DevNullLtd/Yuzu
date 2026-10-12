@@ -31,6 +31,18 @@ int dex_window_to_days(const std::string& window);
 /// at a fixed instant (say a UTC midnight) formats it identically.
 std::string dex_iso_at(std::int64_t epoch_seconds);
 
+/// A window of whole UTC days ending at the current day's midnight: the one
+/// derivation of the cut that events and exposure share.
+struct DexDayWindow {
+    std::int64_t since_day{0};  ///< epoch seconds of the UTC midnight `days` days back
+    std::int64_t end_day{0};    ///< epoch seconds of the UTC midnight at or before `now_epoch`
+    std::string since_iso;      ///< `since_day` as an ISO-8601 UTC instant
+};
+
+/// PURE given its inputs: the `days`-day window ending at the UTC midnight at or
+/// before `now_epoch`.
+DexDayWindow dex_day_window(std::int64_t now_epoch, int days);
+
 /// Turns a resolved day count into an ISO-8601 UTC cutoff ("" when days<=0 =
 /// "all") — the day-count half of the shared window vocabulary.
 std::string dex_iso_since(int days);

@@ -40,7 +40,6 @@
 #include "dex_window.hpp"
 #include "test_verify_api_double.hpp" // CohortRead, AppPerfCohortFn (Providers::cohort)
 
-#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -150,16 +149,14 @@ public:
         auto points = app_fleet_trend(app, version);
         if (!points)
             return std::nullopt;
-        bool capped = false;
-        const auto versions = yuzu::server::app_perf_newest_versions(*points, capped);
-        const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                                     std::chrono::system_clock::now().time_since_epoch())
-                                     .count();
-        const std::int64_t today = (now / 86400) * 86400;
-        const std::int64_t since_day =
-            today - static_cast<std::int64_t>(providers_.failure_window_days) * 86400;
+        const auto sel = yuzu::server::app_perf_newest_versions(*points);
+        const auto cut = yuzu::server::dex_day_window(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count(),
+            providers_.failure_window_days);
         auto failures =
-            providers_.failures(app, versions, since_day, today, yuzu::server::dex_iso_at(since_day));
+            providers_.failures(app, sel.versions, cut.since_day, cut.end_day, cut.since_iso);
         if (!failures)
             return std::nullopt;
         return yuzu::server::app_perf_version_failure_join(std::move(*points), *failures,

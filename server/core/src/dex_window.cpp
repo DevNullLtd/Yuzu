@@ -43,6 +43,14 @@ std::string dex_iso_at(std::int64_t epoch_seconds) {
     return buf;
 }
 
+DexDayWindow dex_day_window(std::int64_t now_epoch, int days) {
+    DexDayWindow w;
+    w.end_day = (now_epoch / 86400) * 86400;
+    w.since_day = w.end_day - static_cast<std::int64_t>(days) * 86400;
+    w.since_iso = dex_iso_at(w.since_day);
+    return w;
+}
+
 std::string dex_iso_since(int days) {
     if (days <= 0)
         return {};

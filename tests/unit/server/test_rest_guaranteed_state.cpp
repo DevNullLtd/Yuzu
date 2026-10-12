@@ -3344,6 +3344,15 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         CHECK(j["data"]["stat_failures"] == 0);
     }
     SECTION("two versions: points unchanged, versions[] joined with the failure rows") {
+        // The exact pre-change bytes of app, version and points[] for the fixture below.
+        const std::string kGoldenPrefix =
+            R"("app":"chrome.exe","version":"","points":[)"
+            R"({"version":"124.0.0.0","day":1700000000,"device_count":12,"suppressed":false,)"
+            R"("cpu_mean":5.00,"cpu_max":9.00,"cpu_p50":null,"cpu_p95":null,"ws_mean":100,)"
+            R"("ws_max":200,"ws_p50":null,"ws_p95":null,"hist_stale":false},)"
+            R"({"version":"125.0.0.0","day":1700000000,"device_count":15,"suppressed":false,)"
+            R"("cpu_mean":5.00,"cpu_max":9.00,"cpu_p50":null,"cpu_p95":null,"ws_mean":100,)"
+            R"("ws_max":200,"ws_p50":null,"ws_p95":null,"hist_stale":false}])";
         RestGsHarness h;
         auto mk = [](const char* v, std::int64_t devices) {
             yuzu::server::AppPerfFleetRow r;
@@ -3377,12 +3386,22 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         f125.affected_devices = 14;
         f125.exposed_crashes = 10;
         f125.exposed_hangs = 2;
+        f125.exposed_affected_devices = 14; // every affected device is exposed: both totals shown
         h.failure_rows_ = {f124, f125};
         auto res = h.sink.Get("/api/v1/dex/perf/app?app=chrome.exe");
         REQUIRE(res);
         CHECK(res->status == 200);
         auto j = nlohmann::json::parse(res->body);
         // points[] keeps its existing shape and its two-decimal means.
+        // The bytes ahead of versions[] are the unchanged fleet-trend body: app, version
+        // and the points, with two-decimal means.
+        {
+            const auto from = res->body.find("\"app\":");
+            const auto to = res->body.find(",\"versions\":");
+            REQUIRE(from != std::string::npos);
+            REQUIRE(to != std::string::npos);
+            CHECK(res->body.substr(from, to - from) == kGoldenPrefix);
+        }
         REQUIRE(j["data"]["points"].size() == 2);
         CHECK(j["data"]["points"][0]["version"].get<std::string>() == "124.0.0.0");
         CHECK(j["data"]["points"][0]["device_count"] == 12);
@@ -3391,6 +3410,7 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         const auto& v125 = j["data"]["versions"][0];
         CHECK(v125["version"].get<std::string>() == "125.0.0.0");
         CHECK(v125["previous_version"].get<std::string>() == "124.0.0.0");
+        CHECK(v125["below_floor"] == false);
         CHECK(v125["crashes"] == 10);
         CHECK(v125["exposure_devices"] == 15);
         CHECK(v125["failure_rate"]["estimate"].get<double>() == Catch::Approx(0.8));

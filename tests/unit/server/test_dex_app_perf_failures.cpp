@@ -11,6 +11,7 @@
  *   12/15 against 5/12 as a ratio    -> 1.92,      95% [0.6296367, 6.9567849]
  */
 #include "dex_app_perf_pure.hpp"
+#include "dex_window.hpp"
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -40,7 +41,8 @@ AppPerfTrendPoint point(const std::string& version, std::int64_t day, std::int64
 
 AppPerfVersionFailureRow fail_row(const std::string& version, std::optional<std::int64_t> exposure,
                                   std::int64_t crashes, std::int64_t hangs, std::int64_t affected,
-                                  std::int64_t exp_crashes, std::int64_t exp_hangs) {
+                                  std::int64_t exp_crashes, std::int64_t exp_hangs,
+                                  std::int64_t exp_affected = 0) {
     AppPerfVersionFailureRow r;
     r.version = version;
     r.exposure_devices = exposure;
@@ -49,6 +51,7 @@ AppPerfVersionFailureRow fail_row(const std::string& version, std::optional<std:
     r.affected_devices = affected;
     r.exposed_crashes = exp_crashes;
     r.exposed_hangs = exp_hangs;
+    r.exposed_affected_devices = exp_affected;
     return r;
 }
 
@@ -59,9 +62,8 @@ const AppPerfVersionRow* row_of(const AppPerfFleetReport& rep, const std::string
     return nullptr;
 }
 
-// Two versions, both with exposure above the floor.
-//   2.0.0.0: 8 fleet events (5 crashes 3 hangs) over 8 devices, 12 exposed events
-//            ... see the population case for why fleet and exposed differ.
+// Two versions of trend points: 1.0.0.0 on day 100, 2.0.0.0 on days 100 and 101;
+// each case supplies its own failure rows.
 std::vector<AppPerfTrendPoint> two_version_points() {
     return {point("1.0.0.0", 100), point("2.0.0.0", 100), point("2.0.0.0", 101)};
 }
@@ -84,14 +86,14 @@ TEST_CASE("app_perf_canon_version_less orders numerically group by group", "[dex
     CHECK_FALSE(app_perf_canon_version_less("", ""));
 }
 
-TEST_CASE("version join: the rate counts exposed events, the breadth counts every event",
+TEST_CASE("version join: the rate counts exposed events and the breadth counts every event",
           "[dex][app_perf]") {
     // 2.0.0.0: 20 fleet events over 14 devices (breadth) but only 12 of them (10 crashes
     // + 2 hangs) on the 15 exposed devices. 1.0.0.0: 8 fleet events, 5 on its 12 exposed
     // devices (4 crashes + 1 hang).
     const std::vector<AppPerfVersionFailureRow> fails{
         fail_row("1.0.0.0", 12, 7, 1, 5, 4, 1),
-        fail_row("2.0.0.0", 15, 17, 3, 14, 10, 2),
+        fail_row("2.0.0.0", 15, 17, 3, 14, 10, 2, 4), // remainder 10: shown
     };
     const auto rep = app_perf_version_failure_join(two_version_points(), fails, 30);
     REQUIRE(rep.versions.size() == 2);
@@ -163,6 +165,51 @@ TEST_CASE("version join: the breadth and exposure cohorts are floored independen
         CHECK(r.crashes == 4);
         CHECK(r.hangs == 6);
     }
+    SECTION("a remainder of 1 to 9 unexposed affected devices withholds the totals") {
+        // 20 affected devices, `rem` of them outside the exposure cohort: showing
+        // crashes beside exposed_crashes would let a reader subtract those events.
+        for (const std::int64_t rem : {1, 5, 9}) {
+            CAPTURE(rem);
+            const auto rep = app_perf_version_failure_join(
+                {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", 15, 30, 4, 20, 10, 2, 20 - rem)}, 30);
+            const auto& r = rep.versions.at(0);
+            CHECK(r.below_floor);
+            CHECK(r.affected_devices == 20);
+            CHECK_FALSE(r.crashes);
+            CHECK_FALSE(r.hangs);
+            // The exposure cohort stands on its own devices, so its figures stay.
+            CHECK(r.exposed_crashes == 10);
+            CHECK(r.exposed_hangs == 2);
+            REQUIRE(r.failure_rate);
+            CHECK(rep.stat_failures == 0);
+        }
+    }
+    SECTION("an empty remainder or one at the floor shows the totals") {
+        for (const std::int64_t rem : {0, 10, 11}) {
+            CAPTURE(rem);
+            const auto rep = app_perf_version_failure_join(
+                {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", 15, 30, 4, 20, 10, 2, 20 - rem)}, 30);
+            const auto& r = rep.versions.at(0);
+            CHECK_FALSE(r.below_floor);
+            CHECK(r.crashes == 30);
+            CHECK(r.hangs == 4);
+            CHECK(r.exposed_crashes == 10);
+            REQUIRE(r.failure_rate);
+        }
+    }
+    SECTION("the remainder is not read off figures that are withheld") {
+        // Exposure under the floor: nothing exposed is shown to subtract from.
+        const auto under = app_perf_version_failure_join(
+            {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", 9, 30, 4, 20, 10, 2, 15)}, 30);
+        CHECK_FALSE(under.versions.at(0).below_floor);
+        CHECK(under.versions.at(0).crashes == 30);
+        CHECK_FALSE(under.versions.at(0).exposed_crashes);
+        // Exposure unknown: same.
+        const auto unknown = app_perf_version_failure_join(
+            {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", std::nullopt, 30, 4, 20, 0, 0, 0)}, 30);
+        CHECK_FALSE(unknown.versions.at(0).below_floor);
+        CHECK(unknown.versions.at(0).crashes == 30);
+    }
     SECTION("exposure under the floor withholds the exposed figures, rate and ratio") {
         const auto rep = app_perf_version_failure_join(
             two_version_points(),
@@ -192,7 +239,7 @@ TEST_CASE("version join: the breadth and exposure cohorts are floored independen
     }
 }
 
-TEST_CASE("version join: unknown exposure is null, never zero", "[dex][app_perf]") {
+TEST_CASE("version join: unknown exposure is null and never zero", "[dex][app_perf]") {
     const auto rep = app_perf_version_failure_join(
         two_version_points(),
         {fail_row("1.0.0.0", 12, 7, 1, 5, 0, 0), fail_row("2.0.0.0", std::nullopt, 17, 3, 15, 0, 0)},
@@ -253,6 +300,30 @@ TEST_CASE("version join: a previous version with no exposed events gives an unbo
     CHECK(rep.stat_failures == 0);
 }
 
+TEST_CASE("version join: a corrupt count the join cannot pre-screen is counted", "[dex][app_perf]") {
+    // A negative store count is outside every documented precondition, so the
+    // statistic comes back empty with the cohort above the floor: that is a
+    // computation failure, not a refusal, and the consumer duty is to count it.
+    SECTION("a rate that returns nothing") {
+        const auto rep = app_perf_version_failure_join(
+            {point("2.0.0.0", 100)}, {fail_row("2.0.0.0", 15, 0, 0, 0, -1, 0)}, 30);
+        const auto& r = rep.versions.at(0);
+        CHECK_FALSE(r.exposure_below_floor);
+        CHECK_FALSE(r.failure_rate);
+        CHECK(rep.stat_failures == 1);
+    }
+    SECTION("a ratio that returns nothing") {
+        // The corrupt newer row fails its own rate and the ratio against 1.0.0.0.
+        const auto rep = app_perf_version_failure_join(
+            two_version_points(),
+            {fail_row("1.0.0.0", 15, 1, 0, 1, 1, 0), fail_row("2.0.0.0", 15, 0, 0, 0, -1, 0)}, 30);
+        CHECK_FALSE(rep.versions.at(0).failure_rate);
+        CHECK_FALSE(rep.versions.at(0).failure_rate_ratio);
+        CHECK(rep.versions.at(1).failure_rate);
+        CHECK(rep.stat_failures == 2);
+    }
+}
+
 TEST_CASE("version join: documented refusals are not counted as failures", "[dex][app_perf]") {
     SECTION("both arms zero events") {
         const auto rep = app_perf_version_failure_join(
@@ -296,10 +367,10 @@ TEST_CASE("newest versions: the one selection the join and the failure read shar
     for (int i = 1; i <= 21; ++i)
         pts.push_back(point(std::to_string(i) + ".0.0.0", 100)); // inserted oldest first
     pts.push_back(point("21.0.0.0", 101));                       // a repeat never duplicates
-    bool truncated = false;
-    const auto keep = app_perf_newest_versions(pts, truncated);
+    const auto sel = app_perf_newest_versions(pts);
+    const auto& keep = sel.versions;
     REQUIRE(keep.size() == kAppPerfVersionJoinCap);
-    CHECK(truncated);
+    CHECK(sel.truncated);
     CHECK(keep.front() == "21.0.0.0");
     CHECK(keep.back() == "2.0.0.0");
     CHECK(std::find(keep.begin(), keep.end(), "1.0.0.0") == keep.end());
@@ -309,16 +380,16 @@ TEST_CASE("newest versions: the one selection the join and the failure read shar
     REQUIRE(rep.versions.size() == keep.size());
     for (std::size_t i = 0; i < keep.size(); ++i)
         CHECK(rep.versions[i].perf.version == keep[i]);
-    CHECK(rep.versions_truncated == truncated);
+    CHECK(rep.versions_truncated == sel.truncated);
 }
 
 TEST_CASE("newest versions: exactly 20 distinct versions are not truncated", "[dex][app_perf]") {
     std::vector<AppPerfTrendPoint> pts;
     for (int i = 1; i <= 20; ++i)
         pts.push_back(point(std::to_string(i) + ".0.0.0", 100));
-    bool truncated = true;
-    CHECK(app_perf_newest_versions(pts, truncated).size() == 20);
-    CHECK_FALSE(truncated);
+    const auto sel = app_perf_newest_versions(pts);
+    CHECK(sel.versions.size() == 20);
+    CHECK_FALSE(sel.truncated);
 }
 
 TEST_CASE("version join: exactly 20 versions are not truncated", "[dex][app_perf]") {
@@ -402,4 +473,17 @@ TEST_CASE("versions json: a small rate is never rounded to two decimals", "[dex]
 
 TEST_CASE("versions json: an empty report is an empty array", "[dex][app_perf]") {
     CHECK(dex_app_perf_versions_json(AppPerfFleetReport{}) == "[]");
+}
+
+TEST_CASE("day window: whole UTC days ending at the current midnight", "[dex][app_perf]") {
+    // 2023-11-15T00:00:00Z is 1'700'006'400; a mid-day instant still floors to it.
+    constexpr std::int64_t kMidnight = 1'700'006'400;
+    const auto w7 = dex_day_window(kMidnight + 12'345, 7);
+    CHECK(w7.end_day == kMidnight);
+    CHECK(w7.since_day == 1'699'401'600);
+    CHECK(w7.since_iso == "2023-11-08T00:00:00Z");
+    const auto w30 = dex_day_window(kMidnight, 30);
+    CHECK(w30.end_day == kMidnight);
+    CHECK(w30.since_day == 1'697'414'400);
+    CHECK(w30.since_iso == "2023-10-16T00:00:00Z");
 }

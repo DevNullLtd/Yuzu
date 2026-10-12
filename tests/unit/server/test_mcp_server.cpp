@@ -9302,10 +9302,13 @@ yuzu::server::DexPerfSnapshot mcp_perf_snapshot(const std::string& key) {
     return snap;
 }
 /// The MCP result rides as JSON text inside result.content[0].text.
-nlohmann::json mcp_tool_payload(const std::string& body) {
+std::string mcp_tool_text(const std::string& body) {
     auto j = nlohmann::json::parse(body);
     REQUIRE(j.contains("result"));
-    return nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+    return j["result"]["content"][0]["text"].get<std::string>();
+}
+nlohmann::json mcp_tool_payload(const std::string& body) {
+    return nlohmann::json::parse(mcp_tool_text(body));
 }
 } // namespace
 
@@ -9768,6 +9771,7 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
     failure_row.affected_devices = 12;
     failure_row.exposed_crashes = 6;
     failure_row.exposed_hangs = 3;
+    failure_row.exposed_affected_devices = 12;
     ts.app_perf_providers_for_test.failures =
         [failure_row](std::string_view, const std::vector<std::string>&, std::int64_t,
                       std::int64_t, std::string_view)
@@ -9793,10 +9797,24 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
     REQUIRE(apps["apps"].size() == 1);
     CHECK(apps["apps"][0]["app_name"] == "chrome.exe");
 
-    auto fleet = mcp_tool_payload(
+    const std::string fleet_text = mcp_tool_text(
         ts.call(
               R"({"jsonrpc":"2.0","method":"tools/call","id":81,"params":{"name":"get_dex_app_perf","arguments":{"app":"chrome.exe"}}})")
             ->body);
+    auto fleet = nlohmann::json::parse(fleet_text);
+    // The bytes ahead of versions[] are the unchanged fleet-trend body (the same point
+    // layout REST serialises, two-decimal means included).
+    {
+        const auto from = fleet_text.find("\"app\":");
+        const auto to = fleet_text.find(",\"versions\":");
+        REQUIRE(from != std::string::npos);
+        REQUIRE(to != std::string::npos);
+        CHECK(fleet_text.substr(from, to - from) ==
+              R"("app":"chrome.exe","version":"","points":[)"
+              R"({"version":"124.0","day":1700000000,"device_count":20,"suppressed":false,)"
+              R"("cpu_mean":5.00,"cpu_max":9.00,"cpu_p50":null,"cpu_p95":null,"ws_mean":100,)"
+              R"("ws_max":200,"ws_p50":null,"ws_p95":null,"hist_stale":false}])");
+    }
     CHECK(fleet["app"] == "chrome.exe");
     REQUIRE(fleet["points"].size() == 1);
     CHECK(fleet["points"][0]["version"] == "124.0");
@@ -10220,6 +10238,39 @@ TEST_CASE("MCP app-perf: unavailable provider + missing arg degrade",
                 ->body);
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams); // missing 'app'
+    }
+    {
+        // The trend reads fine but the failure read degrades: the whole call is an
+        // internal error, never a result with an empty versions[].
+        McpTestServer ts;
+        ts.app_perf_providers_for_test.fleet =
+            [](std::string_view, std::string_view)
+            -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+            yuzu::server::AppPerfFleetRow r;
+            r.app_name = "chrome.exe";
+            r.version = "124.0";
+            r.day = 1'700'000'000;
+            r.device_count = 20; // >= kDexCohortFloor
+            r.cpu_sum = 100.0;
+            r.hist_version = yuzu::server::kAppPerfHistVersion;
+            r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+            r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+            return std::vector<yuzu::server::AppPerfFleetRow>{r};
+        };
+        ts.app_perf_providers_for_test.failures =
+            [](std::string_view, const std::vector<std::string>&, std::int64_t, std::int64_t,
+               std::string_view)
+            -> std::optional<std::vector<yuzu::server::AppPerfVersionFailureRow>> {
+            return std::nullopt;
+        };
+        ts.start("readonly");
+        auto body = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":86,"params":{"name":"get_dex_app_perf","arguments":{"app":"chrome.exe"}}})")
+                ->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK_FALSE(body.contains("result"));
     }
 }
 

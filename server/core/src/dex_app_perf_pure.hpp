@@ -132,6 +132,14 @@ app_perf_version_summaries(const std::vector<AppPerfTrendPoint>& points);
 //     always carried. Zero affected devices singles out nobody, so 0 and 0 are
 //     shown. These are labelled breadth: they cover every reporting device, not
 //     only the sampled ones.
+//   - The REMAINDER: `crashes` is a total and `exposed_crashes` a part of it, so
+//     when both are shown their difference is the events of the affected devices
+//     that are not exposed. If those devices number 1 to `kDexCohortFloor` - 1 the
+//     difference would single them out, so the TOTAL (`crashes`/`hangs`) is
+//     withheld, exactly as for a sub-floor breadth cohort (`below_floor` covers
+//     both causes). The exposed figures and the rate stay: they describe the
+//     exposure cohort. An empty remainder (every affected device is exposed)
+//     singles out nobody and is shown.
 //   - EXPOSURE cohort = `exposure_devices`: devices with retained
 //     resource-significant samples for the version in the window (a selected
 //     subset, not a census). Unknown (no sample rows) is carried as null and is
@@ -150,9 +158,16 @@ inline constexpr int kAppPerfFailureWindowDays = 30;
 /// dropped and `versions_truncated` is set.
 inline constexpr std::size_t kAppPerfVersionJoinCap = 20;
 
+/// What the exposure denominator counts, echoed as `exposure_basis` on both
+/// transports so the label has one spelling.
+inline constexpr std::string_view kAppPerfExposureBasis = "resource_significant";
+
 /// One version's crash and hang counts as the store read returns them. The
 /// `exposed_*` counts are the events on devices that also have exposure rows;
 /// `exposure_devices` is nullopt when the version has no exposure rows at all.
+/// `exposed_affected_devices` (the affected devices that are also exposed) is a
+/// join input only and is never serialised: `affected_devices` minus it is the
+/// remainder the join floors.
 struct AppPerfVersionFailureRow {
     std::string version;
     std::optional<std::int64_t> exposure_devices;
@@ -161,6 +176,7 @@ struct AppPerfVersionFailureRow {
     std::int64_t affected_devices{0};
     std::int64_t exposed_crashes{0};
     std::int64_t exposed_hangs{0};
+    std::int64_t exposed_affected_devices{0};
 };
 
 /// One version row of the report: the performance summary plus the floored
@@ -168,7 +184,9 @@ struct AppPerfVersionFailureRow {
 struct AppPerfVersionRow {
     AppPerfVersionSummary perf;
     std::int64_t affected_devices{0};
-    bool below_floor{false}; ///< breadth cohort under the floor: crashes/hangs withheld
+    /// crashes/hangs withheld: the breadth cohort is under the floor, or the
+    /// affected devices outside the exposure cohort are (the remainder).
+    bool below_floor{false};
     std::optional<std::int64_t> crashes;
     std::optional<std::int64_t> hangs;
     std::optional<std::int64_t> exposure_devices; ///< nullopt = exposure unknown
@@ -194,14 +212,19 @@ struct AppPerfFleetReport {
 /// every other version.
 [[nodiscard]] bool app_perf_canon_version_less(std::string_view a, std::string_view b);
 
+/// The versions a report covers: see `app_perf_newest_versions`.
+struct AppPerfNewestVersions {
+    std::vector<std::string> versions;
+    bool truncated{false}; ///< more distinct versions existed than the cap
+};
+
 /// PURE: the distinct versions of `points`, newest first by canonical version
 /// (the string breaks numeric ties, so the order never depends on input order),
-/// capped at `kAppPerfVersionJoinCap`. `truncated` is set when more distinct
-/// versions existed than the cap. The ONE selection: the join keeps exactly these
-/// rows and the failure read is asked for exactly these versions, so a version
-/// dropped from the report is never counted.
-[[nodiscard]] std::vector<std::string>
-app_perf_newest_versions(const std::vector<AppPerfTrendPoint>& points, bool& truncated);
+/// capped at `kAppPerfVersionJoinCap`. The ONE selection: the join keeps exactly
+/// these rows and the failure read is asked for exactly these versions, so a
+/// version dropped from the report is never counted.
+[[nodiscard]] AppPerfNewestVersions
+app_perf_newest_versions(const std::vector<AppPerfTrendPoint>& points);
 
 /// PURE: build the report from the trend points and the failure rows. Versions
 /// are ordered newest first by canonical version and capped at

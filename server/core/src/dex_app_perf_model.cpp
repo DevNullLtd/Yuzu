@@ -373,8 +373,8 @@ std::int64_t next_group(std::string_view& rest) {
     for (const char c : grp) {
         if (c < '0' || c > '9')
             break;
-        if (v > (std::numeric_limits<std::int64_t>::max() - 9) / 10)
-            return std::numeric_limits<std::int64_t>::max();
+        if (v > ((std::numeric_limits<std::int64_t>::max)() - 9) / 10)
+            return (std::numeric_limits<std::int64_t>::max)();
         v = v * 10 + (c - '0');
     }
     return v;
@@ -408,9 +408,9 @@ bool app_perf_canon_version_less(std::string_view a, std::string_view b) {
     return false;
 }
 
-std::vector<std::string> app_perf_newest_versions(const std::vector<AppPerfTrendPoint>& points,
-                                                  bool& truncated) {
-    std::vector<std::string> versions;
+AppPerfNewestVersions app_perf_newest_versions(const std::vector<AppPerfTrendPoint>& points) {
+    AppPerfNewestVersions sel;
+    auto& versions = sel.versions;
     versions.reserve(points.size());
     for (const auto& p : points)
         versions.push_back(p.version);
@@ -424,10 +424,10 @@ std::vector<std::string> app_perf_newest_versions(const std::vector<AppPerfTrend
         return x < y;
     });
     versions.erase(std::unique(versions.begin(), versions.end()), versions.end());
-    truncated = versions.size() > kAppPerfVersionJoinCap;
-    if (truncated)
+    sel.truncated = versions.size() > kAppPerfVersionJoinCap;
+    if (sel.truncated)
         versions.resize(kAppPerfVersionJoinCap);
-    return versions;
+    return sel;
 }
 
 AppPerfFleetReport app_perf_version_failure_join(std::vector<AppPerfTrendPoint> points,
@@ -438,7 +438,9 @@ AppPerfFleetReport app_perf_version_failure_join(std::vector<AppPerfTrendPoint> 
 
     auto summaries = app_perf_version_summaries(points);
     // Rows are emitted in the shared selection's order (newest first, capped).
-    const auto keep = app_perf_newest_versions(points, rep.versions_truncated);
+    const auto sel = app_perf_newest_versions(points);
+    const auto& keep = sel.versions;
+    rep.versions_truncated = sel.truncated;
     std::map<std::string, std::size_t> summary_index; // tree: agent-controlled keys
     for (std::size_t i = 0; i < summaries.size(); ++i)
         summary_index.emplace(summaries[i].version, i);
@@ -468,13 +470,11 @@ AppPerfFleetReport app_perf_version_failure_join(std::vector<AppPerfTrendPoint> 
             f = *it->second;
 
         row.affected_devices = f.affected_devices;
-        row.below_floor = f.affected_devices > 0 && f.affected_devices < kDexCohortFloor;
-        if (!row.below_floor) {
-            row.crashes = f.crashes;
-            row.hangs = f.hangs;
-        }
 
+        // Exposure cohort first: whether its figures are shown decides whether the
+        // remainder below can be read off them.
         row.exposure_devices = f.exposure_devices;
+        bool exposed_shown = false;
         if (f.exposure_devices) {
             exposed_events[i] = f.exposed_crashes + f.exposed_hangs;
             const auto fr = dex_floored_rate(exposed_events[i],
@@ -482,12 +482,26 @@ AppPerfFleetReport app_perf_version_failure_join(std::vector<AppPerfTrendPoint> 
                                              *f.exposure_devices);
             row.exposure_below_floor = fr.below_floor;
             if (!fr.below_floor) {
+                exposed_shown = true;
                 row.exposed_crashes = f.exposed_crashes;
                 row.exposed_hangs = f.exposed_hangs;
                 row.failure_rate = fr.stats;
                 if (!fr.stats)
-                    ++rep.stat_failures; // valid input, no statistic
+                    ++rep.stat_failures; // no statistic on a count the join could not pre-screen
+                                         // (a corrupt row) or a kernel failure
             }
+        }
+
+        // The totals are withheld when either the affected devices or, with the
+        // exposed part shown beside them, the affected devices outside the exposure
+        // cohort number between one and the floor minus one: crashes minus
+        // exposed_crashes would otherwise single them out.
+        const std::int64_t remainder = f.affected_devices - f.exposed_affected_devices;
+        row.below_floor = (f.affected_devices > 0 && f.affected_devices < kDexCohortFloor) ||
+                          (exposed_shown && remainder > 0 && remainder < kDexCohortFloor);
+        if (!row.below_floor) {
+            row.crashes = f.crashes;
+            row.hangs = f.hangs;
         }
         rep.versions.push_back(std::move(row));
     }

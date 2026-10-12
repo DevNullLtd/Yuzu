@@ -43,7 +43,9 @@
 #include "dex_window.hpp"
 #include "guaranteed_state_store.hpp"
 #include "management_group_store.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "tag_store.hpp"
 
 #include "../test_helpers.hpp"
@@ -55,6 +57,7 @@
 #include <string>
 #include <vector>
 
+#include <libpq-fe.h>
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -468,8 +471,10 @@ std::string aid(int i) { return std::string("a") + (i < 10 ? "0" : "") + std::to
 //   124: 4 crashes + 1 hang on exposed a01..a03, PLUS 3 crashes on x01/x02 which have
 //        no B1 rows                                              (5 affected)
 // plus a decoy subject and a version outside the requested list, neither of which may count.
-void seed_two_version_fixture(AppPerfDailyStore& b1, GuaranteedStateStore& gss) {
-    const std::int64_t today = today_utc();
+// `today` is the caller's one reading of the UTC midnight, so a seed, a window cut
+// and a rollup can never straddle a midnight between two clock reads.
+void seed_two_version_fixture(AppPerfDailyStore& b1, GuaranteedStateStore& gss,
+                              std::int64_t today) {
     const std::int64_t day = today - 86400;
     const std::int64_t at = today - 2 * 86400;
     for (int i = 1; i <= 15; ++i)
@@ -521,10 +526,10 @@ TEST_CASE("DexAppVersionFailuresOwner counts exposed and unexposed events per ve
     GuaranteedStateStore gss{pool};
     REQUIRE(b1.is_open());
     REQUIRE(gss.is_open());
-    seed_two_version_fixture(b1, gss);
+    const std::int64_t today = today_utc();
+    seed_two_version_fixture(b1, gss, today);
 
     DexAppVersionFailuresOwner owner{pool, 0};
-    const std::int64_t today = today_utc();
     const std::int64_t since_day = today - 30 * 86400;
     auto rows = owner.read("chrome.exe", {"124.0.0.0", "125.0.0.0"}, since_day, today,
                            yuzu::server::dex_iso_at(since_day));
@@ -539,6 +544,7 @@ TEST_CASE("DexAppVersionFailuresOwner counts exposed and unexposed events per ve
     CHECK(v125->affected_devices == 7);
     CHECK(v125->exposed_crashes == 10);
     CHECK(v125->exposed_hangs == 2);
+    CHECK(v125->exposed_affected_devices == 7); // every affected device is exposed
 
     const auto* v124 = find_row(*rows, "124.0.0.0");
     REQUIRE(v124);
@@ -548,6 +554,7 @@ TEST_CASE("DexAppVersionFailuresOwner counts exposed and unexposed events per ve
     CHECK(v124->affected_devices == 5);
     CHECK(v124->exposed_crashes == 4); // only the exposed devices feed the rate
     CHECK(v124->exposed_hangs == 1);
+    CHECK(v124->exposed_affected_devices == 3); // x01 and x02 are affected but not exposed
 
     // A version list that names only one version returns only that one.
     auto only = owner.read("chrome.exe", {"125.0.0.0"}, since_day, today,
@@ -596,6 +603,7 @@ TEST_CASE("DexAppVersionFailuresOwner cuts events and exposure at the same windo
     CHECK_FALSE(ghost->front().exposure_devices.has_value());
     CHECK(ghost->front().hangs == 1);
     CHECK(ghost->front().exposed_hangs == 0);
+    CHECK(ghost->front().exposed_affected_devices == 0);
 
     // Exposure with no events still reports the version, with zero events.
     seed_b1(b1, "quiet-1", "app.exe", "2.0.0.0", today - 86400, 3.0, 1000);
@@ -640,6 +648,97 @@ TEST_CASE("DexAppVersionFailuresOwner degrades to nullopt on an unreachable pool
                     .has_value());
 }
 
+TEST_CASE("DexAppVersionFailuresOwner degrades when no connection can be had",
+          "[pg][dex_perf_api]") {
+    // A saturated pool clamps the owner's bounded acquire to the pool's fast-fail
+    // (pg_pool.hpp, Options::saturated_fast_fail), so the outcome is fixed while the
+    // test holds the only lease: no sleep, no elapsed-time assertion.
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    DexAppVersionFailuresOwner owner{pool, 0};
+    const std::int64_t today = today_utc();
+    const std::string iso = yuzu::server::dex_iso_at(today - 86400);
+
+    {
+        auto held = pool.try_acquire_for(std::chrono::seconds(5));
+        REQUIRE(held);
+        CHECK_FALSE(owner.read("app.exe", {"1.0.0.0"}, today - 86400, today, iso).has_value());
+    }
+    // Lease returned: the same read is engaged again (empty, nothing seeded).
+    auto after = owner.read("app.exe", {"1.0.0.0"}, today - 86400, today, iso);
+    REQUIRE(after.has_value());
+    CHECK(after->empty());
+}
+
+TEST_CASE("DexAppVersionFailuresOwner degrades when the statement is blocked",
+          "[pg][dex_perf_api]") {
+    // A second connection holds an ACCESS EXCLUSIVE lock on the exposure table and the
+    // pool's lock_timeout is short, so the owner's SELECT fails with a real SQLSTATE
+    // 55P03 (the approval-manager precedent: no sleep, no retry loop). The owner's own
+    // 10 s SET LOCAL statement_timeout is deliberately NOT exercised: proving it fires
+    // costs at least 10 s of wall clock per run, which the unit suites do not spend; it
+    // is the same bounded-transaction idiom AppPerfRollup uses.
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    DexAppVersionFailuresOwner owner{pool, 0};
+    const std::int64_t today = today_utc();
+    const std::string iso = yuzu::server::dex_iso_at(today - 86400);
+
+    yuzu::server::pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(),
+                "LOCK TABLE app_perf_daily_store.app_perf_daily IN ACCESS EXCLUSIVE MODE",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    CHECK_FALSE(owner.read("app.exe", {"1.0.0.0"}, today - 86400, today, iso).has_value());
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    locker.reset();
+    CHECK(owner.read("app.exe", {"1.0.0.0"}, today - 86400, today, iso).has_value());
+}
+
+TEST_CASE("DexPerfApi app_fleet_report() passes the clamped window into the failure read",
+          "[pg][dex_perf_api]") {
+    // Retention 7 clamps the window to 7 days. A device and an event exactly at the cut
+    // count; one a day earlier does not. A window one day wider, one day narrower or left
+    // unclamped at 30 changes the counts below.
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AppPerfDailyStore b1{pool};
+    AppPerfFleetStore b2{pool};
+    AppPerfRollup rollup{pool};
+    GuaranteedStateStore gss{pool};
+    REQUIRE(b1.is_open());
+    REQUIRE(b2.is_open());
+    REQUIRE(gss.is_open());
+
+    const std::int64_t today = today_utc();
+    const std::int64_t since_day = today - 7 * 86400;
+    seed_b1(b1, "at-cut", "app.exe", "1.0.0.0", since_day, 3.0, 1000);
+    seed_obs(gss, "c1", "at-cut", "app.exe", "1.0.0.0", "process.crashed", since_day);
+    seed_b1(b1, "before-cut", "app.exe", "1.0.0.0", since_day - 86400, 3.0, 1000);
+    seed_obs(gss, "c2", "before-cut", "app.exe", "1.0.0.0", "process.crashed", since_day - 86400);
+    REQUIRE(rollup.roll_day(since_day)); // gives the report its one version
+
+    DexAppVersionFailuresOwner owner{pool, 7};
+    auto api = make_local_dex_perf_api({}, &b2, &b1, nullptr, nullptr, nullptr, &owner);
+    auto rep = api->app_fleet_report("app.exe", "");
+    REQUIRE(rep.has_value());
+    CHECK(rep->failure_window_days == 7);
+    REQUIRE(rep->versions.size() == 1);
+    const auto& v = rep->versions[0];
+    CHECK(v.exposure_devices == 1);  // at-cut only
+    CHECK(v.affected_devices == 1);  // the crash at the cut only
+}
+
 TEST_CASE("DexAppVersionFailuresOwner window clamps to the observation retention",
           "[dex_perf_api]") {
     PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
@@ -649,7 +748,7 @@ TEST_CASE("DexAppVersionFailuresOwner window clamps to the observation retention
     CHECK(DexAppVersionFailuresOwner{pool, 90}.failure_window_days() == 30);
 }
 
-TEST_CASE("DexPerfApi app_fleet_report() joins crashes, hangs and exposure per version",
+TEST_CASE("DexPerfApi app_fleet_report() joins crashes and hangs and exposure per version",
           "[pg][dex_perf_api]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -661,8 +760,9 @@ TEST_CASE("DexPerfApi app_fleet_report() joins crashes, hangs and exposure per v
     REQUIRE(b1.is_open());
     REQUIRE(b2.is_open());
     REQUIRE(gss.is_open());
-    seed_two_version_fixture(b1, gss);
-    const std::int64_t day = today_utc() - 86400;
+    const std::int64_t today = today_utc();
+    seed_two_version_fixture(b1, gss, today);
+    const std::int64_t day = today - 86400;
     // A third version on only 3 devices: its performance point is suppressed and its
     // exposure is under the floor.
     for (int i = 1; i <= 3; ++i)

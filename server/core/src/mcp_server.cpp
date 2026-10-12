@@ -1745,8 +1745,9 @@ static const ToolDef kTools[] = {
      "version first, at most 20; versions_truncated=true when older ones were dropped) "
      "joining the last failure_window_days (30, clamped to observation retention) of "
      "crash and hang observations: affected_devices (fleet-wide devices that reported "
-     "a crash or hang) with crashes and hangs, both withheld when 0 < affected_devices "
-     "< 10 (below_floor=true); exposure_devices (devices with retained "
+     "a crash or hang) with crashes and hangs, both withheld (below_floor=true) when 0 < "
+     "affected_devices < 10, or when the exposed figures are shown and the affected "
+     "devices they do not cover number 1 to 9; exposure_devices (devices with retained "
      "resource-significant samples, a selected subset and not a census; null when "
      "unknown); and, when exposure_devices >= 10, exposed_crashes and exposed_hangs, "
      "failure_rate (exposed events per exposed device with an exact 95 percent "
@@ -16168,7 +16169,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .add("versions_truncated", report->versions_truncated)
                                   .add("failure_window_days",
                                        std::int64_t{report->failure_window_days})
-                                  .add("exposure_basis", "resource_significant")
+                                  .add("exposure_basis", std::string(kAppPerfExposureBasis))
                                   .add("stat_failures", std::int64_t{report->stat_failures})
                                   .str();
                 } else if (tool_name == "get_dex_group_app_perf") {

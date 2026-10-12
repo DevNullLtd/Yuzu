@@ -28,6 +28,8 @@ constexpr const char* kStatementTimeout = "10s";
 // FULL OUTER JOIN keeps a version that has only one side; exposure_devices is
 // NULL (unknown, never zero) when a version has no exposure rows. The version
 // list is bounded by the caller's ANY() list, so LIMIT is a depth guard only.
+// exposed_affected_devices is the part of affected_devices that is also exposed;
+// the join subtracts it to floor the remainder (it is never serialised).
 constexpr const char* kReadSql =
     "WITH exp AS ("
     " SELECT version, agent_id FROM app_perf_daily_store.app_perf_daily"
@@ -47,11 +49,13 @@ constexpr const char* kReadSql =
     "  COUNT(*) FILTER (WHERE obs_type = 'process.hung') AS hangs,"
     "  COUNT(DISTINCT agent_id) AS affected_devices,"
     "  COUNT(*) FILTER (WHERE obs_type = 'process.crashed' AND exposed) AS exposed_crashes,"
-    "  COUNT(*) FILTER (WHERE obs_type = 'process.hung' AND exposed) AS exposed_hangs"
+    "  COUNT(*) FILTER (WHERE obs_type = 'process.hung' AND exposed) AS exposed_hangs,"
+    "  COUNT(DISTINCT agent_id) FILTER (WHERE exposed) AS exposed_affected_devices"
     " FROM obs GROUP BY version) "
     "SELECT COALESCE(ex.version, fo.version), ex.exposure_devices,"
     " COALESCE(fo.crashes, 0), COALESCE(fo.hangs, 0), COALESCE(fo.affected_devices, 0),"
-    " COALESCE(fo.exposed_crashes, 0), COALESCE(fo.exposed_hangs, 0)"
+    " COALESCE(fo.exposed_crashes, 0), COALESCE(fo.exposed_hangs, 0),"
+    " COALESCE(fo.exposed_affected_devices, 0)"
     " FROM ex FULL OUTER JOIN fo ON ex.version = fo.version"
     " ORDER BY 1 LIMIT $6::bigint";
 
@@ -66,7 +70,7 @@ DexAppVersionFailuresOwner::DexAppVersionFailuresOwner(pg::PgPool& pool, int ret
     : pool_(pool), retention_days_(retention_days) {}
 
 int DexAppVersionFailuresOwner::failure_window_days() const {
-    return retention_days_ > 0 ? std::min(kAppPerfFailureWindowDays, retention_days_)
+    return retention_days_ > 0 ? (std::min)(kAppPerfFailureWindowDays, retention_days_)
                                : kAppPerfFailureWindowDays;
 }
 
@@ -110,6 +114,7 @@ DexAppVersionFailuresOwner::read(std::string_view app, const std::vector<std::st
             row.affected_devices = col_i64(r.get(), i, 4);
             row.exposed_crashes = col_i64(r.get(), i, 5);
             row.exposed_hangs = col_i64(r.get(), i, 6);
+            row.exposed_affected_devices = col_i64(r.get(), i, 7);
             rows.push_back(std::move(row));
         }
         out = std::move(rows);

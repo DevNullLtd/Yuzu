@@ -382,7 +382,10 @@ does (agentic-first parity):
 - **`GET /api/v1/dex/perf/apps`** — the application-performance-over-time picker
   (apps with retained fleet data; `{app_name, versions, last_day}`).
 - **`GET /api/v1/dex/perf/app?app=&version=`** — the fleet trend for one app, one
-  point per `(version, day)` over the retained B2 window (≤180 days).
+  point per `(version, day)` over the retained B2 window (≤180 days), plus a
+  per-version `versions[]` join of crash and hang counts, exposure and the
+  exposed-device failure rate and rate ratio (see the REST reference for the two
+  cohort floors).
 - **`GET /api/v1/dex/perf/app/devices?app=&version=`** — the version-row "which
   devices" drill: devices reporting one EXACT `(app, version)` among their
   retained top-N daily summaries (B1, ≤31 days), one row per device (`agent_id`,
