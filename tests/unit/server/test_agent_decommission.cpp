@@ -402,7 +402,9 @@ void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
 }
 
 bool presence_row_exists(yuzu::server::OfflineEndpointStore& presence, const std::string& id) {
-    for (const auto& e : presence.query_stale_within(std::chrono::hours(24 * 365)))
+    auto stale = presence.query_stale_within(std::chrono::hours(24 * 365));
+    REQUIRE(stale.has_value());
+    for (const auto& e : *stale)
         if (e.agent_id == id)
             return true;
     return false;
