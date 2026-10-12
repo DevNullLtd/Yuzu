@@ -166,10 +166,69 @@ bool integral_decimal_digits(const std::string& s, std::string& digits) {
     return digits.find_first_of("0123456789") != std::string::npos;
 }
 
+/// The integer digits (with a leading '-' when negative) of an INTEGER-VALUED exponent spelling
+/// "digits[.digits]e[+-]n" ("564141138995e7" gives "5641411389950000000", "1.50e1" gives "15",
+/// "-9.223372036854775808e18" gives "-9223372036854775808"): the digits are shifted by the exponent
+/// as TEXT, so no floating point is involved. False when the spelling is not that shape, when the
+/// value is not a whole number ("1.25e1"), or when it needs more than 20 digits (beyond the uint64
+/// range, so there is nothing exact to read); the caller then keeps the double parse. A double
+/// cannot stand for such a value at 2^53 or more, which is why this is exact where it is not.
+bool integral_exponent_digits(const std::string& s, std::string& digits) {
+    const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    const bool negative = !s.empty() && s[0] == '-';
+    std::size_t i = negative ? 1 : 0;
+    std::string mantissa;
+    while (i < s.size() && is_digit(s[i]))
+        mantissa.push_back(s[i++]);
+    std::size_t fraction = 0;
+    if (i < s.size() && s[i] == '.') {
+        for (++i; i < s.size() && is_digit(s[i]); ++i, ++fraction)
+            mantissa.push_back(s[i]);
+    }
+    if (mantissa.empty() || i >= s.size() || (s[i] != 'e' && s[i] != 'E'))
+        return false;
+    ++i;
+    const bool exp_negative = i < s.size() && s[i] == '-';
+    if (i < s.size() && (s[i] == '+' || s[i] == '-'))
+        ++i;
+    const std::size_t exp_start = i;
+    while (i < s.size() && is_digit(s[i]))
+        ++i;
+    if (i != s.size() || i == exp_start)
+        return false;
+    const auto exp_first = s.find_first_not_of('0', exp_start);
+    const std::size_t exp_digits = exp_first == std::string::npos ? 0 : s.size() - exp_first;
+    if (exp_digits > 3) // beyond any value that fits 20 digits; the double path judges it
+        return false;
+    long exponent = 0;
+    for (std::size_t k = exp_start; k < s.size(); ++k)
+        exponent = exponent * 10 + (s[k] - '0');
+    // value = mantissa * 10^shift, with the leading zeros of the mantissa dropped.
+    const auto lead = mantissa.find_first_not_of('0');
+    std::string body = lead == std::string::npos ? std::string("0") : mantissa.substr(lead);
+    const long shift = (exp_negative ? -exponent : exponent) - static_cast<long>(fraction);
+    if (body != "0") {
+        if (shift >= 0) {
+            if (body.size() + static_cast<std::size_t>(shift) > 20)
+                return false;
+            body.append(static_cast<std::size_t>(shift), '0');
+        } else {
+            const auto drop = static_cast<std::size_t>(-shift);
+            if (drop >= body.size() ||
+                body.find_first_not_of('0', body.size() - drop) != std::string::npos)
+                return false; // a fraction remains: not a whole number
+            body.resize(body.size() - drop);
+        }
+    }
+    digits = (negative && body != "0" ? "-" : "") + body;
+    return true;
+}
+
 /// A string that is a plain decimal number in full (see plain_decimal_shape: optional '-', then a
 /// digit or '.', no 'x'; exponent forms such as "3e-7" count when the parse consumes them all):
-/// int64, else uint64 (a whole-number spelling such as "9007199254740993.0" reads as the exact
-/// integer, not a rounded double), else double. nullopt for anything else ("5 GB", "1.2.3", "v2",
+/// int64, else uint64 (a whole-number spelling such as "9007199254740993.0" or an integer-valued
+/// exponent spelling such as "564141138995e7" reads as the exact integer, not a rounded double),
+/// else double. nullopt for anything else ("5 GB", "1.2.3", "v2",
 /// " 5", "5\n", "+5", "inf", "nan", an out-of-range "1e400"). The ONE parse for a stored string
 /// and for a string operand of an ordering operator.
 std::optional<Number> parse_number_string(const std::string& s) {
@@ -180,6 +239,12 @@ std::optional<Number> parse_number_string(const std::string& s) {
     if (std::uint64_t u = 0; parse_int_full(s, u))
         return Number{u};
     if (std::string digits; integral_decimal_digits(s, digits)) {
+        if (std::int64_t i = 0; parse_int_full(digits, i))
+            return Number{i};
+        if (std::uint64_t u = 0; parse_int_full(digits, u))
+            return Number{u};
+    }
+    if (std::string digits; integral_exponent_digits(s, digits)) {
         if (std::int64_t i = 0; parse_int_full(digits, i))
             return Number{i};
         if (std::uint64_t u = 0; parse_int_full(digits, u))

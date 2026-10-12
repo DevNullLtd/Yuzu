@@ -25,13 +25,16 @@ struct InventoryCondition {
     /// doubles (`-0` equals `0`). A JSON operand is exact only as an
     /// integer (every JSON float is refused, see parse_inventory_condition: its original text is
     /// gone once parsed); a decimal is sent as a string with an ordering operator
-    /// (`ordering_numeric`), which admits at most 15 significant digits; a whole
-    /// number up to the uint64 range is sent as an integer. A STORED double above 2^53 is whatever
+    /// (`ordering_numeric`), which admits a whole number within int64/uint64 (digits, or an
+    /// integer-valued exponent form such as "1e16", read exactly) or at most 15 significant digits;
+    /// a whole number up to the uint64 range is sent as an integer. A STORED double above 2^53 is whatever
     /// the agent reported. A stored string that parses
     /// in full as a number counts as that number (stored "10.0" equals operand 10, stored "10" is
-    /// greater than operand 9). A stored integer (up to the uint64 maximum) and a stored decimal of
-    /// at most 15 significant digits compare exactly; a stored decimal of more digits is compared as
-    /// the nearest double. Any other stored value (non-numeric string such as "5 GB" or "N/A",
+    /// greater than operand 9). A stored integer within int64/uint64 (including an integer-valued
+    /// exponent spelling that fits, such as "564141138995e7") and a stored decimal with a fraction
+    /// of at most 15 significant digits and a magnitude below 2^53 compare exactly; any other stored
+    /// decimal (more digits, or a non-integer at or above 2^53) compares as the nearest double, as
+    /// does a stored negative integer below -9223372036854775808. Any other stored value (non-numeric string such as "5 GB" or "N/A",
     /// boolean, array) is never equal and never satisfies an ordering operator: a JSON number
     /// operand is strict, with no numeric-prefix tolerance. A string operand
     /// keeps the exact lexical `==` / `!=` (so "1.10" and "1.1" stay different); for the ordering
@@ -75,12 +78,14 @@ struct InventoryCondition {
 /// A decimal STRING under those operators that would be rounded through a double is refused: one
 /// that is not a whole number and has more than 15 significant digits (digits after leading zeros
 /// and trailing zeros; "5.00000000000000001" and "4503599627370497.3" round to a neighbour), a
-/// magnitude of 2^53 or more, a non-zero subnormal ("1e-320": it does not round-trip and strtod
+/// magnitude of 2^53 or more that is not a whole number within int64/uint64 (a whole number is
+/// read exactly and exempt), a non-zero subnormal ("1e-320": it does not round-trip and strtod
 /// differs by OS; zero is fine), or a value outside the double range ("1e400", "1e-400", which
 /// would otherwise fall to a lexical compare). `==` / `!=` with a string stay a text compare, so a
 /// non-integer decimal cannot be matched for equality numerically.
 /// A whole number is sent as an integer of any size up to the int64/uint64 range, or as a digit
-/// string, which reads as that exact integer (also with a zero fraction, "9007199254740993.0").
+/// string, which reads as that exact integer (also with a zero fraction, "9007199254740993.0", or
+/// as an integer-valued exponent form that fits, "564141138995e7" or "1e16").
 /// Returns the 400 / -32602 message, or nullopt when accepted (`out` is then filled in).
 [[nodiscard]] std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
                                                                    InventoryCondition& out);

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1604,8 +1605,10 @@ TEST_CASE("InventoryEval: every JSON float operand and a decimal string of 2^53 
         CHECK(err->find("nor an integer outside that range") != std::string::npos);
     }
     // A string operand is read only under the ordering operators; a fraction or exponent form of
-    // 2^53 or more is refused there too (== / != with a string stay an exact text compare).
-    for (const char* operand : {"\"9007199254740993.5\"", "\"9.007199254740993e15\"", "\"1e16\"",
+    // 2^53 or more is refused there too (== / != with a string stay an exact text compare). An
+    // INTEGER-VALUED exponent spelling that fits the uint64 range ("1e16") is a whole number, read
+    // exactly, and is admitted; "1e300" does not fit and stays refused.
+    for (const char* operand : {"\"9007199254740993.5\"", "\"9.0071992547409935e15\"",
                                 "\"1e300\"", "\"-9007199254740993.5\"",
                                 "\"18446744073709551616.0\"", "\"100000000000000000000\""}) {
         for (const char* op : {">", ">=", "<", "<="}) {
@@ -1819,9 +1822,18 @@ TEST_CASE("InventoryEval: a decimal operand is admitted only with at most 15 sig
         CHECK(std::get<std::uint64_t>(f.numeric_value) == 4503599627370497ULL);
         CHECK(f.value == "4503599627370497");
         InventoryCondition e;
-        REQUIRE_FALSE(admit(">", quoted("1e3"), e).has_value());
+        REQUIRE_FALSE(admit(">", quoted("1.25e1"), e).has_value());
         REQUIRE(std::holds_alternative<double>(e.numeric_value));
-        CHECK(std::get<double>(e.numeric_value) == 1000.0);
+        CHECK(std::get<double>(e.numeric_value) == 12.5);
+        // An integer-valued exponent spelling is the exact integer, not a double.
+        InventoryCondition x;
+        REQUIRE_FALSE(admit(">", quoted("1e3"), x).has_value());
+        REQUIRE(std::holds_alternative<std::int64_t>(x.numeric_value));
+        CHECK(std::get<std::int64_t>(x.numeric_value) == 1000);
+        InventoryCondition big;
+        REQUIRE_FALSE(admit(">", quoted("1e16"), big).has_value());
+        REQUIRE(std::holds_alternative<std::int64_t>(big.numeric_value));
+        CHECK(std::get<std::int64_t>(big.numeric_value) == 10000000000000000LL);
     }
 
     SECTION("a JSON integer, or the same number as a string, compares exactly against a stored integer") {
@@ -1883,6 +1895,155 @@ TEST_CASE("InventoryEval: a whole-number decimal string reads as the exact integ
     CHECK(matches(R"("9007199254740993.0")", ">=", "9007199254740993"));
     CHECK_FALSE(matches(R"("9007199254740993.0")", ">", "9007199254740993"));
     CHECK(matches(R"("9007199254740993.0")", ">", "9007199254740992"));
+}
+
+// An INTEGER-VALUED exponent spelling is read as the exact integer (digits shifted as text), not
+// as a double: at 2^53 or more a double lands off the decimal ("564141138995e7" is 12 significant
+// digits that a double cannot hold at 5.6e18).
+TEST_CASE("InventoryEval: an integer-valued exponent spelling reads as the exact integer",
+          "[inventory_eval][numeric_params]") {
+    using nlohmann::json;
+    auto matches = [](const std::string& stored_json, const char* op,
+                      const std::string& operand_json) {
+        Records records = {{"agent-a|p", R"({"v": )" + stored_json + "}"}};
+        InventoryEvalRequest req;
+        InventoryCondition c;
+        const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
+                                     R"(","value":)" + operand_for(op, operand_json) + "}");
+        REQUIRE_FALSE(parse_inventory_condition(doc, c));
+        req.conditions.push_back(c);
+        return !evaluate_inventory(req, records).empty();
+    };
+    // Every ordering operator at the value itself, then one either side.
+    auto check_exact = [&](const std::string& stored, const std::string& plain,
+                           const std::string& below, const std::string& above) {
+        CAPTURE(stored, plain);
+        CHECK(matches(stored, ">=", plain));
+        CHECK(matches(stored, "<=", plain));
+        CHECK_FALSE(matches(stored, ">", plain));
+        CHECK_FALSE(matches(stored, "<", plain));
+        CHECK(matches(stored, ">", below));
+        CHECK_FALSE(matches(stored, "<=", below));
+        CHECK(matches(stored, "<", above));
+        CHECK_FALSE(matches(stored, ">=", above));
+    };
+    SECTION("12 significant digits at 5.6e18 (bare and with a unit suffix)") {
+        check_exact(R"("564141138995e7")", R"("5641411389950000000")", R"("5641411389949999999")",
+                    R"("5641411389950000001")");
+        check_exact(R"("564141138995e7 B")", R"("5641411389950000000")", R"("5641411389949999999")",
+                    R"("5641411389950000001")");
+    }
+    SECTION("1.84467440737095e19 against operands either side of 18446744073709500000") {
+        const std::string s = R"("1.84467440737095e19")";
+        CHECK(matches(s, "<", R"("18446744073709500001")"));
+        CHECK_FALSE(matches(s, ">=", R"("18446744073709500001")"));
+        CHECK(matches(s, ">", R"("18446744073709499999")"));
+        CHECK_FALSE(matches(s, "<=", R"("18446744073709499999")"));
+        CHECK(matches(s, ">=", R"("18446744073709500000")"));
+        CHECK(matches(s, "<=", R"("18446744073709500000")"));
+        CHECK_FALSE(matches(s, ">", R"("18446744073709500000")"));
+        CHECK_FALSE(matches(s, "<", R"("18446744073709500000")"));
+    }
+    SECTION("the int64 minimum spelled with an exponent") {
+        // The operand one below the minimum is not an int64 and is refused, so test the minimum
+        // and the value above it.
+        const std::string s = R"("-9.223372036854775808e18")";
+        CHECK(matches(s, ">=", R"("-9223372036854775808")"));
+        CHECK(matches(s, "<=", R"("-9223372036854775808")"));
+        CHECK_FALSE(matches(s, ">", R"("-9223372036854775808")"));
+        CHECK_FALSE(matches(s, "<", R"("-9223372036854775808")"));
+        CHECK(matches(s, "<", R"("-9223372036854775807")"));
+        CHECK_FALSE(matches(s, ">=", R"("-9223372036854775807")"));
+    }
+    SECTION("small exponent spellings") {
+        check_exact(R"("1e3")", R"("1000")", R"("999")", R"("1001")");
+        check_exact(R"("1.5e1")", R"("15")", R"("14")", R"("16")");
+        check_exact(R"("0001e2")", R"("100")", R"("99")", R"("101")");
+        check_exact(R"("1000e-2")", R"("10")", R"("9")", R"("11")");
+        check_exact(R"("1.50E+1")", R"("15")", R"("14")", R"("16")");
+        check_exact(R"("-2.5e1")", R"("-25")", R"("-26")", R"("-24")");
+    }
+    SECTION("a non-integer value stays on the double path") {
+        // 1.25e1 is 12.5: three significant digits, exact as a double.
+        CHECK(matches(R"("1.25e1")", ">", R"("12")"));
+        CHECK(matches(R"("1.25e1")", "<", R"("13")"));
+        CHECK(matches(R"("1.25e1")", ">=", R"("12.5")"));
+        CHECK(matches(R"("1.25e1")", "<=", R"("12.5")"));
+        CHECK_FALSE(matches(R"("1.25e1")", ">", R"("12.5")"));
+    }
+    SECTION("1e20 does not fit uint64 and keeps its double behaviour") {
+        // 1e20 > 18446744073709551615 by value, and the double path orders it the same way.
+        CHECK(matches(R"("1e20")", ">", R"("18446744073709551615")"));
+        CHECK_FALSE(matches(R"("1e20")", "<=", R"("18446744073709551615")"));
+        CHECK(matches(R"("1e20")", ">=", R"("1e3")"));
+    }
+    SECTION("a negative below the int64 minimum compares as a double") {
+        CHECK(matches(R"("-9.3e18")", "<", R"("-9223372036854775808")"));
+        CHECK_FALSE(matches(R"("-9.3e18")", ">=", R"("-9223372036854775808")"));
+    }
+    SECTION("an integer-valued exponent spelling is also exact as an OPERAND") {
+        // Not refused for magnitude (it is a whole number within uint64), and exact.
+        CHECK(matches("5641411389950000000", ">=", R"("564141138995e7")"));
+        CHECK(matches("5641411389950000000", "<=", R"("564141138995e7")"));
+        CHECK_FALSE(matches("5641411389950000001", "<=", R"("564141138995e7")"));
+        CHECK(matches("5641411389950000001", ">", R"("5641411389950000000e0")"));
+        CHECK(matches("18446744073709500001", ">", R"("1.84467440737095e19")"));
+        // A non-integer decimal at or above 2^53 is still refused.
+        InventoryCondition c;
+        CHECK(parse_inventory_condition(
+            json::parse(R"({"plugin":"p","field":"v","op":">","value":"9007199254740992.5"})"), c));
+    }
+}
+
+// The exponent expansion must agree with the plain-integer spelling of the same value. A fixed
+// seed keeps this deterministic; a few hundred values, four comparisons each.
+TEST_CASE("InventoryEval: exponent spellings agree with plain integer spellings (seeded)",
+          "[inventory_eval][numeric_params]") {
+    using nlohmann::json;
+    std::mt19937_64 rng(0x4644'5e7ULL);
+    auto matches = [](const std::string& stored, const char* op, const std::string& operand) {
+        Records records = {{"agent-a|p", R"({"v": ")" + stored + R"("})"}};
+        InventoryEvalRequest req;
+        InventoryCondition c;
+        const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
+                                     R"(","value":")" + operand + R"("})");
+        REQUIRE_FALSE(parse_inventory_condition(doc, c));
+        req.conditions.push_back(c);
+        return !evaluate_inventory(req, records).empty();
+    };
+    std::size_t checked = 0;
+    for (int n = 0; n < 400; ++n) {
+        // base (no trailing zero) times 10^zeros, within the uint64 range. Odd iterations aim at
+        // 17 to 20 digits in total, where a double can no longer hold the integer.
+        const bool large = (n & 1) != 0;
+        const std::size_t k = large ? 6 + rng() % 7 : 1 + rng() % 8;
+        std::string base;
+        for (std::size_t d = 0; d < k; ++d)
+            base.push_back(static_cast<char>('0' + (d == 0 ? 1 + rng() % 9 : rng() % 10)));
+        if (base.back() == '0')
+            base.back() = '7';
+        const std::size_t zeros = large ? 17 + rng() % 4 - k : rng() % (20 - k + 1);
+        std::string plain = base + std::string(zeros, '0');
+        if (plain.size() == 20 && plain > "18446744073709551615")
+            continue; // beyond uint64: not an exact integer on either spelling
+        const bool negative = plain.size() < 19 && (rng() & 1);
+        // Spell it as digits[.digits]e<exp>: the point after `before` digits.
+        const std::size_t before = rng() % (k + 1);
+        std::string mantissa = base.substr(0, before);
+        if (before < k)
+            mantissa += "." + base.substr(before);
+        const std::string exponent = std::string(rng() % 3, '0') + std::to_string(zeros + (k - before));
+        const std::string sign = negative ? "-" : "";
+        const std::string spelled = sign + mantissa + (rng() & 1 ? "e" : "E") +
+                                    (rng() & 1 ? "+" : "") + exponent;
+        const std::string plain_signed = sign + plain;
+        CAPTURE(spelled, plain_signed);
+        const bool ok = matches(spelled, ">=", plain_signed) && matches(spelled, "<=", plain_signed) &&
+                        !matches(spelled, ">", plain_signed) && !matches(spelled, "<", plain_signed);
+        CHECK(ok);
+        ++checked;
+    }
+    CHECK(checked > 300);
 }
 
 // legacy_leading_number_text is the shared guard in front of the std::stod fallback (Apple Clang),
