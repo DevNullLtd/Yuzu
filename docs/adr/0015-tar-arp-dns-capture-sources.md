@@ -9,7 +9,7 @@
 > `secrets-at-rest-envelope-encryption`). This is the accepted record; it amends
 > the original proposal per the decisions in "Amendments" below.
 
-> **Amendment pending: ADR-3006 (capability enablement, proposed 2026-10-06).** ADR-3006 sets
+> **Amendment pending: ADR-3006 (plugin management, proposed 2026-10-06).** ADR-3006 sets
 > the direction that, for new installations, the opt-in default in Amendment 1 ("opt-in, not
 > default-on") is replaced by on-by-default with customer-controlled switch-off, and that the
 > staged-then-push guardrail under "Operator surfaces" gives way to the server's enablement

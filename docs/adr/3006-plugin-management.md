@@ -31,7 +31,7 @@ related: ["3005-plugin-config-store", "0015-tar-arp-dns-capture-sources", "0020-
 context-refs: ["#5294", "#5355", "#5371", "#5372", "#5373", "#5374", "#5375", "#4867", "#4915", "#4975", "#5057", "docs/yuzu-guardian-design-v1.1.md", "docs/asset-tagging-guide.md", "docs/tar-implementer.md"]
 ---
 
-# 3006 — Capability enablement: what ships, and how it is switched off
+# 3006 — Plugin management: what ships, and how it is switched off
 
 ## Summary
 

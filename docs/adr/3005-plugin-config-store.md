@@ -11,7 +11,7 @@ context-refs: ["#2568", "#2580", "docs/postgres-store-playbook.md"]
 
 # 3005 — Plugin config/secret plane + per-action kill switch
 
-> **Amendment pending: ADR-3006 (capability enablement, proposed 2026-10-06).** ADR-3006 sets
+> **Amendment pending: ADR-3006 (plugin management, proposed 2026-10-06).** ADR-3006 sets
 > the direction that the kill switch described here becomes one layer of a wider enablement
 > model: enforced on the endpoint as well as at dispatch, targetable beyond operating system,
 > no longer seeded off for any plugin on new installations, and changed under a permission of
