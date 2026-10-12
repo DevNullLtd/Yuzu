@@ -39,10 +39,13 @@ AppPerfTrendPoint point(const std::string& version, std::int64_t day, std::int64
     return p;
 }
 
+// Per-type device counts default to "every affected device did this and is exposed";
+// a case about a cohort or remainder states them. -1 selects the default.
 AppPerfVersionFailureRow fail_row(const std::string& version, std::optional<std::int64_t> exposure,
                                   std::int64_t crashes, std::int64_t hangs, std::int64_t affected,
                                   std::int64_t exp_crashes, std::int64_t exp_hangs,
-                                  std::int64_t exp_affected = 0) {
+                                  std::int64_t crash_dev = -1, std::int64_t hang_dev = -1,
+                                  std::int64_t exp_crash_dev = -1, std::int64_t exp_hang_dev = -1) {
     AppPerfVersionFailureRow r;
     r.version = version;
     r.exposure_devices = exposure;
@@ -51,7 +54,10 @@ AppPerfVersionFailureRow fail_row(const std::string& version, std::optional<std:
     r.affected_devices = affected;
     r.exposed_crashes = exp_crashes;
     r.exposed_hangs = exp_hangs;
-    r.exposed_affected_devices = exp_affected;
+    r.crash_devices = crash_dev >= 0 ? crash_dev : (crashes > 0 ? affected : 0);
+    r.hang_devices = hang_dev >= 0 ? hang_dev : (hangs > 0 ? affected : 0);
+    r.exposed_crash_devices = exp_crash_dev >= 0 ? exp_crash_dev : r.crash_devices;
+    r.exposed_hang_devices = exp_hang_dev >= 0 ? exp_hang_dev : r.hang_devices;
     return r;
 }
 
@@ -93,7 +99,7 @@ TEST_CASE("version join: the rate counts exposed events and the breadth counts e
     // devices (4 crashes + 1 hang).
     const std::vector<AppPerfVersionFailureRow> fails{
         fail_row("1.0.0.0", 12, 7, 1, 5, 4, 1),
-        fail_row("2.0.0.0", 15, 17, 3, 14, 10, 2, 4), // remainder 10: shown
+        fail_row("2.0.0.0", 15, 17, 3, 14, 10, 2, 14, 14, 4, 4), // remainder 10: shown
     };
     const auto rep = app_perf_version_failure_join(two_version_points(), fails, 30);
     REQUIRE(rep.versions.size() == 2);
@@ -144,34 +150,86 @@ TEST_CASE("version join: the rate counts exposed events and the breadth counts e
 
 TEST_CASE("version join: the breadth and exposure cohorts are floored independently",
           "[dex][app_perf]") {
-    SECTION("breadth under the floor withholds the counts but keeps the device count") {
+    SECTION("a crash cohort under the floor withholds the crashes, not the hangs") {
+        // 9 devices crashed (9 events); 12 hung (20 events); 12 affected in all.
         const auto rep = app_perf_version_failure_join(
-            {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", 12, 9, 0, 9, 3, 0)}, 30);
+            {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", 12, 9, 20, 12, 3, 5, 9, 12)}, 30);
         const auto& r = rep.versions.at(0);
         CHECK(r.below_floor);
-        CHECK(r.affected_devices == 9);
+        CHECK(r.affected_devices == 12);
         CHECK_FALSE(r.crashes);
-        CHECK_FALSE(r.hangs);
+        CHECK(r.hangs == 20);
         // The exposure cohort is above the floor on its own devices.
         CHECK(r.exposed_crashes == 3);
         REQUIRE(r.failure_rate);
     }
-    SECTION("breadth exactly at the floor is shown") {
+    SECTION("nine hang-once devices beside one repeat crasher withhold both totals") {
+        // affected 10 passes the union floor, but crashes=3 would be one device and
+        // hangs=9 is nine: each type is judged on its own devices.
+        for (const auto exposure : {std::optional<std::int64_t>{12}, std::optional<std::int64_t>{}}) {
+            const auto rep = app_perf_version_failure_join(
+                {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", exposure, 3, 9, 10, 0, 0, 1, 9)}, 30);
+            const auto& r = rep.versions.at(0);
+            CHECK(r.below_floor);
+            CHECK(r.affected_devices == 10);
+            CHECK_FALSE(r.crashes);
+            CHECK_FALSE(r.hangs);
+        }
+    }
+    SECTION("a hang cohort at the floor is shown while the crash cohort is withheld") {
+        const auto rep = app_perf_version_failure_join(
+            {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", 12, 3, 10, 11, 0, 0, 1, 10)}, 30);
+        const auto& r = rep.versions.at(0);
+        CHECK(r.below_floor); // one omitted total is enough
+        CHECK_FALSE(r.crashes);
+        CHECK(r.hangs == 10);
+    }
+    SECTION("a hang cohort under the floor withholds the hangs and raises below_floor alone") {
+        const auto rep = app_perf_version_failure_join(
+            {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", 12, 20, 3, 12, 0, 0, 12, 3)}, 30);
+        const auto& r = rep.versions.at(0);
+        CHECK(r.below_floor);
+        CHECK(r.crashes == 20);
+        CHECK_FALSE(r.hangs);
+    }
+    SECTION("a cohort below the floor is withheld whether exposure is unknown or itself under the floor") {
+        for (const auto exposure : {std::optional<std::int64_t>{}, std::optional<std::int64_t>{9}}) {
+            const auto rep = app_perf_version_failure_join(
+                {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", exposure, 9, 0, 9, 0, 0)}, 30);
+            CHECK(rep.versions.at(0).below_floor);
+            CHECK_FALSE(rep.versions.at(0).crashes);
+        }
+    }
+    SECTION("cohorts exactly at the floor are shown, and an empty type is shown as zero") {
         const auto rep = app_perf_version_failure_join(
             {point("1.0.0.0", 100)},
-            {fail_row("1.0.0.0", 12, 4, 6, kDexCohortFloor, 4, 6)}, 30);
+            {fail_row("1.0.0.0", 12, 4, 6, kDexCohortFloor, 4, 6, kDexCohortFloor, kDexCohortFloor)},
+            30);
         const auto& r = rep.versions.at(0);
         CHECK_FALSE(r.below_floor);
         CHECK(r.crashes == 4);
         CHECK(r.hangs == 6);
+        const auto none = app_perf_version_failure_join(
+            {point("1.0.0.0", 100)},
+            {fail_row("1.0.0.0", 12, 0, 6, kDexCohortFloor, 0, 6, 0, kDexCohortFloor)}, 30);
+        CHECK_FALSE(none.versions.at(0).below_floor);
+        CHECK(none.versions.at(0).crashes == 0);
+        CHECK(none.versions.at(0).hangs == 6);
+        const auto crash_only = app_perf_version_failure_join(
+            {point("1.0.0.0", 100)},
+            {fail_row("1.0.0.0", 12, 10, 0, kDexCohortFloor, 10, 0, kDexCohortFloor, 0)}, 30);
+        CHECK_FALSE(crash_only.versions.at(0).below_floor);
+        CHECK(crash_only.versions.at(0).crashes == 10);
+        CHECK(crash_only.versions.at(0).hangs == 0);
     }
-    SECTION("a remainder of 1 to 9 unexposed affected devices withholds the totals") {
-        // 20 affected devices, `rem` of them outside the exposure cohort: showing
-        // crashes beside exposed_crashes would let a reader subtract those events.
+    SECTION("a remainder of 1 to 9 unexposed devices of a type withholds that total") {
+        // 20 devices of each type, `rem` of them outside the exposure cohort: showing
+        // the total beside its exposed part would let a reader subtract those events.
         for (const std::int64_t rem : {1, 5, 9}) {
             CAPTURE(rem);
             const auto rep = app_perf_version_failure_join(
-                {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", 15, 30, 4, 20, 10, 2, 20 - rem)}, 30);
+                {point("1.0.0.0", 100)},
+                {fail_row("1.0.0.0", 15, 30, 4, 20, 10, 2, 20, 20, 20 - rem, 20 - rem)}, 30);
             const auto& r = rep.versions.at(0);
             CHECK(r.below_floor);
             CHECK(r.affected_devices == 20);
@@ -184,11 +242,22 @@ TEST_CASE("version join: the breadth and exposure cohorts are floored independen
             CHECK(rep.stat_failures == 0);
         }
     }
+    SECTION("the remainder is judged per type, not on the union") {
+        // 15 of 20 crashing devices are exposed (remainder 5); all 20 hanging devices are.
+        const auto rep = app_perf_version_failure_join(
+            {point("1.0.0.0", 100)},
+            {fail_row("1.0.0.0", 15, 30, 4, 20, 10, 2, 20, 20, 15, 20)}, 30);
+        const auto& r = rep.versions.at(0);
+        CHECK(r.below_floor);
+        CHECK_FALSE(r.crashes);
+        CHECK(r.hangs == 4);
+    }
     SECTION("an empty remainder or one at the floor shows the totals") {
         for (const std::int64_t rem : {0, 10, 11}) {
             CAPTURE(rem);
             const auto rep = app_perf_version_failure_join(
-                {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", 15, 30, 4, 20, 10, 2, 20 - rem)}, 30);
+                {point("1.0.0.0", 100)},
+                {fail_row("1.0.0.0", 15, 30, 4, 20, 10, 2, 20, 20, 20 - rem, 20 - rem)}, 30);
             const auto& r = rep.versions.at(0);
             CHECK_FALSE(r.below_floor);
             CHECK(r.crashes == 30);
@@ -200,13 +269,14 @@ TEST_CASE("version join: the breadth and exposure cohorts are floored independen
     SECTION("the remainder is not read off figures that are withheld") {
         // Exposure under the floor: nothing exposed is shown to subtract from.
         const auto under = app_perf_version_failure_join(
-            {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", 9, 30, 4, 20, 10, 2, 15)}, 30);
+            {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", 9, 30, 4, 20, 10, 2, 20, 20, 15, 15)}, 30);
         CHECK_FALSE(under.versions.at(0).below_floor);
         CHECK(under.versions.at(0).crashes == 30);
         CHECK_FALSE(under.versions.at(0).exposed_crashes);
         // Exposure unknown: same.
         const auto unknown = app_perf_version_failure_join(
-            {point("1.0.0.0", 100)}, {fail_row("1.0.0.0", std::nullopt, 30, 4, 20, 0, 0, 0)}, 30);
+            {point("1.0.0.0", 100)},
+            {fail_row("1.0.0.0", std::nullopt, 30, 4, 20, 0, 0, 20, 20, 0, 0)}, 30);
         CHECK_FALSE(unknown.versions.at(0).below_floor);
         CHECK(unknown.versions.at(0).crashes == 30);
     }
@@ -424,7 +494,8 @@ TEST_CASE("versions json: a fixed report serialises to the exact string", "[dex]
     a.perf.day_count = 3;
     a.perf.device_count = 15;
     a.affected_devices = 7;
-    a.below_floor = true; // crashes and hangs omitted
+    a.below_floor = true; // crashes omitted, hangs shown
+    a.hangs = 3;
     a.exposure_devices = 15;
     a.exposed_crashes = 5;
     a.exposed_hangs = 2;
@@ -448,7 +519,7 @@ TEST_CASE("versions json: a fixed report serialises to the exact string", "[dex]
         R"("exposed_crashes":5,"exposed_hangs":2,"exposure_below_floor":false,)"
         R"("exposure_devices":15,"failure_rate":{"estimate":0.5,"lower":0.25,"reliable":false,)"
         R"("upper":1.5},"failure_rate_ratio":{"estimate":null,"lower":2.5,"reliable":false,)"
-        R"("unbounded":true,"upper":null},"latest_day":20000,"previous_version":"1.0.0.0",)"
+        R"("unbounded":true,"upper":null},"hangs":3,"latest_day":20000,"previous_version":"1.0.0.0",)"
         R"("suppressed":false,"version":"2.0.0.0"},)"
         R"({"affected_devices":0,"below_floor":false,"crashes":0,"day_count":1,"device_count":4,)"
         R"("exposed_crashes":null,"exposed_hangs":null,"exposure_below_floor":false,)"

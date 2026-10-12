@@ -50,8 +50,11 @@ public:
     DexAppVersionFailuresOwner(const DexAppVersionFailuresOwner&) = delete;
     DexAppVersionFailuresOwner& operator=(const DexAppVersionFailuresOwner&) = delete;
 
-    /// The window the report uses: `kAppPerfFailureWindowDays`, clamped to the
-    /// observation retention when that is positive.
+    /// The window the report uses: `kAppPerfFailureWindowDays`, clamped to one
+    /// day less than the observation retention when that is positive. The window
+    /// is W whole UTC days plus the current day so far, and an event is reaped
+    /// `retention` days after it was recorded, so with W = retention - 1 no
+    /// counted day has lost any of its events.
     [[nodiscard]] int failure_window_days() const;
 
     /// One row per version in `versions` that has failure or exposure rows,

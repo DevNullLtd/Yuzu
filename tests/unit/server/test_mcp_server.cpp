@@ -9771,7 +9771,10 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
     failure_row.affected_devices = 12;
     failure_row.exposed_crashes = 6;
     failure_row.exposed_hangs = 3;
-    failure_row.exposed_affected_devices = 12;
+    failure_row.crash_devices = 12;
+    failure_row.hang_devices = 12;
+    failure_row.exposed_crash_devices = 12;
+    failure_row.exposed_hang_devices = 12;
     ts.app_perf_providers_for_test.failures =
         [failure_row](std::string_view, const std::vector<std::string>&, std::int64_t,
                       std::int64_t, std::string_view)
@@ -9871,6 +9874,11 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
               {"upper", number_or_null},
               {"unbounded", {{"type", "boolean"}}},
               {"reliable", {{"type", "boolean"}}}}}};
+        const nlohmann::json omitted_total = {
+            {"type", "integer"},
+            {"description",
+             "Omitted when its own device cohort is under 10 devices or its remainder outside the "
+             "exposure cohort is (below_floor)"}};
         const nlohmann::json versions_items = {
             {"type", "object"},
             {"properties",
@@ -9881,10 +9889,8 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
               {"suppressed", {{"type", "boolean"}}},
               {"affected_devices", {{"type", "integer"}}},
               {"below_floor", {{"type", "boolean"}}},
-              {"crashes",
-               {{"type", "integer"}, {"description", "Omitted when below_floor is true"}}},
-              {"hangs",
-               {{"type", "integer"}, {"description", "Omitted when below_floor is true"}}},
+              {"crashes", omitted_total},
+              {"hangs", omitted_total},
               {"exposure_devices",
                {{"type", nlohmann::json::array({"integer", "null"})},
                 {"description",
@@ -9899,6 +9905,25 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
             {"required", nlohmann::json::array({"version", "affected_devices", "below_floor",
                                                 "exposure_devices", "exposure_below_floor"})}};
         CHECK(props["versions"]["items"] == versions_items);
+
+        // Every key a row emits is declared, and every required key is emitted. The
+        // negative control proves the check fails on a schema missing one key.
+        const auto declared = [](const nlohmann::json& row, const nlohmann::json& items) {
+            for (auto it = row.begin(); it != row.end(); ++it)
+                if (!items["properties"].contains(it.key()))
+                    return false;
+            for (const auto& key : items["required"])
+                if (!row.contains(key.get<std::string>()))
+                    return false;
+            return true;
+        };
+        const auto& items = props["versions"]["items"];
+        REQUIRE_FALSE(fleet["versions"].empty());
+        for (const auto& row : fleet["versions"])
+            CHECK(declared(row, items));
+        auto missing_key = items;
+        missing_key["properties"].erase("failure_rate_ratio");
+        CHECK_FALSE(declared(fleet["versions"][0], missing_key));
     }
 
     auto group = mcp_tool_payload(

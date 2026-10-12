@@ -492,17 +492,22 @@ AppPerfFleetReport app_perf_version_failure_join(std::vector<AppPerfTrendPoint> 
             }
         }
 
-        // The totals are withheld when either the affected devices or, with the
-        // exposed part shown beside them, the affected devices outside the exposure
-        // cohort number between one and the floor minus one: crashes minus
-        // exposed_crashes would otherwise single them out.
-        const std::int64_t remainder = f.affected_devices - f.exposed_affected_devices;
-        row.below_floor = (f.affected_devices > 0 && f.affected_devices < kDexCohortFloor) ||
-                          (exposed_shown && remainder > 0 && remainder < kDexCohortFloor);
-        if (!row.below_floor) {
+        // A total is withheld when the devices that contributed it number between one
+        // and the floor minus one, or, with the exposed part shown beside it, when the
+        // contributing devices outside the exposure cohort do: total minus exposed
+        // part would otherwise single them out. Each type is judged on its own devices.
+        const auto withheld = [exposed_shown](std::int64_t devices, std::int64_t exposed_devices) {
+            const std::int64_t remainder = devices - exposed_devices;
+            return (devices > 0 && devices < kDexCohortFloor) ||
+                   (exposed_shown && remainder > 0 && remainder < kDexCohortFloor);
+        };
+        const bool crashes_withheld = withheld(f.crash_devices, f.exposed_crash_devices);
+        const bool hangs_withheld = withheld(f.hang_devices, f.exposed_hang_devices);
+        row.below_floor = crashes_withheld || hangs_withheld;
+        if (!crashes_withheld)
             row.crashes = f.crashes;
+        if (!hangs_withheld)
             row.hangs = f.hangs;
-        }
         rep.versions.push_back(std::move(row));
     }
 
@@ -545,10 +550,10 @@ std::string dex_app_perf_versions_json(const AppPerfFleetReport& report) {
         o["suppressed"] = r.perf.suppressed;
         o["affected_devices"] = r.affected_devices;
         o["below_floor"] = r.below_floor;
-        if (!r.below_floor) {
-            o["crashes"] = opt_i64(r.crashes);
-            o["hangs"] = opt_i64(r.hangs);
-        }
+        if (r.crashes)
+            o["crashes"] = *r.crashes;
+        if (r.hangs)
+            o["hangs"] = *r.hangs;
         o["exposure_devices"] = opt_i64(r.exposure_devices);
         o["exposure_below_floor"] = r.exposure_below_floor;
         o["exposed_crashes"] = opt_i64(r.exposed_crashes);

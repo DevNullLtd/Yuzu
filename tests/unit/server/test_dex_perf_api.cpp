@@ -468,9 +468,12 @@ std::string aid(int i) { return std::string("a") + (i < 10 ? "0" : "") + std::to
 // The shared two-version fixture. Exposure (B1): a01..a15 on 125.0.0.0, a01..a12 on
 // 124.0.0.0. Events on chrome.exe, all inside the window:
 //   125: 10 crashes + 2 hangs, all on exposed devices a01..a07  (7 affected)
-//   124: 4 crashes + 1 hang on exposed a01..a03, PLUS 3 crashes on x01/x02 which have
-//        no B1 rows                                              (5 affected)
-// plus a decoy subject and a version outside the requested list, neither of which may count.
+//   124: 4 crashes + 1 hang on exposed a01..a03, PLUS 3 crashes on x01/x02 and 1 hang on
+//        x03, none of which have B1 rows                          (6 affected: x03 only hung)
+// a01 and a02 both crashed and hung, so per-type device counts do not add up to the affected
+// devices. a01 also has a second B1 day (exposure counts a device once) and exposed a10 has a
+// decoy observation type. A decoy subject and a version outside the requested list also must
+// not count.
 // `today` is the caller's one reading of the UTC midnight, so a seed, a window cut
 // and a rollup can never straddle a midnight between two clock reads.
 void seed_two_version_fixture(AppPerfDailyStore& b1, GuaranteedStateStore& gss,
@@ -481,6 +484,7 @@ void seed_two_version_fixture(AppPerfDailyStore& b1, GuaranteedStateStore& gss,
         seed_b1(b1, aid(i), "chrome.exe", "125.0.0.0", day, 5.0, 100000000);
     for (int i = 1; i <= 12; ++i)
         seed_b1(b1, aid(i), "chrome.exe", "124.0.0.0", day, 4.0, 90000000);
+    seed_b1(b1, aid(1), "chrome.exe", "125.0.0.0", day - 86400, 5.0, 100000000);
 
     int n = 0;
     auto ev = [&](const std::string& agent, const std::string& app, const std::string& ver,
@@ -502,6 +506,8 @@ void seed_two_version_fixture(AppPerfDailyStore& b1, GuaranteedStateStore& gss,
     ev("x01", "chrome.exe", "124.0.0.0", "process.crashed", at);
     ev("x01", "chrome.exe", "124.0.0.0", "process.crashed", at + 60);
     ev("x02", "chrome.exe", "124.0.0.0", "process.crashed", at); // 3 unexposed crashes
+    ev("x03", "chrome.exe", "124.0.0.0", "process.hung", at);    // a hang-only, unexposed device
+    ev(aid(10), "chrome.exe", "125.0.0.0", "process.started", at); // decoy observation type
 
     ev(aid(1), "other.exe", "125.0.0.0", "process.crashed", at);   // decoy subject
     ev(aid(1), "chrome.exe", "126.0.0.0", "process.crashed", at);  // version not requested
@@ -544,17 +550,23 @@ TEST_CASE("DexAppVersionFailuresOwner counts exposed and unexposed events per ve
     CHECK(v125->affected_devices == 7);
     CHECK(v125->exposed_crashes == 10);
     CHECK(v125->exposed_hangs == 2);
-    CHECK(v125->exposed_affected_devices == 7); // every affected device is exposed
+    CHECK(v125->crash_devices == 7);
+    CHECK(v125->hang_devices == 2); // a01 and a02 crashed and hung: 7 + 2 != 7 affected
+    CHECK(v125->exposed_crash_devices == 7);
+    CHECK(v125->exposed_hang_devices == 2); // every affected device is exposed
 
     const auto* v124 = find_row(*rows, "124.0.0.0");
     REQUIRE(v124);
     CHECK(v124->exposure_devices == 12);
     CHECK(v124->crashes == 7);   // 4 on exposed devices + 3 on unexposed ones
-    CHECK(v124->hangs == 1);
-    CHECK(v124->affected_devices == 5);
+    CHECK(v124->hangs == 2);
+    CHECK(v124->affected_devices == 6); // a01-a03, x01, x02 crashed; x03 only hung
     CHECK(v124->exposed_crashes == 4); // only the exposed devices feed the rate
     CHECK(v124->exposed_hangs == 1);
-    CHECK(v124->exposed_affected_devices == 3); // x01 and x02 are affected but not exposed
+    CHECK(v124->crash_devices == 5);
+    CHECK(v124->hang_devices == 2); // a01 and the hang-only x03
+    CHECK(v124->exposed_crash_devices == 3); // x01 and x02 crashed but are not exposed
+    CHECK(v124->exposed_hang_devices == 1);  // x03 hung but is not exposed
 
     // A version list that names only one version returns only that one.
     auto only = owner.read("chrome.exe", {"125.0.0.0"}, since_day, today,
@@ -585,13 +597,14 @@ TEST_CASE("DexAppVersionFailuresOwner cuts events and exposure at the same windo
     seed_obs(gss, "w2", "in-1", "app.exe", "1.0.0.0", "process.crashed", since_day - 86400);
     // A device whose only B1 rows predate since_day is not exposed.
     seed_b1(b1, "old-1", "app.exe", "1.0.0.0", today - 5 * 86400, 3.0, 1000);
-    // A forward-slack B1 day (tomorrow) must not count as exposure.
+    // A forward-slack B1 day (tomorrow) must not count as exposure; the end day itself does.
     seed_b1(b1, "future-1", "app.exe", "1.0.0.0", today + 86400, 3.0, 1000);
+    seed_b1(b1, "end-1", "app.exe", "1.0.0.0", today, 3.0, 1000);
 
     auto rows = owner.read("app.exe", {"1.0.0.0"}, since_day, today, since_iso);
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
-    CHECK(rows->front().exposure_devices == 1); // in-1 only
+    CHECK(rows->front().exposure_devices == 2); // in-1 and the device on the end day
     CHECK(rows->front().crashes == 1);
     CHECK(rows->front().affected_devices == 1);
 
@@ -603,7 +616,9 @@ TEST_CASE("DexAppVersionFailuresOwner cuts events and exposure at the same windo
     CHECK_FALSE(ghost->front().exposure_devices.has_value());
     CHECK(ghost->front().hangs == 1);
     CHECK(ghost->front().exposed_hangs == 0);
-    CHECK(ghost->front().exposed_affected_devices == 0);
+    CHECK(ghost->front().hang_devices == 1);
+    CHECK(ghost->front().crash_devices == 0);
+    CHECK(ghost->front().exposed_hang_devices == 0);
 
     // Exposure with no events still reports the version, with zero events.
     seed_b1(b1, "quiet-1", "app.exe", "2.0.0.0", today - 86400, 3.0, 1000);
@@ -707,9 +722,10 @@ TEST_CASE("DexAppVersionFailuresOwner degrades when the statement is blocked",
 
 TEST_CASE("DexPerfApi app_fleet_report() passes the clamped window into the failure read",
           "[pg][dex_perf_api]") {
-    // Retention 7 clamps the window to 7 days. A device and an event exactly at the cut
-    // count; one a day earlier does not. A window one day wider, one day narrower or left
-    // unclamped at 30 changes the counts below.
+    // Retention 7 clamps the window to 6 days (one less than retention, so no counted day
+    // has lost events to the reaper). A device and an event exactly at the cut count; one
+    // a day earlier does not. A window one day wider, one day narrower or left unclamped
+    // at 30 changes the counts below.
     YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -722,7 +738,7 @@ TEST_CASE("DexPerfApi app_fleet_report() passes the clamped window into the fail
     REQUIRE(gss.is_open());
 
     const std::int64_t today = today_utc();
-    const std::int64_t since_day = today - 7 * 86400;
+    const std::int64_t since_day = today - 6 * 86400;
     seed_b1(b1, "at-cut", "app.exe", "1.0.0.0", since_day, 3.0, 1000);
     seed_obs(gss, "c1", "at-cut", "app.exe", "1.0.0.0", "process.crashed", since_day);
     seed_b1(b1, "before-cut", "app.exe", "1.0.0.0", since_day - 86400, 3.0, 1000);
@@ -737,7 +753,7 @@ TEST_CASE("DexPerfApi app_fleet_report() passes the clamped window into the fail
     if (today_utc() != today)
         SKIP("UTC midnight passed between seeding and the read: the cut cannot be asserted");
     REQUIRE(rep.has_value());
-    CHECK(rep->failure_window_days == 7);
+    CHECK(rep->failure_window_days == 6);
     REQUIRE(rep->versions.size() == 1);
     const auto& v = rep->versions[0];
     CHECK(v.exposure_devices == 1);  // at-cut only
@@ -749,7 +765,10 @@ TEST_CASE("DexAppVersionFailuresOwner window clamps to the observation retention
     PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
     CHECK(DexAppVersionFailuresOwner{pool, 0}.failure_window_days() == 30);
     CHECK(DexAppVersionFailuresOwner{pool, -1}.failure_window_days() == 30);
-    CHECK(DexAppVersionFailuresOwner{pool, 7}.failure_window_days() == 7);
+    CHECK(DexAppVersionFailuresOwner{pool, 1}.failure_window_days() == 0); // today only
+    CHECK(DexAppVersionFailuresOwner{pool, 7}.failure_window_days() == 6);
+    CHECK(DexAppVersionFailuresOwner{pool, 30}.failure_window_days() == 29);
+    CHECK(DexAppVersionFailuresOwner{pool, 31}.failure_window_days() == 30);
     CHECK(DexAppVersionFailuresOwner{pool, 90}.failure_window_days() == 30);
 }
 
@@ -826,9 +845,10 @@ TEST_CASE("DexPerfApi app_fleet_report() joins crashes and hangs and exposure pe
 
     const auto& v124 = rep->versions[2];
     CHECK(v124.exposure_devices == 12);
-    CHECK(v124.affected_devices == 5); // 3 exposed + 2 unexposed reporting devices
+    CHECK(v124.affected_devices == 6); // 3 exposed + 3 unexposed reporting devices
     CHECK(v124.below_floor);
     CHECK_FALSE(v124.crashes.has_value());
+    CHECK_FALSE(v124.hangs.has_value()); // 2 devices hung: its own cohort is under the floor
     CHECK(v124.exposed_crashes == 4);
     CHECK(v124.previous_version.empty());
     CHECK_FALSE(v124.failure_rate_ratio.has_value());

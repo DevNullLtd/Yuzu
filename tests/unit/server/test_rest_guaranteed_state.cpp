@@ -3376,6 +3376,10 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         f124.crashes = 7;
         f124.hangs = 1;
         f124.affected_devices = 5; // under the floor: counts withheld
+        f124.crash_devices = 5;
+        f124.hang_devices = 1;
+        f124.exposed_crash_devices = 3;
+        f124.exposed_hang_devices = 1;
         f124.exposed_crashes = 4;
         f124.exposed_hangs = 1;
         yuzu::server::AppPerfVersionFailureRow f125;
@@ -3386,7 +3390,10 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         f125.affected_devices = 14;
         f125.exposed_crashes = 10;
         f125.exposed_hangs = 2;
-        f125.exposed_affected_devices = 14; // every affected device is exposed: both totals shown
+        f125.crash_devices = 14; // every affected device is exposed: both totals shown
+        f125.hang_devices = 14;
+        f125.exposed_crash_devices = 14;
+        f125.exposed_hang_devices = 14;
         h.failure_rows_ = {f124, f125};
         auto res = h.sink.Get("/api/v1/dex/perf/app?app=chrome.exe");
         REQUIRE(res);
@@ -3420,6 +3427,7 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         CHECK(v124["below_floor"] == true);
         CHECK(v124["affected_devices"] == 5);
         CHECK_FALSE(v124.contains("crashes"));
+        CHECK_FALSE(v124.contains("hangs")); // 1 hanging device: its own cohort is under the floor
         CHECK(v124["previous_version"].is_null());
         CHECK(v124["failure_rate_ratio"].is_null());
     }

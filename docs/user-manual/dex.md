@@ -228,9 +228,9 @@ numbers match.
   narrows the trend to one version at a time (the same `version` parameter the
   `GET /api/v1/dex/perf/app` / `/perf/group` / `/perf/tag` endpoints already
   accept); "all
-  versions" is the default. Per-version crash/hang counts are not shown here
-  yet (a separate central crash-store join, still deferred) — use the
-  per-application crash/hang drill above for those.
+  versions" is the default. Per-version crash/hang counts are not shown on
+  this panel yet: `GET /api/v1/dex/perf/app` carries the join, the panel does
+  not render it — use the per-application crash/hang drill above for those.
   On the **fleet-wide** view (no management-group or device-model scope), each version row
   has a **&#9656; devices** affordance that expands in place to list the
   devices behind that number — `agent_id`, last-seen day, and that day's CPU /
@@ -423,7 +423,8 @@ view; the rollup, scope, and true aggregate perf endpoints (`/perf/fleet`,
 `/perf/tag`)
 are machine-health telemetry / fleet metadata and are not audited — and the
 app-perf aggregates suppress any sub-floor `(version, day)` point (fewer than
-10 devices) to a count only. **`/perf/devices` and `/perf/app/devices` are the
+10 devices) to a count only and withhold a per-version crash or hang count
+whose own device cohort is under 10. **`/perf/devices` and `/perf/app/devices` are the
 exceptions**: each row names an `agent_id` fleet-wide (or, for `/perf/app/
 devices`, the caller's visible subset), so unlike their aggregate siblings
 they ARE audited — `/perf/devices` as `dex.perf.device.view` (fail-closed,

@@ -28,8 +28,9 @@ constexpr const char* kStatementTimeout = "10s";
 // FULL OUTER JOIN keeps a version that has only one side; exposure_devices is
 // NULL (unknown, never zero) when a version has no exposure rows. The version
 // list is bounded by the caller's ANY() list, so LIMIT is a depth guard only.
-// exposed_affected_devices is the part of affected_devices that is also exposed;
-// the join subtracts it to floor the remainder (it is never serialised).
+// The four per-type distinct-device columns are the cohorts the join floors each
+// total on (and, restricted to exposed devices, the remainder it floors); they
+// are never serialised.
 constexpr const char* kReadSql =
     "WITH exp AS ("
     " SELECT version, agent_id FROM app_perf_daily_store.app_perf_daily"
@@ -50,12 +51,18 @@ constexpr const char* kReadSql =
     "  COUNT(DISTINCT agent_id) AS affected_devices,"
     "  COUNT(*) FILTER (WHERE obs_type = 'process.crashed' AND exposed) AS exposed_crashes,"
     "  COUNT(*) FILTER (WHERE obs_type = 'process.hung' AND exposed) AS exposed_hangs,"
-    "  COUNT(DISTINCT agent_id) FILTER (WHERE exposed) AS exposed_affected_devices"
+    "  COUNT(DISTINCT agent_id) FILTER (WHERE obs_type = 'process.crashed') AS crash_devices,"
+    "  COUNT(DISTINCT agent_id) FILTER (WHERE obs_type = 'process.hung') AS hang_devices,"
+    "  COUNT(DISTINCT agent_id) FILTER (WHERE obs_type = 'process.crashed' AND exposed)"
+    "   AS exposed_crash_devices,"
+    "  COUNT(DISTINCT agent_id) FILTER (WHERE obs_type = 'process.hung' AND exposed)"
+    "   AS exposed_hang_devices"
     " FROM obs GROUP BY version) "
     "SELECT COALESCE(ex.version, fo.version), ex.exposure_devices,"
     " COALESCE(fo.crashes, 0), COALESCE(fo.hangs, 0), COALESCE(fo.affected_devices, 0),"
     " COALESCE(fo.exposed_crashes, 0), COALESCE(fo.exposed_hangs, 0),"
-    " COALESCE(fo.exposed_affected_devices, 0)"
+    " COALESCE(fo.crash_devices, 0), COALESCE(fo.hang_devices, 0),"
+    " COALESCE(fo.exposed_crash_devices, 0), COALESCE(fo.exposed_hang_devices, 0)"
     " FROM ex FULL OUTER JOIN fo ON ex.version = fo.version"
     " ORDER BY 1 LIMIT $6::bigint";
 
@@ -70,7 +77,7 @@ DexAppVersionFailuresOwner::DexAppVersionFailuresOwner(pg::PgPool& pool, int ret
     : pool_(pool), retention_days_(retention_days) {}
 
 int DexAppVersionFailuresOwner::failure_window_days() const {
-    return retention_days_ > 0 ? (std::min)(kAppPerfFailureWindowDays, retention_days_)
+    return retention_days_ > 0 ? (std::min)(kAppPerfFailureWindowDays, retention_days_ - 1)
                                : kAppPerfFailureWindowDays;
 }
 
@@ -91,16 +98,25 @@ DexAppVersionFailuresOwner::read(std::string_view app, const std::vector<std::st
         std::to_string(versions.size() + 1)};
 
     std::optional<std::vector<AppPerfVersionFailureRow>> out;
+    bool statement_failed = false;
+    // Never names the application: it is caller-supplied text.
+    const auto fail = [&statement_failed](const pg::PgResult& res) {
+        statement_failed = true;
+        const char* state = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+        spdlog::warn("DexAppVersionFailuresOwner: statement failed, SQLSTATE {}",
+                     state != nullptr ? state : "unknown");
+        return false;
+    };
     const bool ok = pool_.with_txn_for(kAcquireTimeout, [&](PGconn* c) -> bool {
         pg::PgResult t = pg::exec_params(
             c,
             std::string("SET LOCAL statement_timeout = '").append(kStatementTimeout).append("'").c_str(),
             std::vector<std::string>{});
         if (t.status() != PGRES_COMMAND_OK)
-            return false;
+            return fail(t);
         pg::PgResult r = pg::exec_params(c, kReadSql, params);
         if (r.status() != PGRES_TUPLES_OK)
-            return false;
+            return fail(r);
         std::vector<AppPerfVersionFailureRow> rows;
         const int n = PQntuples(r.get());
         rows.reserve(static_cast<std::size_t>(n));
@@ -114,14 +130,19 @@ DexAppVersionFailuresOwner::read(std::string_view app, const std::vector<std::st
             row.affected_devices = col_i64(r.get(), i, 4);
             row.exposed_crashes = col_i64(r.get(), i, 5);
             row.exposed_hangs = col_i64(r.get(), i, 6);
-            row.exposed_affected_devices = col_i64(r.get(), i, 7);
+            row.crash_devices = col_i64(r.get(), i, 7);
+            row.hang_devices = col_i64(r.get(), i, 8);
+            row.exposed_crash_devices = col_i64(r.get(), i, 9);
+            row.exposed_hang_devices = col_i64(r.get(), i, 10);
             rows.push_back(std::move(row));
         }
         out = std::move(rows);
         return true;
     });
     if (!ok || !out) {
-        spdlog::warn("DexAppVersionFailuresOwner: read degraded (acquire timeout or SQL error)");
+        if (!statement_failed)
+            spdlog::warn(
+                "DexAppVersionFailuresOwner: pool acquire timed out or transaction not committed");
         return std::nullopt;
     }
     return out;

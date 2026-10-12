@@ -28,8 +28,7 @@ int dex_window_to_days(const std::string& window) {
     return 7; // "7d" / default
 }
 
-// ISO-8601 UTC cutoff for "N days ago"; "" for days<=0 (the "all" window, where a
-// per-device-days rate is ill-defined). Mirrors guardian_ingest's ts_to_iso8601.
+// ISO-8601 UTC text of an absolute instant. Mirrors guardian_ingest's ts_to_iso8601.
 std::string dex_iso_at(std::int64_t epoch_seconds) {
     std::time_t tt = static_cast<std::time_t>(epoch_seconds);
     std::tm tm{};
@@ -51,6 +50,8 @@ DexDayWindow dex_day_window(std::int64_t now_epoch, int days) {
     return w;
 }
 
+// ISO-8601 UTC cutoff for "N days ago"; "" for days<=0 (the "all" window, where a
+// per-device-days rate is ill-defined). Mirrors guardian_ingest's ts_to_iso8601.
 std::string dex_iso_since(int days) {
     if (days <= 0)
         return {};
