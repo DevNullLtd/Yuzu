@@ -8,6 +8,7 @@
 #include <charconv>
 #include <limits>
 #include <unordered_set>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -527,6 +528,8 @@ nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*n
         out["last_seen"] = nullptr;
     }
 
+    out["identity_state"] = detail.identity ? "found" : detail.identity_degraded ? "degraded" : "absent";
+
     if (!detail.ci.has_value()) {
         out["ci"] = nullptr;
         out["ci_state"] = "degraded";
@@ -577,6 +580,64 @@ nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*n
     out["software_last_seen"] =
         detail.software_last_seen ? nlohmann::json(*detail.software_last_seen) : nullptr;
     return out;
+}
+
+bool apply_roster_read(InventoryDevicesResult& result, const OfflineRosterRead& eps) {
+    if (eps)
+        return true;
+    result.roster_degraded = true; // unread, not empty
+    result.ci_degraded = true;
+    result.tags_degraded = true;
+    return false;
+}
+
+void apply_tag_read(InventoryDevicesResult& result,
+                    const std::expected<std::vector<std::string>, TagReadError>& keys,
+                    const TagValuesReader& read_values) {
+    if (!keys) {
+        result.tags_degraded = true; // unread keys, not "no keys"
+        return;
+    }
+    const auto values = read_values(*keys);
+    if (!values) {
+        result.tags_degraded = true;
+        return;
+    }
+    for (auto& r : result.rows)
+        if (const auto it = values->find(r.agent_id); it != values->end())
+            r.tags.assign(it->second.begin(), it->second.end());
+}
+
+std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>
+offline_identity_row(const OfflineRosterRead& eps, std::string_view agent_id, std::int64_t now_ms,
+                     std::string (*human_age)(std::int64_t)) {
+    if (!eps)
+        return std::unexpected(eps.error());
+    for (const auto& e : *eps) {
+        if (e.agent_id != agent_id)
+            continue;
+        InventoryDeviceRow r;
+        r.agent_id = e.agent_id;
+        r.hostname = e.hostname;
+        r.os = e.os;
+        r.agent_version = e.agent_version;
+        r.arch = e.arch;
+        r.online = false;
+        const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
+        r.stale = age_ms > kHardwareStaleAfterMs;
+        r.last_seen = human_age(age_ms);
+        r.last_seen_ms = e.last_heartbeat_ms;
+        return std::optional<InventoryDeviceRow>{std::move(r)};
+    }
+    return std::optional<InventoryDeviceRow>{};
+}
+
+void apply_identity_read(HardwareCiDetail& detail,
+                         std::expected<std::optional<InventoryDeviceRow>, PresenceReadError> ident) {
+    if (ident)
+        detail.identity = std::move(*ident);
+    else
+        detail.identity_degraded = true;
 }
 
 } // namespace yuzu::server

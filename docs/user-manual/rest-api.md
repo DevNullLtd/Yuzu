@@ -61,6 +61,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
 - [REST API v1 Endpoints](#rest-api-v1-endpoints)
   - [Current User](#current-user)
   - [Devices](#devices)
+  - [Hardware](#hardware)
   - [Management Groups](#management-groups)
   - [API Tokens](#api-tokens)
   - [Engine Principals](#engine-principals)
@@ -419,6 +420,57 @@ of an unwired TagStore). A device outside the caller's fleet-read scope returns 
 genuinely nonexistent `agent_id` — an out-of-scope match is never distinguishable from "does not
 exist" in the response body (matches the pre-existing MCP `get_agent_details` tool's
 existence-oracle closure exactly).
+
+---
+
+### Hardware
+
+The Hardware CI list and single-device CI record: the two read routes of the OpenAPI tag `Hardware`, followed by a short entry for the on-demand sync `POST /api/v1/hardware/{id}/sync`. Both read routes are audited on a served read, and with `result=failure` when the device roster could not be read.
+
+#### `GET /api/v1/hardware`
+
+The Hardware list: the device roster (identity fields as for `/devices`) plus device-CI columns, a per-page DEX score, claimed IPs and tags.
+
+**Permission:** `Inventory:Read`, via `require_fleet_read` (admit-then-filter).
+
+**Query parameters:** `q`, `os`, `status`, `sort`, `dir`, `tag`, `offset`, `limit`. An unrecognised `sort`, `os` or `status` token, or an invalid `tag` key, is a `400`; any `dir` other than `desc` sorts ascending.
+
+**Response:** `{ "data": { "devices": [...], "count", "total_matching", "devices_omitted", "ci_degraded", "tags_degraded", "kpis", "query" }, "pagination", "meta" }`.
+
+| Status | Meaning |
+|---|---|
+| `200` | The roster was read. `ci_degraded` / `tags_degraded` are `true` when the CI or tag store could not be read, so those columns are blank rather than genuinely absent. At most the 100,000 most recently seen endpoints within the 30-day window are served, with no truncation signal yet. While `tags_degraded` is `true`, a `tag` filter (or a tag match in `q`) sees no tags and answers an empty list. |
+| `400` | Unrecognised `sort`, `os` or `status` token, or an invalid `tag` key. |
+| `403` | Caller lacks `Inventory:Read`. |
+| `503` | Route misconfigured (roster provider unwired), the device roster could not be read (`retry_after_ms` set), the audit row could not be persisted, or the authorization store is unavailable (`retry_after_ms` 5000). A failed roster read is never a `200` with an empty list. |
+
+**Audit:** `inventory.devices`; `result=success` on a served page, `result=failure` (detail `hardware roster read failed`) when the roster could not be read. A persist failure on the success row fails the request closed with `503`.
+
+---
+
+#### `GET /api/v1/hardware/{id}`
+
+One device's CI record: identity, device-CI blob, installed software and tags, each read independently so a degraded read is distinguishable from an absent one.
+
+**Permission:** `Inventory:Read`, via `require_fleet_read`. An id outside the caller's fleet-read scope returns the same `404` as a nonexistent id.
+
+**Response:** `{ "data": { "agent_id", "hostname", "os", "online", "last_seen", "identity_state", "ci", "ci_state", "software", "tags", ... }, "meta" }`. `identity_state` is `found`, `degraded` (the device roster could not be read) or `absent`; `ci_state` is `found`, `absent` or `degraded`. `agent_id`, `hostname`, `os` and `last_seen` are `null` (and `online` is `false`) unless `identity_state` is `found`.
+
+| Status | Meaning |
+|---|---|
+| `200` | The record. A degraded CI store alongside a degraded roster is still a `200` carrying `identity_state` and `ci_state` as `degraded`. |
+| `400` | Device id longer than 256 bytes or containing a byte below `0x20`. Checked after the `Inventory:Read` check and before the scope check. Registration applies the same 256-byte limit and refuses an id with a byte below `0x20` (through its enrollment check), so any id that agent registration accepts passes and a registered device is not affected. |
+| `403` | Caller lacks `Inventory:Read`. |
+| `404` | Not found, or outside the caller's fleet-read scope (indistinguishable by design). |
+| `503` | Route misconfigured, audit row not persisted, the authorization store unavailable (`retry_after_ms` 5000), or the device roster could not be read (`retry_after_ms` set) and the device was not otherwise found (CI record readable-and-absent, no software, no tags). Never a `404`. |
+
+**Audit:** `inventory.device.ci`; `result=failure` when the roster read failed (detail `state=roster unreadable` on the `503`, `state=<...> identity=roster unreadable` on a served `200`).
+
+---
+
+#### `POST /api/v1/hardware/{id}/sync`
+
+Requests an on-demand agent sync for one device. **Permission:** `Execution:Execute` scoped to the device. The body, the `202` and the `409` are described in the OpenAPI document. A device id longer than 256 bytes or containing a byte below `0x20` is a `400`, answered before the permission check and with no audit row (the same id rule as `GET /api/v1/hardware/{id}`, including the registration note there). **Audit:** `inventory.sync.request` (see [audit-log.md](audit-log.md)).
 
 ---
 
@@ -8198,7 +8250,7 @@ Returns the full topology as JSON.
 
 | Status | When | Body |
 |---|---|---|
-| `200` | Success | `fleet_topology.v1` JSON envelope (see schema below) |
+| `200` | Success | `fleet_topology.v1` JSON envelope (see schema below). If the durable offline-host read failed, the live fleet is still returned and the envelope carries `offline_roster_degraded: true` (absent on success) |
 | `400` | `machines_max` non-numeric, out of `[1, 100000]`, or overflows `int` | `{"error":{"code":400,"message":"..."}, "meta":{"api_version":"v1"}}` |
 | `403` | RBAC denied | Standard auth error envelope |
 | `413` | Snapshot exceeds `machines_max` | `{"error":{"code":413,"message":"fleet topology exceeds machines_max..."}, "meta":{"api_version":"v1"}}` |
@@ -8209,7 +8261,7 @@ Returns the full topology as JSON.
 ```json
 {
   "schema": "fleet_topology.v1",
-  "schema_minor": 3,
+  "schema_minor": 4,
   "generated_at": 1715299200,
   "include_vuln": false,
   "machines": [
@@ -8241,6 +8293,8 @@ Returns the full topology as JSON.
 ```
 
 `schema_minor` is bumped (not `schema`) on additive evolution; renderers MUST ignore unknown keys.
+
+Optional top-level key `offline_roster_degraded: true` is present only when the durable offline-host read failed; `machines` is then live-only. It is a request-time, envelope-level annotation like the MCP twin's `audit_persisted` (set per request, outside the cached snapshot document), not a `schema_minor` change.
 
 **`schema_minor` history:**
 

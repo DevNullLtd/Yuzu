@@ -580,17 +580,31 @@ the CI record's **Installed software** lens — the *authoritative* reads — sh
 explicit **"unavailable"** banner rather than an empty table, because an empty table
 would read as "installed nowhere", the fail-open the authoritative-read contract
 (ADR-0016 §7) forbids. The **Hardware list** itself (hostname/OS/status/last-seen/IP/
-DEX/version) is sourced from the deliberately *fail-soft* endpoint-state store, with the
+DEX/version) is sourced from the endpoint-state store (a failed read is reported as such, never shown as an empty roster), with the
 CI and Tags columns layered on top from a best-effort `DeviceInventoryStore`/tag-store
 read — a *whole-store* degrade there is now its own explicit "CI columns unavailable" /
 "Tags unavailable" banner (an improvement on the old Devices tab, where a
 `DeviceInventoryStore` degrade during the list render was indistinguishable from "not
-yet synced"); the dedicated "roster unavailable" banner appears only when the roster
-provider is not wired at all — a failed roster read currently renders as an empty table
-(tracked in #5531). The **per-device CI record's Overview
-lens**, by contrast, has always been an authoritative three-state read: found /
-genuinely-not-yet-synced ("no CI record synced yet") / degraded (an explicit "CI record
-unavailable" banner) are never conflated.
+yet synced"); a FAILED roster read (not only an unwired provider) shows a dedicated
+"roster unavailable" banner rather than an empty table, makes `GET /api/v1/hardware`
+answer `503` with `retry_after_ms`, and audits `result=failure` (see Troubleshooting
+for where to look). On the dashboard's CI record, an unreadable roster with no CI
+record to show reads "roster unreadable"; otherwise the record is shown with a note
+on the Overview lens that the device identity is unavailable. **REST:** `GET /api/v1/hardware/{id}`
+distinguishes "not found" (`404`) from "roster unreadable" (`503`, the device was not
+otherwise found: CI record readable-and-absent, no software, no tags) from a record
+served with a degraded identity (`identity_state: degraded`). **REST:** a degraded CI store
+alongside a degraded roster is a `200` carrying both `identity_state` and `ci_state` as
+`degraded`. The **per-device CI record's Overview lens**, by contrast, has always been
+an authoritative three-state read: found / genuinely-not-yet-synced ("no CI record
+synced yet") / degraded (an explicit "CI record unavailable" banner) are never
+conflated.
+
+The Hardware list and its KPI strip serve at most the 100,000 most recently seen
+endpoints within the 30-day window; a fleet above that sees a capped list without a
+warning (a truncation signal is tracked in #5712). The per-device record's offline
+identity fallback reads the same capped set, so an offline device outside it shows no
+identity and, with nothing else synced, reads as not found.
 
 ## Access control
 
@@ -868,6 +882,8 @@ from the other. Agents that do not emit the skip tag (older agents, or during a
 rollout) are not counted, so a zero there does not rule out a skipping collector.
 
 **A Windows device's software inventory stops updating although the agent is healthy.** Since the #4711 hardening, an Uninstall registry root that cannot be opened or enumerated to the end, or one application subkey whose open fails (access denied above all) or whose name exceeds 255 characters, makes `list_inventory` return rc 1 and the daily sync skips that cycle rather than committing a shorter inventory as authoritative; the device keeps its last good inventory and `last_seen` stops advancing. `list` and `query` return the `error|` row with rc 1 for the same condition. The agent log carries both halves: `installed_apps: Uninstall root <HKLM-64|HKLM-32|HKCU> could not be fully read -- the collection is degraded` and `sync: installed_apps.list_inventory rc=1 — skipping this cycle`. Fix the ACL (the agent runs as LocalSystem) and the next 24 h cycle re-collects. The only fleet-side signal is the indirect `yuzu_inventory_stale_agents{source="installed_software"}` gauge (two missed cycles; its alert `YuzuInventoryStaleAgents` ships disabled and a never-synced device is not counted); there is no direct skip counter yet.
+
+**The Hardware list shows "Hardware roster unavailable" (or `GET /api/v1/hardware` answers `503`).** The persisted device roster could not be read. Check `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`: `reason="store_unavailable"` means no database connection could be obtained (the pool wait is 0.5-2 s, plus up to 10 s to connect to an unreachable database; see `/readyz` `pg_reachable` and the Postgres pool alerts: `YuzuPgPoolSaturated` with `pg_reachable` green points at pool saturation), `reason="db_error"` means the query itself failed (detail in the server's `query_stale_within failed` warn line). The audit row is `inventory.devices` with `result=failure` and detail `hardware roster read failed`; the REST `503` message `hardware roster unavailable` tells it apart from the audit-persist `503` (`audit subsystem unavailable`), which shares the same `retry_after_ms`. The CI-record symptoms ("Device roster unreadable", "Device identity unavailable", the record `503`) share the counter but audit as `inventory.device.ci` / `inventory.device.software`. The banner clears on the next successful read; no restart is needed.
 
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many
