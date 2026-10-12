@@ -44,7 +44,7 @@ static int clamp(int val, int lo, int hi) {
 //
 // A facet value goes into the Create Group button's hx-get query string. html_escape alone
 // leaves `+` (read as a space), `&` (ends the value), `#` (starts a fragment) and `%` (starts an
-// escape) to mangle it on the way to the server (#5700).
+// escape) to mangle it on the way to the server (#5623).
 static std::string percent_encode_component(std::string_view in) {
     static constexpr char kHex[] = "0123456789ABCDEF";
     std::string out;

@@ -100,15 +100,16 @@ refuse it: REST answers `400` (A4 envelope, `retry_after_ms: null`, not retryabl
 `-32602` (A4 `error.data`). A value is refused when it is over 2048 bytes or contains a NUL byte, a line
 feed or invalid UTF-8; over MCP an invalid-UTF-8 byte or a lone surrogate escape instead fails the JSON
 parse of the request (`-32700`, null `id`, no A4 `error.data`) before the tool runs, so the handler
-itself refuses only the over-bound, NUL and line feed cases. A value this version cannot store could never be matched, so for it the `0` told the caller nothing
-true about the fleet (for a legacy 2049 to 2704 byte value still in retention, see "Stored values"
-below: the old answer was a true count and the refusal replaces it until retention removes the row).
-That is why this is fixed in place rather than versioned: keeping the old answer alive for a
-deprecation window has no beneficiary. [`api-versioning-policy.md`](../api-versioning-policy.md) lists
+itself refuses only the over-bound, NUL and line feed cases. A value this version cannot store could
+never be matched, so for it the `0` told the caller nothing true about the fleet. For a legacy value
+over 2048 bytes that is still in retention (see "Stored values" below) the old answer was a true
+count, and the refusal replaces it until retention removes the row. That is why this is fixed in place
+rather than versioned: keeping the old answer for a deprecation window would serve only legacy rows
+that retention removes on its own. [`api-versioning-policy.md`](../api-versioning-policy.md) lists
 narrowing accepted input as Breaking and has no carve-out for a correctness fix, so this is a policy
-exception accepted by Dave Rae on 2026-10-12 (neither carve-out applies: it is not a vulnerability fix
-and it is not additive), with no version increment and no deprecation window. #5687 tracks the policy
-rule, to be decided before the release that carries this change.
+exception accepted by Dave Rae on 2026-10-12 (the security carve-out does not apply, and the change is
+not additive), with no version increment and no deprecation window. #5687 tracks the policy rule, to
+be decided before the release that carries this change.
 
 - The check runs on the raw values before the filter key is resolved, so the same value under an
   unrecognised key is refused too (it used to be silently ignored and answered `0`).
@@ -149,7 +150,8 @@ server binary (nothing to undo; responses already ingested keep the facets they 
   replica is upgraded (see "Lost facets are not recoverable" in
   [`response-store.md`](response-store.md)), and recreate any static group that was built from a
   response ingested during the rollout: running the command again does not repair a group that
-  already exists.
+  already exists, and recreating it from the old result set gives the same short group, so create
+  it again from the NEW run.
 
 See [`response-store.md`](response-store.md) (Facets are bounded), the REST route in
 [`rest-api.md`](rest-api.md) and tool 83 in [`mcp.md`](mcp.md).

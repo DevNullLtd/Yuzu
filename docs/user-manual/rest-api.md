@@ -855,11 +855,11 @@ to report, and no store read is made.
 
 A filter value is refused with `400` (A4 envelope, `retry_after_ms: null`, not retryable) before any
 store read when it is longer than 2048 bytes, or contains a NUL byte, a line feed or invalid UTF-8.
-Such a value can never equal a stored facet: this version does not index a facet value over 2048
+Such a value can match no stored facet of this version: it does not index a facet value over 2048
 bytes (older servers indexed longer values, up to the database index tuple limit of about 2.7 KB,
 and those rows age out with retention), ingest
 rewrites each NUL or invalid-UTF-8 byte to U+FFFD, and it splits the output into lines on every
-line feed, so a stored value contains neither. The request would otherwise answer a misleading `0`
+line feed, so a stored value contains neither. The request would otherwise answer a `0` that says nothing true about the fleet (except for a legacy row still in retention)
 (a NUL would additionally match as a truncated prefix). The error says the exact-match filter is not
 supported and the request was not evaluated. It does not claim that no agent has the value, names
 all the causes and does not echo the value.
