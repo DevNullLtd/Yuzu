@@ -479,12 +479,12 @@ OidcProvider::validate_claims(const IdTokenClaims& claims,
     }
 
     if (claims.iss != config_.issuer)
-        return std::unexpected("iss mismatch: got '" + claims.iss + "', expected '" +
-                               config_.issuer + "'");
+        return std::unexpected("iss mismatch: got '" + ::yuzu::log_key_token(claims.iss) +
+                               "', expected '" + config_.issuer + "'");
 
     if (claims.aud != config_.client_id)
-        return std::unexpected("aud mismatch: got '" + claims.aud + "', expected '" +
-                               config_.client_id + "'");
+        return std::unexpected("aud mismatch: got '" + ::yuzu::log_key_token(claims.aud) +
+                               "', expected '" + config_.client_id + "'");
 
     // #1837 governance follow-up — `sub` is now the authorization-load-
     // bearing half of the stable RBAC principal `oidc:<iss>#<sub>`
@@ -998,7 +998,8 @@ std::expected<std::vector<CachedJwk>, std::string> OidcProvider::parse_jwks(cons
 
             cached.pkey = jwk_to_pkey(key);
             if (!cached.pkey) {
-                spdlog::warn("OidcProvider: failed to parse JWK kid={}", cached.kid);
+                spdlog::warn("OidcProvider: failed to parse JWK kid={}",
+                             ::yuzu::log_key_token(cached.kid));
                 continue;
             }
             keys.push_back(std::move(cached));
@@ -1074,7 +1075,7 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
 
     // Only RS256/RS384/RS512 supported (Entra ID uses RS256)
     if (alg != "RS256" && alg != "RS384" && alg != "RS512")
-        return std::unexpected("unsupported JWT algorithm: " + alg);
+        return std::unexpected("unsupported JWT algorithm: " + ::yuzu::log_key_token(alg));
 
     // Ensure JWKS is cached and fresh
     bool fetch_failed = false;
@@ -1103,7 +1104,8 @@ find_key:;
     }
     // If kid didn't match, re-fetch JWKS once (key rotation)
     if (!pkey && !kid.empty()) {
-        spdlog::info("OidcProvider: kid={} not in cache, re-fetching JWKS", kid);
+        spdlog::info("OidcProvider: kid={} not in cache, re-fetching JWKS",
+                     ::yuzu::log_key_token(kid));
         fetch_failed = !fetch_jwks();
         std::lock_guard lock(jwks_mu_);
         for (const auto& k : jwks_cache_) {
@@ -1122,7 +1124,7 @@ find_key:;
     if (!pkey) {
         if (fetch_failed)
             return std::unexpected(std::string(kJwksUnavailable));
-        return std::unexpected("no matching JWKS key found for kid=" + kid);
+        return std::unexpected("no matching JWKS key found for kid=" + ::yuzu::log_key_token(kid));
     }
 
     // The signing input is "header.payload" (first two base64url segments verbatim)
@@ -1164,7 +1166,8 @@ find_key:;
     if (rc != 1)
         return std::unexpected("JWT signature verification failed — token may be forged");
 
-    spdlog::debug("OidcProvider: JWT signature verified (alg={}, kid={})", alg, kid);
+    spdlog::debug("OidcProvider: JWT signature verified (alg={}, kid={})",
+                  ::yuzu::log_key_token(alg), ::yuzu::log_key_token(kid));
     return {};
 }
 
@@ -1236,7 +1239,8 @@ bool endpoint_acceptable(const std::string& value, std::string_view scheme) {
 // never fail with EMFILE: under descriptor exhaustion a dup() taken after httplib's socket() would
 // fail and the request would run unwatched with no bound. If the reservation fails the request
 // is refused before any socket exists (`reserved()` is false); a dup2 that fails anyway sets
-// `failed()` and the caller reports an error instead of trusting the answer. dup2 does not carry
+// `failed()`, shuts the raw socket down (best effort) and the caller reports an error instead of
+// trusting the answer; that branch is unreachable in practice. dup2 does not carry
 // FD_CLOEXEC, so it is set right after; the window in between is harmless because the server
 // does not fork or exec on this path. The reserved number is ours alone, so it cannot be reused
 // by httplib: it keeps the socket's identity until the destructor closes it. Every use of the
@@ -1287,6 +1291,11 @@ public:
         std::lock_guard lock(mu_);
         if (fd_.fd < 0 || ::dup2(sock, fd_.fd) < 0) {
             failed_ = true;
+            // Best effort: the socket cannot be watched, so shut it down at once so that the
+            // connect or handshake fails fast instead of running unbounded (persists on Linux,
+            // not on macOS). Unreachable in practice: the reserved descriptor is ours alone and
+            // dup2 onto it cannot hit EMFILE.
+            ::shutdown(sock, SHUT_RDWR);
             return;
         }
         (void)::fcntl(fd_.fd, F_SETFD, FD_CLOEXEC);
@@ -1714,8 +1723,10 @@ std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(
         return std::unexpected(claims_result.error());
     }
 
-    spdlog::info("OIDC handle_callback: parsed claims sub={} iss={} aud={} nonce={}",
-                 claims_result->sub, claims_result->iss, claims_result->aud, claims_result->nonce);
+    spdlog::info(
+        "OIDC handle_callback: parsed claims sub={} iss={} aud={} nonce={}",
+        ::yuzu::log_key_token(claims_result->sub), ::yuzu::log_key_token(claims_result->iss),
+        ::yuzu::log_key_token(claims_result->aud), ::yuzu::log_key_token(claims_result->nonce));
 
     // Validate claims
     auto validation = validate_claims(*claims_result, challenge.nonce);
@@ -1724,9 +1735,10 @@ std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(
         return std::unexpected(validation.error());
     }
 
-    spdlog::info("OIDC auth succeeded: sub={} email={} name={}", claims_result->sub,
-                 claims_result->email.empty() ? "(none)" : claims_result->email,
-                 claims_result->name.empty() ? "(none)" : claims_result->name);
+    spdlog::info(
+        "OIDC auth succeeded: sub={} email={} name={}", ::yuzu::log_key_token(claims_result->sub),
+        claims_result->email.empty() ? "(none)" : ::yuzu::log_key_token(claims_result->email),
+        claims_result->name.empty() ? "(none)" : ::yuzu::log_key_token(claims_result->name));
 
     return claims_result;
 }
