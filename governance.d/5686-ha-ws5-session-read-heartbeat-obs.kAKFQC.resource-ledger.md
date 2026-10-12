@@ -1,7 +1,8 @@
 # Resource Ledger — `5686-ha-ws5-session-read-heartbeat-obs.kAKFQC`
 
-Every owning boundary the C++ in `origin/dev..HEAD` (branch `feat/ha-ws5-session-read-and-heartbeat-obs`; six commits
-`0a04dc173` #5684, `ad9168d0f` #5686, `f7a8f6b82` probe, `156824bc4` reconciler tests, `d36c3371d` + `b6ac026b2` docs/HELP;
+Every owning boundary the C++ in `origin/dev..HEAD` (branch `feat/ha-ws5-session-read-and-heartbeat-obs`; nine commits
+`0a04dc173` #5684, `ad9168d0f` #5686, `f7a8f6b82` probe, `156824bc4` reconciler tests, `d36c3371d` + `b6ac026b2` docs/HELP,
+`529a67dc3` ledger, `79ea64780` F1 (probe starts right after the first failure), `683ed5dee` F1 polish (governed HEAD of this update);
 merge-base `6608fcea7`) acquires. Required by the Gate 1 contract on any C++ diff. The author's Gate 1 ledger was
 independently re-proved by `security-guardian`, `cpp-safety` (Gate 2/3) and again at Gate 8 on the fix commits.
 
@@ -38,3 +39,13 @@ still to be observed.
 not committed): moving the `dispatch_session_id` capture after `dispatch_fn` makes the new session-swap test fail; file
 restored. Independent TSan evidence (author, before the fix commits): old reconciler `:600` race reported, fixed code
 clean in 3 runs; per-site TSan sensitivity for `:215`/`:434` is NOT evidenced.
+
+**F1 update (commits `79ea64780`, `683ed5dee`).** No new resource class. Changes: `PresenceBatch::next_probe` is now set to `1` on the
+first failure of a streak (`was_tripped ? std::min(next_probe*2, kMaxProbeSpacing) : 1`, both arms `size_t`; the cap keeps the
+multiply <= 2^17, no wrap), so attempts land on entries 1,2,4,8,16,... (`floor(log2 N)+1` per saturated batch); the batch is
+still a per-RPC stack aggregate lent by raw pointer. New test locals are values only: a `std::vector<int>` of 1-based entry
+indices at which `batch.failed` increments (sequence test) and `PgPool::Lease` holds scoped to inner blocks in the isolated-failure
+and recovery tests (released before the probe; declared after pool and store as before). The 3-entry test gained a
+`next_probe == 2` check. Mutation evidence (scratch copy of the tree at `/tmp/prA-f1-mut-src`, old failure arm, new tests kept):
+5 tests fail, so the new tests discriminate F1. Real-tree results at `683ed5dee`: `[heartbeat_ingestion]` 16 cases / 121
+assertions, `[gateway_route_wiring]` 70 / 1708, `*#5686*` 3 / 117, `*#5684*` 3 / 146, `[reconciler]` 32 / 452.
