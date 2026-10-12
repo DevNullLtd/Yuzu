@@ -243,6 +243,12 @@ struct SoftwareFleetQuery {
     /// install_id churns when an agent's list is fully replaced, so a walk concurrent with
     /// one agent's resync can repeat or skip that agent's same-name rows.
     std::optional<SoftwareCursor> after;
+    /// Rows to pass over AFTER `after` (SQL OFFSET, only when > 0) - the skipped rows never cross
+    /// the wire. Used by the post-filtered scope walk to re-anchor at the last row it served.
+    /// It counts positions, so that walk is best-effort under concurrent change: deleting an
+    /// out-of-scope row in the skipped span, or widening the caller's scope, between pages can
+    /// make the next page skip or repeat a row (same class as the install_id churn above).
+    std::int64_t skip{0};
 };
 
 class SoftwareInventoryStore {
