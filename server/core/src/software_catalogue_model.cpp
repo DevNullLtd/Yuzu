@@ -920,6 +920,13 @@ read_versions(const VersionsReads& io, const SoftwareVersionsQuery& q) {
     return std::move(*rows);
 }
 
+std::string denied_detail(const DevicesPage& page) {
+    if (page.devices_omitted > 0)
+        return "scope: filtered " + std::to_string(page.devices_omitted) +
+               " out-of-scope device(s) (management-group and/or service-tag axis)";
+    return page.target_denied ? "scope: agent_id outside the caller's scope" : std::string{};
+}
+
 std::expected<DevicesPage, std::optional<CursorError>>
 read_devices_page(const DevicesReader& read, const DevicesRequest& rq,
                   const authz::VisibleSet& scope) {

@@ -9014,15 +9014,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // audit_persisted. `success` is written on EVERY call (continuation pages
                 // tagged page=continuation): the cursor is opaque but unauthenticated.
                 bool denied_ok = true;
-                if (page.devices_omitted > 0 || page.target_denied)
-                    denied_ok = mcp_audit(
-                        "denied",
-                        (page.devices_omitted > 0
-                             ? "scope: filtered " + std::to_string(page.devices_omitted) +
-                                   " out-of-scope device(s) (management-group and/or "
-                                   "service-tag axis)"
-                             : std::string("scope: agent_id outside the caller's scope")) +
-                            " for " + audit_key);
+                if (const auto denied = swc::denied_detail(page); !denied.empty())
+                    denied_ok = mcp_audit("denied", denied + " for " + audit_key);
                 const bool audit_ok =
                     mcp_audit("success", audit_key + (continuation ? " page=continuation" : "")) &&
                     denied_ok;

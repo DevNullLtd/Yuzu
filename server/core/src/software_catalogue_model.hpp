@@ -325,4 +325,9 @@ struct DevicesPage {
 [[nodiscard]] std::expected<DevicesPage, std::optional<CursorError>>
 read_devices_page(const DevicesReader& read, const DevicesRequest& rq, const authz::VisibleSet& scope);
 
+/// The audit `denied` detail for a page that dropped devices or refused the named `agent_id`,
+/// or empty when nothing was denied. One builder for both transports, so the two audit rows
+/// cannot drift; each appends its own correlation suffix.
+[[nodiscard]] std::string denied_detail(const DevicesPage& page);
+
 } // namespace yuzu::server::software_catalogue

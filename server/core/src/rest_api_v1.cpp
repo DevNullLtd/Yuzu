@@ -9373,15 +9373,10 @@ void RestApiV1::register_routes(
                  // opaque but unauthenticated, so per-call audit keeps a forged cursor from
                  // walking the fleet unrecorded. A post-filter drop is audited distinctly.
                  bool denied_ok = true;
-                 if (page.devices_omitted > 0 || page.target_denied)
-                     denied_ok = detail::try_persist_audit(
-                         audit_fn, req, verb, "denied", "Inventory", audit_key,
-                         (page.devices_omitted > 0
-                              ? "scope: filtered " + std::to_string(page.devices_omitted) +
-                                    " out-of-scope device(s) (management-group and/or "
-                                    "service-tag axis)"
-                              : std::string("scope: agent_id outside the caller's scope")) +
-                             "; cid=" + cid);
+                 if (const auto denied = swc::denied_detail(page); !denied.empty())
+                     denied_ok = detail::try_persist_audit(audit_fn, req, verb, "denied",
+                                                           "Inventory", audit_key,
+                                                           denied + "; cid=" + cid);
                  const std::string detail_text =
                      (export_mode ? "installs format=" + rq.format +
                                         " rows=" + std::to_string(page.rows.size()) +
