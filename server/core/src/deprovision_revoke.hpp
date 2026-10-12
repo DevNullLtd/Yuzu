@@ -136,7 +136,10 @@ revoke_deprovision_credentials(ApiTokenStore& token_store, auth::AuthManager& au
 /// blow out the audit detail string. Returns an empty string for an empty
 /// `principals` (nothing to enumerate — callers append this directly onto
 /// their existing detail string, so a leading space is included when
-/// non-empty).
+/// non-empty). Each principal string is passed through `yuzu::log_id_token` first (an IdP-chosen
+/// `sub` / NameID must not forge a field or a line in the audit detail, CWE-117), so a principal
+/// containing a space, '=', ',', a control byte or a byte >= 0x80 appears with '_' in its place,
+/// and a string over 256 bytes is shortened.
 constexpr std::size_t kMaxEnumeratedPrincipals = 10;
 std::string enumerate_principals_for_audit(const std::vector<std::string>& principals);
 

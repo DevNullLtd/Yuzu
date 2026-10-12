@@ -351,6 +351,25 @@ gate. Credit affirmatively as a CC6.1/CC6.3 control now, citing
 `docs/authz-model.md`'s `quarantine_device` paragraph and the MCP
 `quarantine_device` twin as the reference implementation.
 
+**Addendum: the last-Administrator guard for account lifecycle (CC6.1/CC6.2,
+#4966).** Deactivating, deleting or demoting the last active local administrator
+account is now refused on the Settings user delete and role change and on every SCIM
+deprovision and group-derived demotion site (a `409` on SCIM, audited as
+`scim.user.last_administrator_refused`). Read it as what it is: a **recovery rule**
+that keeps the fleet from losing its last administrator through an ordinary
+operation, **not** proof that anyone can sign in (a counted administrator may have no
+usable credential or step-up factor), and **not** an HA claim. Limits an assessor
+should know: administrators who sign in only through SSO are not counted until #5182;
+a rolling upgrade or a rollback runs without the guard on the binaries that lack it;
+direct SQL against the database is outside the rule; the SCIM Group role recompute has
+documented known limits and no alert rule ships for it yet (tracked in #5673; the
+interim SIEM keys are in `docs/user-manual/scim-provisioning.md`, "Pilot playbook").
+Operator remedy and the break-glass exit: `docs/user-manual/rbac.md`, "If the guard
+refuses an action you intend".
+Risk-register entry: an identity provider that removes a person who is the fleet's only
+administrator leaves that person active (loud: audit row, counter, critical event),
+until an operator promotes a second administrator and demotes the first.
+
 ---
 
 ## 3.3 Workstream C — Application and Infrastructure Security
@@ -659,6 +678,7 @@ so a runner missing the gateway toolchain fails instead of passing without the g
 - Forward pointer: track 2g (ADR-1005 Decision 16, `docs/agentic-first-principle.md` A5) delivers a near-fully self-describing MCP tool/resource surface — typed schemas, truthful safety annotations, a handshake orientation blob, and OpenAPI/scope-DSL specs discoverable via `resources/list` rather than tool-by-tool, with one narrow tracked residual (streamed-final fallback envelope, #2990 — `retry_after_ms` closed 2026-08 by #3344). Cite this in the security whitepaper / CAIQ responses as evidence of a machine-verifiable, not merely documented, agentic contract — a differentiator against peers whose AI integrations (if any) are undocumented or prose-only; disclose the residuals rather than overclaiming completeness to a technical reviewer.
 - Forward pointer: the plugin README standard (`docs/plugin-readme-standard.md`) makes each agent plugin self-describing as data — its per-OS mechanism, the privilege it runs at with a measured date, its securable/operation/risk tier, output columns and where the rows land — served at `GET /api/v1/discover/plugin-docs` and the `yuzu://plugin-docs` resource. Cite it as the per-plugin answer to "what does the agent collect, at what privilege" (the `Sensitivity is plugin-dependent` rows above point here for the plugins that have adopted it); state the coverage honestly — two pilots today, the remaining plugins in the retrospective sweep, held by a README-existence ratchet in the `docs` test suite.
 - Known-limitations disclosure (#3481, gov Gate 6 enterprise-readiness, 2026-08-24): two tracked, filed, non-blocking `ProductPackStore` residuals worth surfacing in a technical security/reliability review rather than presenting only as public GH issues — #3523 (two concurrent installs of an identical product-pack bundle can cross-couple a `Policy` to an unrelated pack's `Fragment`; no attacker required, an automation/GitOps race is sufficient) and #3524 (a large duplicate-item-id bundle drives an unbounded, synchronous compensation pass over sibling-store locks — a `ProductPack:Write`-privileged-caller resource-exhaustion question a CAIQ-style review would reasonably ask). Both are data-integrity/availability class, not credential/RCE; neither derived BLOCKING under this repo's severity schema.
+- Known-limitations disclosure (#4966): the last-Administrator guard is a recovery rule, not proof of sign-in and not an HA claim; SSO-only administrators are not counted until #5182, direct SQL is outside it, a rolling upgrade or rollback drops it, and the SCIM Group role recompute has documented limits with no shipped alert rules (tracked in #5673). State these alongside the control in the questionnaire/whitepaper rather than presenting the guard as absolute.
 - Forward pointer: Reflex (agent-local Spark-bound automated response, `docs/reflex-design.md`, ADR-0021, `docs/roadmap.md` Phase 20) is design-only as of 2026-09-17 — zero code. Once built it is a CC6/CC8-relevant control (digest-bound two-person deploy approval on any dangerous Reaction) and a CC7.2 evidence source (the `reflex_outcomes` journal, subject to its own stated evidentiary retention floor). Cite it in the whitepaper/questionnaire only once shipped; this bullet exists so the design-stage capability is not silently absent from Workstream G's forward-looking inventory.
 - Forward pointer: enrollment tokens and the pending-agent queue are now durable across restarts and shared fleet-wide via a single Postgres-authoritative store, with atomic race-safe token consumption (HA WS-6 6.2, ADR-2002) — for whoever eventually writes the customer-facing whitepaper/CAIQ, this closes a previously implicit per-replica-state gap in the availability/consistency story for agent enrollment.
 

@@ -179,7 +179,8 @@ announce_connected(#data{agent_id = AgentId, session_id = SessionId, peer_addr =
                       #{agent_id => AgentId, node => node(),
                         session_id => SessionId}),
 
-    logger:info("Agent ~s connected from ~s", [AgentId, PeerAddr]),
+    logger:info("Agent ~s connected from ~s",
+                [yuzu_gw_env:log_text(AgentId), yuzu_gw_env:log_text(PeerAddr)]),
 
     %% Notify C++ server about the stream connection.
     yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
@@ -238,7 +239,7 @@ connecting(cast, {upstream_reannounced, SessionId},
     %% `streaming` clause below — only the state differs.
     logger:debug("Agent ~s: upstream adopted replay under session ~s — re-announcing "
                 "CONNECTED (still connecting) to converge server-side placement",
-                [AgentId, SessionId]),
+                [yuzu_gw_env:log_text(AgentId), yuzu_gw_env:log_text(SessionId)]),
     yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
                                           StreamHomeId),
     keep_state_and_data;
@@ -293,12 +294,14 @@ streaming(info, stream_closed, Data) ->
     {next_state, disconnected, Data};
 
 streaming(info, {stream_error, Reason}, Data) ->
-    logger:warning("Stream error for agent ~s: ~p", [Data#data.agent_id, Reason]),
+    logger:warning("Stream error for agent ~s: ~p",
+                   [yuzu_gw_env:log_text(Data#data.agent_id), Reason]),
     {next_state, disconnected, Data};
 
 streaming(info, {'DOWN', MonRef, process, _Pid, _Reason},
           #data{stream_mon = MonRef} = Data) ->
-    logger:warning("Stream handler died for agent ~s", [Data#data.agent_id]),
+    logger:warning("Stream handler died for agent ~s",
+                   [yuzu_gw_env:log_text(Data#data.agent_id)]),
     {next_state, disconnected, Data};
 
 streaming({call, From}, get_info, Data) ->
@@ -327,7 +330,8 @@ streaming(cast, {upstream_reannounced, SessionId},
     %% path. Does not change `Data` (nothing about THIS process's own state
     %% changed — only the server's independently-installed placement did).
     logger:debug("Agent ~s: upstream adopted replay under session ~s — re-announcing "
-                "CONNECTED to converge server-side placement", [AgentId, SessionId]),
+                "CONNECTED to converge server-side placement",
+                [yuzu_gw_env:log_text(AgentId), yuzu_gw_env:log_text(SessionId)]),
     yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
                                           StreamHomeId),
     keep_state_and_data;
@@ -338,7 +342,7 @@ streaming(cast, {upstream_reannounced, _OtherSessionId}, Data) ->
     %% drip and a genuine agent reconnect. Ignore; the reconnect's own
     %% CONNECTED already carries the correct, current placement.
     logger:debug("Agent ~s: ignoring stale upstream_reannounced for a superseded session",
-                [Data#data.agent_id]),
+                [yuzu_gw_env:log_text(Data#data.agent_id)]),
     keep_state_and_data.
 
 %%--------------------------------------------------------------------
@@ -462,7 +466,8 @@ handle_stream_response(ResponseFrame, #data{agent_id = AgentId, pending = Pendin
             {keep_state, Data#data{pending = Pending2}};
 
         error ->
-            logger:debug("Orphaned response from ~s for cmd ~s", [AgentId, CmdId]),
+            logger:debug("Orphaned response from ~s for cmd ~s",
+                         [yuzu_gw_env:log_text(AgentId), yuzu_gw_env:log_text(CmdId)]),
             keep_state_and_data
     end.
 
@@ -506,7 +511,8 @@ do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
                       occurred_at => #{millis_epoch => erlang:system_time(millisecond)},
                       event       => {disconnected, #{reason => <<"normal">>}}}),
 
-    logger:info("Agent ~s disconnected (was connected ~bms)", [AgentId, Duration]),
+    logger:info("Agent ~s disconnected (was connected ~bms)",
+                [yuzu_gw_env:log_text(AgentId), Duration]),
     ok.
 
 notify_watchers(Event) ->

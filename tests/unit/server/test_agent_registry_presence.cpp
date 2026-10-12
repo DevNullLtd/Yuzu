@@ -272,7 +272,9 @@ TEST_CASE("HA WS-5: a graceful disconnect's remove_if_session prevents zero-mono
     // DexFleet.windows_online reads through live_presence(), so its 3 s cache
     // is not in this path.
     bool on_roster = false;
-    for (const auto& e : store.query_stale_within(std::chrono::hours(1)))
+    const auto roster = store.query_stale_within(std::chrono::hours(1));
+    REQUIRE(roster.has_value()); // #5531: the roster read is typed
+    for (const auto& e : *roster)
         on_roster = on_roster || e.agent_id == "departed-agent";
     CHECK(on_roster);
     CHECK_FALSE(contains(registry.all_ids(), "departed-agent"));
