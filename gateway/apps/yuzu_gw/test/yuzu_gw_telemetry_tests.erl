@@ -80,11 +80,15 @@ counter_val(Name, Labels) ->
     end.
 
 %% Every event in Metas folds into the `unknown' series of Counter (so the series
-%% moves once per event) and creates no series named after a binary reason.
+%% moves by the sum of the events' counts) and creates no series named after a
+%% binary reason.
 assert_folds_into_unknown(Event, Counter, Metas) ->
     Before = counter_val(Counter, [<<"unknown">>]),
-    [telemetry:execute(Event, #{count => 1}, Meta) || Meta <- Metas],
-    ?assertEqual(Before + length(Metas), counter_val(Counter, [<<"unknown">>])),
+    %% Each event carries its own count (1, 2, 3, 1, ...): the series moves by the
+    %% measured count, not by one per event.
+    Counts = [1 + (I rem 3) || I <- lists:seq(0, length(Metas) - 1)],
+    [telemetry:execute(Event, #{count => N}, Meta) || {N, Meta} <- lists:zip(Counts, Metas)],
+    ?assertEqual(Before + lists:sum(Counts), counter_val(Counter, [<<"unknown">>])),
     [?assertEqual(undefined, prometheus_counter:value(Counter, [Reason]))
      || #{reason := Reason} <- Metas, is_binary(Reason)],
     ok.

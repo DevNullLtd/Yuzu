@@ -23,6 +23,13 @@ valid_multibyte_within_the_limit_is_unchanged_test() ->
     Addr = <<"host-", ?EURO/binary, "-", ?GRIN/binary>>,
     ?assertEqual(Addr, yuzu_gw_peer_addr:sanitize(Addr)).
 
+%% The boundary itself: one byte over the limit is cut to the limit. Every other
+%% cut case starts well past it, so only this one separates "at most 255" from
+%% "at most 256".
+one_over_the_limit_is_cut_to_the_limit_test() ->
+    Addr = binary:copy(<<"a">>, 256),
+    ?assertEqual(binary:copy(<<"a">>, 255), yuzu_gw_peer_addr:sanitize(Addr)).
+
 cut_never_splits_a_multibyte_character_test_() ->
     %% A multibyte character that starts before byte 255 and ends at or after it:
     %% the result stops before it. Pad so the character begins at offset Pad, for

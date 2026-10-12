@@ -97,6 +97,8 @@ binding_test_() ->
        {timeout, 30, fun register_sanitises_the_peer_address_and_warns_once/0}},
       {"agent id and peer address are logged without raw control characters",
        {timeout, 30, fun agent_text_is_logged_without_control_characters/0}},
+      {"the Register peer address warning carries the agent id without raw control characters",
+       {timeout, 30, fun register_peer_address_warning_has_no_raw_control_characters/0}},
       {"rejections produce a rate-limited summary log with no session id",
        fun rejection_log_is_rate_limited_and_id_free/0},
       {"Register and agent-connected info logs carry no session id",
@@ -703,6 +705,22 @@ agent_text_is_logged_without_control_characters() ->
     ?assertMatch([_], Connected),
     [?assertEqual(nomatch, binary:match(L, [<<13>>, <<10>>])) || L <- Registered ++ Connected],
     ?assertNotEqual(nomatch, binary:match(hd(Connected), <<"peer-marker">>)).
+
+%% The peer address warning of Register names the agent id, which the agent chose
+%% and the edge bounds only by length. It must pass through log_text/1 like the
+%% other Register lines (a bare ~s would let a CR or LF start a second line). The
+%% address must be one the sanitiser changes, or the line is never written.
+register_peer_address_warning_has_no_raw_control_characters() ->
+    A = <<"crlf-marker", 13, 10, "INJECTED-", (uid(<<"u">>))/binary>>,
+    Req = #{info => #{agent_id => A, hostname => <<"h">>}},
+    yuzu_gw_safe_call:reset_limits(),
+    Lines = capture_logs(fun() ->
+        {ok, _, _} = yuzu_gw_agent_service:register(ctx_authority(conn_a, <<255, 254>>), Req)
+    end),
+    Warned = [L || L <- Lines, binary:match(L, <<"the peer address was replaced">>) =/= nomatch,
+                   binary:match(L, <<"crlf-marker">>) =/= nomatch],
+    ?assertMatch([_], Warned),
+    [?assertEqual(nomatch, binary:match(L, [<<13>>, <<10>>])) || L <- Warned].
 
 %% The :authority header of a Register, as grpcbox hands it to the handler.
 ctx_authority(Key, Authority) ->

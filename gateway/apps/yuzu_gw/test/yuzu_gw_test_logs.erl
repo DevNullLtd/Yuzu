@@ -28,9 +28,11 @@ with_handler(Level, Fun) ->
     Prev = maps:get(level, logger:get_primary_config()),
     ok = logger:set_primary_config(level, Level),
     catch logger:remove_handler(?HANDLER),
-    ok = logger:add_handler(?HANDLER, ?MODULE,
-                            #{config => #{pid => self()}, level => Level}),
     try
+        %% Inside the try: a handler that cannot be added must still put the
+        %% primary level back.
+        ok = logger:add_handler(?HANDLER, ?MODULE,
+                                #{config => #{pid => self()}, level => Level}),
         flush(),
         Fun()
     after

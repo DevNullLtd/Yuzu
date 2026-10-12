@@ -60,6 +60,8 @@ safe_call_test_() ->
        fun warn_names_class_only_and_is_limited/0},
       {"exit_class reads only the shape of the reason",
        fun exit_class_shapes/0},
+      {"init_limits creates the stamp of every warning kind",
+       fun warn_kinds_have_stamps_after_init/0},
       {"warn_limited logs the first line, counts the rest and reports the count on the next",
        fun warn_limited_counts_suppressed_lines/0},
       {"warn_limited keeps the kinds apart and logs the first line of a kind without a stamp",
@@ -197,6 +199,16 @@ agent_init_registry_down() ->
     ?assertMatch([_|_], [E || E <- Events, is_agent_crash_report(E)]),
     ?assert(contains(events_text(Events), <<"registry_unavailable">>)),
     assert_no_markers(Events).
+
+%% The six closed kinds of warn_limited/3 each have a stamp as soon as init_limits/0
+%% has run, so the first failures of a burst share it instead of each creating its
+%% own (the race init_limits/0 exists to remove). The key shape is the one
+%% warn_limited_kinds_are_independent/0 also reads.
+warn_kinds_have_stamps_after_init() ->
+    ok = yuzu_gw_safe_call:init_limits(),
+    [?assertNotEqual(undefined, persistent_term:get({yuzu_gw_safe_call, {kind, Kind}}, undefined))
+     || Kind <- [register_refused, register_peer_addr, register_failed, inventory_failed,
+                 rpc_raised, rpc_answered_error]].
 
 %% The stamp is held quiet around the burst, so the interval cannot pass in the
 %% middle of it: the counts are exact.
