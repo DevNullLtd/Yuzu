@@ -1049,11 +1049,10 @@ TEST_CASE("/fragments/results: a cut read that parses to zero lines still says i
 // `this:abort`, so a correction typed during a refused or slow response was never sent, and a
 // late sort/page response could land after another response's OOB swap had detached its issuer.
 // Every element whose hx-get targets /fragments/results (filter-bar controls, the View select,
-// th sort links, Prev/Next) carries the same `#filter-bar:replace`. The deck refresh trigger lives in
-// the filter-bar form (render_filter_bar, see its test in test_dashboard_results_columns.cpp). The
-// replacing semantics were verified in headless
-// Chromium during the #5623 review, not by this test: it pins the exact scope string and that
-// no element is left behind.
+// th sort links, Prev/Next) carries the same `#filter-bar:replace`. The deck refresh trigger lives
+// in the filter-bar form (render_filter_bar; its test is in test_dashboard_results_columns.cpp).
+// The replacing semantics were verified in headless Chromium during the #5623 review, not by
+// this test: it pins the exact scope string and that no element is left behind.
 namespace {
 // Number of elements whose hx-get is /fragments/results[?...] (not /filter-bar), failing the
 // calling test for any one of them whose tag lacks the shared scope or carries a second hx-sync.
@@ -1241,7 +1240,7 @@ TEST_CASE("/fragments/results: sort headers and Prev/Next include the live filte
     CHECK(contains(page->body, ">Next</button>"));
 
     const auto tags = sort_and_pager_tags(page->body);
-    // Agent sort header + Output sort header + Prev + Next, measured as 4.
+    // The Agent column is always shown: Agent + Output sort headers, Prev and Next make 4.
     REQUIRE(tags.size() == 4);
     for (const auto& tag : tags) {
         INFO(tag);
@@ -1292,11 +1291,9 @@ TEST_CASE("/fragments/results: sort headers and Prev/Next include the live filte
 // for every LATER key, so `htmx:abort` must be the LAST key, with showToast first on the issuer.
 namespace {
 struct ExecDispatchHarness {
-    // MEMBER ORDER IS LOAD-BEARING: `sink` (declared before `sent`) is destroyed after `sent`.
-    // `sent` is a trivial std::size_t only read by the dispatch lambda while post() runs, so
-    // that order is harmless; the rule that matters is that `routes` and `metrics`, which the
-    // registered handlers reference, outlive the sink's last dispatch (see the other harnesses
-    // in this file).
+    // `routes` and `metrics`, which the registered handlers reference, must outlive the sink's
+    // last dispatch (see the other harnesses in this file). `sent` is a trivial std::size_t only
+    // read by the dispatch lambda while post() runs, so its destruction order does not matter.
     yuzu::MetricsRegistry metrics;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
@@ -1387,7 +1384,7 @@ TEST_CASE("dashboard execute: the HX-Trigger ends with an htmx:abort at the resu
     CHECK_FALSE(j["showToast"].contains("target"));
 }
 
-// -- #5623 (Gate 7 fix round G): the dispatch response only CLEARS the chart-deck host ----------
+// -- #5623: the dispatch response only CLEARS the chart-deck host --------------------------------
 // The deck refresh (one request, no polling) used to be emitted here as a `load delay:2s` host
 // queued behind the placeholder (`queue last`); a real browser showed htmx discards the
 // placeholder's queue when its outerHTML swap removes it, so the request was never sent. The
@@ -1422,7 +1419,8 @@ TEST_CASE("dashboard execute: the chart-deck host is cleared, never a refresh re
 
     // The filter-bar placeholder still carries the definition id (the form fetched from it renders
     // the deck trigger), and the deck host is the bare clearing div.
-    CHECK(contains(body, "<div id=\"filter-bar\" hx-swap-oob=\"true\" hx-get=\"/fragments/results/filter-bar?"));
+    CHECK(contains(body, "<div id=\"filter-bar\" hx-swap-oob=\"true\""
+                         " hx-get=\"/fragments/results/filter-bar?"));
     CHECK(contains(body, "definition_id="));
     CHECK(contains(body, "<div id=\"chart-deck-host\" hx-swap-oob=\"true\"></div>"));
     const auto deck_at = body.find("id=\"chart-deck-host\"");
@@ -1430,6 +1428,8 @@ TEST_CASE("dashboard execute: the chart-deck host is cleared, never a refresh re
     const auto deck_close = body.find('>', deck_at);
     REQUIRE(deck_close != std::string::npos);
     CHECK_FALSE(contains(body.substr(deck_at, deck_close - deck_at), "hx-get"));
+    // Nothing else in the dispatch response may fetch /fragments/results on its own.
+    CHECK_FALSE(contains(body, "hx-get=\"/fragments/results?"));
 }
 
 // -- #5623: authorization runs before the refusal, and a refusal is counted ---------------------

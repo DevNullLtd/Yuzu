@@ -1331,8 +1331,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // Success: return OOB swaps for the results area. Uses the
                  // same schema-aware resolution as render_results (PR1.7
                  // remediation) so a schema-only action's initial thead
-                 // matches what the 2s-later chart-deck-host refresh
-                 // renders, instead of flashing columns_for_plugin's
+                 // matches what the 2s-later deck refresh (started by the
+                 // filter-bar form) renders, instead of flashing columns_for_plugin's
                  // fallback shape first.
                  auto col_names = resolve_render_columns(plugin, def_id);
 
@@ -1380,15 +1380,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      html += "&amp;definition_id=" + html_escape(def_id);
                  html += "\" hx-trigger=\"load delay:2s\" hx-swap=\"outerHTML\"></div>";
 
-                 // OOB: chart deck, empty initially; ONE request fired 2 s after this
-                 // response (`load delay:2s`, not polling). Same as the filter bar.
-                 // Without this, the deck only appears after the operator
-                 // touches a filter; users expect the chart to render as
-                 // soon as the data arrives. `hx-swap-oob="true"` replaces
-                 // the whole element (outerHTML) so the new hx-get /
-                 // hx-trigger attributes attach; `innerHTML` would lose
-                 // them.
-                 // (#5623, Gate 7 fix round G) The deck refresh is no longer fired from
+                 // OOB: chart deck host, cleared here.
+                 // (#5623) The deck refresh is no longer fired from
                  // here: a request on this host would race the user's filter changes
                  // (its response carries pager / summary / Create-Group chrome) and could
                  // not be synced safely against the placeholder, which the filter-bar
@@ -2882,17 +2875,19 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
             " hx-trigger=\"input changed delay:300ms\""
             " hx-sync=\"" + std::string(kResultsSyncScope) + "\">";
 
-    // Chart-deck / pager refresh (#5623, Gate 7 fix round G). It lives INSIDE this
+    // Chart-deck / pager refresh (#5623). It lives INSIDE this
     // form so its `load` trigger fires only once the new form is in the DOM: the
     // request includes the form's live values (command_id, plugin, definition_id and
     // every filter) and registers on THIS form's hx-sync slot, so a later filter
     // change (scope `replace`) or a second dispatch (HX-Trigger htmx:abort on
     // #filter-bar) aborts it, and its late response cannot overwrite the filtered
-    // pager / summary / Create-Group chrome with unfiltered content. Round F put
+    // pager / summary / Create-Group chrome with unfiltered content. An earlier shape put
     // this request on the dispatch response's chart-deck-host, queued behind the
     // placeholder (`queue last`); a real browser showed htmx discards the
     // placeholder's queue when its outerHTML swap removes it, so the request was
-    // never sent.
+    // never sent. DEPENDENCE: the refresh exists only if this fragment loaded, and its route
+    // is still on the flat Response:Read gate (see the route's own comment), so an operator
+    // whose only grant is management-group-scoped gets no deck, pager or summary.
     if (!definition_id.empty()) {
         html += "<span class=\"deck-refresh\" hidden hx-get=\"/fragments/results\""
                 " hx-trigger=\"load\" hx-swap=\"none\" hx-include=\"#filter-bar\""

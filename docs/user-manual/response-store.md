@@ -355,18 +355,21 @@ operator-visible notes:
     request target over 8192 bytes before any handler runs, so a heavily percent-encoded value
     (about 2.7 KB decoded) or several individually legal values can still hit that limit (#5668).
   - **Dashboard refresh while a filter is applied.** The chart deck is refreshed ONCE, by a
-    request fired 2 seconds after a command is dispatched (not polling). That request carries no
-    filter state, so unscoped it could land after a filter change and overwrite the pager,
+    request fired 2 seconds after a command is dispatched (not polling). That request used to carry
+    no filter state, so it could land after a filter change and overwrite the pager,
     summary and Create Group button of a filtered view with unfiltered ones. Closed: the request
     is now started by the filter bar itself, so it is sent only once the filter bar has rendered,
     carries the filter values shown, and is cancelled by a later filter change or a second
     command; a column-header sort or a pagination click reads the live filter bar (they
     no longer re-send the filters of the last render); and sending a command aborts a results
     request still in flight, so a late response for the previous command cannot swap its rows or
-    its Create Group button over the new command's table. For about 2 seconds after a command is sent the filter
-    bar is an empty placeholder and the header refresh fires on the same delay; this is not a
+    its Create Group button over the new command's table. For about 2 seconds after a command is
+    sent the filter bar is an empty placeholder and the header refresh fires on the same delay;
+    this is not a
     defect, because in a browser check the header had no sort links and the page no Prev or Next
-    controls in that window, so nothing could be clicked. Still open: an open Create Static
+    controls in that window, so nothing could be clicked. Still open: an operator whose only
+    `Response:Read` grant is scoped to a management group is refused at the filter bar, so
+    gets no chart deck, pager or summary after a command (#5688); an open Create Static
     Group form is not cleared by a valid filter change and keeps its old filters and count
     (#5669); and the built-in `help` command and a TAR SQL query clear the results area without
     aborting a request in flight, and the hardware list keeps the older `this:abort` sync

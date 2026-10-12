@@ -62,13 +62,13 @@ class EventBus;
 //  * `POST /api/dashboard/execute` replaces #filter-bar, discarding this scope's registry, so
 //    its HX-Trigger ends with `"htmx:abort":{"target":"#filter-bar"}` (the selector half of
 //    this constant) to abort an in-flight results request first. It must stay the LAST key.
-//    Residual (tracked with #5677): after a dispatch `#filter-bar` is an empty placeholder for
-//    ~2 seconds and the thead refresh fires on the same delay. A browser check found no sort
-//    links or Prev / Next controls rendered in that window, so nothing is clickable; a sort
-//    link pointing at the empty bar would send no command_id and answer 400, which htmx does
-//    not display.
+//    Not a defect: after a dispatch `#filter-bar` is an empty placeholder for ~2 seconds and
+//    the thead refresh fires on the same delay. A browser check found no sort links or Prev /
+//    Next controls rendered in that window, so nothing is clickable; a sort link pointing at
+//    the empty bar would send no command_id and answer 400, which htmx does not display.
 // The chart-deck / pager refresh (ONE request, not polling) is a hidden `load` trigger rendered
-// INSIDE the filter-bar form by render_filter_bar, so it fires only once the new form is in the DOM,
+// INSIDE the filter-bar form by render_filter_bar, so it fires only once the new form is in the
+// DOM,
 // includes the form's live values, and registers on this same scope: a filter change (`replace`) or
 // a second dispatch (the htmx:abort above) aborts it, and a late response cannot overwrite the
 // pager / summary / Create-Group chrome of a filtered view with unfiltered content (#5623).

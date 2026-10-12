@@ -810,7 +810,7 @@ TEST_CASE("render_filter_bar route: a JIT-elevated session sees every agent's "
     CHECK(contains(res->body, "value=\"unloaded\""));
 }
 
-// -- #5623 (Gate 7 fix round G): the chart-deck / pager refresh starts from the filter bar --------
+// -- #5623: the chart-deck / pager refresh starts from the filter bar ----------------------------
 // A deck request on the dispatch response's host could not be synced safely against the placeholder
 // the filter-bar swap discards (a real browser showed the queued request was never sent). The
 // trigger is a hidden `load` element INSIDE the form: it fires once the new form exists, includes
