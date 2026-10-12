@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-12 · euid 501 (jsmith) · leg-hash 4dd487c27180
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-12 · euid 501 (jsmith) · leg-hash b71a64faa4b7
 == action=list
 status|list|supported|-
 source|exports|absent|-

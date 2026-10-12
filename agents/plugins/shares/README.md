@@ -1,6 +1,15 @@
 # shares
 
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
+| | |
+|---|---|
+| **What it does** | Shares this host serves over SMB/NFS: names, paths and a few flags, never ACLs |
+| **Version** | 1.0.0 |
+| **Kind** | Collector · read-only · gathered (crossplatform.network.shares) |
+| **Platforms** | Windows 🟡 planned · macOS ✅ · Linux ✅ |
+| **Actions** | `list` (definition `crossplatform.network.shares`) |
+| **Security** | securable `Infrastructure` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -22,6 +31,15 @@ flowchart LR
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
+| Action | Windows | macOS | Linux |
+|---|---|---|---|
+| `list` | 🟡 planned · rung 1 · NetShareEnum level 2 (netapi32) | ✅ supported · rung 2 · subprocess_runner:/usr/sbin/sharing -l -f json plus a bounded no-follow read of /etc/exports (BSD syntax) | ✅ supported · rung 1 · bounded no-follow reads of /etc/exports, /etc/exports.d/*.exports and /etc/samba/smb.conf (pure parsers); one lstat of the usershares directory |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`list` / Windows** — not read yet: one unsupported status row, windows:planned
+- **`list` / macOS** — SMB share points from sharing(8) and NFS exports as configured in /etc/exports; the sharepoints dslocal node is not read
+- **`list` / Linux** — configured shares as written, not live nfsd/smbd state; Samba registry backend, include= files and usershares are not read (constrained token); a symlinked config file or exports.d is refused
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -39,6 +57,7 @@ No shell interpreter and no network use. The macOS leg runs one fixed absolute a
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
+The action takes no parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -46,6 +65,18 @@ No shell interpreter and no network use. The macOS leg runs one fixed absolute a
 Every row is pipe-delimited; field 0 is the row kind, `-` is an absent value, and the first row is always `status|list|<supported\|constrained\|permission_denied\|unsupported>|<reason or ->`. A `source|<exports\|exports_d\|smb_conf\|sharing>|<read\|absent\|refused\|failed>|<share count or ->` row follows for every source the leg knows about (Linux three, macOS two: `exports` and `sharing`; `absent` is a state, not a failure). Each share is `share|<nfs\|smb>|<name or ->|<path or ->|<ro\|rw\|mixed\|->|<true\|false\|->|<flags or ->|<source>`: the name is the SMB share name and `-` for NFS (identified by path), `mixed` means clients or security flavours disagree, and the flags are a closed set: `hidden`, `unavailable`, `special` (Samba `[homes]`, `[printers]`, `[print$]`), `sealed`, `no_root_squash` and `clients_<n>`. Every free field is scrubbed of NUL and invalid UTF-8 and pipe-escaped.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
+**`crossplatform.network.shares` — `row_kind|field_1|field_2|field_3|field_4|field_5|field_6|field_7`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `source` `share` | Windows, Linux, macOS | `share` | Row shape discriminator (field 0). Values: status, source, share. |
+| `field_1` | string | - | Windows, Linux, macOS | `smb` | status: the literal "list". source: exports, exports_d, smb_conf or sharing. share: nfs or smb. |
+| `field_2` | string | - | Windows, Linux, macOS | `supported` | status: supported, constrained, permission_denied or unsupported (Windows and a leg that threw). source: read, absent, refused or failed (absent is a state, not a failure). share: the SMB share name, or "-" for NFS (identified by path). |
+| `field_3` | string | - | Windows, Linux, macOS | `-` | status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:shares:exports:permission_denied, linux:shares:smb_conf:registry_backend, macos:shares:sharing:exit_nonzero, subprocess_runner:deadline, windows:planned. source: the number of shares read from it, "-" unless it was read. share: the exported path ("-" when none is set). |
+| `field_4` | string | - | Linux, macOS | `rw` | share: ro, rw, mixed (clients or security flavours disagree) or "-" when unknown. Not used by the other kinds. |
+| `field_5` | string | - | Linux, macOS | `false` | share: true when anonymous (guest or world) access is allowed, false when not, "-" when unknown. Not used by the other kinds. |
+| `field_6` | string | - | Linux, macOS | `clients_2` | share: comma-separated flags from hidden, unavailable, special, sealed, no_root_squash, clients_<n> (the NFS client count; hosts are never listed), or "-". Not used by the other kinds. |
+| `field_7` | string | - | Linux, macOS | `exports` | share: the source it came from (exports, exports_d, smb_conf or sharing). Not used by the other kinds. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -74,6 +105,32 @@ Every row is pipe-delimited; field 0 is the row kind, `-` is an absent value, an
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-12 · euid 501 (jsmith) · leg-hash b71a64faa4b7
+
+```
+== action=list
+status|list|supported|-
+source|exports|absent|-
+source|sharing|read|1
+share|smb|Shared Folder|/Users/jsmith/Public|rw|true|-|sharing
+[result_status] OK / FULL
+```
+
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-12 · euid 0 · leg-hash b71a64faa4b7
+
+```
+== action=list
+status|list|supported|-
+source|exports|read|2
+source|exports_d|read|1
+source|smb_conf|read|2
+share|nfs|-|/srv/nfs/public|ro|true|clients_1|exports
+share|nfs|-|/srv/nfs/projects|mixed|false|no_root_squash,clients_2|exports
+share|nfs|-|/srv/nfs/archive|ro|true|clients_1|exports_d
+share|smb|public|/srv/samba/public|ro|true|-|smb_conf
+share|smb|projects|/srv/samba/projects|rw|false|hidden|smb_conf
+[result_status] OK / FULL
+```
 <!-- END GENERATED -->
 
 ## Caveats and known gaps
@@ -87,4 +144,10 @@ Every row is pipe-delimited; field 0 is the row kind, `-` is an absent value, an
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
+- Plugin: `agents/plugins/shares/src/shares_legs.hpp` · `agents/plugins/shares/src/shares_linux.cpp` · `agents/plugins/shares/src/shares_macos.cpp` · `agents/plugins/shares/src/shares_parsers.hpp` · `agents/plugins/shares/src/shares_plugin.cpp` · `agents/plugins/shares/src/shares_posix_fs.hpp` · `agents/plugins/shares/src/shares_win.cpp`
+- Definitions: `content/definitions/shares.yaml`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_shares.hpp`
+- Tests: `tests/test_shares_definition.py` · `tests/unit/test_shares_legs.cpp` · `tests/unit/test_shares_local_dispatcher.cpp` · `tests/unit/test_shares_parsers.cpp` · `tests/unit/test_shares_posix_fs.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
+- Changelog: `changelog.d/2026-10-12-shares.added.md`
 <!-- END GENERATED -->

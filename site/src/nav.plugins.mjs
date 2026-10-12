@@ -56,6 +56,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/sccm/README', slug: 'plugins/sccm', title: 'sccm' },
   { file: 'agents/plugins/script_exec/README', slug: 'plugins/script_exec', title: 'script_exec' },
   { file: 'agents/plugins/services/README', slug: 'plugins/services', title: 'services' },
+  { file: 'agents/plugins/shares/README', slug: 'plugins/shares', title: 'shares' },
   { file: 'agents/plugins/software_actions/README', slug: 'plugins/software_actions', title: 'software_actions' },
   { file: 'agents/plugins/status/README', slug: 'plugins/status', title: 'status' },
   { file: 'agents/plugins/storage/README', slug: 'plugins/storage', title: 'storage' },
