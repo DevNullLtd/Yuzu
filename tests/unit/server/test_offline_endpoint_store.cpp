@@ -167,7 +167,7 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
     SECTION("WS-5 blank-preserve: a blank hostname or os never clobbers a known one") {
         REQUIRE(store.upsert("agent-ws5-bp", "known-host", "linux", t - 1000, 0, "3.0.0", "arm64"));
         REQUIRE(store.upsert("agent-ws5-bp", "", "", t, 7, "", ""));
-        auto rows = store.query_stale_within(std::chrono::hours(1));
+        auto rows = stale_ok(store, std::chrono::hours(1));
         const auto* v = find(rows, "agent-ws5-bp");
         REQUIRE(v != nullptr);
         CHECK(v->hostname == "known-host");   // preserved, not blanked
@@ -179,7 +179,7 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
 
         // Blank hostname alone (os supplied) -> hostname preserved, os overwritten.
         REQUIRE(store.upsert("agent-ws5-bp", "", "windows", t, 8, "", ""));
-        rows = store.query_stale_within(std::chrono::hours(1));
+        rows = stale_ok(store, std::chrono::hours(1));
         v = find(rows, "agent-ws5-bp");
         REQUIRE(v != nullptr);
         CHECK(v->hostname == "known-host");
@@ -187,7 +187,7 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
 
         // Non-blank hostname still overwrites.
         REQUIRE(store.upsert("agent-ws5-bp", "renamed-host", "", t, 9, "", ""));
-        rows = store.query_stale_within(std::chrono::hours(1));
+        rows = stale_ok(store, std::chrono::hours(1));
         v = find(rows, "agent-ws5-bp");
         REQUIRE(v != nullptr);
         CHECK(v->hostname == "renamed-host");
@@ -196,7 +196,7 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
 
     SECTION("WS-5 blank hostname on a FIRST insert stores empty (nothing to preserve)") {
         REQUIRE(store.upsert("agent-ws5-first", "", "", t, 0));
-        auto rows = store.query_stale_within(std::chrono::hours(1));
+        auto rows = stale_ok(store, std::chrono::hours(1));
         const auto* v = find(rows, "agent-ws5-first");
         REQUIRE(v != nullptr);
         CHECK(v->hostname.empty());
