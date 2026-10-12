@@ -343,6 +343,39 @@ TEST_CASE("GuardianGenerationCache: an invalidate during a flight is not undone 
     CHECK(calls.load() == 2);
 }
 
+TEST_CASE("GuardianGenerationCache: a waiter that joined a flight invalidate() detached still gets that flight's result",
+          "[guardian][generation_cache]") {
+    // Cold cache, so the second caller has no stale value to be served and waits on the flight.
+    CountingClock clk;
+    Event entered, release;
+    std::atomic<int> calls{0};
+    GuardianGenerationCache c(
+        [&]() -> GuardianGenerationCache::Result {
+            if (calls.fetch_add(1) == 0) {
+                entered.set();
+                release.wait();
+                return 7;  // the older read
+            }
+            return 8;
+        },
+        {}, clk.fn());
+    std::uint64_t leader_got = 0, waiter_got = 0;
+    std::jthread leader([&] { leader_got = c.get().value(); });
+    REQUIRE(entered.wait());
+    std::jthread waiter([&] { waiter_got = c.get().value(); });
+    // The waiter reads the clock (read 2) INSIDE the critical section in which it joins the
+    // flight, so once that read is seen invalidate() can only run after the join.
+    REQUIRE(clk.wait_for_calls(2));
+    c.invalidate();
+    release.set();
+    leader.join();
+    waiter.join();
+    CHECK(leader_got == 7);
+    CHECK(waiter_got == 7);       // the waiter holds the detached flight and still receives it
+    CHECK(c.get().value() == 8);  // but neither installed it
+    CHECK(calls.load() == 2);
+}
+
 TEST_CASE("GuardianGenerationCache: get_fresh bypasses the TTL and installs the result",
           "[guardian][generation_cache]") {
     ManualClock clk;

@@ -643,6 +643,155 @@ TEST_CASE("GuardianRuleBundleCache: a waiter gives up after max_wait while the l
     CHECK(cache.get(4, slow).has_value());  // the load installed
 }
 
+TEST_CASE("GuardianRuleBundleCache: epoch() advances on every invalidate and on nothing else",
+          "[guardian][rule_bundle][epoch]") {
+    ManualClock clk;
+    GuardianRuleBundleCache cache({}, clk.fn());
+    const auto e0 = cache.epoch();
+
+    std::atomic<int> calls{0};
+    REQUIRE(cache.get(1, counting_loader(calls, "a")).has_value());  // a load and its install
+    REQUIRE(cache.get(1, counting_loader(calls, "a")).has_value());  // a hit
+    REQUIRE_FALSE(cache.get(2, failing_loader(calls)).has_value());  // a failure
+    REQUIRE_FALSE(cache.get(2, failing_loader(calls)).has_value());  // a remembered failure
+    CHECK(cache.epoch() == e0);
+
+    cache.invalidate();
+    CHECK(cache.epoch() == e0 + 1);
+    cache.invalidate();  // an invalidate that finds nothing to drop still counts
+    CHECK(cache.epoch() == e0 + 2);
+    REQUIRE(cache.get(1, counting_loader(calls, "b")).has_value());
+    CHECK(cache.epoch() == e0 + 2);
+}
+
+TEST_CASE("GuardianRuleBundleCache: epoch() is safe against concurrent invalidates and never goes back",
+          "[guardian][rule_bundle][epoch]") {
+    GuardianRuleBundleCache cache;
+    constexpr int kThreads = 4;
+    constexpr int kEach = 500;
+    const auto e0 = cache.epoch();
+    std::atomic<bool> monotonic{true};
+    std::atomic<bool> stop{false};
+    std::jthread reader([&] {
+        auto last = cache.epoch();
+        while (!stop.load()) {
+            const auto e = cache.epoch();
+            if (e < last)
+                monotonic.store(false);
+            last = e;
+        }
+    });
+    {
+        std::vector<std::jthread> writers;
+        for (int i = 0; i < kThreads; ++i)
+            writers.emplace_back([&] {
+                for (int n = 0; n < kEach; ++n)
+                    cache.invalidate();
+            });
+    }  // joined here
+    stop.store(true);
+    reader.join();
+    CHECK(monotonic.load());
+    CHECK(cache.epoch() == e0 + static_cast<std::uint64_t>(kThreads) * kEach);  // none lost
+}
+
+TEST_CASE("GuardianRuleBundleCache: an owner and a waiter of a detached load both see the epoch move",
+          "[guardian][rule_bundle][epoch]") {
+    // What the reconcile flow relies on: a result handed to the owner AND to a waiter that had
+    // joined the flight is still delivered after invalidate(), so the epoch read BEFORE the get
+    // is the only signal either of them has.
+    CountingClock clk;
+    GuardianRuleBundleCache cache({.max_wait = 60'000ms}, clk.fn());
+    Event entered, release;
+    const GuardianRuleBundleCache::LoaderFn slow = [&] {
+        entered.set();
+        release.wait();
+        return std::expected<Bundle, BundleLoadError>(make_bundle({rule("pre-edit", "")}, {"pre-edit"}));
+    };
+    const auto before = cache.epoch();
+    GuardianRuleBundleCache::Result owner_r, waiter_r;
+    std::jthread owner([&] { owner_r = cache.get(5, slow); });
+    REQUIRE(entered.wait());
+    std::jthread waiter([&] { waiter_r = cache.get(5, slow); });
+    REQUIRE(clk.wait_for_calls(3));  // the waiter has joined the flight and is about to block
+    cache.invalidate();
+    release.set();
+    owner.join();
+    waiter.join();
+
+    REQUIRE(owner_r.has_value());
+    REQUIRE(waiter_r.has_value());  // both still receive the pre-edit result...
+    CHECK(owner_r->get() == waiter_r->get());
+    CHECK(cache.epoch() != before);  // ...so the epoch is what tells them it was overtaken
+    CHECK_FALSE(cache.held_generation().has_value());
+}
+
+TEST_CASE("GuardianRuleBundleCache: waiters of a FAILED load all receive its error from the one load",
+          "[guardian][rule_bundle]") {
+    CountingClock clk;
+    GuardianRuleBundleCache cache({.max_wait = 60'000ms}, clk.fn());
+    Event entered, release;
+    std::atomic<int> calls{0};
+    const GuardianRuleBundleCache::LoaderFn slow_failing = [&] {
+        calls.fetch_add(1);
+        entered.set();
+        release.wait();
+        return std::expected<Bundle, BundleLoadError>(
+            std::unexpected(BundleLoadError{BundleLoadError::Source::deployed, "shared failure"}));
+    };
+    constexpr int kWaiters = 3;
+    std::vector<GuardianRuleBundleCache::Result> got(kWaiters + 1, std::shared_ptr<const Bundle>{});
+    std::vector<std::jthread> ts;
+    ts.emplace_back([&] { got[0] = cache.get(6, slow_failing); });
+    REQUIRE(entered.wait());
+    for (int i = 1; i <= kWaiters; ++i)
+        ts.emplace_back([&, i] { got[static_cast<std::size_t>(i)] = cache.get(6, slow_failing); });
+    // The owner read the clock once; each waiter reads it twice before it blocks.
+    REQUIRE(clk.wait_for_calls(1 + 2 * kWaiters));
+    release.set();
+    for (auto& t : ts)
+        t.join();
+
+    CHECK(calls.load() == 1);
+    CHECK(cache.loads() == 1);
+    for (const auto& r : got) {
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().source == BundleLoadError::Source::deployed);
+        CHECK(r.error().detail == "shared failure");
+    }
+    CHECK_FALSE(cache.held_generation().has_value());
+}
+
+TEST_CASE("GuardianRuleBundleCache: a waiter that times out still reports the time it was blocked",
+          "[guardian][rule_bundle][waited]") {
+    // A timed-out wait misreported as zero would be charged to the waiter's budget debit by
+    // Scoped::exclude(0). The clock's FOURTH read is the one after the wait ends (owner: 1,
+    // waiter: the lock and t0, then this), and it advances 3 s before returning.
+    ManualClock mc;
+    std::atomic<int> reads{0};
+    GuardianRuleBundleCache cache({.max_wait = 10ms}, [&] {
+        if (reads.fetch_add(1) + 1 == 4)
+            mc.advance(3s);
+        return mc.now();
+    });
+    Event entered, release;
+    const GuardianRuleBundleCache::LoaderFn slow = [&] {
+        entered.set();
+        release.wait();
+        return std::expected<Bundle, BundleLoadError>(make_bundle({rule("x", "")}, {"x"}));
+    };
+    std::jthread owner([&] { (void)cache.get(4, slow); });
+    REQUIRE(entered.wait());
+
+    std::chrono::nanoseconds waited{-1};
+    auto r = cache.get(4, slow, &waited);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().detail.find("timed out") != std::string::npos);
+    CHECK(waited == 3s);
+    release.set();
+    owner.join();
+}
+
 TEST_CASE("GuardianRuleBundleCache: a loader that throws bad_alloc leaves the cache usable",
           "[guardian][rule_bundle]") {
     GuardianRuleBundleCache cache({.negative_ttl = 0ms});  // the retry below must reach the loader

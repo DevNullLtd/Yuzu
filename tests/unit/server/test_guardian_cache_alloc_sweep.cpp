@@ -41,6 +41,8 @@
  */
 
 #include "../../../server/core/src/guardian_generation_cache.hpp"
+#include "../../../server/core/src/guardian_reconcile_budget.hpp"
+#include "../../../server/core/src/guardian_reconcile_gate.hpp"
 #include "../../../server/core/src/guardian_rule_bundle.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -440,4 +442,55 @@ TEST_CASE("alloc sweep: GuardianRuleBundleCache::invalidate() after a failed get
         CHECK(k - 1 >= min_points);  // allocation points exercised
         CHECK(broken == 0);
     }
+}
+
+// -- GuardianReconcileGate ----------------------------------------------------------------
+
+TEST_CASE("alloc sweep: GuardianReconcileGate::decide() after a failed claim insert leaves no claim and no slot",
+          "[guardian][reconcile_gate][alloc_sweep]") {
+    // The documented ALLOCATION FAILURE arm (guardian_reconcile_gate.hpp): decide() may throw
+    // bad_alloc while inserting the claim, after try_admit() succeeded. Nothing may leak: no
+    // claim is written, no in-flight slot is held, and the agent is admitted on its next call.
+    // The agent id is beyond the small-string buffer, so copying it into the map allocates.
+    const std::string agent(40, 'a');
+    int broken = 0;
+    long threw_points = 0;
+    const long k = sweep([&](long n) {
+        ManualClock clk;
+        const auto clock_fn = [&clk] { return clk.now(); };
+        yuzu::server::GuardianReconcileBudget budget(
+            {.budget_ms_per_s = 1'000'000.0, .burst_ms = 3'600'000.0, .max_per_s = 1'000'000},
+            clock_fn);
+        yuzu::server::GuardianReconcileGate gate(budget, clock_fn, std::chrono::seconds(25),
+                                                 {.max_reserve = 0});
+        bool threw = false;
+        {
+            FailNth arm(n);
+            try {
+                (void)gate.decide(agent, 0, 7);
+            } catch (const std::bad_alloc&) {
+                threw = true;
+            } catch (...) {
+                ++broken;
+            }
+        }
+        const bool fired = g_fired;
+        if (threw != fired)
+            ++broken;  // an injected failure must surface as bad_alloc, nothing else may throw
+        if (threw) {
+            ++threw_points;
+            if (gate.claims_size() != 0 || gate.in_flight() != 0)
+                ++broken;
+        }
+        // The retry: never rate limited by a claim that was not written, and it admits.
+        yuzu::server::GuardianReconcileGate::ShedCause cause{};
+        const auto again = threw ? gate.decide(agent, 0, 7, &cause) : yuzu::server::GuardianReconcileGate::Decision::Admit;
+        if (again != yuzu::server::GuardianReconcileGate::Decision::Admit || gate.claims_size() != 1 ||
+            gate.in_flight() != 0)
+            ++broken;
+        return fired;
+    });
+    REQUIRE(k > 0);
+    CHECK(threw_points >= 2);  // the key copy and the map node: the insert really was reached
+    CHECK(broken == 0);
 }

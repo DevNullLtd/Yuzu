@@ -269,6 +269,17 @@ public:
         ++epoch_;
     }
 
+    /// The invalidation epoch: advances by one on every `invalidate()`, never otherwise.
+    /// A caller that must not act on a result a concurrent `invalidate()` could have made
+    /// stale reads it BEFORE `get()` and compares it again after: `get()` hands a load that was
+    /// detached by `invalidate()` to its own callers (and to the waiters that had joined it),
+    /// so the result alone does not say whether an invalidation overtook it. Safe from any
+    /// thread.
+    [[nodiscard]] std::uint64_t epoch() const {
+        std::lock_guard lk(mu_);
+        return epoch_;
+    }
+
     /// Number of loads started (single-flight waiters and cache hits do not count).
     [[nodiscard]] std::uint64_t loads() const {
         std::lock_guard lk(mu_);
