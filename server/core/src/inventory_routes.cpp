@@ -112,6 +112,9 @@ constexpr const char* kConfinedFleetMsg =
     "Hardware to see its software, or ask for fleet-wide Inventory:Read.";
 constexpr const char* kConfinedHostMsg =
     "This device is outside your management groups (or unknown), so its software is not shown.";
+constexpr const char* kBuildingMsg =
+    "Catalogue is building \xE2\x80\x94 the rollup refreshes hourly and populates shortly after "
+    "startup. Reload in a moment.";
 constexpr const char* kStaleCursorMsg =
     "The catalogue was refreshed since this page loaded; reload to restart from the first page.";
 
@@ -252,6 +255,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         auto page = std::move(*read);
+        page.kpis.reset(); // computed with the inert stale stub above: never consumed, so never kept
 
         // Strip: fleet figures only for an unconfined caller (a confined host view reads
         // none, and its render carries no tiles). The coverage reads cost a registry walk
@@ -347,9 +351,24 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         f.ecosystem = q.ecosystem;
         f.source = q.source;
         f.agent_id = q.agent_id;
+        // The shared seam (as the REST/MCP twins): the unfiltered fleet drill reads the rollup, so
+        // before its first refresh it is `building`, not an authoritative empty table.
+        const swc::VersionsReads vio{
+            [&] { return deps_.catalog_meta_fn ? deps_.catalog_meta_fn() : std::optional<CatalogRollupMeta>{}; },
+            [&](const SoftwareVersionsQuery& v) {
+                return deps_.versions_fn ? deps_.versions_fn(v)
+                                         : std::optional<std::vector<SoftwareVersionCount>>{};
+            }};
+        auto read = swc::read_versions(vio, q);
+        if (!read && read.error() == swc::VersionsError::kBuilding) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.versions", "failure",
+                                            "Inventory", target, "building");
+            send_html(res, caveat_div(std::string(kBuildingMsg)));
+            return;
+        }
         std::optional<std::vector<SoftwareVersionCount>> vers;
-        if (deps_.versions_fn)
-            vers = deps_.versions_fn(q);
+        if (read)
+            vers = std::move(*read);
         (void)detail::try_persist_audit(
             deps_.audit_fn, req, "inventory.software.versions", vers ? "success" : "failure",
             "Inventory", target, vers ? ("versions=" + std::to_string(vers->size())) : "store degraded");

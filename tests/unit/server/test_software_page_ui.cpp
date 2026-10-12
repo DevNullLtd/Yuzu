@@ -213,8 +213,17 @@ TEST_CASE("software page: search box carries the CSP-safe htmx wiring", "[invent
     REQUIRE(has(h, "name=\"q\""));
     REQUIRE(has(h, "placeholder=\"Search software, publisher, ecosystem or found-by"));
     REQUIRE(has(h, "hx-trigger=\"keyup changed delay:400ms, search\""));
-    REQUIRE(has(h, "hx-sync=\"this:replace\""));
+    // One shared sync scope (a stable container outside every swap) for every control that
+    // re-requests the results, so a slow earlier response cannot overwrite a later one.
+    REQUIRE(has(h, "hx-trigger=\"keyup changed delay:400ms, search\" hx-sync=\"#sw-filters:replace\""));
+    REQUIRE_FALSE(has(h, "hx-sync=\"this:replace\""));
+    REQUIRE(has(h, "<div id=\"sw-filters\""));
+    REQUIRE(has(h, "hx-trigger=\"change\" hx-sync=\"#sw-filters:replace\" hx-include=\"#sw-state,#sw-q,#sw-agent\""));
+    REQUIRE(has(h, "hx-include=\"#sw-q,#sw-agent\" hx-sync=\"#sw-filters:replace\""));
     REQUIRE(has(h, "hx-include=\"#sw-state,#sw-agent\""));
+    // The search box sits before, and outside, the swapped results region.
+    REQUIRE(count_of(h, "id=\"sw-q\"") == 1);
+    REQUIRE(h.find("id=\"sw-q\"") < h.find("id=\"sw-results\""));
     REQUIRE_FALSE(has(h, "hx-on"));
     // No event filter ('[' inside an hx-trigger) - the no-unsafe-eval CSP silently drops it.
     for (auto p = h.find("hx-trigger=\""); p != std::string::npos; p = h.find("hx-trigger=\"", p + 1))
@@ -228,8 +237,9 @@ TEST_CASE("software page: kind control, ecosystem and found-by chips", "[invento
     f.source = "pkg_inventory.packages";
     const std::string h = full(f, page());
     REQUIRE(has(h, "<button type=\"button\" class=\"gp-chip\" data-g=\"kind\" data-v=\"\""));
-    REQUIRE(has(h, "class=\"gp-chip on\" data-g=\"kind\" data-v=\"pkg\" title=\"macOS pkgutil and "
-                   "Homebrew packages\""));
+    REQUIRE(has(h, "class=\"gp-chip on\" data-g=\"kind\" data-v=\"pkg\" aria-pressed=\"true\" "
+                   "title=\"macOS pkgutil and Homebrew packages\""));
+    REQUIRE(has(h, "data-g=\"kind\" data-v=\"\" aria-pressed=\"false\""));
     REQUIRE(has(h, "title=\"OS packages (rpm, deb, apk, pacman)\""));
     // One ecosystem chip per kEcosystemFamilies entry, in table order.
     std::size_t last = 0;
@@ -305,6 +315,7 @@ TEST_CASE("software page: active pills, Clear all and the REST line", "[inventor
         REQUIRE(has(h, std::string("<span class=\"inv-apill\">") + p));
     REQUIRE(count_of(h, "<span class=\"inv-apill\">") == 6);
     REQUIRE(has(h, "data-act=\"clear\""));
+    REQUIRE(has(h, "hx-swap=\"outerHTML\" hx-sync=\"#sw-filters:replace\">Clear all</button>"));
     const std::string call = software_rest_call(f);
     REQUIRE(call == "/api/v1/inventory/software/catalogue?q=a%26b%20c&kind=app&ecosystem=brew&"
                     "source=pkg_inventory.packages&agent_id=id-1&versions_min=3&limit=100");
@@ -402,7 +413,7 @@ TEST_CASE("software page: result bar counts and the Load-more sentinel", "[inven
     REQUIRE_FALSE(has(h, "match your filters"));
     REQUIRE(has(h, "data-act=\"more\" hx-get=\"/fragments/inventory/software?rows_only=1&amp;"
                    "cursor=c1%3Atok&amp;shown=102\""));
-    REQUIRE(has(h, "hx-target=\"closest tr\" hx-swap=\"outerHTML\""));
+    REQUIRE(has(h, "hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-disabled-elt=\"this\">Load 100 more titles"));
     REQUIRE(has(h, "<span class=\"inv-cursor\">102 of 250 &middot; cursor after (7 installs, Zed)</span>"));
     f.q = "z";
     REQUIRE(has(full(f, d), "match your filters"));
@@ -479,6 +490,9 @@ TEST_CASE("software page: degrade, empty, filtered-empty and caveat states", "[i
     REQUIRE_FALSE(has(h, "<table"));
     REQUIRE_FALSE(has(h, "<div class=\"inv-kpi"));
     REQUIRE_FALSE(has(h, "Scope (ADR-0017)"));
+    // A confined notice has no controls, so it carries the reset too (a bad #host= is repaired here).
+    REQUIRE(has(h, "<a class=\"inv-link\" href=\"/software\" "
+                   "onclick=\"history.replaceState(null,'',location.pathname)\">Clear all filters and reload</a>"));
 
     // Rows mode with the rows read degraded: a retry row, never a table.
     d = page();
@@ -491,14 +505,23 @@ TEST_CASE("software page: degrade, empty, filtered-empty and caveat states", "[i
 
 TEST_CASE("software page: hostile text is escaped everywhere it lands", "[inventory][ui]") {
     const std::string evil = "<script>alert(1)</script> \"x\" 100%";
-    auto d = page({row(evil, 3)});
+    const std::string img = "<img src=x onerror=alert(1)>";
+    auto hostile = row(evil, 3);
+    hostile.publisher = hostile.newest_version = hostile.ecosystems = hostile.kinds = img;
+    auto d = page({hostile});
     SoftwarePageFilters f;
+    f.kind = f.ecosystem = f.source = "\"><script>"; // echoed to pills and the hidden inputs
     f.q = evil;
     f.host_display = evil;
     f.agent_id = "id\"1";
     const std::string h = full(f, d);
     REQUIRE_FALSE(has(h, "<script>alert"));
     REQUIRE(has(h, "&lt;script&gt;alert(1)&lt;/script&gt;"));
+    // Publisher, newest version, ecosystem and kind cells, and the kind/ecosystem/source filters.
+    REQUIRE_FALSE(has(h, "<img"));
+    REQUIRE(has(h, "&lt;img src=x onerror=alert(1)&gt;"));
+    REQUIRE_FALSE(has(h, "\"><script>"));
+    REQUIRE(has(h, "&quot;&gt;&lt;script&gt;"));
     // The row's element ids carry no raw punctuation from the title.
     const auto p = h.find("hx-target=\"#exp-");
     REQUIRE(p != std::string::npos);
@@ -565,6 +588,18 @@ TEST_CASE("software page: versions expansion", "[inventory][ui]") {
                 "No version data"));
 }
 
+TEST_CASE("software page: versions expansion escapes hostile text", "[inventory][ui]") {
+    SoftwarePageFilters f;
+    f.kind = f.ecosystem = f.source = "\"><script>";
+    const std::string h = render_software_versions_expansion(
+        f, "<img src=x onerror=alert(1)>", {{{"<b>", 3, true}, {"2.0", 1, false}}}, false);
+    REQUIRE_FALSE(has(h, "<img"));
+    REQUIRE_FALSE(has(h, "<td class=\"inv-mono\"><b>"));
+    REQUIRE_FALSE(has(h, "\"><script>"));
+    REQUIRE(has(h, "<b>&lt;img src=x onerror=alert(1)&gt;</b>"));
+    REQUIRE(has(h, "<td class=\"inv-mono\">&lt;b&gt; <span class=\"inv-pill on\">newest in fleet</span>"));
+}
+
 TEST_CASE("software devices table: header, columns, host links and last synced", "[inventory][ui]") {
     SoftwareDevicesTable t;
     t.name = "Chrome";
@@ -580,7 +615,8 @@ TEST_CASE("software devices table: header, columns, host links and last synced",
     REQUIRE(has(h, "<th>Host</th><th>OS</th><th>Version</th><th>Ecosystem &middot; found by</th>"
                    "<th>Installed</th><th>Last synced</th>"));
     REQUIRE(has(h, "<a class=\"inv-hostlink\" href=\"/hardware/ci?id=a1\""));
-    REQUIRE(has(h, "<a class=\"inv-hostlink inv-unnamed\" href=\"/hardware/ci?id=a2\""));
+    REQUIRE(has(h, "<a class=\"inv-hostlink inv-unnamed\" href=\"/hardware/ci?id=a2\" "
+                   "title=\"No host name on record; opens the device page by agent id\""));
     REQUIRE(has(h, ">a2</a>"));
     REQUIRE(has(h, "<span class=\"inv-pill win\">Windows</span>"));
     REQUIRE(has(h, "<span class=\"inv-pill lin\">Linux</span>"));
@@ -632,7 +668,7 @@ TEST_CASE("software devices table: filter box, sentinel, rows_only and scoped ou
     REQUIRE(has(h, "oninput=\"gpSearch(this)\""));
     REQUIRE(has(h, "data-act=\"dmore\" hx-get=\"/fragments/inventory/software/devices?name=Chrome&amp;"
                    "cursor=d1%3Atok&amp;total=250&amp;shown=100\""));
-    REQUIRE(has(h, "hx-target=\"closest tr\" hx-swap=\"outerHTML\">Load 100 more"));
+    REQUIRE(has(h, "hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-disabled-elt=\"this\">Load 100 more"));
     REQUIRE(has(h, "<span class=\"inv-cursor\">100 of 250</span>"));
     // rows_only: only <tr>s.
     const std::string r = render_software_devices_table({}, t, true);
@@ -658,6 +694,9 @@ TEST_CASE("software devices table: filter box, sentinel, rows_only and scoped ou
     REQUIRE_FALSE(has(degraded_rows, "<table"));
     bad.rows = std::vector<SoftwareFleetRow>{};
     REQUIRE(has(render_software_devices_table({}, bad, false), "No host matches."));
+    // A continuation that comes back empty with no further cursor must not append the notice
+    // beneath the rows already shown: it renders nothing at all.
+    REQUIRE(render_software_devices_table({}, bad, true).empty());
     // Empty page but a cursor is offered (wide scope): never "No host matches", point at Load more.
     bad.next_cursor = "tok";
     for (const bool rows_only : {false, true}) {
@@ -676,6 +715,7 @@ TEST_CASE("software devices table: hostile text is escaped everywhere it lands",
     t.now_secs = kNow;
     auto r = fleet("a&b", "<b>", "windows");
     r.entry.source = "\"x\"";
+    r.entry.install_date = "<i id=d>";
     t.rows = std::vector<SoftwareFleetRow>{r};
     t.hostnames = {{"a&b", "<img src=x onerror=alert(1)>\""}};
     const std::string h = render_software_devices_table({}, t, false);
@@ -683,6 +723,8 @@ TEST_CASE("software devices table: hostile text is escaped everywhere it lands",
     REQUIRE_FALSE(has(h, "<script"));
     REQUIRE_FALSE(has(h, "<td class=\"inv-mono\"><b>"));
     REQUIRE_FALSE(has(h, ">\"x\"<"));
+    REQUIRE_FALSE(has(h, "<i id=d>"));
+    REQUIRE(has(h, "&lt;i id=d&gt;"));
     REQUIRE(has(h, "&lt;img src=x onerror=alert(1)&gt;&quot;"));
     REQUIRE(has(h, "<b>&lt;script&gt;</b>"));
     REQUIRE(has(h, "<td class=\"inv-mono\">&lt;b&gt;</td>"));

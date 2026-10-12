@@ -2932,7 +2932,7 @@ TEST_CASE("source_last_seen_bulk returns the receipt time per agent and omits th
     REQUIRE(got.has_value());
     REQUIRE(got->size() == 2);
     // last_seen is the SERVER receipt time (#1685), never the caller-supplied timestamp.
-    CHECK(got->at("agent-a") > 0);
+    CHECK(got->at("agent-a") > 1'000'000'000); // a real wall-clock epoch, not the 1000/2000/3000 passed in
     CHECK(got->at("agent-b") >= *b_before); // the touch never moves it backwards
     CHECK_FALSE(got->contains("agent-never")); // absent, never a 0
     // Same datum the Hardware record shows, read one device at a time.

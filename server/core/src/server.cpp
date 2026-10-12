@@ -17716,12 +17716,11 @@ private:
 
         // InventoryRoutes — /software: the SOFTWARE inventory list (fleet catalogue +
         // installs-per-version drill + "devices >" expansion) over SoftwareInventoryStore,
-        // gated on the GLOBAL Inventory:Read (the catalogue aggregates are NOT mgmt-group
-        // scoped — ADR-0017 confinement inert under the global gate, caveated in the UI;
-        // the expansion applies a per-row Inventory:Read drop filter). Reuses the shared
-        // auth/perm/audit closures + a fail-closed check_scoped_permission predicate
-        // (below). The REST /api/v1/inventory/software route and MCP tool have since
-        // migrated onto require_fleet_read; this page has not, so it does not match them.
+        // gated solely on fleet_read_fn (ADR-0017 admit-then-filter, the same gate as the REST
+        // route and MCP tool): the catalogue and version aggregates cannot be narrowed to a
+        // management group, so a confined caller is refused them; the host view and the
+        // devices tables are admitted and narrowed by the gate's own scope. Reuses the shared
+        // auth/audit closures.
         auto inv_human_age = [](std::int64_t ms) -> std::string {
             if (ms < 0)
                 ms = 0;

@@ -325,7 +325,8 @@ public:
     /// epoch-seconds of its last accepted `source` report (the value the Hardware record
     /// shows as `software_last_seen`). An agent with no row is ABSENT from the map (never a
     /// 0). Empty `source`/`agent_ids` -> empty map (precondition miss).
-    /// AUTHORITATIVE read: `std::nullopt` on a degrade.
+    /// AUTHORITATIVE read: `std::nullopt` on a degrade. The caller bounds `agent_ids` (the
+    /// Software page passes at most one page, 100 ids); nothing here caps it.
     [[nodiscard]] std::optional<std::unordered_map<std::string, std::int64_t>>
     source_last_seen_bulk(std::string_view source, const std::vector<std::string>& agent_ids);
 

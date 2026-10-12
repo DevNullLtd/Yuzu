@@ -16,7 +16,8 @@
 ///     management group, so a confined caller is refused them (audited `denied`); the host
 ///     view and the devices tables are admitted and narrowed by the gate's own scope;
 ///   * service-scoped API tokens are denied outright;
-///   * every call is audited, continuation pages included.
+///   * every call that serves data (or is refused on scope) is audited, continuation pages
+///     included.
 
 #include <yuzu/server/auth.hpp>
 

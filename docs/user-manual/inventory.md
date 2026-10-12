@@ -581,19 +581,22 @@ place, **Hardware** and **Software**, each its own page:
   - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
     a management group, so the fleet view, the strip and the version counts need an
     unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused
-    (audited as denied). A scoped account can open the host view and the devices tables
-    for devices in its scope; there the "newest in fleet" mark is blanked, no fleet
+    (audited as denied); the notice points to Hardware and carries a
+    **Clear all filters and reload** link. A scoped account can still use the host view
+    and the devices tables for devices in its scope, but only through a hand-typed
+    `/software#host=<agent_id>` address, which has no host-name type-ahead; there the "newest in fleet" mark is
+    blanked, no fleet
     figures are read, and device counts omit "of M". A scope wider than 10,000 devices is
     applied after the read in at most four bounded reads, so a devices page can come back short or
     even empty while **Load more** is still offered; keep loading. Service-scoped API
     tokens are denied outright.
-  - **Audit.** Every call is audited, not only the first page: `inventory.software.catalog`
+  - **Audit.** Every call that serves data (or is refused on scope) is audited, not only the first page: `inventory.software.catalog`
     (title pages), `inventory.software.versions` and `inventory.software.query` (devices
     tables). A continuation page is tagged `page=continuation`; a degraded read is
     `failure`; a refused caller is `denied`, as is a devices page that drops devices through the
     scope post-filter or names an `agent_id` outside the caller's scope. See [Audit log](audit-log.md).
   - **Degraded or refused.** A store that cannot answer shows an unavailable banner with
-    a Retry button, never an empty table. A malformed filter in the URL shows a notice
+    a Retry button on the catalogue and a plain retry notice on the version and device tables, never an empty table. A malformed filter in the URL shows a notice
     and reads nothing; use the **Clear all filters and reload** link, which drops the
     stored filters. A Load-more token from a different filter set or from before the
     latest hourly refresh shows a notice and reads nothing; reload the page to restart

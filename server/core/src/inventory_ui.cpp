@@ -291,12 +291,18 @@ void add_state(std::vector<std::pair<std::string, std::string>>& kv, const Softw
 
 constexpr const char* kFragment = "/fragments/inventory/software";
 
+// One sync scope for every control that re-requests the results (search, chips, pills, host,
+// Clear all): #sw-filters is stable (outside every swap), so a later request supersedes a slower
+// earlier one instead of racing it.
+constexpr const char* kSync = "hx-sync=\"#sw-filters:replace\"";
+
 // An htmx control that re-requests the results region with explicit (non-input) filter state;
 // the search box and the hidden host id ride along via hx-include (never also in the URL —
 // the model's parser refuses a repeated key).
 std::string results_get(const SoftwarePageFilters& f) {
     return "hx-get=\"" + esc(software_page_url(f, SoftwarePageMode::Results, false)) +
-           "\" hx-target=\"#sw-results\" hx-swap=\"outerHTML\" hx-include=\"#sw-q,#sw-agent\"";
+           "\" hx-target=\"#sw-results\" hx-swap=\"outerHTML\" hx-include=\"#sw-q,#sw-agent\" " +
+           kSync;
 }
 
 std::string sw_head() {
@@ -309,17 +315,24 @@ std::string sw_head() {
            "tabindex=\"0\">Software</a></div>";
 }
 
-std::string sw_degrade() {
+// Retry re-requests the whole page WITH the current filters (a bare retry would drop them).
+std::string sw_degrade(const SoftwarePageFilters& f) {
     return std::string("<div class=\"inv-degrade\"><b>Inventory store unavailable.</b> The "
-                       "installed-software store did not answer (503), so nothing is shown rather "
+                       "installed-software store did not answer, so nothing is shown rather "
                        "than an empty list that could be mistaken for \"no software\". <button "
                        "class=\"inv-btn\" data-act=\"retry\" style=\"margin-left:.6rem\" hx-get=\"") +
-           kFragment + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">Retry</button></div>";
+           esc(software_page_url(f, SoftwarePageMode::Full, true)) + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">Retry</button></div>";
 }
 
 std::string caveat(const std::string& msg) {
     return "<div class=\"inv-caveat\">" + esc(msg) + "</div>";
 }
+
+// The Full-page caveat has no controls, so a bad URL hash cannot be repaired from the page:
+// offer the reset. replaceState first makes the click a real navigation, not a fragment change.
+constexpr const char* kResetLink =
+    "<a class=\"inv-link\" href=\"/software\" "
+    "onclick=\"history.replaceState(null,'',location.pathname)\">Clear all filters and reload</a>";
 
 std::string tile(const char* cls, const std::string& title, const std::string& big,
                  const std::string& s2, const std::string& extra = {}) {
@@ -383,9 +396,9 @@ std::string kpi_strip(const SoftwarePageFilters& f, const swc::KpiFigures& k, st
          "needs usage data joined to installs"},
         {"needs an allow-list policy", "Unauthorised", "needs an allow-list policy"},
         {"needs a first_seen_at column on the rollup", "New titles 7 d",
-         "needs a first-seen stamp on the rollup (cheap)"},
-        {"post-MVP title dimension", "Normalised",
-         "share of titles mapped to a canonical product (later)"},
+         "needs a first-seen date per title; not collected yet"},
+        {"not collected yet", "Normalised",
+         "share of titles mapped to a canonical product (not available yet)"},
     };
     for (const auto& l : kLater)
         h += std::string("<div class=\"inv-kpi later\" hidden title=\"") + l.title + "\"><div class=\"h\">" +
@@ -412,7 +425,8 @@ std::string chips_region(const SoftwarePageFilters& f, bool oob) {
         SoftwarePageFilters t = f;
         t.kind = v;
         return std::string("<button type=\"button\" class=\"gp-chip") + (f.kind == v ? " on" : "") +
-               "\" data-g=\"kind\" data-v=\"" + esc(v) + "\" title=\"" + esc(title) + "\" " +
+               "\" data-g=\"kind\" data-v=\"" + esc(v) + "\" aria-pressed=\"" +
+               (f.kind == v ? "true" : "false") + "\" title=\"" + esc(title) + "\" " +
                results_get(t) + ">" + esc(label) + "</button>";
     };
     h += kind_chip("", "All", "every kind");
@@ -464,7 +478,7 @@ std::string active_region(const SoftwarePageFilters& f, bool oob) {
     if (!pills.empty())
         h += "<div class=\"inv-active\">" + pills + "<button type=\"button\" class=\"inv-link\" "
              "data-act=\"clear\" onclick=\"swClear('all')\" hx-get=\"" + std::string(kFragment) +
-             "?results_only=1\" hx-target=\"#sw-results\" hx-swap=\"outerHTML\">Clear all</button></div>";
+             "?results_only=1\" hx-target=\"#sw-results\" hx-swap=\"outerHTML\" " + kSync + ">Clear all</button></div>";
     const std::string call = software_rest_call(f);
     h += "<div class=\"inv-rest\" title=\"every control maps to one REST parameter\"><span>GET</span>"
          "<span class=\"v\">" + esc(call) + "</span><button type=\"button\" class=\"inv-link\" "
@@ -480,7 +494,7 @@ std::string controls(const SoftwarePageFilters& f, const SoftwarePageData& d) {
                     "\xE2\x80\xA6\" value=\"" + esc(f.q) +
                     "\" aria-label=\"Search\" style=\"min-width:340px\" hx-get=\"" + esc(base) +
                     "\" hx-target=\"#sw-results\" hx-swap=\"outerHTML\" hx-trigger=\"keyup changed "
-                    "delay:400ms, search\" hx-sync=\"this:replace\" "
+                    "delay:400ms, search\" " + std::string(kSync) + " "
                     "hx-include=\"#sw-state,#sw-agent\"></div>";
     h += "<div id=\"sw-filters\" class=\"inv-filters\">" + chips_region(f, false);
     h += "<div class=\"inv-frow\"><span class=\"lab\">Host</span><input id=\"sw-host\" "
@@ -488,8 +502,8 @@ std::string controls(const SoftwarePageFilters& f, const SoftwarePageData& d) {
          "\xE2\x80\xA6\" aria-label=\"Host\" value=\"" +
          esc(f.host_display) + "\"" + (d.confined ? "" : " list=\"hostlist\"") +
          " onchange=\"swHost(this)\" oninput=\"this.setCustomValidity('')\" hx-get=\"" + esc(base) +
-         "\" hx-target=\"#sw-results\" hx-swap=\"outerHTML\" hx-trigger=\"change\" "
-         "hx-include=\"#sw-state,#sw-q,#sw-agent\"><input id=\"sw-agent\" type=\"hidden\" "
+         "\" hx-target=\"#sw-results\" hx-swap=\"outerHTML\" hx-trigger=\"change\" " +
+         std::string(kSync) + " hx-include=\"#sw-state,#sw-q,#sw-agent\"><input id=\"sw-agent\" type=\"hidden\" "
          "name=\"agent_id\" value=\"" + esc(f.agent_id) + "\">";
     if (!d.confined) {
         h += "<datalist id=\"hostlist\">";
@@ -575,7 +589,7 @@ std::string title_rows(const SoftwarePageFilters& f, const SoftwarePageData& d) 
         h += "<tr class=\"inv-more\"><td colspan=\"7\"><button type=\"button\" class=\"inv-btn pri\" "
              "data-act=\"more\" hx-get=\"" +
              esc(software_page_url(t, SoftwarePageMode::Rows, true) + "&shown=" + std::to_string(shown)) +
-             "\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Load " +
+             "\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-disabled-elt=\"this\">Load " +
              std::to_string(swc::kCatalogueDefaultLimit) + " more titles</button><span class=\"inv-cursor\">" +
              fmt_int(shown) + " of " + fmt_int(total) + " &middot; cursor after (" +
              fmt_int(last.device_count) + " installs, " + esc(last.name) + ")</span></td></tr>";
@@ -593,7 +607,7 @@ std::string results_region(const SoftwarePageFilters& f, const SoftwarePageData&
         return h;
     }
     if (!d.rows || !d.totals) {
-        h += sw_degrade() + "</div>";
+        h += sw_degrade(f) + "</div>";
         return h;
     }
     if (d.kpis && d.kpis->building) {
@@ -708,7 +722,7 @@ std::string render_software_page(const SoftwarePageFilters& f, const SoftwarePag
         if (d.caveat)
             return "<tr><td colspan=\"7\">" + caveat(*d.caveat) + "</td></tr>";
         if (!d.rows)
-            return "<tr><td colspan=\"7\">" + sw_degrade() + "</td></tr>";
+            return "<tr><td colspan=\"7\">" + sw_degrade(f) + "</td></tr>";
         return title_rows(f, d);
     }
     if (mode == SoftwarePageMode::Results) {
@@ -729,17 +743,12 @@ std::string render_software_page(const SoftwarePageFilters& f, const SoftwarePag
                                                        "management-group-scoped account; this page "
                                                        "shows the selected device's software only.") +
              "</div>";
-        if (d.caveat)
-            return h + "</div>";
+        if (d.caveat) // refused: the caveat is all there is, so it carries the reset too
+            return h + "<div class=\"inv-caveat\">" + kResetLink + "</div></div>";
     } else if (d.caveat) {
-        // No controls here, so a bad filter in the URL hash could not be repaired from the page:
-        // offer the reset. replaceState first makes the click a real navigation, not a fragment change.
-        return h + "<div class=\"inv-caveat\">" + esc(*d.caveat) +
-               " <a class=\"inv-link\" href=\"/software\" "
-               "onclick=\"history.replaceState(null,'',location.pathname)\">Clear all filters and "
-               "reload</a></div></div>";
+        return h + "<div class=\"inv-caveat\">" + esc(*d.caveat) + " " + kResetLink + "</div></div>";
     } else if (!d.rows || !d.totals || !d.kpis) {
-        return h + sw_degrade() + "</div>";
+        return h + sw_degrade(f) + "</div>";
     } else if (d.kpis->building || (d.totals->titles == 0 && !any_filter(f))) {
         return h + results_region(f, d) + "</div>";
     } else {
@@ -828,7 +837,7 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
                 (named ? "" : " inv-unnamed") + "\" href=\"/hardware/ci?id=" + url_encode(r.agent_id) +
                 "\" title=\"" +
                 (named ? "Open this device (Hardware &rsaquo; CI view)"
-                       : "Hostname unknown (not seen in the last 30 days); opens the device page by agent id") +
+                       : "No host name on record; opens the device page by agent id") +
                 "\">" + esc(host) + "</a></td><td>" +
                 (fam.empty() ? dash()
                              : std::string("<span class=\"inv-pill ") + family_cls(fam) + "\">" +
@@ -843,7 +852,7 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
     }
     // A wide-scope page can be empty yet non-terminal: never claim "no match" then. The notice is
     // first-page only: Load more swaps just its own row, so a continuation notice would pile up.
-    if (t.rows->empty() && (!t.next_cursor || !rows_only))
+    if (t.rows->empty() && !rows_only)
         body += "<tr><td colspan=\"" + std::to_string(ncol) + "\" class=\"inv-empty\">" +
                 (t.next_cursor ? "No hosts on this page; more may be in later pages. Use the Load button below."
                                : "No host matches.") +
@@ -857,7 +866,7 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
         body += "<tr class=\"inv-more\"><td colspan=\"" + std::to_string(ncol) +
                 "\"><button type=\"button\" class=\"inv-btn sm\" data-act=\"dmore\" hx-get=\"" +
                 esc("/fragments/inventory/software/devices?" + query_of(kv)) +
-                "\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Load " +
+                "\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-disabled-elt=\"this\">Load " +
                 std::to_string(swc::kCatalogueDefaultLimit) + " more</button><span class=\"inv-cursor\">" +
                 fmt_int(t.shown_before) + (t.total ? " of " + fmt_int(*t.total) : " loaded") +
                 "</span></td></tr>";

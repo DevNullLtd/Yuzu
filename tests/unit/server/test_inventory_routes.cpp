@@ -79,6 +79,7 @@ struct InvHarness {
     std::unordered_map<std::string, std::int64_t> last_synced;
     bool last_synced_degrade = false;
     bool meta_degrade = false; // only the rollup-meta read fails (every other provider answers)
+    bool catalog_degrade = false; // only the catalogue rows read fails
     std::int64_t refreshed_at = 1000;
     int bump_refreshed_on_meta_call = 0; // 1-based: that meta read returns refreshed_at + 1
     std::vector<std::string> calls;      // provider order: "meta" | "catalog" | "totals" | ...
@@ -114,7 +115,7 @@ struct InvHarness {
             -> std::optional<std::vector<SoftwareCatalogRow>> {
             calls.push_back("catalog");
             last_catalog_query = q;
-            if (degrade)
+            if (degrade || catalog_degrade)
                 return std::nullopt;
             std::vector<SoftwareCatalogRow> out;
             for (const auto& r : titles) {
@@ -600,6 +601,32 @@ TEST_CASE("software routes: any degraded read is the retry banner with an audite
     REQUIRE(contains(res->body, "data-act=\"retry\""));
     REQUIRE_FALSE(contains(res->body, "<table"));
     REQUIRE(h.audited("inventory.software.catalog|failure"));
+    // The Retry button re-requests the page with the current filters, and does not claim a 503.
+    REQUIRE(contains(res->body, "hx-get=\"/fragments/inventory/software\" hx-target"));
+    REQUIRE_FALSE(contains(res->body, "(503)"));
+    auto filtered = h.sink.Get(std::string(kSoftware) + "?kind=app");
+    REQUIRE(contains(filtered->body, "data-act=\"retry\" style=\"margin-left:.6rem\" "
+                                     "hx-get=\"/fragments/inventory/software?kind=app\""));
+
+    // ONE provider failing (the rows read; every other read answers) is the same degrade.
+    InvHarness one;
+    one.catalog_degrade = true;
+    auto only = one.sink.Get(kSoftware);
+    REQUIRE(only);
+    REQUIRE(contains(only->body, "Inventory store unavailable."));
+    REQUIRE_FALSE(contains(only->body, "<table"));
+    REQUIRE(one.audited("inventory.software.catalog|failure"));
+    REQUIRE_FALSE(one.audited("inventory.software.catalog|success"));
+
+    // A Load-more continuation that degrades is a retry ROW, never a table.
+    InvHarness more;
+    more.degrade = true;
+    auto row = more.sink.Get(std::string(kSoftware) + "?rows_only=1");
+    REQUIRE(row);
+    REQUIRE(row->body.rfind("<tr", 0) == 0);
+    REQUIRE(contains(row->body, "inv-degrade"));
+    REQUIRE_FALSE(contains(row->body, "<table"));
+    REQUIRE(more.audited("inventory.software.catalog|failure"));
 }
 
 TEST_CASE("software routes: results_only and rows_only return their regions", "[inventory][route]") {
@@ -651,6 +678,20 @@ TEST_CASE("software routes: versions drill", "[inventory][route]") {
     auto bad = h.sink.Get(std::string(kVersions) + "?name=Chrome");
     REQUIRE(contains(bad->body, "unavailable"));
     REQUIRE(h.audited("inventory.software.versions|failure"));
+    // The unfiltered fleet drill reads the rollup, so before its first refresh it is `building`
+    // (the shared read_versions seam), never an authoritative "No version data"; a filtered drill
+    // reads no rollup and still answers.
+    InvHarness building;
+    building.refreshed_at = 0;
+    auto early = building.sink.Get(std::string(kVersions) + "?name=Chrome");
+    REQUIRE(early);
+    REQUIRE(contains(early->body, "Catalogue is building"));
+    REQUIRE_FALSE(contains(early->body, "No version data"));
+    REQUIRE_FALSE(building.last_versions_query); // no rows were read
+    REQUIRE(building.audits.back() == "inventory.software.versions|failure");
+    REQUIRE(building.audit_details.back() == "building");
+    REQUIRE(contains(building.sink.Get(std::string(kVersions) + "?name=Chrome&kind=app")->body,
+                     "installs per version"));
     // Confined host view: admitted for an in-scope device, the newest mark is blanked.
     InvHarness c;
     c.scope = ids({"a1"});
@@ -837,8 +878,9 @@ TEST_CASE("software routes: devices paging follows the keyset and tags continuat
     REQUIRE(contains(url, "shown=100"));
     auto p2 = h.sink.Get(url);
     REQUIRE(p2);
-    REQUIRE(p2->body.rfind("<tr", 0) == 0);
-    REQUIRE_FALSE(contains(p2->body, "<table"));
+    // The exact-multiple-of-100 case: the continuation is empty and final, so it appends nothing
+    // (no "No host matches" beneath the hundred rows already on screen).
+    REQUIRE(p2->body.empty());
     REQUIRE(h.last_fleet_query->after);
     REQUIRE(h.last_fleet_query->after->agent_id == "a099");
     REQUIRE(h.audit_details.size() == 2);
