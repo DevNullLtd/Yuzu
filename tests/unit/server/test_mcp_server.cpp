@@ -28878,8 +28878,8 @@ TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
               R"({"plugin":"p","field":"f","op":"contains","value":5})",
               R"({"plugin":"p","field":"f","op":5,"value":"5"})",
               R"({"plugin":["p"],"field":"f","op":">","value":"5"})",
-              // A decimal operand of 2^53 or more is rounded by a double, so it is refused
-              // (CDX-P1-01); a string is read only under the ordering operators.
+              // Every JSON float is refused (CDX-P1-01: 9007199254740993.0 is already 2^53 once
+              // parsed); a decimal string of 2^53 or more is refused under the ordering operators.
               R"({"plugin":"p","field":"f","op":">","value":9007199254740993.0})",
               R"({"plugin":"p","field":"f","op":"==","value":1e300})",
               R"({"plugin":"p","field":"f","op":"<=","value":"9007199254740993.5"})",

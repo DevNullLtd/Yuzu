@@ -2514,8 +2514,8 @@ TEST_CASE("from-inventory-query: a numeric condition value is compared as a numb
         CHECK(st == 400);
         CHECK(j["error"]["message"].get<std::string>().find("conditions[]") != std::string::npos);
     }
-    // A decimal operand a double cannot hold (CDX-P1-01): 9007199254740993.0 is already
-    // 9007199254740992.0 once parsed, so stored 9007199254740993 `>` it used to match. Refused.
+    // EVERY JSON float is refused (CDX-P1-01): 9007199254740993.0 is already 9007199254740992.0
+    // once parsed, so stored 9007199254740993 `>` it used to match.
     for (const char* cond :
          {R"({"plugin":"custom","field":"ram","op":">","value":9007199254740993.0})",
           R"({"plugin":"custom","field":"ram","op":"==","value":1e300})",

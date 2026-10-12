@@ -29,7 +29,9 @@ struct InventoryCondition {
     /// number up to the uint64 range is sent as an integer. A STORED double above 2^53 is whatever
     /// the agent reported. A stored string that parses
     /// in full as a number counts as that number (stored "10.0" equals operand 10, stored "10" is
-    /// greater than operand 9); any other stored value (non-numeric string such as "5 GB" or "N/A",
+    /// greater than operand 9). A stored integer (up to the uint64 maximum) and a stored decimal of
+    /// at most 15 significant digits compare exactly; a stored decimal of more digits is compared as
+    /// the nearest double. Any other stored value (non-numeric string such as "5 GB" or "N/A",
     /// boolean, array) is never equal and never satisfies an ordering operator: a JSON number
     /// operand is strict, with no numeric-prefix tolerance. A string operand
     /// keeps the exact lexical `==` / `!=` (so "1.10" and "1.1" stay different); for the ordering
@@ -38,10 +40,12 @@ struct InventoryCondition {
     /// True when the caller's `value` was a STRING that is a plain decimal number in full (optional
     /// '-', a digit or '.', no 'x'; exponent forms such as "2e-7" count; set by
     /// parse_inventory_condition, ordering operators `>` `>=` `<` `<=` only). Against a stored
-    /// number or fully numeric string the ordering operators compare exactly, like a JSON-number
-    /// operand. Unlike a JSON-number operand this one tolerates the legacy leading-number read of a
-    /// stored STRING that merely starts with a number (dotted version "1.2.3" reads as 1.2,
-    /// "5 GB" as 5), so devices that matched before keep matching; any other stored value (no
+    /// number or fully numeric string the ordering operators compare exactly (to the limits stated
+    /// on `numeric_operand`), like a JSON-number operand. Unlike a JSON-number operand this one
+    /// tolerates a stored STRING that merely starts with a number: its leading plain-decimal number
+    /// (optional '-', digits, optional fraction, optional exponent) goes through the same exact
+    /// parse and compare (dotted version "1.2.3" reads as 1.2, "5 GB" as 5, "9007199254740993 B" as
+    /// that exact integer), so devices that matched before keep matching; any other stored value (no
     /// numeric start such as "N/A", "" or "v2.1", boolean, array, object) never satisfies the
     /// operators, never a lexical compare. Dotted versions belong with `version_gte` /
     /// `version_lte`. `==` / `!=` are unaffected (exact text compare). A string operand that is not
@@ -65,7 +69,7 @@ struct InventoryCondition {
 /// refused. A number used to become "": `{"op":">","value":5}` then selected EVERY device that had the
 /// field, because the evaluator falls back to a lexicographic compare against the empty string.
 /// EVERY JSON float operand is refused (anything written with a decimal point or exponent: 5.0,
-/// 1e3, -0.0, non-finite): its original text is gone once parsed (5.00000000000000001 arrives as
+/// 1e3, -0.0, non-finite; an integer literal outside int64/uint64 arrives as a float too): its original text is gone once parsed (5.00000000000000001 arrives as
 /// 5.0), so even a whole-valued one would accept lexemes whose true value differs. JSON integers
 /// (signed and unsigned) are exact. The caller sends a decimal as a string under `>` `>=` `<` `<=`.
 /// A decimal STRING under those operators that would be rounded through a double is refused: one

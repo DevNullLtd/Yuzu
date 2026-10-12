@@ -1431,6 +1431,62 @@ TEST_CASE("InventoryEval: a plain-decimal string operand orders exactly like the
     }
 }
 
+TEST_CASE("InventoryEval: a stored string that starts with a number reads its leading number exactly",
+          "[inventory_eval][numeric_params]") {
+    using nlohmann::json;
+    // Stored `stored_json` against the string operand under `op`, through the production parse.
+    auto matches = [](const char* stored_json, const char* op, const char* operand) {
+        Records records = {{"agent-a|p", std::string(R"({"v": )") + stored_json + "}"}};
+        InventoryEvalRequest req;
+        InventoryCondition c;
+        const json doc = {{"plugin", "p"}, {"field", "v"}, {"op", op}, {"value", operand}};
+        REQUIRE_FALSE(parse_inventory_condition(doc, c));
+        req.conditions.push_back(c);
+        return !evaluate_inventory(req, records).empty();
+    };
+    // The prefix keeps its integer exactness (a double would round 2^53 + 1 down to 2^53).
+    const char* const big = R"("9007199254740993 B")";
+    CHECK(matches(big, ">", "9007199254740992"));
+    CHECK(matches(big, ">=", "9007199254740992"));
+    CHECK_FALSE(matches(big, "<", "9007199254740992"));
+    CHECK_FALSE(matches(big, "<=", "9007199254740992"));
+    CHECK(matches(big, ">=", "9007199254740993"));
+    CHECK(matches(big, "<=", "9007199254740993"));
+    CHECK_FALSE(matches(big, ">", "9007199254740993"));
+    CHECK_FALSE(matches(big, "<", "9007199254740993"));
+    CHECK(matches(big, "<", "9007199254740994"));
+    CHECK_FALSE(matches(big, ">=", "9007199254740994"));
+    // Dotted versions and unit suffixes keep reading as before.
+    CHECK(matches(R"("1.2.3")", "<", "2.0"));
+    CHECK_FALSE(matches(R"("1.2.3")", ">", "2.0"));
+    CHECK(matches(R"("10.0.19045")", ">=", "10"));
+    CHECK(matches(R"("5 GB")", ">", "4"));
+    CHECK_FALSE(matches(R"("5 GB")", "<", "4"));
+    // An exponent in the prefix counts; an exponent with no digits does not.
+    CHECK(matches(R"("1e3 units")", ">", "999"));
+    CHECK_FALSE(matches(R"("1e3 units")", "<", "999"));
+    CHECK(matches(R"("5e units")", ">", "4"));
+    CHECK_FALSE(matches(R"("5e units")", ">", "5"));
+    // A negative prefix.
+    CHECK(matches(R"("-5 apples")", "<", "-4"));
+    CHECK_FALSE(matches(R"("-5 apples")", ">", "-4"));
+    CHECK(matches(R"("-5 apples")", ">", "-6"));
+    // No usable number: never matches, under any operator, and never lexically.
+    for (const char* op : {">", ">=", "<", "<="}) {
+        INFO(op);
+        CHECK_FALSE(matches(R"("N/A")", op, "5"));
+        CHECK_FALSE(matches(R"(". dot")", op, "0"));
+        CHECK_FALSE(matches(R"("-. dot")", op, "0"));
+        CHECK_FALSE(matches(R"("1e400 huge")", op, "5"));
+    }
+    // Documented limit: a stored decimal of more than 15 significant digits is compared as the
+    // nearest double ("0.29999999999999999" is the double 0.3), whole or as a prefix.
+    CHECK(matches(R"("0.29999999999999999")", ">=", "0.3"));
+    CHECK_FALSE(matches(R"("0.29999999999999999")", ">", "0.3"));
+    CHECK(matches(R"("0.29999999999999999 x")", ">=", "0.3"));
+    CHECK_FALSE(matches(R"("0.29999999999999999 x")", ">", "0.3"));
+}
+
 TEST_CASE("InventoryEval: a string operand that is not a plain decimal keeps the legacy ordering",
           "[inventory_eval][numeric_params]") {
     using nlohmann::json;
@@ -1516,8 +1572,9 @@ TEST_CASE("InventoryEval: parse_inventory_condition refuses what used to become 
 
 // A decimal operand a double cannot hold exactly (CDX-P1-01): a JSON float arrives already rounded
 // (9007199254740993.0 is 2^53 by the time the evaluator sees it), so stored 9007199254740993
-// `> 9007199254740993.0` matched while `==` / `<=` did not. Refused at admission instead.
-TEST_CASE("InventoryEval: a decimal operand of 2^53 or more is refused at admission",
+// `> 9007199254740993.0` matched while `==` / `<=` did not. EVERY JSON float is refused at
+// admission, and a decimal STRING of 2^53 or more (or over 15 significant digits) is refused too.
+TEST_CASE("InventoryEval: every JSON float operand and a decimal string of 2^53 or more are refused at admission",
           "[inventory_eval][numeric_params]") {
     using nlohmann::json;
     const char* const ops[] = {"==", "!=", ">", ">=", "<", "<="};
@@ -1539,6 +1596,12 @@ TEST_CASE("InventoryEval: a decimal operand of 2^53 or more is refused at admiss
             REQUIRE(err.has_value());
             CHECK(err->find("JSON string") != std::string::npos);
         }
+    }
+    // An out-of-range integer literal arrives as a float; the message names that case too.
+    for (const char* operand : {"100000000000000000000", "-9223372036854775809"}) {
+        const auto err = admit("==", operand);
+        REQUIRE(err.has_value());
+        CHECK(err->find("nor an integer outside that range") != std::string::npos);
     }
     // A string operand is read only under the ordering operators; a fraction or exponent form of
     // 2^53 or more is refused there too (== / != with a string stay an exact text compare).

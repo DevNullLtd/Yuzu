@@ -306,20 +306,50 @@ std::partial_ordering compare_numbers(const Number& a, const Number& b) {
         a, b);
 }
 
-/// `>` / `>=` / `<` / `<=` for a condition whose operand was a JSON number: the RAW stored value
-/// (a number, or a string that parses as a number in full) against the parsed operand, exactly.
-/// A stored value that is not a number, or an unordered (NaN) pair, never satisfies the operator.
-bool numeric_order(const nlohmann::json& stored, const InventoryCondition& cond) {
-    const auto n = stored_number(stored);
-    if (!n.has_value())
-        return false;
-    const auto ord = compare_numbers(*n, cond.numeric_value);
+/// Whether an ordering `ord` of (stored, operand) satisfies the condition's `>` / `>=` / `<` / `<=`;
+/// an unordered (NaN) pair never does.
+bool ordering_satisfies(const InventoryCondition& cond, std::partial_ordering ord) {
     if (ord == std::partial_ordering::unordered)
         return false;
     if (cond.op == ">") return ord > 0;
     if (cond.op == ">=") return ord >= 0;
     if (cond.op == "<") return ord < 0;
     return ord <= 0;
+}
+
+/// `>` / `>=` / `<` / `<=` for a condition with a parsed numeric operand (a JSON integer, or a
+/// plain-decimal string under an ordering operator): the RAW stored value (a number, or a string
+/// that parses as a number in full) against the parsed operand, exactly. A stored value that is
+/// not a number, or an unordered (NaN) pair, never satisfies the operator.
+bool numeric_order(const nlohmann::json& stored, const InventoryCondition& cond) {
+    const auto n = stored_number(stored);
+    if (!n.has_value())
+        return false;
+    return ordering_satisfies(cond, compare_numbers(*n, cond.numeric_value));
+}
+
+/// The leading plain-decimal number of `s` (optional '-', digits, optional '.' and digits,
+/// optional exponent that has at least one digit), stopping at the first character that cannot
+/// continue it: "9007199254740993 B" gives "9007199254740993", "1.2.3" gives "1.2", "1e3 units"
+/// gives "1e3", "5e" gives "5". The caller has already checked the first character; whether the
+/// prefix is a number at all (".", "-.") is left to parse_number_string.
+std::string leading_decimal_prefix(const std::string& s) {
+    const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    std::size_t i = (!s.empty() && s[0] == '-') ? 1 : 0;
+    while (i < s.size() && is_digit(s[i])) ++i;
+    if (i < s.size() && s[i] == '.') {
+        ++i;
+        while (i < s.size() && is_digit(s[i])) ++i;
+    }
+    if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+        std::size_t j = i + 1;
+        if (j < s.size() && (s[j] == '+' || s[j] == '-')) ++j;
+        if (j < s.size() && is_digit(s[j])) {
+            while (j < s.size() && is_digit(s[j])) ++j;
+            i = j;
+        }
+    }
+    return s.substr(0, i);
 }
 
 /// `==` / `!=` for a condition whose operand was a JSON number: compares the RAW stored value
@@ -348,14 +378,15 @@ constexpr const char* kInexactOperandMessage =
     "value within the range of a double; an integer outside -9223372036854775808 to "
     "18446744073709551615 cannot be compared exactly";
 
-/// The 400 / -32602 text for ANY JSON float operand (a number written with a decimal point or an
-/// exponent: 5.0, 1e3, -0.0): its original text is gone once parsed, so it cannot be judged
-/// exactly. Both remedies are satisfiable by the caller.
+/// The 400 / -32602 text for a JSON number operand that arrives as a float: written with a decimal
+/// point or an exponent (5.0, 1e3, -0.0), or an integer outside the int64/uint64 range
+/// (100000000000000000000 is parsed as a double). Its original text is gone once parsed, so it
+/// cannot be judged exactly. Both remedies are satisfiable by the caller.
 constexpr const char* kJsonFloatOperandMessage =
-    "conditions[].value: a JSON number operand must be an integer (no decimal point or exponent); "
-    "to compare against a decimal send it as a JSON string with an ordering operator (>, >=, <, "
-    "<=), or write a whole number as an integer within -9223372036854775808 to "
-    "18446744073709551615";
+    "conditions[].value: a JSON number operand must be an integer within -9223372036854775808 to "
+    "18446744073709551615, not a number with a decimal point or exponent, nor an integer outside "
+    "that range; to compare against a decimal send it as a JSON string with an ordering operator "
+    "(>, >=, <, <=)";
 
 /// The significant digits of a decimal spelling: the digits of the mantissa (everything before an
 /// 'e' / 'E'), without leading zeros and without trailing zeros ("0.0123" is 3, "5.50" is 2,
@@ -449,17 +480,19 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
 
     // A string operand that is a plain decimal number is exact against a stored number or fully
     // numeric string. A stored STRING that merely starts with a number ("1.2.3", "10.0.19045",
-    // "5 GB") keeps the legacy leading-number read below (the same from_chars prefix compare as
-    // before the exact path existed); anything else (no numeric start, bool, array, object) never
-    // matches, never lexical.
-    const bool prefix_tolerant = cond.ordering_numeric && !cond.numeric_operand && ordering_op;
-    if (prefix_tolerant) {
+    // "5 GB", "9007199254740993 B") compares its leading plain-decimal number through the same
+    // exact parse; anything else (no numeric start, bool, array, object) never matches, never
+    // lexical.
+    if (cond.ordering_numeric && !cond.numeric_operand && ordering_op) {
         if (stored_number(*val).has_value())
             return numeric_order(*val, cond);
         std::size_t start = (!val_str.empty() && val_str[0] == '-') ? 1 : 0;
         if (!val->is_string() || start >= val_str.size() ||
             !((val_str[start] >= '0' && val_str[start] <= '9') || val_str[start] == '.'))
             return false;
+        const auto prefix = parse_number_string(leading_decimal_prefix(val_str));
+        return prefix.has_value() &&
+               ordering_satisfies(cond, compare_numbers(*prefix, cond.numeric_value));
     }
 
     // Numeric comparisons — attempt to parse both sides as numbers
@@ -494,8 +527,6 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
 #endif
 
     if (!lhs_ok || !rhs_ok) {
-        if (prefix_tolerant)
-            return false; // never lexical for a plain-decimal string operand
         // Fall back to lexicographic comparison for non-numeric values
         if (cond.op == ">=" ) return val_str >= cond.value;
         if (cond.op == "<=" ) return val_str <= cond.value;
@@ -584,10 +615,11 @@ std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
         } else if (v.is_number_integer()) {
             parsed = v.get<std::int64_t>();
         } else {
-            // EVERY JSON float is refused. Its original text is gone by the time it is read
-            // (5.00000000000000001 arrives as 5.0, 4503599627370497.3 as ...497.0), so no rule
-            // about its digits can be applied and accepting even a whole-valued one would accept
-            // lexemes whose true value differs. A JSON integer is exact; a decimal goes as a string.
+            // EVERY JSON float is refused (an out-of-range integer literal arrives as one too).
+            // Its original text is gone by the time it is read (5.00000000000000001 arrives as
+            // 5.0, 4503599627370497.3 as ...497.0), so no rule about its digits can be applied
+            // and accepting even a whole-valued one would accept lexemes whose true value differs.
+            // A JSON integer is exact; a decimal goes as a string.
             return std::string(kJsonFloatOperandMessage);
         }
         out.value = v.dump();
