@@ -311,8 +311,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "lease renewal, or a presence upsert; outcome=\"ok\" otherwise. The directory read "
             "and the renewal each bound their pool acquire at 500 ms and a failing presence "
             "upsert at 250 ms. After a failed presence upsert later upserts in that batch are "
-            "skipped EXCEPT exponentially spaced probes, so a batch waits at most "
-            "ceil(log2 N)+1 times 250 ms on a failing presence store (N = batch size). A batch "
+            "skipped EXCEPT exponentially spaced probes, so under total saturation (every "
+            "attempt fails) a batch waits at most ceil(log2 N)+1 times 250 ms on a failing "
+            "presence store (N = batch size); under partial brownout a success resets the "
+            "spacing. A batch "
             "that waited out one or both 500 ms acquires lands just above 0.5 s or 1 s.",
             "histogram");
         for (const char* outcome : {"ok", "degraded"})
@@ -324,8 +326,11 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "presence upsert in the same batch had failed (skipped except for exponentially "
             "spaced probes; attempts that fail are counted in "
             "yuzu_server_agent_presence_store_failed_total{op=\"upsert\"}). The heartbeat is "
-            "still acknowledged and its lease renewed; the row is refreshed by a later probe "
-            "in the same batch or by the next batch.",
+            "still acknowledged and its lease renewed; once the presence store recovers (a "
+            "later probe in the same batch or the next batch then refreshes the row) the row "
+            "is current again. Under total saturation (every attempt fails) a batch waits at "
+            "most ceil(log2 N)+1 times 250 ms; under partial brownout a success resets the "
+            "spacing.",
             "counter");
         metrics_->counter("yuzu_server_agent_presence_upsert_skipped_total");
         metrics_->describe(
