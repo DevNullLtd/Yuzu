@@ -45,6 +45,7 @@
 #include <format>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1240,8 +1241,8 @@ TEST_CASE("/fragments/results: sort headers and Prev/Next include the live filte
     CHECK(contains(page->body, ">Next</button>"));
 
     const auto tags = sort_and_pager_tags(page->body);
-    // Output sort header + Prev + Next (the Agent header is hidden by the one-column View).
-    REQUIRE(tags.size() >= 3);
+    // Agent sort header + Output sort header + Prev + Next, measured as 4.
+    REQUIRE(tags.size() == 4);
     for (const auto& tag : tags) {
         INFO(tag);
         CHECK(contains(tag, "hx-include=\"#filter-bar\""));
@@ -1255,6 +1256,17 @@ TEST_CASE("/fragments/results: sort headers and Prev/Next include the live filte
         CHECK(contains(q, "&amp;dir="));
         CHECK(contains(q, "&amp;page="));
         CHECK(contains(q, "&amp;per_page=10"));
+        // Exact key set: no extra param of any name may be baked in.
+        std::set<std::string> keys;
+        std::size_t pos = 0;
+        while (pos <= q.size()) {
+            auto end = q.find("&amp;", pos);
+            if (end == std::string::npos) end = q.size();
+            const std::string pair = q.substr(pos, end - pos);
+            keys.insert(pair.substr(0, pair.find('=')));
+            pos = end + 5;
+        }
+        CHECK(keys == std::set<std::string>{"sort", "dir", "page", "per_page"});
     }
 
     // The Create Group button is NOT a sort/page link and must keep its own command_id +
