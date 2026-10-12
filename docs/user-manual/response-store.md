@@ -365,15 +365,16 @@ operator-visible notes:
     request still in flight, so a late response for the previous command cannot swap its rows or
     its Create Group button over the new command's table; every results response also closes an
     open Create Static Group form, so it cannot keep the filters and count of an earlier render.
-    For about 2 seconds after a command is
-    sent the filter bar is an empty placeholder and the header refresh fires on the same delay;
-    this is not a
-    defect, because in a browser check the header had no sort links and the page no Prev or Next
-    controls in that window, so nothing could be clicked. Still open: an operator whose only
-    `Response:Read` grant is scoped to a management group is refused at the filter bar, so
-    gets no chart deck, pager or summary after a command (#5688); and the built-in `help` command and a TAR SQL query clear the results area without
-    aborting a request in flight, and the hardware list keeps the older `this:abort` sync
-    (#5677).
+    For about 2 seconds after a command is sent the filter bar is an empty placeholder and the
+    header refresh fires on the same delay; this is not a defect, because in a browser check the
+    header had no sort links and the page no Prev or Next controls in that window, so nothing
+    could be clicked. Still open: an operator whose only `Response:Read` grant is scoped to a
+    management group is refused at the filter bar, so gets no chart deck, pager or summary after
+    a command (#5688); the Create Group button does not percent-encode a filter value, so a
+    value containing `+`, `&`, `%` or `#` previews "0 agents", and the group is built from the
+    column filters only, never the text query (#5700); and the built-in `help` command and a TAR
+    SQL query clear the results area without aborting a request in flight, and the hardware list
+    keeps the older `this:abort` sync (#5677).
   - **Cap.** At most 5,000 facets are kept per response, chosen by most lines first, then column,
     then value, so a rare value can be cut. The symptom is an agent missing from a facet filter or
     preview while its response still shows in the results.
