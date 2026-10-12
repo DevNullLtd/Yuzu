@@ -261,8 +261,9 @@ int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0
 }
 
 /// Builds the catalogue model's `Params` from the named MCP arguments (strings and integers
-/// only; any other JSON type is left out and the strict input schema has already refused it),
-/// so MCP and REST parse through the one model.
+/// only; any other JSON type is left out: the two catalogue twins refuse it earlier through
+/// `strict_args_error`, while `query_installed_software` runs no strict check and so ignores it,
+/// as the other read tools do), so MCP and REST parse through the one model.
 software_catalogue::Params catalogue_params(const nlohmann::json& args,
                                             std::initializer_list<const char*> keys) {
     software_catalogue::Params p;
