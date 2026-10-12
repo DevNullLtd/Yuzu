@@ -708,10 +708,11 @@ agent_text_is_logged_without_control_characters() ->
 
 %% The peer address warning of Register names the agent id, which the agent chose
 %% and the edge bounds only by length. It must pass through log_text/1 like the
-%% other Register lines (a bare ~s would let a CR or LF start a second line). The
+%% other Register lines (a bare ~s would pass a CR or LF, which start a second
+%% line, or an ESC, which starts a terminal escape sequence, through). The
 %% address must be one the sanitiser changes, or the line is never written.
 register_peer_address_warning_has_no_raw_control_characters() ->
-    A = <<"crlf-marker", 13, 10, "INJECTED-", (uid(<<"u">>))/binary>>,
+    A = <<"crlf-marker", 13, 10, 27, "INJECTED-", (uid(<<"u">>))/binary>>,
     Req = #{info => #{agent_id => A, hostname => <<"h">>}},
     yuzu_gw_safe_call:reset_limits(),
     Lines = capture_logs(fun() ->
@@ -720,7 +721,7 @@ register_peer_address_warning_has_no_raw_control_characters() ->
     Warned = [L || L <- Lines, binary:match(L, <<"the peer address was replaced">>) =/= nomatch,
                    binary:match(L, <<"crlf-marker">>) =/= nomatch],
     ?assertMatch([_], Warned),
-    [?assertEqual(nomatch, binary:match(L, [<<13>>, <<10>>])) || L <- Warned].
+    [?assertEqual(nomatch, binary:match(L, [<<13>>, <<10>>, <<27>>])) || L <- Warned].
 
 %% The :authority header of a Register, as grpcbox hands it to the handler.
 ctx_authority(Key, Authority) ->
