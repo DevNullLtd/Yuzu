@@ -89,6 +89,19 @@
  * shape as the enqueue-waker capturing only a shared Signal, never `this`.
  * Shutdown is coordinated purely by atomics: the journal's own stopping_ gate
  * (set FIRST in engine::stop()) plus this worker's stopping flag.
+ *
+ * SEND LANES (#3847, #3972, #3980): the two lanes (lifecycle; compliance + health) each have
+ * their own GuardianOutboxSendExecutor. This worker (a) gates each lane's LAUNCH on the other
+ * lane's older entries with a bounded, counted hold (wrapped_send(); the contract is stated at
+ * GuardianSparkRuntime::drain_bounded()), (b) probes the compliance lane's executor once per
+ * loop cycle so an orphan send on an emptied lane is still stall-counted and reaped
+ * (guardian_outbox_send_executor.hpp probe_orphan()), and (c) bounds its OWN wait with the
+ * send-driven clamps in loop()'s tail - WAIT clamps only, never a wake source. The clamps
+ * compose by minimum: while a send is in flight and its stall is not yet counted the wait is
+ * at most kGuardianSendRecheckInterval (an orphan on an emptied compliance lane instead waits
+ * once for its remaining time to the stall threshold); a counted stall adds no clamp; a held
+ * lane adds min(recheck or periodic, remaining hold). Detail: compute_wait_clamp() and
+ * apply_cross_lane_tail() in the .cpp.
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
@@ -180,7 +193,10 @@ inline constexpr std::chrono::milliseconds kGuardianSendOfferWait{200};
 /// kGuardianSendOfferWait + this, not by kDefaultPeriodicBoundMs (5s in production).
 /// Deliberately NOT a wake source (no sig_->gen bump, no notify_all) - it only shortens
 /// how long the loop's OWN wait blocks, so it cannot perturb any test whose timing
-/// depends on nothing else waking the loop (see the R4 test's own comment).
+/// depends on nothing else waking the loop (see the R4 test's own comment). The #3972
+/// cross-lane hold reuses this bound while a RUNNING blocker holds a lane, capped by the
+/// remaining hold (apply_cross_lane_tail()); a PENDING blocker that makes no progress is
+/// clamped to min(periodic bound, remaining hold) instead.
 inline constexpr std::chrono::milliseconds kGuardianSendRecheckInterval{200};
 
 /// #3972 cross-lane launch hold and its release allowance. Defaults for the
@@ -325,7 +341,8 @@ public:
     /// UNBOUNDED. It has NO production caller by design - the loop body uses the bounded
     /// private drain_bounded(). Deliberately retained rather than deleted because several
     /// tests rely on a synchronous drain, but note it bypasses every limit the worker applies
-    /// in production (count, wall clock, stop predicate), so it must not become a shortcut for
+    /// in production (count, wall clock, stop predicate) and, since it passes the raw send_,
+    /// the executors and the #3972 cross-lane launch hold, so it must not become a shortcut for
     /// production code (#2345 / Sol). Does NOT firewall
     /// exceptions - the worker thread's loop() does (so a test can still observe a
     /// throw, but a bad_alloc on the bare worker thread never terminates the agent).
@@ -548,16 +565,20 @@ private:
     /// in flight at once - that is the SAME pre-existing, already-disclaimed
     /// contention this whole class's header names ("NOT a fix for stream_write_mu_
     /// contention"), now on two detached threads instead of one; it never touches the
-    /// worker's own thread. The same two-executor split also makes a same-pass
-    /// cross-lane WIRE ORDERING residual reachable (#3953 item 5 / #3972) - see
-    /// GuardianSparkRuntime::drain_bounded()'s own note for the mechanism.
+    /// worker's own thread. The same two-executor split would also make a same-pass
+    /// cross-lane wire reordering reachable (#3953 item 5), which is why the LAUNCH
+    /// is additionally gated here (#3972):
     ///
-    /// #3972: the LAUNCH is additionally gated by a bounded, symmetric, seq-ordered hold. An entry
-    /// is held while the OTHER lane has an older entry (lower OutboxEntry::seq) either pending at
-    /// its head or running in its executor; seq == 0 on either side fails open. A lane's hold
-    /// clock (cross_lane_order_hold) runs across ACTUAL launch denials only; on expiry the lane
-    /// is released for cross_lane_release_allowance overtaking launches, cleared the moment the
-    /// lane next finds no blocker. Defined in the .cpp, with the full contract.
+    /// the gate is a bounded, symmetric, seq-ordered hold. An entry is held while the OTHER
+    /// lane has an older entry (lower OutboxEntry::seq) either pending at its head or running
+    /// in its executor; seq == 0 on either side fails open. A lane's hold clock
+    /// (cross_lane_order_hold) runs across ACTUAL launch denials only; on expiry the lane is
+    /// released for cross_lane_release_allowance overtaking launches, cleared the moment the
+    /// lane next finds no blocker. Each release is counted (cross_lane_order_release_count()).
+    /// The gate lives in this wrapper only: drain_once() (test-only) calls the runtime's
+    /// drain() with the raw send and bypasses it. The guarantee, what it does not give, and its
+    /// bounds are stated once, at GuardianSparkRuntime::drain_bounded(); the mechanism is in the
+    /// .cpp.
     [[nodiscard]] SendResult wrapped_send(const OutboxEntry& entry);
     /// True once stop() has been requested. Lock-free and noexcept BY DESIGN: this is
     /// the one check loop() makes outside a try, and taking a mutex here would let

@@ -44,13 +44,27 @@
  * review of this file's first draft, independently by two reviewers; direct
  * regression coverage: tests/unit/test_guardian_outbox_send_executor.cpp).
  *
+ * Per-lane single-flight is unchanged by #3972/#3980, with two additions. (1) A LAUNCH is
+ * additionally gated by the drain worker's cross-lane order hold: offer() takes a
+ * `launch_permitted` flag and reports a refusal through OfferTrace::launch_denied; the flag
+ * gates only the decision to start a new detached worker, never waiting on or consuming the
+ * in-flight entry or reclaiming a done orphan (see offer()). (2) offer() is no longer the
+ * only reclaim trigger: probe_orphan(), called once per loop cycle by the drain worker for the
+ * compliance lane, counts a stall and reaps a done orphan when that lane is EMPTY (no head,
+ * so no offer() will ever run). A non-empty lane's reclaim stays with offer().
+ *
  * ORPHAN-EXIT CONTRACT: reuses the exact hazard guardian_io_executor.hpp
  * documents - a worker wedged in a blocking syscall cannot be joined or
  * force-cancelled, so normal C++ teardown must not run while one is alive.
  * active_worker_count() MUST be summed into GuardianEngine::active_io_workers()
  * (guardian_engine.cpp) alongside the state-reader and arm/disarm executors -
  * a source left out of that sum lets a detached send survive teardown
- * undetected (the same comment guards that call site).
+ * undetected (the same comment guards that call site). probe_orphan() never joins or cancels a
+ * worker and never touches worker_count (only AliveTicket's destructor does), so reaping a
+ * done orphan's slot leaves active_worker_count() exactly as it was. The detached worker
+ * lambda wears GuardianDetachedWorkerRole as its first statement (guardian_detached_worker_
+ * role.hpp), like the sibling executors, so an engine mtx_ acquisition inside `send` aborts in
+ * debug/sanitizer builds.
  */
 
 #include "guardian_detached_worker_role.hpp" // GuardianDetachedWorkerRole
@@ -404,7 +418,8 @@ public:
     }
 
     /// #3953 item 2: cumulative count of sends (same-entry or mismatched-orphan) that
-    /// crossed kGuardianSendStallThreshold before completing or being reclaimed.
+    /// crossed kGuardianSendStallThreshold before completing or being reclaimed. #3980: also an
+    /// orphan on an emptied lane, counted by probe_orphan() with no offer() in between.
     [[nodiscard]] std::uint64_t send_stall_count() const {
         std::lock_guard<std::mutex> lk{state_->mu};
         return state_->stalls;

@@ -2493,7 +2493,14 @@ Guardian ladder must check these.
   captures while a detached send is still running, `hard_exit()`ing instead
   after a bounded grace. A source left out of that sum would silently reinstate
   the use-after-free the joined-thread rule used to prevent by a different
-  mechanism.
+  mechanism. Per-lane single-flight is unchanged by #3972/#3980; the drain
+  worker additionally gates each lane's LAUNCH with a bounded symmetric
+  seq-order hold (default H = 1 s, N = 64 overtaking launches per release,
+  `GuardianMaintenanceConfig::cross_lane_order_hold` /
+  `cross_lane_release_allowance`) and, once per loop cycle, probes an orphan
+  send on an emptied compliance lane (`GuardianOutboxSendExecutor::
+  probe_orphan()`), which touches no worker count; the executor's detached
+  worker wears `GuardianDetachedWorkerRole`.
   **Fourth additive source since #4783:** `GuardianLegacySinkExecutor::
   active_worker_count()` (`guardian_legacy_sink_executor.hpp`) is summed into
   `GuardianEngine::active_io_workers()` itself - the same `GuardianEngine`-level

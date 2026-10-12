@@ -78,8 +78,11 @@ struct OutboxEntry {
     /// increasing across BOTH logs; 0 = unstamped). Stamped by GuardianSparkRuntime under
     /// outbox_mu_ immediately before each enqueue; the logs below only carry it, and a
     /// coalesce (whole-struct replace) carries the NEW entry's seq, so "enqueue order" for a
-    /// coalesced entry is its latest observation. NOT a wire field and NOT journalled:
-    /// guardian_outbox_entry_to_event and the journal format ignore it.
+    /// coalesced entry is its latest observation. A journal-replayed lifecycle entry is
+    /// stamped when it is paged into the window, not when it was first produced. NOT a wire
+    /// field and NOT journalled: guardian_outbox_entry_to_event and the journal format ignore
+    /// it. 0 means the cross-lane order hold never holds that entry and never treats it as a
+    /// blocker (GuardianOutboxDrainWorker::wrapped_send()).
     std::uint64_t seq{0};
 
     GuardDrift drift{};          ///< Compliance payload
@@ -350,6 +353,17 @@ private:
 /// class enqueues FIFO, sends FIFO, coalesces nothing, and is never purged by
 /// rule_id or generation - an entry leaves only when successfully sent.
 /// Capacity-bounded like its sibling (reject-new + count on full; never evict).
+///
+/// PRODUCTION-PATH INVARIANT (#3980/#3972): this log never empties underneath an in-flight
+/// lifecycle send. Its head leaves only through pop_front_if(event_id), called by
+/// GuardianSparkRuntime's drain_log_unlocked (guardian_spark_runtime.cpp) after the send for
+/// that very head returned Sent; every other mutation of the log in guardian_spark_runtime.cpp
+/// is an append (enqueue at the arm, disarm and replay-page sites) or an annotation of
+/// existing entries (stamp_provenance). So the drain worker's loop-tail
+/// orphan probe covers the compliance lane only and the lifecycle lane gets a read-only
+/// snapshot. The invariant is voided only by concurrent use of the test-only
+/// GuardianOutboxDrainWorker::drain_once() (and this class's own TEST-ONLY drain()), which
+/// remove entries without going through the lane executors.
 class GuardianLifecycleLog {
 public:
     explicit GuardianLifecycleLog(std::size_t capacity) : capacity_(capacity) {}

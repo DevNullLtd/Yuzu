@@ -4386,8 +4386,8 @@ groups:
   #       endpoints and the runbook advice to "identify the reporting agents" is
   #       unactionable without it;
   #   (b) the per-agent axis above (#2083-class work);
-  #   (c) a soak at fleet scale with all 30 families live concurrently with the
-  #       revocation sweep - the heartbeat tag-map grows by up to 30 entries per agent
+  #   (c) a soak at fleet scale with all 33 families live concurrently with the
+  #       revocation sweep - the heartbeat tag-map grows by up to 33 entries per agent
   #       the instant prefer_spark flips, which no pre-cutover soak can observe;
   #   (d) runbooks at the docs.yuzu.io URLs below, which do not exist yet.
   #
@@ -4401,7 +4401,7 @@ groups:
   # alert is the signal; the audit trail is the evidence.
   #
   # PIPELINE HEALTH: yuzu_fleet_guardian_journal_reporting and ..._tag_rejected are
-  # published on EVERY sweep including at 0, unlike the 30 counters. They are the only
+  # published on EVERY sweep including at 0, unlike the 33 counters. They are the only
   # rules here that CAN be sound, because they are server-owned counts rather than fleet
   # sums of agent monotonics. They differ from each other: TagRejected is
   # unconditionally sound, while TelemetryDark is sound only once Guardian is actually
