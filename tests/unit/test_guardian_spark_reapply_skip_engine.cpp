@@ -2276,7 +2276,7 @@ TEST_CASE("#4415 PR-A (CH-5): a re-enabled rule behind a retained disarm is driv
             },
             30s));
         if (rt.status_for_rule("x")->in_unknown)
-            SKIP("this host reads the Service rule Unknown (no system bus), so it is never skipped");
+            SKIP("this host reads the Service rule Unknown (no system bus), so the re-push rebuilds it instead of skipping it");
     }
     r.sm->hang_next_watch();
     r.dispatch(push_bytes({x, h}, kGen));

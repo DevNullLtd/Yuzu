@@ -5666,8 +5666,8 @@ TEST_CASE("#5459 held generation: identical pushes while a hung arm is outstandi
     REQUIRE(sib.unwatch_completed_count() == 0);
     // #4415: the forced Reapply below moves the sibling ONLY if the sibling is rebuilt, and the
     // skip leaves a healthy, unchanged rule alone. r2 is a REGISTRY rule: on a host with no
-    // registry (Linux) it reads Unknown and is always rebuilt; on Windows it reads a verdict and
-    // is skipped. Wait for its first verdict, then expect the matching outcome on this host.
+    // registry (Linux, macOS) it reads Unknown and is always rebuilt; on Windows it reads a verdict
+    // and is skipped. Wait for its first verdict, then expect the matching outcome on this host.
     auto& rt5459 = r.runtime();
     REQUIRE(yuzu::test::spin_until(
         [&] {
@@ -5709,6 +5709,9 @@ TEST_CASE("#5459 held generation: identical pushes while a hung arm is outstandi
     // The real Reapply moves the sibling only when it is rebuilt (an Unknown sibling, see above):
     // its teardown unwatches r2 and the re-arm watches it again (+1 each). A healthy sibling is
     // skipped and stays exactly as it was.
+    // With sibling_rebuilds == 0 (Windows) this wait is already true on entry and proves nothing
+    // about the Reapply; the untouched-sibling property is pinned by the same counts re-checked
+    // after the valve drains and after the late-recovery tail below.
     REQUIRE(yuzu::test::spin_until(
         [&] {
             return sib.unwatch_completed_count() == sibling_rebuilds &&

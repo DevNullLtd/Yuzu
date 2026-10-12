@@ -1558,10 +1558,18 @@ flip, with a red-first test each:
     `[4415prA]` tests (`test_guardian_spark_reapply_skip_engine.cpp`,
     `test_guardian_spark_reapply_skip_runtime.cpp`) and the rewritten `[5459fu10]`,
     `[5459fu11]`, `[5459valve]`, `[5459kv]`, on fake mechanisms. TSan and ASan/UBSan ran clean
-    on the test code at `5111621cd` (Linux debug; the three later commits only add host-conditional waits and SKIPs; `[4415prA]` under TSan 8 runs per case, `[guardian]` and
-    `[spark]` once). A first TSan re-run found a test-exit race (a detached worker committing after
-    the case ended); the test Rig now waits for the worker count to reach zero. Windows (MSVC, weecolin) built and ran
-    `[4415prA]` 64/64, `[guardian]` and `[spark]` green at `490c773fa` (one full `[guardian]` run also hit the pre-existing `FileGuard rename*` flake, which fails 2 of 20 on baseline `dev`). macOS (Apple Clang, mini-colin, arm64) built and ran `[4415prA]` 64 cases (63 pass, 1 skips on a host with no system bus), `[guardian]`, `[spark]` and the 10-shard agent suite all green at `0223018f6`; its first run found one more host-dependent test (CH-5), fixed.
+    on the test code at `5111621cd` (Linux debug; `[4415prA]` under TSan 8 runs per case,
+    `[guardian]` and `[spark]` once). The three later test commits add only host-conditional
+    waits, host-conditional expected counts and one SKIP, equal to the earlier expectations on
+    Linux, and add no thread or owned resource. A first TSan re-run found a test-exit race (a
+    detached worker committing after the case ended); the test Rig now waits for the worker count
+    to reach zero. Windows (MSVC, weecolin) built and ran `[4415prA]` 64/64, `[guardian]` and
+    `[spark]` green at `490c773fa`; one full `[guardian]` run also hit the pre-existing
+    `FileGuard rename*` flake (#5508; alone on baseline `f7a000fc3` it failed 2 of 20 and 5 of 12
+    runs, on this tip 0 of 20). macOS (Apple Clang, mini-colin, arm64) built and ran `[4415prA]`
+    64 cases (63 pass, 1 skipped on a host with no system bus), `[guardian]`, `[spark]` and the
+    10-shard agent suite all green at `0223018f6`; its first run found one more host-dependent
+    test (CH-5), fixed.
     **Flip preconditions beside AC-18** (none is done): (a) enable the `yuzu-fleet-spark`
     `armed_faulted > 0` alert (its group in `docs/prometheus/yuzu-alerts.yml` is commented out);
     (b) a bounded per-rule rebuild-reason INFO log and, optionally, a skip counter (the
