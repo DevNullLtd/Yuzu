@@ -2598,8 +2598,9 @@ Guardian ladder must check these.
   the agent cannot enforce (or silently drops one it can), and nothing else in
   the build catches the divergence.
 
-- **`full_sync`'s KV teardown clears `rule:` keys ONLY, never `baseline:`
-  records (#4021).** A `file-hash-equals` rule authored with no `expected_hash`
+- **`full_sync`'s KV teardown touches `rule:` keys ONLY, never `baseline:`
+  records (#4021).** (Since #4415 it deletes only the `rule:` rows the push omits and
+  conditionally rewrites the rest; it no longer clears them wholesale.) A `file-hash-equals` rule authored with no `expected_hash`
   captures a baseline on arm; that capture is persisted per `rule_id` under
   `__guardian__`/`baseline:` (fingerprint = assertion type + authored path,
   schema-versioned separately from the fingerprint content so a future schema

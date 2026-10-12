@@ -13,6 +13,9 @@
 // STATUS ON THE BASELINE (origin/dev 45f727420), recorded in each case's own header:
 //   RED  : reuse-1, reuse-3a, reuse-3b, #5512 (both variants), one-incarnation
 //   GREEN: reuse-2, reuse-3c, scoped-detach 6a/6b, 7 (regression guards)
+// Later additions with no baseline status of their own: reuse-3d (blocking identical attach),
+// scoped-detach 7b (detach_rules_except), and the health-authority cases (F1: a lost Faulted
+// event must not turn a deaf rule into a skipped one).
 //
 // Every wait is event-driven (gate entry, spin_until on an observable effect); there is
 // no sleep. A wedge is created by parking the key's first arm() and abandoning the
@@ -132,6 +135,17 @@ struct FakeBackend : ISparkBackend {
         std::lock_guard<std::mutex> lk{ids_mu_};
         disarmed_ids_.push_back(sub);
     }
+    /// What subscription_health() reports for `id` (Healthy when never set), standing in for the
+    /// engine's own state independent of whether any Faulted event was ever delivered.
+    void set_health(std::uint64_t id, SubscriptionHealth h) {
+        std::lock_guard<std::mutex> lk{ids_mu_};
+        health_[id] = h;
+    }
+    SubscriptionHealth subscription_health(std::uint64_t id) override {
+        std::lock_guard<std::mutex> lk{ids_mu_};
+        const auto it = health_.find(id);
+        return it != health_.end() ? it->second : SubscriptionHealth::Healthy;
+    }
     std::vector<std::uint64_t> armed_ids() const {
         std::lock_guard<std::mutex> lk{ids_mu_};
         return armed_ids_;
@@ -148,6 +162,7 @@ private:
     mutable std::mutex ids_mu_;
     std::vector<std::uint64_t> armed_ids_;
     std::vector<std::uint64_t> disarmed_ids_;
+    std::unordered_map<std::uint64_t, SubscriptionHealth> health_;
 };
 
 SparkSpec file_spec(const std::string& path) {
@@ -165,6 +180,16 @@ RuleAssertion file_hash_rule(const std::string& rule_id, const std::string& expe
     a.kind = AssertionKind::FileHashEquals;
     a.rule_id = rule_id;
     a.expected_hash = expected_hash;
+    return a;
+}
+
+SparkSpec svc_spec_for_identity() {
+    return SparkSpec{SparkType::Service, ServiceSparkParams{"svc"}};
+}
+RuleAssertion svc_rule_for_identity(const std::string& rule_id, AssertionKind kind) {
+    RuleAssertion a;
+    a.kind = kind;
+    a.rule_id = rule_id;
     return a;
 }
 
@@ -425,6 +450,11 @@ TEST_CASE("#4415 PR-A reuse 3c: an attach after the rule was detached is a fresh
 // there used to assume a retained wedge (an outcome already set); a live claim has none, so the
 // call must wait for that claim and must not abandon it (this call owns nothing).
 // BASELINE: a Case 0 withdraw + requeue; the first claim ends Withdrawn.
+// NON-DETERMINISTIC BRANCH: the waiter thread may call attach_rule before the test releases the
+// gate (it parks on the live claim: the re-observation branch) or, if the thread is slow, after
+// the commit (the committed-live skip). Both end in the same observable state and both are
+// asserted below; only one of them is exercised per run, so the re-observation branch is
+// covered probabilistically here and deterministically by 3a (NonWaiting) instead.
 // ---------------------------------------------------------------------------------------
 TEST_CASE("#4415 PR-A reuse 3d: a BLOCKING identical attach on a rule whose arm is in flight "
           "waits for that claim and returns its generation, abandoning nothing",
@@ -589,7 +619,7 @@ TEST_CASE("#4415 PR-A one incarnation: a revert-to-old push while a new-content 
 // 6a. Scoped full_sync detach, an ABSENT rule's pending (in-flight, non-wedge) arm: it is
 // withdrawn, its late success is compensated, and a healthy sibling is untouched.
 // Expressed through detach_rule (the per-rule primitive the scoped bulk detach is built
-// from; the bulk entry point itself does not exist yet - see 7).
+// from; the bulk entry point, detach_rules_except, is covered by 7b).
 // BASELINE: GREEN (regression guard).
 // ---------------------------------------------------------------------------------------
 TEST_CASE("#4415 PR-A scoped detach 6a: an absent rule's pending arm is withdrawn and its "
@@ -742,4 +772,267 @@ TEST_CASE("#4415 PR-A scoped detach 7b: detach_rules_except detaches only the om
     CHECK(rig.rt->wedge_candidate_count_for_test("r1") == 0);
     CHECK(status_name(*rig.rt, w1.receipt) == "Wedged");
     CHECK(rig.rt->invariant_violations_for_test().empty());
+}
+
+// ---------------------------------------------------------------------------------------
+// 8. The skip never depends on a Faulted EVENT having been delivered (governance F1). The
+// backend's own health is the authority; the event only maintains a recorded bit. Each case
+// makes the backend report Faulted for the key's subscription WITHOUT the runtime hearing it
+// (the three ways an event is lost), then pushes the identical rule again: it must be rebuilt
+// (a real disarm + arm), never skipped and reported Armed.
+// Mutation: make probe_key_health report Healthy whatever the backend says and 8a/8b/8c/8d go red.
+// ---------------------------------------------------------------------------------------
+namespace {
+/// Pushes the identical rule again and returns true iff it was REBUILT (an Accepted claim, a
+/// second disarm and a second arm entered the mechanism) rather than skipped.
+bool identical_push_rebuilds(Rig& rig, const SparkSpec& spec, const std::string& rid) {
+    const auto key = spark_key(spec);
+    auto again = rig.rt->attach_rule(RT::NonWaiting{}, rid, spec, file_exists_rule(rid), true);
+    INFO("identical re-push: " << (again ? "ok" : again.error().message));
+    REQUIRE(again.has_value());
+    REQUIRE(yuzu::test::spin_until([&] { return rig.rt->claim_queue_depth_for_test(key) == 0; }, 10s));
+    return again->kind != RT::ArmOutcomeKind::Armed && rig.backend->arm_entries.load() == 2 &&
+           rig.backend->disarm_entries.load() == 1;
+}
+} // namespace
+
+TEST_CASE("#4415 PR-A F1a: a dropped Faulted event does not make a deaf rule skippable",
+          "[spark][runtime][4415prA]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    REQUIRE(rig.backend->armed_ids().size() == 1);
+    // The engine marks the subscription faulted; the event is dropped (full queued channel), so
+    // on_event is never called.
+    rig.backend->set_health(rig.backend->armed_ids().front(), SubscriptionHealth::Faulted);
+    CHECK(identical_push_rebuilds(rig, spec, "r1"));
+    CHECK(rig.rt->invariant_violations_for_test().empty());
+}
+
+TEST_CASE("#4415 PR-A F1b: a Faulted that arrived before keys_ held the key is not lost to the "
+          "skip decision",
+          "[spark][runtime][4415prA]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    const auto key = spark_key(spec);
+    auto parked = attach_parked(rig, "r1", spec, file_exists_rule("r1"));
+    // keys_ has no entry yet: the staleness guard discards this event (the id is the one the
+    // parked arm will return, FakeBackend::next starts at 1).
+    rig.rt->on_event(SparkEvent{.key = key, .kind = SparkEventKind::Faulted,
+                                .subscription_id = 1, .detail = "early"});
+    rig.backend->set_health(1, SubscriptionHealth::Faulted);
+    parked.gate->release();
+    REQUIRE(yuzu::test::spin_until([&] {
+        return rig.rt->rule_count() == 1 && rig.rt->claim_queue_depth_for_test(key) == 0;
+    }, 10s));
+    REQUIRE(rig.backend->armed_ids() == std::vector<std::uint64_t>{1});
+    CHECK(identical_push_rebuilds(rig, spec, "r1"));
+}
+
+TEST_CASE("#4415 PR-A F1c: a fresh watcher that joins an engine key which is still faulted is "
+          "not skippable",
+          "[spark][runtime][4415prA]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    rig.rt->detach_rule("r1");
+    REQUIRE(yuzu::test::spin_until([&] { return rig.rt->armed_key_count() == 0; }, 10s));
+    // The mechanism's key is shared with another consumer and still faulted: the next arm gets a
+    // NEW subscription id on it (a dedup join, no fault edge, so no Faulted event), and the
+    // runtime's PerKey for it starts with faulted == false.
+    rig.backend->set_health(2, SubscriptionHealth::Faulted);
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    REQUIRE(rig.backend->armed_ids().size() == 2);
+    const auto disarms_before = rig.backend->disarm_entries.load();
+    auto again = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, file_exists_rule("r1"), true);
+    REQUIRE(again.has_value());
+    CHECK(again->kind != RT::ArmOutcomeKind::Armed);
+    REQUIRE(yuzu::test::spin_until([&] {
+        return rig.rt->claim_queue_depth_for_test(spark_key(spec)) == 0;
+    }, 10s));
+    CHECK(rig.backend->disarm_entries.load() == disarms_before + 1);
+}
+
+TEST_CASE("#4415 PR-A F1d: a healthy key is still skipped, and a health the probe cannot read "
+          "rebuilds",
+          "[spark][runtime][4415prA]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    rig.backend->set_health(rig.backend->armed_ids().front(), SubscriptionHealth::Healthy);
+    auto again = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, file_exists_rule("r1"), true);
+    REQUIRE(again.has_value());
+    CHECK(again->kind == RT::ArmOutcomeKind::Armed);
+    CHECK(rig.backend->arm_entries.load() == 1);
+    CHECK(rig.backend->disarm_entries.load() == 0);
+    // Dead is not healthy either (its Lost handling is separate; the push must not skip it).
+    rig.backend->set_health(rig.backend->armed_ids().front(), SubscriptionHealth::Dead);
+    auto dead = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, file_exists_rule("r1"), true);
+    REQUIRE(dead.has_value());
+    CHECK(dead->kind != RT::ArmOutcomeKind::Armed);
+    REQUIRE(yuzu::test::spin_until([&] {
+        return rig.rt->claim_queue_depth_for_test(spark_key(spec)) == 0;
+    }, 10s));
+}
+
+TEST_CASE("#4415 PR-A F1e: the health sweep refreshes the faulted bit both ways, so the scoped "
+          "detach tears down a kept rule on a deaf key",
+          "[spark][runtime][4415prA]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    const auto sub = rig.backend->armed_ids().front();
+    // Faulted, no event: the scoped detach consults the backend before deciding, so the kept
+    // rule goes with its key and the next per-rule reconcile re-arms a fresh watcher.
+    rig.backend->set_health(sub, SubscriptionHealth::Faulted);
+    rig.rt->detach_rules_except({"r1"});
+    CHECK(rig.rt->rule_count() == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return rig.backend->disarm_entries.load() == 1; }, 10s));
+
+    // Recovered, event lost: a Faulted event set the bit, the backend now says Healthy, and the
+    // poll backstop clears it, so an identical push skips again.
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    const auto sub2 = rig.backend->armed_ids().back();
+    rig.rt->on_event(SparkEvent{.key = spark_key(spec), .kind = SparkEventKind::Faulted,
+                                .subscription_id = sub2, .detail = "deaf"});
+    rig.backend->set_health(sub2, SubscriptionHealth::Healthy);
+    rig.rt->revalidate_subscriptions();
+    auto again = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, file_exists_rule("r1"), true);
+    REQUIRE(again.has_value());
+    CHECK(again->kind == RT::ArmOutcomeKind::Armed);
+}
+
+// ---------------------------------------------------------------------------------------
+// 9. The withdrawal of a same-rule follower with MORE than one claim behind the wedge head. The
+// head is r1's retained wedge (content A); r1 then pushes B and C (each replaces the previous
+// follower through detach_rule_locked, which leaves a withdrawn entry in the fifo until it is
+// swept); an identical push of A re-observes the head and withdraws the live follower. The
+// helper that expires claims also drops another rule's QUEUED claim, so a foreign claim behind
+// a wedge cannot be built through the public seam: the reachable three-plus-element fifo is the
+// same-rule shape below, and the foreign claim is covered by the engine-level cases instead.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#4415 PR-A re-observation withdraws the live follower when several claims sit "
+          "behind the wedge head",
+          "[spark][runtime][4415prA]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    const auto key = spark_key(spec);
+    auto wedge = attach_wedged(rig, "r1", spec, file_exists_rule("r1", /*present=*/true)); // A
+    auto b = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec,
+                                 file_exists_rule("r1", /*present=*/false), true); // B
+    REQUIRE(b.has_value());
+    RuleAssertion c_rule = file_exists_rule("r1", /*present=*/false);
+    c_rule.rule_name = "third";
+    auto c = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, c_rule, true); // C replaces B
+    REQUIRE(c.has_value());
+    REQUIRE(c->receipt.claim != wedge.receipt.claim);
+    REQUIRE(rig.rt->claim_queue_depth_for_test(key) >= 2);
+
+    auto revert = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec,
+                                      file_exists_rule("r1", /*present=*/true), true); // A again
+    REQUIRE(revert.has_value());
+    CHECK(revert->receipt.claim == wedge.receipt.claim); // the head is re-observed
+    CHECK(status_name(*rig.rt, c->receipt) == "Withdrawn");
+    CHECK(status_name(*rig.rt, wedge.receipt) == "Wedged");
+    CHECK(rig.rt->wedge_candidate_count_for_test("r1") == 1);
+    CHECK(rig.rt->invariant_violations_for_test().empty());
+}
+
+// ---------------------------------------------------------------------------------------
+// 10. The content identity covers every RuleAssertion field that changes what a rule enforces
+// or reports. Each case pushes a mutated copy of a healthy committed rule with exactly ONE field
+// (or the compliant-edge flag) changed and requires a rebuild, never a skip. Two fields are
+// deliberately outside the identity and are covered elsewhere: rule_id is the lookup key, and
+// expected_hash is compared against the live effective baseline (engine case 3b, and the
+// FileHashEquals block of reuse_existing_locked). A new RuleAssertion field must be added to
+// assertion_content_id AND to this table (a field added to neither is the gap this guards).
+// Mutation: delete any one `put(...)` line of assertion_content_id and its row goes red.
+// ---------------------------------------------------------------------------------------
+namespace {
+bool field_change_rebuilds(const SparkSpec& spec, const RuleAssertion& base,
+                           const RuleAssertion& changed, bool base_emit, bool changed_emit) {
+    Rig rig;
+    REQUIRE(rig.rt->attach_rule("r1", spec, base, base_emit).has_value());
+    // Control: the unchanged push IS a skip, so a "rebuild" below is caused by the change.
+    auto same = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, base, base_emit);
+    REQUIRE(same.has_value());
+    REQUIRE(same->kind == RT::ArmOutcomeKind::Armed);
+    auto out = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, changed, changed_emit);
+    REQUIRE(out.has_value());
+    const bool rebuilt = out->kind != RT::ArmOutcomeKind::Armed;
+    REQUIRE(yuzu::test::spin_until([&] {
+        return rig.rt->claim_queue_depth_for_test(spark_key(spec)) == 0;
+    }, 10s));
+    return rebuilt;
+}
+} // namespace
+
+TEST_CASE("#4415 PR-A content identity: a change to any single RuleAssertion field rebuilds",
+          "[spark][runtime][4415prA]") {
+    const auto fspec = file_spec("/a");
+    const RuleAssertion fbase = file_exists_rule("r1");
+    {
+        auto m = fbase; m.rule_name = "renamed";
+        CHECK(field_change_rebuilds(fspec, fbase, m, true, true));
+    }
+    {
+        auto m = fbase; m.debounce_ms = fbase.debounce_ms + 1;
+        CHECK(field_change_rebuilds(fspec, fbase, m, true, true));
+    }
+    {
+        auto m = fbase; m.expect_present = !fbase.expect_present;
+        CHECK(field_change_rebuilds(fspec, fbase, m, true, true));
+    }
+    {
+        auto m = fbase; m.max_bytes = fbase.max_bytes + 1;
+        CHECK(field_change_rebuilds(fspec, fbase, m, true, true));
+    }
+    {
+        auto m = fbase; m.expected_value = "v";
+        CHECK(field_change_rebuilds(fspec, fbase, m, true, true));
+    }
+    {
+        auto m = fbase; m.value_name = "n";
+        CHECK(field_change_rebuilds(fspec, fbase, m, true, true));
+    }
+    CHECK(field_change_rebuilds(fspec, fbase, fbase, /*base_emit=*/true, /*changed_emit=*/false));
+    // kind: ServiceRunning -> ServiceStopped on the same service key.
+    const auto sspec = svc_spec_for_identity();
+    const RuleAssertion sbase = svc_rule_for_identity("r1", AssertionKind::ServiceRunning);
+    CHECK(field_change_rebuilds(sspec, sbase,
+                                svc_rule_for_identity("r1", AssertionKind::ServiceStopped), true, true));
+}
+
+// ---------------------------------------------------------------------------------------
+// 11. ADR-0021 clause 3: stop() is sticky. A skip is a claim the rule is live, so an identical
+// push after begin_stop() must be REFUSED like any attach, never answered Armed.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#4415 PR-A an identical attach after begin_stop() is refused, not skipped",
+          "[spark][runtime][4415prA]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    rig.rt->begin_stop();
+    auto again = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, file_exists_rule("r1"), true);
+    CHECK_FALSE(again.has_value());
+    auto blocking = rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true);
+    CHECK_FALSE(blocking.has_value());
+}
+
+// ---------------------------------------------------------------------------------------
+// 12. An in-flight arm whose push differs ONLY in the authored expected_hash is not re-observed:
+// content_id leaves expected_hash out, so the claim's pushed_hash term is what separates the two.
+// Mutation: delete `c->pushed_hash == pushed.assertion.expected_hash` in reuse_existing_locked
+// (the second push then returns the first push's claim and the new hash is dropped).
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#4415 PR-A an in-flight arm is not re-observed by a push with a different expected_hash",
+          "[spark][runtime][4415prA]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    auto parked = attach_parked(rig, "r1", spec, file_hash_rule("r1", "h"));
+    auto changed = rig.rt->attach_rule(RT::NonWaiting{}, "r1", spec, file_hash_rule("r1", "other"), true);
+    INFO("changed-hash attach: " << (changed ? "ok" : changed.error().message));
+    REQUIRE(changed.has_value());
+    CHECK(changed->receipt.claim != parked.receipt.claim);
+    CHECK(status_name(*rig.rt, parked.receipt) == "Withdrawn"); // replaced, not kept alongside
 }

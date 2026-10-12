@@ -333,11 +333,13 @@ struct Rig {
         kv = std::make_unique<KvStore>(std::move(*opened));
         spark = std::make_unique<SparkEngine>();
         auto f = std::make_unique<CountingMechanism>();
-        fm = f.get();
+        CountingMechanism* const file_mech = f.get();
         REQUIRE(spark->register_mechanism(SparkType::File, std::move(f)).has_value());
+        fm = file_mech; // aliased only once the SparkEngine owns it
         auto s = std::make_unique<CountingMechanism>();
-        sm = s.get();
+        CountingMechanism* const service_mech = s.get();
         REQUIRE(spark->register_mechanism(SparkType::Service, std::move(s)).has_value());
+        sm = service_mech;
         spark->start();
         {
             std::lock_guard<std::mutex> lk{sent_mu};
@@ -498,6 +500,23 @@ struct Rig {
             },
             t);
     }
+
+    /// settle() plus the quiescence a stable signature alone does not prove: exactly `armed`
+    /// rules armed, no arm acknowledgement still pending and no backend worker alive. For the
+    /// cases whose healthy rules must have finished, unlike the hung-arm cases that settle on
+    /// purpose with a worker parked.
+    bool settle_idle(std::size_t armed, std::chrono::milliseconds t = 10s) {
+        if (!settle(10, t))
+            return false;
+        return yuzu::test::spin_until(
+            [&] {
+                engine->journal_maintenance_tick();
+                return engine->spark_armed_rule_count() == armed &&
+                       engine->ack_pending_count_for_test() == 0 &&
+                       engine->active_io_workers() == 0;
+            },
+            t);
+    }
 };
 
 /// `key` was armed exactly once and never torn down on `m`.
@@ -621,7 +640,7 @@ TEST_CASE("#4415 PR-A (1): an identical full_sync re-push of R healthy rules tou
     REQUIRE(lifecycle_before == R);
 
     r.dispatch(bytes); // byte-identical re-push
-    CHECK(r.settle());
+    CHECK(r.settle_idle(R));
 
     // Headline: the whole ruleset's mechanism traffic across the identical re-push.
     CHECK(r.fm->total_watch() == R);
@@ -767,6 +786,41 @@ TEST_CASE("#4415 PR-A (3): a one-rule content change rebuilds only that rule (sa
 }
 
 // =================================================================================================
+// 3b. A changed AUTHORED expected_hash is content the identity deliberately leaves out (a
+//     baseline-on-arm rule's seed differs push to push), so reuse_existing_locked compares it
+//     against the live effective hash. Everything else identical, H1 -> H2 must rebuild ONLY that
+//     rule. Mutation: delete the `pushed.expected_hash != live_hash` clause (the changed rule is
+//     skipped and keeps H1: its key counts stay 1/0), or the `pushed_hash` term on the claims branch.
+// =================================================================================================
+TEST_CASE("#4415 PR-A (3b): a changed authored expected_hash rebuilds that rule only",
+          "[spark][guardian][reconcile][4415prA]") {
+    Rig r;
+    r.open();
+    const auto p0 = r.make_file("h0"), p1 = r.make_file("h1");
+    const std::string h1(64, 'a'), h2(64, 'b');
+    const auto build = [&](const std::string& hash) {
+        auto hr = file_hash_rule("hr", p0);
+        (*hr.mutable_assertion()->mutable_params())["expected_hash"] = hash;
+        return push_bytes({hr, file_rule("s1", p1)}, kGen);
+    };
+    r.dispatch(build(h1));
+    REQUIRE(r.wait_armed(2));
+    REQUIRE(r.wait_generation(kGen));
+    REQUIRE(r.settle());
+    const std::string kh = file_key(p0), ks = file_key(p1);
+
+    r.dispatch(build(h1)); // identical: both skipped
+    CHECK(r.settle_idle(2));
+    check_untouched(*r.fm, "hr (identical hash)", kh);
+    check_untouched(*r.fm, "s1", ks);
+
+    r.dispatch(build(h2)); // only the authored hash differs
+    CHECK(r.settle_idle(2));
+    check_rebuilt_once(*r.fm, "hr (authored hash changed)", kh);
+    check_untouched(*r.fm, "s1", ks);
+}
+
+// =================================================================================================
 // 4. Baseline-on-arm (AC-10 case 6).
 //    4a RED-BY-DESIGN: a persisted baseline equal to the live one is SKIPPED.
 //    4b MIXED: with the persisted baseline gone (EMPTY seed) the baseline rule is REBUILT (a GUARD,
@@ -864,8 +918,12 @@ TEST_CASE("#4415 PR-A (5a): a rule in an Unknown-eval episode is rebuilt on an i
     // A symlink loop makes read_file_blocking return Unknown (open ELOOP, stat ELOOP), on every
     // user including root, with no permission dependency.
     const fs::path a = r.dir.path / "loop_a", b = r.dir.path / "loop_b";
-    fs::create_symlink("loop_b", a);
-    fs::create_symlink("loop_a", b);
+    std::error_code link_ec;
+    fs::create_symlink("loop_b", a, link_ec);
+    if (!link_ec)
+        fs::create_symlink("loop_a", b, link_ec);
+    if (link_ec)
+        SKIP("symlinks are unavailable here (" << link_ec.message() << "): the Unknown-read premise needs a loop");
     const auto p0 = r.make_file("s0"), p1 = r.make_file("s1");
     const std::string ku = file_key(a), k0 = file_key(p0), k1 = file_key(p1);
     const std::string bytes =
@@ -1263,6 +1321,11 @@ TEST_CASE("#4415 PR-A (9b): AC-16 post-fix: the forced Reapply during a hung sam
 // (INSERT .. ON CONFLICT DO UPDATE) fires AFTER UPDATE even when the new bytes equal the old, so an
 // identical rewrite IS a logged write. The triggers are the test's own DDL; no product seam.
 // Assertions are on EFFECT SETS (which keys were written / deleted), never on log text.
+// KNOWN GAP, stated rather than hidden: put_rule_locked's stored-row READ failing cannot be
+// injected (KvStore is final and non-virtual, with no read-failure seam), so the "an unreadable
+// row is written, never skipped" arm is held only by the shape of its guard (a skip needs a
+// present, equal row) and by KV-5's differing-bytes case. A failed del_keys and a failed row
+// scan ARE injected (KV-8a, KV-8b).
 // The apply_rules KV work is synchronous inside dispatch(), so the log is complete when dispatch
 // returns; settle() is still called so nothing asynchronous is left running at close().
 // =================================================================================================
@@ -1302,10 +1365,11 @@ public:
     }
     void exec(const char* sql) {
         REQUIRE(db_ != nullptr);
-        char* err = nullptr;
-        const int rc = sqlite3_exec(db_, sql, nullptr, nullptr, &err);
-        const std::string msg = err ? err : "";
-        sqlite3_free(err);
+        char* raw_err = nullptr;
+        const int rc = sqlite3_exec(db_, sql, nullptr, nullptr, &raw_err);
+        // Owned before the message string is built, so a throwing std::string cannot leak it.
+        const std::unique_ptr<char, decltype(&sqlite3_free)> err{raw_err, &sqlite3_free};
+        const std::string msg = err ? err.get() : "";
         CAPTURE(sql, msg);
         REQUIRE(rc == SQLITE_OK);
     }
@@ -1314,16 +1378,20 @@ public:
     std::vector<KvOp> ops() {
         REQUIRE(db_ != nullptr);
         std::vector<KvOp> out;
-        sqlite3_stmt* st = nullptr;
-        REQUIRE(sqlite3_prepare_v2(db_, "SELECT op, k FROM yuzu_test_kvlog ORDER BY seq", -1, &st,
-                                   nullptr) == SQLITE_OK);
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            const auto* o = sqlite3_column_text(st, 0);
-            const auto* k = sqlite3_column_text(st, 1);
+        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> st{nullptr, &sqlite3_finalize};
+        {
+            sqlite3_stmt* raw = nullptr;
+            const int rc = sqlite3_prepare_v2(db_, "SELECT op, k FROM yuzu_test_kvlog ORDER BY seq",
+                                              -1, &raw, nullptr);
+            st.reset(raw); // owned even when prepare reports an error
+            REQUIRE(rc == SQLITE_OK);
+        }
+        while (sqlite3_step(st.get()) == SQLITE_ROW) {
+            const auto* o = sqlite3_column_text(st.get(), 0);
+            const auto* k = sqlite3_column_text(st.get(), 1);
             out.push_back({static_cast<char>(o ? o[0] : '?'),
                            k ? reinterpret_cast<const char*>(k) : ""});
         }
-        sqlite3_finalize(st);
         return out;
     }
     /// The keys written / deleted (with multiplicity: a key hit twice appears twice) under `prefix`.
@@ -1421,7 +1489,7 @@ TEST_CASE("#4415 PR-A KV (1): an identical full_sync re-push of R rules deletes 
 
     k.probe.clear();
     k.r.dispatch(bytes); // byte-identical re-push
-    CHECK(k.r.settle());
+    CHECK(k.r.settle_idle(R));
 
     CHECK(k.probe.deletes().empty());
     CHECK(k.probe.writes().empty());
@@ -1429,6 +1497,35 @@ TEST_CASE("#4415 PR-A KV (1): an identical full_sync re-push of R rules deletes 
     REQUIRE(k.r.persisted_generation().has_value());
     CHECK(*k.r.persisted_generation() == kGen);
     CHECK(k.r.engine->policy_generation() == kGen);
+}
+
+// -------------------------------------------------------------------------------------------------
+// KV-1d. An identical DELTA (full_sync=false) re-push of a subset of the rules: the pushed rules are
+//        skipped (no mechanism call), no row is deleted or rewritten, and the rules the delta does
+//        not carry are untouched. Mutation: delete the skip branch (the pushed rules' key counts
+//        move); delete the equal-bytes skip (writes go red).
+// -------------------------------------------------------------------------------------------------
+TEST_CASE("#4415 PR-A KV (1d): an identical delta re-push skips the pushed rules, rewrites no row "
+          "and leaves the rules it does not carry alone",
+          "[spark][guardian][reconcile][4415prA][4415kv]") {
+    constexpr int R = 4;
+    KvRig k;
+    k.start();
+    const auto s = make_kv_rules(k.r, R);
+    first_push(k, s, push_bytes(s.rules, kGen));
+    const auto rows_before = k.rule_rows();
+
+    const std::string delta = push_bytes({s.rules[0], s.rules[1]}, kGen + 1, /*full_sync=*/false);
+    k.probe.clear();
+    k.r.dispatch(delta);
+    CHECK(k.r.settle_idle(R));
+
+    for (int i = 0; i < R; ++i)
+        check_untouched(*k.r.fm, s.ids[static_cast<std::size_t>(i)], s.spark_keys[static_cast<std::size_t>(i)]);
+    CHECK(k.probe.deletes().empty());
+    CHECK(k.probe.writes().empty());
+    CHECK(k.rule_rows() == rows_before);
+    CHECK(k.r.engine->spark_armed_rule_count() == R);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1850,6 +1947,49 @@ TEST_CASE("#4415 PR-A (10c): a rule whose identical arm is still in flight is re
           "Guardian: full_sync preserved 2 rule(s) (skipped re-arm) ids=[s0,s1] more=0 "
           "pending_reused 1 ids=[h] more=0");
     CHECK(r.sm->watch_calls(service_key("yuzu-4415-hung")) == 1); // re-observed, not re-armed
+}
+
+// A re-observed in-flight arm must not launder a failure: when its late result is a REFUSAL the
+// generation stays held (the re-observation was not an acknowledgement), and the next differing
+// push rebuilds ONLY that rule while every committed sibling is still untouched.
+// Pins: the generation hold and the single-rule rebuild after a refused re-observed arm (not
+// mutation-checked: no seam makes apply_rules report a pending arm as committed).
+TEST_CASE("#4415 PR-A (10e): a re-observed in-flight arm that then refuses holds the generation, "
+          "and the next push rebuilds only that rule",
+          "[spark][guardian][reconcile][4415prA]") {
+    Rig r;
+    r.open();
+    const auto p0 = r.make_file("s0"), p1 = r.make_file("s1"), p2 = r.make_file("s2");
+    const std::string hk = service_key("yuzu-4415-refused");
+    const auto hung = service_rule("h", "yuzu-4415-refused");
+
+    r.sm->hang_next_watch();
+    r.dispatch(push_bytes({hung, file_rule("s0", p0), file_rule("s1", p1)}, kGen));
+    REQUIRE(r.sm->wait_entered_hang(10s));
+    REQUIRE(r.wait_armed(2));
+    REQUIRE(r.wait_compliant({"s0", "s1"}));
+    // A differing push (a rule is added) re-observes h's live arm rather than re-arming it.
+    r.dispatch(push_bytes({hung, file_rule("s0", p0), file_rule("s1", p1), file_rule("s2", p2)}, kGen));
+    REQUIRE(r.wait_armed(3));
+    CHECK(r.sm->watch_calls(hk) == 1);
+
+    r.sm->set_late_refuse();
+    r.sm->release_hang();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return r.rt().active_backend_op_workers() == 0 && r.rt().claim_queue_depth_for_test(hk) == 0; },
+        10s));
+    r.engine->journal_maintenance_tick();
+    CHECK(r.engine->policy_generation() == 0); // held: the refused arm was never acknowledged
+    CHECK(r.engine->spark_armed_rule_count() == 3);
+
+    const auto p3 = r.make_file("s3");
+    r.dispatch(push_bytes({hung, file_rule("s0", p0), file_rule("s1", p1), file_rule("s2", p2),
+                           file_rule("s3", p3)},
+                          kGen));
+    CHECK(r.settle());
+    CHECK(r.sm->watch_calls(hk) == 2); // h alone is attempted again
+    for (const auto& [id, p] : {std::pair<const char*, fs::path>{"s0", p0}, {"s1", p1}, {"s2", p2}})
+        check_untouched(*r.fm, id, file_key(p));
 }
 
 TEST_CASE("#4415 PR-A (10d): the pending-reused list is bounded and sanitised like the committed one, "

@@ -1398,8 +1398,9 @@ flip, with a red-first test each:
     the Reapply used to be a teardown and re-arm of a rule that has just armed; since #4415
     that rule is committed, healthy and unchanged, so the Reapply skips it (AC-18, shown for
     the valve-spent shape by `[5459valve]`). Safe direction: the new application re-observes
-    the true state (a skipped rule registers no receipt, so nothing is left pending and the push
-    can acknowledge the held generation inline). The
+    the true state (a committed, healthy skipped rule registers no receipt, so nothing is left
+    pending and the push can acknowledge the held generation inline; an identical in-flight arm
+    that is re-observed registers its existing claim's receipt and stays pending). The
     suppression statements for `Recovered`/`WedgeEligible` apply to RETAINED entries only.
   - (AC-16) **A forced Reapply during a hung same-type mechanism call can withdraw a
     same-type sibling that it rebuilds; since #4415 it no longer withdraws a healthy,
@@ -1483,14 +1484,22 @@ flip, with a red-first test each:
     unchanged; its key holds no claim (the one exception is the same rule's own identical,
     still-in-flight arm, which is re-observed instead of withdrawn and requeued); its content
     id (kind, name, debounce, expected value and the other fields that change what it enforces)
-    is equal; it is not in an Unknown episode; its key has not been reported faulted by the
-    mechanism; the index still owns it; and, for `FileHashEquals`, the pushed (post-seed) hash
+    is equal; it is not in an Unknown episode; its key is not faulted, meaning neither the
+    recorded bit nor the backend's own health for the key's subscription, asked at decision time
+    with the registry lock released, says so (a `Faulted` event can be lost to a full queued
+    channel or arrive before the key is recorded, so the skip never relies on delivery alone,
+    and an unreadable health is not healthy); the index still owns it; and, for `FileHashEquals`, the pushed (post-seed) hash
     is non-empty and equals the live effective baseline. Any term false rebuilds the rule as
-    before. A skipped rule gets no new incarnation, no lifecycle record, no receipt and no
-    `guard.armed` re-emit; the detach epoch still moves on every full_sync. A full_sync now
+    before. A committed, healthy skipped rule gets no new incarnation, no lifecycle record, no
+    receipt and no `guard.armed` re-emit (an identical in-flight arm that is re-observed
+    registers its existing claim's receipt and stays pending, and is named separately in the
+    full_sync line); the detach epoch still moves on every full_sync. A full_sync now
     detaches only the rules the push omits (`detach_rules_except`; the global wedge-candidate
-    sweep and the unconditional epoch bump are unchanged) plus any kept rule whose key the
-    mechanism reported faulted, so that a shared faulted key is rebuilt rather than rejoined.
+    sweep and the unconditional epoch bump are unchanged) plus any kept rule whose key is faulted (the
+    recorded bit, refreshed from the backend first), so that a shared faulted key is rebuilt
+    rather than rejoined. The health read costs each re-pushed rule one extra short registry
+    lock and one lock-only backend lookup, a few microseconds, so about a few milliseconds
+    per 1000-rule push (an estimate, not measured).
     The persisted `rule:` rows follow the same shape: a full_sync deletes only the rows the
     push omits, and an unchanged row is not rewritten (a row that cannot be read, or that
     differs, is written); every existing hold on a failed scan or delete is unchanged. Accepted
@@ -1872,9 +1881,11 @@ tracked separately below)
     any pre-existing test double) plus `GuardianSparkRuntime::revalidate_
     subscriptions()` are wired into `ConvergenceScheduler`'s existing ~5s priority lane
     (no new thread) and report/detach a `Dead` subscription exactly as a delivered `Lost`
-    would, whether or not one was ever actually delivered. Scoped to `Dead` only - a
-    missed `Faulted`/`Recovered` toggle is health-reporting-only, lower severity, not
-    backstopped here.
+    would, whether or not one was ever actually delivered. As shipped it acted on `Dead` only,
+    and a missed `Faulted`/`Recovered` toggle was health-reporting-only. Since #4415 that no
+    longer holds: a re-push skip must not rest on an event that can be lost, so the same sweep
+    also refreshes the runtime's recorded faulted bit from `Faulted`/`Healthy`, and the skip
+    asks the backend for the key's health at decision time (AC-18).
   - **Verification**: full `[spark]` suite (plain, TSan `[tsan]`+`[tsan-heavy]`, and real
     ASan against the `x64-linux-asan` instrumented triplet - the stock `x64-linux` tree
     reproduces exactly the phantom protobuf-static-init `use-after-poison` §2 criterion 2

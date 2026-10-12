@@ -398,6 +398,9 @@ public:
     /// and commits against the same subscription when it lands, never a redundant
     /// backend arm and never a fail-fast. Interval/Startup/Disk stay synchronous/
     /// inline (never blocking OS watches).
+    /// Blocking overload: it waits for its own claim, so it must never be called under
+    /// GuardianEngine::mtx_ or from a mechanism worker. The engine's apply_rules/start_local
+    /// use the NonWaiting overload below; this one is for tests and direct callers.
     std::expected<std::uint64_t, std::string> attach_rule(std::string rule_id, SparkSpec spec,
                                                           RuleAssertion assertion,
                                                           bool emit_compliant_edge);
@@ -424,7 +427,7 @@ public:
     /// when attach_rule re-observes it. A kept rule whose key the mechanism reported faulted is
     /// detached as well, so a key shared by several rules is torn down and re-armed rather than
     /// rejoined by each of them.
-    void detach_rules_except(const std::set<std::string>& keep);
+    void detach_rules_except(const std::set<std::string, std::less<>>& keep);
 
     /// The queued-handler body: resolve `ev.key` to its rules and run one
     /// evaluate_key(Event) pass. Safe to call on a detached thread post-shutdown
@@ -460,9 +463,11 @@ public:
     ///       what actually recovers that case, bounded by its own cadence rather
     ///       than instant.
     /// Intended to be driven off GuardianConvergenceScheduler's existing ~5s priority
-    /// lane - no new thread. Scoped to Dead only: a missed Faulted/Recovered toggle is
-    /// health-reporting-only (no enforcement break, no keys_ mutation), lower
-    /// severity, and not backstopped here.
+    /// lane - no new thread. Only a Dead subscription is acted on (reported like a Lost).
+    /// A Faulted or Healthy answer only refreshes PerKey::faulted (#4415), which a missed
+    /// Faulted/Recovered event would otherwise leave stale: an identical re-push consults the
+    /// live health itself (attach_core), so this refresh is the backstop for the full_sync
+    /// scoped detach and for the bit's own accuracy, not the skip decision's only source.
     void revalidate_subscriptions();
 
     /// Drain buffered emits through `send`. `send(const OutboxEntry&) -> SendResult`.
@@ -1263,9 +1268,10 @@ private:
         std::map<std::string, PendingState> pending_initial;
         /// #4415: the mechanism reported this key's subscription faulted and has not yet
         /// reported it recovered (registry_mu_-guarded; set and cleared in
-        /// on_subscription_faulted, which touches no other registry state). Read by
-        /// reuse_existing_locked so a faulted key is never skipped as healthy. A key torn down
-        /// and re-armed gets a fresh PerKey, so a rebuilt rule starts clear.
+        /// on_subscription_faulted, and refreshed from the backend's own health by
+        /// sweep_key_health and the skip probe, since an event can be lost). Read by
+        /// reuse_existing_locked and detach_rules_except. A key torn down and re-armed gets a
+        /// fresh PerKey that starts clear: the skip decision does not rely on the bit alone.
         bool faulted{false};
     };
 
@@ -1986,17 +1992,40 @@ private:
                                  RuleAssertion assertion, bool emit_compliant_edge,
                                  std::shared_ptr<KeyClaim>& arm_claim);
 
+    /// #4415: the backend's own answer to "is this key's subscription healthy", read by
+    /// probe_key_health() with registry_mu_ RELEASED and carried into the locked skip decision.
+    struct KeyHealthProbe {
+        std::uint64_t subscription{0}; ///< the id keys_[key] held when the probe was taken
+        SubscriptionHealth health{SubscriptionHealth::Dead};
+    };
+
+    /// #4415: snapshot-then-act health read for the skip decision. Takes registry_mu_ only to
+    /// copy keys_[key]'s subscription id, releases it, then asks the backend (the engine's own
+    /// state, the authority a lost Faulted event cannot corrupt). nullopt when there is nothing
+    /// committed to probe (stopping, no such rule or key, a claim on the key) or the backend
+    /// threw; the caller then does not skip. Must not be called with registry_mu_ held.
+    [[nodiscard]] std::optional<KeyHealthProbe>
+    probe_key_health(const std::string& key, const std::string& rule_id);
+
+    /// Refresh PerKey::faulted for every armed key from the backend (registry_mu_ released while
+    /// asking). With `report_dead`, a Dead subscription is reported like a Lost (the poll
+    /// backstop). A write is dropped if the key was re-armed meanwhile (subscription id differs).
+    void sweep_key_health(bool report_dead);
+
     /// #4415: the skip decision, called from attach_core() under registry_mu_ and before
     /// anything is mutated. Returns Armed (a healthy committed rule whose pushed content is
     /// identical: the existing generation, no receipt) or Reobserved (a live in-flight or
     /// queued same-rule claim whose content is identical: that claim), else nullopt and the
     /// caller rebuilds as before. A skip is a claim that the rule is healthy, so a rule that is
-    /// in an Unknown episode, whose key the mechanism reported faulted, whose key still has any
-    /// claim, whose baseline differs, or that has a retained wedge never reaches it (the wedge
-    /// has its own Reobserved path in attach_core). Reads only; may not throw.
+    /// in an Unknown episode, whose key the mechanism reported faulted (the recorded bit, or
+    /// `probe` not Healthy or taken against another subscription), whose key still has any claim
+    /// other than this rule's own identical live arm (the Reobserved case), whose baseline differs, or that has a retained wedge never reaches it (the wedge
+    /// has its own Reobserved path in attach_core). `probe` is required for the Armed skip: a
+    /// null one means health is unknown, which is not healthy. Reads only; may not throw.
     [[nodiscard]] std::optional<AttachCoreResult>
     reuse_existing_locked(const std::string& key, const std::string& rule_id,
-                          const SparkSpec& spec, const RuleGeneration& pushed) const noexcept;
+                          const SparkSpec& spec, const RuleGeneration& pushed,
+                          const std::optional<KeyHealthProbe>& probe) const noexcept;
 
     /// rung 9c PR-5c round 2 governance fold (#4221): the retained-wedge
     /// classification - a claim kind==Arm, dispatch in {Dispatching, Dispatched},

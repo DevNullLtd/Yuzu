@@ -2233,7 +2233,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // resource, so it is deliberately NOT blanket-cleared (see the comment further down) - it
     // needs this set instead. Filled for EVERY rule in the push, disabled ones included:
     // reconcile_rule_locked detaches a disabled rule itself.
-    std::set<std::string> full_sync_ids;
+    std::set<std::string, std::less<>> full_sync_ids; // transparent: contains(string_view) allocates nothing
     if (push.full_sync()) {
         for (const auto& rule : push.rules())
             full_sync_ids.insert(rule.rule_id());
@@ -2305,7 +2305,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
                 // decides whether to rewrite it). full_sync_ids holds only ids the
                 // up-front validation accepted, so a non-conforming stored row never
                 // matches and is still swept and counted.
-                if (full_sync_ids.contains(std::string(rid)))
+                if (full_sync_ids.contains(rid))
                     continue;
                 if (!is_valid_rule_id(rid))
                     ++non_conforming;
@@ -3495,7 +3495,8 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
                     preserved_tally_.note_pending(rule.rule_id());
             }
             if (res->kind == GuardianSparkRuntime::ArmOutcomeKind::Armed)
-                return ReconcileOutcome::Armed; // attach_rule already enqueued its own "armed" audit entry
+                return ReconcileOutcome::Armed; // attach_rule already enqueued its own "armed" audit entry,
+                                                // unless it skipped the rule (#4415): then none is owed
             // Accepted: register the receipt with whichever application is currently open
             // (apply_rules()'s per-push application, or none at boot - start_local()'s own
             // re-arm loop opens its own application before this ever runs, §R5.3's "handle

@@ -34,6 +34,7 @@
 
 #include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::agent {
@@ -91,8 +92,9 @@ private:
                 std::string tok = ::yuzu::log_id_token(rule_id);
                 if (id_bytes + tok.size() > kMaxIdBytes)
                     return;
-                id_bytes += tok.size();
+                const std::size_t tok_bytes = tok.size();
                 ids.push_back(std::move(tok));
+                id_bytes += tok_bytes; // after push_back: a throwing push leaves the byte count true
             } catch (...) {
             }
         }
