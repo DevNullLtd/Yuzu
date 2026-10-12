@@ -146,8 +146,11 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
     // step status (no sqlite3_changes()-style mutate-and-count race, #1033).
     // agent_version/arch/os: a blank incoming value preserves the existing
     // column (CASE ... THEN endpoints.x) — see the header doc comment — while
-    // hostname/last_heartbeat_ms/agent_ts stay an unconditional EXCLUDED
-    // write (pre-v2 behaviour, unchanged). os blank-preserves (#5294): the
+    // last_heartbeat_ms/agent_ts stay an unconditional EXCLUDED write
+    // (pre-v2 behaviour, unchanged). hostname blank-preserves too (HA WS-5): a
+    // replica holding no local AgentSession for a gateway-fronted agent
+    // ingests its heartbeat with a blank hostname, which must not erase the
+    // owning replica's value. os blank-preserves (#5294): the
     // per-OS kill-switch filter reads it for remote ids, and a heartbeat that
     // missed the session lookup must not erase a known OS. session_id (HA WS-5)
     // blank-preserves too (#5678): a heartbeat that raced the session lookup on
@@ -165,7 +168,8 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
         "last_seen_at) "
         "VALUES ($1, $2, $3, $4::bigint, $5::bigint, $6, $7, $8, now()) "
         "ON CONFLICT (agent_id) DO UPDATE SET "
-        "  hostname = EXCLUDED.hostname, "
+        "  hostname = CASE WHEN EXCLUDED.hostname = '' THEN endpoints.hostname "
+        "                  ELSE EXCLUDED.hostname END, "
         "  os = CASE WHEN EXCLUDED.os = '' THEN endpoints.os ELSE EXCLUDED.os END, "
         "  last_heartbeat_ms = EXCLUDED.last_heartbeat_ms, agent_ts = EXCLUDED.agent_ts, "
         "  agent_version = CASE WHEN EXCLUDED.agent_version = '' THEN endpoints.agent_version "

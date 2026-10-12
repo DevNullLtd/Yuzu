@@ -89,13 +89,20 @@ TEST_CASE("mirror_departure_to_presence gates on removed_current_session", "[pre
 
 TEST_CASE("both disconnect paths call the helper with the real gate and no raw remove_if_session",
           "[presence][wiring_order]") {
-    constexpr std::string_view kCall =
-        "mirror_departure_to_presence(removed_current_session, heartbeat_ingestion_ ? "
-        "heartbeat_ingestion_->offline_endpoint_store() : nullptr, agent_id, session_id);";
-    for (const char* name : {"agent_service_impl.cpp", "gateway_service_impl.cpp"}) {
-        INFO(name);
-        const auto code = normalised_code(fs::path(YUZU_SERVER_SRC_DIR) / name);
-        CHECK(count_of(code, kCall) == 1);
+    // The gateway gate also admits the route directory's deregister result (HA WS-5 slice 2:
+    // a non-owning replica removes no local session, so the directory is its only proof).
+    struct Site {
+        const char* file;
+        std::string_view gate;
+    };
+    for (const Site& site : {Site{"agent_service_impl.cpp", "removed_current_session"},
+                             Site{"gateway_service_impl.cpp", "removed_current_session || store_removed"}}) {
+        INFO(site.file);
+        const auto code = normalised_code(fs::path(YUZU_SERVER_SRC_DIR) / site.file);
+        const std::string call = "mirror_departure_to_presence(" + std::string(site.gate) +
+                                 ", heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() "
+                                 ": nullptr, agent_id, session_id);";
+        CHECK(count_of(code, call) == 1);
         CHECK(count_of(code, "->remove_if_session(") == 0);
         CHECK(count_of(code, ".remove_if_session(") == 0);
     }

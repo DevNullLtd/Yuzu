@@ -843,7 +843,7 @@ through a durable per-`(policy, agent)` row in `PolicyStore`
 (`policy_status.remediation_claim_at`), instead of an in-process-only guard.
 This closes the cross-replica gap noted in the ADR-0056 Follow-ups: two
 replicas racing a remediate call for the same policy/agent can no longer both
-dispatch a fix.
+dispatch a fix. (This is the guarantee for when the safe-to-scale gate lifts, ADR-2002 §7c; exactly one server replica is supported today.)
 
 **Scope of the guarantee.** This holds between replicas running the **same
 schema version**. A rolling upgrade across the migration boundary can

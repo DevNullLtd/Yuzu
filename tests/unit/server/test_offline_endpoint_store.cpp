@@ -136,13 +136,13 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
     SECTION("v2 blank-preserve: a blank agent_version/arch does not clobber a known value") {
         REQUIRE(store.upsert("agent-v2b", "host-v2b", "linux", t - 1000, 0, "2.0.0", "arm64"));
         // A later heartbeat that raced the session lookup supplies blanks —
-        // hostname still updates unconditionally, but the last-known
+        // a NON-blank hostname still overwrites, but the last-known
         // version/arch/os must survive (see upsert()'s CASE WHEN doc comment).
         REQUIRE(store.upsert("agent-v2b", "host-v2b-renamed", "", t, 0, "", ""));
         auto rows = store.query_stale_within(std::chrono::hours(1));
         const auto* v = find(rows, "agent-v2b");
         REQUIRE(v != nullptr);
-        CHECK(v->hostname == "host-v2b-renamed"); // unconditional field still updates
+        CHECK(v->hostname == "host-v2b-renamed"); // non-blank hostname still overwrites
         CHECK(v->agent_version == "2.0.0");       // preserved, not blanked
         CHECK(v->arch == "arm64");                // preserved, not blanked
         CHECK(v->os == "linux");                  // #5294: preserved, not blanked
@@ -152,6 +152,47 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
         v = find(rows, "agent-v2b");
         REQUIRE(v != nullptr);
         CHECK(v->os == "windows");
+    }
+
+    // HA WS-5: a replica without the local AgentSession ingests heartbeats whose
+    // hostname/os are blank; that must never wipe what the owning replica wrote.
+    SECTION("WS-5 blank-preserve: a blank hostname or os never clobbers a known one") {
+        REQUIRE(store.upsert("agent-ws5-bp", "known-host", "linux", t - 1000, 0, "3.0.0", "arm64"));
+        REQUIRE(store.upsert("agent-ws5-bp", "", "", t, 7, "", ""));
+        auto rows = store.query_stale_within(std::chrono::hours(1));
+        const auto* v = find(rows, "agent-ws5-bp");
+        REQUIRE(v != nullptr);
+        CHECK(v->hostname == "known-host");   // preserved, not blanked
+        CHECK(v->os == "linux");              // preserved, not blanked
+        CHECK(v->agent_version == "3.0.0");
+        CHECK(v->arch == "arm64");
+        CHECK(v->agent_ts == 7);              // non-identity columns still advance
+        CHECK(v->last_heartbeat_ms == t);
+
+        // Blank hostname alone (os supplied) -> hostname preserved, os overwritten.
+        REQUIRE(store.upsert("agent-ws5-bp", "", "windows", t, 8, "", ""));
+        rows = store.query_stale_within(std::chrono::hours(1));
+        v = find(rows, "agent-ws5-bp");
+        REQUIRE(v != nullptr);
+        CHECK(v->hostname == "known-host");
+        CHECK(v->os == "windows");
+
+        // Non-blank hostname still overwrites.
+        REQUIRE(store.upsert("agent-ws5-bp", "renamed-host", "", t, 9, "", ""));
+        rows = store.query_stale_within(std::chrono::hours(1));
+        v = find(rows, "agent-ws5-bp");
+        REQUIRE(v != nullptr);
+        CHECK(v->hostname == "renamed-host");
+        CHECK(v->os == "windows");
+    }
+
+    SECTION("WS-5 blank hostname on a FIRST insert stores empty (nothing to preserve)") {
+        REQUIRE(store.upsert("agent-ws5-first", "", "", t, 0));
+        auto rows = store.query_stale_within(std::chrono::hours(1));
+        const auto* v = find(rows, "agent-ws5-first");
+        REQUIRE(v != nullptr);
+        CHECK(v->hostname.empty());
+        CHECK(v->os.empty());
     }
 
     SECTION("v2 pre-migration rows read back as empty version/arch") {

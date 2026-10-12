@@ -149,14 +149,14 @@ public:
     /// stores remain the source of truth; this is durability on top. Single
     /// statement, autocommit, `INSERT ... ON CONFLICT ... RETURNING`.
     ///
-    /// `agent_version`/`arch` (round-3 v2 columns) and `os` (#5294): a BLANK
-    /// value on the incoming row NEVER overwrites an already-known non-blank
-    /// value — `hostname` is the ONE per-ingest source of truth (unconditional
-    /// EXCLUDED write, matching the pre-v2 columns), but a heartbeat that
-    /// raced the session lookup (registry lookup miss) supplies "" here, and
-    /// must not blank out a version/arch/os this store already learned from an
-    /// earlier heartbeat for the same agent. A non-blank `os` still overwrites,
-    /// so a genuine OS change lands on the next session-hit heartbeat.
+    /// `hostname`, `agent_version`/`arch` (round-3 v2 columns) and `os`
+    /// (#5294): a BLANK value on the incoming row NEVER overwrites an
+    /// already-known non-blank value. A heartbeat that raced the session
+    /// lookup, or one ingested on a replica that holds no local `AgentSession`
+    /// for a gateway-fronted agent (HA WS-5), supplies "" here and must not
+    /// blank out what this store already learned from the owning replica. A
+    /// non-blank value still overwrites, so a genuine hostname/OS change
+    /// lands on the next session-hit heartbeat.
     ///
     /// `session_id` (#5678) blank-preserves the same way: a raced-lookup
     /// heartbeat on a LIVE agent keeps its stored session and stays present. A
