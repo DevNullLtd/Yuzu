@@ -28833,6 +28833,38 @@ TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
         CHECK(body["error"]["code"] != kInvalidParams);
     }
 
+    SECTION("create_result_set_from_inventory_query: a JSON integer or a decimal string is "
+            "accepted; EVERY JSON float (1e3, 5.0, 5.5) is -32602 with the string hint") {
+        ts.start();
+        int call_id = 70;
+        for (const char* value : {"1000", "5", R"("5.0")", R"("1234567890123456.0")"}) {
+            const std::string req =
+                R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id++) +
+                R"(,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[{"plugin":"p","field":"f","op":">=","value":)" +
+                value + R"(}]}}})";
+            INFO(req);
+            auto res = ts.call(req);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInternalError); // no store wired: past the parse
+        }
+        for (const char* value : {"1e3", "5.0", "5.5", "-0.0", "1234567890123456.0"}) {
+            const std::string req =
+                R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(call_id++) +
+                R"(,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[{"plugin":"p","field":"f","op":">=","value":)" +
+                value + R"(}]}}})";
+            INFO(req);
+            auto res = ts.call(req);
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+            CHECK(body["error"]["message"].get<std::string>().find("JSON string") !=
+                  std::string::npos);
+        }
+    }
+
     SECTION("create_result_set_from_inventory_query: a condition operand that cannot be read "
             "as the declared type is -32602, never the empty string (#4644: value 5 under `>` "
             "became \"\" and selected every device that had the field)") {
@@ -28851,9 +28883,11 @@ TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
               R"({"plugin":"p","field":"f","op":">","value":9007199254740993.0})",
               R"({"plugin":"p","field":"f","op":"==","value":1e300})",
               R"({"plugin":"p","field":"f","op":"<=","value":"9007199254740993.5"})",
-              // Under 2^53 but rounded by a double, and a plain decimal string out of the double
-              // range (Gate 8 round 13): all refused at the conditions parse.
-              R"({"plugin":"p","field":"f","op":">=","value":4503599627370497.3})",
+              // A JSON float with a fraction is refused (its text is gone): send it as a string
+              // under an ordering operator. A plain decimal string out of the double range is
+              // refused too (Gate 8 round 13).
+              R"({"plugin":"p","field":"f","op":">=","value":0.5})",
+              R"({"plugin":"p","field":"f","op":"==","value":22359.09411})",
               R"({"plugin":"p","field":"f","op":">","value":"5.00000000000000001"})",
               R"({"plugin":"p","field":"f","op":">","value":"1e400"})"}) {
             const std::string req =

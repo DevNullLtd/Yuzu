@@ -13,6 +13,7 @@
 #include <compare>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <string_view>
 #include <type_traits>
@@ -329,23 +330,32 @@ bool numeric_equal(const nlohmann::json& stored, const InventoryCondition& cond)
 }
 
 /// 2^53: below it every integer-valued double is exact; at or above it a double stands for a whole
-/// range of decimals. A decimal operand of this magnitude or more is refused outright (subsumed
-/// for a fraction by the digit rule below, kept so the 2^53 boundary stays explicit).
+/// range of decimals. A decimal STRING operand of this magnitude or more is refused outright
+/// (subsumed for a fraction by the digit rule below, kept so the 2^53 boundary stays explicit).
 constexpr double kExactDoubleLimit = 9007199254740992.0;
 
-/// DBL_DIG: a decimal of at most this many significant digits survives the round trip through a
-/// double, so the rounding cannot move it across a neighbouring integer or past the next stored
-/// value. A decimal of more digits ("5.00000000000000001", "4503599627370497.3") is rounded by the
-/// parse, and a comparison against a stored integer can then flip.
+/// DBL_DIG: a decimal STRING of at most this many significant digits survives the round trip
+/// through a double, so the rounding cannot move it across a neighbouring integer or past the next
+/// stored value. A decimal of more digits ("5.00000000000000001", "4503599627370497.3") is rounded
+/// by the parse, and a comparison against a stored integer can then flip.
 constexpr std::size_t kMaxOperandSignificantDigits = 15;
 
-/// The 400 / -32602 text for an operand the exact comparator cannot trust (see
-/// operand_is_refused); every clause is satisfiable by the caller.
+/// The 400 / -32602 text for a decimal STRING operand the exact comparator cannot trust (see
+/// operand_rounds_through_double); every clause is satisfiable by the caller.
 constexpr const char* kInexactOperandMessage =
     "conditions[].value: a numeric operand must be an integer, or a decimal with at most 15 "
-    "significant digits, a magnitude below 9007199254740992 and a value within the range of a "
-    "double; an integer outside -9223372036854775808 to 18446744073709551615 cannot be compared "
-    "exactly";
+    "significant digits, a magnitude below 9007199254740992, not subnormal (zero is fine) and a "
+    "value within the range of a double; an integer outside -9223372036854775808 to "
+    "18446744073709551615 cannot be compared exactly";
+
+/// The 400 / -32602 text for ANY JSON float operand (a number written with a decimal point or an
+/// exponent: 5.0, 1e3, -0.0): its original text is gone once parsed, so it cannot be judged
+/// exactly. Both remedies are satisfiable by the caller.
+constexpr const char* kJsonFloatOperandMessage =
+    "conditions[].value: a JSON number operand must be an integer (no decimal point or exponent); "
+    "to compare against a decimal send it as a JSON string with an ordering operator (>, >=, <, "
+    "<=), or write a whole number as an integer within -9223372036854775808 to "
+    "18446744073709551615";
 
 /// The significant digits of a decimal spelling: the digits of the mantissa (everything before an
 /// 'e' / 'E'), without leading zeros and without trailing zeros ("0.0123" is 3, "5.50" is 2,
@@ -363,16 +373,16 @@ std::size_t significant_digits(std::string_view lexeme) {
     return last - first + 1;
 }
 
-/// True for a parsed operand that is a double the exact comparator cannot trust: a magnitude of
-/// 2^53 or more (or infinite), or a lexeme of more than 15 significant digits. `lexeme` is the
-/// operand text; for a JSON float the original text is gone, so it is the shortest round-trip
-/// text of the double (a value that needs 16 or 17 digits to round-trip is refused). Integers are
-/// exact and never refused here.
+/// True for a parsed decimal STRING operand that is a double the exact comparator cannot trust: a
+/// magnitude of 2^53 or more (or infinite), a non-zero magnitude below DBL_MIN (a subnormal does
+/// not round-trip 15 digits and strtod implementations differ on it; zero is fine), or a lexeme of
+/// more than 15 significant digits. Integers are exact and never refused here.
 bool operand_rounds_through_double(const Number& n, std::string_view lexeme) {
     const double* d = std::get_if<double>(&n);
     if (d == nullptr)
         return false;
     return !(std::fabs(*d) < kExactDoubleLimit) ||
+           (*d != 0.0 && std::fabs(*d) < std::numeric_limits<double>::min()) ||
            significant_digits(lexeme) > kMaxOperandSignificantDigits;
 }
 
@@ -569,15 +579,18 @@ std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
     const bool equality = out.op == "==" || out.op == "!=";
     if (v.is_number() && comparison) {
         Number parsed;
-        if (v.is_number_unsigned())
+        if (v.is_number_unsigned()) {
             parsed = v.get<std::uint64_t>();
-        else if (v.is_number_integer())
+        } else if (v.is_number_integer()) {
             parsed = v.get<std::int64_t>();
-        else
-            parsed = v.get<double>();
+        } else {
+            // EVERY JSON float is refused. Its original text is gone by the time it is read
+            // (5.00000000000000001 arrives as 5.0, 4503599627370497.3 as ...497.0), so no rule
+            // about its digits can be applied and accepting even a whole-valued one would accept
+            // lexemes whose true value differs. A JSON integer is exact; a decimal goes as a string.
+            return std::string(kJsonFloatOperandMessage);
+        }
         out.value = v.dump();
-        if (operand_rounds_through_double(parsed, out.value))
-            return std::string(kInexactOperandMessage);
         out.numeric_operand = true;
         out.numeric_value = parsed;
         return std::nullopt;

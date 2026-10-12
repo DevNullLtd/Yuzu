@@ -2519,22 +2519,37 @@ TEST_CASE("from-inventory-query: a numeric condition value is compared as a numb
     for (const char* cond :
          {R"({"plugin":"custom","field":"ram","op":">","value":9007199254740993.0})",
           R"({"plugin":"custom","field":"ram","op":"==","value":1e300})",
+          // A JSON float with a fraction is refused (its text is gone); a decimal string over 15
+          // significant digits, subnormal or out of the double range is refused too.
+          R"({"plugin":"custom","field":"ram","op":">=","value":0.5})",
+          // even a whole-valued JSON float: 5.0 cannot be told from 5.00000000000000001
+          R"({"plugin":"custom","field":"ram","op":">","value":5.0})",
+          R"({"plugin":"custom","field":"ram","op":"==","value":1e3})",
           R"({"plugin":"custom","field":"ram","op":"<=","value":"9007199254740993.5"})",
-          // Under 2^53 but rounded by a double (Gate 8 round 13): over 15 significant digits, and
-          // a plain decimal string out of the double range (it used to order lexically).
-          R"({"plugin":"custom","field":"ram","op":">=","value":4503599627370497.3})",
           R"({"plugin":"custom","field":"ram","op":">","value":"5.00000000000000001"})",
+          R"({"plugin":"custom","field":"ram","op":">","value":"1e-320"})",
           R"({"plugin":"custom","field":"ram","op":">","value":"1e400"})"}) {
         const std::string body = std::string(R"({"name":"refused","conditions":[)") + cond + "]}";
         INFO(body);
         int st = 0;
         auto j = h.post("/api/v1/result-sets/from-inventory-query", body, st);
         CHECK(st == 400);
-        CHECK(j["error"]["message"].get<std::string>().find("15 significant digits") !=
-              std::string::npos);
+        const auto msg = j["error"]["message"].get<std::string>();
+        CHECK((msg.find("15 significant digits") != std::string::npos ||
+               msg.find("JSON string") != std::string::npos));
+    }
+    // The same number as a decimal string is accepted under an ordering operator (32 > "5.0"
+    // selects one).
+    {
+        int st = 0;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query",
+                        R"({"name":"integral","conditions":[{"plugin":"custom","field":"ram","op":">","value":"5.0"}]})",
+                        st);
+        CHECK(st == 201);
+        CHECK(j["data"]["device_count"] == 1);
     }
     std::string next;
-    CHECK(h.store->list_by_owner("operator-1", "", 50, next).size() == 1);
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).size() == 2); // "big" and "integral"
 }
 
 TEST_CASE("from-inventory-query: a supplied parent_id is persisted as scope_input_id "
@@ -2991,11 +3006,14 @@ TEST_CASE("POST /api/v1/inventory/evaluate: a numeric condition value is compare
     };
     using Ids = std::vector<std::string>;
     CHECK(agents_for(">", "5") == Ids{"agent-big", "agent-half"}); // was all three: 5 became ""
-    CHECK(agents_for("==", "5.5") == Ids{"agent-half"});
-    CHECK(agents_for("!=", "5.5") == Ids{"agent-big", "agent-small", "agent-tiny"});
-    CHECK(agents_for("==", "32.0") == Ids{"agent-big"});
+    // A decimal travels as a string under an ordering operator (a JSON float's text is lost).
+    CHECK(agents_for(">=", R"("5.5")") == Ids{"agent-big", "agent-half"});
+    CHECK(agents_for("<=", R"("5.5")") == Ids{"agent-half", "agent-small", "agent-tiny"});
+    CHECK(agents_for("==", "32") == Ids{"agent-big"});
+    CHECK(agents_for(">=", R"("32.0")") == Ids{"agent-big"});
     // The stored number is compared raw: a 7-decimal value is not rounded to 6 decimals first.
-    CHECK(agents_for("==", "0.1234567") == Ids{"agent-tiny"});
+    CHECK(agents_for("<=", R"("0.1234567")") == Ids{"agent-tiny"});
+    CHECK(agents_for(">", R"("0.1234567")") == Ids{"agent-big", "agent-half", "agent-small"});
     CHECK(agents_for("==", "0") == Ids{});
 
     for (const char* cond :
@@ -3012,16 +3030,28 @@ TEST_CASE("POST /api/v1/inventory/evaluate: a numeric condition value is compare
         CHECK(st == 400);
         CHECK(j["error"]["message"].get<std::string>().find("conditions[]") != std::string::npos);
     }
-    // A decimal operand of 2^53 or more is refused (CDX-P1-01); 2^53 itself, as an integer, is not.
+    // EVERY JSON float is refused with the string hint (CDX-P1-01), a whole-valued one too;
+    // 2^53 itself, as an integer, is not.
     for (const char* cond :
          {R"({"plugin":"custom","field":"ram","op":">","value":9007199254740993.0})",
           R"({"plugin":"custom","field":"ram","op":"==","value":9007199254740992.0})",
           R"({"plugin":"custom","field":"ram","op":"<=","value":1e300})",
-          R"({"plugin":"custom","field":"ram","op":">=","value":"9007199254740993.5"})",
-          // Under 2^53 but rounded by a double (Gate 8 round 13): over 15 significant digits, and
-          // a plain decimal string out of the double range (it used to order lexically).
-          R"({"plugin":"custom","field":"ram","op":"<=","value":4503599627370497.5})",
+          R"({"plugin":"custom","field":"ram","op":"==","value":5.5})",
+          R"({"plugin":"custom","field":"ram","op":"==","value":32.0})",
+          R"({"plugin":"custom","field":"ram","op":">","value":1e3})",
+          R"({"plugin":"custom","field":"ram","op":">=","value":22359.09411})"}) {
+        const std::string body = std::string(R"({"conditions":[)") + cond + "]}";
+        INFO(body);
+        int st = 0;
+        auto j = h.post("/api/v1/inventory/evaluate", body, st);
+        CHECK(st == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("JSON string") != std::string::npos);
+    }
+    // A decimal STRING over 15 significant digits, out of range or subnormal is refused too.
+    for (const char* cond :
+         {R"({"plugin":"custom","field":"ram","op":">=","value":"9007199254740993.5"})",
           R"({"plugin":"custom","field":"ram","op":">","value":"5.00000000000000001"})",
+          R"({"plugin":"custom","field":"ram","op":">","value":"1e-320"})",
           R"({"plugin":"custom","field":"ram","op":">","value":"1e400"})"}) {
         const std::string body = std::string(R"({"conditions":[)") + cond + "]}";
         INFO(body);

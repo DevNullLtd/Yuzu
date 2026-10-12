@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 #include <utility>
 #include <vector>
@@ -19,6 +20,19 @@
 using namespace yuzu::server;
 
 using Records = std::vector<std::pair<std::string, std::string>>;
+
+namespace {
+/// EVERY JSON float operand is refused (its original text is lost), so a decimal travels as a
+/// string under an ordering operator. Quote a float operand for `>` `>=` `<` `<=`; leave every
+/// other operand as the caller's JSON (an `==` / `!=` caller writes an integer).
+std::string operand_for(const std::string& op, const std::string& operand_json) {
+    const bool ordering = op == ">" || op == ">=" || op == "<" || op == "<=";
+    const auto v = nlohmann::json::parse(operand_json);
+    if (ordering && v.is_number_float())
+        return "\"" + operand_json + "\"";
+    return operand_json;
+}
+} // namespace
 
 // ============================================================================
 // Operator: ==
@@ -1075,8 +1089,8 @@ TEST_CASE("InventoryEval: parse_inventory_condition renders a numeric operand fo
     // Numbers keep their dump() text and set numeric_operand, so ==/!= compare numerically
     // (a string operand leaves the flag clear and stays lexical).
     struct Case { const char* op; const char* json_value; const char* expect; };
-    for (const auto& k : {Case{">", "5", "5"}, Case{">=", "-1", "-1"}, Case{"<", "5.5", "5.5"},
-                          Case{"<=", "1e3", "1000.0"}, Case{"==", "4294967297", "4294967297"},
+    for (const auto& k : {Case{">", "5", "5"}, Case{">=", "-1", "-1"}, Case{"<", "5", "5"},
+                          Case{"<=", "1000", "1000"}, Case{"==", "4294967297", "4294967297"},
                           Case{"!=", "18446744073709551615", "18446744073709551615"},
                           Case{"==", "true", "true"}, Case{"!=", "false", "false"}}) {
         INFO(k.op << " " << k.json_value);
@@ -1087,6 +1101,14 @@ TEST_CASE("InventoryEval: parse_inventory_condition renders a numeric operand fo
         CHECK(c.value == k.expect);
         CHECK(c.numeric_operand == (std::string(k.json_value) != "true" &&
                                     std::string(k.json_value) != "false"));
+    }
+    // Every JSON float operand is refused, whole-valued or not, under every comparison operator.
+    for (const char* op : {"==", "!=", ">", ">=", "<", "<="}) {
+        for (const char* f : {"5.0", "1e3", "-0.0", "5.5", "1234567890123456.0"}) {
+            INFO(op << " " << f);
+            c = {};
+            CHECK(parse(json::parse(std::string(R"({"op":")") + op + R"(","value":)" + f + "}"), c));
+        }
     }
 }
 
@@ -1104,7 +1126,7 @@ TEST_CASE("InventoryEval: a JSON-number operand compares numerically under == an
         InventoryEvalRequest req;
         InventoryCondition c;
         const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
-                                     R"(","value":)" + operand_json + "}");
+                                     R"(","value":)" + operand_for(op, operand_json) + "}");
         REQUIRE_FALSE(parse_inventory_condition(doc, c));
         req.conditions.push_back(c);
         std::vector<std::string> ids;
@@ -1114,14 +1136,24 @@ TEST_CASE("InventoryEval: a JSON-number operand compares numerically under == an
         return ids;
     };
     using Ids = std::vector<std::string>;
-    // 5.5 == stored float 5.5 (and the numeric-looking string "5.50"); never the others.
-    CHECK(matching("==", "5.5") == Ids{"agent-f", "agent-n"});
-    // != 5.5 excludes those, and selects the int, the non-numeric string and the boolean.
-    CHECK(matching("!=", "5.5") == Ids{"agent-b", "agent-i", "agent-k", "agent-s"});
-    // 5.0 equals stored int 5 (and 1000 matches 1e3 below).
-    CHECK(matching("==", "5.0") == Ids{"agent-i"});
-    CHECK(matching("==", "1e3") == Ids{"agent-k"});
-    CHECK(matching("!=", "1e3") == Ids{"agent-b", "agent-f", "agent-i", "agent-n", "agent-s"});
+    // A fractional JSON float operand is refused under == and != (its text is lost); the decimal
+    // orders as a string, and a string under == is a text compare that matches no stored number.
+    {
+        InventoryCondition refused;
+        CHECK(parse_inventory_condition(json::parse(R"({"op":"==","value":5.5})"), refused));
+        CHECK(parse_inventory_condition(json::parse(R"({"op":"!=","value":5.5})"), refused));
+    }
+    CHECK(matching("==", "\"5.5\"") == Ids{});
+    CHECK(matching(">=", "\"5.5\"") == Ids{"agent-f", "agent-k", "agent-n"});
+    CHECK(matching("<=", "\"5.5\"") == Ids{"agent-f", "agent-i", "agent-n"});
+    // A JSON integer is exact; a whole-valued JSON float is refused like any other.
+    CHECK(matching("==", "1000") == Ids{"agent-k"});
+    CHECK(matching("!=", "1000") == Ids{"agent-b", "agent-f", "agent-i", "agent-n", "agent-s"});
+    {
+        InventoryCondition refused;
+        CHECK(parse_inventory_condition(json::parse(R"({"op":"==","value":5.0})"), refused));
+        CHECK(parse_inventory_condition(json::parse(R"({"op":"!=","value":1e3})"), refused));
+    }
     CHECK(matching("==", "5") == Ids{"agent-i"});
     // A non-numeric stored value is never equal to a numeric operand.
     CHECK(matching("==", "0") == Ids{});
@@ -1136,35 +1168,34 @@ TEST_CASE("InventoryEval: numeric == and != compare the raw stored number, not a
         InventoryEvalRequest req;
         InventoryCondition c;
         const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
-                                     R"(","value":)" + operand_json + "}");
+                                     R"(","value":)" + operand_for(op, operand_json) + "}");
         REQUIRE_FALSE(parse_inventory_condition(doc, c));
         req.conditions.push_back(c);
         return !evaluate_inventory(req, records).empty();
     };
     // 6-decimal rendering used to make these equal or unequal wrongly.
-    CHECK(matches("0.1234567", "==", "0.1234567"));
-    CHECK_FALSE(matches("0.1234567", "!=", "0.1234567"));
+    // (A fractional operand now travels as a string under an ordering operator; the ordering case
+    // below covers 0.1234567 and 1e-7 exactly.)
     CHECK_FALSE(matches("1e-7", "==", "0"));
     CHECK(matches("1e-7", "!=", "0"));
-    CHECK(matches("1e-7", "==", "1e-7"));
     // Integers above 2^53 compare exactly (they used to round through a double).
     CHECK_FALSE(matches("9007199254740993", "==", "9007199254740992"));
     CHECK(matches("9007199254740993", "!=", "9007199254740992"));
     CHECK(matches("9007199254740993", "==", "9007199254740993"));
     CHECK_FALSE(matches("9007199254740992.0", "==", "9007199254740993"));
     // Int vs float spelling of the same value, and plain floats.
-    CHECK(matches("5", "==", "5.0"));
+    CHECK(matches("5", "==", "5"));
     CHECK(matches("5.0", "==", "5"));
-    CHECK(matches("5.5", "==", "5.5"));
     CHECK(matches("-0.0", "==", "0"));
-    CHECK_FALSE(matches("0.30000000000000004", "==", "0.3"));
+    CHECK_FALSE(matches("0.30000000000000004", "<=", "0.3"));
     // Unsigned beyond int64 max, and the signed/unsigned mix.
     CHECK(matches("18446744073709551615", "==", "18446744073709551615"));
     CHECK_FALSE(matches("18446744073709551615", "==", "-1"));
     CHECK_FALSE(matches("-1", "==", "18446744073709551615"));
     CHECK(matches("-1", "==", "-1"));
     // Stored numeric strings parse as numbers; a non-numeric string, bool or null never equals.
-    CHECK(matches(R"("1.10")", "==", "1.1"));
+    CHECK(matches(R"("1.10")", ">=", "1.1"));
+    CHECK(matches(R"("1.10")", "<=", "1.1"));
     CHECK(matches(R"("9007199254740993")", "==", "9007199254740993"));
     CHECK_FALSE(matches(R"("9007199254740993")", "==", "9007199254740992"));
     CHECK_FALSE(matches("true", "==", "1"));
@@ -1179,12 +1210,12 @@ TEST_CASE("InventoryEval: numeric == and != compare the raw stored number, not a
         CHECK(matches(text, "!=", "5"));
     }
     // A negative integer against a double: exact, integral and in range.
-    CHECK(matches("-5", "==", "-5.0"));
-    CHECK_FALSE(matches("-5", "==", "-5.5"));
+    CHECK(matches("-5.0", "==", "-5"));
+    CHECK_FALSE(matches("-5", "==", "-6"));
     CHECK(matches("-9223372036854775808.0", "==", "-9223372036854775808"));
     CHECK_FALSE(matches("-9223372036854777856.0", "==", "-9223372036854775808"));
     // A stored string that parses as an int64 against a double operand.
-    CHECK(matches(R"("5")", "==", "5.0"));
+    CHECK(matches(R"("5.0")", "==", "5"));
     CHECK_FALSE(matches(R"("9007199254740992.0")", "==", "9007199254740993"));
     // The 2^63 and 2^64 range guards: the double one past the type's max never equals its max.
     CHECK_FALSE(matches("18446744073709551616.0", "==", "18446744073709551615"));
@@ -1192,16 +1223,17 @@ TEST_CASE("InventoryEval: numeric == and != compare the raw stored number, not a
     CHECK(matches("9223372036854775808.0", "==", "9223372036854775808"));
     // Stored strings: sign, leading '.', leading zeros, and an out-of-range exponent.
     CHECK(matches(R"("-1")", "==", "-1"));
-    CHECK(matches(R"(".5")", "==", "0.5"));
+    CHECK(matches(R"(".5")", ">=", "0.5"));
+    CHECK(matches(R"(".5")", "<=", "0.5"));
     CHECK(matches(R"("007")", "==", "7"));
     CHECK_FALSE(matches(R"("1e400")", "==", "5"));
     CHECK_FALSE(matches(R"("1e400")", "==", "0"));
     CHECK(matches(R"("1e400")", "!=", "5"));
-    // An operand of -0 or 0.0 equals a stored zero in every spelling.
+    // An operand of -0 or 0 equals a stored zero in every spelling.
     CHECK(matches("0", "==", "-0"));
-    CHECK(matches("0", "==", "0.0"));
-    CHECK(matches("-0.0", "==", "0.0"));
-    CHECK(matches(R"("0")", "==", "-0.0"));
+    CHECK(matches("0.0", "==", "0"));
+    CHECK(matches("-0.0", "==", "0"));
+    CHECK(matches(R"("-0.0")", "==", "0"));
     // A stored null is "no value": neither == nor != selects it (unchanged).
     CHECK_FALSE(matches("null", "==", "0"));
     CHECK_FALSE(matches("null", "!=", "0"));
@@ -1222,7 +1254,7 @@ TEST_CASE("InventoryEval: numeric > >= < <= compare the raw stored number exactl
         InventoryEvalRequest req;
         InventoryCondition c;
         const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
-                                     R"(","value":)" + operand_json + "}");
+                                     R"(","value":)" + operand_for(op, operand_json) + "}");
         REQUIRE_FALSE(parse_inventory_condition(doc, c));
         req.conditions.push_back(c);
         return !evaluate_inventory(req, records).empty();
@@ -1297,7 +1329,7 @@ TEST_CASE("InventoryEval: a plain-decimal string operand orders exactly like the
         InventoryEvalRequest req;
         InventoryCondition c;
         const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
-                                     R"(","value":)" + operand_json + "}");
+                                     R"(","value":)" + operand_for(op, operand_json) + "}");
         REQUIRE_FALSE(parse_inventory_condition(doc, c));
         req.conditions.push_back(c);
         return !evaluate_inventory(req, records).empty();
@@ -1355,7 +1387,7 @@ TEST_CASE("InventoryEval: a plain-decimal string operand orders exactly like the
         InventoryEvalRequest req;
         InventoryCondition c;
         const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
-                                     R"(","value":)" + operand_json + "}");
+                                     R"(","value":)" + operand_for(op, operand_json) + "}");
         REQUIRE_FALSE(parse_inventory_condition(doc, c));
         req.conditions.push_back(c);
         std::vector<std::string> ids;
@@ -1495,16 +1527,17 @@ TEST_CASE("InventoryEval: a decimal operand of 2^53 or more is refused at admiss
                                                      op + R"(","value":)" + operand_json + "}"),
                                          c);
     };
-    // JSON floats (the reproduced case first), and exponent forms and ns-scale values, every op.
+    // JSON floats (the reproduced case first), and exponent forms and ns-scale values, every op:
+    // EVERY JSON float is refused with the string hint.
     for (const char* operand : {"9007199254740993.0", "9007199254740992.0", "-9007199254740993.0",
                                 "9.007199254740993e15", "1e16", "1e300", "-1e300",
                                 "1700000000000000000.5", "18446744073709551616.0",
-                                "100000000000000000000"}) {
+                                "100000000000000000000", "0.1234567", "5.5", "-1e-7"}) {
         for (const char* op : ops) {
             INFO(op << " " << operand);
             const auto err = admit(op, operand);
             REQUIRE(err.has_value());
-            CHECK(err->find("15 significant digits") != std::string::npos);
+            CHECK(err->find("JSON string") != std::string::npos);
         }
     }
     // A string operand is read only under the ordering operators; a fraction or exponent form of
@@ -1521,17 +1554,27 @@ TEST_CASE("InventoryEval: a decimal operand of 2^53 or more is refused at admiss
         for (const char* op : {"==", "!="})
             CHECK_FALSE(admit(op, operand).has_value());
     }
-    // Accepted: 2^53 and larger WHOLE numbers as integers, small decimals, and exact fractions.
+    // Accepted: 2^53 and larger WHOLE numbers as JSON integers.
     for (const char* operand : {"9007199254740992", "9007199254740993", "-9007199254740993",
-                                "18446744073709551615", "-9223372036854775808", "0.1234567", "5.5",
-                                "1e3", "-1e-7", "0", "-0.0"}) {
+                                "18446744073709551615", "-9223372036854775808", "0"}) {
         for (const char* op : ops) {
             INFO(op << " " << operand);
             CHECK_FALSE(admit(op, operand).has_value());
         }
     }
+    // Refused, whatever the value: a JSON float even when it is a whole number below 2^53.
+    for (const char* operand : {"1e3", "9007199254740991.0", "-0.0", "5.0", "1234567890123456.0",
+                                "4503599627370497.0"}) {
+        for (const char* op : ops) {
+            INFO(op << " " << operand);
+            const auto err = admit(op, operand);
+            REQUIRE(err.has_value());
+            CHECK(err->find("JSON string") != std::string::npos);
+        }
+    }
     for (const char* operand : {"\"9007199254740992\"", "\"0.1234567\"", "\"5.5\"", "\"2e-7\"",
-                                "\"9007199254740991.0\""}) {
+                                "\"9007199254740991.0\"", "\"1000\"", "\"5.0\"",
+                                "\"1234567890123456.0\"", "\"4503599627370497\""}) {
         for (const char* op : {">", ">=", "<", "<="}) {
             INFO(op << " " << operand);
             CHECK_FALSE(admit(op, operand).has_value());
@@ -1559,19 +1602,83 @@ TEST_CASE("InventoryEval: a decimal operand is admitted only with at most 15 sig
     const std::string long_int(400, '9');
     using Strs = std::vector<std::string>;
 
-    SECTION("a JSON float is refused when its shortest round-trip text has over 15 digits") {
+    SECTION("EVERY JSON float is refused, whole-valued or not, with the string hint") {
         for (const std::string& operand :
-             Strs{"123456789012345.6",  // 16 digits
-                  "1234567890123456.7", // 17 digits
-                  "0.1234567890123456", // 16 digits
-                  "4503599627370497.3", "4503599627370497.5", "0.30000000000000004",
-                  "9007199254740991.0"}) { // its text has 16 digits (a string spelling is exact)
+             Strs{"123456789012345.6", "1234567890123456.7", "0.1234567890123456",
+                  "0.30000000000000004", "5.5", "0.1", "22359.09411", "1e-320", "5e-324",
+                  "9007199254740992.0",
+                  // a whole-valued float is refused too: its text is gone, so 5.0 cannot be told
+                  // from 5.00000000000000001 and 4503599627370497.0 from ...497.3
+                  "1e3", "5.0", "-0.0", "1234567890123456.0", "4503599627370497.0",
+                  "5.00000000000000001", "4503599627370497.3"}) {
             for (const char* op : ops) {
                 INFO(op << " " << operand);
                 InventoryCondition c;
                 const auto err = admit(op, operand, c);
                 REQUIRE(err.has_value());
-                CHECK(err->find("15 significant digits") != std::string::npos);
+                CHECK(err->find("must be an integer") != std::string::npos);
+                CHECK(err->find("JSON string") != std::string::npos);
+                CHECK(err->find("(>, >=, <, <=)") != std::string::npos);
+            }
+        }
+    }
+
+    SECTION("the same numbers as strings are accepted under ordering operators where the string "
+            "rules allow") {
+        for (const std::string& operand :
+             Strs{quoted("1000"), quoted("5.0"), quoted("1234567890123456.0"),
+                  quoted("4503599627370497"), quoted("-0.0"), quoted("1e3")}) {
+            for (const char* op : ordering) {
+                INFO(op << " " << operand);
+                InventoryCondition c;
+                CHECK_FALSE(admit(op, operand, c).has_value());
+            }
+        }
+        // ... and the long decimals the digit rule exists for stay refused as strings.
+        for (const std::string& operand : Strs{quoted("5.00000000000000001"),
+                                               quoted("4503599627370497.3")}) {
+            for (const char* op : ordering) {
+                InventoryCondition c;
+                CHECK(admit(op, operand, c).has_value());
+            }
+        }
+    }
+
+    SECTION("a string operand carries the decimals a JSON float cannot") {
+        // 22359.09411 dumps as 22359.094109999998, so a digit count over the JSON float's text
+        // refused a plain 10-digit literal; as a string the 15-digit rule judges the original text.
+        for (const std::string& operand :
+             Strs{quoted("22359.09411"), quoted("0.1"), quoted("5.00000000000000000")}) {
+            for (const char* op : ordering) {
+                INFO(op << " " << operand);
+                InventoryCondition c;
+                CHECK_FALSE(admit(op, operand, c).has_value());
+            }
+        }
+    }
+
+    SECTION("a subnormal string operand is refused; zero is accepted") {
+        // Subnormals do not round-trip 15 digits and Linux (from_chars) and macOS (strtod, which
+        // reports ERANGE: the plain_decimal_out_of_range fallback branch) diverge on them, so the
+        // refusal must hold on both legs. The macOS CI leg checks the strtod branch.
+        for (const std::string& operand :
+             Strs{quoted("1e-320"), quoted("5e-324"), quoted("1.23456789012345e-320"),
+                  quoted("-1e-320"), quoted("2.2250738585072e-308")}) {
+            for (const char* op : ordering) {
+                INFO(op << " " << operand);
+                InventoryCondition c;
+                const auto err = admit(op, operand, c);
+                REQUIRE(err.has_value());
+                CHECK(err->find("subnormal") != std::string::npos);
+            }
+        }
+        for (const std::string& operand :
+             Strs{quoted("0"), quoted("-0"), quoted("0.0"), quoted("0e0"),
+                  quoted("2.2250738585073e-308")}) { // just above DBL_MIN: a normal double
+            for (const char* op : ordering) {
+                INFO(op << " " << operand);
+                InventoryCondition c;
+                CHECK_FALSE(admit(op, operand, c).has_value());
             }
         }
     }
@@ -1610,12 +1717,11 @@ TEST_CASE("InventoryEval: a decimal operand is admitted only with at most 15 sig
         CHECK(err->find("18446744073709551615") != std::string::npos);
     }
 
-    SECTION("admitted: 15 digits or fewer, exact integers of any int64/uint64 size") {
+    SECTION("admitted: JSON integers of any int64/uint64 size") {
         for (const std::string& operand :
-             Strs{"12345678901234.5", "0.123456789012345", "0.1234567", "5.5", "0.1", "1e3",
-                  "-1e-7", "1.5e10", "-0.0", "0", "0.000000123456789012345",
-                  "9007199254740992", "9007199254740993", "-9007199254740993",
-                  "9223372036854775807", "-9223372036854775808", "18446744073709551615"}) {
+             Strs{"0", "5", "1234567890123456", "9007199254740991", "9007199254740992",
+                  "9007199254740993", "-9007199254740993", "9223372036854775807",
+                  "-9223372036854775808", "18446744073709551615"}) {
             for (const char* op : ops) {
                 INFO(op << " " << operand);
                 InventoryCondition c;
@@ -1625,7 +1731,7 @@ TEST_CASE("InventoryEval: a decimal operand is admitted only with at most 15 sig
         for (const std::string& operand :
              Strs{quoted("12345678901234.5"), quoted("0.123456789012345"), quoted("5.5"),
                   quoted("1e3"), quoted("2e-7"), quoted("0.1"), quoted("9007199254740993"),
-                  quoted("18446744073709551615"),
+                  quoted("18446744073709551615"), quoted("0.000000123456789012345"),
                   // a zero fraction is reduced to the exact integer BEFORE the digit rule
                   quoted("9007199254740993.0"), quoted("-9007199254740993.00"),
                   quoted("1234567890123456789.0")}) {
@@ -1642,14 +1748,46 @@ TEST_CASE("InventoryEval: a decimal operand is admitted only with at most 15 sig
         REQUIRE_FALSE(admit(">", quoted("9007199254740993.0"), c).has_value());
         CHECK(std::holds_alternative<std::int64_t>(c.numeric_value));
         CHECK(std::get<std::int64_t>(c.numeric_value) == 9007199254740993LL);
-        InventoryCondition d;
-        REQUIRE_FALSE(admit(">", "1e3", d).has_value());
-        REQUIRE(std::holds_alternative<double>(d.numeric_value));
-        CHECK(std::get<double>(d.numeric_value) == 1000.0);
+        // A JSON integer keeps its exact value, including one above 2^53.
+        InventoryCondition f;
+        REQUIRE_FALSE(admit(">=", "4503599627370497", f).has_value());
+        // nlohmann reads a non-negative integer as unsigned; the value is exact either way.
+        REQUIRE(std::holds_alternative<std::uint64_t>(f.numeric_value));
+        CHECK(std::get<std::uint64_t>(f.numeric_value) == 4503599627370497ULL);
+        CHECK(f.value == "4503599627370497");
         InventoryCondition e;
         REQUIRE_FALSE(admit(">", quoted("1e3"), e).has_value());
         REQUIRE(std::holds_alternative<double>(e.numeric_value));
         CHECK(std::get<double>(e.numeric_value) == 1000.0);
+    }
+
+    SECTION("a JSON integer, or the same number as a string, compares exactly against a stored integer") {
+        Records records = {{"agent-a|p", R"({"v": 4503599627370497})"},
+                           {"agent-b|p", R"({"v": 4503599627370496})"},
+                           {"agent-c|p", R"({"v": 4503599627370498})"}};
+        auto run = [&](const char* op, const char* operand) {
+            InventoryEvalRequest req;
+            InventoryCondition c;
+            c.plugin = "p";
+            c.field = "v";
+            c.op = op;
+            const auto err = parse_inventory_condition(
+                json::parse(std::string(R"({"op":")") + op + R"(","value":)" + operand + "}"), c);
+            REQUIRE_FALSE(err.has_value());
+            req.conditions = {c};
+            std::vector<std::string> ids;
+            for (const auto& r : evaluate_inventory(req, records))
+                ids.push_back(r.agent_id);
+            std::sort(ids.begin(), ids.end());
+            return ids;
+        };
+        CHECK(run("<", "4503599627370497") == Strs{"agent-b"});
+        CHECK(run(">=", "4503599627370497") == Strs{"agent-a", "agent-c"});
+        CHECK(run("==", "4503599627370497") == Strs{"agent-a"});
+        CHECK(run("<=", "4503599627370497") == Strs{"agent-a", "agent-b"});
+        // The string equivalent orders identically (the zero fraction reads as the exact integer).
+        CHECK(run("<", "\"4503599627370497.0\"") == Strs{"agent-b"});
+        CHECK(run(">=", "\"4503599627370497.0\"") == Strs{"agent-a", "agent-c"});
     }
 }
 
@@ -1663,7 +1801,7 @@ TEST_CASE("InventoryEval: a whole-number decimal string reads as the exact integ
         InventoryEvalRequest req;
         InventoryCondition c;
         const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
-                                     R"(","value":)" + operand_json + "}");
+                                     R"(","value":)" + operand_for(op, operand_json) + "}");
         REQUIRE_FALSE(parse_inventory_condition(doc, c));
         req.conditions.push_back(c);
         return !evaluate_inventory(req, records).empty();
