@@ -69,6 +69,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -87,6 +88,22 @@ struct DexTierPolicy {
     StabilityBandEdges edges;
     std::array<std::string, 4> names{"excellent", "good", "fair", "poor"};
 };
+
+// dex_tier_name indexes names[] by the StabilityBand value, and DexScoreOverride
+// and apply_override mirror the edge and weight fields one by one: a new band
+// or a new weight must be added to those places too, so these fail the build
+// until it is.
+static_assert(static_cast<std::size_t>(StabilityBand::Excellent) == 0 &&
+                  static_cast<std::size_t>(StabilityBand::Good) == 1 &&
+                  static_cast<std::size_t>(StabilityBand::Fair) == 2 &&
+                  static_cast<std::size_t>(StabilityBand::Poor) == 3 &&
+                  static_cast<std::size_t>(StabilityBand::Poor) + 1 ==
+                      std::tuple_size_v<decltype(DexTierPolicy::names)>,
+              "names[] is indexed by StabilityBand; extend DexScoreOverride and apply_override");
+static_assert(sizeof(StabilityWeights) == 4 * sizeof(double),
+              "a new weight must be mirrored in DexScoreOverride and apply_override");
+static_assert(sizeof(StabilityBandEdges) == 3 * sizeof(double),
+              "a new edge must be mirrored in DexScoreOverride and apply_override");
 
 /// Every field optional: an unset field inherits the global policy.
 struct DexScoreOverride {
@@ -153,7 +170,7 @@ struct DexPolicyRejection {
     std::size_t override_index; ///< kDexPolicyGlobalIndex for the global policy
 };
 
-namespace detail {
+namespace dex_score_policy_detail {
 
 /// ASCII-only, locale-independent; bytes >= 0x80 are preserved. Shared by the
 /// validator and the resolver so the two cannot disagree on a key.
@@ -240,28 +257,28 @@ struct Merged {
     return std::nullopt;
 }
 
-} // namespace detail
+} // namespace dex_score_policy_detail
 
 /// nullopt means the policy is valid; nothing else is a success sentinel.
 [[nodiscard]] inline std::optional<DexPolicyRejection>
 dex_score_policy_fault(const DexScorePolicy& p) {
-    if (const auto f = detail::tier_fault(p.tiers))
+    if (const auto f = dex_score_policy_detail::tier_fault(p.tiers))
         return DexPolicyRejection{*f, kDexPolicyGlobalIndex};
-    if (const auto f = detail::weight_fault(p.weights))
+    if (const auto f = dex_score_policy_detail::weight_fault(p.weights))
         return DexPolicyRejection{*f, kDexPolicyGlobalIndex};
     if (p.overrides.size() > kDexPolicyMaxOverrides)
         return DexPolicyRejection{DexPolicyFault::TooManyOverrides, kDexPolicyGlobalIndex};
     for (std::size_t i = 0; i < p.overrides.size(); ++i) {
         const auto& o = p.overrides[i];
-        if (o.image.empty() || detail::ascii_lower(o.image) != o.image)
+        if (o.image.empty() || dex_score_policy_detail::ascii_lower(o.image) != o.image)
             return DexPolicyRejection{DexPolicyFault::OverrideKeyInvalid, i};
         for (std::size_t j = 0; j < i; ++j)
             if (p.overrides[j].image == o.image)
                 return DexPolicyRejection{DexPolicyFault::OverrideKeyDuplicate, i};
-        const auto m = detail::apply_override(p, o);
-        if (const auto f = detail::tier_fault(m.tiers))
+        const auto m = dex_score_policy_detail::apply_override(p, o);
+        if (const auto f = dex_score_policy_detail::tier_fault(m.tiers))
             return DexPolicyRejection{*f, i};
-        if (const auto f = detail::weight_fault(m.weights))
+        if (const auto f = dex_score_policy_detail::weight_fault(m.weights))
             return DexPolicyRejection{*f, i};
     }
     return std::nullopt;
@@ -283,12 +300,12 @@ struct DexEffectivePolicy {
 /// policy that passed dex_score_policy_fault.
 [[nodiscard]] inline DexEffectivePolicy resolve_dex_score_policy(const DexScorePolicy& p,
                                                                  std::string_view image) {
-    const std::string key = detail::ascii_lower(image);
+    const std::string key = dex_score_policy_detail::ascii_lower(image);
     // Known ceiling: linear scan over <=200 overrides, per-application lookups
     // on a page of a few hundred apps; upgrade to a map if a profile ever shows it.
     for (const auto& o : p.overrides) {
         if (o.image == key) {
-            auto m = detail::apply_override(p, o);
+            auto m = dex_score_policy_detail::apply_override(p, o);
             return {std::move(m.tiers), m.weights, DexPolicyProfile::Override};
         }
     }

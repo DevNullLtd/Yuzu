@@ -50,14 +50,15 @@
  * - Bands: excellent >= 90, good >= 75, fair >= 60, else poor. These defaults
  *   are the edges and labels of the fleet health-score band
  *   (build_dex_health_model, dex_read_model.cpp); the per-device buckets there
- *   (great / fair / poor at 90 / 75) are a different scale. The edges are a
- *   parameter (StabilityBandEdges, defaulting to 90 / 75 / 60) and are applied
- *   to the displayed value exactly as the defaults are. This module does not
+ *   (great / fair / poor at 90 / 75) are a different scale. The rule differs:
+ *   the health page bands the RAW double and prints it at zero decimals,
+ *   while this module bands the one-decimal DISPLAY value, so 89.96 reads
+ *   "good" there and "excellent" here. A page must not share one band
+ *   expression across the two. The edges are a parameter
+ *   (StabilityBandEdges, defaulting to 90 / 75 / 60) and are applied to the
+ *   displayed value exactly as the defaults are. This module does not
  *   validate edges: garbage edges band wrongly and never withhold; validation
- *   lives in dex_score_policy.hpp. The rule differs: the health page bands
- *   the RAW double and prints it at zero decimals, while this module bands the
- *   one-decimal DISPLAY value, so 89.96 reads "good" there and "excellent"
- *   here. A page must not share one band expression across the two.
+ *   lives in dex_score_policy.hpp.
  * - Display and banding. The returned `score` is UNROUNDED. The display
  *   precision is one decimal (kStabilityScoreScale) and the rounding rule is
  *   stability_display_score(): round half away from zero at one decimal on
