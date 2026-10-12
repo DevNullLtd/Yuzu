@@ -444,9 +444,12 @@ for up to 10 000 devices, so it gets **complete pages of its own devices** — t
 post-filter, where `devices_omitted` is a distinct-device count within the scanned window(s)
 and still signals that out-of-scope matches exist. The page is refilled with at most four
 bounded reads, so it can be empty with a non-null `next_cursor`; that cursor re-anchors at
-the last row you were served and skips the rows already scanned (a row inserted inside that
-span during a walk can be missed or repeated, the same class as the `install_id` churn
-noted for a concurrent resync). Keep paging until `next_cursor` is `null`.
+the last row you were served and skips the rows already scanned (a row inserted or deleted inside
+that span, or a scope that widens between pages, can make a walk miss or repeat a row, the
+same class as the `install_id` churn noted for a concurrent resync). A continuation's skip is
+a position count, so a long run of out-of-scope rows costs proportionally more to resume, and
+a statement timeout there degrades the page to a 503 (tracked in #5698). Keep paging until
+`next_cursor` is `null`.
 
 ### REST: software title catalogue
 
