@@ -5669,13 +5669,15 @@ TEST_CASE("#5459 held generation: identical pushes while a hung arm is outstandi
     // registry (Linux, macOS) it reads Unknown and is always rebuilt; on Windows it reads a verdict
     // and is skipped. Wait for its first verdict, then expect the matching outcome on this host.
     auto& rt5459 = r.runtime();
+    decltype(rt5459.status_for_rule("r2")) first_verdict; // the snapshot that satisfied the poll
     REQUIRE(yuzu::test::spin_until(
         [&] {
-            const auto st = rt5459.status_for_rule("r2");
-            return st.has_value() && (st->last_compliant.has_value() || st->in_unknown);
+            first_verdict = rt5459.status_for_rule("r2");
+            return first_verdict.has_value() &&
+                   (first_verdict->last_compliant.has_value() || first_verdict->in_unknown);
         },
         30s));
-    const int sibling_rebuilds = rt5459.status_for_rule("r2")->in_unknown ? 1 : 0;
+    const int sibling_rebuilds = first_verdict->in_unknown ? 1 : 0;
 
     // Held: every identical push up to the budget is Suppressed. The Application survives
     // each one (pending 0 / failed 1), the mechanisms see nothing, nothing is acknowledged.

@@ -2269,13 +2269,15 @@ TEST_CASE("#4415 PR-A (CH-5): a re-enabled rule behind a retained disarm is driv
     // own watch would take the hang: wait for x's first verdict and SKIP the case on such a host.
     {
         auto& rt = r.rt(); // once, outside the poll
+        decltype(rt.status_for_rule("x")) first_verdict; // the snapshot that satisfied the poll
         REQUIRE(yuzu::test::spin_until(
             [&] {
-                const auto st = rt.status_for_rule("x");
-                return st.has_value() && (st->last_compliant.has_value() || st->in_unknown);
+                first_verdict = rt.status_for_rule("x");
+                return first_verdict.has_value() &&
+                       (first_verdict->last_compliant.has_value() || first_verdict->in_unknown);
             },
             30s));
-        if (rt.status_for_rule("x")->in_unknown)
+        if (first_verdict->in_unknown)
             SKIP("this host reads the Service rule Unknown (no system bus), so the re-push rebuilds it instead of skipping it");
     }
     r.sm->hang_next_watch();

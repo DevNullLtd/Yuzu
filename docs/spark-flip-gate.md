@@ -1566,7 +1566,7 @@ flip, with a red-first test each:
     to reach zero. Windows (MSVC, weecolin) built and ran `[4415prA]` 64/64, `[guardian]` and
     `[spark]` green at `490c773fa`; one full `[guardian]` run also hit the pre-existing
     `FileGuard rename*` flake (#5508; alone on baseline `f7a000fc3` it failed 2 of 20 and 5 of 12
-    runs, on this tip 0 of 20). macOS (Apple Clang, mini-colin, arm64) built and ran `[4415prA]`
+    runs; on the PR-A branch 0 of 20 alone and 1 of 6 in an earlier mixed run). macOS (Apple Clang, mini-colin, arm64) built and ran `[4415prA]`
     64 cases (63 pass, 1 skipped on a host with no system bus), `[guardian]`, `[spark]` and the
     10-shard agent suite all green at `0223018f6`; its first run found one more host-dependent
     test (CH-5), fixed.
