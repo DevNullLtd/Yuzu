@@ -185,7 +185,7 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # (already "twinned", count unchanged). The catalogue route's format=csv titles export is REST-only by design: a CSV
 # body is a download for a person or a pipeline, not a structured tool result (the JSON route
 # is the structured surface; its MCP twin, query_software_catalogue, now exists, and the
-# remaining exception is recorded under ADR-1005 as #ISSUE-ADR1005).
+# remaining exception is recorded under ADR-1005 as #5699).
 # Measured post-flip at 204 (205 - 1), not hand-picked.
 #
 # Merge of the two changes above: 205 - 4 (legacy rows deleted) - 1 (versions row twinned)

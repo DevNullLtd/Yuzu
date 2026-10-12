@@ -115,12 +115,12 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 `GET /api/v1/inventory/software` - have no MCP tool. An agent reads the same data page by page
 through the cursor on `query_software_catalogue` / `query_installed_software`; a bulk file
 download is a human/automation convenience, so the ledger rows for those routes are `twinned` on
-the paged shape and the export mode is recorded here rather than as a separate row. Tracked by `#ISSUE-ADR1005` (revisit by 2026-11-07); the exception is recorded in `docs/adr/1005-headless-platform-use-case-engines.md`.
+the paged shape and the export mode is recorded here rather than as a separate row. Tracked by `#5699` (revisit by 2026-11-07); the exception is recorded in `docs/adr/1005-headless-platform-use-case-engines.md`.
 
 **Known asymmetry on the raw-route pair.** The `q`, `kind`, `ecosystem` and `source` filters of
 `GET /api/v1/inventory/software` are REST-only: `query_installed_software` takes `name`, `agent_id`,
 `version`, `limit` and `cursor` only (an unknown argument name is ignored, as on the other read tools; only approval-gated tools validate argument names at dispatch). The row
-stays `twinned` on the paged shape; the gap is recorded here so it is not silent. Tracked by `#ISSUE-ADR1005` (revisit by 2026-11-07), with the same ADR-1005 exception entry.
+stays `twinned` on the paged shape; the gap is recorded here so it is not silent. Tracked by `#5699` (revisit by 2026-11-07), with the same ADR-1005 exception entry.
 
 ## Summary
 

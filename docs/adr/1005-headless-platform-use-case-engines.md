@@ -573,13 +573,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        REST/MCP twin") is answered on the twin half by the tools above; its
        confinement criterion is superseded by the refuse-to-confined ruling.
        **Revisit by 2026-11-07.**
-     - **The raw route's export is REST-only (`#ISSUE-ADR1005`).**
+     - **The raw route's export is REST-only (`#5699`).**
        `GET /api/v1/inventory/software?format=csv|json` has no MCP tool: an
        agent pages the same rows through the cursor on `query_installed_software`,
        and a bulk file is a human/automation convenience. **Revisit by
        2026-11-07.**
      - **The raw route's `q`, `kind`, `ecosystem` and `source` filters are
-       REST-only (`#ISSUE-ADR1005`).** `query_installed_software` takes `name`,
+       REST-only (`#5699`).** `query_installed_software` takes `name`,
        `agent_id`, `version`, `limit` and `cursor` only; the parity ledger row
        stays `twinned` on the paged shape and the gap is recorded in
        `docs/api-parity-ledger.md`. **Revisit by 2026-11-07.**
