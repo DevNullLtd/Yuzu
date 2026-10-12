@@ -108,8 +108,9 @@ Three refinements from the grill-with-docs session that fixed the author-facing 
   `ca_store`); all-caps acronyms are **forbidden** in store class names so the mapping stays
   one-to-one. The `PgMigrationRunner` identifier regex / reserved-name check is unchanged and
   remains the runtime backstop. The one shipped schema that predates this rule, `endpoint_state`,
-  is **renamed to `offline_endpoint_store`** (implementation follow-up; safe pre-alpha — its data
-  reconstructs from heartbeats).
+  is **renamed to `offline_endpoint_store`** (implementation follow-up; safe pre-alpha — a connected
+  agent's identity fields reconstruct from its next heartbeat; a departed device's last-seen history
+  does not, since #5678 retains it for the offline roster).
 
   **Extension (2026-08-28, ADR-0062) — non-`*Store`-suffixed classes.** The 7-component "Wave 4"
   ladder blind spot found 2026-08-27 (`docs/postgres-migration-ladder.md`) includes components

@@ -267,10 +267,11 @@ TEST_CASE("HA WS-5: a graceful disconnect's remove_if_session prevents zero-mono
     CHECK_FALSE(contains(*matched, "departed-agent"));
 
     // #5678: the clear keeps the roster row (so /hardware lists the device
-    // offline), but the online population is all_ids() ∩ roster — a departed
-    // row can never count as online. Neither /hardware's online set nor
-    // DexFleet.windows_online reads through live_presence(), so its 3 s cache
-    // is not in this path.
+    // offline), but the online population is all_ids() ∩ roster, and all_ids()
+    // is local sessions plus cached durable presence (live_presence(), <= 3 s
+    // kPresenceCacheTtl). The cleared row is excluded from presence, so a
+    // departed device is not online once that cache refreshes; the cache is
+    // unpopulated in this test, so all_ids() excludes it outright.
     bool on_roster = false;
     const auto roster = store.query_stale_within(std::chrono::hours(1));
     REQUIRE(roster.has_value()); // #5531: the roster read is typed
@@ -283,7 +284,7 @@ TEST_CASE("HA WS-5: a graceful disconnect's remove_if_session prevents zero-mono
 // External review hardening (2026-09-22, @Doomgoose) — 3 more BLOCKING bugs
 // in the same "silently narrower dispatch target set" class, found after the
 // first governance round. Direct coverage for the two AgentRegistry-level
-// fixes (has_any_reachable, remove_agent_if_session's gated durable delete);
+// fixes (has_any_reachable, remove_agent_if_session's gated durable presence clear);
 // forward_legacy_command's route_unreadable branch fix is HTTP-handler-level
 // and shares the same already-tested dispatch_confined_arms machinery, so is
 // not independently re-tested here.
@@ -338,11 +339,11 @@ TEST_CASE("HA WS-5: remove_agent_if_session reports whether it removed the CURRE
     }
 
     SECTION("a stale/mismatched session_id no-ops and returns false — "
-            "the exact case the durable-presence-delete gate depends on") {
+            "the exact case the durable-presence-clear gate depends on") {
         // Simulates: agent-x reconnects under a NEW session (sess-2) on the
         // SAME replica before sess-1's disconnect handler runs. sess-1's
         // late cleanup must not report "removed" (which would otherwise
-        // trigger a durable presence delete for a still-live agent).
+        // trigger a durable presence clear for a still-live agent).
         (void)registry.register_agent(make_agent_info("agent-x", "linux", "host-x"));
         registry.map_session("sess-2", "agent-x");
 

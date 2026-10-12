@@ -9,6 +9,11 @@
 // (OfflineEndpointStore::remove_if_session); the row stays for the offline
 // /hardware roster (#5678). Gate rationale: AgentRegistry::remove_agent_if_session
 // doc, agent_registry.hpp.
+//
+// Returns true only when the durable session was actually cleared: the gate was
+// open, a store is wired, and remove_if_session matched the stored session. A
+// false return (gate closed, no store, session mismatch or a best-effort store
+// failure) is never an error the caller must act on.
 
 #include <string_view>
 

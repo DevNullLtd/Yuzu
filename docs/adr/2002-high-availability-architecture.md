@@ -1952,7 +1952,8 @@ is counted under route-store failure op `session_lookup`.
   directory verified at `ProxyRegister`, which is sound only for a single replica; see "Deferred, not
   silent"); otherwise it is refused and counted
   `notify_stream_status/connected_unverified`. DISCONNECTED proceeds on the local-map check when the
-  directory read fails (it is a teardown, not an admission), and its presence-row delete (#5678: now a session clear; the row is kept for the roster) is gated on
+  directory read fails (it is a teardown, not an admission), and its presence-row delete (#5678: now
+  a session clear; the row is kept for the roster) is gated on
   `removed_current_session || store_removed`. A CONNECTED on a replica with a directory row but no
   local `AgentSession` skips the registry `set_gateway_route`/unpublish (nothing local to update) and
   still announces.
@@ -1962,14 +1963,15 @@ is counted under route-store failure op `session_lookup`.
   A graceful disconnect (`remove_if_session`) clears ONLY the row's `session_id` (session-guarded
   `UPDATE`, #5678); `hostname` and the other fields survive so the offline-inclusive `/hardware`
   roster keeps listing the device with its real last-seen time. Rows are aged out by a clock-guarded
-  hourly per-replica prune (`pg::run_clock_guarded_prune` on `preflight_runner_thread_`: 37 d = the
-  30 d roster window + a 7 d margin, capped at 1000 rows per pass, advisory-locked) (#5678, 2026-10-12).
+  hourly per-replica prune (`pg::run_clock_guarded_prune` on `preflight_runner_thread_`, keyed on the
+  PG-authored `last_seen_at`: 37 d = the 30 d roster window + a 7 d margin, advisory-locked, up to 12
+  passes of 1000 rows per hourly tick) (#5678, 2026-10-12).
   Recorded gap (pre-existing, not introduced here): `OfflineEndpointStore` has no `delete_agent` and
   is not a member of the decommission cascade (`AgentDecommissionStores`), so a decommissioned
   agent's `endpoint_state.endpoints` row (including its `hostname`) persists until that prune
   removes it, up to 37 d after its last heartbeat (#5678, 2026-10-12); an explicit delete needs the
-  decommission-cascade item (#5682). Reads filter by TTL or stale window, so the row is invisible to
-  scope evaluation and `/viz` once stale. `HeartbeatIngestion::ingest` takes the resolved session id,
+  decommission-cascade item (#5682). Reads filter by TTL or stale window, so a departed row is flagged
+  stale on `/viz` for 7 days and is invisible to scope evaluation. `HeartbeatIngestion::ingest` takes the resolved session id,
   so a heartbeat on a non-owning replica (no local `AgentSession`) cannot blank the presence row's
   `session_id`.
 

@@ -31,8 +31,9 @@ constexpr std::chrono::milliseconds kQueryAcquireTimeout{2000};
 // Retention-prune guard constants (#5678 / #1545 UP-4; see run_retention_prune).
 // big step floor 7 d: the prune runs hourly per replica, and a weekend/holiday
 // shutdown of a lab server must not decline — 7 d is still far below the 37 d
-// window. Implausibility 1 d: last_heartbeat_ms is PAST-dated, so only a small
-// forward skew is tolerated in the would-wipe denominator.
+// window. Implausibility 1 d: the prune keys on last_seen_at (PG-authored, so
+// never future-dated), and only a small forward skew is tolerated in the
+// would-wipe denominator.
 constexpr std::int64_t kPruneBigStepFloorMs = 7LL * 24 * 3600 * 1000;
 constexpr std::int64_t kPruneImplausibilityMs = 24LL * 3600 * 1000;
 constexpr std::int64_t kPruneMinPlausibleMs = 946'684'800'000LL; // 2000-01-01
@@ -157,7 +158,10 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
     // a LIVE agent keeps its stored session_id, so it stays present. A blank
     // session on a NEW or just-departed row leaves session_id '' — the agent is
     // NOT present (query_live_ids requires a non-blank session_id) until a
-    // session-carrying heartbeat; the accepted fail-closed residual.
+    // session-carrying heartbeat; the accepted fail-closed residual. The same
+    // holds for a departed gateway agent that reconnects through a replica whose
+    // session-directory lookup is degraded: it stays absent from presence for
+    // the duration of the degradation.
     // last_seen_at is PG-authored (`now()` in-SQL, never the replica's
     // `system_clock` — the #3715 precedent) on every call, whether the row is
     // new or existing.
@@ -287,13 +291,19 @@ int OfflineEndpointStore::run_retention_prune(std::chrono::seconds roster_window
     // Decline: a device's last-seen evidence is non-regenerable, so a
     // from-boot skewed clock must not delete it (preflight_run_store's answer).
     // Window, clock domains and cadence: docs/clock-guarded-retention.md register row.
+    // The timestamp is last_seen_at (PG now() on every upsert), NOT the roster's
+    // replica-authored last_heartbeat_ms: column and cutoff then share the PG
+    // clock domain, so a lagging or future-stamped replica clock can neither
+    // expire a live row nor make a dead one immortal. The epoch-ms expression
+    // cannot use endpoints_last_seen_idx (hourly seq scan over a fleet-bounded
+    // table, bounded by the pool's statement_timeout).
     const auto window_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(roster_window + kPruneMargin)
             .count();
     const pg::ClockGuardedPruneSpec spec{
         .store_label = kStoreName,
         .target_table = "endpoint_state.endpoints",
-        .ts_column = "last_heartbeat_ms",
+        .ts_column = "(EXTRACT(EPOCH FROM last_seen_at)*1000)::bigint",
         .now_expr = "(EXTRACT(EPOCH FROM now())*1000)::bigint",
         .meta_table = "endpoint_state.retention_meta",
         .anchor_key = "endpoints_prune_last_pass_now",

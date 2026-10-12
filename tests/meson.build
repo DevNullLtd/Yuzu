@@ -3358,10 +3358,12 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
 # agent_service_impl.cpp, gateway DISCONNECTED in gateway_service_impl.cpp) mirror a departure into
 # durable presence only through mirror_departure_to_presence() with the real gate; the direct path
 # has no unit harness (bidi stream). Carries its own in-memory mutation self-test. No build required.
+# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
+# no-build gate labelled 'server' fails that check on the Windows legs (see the gateway-upstream gate below).
 test('presence departure wiring lexical gate (#5678)',
   _python3_test,
   args: [files('test_presence_departure_wiring_lexical.py')],
-  suite: 'server',
+  suite: 'docs',
   timeout: 30,
 )
 

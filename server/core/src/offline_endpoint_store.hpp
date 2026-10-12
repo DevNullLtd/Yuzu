@@ -117,8 +117,10 @@ public:
     static constexpr int kQueryRowCap = 100000;
 
     /// #5678 / #1545 UP-4 endpoint prune: rows are deleted only once unseen for
-    /// the roster read window PLUS this margin, so a prune cutoff can reach a
-    /// roster-visible row only under >7 d replica/PG clock disagreement.
+    /// the roster read window PLUS this margin. The prune keys on the PG-authored
+    /// `last_seen_at`; the roster still reads the replica-authored
+    /// `last_heartbeat_ms`, so a cutoff can reach a roster-visible row only under
+    /// >7 d replica/PG clock disagreement.
     static constexpr std::chrono::hours kPruneMargin{24 * 7};
     /// Per-replica, per-pass delete cap (must stay > 0 or every pass is a no-op).
     static constexpr int kPruneCapPerPass = 1000;
@@ -168,7 +170,9 @@ public:
     /// heartbeat on a LIVE agent keeps its stored session and stays present. A
     /// blank session on a NEW or just-departed row leaves it blank, so the
     /// agent is not present (see query_live_ids) until a session-carrying
-    /// heartbeat arrives.
+    /// heartbeat arrives — including a departed gateway agent that reconnects
+    /// through a replica with a degraded session-directory lookup, for the
+    /// duration of the degradation.
     bool upsert(std::string_view agent_id, std::string_view hostname, std::string_view os,
                 std::int64_t last_heartbeat_ms, std::int64_t agent_ts,
                 std::string_view agent_version = {}, std::string_view arch = {},
@@ -198,7 +202,9 @@ public:
     /// for kPresenceCacheTtl (3 s) and disconnect does not invalidate that
     /// cache, so a replica's scope evaluation can still see a departed agent
     /// for up to 3 s — unchanged from the pre-#5678 DELETE, which left the
-    /// deleted row cached the same 3 s.
+    /// deleted row cached the same 3 s. The same cache feeds /hardware's
+    /// `online` flag (AgentRegistry::all_ids() = local sessions UNION cached
+    /// durable presence), so the same <= 3 s applies there.
     ///
     /// #4981 PR-1 (Finding B): type-distinguishable — `std::unexpected` on a
     /// genuine read failure (`StoreUnavailable`: no connection in time;

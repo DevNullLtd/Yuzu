@@ -3392,10 +3392,11 @@ TEST_CASE("WS-5 NotifyStreamStatus: a superseded session is refused CONNECTED an
     REQUIRE(after_disc->has_value());
     CHECK((*after_disc)->session_id == winner);
     CHECK(offline_row_present(offline, agent));
+    CHECK(live_present(offline, agent)); // the stale DISCONNECTED must not clear the winner's presence
     CHECK_FALSE(owner.registry.get_session(agent));
 }
 
-TEST_CASE("WS-5 NotifyStreamStatus: the presence delete gate honours each half separately",
+TEST_CASE("WS-5 NotifyStreamStatus: the presence clear gate honours each half separately",
           "[pg][gateway_route_wiring][ws5]") {
     YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
     BatchHbFixture owner(db.dsn());
@@ -3433,6 +3434,7 @@ TEST_CASE("WS-5 NotifyStreamStatus: the presence delete gate honours each half s
         CHECK(notify(owner.svc, agent, sid, gw::StreamStatusNotification::DISCONNECTED));
         CHECK(owner.desync("deregister", "session_mismatch") == 1);
         CHECK(offline_row_present(offline, agent));
+        CHECK(live_present(offline, agent)); // neither half fired: presence is untouched
     }
 }
 

@@ -43,7 +43,7 @@
 /// `command_capability.hpp` ExecuteGate precedent): all FencedLeaderOnly and
 /// DisabledUntilFixed passes (schedule/policy/quarantine dispatch, ca.publish_crl,
 /// nvd_sync, the concurrency reconciler), plus the load-bearing ReplicaSafe ones —
-/// the event-outbox poll, the three retention prunes, the app_perf rollup upsert,
+/// the event-outbox poll, the four retention prunes, the app_perf rollup upsert,
 /// and the MUST-run-per-replica / shared-PG-writing passes found by the sweep
 /// (cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
 /// projector, MCP bridge sweep + session gc, store-worker delivery pools, the

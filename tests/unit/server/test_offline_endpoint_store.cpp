@@ -332,6 +332,15 @@ TEST_CASE("OfflineEndpointStore HA WS-5 presence", "[pg][offline]") {
     }
 }
 
+// Raw SQL on the store's table, for fixtures the public API cannot express:
+// last_seen_at is PG-authored on every upsert, so ageing a row means rewriting it.
+static void exec_sql(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    REQUIRE(r.ok());
+}
+
 TEST_CASE("OfflineEndpointStore run_retention_prune deletes only rows past roster+margin",
           "[pg][offline][retention-guard]") {
     YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
@@ -340,11 +349,17 @@ TEST_CASE("OfflineEndpointStore run_retention_prune deletes only rows past roste
     OfflineEndpointStore store{pool};
     REQUIRE(store.is_open());
 
-    constexpr std::int64_t kDayMs = 24LL * 3600 * 1000;
     const auto t = now_ms();
-    REQUIRE(store.upsert("prune-a", "h", "linux", t - 40 * kDayMs, 0, "", "", "s")); // past 37 d
-    REQUIRE(store.upsert("prune-b", "h", "linux", t - 31 * kDayMs, 0, "", "", "s")); // in margin
-    REQUIRE(store.upsert("prune-c", "h", "linux", t - 10 * kDayMs, 0, "", "", "s"));
+    REQUIRE(store.upsert("prune-a", "h", "linux", t, 0, "", "", "s"));
+    REQUIRE(store.upsert("prune-b", "h", "linux", t, 0, "", "", "s"));
+    REQUIRE(store.upsert("prune-c", "h", "linux", t, 0, "", "", "s"));
+    // The prune keys on the PG-authored last_seen_at, so age the rows there.
+    exec_sql(db.dsn(), "UPDATE endpoint_state.endpoints SET last_seen_at = now() - interval "
+                       "'40 days' WHERE agent_id = 'prune-a'"); // past 37 d
+    exec_sql(db.dsn(), "UPDATE endpoint_state.endpoints SET last_seen_at = now() - interval "
+                       "'31 days' WHERE agent_id = 'prune-b'"); // in margin
+    exec_sql(db.dsn(), "UPDATE endpoint_state.endpoints SET last_seen_at = now() - interval "
+                       "'10 days' WHERE agent_id = 'prune-c'");
 
     const auto window = std::chrono::hours(24 * 30);
     // Part-6 Decline: the first pass on a store with data and no persisted
@@ -355,6 +370,66 @@ TEST_CASE("OfflineEndpointStore run_retention_prune deletes only rows past roste
     CHECK(find(rows, "prune-a") == nullptr);
     CHECK(find(rows, "prune-b") != nullptr);
     CHECK(find(rows, "prune-c") != nullptr);
+}
+
+// The prune clock is PG's last_seen_at, never the replica-authored
+// last_heartbeat_ms the roster reads (gov GV-2): a lagging replica clock cannot
+// expire a live row, and a future-stamped one cannot make a dead row immortal.
+TEST_CASE("OfflineEndpointStore run_retention_prune keys on last_seen_at, not last_heartbeat_ms",
+          "[pg][offline][retention-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    constexpr std::int64_t kDayMs = 24LL * 3600 * 1000;
+    const auto t = now_ms();
+    // A: live agent whose replica clock lags 60 d; last_seen_at is fresh -> survives.
+    REQUIRE(store.upsert("ch-a", "h", "linux", t - 60 * kDayMs, 0, "", "", "s"));
+    // B: departed 2 d ago -> survives.
+    REQUIRE(store.upsert("ch-b", "h", "linux", t, 0, "", "", "s"));
+    // C: unseen 40 d -> deleted.
+    REQUIRE(store.upsert("ch-c", "h", "linux", t, 0, "", "", "s"));
+    // D: replica clock 90 d AHEAD, unseen 40 d -> deleted (not immortal).
+    REQUIRE(store.upsert("ch-d", "h", "linux", t + 90 * kDayMs, 0, "", "", "s"));
+    exec_sql(db.dsn(), "UPDATE endpoint_state.endpoints SET last_seen_at = now() - interval "
+                       "'2 days' WHERE agent_id = 'ch-b'");
+    exec_sql(db.dsn(), "UPDATE endpoint_state.endpoints SET last_seen_at = now() - interval "
+                       "'40 days' WHERE agent_id IN ('ch-c', 'ch-d')");
+
+    const auto window = std::chrono::hours(24 * 30);
+    CHECK(store.run_retention_prune(window) == 0); // bootstrap decline settles the anchor
+    CHECK(store.run_retention_prune(window) == 2);
+    auto rows = stale_ok(store, std::chrono::hours(24 * 120));
+    CHECK(find(rows, "ch-a") != nullptr);
+    CHECK(find(rows, "ch-b") != nullptr);
+    CHECK(find(rows, "ch-c") == nullptr);
+    CHECK(find(rows, "ch-d") == nullptr);
+}
+
+// The server's drain loop re-arms only while a pass returns exactly the cap, so
+// the store must return kPruneCapPerPass when more expired rows remain (GV-17).
+TEST_CASE("OfflineEndpointStore run_retention_prune returns the cap while more rows remain",
+          "[pg][offline][retention-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    // One fresh survivor (else the would-wipe decline fires) + cap+1 expired rows.
+    REQUIRE(store.upsert("cap-live", "h", "linux", now_ms(), 0, "", "", "s"));
+    exec_sql(db.dsn(),
+             "INSERT INTO endpoint_state.endpoints (agent_id, last_heartbeat_ms, last_seen_at) "
+             "SELECT 'cap-' || g, 0, now() - interval '40 days' FROM generate_series(1, " +
+                 std::to_string(OfflineEndpointStore::kPruneCapPerPass + 1) + ") g");
+
+    const auto window = std::chrono::hours(24 * 30);
+    CHECK(store.run_retention_prune(window) == 0); // bootstrap decline
+    CHECK(store.run_retention_prune(window) == OfflineEndpointStore::kPruneCapPerPass);
+    CHECK(store.run_retention_prune(window) == 1);
+    CHECK(store.run_retention_prune(window) == 0);
 }
 
 // gov fjarvis B1: a reachable database whose schema migration FAILS must leave
