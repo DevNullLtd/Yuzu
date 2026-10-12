@@ -1,7 +1,7 @@
 /**
  * test_shares_posix_fs.cpp -- the REAL make_posix_fs binding over a TempDir: the no-follow
  * reads, the bounded exports.d listing, dir-fd confinement and the lstat directory probe,
- * exercised through the same Paths struct the Linux and macOS legs use. POSIX only; the body
+ * exercised through the same Paths struct the Linux leg uses. POSIX only; the body
  * is compiled out on Windows (the registration is unconditional).
  *
  * Provenance: every file is written by the test (a SYNTHETIC tree); the stock-file rows in

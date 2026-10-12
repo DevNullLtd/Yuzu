@@ -13,9 +13,8 @@
 /// `RbacStore` `types[]`/`ops[]` entry; none is minted here.
 ///
 /// `list` is ReadOnly/None. The Linux leg reads /etc/exports, /etc/exports.d/*.exports and
-/// /etc/samba/smb.conf with bounded no-follow reads plus one lstat; the macOS leg runs one
-/// bounded, fixed-argv `sharing -l -f json` and reads /etc/exports. The Windows leg is a
-/// PLANNED placeholder that reads nothing. No leg touches the network, takes an
+/// /etc/samba/smb.conf with bounded no-follow reads plus one lstat; the macOS and Windows
+/// legs are PLANNED placeholders that read nothing. No leg touches the network, takes an
 /// operator-supplied argument, emits an ACL or an NFS client host list, or changes host
 /// state: the action reports which shares the host is configured to serve as a FACT. Share
 /// names and paths can embed account names; that is disclosed in the README and definition.

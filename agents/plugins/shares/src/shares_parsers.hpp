@@ -5,10 +5,8 @@
 // every host; no file I/O, no subprocess, no OS header.
 //
 //   parse_exports       Linux exports(5) grammar (/etc/exports, /etc/exports.d/*.exports)
-//   parse_bsd_exports   BSD/macOS exports(5) grammar (/etc/exports read by macOS nfsd)
 //   parse_smb_conf      Samba smb.conf: share sections, synonyms, `copy =` and [global]
 //                       inheritance, plus detection of the parts this plugin does not read
-//   parse_sharing_json  macOS `sharing -l -f json`
 //
 // NAMES AND PATHS ONLY, NEVER ACLs. NFS client host lists are never emitted: a share carries
 // `clients_<n>` and an `anonymous` flag only. Every parser charges a caller-owned
@@ -21,8 +19,6 @@
 #include <row_byte_budget.hpp>
 #include <wire_utf8.hpp>
 #include <yuzu/string_utils.hpp>
-
-#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -45,9 +41,6 @@ inline constexpr std::size_t kMaxFieldBytes = 4096;
 /// Fixed per-share cost charged on top of the field bytes, so a flood of empty shares is
 /// bounded by the byte budget as well as the row budget.
 inline constexpr std::size_t kRowOverhead = 64;
-/// What `sharing -l -f json` prints (not JSON) when no share point exists. Taken from the
-/// binary's string table, not a live run.
-inline constexpr std::string_view kNoSharePoints = "No share point records.";
 
 struct Share {
     Proto proto = Proto::nfs;
@@ -55,7 +48,7 @@ struct Share {
     std::string path;
     Access access = Access::unknown;
     std::optional<bool> anonymous;
-    std::vector<std::string> flags; ///< closed vocabulary: hidden, unavailable, special, sealed, no_root_squash, clients_<n>
+    std::vector<std::string> flags; ///< closed vocabulary: hidden, unavailable, special, no_root_squash, clients_<n>
     std::string source;
 };
 
@@ -420,109 +413,6 @@ inline void parse_exports(std::string_view text, std::string_view source,
 }
 
 // ---------------------------------------------------------------------------
-// BSD / macOS exports(5)
-// ---------------------------------------------------------------------------
-
-/// BSD exports(5) as read by macOS nfsd (man exports, macOS 26.6): `<path>... [-opts]
-/// [hosts | -network net [-mask mask]]`. Leading tokens that start with `/` or a quote are
-/// the exported paths (one share each); `-ro`/`-o` is read-only (default rw), `-offline`
-/// flags the share unavailable, `-network`/`-mask` take the next token unless written
-/// `-network=...` (a `-network` with no value is not a client), `-maproot=`/`-mapall=` naming
-/// `root` or `0` raises `no_root_squash`; every other `-option` (alldirs, sec, ...) is
-/// ignored; remaining tokens are hosts or netgroups and are only COUNTED. No host and no
-/// network, or a zero network with no mask or a zero mask, means the share is exported to the
-/// world (anonymous).
-inline void parse_bsd_exports(std::string_view text, std::string_view source,
-                              yuzu::shared::RowByteBudget& budget, ExportsParse& out) {
-    detail::for_each_logical_line(text, [&](std::string_view line) {
-        std::size_t i = 0;
-        std::vector<std::string> paths;
-        for (;;) {
-            detail::skip_ws(line, i);
-            if (i >= line.size() || (line[i] != '/' && line[i] != '"' && line[i] != '\''))
-                break;
-            auto p = detail::next_token(line, i).text;
-            if (p.empty() || p[0] != '/') // exported paths are absolute: stop the path list
-                break;
-            paths.push_back(std::move(p));
-        }
-        if (paths.empty())
-            return true;
-        bool ro = false, offline = false, root = false, world = false;
-        std::size_t clients = 0;
-        std::string network, mask;
-        const auto flush_network = [&] { // judges the network (and its mask) read so far
-            if (network.empty())
-                return;
-            std::string spec = network;
-            if (!mask.empty() && !detail::is_zero_addr(mask))
-                spec += '/' + mask;
-            else if (detail::is_zero_addr(network))
-                spec += "/0"; // a zero network with no mask or a zero mask is the world
-            world = world || detail::is_world_client(spec);
-            network.clear();
-            mask.clear();
-        };
-        for (;;) {
-            detail::skip_ws(line, i);
-            if (i >= line.size() || line[i] == '#')
-                break;
-            const auto t = detail::next_token(line, i);
-            if (!t.quoted && t.text.size() > 1 && t.text[0] == '-') {
-                const auto eq = t.text.find('=');
-                const std::string name = t.text.substr(1, eq == std::string::npos ? eq : eq - 1);
-                if (name == "ro" || name == "o") {
-                    ro = true;
-                } else if (name == "offline") {
-                    offline = true;
-                } else if (name == "maproot" || name == "mapall") {
-                    // `-maproot=user[:group]`: naming root (or uid 0) leaves root unsquashed;
-                    // `-mapall=root` makes every client root.
-                    if (eq != std::string::npos) {
-                        const auto v = std::string_view{t.text}.substr(eq + 1);
-                        const auto user = v.substr(0, v.find(':'));
-                        root = root || user == "root" || user == "0";
-                    }
-                } else if (name == "network" || name == "mask") {
-                    std::string v; // the value: `=...` or the next token
-                    if (eq != std::string::npos) {
-                        v = t.text.substr(eq + 1);
-                    } else {
-                        detail::skip_ws(line, i);
-                        if (i < line.size())
-                            v = detail::next_token(line, i).text;
-                    }
-                    if (name == "network") {
-                        flush_network();
-                        if (!v.empty()) {
-                            ++clients; // a client only when a value was read
-                            network = std::move(v);
-                        }
-                    } else {
-                        mask = std::move(v);
-                    }
-                }
-            } else if (!t.text.empty()) {
-                ++clients;
-            }
-        }
-        flush_network();
-        for (const auto& p : paths) {
-            std::vector<std::string> flags;
-            if (offline)
-                flags.emplace_back("unavailable");
-            if (root)
-                flags.emplace_back("no_root_squash");
-            flags.emplace_back("clients_" + std::to_string(clients));
-            if (!detail::emit_nfs_share(out, budget, source, p, ro ? Access::ro : Access::rw,
-                                        clients == 0 || world, std::move(flags)))
-                return false;
-        }
-        return true;
-    });
-}
-
-// ---------------------------------------------------------------------------
 // Samba smb.conf
 // ---------------------------------------------------------------------------
 
@@ -713,80 +603,6 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
 }
 
 // ---------------------------------------------------------------------------
-// macOS `sharing -l -f json`
-// ---------------------------------------------------------------------------
-
-struct SharingParse {
-    std::vector<Share> shares;
-    bool recognised = false;
-    std::size_t malformed_records = 0;
-    bool truncated = false;
-    bool field_oversized = false;
-};
-
-namespace detail {
-
-inline std::optional<long long> json_flag(const nlohmann::json& rec, const char* key) {
-    const auto it = rec.find(key);
-    if (it == rec.end())
-        return std::nullopt;
-    if (it->is_boolean())
-        return it->get<bool>() ? 1 : 0;
-    if (it->is_number_integer())
-        return it->get<long long>();
-    return std::nullopt;
-}
-
-} // namespace detail
-
-/// Whitespace-only text, `No share point records.` (what the tool prints when none exists) or
-/// `{}` is a recognised empty list; anything else that is not a JSON object is unrecognised. Each entry must be an object carrying a string `path`, else it
-/// is counted in malformed_records and skipped (valid siblings are still emitted).
-inline SharingParse parse_sharing_json(std::string_view text, yuzu::shared::RowByteBudget& budget) {
-    SharingParse out;
-    if (text.find_first_not_of(" \t\r\n") == std::string_view::npos ||
-        yuzu::shared::ini_trim(text) == kNoSharePoints) {
-        out.recognised = true;
-        return out;
-    }
-    const auto j = nlohmann::json::parse(text.begin(), text.end(), nullptr, false);
-    if (j.is_discarded() || !j.is_object())
-        return out;
-    out.recognised = true;
-    for (const auto& [key, rec] : j.items()) {
-        if (!rec.is_object() || !rec.contains("path") || !rec["path"].is_string()) {
-            ++out.malformed_records;
-            continue;
-        }
-        const std::string& path = rec["path"].get_ref<const std::string&>();
-        std::string_view name = key;
-        if (const auto n = rec.find("smb_name"); n != rec.end() && n->is_string())
-            name = n->get_ref<const std::string&>();
-        Share s;
-        s.proto = Proto::smb;
-        s.source = "sharing";
-        if (const auto v = detail::json_flag(rec, "smb_shared"); v && *v == 0)
-            s.flags.emplace_back("unavailable");
-        if (const auto v = detail::json_flag(rec, "smb_sealed"); v && *v == 1)
-            s.flags.emplace_back("sealed");
-        if (!detail::charge_share(budget, name.size(), path.size(), detail::flags_bytes(s.flags))) {
-            out.truncated = true;
-            break;
-        }
-        s.name = detail::cut(name, out.field_oversized);
-        s.path = detail::cut(path, out.field_oversized);
-        if (const auto v = detail::json_flag(rec, "smb_read_only"); v && *v == 1)
-            s.access = Access::ro;
-        else if (v && *v == 0)
-            s.access = Access::rw;
-        if (const auto v = detail::json_flag(rec, "smb_guest_access"); v && (*v == 0 || *v == 1))
-            s.anonymous = *v == 1;
-        out.shares.push_back(std::move(s));
-    }
-    return out;
-}
-
-// ---------------------------------------------------------------------------
 // Row formatters
 // ---------------------------------------------------------------------------
 
@@ -826,7 +642,7 @@ inline SharingParse parse_sharing_json(std::string_view text, yuzu::shared::RowB
     return r;
 }
 
-/// `source|<exports|exports_d|smb_conf|sharing>|<state>|<share count or ->`
+/// `source|<exports|exports_d|smb_conf>|<state>|<share count or ->`
 [[nodiscard]] inline std::string source_row(std::string_view kind, SourceState state,
                                             std::optional<std::size_t> count = std::nullopt) {
     std::string r = "source|";

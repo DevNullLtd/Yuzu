@@ -1,8 +1,8 @@
 /**
  * shares_posix_fs.hpp -- the POSIX shell for the shares plugin's file reads: binds the
  * no-follow primitives of agents/shared/posix_secure_read.hpp to the LinuxFs boundary that
- * `list_linux` / `list_macos` decide over. Parameterised on Paths so the real binding is
- * unit-tested under a TempDir on Linux AND macOS.
+ * `list_linux` decides over. Parameterised on Paths so the real binding is unit-tested under
+ * a TempDir on any POSIX host.
  *
  * Reads are bounded (kFileCap) and never follow a symlink leaf; the exports.d directory is
  * opened per listing with O_NOFOLLOW|O_DIRECTORY and every snippet is then read through THAT
@@ -59,7 +59,7 @@ inline FileReadLike to_read_like(yuzu::shared::FileRead&& r) {
     return out;
 }
 
-/// Bounded no-follow read of one regular file (the LinuxFs / list_macos `read` boundary).
+/// Bounded no-follow read of one regular file (the LinuxFs `read` boundary).
 inline FileReadLike read_no_follow(const std::string& path) {
     return to_read_like(yuzu::shared::read_file_no_follow(path, kFileCap));
 }
@@ -76,7 +76,7 @@ inline LinuxFs make_posix_fs(const Paths& p) {
                          cap = p.max_dir_entries](std::vector<std::string>& names, bool& too_many) {
         *dir = yuzu::shared::open_dir_no_follow(path);
         if (!dir->opened()) {
-            // A symlinked exports.d answers ENOTDIR on both Linux and macOS.
+            // A symlinked exports.d answers ENOTDIR (O_NOFOLLOW|O_DIRECTORY), not ELOOP.
             return dir->err != 0 ? dir->err : EIO;
         }
         const auto w = yuzu::shared::walk_dir_capped(dir->dir.get(), cap, [&](const dirent* e) {

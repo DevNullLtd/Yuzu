@@ -566,8 +566,8 @@ agent_test_exe = executable(
     'unit/test_mgmt_posture_parsers.cpp',           # mgmt_posture: pure sssd/ipa/profiles parsers, plane classifier, row formatters; portable
     'unit/test_mgmt_posture_legs.cpp',              # mgmt_posture: OS-free posture_linux/posture_macos decision seams over injected fakes; portable
     'unit/test_mgmt_posture_local_dispatcher.cpp',  # mgmt_posture: real plugin via LocalDispatcher + execute seam, unguarded on every OS
-    'unit/test_shares_parsers.cpp',                 # shares: pure exports/smb.conf/sharing-json parsers + row formatters over labelled fixtures; portable
-    'unit/test_shares_legs.cpp',                    # shares: OS-free list_linux/list_macos decision seams over injected fakes; portable
+    'unit/test_shares_parsers.cpp',                 # shares: pure exports/smb.conf parsers + row formatters over labelled fixtures; portable
+    'unit/test_shares_legs.cpp',                    # shares: OS-free list_linux decision seam over injected fakes; portable
     'unit/test_shares_posix_fs.cpp',                # shares: the real POSIX fs binding under a TempDir (symlink/FIFO/cap/dirfd); body #if !defined(_WIN32)
     'unit/test_shares_local_dispatcher.cpp',        # shares: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_firmware_posture_parsers.cpp',           # Wave 8 PR8.4: pure SMBIOS/DMI/fwupd/IODeviceTree decoders over REAL CAPTURE fixtures

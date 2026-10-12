@@ -5,7 +5,7 @@
  *   "list" -- the shares this host is CONFIGURED to serve, names and paths only:
  *               Linux   /etc/exports, the /etc/exports.d snippets (*.exports) and
  *                       /etc/samba/smb.conf (bounded no-follow file reads);
- *               macOS   SMB share points via `sharing -l -f json` plus /etc/exports;
+ *               macOS   PLANNED (share points plus /etc/exports; not read yet);
  *               Windows PLANNED (NetShareEnum; not read yet).
  *
  * READ-ONLY and FACTS ONLY. Configured shares as written, not live nfsd/smbd state; ACLs,
@@ -37,18 +37,16 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "include= files and usershares are not read (constrained token); a symlinked config "
          "file or exports.d is refused"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 2,
-         "subprocess_runner:/usr/sbin/sharing -l -f json plus a bounded no-follow read of "
-         "/etc/exports (BSD syntax)",
-         "SMB share points from sharing(8) and NFS exports as configured in /etc/exports; the "
-         "sharepoints dslocal node is not read"},
+        {YUZU_SUPPORT_PLANNED, 2, "share-point listing plus /etc/exports (BSD syntax)",
+         "not read yet: one unsupported status row, macos:planned"},
         /* .windows_leg = */
         {YUZU_SUPPORT_PLANNED, 1, "NetShareEnum level 2 (netapi32)",
          "not read yet: one unsupported status row, windows:planned"},
     },
 };
 
-// This build's leg and its exception token, defined together.
+// This build's leg and its exception token, defined together. The macOS and Windows legs are
+// the PLANNED placeholders.
 #if defined(_WIN32)
 constexpr yuzu::shares::LegFn kLeg = &yuzu::shares::run_windows;
 constexpr const char* kLegExceptionToken = "windows:leg:exception";
@@ -90,9 +88,8 @@ public:
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        // Every failure-token literal matches ^(windows|macos|linux|subprocess_runner):[a-z0-9_]+
-        // (:[a-z0-9_]+)*$ (subprocess_runner:* come from the shared runner classifier); the body
-        // is execute_list.
+        // Every failure-token literal matches ^(windows|macos|linux):[a-z0-9_]+(:[a-z0-9_]+)*$;
+        // the body is execute_list.
         return yuzu::shares::execute_list(ctx, action, kLeg, kLegExceptionToken);
     }
 };

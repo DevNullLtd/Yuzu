@@ -137,8 +137,7 @@ int seam_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /
     return yuzu::shares::execute_list(ctx, action, Leg, "linux:leg:exception");
 }
 
-
-
+#if !defined(_WIN32) && !defined(__APPLE__) // the planned legs emit no share rows
 bool share_row_is_wellformed(const std::string& row) {
     std::size_t pipes = 0;
     for (std::size_t i = 0; i < row.size(); ++i)
@@ -163,8 +162,9 @@ bool share_row_is_wellformed(const std::string& row) {
         return std::ranges::any_of(set, [&](const char* s) { return v == s; });
     };
     return f[0] == "share" && in(f[1], {"nfs", "smb"}) && in(f[4], {"ro", "rw", "mixed", "-"}) &&
-           in(f[5], {"true", "false", "-"}) && in(f[7], {"exports", "exports_d", "smb_conf", "sharing"});
+           in(f[5], {"true", "false", "-"}) && in(f[7], {"exports", "exports_d", "smb_conf"});
 }
+#endif
 
 } // namespace
 
@@ -216,26 +216,23 @@ TEST_CASE("shares plugin: status row first, source rows next, then well-formed s
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
     }
 
+#if defined(_WIN32) || defined(__APPLE__)
+    // PLANNED leg (Windows and macOS): exactly one row and UNAVAILABLE/UNKNOWN.
+    // MUTATION: wiring any read here changes this row.
 #if defined(_WIN32)
-    // PLANNED leg: exactly one row and UNAVAILABLE/UNKNOWN.
-    // MUTATION: wiring any Windows read changes this row.
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == "status|list|unsupported|windows:planned");
-    CHECK(result.result_provenance == "windows:planned");
+    constexpr const char* kPlanned = "windows:planned";
 #else
-#if defined(__APPLE__)
-    // Both source rows appear on every arm, including a `sharing` that could not start.
-    REQUIRE(rows.size() >= 3);
-    CHECK(starts_with(rows[1], "source|exports|"));
-    CHECK(starts_with(rows[2], "source|sharing|"));
-    constexpr std::size_t kSources = 2;
+    constexpr const char* kPlanned = "macos:planned";
+#endif
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == std::string{"status|list|unsupported|"} + kPlanned);
+    CHECK(result.result_provenance == kPlanned);
 #else
     REQUIRE(rows.size() >= 4);
     CHECK(starts_with(rows[1], "source|exports|"));
     CHECK(starts_with(rows[2], "source|exports_d|"));
     CHECK(starts_with(rows[3], "source|smb_conf|"));
     constexpr std::size_t kSources = 3;
-#endif
     for (std::size_t i = 1; i < rows.size(); ++i) {
         INFO("row " << i << ": " << rows[i]);
         if (i <= kSources)
