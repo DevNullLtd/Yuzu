@@ -1561,7 +1561,7 @@ flip, with a red-first test each:
     on the final test code (Linux debug; `[4415prA]` under TSan 8 runs per case, `[guardian]` and
     `[spark]` once). A first TSan re-run found a test-exit race (a detached worker committing after
     the case ended); the test Rig now waits for the worker count to reach zero. Windows (MSVC, weecolin) built and ran
-    `[4415prA]` 64/64, `[guardian]` and `[spark]` all green at `490c773fa`; macOS is not built.
+    `[4415prA]` 64/64, `[guardian]` and `[spark]` all green at `490c773fa`. macOS (Apple Clang, mini-colin, arm64) built and ran `[4415prA]` 64 cases (63 pass, 1 skips on a host with no system bus), `[guardian]`, `[spark]` and the 10-shard agent suite all green at `0223018f6`; its first run found one more host-dependent test (CH-5), fixed.
     **Flip preconditions beside AC-18** (none is done): (a) enable the `yuzu-fleet-spark`
     `armed_faulted > 0` alert (its group in `docs/prometheus/yuzu-alerts.yml` is commented out);
     (b) a bounded per-rule rebuild-reason INFO log and, optionally, a skip counter (the
