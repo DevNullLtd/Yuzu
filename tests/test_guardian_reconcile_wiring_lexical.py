@@ -72,6 +72,16 @@ Invariants over the FLOW:
   s. The push is counted `sent`, and audited `success`, ONLY inside `if (send_push_(`: a failed
      send must not count, gauge or audit a reconcile that did not happen.
 
+  w. A rule bundle that an invalidation overtook is never sent (the epoch check): the flow reads
+     `const auto bundle_epoch = guardian_rule_bundle_cache_.epoch();` BEFORE the fresh generation
+     read (so every invalidation after that point is seen), and compares
+     `guardian_rule_bundle_cache_.epoch() != bundle_epoch` AFTER the bundle get and BEFORE the
+     send, where a changed epoch aborts through `abort_degraded("rule bundle invalidated during
+     load", ...)` AND returns. GuardianRuleBundleCache::get() hands a load that invalidate()
+     detached to its own caller and to its waiters, so without this check a rule edit whose
+     best-effort generation bump failed lets an in-flight reconcile send the pre-edit rows under
+     the unchanged generation, and the agent stays converged on them until the next bump.
+
 Invariants over the WIRING (server.cpp):
 
   i. `guardian_last_reconcile_` and `guardian_reconcile_mu_` no longer exist; the claim-map sweep
@@ -458,6 +468,26 @@ def flow_problems(src):
             out.append('the `sent` counter is no longer the first statement of the delivered-push branch (s)')
         if not re.search(r'\bev\.result = "success" ?; ?audit_\( ?ev ?\) ?;', tail):
             out.append("the success audit row is no longer written inside the delivered-push branch (s)")
+
+    # (w) an invalidated bundle is never sent.
+    epoch_read = re.search(r"\bconst auto bundle_epoch = guardian_rule_bundle_cache_\.epoch\(\) ?;", b)
+    if not epoch_read:
+        out.append("the flow no longer reads guardian_rule_bundle_cache_.epoch() into bundle_epoch (w)")
+    elif fresh_read and not epoch_read.start() < fresh_read.start():
+        out.append("bundle_epoch is no longer read BEFORE the fresh generation read: an invalidation "
+                   "that lands between the two would go unseen (w)")
+    send_at = re.search(r"\bsend_push_\(", b)
+    check = re.search(r"\bif \( ?guardian_rule_bundle_cache_\.epoch\(\) ?!= ?bundle_epoch ?\) ?\{([^{}]*)\}", b)
+    if not check:
+        out.append("the `if (guardian_rule_bundle_cache_.epoch() != bundle_epoch)` check is gone: a rule "
+                   "bundle an invalidation overtook would be sent under the unchanged generation (w)")
+    else:
+        if not re.search(r'\babort_degraded\( ?"rule_bundle_invalidated_during_load"[^;]*;[^{}]*?\breturn ?;', check.group(1)):
+            out.append("a changed bundle epoch no longer aborts through abort_degraded and returns (w)")
+        if bundle_get and not bundle_get.start() < check.start():
+            out.append("the bundle epoch check is no longer AFTER the bundle get (w)")
+        if send_at and not check.start() < send_at.start():
+            out.append("the bundle epoch check is no longer BEFORE the send (w)")
     return out
 
 
@@ -998,6 +1028,30 @@ MUTATIONS += [
 
 # Invariants that live in server.cpp; every other lettered entry above mutates the flow header.
 SERVER_LETTERS = ("(i)", "(p)", "(q)")
+
+# (w) the bundle epoch check.
+EPOCH_READ = "const auto bundle_epoch = guardian_rule_bundle_cache_.epoch();"
+MUTATIONS += [
+    ("bundle epoch no longer read", _sub(EPOCH_READ, "const std::uint64_t bundle_epoch = 0;"), "(w)"),
+    ("bundle epoch read after the fresh generation read",
+     lambda s: _sub(EPOCH_READ, "")(s).replace(
+         "const std::uint64_t fresh_generation = *fresh_res;",
+         "const std::uint64_t fresh_generation = *fresh_res; " + EPOCH_READ, 1), "(w)"),
+    ("bundle epoch comparison dropped",
+     _sub("guardian_rule_bundle_cache_.epoch() != bundle_epoch", "false"), "(w)"),
+    ("bundle epoch comparison inverted",
+     _sub("guardian_rule_bundle_cache_.epoch() != bundle_epoch", "guardian_rule_bundle_cache_.epoch() == bundle_epoch"), "(w)"),
+    ("changed bundle epoch no longer aborts",
+     _resub(r'abort_degraded\("rule bundle invalidated during load",.*?retried on a later heartbeat"\);', "(void)0;"), "(w)"),
+    ("changed bundle epoch aborts but no longer returns",
+     _resub(r'(abort_degraded\("rule bundle invalidated during load",.*?retried on a later heartbeat"\);)\s*return;', r"\1"), "(w)"),
+    ("bundle epoch check moved after the send",
+     lambda s: (lambda m: s[:m.start()] + s[m.end():])(
+         re.search(r"if \(guardian_rule_bundle_cache_\.epoch\(\) != bundle_epoch\) \{.*?return;  // send NOTHING[^\n]*\n\s*\}",
+                   s, re.S)).replace(
+         "if (send_push_(agent_id, command_id, push.SerializeAsString())) {",
+         "if (send_push_(agent_id, command_id, push.SerializeAsString())) { if (guardian_rule_bundle_cache_.epoch() != bundle_epoch) { abort_degraded(\"rule bundle invalidated during load\", \"x\"); return; }", 1), "(w)"),
+]
 
 # (s) the delivered-push branch.
 SEND = "if (send_push_(agent_id, command_id, push.SerializeAsString())) {"

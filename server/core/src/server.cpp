@@ -5883,7 +5883,8 @@ public:
                               "dispatched), rate_limited (per-agent 25 s slot), shed (admission "
                               "budget or per-second ceiling exhausted, or in-flight cap reached, "
                               "nothing sent, no audit row), degraded "
-                              "(a store read failed, re-push aborted), no_session",
+                              "(a store read failed or the rule set was invalidated while "
+                              "the reconcile was running, re-push aborted), no_session",
                               "counter");
             for (auto result : {"sent", "rate_limited", "shed", "degraded", "no_session"})
                 metrics_.counter("yuzu_server_guardian_reconciles_total", {{"result", result}});

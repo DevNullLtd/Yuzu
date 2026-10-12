@@ -312,6 +312,14 @@ public:
             // is written on this path.
             return;
         }
+        // The bundle cache's invalidation epoch, read BEFORE the fresh generation and the
+        // bundle load. Both caches are invalidated by a rule edit on this replica (the store's
+        // post-mutation hook) even when the edit's generation bump failed, and
+        // GuardianRuleBundleCache::get() still hands a load that invalidate() detached to its
+        // own caller and to the waiters that joined it. So the bundle returned below may predate
+        // an edit while carrying a generation label that did not move. The epoch is compared
+        // again just before the send; if it advanced, nothing is sent (see there).
+        const auto bundle_epoch = guardian_rule_bundle_cache_.epoch();
         // The generation that LABELS this push, read fresh from the store (cache
         // bypassed). The cached `current` can be up to its TTL stale; if a REST
         // fan-out already delivered a newer generation, building from the stale
@@ -452,6 +460,28 @@ public:
                          scope_degraded_detail, ::yuzu::log_token(agent_id));
             abort_degraded("scope store degraded", scope_degraded_detail);
             return;  // send NOTHING: a narrowed full_sync would disarm the rule
+        }
+        // The last check before the send: an invalidation (a rule edit on this replica, a
+        // baseline deploy or delete, an explicit push) since the epoch was read means the
+        // bundle may be a load that predates it, and `fresh_generation` may not have moved
+        // (the edit's best-effort bump can fail). Labelling those rows with that generation
+        // would leave the agent converged on them until the next bump, so send NOTHING: the
+        // claim is kept, the agent is admitted again after the young-claim window and then
+        // reconciles from a fresh load. This is the same abort as every other store-state
+        // failure here (counter, ABORTED audit row, log). It is conservative: an invalidation
+        // that merely overlapped this reconcile aborts it even when the bundle was in fact
+        // loaded afterwards. It does not close the gap between a committed edit and the
+        // hook that follows it (an edit whose hook has not yet run is invisible to this
+        // comparison), nor an invalidation that lands after this line and before the send.
+        if (guardian_rule_bundle_cache_.epoch() != bundle_epoch) {
+            spdlog::warn("Guardian heartbeat reconcile: the rule bundle was invalidated "
+                         "while this re-push was being prepared - aborting re-push for "
+                         "agent_id={}",
+                         ::yuzu::log_token(agent_id));
+            abort_degraded("rule bundle invalidated during load",
+                           "a rule or policy change landed while the bundle was loading; "
+                           "retried on a later heartbeat");
+            return;  // send NOTHING: the rows may predate the change under an unchanged label
         }
         // Unique per re-push (random suffix) so a same-generation reconcile
         // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).

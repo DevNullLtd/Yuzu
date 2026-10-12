@@ -41,6 +41,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -208,6 +209,8 @@ public:
                 ++eval_calls;
                 note("eval_scope");
                 eval_agents.push_back(agent_id);
+                if (eval_hook)
+                    eval_hook();
                 const auto* cond = std::get_if<yuzu::scope::Condition>(&expr);
                 const auto it = scope_outcomes.find(cond ? cond->value : std::string{});
                 switch (it == scope_outcomes.end() ? ScopeOutcome::NotMember : it->second) {
@@ -231,6 +234,9 @@ public:
                 return send_result;
             },
             .audit = [this](const AuditEvent& ev) {
+                // Two flows can abort at once in the two-thread tests; note() takes the same
+                // (recursive) lock.
+                std::lock_guard lk(fx_mu);
                 note("audit");
                 audits.push_back(ev);
             },
@@ -291,11 +297,14 @@ public:
     std::unordered_map<std::string, ScopeOutcome> scope_outcomes;
     bool send_result{true};
     std::function<void()> list_hook;
+    std::function<void()> eval_hook;
     std::function<void()> bundle_clock_hook;
+    std::recursive_mutex fx_mu;  // guards trace/inflight_at/audits against two concurrent flows
 
     // ---- recorded effects ----
     // Every stub call, in order, with the gate's in-flight count as the stub saw it.
     void note(std::string what) {
+        std::lock_guard lk(fx_mu);
         trace.push_back(std::move(what));
         inflight_at.push_back(gate.in_flight());
     }
@@ -508,6 +517,30 @@ TEST_CASE("GuardianReconcileFlow: the shed log is throttled to one line a minute
         CHECK(log.count("in-flight reconcile cap reached") == 1);
         CHECK(log.count("admission budget or per-second ceiling exhausted") == 0);
         CHECK(rig.count("shed") == 2.0);
+    }
+    SECTION("the logged total adds the budget sheds and the in-flight-cap sheds") {
+        RigOptions o;
+        o.gate.max_in_flight = 1;
+        o.budget = {.budget_ms_per_s = 1000.0, .burst_ms = 100'000.0, .max_per_s = 1};
+        Rig rig(o);
+        LogCapture log;
+        rig.run("agent-a");  // admitted: takes the one admission of this second
+        rig.hold_slot();
+        rig.run("agent-b");  // shed by the in-flight cap
+        CHECK(log.count("in-flight reconcile cap reached") == 1);
+        CHECK(log.count("1 shed so far") == 1);
+
+        rig.held.reset();
+        rig.shed_clock.advance(60s);
+        rig.run("agent-c");  // shed by the per-second ceiling
+        CHECK(log.count("admission budget or per-second ceiling exhausted") == 1);
+        CHECK(log.count("2 shed so far") == 1);  // one of each, in the budget wording
+
+        rig.hold_slot();
+        rig.shed_clock.advance(60s);
+        rig.run("agent-d");  // shed by the cap again
+        CHECK(log.count("in-flight reconcile cap reached") == 2);
+        CHECK(log.count("3 shed so far") == 1);  // and in the cap wording
     }
 }
 
@@ -875,6 +908,167 @@ TEST_CASE("GuardianReconcileFlow: C7, a rule edit whose bump failed is served fr
     CHECK(rig.list_calls == 2);  // the invalidation forced exactly one reload
 }
 
+namespace {
+
+// The audit text of the abort the epoch check raises.
+std::string invalidated_abort(std::uint64_t agent_gen = 3) {
+    return aborted("rule bundle invalidated during load",
+                   "a rule or policy change landed while the bundle was loading; retried on a "
+                   "later heartbeat",
+                   agent_gen);
+}
+
+}  // namespace
+
+TEST_CASE("GuardianReconcileFlow: C1, a bundle an invalidation overtook is not sent under the unchanged generation",
+          "[guardian][reconcile_flow]") {
+    // A rule edit commits after this reconcile's load read its rows; the edit's best-effort
+    // generation bump FAILS (the stored generation stays 7), and the store hook invalidates both
+    // caches while the load is still running. GuardianRuleBundleCache::get() still hands the
+    // pre-edit rows to this caller, so only the flow's own epoch check stands between them and
+    // an agent that would then report generation 7 and stay converged on them.
+    Rig rig;
+    bool fired = false;
+    rig.list_hook = [&] {
+        if (std::exchange(fired, true))
+            return;
+        rig.gen_cache.invalidate();
+        rig.bundle_cache.invalidate();
+    };
+
+    rig.run("agent-1", 0);
+
+    CHECK(rig.sent.empty());  // NOTHING is sent
+    CHECK(rig.dispatched() == 0.0);
+    CHECK(rig.generation_gauge() == 0.0);
+    CHECK(rig.count("degraded") == 1.0);
+    CHECK(rig.total() == 1.0);
+    REQUIRE(rig.audits.size() == 1);
+    CHECK(rig.audits[0].detail == invalidated_abort(0));
+    CHECK(rig.audits[0].result == "degraded");
+    CHECK(rig.gate.in_flight() == 0);
+    CHECK(rig.duration_count() == 1);
+    CHECK_FALSE(rig.bundle_cache.held_generation().has_value());  // the late load installed nothing
+
+    // The claim is KEPT: a heartbeat inside the young-claim window is rate limited, not admitted.
+    rig.run("agent-1", 0);
+    CHECK(rig.count("rate_limited") == 1.0);
+    CHECK(rig.sent.empty());
+    CHECK(rig.list_calls == 1);
+
+    // The edit has committed by now. Once the claim is old enough the agent is admitted again,
+    // loads afresh, and receives the NEW rows under the same generation.
+    rig.set_rules({rule("r1"), rule("r2")});
+    rig.clock.advance(26s);
+    rig.run("agent-1", 0);
+    REQUIRE(rig.sent.size() == 1);
+    CHECK(rule_ids(parse_push(rig.sent[0].bytes)) == std::vector<std::string>{"r1", "r2"});
+    CHECK(parse_push(rig.sent[0].bytes).policy_generation() == 7);
+    CHECK(rig.list_calls == 2);
+    CHECK(rig.count("sent") == 1.0);
+}
+
+TEST_CASE("GuardianReconcileFlow: C1, an invalidation during the fresh generation read also aborts",
+          "[guardian][reconcile_flow]") {
+    // The epoch is read before the fresh generation, so a change landing anywhere from that
+    // point on is seen. Conservative on purpose: the bundle loaded afterwards would have been
+    // current, but one window covering the whole read-label-load sequence is simpler to reason
+    // about than two.
+    Rig rig;
+    rig.on_fetch = [&](int n) -> GuardianGenerationCache::Result {
+        if (n == 2)
+            rig.bundle_cache.invalidate();  // the fresh generation read
+        return 7;
+    };
+    rig.run("agent-1", 0);
+    CHECK(rig.sent.empty());
+    CHECK(rig.count("degraded") == 1.0);
+    REQUIRE(rig.audits.size() == 1);
+    CHECK(rig.audits[0].detail == invalidated_abort(0));
+}
+
+TEST_CASE("GuardianReconcileFlow: C1, an invalidation during scope evaluation also aborts",
+          "[guardian][reconcile_flow]") {
+    // Scope reads can take seconds; the comparison sits right before the send so that window is
+    // covered too, not only the bundle load.
+    Rig rig;
+    rig.set_rules({rule("open"), rule("scoped", "", "tag:grp == inside")});
+    rig.scope_outcomes["inside"] = ScopeOutcome::Member;
+    rig.eval_hook = [&] { rig.bundle_cache.invalidate(); };
+    rig.run("agent-1", 0);
+    REQUIRE(rig.eval_calls == 1);  // the push was fully prepared...
+    CHECK(rig.sent.empty());       // ...and then withheld
+    CHECK(rig.count("degraded") == 1.0);
+    CHECK(rig.count("sent") == 0.0);
+    REQUIRE(rig.audits.size() == 1);
+    CHECK(rig.audits[0].detail == invalidated_abort(0));
+}
+
+TEST_CASE("GuardianReconcileFlow: C1, an invalidation BEFORE the reconcile starts does not abort it",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    rig.run("agent-1", 0);  // loads and holds the bundle
+    REQUIRE(rig.sent.size() == 1);
+    rig.gen_cache.invalidate();
+    rig.bundle_cache.invalidate();
+    rig.run("agent-2", 0);  // a later reconcile reads the new epoch and is not affected
+    REQUIRE(rig.sent.size() == 2);
+    CHECK(rig.count("degraded") == 0.0);
+    CHECK(rig.audits.size() == 2);  // the two success rows only
+    CHECK(rig.audits[1].result == "success");
+}
+
+TEST_CASE("GuardianReconcileFlow: C1, the owner of a detached load and a waiter that joined it both abort",
+          "[guardian][reconcile_flow]") {
+    // get() hands the detached flight's result to its owner AND to every waiter that had joined
+    // it, so each of them must reach the abort on its own epoch comparison.
+    Rig rig;
+    std::mutex m;
+    std::condition_variable cv;
+    bool release = false;
+    std::promise<void> entered;
+    auto entered_f = entered.get_future();
+    std::atomic<std::thread::id> waiter_thread{};
+    int waiter_clock_calls = 0;  // touched only by the waiter thread
+    // Only the owner runs the loader.
+    rig.list_hook = [&] {
+        entered.set_value();
+        std::unique_lock lk(m);
+        // Bounded so a regression fails the test instead of hanging it.
+        cv.wait_for(lk, 10s, [&] { return release; });
+    };
+    // The waiter's SECOND bundle-cache clock read is the one taken right after it joined the
+    // flight and before it blocks: invalidate there, then release the owner.
+    rig.bundle_clock_hook = [&] {
+        if (std::this_thread::get_id() != waiter_thread.load())
+            return;
+        if (++waiter_clock_calls == 2) {
+            rig.bundle_cache.invalidate();
+            std::lock_guard lk(m);
+            release = true;
+            cv.notify_all();
+        }
+    };
+
+    std::jthread owner([&] { rig.run("agent-owner", 0); });
+    REQUIRE(entered_f.wait_for(10s) == std::future_status::ready);
+    std::jthread waiter([&] {
+        waiter_thread.store(std::this_thread::get_id());
+        rig.run("agent-waiter", 0);
+    });
+    waiter.join();
+    owner.join();
+
+    CHECK(rig.list_calls == 1);  // the waiter never ran the loader
+    CHECK(rig.sent.empty());
+    CHECK(rig.count("degraded") == 2.0);
+    CHECK(rig.total() == 2.0);
+    REQUIRE(rig.audits.size() == 2);
+    for (const auto& a : rig.audits)
+        CHECK(a.detail == invalidated_abort(0));
+    CHECK(rig.gate.in_flight() == 0);
+}
+
 TEST_CASE("GuardianReconcileFlow: C2, a policy bump during a tag-store outage aborts each agent once and recovers",
           "[guardian][reconcile_flow]") {
     Rig rig;
@@ -1123,6 +1317,11 @@ std::vector<Scenario> all_exits() {
         {"rule store degraded", {}, [](Rig& r) { r.rules_error = "x"; }, true, 1},
         {"baseline store degraded", {}, [](Rig& r) { r.deployed_error = "x"; }, true, 1},
         {"bundle load throws", {}, [](Rig& r) { r.rules_throw = true; }, true, 1},
+        {"bundle invalidated during the load",
+         {},
+         [](Rig& r) { r.list_hook = [&r] { r.bundle_cache.invalidate(); }; },
+         true,
+         1},
         {"scope store degraded",
          {},
          [](Rig& r) {
