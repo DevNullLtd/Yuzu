@@ -280,8 +280,10 @@ public:
     /// covering the connect and the response; on Linux/macOS a deadline watchdog extends the same
     /// bound to the TLS handshake, which httplib's own total bound does not cover (a server that
     /// drips handshake bytes would otherwise hold the call). On Windows the handshake phase has
-    /// no total bound. A 256 KiB body cap, redirects NOT followed (a 3xx is a failure), TLS
-    /// verification honored. The URL's authority must be a well-formed `host[:port]` (see
+    /// no total bound. The watchdog reserves a spare descriptor first; when none is available the
+    /// call fails closed ("request failed: no file descriptor available") before any socket is
+    /// opened. A 256 KiB body cap, redirects NOT followed (a 3xx is a failure), TLS verification
+    /// honored. The URL's authority must be a well-formed `host[:port]` (see
     /// `fetch_discovery_document`). Returns the body of a 200 response.
     [[nodiscard]] static std::expected<std::string, std::string>
     http_get_bounded(const std::string& url, bool skip_tls_verify, int timeout_ms = 5000);
@@ -343,7 +345,7 @@ private:
     std::optional<DiscoveryDocument> discovered_;
     bool discovery_in_flight_{false}; // one fetcher at a time; the others fail fast
     std::chrono::steady_clock::time_point discovery_retry_after_{};
-    // 30 s; set_discovery_negative_cache_for_test
+    // 30 s by default; see set_discovery_negative_cache_for_test.
     std::chrono::milliseconds discovery_retry_window_{30000};
     std::unordered_map<std::string, PkceChallenge> pending_challenges_;
     std::atomic<bool> binding_digest_forced_failure_{false}; // test seam only

@@ -820,8 +820,8 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
         form_body += "&client_id=" + url_encode(config_.client_id);
     }
 
-    spdlog::info("OIDC token exchange: endpoint={} redirect_uri={}", *token_endpoint,
-                 redirect_uri);
+    spdlog::info("OIDC token exchange: endpoint={} redirect_uri={}",
+                 ::yuzu::log_key_token(*token_endpoint), redirect_uri);
 
     std::string response_body;
 
@@ -1011,13 +1011,14 @@ std::expected<std::vector<CachedJwk>, std::string> OidcProvider::parse_jwks(cons
 
 bool OidcProvider::fetch_jwks() {
     {
-        // Stamp every attempt, success or not (#1900): the no-kid path re-fetches on age, so
-        // while the cache holds keys a failing IdP is retried once per TTL, not once per login.
-        // An EMPTY cache and every kid miss still refetch on every call (#1900). Cached keys are
-        // trusted until the next SUCCESSFUL fetch replaces them (not "one more TTL": the failed
-        // fetch leaves the cache untouched, as it did before discovery), so a retired key keeps
-        // verifying while jwks_uri stays unreachable. Tracked under #1900/#1901 (a hard maximum
-        // key age); the alternative here is hammering a dead IdP on every request.
+        // Stamp every attempt, success or not (#1900): the age gate in verify_jwt_signature
+        // applies to every token, so while the cache holds keys a failing IdP is retried once
+        // per TTL, not once per login. An EMPTY cache and every kid miss still refetch on every
+        // call (#1900). Cached keys are trusted until the next SUCCESSFUL fetch replaces them
+        // (not "one more TTL": the failed fetch leaves the cache untouched, as it did before
+        // discovery), so a retired key keeps verifying while jwks_uri stays unreachable. Tracked
+        // under #1900/#1901 (a hard maximum key age); the alternative here is hammering a dead
+        // IdP on every request.
         std::lock_guard lock(jwks_mu_);
         jwks_fetched_at_ = std::chrono::steady_clock::now();
     }
@@ -1027,7 +1028,7 @@ bool OidcProvider::fetch_jwks() {
         return false;
     }
 
-    spdlog::info("OidcProvider: fetching JWKS from {}", *jwks_uri);
+    spdlog::info("OidcProvider: fetching JWKS from {}", ::yuzu::log_key_token(*jwks_uri));
     auto body = http_get_bounded(*jwks_uri, config_.skip_tls_verify, http_timeout_ms_.load());
     if (!body) {
         spdlog::error("OidcProvider: JWKS fetch failed: {}", body.error());
@@ -1035,7 +1036,7 @@ bool OidcProvider::fetch_jwks() {
     }
     auto keys = parse_jwks(*body);
     if (!keys) {
-        spdlog::error("OidcProvider: {}", keys.error());
+        spdlog::error("OidcProvider: {}", ::yuzu::log_key_token(keys.error()));
         return false;
     }
     std::lock_guard lock(jwks_mu_);
@@ -1221,24 +1222,41 @@ bool endpoint_acceptable(const std::string& value, std::string_view scheme) {
 // `Client::Get` for as long as it likes: the handshake restarts a fresh per-timeout wait on every
 // step, and `Client::stop()` is a no-op until the socket is in flight. On POSIX this closes that:
 // httplib's socket-options callback hands the new socket to `adopt` BEFORE `connect()` (once per
-// candidate address); `adopt` keeps a dup() of it, and when the budget (measured from this
-// object's construction) runs out the watchdog thread calls shutdown(SHUT_RD) on the dup. That
-// acts on the socket itself, so a blocked handshake read or response read returns at once (end
-// of stream) and `Get` fails; a connect is bounded by httplib's own timeouts. SHUT_RD, not
-// SHUT_RDWR: shutting the write side raised SIGPIPE in 5 of 15 repeated test runs, and OpenSSL
-// 3.6's writesocket() is write(), not send(), on Linux/macOS. The dup is what makes this race-free:
-// httplib may close the number it holds and the kernel may reuse it, but our own descriptor keeps
-// the socket's identity until the destructor closes it. Every use of the dup happens under `mu_`.
-// The destructor wakes the thread (condition variable, no polling), joins it, then closes the dup,
-// so nothing outlives the request. If dup() fails (descriptor exhaustion) the socket is simply
-// unwatched and only httplib's own bounds apply. Windows: no watchdog (no WSADuplicateSocket); only
-// `set_max_timeout` applies there, so the TLS handshake phase is NOT covered by the total bound on
-// Windows.
+// candidate address); `adopt` makes the descriptor this object already holds an alias of that
+// socket (dup2), and once the budget (measured from this object's construction) runs out the
+// watchdog thread calls shutdown(SHUT_RD) on it. That acts on the socket itself, so a blocked
+// handshake read or response read returns at once (end of stream) and `Get` fails; a connect is
+// bounded by httplib's own timeouts. The shutdown is RE-ISSUED every 50 ms until the request
+// ends: on Linux a shutdown of a not yet connected socket persists across the later connect(),
+// on macOS it does NOT (measured: the flag is gone once connect() completes), so a socket that
+// connects after the deadline (for example a resolver that burned the budget) is still woken by
+// the next tick. On both, a reader blocked in recv/poll/select/SSL_connect is woken (measured).
+//
+// The descriptor is RESERVED at construction (open of /dev/null) so that adopting a socket can
+// never fail with EMFILE: under descriptor exhaustion a dup() taken after httplib's socket() would
+// fail and the request would run unwatched with no bound. If the reservation fails the request
+// is refused before any socket exists (`reserved()` is false); a dup2 that fails anyway sets
+// `failed()` and the caller reports an error instead of trusting the answer. dup2 does not carry
+// FD_CLOEXEC, so it is set right after; the window in between is harmless because the server
+// does not fork or exec on this path. The reserved number is ours alone, so it cannot be reused
+// by httplib: it keeps the socket's identity until the destructor closes it. Every use of the
+// descriptor happens under `mu_`. The destructor wakes the thread (condition variable, no
+// polling of the request), joins it, then closes the descriptor, so nothing outlives the request.
+//
+// SHUT_RD, not SHUT_RDWR. Shutting the write side too killed a test process with SIGPIPE in 4 of
+// 4 runs of an HTTPS response that completes right at the deadline (default SIGPIPE disposition;
+// measured in Gate 5, not the handshake-drip case); with SHUT_RD there were none. Production is
+// protected anyway: httplib::Server's constructor ignores SIGPIPE process-wide (httplib.h:10405)
+// and nothing in server/core/src installs another disposition; the read side is simply the
+// smaller hammer. Tests that drive the watchdog set SIGPIPE to ignored themselves. Windows: no
+// watchdog (no WSADuplicateSocket); only `set_max_timeout` applies there, so the TLS handshake
+// phase is NOT covered by the total bound on Windows.
 #ifndef _WIN32
 class RequestDeadlineWatchdog {
 public:
     explicit RequestDeadlineWatchdog(std::chrono::milliseconds budget)
-        : deadline_(std::chrono::steady_clock::now() + budget), thread_([this] { run(); }) {}
+        : deadline_(std::chrono::steady_clock::now() + budget),
+          fd_(::open("/dev/null", O_RDONLY | O_CLOEXEC)), thread_([this] { run(); }) {}
 
     ~RequestDeadlineWatchdog() {
         {
@@ -1254,52 +1272,69 @@ public:
     RequestDeadlineWatchdog(RequestDeadlineWatchdog&&) = delete;
     RequestDeadlineWatchdog& operator=(RequestDeadlineWatchdog&&) = delete;
 
-    // httplib::Client::set_socket_options callback: runs on the request thread, after socket()
-    // and before connect(). Replaces the dup of a candidate address that failed to connect.
-    void adopt(socket_t sock) noexcept {
-        const int copy = ::fcntl(sock, F_DUPFD_CLOEXEC, 0);
+    // True when the spare descriptor was obtained; check BEFORE creating the client.
+    [[nodiscard]] bool reserved() const noexcept { return fd_.fd >= 0; }
+
+    // True when a socket could not be put under watch (dup2 failed): the answer is not trusted.
+    [[nodiscard]] bool failed() const {
         std::lock_guard lock(mu_);
-        dup_.reset(copy);
-        if (expired_ && copy >= 0)
-            ::shutdown(copy, SHUT_RD);
+        return failed_;
+    }
+
+    // httplib::Client::set_socket_options callback: runs on the request thread, after socket()
+    // and before connect(). Replaces the socket held for a candidate address that failed.
+    void adopt(socket_t sock) noexcept {
+        std::lock_guard lock(mu_);
+        if (fd_.fd < 0 || ::dup2(sock, fd_.fd) < 0) {
+            failed_ = true;
+            return;
+        }
+        (void)::fcntl(fd_.fd, F_SETFD, FD_CLOEXEC);
+        if (expired_)
+            ::shutdown(fd_.fd, SHUT_RD);
     }
 
 private:
-    // Owns the one dup'd descriptor.
+    // Owns the one reserved descriptor.
     struct OwnedFd {
         int fd{-1};
-        OwnedFd() = default;
-        ~OwnedFd() { reset(-1); }
-        OwnedFd(const OwnedFd&) = delete;
-        OwnedFd& operator=(const OwnedFd&) = delete;
-        void reset(int next) noexcept {
+        explicit OwnedFd(int adopted) noexcept : fd(adopted) {}
+        ~OwnedFd() {
             if (fd >= 0)
                 ::close(fd);
-            fd = next;
         }
+        OwnedFd(const OwnedFd&) = delete;
+        OwnedFd& operator=(const OwnedFd&) = delete;
     };
 
     void run() {
+        using namespace std::chrono_literals;
         std::unique_lock lock(mu_);
         if (cv_.wait_until(lock, deadline_, [this] { return done_; }))
             return; // the request finished first
         expired_ = true;
-        if (dup_.fd >= 0)
-            ::shutdown(dup_.fd, SHUT_RD);
+        do {
+            // Harmless ENOTSOCK while the descriptor still aliases /dev/null (no socket yet).
+            if (fd_.fd >= 0)
+                ::shutdown(fd_.fd, SHUT_RD);
+        } while (!cv_.wait_for(lock, 50ms, [this] { return done_; }));
     }
 
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::condition_variable cv_;
     bool done_{false};
     bool expired_{false};
-    OwnedFd dup_;
+    bool failed_{false};
     const std::chrono::steady_clock::time_point deadline_;
+    OwnedFd fd_;
     std::thread thread_; // last: starts running once every member above exists
 };
 #else
 class RequestDeadlineWatchdog {
 public:
     explicit RequestDeadlineWatchdog(std::chrono::milliseconds) {}
+    [[nodiscard]] bool reserved() const noexcept { return true; }
+    [[nodiscard]] bool failed() const { return false; }
     void adopt(socket_t) noexcept {}
 };
 #endif
@@ -1315,6 +1350,10 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify, int
         // Declared BEFORE the client so it is destroyed after it (the client holds a reference).
         const auto t = std::chrono::milliseconds(timeout_ms);
         RequestDeadlineWatchdog watchdog(2 * t);
+        // Fail closed before any socket exists: without the reserved descriptor the watchdog
+        // could not take hold of the socket (see RequestDeadlineWatchdog).
+        if (!watchdog.reserved())
+            return std::unexpected("request failed: no file descriptor available");
         // Heap-allocated with an explicit reset: httplib 0.37.1's SSLClient destructor can crash
         // after a failed connection to a non-routable host.
         auto client = std::make_unique<httplib::Client>(target->origin);
@@ -1325,8 +1364,8 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify, int
         // timeout would hold the GET for as long as it likes. set_max_timeout bounds the
         // connect and the response at twice the per-operation timeout (10 s by default),
         // measured from the start of the request. It does NOT cover the TLS handshake, so on
-        // POSIX the watchdog shuts the socket down at the same deadline; on Windows the
-        // handshake phase has no total bound (see RequestDeadlineWatchdog).
+        // POSIX the watchdog shuts the socket down at the same deadline (and keeps doing so every
+        // 50 ms); on Windows the handshake phase has no total bound (see RequestDeadlineWatchdog).
         client->set_max_timeout(2 * t);
         client->set_socket_options([&watchdog](socket_t sock) { watchdog.adopt(sock); });
         client->set_payload_max_length(kHttpMaxBody);
@@ -1341,6 +1380,8 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify, int
 
         if (status == 0)
             return std::unexpected("request failed: " + err);
+        if (watchdog.failed()) // a socket escaped the watchdog: do not trust an unbounded answer
+            return std::unexpected("request failed: no file descriptor available");
         if (status != 200)
             return std::unexpected("HTTP " + std::to_string(status));
         return body;
@@ -1363,6 +1404,10 @@ OidcProvider::fetch_discovery_document(const std::string& issuer, bool skip_tls_
         return std::unexpected("the issuer contains a space or control character");
     if (!split_http_url(issuer))
         return std::unexpected("the issuer has no well-formed host");
+    // OIDC Discovery 3: an issuer has no query or fragment (the discovery URL is built by
+    // appending a path, so either would land in the wrong place).
+    if (issuer.find_first_of("?#") != std::string::npos)
+        return std::unexpected("the issuer must not contain a query or fragment");
 
     auto url = issuer;
     if (url.ends_with('/'))

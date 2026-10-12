@@ -3097,7 +3097,8 @@ std::string SettingsRoutes::render_directory_fragment() {
             "value=\"" +
             html_escape(cfg_->oidc_redirect_uri) +
             "\" "
-            "placeholder=\"(auto-computed from web address)\" "
+            "placeholder=\"Required: https://&lt;server&gt;/auth/callback, exactly as registered "
+            "at the IdP\" "
             "style=\"flex:1;min-width:0\">"
             "</div>";
 
