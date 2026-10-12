@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1693,6 +1694,198 @@ TEST_CASE("#3953 item 3: an internal re-check bounds detection latency for a sen
 
     CHECK(spin_until([&] { return sent_count.load() >= 2; }, 5s));
     worker.stop();
+}
+
+namespace {
+
+// #3980 fixture: ONE compliance send parked on a CV (lifecycle sends are instant), the
+// worker running with a periodic bound so long (1 h) that only the loop's own clamps and the
+// loop-tail probe can make progress, and a short send_stall_threshold so the stall is crossed
+// in test time. The threshold is deliberately larger than the 200 ms offer wait plus the time
+// it takes to withdraw the rule, so the first offer() RETURNS nullopt below the threshold.
+//
+// The destructor is the scope-exit guard: it stops the worker (no further admissions), opens
+// the CV and drains the detached sends, so a REQUIRE unwind can never leave a parked send
+// referencing a destroyed sink. CHECK, not REQUIRE: it may run during unwind.
+constexpr std::uint64_t kOrphanPeriodicMs = 3'600'000;
+constexpr std::chrono::milliseconds kOrphanStallThreshold{600};
+
+struct ParkedComplianceSink {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool release{false};
+    std::atomic<int> compliance_invocations{0};
+    SendResult operator()(const OutboxEntry& e) {
+        if (e.domain == OutboxDomain::Lifecycle)
+            return SendResult::Sent;
+        compliance_invocations.fetch_add(1);
+        std::unique_lock<std::mutex> lk{mu};
+        cv.wait(lk, [&] { return release; });
+        return SendResult::Sent;
+    }
+    void open() {
+        {
+            std::lock_guard<std::mutex> lk{mu};
+            release = true;
+        }
+        cv.notify_all();
+    }
+};
+
+struct OrphanFixture {
+    JournalRig rig;
+    ParkedComplianceSink sink;
+    GuardianOutboxDrainWorker worker;
+
+    OrphanFixture()
+        : worker(*rig.rt, std::ref(sink), kOrphanPeriodicMs,
+                 {.send_stall_threshold = kOrphanStallThreshold}) {
+        enqueue_drift("cmp");
+        worker.start(); // last: nothing below can throw while a send is parked
+    }
+    ~OrphanFixture() {
+        worker.stop();
+        sink.open();
+        CHECK(spin_until([&] { return worker.active_send_workers() == 0; }, 5s));
+    }
+    OrphanFixture(const OrphanFixture&) = delete;
+    OrphanFixture& operator=(const OrphanFixture&) = delete;
+
+    /// A real compliance verdict on a fresh rule: attach compliant, then flip to drift.
+    void enqueue_drift(const std::string& rule) {
+        rig.reader->file = read_known(FileSnapshot{.exists = true});
+        REQUIRE(rig.rt->attach_rule(rule, file_spec("/" + rule), file_exists_rule(rule), true));
+        rig.reader->file = read_known(FileSnapshot{.exists = false});
+        rig.rt->evaluate_key(spark_key(file_spec("/" + rule)), EvalReason::Convergence);
+    }
+    const GuardianOutboxSendExecutor& compliance() const {
+        return worker.compliance_send_exec_for_test();
+    }
+    /// Barrier: the compliance send was launched, the first offer() has been entered exactly
+    /// once and no stall is counted yet.
+    bool wait_parked() {
+        return spin_until(
+            [&] {
+                return compliance().offer_calls_for_test() == 1 &&
+                       compliance().in_flight_snapshot().running &&
+                       worker.send_stall_count() == 0;
+            },
+            5s);
+    }
+};
+
+} // namespace
+
+TEST_CASE("#3980: an orphan stalled on an emptied compliance lane is counted and reaped by "
+          "the loop-tail probe alone, and the cadence then returns to the periodic bound",
+          "[spark][guardian][drain][chaos]") {
+    // THE FALSIFIER. detach_rule() drops the rule's verdict from the outbox while its send is
+    // still parked, so the compliance lane is EMPTY under a running send: no head means no
+    // offer() ever runs again for that lane, which is the only place a stall used to be
+    // counted and a finished slot reclaimed. Only the worker's per-cycle probe can do either.
+    OrphanFixture f;
+    REQUIRE(f.wait_parked()); // the first offer() returned nullopt below the threshold
+    REQUIRE(f.sink.compliance_invocations.load() == 1);
+
+    f.rig.rt->detach_rule("cmp");
+    REQUIRE(f.rig.rt->outbox_size() == 0);
+    CHECK(f.worker.send_stall_count() == 0);
+    CHECK(f.compliance().offer_calls_for_test() == 1);
+
+    // The stall is counted with offer() NEVER called again: only the probe can have done it.
+    REQUIRE(spin_until([&] { return f.worker.send_stall_count() == 1; }, 5s));
+    CHECK(f.compliance().offer_calls_for_test() == 1);
+    CHECK(f.compliance().in_flight_snapshot().stall_counted);
+
+    // Cadence: a COUNTED stall contributes no clamp, so the loop is back on the periodic bound
+    // and stops cycling. The one justified sleep of this test: a NEGATIVE assertion ("nothing
+    // happens") has no event to wait on, so it spans three recheck intervals - at the old
+    // 200 ms recheck clamp the loop would have run ~3 more cycles inside it.
+    REQUIRE(spin_until(
+        [&] {
+            return f.worker.last_computed_wait_ms_for_test() ==
+                   static_cast<std::int64_t>(kOrphanPeriodicMs);
+        },
+        3s));
+    const auto cycles = f.worker.loop_cycles_for_test();
+    std::this_thread::sleep_for(3 * kGuardianSendRecheckInterval);
+    CHECK(f.worker.loop_cycles_for_test() == cycles);
+    CHECK(f.worker.last_computed_wait_ms_for_test() == static_cast<std::int64_t>(kOrphanPeriodicMs));
+
+    // The send is still parked; a stale in_flight is the documented cost of "no clamp once
+    // counted". Complete it and wake the loop the way the periodic tick eventually would
+    // (notify() enqueues NOTHING): the probe reaps the finished slot on the emptied lane.
+    CHECK(f.compliance().in_flight_snapshot().running);
+    f.sink.open();
+    f.worker.notify();
+    REQUIRE(spin_until([&] { return !f.compliance().in_flight_snapshot().in_flight; }, 5s));
+    CHECK(f.compliance().offer_calls_for_test() == 1); // reaped by the probe, not by an offer()
+    CHECK(f.worker.send_stall_count() == 1);
+
+    // Only now does a fresh enqueue exist - and it launches (the slot really was freed).
+    f.enqueue_drift("cmp2");
+    REQUIRE(spin_until([&] { return f.sink.compliance_invocations.load() >= 2; }, 5s));
+    CHECK(f.compliance().offer_calls_for_test() >= 2);
+}
+
+TEST_CASE("#3980: an orphan that finishes BEFORE the stall threshold is reaped on an emptied "
+          "lane with no enqueue and no external wake",
+          "[spark][guardian][drain][chaos]") {
+    OrphanFixture f;
+    REQUIRE(f.wait_parked());
+    f.rig.rt->detach_rule("cmp");
+    REQUIRE(f.rig.rt->outbox_size() == 0);
+
+    // The first offer() has returned once the loop reached its tail (cycles are counted there),
+    // so releasing now cannot be consumed by an offer(): the slot is an unreaped orphan.
+    REQUIRE(spin_until([&] { return f.worker.loop_cycles_for_test() >= 1; }, 5s));
+    f.sink.open();
+
+    // No notify(), no enqueue: the clamp's own wake (or the tail it already ran) must reap it.
+    REQUIRE(spin_until([&] { return !f.compliance().in_flight_snapshot().in_flight; }, 5s));
+    CHECK(f.compliance().offer_calls_for_test() == 1);
+    CHECK(f.worker.send_stall_count() == 0); // completed under the threshold: never a stall
+}
+
+TEST_CASE("#3980: below the stall threshold an orphan's wait is its remaining time to the "
+          "threshold, not the 200 ms recheck",
+          "[spark][guardian][drain][chaos]") {
+    OrphanFixture f;
+    REQUIRE(f.wait_parked());
+    f.rig.rt->detach_rule("cmp");
+    REQUIRE(f.rig.rt->outbox_size() == 0);
+
+    // The first value written after the withdrawal: > the recheck interval (the orphan has most
+    // of the threshold left) and <= the threshold. The old rule wrote exactly the recheck.
+    const auto recheck = static_cast<std::int64_t>(kGuardianSendRecheckInterval.count());
+    const auto threshold = static_cast<std::int64_t>(kOrphanStallThreshold.count());
+    REQUIRE(spin_until(
+        [&] {
+            const auto w = f.worker.last_computed_wait_ms_for_test();
+            return w > recheck && w <= threshold;
+        },
+        3s));
+    const auto computed = f.worker.last_computed_wait_ms_for_test();
+    const auto remaining_now = f.compliance().in_flight_snapshot().remaining_to_stall.count();
+    CHECK(computed >= remaining_now); // remaining only shrinks after the wait was computed
+    CHECK(f.worker.send_stall_count() == 0);
+}
+
+TEST_CASE("#3980: while the compliance lane still HAS a head, an uncounted in-flight send "
+          "keeps the 200 ms recheck (the item-3 cliff fix is not replaced by the orphan rule)",
+          "[spark][guardian][drain][chaos]") {
+    OrphanFixture f;
+    REQUIRE(f.wait_parked());
+    // No withdrawal: the head is still queued, so offer() owns this send and the loop re-checks
+    // it at the recheck interval, NOT at its remaining time to the threshold (~400 ms here).
+    REQUIRE(f.rig.rt->outbox_size() == 1);
+    CHECK(spin_until(
+        [&] {
+            return f.worker.last_computed_wait_ms_for_test() ==
+                   static_cast<std::int64_t>(kGuardianSendRecheckInterval.count());
+        },
+        3s));
+    CHECK(f.worker.send_stall_count() == 0);
 }
 
 TEST_CASE("item 4 regression: a stalled lifecycle send does not starve compliance delivery",

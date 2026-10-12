@@ -170,8 +170,10 @@ inline constexpr std::chrono::milliseconds kGuardianDrainMaxWall{2'000};
 inline constexpr std::chrono::milliseconds kGuardianSendOfferWait{200};
 
 /// Internal re-check bound (#3953 item 3): when a send is known in flight on either
-/// lane (GuardianOutboxSendExecutor::has_in_flight_send()), loop()'s own wait is
-/// clamped to at most this, instead of riding out the full periodic bound. Closes the
+/// lane and has NOT yet been counted as a stall (#3980: a counted stall no longer clamps),
+/// loop()'s own wait is clamped to at most this, instead of riding out the full periodic
+/// bound; a compliance send left running on an EMPTIED lane is instead clamped to its
+/// remaining time to the stall threshold (see compute_wait_clamp). Closes the
 /// throughput cliff a send finishing between kGuardianSendOfferWait and the periodic
 /// bound used to hit: detection latency after completion is now bounded by roughly
 /// kGuardianSendOfferWait + this, not by kDefaultPeriodicBoundMs (5s in production).
@@ -179,6 +181,12 @@ inline constexpr std::chrono::milliseconds kGuardianSendOfferWait{200};
 /// how long the loop's OWN wait blocks, so it cannot perturb any test whose timing
 /// depends on nothing else waking the loop (see the R4 test's own comment).
 inline constexpr std::chrono::milliseconds kGuardianSendRecheckInterval{200};
+
+/// #3972 cross-lane launch hold and its release allowance. Defaults for the
+/// GuardianMaintenanceConfig knobs below; CONSUMED BY THE NEXT COMMIT (the symmetric
+/// cross-lane hold in wrapped_send()) - nothing in this worker reads them yet.
+inline constexpr std::chrono::milliseconds kGuardianCrossLaneOrderHold{1'000};
+inline constexpr std::size_t kGuardianCrossLaneReleaseAllowance{64};
 
 /// Journal-maintenance knobs for GuardianOutboxDrainWorker. A struct rather than more
 /// positional parameters so the two same-typed intervals cannot be transposed at a call
@@ -218,6 +226,16 @@ struct GuardianMaintenanceConfig {
     /// that depends on the worker running IMMEDIATELY - a hollow pass is the failure mode
     /// there, not a red one.
     bool jitter{false};
+    /// #3980: how long a send may stay in flight before BOTH lane executors count it as a stall
+    /// (GuardianOutboxSendExecutor::kGuardianSendStallThreshold in production). A knob so a test
+    /// can cross it in test time; the executors are built from this value (the ctor parameter,
+    /// not the later-declared maint_).
+    std::chrono::milliseconds send_stall_threshold{
+        GuardianOutboxSendExecutor::kGuardianSendStallThreshold};
+    /// #3972: NOT consumed in this commit - read by the cross-lane hold that lands next. Added
+    /// here with the other executor knob so GuardianMaintenanceConfig changes once.
+    std::chrono::milliseconds cross_lane_order_hold{kGuardianCrossLaneOrderHold};
+    std::size_t cross_lane_release_allowance{kGuardianCrossLaneReleaseAllowance};
 };
 
 /// Which maintenance passes to run this cycle. The CALLER owns cadence - the worker loop
@@ -445,6 +463,28 @@ public:
         return wrapped_send(entry);
     }
 
+    /// Test-only read-only views of the two lane executors (#3980): lets a test observe
+    /// offer_calls_for_test() / in_flight_snapshot() / active_worker_count() per lane. No
+    /// production caller.
+    [[nodiscard]] const GuardianOutboxSendExecutor& lifecycle_send_exec_for_test() const noexcept {
+        return lifecycle_send_exec_;
+    }
+    [[nodiscard]] const GuardianOutboxSendExecutor& compliance_send_exec_for_test() const noexcept {
+        return compliance_send_exec_;
+    }
+
+    /// Test-only (relaxed atomics, no lock): how many loop() cycles have reached their tail
+    /// (counted BEFORE that cycle's wait is computed), and the wait in ms the loop last handed
+    /// to cv.wait_for (-1 = it has not waited yet; skip_wait cycles do not write it). Together
+    /// they pin the wait CADENCE without sleeping: a clamp that keeps firing shows up as a
+    /// cycle count that keeps advancing. No production caller.
+    [[nodiscard]] std::uint64_t loop_cycles_for_test() const noexcept {
+        return loop_cycles_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::int64_t last_computed_wait_ms_for_test() const noexcept {
+        return last_computed_wait_ms_.load(std::memory_order_relaxed);
+    }
+
     /// Test-only synchronization seam - see the call site in stop() for what race it
     /// exists to make deterministic (#3953 item 6). Production callers never set this.
     void set_stop_race_hook_for_test(std::function<void()> hook) {
@@ -560,6 +600,10 @@ private:
     /// TEST-ONLY one-shot: make loop()'s tail throw once (item 13). Consumed by exchange, so it
     /// arms a single throw. Default false = inert in production (one relaxed load per cycle).
     std::atomic<bool> inject_loop_tail_throw_{false};
+    /// Test seams (loop_cycles_for_test / last_computed_wait_ms_for_test). Written only by the
+    /// worker thread, read by anyone, relaxed.
+    std::atomic<std::uint64_t> loop_cycles_{0};
+    std::atomic<std::int64_t> last_computed_wait_ms_{-1};
     /// Earliest steady-clock ms at which a pending forced page may be consumed (item 12).
     /// 0 = no deferral. Written under sig_->mu (by notify() and the loop) so the loop can
     /// derive its wait deadline from it without a second synchronisation point.

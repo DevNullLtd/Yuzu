@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <utility>
@@ -46,6 +47,42 @@ std::int64_t steady_now_ms() {
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
+
+/// #3953 item 3 / #3980: the send-driven part of the loop's next wait, as a clamp on top of the
+/// periodic bound (nullopt = no send-driven clamp). A WAIT clamp only: it shortens how long the
+/// loop's OWN cv.wait_for blocks and is never a wake source (R4 depends on that).
+///  - a send in flight that has NOT been counted as a stall re-checks every
+///    kGuardianSendRecheckInterval - the item-3 cliff fix, unchanged below the threshold;
+///  - EXCEPT a compliance send on an EMPTIED lane (an orphan: its head was withdrawn, so no
+///    offer() will ever run again to count its stall): it needs exactly ONE wake, at the
+///    instant it crosses the threshold, for the loop-tail probe to count it;
+///  - a send whose stall is already counted contributes no clamp at all - its completion is
+///    seen at the next periodic/enqueue wake (its in_flight reads stale until then). This is
+///    what returns the cadence to the periodic bound; without it a stalled send would keep the
+///    loop spinning at the recheck interval for as long as it stays stuck.
+/// Inputs are the POST-probe snapshots, so a stall the probe just counted already reads
+/// stall_counted here.
+std::optional<std::chrono::milliseconds>
+compute_wait_clamp(const GuardianOutboxSendExecutor::InFlightSnapshot& lifecycle,
+                   const GuardianOutboxSendExecutor::InFlightSnapshot& compliance,
+                   bool compliance_lane_empty) {
+    std::optional<std::chrono::milliseconds> clamp;
+    const auto fold = [&clamp](std::chrono::milliseconds c) {
+        clamp = clamp ? (std::min)(*clamp, c) : c;
+    };
+    if (lifecycle.in_flight && !lifecycle.stall_counted)
+        fold(kGuardianSendRecheckInterval);
+    if (compliance.in_flight && !compliance.stall_counted) {
+        if (compliance_lane_empty)
+            // Floored at 1 ms: a zero wait would be a busy loop. (remaining_to_stall is 0 only
+            // once crossed; the probe counts a crossed stall under the same lock as this
+            // snapshot, so !stall_counted with 0 remaining is not expected - belt and braces.)
+            fold((std::max)(compliance.remaining_to_stall, std::chrono::milliseconds{1}));
+        else
+            fold(kGuardianSendRecheckInterval);
+    }
+    return clamp;
+}
 } // namespace
 
 std::chrono::milliseconds guardian_jitter_offset(std::mt19937& rng,
@@ -62,8 +99,12 @@ YUZU_EXPORT bool on_guardian_joined_thread() noexcept { return tl_guardian_joine
 GuardianOutboxDrainWorker::GuardianOutboxDrainWorker(GuardianSparkRuntime& rt, SendFn send,
                                                      std::uint64_t periodic_bound_ms,
                                                      GuardianMaintenanceConfig maintenance)
-    : rt_(rt), send_(std::move(send)), periodic_bound_ms_(periodic_bound_ms),
-      maint_(maintenance), sig_(std::make_shared<Signal>()),
+    : rt_(rt), send_(std::move(send)),
+      // From the ctor PARAMETER: maint_ is declared after the executors, so it is not yet
+      // constructed here (no member-order dependency).
+      lifecycle_send_exec_(maintenance.send_stall_threshold),
+      compliance_send_exec_(maintenance.send_stall_threshold),
+      periodic_bound_ms_(periodic_bound_ms), maint_(maintenance), sig_(std::make_shared<Signal>()),
       jitter_rng_(std::random_device{}()) {}
 
 GuardianOutboxDrainWorker::~GuardianOutboxDrainWorker() { stop(); }
@@ -111,10 +152,10 @@ void GuardianOutboxDrainWorker::start() {
     // (test_guardian_outbox_drain_worker.cpp): that test's whole point is proving the
     // loop re-arms a forced page from ITS OWN internal refill logic with NO external
     // wake, and an unrelated wake source let it pass for the wrong reason. Fixed
-    // instead with a WAIT clamp, not a wake: loop() polls
-    // GuardianOutboxSendExecutor::has_in_flight_send() on both lanes after every drain
-    // pass and clamps its OWN wait to kGuardianSendRecheckInterval (200ms) while
-    // anything is in flight - see loop()'s wait computation. This closes the same
+    // instead with a WAIT clamp, not a wake: loop() reads both lanes' in-flight snapshots
+    // after every drain pass and clamps its OWN wait (kGuardianSendRecheckInterval, 200ms,
+    // for an uncounted in-flight send; #3980 refines the rule - see compute_wait_clamp() and
+    // loop()'s wait computation). This closes the same
     // cadence cliff (detection latency after completion now bounded by roughly
     // kGuardianSendOfferWait + kGuardianSendRecheckInterval, not by
     // periodic_bound_ms_) without adding a wake source, so R4 - whose sink is fully
@@ -321,15 +362,15 @@ void GuardianOutboxDrainWorker::loop() {
     // wire_spark_engine is safe.
     bool skip_wait = true;
     bool logged_baseline_throw = false; // #4045: log-once latch for the baseline persist firewall
-    // #3953 item 3: a LOCAL, not a member (same convention as the timers above) - set
+    // #3953 item 3 / #3980: a LOCAL, not a member (same convention as the timers above) - set
     // after each drain pass, consumed by the wait computation below. Lets loop() poll a
     // stalled-past-kGuardianSendOfferWait send sooner than the full periodic bound,
     // without becoming a wake SOURCE itself (no sig_->gen bump, no notify_all) - see the
     // wait computation's own comment for why that distinction is what keeps R4 sound.
-    bool send_in_flight_pending = false;
+    std::optional<std::chrono::milliseconds> send_clamp;
     // #4045: the baseline pass yielded to an apply_rules or a fence waiter (or deferred while an
     // apply_rules was in flight). Nothing wakes the worker when that apply finishes, so the wait
-    // is clamped like send_in_flight_pending (a WAIT clamp, not a wake source).
+    // is clamped like send_clamp (a WAIT clamp, not a wake source).
     bool baseline_recheck_pending = false;
     // Concurrent arm/disarm traffic can refill the window between the end-of-cycle headroom
     // check and the next page pass, so the immediate re-arm could chain indefinitely - each
@@ -394,7 +435,10 @@ void GuardianOutboxDrainWorker::loop() {
             // #3953 item 3: a send known in flight on either lane at the end of the last
             // pass is re-checked sooner than the full periodic bound - closes the
             // throughput cliff a send finishing between kGuardianSendOfferWait (200ms)
-            // and the periodic backstop used to hit. Deliberately just a WAIT clamp, not
+            // and the periodic backstop used to hit. #3980 bounds that clamp (see
+            // compute_wait_clamp): a send whose stall is already counted no longer
+            // clamps, and a compliance orphan on an emptied lane gets one wake at its
+            // stall threshold. Deliberately just a WAIT clamp, not
             // a wake (no gen bump, no notify_all): R4 ("a refill re-arm does not wait out
             // the periodic bound") discriminates entirely on nothing but its own re-arm
             // being able to produce a page inside its spin_until window - an added wake
@@ -403,9 +447,13 @@ void GuardianOutboxDrainWorker::loop() {
             // against. A shortened WAIT cannot do that: it only changes how long THIS
             // loop's own cv.wait_for blocks before re-evaluating its own predicate, so R4
             // (whose sink is fully synchronous - offer() never returns nullopt there, so
-            // send_in_flight_pending is always false in that test) is untouched.
-            if (send_in_flight_pending || baseline_recheck_pending)
+            // send_clamp is always empty in that test) is untouched.
+            if (send_clamp)
+                wait_ms = (std::min)(wait_ms, *send_clamp);
+            if (baseline_recheck_pending)
                 wait_ms = (std::min)(wait_ms, kGuardianSendRecheckInterval);
+            last_computed_wait_ms_.store(static_cast<std::int64_t>(wait_ms.count()),
+                                         std::memory_order_relaxed);
             sig_->cv.wait_for(lk, wait_ms, [this, seen] {
                 return sig_->stopping.load(std::memory_order_acquire) || sig_->gen != seen;
             });
@@ -576,15 +624,32 @@ void GuardianOutboxDrainWorker::loop() {
         if (baselines_more && !stop_requested())
             skip_wait = true; // staged captures remain and nothing failed: go again now
 
-        // #3953 item 3: firewalled like every other read in this bare-thread tail (the
+        // #3953 item 3 / #3980: firewalled like every other read in this bare-thread tail (the
         // item-13 seam below models exactly this class of exposure) - a std::system_error
-        // from either executor's mutex lock must not escape and kill the one-shot worker.
-        // Fails toward the existing periodic-bound cadence (false), never toward a crash.
+        // from outbox_size() or either executor's mutex lock must not escape and kill the
+        // one-shot worker. Fails toward the periodic-bound cadence (no clamp), never a crash.
+        //
+        // COMPLIANCE lane: probe it once per cycle. Its queue can be emptied under a still-
+        // running send (detach_rule() drops the rule's verdict from the outbox), and then no
+        // offer() ever runs again to count that send's stall or notice its completion - the
+        // probe does both (counts the stall at the threshold; reclaims the slot once the send is
+        // done AND the lane is empty). A non-empty lane is left to offer(), which owns the
+        // reclaim/consume decision for its head. Lane-empty is outbox_size()==0 (compliance +
+        // health share that list and that lane).
+        //
+        // LIFECYCLE lane: deliberately NO probe, only a read-only snapshot. On the production
+        // path its head changes only via pop_front_if(event_id) after offer() returned Sent for
+        // that very head, and the page path only appends, so a lifecycle send cannot be in
+        // flight on an emptied lane. The invariant is voided only by concurrent use of the
+        // test-only drain_once() seam (it calls rt_.drain() directly, bypassing the executors).
+        loop_cycles_.fetch_add(1, std::memory_order_relaxed);
         try {
-            send_in_flight_pending =
-                lifecycle_send_exec_.has_in_flight_send() || compliance_send_exec_.has_in_flight_send();
+            const bool compliance_lane_empty = rt_.outbox_size() == 0;
+            const auto compliance = compliance_send_exec_.probe_orphan(compliance_lane_empty);
+            send_clamp = compute_wait_clamp(lifecycle_send_exec_.in_flight_snapshot(),
+                                            compliance.snapshot, compliance_lane_empty);
         } catch (...) {
-            send_in_flight_pending = false;
+            send_clamp.reset();
         }
 
         // TEST-ONLY item-13 seam: model a throw from the loop's OWN tail (the refill re-arm's
