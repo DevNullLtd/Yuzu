@@ -194,6 +194,30 @@ TEST_CASE("route: results_only returns ONLY the #hw-results region", "[hardware]
     REQUIRE(contains(full->body, "HW-RESULTS-HOST"));
 }
 
+// Kills: the route dropping all.tags_degraded / all.ci_degraded on the results_only call, which
+// every htmx control uses, so a degraded read would read as "no tags" / "no CI" after one click.
+TEST_CASE("route: results_only list keeps the degrade banners", "[hardware][route]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "HW-DEGRADE-HOST", "windows", true)};
+
+    auto healthy = h.sink.Get("/fragments/hardware/list?results_only=1");
+    REQUIRE(healthy);
+    REQUIRE_FALSE(contains(healthy->body, "Tags unavailable"));
+    REQUIRE_FALSE(contains(healthy->body, "CI columns unavailable"));
+
+    h.roster_tags_degraded = true;
+    auto tags = h.sink.Get("/fragments/hardware/list?results_only=1");
+    REQUIRE(tags);
+    REQUIRE(tags->body.starts_with("<div id=\"hw-results\""));
+    REQUIRE(contains(tags->body, "Tags unavailable"));
+
+    h.roster_tags_degraded = false;
+    h.roster_ci_degraded = true;
+    auto ci = h.sink.Get("/fragments/hardware/list?results_only=1");
+    REQUIRE(ci);
+    REQUIRE(contains(ci->body, "CI columns unavailable"));
+}
+
 TEST_CASE("route: list — invalid tag key is a 400 (normalise_hardware_query nullopt path)",
           "[hardware][route]") {
     HwHarness h;
@@ -953,6 +977,45 @@ TEST_CASE("route: hardware record id of exactly the length limit passes the floo
         REQUIRE_FALSE(h.audit_full.empty());
         REQUIRE(h.audit_full.back() == expected_row);
     }
+}
+
+// Kills: an over-strict floor on the accept side (`c <= 0x20` refusing a space, or a signed `char`
+// refusing every byte >= 0x80) and an over-lax one (a threshold under 0x1f letting US through).
+// Accept-side ids are legal on both routes and reach their normal audit row; the reject-side id
+// is the floor's 400 with no audit row. (An embedded NUL is not tested: a std::string URL handed
+// to the sink may truncate at it, which would turn the case into a vacuous accept.)
+TEST_CASE("route: hardware record id floor accepts 0x20 and bytes over 0x7f and refuses 0x1f",
+          "[hardware][route][rest][security]") {
+    for (const auto& id : {std::string("agent 1"), std::string("a\xC3\xA9")}) {
+        CAPTURE(id);
+        const std::string expected_row = "inventory.device.ci|success|Agent|" + id;
+        {
+            HwHarness h;
+            auto rest = h.sink.Get("/api/v1/hardware/" + id);
+            REQUIRE(rest);
+            REQUIRE(rest->status != 400);
+            REQUIRE_FALSE(h.audit_full.empty());
+            REQUIRE(h.audit_full.back() == expected_row);
+        }
+        {
+            HwHarness h;
+            auto frag = h.sink.Get("/fragments/hardware/ci?id=" + id);
+            REQUIRE(frag);
+            REQUIRE(frag->status != 400);
+            REQUIRE_FALSE(h.audit_full.empty());
+            REQUIRE(h.audit_full.back() == expected_row);
+        }
+    }
+    const std::string us = "a\x1f" "b";
+    HwHarness h;
+    h.ci_detail = degraded_identity_detail(false);
+    auto rest = h.sink.Get("/api/v1/hardware/" + us);
+    REQUIRE(rest);
+    REQUIRE(rest->status == 400);
+    auto frag = h.sink.Get("/fragments/hardware/ci?id=" + us);
+    REQUIRE(frag);
+    REQUIRE(frag->status == 400);
+    REQUIRE(h.audits.empty());
 }
 
 // Kills: moving the floor BELOW the scope gate on either route - an invalid id is refused before

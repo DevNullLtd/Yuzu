@@ -665,18 +665,21 @@ TEST_CASE("apply_tag_read: every failed read degrades and every healthy read pop
         bool reader_called;
         bool degraded;
         std::vector<std::pair<std::string, std::string>> a1_tags;
+        std::vector<std::string> expected_keys; // what the reader must be handed
     };
     const TagValuesRead no_values{TagValuesRead::value_type{}};
     const std::array<Row, 5> table{{
-        {"key read fails", std::unexpected(TagReadError::kDegraded), no_values, false, true, {}},
+        {"key read fails", std::unexpected(TagReadError::kDegraded), no_values, false, true, {}, {}},
         {"keys ok, values fail", Keys{std::vector<std::string>{"env"}},
-         std::unexpected(TagReadError::kDegraded), true, true, {}},
+         std::unexpected(TagReadError::kDegraded), true, true, {}, {"env"}},
         {"keys ok, values ok",
          Keys{std::vector<std::string>{"env"}},
-         TagValuesRead{TagValuesRead::value_type{{"a1", {{"env", "prod"}}}}}, true, false, {{"env", "prod"}}},
-        {"keys ok but empty", Keys{std::vector<std::string>{}}, no_values, true, false, {}},
+         TagValuesRead{TagValuesRead::value_type{{"a1", {{"env", "prod"}}}}}, true, false, {{"env", "prod"}},
+         {"env"}},
+        {"keys ok but empty", Keys{std::vector<std::string>{}}, no_values, true, false, {}, {}},
         {"keys ok, device has no tags", Keys{std::vector<std::string>{"env"}},
-         TagValuesRead{TagValuesRead::value_type{{"a2", {{"env", "dev"}}}}}, true, false, {}},
+         TagValuesRead{TagValuesRead::value_type{{"a2", {{"env", "dev"}}}}}, true, false, {},
+         {"env"}},
     }};
     for (const auto& row : table) {
         CAPTURE(row.name);
@@ -685,11 +688,15 @@ TEST_CASE("apply_tag_read: every failed read degrades and every healthy read pop
         result.rows[0].agent_id = "a1";
         result.rows[1].agent_id = "a2";
         bool called = false;
-        apply_tag_read(result, row.keys, [&](const std::vector<std::string>&) {
+        std::vector<std::string> seen;
+        apply_tag_read(result, row.keys, [&](const std::vector<std::string>& keys) {
             called = true;
+            seen = keys;
             return row.values;
         });
         CHECK(called == row.reader_called);
+        if (row.reader_called)
+            CHECK(seen == row.expected_keys); // the keys read are the ones handed to the values read
         CHECK(result.tags_degraded == row.degraded);
         CHECK(result.rows[0].tags == row.a1_tags);
     }
@@ -718,7 +725,9 @@ TEST_CASE("offline_identity_row: error propagates; hit is offline; miss is nullo
     REQUIRE(old.has_value());
     CHECK((*old)->stale);
 
-    // kHardwareStaleAfterMs boundary: exactly two days old is fresh, one millisecond over is stale.
+    // kHardwareStaleAfterMs boundary: the probes are derived from the constant, so its value is
+    // pinned separately; at the edge is fresh, one millisecond over is stale.
+    CHECK(kHardwareStaleAfterMs == 2 * kDayMs);
     const auto at_edge = offline_identity_row(
         OfflineRosterRead{
             std::vector<OfflineEndpoint>{make_offline_ep("a1", 10 * kDayMs - kHardwareStaleAfterMs)}},

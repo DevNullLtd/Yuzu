@@ -528,3 +528,49 @@ TEST_CASE("hardware list fragment: a degraded full-form list renders no KPI stri
     const auto healthy = render_hardware_list_fragment(HardwareListPage{}, false, false, false);
     CHECK(healthy.find(marker) != std::string::npos);
 }
+
+// Kills: leaving the CI / Tags degrade banners in the page shell (outside #hw-results), where a
+// results_only htmx swap drops them; passing a hardcoded false for tags_degraded on either path;
+// emitting a banner in both the shell and the region (the exactly-once check).
+TEST_CASE("hardware list fragment: degrade banners live inside #hw-results, once, on every path",
+          "[hardware][ui]") {
+    const std::string ci_banner = "CI columns unavailable";
+    const std::string tags_banner = "Tags unavailable";
+    const std::string region = "id=\"hw-results\"";
+
+    SECTION("full render: each banner exactly once, after the region opens") {
+        const auto html = render_hardware_list_fragment(HardwareListPage{}, /*ci_degraded=*/true,
+                                                        /*roster_unavailable=*/false,
+                                                        /*results_only=*/false,
+                                                        /*tags_degraded=*/true);
+        const auto open = html.find(region);
+        REQUIRE(open != std::string::npos);
+        CHECK(count_occurrences(html, ci_banner) == 1);
+        CHECK(count_occurrences(html, tags_banner) == 1);
+        CHECK(html.find(ci_banner) > open);
+        CHECK(html.find(tags_banner) > open);
+    }
+    SECTION("results_only: Tags banner survives the refresh") {
+        const auto html = render_hardware_list_fragment(HardwareListPage{}, false, false,
+                                                        /*results_only=*/true,
+                                                        /*tags_degraded=*/true);
+        CHECK(html.starts_with("<div id=\"hw-results\""));
+        CHECK(count_occurrences(html, tags_banner) == 1);
+        CHECK(html.find(ci_banner) == std::string::npos);
+    }
+    SECTION("results_only: CI banner survives the refresh") {
+        const auto html = render_hardware_list_fragment(HardwareListPage{}, /*ci_degraded=*/true,
+                                                        false, /*results_only=*/true, false);
+        CHECK(html.starts_with("<div id=\"hw-results\""));
+        CHECK(count_occurrences(html, ci_banner) == 1);
+        CHECK(html.find(tags_banner) == std::string::npos);
+    }
+    SECTION("healthy: no banner on either form") {
+        for (const bool results_only : {false, true}) {
+            const auto html = render_hardware_list_fragment(HardwareListPage{}, false, false,
+                                                            results_only, false);
+            CHECK(html.find(ci_banner) == std::string::npos);
+            CHECK(html.find(tags_banner) == std::string::npos);
+        }
+    }
+}

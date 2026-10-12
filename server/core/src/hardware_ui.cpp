@@ -379,12 +379,22 @@ std::string sync_button(const std::string& agent_id, const char* source, const c
     return h;
 }
 
-std::string render_hardware_results_region(const HardwareListPage& page, bool ci_degraded) {
+std::string render_hardware_results_region(const HardwareListPage& page, bool ci_degraded,
+                                           bool tags_degraded) {
     const HardwareListQuery& q = page.query;
     // data-url: the bulk-tag action bar re-fetches this exact view (with the live q
     // included) after applying tags to the selection, so the refreshed list reflects
     // the SAME filter/sort/page the operator was looking at.
     std::string h = "<div id=\"hw-results\" data-url=\"" + esc(list_url(q, true, true)) + "\">";
+    // The degrade banners live INSIDE the swap target: every htmx control re-renders
+    // only #hw-results (results_only=1), so a banner in the page shell would vanish on
+    // the first refresh and leave a blank cell reading as "no CI" / "no tags".
+    if (ci_degraded)
+        h += "<div class=\"hw-degrade\"><b>CI columns unavailable.</b> The device-CI store could not "
+             "be read &mdash; a blank cell here is not \"no CI\", it is a degraded read.</div>";
+    if (tags_degraded)
+        h += "<div class=\"hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
+             "&mdash; a blank Tags column here is not \"no tags\", it is a degraded read.</div>";
     // Sticky bulk-tag action bar (round-3 item 7) — hidden by CSS until a row is
     // checked (hwSelRender toggles a `show` class); JS lives in guardian_page_ui.cpp.
     // Applying loops the EXISTING single-agent /api/tags/set|delete per selected
@@ -455,7 +465,7 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
         return "<div id=\"hw-results\" data-url=\"" + esc(list_url(page.query, true, true)) +
                "\">" + kRosterBanner + "</div>";
     if (results_only)
-        return render_hardware_results_region(page, ci_degraded);
+        return render_hardware_results_region(page, ci_degraded, tags_degraded);
 
     std::string h = hw_style();
     h += "<div class=\"hw-wrap\">";
@@ -469,12 +479,6 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
     }
 
     h += kpis_html(page.kpis, ci_degraded);
-    if (ci_degraded)
-        h += "<div class=\"hw-degrade\"><b>CI columns unavailable.</b> The device-CI store could not "
-             "be read &mdash; a blank cell here is not \"no CI\", it is a degraded read.</div>";
-    if (tags_degraded)
-        h += "<div class=\"hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
-             "&mdash; a blank Tags column here is not \"no tags\", it is a degraded read.</div>";
 
     const HardwareListQuery& q = page.query;
     h += "<div class=\"hw-ctrls\">";
@@ -491,7 +495,7 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
          "hx-trigger=\"keyup changed delay:400ms, search\" hx-sync=\"this:replace\">";
     h += "</div>";
 
-    h += render_hardware_results_region(page, ci_degraded);
+    h += render_hardware_results_region(page, ci_degraded, tags_degraded);
     h += "</div>";
     return h;
 }

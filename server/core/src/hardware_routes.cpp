@@ -129,8 +129,9 @@ scoped_roster(const InventoryDevicesResult& all, const authz::VisibleSet& scope)
 }
 
 // Audit-trail floor for an id taken raw from a URL: a device id reaches `target_id`
-// on the roster-failure audit rows, so over-long ids and C0 control bytes (CR/LF) are
-// refused before any audit write. Mirrors viz_routes.cpp's agent_id floor.
+// on every audit row these routes write and on the permission-denial audit, so ids over
+// kMaxAgentIdLength bytes or carrying a byte below 0x20 (CR/LF) are refused before any
+// audit write. Mirrors viz_routes.cpp's agent_id floor.
 bool id_is_audit_safe(const std::string& id) {
     return id.size() <= auth::kMaxAgentIdLength &&
            std::none_of(id.begin(), id.end(), [](unsigned char c) { return c < 0x20; });
@@ -211,7 +212,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!normalised) {
             res.status = 400;
             send_html(res, "<div class=\"gp-placeholder\"><b>Bad request.</b> Unrecognised sort, "
-                          "direction, OS, or status filter.</div>");
+                          "OS, or status filter, or invalid tag key.</div>");
             return;
         }
         const bool results_only = req.has_param("results_only") && req.get_param_value("results_only") == "1";
@@ -500,7 +501,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto normalised = normalise_hardware_query(raw);
         if (!normalised) {
             res.status = 400;
-            res.set_content(detail::a4_error(res, "unrecognised sort, dir, os, or status token"),
+            res.set_content(detail::a4_error(res, "unrecognised sort, os, or status token or invalid tag key"),
                             "application/json");
             return;
         }
