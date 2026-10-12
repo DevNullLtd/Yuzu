@@ -1563,12 +1563,14 @@ flip, with a red-first test each:
     waits, host-conditional expected counts and one SKIP, equal to the earlier expectations on
     Linux, and add no thread or owned resource. A first TSan re-run found a test-exit race (a
     detached worker committing after the case ended); the test Rig now waits for the worker count
-    to reach zero. Windows (MSVC, weecolin) built and ran `[4415prA]` 64/64, `[guardian]` and
-    `[spark]` green at `490c773fa`; one full `[guardian]` run also hit the pre-existing
-    `FileGuard rename*` flake (#5508; alone on baseline `f7a000fc3` it failed 2 of 20 and 5 of 12
-    runs; on the PR-A branch 0 of 20 alone and 1 of 6 in an earlier mixed run). macOS (Apple Clang, mini-colin, arm64) built and ran `[4415prA]`
-    64 cases (63 pass, 1 skipped on a host with no system bus), `[guardian]`, `[spark]` and the
-    10-shard agent suite all green at `0223018f6`; its first run found one more host-dependent
+    to reach zero. Windows (MSVC, weecolin) built and ran `[4415prA]` 64/64, `[guardian]` 723 and
+    `[spark]` 1131 green at `a34d19103` (and the first two at `490c773fa`). The pre-existing
+    `FileGuard rename*` flake (#5508) also fires there: alone, baseline `f7a000fc3` failed 10 of
+    52 runs (2/20, 5/12, 3/20) and the PR-A branch 8 of 46 (0/20, 2/6, 6/20); the test includes
+    only `guard_file.hpp` and uses none of the code this change touches, so the two rates are
+    read as the same flake. macOS (Apple Clang, mini-colin, arm64) built and ran `[4415prA]` 64
+    cases (63 pass, 1 skipped on a host with no system bus), `[guardian]`, `[spark]` and the
+    10-shard agent suite all green at `a34d19103`; its first run found one more host-dependent
     test (CH-5), fixed.
     **Flip preconditions beside AC-18** (none is done): (a) enable the `yuzu-fleet-spark`
     `armed_faulted > 0` alert (its group in `docs/prometheus/yuzu-alerts.yml` is commented out);
