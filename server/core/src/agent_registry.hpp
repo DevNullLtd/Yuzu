@@ -1209,19 +1209,20 @@ private:
     EventBus& bus_;
     yuzu::MetricsRegistry& metrics_;
 
-    /// HA WS-5 (ADR-2002 §7a). Non-owning; null = presence unconfigured
-    /// (local-only behavior, unchanged from pre-WS-5). Set once via
-    /// configure_presence during server wiring, read (without mu_ held — a
-    /// Postgres round trip must never run under the same lock
-    /// register_agent/send_to/evaluate_scope contend on) by all_ids() and
-    /// evaluate_scope().
-    OfflineEndpointStore* presence_store_{nullptr};
-    /// PM0.1: the one `query_live_ids` caller path (empty = unconfigured).
+    /// HA WS-5 (ADR-2002 §7a). Empty = presence unconfigured (local-only
+    /// behavior, unchanged from pre-WS-5). Set once via configure_presence
+    /// during server wiring, read (without mu_ held — a Postgres round trip
+    /// must never run under the same lock register_agent/send_to/
+    /// evaluate_scope contend on) by all_ids() and evaluate_scope(). The
+    /// production binding borrows the `OfflineEndpointStore*` non-owning:
+    /// server teardown nulls it via `configure_presence(nullptr, ...)` BEFORE
+    /// `offline_endpoint_store_.reset()` (test_store_wiring_order.cpp).
+    /// PM0.1: the one `query_live_ids` caller path.
     PresenceReadFn presence_reader_;
     std::chrono::seconds presence_ttl_{90};
 
     /// HA WS-5 governance hardening (Gate 3 performance + sre, 2026-09-22):
-    /// a bare `presence_store_->query_live_ids(...)` on every all_ids()/
+    /// a bare `query_live_ids(...)` on every all_ids()/
     /// evaluate_scope() call put a synchronous Postgres round trip on paths
     /// that were previously pure in-memory on EVERY deployment — presence is
     /// wired unconditionally at boot whenever `OfflineEndpointStore`
@@ -1256,7 +1257,7 @@ private:
     /// Returns the cached (or freshly-fetched, if stale/first-call) live
     /// presence set — or the cached/fresh `PresenceReadError` on a degraded
     /// read (#4981 PR-1 Finding B). Success-empty immediately, no lock taken,
-    /// when presence is unconfigured (`presence_store_ == nullptr`) — the
+    /// when presence is unconfigured (`presence_reader_` empty) — the
     /// common single-replica case pays only the pointer check, and can never
     /// fail this way.
     std::expected<std::vector<PresenceIdentity>, PresenceReadError> live_presence() const;

@@ -654,9 +654,8 @@ struct QuarantineDegradationResult {
 /// function) on an agent with no reported inventory at all, so a
 /// freshly-registered or gateway-relayed agent is never wrongly withheld for
 /// absence of DATA rather than absence of the plugin.
-/// The protective set (`yuzu::protective::is_protective_action`) is carved out
-/// inside `ids_missing_plugin` itself, so a stale registration-time inventory
-/// can never withhold a quarantine/Guardian dispatch from this arm.
+/// The protective set is carved out inside `ids_missing_plugin` (see its
+/// declaration).
 ///
 /// `os_kill_switched` (#5294) follows the identical empty-is-safe argument:
 /// the ids a per-OS kill switch withholds, built once per dispatch by

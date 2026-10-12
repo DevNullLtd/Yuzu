@@ -1499,7 +1499,7 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
 std::vector<std::string> AgentRegistry::all_ids() const {
     // HA WS-5: live_presence() is cached (kPresenceCacheTtl) and runs OFF
     // mu_ — the same rule the evaluate_scope preloads follow, never holding
-    // the registry lock across Postgres I/O. A null presence_store_
+    // the registry lock across Postgres I/O. An empty presence_reader_
     // (unconfigured) makes this call cost nothing beyond the pointer check;
     // a configured one (the production default — see live_presence()'s own
     // doc comment for why this is NOT gated behind an HA-only signal) costs
@@ -1546,13 +1546,11 @@ bool AgentRegistry::has_remote_presence(const std::vector<std::string>& ids) con
 }
 
 void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl) {
-    presence_store_ = store;
-    presence_ttl_ = ttl;
-    if (store) {
-        presence_reader_ = [store](std::chrono::seconds t) { return store->query_live_ids(t); };
-    } else {
-        presence_reader_ = nullptr;
-    }
+    configure_presence(store ? PresenceReadFn{[store](std::chrono::seconds t) {
+                                   return store->query_live_ids(t);
+                               }}
+                             : PresenceReadFn{},
+                       ttl);
 }
 
 void AgentRegistry::configure_presence(PresenceReadFn reader, std::chrono::seconds ttl) {

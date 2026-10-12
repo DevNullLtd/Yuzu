@@ -21,6 +21,20 @@
 
 namespace yuzu::protective {
 
+namespace detail {
+/// Case-insensitive equality against a LOWERCASE literal `b` (only `a` is
+/// folded). The one comparison both predicates below share.
+[[nodiscard]] inline bool iequals(std::string_view a, std::string_view b) {
+    if (a.size() != b.size())
+        return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) != b[i])
+            return false;
+    }
+    return true;
+}
+} // namespace detail
+
 /// #881: case-insensitive predicate for the quarantine control-channel
 /// exemption. Pure — no store access — so a test can bind it directly without
 /// a live `QuarantineStore`. Normalises to lowercase itself
@@ -41,16 +55,8 @@ namespace yuzu::protective {
 /// the body.
 [[nodiscard]] inline bool is_quarantine_control_plugin(std::string_view plugin,
                                                        std::string_view action) {
+    using detail::iequals;
     constexpr std::string_view kQuarantinePlugin{"quarantine"};
-    auto iequals = [](std::string_view a, std::string_view b) {
-        if (a.size() != b.size())
-            return false;
-        for (std::size_t i = 0; i < a.size(); ++i) {
-            if (std::tolower(static_cast<unsigned char>(a[i])) != b[i])
-                return false;
-        }
-        return true;
-    };
     if (!iequals(plugin, kQuarantinePlugin))
         return false;
 
@@ -83,15 +89,7 @@ namespace yuzu::protective {
 [[nodiscard]] inline bool is_protective_action(std::string_view plugin, std::string_view action) {
     if (is_quarantine_control_plugin(plugin, action))
         return true;
-    auto iequals = [](std::string_view a, std::string_view b) {
-        if (a.size() != b.size())
-            return false;
-        for (std::size_t i = 0; i < a.size(); ++i) {
-            if (std::tolower(static_cast<unsigned char>(a[i])) != b[i])
-                return false;
-        }
-        return true;
-    };
+    using detail::iequals;
     return iequals(plugin, "__guard__") && iequals(action, "push_rules");
 }
 
