@@ -381,9 +381,10 @@ struct DexEffectivePolicy {
 [[nodiscard]] inline const std::string& dex_tier_name(const DexTierPolicy& t, StabilityBand b) {
     return t.names[static_cast<std::size_t>(b)];
 }
-/// A temporary (resolve_dex_score_policy(p, img).tiers) would leave the
-/// reference dangling after the full expression.
+/// A temporary (resolve_dex_score_policy(p, img).tiers), const or not, would
+/// leave the reference dangling after the full expression.
 const std::string& dex_tier_name(DexTierPolicy&&, StabilityBand) = delete;
+const std::string& dex_tier_name(const DexTierPolicy&&, StabilityBand) = delete;
 
 /// Scores under ONE effective policy: its weights and its edges together. The
 /// one spelling a consumer uses; compute_stability_score's defaulted edges

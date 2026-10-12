@@ -82,6 +82,12 @@ template <class T>
 concept TierNameOfTemporary = requires { dex_tier_name(T{}, StabilityBand::Poor); };
 static_assert(!TierNameOfTemporary<DexTierPolicy>,
               "dex_tier_name must not accept a temporary: the returned reference would dangle");
+// A const rvalue (std::move of a const object) must be refused as well.
+template <class T>
+concept TierNameOfConstTemporary =
+    requires(const T t) { dex_tier_name(std::move(t), StabilityBand::Poor); };
+static_assert(!TierNameOfConstTemporary<DexTierPolicy>,
+              "dex_tier_name must not accept a const temporary: the reference would dangle");
 
 StabilityBand hand_band(double score, const StabilityBandEdges& e) {
     const double shown = stability_display_score(score);
@@ -294,6 +300,19 @@ TEST_CASE("policy: every invalid shape is refused whole with its typed fault and
         p = defaults();
         p.overrides = {both};
         require_fault(p, DexPolicyFault::EdgesNotDescending, 0);
+
+        // Names before weights: a bad name wins over a bad weight, globally
+        // and within one override's effective policy.
+        p = defaults();
+        p.tiers.names[0] = "";
+        p.weights.hangs = -1.0;
+        require_fault(p, DexPolicyFault::NameInvalid);
+        auto named = ov("named.exe");
+        named.names[0] = "";
+        named.breadth = 70.0; // effective weights sum past 100
+        p = defaults();
+        p.overrides = {named};
+        require_fault(p, DexPolicyFault::NameInvalid, 0);
 
         // Within the tiers: every edge fault before any name fault.
         const std::pair<StabilityBandEdges, DexPolicyFault> edge_then_name[] = {
