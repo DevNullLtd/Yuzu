@@ -110,6 +110,12 @@ document's generated block going stale relative to a fresh render. See
 unit-test half (RestApiV1's own `register_routes()` vs `openapi_spec()`,
 plus `$ref` validity) - the #842 companion to this whole-tree script.
 
+**REST-only exports.** The `format=csv` titles export on
+`GET /api/v1/inventory/software/catalogue` is REST-only by design and has no MCP
+twin: a CSV body is a download for a person or a pipeline, not a structured tool
+result (the same reason is recorded beside `BASELINE_UNTWINNED` in
+`check-api-parity.py`).
+
 ## Summary
 
 <!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; regenerate with `python3 scripts/ci/check-api-parity.py --render-doc` and splice between these markers -->
@@ -117,7 +123,7 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
 | devices | 14 | 9 | 5 |
-| inventory | 3 | 1 | 2 |
+| inventory | 3 | 2 | 1 |
 | dex | 26 | 18 | 8 |
 | guardian | 16 | 6 | 10 |
 | tar | 12 | 4 | 8 |
@@ -139,11 +145,11 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
 | other | 74 | 13 | 61 |
-| **Total** | **282** | **81** | **201** |
+| **Total** | **282** | **82** | **200** |
 
-Registered `/api/vN/*` routes: 244. OpenAPI `paths` entries: 243. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 184.
+Registered `/api/vN/*` routes: 246. OpenAPI `paths` entries: 245. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 184.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 201.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 200.
 
 <!-- END GENERATED -->
 
