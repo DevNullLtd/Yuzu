@@ -17,6 +17,7 @@
 /// (relocated from the dashboard TU, ADR-0031 WS-A4 PR-1 F1 fix, closing the
 /// #4579 link residual's DEX half).
 
+#include <cstdint>
 #include <string>
 
 namespace yuzu::server {
@@ -24,6 +25,11 @@ namespace yuzu::server {
 /// Maps the window token "24h"/"7d"/"30d"/"all" (anything else → 7d) to a day
 /// count (0 = "all"). Pair with `dex_iso_since` to get the ISO-8601 UTC cutoff.
 int dex_window_to_days(const std::string& window);
+
+/// ISO-8601 UTC rendering of an absolute epoch-seconds instant — the shared
+/// formatter behind `dex_iso_since`, exposed so a caller that cuts one window
+/// at a fixed instant (say a UTC midnight) formats it identically.
+std::string dex_iso_at(std::int64_t epoch_seconds);
 
 /// Turns a resolved day count into an ISO-8601 UTC cutoff ("" when days<=0 =
 /// "all") — the day-count half of the shared window vocabulary.

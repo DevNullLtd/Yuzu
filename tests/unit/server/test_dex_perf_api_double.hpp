@@ -37,8 +37,12 @@
 #include "dex_app_perf_builders.hpp" // app_perf_fleet_trend/group_trend, dex_device_app_perf_json
 #include "dex_perf_api.hpp"
 #include "dex_perf_model.hpp" // DexPerfFn
+#include "dex_window.hpp"
 #include "test_verify_api_double.hpp" // CohortRead, AppPerfCohortFn (Providers::cohort)
 
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -75,6 +79,12 @@ using AppPerfVersionDevicesFn = std::function<std::optional<std::vector<AppPerfV
     std::string_view app_name, std::string_view version,
     const std::optional<std::vector<std::string>>& visible_agent_ids, bool& truncated)>;
 
+/// The owner's read signature (dex_app_version_failures_owner.hpp), as a provider.
+using AppPerfVersionFailuresFn =
+    std::function<std::optional<std::vector<AppPerfVersionFailureRow>>(
+        std::string_view app, const std::vector<std::string>& versions, std::int64_t since_day,
+        std::int64_t end_day, std::string_view since_iso)>;
+
 } // namespace yuzu::server
 
 namespace yuzu::server::test {
@@ -92,6 +102,17 @@ public:
         yuzu::server::AppPerfCohortFn cohort; ///< VERIFY before/after compare; unused by DexPerfApi
         yuzu::server::AppPerfVersionDevicesFn version_devices;
         yuzu::server::AppPerfTagCohortFn tag_cohort;
+        /// Crash and hang rows for `app_fleet_report`. Defaults to an engaged
+        /// EMPTY read (no failures, exposure unknown) so a harness that never
+        /// sets it keeps serving a 200; set a lambda returning nullopt to model
+        /// the owner's typed degrade.
+        yuzu::server::AppPerfVersionFailuresFn failures =
+            [](std::string_view, const std::vector<std::string>&, std::int64_t, std::int64_t,
+               std::string_view) {
+                return std::optional<std::vector<yuzu::server::AppPerfVersionFailureRow>>{
+                    std::vector<yuzu::server::AppPerfVersionFailureRow>{}};
+            };
+        int failure_window_days{yuzu::server::kAppPerfFailureWindowDays};
     };
 
     FnDexPerfApi(yuzu::server::DexPerfFn dex_perf_fn, Providers providers)
@@ -117,6 +138,40 @@ public:
         if (!rows)
             return std::nullopt;
         return yuzu::server::app_perf_fleet_trend(*rows);
+    }
+
+    // Mirrors LocalDexPerfApi::app_fleet_report step for step: the same points,
+    // the same newest-first capped version list handed to the failure read, the
+    // same join. Either read degrading makes the report nullopt.
+    [[nodiscard]] std::optional<yuzu::server::AppPerfFleetReport>
+    app_fleet_report(const std::string& app, const std::string& version) const override {
+        if (!providers_.failures)
+            return std::nullopt;
+        auto points = app_fleet_trend(app, version);
+        if (!points)
+            return std::nullopt;
+        std::vector<std::string> versions;
+        for (const auto& p : *points)
+            versions.push_back(p.version);
+        std::sort(versions.begin(), versions.end(),
+                  [](const std::string& a, const std::string& b) {
+                      return yuzu::server::app_perf_canon_version_less(b, a);
+                  });
+        versions.erase(std::unique(versions.begin(), versions.end()), versions.end());
+        if (versions.size() > yuzu::server::kAppPerfVersionJoinCap)
+            versions.resize(yuzu::server::kAppPerfVersionJoinCap);
+        const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count();
+        const std::int64_t today = (now / 86400) * 86400;
+        const std::int64_t since_day =
+            today - static_cast<std::int64_t>(providers_.failure_window_days) * 86400;
+        auto failures =
+            providers_.failures(app, versions, since_day, today, yuzu::server::dex_iso_at(since_day));
+        if (!failures)
+            return std::nullopt;
+        return yuzu::server::app_perf_version_failure_join(std::move(*points), *failures,
+                                                           providers_.failure_window_days);
     }
 
     [[nodiscard]] std::optional<std::vector<yuzu::server::AppPerfVersionDeviceRow>>

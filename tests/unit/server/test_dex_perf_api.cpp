@@ -39,6 +39,9 @@
 #include "app_perf_group_reader.hpp"
 #include "app_perf_rollup.hpp"
 #include "dex_app_perf_builders.hpp" // app_perf_fleet_trend parity oracle
+#include "dex_app_version_failures_owner.hpp"
+#include "dex_window.hpp"
+#include "guaranteed_state_store.hpp"
 #include "management_group_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "tag_store.hpp"
@@ -52,13 +55,19 @@
 #include <string>
 #include <vector>
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 using yuzu::server::AppPerfDailyRow;
 using yuzu::server::AppPerfDailyStore;
 using yuzu::server::AppPerfFleetStore;
 using yuzu::server::AppPerfGroupReader;
 using yuzu::server::AppPerfRollup;
+using yuzu::server::AppPerfVersionFailureRow;
+using yuzu::server::DexAppVersionFailuresOwner;
+using yuzu::server::GuaranteedStateEventRow;
+using yuzu::server::GuaranteedStateStore;
 using yuzu::server::DexPerfSnapshot;
 using yuzu::server::make_local_dex_perf_api;
 using yuzu::server::ManagementGroup;
@@ -83,6 +92,11 @@ yuzu::test::PgTestTemplate dex_perf_api_tpl{"dexperfapi", [](const std::string& 
     TagStore tags{pool};
     if (!mgmt.is_open() || !tags.is_open())
         throw std::runtime_error("dexperfapi template: mgmt/tag store failed to migrate");
+    // The per-version failure read (DexAppVersionFailuresOwner) joins the crash and
+    // hang observations in this store's schema with B1's.
+    GuaranteedStateStore gss{pool};
+    if (!gss.is_open())
+        throw std::runtime_error("dexperfapi template: guaranteed-state store failed to migrate");
 }};
 
 std::int64_t today_utc() {
@@ -422,4 +436,345 @@ TEST_CASE("DexPerfApi group_trend()/tag_trend() REAL member resolution + kDexCoh
         CHECK_FALSE((*trend)[0].suppressed);
         CHECK((*trend)[0].cpu_mean > 0.0);
     }
+}
+
+// ── Per-version crash and hang join (DexAppVersionFailuresOwner + app_fleet_report) ──
+
+namespace {
+
+using Catch::Approx;
+
+// One ruleless crash or hang observation for `app` at `version` on `agent`.
+void seed_obs(GuaranteedStateStore& gss, const std::string& id, const std::string& agent,
+              const std::string& app, const std::string& version, const char* type,
+              std::int64_t at_epoch) {
+    GuaranteedStateEventRow e;
+    e.event_id = id;
+    e.rule_id = "__observation__";
+    e.agent_id = agent;
+    e.event_type = type;
+    e.severity = "info";
+    e.detail_json =
+        nlohmann::json{{"subject", app}, {"version", version}, {"platform", "windows"}}.dump();
+    e.timestamp = yuzu::server::dex_iso_at(at_epoch);
+    REQUIRE(gss.insert_event(e));
+}
+
+std::string aid(int i) { return std::string("a") + (i < 10 ? "0" : "") + std::to_string(i); }
+
+// The shared two-version fixture. Exposure (B1): a01..a15 on 125.0.0.0, a01..a12 on
+// 124.0.0.0. Events on chrome.exe, all inside the window:
+//   125: 10 crashes + 2 hangs, all on exposed devices a01..a07  (7 affected)
+//   124: 4 crashes + 1 hang on exposed a01..a03, PLUS 3 crashes on x01/x02 which have
+//        no B1 rows                                              (5 affected)
+// plus a decoy subject and a version outside the requested list, neither of which may count.
+void seed_two_version_fixture(AppPerfDailyStore& b1, GuaranteedStateStore& gss) {
+    const std::int64_t today = today_utc();
+    const std::int64_t day = today - 86400;
+    const std::int64_t at = today - 2 * 86400;
+    for (int i = 1; i <= 15; ++i)
+        seed_b1(b1, aid(i), "chrome.exe", "125.0.0.0", day, 5.0, 100000000);
+    for (int i = 1; i <= 12; ++i)
+        seed_b1(b1, aid(i), "chrome.exe", "124.0.0.0", day, 4.0, 90000000);
+
+    int n = 0;
+    auto ev = [&](const std::string& agent, const std::string& app, const std::string& ver,
+                  const char* type, std::int64_t when) {
+        seed_obs(gss, "e" + std::to_string(++n), agent, app, ver, type, when);
+    };
+    for (int i = 1; i <= 7; ++i)
+        ev(aid(i), "chrome.exe", "125.0.0.0", "process.crashed", at); // 7 crashes
+    for (int i = 1; i <= 3; ++i)
+        ev(aid(i), "chrome.exe", "125.0.0.0", "process.crashed", at + 60); // +3 = 10
+    ev(aid(1), "chrome.exe", "125.0.0.0", "process.hung", at);
+    ev(aid(2), "chrome.exe", "125.0.0.0", "process.hung", at); // 2 hangs
+
+    ev(aid(1), "chrome.exe", "124.0.0.0", "process.crashed", at);
+    ev(aid(1), "chrome.exe", "124.0.0.0", "process.crashed", at + 60);
+    ev(aid(2), "chrome.exe", "124.0.0.0", "process.crashed", at);
+    ev(aid(3), "chrome.exe", "124.0.0.0", "process.crashed", at); // 4 exposed crashes
+    ev(aid(1), "chrome.exe", "124.0.0.0", "process.hung", at);    // 1 exposed hang
+    ev("x01", "chrome.exe", "124.0.0.0", "process.crashed", at);
+    ev("x01", "chrome.exe", "124.0.0.0", "process.crashed", at + 60);
+    ev("x02", "chrome.exe", "124.0.0.0", "process.crashed", at); // 3 unexposed crashes
+
+    ev(aid(1), "other.exe", "125.0.0.0", "process.crashed", at);   // decoy subject
+    ev(aid(1), "chrome.exe", "126.0.0.0", "process.crashed", at);  // version not requested
+}
+
+const AppPerfVersionFailureRow* find_row(const std::vector<AppPerfVersionFailureRow>& rows,
+                                         const std::string& v) {
+    for (const auto& r : rows)
+        if (r.version == v)
+            return &r;
+    return nullptr;
+}
+
+} // namespace
+
+TEST_CASE("DexAppVersionFailuresOwner counts exposed and unexposed events per version",
+          "[pg][dex_perf_api]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AppPerfDailyStore b1{pool};
+    GuaranteedStateStore gss{pool};
+    REQUIRE(b1.is_open());
+    REQUIRE(gss.is_open());
+    seed_two_version_fixture(b1, gss);
+
+    DexAppVersionFailuresOwner owner{pool, 0};
+    const std::int64_t today = today_utc();
+    const std::int64_t since_day = today - 30 * 86400;
+    auto rows = owner.read("chrome.exe", {"124.0.0.0", "125.0.0.0"}, since_day, today,
+                           yuzu::server::dex_iso_at(since_day));
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 2); // the decoy subject and the unrequested version are absent
+
+    const auto* v125 = find_row(*rows, "125.0.0.0");
+    REQUIRE(v125);
+    CHECK(v125->exposure_devices == 15);
+    CHECK(v125->crashes == 10);
+    CHECK(v125->hangs == 2);
+    CHECK(v125->affected_devices == 7);
+    CHECK(v125->exposed_crashes == 10);
+    CHECK(v125->exposed_hangs == 2);
+
+    const auto* v124 = find_row(*rows, "124.0.0.0");
+    REQUIRE(v124);
+    CHECK(v124->exposure_devices == 12);
+    CHECK(v124->crashes == 7);   // 4 on exposed devices + 3 on unexposed ones
+    CHECK(v124->hangs == 1);
+    CHECK(v124->affected_devices == 5);
+    CHECK(v124->exposed_crashes == 4); // only the exposed devices feed the rate
+    CHECK(v124->exposed_hangs == 1);
+
+    // A version list that names only one version returns only that one.
+    auto only = owner.read("chrome.exe", {"125.0.0.0"}, since_day, today,
+                           yuzu::server::dex_iso_at(since_day));
+    REQUIRE(only.has_value());
+    CHECK(only->size() == 1);
+}
+
+TEST_CASE("DexAppVersionFailuresOwner cuts events and exposure at the same window",
+          "[pg][dex_perf_api]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AppPerfDailyStore b1{pool};
+    GuaranteedStateStore gss{pool};
+    REQUIRE(b1.is_open());
+    REQUIRE(gss.is_open());
+
+    const std::int64_t today = today_utc();
+    const std::int64_t since_day = today - 3 * 86400;
+    const std::string since_iso = yuzu::server::dex_iso_at(since_day);
+    DexAppVersionFailuresOwner owner{pool, 0};
+
+    // Inside the window: one exposed device with one crash.
+    seed_b1(b1, "in-1", "app.exe", "1.0.0.0", today - 86400, 3.0, 1000);
+    seed_obs(gss, "w1", "in-1", "app.exe", "1.0.0.0", "process.crashed", today - 86400);
+    // Events before the cut do not count.
+    seed_obs(gss, "w2", "in-1", "app.exe", "1.0.0.0", "process.crashed", since_day - 86400);
+    // A device whose only B1 rows predate since_day is not exposed.
+    seed_b1(b1, "old-1", "app.exe", "1.0.0.0", today - 5 * 86400, 3.0, 1000);
+    // A forward-slack B1 day (tomorrow) must not count as exposure.
+    seed_b1(b1, "future-1", "app.exe", "1.0.0.0", today + 86400, 3.0, 1000);
+
+    auto rows = owner.read("app.exe", {"1.0.0.0"}, since_day, today, since_iso);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().exposure_devices == 1); // in-1 only
+    CHECK(rows->front().crashes == 1);
+    CHECK(rows->front().affected_devices == 1);
+
+    // Unknown exposure: a version with events but no B1 rows is null, never zero.
+    seed_obs(gss, "w3", "ghost-1", "app.exe", "9.0.0.0", "process.hung", today - 86400);
+    auto ghost = owner.read("app.exe", {"9.0.0.0"}, since_day, today, since_iso);
+    REQUIRE(ghost.has_value());
+    REQUIRE(ghost->size() == 1);
+    CHECK_FALSE(ghost->front().exposure_devices.has_value());
+    CHECK(ghost->front().hangs == 1);
+    CHECK(ghost->front().exposed_hangs == 0);
+
+    // Exposure with no events still reports the version, with zero events.
+    seed_b1(b1, "quiet-1", "app.exe", "2.0.0.0", today - 86400, 3.0, 1000);
+    auto quiet = owner.read("app.exe", {"2.0.0.0"}, since_day, today, since_iso);
+    REQUIRE(quiet.has_value());
+    REQUIRE(quiet->size() == 1);
+    CHECK(quiet->front().exposure_devices == 1);
+    CHECK(quiet->front().crashes == 0);
+    CHECK(quiet->front().affected_devices == 0);
+}
+
+TEST_CASE("DexAppVersionFailuresOwner separates an empty answer from a degrade",
+          "[pg][dex_perf_api]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DexAppVersionFailuresOwner owner{pool, 0};
+    const std::int64_t today = today_utc();
+    const std::string iso = yuzu::server::dex_iso_at(today - 86400);
+
+    // Preconditions that cannot match anything: engaged and empty, no query run.
+    auto no_app = owner.read("", {"1.0.0.0"}, today - 86400, today, iso);
+    REQUIRE(no_app.has_value());
+    CHECK(no_app->empty());
+    auto no_versions = owner.read("app.exe", {}, today - 86400, today, iso);
+    REQUIRE(no_versions.has_value());
+    CHECK(no_versions->empty());
+    // A real query over an application with no rows is engaged and empty too.
+    auto none = owner.read("nothing.exe", {"1.0.0.0"}, today - 86400, today, iso);
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+}
+
+TEST_CASE("DexAppVersionFailuresOwner degrades to nullopt on an unreachable pool",
+          "[dex_perf_api]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    REQUIRE_FALSE(pool.valid());
+    DexAppVersionFailuresOwner owner{pool, 0};
+    const std::int64_t today = today_utc();
+    CHECK_FALSE(owner.read("app.exe", {"1.0.0.0"}, today - 86400, today,
+                           yuzu::server::dex_iso_at(today - 86400))
+                    .has_value());
+}
+
+TEST_CASE("DexAppVersionFailuresOwner window clamps to the observation retention",
+          "[dex_perf_api]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    CHECK(DexAppVersionFailuresOwner{pool, 0}.failure_window_days() == 30);
+    CHECK(DexAppVersionFailuresOwner{pool, -1}.failure_window_days() == 30);
+    CHECK(DexAppVersionFailuresOwner{pool, 7}.failure_window_days() == 7);
+    CHECK(DexAppVersionFailuresOwner{pool, 90}.failure_window_days() == 30);
+}
+
+TEST_CASE("DexPerfApi app_fleet_report() joins crashes, hangs and exposure per version",
+          "[pg][dex_perf_api]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AppPerfDailyStore b1{pool};
+    AppPerfFleetStore b2{pool};
+    AppPerfRollup rollup{pool};
+    GuaranteedStateStore gss{pool};
+    REQUIRE(b1.is_open());
+    REQUIRE(b2.is_open());
+    REQUIRE(gss.is_open());
+    seed_two_version_fixture(b1, gss);
+    const std::int64_t day = today_utc() - 86400;
+    // A third version on only 3 devices: its performance point is suppressed and its
+    // exposure is under the floor.
+    for (int i = 1; i <= 3; ++i)
+        seed_b1(b1, aid(i), "chrome.exe", "126.0.0.0", day, 2.0, 80000000);
+    REQUIRE(rollup.roll_day(day));
+
+    DexAppVersionFailuresOwner owner{pool, 0};
+    auto api = make_local_dex_perf_api({}, &b2, &b1, nullptr, nullptr, nullptr, &owner);
+
+    auto rep = api->app_fleet_report("chrome.exe", "");
+    REQUIRE(rep.has_value());
+    CHECK(rep->failure_window_days == 30);
+    CHECK(rep->stat_failures == 0);
+    REQUIRE(rep->versions.size() == 3);
+    CHECK(rep->versions[0].perf.version == "126.0.0.0");
+    CHECK(rep->versions[1].perf.version == "125.0.0.0");
+    CHECK(rep->versions[2].perf.version == "124.0.0.0");
+
+    // 126: 3 exposure devices is under the floor -> exposed figures withheld; its one
+    // crash (a01) is a breadth cohort of 1 device, under the floor -> counts withheld.
+    const auto& v126 = rep->versions[0];
+    CHECK(v126.perf.suppressed);
+    CHECK(v126.perf.device_count == 3);
+    CHECK(v126.exposure_devices == 3);
+    CHECK(v126.exposure_below_floor);
+    CHECK_FALSE(v126.failure_rate.has_value());
+    CHECK_FALSE(v126.failure_rate_ratio.has_value());
+    CHECK(v126.below_floor);
+    CHECK(v126.affected_devices == 1);
+    CHECK_FALSE(v126.crashes.has_value());
+    CHECK(v126.previous_version == "125.0.0.0");
+
+    const auto& v125 = rep->versions[1];
+    CHECK(v125.exposure_devices == 15);
+    // 7 affected devices is under the breadth floor: the fleet-wide counts are
+    // withheld, while the exposure cohort (15 devices) is independently above it.
+    CHECK(v125.affected_devices == 7);
+    CHECK(v125.below_floor);
+    CHECK_FALSE(v125.crashes.has_value());
+    CHECK_FALSE(v125.hangs.has_value());
+    CHECK(v125.exposed_crashes == 10);
+    CHECK(v125.exposed_hangs == 2);
+    REQUIRE(v125.failure_rate.has_value());
+    // 12 exposed events over 15 exposed devices; exact Poisson bounds derived offline
+    // from the CDFs (6.2005751 / 15 and 20.9615850 / 15).
+    CHECK(v125.failure_rate->estimate == Approx(0.8));
+    CHECK(v125.failure_rate->lower == Approx(0.4133717).epsilon(1e-3));
+    CHECK(v125.failure_rate->upper == Approx(1.3974390).epsilon(1e-3));
+    CHECK(v125.previous_version == "124.0.0.0");
+    REQUIRE(v125.failure_rate_ratio.has_value());
+    // (12/15) / (5/12) = 1.92; the 3 unexposed crashes on 124 do not enter the
+    // denominator arm. Clopper-Pearson bounds derived offline.
+    CHECK(v125.failure_rate_ratio->estimate == Approx(1.92));
+    CHECK(v125.failure_rate_ratio->lower == Approx(0.6296367).epsilon(1e-3));
+    CHECK(v125.failure_rate_ratio->upper == Approx(6.9567849).epsilon(1e-3));
+
+    const auto& v124 = rep->versions[2];
+    CHECK(v124.exposure_devices == 12);
+    CHECK(v124.affected_devices == 5); // 3 exposed + 2 unexposed reporting devices
+    CHECK(v124.below_floor);
+    CHECK_FALSE(v124.crashes.has_value());
+    CHECK(v124.exposed_crashes == 4);
+    CHECK(v124.previous_version.empty());
+    CHECK_FALSE(v124.failure_rate_ratio.has_value());
+
+    // Parity: the points are exactly app_fleet_trend's, element for element.
+    auto trend = api->app_fleet_trend("chrome.exe", "");
+    REQUIRE(trend.has_value());
+    REQUIRE(trend->size() == rep->points.size());
+    for (std::size_t i = 0; i < trend->size(); ++i) {
+        CHECK((*trend)[i].version == rep->points[i].version);
+        CHECK((*trend)[i].day == rep->points[i].day);
+        CHECK((*trend)[i].device_count == rep->points[i].device_count);
+        CHECK((*trend)[i].suppressed == rep->points[i].suppressed);
+    }
+
+    // One exact version: a one-row report with no previous to compare.
+    auto one = api->app_fleet_report("chrome.exe", "125.0.0.0");
+    REQUIRE(one.has_value());
+    REQUIRE(one->versions.size() == 1);
+    CHECK(one->versions[0].previous_version.empty());
+    CHECK_FALSE(one->versions[0].failure_rate_ratio.has_value());
+    CHECK(one->versions[0].exposure_devices == 15);
+}
+
+TEST_CASE("DexPerfApi app_fleet_report() degrades without an owner while the trend still serves",
+          "[pg][dex_perf_api]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_perf_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AppPerfDailyStore b1{pool};
+    AppPerfFleetStore b2{pool};
+    AppPerfRollup rollup{pool};
+    REQUIRE(b1.is_open());
+    REQUIRE(b2.is_open());
+    const std::int64_t day = today_utc() - 86400;
+    seed_b1(b1, "agent-1", "chrome.exe", "124.0.0.0", day, 5.0, 100000000);
+    REQUIRE(rollup.roll_day(day));
+
+    auto api = make_local_dex_perf_api({}, &b2, &b1, nullptr, nullptr, nullptr);
+    CHECK_FALSE(api->app_fleet_report("chrome.exe", "").has_value());
+    CHECK(api->app_fleet_trend("chrome.exe", "").has_value());
+
+    // The failure read itself degrading (an unreachable pool) degrades the report,
+    // never a report with an empty versions list.
+    PgPool dead{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    DexAppVersionFailuresOwner dead_owner{dead, 0};
+    auto api2 = make_local_dex_perf_api({}, &b2, &b1, nullptr, nullptr, nullptr, &dead_owner);
+    CHECK_FALSE(api2->app_fleet_report("chrome.exe", "").has_value());
+    CHECK(api2->app_fleet_trend("chrome.exe", "").has_value());
+
+    // A null B2 store degrades the report too.
+    auto api3 = make_local_dex_perf_api({}, nullptr, &b1, nullptr, nullptr, nullptr, &dead_owner);
+    CHECK_FALSE(api3->app_fleet_report("chrome.exe", "").has_value());
 }

@@ -9757,6 +9757,22 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
         -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
         return std::vector<yuzu::server::AppPerfFleetRow>{mk_row(20)}; // >= kDexCohortFloor
     };
+    // One version, exposure 20 devices, 12 affected devices (6 crashes + 3 hangs
+    // fleet-wide), all 9 events on exposed devices.
+    yuzu::server::AppPerfVersionFailureRow failure_row;
+    failure_row.version = "124.0";
+    failure_row.exposure_devices = 20;
+    failure_row.crashes = 6;
+    failure_row.hangs = 3;
+    failure_row.affected_devices = 12;
+    failure_row.exposed_crashes = 6;
+    failure_row.exposed_hangs = 3;
+    ts.app_perf_providers_for_test.failures =
+        [failure_row](std::string_view, const std::vector<std::string>&, std::int64_t,
+                      std::int64_t, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfVersionFailureRow>> {
+        return std::vector<yuzu::server::AppPerfVersionFailureRow>{failure_row};
+    };
     ts.app_perf_providers_for_test.group =
         [mk_row](std::string_view, std::string_view, std::string_view)
         -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
@@ -9784,6 +9800,42 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
     REQUIRE(fleet["points"].size() == 1);
     CHECK(fleet["points"][0]["version"] == "124.0");
     CHECK(fleet["points"][0]["device_count"] == 20);
+    // The per-version join rides the same payload, serialised by the SAME shared
+    // function REST uses: compare against an independent join of the same inputs.
+    const auto expected_report = yuzu::server::app_perf_version_failure_join(
+        yuzu::server::app_perf_fleet_trend({mk_row(20)}), {failure_row}, 30);
+    REQUIRE(fleet["versions"].size() == 1);
+    CHECK(fleet["versions"] ==
+          nlohmann::json::parse(yuzu::server::dex_app_perf_versions_json(expected_report)));
+    CHECK(fleet["versions"][0]["exposure_devices"] == 20);
+    CHECK(fleet["versions"][0]["crashes"] == 6);
+    CHECK(fleet["versions"][0]["failure_rate"]["estimate"].get<double>() ==
+          Catch::Approx(9.0 / 20.0));
+    CHECK(fleet["versions"][0]["failure_rate_ratio"].is_null()); // a single version
+    CHECK(fleet["versions_truncated"] == false);
+    CHECK(fleet["failure_window_days"] == 30);
+    CHECK(fleet["exposure_basis"] == "resource_significant");
+    CHECK(fleet["stat_failures"] == 0);
+
+    // The advertised outputSchema declares the new typed fields.
+    {
+        auto listed = nlohmann::json::parse(
+            ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":85})")->body)["result"]["tools"];
+        const nlohmann::json* schema = nullptr;
+        for (const auto& t : listed)
+            if (t["name"] == "get_dex_app_perf")
+                schema = &t["outputSchema"];
+        REQUIRE(schema != nullptr);
+        const auto& props = (*schema)["properties"];
+        CHECK(props.contains("versions"));
+        CHECK(props.contains("versions_truncated"));
+        CHECK(props.contains("failure_window_days"));
+        const auto& item = props["versions"]["items"]["properties"];
+        CHECK(item["exposure_devices"]["type"] == nlohmann::json::array({"integer", "null"}));
+        CHECK(item["failure_rate_ratio"]["properties"]["upper"]["type"] ==
+              nlohmann::json::array({"number", "null"}));
+        CHECK(item["failure_rate_ratio"]["properties"].contains("unbounded"));
+    }
 
     auto group = mcp_tool_payload(
         ts.call(

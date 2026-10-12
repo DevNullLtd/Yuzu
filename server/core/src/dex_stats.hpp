@@ -10,9 +10,10 @@
  *                         up to kDexStatsExactMaxEvents, Wilson-Hilferty above
  *   - dex_rate_ratio      rate A / rate B with the exact conditional (binomial,
  *                         Clopper-Pearson) interval and a minimum-exposure guard
- *   - dex_floored_*       the same for a proportion and a rate, but below the
- *                         cohort floor (kDexCohortFloor devices) only the DEVICE
- *                         count and a below-floor flag are returned
+ *   - dex_floored_*       the same for a proportion, a rate and a rate ratio,
+ *                         but below the cohort floor (kDexCohortFloor devices)
+ *                         only the DEVICE count and a below-floor flag are
+ *                         returned (for a ratio, per arm)
  *
  * Honesty rules:
  *   - std::optional carries ONE meaning: "no statistic can be stated for these
@@ -41,9 +42,9 @@
  *     devices that contributed THE events and exposure passed alongside it,
  *     counted in the same window: a count from another window or population
  *     passes the floor and misstates the cohort. dex_proportion, dex_rate and
- *     dex_rate_ratio are unfloored primitives; there is no floored ratio helper,
- *     so floor each rate-ratio arm by DEVICES before calling (the ratio's own
- *     guard is on exposure, and one device over ten days passes it).
+ *     dex_rate_ratio are unfloored primitives; a surface printing a rate ratio
+ *     calls dex_floored_rate_ratio, which floors each arm by DEVICES (the
+ *     ratio's own guard is on exposure, and one device over ten days passes it).
  *   - `reliable` means "not flagged as small-count", never "precise":
  *     dex_rate(20, 1.0) is [12.2, 30.9]. A ratio with a zero-event denominator
  *     is always unreliable. Print the interval beside the flag, and send an
@@ -448,8 +449,8 @@ struct DexInterval {
 /// representable. events_b == 0 with events_a > 0 gives ratio and upper of
 /// +infinity (the data are valid; the lower bound is finite). A reliable ==
 /// false ratio is printed as indicative, never hidden. The exposure guard is on
-/// exposure, not devices, and there is no floored ratio helper: a surface
-/// applies the device floor to each arm before calling.
+/// exposure, not devices: a surface applies the device floor to each arm
+/// (dex_floored_rate_ratio) before calling.
 [[nodiscard]] inline std::optional<DexInterval>
 dex_rate_ratio(std::int64_t events_a, double exposure_a, std::int64_t events_b, double exposure_b) {
     constexpr double kInf = std::numeric_limits<double>::infinity();
@@ -514,6 +515,35 @@ struct DexFloored {
                                                  std::int64_t devices) {
     return {devices, devices >= 0 && devices < kDexCohortFloor,
             devices < kDexCohortFloor ? std::nullopt : dex_rate(events, exposure)};
+}
+
+/// A rate ratio withheld per arm below the cohort floor. Only the device counts
+/// of the two arms are carried: either arm's events are the behaviour the floor
+/// withholds. `below_floor_a`/`below_floor_b` say which arm is under the floor;
+/// `stats` is absent whenever either is, and also for invalid input or a result
+/// the ratio cannot state (stats absent with both flags false is a computation
+/// failure the consumer counts, or a documented refusal such as both arms
+/// zero-event or an arm above kDexRateRatioMaxEvents).
+struct DexFlooredRatio {
+    std::int64_t devices_a;
+    std::int64_t devices_b;
+    bool below_floor_a;
+    bool below_floor_b;
+    std::optional<DexInterval> stats;
+};
+
+/// dex_rate_ratio with the device floor applied to EACH arm: `devices_x` is the
+/// number of distinct devices that contributed arm x's events and exposure in
+/// the same window. A negative device count is invalid input, not a small
+/// cohort: that arm's flag is false and stats are absent.
+[[nodiscard]] inline DexFlooredRatio
+dex_floored_rate_ratio(std::int64_t events_a, double exposure_a, std::int64_t devices_a,
+                       std::int64_t events_b, double exposure_b, std::int64_t devices_b) {
+    const bool below_a = devices_a >= 0 && devices_a < kDexCohortFloor;
+    const bool below_b = devices_b >= 0 && devices_b < kDexCohortFloor;
+    const bool usable = devices_a >= kDexCohortFloor && devices_b >= kDexCohortFloor;
+    return {devices_a, devices_b, below_a, below_b,
+            usable ? dex_rate_ratio(events_a, exposure_a, events_b, exposure_b) : std::nullopt};
 }
 
 } // namespace yuzu::server
