@@ -213,6 +213,14 @@ public:
     /// authority).
     bool remove_if_session(std::string_view agent_id, std::string_view session_id);
 
+    /// Decommission erasure (#5682, `AgentDecommissionStores::offline_endpoint`):
+    /// deletes the agent's row whatever its `session_id`, unlike
+    /// `remove_if_session`. Returns true iff the DELETE ran (zero rows
+    /// included, so a re-issued decommission stays idempotent); false on an
+    /// empty id, a closed store, no lease in time, or a SQL error, so the
+    /// cascade records `Failed`, never a false erasure.
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
+
 private:
     pg::PgPool& pool_;
     bool open_{false};

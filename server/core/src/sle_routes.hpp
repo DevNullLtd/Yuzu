@@ -33,7 +33,10 @@
 ///     read-gated by `Inventory`), `AppPerfDailyStore` (DEX behavioural PII,
 ///     read-gated by `GuaranteedState`), and `SoftwareLicensingStore` (read-gated by
 ///     `SoftwareLicensing`). A companion package (Wave 7 PR7.2) adds a sixth store,
-///     `AppUsageStore` (read-gated by `Forensics`). This was originally a
+///     `AppUsageStore` (read-gated by `Forensics`), and #5682 a seventh,
+///     `OfflineEndpointStore` (the `endpoint_state` presence row: hostname, os,
+///     agent version, arch; read on `/hardware` under `Inventory` and on
+///     `/viz/fleet` under `Response`). This was originally a
 ///     hand-maintained conjunction over the per-store securables (rejected as of
 ///     Decision 9's reversal — see the ADR): it stopped scaling once a fourth
 ///     securable (`Forensics`, via `AppUsageStore`) was set to join the cascade, per

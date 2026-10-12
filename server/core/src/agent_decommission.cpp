@@ -11,6 +11,7 @@
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
 #include "app_usage_store.hpp"
+#include "offline_endpoint_store.hpp"
 
 namespace yuzu::server {
 
@@ -75,6 +76,15 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                             return p->delete_agent(id);
                         })
                                          : nullptr});
+    // The seventh store (#5682): the endpoint_state presence row (hostname, os,
+    // agent_version, arch), which no session-guarded delete reaches for a
+    // decommissioned agent that never sends DISCONNECTED.
+    targets_.push_back({"offline_endpoint",
+                        stores.offline_endpoint
+                            ? Fn([p = stores.offline_endpoint](std::string_view id) {
+                                  return p->delete_agent(id);
+                              })
+                            : nullptr});
 }
 
 void AgentDecommission::add_store(std::string name, std::function<bool(std::string_view)> deleter) {
