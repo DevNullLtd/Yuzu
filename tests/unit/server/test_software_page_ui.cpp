@@ -5,6 +5,7 @@
 /// scope, cursors, audit) lives in test_inventory_routes.cpp.
 
 #include "inventory_routes.hpp"
+#include "software_catalog_rules.hpp" // software_catalog::kEcosystemFamilies
 
 #include <catch2/catch_test_macros.hpp>
 

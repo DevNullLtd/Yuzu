@@ -584,7 +584,8 @@ place, **Hardware** and **Software**, each its own page:
     (audited as denied). A scoped account can open the host view and the devices tables
     for devices in its scope; there the "newest in fleet" mark is blanked, no fleet
     figures are read, and device counts omit "of M". A scope wider than 10,000 devices is
-    applied after the read, so a devices page can come back short; keep paging. Service-scoped API
+    applied after the read in at most four bounded reads, so a devices page can come back short or
+    even empty while **Load more** is still offered; keep loading. Service-scoped API
     tokens are denied outright.
   - **Audit.** Every call is audited, not only the first page: `inventory.software.catalog`
     (title pages), `inventory.software.versions` and `inventory.software.query` (devices

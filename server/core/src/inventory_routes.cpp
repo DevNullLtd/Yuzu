@@ -200,7 +200,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         auto parsed = swc::parse_catalogue_params(req.params);
         if (!parsed) {
-            d.caveat = parsed.error().message; // 200 + caveat: htmx does not swap 4xx
+            d.caveat = parsed.error(); // 200 + caveat: htmx does not swap 4xx
             reply();
             return;
         }
@@ -233,25 +233,25 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             },
             [&](const SoftwareCatalogQuery& c) {
                 return deps_.totals_fn ? deps_.totals_fn(c) : std::optional<SoftwareCatalogTotals>{};
-            }};
-        swc::CataloguePage page;
-        switch (swc::read_catalogue_page(io, rq, page)) {
-        case swc::PageStatus::kOk:
-            break;
-        case swc::PageStatus::kDegraded:
-            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.catalog", "failure",
-                                            "Inventory", target, "store degraded");
-            reply(); // rows nullopt -> the retry banner, never an empty table
-            return;
-        case swc::PageStatus::kBadCursor:
-            d.caveat = std::string(swc::cursor_error_message(page.cursor_error));
-            reply();
-            return;
-        case swc::PageStatus::kStale:
-            d.caveat = kStaleCursorMsg;
+            },
+            // The coverage figures are read below, only for a Full render; the model's own KPI
+            // derivation (a first fleet page) is not used, so its stale read stays inert.
+            [](std::int64_t) { return std::optional<std::int64_t>{}; }};
+        auto read = swc::read_catalogue_page(io, rq, d.now_secs);
+        if (!read) {
+            if (!read.error()) { // any read degraded (or the generation moved twice)
+                (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.catalog", "failure",
+                                                "Inventory", target, "store degraded");
+                reply(); // rows nullopt -> the retry banner, never an empty table
+                return;
+            }
+            d.caveat = *read.error() == swc::CursorError::kStale
+                           ? std::string(kStaleCursorMsg)
+                           : std::string(swc::cursor_error_message(*read.error()));
             reply();
             return;
         }
+        auto page = std::move(*read);
 
         // Strip: fleet figures only for an unconfined caller (a confined host view reads
         // none, and its render carries no tiles). The coverage reads cost a registry walk
@@ -327,7 +327,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         auto parsed = swc::parse_versions_params(req.params);
         if (!parsed) {
-            send_html(res, caveat_div(parsed.error().message));
+            send_html(res, caveat_div(parsed.error()));
             return;
         }
         auto q = std::move(parsed->query);
@@ -373,7 +373,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         auto parsed = swc::parse_devices_params(req.params);
         if (!parsed) {
-            send_html(res, caveat_div(parsed.error().message));
+            send_html(res, caveat_div(parsed.error()));
             return;
         }
         swc::DevicesRequest rq = std::move(*parsed);
@@ -384,16 +384,6 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         q.limit = static_cast<int>(swc::kCatalogueDefaultLimit);
         const bool continuation = !rq.cursor.empty();
-        const std::string fp = swc::devices_fingerprint(q); // bound to the filters, never the scope
-        if (continuation) {
-            auto cur = swc::decode_devices_cursor(rq.cursor, fp);
-            if (!cur) {
-                send_html(res, caveat_div(std::string(swc::cursor_error_message(cur.error()))));
-                return;
-            }
-            q.after = *cur;
-        }
-        const auto applied = swc::apply_scope(q, gate->scope);
         const std::string target = swc::audit_target(q);
 
         SoftwareDevicesTable t;
@@ -410,35 +400,28 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             send_html(res, render_software_devices_table(f, t, continuation));
         };
 
-        std::optional<std::vector<SoftwareFleetRow>> rows;
-        if (deps_.fleet_fn)
-            rows = deps_.fleet_fn(q);
-        if (!rows) {
+        // The model decodes the cursor, pushes the scope into SQL up to kScopePushdownMaxIds
+        // (complete pages) and post-filters only a wider scope with a bounded refill; its cursor
+        // never names a row the caller was not served.
+        auto read = swc::read_devices_page(
+            [&](const SoftwareFleetQuery& c) {
+                return deps_.fleet_fn ? deps_.fleet_fn(c)
+                                      : std::optional<std::vector<SoftwareFleetRow>>{};
+            },
+            rq, gate->scope);
+        if (!read) {
+            if (read.error()) { // 200 + caveat: htmx does not swap 4xx
+                send_html(res, caveat_div(std::string(swc::cursor_error_message(*read.error()))));
+                return;
+            }
             (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.query", "failure",
                                             "Inventory", target, "store degraded");
             reply(); // t.rows nullopt -> the retry banner
             return;
         }
-        // The page is full when the SCANNED count hits the limit; the next keyset position is
-        // the last scanned row, so a post-filtered page still advances. Known gap: that token
-        // may name a row outside the caller's scope (the rendered rows never do).
-        const bool full = rows->size() == static_cast<std::size_t>(q.limit);
-        if (full)
-            t.next_cursor = swc::encode_devices_cursor(rows->back(), fp);
-        std::size_t dropped = 0;
-        if (applied == swc::ScopeApply::kPostFilter) {
-            std::unordered_set<std::string> dropped_ids;
-            std::vector<SoftwareFleetRow> visible;
-            visible.reserve(rows->size());
-            for (auto& r : *rows) {
-                if (authz::in_scope(gate->scope, r.agent_id))
-                    visible.push_back(std::move(r));
-                else
-                    dropped_ids.insert(r.agent_id);
-            }
-            rows->swap(visible);
-            dropped = dropped_ids.size();
-        }
+        std::optional<std::vector<SoftwareFleetRow>> rows{std::move(read->rows)};
+        if (!read->next_cursor.empty())
+            t.next_cursor = read->next_cursor;
 
         std::vector<std::string> ids;
         std::unordered_set<std::string> seen;
@@ -456,10 +439,9 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!t.scoped)
             t.total = int_hint(req, "total");
 
-        if (dropped > 0)
-            (void)detail::try_persist_audit(
-                deps_.audit_fn, req, "inventory.software.query", "denied", "Inventory", target,
-                "scope: filtered " + std::to_string(dropped) + " out-of-scope device(s)");
+        if (const auto denied = swc::denied_detail(*read); !denied.empty())
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.query", "denied",
+                                            "Inventory", target, denied);
         (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.software.query", "success",
                                         "Inventory", target,
                                         "rows=" + std::to_string(rows->size()) +

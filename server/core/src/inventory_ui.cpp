@@ -12,6 +12,7 @@
 /// as device_routes' live snapshot (`.ls-*`).
 
 #include "inventory_routes.hpp"
+#include "software_catalog_rules.hpp" // software_catalog::kEcosystemFamilies
 
 #include "web_utils.hpp"
 

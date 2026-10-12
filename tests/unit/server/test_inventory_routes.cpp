@@ -158,12 +158,17 @@ struct InvHarness {
                 return std::vector<SoftwareFleetRow>{}; // deny-all: the store returns empty, no SQL
             // Honours `after` and `limit` like the store (one title's fleet_rows, kept in agent_id order).
             std::vector<SoftwareFleetRow> out;
+            std::int64_t skipped = 0;
             for (const auto& r : fleet_rows) {
                 if (q.after && r.agent_id <= q.after->agent_id)
                     continue;
                 if (q.agent_ids &&
                     std::ranges::find(*q.agent_ids, r.agent_id) == q.agent_ids->end())
                     continue;
+                if (skipped < q.skip) { // rows to pass over after the anchor (the d2 cursor)
+                    ++skipped;
+                    continue;
+                }
                 if (static_cast<int>(out.size()) == q.limit)
                     break;
                 out.push_back(r);
@@ -715,10 +720,9 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
         REQUIRE(h.audited("inventory.software.query|denied")); // the post-filter drop is audited
         REQUIRE(h.audited("inventory.software.query|success"));
     }
-    {   // A FULL scanned page whose last row is out of scope still carries the sentinel and the
-        // next page resumes after the last SCANNED row (a099), never the last visible one (a098):
-        // no out-of-scope ROW is rendered; the cursor token itself still names a scanned row
-        // (a known gap; pinned here only as the resume position, not endorsed).
+    {   // A wide-scope page is REFILLED past a dropped row (bounded reads continue after the last
+        // SCANNED row, in-process): a099 is dropped from the first read, a100 fills the page, and
+        // the read ended exactly, so there is no sentinel and no token naming an out-of-scope row.
         InvHarness h;
         authz::VisibleSet big{std::unordered_set<std::string>{}};
         for (std::size_t i = 0; i <= swc::kScopePushdownMaxIds; ++i)
@@ -734,23 +738,19 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
         REQUIRE_FALSE(h.last_fleet_query->agent_ids); // post-filter arm
         REQUIRE(contains(p1->body, "id=a098"));
         REQUIRE_FALSE(contains(p1->body, "id=a099"));
-        REQUIRE(contains(p1->body, "data-act=\"dmore\""));
-        auto p2 = h.sink.Get(next_url(p1->body, "dmore"));
-        REQUIRE(p2);
-        REQUIRE(h.last_fleet_query->after);
-        REQUIRE(h.last_fleet_query->after->agent_id == "a099");
-        REQUIRE(contains(p2->body, "id=a100"));        // page 2 resumes after the cursor...
-        REQUIRE_FALSE(contains(p2->body, "id=a098"));  // ...and never re-serves page 1
+        REQUIRE(contains(p1->body, "id=a100"));
+        REQUIRE_FALSE(contains(p1->body, "data-act=\"dmore\""));
     }
-    {   // A FULL scanned page with NO row in scope is incomplete, not terminal: the empty table
-        // still carries the sentinel and the cursor follows the last SCANNED row (a099).
+    {   // Four bounded reads, none in scope: the page is empty but NOT terminal. The cursor
+        // re-anchors at the head with a skip count (never a dropped row's key); the next page
+        // passes over the scanned rows in SQL and finds the in-scope row beyond them.
         InvHarness h;
         authz::VisibleSet big{std::unordered_set<std::string>{}};
         for (std::size_t i = 0; i <= swc::kScopePushdownMaxIds; ++i)
             big->insert("syn" + std::to_string(i));
-        big->insert(dev_id(100)); // only the row beyond page 1 is in scope
+        big->insert(dev_id(450)); // only a row beyond the four-read window is in scope
         h.scope = big;
-        for (int i = 0; i <= 100; ++i)
+        for (int i = 0; i <= 450; ++i)
             h.fleet_rows.push_back(fleet_row(dev_id(i), "Chrome", "1"));
         auto p1 = h.sink.Get(url);
         REQUIRE(p1);
@@ -760,9 +760,9 @@ TEST_CASE("software routes: devices table scope arms", "[inventory][route]") {
         REQUIRE_FALSE(contains(p1->body, "id=a0"));
         auto p2 = h.sink.Get(next_url(p1->body, "dmore"));
         REQUIRE(p2);
-        REQUIRE(h.last_fleet_query->after);
-        REQUIRE(h.last_fleet_query->after->agent_id == "a099");
-        REQUIRE(contains(p2->body, "id=a100"));
+        REQUIRE_FALSE(h.last_fleet_query->after); // re-anchored at the head
+        REQUIRE(h.last_fleet_query->skip == 400);
+        REQUIRE(contains(p2->body, "id=a450"));
     }
 }
 
