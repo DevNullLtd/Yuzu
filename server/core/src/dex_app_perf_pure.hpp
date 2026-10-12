@@ -158,10 +158,6 @@ inline constexpr int kAppPerfFailureWindowDays = 30;
 /// dropped and `versions_truncated` is set.
 inline constexpr std::size_t kAppPerfVersionJoinCap = 20;
 
-/// What the exposure denominator counts, echoed as `exposure_basis` on both
-/// transports so the label has one spelling.
-inline constexpr std::string_view kAppPerfExposureBasis = "resource_significant";
-
 /// One version's crash and hang counts as the store read returns them. The
 /// `exposed_*` counts are the events on devices that also have exposure rows;
 /// `exposure_devices` is nullopt when the version has no exposure rows at all.

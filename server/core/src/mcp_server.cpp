@@ -16169,7 +16169,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .add("versions_truncated", report->versions_truncated)
                                   .add("failure_window_days",
                                        std::int64_t{report->failure_window_days})
-                                  .add("exposure_basis", std::string(kAppPerfExposureBasis))
+                                  .add("exposure_basis", "resource_significant")
                                   .add("stat_failures", std::int64_t{report->stat_failures})
                                   .str();
                 } else if (tool_name == "get_dex_group_app_perf") {
