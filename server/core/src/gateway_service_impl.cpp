@@ -2369,11 +2369,17 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             }
         }
         // HA WS-5 (ADR-2002 §7a) + #5678: session-guarded presence CLEAR (row kept
-        // for the offline roster) via the shared helper. Gated on proof this
-        // session was current (local removal, or the directory deregister
-        // matching) — an ungated clear could drop a LIVE agent from presence on a
-        // reconnect. A non-owning replica removes no local session, so the
-        // directory result is its only proof.
+        // for the offline roster) via the shared helper. Gated on
+        // `removed_current_session` (this replica held the session) OR
+        // `store_removed` (this session owned the gateway directory entry — a
+        // non-owning replica removes no local session, so that is its only
+        // proof). An ungated clear could drop a LIVE agent from presence on a
+        // reconnect. `store_removed` proves directory ownership, NOT the
+        // absence of a newer DIRECT local session: a gateway-S1 -> direct-S2
+        // re-home followed by a late DISCONNECTED(S1) can clear the row's S1
+        // before S2's first heartbeat. Under-inclusion only, bounded by one
+        // heartbeat interval (the next heartbeat re-writes S2), dispatch-inert,
+        // and inherited unchanged from the #5694 delete gate.
         mirror_departure_to_presence(
             removed_current_session || store_removed,
             heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr,

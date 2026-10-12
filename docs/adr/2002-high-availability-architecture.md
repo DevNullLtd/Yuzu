@@ -1903,18 +1903,21 @@ is counted under route-store failure op `session_lookup`.
   local `AgentSession` skips the registry `set_gateway_route`/unpublish (nothing local to update) and
   still announces.
 - **Presence correctness (§7a).** `OfflineEndpointStore::upsert` blank-preserves `hostname`
-  (newly; `os` has been blank-preserved since #5294, as were `agent_version`/`arch`): a blank incoming
-  value never overwrites a known non-blank one. Consequence: a presence row's `hostname` is never
-  cleared by an upsert — it is reset only by deleting the row (`remove_if_session`). Recorded gap
-  (pre-existing, not introduced here): `OfflineEndpointStore` has no `delete_agent` and is not a
-  member of the decommission cascade (`AgentDecommissionStores`), so a decommissioned agent's
-  `endpoint_state.endpoints` row (including its `hostname`) persists indefinitely: there is no
-  age-out pass for that table (the only delete is the session-guarded `remove_if_session`, reached
-  from a DISCONNECTED the decommissioned agent never sends). Reads filter by TTL or stale window, so
-  the row is invisible to scope evaluation and `/viz` once stale, but it is not deleted; deletion
-  needs the decommission-cascade item (#5682). `HeartbeatIngestion::ingest`
-  takes the resolved session id, so a heartbeat on a non-owning replica (no local `AgentSession`)
-  cannot blank the presence row's `session_id`.
+  (newly; `os` has been blank-preserved since #5294, as were `agent_version`/`arch`) and, since
+  #5678 (2026-10-12), `session_id`: a blank incoming value never overwrites a known non-blank one.
+  A graceful disconnect (`remove_if_session`) clears ONLY the row's `session_id` (session-guarded
+  `UPDATE`, #5678); `hostname` and the other fields survive so the offline-inclusive `/hardware`
+  roster keeps listing the device with its real last-seen time. Rows are aged out by a clock-guarded
+  hourly per-replica prune (`pg::run_clock_guarded_prune` on `preflight_runner_thread_`: 37 d = the
+  30 d roster window + a 7 d margin, capped at 1000 rows per pass, advisory-locked) (#5678, 2026-10-12).
+  Recorded gap (pre-existing, not introduced here): `OfflineEndpointStore` has no `delete_agent` and
+  is not a member of the decommission cascade (`AgentDecommissionStores`), so a decommissioned
+  agent's `endpoint_state.endpoints` row (including its `hostname`) persists until that prune
+  removes it, up to 37 d after its last heartbeat (#5678, 2026-10-12); an explicit delete needs the
+  decommission-cascade item (#5682). Reads filter by TTL or stale window, so the row is invisible to
+  scope evaluation and `/viz` once stale. `HeartbeatIngestion::ingest` takes the resolved session id,
+  so a heartbeat on a non-owning replica (no local `AgentSession`) cannot blank the presence row's
+  `session_id`.
 
 **Local hydration (server-only restart).** The directory rows survive a server restart but the local
 registry and `gateway_sessions_` do not, and the gateway only replays `ProxyRegister` for ids the
