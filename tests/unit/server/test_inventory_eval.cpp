@@ -1285,13 +1285,130 @@ TEST_CASE("InventoryEval: numeric > >= < <= compare the raw stored number exactl
         CHECK_FALSE(matches("[5]", op, "4"));
         CHECK_FALSE(matches("null", op, "4"));
     }
-    // A string operand keeps today's lexical / existing numeric behaviour (not numeric_operand).
-    {
-        Records records = {{"agent-a|p", R"({"v": "N/A"})"}};
+}
+
+TEST_CASE("InventoryEval: a plain-decimal string operand orders exactly like the JSON number",
+          "[inventory_eval][numeric_params]") {
+    using nlohmann::json;
+    // Run a condition built by parse_inventory_condition (the production path) against one stored
+    // value; operand_json is the caller's JSON `value` (a number or a quoted string).
+    auto matches = [](const char* stored_json, const char* op, const std::string& operand_json) {
+        Records records = {{"agent-a|p", std::string(R"({"v": )") + stored_json + "}"}};
         InventoryEvalRequest req;
-        req.conditions = {{"p", "v", ">", "5"}};
-        CHECK(evaluate_inventory(req, records).size() == 1);
+        InventoryCondition c;
+        const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
+                                     R"(","value":)" + operand_json + "}");
+        REQUIRE_FALSE(parse_inventory_condition(doc, c));
+        req.conditions.push_back(c);
+        return !evaluate_inventory(req, records).empty();
+    };
+    auto quoted = [](const char* n) { return std::string("\"") + n + "\""; };
+
+    // Stored "5 GB" is not 5: it used to read as a numeric prefix and beat operand "4".
+    CHECK_FALSE(matches(R"("5 GB")", ">", quoted("4")));
+    // Digits a 6-decimal rendering used to drop.
+    CHECK_FALSE(matches("0.1234567", ">", quoted("0.1234567")));
+    CHECK(matches("0.1234567", ">=", quoted("0.1234567")));
+    // Exponent forms are plain decimals (from_chars consumes them in full).
+    CHECK(matches("3e-7", ">", quoted("2e-7")));
+    CHECK_FALSE(matches("3e-7", "<", quoted("2e-7")));
+    CHECK(matches("18446744073709551615", ">=", quoted("18446744073709551615")));
+    CHECK_FALSE(matches("18446744073709551615", ">", quoted("18446744073709551615")));
+    CHECK(matches("9007199254740993", ">", quoted("9007199254740992")));
+    // A stored non-number never matches a plain-decimal string operand, not even lexically.
+    for (const char* op : {">", ">=", "<", "<="}) {
+        INFO(op);
+        CHECK_FALSE(matches(R"("N/A")", op, quoted("5")));
+        CHECK_FALSE(matches(R"("123\n")", op, quoted("5")));
+        CHECK_FALSE(matches(R"(" 5")", op, quoted("4")));
+        CHECK_FALSE(matches("true", op, quoted("0")));
     }
+
+    // The JSON number 4 and the string "4" select the same devices for all four ordering ops.
+    const std::vector<std::pair<std::string, std::string>> fixture = {
+        {"agent-int", R"({"v": 7})"},
+        {"agent-eq", R"({"v": 4})"},
+        {"agent-low", R"({"v": 3})"},
+        {"agent-float", R"({"v": 4.5})"},
+        {"agent-lowfloat", R"({"v": 3.5})"},
+        {"agent-numstr", R"({"v": "10"})"},
+        {"agent-lownumstr", R"({"v": "2"})"},
+        {"agent-text", R"({"v": "5 GB"})"},
+        {"agent-bool", R"({"v": true})"},
+        {"agent-na", R"({"v": "N/A"})"},
+    };
+    Records records;
+    for (const auto& [id, body] : fixture)
+        records.emplace_back(id + "|p", body);
+    auto run = [&](const char* op, const char* operand_json) {
+        InventoryEvalRequest req;
+        InventoryCondition c;
+        const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
+                                     R"(","value":)" + operand_json + "}");
+        REQUIRE_FALSE(parse_inventory_condition(doc, c));
+        req.conditions.push_back(c);
+        std::vector<std::string> ids;
+        for (const auto& r : evaluate_inventory(req, records))
+            ids.push_back(r.agent_id);
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    };
+    for (const char* op : {">", ">=", "<", "<="}) {
+        INFO(op);
+        CHECK(run(op, "4") == run(op, "\"4\""));
+    }
+    using Ids = std::vector<std::string>;
+    CHECK(run(">", "\"4\"") == Ids{"agent-float", "agent-int", "agent-numstr"});
+    CHECK(run("<=", "\"4\"") ==
+          Ids{"agent-eq", "agent-low", "agent-lowfloat", "agent-lownumstr"});
+
+    // == and != keep the exact text compare for a string operand.
+    {
+        InventoryCondition c;
+        REQUIRE_FALSE(parse_inventory_condition(
+            json::parse(R"({"plugin":"p","field":"v","op":"==","value":"4"})"), c));
+        CHECK_FALSE(c.ordering_numeric);
+    }
+}
+
+TEST_CASE("InventoryEval: a string operand that is not a plain decimal keeps the legacy ordering",
+          "[inventory_eval][numeric_params]") {
+    using nlohmann::json;
+    auto parsed = [](const char* op, const char* operand) {
+        InventoryCondition c;
+        const json doc = {{"plugin", "p"}, {"field", "v"}, {"op", op}, {"value", operand}};
+        REQUIRE_FALSE(parse_inventory_condition(doc, c));
+        return c;
+    };
+    for (const char* operand : {"abc", "1.2.3", "v2", " 5", "5 GB", "+5", "inf", "nan", "0x10",
+                                "5\n", "1e400", "", "-", "."}) {
+        INFO(operand);
+        CHECK_FALSE(parsed(">", operand).ordering_numeric);
+    }
+    for (const char* operand : {"5", "-5", "5.5", ".5", "3e-7", "1E5", "18446744073709551615",
+                                "-9223372036854775808"}) {
+        INFO(operand);
+        CHECK(parsed(">=", operand).ordering_numeric);
+        // Equality never takes the numeric view.
+        CHECK_FALSE(parsed("==", operand).ordering_numeric);
+        CHECK_FALSE(parsed("!=", operand).ordering_numeric);
+    }
+    // A non-numeric operand: stored "N/A" still compares lexically ("N/A" > "abc" is false,
+    // "N/A" < "abc" is true), exactly as before.
+    Records records = {{"agent-a|p", R"({"v": "N/A"})"}};
+    auto run = [&](const char* op) {
+        InventoryEvalRequest req;
+        req.conditions.push_back(parsed(op, "abc"));
+        return evaluate_inventory(req, records).size();
+    };
+    CHECK(run(">") == 0);
+    CHECK(run("<") == 1);
+    // A version-like operand still uses the legacy numeric-prefix path ("5.9.1" reads as 5.9, the
+    // stored "5.10" as 5.1), unchanged.
+    Records vrec = {{"agent-a|p", R"({"v": "5.10"})"}};
+    InventoryEvalRequest vreq;
+    vreq.conditions.push_back(parsed("<", "5.9.1"));
+    CHECK(evaluate_inventory(vreq, vrec).size() == 1);
 }
 
 TEST_CASE("InventoryEval: a string operand keeps the exact lexical == and !=",

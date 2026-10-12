@@ -151,6 +151,23 @@ bool parse_int_full(const std::string& s, T& out) {
 
 using Number = std::variant<std::int64_t, std::uint64_t, double>;
 
+/// A string that is a plain decimal number in full (see plain_decimal_shape: optional '-', then a
+/// digit or '.', no 'x'; exponent forms such as "3e-7" count when the parse consumes them all):
+/// int64, else uint64, else double. nullopt for anything else ("5 GB", "1.2.3", "v2", " 5", "5\n",
+/// "+5", "inf", "nan", an out-of-range "1e400"). The ONE parse for a stored string and for a
+/// string operand of an ordering operator.
+std::optional<Number> parse_number_string(const std::string& s) {
+    if (!plain_decimal_shape(s))
+        return std::nullopt;
+    if (std::int64_t i = 0; parse_int_full(s, i))
+        return Number{i};
+    if (std::uint64_t u = 0; parse_int_full(s, u))
+        return Number{u};
+    if (double d = 0.0; parse_double_full(s, d))
+        return Number{d};
+    return std::nullopt;
+}
+
 /// A stored JSON number, or a stored string that parses as a number in full; nullopt otherwise
 /// (a non-numeric string, a boolean, an array/object: never equal to a numeric operand).
 std::optional<Number> stored_number(const nlohmann::json& val) {
@@ -162,16 +179,7 @@ std::optional<Number> stored_number(const nlohmann::json& val) {
         return Number{val.get<double>()};
     if (!val.is_string())
         return std::nullopt;
-    const auto& s = val.get_ref<const std::string&>();
-    if (!plain_decimal_shape(s))
-        return std::nullopt;
-    if (std::int64_t i = 0; parse_int_full(s, i))
-        return Number{i};
-    if (std::uint64_t u = 0; parse_int_full(s, u))
-        return Number{u};
-    if (double d = 0.0; parse_double_full(s, d))
-        return Number{d};
-    return std::nullopt;
+    return parse_number_string(val.get_ref<const std::string&>());
 }
 
 /// Exact integer-vs-double equality: the double must be integral and in range, then the integers
@@ -331,8 +339,9 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
     if (cond.op == "version_gte") return compare_versions(val_str, cond.value) >= 0;
     if (cond.op == "version_lte") return compare_versions(val_str, cond.value) <= 0;
 
-    // A JSON-number operand: exact numeric ordering on the raw stored value, never lexical.
-    if (cond.numeric_operand &&
+    // A JSON-number operand, or a string operand that is a plain decimal number: exact numeric
+    // ordering on the raw stored value, never lexical.
+    if ((cond.numeric_operand || cond.ordering_numeric) &&
         (cond.op == ">" || cond.op == ">=" || cond.op == "<" || cond.op == "<="))
         return numeric_order(*val, cond);
 
@@ -404,6 +413,14 @@ std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
     const auto& v = c["value"];
     if (v.is_string()) {
         out.value = v.get<std::string>();
+        // A string operand that is a plain decimal number orders numerically (exact, same path as
+        // a JSON-number operand) under > >= < <= only; == / != keep the exact text compare.
+        if (out.op == ">" || out.op == ">=" || out.op == "<" || out.op == "<=") {
+            if (const auto n = parse_number_string(out.value)) {
+                out.ordering_numeric = true;
+                out.numeric_value = *n;
+            }
+        }
         return std::nullopt;
     }
     const bool comparison = out.op == "==" || out.op == "!=" || out.op == ">" || out.op == ">=" ||
