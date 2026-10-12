@@ -1127,6 +1127,69 @@ TEST_CASE("InventoryEval: a JSON-number operand compares numerically under == an
     CHECK(matching("==", "0") == Ids{});
 }
 
+TEST_CASE("InventoryEval: numeric == and != compare the raw stored number, not a rendering of it",
+          "[inventory_eval][numeric_params]") {
+    using nlohmann::json;
+    // One record per agent, one stored JSON value each (raw JSON text, so integer width is kept).
+    auto matches = [](const char* stored_json, const char* op, const char* operand_json) {
+        Records records = {{"agent-a|p", std::string(R"({"v": )") + stored_json + "}"}};
+        InventoryEvalRequest req;
+        InventoryCondition c;
+        const auto doc = json::parse(std::string(R"({"plugin":"p","field":"v","op":")") + op +
+                                     R"(","value":)" + operand_json + "}");
+        REQUIRE_FALSE(parse_inventory_condition(doc, c));
+        req.conditions.push_back(c);
+        return !evaluate_inventory(req, records).empty();
+    };
+    // 6-decimal rendering used to make these equal or unequal wrongly.
+    CHECK(matches("0.1234567", "==", "0.1234567"));
+    CHECK_FALSE(matches("0.1234567", "!=", "0.1234567"));
+    CHECK_FALSE(matches("1e-7", "==", "0"));
+    CHECK(matches("1e-7", "!=", "0"));
+    CHECK(matches("1e-7", "==", "1e-7"));
+    // Integers above 2^53 compare exactly (they used to round through a double).
+    CHECK_FALSE(matches("9007199254740993", "==", "9007199254740992"));
+    CHECK(matches("9007199254740993", "!=", "9007199254740992"));
+    CHECK(matches("9007199254740993", "==", "9007199254740993"));
+    CHECK_FALSE(matches("9007199254740993", "==", "9007199254740992.0"));
+    // Int vs float spelling of the same value, and plain floats.
+    CHECK(matches("5", "==", "5.0"));
+    CHECK(matches("5.0", "==", "5"));
+    CHECK(matches("5.5", "==", "5.5"));
+    CHECK(matches("-0.0", "==", "0"));
+    CHECK_FALSE(matches("0.30000000000000004", "==", "0.3"));
+    // Unsigned beyond int64 max, and the signed/unsigned mix.
+    CHECK(matches("18446744073709551615", "==", "18446744073709551615"));
+    CHECK_FALSE(matches("18446744073709551615", "==", "-1"));
+    CHECK_FALSE(matches("-1", "==", "18446744073709551615"));
+    CHECK(matches("-1", "==", "-1"));
+    // Stored numeric strings parse as numbers; a non-numeric string, bool or null never equals.
+    CHECK(matches(R"("1.10")", "==", "1.1"));
+    CHECK(matches(R"("9007199254740993")", "==", "9007199254740993"));
+    CHECK_FALSE(matches(R"("9007199254740993")", "==", "9007199254740992"));
+    CHECK_FALSE(matches("true", "==", "1"));
+    CHECK(matches("true", "!=", "1"));
+    CHECK_FALSE(matches(R"("abc")", "==", "0"));
+    CHECK(matches(R"("abc")", "!=", "0"));
+    // Forms a number parser could be lenient about are not numbers on any platform.
+    for (const char* text : {R"(" 5")", R"("+5")", R"("0x5")", R"("5 ")", R"("nan")", R"("inf")",
+                             R"("")"}) {
+        INFO(text);
+        CHECK_FALSE(matches(text, "==", "5"));
+        CHECK(matches(text, "!=", "5"));
+    }
+    // A stored null is "no value": neither == nor != selects it (unchanged).
+    CHECK_FALSE(matches("null", "==", "0"));
+    CHECK_FALSE(matches("null", "!=", "0"));
+    // A string operand stays lexical against a stored string.
+    {
+        Records records = {{"agent-a|p", R"({"v": "1.10"})"}};
+        InventoryEvalRequest req;
+        req.conditions = {{"p", "v", "==", "1.1"}};
+        CHECK(evaluate_inventory(req, records).empty());
+    }
+}
+
 TEST_CASE("InventoryEval: a string operand keeps the exact lexical == and !=",
           "[inventory_eval][numeric_params]") {
     Records records = {

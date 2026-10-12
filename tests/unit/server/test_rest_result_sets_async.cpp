@@ -2945,7 +2945,8 @@ TEST_CASE("POST /api/v1/inventory/evaluate: a numeric condition value is compare
         REQUIRE(lease);
         for (const auto& [agent, ram] : {std::pair<const char*, const char*>{"agent-big", "32"},
                                          {"agent-small", "3"},
-                                         {"agent-half", "5.5"}}) {
+                                         {"agent-half", "5.5"},
+                                         {"agent-tiny", "0.1234567"}}) {
             auto seeded = yuzu::server::pg::exec_params(
                 lease.get(),
                 "INSERT INTO inventory_store.inventory_data "
@@ -2972,8 +2973,11 @@ TEST_CASE("POST /api/v1/inventory/evaluate: a numeric condition value is compare
     using Ids = std::vector<std::string>;
     CHECK(agents_for(">", "5") == Ids{"agent-big", "agent-half"}); // was all three: 5 became ""
     CHECK(agents_for("==", "5.5") == Ids{"agent-half"});
-    CHECK(agents_for("!=", "5.5") == Ids{"agent-big", "agent-small"});
+    CHECK(agents_for("!=", "5.5") == Ids{"agent-big", "agent-small", "agent-tiny"});
     CHECK(agents_for("==", "32.0") == Ids{"agent-big"});
+    // The stored number is compared raw: a 7-decimal value is not rounded to 6 decimals first.
+    CHECK(agents_for("==", "0.1234567") == Ids{"agent-tiny"});
+    CHECK(agents_for("==", "0") == Ids{});
 
     for (const char* cond :
          {R"({"plugin":"custom","field":"ram","op":">","value":null})",

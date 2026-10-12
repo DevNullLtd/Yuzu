@@ -8,8 +8,12 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
+#include <cstdint>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <variant>
 
 namespace yuzu::server {
 
@@ -104,8 +108,21 @@ std::string json_value_to_string(const nlohmann::json& val) {
     return val.dump();
 }
 
+/// True when `s` has the plain decimal shape every platform's parser agrees on: an optional '-',
+/// then a digit or '.', and no 'x' / 'X'. This keeps the std::stod fallback (Apple Clang) from
+/// accepting what std::from_chars refuses (leading whitespace, '+', hex, inf, nan), so a stored
+/// string means the same on every OS. Applied on all platforms.
+bool plain_decimal_shape(const std::string& s) {
+    std::size_t i = (!s.empty() && s[0] == '-') ? 1 : 0;
+    if (i >= s.size() || !((s[i] >= '0' && s[i] <= '9') || s[i] == '.'))
+        return false;
+    return s.find_first_of("xX") == std::string::npos;
+}
+
 /// Parse a whole string as a double; false when empty, partly consumed or out of range.
 bool parse_double_full(const std::string& s, double& out) {
+    if (!plain_decimal_shape(s))
+        return false;
 #if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
     const auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
     return ec == std::errc{} && p == s.data() + s.size();
@@ -120,12 +137,80 @@ bool parse_double_full(const std::string& s, double& out) {
 #endif
 }
 
-/// `==` / `!=` for a condition whose operand was a JSON number: equal iff BOTH sides parse in full
-/// and compare equal as doubles (a non-numeric stored value is never equal).
-bool numeric_equal(const std::string& stored, const std::string& operand) {
-    double a = 0.0;
-    double b = 0.0;
-    return parse_double_full(stored, a) && parse_double_full(operand, b) && a == b;
+/// Parse a whole string as an integer of type T; false when empty, partly consumed or out of range.
+template <typename T>
+bool parse_int_full(const std::string& s, T& out) {
+    const char* const end = s.data() + s.size();
+    const auto [p, ec] = std::from_chars(s.data(), end, out);
+    return ec == std::errc{} && p == end;
+}
+
+using Number = std::variant<std::int64_t, std::uint64_t, double>;
+
+/// A stored JSON number, or a stored string that parses as a number in full; nullopt otherwise
+/// (a non-numeric string, a boolean, an array/object: never equal to a numeric operand).
+std::optional<Number> stored_number(const nlohmann::json& val) {
+    if (val.is_number_unsigned())
+        return Number{val.get<std::uint64_t>()};
+    if (val.is_number_integer())
+        return Number{val.get<std::int64_t>()};
+    if (val.is_number_float())
+        return Number{val.get<double>()};
+    if (!val.is_string())
+        return std::nullopt;
+    const auto& s = val.get_ref<const std::string&>();
+    if (!plain_decimal_shape(s))
+        return std::nullopt;
+    if (std::int64_t i = 0; parse_int_full(s, i))
+        return Number{i};
+    if (std::uint64_t u = 0; parse_int_full(s, u))
+        return Number{u};
+    if (double d = 0.0; parse_double_full(s, d))
+        return Number{d};
+    return std::nullopt;
+}
+
+/// Exact integer-vs-double equality: the double must be integral and in range, then the integers
+/// compare (so 9007199254740993 never equals 9007199254740992.0).
+bool int_equals_double(std::int64_t i, double d) {
+    return d >= -9223372036854775808.0 && d < 9223372036854775808.0 && d == std::trunc(d) &&
+           static_cast<std::int64_t>(d) == i;
+}
+bool uint_equals_double(std::uint64_t u, double d) {
+    return d >= 0.0 && d < 18446744073709551616.0 && d == std::trunc(d) &&
+           static_cast<std::uint64_t>(d) == u;
+}
+
+/// `==` for two numbers: integers exactly (a negative never equals an unsigned), integer vs
+/// double exactly, two doubles by exact equality.
+bool numbers_equal(const Number& a, const Number& b) {
+    return std::visit(
+        [](const auto& x, const auto& y) -> bool {
+            using X = std::decay_t<decltype(x)>;
+            using Y = std::decay_t<decltype(y)>;
+            if constexpr (std::is_same_v<X, Y>) {
+                return x == y;
+            } else if constexpr (std::is_same_v<X, double>) {
+                return numbers_equal(y, x);
+            } else if constexpr (std::is_same_v<Y, double>) {
+                if constexpr (std::is_same_v<X, std::int64_t>)
+                    return int_equals_double(x, y);
+                else
+                    return uint_equals_double(x, y);
+            } else if constexpr (std::is_same_v<X, std::int64_t>) {
+                return x >= 0 && static_cast<std::uint64_t>(x) == y;
+            } else {
+                return y >= 0 && static_cast<std::uint64_t>(y) == x;
+            }
+        },
+        a, b);
+}
+
+/// `==` / `!=` for a condition whose operand was a JSON number: compares the RAW stored value
+/// against the parsed operand (never a rendered text, which loses digits).
+bool numeric_equal(const nlohmann::json& stored, const InventoryCondition& cond) {
+    const auto n = stored_number(stored);
+    return n.has_value() && numbers_equal(*n, cond.numeric_value);
 }
 
 /// Evaluate a single condition against parsed JSON data.
@@ -150,7 +235,7 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
     matched_value_out = val_str;
 
     if (cond.op == "==" || cond.op == "!=") {
-        const bool eq = cond.numeric_operand ? numeric_equal(val_str, cond.value)
+        const bool eq = cond.numeric_operand ? numeric_equal(*val, cond)
                                              : val_str == cond.value;
         return cond.op == "==" ? eq : !eq;
     }
@@ -236,6 +321,12 @@ std::optional<std::string> parse_inventory_condition(const nlohmann::json& c,
     if (v.is_number() && comparison) {
         out.value = v.dump();
         out.numeric_operand = true;
+        if (v.is_number_unsigned())
+            out.numeric_value = v.get<std::uint64_t>();
+        else if (v.is_number_integer())
+            out.numeric_value = v.get<std::int64_t>();
+        else
+            out.numeric_value = v.get<double>();
         return std::nullopt;
     }
     if (v.is_boolean() && equality) {
