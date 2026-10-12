@@ -346,7 +346,7 @@ TEST_CASE("/fragments/results: admitted + unfiltered (TOP) gate shows every agen
     CHECK(contains(res->body, "output a"));
     CHECK(contains(res->body, "output b"));
     CHECK(contains(res->body, "2 agents"));
-    // #5669: every results response clears an open Create Static Group form, which would
+    // #5669: every successful results response clears an open Create Static Group form, which would
     // otherwise keep the filters and agent count of the render that opened it.
     CHECK(contains(res->body, "<div id=\"group-form-slot\" hx-swap-oob=\"innerHTML\"></div>"));
 
