@@ -1577,11 +1577,13 @@ flip, with a red-first test each:
     (b) a bounded per-rule rebuild-reason INFO log and, optionally, a skip counter (the
     unhappy-path SRE-1 finding: with the skip, an operator cannot tell from the agent log why a
     given rule was or was not rebuilt); (c) PARTLY DONE: a release-build A/B (base `45f727420` against branch tip
-    `3f8dd8d0d`, uncommitted throwaway harness) ran on a loaded Linux box (S0, S5, S1d, S3s at
-    R up to 5000 with fake mechanisms; the real Linux Service mechanism up to R=400) and on
+    `3f8dd8d0d`, uncommitted throwaway harness) ran on a loaded Linux box (S0, S5 and S3s at
+    R up to 5000 and S1d up to R=1000 with fake mechanisms; the real Linux Service mechanism up to R=400) and on
     weecolin (S0, S5, S3s up to R=5000 with fake mechanisms; the real SCM Service, File and
     Registry mechanisms up to R=1000): zero watch and unwatch calls and zero un-armed pushes
-    on a skipped re-push, and an engine health-probe call of about 70 to 100 ns. Counts are
+    on a skipped re-push (with the real Registry mechanism after the first few pushes, while
+    the initial real arms of 400 to 1000 rules complete; the baseline never converged there),
+    and an engine health-probe call of about 70 to 100 ns. Counts are
     exact, wall times are not (the Linux box was shared). Still NOT done: a quiet-box run, a
     shared-faulted-key cell, the engine `mtx_` hold time recorded directly, a real mechanism
     on macOS, and an isolated probe on/off measurement (the probe cost above is a bound); (d) an explicit census resync mechanism for
