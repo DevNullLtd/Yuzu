@@ -272,11 +272,7 @@ public:
         // success path, no audit storm. (The earlier generation-unreadable gate is
         // pre-dedup and coarse, counter-only there, plus the persistent degraded
         // gauge tracked in #2662.)
-        auto abort_degraded = [&](std::string_view what, const std::string& err) {
-            metrics_
-                .counter("yuzu_server_guardian_reconciles_total",
-                         {{"result", "degraded"}})
-                .increment();
+        auto audit_abort = [&](std::string_view what, const std::string& err) {
             AuditEvent ev;
             ev.timestamp =
                 std::chrono::duration_cast<std::chrono::seconds>(
@@ -292,6 +288,21 @@ public:
                         std::to_string(agent_gen) + ")";
             ev.result = "degraded";
             audit_(ev);
+        };
+        auto abort_degraded = [&](std::string_view what, const std::string& err) {
+            metrics_
+                .counter("yuzu_server_guardian_reconciles_total",
+                         {{"result", "degraded"}})
+                .increment();
+            audit_abort(what, err);
+        };
+        // The same ABORTED audit row, counted on its OWN counter and NOT as result="degraded":
+        // this abort is not a store failure. It means a rule or policy change landed on this
+        // replica while the push was being prepared (see the epoch check before the send), so
+        // it must not move the degraded series that is read as the pool-pressure signal.
+        auto abort_invalidated = [&](std::string_view what, const std::string& err) {
+            metrics_.counter("yuzu_server_guardian_reconcile_invalidated_total").increment();
+            audit_abort(what, err);
         };
 
         auto sess = session_os_(agent_id);
@@ -469,20 +480,20 @@ public:
         // (the edit's best-effort bump can fail). Labelling those rows with that generation
         // would leave the agent converged on them until the next bump, so send NOTHING: the
         // claim is kept, the agent is admitted again after the young-claim window and then
-        // reconciles from a fresh load. This is the same abort as every other store-state
-        // failure here (counter, ABORTED audit row, log). It is conservative: an invalidation
-        // that merely overlapped this reconcile aborts it even when the bundle was in fact
-        // loaded afterwards. It does not close the gap between a committed edit and the
+        // reconciles from a fresh load. It writes the same ABORTED audit row as the store
+        // aborts but is counted on its own counter, not as result="degraded" (no store
+        // failed). It is conservative: an invalidation that merely overlapped this
+        // reconcile aborts it even when the bundle was in fact loaded afterwards. It does not close the gap between a committed edit and the
         // hook that follows it (an edit whose hook has not yet run is invisible to this
         // comparison), nor an invalidation that lands after this line and before the send.
         if (guardian_rule_bundle_cache_.epoch() != bundle_epoch) {
-            spdlog::warn("Guardian heartbeat reconcile: the rule bundle was invalidated "
-                         "while this re-push was being prepared - aborting re-push for "
-                         "agent_id={}",
+            spdlog::info("Guardian heartbeat reconcile: a rule or policy change landed while "
+                         "this re-push was being prepared - withholding it for agent_id={} "
+                         "(retried on a later heartbeat)",
                          ::yuzu::log_token(agent_id));
-            abort_degraded("rule bundle invalidated during load",
-                           "a rule or policy change landed while the bundle was loading; "
-                           "retried on a later heartbeat");
+            abort_invalidated("rule bundle invalidated during load",
+                              "a rule or policy change landed while the re-push was being "
+                              "prepared; retried on a later heartbeat");
             return;  // send NOTHING: the rows may predate the change under an unchanged label
         }
         // Unique per re-push (random suffix) so a same-generation reconcile

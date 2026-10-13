@@ -5883,11 +5883,17 @@ public:
                               "dispatched), rate_limited (per-agent 25 s slot), shed (admission "
                               "budget or per-second ceiling exhausted, or in-flight cap reached, "
                               "nothing sent, no audit row), degraded "
-                              "(a store read failed or the rule set was invalidated while "
-                              "the reconcile was running, re-push aborted), no_session",
+                              "(a store read failed, re-push aborted), no_session",
                               "counter");
             for (auto result : {"sent", "rate_limited", "shed", "degraded", "no_session"})
                 metrics_.counter("yuzu_server_guardian_reconciles_total", {{"result", result}});
+            metrics_.describe("yuzu_server_guardian_reconcile_invalidated_total",
+                              "Guardian heartbeat reconciles withheld because a rule or policy "
+                              "change landed on this replica while the re-push was being "
+                              "prepared (nothing sent, retried on a later heartbeat; not a "
+                              "store failure and not counted as result=degraded)",
+                              "counter");
+            metrics_.counter("yuzu_server_guardian_reconcile_invalidated_total");
             metrics_.describe("yuzu_server_guardian_reconcile_duration_seconds",
                               "Wall time of an ADMITTED Guardian heartbeat reconcile (from "
                               "admission to every exit, including aborted ones); the sizing "
@@ -7020,6 +7026,17 @@ public:
                     cfg_.db_dir() / "guardian-baselines.db", "BaselineStore",
                     {"guaranteed_state_baselines", "guaranteed_state_baseline_rules",
                      "guaranteed_state_baseline_groups"});
+                // #5513: a committed Baseline update (a deploy rewrites the deployed snapshot)
+                // or delete drops the heartbeat reconcile's cached generation and held bundle
+                // immediately, BEFORE the caller's own policy-generation bump (its own lease)
+                // and fan-out. Without it a reconcile running in that gap could send the old
+                // deployed set under the unchanged generation label. Same two invalidations as
+                // the rule-mutation hook; both caches are members declared AFTER baseline_store_
+                // (destroyed first), the hook only fires from a mutation, and stop() clears it.
+                baseline_store_->set_on_baseline_mutation([this] {
+                    guardian_generation_cache_.invalidate();
+                    guardian_rule_bundle_cache_.invalidate();
+                });
             }
         }
 
@@ -10617,6 +10634,8 @@ public:
             gateway_service_->set_guaranteed_state_store(nullptr);
         if (guaranteed_state_store_)
             guaranteed_state_store_->set_on_rule_mutation({}); // hook captures `this` (#5513)
+        if (baseline_store_)
+            baseline_store_->set_on_baseline_mutation({}); // hook captures `this` (#5513)
         guaranteed_state_store_.reset();
         // RbacStore (authorization substrate, ADR-0041) borrows pg_pool_ — drop
         // before the pool. Every HTTP/gRPC/MCP handler holding the raw pointer is
@@ -19625,13 +19644,29 @@ private:
             (guardian_push_fn_ = [this](const std::string& scope, bool full_sync) -> int {
                 if (!guaranteed_state_store_)
                     return 0;
+                // Parse an explicit scope FIRST. It is a pure check (no store read), and an
+                // invalid scope must be refused (-1) without touching the heartbeat reconcile:
+                // the invalidations below move the bundle cache epoch and withhold every
+                // reconcile that is in flight on this replica, which a push that sends nothing
+                // has no business doing. The parsed expression is used for the target
+                // resolution further down. (A degraded store read below still returns -2 after
+                // the invalidations: the caller's bump already happened, so they stay due.)
+                std::optional<yuzu::scope::Expression> parsed_scope;
+                if (!scope.empty() && !(scope.starts_with("group:") && mgmt_group_store_)) {
+                    auto parsed = yuzu::scope::parse(scope);
+                    if (!parsed)
+                        return -1;
+                    parsed_scope = std::move(*parsed);
+                }
                 // Callers reach here right after a local policy-generation bump (baseline
                 // deploy, delete of a DEPLOYED baseline) or an explicit push (REST, MCP). Drop
                 // the heartbeat reconcile's cached generation (about 2 s stale) and held bundle
                 // so the next heartbeat decides from the post-bump state instead of waiting out the TTL.
                 // Rule create/update/delete on this replica reach the same two invalidations
-                // through GuaranteedStateStore::set_on_rule_mutation (wired where the store is
-                // constructed), because they do not pass through here.
+                // through GuaranteedStateStore::set_on_rule_mutation, and a Baseline update or
+                // delete through BaselineStore::set_on_baseline_mutation (both wired where the
+                // store is constructed), because they do not pass through here before their own
+                // bump. These come BEFORE the generation, rules and deployed-set reads below.
                 guardian_generation_cache_.invalidate();
                 guardian_rule_bundle_cache_.invalidate();
                 const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
@@ -19692,9 +19727,7 @@ private:
                     for (const auto& m : mgmt_group_store_->get_members(scope.substr(6)))
                         targets.push_back(m.agent_id);
                 } else {
-                    auto parsed = yuzu::scope::parse(scope);
-                    if (!parsed)
-                        return -1;
+                    // `parsed_scope` was parsed (and an invalid scope refused) at the top.
                     // No rs_store/principal passed — LOCAL-ONLY dispatch
                     // (registry_.send_to below), so evaluate_scope_local
                     // (#4981 PR-1 B4) is correct: a from_result_set:/props.<key>
@@ -19706,7 +19739,7 @@ private:
                     // evaluate_scope, this can never abort for a presence
                     // reason, so a presence-store blip cannot periodically
                     // disarm this push.
-                    targets = registry_.evaluate_scope_local(*parsed, tag_store_.get(),
+                    targets = registry_.evaluate_scope_local(*parsed_scope, tag_store_.get(),
                                                              custom_properties_store_.get())
                                   .value_or(std::vector<std::string>{});
                 }

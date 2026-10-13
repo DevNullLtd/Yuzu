@@ -279,6 +279,10 @@ public:
             t += count(l);
         return t;
     }
+    // The dedicated counter of the epoch-check abort (NOT a result label of reconciles_total).
+    double invalidated() {
+        return metrics.counter("yuzu_server_guardian_reconcile_invalidated_total").value();
+    }
     double dispatched() {
         return metrics.counter("yuzu_server_guardian_pushes_dispatched_total",
                                {{"reason", "reconcile"}})
@@ -933,8 +937,8 @@ namespace {
 // The audit text of the abort the epoch check raises.
 std::string invalidated_abort(std::uint64_t agent_gen = 3) {
     return aborted("rule bundle invalidated during load",
-                   "a rule or policy change landed while the bundle was loading; retried on a "
-                   "later heartbeat",
+                   "a rule or policy change landed while the re-push was being prepared; "
+                   "retried on a later heartbeat",
                    agent_gen);
 }
 
@@ -961,11 +965,12 @@ TEST_CASE("GuardianReconcileFlow: C1, a bundle an invalidation overtook is not s
     CHECK(rig.sent.empty());  // NOTHING is sent
     CHECK(rig.dispatched() == 0.0);
     CHECK(rig.generation_gauge() == 0.0);
-    CHECK(rig.count("degraded") == 1.0);
-    CHECK(rig.total() == 1.0);
+    CHECK(rig.count("degraded") == 0.0);  // no store failed: the degraded series does not move
+    CHECK(rig.total() == 0.0);            // and no result label of reconciles_total moves at all
+    CHECK(rig.invalidated() == 1.0);      // the dedicated counter does
     REQUIRE(rig.audits.size() == 1);
     CHECK(rig.audits[0].detail == invalidated_abort(0));
-    CHECK(rig.audits[0].result == "degraded");
+    CHECK(rig.audits[0].result == "degraded");  // the audit row keeps the documented shape
     CHECK(rig.gate.in_flight() == 0);
     CHECK(rig.duration_count() == 1);
     CHECK_FALSE(rig.bundle_cache.held_generation().has_value());  // the late load installed nothing
@@ -973,6 +978,7 @@ TEST_CASE("GuardianReconcileFlow: C1, a bundle an invalidation overtook is not s
     // The claim is KEPT: a heartbeat inside the young-claim window is rate limited, not admitted.
     rig.run("agent-1", 0);
     CHECK(rig.count("rate_limited") == 1.0);
+    CHECK(rig.invalidated() == 1.0);  // a rate-limited heartbeat is not counted again
     CHECK(rig.sent.empty());
     CHECK(rig.list_calls == 1);
 
@@ -986,6 +992,7 @@ TEST_CASE("GuardianReconcileFlow: C1, a bundle an invalidation overtook is not s
     CHECK(parse_push(rig.sent[0].bytes).policy_generation() == 7);
     CHECK(rig.list_calls == 2);
     CHECK(rig.count("sent") == 1.0);
+    CHECK(rig.invalidated() == 1.0);
 }
 
 TEST_CASE("GuardianReconcileFlow: C1, an invalidation during the fresh generation read also aborts",
@@ -1002,7 +1009,9 @@ TEST_CASE("GuardianReconcileFlow: C1, an invalidation during the fresh generatio
     };
     rig.run("agent-1", 0);
     CHECK(rig.sent.empty());
-    CHECK(rig.count("degraded") == 1.0);
+    CHECK(rig.count("degraded") == 0.0);
+    CHECK(rig.invalidated() == 1.0);
+    CHECK(rig.gate.in_flight() == 0);
     REQUIRE(rig.audits.size() == 1);
     CHECK(rig.audits[0].detail == invalidated_abort(0));
 }
@@ -1018,8 +1027,10 @@ TEST_CASE("GuardianReconcileFlow: C1, an invalidation during scope evaluation al
     rig.run("agent-1", 0);
     REQUIRE(rig.eval_calls == 1);  // the push was fully prepared...
     CHECK(rig.sent.empty());       // ...and then withheld
-    CHECK(rig.count("degraded") == 1.0);
+    CHECK(rig.count("degraded") == 0.0);
+    CHECK(rig.invalidated() == 1.0);
     CHECK(rig.count("sent") == 0.0);
+    CHECK(rig.gate.in_flight() == 0);
     REQUIRE(rig.audits.size() == 1);
     CHECK(rig.audits[0].detail == invalidated_abort(0));
 }
@@ -1034,6 +1045,7 @@ TEST_CASE("GuardianReconcileFlow: C1, an invalidation BEFORE the reconcile start
     rig.run("agent-2", 0);  // a later reconcile reads the new epoch and is not affected
     REQUIRE(rig.sent.size() == 2);
     CHECK(rig.count("degraded") == 0.0);
+    CHECK(rig.invalidated() == 0.0);
     CHECK(rig.audits.size() == 2);  // the two success rows only
     CHECK(rig.audits[1].result == "success");
 }
@@ -1076,7 +1088,11 @@ TEST_CASE("GuardianReconcileFlow: C1, the owner of a detached load and a waiter 
         rig.run("agent-waiter", 0);
     });
     REQUIRE(joined_f.wait_for(10s) == std::future_status::ready);
-    rig.bundle_cache.invalidate();  // the waiter has joined the owner's flight and is about to block
+    // The waiter has joined the owner's flight and is about to block. Time passes while it
+    // blocks, as in production, so its `waited` is not zero: a waiter must abort exactly like
+    // the owner (a check that only the zero-wait owner performs would leave it sending).
+    rig.clock.advance(1s);
+    rig.bundle_cache.invalidate();
     {
         std::lock_guard lk(m);
         release = true;
@@ -1087,8 +1103,9 @@ TEST_CASE("GuardianReconcileFlow: C1, the owner of a detached load and a waiter 
 
     CHECK(rig.list_calls == 1);  // the waiter never ran the loader
     CHECK(rig.sent.empty());
-    CHECK(rig.count("degraded") == 2.0);
-    CHECK(rig.total() == 2.0);
+    CHECK(rig.count("degraded") == 0.0);
+    CHECK(rig.total() == 0.0);
+    CHECK(rig.invalidated() == 2.0);
     REQUIRE(rig.audits.size() == 2);
     for (const auto& a : rig.audits)
         CHECK(a.detail == invalidated_abort(0));
@@ -1304,6 +1321,7 @@ struct Scenario {
     std::function<void(Rig&)> setup;  // earlier state and calls; not measured
     bool admitted;                    // does the measured call get past Admit?
     double labels;                    // result-label increments the measured call must make
+    double invalidated{0};            // increments of the dedicated invalidated counter
 };
 
 std::vector<Scenario> all_exits() {
@@ -1347,6 +1365,7 @@ std::vector<Scenario> all_exits() {
          {},
          [](Rig& r) { r.list_hook = [&r] { r.bundle_cache.invalidate(); }; },
          true,
+         0,  // no result label: it has its own counter
          1},
         {"scope store degraded",
          {},
@@ -1378,6 +1397,7 @@ TEST_CASE("GuardianReconcileFlow: every exit path makes at most one result incre
             Rig rig(sc.opts);
             sc.setup(rig);
             const double labels_before = rig.total();
+            const double invalidated_before = rig.invalidated();
             const auto durations_before = rig.duration_count();
             const auto admitted_before = rig.budget.admitted_total();
             const auto held = rig.held.has_value() ? 1u : 0u;
@@ -1407,8 +1427,9 @@ TEST_CASE("GuardianReconcileFlow: every exit path makes at most one result incre
             }
 
             const double delta = rig.total() - labels_before;
-            CHECK(delta <= 1.0);
+            CHECK(delta + (rig.invalidated() - invalidated_before) <= 1.0);  // one outcome per call
             CHECK(delta == sc.labels);
+            CHECK(rig.invalidated() - invalidated_before == sc.invalidated);
             CHECK(rig.duration_count() - durations_before == (sc.admitted ? 1u : 0u));
             CHECK(rig.budget.admitted_total() - admitted_before == (sc.admitted ? 1u : 0u));
             CHECK(rig.gate.in_flight() == held);  // only a slot the test itself holds remains

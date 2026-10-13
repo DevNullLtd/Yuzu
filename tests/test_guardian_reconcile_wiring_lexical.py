@@ -76,11 +76,18 @@ Invariants over the FLOW:
      `const auto bundle_epoch = guardian_rule_bundle_cache_.epoch();` BEFORE the fresh generation
      read (so every invalidation after that point is seen), and compares
      `guardian_rule_bundle_cache_.epoch() != bundle_epoch` AFTER the bundle get and BEFORE the
-     send, where a changed epoch aborts through `abort_degraded("rule bundle invalidated during
-     load", ...)` AND returns. GuardianRuleBundleCache::get() hands a load that invalidate()
-     detached to its own caller and to its waiters, so without this check a rule edit whose
-     best-effort generation bump failed lets an in-flight reconcile send the pre-edit rows under
-     the unchanged generation, and the agent stays converged on them until the next bump.
+     send, where a changed epoch aborts through `abort_invalidated("rule bundle invalidated
+     during load", ...)` AND returns. `abort_invalidated` counts
+     `yuzu_server_guardian_reconcile_invalidated_total` and NOT result="degraded" (no store
+     failed; the degraded series is the pool-pressure signal), and writes the same ABORTED audit
+     row through the shared `audit_abort` helper that `abort_degraded` also uses (m).
+     GuardianRuleBundleCache::get() hands a load that invalidate() detached to its own caller and
+     to its waiters, so without this check a rule edit whose best-effort generation bump failed
+     lets an in-flight reconcile send the pre-edit rows under the unchanged generation, and the
+     agent stays converged on them until the next bump. Tolerated spellings: a `this->` prefix,
+     `auto` or `std::uint64_t` for `bundle_epoch`, `const` or not, either operand order of the
+     `!=`. NOT pinnable lexically (review-enforced): a conditional `return` or an `if (false)`
+     wrapped around the abort inside the check block, and a dead or unreachable check.
 
 Invariants over the WIRING (server.cpp):
 
@@ -145,6 +152,17 @@ Invariants over the WIRING (server.cpp):
      and after the bump attempt on all three mutation paths, never throws, holds no lease) is
      pinned by the [rule_hook] cases in tests/unit/server/test_guaranteed_state_store.cpp, which
      need a Postgres.
+
+  x. `GuardianRoutes` baseline deploy/delete reach the reconcile caches BEFORE their own policy
+     bump: `BaselineStore::set_on_baseline_mutation(` is wired exactly once, with a lambda that
+     invalidates both caches and nothing else (a deploy writes the new deployed snapshot, then
+     takes a second lease for the bump; a reconcile in that gap would send the old deployed set
+     under the unchanged label). The pre-seed of `yuzu_server_guardian_reconcile_invalidated_total`
+     is present.
+  y. Inside the `guardian_push_fn_` body the explicit scope is parsed (`scope::parse(scope)`,
+     refused with `return -1`) BEFORE the two cache invalidations, and the invalidations come
+     BEFORE the generation read (`current_policy_generation(`): an invalid-scope push must not
+     withhold in-flight reconciles, and the fan-out order stays safe.
 
 LEXICAL ONLY. It cannot see a relocation that keeps the tokens but changes control flow (that
 stays review-enforced), and the behavioural guarantees are the building blocks' own unit tests.
@@ -422,14 +440,19 @@ def flow_problems(src):
 
     # (m) abort_degraded body, and the degrade branches that reach it.
     ab = block_after(b, "auto abort_degraded = [")
+    aa = block_after(b, "auto audit_abort = [")
     if ab is None:
         out.append("could not isolate the abort_degraded lambda body (m)")
     else:
         if not re.search(r'\.counter\( ?"yuzu_server_guardian_reconciles_total", ?\{ ?\{ ?"result", ?"degraded" ?\} ?\} ?\)'
                          r' ?\.increment\(\)', ab):
             out.append('abort_degraded no longer increments result="degraded" (m)')
-        if not (re.search(r"\bAuditEvent\b", ab) and re.search(r"\baudit_ ?\( ?ev ?\) ?;", ab)):
-            out.append("abort_degraded no longer writes the audit event (m)")
+        if not re.search(r"\baudit_abort\( ?what, ?err ?\) ?;", ab):
+            out.append("abort_degraded no longer writes the audit event through audit_abort (m)")
+    if aa is None:
+        out.append("could not isolate the audit_abort lambda body (m)")
+    elif not (re.search(r"\bAuditEvent\b", aa) and re.search(r"\baudit_ ?\( ?ev ?\) ?;", aa)):
+        out.append("audit_abort no longer writes the audit event (m)")
     for site in ("rule_store_degraded", "baseline_store_degraded", "rule_bundle_load_failed"):
         if not re.search(r'abort_degraded\( ?"' + site + '"', b):
             out.append(f'the "{site}" branch no longer reaches abort_degraded (m)')
@@ -470,24 +493,37 @@ def flow_problems(src):
             out.append("the success audit row is no longer written inside the delivered-push branch (s)")
 
     # (w) an invalidated bundle is never sent.
-    epoch_read = re.search(r"\bconst auto bundle_epoch = guardian_rule_bundle_cache_\.epoch\(\) ?;", b)
+    epoch_read = re.search(r"\b(?:const )?(?:auto|std::uint64_t) bundle_epoch = (?:this ?-> ?)?"
+                           r"guardian_rule_bundle_cache_\.epoch\(\) ?;", b)
     if not epoch_read:
         out.append("the flow no longer reads guardian_rule_bundle_cache_.epoch() into bundle_epoch (w)")
     elif fresh_read and not epoch_read.start() < fresh_read.start():
         out.append("bundle_epoch is no longer read BEFORE the fresh generation read: an invalidation "
                    "that lands between the two would go unseen (w)")
     send_at = re.search(r"\bsend_push_\(", b)
-    check = re.search(r"\bif \( ?guardian_rule_bundle_cache_\.epoch\(\) ?!= ?bundle_epoch ?\) ?\{([^{}]*)\}", b)
+    ep = r"(?:this ?-> ?)?guardian_rule_bundle_cache_\.epoch\(\)"
+    check = re.search(r"\bif \( ?(?:" + ep + r" ?!= ?bundle_epoch|bundle_epoch ?!= ?" + ep + r") ?\) ?\{([^{}]*)\}", b)
     if not check:
         out.append("the `if (guardian_rule_bundle_cache_.epoch() != bundle_epoch)` check is gone: a rule "
                    "bundle an invalidation overtook would be sent under the unchanged generation (w)")
     else:
-        if not re.search(r'\babort_degraded\( ?"rule_bundle_invalidated_during_load"[^;]*;[^{}]*?\breturn ?;', check.group(1)):
-            out.append("a changed bundle epoch no longer aborts through abort_degraded and returns (w)")
+        if not re.search(r'\babort_invalidated\( ?"rule_bundle_invalidated_during_load"[^;]*;[^{}]*?\breturn ?;', check.group(1)):
+            out.append("a changed bundle epoch no longer aborts through abort_invalidated and returns (w)")
         if bundle_get and not bundle_get.start() < check.start():
             out.append("the bundle epoch check is no longer AFTER the bundle get (w)")
         if send_at and not check.start() < send_at.start():
             out.append("the bundle epoch check is no longer BEFORE the send (w)")
+    ai = block_after(b, "auto abort_invalidated = [")
+    if ai is None:
+        out.append("could not isolate the abort_invalidated lambda body (w)")
+    else:
+        if not re.search(r'\.counter\( ?"yuzu_server_guardian_reconcile_invalidated_total" ?\) ?\.increment\(\)', ai):
+            out.append("abort_invalidated no longer increments yuzu_server_guardian_reconcile_invalidated_total (w)")
+        if re.search(r'"yuzu_server_guardian_reconciles_total"|"degraded"', ai):
+            out.append('abort_invalidated counts result="degraded": no store failed, and that series is the '
+                       'pool-pressure signal (w)')
+        if not re.search(r"\baudit_abort\( ?what, ?err ?\) ?;", ai):
+            out.append("abort_invalidated no longer writes the ABORTED audit row through audit_abort (w)")
     return out
 
 
@@ -643,6 +679,21 @@ def problems(src):
         for cache in ("guardian_generation_cache_", "guardian_rule_bundle_cache_"):
             if not re.search(cache + r"\.invalidate\(\)", push_body):
                 out.append(f"guardian_push_fn_ no longer calls {cache}.invalidate() (p)")
+        # (y) order inside the body: scope parse (refused with -1) < invalidations < generation read.
+        parses = list(re.finditer(r"\bscope::parse\( ?scope ?\)", push_body))
+        invs = list(re.finditer(r"\bguardian_(?:generation|rule_bundle)_cache_\.invalidate\(\)", push_body))
+        gen_read = re.search(r"\bcurrent_policy_generation\(", push_body)
+        if len(parses) != 1:
+            out.append("guardian_push_fn_ no longer parses the explicit scope exactly once up front "
+                       "(scope::parse(scope)) (y)")
+        elif not re.search(r"scope::parse\( ?scope ?\) ?;[^;]*?\bif ?\( ?! ?\w+ ?\) ?return -1 ?;", push_body[parses[0].start():]):
+            out.append("guardian_push_fn_ no longer refuses an unparseable scope with `return -1` right "
+                       "after parsing it (y)")
+        if invs and parses and not parses[0].start() < invs[0].start():
+            out.append("the guardian_push_fn_ cache invalidations run BEFORE the scope parse: an invalid-scope "
+                       "push would withhold every in-flight reconcile for nothing (y)")
+        if invs and gen_read and not invs[-1].start() < gen_read.start():
+            out.append("the guardian_push_fn_ cache invalidations no longer come BEFORE the generation read (y)")
 
     # (v) a rule create/update/delete on this replica drops both reconcile caches (chaos-F1).
     hooks = [m.end() - 1 for m in re.finditer(r"\bset_on_rule_mutation\((?= ?\[)", t)]
@@ -658,6 +709,23 @@ def problems(src):
                 re.search(r"^\{ ?" + bun + " ?" + gen + r" ?\}$", body.strip())):
             out.append("the set_on_rule_mutation lambda no longer does exactly "
                        "{ guardian_generation_cache_.invalidate(); guardian_rule_bundle_cache_.invalidate(); } (v)")
+
+    # (x) a committed Baseline update/delete drops both reconcile caches before the caller's own bump.
+    bhooks = [m.end() - 1 for m in re.finditer(r"\bset_on_baseline_mutation\((?= ?\[)", t)]
+    if len(bhooks) != 1:
+        out.append("server.cpp no longer wires exactly one BaselineStore::set_on_baseline_mutation( lambda (x)")
+    else:
+        end = match_close(t, bhooks[0], "(", ")")
+        arg = "" if end < 0 else t[bhooks[0] + 1:end]
+        body = block_after(arg, "]") or ""
+        inv = r"(?:this ?-> ?)?%s ?\. ?invalidate\( ?\) ?;"
+        gen, bun = inv % "guardian_generation_cache_", inv % "guardian_rule_bundle_cache_"
+        if not (re.search(r"^\{ ?" + gen + " ?" + bun + r" ?\}$", body.strip()) or
+                re.search(r"^\{ ?" + bun + " ?" + gen + r" ?\}$", body.strip())):
+            out.append("the set_on_baseline_mutation lambda no longer does exactly "
+                       "{ guardian_generation_cache_.invalidate(); guardian_rule_bundle_cache_.invalidate(); } (x)")
+    if not re.search(r'metrics_\.counter\( ?"yuzu_server_guardian_reconcile_invalidated_total" ?\) ?;', t):
+        out.append("yuzu_server_guardian_reconcile_invalidated_total is no longer pre-seeded (x)")
 
     # (q) the saturation gauges and the claim sweep (see q_problems).
     out.extend(q_problems(t))
@@ -935,7 +1003,9 @@ MUTATIONS += [
     ("abort_degraded stops counting",
      _after("auto abort_degraded = [", '{{"result", "degraded"}}', '{{"result", "degradedx"}}'), "(m)"),
     ("abort_degraded stops auditing",
-     _after("auto abort_degraded = [", "audit_(ev);", "(void)0;"), "(m)"),
+     _after("auto abort_degraded = [", "audit_abort(what, err);", "(void)0;"), "(m)"),
+    ("the shared audit helper stops auditing",
+     _after("auto audit_abort = [", "audit_(ev);", "(void)0;"), "(m)"),
     ("rule store degrade no longer aborts",
      _sub('abort_degraded("rule store degraded", err.detail);', "(void)0;"), "(m)"),
     ("baseline store degrade no longer aborts",
@@ -1027,10 +1097,11 @@ MUTATIONS += [
 ]
 
 # Invariants that live in server.cpp; every other lettered entry above mutates the flow header.
-SERVER_LETTERS = ("(i)", "(p)", "(q)")
+SERVER_LETTERS = ("(i)", "(p)", "(q)", "(x)", "(y)")
 
 # (w) the bundle epoch check.
 EPOCH_READ = "const auto bundle_epoch = guardian_rule_bundle_cache_.epoch();"
+ABORT_INV = r'abort_invalidated\("rule bundle invalidated during load",.*?retried on a later heartbeat"\);'
 MUTATIONS += [
     ("bundle epoch no longer read", _sub(EPOCH_READ, "const std::uint64_t bundle_epoch = 0;"), "(w)"),
     ("bundle epoch read after the fresh generation read",
@@ -1042,15 +1113,57 @@ MUTATIONS += [
     ("bundle epoch comparison inverted",
      _sub("guardian_rule_bundle_cache_.epoch() != bundle_epoch", "guardian_rule_bundle_cache_.epoch() == bundle_epoch"), "(w)"),
     ("changed bundle epoch no longer aborts",
-     _resub(r'abort_degraded\("rule bundle invalidated during load",.*?retried on a later heartbeat"\);', "(void)0;"), "(w)"),
+     _resub(ABORT_INV, "(void)0;"), "(w)"),
     ("changed bundle epoch aborts but no longer returns",
-     _resub(r'(abort_degraded\("rule bundle invalidated during load",.*?retried on a later heartbeat"\);)\s*return;', r"\1"), "(w)"),
+     _resub("(" + ABORT_INV + r")\s*return;", r"\1"), "(w)"),
+    ("changed bundle epoch aborts through abort_degraded (counts as a store failure)",
+     _resub(r'abort_invalidated\("rule bundle invalidated during load"', 'abort_degraded("rule bundle invalidated during load"'), "(w)"),
+    ("abort_invalidated counts result=degraded instead of its own counter",
+     _after("auto abort_invalidated = [", '"yuzu_server_guardian_reconcile_invalidated_total"',
+            '"yuzu_server_guardian_reconciles_total", {{"result", "degraded"}}'), "(w)"),
+    ("abort_invalidated also counts result=degraded",
+     _after("auto abort_invalidated = [", "audit_abort(what, err);",
+            'metrics_.counter("yuzu_server_guardian_reconciles_total", {{"result", "degraded"}}).increment(); audit_abort(what, err);'), "(w)"),
+    ("abort_invalidated stops auditing",
+     _after("auto abort_invalidated = [", "audit_abort(what, err);", "(void)0;"), "(w)"),
     ("bundle epoch check moved after the send",
      lambda s: (lambda m: s[:m.start()] + s[m.end():])(
          re.search(r"if \(guardian_rule_bundle_cache_\.epoch\(\) != bundle_epoch\) \{.*?return;  // send NOTHING[^\n]*\n\s*\}",
                    s, re.S)).replace(
          "if (send_push_(agent_id, command_id, push.SerializeAsString())) {",
-         "if (send_push_(agent_id, command_id, push.SerializeAsString())) { if (guardian_rule_bundle_cache_.epoch() != bundle_epoch) { abort_degraded(\"rule bundle invalidated during load\", \"x\"); return; }", 1), "(w)"),
+         "if (send_push_(agent_id, command_id, push.SerializeAsString())) { if (guardian_rule_bundle_cache_.epoch() != bundle_epoch) { abort_invalidated(\"rule bundle invalidated during load\", \"x\"); return; }", 1), "(w)"),
+]
+
+# (x)/(y): the baseline hook and the push fan-out ordering (server.cpp).
+BH = "set_on_baseline_mutation([this] {"
+def _scope_parse_block(s):
+    m = re.search(r"[ \t]*std::optional<yuzu::scope::Expression> parsed_scope;.*?parsed_scope = std::move\(\*parsed\);\n\s*\}\n", s, re.S)
+    assert m, "scope parse block not found (stale pattern)"
+    return s[:m.start()] + s[m.end():], m.group(0)
+def _invalidate_before_parse(s):
+    s, blk = _scope_parse_block(s)
+    anchor = "                guardian_generation_cache_.invalidate();\n                guardian_rule_bundle_cache_.invalidate();\n"
+    i = s.index(anchor, s.index("guardian_push_fn_ = [this]"))
+    return s[:i + len(anchor)] + blk + s[i + len(anchor):]
+def _invalidate_after_generation_read(s):
+    anchor = "                guardian_generation_cache_.invalidate();\n                guardian_rule_bundle_cache_.invalidate();\n"
+    i = s.index(anchor, s.index("guardian_push_fn_ = [this]"))
+    s = s[:i] + s[i + len(anchor):]
+    j = s.index("const std::uint64_t generation = *generation_opt;", i)
+    return s[:j] + anchor + s[j:]
+MUTATIONS += [
+    ("baseline-mutation hook is never wired",
+     _wafter(BH, "guardian_generation_cache_.invalidate(); guardian_rule_bundle_cache_.invalidate(); });", "});"), "(x)"),
+    ("baseline-mutation hook forgets the rule bundle cache",
+     _wafter(BH, "guardian_rule_bundle_cache_.invalidate();", "(void)0;"), "(x)"),
+    ("baseline-mutation hook forgets the generation cache",
+     _wafter(BH, "guardian_generation_cache_.invalidate();", "(void)0;"), "(x)"),
+    ("invalidated counter no longer pre-seeded",
+     _sub('metrics_.counter("yuzu_server_guardian_reconcile_invalidated_total");', "(void)0;"), "(x)"),
+    ("push fan-out invalidates before parsing the scope", _invalidate_before_parse, "(y)"),
+    ("push fan-out invalidates after the generation read", _invalidate_after_generation_read, "(y)"),
+    ("push fan-out no longer refuses an unparseable scope up front",
+     _resub(r"(auto parsed = yuzu::scope::parse\(scope\);\s*)if \(!parsed\)\s*return -1;", r"\1"), "(y)"),
 ]
 
 # (s) the delivered-push branch.
@@ -1182,6 +1295,18 @@ BENIGN_FLOW = [
      _sub("bool scope_degraded = false;", 'bool scope_degraded = false; const char* old_name = "guardian_last_reconcile_";')),
     ("block comment mentions current_policy_generation(",
      _sub("bool scope_degraded = false;", "bool scope_degraded = false; /* current_policy_generation( */")),
+]
+
+BENIGN_FLOW += [
+    # (w) tolerated spellings of the epoch pin: they do not change what it does.
+    ("(w) bundle_epoch spelled with std::uint64_t and a this-> prefix",
+     _sub(EPOCH_READ, "const std::uint64_t bundle_epoch = this->guardian_rule_bundle_cache_.epoch();")),
+    ("(w) epoch comparison with swapped operands",
+     _sub("guardian_rule_bundle_cache_.epoch() != bundle_epoch", "bundle_epoch != guardian_rule_bundle_cache_.epoch()")),
+    ("(w) a comment and a string that merely mention the abort and the epoch",
+     _sub("bool scope_degraded = false;",
+          'bool scope_degraded = false; // abort_degraded("rule bundle invalidated during load") if epoch() != bundle_epoch\n'
+          ' const char* note = "guardian_rule_bundle_cache_.epoch() != bundle_epoch";')),
 ]
 
 BENIGN_SERVER = [
