@@ -899,7 +899,7 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
         auto err = j["error"].get<std::string>();
         auto desc = j.value("error_description", "");
         // `error` and `error_description` are IdP-controlled. Fold `err` where the returned string
-        // is built so the caller's "OIDC callback failed: {}" line and the audit detail are safe.
+        // is built so the caller's "OIDC callback failed: {}" line and event attribute are safe.
         const auto safe_err = ::yuzu::log_key_token(err);
         spdlog::error("OIDC token exchange error: {} - {}", safe_err,
                       ::yuzu::log_key_token(desc.substr(0, 300)));

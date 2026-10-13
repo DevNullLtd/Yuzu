@@ -27,7 +27,7 @@
 #include "pg/secret_codec.hpp"
 #include "totp.hpp"
 
-#include <yuzu/log_token.hpp> // log_key_token — IdP-controlled principal in log lines
+#include <yuzu/log_token.hpp> // log_key_token: IdP-controlled principal in log lines
 
 #include <spdlog/spdlog.h>
 

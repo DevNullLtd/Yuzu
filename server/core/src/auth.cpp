@@ -1,6 +1,6 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
-#include <yuzu/log_token.hpp> // log_key_token — IdP-controlled values in sign-in log lines
+#include <yuzu/log_token.hpp> // log_key_token: IdP-controlled values in sign-in log lines
 #include <yuzu/metrics.hpp>
 
 #include "oidc_principal.hpp" // oidc_principal_id — ADR-2001 §5 single principal-string builder

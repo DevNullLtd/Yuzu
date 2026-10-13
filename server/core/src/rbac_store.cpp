@@ -11,7 +11,7 @@
 #include "rbac_store_sql_helpers.hpp"
 #include "utf8_sanitize.hpp"
 
-#include <yuzu/log_token.hpp> // log_key_token — IdP-controlled principal/group in log lines
+#include <yuzu/log_token.hpp> // log_key_token: IdP-controlled principal/group in log lines
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
