@@ -5912,6 +5912,56 @@ you've already narrowed them.
 twin of `GET /api/workflows/{id}` above, MCP twin `get_workflow`. `404` for an unknown or
 soft-deleted id.
 
+#### `GET /api/v1/workflow-executions`
+
+**Permission:** `Workflow:Read`, gated on the fleet-read chokepoint (ADR-0017), the same sole gate as
+the detail route below. Lists workflow **runs** (`WorkflowEngine`'s own multi-step run records, a
+different data model from the instruction `Execution`s `GET /api/v1/executions` lists; a workflow
+run never appears there). MCP twin `list_workflow_executions`; there is no legacy unversioned list.
+
+Rows carry metadata only: `id`, `workflow_id`, `workflow_name`, `workflow_deleted` (`true` when the
+workflow was soft-deleted; its history is kept), `status`, `current_step`, `started_at`,
+`completed_at`. Never agent ids, step results or `agents_reached` (use the detail route for those).
+Newest first by `(started_at, id)`.
+
+A confined caller (management-group or service-scoped) sees only runs with at least one agent in
+its scope. The scope is applied in the database **before** ordering and the page limit, so a run
+the caller cannot see never takes a page slot, `next_cursor` and the page length depend only on
+runs the caller may see, and a hand-made cursor naming a hidden run reveals nothing. A run whose
+stored agent list is malformed, empty or not an array is invisible to a confined caller.
+`pagination.total` is the number of rows **in this page**, never a fleet-wide count.
+
+| Parameter | Meaning |
+|---|---|
+| `workflow_id` | Exact workflow filter (1-128 characters of `A-Z a-z 0-9 _ -`). |
+| `status` | Exact filter: `pending`, `running`, `completed`, `failed`, `cancelled`. |
+| `since` / `until` | Epoch seconds, `started_at >= since` and `started_at < until`; `0` to `2^53`; `since` must not be after `until`. |
+| `limit` | Page size, default 50. Below 1 is a `400`; above 500 is clamped to 500. |
+| `cursor` | The previous page's `next_cursor`. A position only: it does not bind the other filters. |
+| `latest_per_workflow` | `true` returns at most one run per workflow: its newest run among those passing the other filters **and** the caller's visibility (so a confined caller gets its newest *visible* run, never a blanked newest one), ordered by `workflow_id`, with no cursor. `result_truncated_by_cap` is `true` when more workflows matched than `limit`. |
+
+Input is strict: an unknown or repeated parameter, a value outside the vocabulary or bounds above, or
+`cursor` together with `latest_per_workflow` is a `400` (A4 envelope) rather than being ignored, so a
+mistyped filter can never read as "all runs". No audit row is written for a successful list (run
+metadata, not operator-supplied step parameters); a refusal is audited by the gate as
+`auth.fleet_read_required`. A store failure or the 1.5 s statement timeout is a `503` with
+`retry_after_ms`, never an empty `200`. On a large run table the unfiltered query scans and sorts
+(there is no `started_at` index), so prefer `workflow_id`/`since`/`until` filters.
+
+**Response:**
+
+```json
+{
+  "data": [
+    { "id": "exec-wf-9", "workflow_id": "wf-1", "workflow_name": "Patch and Reboot",
+      "workflow_deleted": false, "status": "failed", "current_step": 1,
+      "started_at": 1735693200, "completed_at": 1735693260 }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50, "next_cursor": null },
+  "meta": { "api_version": "v1" }
+}
+```
+
 #### `GET /api/v1/workflow-executions/{id}`
 
 **Permission:** `Workflow:Read`, gated on the fleet-read chokepoint (the legacy route now shares
