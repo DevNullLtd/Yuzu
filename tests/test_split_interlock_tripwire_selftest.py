@@ -68,7 +68,7 @@ EXPECTED_SUBSTRATE_MARKERS = {
     "engine_principal_store": {"cell": "a", "regex": "engine_principal_store"},
     "principal_quota": {"cell": "m", "regex": "class PrincipalQuota"},
     "use_case_run_id": {"cell": "c", "regex": "use_case_run_id"},
-    "release_log_store": {"cell": "d", "regex": "release_log|ReleaseLog"},
+    "release_log_store": {"cell": "d", "regex": "class ReleaseLog|release_log_store"},
     "evaluate_as_operator": {"cell": "b", "regex": "evaluate_as_operator"},
     "capability_registry": {"cell": "h", "regex": "register_securable|create_securable|ratified_mapping"},
 }
