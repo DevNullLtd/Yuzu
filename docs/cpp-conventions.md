@@ -110,7 +110,7 @@ Use for assets we author in this repo (page HTML shells, small bespoke JS module
 
 ### Pattern B — codegen TU
 
-Use for vendored assets (Three.js r168, ECharts, Inter typeface) and for first-party assets that outgrew Pattern A (`static/yuzu-viz.js`, `static/yuzu-viz-host.js`, `static/yuzu.css`). htmx is the exception: it is vendored but hand-split into raw-string literals in the tracked `static_js_bundle.cpp`, not codegen'd.
+Use for vendored assets (Three.js r168, ECharts, IBM Plex typeface) and for first-party assets that outgrew Pattern A (`static/yuzu-viz.js`, `static/yuzu-viz-host.js`, `static/yuzu.css`). htmx is the exception: it is vendored but hand-split into raw-string literals in the tracked `static_js_bundle.cpp`, not codegen'd.
 
 - Source file lives in `server/core/vendor/` (vendored text), `server/core/vendor/<asset>/` (vendored binary), or `server/core/static/` (first-party). One exception: `static/cytoscape.min.js` is vendored third-party code that lives in `static/` (not `vendor/`) and has no `cytoscape-NOTICE.txt` yet.
 - `meson.build` declares a `custom_target` that invokes `server/core/scripts/embed_js.py` (text) or `embed_binary.py` (binary). The script chunks input bytes into raw-string fragments and concatenates them at static-init time so MSVC's per-literal 16,380-byte limit cannot be hit.

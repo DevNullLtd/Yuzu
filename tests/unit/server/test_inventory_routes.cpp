@@ -956,6 +956,9 @@ TEST_CASE("software routes: the shell carries the page script and /inventory red
     REQUIRE(contains(shell->body, "function swHost"));
     REQUIRE(contains(shell->body, "hx-get=\"/fragments/inventory/software\""));
     REQUIRE(contains(shell->body.substr(shell->body.rfind("function swHost")), "</body>"));
+    // The route's active_key lights the Software sidebar item and ends the breadcrumb on it.
+    REQUIRE(contains(shell->body, "<a class=\"shell-nav on\" href=\"/software\" aria-current=\"page\">"));
+    REQUIRE(contains(shell->body, "<span class=\"shell-sep\">/</span><b>Software</b>"));
     auto redirect = h.sink.Get("/inventory");
     REQUIRE(redirect);
     REQUIRE(redirect->status == 302);
