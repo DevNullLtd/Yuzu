@@ -61,8 +61,11 @@ Postgres.
 three-model adversarial review's strongest, unanimous finding:
 
 > **A second server replica may be enabled only when WS-0, WS-1, WS-2(2a
-> outbox), WS-3, WS-4, WS-5, WS-6, WS-10 are done, AND WS-8's per-tier
-> `/readyz` exists.**
+> outbox), WS-3, WS-4, WS-5, WS-6, WS-10 are done, WS-8's per-tier
+> `/readyz` exists, the WS-11 leader-observability subset (#4014:
+> leader/epoch metrics and the split-brain alert) ships, AND, for
+> gateway-fronted fleets, WS-13 is done.** (The last two clauses were added
+> 2026-10-13; the rest of WS-11 does not gate.)
 
 Miss any one and the failure is **not cosmetic**:
 - No **WS-3** (fenced leader) → both replicas run the singleton workers →
@@ -392,7 +395,7 @@ gateway-fronted fleets.**
 | **WS-8** | Per-tier health contract (`/livez` vs `/readyz`; presentation→operator LB, core→presentation routing). **BYO-LB doc** + LB/session semantics | conceptual on WS-1/WS-2; readyz before LB fronts replicas | **Y** (readyz) | `docs-writer`+`release-deploy`+`sre` | P0 readyz / P2 doc | **readyz DONE (monolith, 2026-09-24): `pg_reachable` probe + drain grace; tier-split with the split; BYO-LB doc (P2) planned** |
 | **WS-9** | **Failover test harness** — continuous, incremental scenarios added as each feature lands (not a final gate): session survival, no double-dispatch, effectively-once, cursor-poll no-loss, re-home races, quorum-degrade, standby loss | scenarios track WS-0…WS-7 as they land | N | `build-ci`+`release-deploy`; scenarios by `chaos-injector` | P1 (continuous) | in-progress: scenarios for WS-6, WS-7, WS-8 landed; WS-0…WS-5 and WS-10 have none yet |
 | **WS-10** | **Background-job replica-safety classification** — checked-in, CI-auditable table (job → fenced-leader-only / replica-safe / disabled-until-fixed); bring #2508 wall-clock passes to clock-guard | audit+disable need nothing; `fenced-leader-only` enforcement needs WS-3 | **Y** | `cpp-safety`+`sre`+`compliance-officer` | P0 | **10.1/10.2 done (#4092); 10.3 enforcement wired by WS-3 3.2** |
-| **WS-11** | **HA-state observability** (NEW): leader identity/epoch, replica lag, quorum state, outbox backlog, failover duration, routing re-homes, split-brain alerts — Prometheus metrics + rules | WS-3, WS-7 | N (ship *with* the 2nd replica) | `sre`+`docs-writer` (+ alert-rule gate) | P1 | planned |
+| **WS-11** | **HA-state observability** (NEW): leader identity/epoch, replica lag, quorum state, outbox backlog, failover duration, routing re-homes, split-brain alerts — Prometheus metrics + rules | WS-3, WS-7 | N, except the #4014 leader-observability subset, which **gates** (2026-10-13); the rest ships *with* the 2nd replica | `sre`+`docs-writer` (+ alert-rule gate) | P1 | planned |
 | **WS-12** | **Single→HA cutover + DR** (NEW): runbook to move an existing single deployment to HA-PG + gateway-front rollout; **backup/PITR/WAL under HA-PG** (replaces superseded `disaster-recovery.md`) | WS-7 | N | `release-deploy`+`sre`+`docs-writer` | P1 | planned |
 | **WS-13** | **Agent-side gateway failover rollout** (NEW): agent endpoint discovery/failover + fleet rollout flipping direct-connect fleets to gateway-front | WS-4 | Y (gateway-fronted fleets) | `cross-platform`+`security-guardian` | P1 | planned |
 | **WS-14** | **Coordination-substrate security & capacity review** (NEW): threat review of advisory locks / etcd / Patroni / HAProxy / fencing tokens; capacity + failure-domain + sync-quorum latency validation | WS-3, WS-7 | N | `security-guardian`+`sre` | P2 | planned |
