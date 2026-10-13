@@ -1114,6 +1114,21 @@ TEST_CASE("static_js_bundle: kYuzuChartsJs reads design-system chart tokens",
                ContainsSubstring("--mds-color-theme-background-solid-primary"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuChartsJs fallbacks are the slate values and the Plex stack",
+          "[static-js][yuzu-charts]") {
+    // tok(name, fallback) only falls back when yuzu.css failed to load, so
+    // nothing else observes these literals. They mirror the slate tokens
+    // (chart-1 blue, chart-grid, chart-tooltip-bg) and the IBM Plex stack.
+    const auto& js = yuzu::server::kYuzuChartsJs;
+    CHECK_THAT(js, ContainsSubstring("#4c9aff"));
+    CHECK_THAT(js, ContainsSubstring("#2a303a"));
+    CHECK_THAT(js, ContainsSubstring("#2b313c"));
+    CHECK_THAT(js, ContainsSubstring("'IBM Plex Sans',system-ui"));
+    // The previous palette and font fallback must be gone.
+    CHECK_THAT(js, !ContainsSubstring("#58a6ff"));
+    CHECK_THAT(js, !ContainsSubstring("BlinkMacSystemFont"));
+}
+
 TEST_CASE("static_js_bundle: kYuzuChartsJs has no embedded NULs", "[static-js][yuzu-charts]") {
     CHECK(yuzu::server::kYuzuChartsJs.find('\0') == std::string::npos);
 }

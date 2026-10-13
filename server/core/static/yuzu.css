@@ -268,9 +268,6 @@
   --radius-lg: var(--mds-border-radius-lg);
 }
 
-/* Compact density - set data-density="compact" on <html>; the default is comfortable. */
-:root[data-density="compact"] { --cell-y: 6px; --ctl: 30px; }
-
 /* Global reset */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: var(--font-sans); background: var(--bg); color: var(--ink); line-height: 1.45; font-size: 14px; font-variant-numeric: tabular-nums; }
@@ -318,17 +315,19 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 .readout > .ro.bad .v { color: var(--bad); }
 
 /* -- Buttons -------------------------------------------------------------
-   .btn is the neutral button (.btn-secondary is that same look, so it needs
-   no rule). Variants take the product's -primary / -success / -danger /
-   -ghost / -sm names or the design's .primary / .danger / .link / .sm. One
-   solid .btn-primary per panel; row actions are text buttons. */
-.btn { height: var(--ctl); padding: 0 14px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
-       font: inherit; font-weight: 500; text-decoration: none; cursor: pointer;
-       color: var(--ink); background: var(--raise); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
-       transition: background-color .12s, border-color .12s, color .12s; }
-.btn:hover:not(:disabled) { background: var(--surface2); border-color: var(--mut); }
-.btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+   .btn is the neutral button; .btn-secondary is that same look. The product
+   writes variants both ways (`btn btn-danger` and a bare `btn-danger`), so
+   every variant name shares the base rules: a bare variant is a full button.
+   The design's .primary / .danger / .link / .sm modifiers need .btn. One
+   solid primary per panel; row actions are text buttons. */
+:is(.btn, .btn-primary, .btn-secondary, .btn-success, .btn-danger, .btn-ghost, .btn-sm) {
+  height: var(--ctl); padding: 0 14px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  font: inherit; font-weight: 500; text-decoration: none; cursor: pointer;
+  color: var(--ink); background: var(--raise); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+  transition: background-color .12s, border-color .12s, color .12s; }
+:is(.btn, .btn-primary, .btn-secondary, .btn-success, .btn-danger, .btn-ghost, .btn-sm):hover:not(:disabled) { background: var(--surface2); border-color: var(--mut); }
+:is(.btn, .btn-primary, .btn-secondary, .btn-success, .btn-danger, .btn-ghost, .btn-sm):disabled { opacity: 0.4; cursor: not-allowed; }
+:is(.btn, .btn-primary, .btn-secondary, .btn-success, .btn-danger, .btn-ghost, .btn-sm):focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .btn-primary, .btn-success, .btn.primary { background: var(--primary); color: var(--on-primary); border-color: var(--primary); font-weight: 600; }
 :is(.btn-primary, .btn-success, .btn.primary):hover:not(:disabled) { background: var(--primary-h); border-color: var(--primary-h); }
 .btn-danger, .btn.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line2)); }
@@ -340,8 +339,9 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 .btn.link.danger { color: var(--bad); }
 .btn-sm, .btn.sm { height: 28px; padding: 0 10px; font-size: 13px; }
 /* Two-click confirm (armed): solid red until it fires or times out. A static
-   state - no pulse. */
-.btn-confirming, .btn-confirming:hover:not(:disabled) { background: var(--bad); border-color: var(--bad); color: var(--on-primary); }
+   state - no pulse. The doubled class lets the hover rule outrank the
+   -primary / -danger hover rules the armed button also carries. */
+.btn-confirming, .btn-confirming.btn-confirming:hover:not(:disabled) { background: var(--bad); border-color: var(--bad); color: var(--on-primary); }
 .rowact { display: flex; gap: 4px; justify-content: flex-end; }
 
 /* -- Segmented control: <div class="seg"> of buttons (.on) or radio labels -- */
