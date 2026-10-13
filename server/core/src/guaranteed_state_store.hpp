@@ -397,7 +397,7 @@ public:
     /// succeeded (a failed bump leaves the generation unchanged, so a cache keyed by
     /// generation cannot notice the edit on its own). Contract: called on the MUTATING
     /// thread with no pool lease and no store lock held; must be cheap and non-blocking
-    /// (it sits on the REST/MCP write path); an exception is caught and logged at debug,
+    /// (it sits on the REST/MCP write path); an exception is caught and logged at warn,
     /// never propagated (the mutation is already durable); may be empty (the default).
     /// Set once during single-threaded wiring, before the store is shared; it is not
     /// synchronised against concurrent mutation. NOT invoked by bump_policy_generation().

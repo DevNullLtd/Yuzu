@@ -720,3 +720,66 @@ TEST_CASE("BaselineStore: the baseline-mutation hook runs with no pool lease hel
     CHECK(fired == 2);
     CHECK(leases_granted == 2);
 }
+
+TEST_CASE("BaselineStore: a mutation that fails inside the database does not fire the baseline-mutation hook",
+          "[pg][baseline_store][baseline_hook]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BaselineStore store{pool};
+    REQUIRE(store.is_open());
+    auto created = store.create_baseline(make_baseline("sql-error"));
+    REQUIRE(created.has_value());
+    const std::string id = *created;
+    auto row = store.get_baseline(id);
+    REQUIRE(row.has_value());
+
+    int fired = 0;
+    store.set_on_baseline_mutation([&] { ++fired; });
+
+    // Break the table from a second connection: the generic SQL-error arm of both writers.
+    exec_sql(db.dsn(), "ALTER TABLE baseline_store.baselines RENAME TO baselines_broken");
+    row->description = "edited";
+    const auto upd = store.update_baseline(*row);
+    REQUIRE_FALSE(upd.has_value());
+    CHECK(upd.error().find("update failed") != std::string::npos);
+    const auto del = store.delete_baseline(id);
+    REQUIRE_FALSE(del.has_value());
+    CHECK(del.error().find("delete failed") != std::string::npos);
+    CHECK(fired == 0);  // nothing committed, nothing announced
+
+    // And once the table is back the same calls commit and fire.
+    exec_sql(db.dsn(), "ALTER TABLE baseline_store.baselines_broken RENAME TO baselines");
+    REQUIRE(store.update_baseline(*row).has_value());
+    REQUIRE(store.delete_baseline(id).has_value());
+    CHECK(fired == 2);
+}
+
+TEST_CASE("BaselineStore: a mutation that cannot get a connection does not fire the baseline-mutation hook",
+          "[pg][baseline_store][baseline_hook]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    // One connection, held by the test, and a short saturation fast-fail: the writers' bounded
+    // acquire gives up at once (the !lease arm) instead of waiting out its full write timeout.
+    PgPool pool{{.conninfo = db.dsn(), .size = 1, .saturated_fast_fail = std::chrono::milliseconds{1}}};
+    BaselineStore store{pool};
+    REQUIRE(store.is_open());
+    auto created = store.create_baseline(make_baseline("no-lease"));
+    REQUIRE(created.has_value());
+    auto row = store.get_baseline(*created);
+    REQUIRE(row.has_value());
+
+    int fired = 0;
+    store.set_on_baseline_mutation([&] { ++fired; });
+    {
+        auto held = pool.acquire();
+        REQUIRE(held);
+        const auto upd = store.update_baseline(*row);
+        REQUIRE_FALSE(upd.has_value());
+        CHECK(upd.error().find("no database connection") != std::string::npos);
+        const auto del = store.delete_baseline(*created);
+        REQUIRE_FALSE(del.has_value());
+        CHECK(del.error().find("no database connection") != std::string::npos);
+    }
+    CHECK(fired == 0);
+    REQUIRE(store.delete_baseline(*created).has_value());  // the lease is back: it commits and fires
+    CHECK(fired == 1);
+}

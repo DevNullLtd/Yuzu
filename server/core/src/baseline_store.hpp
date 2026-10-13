@@ -190,8 +190,13 @@ public:
     /// MUTATING thread with no pool lease held; must be cheap and non-blocking; an exception is
     /// caught and logged, never propagated (the mutation is already durable); may be empty (the
     /// default). Set once during single-threaded wiring, before the store is shared; it is not
-    /// synchronised against concurrent mutation. create_baseline, set_members and set_assignment
-    /// do not fire it: none of them changes the deployed snapshot.
+    /// synchronised against concurrent mutation. set_members and set_assignment do not fire it:
+    /// neither touches the deployed snapshot. create_baseline does not fire it either, but note
+    /// why: it accepts any lifecycle, yet every production caller creates a draft (the
+    /// Guardian route create_baseline_from_form), and a draft is not part of the deployed set.
+    /// A caller that creates a deployed baseline must fire the hook itself (or the store must
+    /// be changed to). The writer sweep in tests/test_guardian_reconcile_wiring_lexical.py
+    /// keeps every other writer of the baselines table honest.
     void set_on_baseline_mutation(std::function<void()> hook);
 
     // ── Member Guards (M:N) ────────────────────────────────────────────────
