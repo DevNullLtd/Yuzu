@@ -1074,8 +1074,8 @@ TEST_CASE("build_execution_page_sql: the unfiltered newest-first statement is pi
                        " ORDER BY e.started_at DESC, e.id DESC LIMIT $1::bigint");
     CHECK(b.params == std::vector<std::string>{"51"}); // limit 50 + the sentinel row
     // The read's statement bound comes from the builder, not from a literal in the shell. This
-    // pins the text only: that the shell RUNS it (a lock-held read ending at 1.5 s) needs a second
-    // connection and ~1.5 s of wall time, and is not covered by a DB-free test.
+    // pins the text only: that the shell RUNS it is pinned by the lock-held read case below
+    // ("a read blocked behind an exclusive lock ...", [timeout]), which needs a real connection.
     CHECK(b.statement_timeout_sql == "SET LOCAL statement_timeout = '1500ms'");
 }
 
@@ -1544,6 +1544,42 @@ TEST_CASE("WorkflowEngine::query_executions_page: a query failure is a typed deg
     auto lp = engine.query_executions_page(latest, std::nullopt);
     REQUIRE_FALSE(lp.has_value());
     CHECK(lp.error().starts_with(kDbErrorPrefix));
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: a read blocked behind an exclusive lock ends at "
+          "the statement timeout as a typed degrade and the pool stays usable",
+          "[workflow_engine][pg][list][timeout]") {
+    // Pins that the shell EXECUTES the builder's `SET LOCAL statement_timeout` (the builder case
+    // pins only its text). A second connection holds ACCESS EXCLUSIVE on the table the read
+    // touches, so the read blocks server-side until the budget fires. With the statement skipped
+    // the read is bounded only by the pool's own `lock_timeout_ms` below and ends as a LOCK
+    // timeout, so asserting the statement-timeout wording fails instead of hanging. No sleeps and
+    // no clock reads: the 100 ms budget is a server-side timer, the lock is held until released.
+    YUZU_REQUIRE_PG_DB_TPL(wf_db_fx_, workflow_engine_tpl);
+    PgPool wf_pool_fx_{{.conninfo = wf_db_fx_.dsn(), .size = 2, .lock_timeout_ms = 5000}};
+    REQUIRE(wf_pool_fx_.valid());
+    WorkflowEngine engine{wf_pool_fx_};
+    REQUIRE(engine.is_open());
+
+    PgConn holder{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    for (const char* sql : {"BEGIN", "LOCK TABLE workflow_engine.workflow_executions "
+                                     "IN ACCESS EXCLUSIVE MODE"}) {
+        PgResult r = yuzu::server::pg::exec_params(holder.get(), sql, std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    auto blocked = engine.query_executions_page({}, std::nullopt, std::chrono::milliseconds{100});
+    REQUIRE_FALSE(blocked.has_value()); // a timeout is a degrade, never an empty or short page
+    CHECK(blocked.error().starts_with(kDbErrorPrefix));
+    CHECK(blocked.error().find("statement timeout") != std::string::npos);
+
+    PgResult release =
+        yuzu::server::pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
+    REQUIRE(release.status() == PGRES_COMMAND_OK);
+    auto after = engine.query_executions_page({}, std::nullopt); // the shipped default budget
+    REQUIRE(after.has_value());
+    CHECK(after->rows.empty());
 }
 
 TEST_CASE("WorkflowEngine::query_executions_page: latest-per-workflow is the newest VISIBLE run "

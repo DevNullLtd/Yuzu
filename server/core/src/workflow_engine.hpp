@@ -59,6 +59,13 @@ using ConditionEvalFn = std::function<bool(
 
 // ── Execution-list SQL ──────────────────────────────────────────────────────
 
+/// Server-side bound on one execution-list read (`SET LOCAL statement_timeout`; same idiom as
+/// ExecutionTracker's children read): the confined predicate parses `agent_ids_json` per candidate
+/// row, so a pathological table must end as an honest degrade, never a wedged pool connection.
+/// Production never passes another value; the argument exists so a test can end a lock-held read
+/// in milliseconds. It must be positive: PostgreSQL reads 0 as "no timeout".
+inline constexpr std::chrono::milliseconds kExecutionPageStatementTimeout{1500};
+
 /// The statement and its positional parameters for one `query_executions_page` read. Built by a
 /// pure function (no database) so the exact text, the parameter order and the position of the
 /// visibility clause relative to `ORDER BY`/`LIMIT` are unit-pinned. `$n` placeholders only —
@@ -80,9 +87,10 @@ struct ExecutionPageSql {
 /// engaged adds the confinement predicate (engaged-empty adds `1=0`, never an unfiltered read).
 /// The predicate is NOT a byte-for-byte image of `workflow_execution_visible()`: see the
 /// divergence list on `query_executions_page`.
-[[nodiscard]] ExecutionPageSql
-build_execution_page_sql(const WorkflowExecutionListQuery& q,
-                         const std::optional<std::vector<std::string>>& visible_agents);
+[[nodiscard]] ExecutionPageSql build_execution_page_sql(
+    const WorkflowExecutionListQuery& q,
+    const std::optional<std::vector<std::string>>& visible_agents,
+    std::chrono::milliseconds statement_timeout = kExecutionPageStatementTimeout);
 
 // ── WorkflowEngine ──────────────────────────────────────────────────────────
 
@@ -165,11 +173,12 @@ public:
     /// in-scope agent.
     ///
     /// `unexpected(msg)` (prefixed `kDbErrorPrefix`) is a genuine failure — engine not open, pool
-    /// exhausted, statement timeout (`kReadStatementTimeout`) or query error — and is never an
+    /// exhausted, statement timeout (`statement_timeout`) or query error — and is never an
     /// empty page. The caller must genericize it before rendering.
     std::expected<WorkflowExecutionPage, std::string> query_executions_page(
         const WorkflowExecutionListQuery& q,
-        const std::optional<std::vector<std::string>>& visible_agents) const;
+        const std::optional<std::vector<std::string>>& visible_agents,
+        std::chrono::milliseconds statement_timeout = kExecutionPageStatementTimeout) const;
 
     /// Cancel a running execution.
     std::expected<void, std::string> cancel_execution(const std::string& id);

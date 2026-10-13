@@ -32,10 +32,6 @@ constexpr const char* kStoreName = "workflow_engine";
 // "Lease discipline").
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
-// SET LOCAL bound on the execution-list statement (same idiom as ExecutionTracker's children read):
-// the confined predicate parses `agent_ids_json` per candidate row, so a pathological table must
-// end as an honest degrade, never a wedged pool connection.
-constexpr const char* kReadStatementTimeout = "1500ms";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for the migration txn.
@@ -1174,7 +1170,8 @@ constexpr const char* kGuardedAgentIdsJsonb =
 
 ExecutionPageSql build_execution_page_sql(
     const WorkflowExecutionListQuery& q,
-    const std::optional<std::vector<std::string>>& visible_agents) {
+    const std::optional<std::vector<std::string>>& visible_agents,
+    std::chrono::milliseconds statement_timeout) {
     ExecutionPageSql out;
     int idx = 1;
     const auto bind = [&](std::string v) {
@@ -1183,7 +1180,7 @@ ExecutionPageSql build_execution_page_sql(
     };
     out.limit = std::clamp(q.limit, 1, kWorkflowExecutionListMax);
     out.statement_timeout_sql =
-        std::string("SET LOCAL statement_timeout = '") + kReadStatementTimeout + "'";
+        "SET LOCAL statement_timeout = '" + std::to_string(statement_timeout.count()) + "ms'";
 
     out.sql = std::string("SELECT ") + (q.latest_per_workflow ? "DISTINCT ON (e.workflow_id) " : "") +
               "e.id, e.workflow_id, w.name, (w.deleted_at <> 0), e.status, e.current_step, "
@@ -1227,12 +1224,13 @@ ExecutionPageSql build_execution_page_sql(
 
 std::expected<WorkflowExecutionPage, std::string> WorkflowEngine::query_executions_page(
     const WorkflowExecutionListQuery& q,
-    const std::optional<std::vector<std::string>>& visible_agents) const {
+    const std::optional<std::vector<std::string>>& visible_agents,
+    std::chrono::milliseconds statement_timeout) const {
     if (!open_)
         return std::unexpected(std::string(kDbErrorPrefix) + "workflow engine not available");
     if (visible_agents && visible_agents->empty())
         return WorkflowExecutionPage{}; // deny-all: nothing to read, nothing to disclose
-    const auto built = build_execution_page_sql(q, visible_agents);
+    const auto built = build_execution_page_sql(q, visible_agents, statement_timeout);
     const int limit = built.limit;
 
     WorkflowExecutionPage page;
