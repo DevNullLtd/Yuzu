@@ -1029,7 +1029,7 @@ TEST_CASE("POST /api/schedules/:id/enable: enabled must be a boolean or the inte
     };
 
     const std::vector<std::string> bad = {
-        R"({"enabled":"true"})", R"({"enabled":"false"})", R"({"enabled":"0"})",
+        R"({"enabled":"True"})", R"({"enabled":"FALSE"})", R"({"enabled":"0"})",
         R"({"enabled":"no"})",   R"({"enabled":""})",      R"({"enabled":null})",
         R"({"enabled":2})",      R"({"enabled":-1})",      R"({"enabled":1.0})",
         R"({"enabled":5.5})",    R"({"enabled":1e3})",     R"({"enabled":4294967297})",
@@ -1058,7 +1058,8 @@ TEST_CASE("POST /api/schedules/:id/enable: enabled must be a boolean or the inte
         const char* body;
         bool want;
     } good[] = {{R"({"enabled":false})", false}, {R"({"enabled":true})", true},
-                {R"({"enabled":0})", false},     {R"({"enabled":1})", true}};
+                {R"({"enabled":0})", false},     {R"({"enabled":1})", true},
+                {R"({"enabled":"false"})", false}, {R"({"enabled":"true"})", true}};
     for (const auto& g : good) {
         INFO(g.body);
         auto res = h.sink.dispatch("POST", "/api/schedules/" + armed + "/enable", g.body,

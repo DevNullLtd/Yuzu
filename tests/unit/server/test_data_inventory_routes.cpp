@@ -289,8 +289,8 @@ TEST_CASE("POST /api/inventory/query: since and until are presence-tracked and u
 
 TEST_CASE("POST /api/inventory/query: a body that is valid JSON but not an object is 400, not a 500 "
           "(#4644)",
-          "[server][routes][data_inventory_routes][numeric_params]") {
-    Harness h;
+          "[server][routes][data_inventory_routes][numeric_params][rest][pg]") {
+    PgHarness h;
     for (const char* bad : {"[]", "null", "5", R"("x")", "true"}) {
         INFO(bad);
         auto res = h.sink.Post("/api/inventory/query", bad);
