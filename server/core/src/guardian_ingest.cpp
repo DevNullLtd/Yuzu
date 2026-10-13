@@ -358,9 +358,15 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             return;
         case EventInsertOutcome::Error:
             // res.error is server-constructed (fixed strings plus libpq error text such as
-            // "insert failed: " + PQresultErrorMessage, guaranteed_state_store.cpp) and is not
-            // an agent-supplied field; Postgres can quote an offending value in that text, so
-            // do not assume it is free of agent input. The identifiers still get neutralised.
+            // "insert failed: " + PQresultErrorMessage, guaranteed_state_store.cpp), not an
+            // agent-supplied field. In principle that text can quote an offending value, and
+            // it is logged RAW on the next statement. The exposure is bounded and accepted as
+            // a residual: guaranteed_state_events has only TEXT columns plus BIGINT ones the
+            // server binds from numbers it formats, with no CHECK or foreign key; embedded
+            // NULs are rejected before the insert (guaranteed_state_store.cpp:884); a duplicate
+            // event_id is resolved to Redelivered or Conflict before this path; and
+            // detail_json is capped at 16 KiB (kMaxDetailJson, earlier in this function). The
+            // identifiers are neutralised.
             spdlog::warn("Guardian: event ingest error (agent={}, rule={}): {}",
                          log_id_token(agent_id), log_id_token(ev_row.rule_id), res.error);
             return;
