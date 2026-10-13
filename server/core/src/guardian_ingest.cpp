@@ -357,8 +357,10 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
                          log_id_token(ev_row.rule_id));
             return;
         case EventInsertOutcome::Error:
-            // res.error is server-constructed (SQLite errmsg / fixed strings) — no agent
-            // input — but the identifiers still get neutralised.
+            // res.error is server-constructed (fixed strings plus libpq error text such as
+            // "insert failed: " + PQresultErrorMessage, guaranteed_state_store.cpp) and is not
+            // an agent-supplied field; Postgres can quote an offending value in that text, so
+            // do not assume it is free of agent input. The identifiers still get neutralised.
             spdlog::warn("Guardian: event ingest error (agent={}, rule={}): {}",
                          log_id_token(agent_id), log_id_token(ev_row.rule_id), res.error);
             return;
