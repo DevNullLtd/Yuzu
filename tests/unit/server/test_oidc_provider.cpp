@@ -24,6 +24,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -2096,8 +2097,12 @@ int run_in_fd_limited_process(int spare, const std::string& base, int limit_ms,
                               const std::string& required_error) {
     std::vector<std::string> env_store;
     for (char** e = environ; e != nullptr && *e != nullptr; ++e) {
-        if (std::string_view(*e).substr(0, std::string_view(kLowFdEnvPrefix).size()) !=
-            kLowFdEnvPrefix)
+        const std::string_view entry(*e);
+        // The helper does no Postgres work: its Catch listener must not see the parent's DSN.
+        if (entry.starts_with("YUZU_TEST_POSTGRES_DSN=") ||
+            entry.starts_with("YUZU_TEST_ENABLE_PG="))
+            continue;
+        if (entry.substr(0, std::string_view(kLowFdEnvPrefix).size()) != kLowFdEnvPrefix)
             env_store.emplace_back(*e);
     }
     const std::string prefix = kLowFdEnvPrefix;
@@ -2124,6 +2129,17 @@ int run_in_fd_limited_process(int spare, const std::string& base, int limit_ms,
     if (r != pid)
         return -1000;
     return WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status);
+}
+
+// Names a helper status for INFO(): a signal, a spawn failure or the exit code.
+std::string lowfd_status_name(int rc) {
+    if (rc == -1000)
+        return "spawn failed (posix_spawn or waitpid)";
+    if (rc < 0) {
+        const char* name = ::strsignal(-rc);
+        return "killed by signal " + std::to_string(-rc) + " (" + (name ? name : "?") + ")";
+    }
+    return "exit code " + std::to_string(rc);
 }
 } // namespace
 
@@ -2192,6 +2208,7 @@ TEST_CASE("OIDC http_get_bounded: with no descriptor to spare the request is ref
     TlsDripServer drip;
     const int rc = run_in_fd_limited_process(0, drip.base(), 500,
                                              "request failed: no file descriptor available");
+    INFO("helper status: " << lowfd_status_name(rc));
     CHECK(rc == kLowFdOk); // 12 = another error text, 11 = slow, 10 = succeeded, negative = signal
     CHECK(drip.accepted() == 0); // never connected
 }
@@ -2207,6 +2224,7 @@ TEST_CASE("OIDC http_get_bounded: with one descriptor to spare the fetch still f
     // the call and spends the one spare descriptor first, which fails the fetch early for an
     // unrelated reason. The zero-spare case above is the order-independent pin.
     const int rc = run_in_fd_limited_process(1, drip.base(), 3000, "");
+    INFO("helper status: " << lowfd_status_name(rc));
     CHECK(rc == kLowFdOk);
 }
 
@@ -2218,6 +2236,7 @@ TEST_CASE("OIDC http_get_bounded: with exactly the reservation and the socket to
     // total bound (2 s here) must still hold. Anything else that wants a descriptor during the
     // handshake would fail the fetch early, which is also a failure within the bound.
     const int rc = run_in_fd_limited_process(2, drip.base(), 3000, "");
+    INFO("helper status: " << lowfd_status_name(rc));
     CHECK(rc == kLowFdOk);
 }
 #endif // __linux__ && !TSan && !ASan

@@ -1300,11 +1300,13 @@ public:
         std::lock_guard lock(mu_);
         if (fd_.fd < 0 || ::dup2(sock, fd_.fd) < 0) {
             failed_ = true;
-            // Best effort: the socket cannot be watched, so shut it down at once so that the
-            // connect or handshake fails fast instead of running unbounded (persists on Linux,
-            // not on macOS). Unreachable in practice: the reserved descriptor is ours alone and
-            // dup2 onto it cannot hit EMFILE.
-            ::shutdown(sock, SHUT_RDWR);
+            // Best effort: the socket cannot be watched, so shut its read side down at once so
+            // that the connect or handshake fails fast instead of running unbounded (persists on
+            // Linux, not on macOS). SHUT_RD, not SHUT_RDWR, for the reason in the class banner:
+            // the write side stays usable, so a first write() cannot raise SIGPIPE.
+            // Unreachable in practice: the reserved descriptor is ours alone and dup2 onto it
+            // cannot hit EMFILE.
+            ::shutdown(sock, SHUT_RD);
             return;
         }
         (void)::fcntl(fd_.fd, F_SETFD, FD_CLOEXEC);
