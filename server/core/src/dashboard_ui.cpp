@@ -217,6 +217,10 @@ extern const char* const kDashboardIndexHtml =
       padding: 8px 12px; font-size: 13.5px; color: var(--ink2); background: var(--surface2);
       border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--line2)); border-radius: var(--rad-panel);
     }
+    /* Collapsed borders: the header rule wins the top edge, so frame the td with an inset shadow. */
+    #results-table td.result-degrade-banner {
+      border: 0; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 50%, var(--line2));
+    }
     .result-degrade-banner b { color: var(--ink); }
 
     #result-pagination {
