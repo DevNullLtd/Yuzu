@@ -107,93 +107,96 @@ std::string rel_time(std::int64_t now_secs, std::int64_t then_secs) {
 
 // Inlined component CSS — emitted once per top-level fragment so styling is present
 // on any tab entry point (duplicate <style> on a tab swap is idempotent/harmless).
+// Design tokens only (yuzu.css): bordered panels, one readout row, 36 px controls.
 std::string inv_style() {
     return R"css(<style>
-  .inv-wrap{max-width:1180px}
-  .inv-h1{font-size:1.35rem;margin:.2rem 0 0;color:var(--white,#fff);font-weight:700}
-  .inv-sub{color:var(--muted,#8fa3bd);font-size:.8rem;margin-top:.25rem}
-  .inv-subnav{display:flex;gap:.3rem;align-items:center;border-bottom:1px solid var(--border,#2d4068);padding-bottom:.6rem;margin:.8rem 0}
-  .inv-subnav a{font-size:.78rem;color:var(--muted,#8fa3bd);border:1px solid transparent;border-radius:.35rem;padding:.22rem .7rem;cursor:pointer}
-  .inv-subnav a.on{color:var(--white,#fff);border-color:var(--accent,#00bceb)}
-  .inv-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.55rem;margin:.8rem 0}
-  .inv-kpi{background:var(--surface,#1a2940);border:1px solid var(--border,#2d4068);border-radius:.5rem;padding:.55rem .8rem}
-  .inv-kpi .h{font-size:.6rem;color:var(--muted,#8fa3bd);text-transform:uppercase;letter-spacing:.05em}
-  .inv-kpi .big{font-size:1.3rem;font-weight:800;color:var(--white,#fff);margin-top:.1rem}
-  .inv-kpi.warn .big{color:var(--yellow,#ffcc00)}.inv-kpi .s2{font-size:.58rem;color:var(--muted,#8fa3bd)}
-  .inv-search{background:var(--surface,#1a2940);border:1px solid var(--border,#2d4068);border-radius:.4rem;color:var(--fg,#cfdbe8);padding:.32rem .6rem;font-size:.78rem;min-width:240px}
-  .inv-banner{font-size:.72rem;color:var(--lightblue,#a5d6ff);background:rgba(165,214,255,.06);border:1px solid rgba(165,214,255,.25);border-radius:.4rem;padding:.45rem .7rem;margin:.55rem 0}
-  .inv-degrade{font-size:.78rem;color:#ff8a94;background:rgba(255,87,101,.08);border:1px solid rgba(255,87,101,.4);border-radius:.5rem;padding:.7rem .9rem;margin:.7rem 0}
-  .inv-degrade b{color:var(--red,#ff5765)}
-  .inv-caveat{font-size:.67rem;color:var(--yellow,#ffcc00);background:rgba(255,204,0,.06);border:1px solid rgba(255,204,0,.25);border-radius:.4rem;padding:.4rem .65rem;margin:.55rem 0}
-  table.inv-tbl{width:100%;border-collapse:collapse;font-size:.8rem}
-  table.inv-tbl th{text-align:left;padding:.42rem .6rem;border-bottom:2px solid var(--border,#2d4068);color:var(--muted,#8fa3bd);font-size:.58rem;text-transform:uppercase;letter-spacing:.05em}
-  table.inv-tbl td{padding:.44rem .6rem;border-bottom:1px solid var(--border,#2d4068);vertical-align:middle}
-  table.inv-tbl tr.click{cursor:pointer}table.inv-tbl tr.click:hover td{background:var(--surface,#1a2940)}
-  .inv-name{color:var(--white,#fff);font-weight:600}.inv-num{text-align:right;font-variant-numeric:tabular-nums}
-  .inv-mono{font-family:'JetBrains Mono',Consolas,monospace;font-size:.72rem;color:var(--muted,#8fa3bd)}
-  .inv-pub{color:var(--muted,#8fa3bd);font-size:.72rem}
-  .inv-pill{font-size:.57rem;border:1px solid var(--border,#2d4068);border-radius:.3rem;padding:.04rem .4rem;color:var(--lightblue,#a5d6ff)}
-  .inv-pill.old{color:#ff8a94;border-color:rgba(255,87,101,.4)}
-  .inv-bar{display:flex;height:9px;border-radius:3px;overflow:hidden;background:var(--surface2,#243553);min-width:90px}.inv-bar>span{display:block;height:100%;background:var(--accent,#00bceb)}
-  .inv-empty{color:var(--muted,#8fa3bd);font-size:.78rem;padding:.8rem .2rem}
-  .inv-panel{background:var(--surface,#1a2940);border:1px solid var(--border,#2d4068);border-radius:.6rem;margin-top:.8rem}
-  .inv-panelh{display:flex;align-items:center;gap:.6rem;padding:.6rem .9rem;border-bottom:1px solid var(--border,#2d4068)}
-  .inv-panelh .t{color:var(--white,#fff);font-weight:700;font-size:.88rem}
-  .inv-note{margin-top:1.2rem;font-size:.7rem;color:var(--muted,#8fa3bd);border-top:1px solid var(--border,#2d4068);padding-top:.6rem}.inv-note b{color:var(--lightblue,#a5d6ff)}
-  /* Round-3 item 8: the catalogue row's "devices ›" inline expansion. An empty
-     cell collapses to nothing (no dead whitespace before anything is loaded);
-     the expansion's own close link empties the cell via a plain inline
-     onclick — the CSP has no unsafe-eval). */
-  tr.inv-exp>td{padding:0;border-bottom:1px solid var(--border,#2d4068)}
-  tr.inv-exp>td:empty{padding:0;border-bottom:0}
-  .inv-exp-body{padding:.6rem .8rem;background:rgba(0,188,235,.03)}
-  .inv-devbtn{cursor:pointer;color:var(--accent,#00bceb)}
-  .inv-close{float:right;cursor:pointer;color:var(--muted,#8fa3bd);font-size:.7rem}
-  /* Software page (M.9) */
-  .inv-kpi.click{cursor:pointer}
-  .inv-kpi.click:hover{border-color:var(--accent,#00bceb)}
-  .inv-kpi[aria-pressed=true]{border-color:var(--accent,#00bceb);box-shadow:inset 0 0 0 1px var(--accent,#00bceb)}
-  .inv-kpi.later{opacity:.45;border-style:dashed}
-  .inv-kpi .s2 b{color:var(--fg,#cfdbe8)}
-  .inv-osbar{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--surface2,#243553);margin:.3rem 0 .2rem}
-  .inv-osbar>span{display:block;height:100%}
-  .inv-osbar .w{background:#a5d6ff}.inv-osbar .m{background:#c7b3ff}.inv-osbar .l{background:#ffcc88}
-  .inv-fresh{font-size:.66rem;color:var(--slate,#6f86a6);margin:-.3rem 0 .6rem}
-  .inv-filters{display:grid;gap:.45rem;margin:.7rem 0 .4rem}
-  .inv-frow{display:flex;gap:.45rem;align-items:center;flex-wrap:wrap}
-  .inv-frow .lab{min-width:5.4rem;font-size:.62rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted,#8fa3bd);font-weight:700}
-  .inv-chip{background:var(--surface,#1a2940);color:var(--muted,#8fa3bd);border:1px solid var(--border,#2d4068);border-radius:999px;padding:.18rem .62rem;font-size:.72rem;cursor:pointer}
-  .inv-chip:hover{border-color:var(--accent,#00bceb);color:var(--white,#fff)}
-  .inv-chip[aria-pressed=true]{background:var(--accent,#00bceb);border-color:var(--accent,#00bceb);color:#062534;font-weight:600}
-  .inv-hostin{background:var(--surface,#1a2940);border:1px solid var(--border,#2d4068);border-radius:.4rem;color:var(--fg,#cfdbe8);padding:.24rem .55rem;font-size:.74rem;min-width:200px}
-  .inv-active{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin:.35rem 0}
-  .inv-apill{display:inline-flex;gap:.2rem;align-items:center;border:1px solid var(--accent,#00bceb);color:var(--white,#fff);border-radius:999px;padding:.1rem .15rem .1rem .6rem;font-size:.72rem}
-  .inv-apill button{background:none;border:0;color:var(--muted,#8fa3bd);cursor:pointer;font-size:.85rem;padding:0 .35rem;line-height:1}
-  .inv-apill button:hover{color:var(--white,#fff)}
-  .inv-link{color:var(--accent,#00bceb);cursor:pointer;font-size:.72rem;background:none;border:0;padding:0}
-  .inv-rest{font-family:'JetBrains Mono',Consolas,monospace;font-size:.66rem;color:var(--muted,#8fa3bd);background:var(--surface,#1a2940);border:1px solid var(--border,#2d4068);border-radius:.4rem;padding:.32rem .6rem;display:flex;gap:.6rem;align-items:center;overflow:auto;white-space:nowrap;margin:.35rem 0}
-  .inv-rest .v{color:var(--lightblue,#a5d6ff)}
-  .inv-resbar{display:flex;justify-content:space-between;align-items:center;gap:.8rem;flex-wrap:wrap;margin:.55rem 0 .3rem}
-  .inv-count{font-size:.78rem;color:var(--muted,#8fa3bd)}.inv-count b{color:var(--white,#fff)}
-  .inv-exports{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;font-size:.7rem;color:var(--muted,#8fa3bd)}
-  .inv-btn{background:var(--surface,#1a2940);color:var(--fg,#cfdbe8);border:1px solid var(--border,#2d4068);border-radius:.4rem;padding:.26rem .7rem;font-size:.74rem;cursor:pointer;text-decoration:none}
-  .inv-btn:hover{border-color:var(--accent,#00bceb);color:var(--white,#fff)}
-  .inv-btn.pri{background:var(--accent,#00bceb);border-color:var(--accent,#00bceb);color:#062534;font-weight:600}
-  .inv-btn.sm{padding:.14rem .5rem;font-size:.68rem}
-  .inv-tblwrap{overflow:auto;border:1px solid var(--border,#2d4068);border-radius:.5rem}
-  .inv-tblwrap>table.inv-tbl>thead th{position:sticky;top:0;background:var(--bg,#0e1a2d);z-index:2;white-space:nowrap}
-  table.inv-tbl tr.click[aria-expanded=true] td{background:var(--surface,#1a2940)}
-  table.inv-sub{font-size:.76rem;margin:.4rem 0 .2rem}
-  table.inv-sub th{font-size:.55rem}
-  table.inv-sub td{padding:.34rem .55rem}
-  .inv-devs{padding:.45rem .6rem .5rem;border-left:2px solid var(--accent,#00bceb);background:rgba(0,188,235,.025);margin:.2rem 0 .4rem}
-  .inv-devhead{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;font-size:.76rem;color:var(--muted,#8fa3bd)}
-  .inv-devhead b{color:var(--white,#fff)}
-  .inv-hostlink{color:var(--accent,#00bceb);text-decoration:none}.inv-hostlink:hover{text-decoration:underline}
-  .inv-unnamed{color:var(--muted,#8fa3bd);font-style:italic}
-  tr.inv-more td{text-align:center;padding:.7rem;white-space:normal}
-  .inv-cursor{font-family:'JetBrains Mono',Consolas,monospace;font-size:.62rem;color:var(--slate,#6f86a6);margin-left:.7rem}
-  .inv-exp-body .inv-bar{min-width:120px;max-width:240px}
+  .inv-wrap>*+*{margin-top:22px}
+  .inv-h1{margin:0;font-size:24px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
+  .inv-wrap>.inv-sub{margin-top:4px;max-width:70ch;color:var(--mut)}
+  .inv-wrap>.inv-sub a{color:var(--primary)}.inv-wrap>.inv-sub a:hover{text-decoration:underline}
+  .inv-wrap :focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+  .inv-panel{min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+  .inv-pb{display:flex;flex-direction:column;gap:12px;padding:16px}
+  .inv-kpis{display:flex;flex-wrap:wrap;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+  .inv-kpi{flex:1 1 170px;min-width:0;display:flex;flex-direction:column;padding:14px 18px;border-left:1px solid var(--line)}
+  .inv-kpi:first-child{border-left:0}
+  .inv-kpi[hidden]{display:none}
+  .inv-kpi .big{order:-2;font-size:26px;font-weight:500;letter-spacing:-.02em;line-height:1.15;color:var(--ink)}
+  .inv-kpi .h{order:-1;margin-top:2px;font-size:13px;color:var(--mut)}
+  .inv-kpi .s2{margin-top:4px;font-size:12.5px;color:var(--mut)}.inv-kpi .s2 b{color:var(--ink2);font-weight:600}
+  .inv-kpi.warn .big{color:var(--warn)}
+  .inv-kpi.later{opacity:.55}
+  button.inv-kpi{border:0;border-left:1px solid var(--line);background:none;color:inherit;font:inherit;text-align:left}
+  .inv-kpi.click{cursor:pointer}.inv-kpi.click:hover{background:var(--surface2)}
+  .inv-kpi[aria-pressed=true]{background:color-mix(in srgb,var(--primary) 12%,transparent);box-shadow:inset 0 -2px 0 var(--primary)}
+  .inv-osbar{display:flex;height:6px;margin:6px 0 2px;border-radius:2px;overflow:hidden;background:var(--line)}
+  .inv-osbar>span{display:block;height:100%}.inv-osbar>span+span{border-left:1px solid var(--surface)}
+  .inv-osbar .w{background:var(--c1)}.inv-osbar .m{background:var(--c2)}.inv-osbar .l{background:var(--c3)}
+  .inv-fresh{font-size:12.5px;color:var(--faint)}
+  .inv-wrap>.inv-fresh,.inv-wrap>button.inv-link{margin-top:8px}.inv-wrap>.inv-fresh+button.inv-link{margin-top:2px}
+  .inv-caveat,.inv-degrade{padding:12px 14px;border:1px solid var(--line2);border-radius:var(--rad-panel);background:var(--surface2);color:var(--ink2);font-size:13.5px}
+  .inv-degrade{border-color:color-mix(in srgb,var(--bad) 50%,var(--line2))}.inv-degrade b{color:var(--bad)}
+  .inv-search,.inv-hostin{height:var(--ctl);padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink);font:inherit}
+  .inv-search::placeholder,.inv-hostin::placeholder{color:var(--faint)}
+  .inv-search{width:100%;max-width:520px}.inv-hostin{min-width:340px}
+  .inv-hostin.inv-devfilter{height:28px;min-width:180px;margin-left:auto;font-size:13px}
+  .inv-filters{display:grid;gap:8px}
+  .inv-frow,.inv-chips{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .inv-frow .lab{min-width:88px;font-size:13px;font-weight:500;color:var(--ink2)}
+  .inv-chip{height:28px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--mut);font:inherit;font-size:13px;font-weight:500;cursor:pointer}
+  .inv-chip[data-g=src]{font-family:var(--mds-font-family-mono);font-size:12.5px;font-weight:400}
+  .inv-chip:hover{background:var(--surface2);color:var(--ink)}
+  .inv-chip[aria-pressed=true]{border-color:var(--primary);background:color-mix(in srgb,var(--primary) 14%,transparent);color:var(--ink)}
+  .inv-active{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .inv-apill{display:inline-flex;align-items:center;gap:2px;height:28px;padding:0 4px 0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--surface2);color:var(--ink);font-size:13px}
+  .inv-apill button{padding:0 6px;border:0;background:none;color:var(--mut);font-size:16px;line-height:1;cursor:pointer}.inv-apill button:hover{color:var(--ink)}
+  .inv-link{padding:0;border:0;background:none;color:var(--primary);font:inherit;font-size:13px;cursor:pointer}.inv-link:hover{text-decoration:underline}
+  .inv-rest{display:flex;gap:10px;align-items:center;overflow:auto;white-space:nowrap;padding:6px 10px;border:1px solid var(--line);border-radius:var(--rad-ctl);background:var(--bg);color:var(--mut);font-family:var(--mds-font-family-mono);font-size:12.5px}
+  .inv-rest .v{color:var(--ink2)}
+  .inv-resbar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px 14px;padding:12px 16px;border-bottom:1px solid var(--line)}
+  .inv-count{font-size:13px;color:var(--mut)}.inv-count b{color:var(--ink);font-weight:600}
+  .inv-exports{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:13px;color:var(--mut)}
+  .inv-btn{display:inline-flex;align-items:center;height:var(--ctl);padding:0 14px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--raise);color:var(--ink);font:inherit;font-weight:500;white-space:nowrap;text-decoration:none;cursor:pointer}
+  .inv-btn:hover{border-color:var(--mut);background:var(--surface2)}
+  .inv-btn:disabled{opacity:.5;cursor:not-allowed}
+  .inv-btn.pri{border-color:var(--primary);background:var(--primary);color:var(--on-primary);font-weight:600}.inv-btn.pri:hover{border-color:var(--primary-h);background:var(--primary-h)}
+  .inv-btn.sm{height:28px;padding:0 10px;font-size:13px}
+  .inv-tblwrap{overflow-x:auto}
+  table.inv-tbl{width:100%;border-collapse:collapse}
+  table.inv-tbl th{padding:8px 16px;border-bottom:1px solid var(--line);background:var(--surface2);color:var(--mut);font-size:12.5px;font-weight:500;text-align:left;white-space:nowrap}
+  table.inv-tbl td{padding:var(--cell-y) 16px;border-bottom:1px solid var(--line);vertical-align:middle;color:var(--ink2)}
+  table.inv-tbl tbody tr:not(.inv-exp):not(.inv-more):hover>td{background:var(--surface2)}
+  table.inv-tbl tr.click{cursor:pointer}
+  table.inv-tbl tbody tr.click[aria-expanded=true]>td{background:color-mix(in srgb,var(--hl) 8%,transparent)}
+  table.inv-tbl tbody tr.click[aria-expanded=true]>td:first-child{box-shadow:inset 3px 0 0 var(--hl)}
+  th.inv-num,td.inv-num{text-align:right;font-variant-numeric:tabular-nums}
+  .inv-name{color:var(--ink);font-weight:600}.inv-pub{color:var(--ink2)}.inv-grey{color:var(--mut)}
+  .inv-mono{font-family:var(--mds-font-family-mono);font-size:12.5px}
+  td.inv-act{white-space:nowrap}
+  .inv-pill{display:inline-block;vertical-align:middle;padding:0 5px;border:1px solid var(--line2);border-radius:3px;color:var(--mut);font-family:var(--mds-font-family-mono);font-size:11.5px}
+  .inv-pill.on,.inv-pill.stale{padding:1px 8px;border-color:transparent;font:500 12.5px var(--font)}
+  .inv-pill.on{background:color-mix(in srgb,var(--info) 14%,transparent);color:var(--info)}
+  .inv-pill.stale{background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)}
+  .inv-bar{display:flex;height:6px;min-width:110px;border-radius:2px;overflow:hidden;background:var(--line)}.inv-bar>span{display:block;height:100%;background:var(--primary)}
+  .inv-empty{padding:16px;color:var(--mut)}
+  #sw-results>.inv-empty{background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+  /* The title row's inline expansions (versions, devices). A cell whose box is empty
+     collapses to nothing; the close link empties it via a plain inline onclick (the CSP has
+     no unsafe-eval). */
+  tr.inv-exp>td{padding:0;border-bottom:0}
+  tr.inv-exp>td:has(>div:not(:empty)){border-bottom:1px solid var(--line)}
+  tr.inv-exp .inv-caveat{margin:12px 16px}
+  .inv-exp-body .inv-degrade{margin-top:10px}
+  .inv-exp-body,.inv-devs{padding:12px 16px 14px;background:var(--bg)}
+  .inv-close{float:right;color:var(--mut);cursor:pointer}.inv-close:hover{color:var(--ink)}
+  .inv-devbtn,.inv-hostlink{color:var(--primary);text-decoration:none;cursor:pointer}.inv-devbtn:hover,.inv-hostlink:hover{color:var(--primary-h)}
+  .inv-hostlink:hover{text-decoration:underline}
+  .inv-devhead{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;color:var(--mut)}.inv-devhead b{color:var(--ink);font-weight:600}
+  table.inv-sub{margin-top:10px;background:var(--surface)}
+  table.inv-sub td{padding:8px 16px}
+  tr.inv-more td{padding:12px;text-align:center;white-space:normal}
+  .inv-cursor{margin-left:12px;color:var(--faint);font-family:var(--mds-font-family-mono);font-size:12px}
+  .inv-unnamed{color:var(--mut);font-style:italic}
 </style>)css";
 }
 
@@ -310,9 +313,7 @@ std::string sw_head() {
            "<div class=\"inv-wrap\"><h1 class=\"inv-h1\">Software</h1>"
            "<div class=\"inv-sub\">Installed-software inventory by application, version and "
            "device, synced <b>daily</b> from every endpoint (ADR-0016 daily-sync). Looking for a "
-           "device? See <a href=\"/hardware\">Hardware</a>.</div>"
-           "<div class=\"inv-subnav\" role=\"tablist\"><a class=\"on\" role=\"tab\" "
-           "tabindex=\"0\">Software</a></div>";
+           "device? See <a href=\"/hardware\">Hardware</a>.</div>";
 }
 
 // Retry re-requests the whole page WITH the current filters (a bare retry would drop them).
@@ -347,7 +348,7 @@ std::string sprawl_tile(const SoftwarePageFilters& f, const swc::KpiFigures& k, 
                        "data-act=\"sprawl\" aria-pressed=\"") +
            (f.versions_min > 0 ? "true" : "false") + "\" " + results_get(t) +
            (oob ? " hx-swap-oob=\"true\"" : "") +
-           " style=\"text-align:left;font:inherit\"><div class=\"h\">Version sprawl</div><div "
+           "><div class=\"h\">Version sprawl</div><div "
            "class=\"big\">" +
            fmt_int(k.meta.sprawl_titles) + "</div><div class=\"s2\">titles on 3+ versions (" +
            fmt_pct1(k.sprawl_pct) + "%) &middot; click to show only these</div></button>";
@@ -424,8 +425,8 @@ std::string chips_region(const SoftwarePageFilters& f, bool oob) {
     const auto kind_chip = [&](const std::string& v, const std::string& label, const std::string& title) {
         SoftwarePageFilters t = f;
         t.kind = v;
-        return std::string("<button type=\"button\" class=\"gp-chip") + (f.kind == v ? " on" : "") +
-               "\" data-g=\"kind\" data-v=\"" + esc(v) + "\" aria-pressed=\"" +
+        return std::string("<button type=\"button\" class=\"inv-chip\" data-g=\"kind\" data-v=\"") +
+               esc(v) + "\" aria-pressed=\"" +
                (f.kind == v ? "true" : "false") + "\" title=\"" + esc(title) + "\" " +
                results_get(t) + ">" + esc(label) + "</button>";
     };
@@ -574,7 +575,7 @@ std::string title_rows(const SoftwarePageFilters& f, const SoftwarePageData& d) 
              "<td class=\"inv-num\">" + fmt_int(r.device_count) + "</td><td class=\"inv-num\">" +
              fmt_int(r.version_count) + "</td><td class=\"inv-mono\">" +
              ((r.newest_version.empty() || d.confined) ? dash() : esc(r.newest_version)) +
-             "</td><td class=\"inv-mono\"><span class=\"inv-devbtn\" data-vers>versions &rsaquo;</span>"
+             "</td><td class=\"inv-act\"><span class=\"inv-devbtn\" data-vers>versions &rsaquo;</span>"
              " &middot; <span class=\"inv-devbtn\" data-devs data-tog=\"d\" "
              "onclick=\"event.stopPropagation()\" hx-get=\"" + esc(durl) + "\" hx-target=\"#" + box +
              "\" hx-swap=\"innerHTML\">devices &rsaquo;</span></td></tr>"
@@ -646,7 +647,7 @@ std::string results_region(const SoftwarePageFilters& f, const SoftwarePageData&
                   (d.confined ? " &middot; <span class=\"inv-grey\">Newest in fleet: your management "
                                 "groups only</span>"
                               : "");
-    h += "<div class=\"inv-resbar\"><div class=\"inv-count\" aria-live=\"polite\">" + count +
+    h += "<div class=\"inv-panel\"><div class=\"inv-resbar\"><div class=\"inv-count\" aria-live=\"polite\">" + count +
          "</div><div class=\"inv-exports\"><span>Export installs</span>" +
          dl("json", "software-installs.json", "/api/v1/inventory/software?" + export_kv("json", false), tip, "JSON") +
          dl("csv", "software-installs.csv", "/api/v1/inventory/software?" + export_kv("csv", false), tip, "CSV") +
@@ -658,7 +659,7 @@ std::string results_region(const SoftwarePageFilters& f, const SoftwarePageData&
         h += "<div class=\"inv-empty\">No software matches these filters. <button type=\"button\" "
              "class=\"inv-link\" data-act=\"clear\" onclick=\"swClear('all')\" hx-get=\"" +
              std::string(kFragment) + "?results_only=1\" hx-target=\"#sw-results\" "
-             "hx-swap=\"outerHTML\">Clear all filters</button></div></div>";
+             "hx-swap=\"outerHTML\">Clear all filters</button></div></div></div>";
         return h;
     }
     h += "<div class=\"inv-tblwrap\"><table class=\"inv-tbl\"><thead><tr><th scope=\"col\">Software</th>"
@@ -667,7 +668,7 @@ std::string results_region(const SoftwarePageFilters& f, const SoftwarePageData&
          "exactly under the active filters\">Installs <span class=\"inv-grey\">\xE2\x93\x98</span></th>"
          "<th scope=\"col\" class=\"inv-num\">Versions</th><th scope=\"col\">Newest in fleet</th>"
          "<th scope=\"col\"></th></tr></thead><tbody>" +
-         title_rows(f, d) + "</tbody></table></div></div>";
+         title_rows(f, d) + "</tbody></table></div></div></div>";
     return h;
 }
 
@@ -760,8 +761,7 @@ std::string render_software_page(const SoftwarePageFilters& f, const SoftwarePag
              "<span class=\"inv-mono\">Inventory:Read</span> grant. A management-group-confined "
              "account is refused the fleet view and sees only the devices in its own groups; every "
              "read is audited.</div>";
-    h += controls(f, d);
-    h += active_region(f, false);
+    h += "<div class=\"inv-panel inv-pb\">" + controls(f, d) + active_region(f, false) + "</div>";
     h += results_region(f, d);
     h += "</div>";
     return h;
@@ -789,7 +789,7 @@ std::string render_software_versions_expansion(
              ((r.newest && !confined) ? " <span class=\"inv-pill on\">newest in fleet</span>" : "") +
              "</td><td class=\"inv-num\">" + fmt_int(r.device_count) +
              "</td><td><div class=\"inv-bar\"><span style=\"width:" + std::to_string(pct) +
-             "%\"></span></div></td><td class=\"inv-mono\"><span class=\"inv-devbtn\" data-vdevs "
+             "%\"></span></div></td><td class=\"inv-act\"><span class=\"inv-devbtn\" data-vdevs "
              "data-tog=\"d\" aria-expanded=\"false\" hx-get=\"" +
              esc(version_devices_url(f, name, r.version, r.device_count)) + "\" hx-target=\"#" + box +
              "\" hx-swap=\"innerHTML\">devices &rsaquo;</span></td></tr><tr class=\"inv-exp\">"

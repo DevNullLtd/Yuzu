@@ -24,50 +24,51 @@ std::string esc(const std::string& s) { return html_escape(s); }
 // KPI counts above are always exact. 100k-scale paging is a follow-up.
 constexpr int kRenderCapPerGroup = 500;
 
+// Reuses the `af-*` fields, buttons and panel from kAutoCss (preflight_ui.cpp): this
+// fragment only ever renders inside the /auto page. Design tokens only (yuzu.css).
 const char* kDeployCss = R"CSS(<style>
-.dp-note{color:#7f93ad;font-size:.72rem;margin:.2rem 0 .4rem}
-.dp-cohort{font-size:.72rem;color:#54c2d6;background:#0c1e26;border:1px solid #1d4350;border-radius:.4rem;padding:.4rem .6rem;margin:.1rem 0 .6rem}
-.dp-cfg{border-top:1px solid #1a2c46;padding:.55rem 0;display:flex;gap:.6rem;align-items:end;flex-wrap:wrap}
-.dp-cfg:first-of-type{border-top:none}
-.dp-name{font-weight:600;color:#dce7f4;font-size:.82rem;min-width:90px}
-.dp-fld{display:flex;flex-direction:column;gap:.16rem}
-.dp-fld label{font-size:.66rem;color:#7f93ad}
-.dp-cfg input{background:#0c1626;border:1px solid #2d4068;border-radius:.36rem;color:#cfdbe8;padding:.28rem .5rem;font-size:.76rem;font-family:ui-monospace,Consolas,monospace}
-.dp-tag{font-size:.58rem;color:#7f93ad;border:1px solid #25395a;border-radius:.5rem;padding:.02rem .35rem;margin-left:.4rem}
-.dp-warn{font-size:.72rem;color:#e9c98a;background:#231d10;border:1px solid #5a4a23;border-radius:.4rem;padding:.4rem .6rem;margin:.6rem 0}
-.dp-rhd{font-size:.74rem;color:#7f93ad;margin-bottom:.5rem}
-.dp-rhd b{color:#dce7f4}
-.dp-rhd .art{font-family:ui-monospace,Consolas,monospace;color:#9fb2cc}
-.dp-kpis{display:flex;gap:.55rem;flex-wrap:wrap;margin:.1rem 0 .5rem}
-.dp-kpi{border:1px solid #2d4068;border-radius:.6rem;padding:.4rem .75rem;min-width:78px;background:#101f34;cursor:pointer;user-select:none}
-.dp-kpi .v{font-size:1.3rem;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
-.dp-kpi .l{font-size:.62rem;color:#7f93ad;text-transform:uppercase;letter-spacing:.03em;margin-top:.2rem}
-.dp-kpi.sel{outline:2px solid currentColor;outline-offset:1px}
-.dp-kpi.tot .v{color:#fff} .dp-kpi.ok .v{color:#4ed27e} .dp-kpi.run .v{color:#54c2d6}
-.dp-kpi.stg .v{color:#8fb4ec} .dp-kpi.fail .v{color:#e57373} .dp-kpi.skip .v{color:#7f93ad}
-.dp-bar{height:.5rem;border-radius:.3rem;overflow:hidden;display:flex;background:#0c1626;border:1px solid #1a2c46;margin:.3rem 0}
+.dp-cohort{margin:0 0 14px;padding:12px 14px;border:1px solid var(--line2);border-radius:var(--rad-panel);background:var(--surface2);color:var(--ink2);font-size:13.5px}
+.dp-cohort b{color:var(--ink)}
+#deploy-cfg input{font-family:var(--mds-font-family-mono);font-size:12.5px}
+#deploy-cfg .af-cfg:first-of-type{padding-top:0}
+.dp-warn{margin:14px 0;padding:12px 14px;border:1px solid color-mix(in srgb,var(--warn) 50%,var(--line2));border-radius:var(--rad-panel);background:var(--surface2);color:var(--ink2);font-size:13.5px}
+.dp-warn b{color:var(--ink)}
+.dp-rhd{margin-bottom:12px;font-size:13px;color:var(--mut)}
+.dp-rhd b{color:var(--ink);font-weight:600}
+.dp-rhd .art{font-family:var(--mds-font-family-mono);font-size:12.5px;color:var(--ink2)}
+.dp-kpis{display:flex;flex-wrap:wrap;margin:0 0 14px;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+.dp-kpi{flex:1 1 110px;padding:12px 16px;border-left:1px solid var(--line);user-select:none}
+.dp-kpi:first-child{border-left:0}
+.dp-kpi[data-b]{cursor:pointer}.dp-kpi[data-b]:hover{background:var(--surface2)}
+.dp-kpi .v{font-size:26px;font-weight:500;letter-spacing:-.02em;line-height:1.15;font-variant-numeric:tabular-nums;color:var(--ink)}
+.dp-kpi .l{margin-top:2px;font-size:13px;color:var(--mut)}
+.dp-kpi.sel{background:color-mix(in srgb,var(--primary) 12%,transparent);box-shadow:inset 0 -2px 0 var(--primary)}
+.dp-kpi.ok .v{color:var(--ok)}.dp-kpi.run .v{color:var(--info)}.dp-kpi.stg .v{color:var(--ink2)}.dp-kpi.fail .v{color:var(--bad)}.dp-kpi.skip .v{color:var(--mut)}
+.dp-bar{display:flex;height:6px;margin:0 0 8px;border-radius:2px;overflow:hidden;background:var(--line)}
 .dp-bar i{display:block;height:100%}
-.dp-seg-ok{background:#4ed27e}.dp-seg-run{background:#54c2d6}.dp-seg-stg{background:#3d6fb0}.dp-seg-fail{background:#e57373}.dp-seg-skip{background:#33476b}
-.dp-prog{font-size:.7rem;color:#7f93ad;font-variant-numeric:tabular-nums;margin-bottom:.6rem}
-.dp-grp{margin-bottom:.5rem}
-.dp-grp-hd{font-size:.72rem;font-weight:600;letter-spacing:.02em;color:#9fb2cc;padding:.3rem .1rem;border-bottom:1px solid #1a2c46;margin-bottom:.3rem;text-transform:uppercase}
-.dp-grp-hd .c{color:#7f93ad;font-weight:400}
-.dp-dev{display:flex;align-items:center;gap:.7rem;padding:.4rem .55rem;border:1px solid #14233a;border-radius:.42rem;margin-bottom:.34rem;background:#0c1626}
-.dp-dev .hn{font-weight:600;color:#dce7f4;font-size:.82rem;min-width:148px;word-break:break-all}
-.dp-dev .hn a{color:#6ea8e6;text-decoration:none;border-bottom:1px solid rgba(110,168,230,.35)}
-.dp-dev .os{font-size:.66rem;color:#7f93ad;min-width:118px}
-.dp-dev .prog{display:flex;align-items:center;gap:.34rem;flex:1;flex-wrap:wrap}
-.dp-step{font-size:.64rem;padding:.06rem .42rem;border-radius:.42rem;border:1px solid;white-space:nowrap}
-.dp-step.done{color:#4ed27e;border-color:#235a3a;background:#0e1f16}
-.dp-step.act{color:#54c2d6;border-color:#1d4350;background:#0c1e26}
-.dp-step.wait{color:#7f93ad;border-color:#33476b;background:#101f34}
-.dp-step.err{color:#e57373;border-color:#5a2323;background:#1f0e0e}
-.dp-arrow{color:#36507e;font-size:.66rem}
-.dp-detail{font-size:.64rem;color:#7f93ad;word-break:break-all}
-.dp-detail.bad{color:#e57373}
-.dp-skip{font-size:.66rem;color:#e0b85a}
-.dp-more{font-size:.66rem;color:#7f93ad;padding:.2rem .1rem}
-.dp-empty{font-size:.74rem;color:#7f93ad;padding:.3rem .1rem;display:none}
+.dp-seg-ok{background:var(--ok)}.dp-seg-run{background:var(--info)}.dp-seg-stg{background:var(--primary)}.dp-seg-fail{background:var(--bad)}.dp-seg-skip{background:var(--line2)}
+.dp-prog{margin-bottom:14px;font-size:13px;color:var(--mut);font-variant-numeric:tabular-nums}
+.dp-grp{margin-bottom:16px;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+.dp-grp-hd{padding:12px 16px;border-bottom:1px solid var(--line);font-size:14px;font-weight:600;color:var(--ink)}
+.dp-grp-hd .c{font-weight:400;color:var(--mut)}
+.dp-dev{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
+.dp-dev:last-child{border-bottom:0}
+.dp-dev:hover{background:var(--surface2)}
+.dp-dev .hn{min-width:148px;font-weight:600;color:var(--ink);word-break:break-all}
+.dp-dev .hn a{color:var(--primary);text-decoration:none}.dp-dev .hn a:hover{color:var(--primary-h);text-decoration:underline}
+.dp-dev .os{min-width:118px;font-size:13px;color:var(--mut)}
+.dp-dev .prog{display:flex;flex:1;flex-wrap:wrap;align-items:center;gap:6px}
+.dp-step{padding:1px 8px;border-radius:3px;font-size:12.5px;font-weight:500;white-space:nowrap}
+.dp-step.done{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
+.dp-step.act{background:color-mix(in srgb,var(--info) 14%,transparent);color:var(--info)}
+.dp-step.wait{background:var(--surface2);color:var(--mut)}
+.dp-step.err{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
+.dp-arrow{color:var(--faint);font-size:12.5px}
+.dp-detail{font-size:12.5px;color:var(--mut);word-break:break-all}
+.dp-detail.bad{color:var(--bad)}
+.dp-skip{font-size:13px;color:var(--warn)}
+.dp-more{padding:8px 16px;font-size:13px;color:var(--mut)}
+.dp-empty{display:none;padding:4px 0;font-size:13px;color:var(--mut)}
 </style>)CSS";
 
 struct DispBucket {
@@ -139,22 +140,22 @@ std::string render_deploy_config(const std::string& run_id, const std::string& r
                                  int go_count, int warn_count) {
     const int cohort = go_count + warn_count;
     std::string h = kDeployCss;
-    h += "<div class=\"dp-cohort\">\xE2\x86\x92 Deploys to the <b>" + std::to_string(cohort) +
+    h += "<div class=\"af-panel af-pb\"><div class=\"dp-cohort\">\xE2\x86\x92 Deploys to the <b>" + std::to_string(cohort) +
          "</b> device" + (cohort == 1 ? "" : "s") + " this pre-flight cleared (" +
          std::to_string(go_count) + " go-clean + " + std::to_string(warn_count) +
          " warn-only). No-go and incomplete devices are excluded.</div>";
 
     h += "<div id=\"deploy-cfg\">";
     h += "<input type=\"hidden\" name=\"run\" value=\"" + esc(run_id) + "\">";
-    h += "<div class=\"dp-cfg\"><span class=\"dp-name\">Artifact</span>"
-         "<div class=\"dp-fld\"><label>Download URL</label>"
+    h += "<div class=\"af-cfg\"><span class=\"af-name\">Artifact</span>"
+         "<div class=\"af-fld\"><label>Download URL</label>"
          "<input name=\"url\" placeholder=\"https://repo/pkg.msi\" style=\"min-width:300px\"></div></div>";
-    h += "<div class=\"dp-cfg\">"
-         "<div class=\"dp-fld\"><label>Filename</label>"
+    h += "<div class=\"af-cfg\">"
+         "<div class=\"af-fld\"><label>Filename</label>"
          "<input name=\"filename\" placeholder=\"pkg.msi\" style=\"min-width:160px\"></div>"
-         "<div class=\"dp-fld\"><label>SHA-256</label>"
+         "<div class=\"af-fld\"><label>SHA-256</label>"
          "<input name=\"sha256\" placeholder=\"64 hex chars\" style=\"min-width:230px\"></div>"
-         "<div class=\"dp-fld\"><label>Install args<span class=\"dp-tag\">optional</span></label>"
+         "<div class=\"af-fld\"><label>Install args<span class=\"af-tag\">optional</span></label>"
          "<input name=\"args\" placeholder=\"/qn /norestart\" style=\"min-width:150px\"></div></div>";
 
     h += "</div>"; // #deploy-cfg
@@ -165,8 +166,7 @@ std::string render_deploy_config(const std::string& run_id, const std::string& r
 
     // Confirm-guarded (hx-confirm → native confirm(), CSP-safe). Cohort size + run
     // name are baked in at render; the artifact filename is visible in the form.
-    h += "<button class=\"gp-chip\" style=\"background:#1f7a47;border-color:#1f7a47;color:#fff;"
-         "font-weight:600;cursor:pointer\" "
+    h += "<button class=\"af-btn pri\" "
          "hx-post=\"/fragments/auto/deploy/run\" hx-include=\"#deploy-cfg input\" "
          "hx-confirm=\"Deploy to " +
          std::to_string(cohort) + " device" + (cohort == 1 ? "" : "s") + " from &quot;" +
@@ -174,7 +174,7 @@ std::string render_deploy_config(const std::string& run_id, const std::string& r
          "&quot;? This runs the installer on each device and cannot be undone.\" "
          "hx-target=\"#auto-deploy-grid\" hx-swap=\"innerHTML\">Stage + deploy to cohort\xE2\x80\xA6</button>";
 
-    h += "<div id=\"auto-deploy-grid\" style=\"margin-top:.7rem\"></div>";
+    h += "<div id=\"auto-deploy-grid\" style=\"margin-top:14px\"></div></div>";
     return h;
 }
 

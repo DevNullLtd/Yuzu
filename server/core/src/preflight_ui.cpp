@@ -21,62 +21,85 @@ namespace yuzu::server {
 namespace {
 std::string esc(const std::string& s) { return html_escape(s); }
 
+// The `/auto` page's shared component CSS: the deploy (`dp-*`) and verify (`vf-*`)
+// fragments only ever render inside this page and reuse the `af-*` fields, buttons,
+// pills and panels below. Design tokens only (yuzu.css).
 const char* kAutoCss = R"CSS(<style>
-.gp-wrap{max-width:1320px}
-.af-cfg{border-top:1px solid #1a2c46;padding:.55rem 0;display:flex;gap:.6rem;align-items:end;flex-wrap:wrap}
-.af-cfg:first-of-type{border-top:none}
-.af-name{font-weight:600;color:#dce7f4;font-size:.82rem;min-width:150px}
-.af-fld{display:flex;flex-direction:column;gap:.16rem}
-.af-fld label{font-size:.66rem;color:#7f93ad}
-.af-fld label.thr{color:#8fb4ec}
-.af-cfg input,.af-cfg select{background:#0c1626;border:1px solid #2d4068;border-radius:.36rem;color:#cfdbe8;padding:.28rem .5rem;font-size:.78rem}
-.af-cfg input[type=number]{width:6.5rem}
-.af-tag{font-size:.58rem;color:#7f93ad;border:1px solid #25395a;border-radius:.5rem;padding:.02rem .35rem;margin-left:.4rem}
-.af-note{color:#7f93ad;font-size:.72rem;margin:.2rem 0 .3rem}
-.af-rail{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin:0 0 .7rem;padding-bottom:.55rem;border-bottom:1px solid #1a2c46}
-.af-rail-lbl{font-size:.66rem;text-transform:uppercase;letter-spacing:.04em;color:#7f93ad;margin-right:.2rem}
-.af-rail-keep{font-size:.62rem;color:#5d6f88;text-transform:none;letter-spacing:0}
-.af-run-wrap{display:inline-flex;align-items:stretch}
-.af-run{background:#0c1626;border:1px solid #25395a;border-radius:.5rem 0 0 .5rem;border-right:none;color:#cfe0f6;font-size:.72rem;padding:.22rem .55rem;cursor:pointer}
-.af-run:hover{border-color:#3d7ad6;background:#0f1f37}
-.af-run-x{background:#0c1626;border:1px solid #25395a;border-radius:0 .5rem .5rem 0;color:#7f93ad;font-size:.74rem;line-height:1;padding:0 .42rem;cursor:pointer}
-.af-run-x:hover{border-color:#5a2323;background:#1f0e0e;color:#e57373}
-.af-cfg-hd{display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:.78rem;font-weight:600;color:#9fb2cc;text-transform:uppercase;letter-spacing:.04em;padding:.2rem 0;user-select:none}
-.af-cfg-hd:hover{color:#cfe0f6}
-.af-cfg-hd .chev{font-size:.7rem;color:#7f93ad;transition:transform .12s}
+.af-page>*+*{margin-top:22px}.af-page>*+*:empty{display:none}
+.af-page :focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.af-ph h1{margin:0;font-size:24px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
+.af-ph p{margin-top:4px;max-width:70ch;color:var(--mut)}
+.af-note{margin:0;font-size:13px;color:var(--mut)}.af-note b{color:var(--ink2);font-weight:600}
+.af-page>.af-ph+.af-note{margin-top:8px}
+.af-panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+.af-pb{padding:16px}
+.af-page>.af-sect+*{margin-top:10px}
+.af-sect{font-size:16px;font-weight:600;color:var(--ink)}
+.af-cfg-hd{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--line);font-size:14px;font-weight:600;color:var(--ink);cursor:pointer;user-select:none}
+.af-cfg-hd .chev{font-size:11px;color:var(--faint);transition:transform .12s}
+.af-cfg-hd.af-collapsed{border-bottom:0}
 .af-cfg-hd.af-collapsed .chev{transform:rotate(-90deg)}
+#auto-cfg{padding:0 16px}
 #auto-cfg.af-hide{display:none}
-.af-bdg.p{color:#7fcf9a;border-color:#235a3a;background:#0e1f16}
-.af-dev .hn a{color:#6ea8e6;text-decoration:none;border-bottom:1px solid rgba(110,168,230,.35)}
-.af-dev .hn a:hover{color:#9fc4f0;border-bottom-color:#9fc4f0}
+.af-cfg{display:flex;flex-wrap:wrap;align-items:end;gap:12px 16px;padding:14px 0;border-top:1px solid var(--line)}
+.af-cfg:first-of-type{border-top:0}
+.af-name{min-width:150px;font-size:13.5px;font-weight:600;color:var(--ink)}
+.af-fld{display:flex;flex-direction:column;gap:5px}
+.af-fld label{font-size:13px;font-weight:500;color:var(--mut)}
+.af-fld label.thr{color:var(--ink2)}
+.af-cfg input,.af-cfg select,.vf-fld input,.vf-fld select{height:var(--ctl);padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink);font:inherit}
+.af-cfg input::placeholder,.vf-fld input::placeholder{color:var(--faint)}
+.af-cfg input[type=number]{width:6.5rem}
+.af-cfg input:disabled{color:var(--faint)}
+.af-tag{margin-left:8px;padding:0 6px;border-radius:3px;background:var(--surface2);color:var(--mut);font-size:12px;font-weight:500}
+.af-hint{padding:0 0 14px;font-size:13px;color:var(--mut)}.af-hint b{color:var(--ink2);font-weight:600}
+.af-acts{display:flex;flex-wrap:wrap;gap:8px;padding:12px 16px;border-top:1px solid var(--line)}
+.af-btn{display:inline-flex;align-items:center;height:var(--ctl);padding:0 14px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--raise);color:var(--ink);font:inherit;font-weight:500;white-space:nowrap;cursor:pointer}
+.af-btn:hover{border-color:var(--mut);background:var(--surface2)}
+.af-btn.pri{border-color:var(--primary);background:var(--primary);color:var(--on-primary);font-weight:600}.af-btn.pri:hover{border-color:var(--primary-h);background:var(--primary-h)}
+.af-btn.sm{height:28px;padding:0 10px;font-size:13px}
+.af-rail{display:flex;flex-wrap:wrap;gap:8px 10px;align-items:center;padding:12px 16px;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+.af-rail-lbl{margin-right:6px;font-size:13px;font-weight:600;color:var(--ink)}
+.af-rail-keep{font-weight:400;color:var(--mut)}
+.af-run-wrap{display:inline-flex;align-items:stretch}
+.af-run,.af-run-x{height:28px;border:1px solid var(--line2);background:var(--raise);font:inherit;font-size:13px;cursor:pointer}
+.af-run{padding:0 10px;border-right:0;border-radius:var(--rad-ctl) 0 0 var(--rad-ctl);color:var(--ink);font-weight:500}
+.af-run:hover{background:var(--surface2)}
+.af-run-x{padding:0 8px;border-radius:0 var(--rad-ctl) var(--rad-ctl) 0;color:var(--mut);font-size:15px;line-height:1}
+.af-run-x:hover{border-color:var(--bad);background:color-mix(in srgb,var(--bad) 12%,transparent);color:var(--bad)}
+.af-dev .hn a{color:var(--primary);text-decoration:none}.af-dev .hn a:hover{color:var(--primary-h);text-decoration:underline}
 /* results */
-.af-rhd{font-size:.74rem;color:#7f93ad;margin-bottom:.5rem}
-.af-rhd b{color:#dce7f4}
-.af-pills{display:flex;gap:.55rem;flex-wrap:wrap;margin:.2rem 0 .8rem}
-.af-pill{font-size:.94rem;font-weight:600;padding:.34rem .9rem;border-radius:.7rem;border:1px solid;cursor:pointer;user-select:none}
-.af-pill.tot{color:#cfdbe8;border-color:#2d4068;background:#101f34}
-.af-pill.go{color:#4ed27e;border-color:#235a3a;background:#10241a}
-.af-pill.warn{color:#e0b85a;border-color:#5a4a23;background:#231d10}
-.af-pill.nogo{color:#e57373;border-color:#5a2323;background:#241010}
-.af-pill.inc{color:#8fb4ec;border-color:#33476b;background:#11243d}
+.af-rhd{margin-bottom:12px;font-size:13px;color:var(--mut)}
+.af-rhd b{color:var(--ink);font-weight:600}
+.af-pills,.af-chips{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 14px}
+.af-pill{padding:4px 12px;border-radius:3px;font-size:13px;font-weight:600;cursor:pointer;user-select:none}
+.af-pill.tot{background:var(--surface2);color:var(--ink2)}
+.af-pill.go{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
+.af-pill.warn{background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)}
+.af-pill.nogo{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
+.af-pill.inc{background:color-mix(in srgb,var(--info) 14%,transparent);color:var(--info)}
 .af-pill.sel{outline:2px solid currentColor;outline-offset:1px}
-.af-chips{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin:0 0 .7rem}
-.af-chips .lbl{font-size:.68rem;color:#7f93ad;margin-right:.1rem}
-.af-chip{font-size:.7rem;padding:.12rem .5rem;border-radius:.5rem;border:1px solid #5a2323;background:#1c0f0f;color:#e9a6a6;cursor:pointer;user-select:none}
-.af-chip.sel{background:#3a1414;color:#fff;border-color:#8a3a3a}
-.af-grp{margin-bottom:.5rem}
-.af-grp-hd{font-size:.72rem;font-weight:600;letter-spacing:.02em;color:#9fb2cc;padding:.3rem .1rem;border-bottom:1px solid #1a2c46;margin-bottom:.3rem;text-transform:uppercase}
-.af-grp-hd .c{color:#7f93ad;font-weight:400}
-.af-dev{display:flex;align-items:center;gap:.7rem;padding:.4rem .55rem;border:1px solid #14233a;border-radius:.42rem;margin-bottom:.34rem;background:#0c1626}
-.af-dev .hn{font-weight:600;color:#dce7f4;font-size:.82rem;min-width:148px;word-break:break-all}
-.af-dev .os{font-size:.66rem;color:#7f93ad;min-width:118px}
-.af-dev .badges{display:flex;gap:.34rem;flex-wrap:wrap;flex:1}
-.af-bdg{font-size:.66rem;padding:.06rem .42rem;border-radius:.42rem;border:1px solid;white-space:nowrap;font-variant-numeric:tabular-nums}
-.af-bdg.f{color:#e57373;border-color:#5a2323;background:#1f0e0e}
-.af-bdg.w{color:#e0b85a;border-color:#5a4a23;background:#1f1a0e}
-.af-bdg.u{color:#7f93ad;border-color:#33476b;background:#101f34}
-.af-bdg .v{opacity:.85;margin-left:.25rem}
-.af-empty{font-size:.74rem;color:#7f93ad;padding:.3rem .1rem;display:none}
+.af-go{margin:0 0 14px}
+.af-chips .lbl{font-size:13px;color:var(--mut)}
+.af-chip{padding:2px 8px;border:1px solid color-mix(in srgb,var(--bad) 45%,var(--line2));border-radius:3px;color:var(--bad);font-size:12.5px;cursor:pointer;user-select:none}
+.af-chip:hover{background:color-mix(in srgb,var(--bad) 12%,transparent)}
+.af-chip.sel{border-color:var(--bad);background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--ink)}
+.af-grp{margin-bottom:16px;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+.af-grp-hd{padding:12px 16px;border-bottom:1px solid var(--line);font-size:14px;font-weight:600;color:var(--ink)}
+.af-grp-hd .c{font-weight:400;color:var(--mut)}
+.af-dev{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
+.af-dev:last-child{border-bottom:0}
+.af-dev:hover{background:var(--surface2)}
+.af-dev .hn{min-width:148px;font-weight:600;color:var(--ink);word-break:break-all}
+.af-dev .os{min-width:118px;font-size:13px;color:var(--mut)}
+.af-dev .badges{display:flex;flex:1;flex-wrap:wrap;gap:6px}
+.af-bdg{padding:1px 8px;border-radius:3px;font-size:12.5px;font-weight:500;white-space:nowrap}
+.af-bdg.p{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
+.af-bdg.f{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad)}
+.af-bdg.w{background:color-mix(in srgb,var(--warn) 15%,transparent);color:var(--warn)}
+.af-bdg.u{background:var(--surface2);color:var(--mut)}
+.af-bdg .v{margin-left:4px;opacity:.85}
+.af-empty{display:none;padding:4px 0;font-size:13px;color:var(--mut)}
 </style>)CSS";
 
 // Verdict → badge css class.
@@ -103,7 +126,7 @@ std::string render_auto_rail(const std::vector<std::pair<std::string, std::strin
     h += "<span class=\"af-rail-lbl\">Recent runs<span class=\"af-rail-keep\"> &middot; kept 14 "
          "days</span></span>";
     if (recent.empty()) {
-        h += "<span class=\"gp-mute\" style=\"font-size:.7rem\">none yet</span>";
+        h += "<span class=\"af-note\">none yet</span>";
     } else {
         for (const auto& [run_id, label] : recent) {
             h += "<span class=\"af-run-wrap\">";
@@ -127,7 +150,11 @@ std::string render_auto_rail(const std::vector<std::pair<std::string, std::strin
 std::string render_auto_config(const std::vector<std::pair<std::string, std::string>>& groups,
                                const std::vector<std::pair<std::string, std::string>>& recent) {
     std::string h = kAutoCss;
-    h += "<div class=\"gp-mute\" style=\"font-size:.76rem;margin-bottom:.6rem\">"
+    h += "<div class=\"af-page\">";
+    // Page title block: the design's Deployments artboard wording.
+    h += "<div class=\"af-ph\"><h1>Deployments</h1><p>Roll out software and patches in rings, check them "
+         "first, and roll back if needed.</p></div>";
+    h += "<div class=\"af-note\">"
          "Configure the checks (parameters + thresholds), run across a cohort, and get a go/no-go "
          "grouped by device. Runs persist \xE2\x80\x94 reopen one below to revisit it.</div>";
 
@@ -137,7 +164,7 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
     // Collapsible configuration. Inline onclick (CSP-safe; never hx-on) toggles
     // #auto-cfg's visibility — hidden inputs still submit via the Run button's
     // hx-include, so collapsing never drops the config.
-    h += "<div class=\"af-cfg-hd\" onclick=\"document.getElementById('auto-cfg')"
+    h += "<div class=\"af-panel\"><div class=\"af-cfg-hd\" onclick=\"document.getElementById('auto-cfg')"
          ".classList.toggle('af-hide');this.classList.toggle('af-collapsed')\">"
          "<span class=\"chev\">&#9660;</span> Pre-flight configuration</div>";
 
@@ -158,7 +185,7 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
     h += "<div class=\"af-fld\"><label>Run window \xE2\x80\x94 catch offline (min)</label>"
          "<input name=\"window\" type=\"number\" value=\"30\" style=\"width:6rem\"></div>";
     h += "</div>";
-    h += "<div class=\"af-note\">The run keeps re-trying for the window, so a device that is offline at "
+    h += "<div class=\"af-hint\">The run keeps re-trying for the window, so a device that is offline at "
          "dispatch still reports if it reconnects in time; a device that never answers stays "
          "<b>incomplete</b>.</div>";
 
@@ -201,19 +228,18 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
 
     h += "</div>"; // #auto-cfg
 
-    h += "<div style=\"margin-top:.7rem\">"
-         "<button class=\"gp-chip\" style=\"background:#3d7ad6;border-color:#3d7ad6;color:#fff;"
-         "font-weight:600;cursor:pointer\" onclick=\"pfCollapseCfg()\" "
+    h += "<div class=\"af-acts\">"
+         "<button class=\"af-btn pri\" onclick=\"pfCollapseCfg()\" "
          "hx-post=\"/fragments/auto/run\" hx-include=\"#auto-cfg input, #auto-cfg select\" "
-         "hx-target=\"#auto-results\" hx-swap=\"innerHTML\">Run pre-flight</button></div>";
+         "hx-target=\"#auto-results\" hx-swap=\"innerHTML\">Run pre-flight</button></div></div>";
 
-    h += "<div id=\"auto-results\" style=\"margin-top:.9rem\">"
+    h += "<div id=\"auto-results\">"
          "<div class=\"gp-placeholder\"><b>Configure and run</b>"
          "Results group by device as each one answers.</div></div>";
 
     // Deploy panel target (the ACT stage). Sibling of #auto-results so it persists
     // across the pre-flight grid's repolls; filled by the "Deploy go-cohort" button.
-    h += "<div id=\"auto-deploy\" style=\"margin-top:.9rem\"></div>";
+    h += "<div id=\"auto-deploy\"></div>";
 
     // CSP-safe helper: collapse the config so the results (verdict + pills) rise
     // to the top. Called by Run and by each saved-run in the rail. Defined once
@@ -227,10 +253,10 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
     // logic lives in verify_routes/verify_ui; the /auto page only hosts it (one
     // fragment URL, no code coupling). The lifecycle after ASSESS (pre-flight) and
     // ACT (deploy): did the upgrade change how the same machines perform?
-    h += "<div class=\"af-cfg-hd\" style=\"margin-top:1.6rem\">"
-         "<span class=\"chev\">&#9660;</span> Verify &mdash; before / after performance</div>";
+    h += "<div class=\"af-sect\">Verify &mdash; before / after performance</div>";
     h += "<div id=\"auto-verify\" hx-get=\"/fragments/auto/verify\" hx-trigger=\"load\" "
          "hx-swap=\"innerHTML\"><div class=\"gp-placeholder\">Loading verify&hellip;</div></div>";
+    h += "</div>"; // .af-page
     return h;
 }
 
@@ -316,9 +342,8 @@ std::string render_auto_results(const std::vector<preflight::PreflightDeviceResu
     // devices clear. Loads the deploy panel into the sibling #auto-deploy container
     // (outside #auto-grid, so it persists across this grid's repolls).
     if ((go + warn) > 0 && !run_id.empty()) {
-        h += "<div style=\"margin:.1rem 0 .8rem\">"
-             "<button class=\"gp-chip\" style=\"background:#1f7a47;border-color:#1f7a47;color:#fff;"
-             "font-weight:600;cursor:pointer\" hx-get=\"/fragments/auto/deploy?run=" +
+        h += "<div class=\"af-go\">"
+             "<button class=\"af-btn pri\" hx-get=\"/fragments/auto/deploy?run=" +
              esc(run_id) +
              "\" hx-target=\"#auto-deploy\" hx-swap=\"innerHTML\">Deploy go-cohort (" +
              std::to_string(go + warn) + ") \xE2\x86\x92</button></div>";
@@ -392,7 +417,7 @@ std::string render_auto_results(const std::vector<preflight::PreflightDeviceResu
     h += "<div class=\"af-empty\">No devices match this filter.</div>";
 
     if (!repoll_url.empty())
-        h += "<div class=\"gp-mute\" style=\"font-size:.66rem;margin-top:.3rem\">Polling devices&hellip;</div>";
+        h += "<div class=\"af-note\">Polling devices&hellip;</div>";
     else if (run_complete)
         h += "<div class=\"gp-note\">Complete. A device is <b>no-go</b> if any blocking check fails, "
              "<b>warn-only</b> if it has warnings but no blocking fail, <b>incomplete</b> until every "
