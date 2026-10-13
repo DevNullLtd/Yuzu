@@ -9,8 +9,9 @@
 // The set is the quarantine plugin's own four actions plus the Guardian rule
 // push (`__guard__.push_rules`). It is CLOSED: widening it is a security
 // decision (see the quarantine row of .claude/routed-concerns.md), never a
-// drive-by edit. Lives in common/include so the agent can include the same
-// list the server dispatch chokepoint uses.
+// drive-by edit. Lives in common/include so the agent dispatch gate, which
+// follows, can include the same list the server dispatch chokepoint uses
+// today.
 //
 // Pure: no I/O, no store or wire types, so it stays inside the
 // common/include firewall and tests bind it directly.
@@ -97,6 +98,16 @@ namespace detail {
         return true;
     using detail::iequals;
     return iequals(plugin, "__guard__") && iequals(action, "push_rules");
+}
+
+/// True iff `plugin` declares at least one protective action, so a plugin-level
+/// kill-switch row for it covers the protective set. Kept beside
+/// `is_protective_action` so the plugin names are never spelled a second time;
+/// the exhaustive table in tests/unit/test_protective_actions.cpp fails if the
+/// two drift.
+[[nodiscard]] inline bool plugin_owns_protective_actions(std::string_view plugin) {
+    using detail::iequals;
+    return iequals(plugin, "quarantine") || iequals(plugin, "__guard__");
 }
 
 } // namespace yuzu::protective

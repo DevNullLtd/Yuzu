@@ -292,8 +292,10 @@ the plugin-presence filter, and not a degraded plugin-config store. The set is c
 quarantine actions are **newly** exempt; before this change only the containment gate exempted
 them. Decision record: the 2026-10-12 update in [ADR-3005](../adr/3005-plugin-config-store.md).
 
-A kill-switch row for one of these pairs (or for the plugin-level `quarantine` / `__guard__` row)
-is still accepted and displayed, but it is **kept and inert**: it no longer stops dispatch. A
+A kill-switch row for one of these pairs is still accepted and displayed, but it is **kept and
+inert**: it no longer stops dispatch. A plugin-level `quarantine` / `__guard__` row never stops the
+plugin's protective actions either, and still gates any non-protective action the plugin declares
+(none today: `quarantine` declares only the four, and `__guard__` dispatches only `push_rules`). A
 `PUT` on one is audited with `protective_exempt=true` in the `plugin_config.kill_switch.set`
 detail and logs a warning. If you stopped Guardian rule delivery by switching
 `__guard__.push_rules` off, that stop **ends when you upgrade**: rules deploy on the next Baseline

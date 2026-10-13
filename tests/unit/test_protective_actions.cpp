@@ -6,8 +6,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <string_view>
 
 using yuzu::protective::is_protective_action;
+using yuzu::protective::plugin_owns_protective_actions;
 using yuzu::protective::is_quarantine_control_plugin;
 
 TEST_CASE("is_quarantine_control_plugin: the closed four-action set (case-insensitive)",
@@ -54,4 +56,16 @@ TEST_CASE("is_protective_action: exactly five pairs across the cross product",
         }
     }
     CHECK(protective == 5);
+}
+
+TEST_CASE("plugin_owns_protective_actions: true exactly for plugins with a protective action",
+          "[protective][security]") {
+    // The tie between the two lists: fails if either drifts.
+    for (const auto plugin : {"quarantine", "Quarantine", "__guard__", "tar", "firewall", ""}) {
+        bool any = false;
+        for (const auto action :
+             {"quarantine", "unquarantine", "status", "whitelist", "push_rules", "sql", ""})
+            any = any || is_protective_action(plugin, action);
+        CHECK(plugin_owns_protective_actions(plugin) == any);
+    }
 }

@@ -225,16 +225,18 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
     return key;
 }
 
-/// True iff a kill-switch row at `scope` (any OS layer) is inert for dispatch
-/// because it covers a protective action (`yuzu/protective_actions.hpp`): an
-/// action-level row for a protective pair, or a plugin-level row for a plugin
-/// that owns protective actions (`quarantine`, `__guard__`). The write
-/// surfaces use it to label the audit evidence so a stored OFF row is never
-/// read as proof of a stop. One list: the pairs come from the shared header.
+/// True iff a kill-switch row at `scope` (any OS layer) covers a protective
+/// action (`yuzu/protective_actions.hpp`): an action-level row for a protective
+/// pair, or a plugin-level row for a plugin that owns protective actions. Such
+/// a row never stops the protective actions and still gates any non-protective
+/// action the plugin declares (none today: `quarantine` declares exactly the
+/// four protective actions and `__guard__` dispatches only `push_rules`). The
+/// write surfaces use it to label the audit evidence so a stored OFF row is
+/// never read as proof of a stop. One list: both predicates come from the
+/// shared header.
 [[nodiscard]] inline bool kill_switch_row_covers_protective(const KillSwitchScope& scope) {
     if (scope.action.empty())
-        return yuzu::protective::detail::iequals(scope.plugin, "quarantine") ||
-               yuzu::protective::detail::iequals(scope.plugin, "__guard__");
+        return yuzu::protective::plugin_owns_protective_actions(scope.plugin);
     return yuzu::protective::is_protective_action(scope.plugin, scope.action);
 }
 
@@ -242,7 +244,8 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
 /// `, protective_exempt=true` when the row covers a protective action (stored
 /// but never gating dispatch). One definition for the REST and MCP write
 /// surfaces so the documented evidence format cannot drift between them.
-[[nodiscard]] inline std::string kill_switch_set_detail(const KillSwitchScope& scope, bool enabled) {
+[[nodiscard]] inline std::string kill_switch_set_detail(const KillSwitchScope& scope,
+                                                        bool enabled) {
     std::string detail = enabled ? "enabled=true" : "enabled=false";
     if (kill_switch_row_covers_protective(scope))
         detail += ", protective_exempt=true";

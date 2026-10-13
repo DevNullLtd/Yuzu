@@ -31,6 +31,7 @@
 #include "rbac_store.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <libpq-fe.h>
 
@@ -381,10 +382,13 @@ TEST_CASE("plugin_config_routes: kill-switch PUT flips the switch and is audited
     h.store = &w.store;
     h.wire();
 
+    yuzu::test::LogCapture logs;
     auto put = h.sink.Put("/api/v1/plugin-config/firewall/kill-switch?action=block",
                           json{{"enabled", false}, {"reason", "incident 99"}}.dump());
+    logs.stop();
     REQUIRE(put);
     CHECK(put->status == 200);
+    CHECK(logs.text().find("protective") == std::string::npos); // ordinary pair: no warning
     auto data = body(put->body)["data"];
     CHECK(data["enabled"] == false);
     CHECK(data["action"] == "block");
@@ -423,11 +427,20 @@ TEST_CASE("plugin_config_routes: kill-switch PUT writes and reads the reserved-n
     // Baseline: no row yet — the #3265 regression shape exactly.
     CHECK(w.store.action_allowed("__guard__", "push_rules"));
 
+    yuzu::test::LogCapture logs;
     auto put = h.sink.Put("/api/v1/plugin-config/__guard__/kill-switch?action=push_rules",
                           json{{"enabled", false}, {"reason", "incident"}}.dump());
+    logs.stop();
     REQUIRE(put);
     CHECK(put->status == 200);
     CHECK(body(put->body)["data"]["enabled"] == false);
+
+    // Exactly one warning, naming the scope key, emitted after the successful store.
+    const auto text = logs.text();
+    const auto first = text.find("covers a protective action");
+    CHECK(first != std::string::npos);
+    CHECK(text.find("covers a protective action", first + 1) == std::string::npos);
+    CHECK(text.find("__guard__.push_rules") != std::string::npos);
 
     // The audit evidence says the row is inert for dispatch: a stored OFF row
     // on a protective pair must never read as proof of a stop.

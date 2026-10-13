@@ -1500,10 +1500,11 @@ std::vector<std::string> AgentRegistry::all_ids() const {
     // HA WS-5: live_presence() is cached (kPresenceCacheTtl) and runs OFF
     // mu_ — the same rule the evaluate_scope preloads follow, never holding
     // the registry lock across Postgres I/O. An empty presence_reader_
-    // (unconfigured) makes this call cost nothing beyond the pointer check;
-    // a configured one (the production default — see live_presence()'s own
-    // doc comment for why this is NOT gated behind an HA-only signal) costs
-    // at most one cached-or-fresh read, never a bare per-call round trip.
+    // (unconfigured) makes this call cost one uncontended mutex acquisition plus
+    // the pointer check; a configured one (the production default — see
+    // live_presence()'s own doc comment for why this is NOT gated behind an
+    // HA-only signal) costs at most one cached-or-fresh read, never a bare
+    // per-call round trip.
     //
     // #4981 PR-1: this method's signature/contract predates the typed
     // PresenceReadError split and stays a plain vector — a degraded read

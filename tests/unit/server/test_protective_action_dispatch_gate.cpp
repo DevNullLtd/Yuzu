@@ -20,13 +20,17 @@
 #include <yuzu/metrics.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <expected>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -142,8 +146,8 @@ yuzu::server::ConfinedDispatchOutcome wire(AgentRegistry& registry, const Classi
     auto noop = [](const std::string&, const std::string&, const std::string&,
                    const std::string&) {};
     return yuzu::server::wire_and_dispatch_confined(
-        registry, nullptr, nullptr, nullptr, nullptr, nullptr, noop, noop, "protective-cmd", "exec-1", "",
-        ids, "", std::nullopt, false, ContainmentGate::exempt_control_plugin(), cmd);
+        registry, nullptr, nullptr, nullptr, nullptr, nullptr, noop, noop, "protective-cmd",
+        "exec-1", "", ids, "", std::nullopt, false, ContainmentGate::exempt_control_plugin(), cmd);
 }
 
 const std::vector<std::pair<std::string, std::string>> kProtectiveWire{
@@ -382,6 +386,15 @@ TEST_CASE("kill_switch_row_covers_protective: labels rows that can never gate di
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"__guard__", "get_status", ""}));
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "", ""}));
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"tar", "sql", ""}));
+
+    // The audit-evidence detail both write surfaces share (their only other
+    // bindings are [pg]-tagged and SKIP without a DSN).
+    using yuzu::server::plugin_config::kill_switch_set_detail;
+    CHECK(kill_switch_set_detail(KillSwitchScope{"quarantine", "unquarantine", ""}, false) ==
+          "enabled=false, protective_exempt=true");
+    CHECK(kill_switch_set_detail(KillSwitchScope{"__guard__", "", "linux"}, true) ==
+          "enabled=true, protective_exempt=true");
+    CHECK(kill_switch_set_detail(KillSwitchScope{"tar", "sql", ""}, false) == "enabled=false");
 }
 
 TEST_CASE("configure_presence: reconfiguring resets the cache age so the next read uses the "
@@ -406,4 +419,107 @@ TEST_CASE("configure_presence: reconfiguring resets the cache age so the next re
     CHECK(*second.calls == 1);
     CHECK(*second.ttl == std::chrono::seconds{91});
     CHECK(*first.calls == first_calls);
+}
+
+namespace {
+
+/// Parks a presence read in flight: `entered` flips once the reader is inside,
+/// the reader then blocks until `release()`. Every wait is a bounded condition
+/// variable wait, never sleep+poll.
+struct ParkedRead {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool entered = false;
+    bool released = false;
+    std::atomic<int> seq{0};
+    std::atomic<int> exit_stamp{0};
+    std::atomic<int> calls{0};
+
+    AgentRegistry::PresenceReadFn fn() {
+        return [this](std::chrono::seconds) -> std::expected<Presence, PresenceReadError> {
+            ++calls;
+            std::unique_lock lk(mu);
+            entered = true;
+            cv.notify_all();
+            cv.wait_for(lk, std::chrono::seconds(30), [this] { return released; });
+            exit_stamp = ++seq;
+            return Presence{};
+        };
+    }
+    bool wait_entered() {
+        std::unique_lock lk(mu);
+        return cv.wait_for(lk, std::chrono::seconds(30), [this] { return entered; });
+    }
+    void release() {
+        {
+            std::lock_guard lk(mu);
+            released = true;
+        }
+        cv.notify_all();
+    }
+};
+
+} // namespace
+
+TEST_CASE("configure_presence: a reconfigure cannot return while a presence read is in flight",
+          "[server][dispatch][protective][registry]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+
+    ParkedRead a;
+    PresenceStub b;
+    b.truncated = false;
+    registry.configure_presence(a.fn(), kTtl);
+
+    std::mutex done_mu;
+    std::condition_variable done_cv;
+    bool reconf_started = false;
+    bool reconf_done = false;
+    std::atomic<int> reconf_stamp{0};
+
+    std::jthread reader([&] { (void)registry.all_ids(); });
+    // Declared after `reader` so a failing REQUIRE still unparks A before the
+    // jthread joins.
+    struct Unpark {
+        ParkedRead& p;
+        ~Unpark() { p.release(); }
+    } unpark{a};
+    REQUIRE(a.wait_entered());
+
+    std::jthread reconf([&] {
+        {
+            std::lock_guard lk(done_mu);
+            reconf_started = true;
+        }
+        done_cv.notify_all();
+        registry.configure_presence(b.fn(), std::chrono::seconds{91});
+        reconf_stamp = ++a.seq;
+        {
+            std::lock_guard lk(done_mu);
+            reconf_done = true;
+        }
+        done_cv.notify_all();
+    });
+    {
+        std::unique_lock lk(done_mu);
+        CHECK(done_cv.wait_for(lk, std::chrono::seconds(30), [&] { return reconf_started; }));
+        // Under the lock the reconfigure cannot finish while A is parked, so this
+        // bounded wait is expected to time out; completing means the guard is gone.
+        CHECK_FALSE(done_cv.wait_for(lk, std::chrono::milliseconds(100),
+                                     [&] { return reconf_done; }));
+    }
+    a.release();
+    reader.join();
+    {
+        std::unique_lock lk(done_mu);
+        CHECK(done_cv.wait_for(lk, std::chrono::seconds(30), [&] { return reconf_done; }));
+    }
+    reconf.join();
+
+    CHECK(a.exit_stamp.load() < reconf_stamp.load());
+    (void)registry.all_ids();
+    CHECK(*b.calls == 1);
+    CHECK(*b.ttl == std::chrono::seconds{91});
+    CHECK(a.calls == 1);
 }

@@ -1261,10 +1261,11 @@ private:
 
     /// Returns the cached (or freshly-fetched, if stale/first-call) live
     /// presence set — or the cached/fresh `PresenceReadError` on a degraded
-    /// read (#4981 PR-1 Finding B). Success-empty immediately, no lock taken,
-    /// when presence is unconfigured (`presence_reader_` empty) — the
-    /// common single-replica case pays only the pointer check, and can never
-    /// fail this way.
+    /// read (#4981 PR-1 Finding B). Always acquires `presence_cache_mu_` first, so
+    /// `configure_presence` can never race a read; when presence is unconfigured
+    /// (`presence_reader_` empty) it then returns success-empty — the common
+    /// single-replica case pays one uncontended mutex acquisition plus the
+    /// pointer check, and can never fail this way.
     std::expected<std::vector<PresenceIdentity>, PresenceReadError> live_presence() const;
 
     // #4981 PR-1 (Finding B4): which agent population evaluate_scope_impl

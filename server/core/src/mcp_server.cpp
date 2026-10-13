@@ -20750,12 +20750,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::string target_id = plugin_config::kill_switch_scope_key(*scope);
                 // A row on a protective pair is stored but never gates dispatch;
                 // label the evidence so it is never read as proof of a stop.
-                const std::string ks_detail = plugin_config::kill_switch_set_detail(*scope, enabled);
-                if (plugin_config::kill_switch_row_covers_protective(*scope)) {
-                    spdlog::warn("plugin_config: kill-switch row {} is a protective action; "
-                                 "stored but never refuses dispatch",
-                                 target_id);
-                }
+                const std::string ks_detail =
+                    plugin_config::kill_switch_set_detail(*scope, enabled);
                 if (!audit_fn(req, "plugin_config.kill_switch.set", "attempted", "PluginConfig",
                               target_id, ks_detail)) {
                     res.set_content(
@@ -20780,6 +20776,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 plugin_config_outcome("plugin_config.kill_switch.set", true, "PluginConfig",
                                       target_id, ks_detail);
+                // Warn only once the row is stored, so the log never claims a store
+                // that an audit 503 or a failed write prevented.
+                if (plugin_config::kill_switch_row_covers_protective(*scope)) {
+                    spdlog::warn("plugin_config: kill-switch row {} covers a protective action; "
+                                 "stored, never refuses the protective dispatch",
+                                 target_id);
+                }
                 JObj payload;
                 payload.add("plugin", result->plugin)
                     .add("action", result->action)

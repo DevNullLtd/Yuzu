@@ -379,8 +379,8 @@ struct ConfinedDispatchOutcome {
 };
 
 // The closed quarantine-control predicate lives in the shared pure header so the
-// agent dispatch gate consumes the identical set; re-exported here so existing
-// server-side callers and tests compile unchanged.
+// agent dispatch gate, which follows, consumes the identical set; re-exported
+// here so existing server-side callers and tests compile unchanged.
 using yuzu::protective::is_quarantine_control_plugin;
 
 /// The bounded-staleness budget (#881 spec item 6): a `nullopt` read served
