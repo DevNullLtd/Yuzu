@@ -1746,7 +1746,7 @@ static const ToolDef kTools[] = {
      "when older ones were dropped; a version with no retained performance rows is not "
      "listed, so no row is not no failures) joining the last failure_window_days of "
      "crash and hang observations (30, clamped to one day less than the observation "
-     "retention when that is 30 days or fewer; whole UTC days plus the current day so "
+     "retention when that is 1 to 30 days; whole UTC days plus the current day so "
      "far), matched on the exact canonical version and subject the agent reported: "
      "affected_devices (fleet-wide devices that reported a crash or hang) with crashes "
      "and hangs, each omitted when its own devices number 1 to 9 or, with the exposed "
@@ -1757,10 +1757,10 @@ static const ToolDef kTools[] = {
      "version with no samples); and, when exposure_devices >= 10, exposed_crashes and "
      "exposed_hangs and failure_rate (exposed events per exposed device over the "
      "window, not per day of use: read it beside day_count and latest_day, a version "
-     "with fewer days has had less time to fail; exact 95 percent interval), and, when "
+     "with fewer than failure_window_days + 1 days has had less time to fail; exact 95 percent interval), and, when "
      "both versions have exposure_devices >= 10, failure_rate_ratio against "
-     "previous_version (the next older returned version; null for the oldest returned "
-     "row and for the unknown version; exact conditional interval; upper is null with "
+     "previous_version (the next older returned version; null for the oldest known "
+     "version and for the unknown version; exact conditional interval; upper is null with "
      "unbounded=true when the previous version saw no exposed events). "
      "exposure_below_floor=true withholds the exposed figures; it is false also when "
      "exposure_devices is null (unknown). The exposed counts and the rate are floored on "
@@ -1787,7 +1787,7 @@ static const ToolDef kTools[] = {
      R"j("versions":{"type":"array","items":{"type":"object","properties":{)j"
      R"j("version":{"type":"string"},"latest_day":{"type":"integer"},"day_count":{"type":"integer"},"device_count":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
      R"j("affected_devices":{"type":"integer"},"below_floor":{"type":"boolean"},)j"
-     R"j("crashes":{"type":"integer","description":"Omitted when its own device cohort is under 10 devices or its remainder outside the exposure cohort is (below_floor)"},"hangs":{"type":"integer","description":"Omitted when its own device cohort is under 10 devices or its remainder outside the exposure cohort is (below_floor)"},)j"
+     R"j("crashes":{"type":"integer","description":"Omitted when its own device cohort is 1 to 9 devices or its remainder outside the exposure cohort is (below_floor)"},"hangs":{"type":"integer","description":"Omitted when its own device cohort is 1 to 9 devices or its remainder outside the exposure cohort is (below_floor)"},)j"
      R"j("exposure_devices":{"type":["integer","null"],"description":"Devices with retained resource-significant samples; null = unknown, never zero"},"exposure_below_floor":{"type":"boolean"},)j"
      R"j("exposed_crashes":{"type":["integer","null"]},"exposed_hangs":{"type":["integer","null"]},)j"
      R"j("failure_rate":{"type":["object","null"],"properties":{"estimate":{"type":"number"},"lower":{"type":"number"},"upper":{"type":"number"},"reliable":{"type":"boolean"}}},)j"
@@ -16148,7 +16148,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!report) { // AUTHORITATIVE read degrade
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store read degraded",
-                                           a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf store could not be read; "
+                                           a4_data(mcp::kMcpStoreFaultShortRetryMs, "the app-perf or crash-and-hang store could not be read; "
                                                          "retry shortly")),
                             "application/json");
                         return;

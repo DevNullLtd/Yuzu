@@ -514,6 +514,16 @@ TEST_CASE("versions json: a fixed report serialises to the exact string", "[dex]
     b.hangs = 0;
     rep.versions.push_back(b);
 
+    AppPerfVersionRow c;
+    c.perf.version = "0.9.0.0";
+    c.perf.latest_day = 19998;
+    c.perf.day_count = 1;
+    c.perf.device_count = 11;
+    c.affected_devices = 11;
+    c.below_floor = true; // hangs omitted, crashes shown
+    c.crashes = 20;
+    rep.versions.push_back(c);
+
     const std::string expected =
         R"([{"affected_devices":7,"below_floor":true,"day_count":3,"device_count":15,)"
         R"("exposed_crashes":5,"exposed_hangs":2,"exposure_below_floor":false,)"
@@ -524,7 +534,11 @@ TEST_CASE("versions json: a fixed report serialises to the exact string", "[dex]
         R"({"affected_devices":0,"below_floor":false,"crashes":0,"day_count":1,"device_count":4,)"
         R"("exposed_crashes":null,"exposed_hangs":null,"exposure_below_floor":false,)"
         R"("exposure_devices":null,"failure_rate":null,"failure_rate_ratio":null,"hangs":0,)"
-        R"("latest_day":19999,"previous_version":null,"suppressed":true,"version":"1.0.0.0"}])";
+        R"("latest_day":19999,"previous_version":null,"suppressed":true,"version":"1.0.0.0"},)"
+        R"({"affected_devices":11,"below_floor":true,"crashes":20,"day_count":1,"device_count":11,)"
+        R"("exposed_crashes":null,"exposed_hangs":null,"exposure_below_floor":false,)"
+        R"("exposure_devices":null,"failure_rate":null,"failure_rate_ratio":null,)"
+        R"("latest_day":19998,"previous_version":null,"suppressed":false,"version":"0.9.0.0"}])";
     CHECK(dex_app_perf_versions_json(rep) == expected);
 }
 

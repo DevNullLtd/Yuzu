@@ -61,8 +61,9 @@ and perf identity already share on Windows/Linux — an exact match, not a
 name-normalized guess. Attribution of repository/install/service signals to the
 originating app is a follow-on slice; the Apps tab today scopes to crash and
 hang signals only. Per-version crash/hang *counts* on the performance trend
-(as opposed to the per-app crash/hang totals already shown here) remain
-deferred — see "Fleet-wide application performance" under Drill-downs.
+(as opposed to the per-app crash/hang totals already shown here) are not
+rendered on the Apps tab; `GET /api/v1/dex/perf/app` carries them per version
+— see "Fleet-wide application performance" under Drill-downs.
 
 ### Catalogue
 
@@ -424,7 +425,7 @@ view; the rollup, scope, and true aggregate perf endpoints (`/perf/fleet`,
 are machine-health telemetry / fleet metadata and are not audited — and the
 app-perf aggregates suppress any sub-floor `(version, day)` point (fewer than
 10 devices) to a count only and withhold a per-version crash or hang count
-whose own device cohort is under 10 (the exposed counts and failure rate are floored on the exposure cohort of 10 or more devices instead, so they can reflect events from 1 to 9 devices — see the REST reference). **`/perf/devices` and `/perf/app/devices` are the
+whose own device cohort (or whose unexposed remainder, with the exposed figures shown) is 1 to 9 devices (the exposed counts and failure rate are floored on the exposure cohort of 10 or more devices instead, so they can reflect events from 1 to 9 devices — see the REST reference). **`/perf/devices` and `/perf/app/devices` are the
 exceptions**: each row names an `agent_id` fleet-wide (or, for `/perf/app/
 devices`, the caller's visible subset), so unlike their aggregate siblings
 they ARE audited — `/perf/devices` as `dex.perf.device.view` (fail-closed,

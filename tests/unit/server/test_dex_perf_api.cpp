@@ -534,6 +534,9 @@ TEST_CASE("DexAppVersionFailuresOwner counts exposed and unexposed events per ve
     REQUIRE(gss.is_open());
     const std::int64_t today = today_utc();
     seed_two_version_fixture(b1, gss, today);
+    // A repeat hang on an unexposed and on an exposed device: events exceed devices per type.
+    seed_obs(gss, "h2", "x03", "chrome.exe", "124.0.0.0", "process.hung", today - 2 * 86400 + 60);
+    seed_obs(gss, "h3", aid(1), "chrome.exe", "124.0.0.0", "process.hung", today - 2 * 86400 + 60);
 
     DexAppVersionFailuresOwner owner{pool, 0};
     const std::int64_t since_day = today - 30 * 86400;
@@ -559,10 +562,10 @@ TEST_CASE("DexAppVersionFailuresOwner counts exposed and unexposed events per ve
     REQUIRE(v124);
     CHECK(v124->exposure_devices == 12);
     CHECK(v124->crashes == 7);   // 4 on exposed devices + 3 on unexposed ones
-    CHECK(v124->hangs == 2);
+    CHECK(v124->hangs == 4);     // 2 more repeat hangs: events exceed devices
     CHECK(v124->affected_devices == 6); // a01-a03, x01, x02 crashed; x03 only hung
     CHECK(v124->exposed_crashes == 4); // only the exposed devices feed the rate
-    CHECK(v124->exposed_hangs == 1);
+    CHECK(v124->exposed_hangs == 2);
     CHECK(v124->crash_devices == 5);
     CHECK(v124->hang_devices == 2); // a01 and the hang-only x03
     CHECK(v124->exposed_crash_devices == 3); // x01 and x02 crashed but are not exposed
@@ -743,6 +746,7 @@ TEST_CASE("DexPerfApi app_fleet_report() passes the clamped window into the fail
     seed_obs(gss, "c1", "at-cut", "app.exe", "1.0.0.0", "process.crashed", since_day);
     seed_b1(b1, "before-cut", "app.exe", "1.0.0.0", since_day - 86400, 3.0, 1000);
     seed_obs(gss, "c2", "before-cut", "app.exe", "1.0.0.0", "process.crashed", since_day - 86400);
+    seed_b1(b1, "future", "app.exe", "1.0.0.0", today + 86400, 3.0, 1000); // forward slack
     REQUIRE(rollup.roll_day(since_day)); // gives the report its one version
 
     DexAppVersionFailuresOwner owner{pool, 7};

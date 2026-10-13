@@ -9877,7 +9877,7 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
         const nlohmann::json omitted_total = {
             {"type", "integer"},
             {"description",
-             "Omitted when its own device cohort is under 10 devices or its remainder outside the "
+             "Omitted when its own device cohort is 1 to 9 devices or its remainder outside the "
              "exposure cohort is (below_floor)"}};
         const nlohmann::json versions_items = {
             {"type", "object"},

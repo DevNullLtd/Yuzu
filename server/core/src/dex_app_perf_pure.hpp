@@ -123,8 +123,8 @@ app_perf_version_summaries(const std::vector<AppPerfTrendPoint>& points);
 // ── Per-version crash and hang join (the fleet app-perf report) ──────────────
 //
 // Joins the per-(version, day) performance series with the crash and hang
-// observations of the same application. Each cohort is floored on the devices
-// that contributed the figure it guards (dex_stats.hpp consumer duties):
+// observations of the same application. Except for the exposed figures (last
+// bullet), each cohort is floored on the devices that contributed the figure it guards (dex_stats.hpp consumer duties):
 //
 //   - BREADTH, per type: `crashes` is shown only when the distinct devices that
 //     crashed number 0 or at least `kDexCohortFloor`; `hangs` likewise on the
