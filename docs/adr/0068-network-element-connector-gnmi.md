@@ -578,7 +578,8 @@ subscriptions only; there is no on-demand device RPC. So under D3 there is no *l
   One table in `server/core` (one copy for REST and MCP — the `dispatch_target_shape.hpp` rule)
   lists the **canonical facts**: `interfaces`, `lldp`, `system`, `platform`, `fdb`, `arp_nd`.
   Each vendor profile (D11) expands a fact to that vendor's `state`-container paths — OpenConfig
-  by default (`/interfaces/interface/state`, `/lldp/…/state`, `/system/state`,
+  by default (`/interfaces/interface/state` **minus its `counters` subtree**, which core drops at
+  ingest and at `Get` — D3 —, `/lldp/…/state`, `/system/state`,
   `/components/…/state`, `/network-instances/…/fdb/…/state`,
   `/network-instances/…/neighbors/…/state`), vendor-native where a profile must — at **both**
   the subscription publish and the `Get` shape check. gnmic's loader takes per-target
