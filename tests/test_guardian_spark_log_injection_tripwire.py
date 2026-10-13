@@ -359,10 +359,13 @@ SENSITIVE_PATTERNS = [
     # "agent {}" (guardian_ingest.cpp's "ignoring __guard__ action '{}' from agent {}") and
     # "agent={}" (the T_server line). Register only length- and NUL-checks the id (CWE-117
     # log-injection model as above); found by the round-3 security review of #5513, where a
-    # success-path info line of this shape
-    # printed it raw.
+    # success-path info line of this shape printed it raw.
     Pattern("agent {}", "agent {}"),
     Pattern("agent={}", "agent={}"),
+    # ... and the quoted and colon spellings ("agent '{}'", "agent: {}"), so a reworded line cannot
+    # slip past the same threat model.
+    Pattern("agent '{}'", "agent '{}'"),
+    Pattern("agent: {}", "agent: {}"),
     # Unquoted key=value path/service forms in the "guard armed" summary lines
     # -- guardian_engine.cpp.
     Pattern("path={}", "path={}"),
@@ -809,6 +812,8 @@ def _selfcheck() -> None:
         'spdlog::info("Guardian: reconciled agent {} (generation {} -> {})", agent_id, agent_gen, fresh_generation);',
         'spdlog::debug("Guardian: ignoring __guard__ action \'{}\' from agent {} (only \'event\' ingested in A1)", ::yuzu::log_key_token(resp.action()), agent_id);',
         'spdlog::info("Guardian peer agent={} seen", agent_id);',
+        'spdlog::warn("Guardian: dropped a frame from agent \'{}\'", agent_id);',
+        'spdlog::warn("Guardian: frame rejected, agent: {}", agent_id);',
     ]
     for src in must_match:
         if not flagged(src):
@@ -857,7 +862,9 @@ def _selfcheck() -> None:
         'logger->info("Guardian T_server event_id={} agent={} rule={} recv_ns={} committed_ns={} agent_ns={} store_ms={}", log_id_token(ev_row.event_id), log_id_token(agent_id), log_id_token(ev_row.rule_id), recv_wall_ns, res.committed_wall_ns, agent_ns, store_ms);',
         # #5513: both agent_id shapes, wrapped.
         'spdlog::info("Guardian: reconciled agent {} (generation {} -> {})", ::yuzu::log_id_token(agent_id), agent_gen, fresh_generation);',
-        'spdlog::debug("Guardian: ignoring __guard__ action \'{}\' from agent {} (only \'event\' ingested in A1)", ::yuzu::log_key_token(resp.action()), ::yuzu::log_id_token(agent_id));',
+        'spdlog::debug("Guardian: ignoring __guard__ action \'{}\' from agent {} (only \'event\' ingested in A1)", ::yuzu::log_id_token(resp.action()), ::yuzu::log_id_token(agent_id));',
+        'spdlog::warn("Guardian: dropped a frame from agent \'{}\'", ::yuzu::log_id_token(agent_id));',
+        'spdlog::warn("Guardian: frame rejected, agent: {}", ::yuzu::log_id_token(agent_id));',
     ]
     for src in must_not:
         if flagged(src):
