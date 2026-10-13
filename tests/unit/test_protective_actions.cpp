@@ -6,8 +6,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <string_view>
-
 using yuzu::protective::is_protective_action;
 using yuzu::protective::plugin_owns_protective_actions;
 using yuzu::protective::is_quarantine_control_plugin;

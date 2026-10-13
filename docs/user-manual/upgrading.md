@@ -306,21 +306,28 @@ deploy or heartbeat reconcile.
 1. **Find held rows.** There is no list route. Search the audit log for
    `plugin_config.kill_switch.set` entries whose `target_id` is `__guard__.push_rules`,
    `quarantine.<action>` or the plugin-level `__guard__` / `quarantine`, each with an optional `@<os>`
-   suffix. Confirm each with `GET /api/v1/plugin-config/<plugin>/kill-switch` at every layer: the
-   plugin row, the action row (`?action=<action>`) and each `?os=windows|linux|darwin` variant.
+   suffix. Each write leaves two rows (`attempted`, then `success` or `failure`) and a later
+   `enabled=true` supersedes an earlier OFF, so take the latest `result=success` row per `target_id`.
+   Confirm each with `GET /api/v1/plugin-config/<plugin>/kill-switch` at every layer: the
+   plugin row, the action row (`?action=<action>`) and each `?os=windows|linux|darwin` variant, reading `source` in the response: it names the row that wins.
 2. **Re-establish the stop through the rule lever first**, because the hold ends on upgrade. Disable
    the Guards (`PUT /api/v1/guaranteed-state/rules/<id>` with `{"enabled": false}`) or remove them.
    This is state-only: it disarms each Guard on the agent's next Baseline deploy or heartbeat
    reconcile, so the latency is the reconcile cadence. It disarms the rule; it does not freeze a push
-   already in flight. It needs `GuaranteedState:Write` (disable) or `GuaranteedState:Delete`
+   already in flight. No lever stops delivery while leaving armed Guards armed: the old switch did
+   that, but disabling or removing a rule disarms it on the next reconcile. It needs `GuaranteedState:Write` (disable) or `GuaranteedState:Delete`
    (remove). `PluginConfig:Write` alone no longer stops anything, and a service-scoped token is
-   denied on rule writes.
+   denied on rule writes. A `quarantine.*` hold has no replacement switch: those actions are
+   governed by their permission (`Security:Execute` on the catalogue rows) and any approval policy,
+   not by enablement.
+
+Also be aware of:
 
 - **Rollback.** An older server has no exemption and honours stored OFF rows again, which can strand
   a quarantine release or hold back a rule push. Before rolling back, `PUT enabled=true` on every
   protective-pair OFF row you found (each layer and OS), then roll back.
-- **Mixed versions.** During a rolling upgrade an older replica still refuses a protective dispatch
-  while an upgraded replica delivers it, so the outcome depends on which replica serves the
+- **Mixed versions.** During a rolling upgrade an older replica still honours a held row (or a degraded store or
+  plugin-inventory gap) and refuses a protective dispatch while an upgraded replica delivers it, so the outcome depends on which replica serves the
   heartbeat or the reconcile. Lifting a hold arms rules fleet-wide on the next reconcile, including
   `enforce` rules, so expect a burst of arming rather than a gradual one.
 - **Agents without the quarantine plugin.** The server no longer withholds a protective dispatch

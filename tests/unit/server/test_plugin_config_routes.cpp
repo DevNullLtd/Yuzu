@@ -388,7 +388,7 @@ TEST_CASE("plugin_config_routes: kill-switch PUT flips the switch and is audited
     logs.stop();
     REQUIRE(put);
     CHECK(put->status == 200);
-    CHECK(logs.text().find("protective") == std::string::npos); // ordinary pair: no warning
+    CHECK(logs.text().find("covers a protective action") == std::string::npos); // ordinary pair: no warning
     auto data = body(put->body)["data"];
     CHECK(data["enabled"] == false);
     CHECK(data["action"] == "block");
@@ -484,6 +484,16 @@ TEST_CASE("plugin_config_routes: a dropped audit row fails the write closed (503
     auto ks_entry = w.store.get_kill_switch("firewall", "");
     REQUIRE(ks_entry.has_value());
     CHECK(ks_entry->enabled); // still default-enabled — the flip never landed
+
+    // A protective pair refused at the audit gate must not log the "row stored"
+    // warning: the warn is emitted only once the row is stored.
+    yuzu::test::LogCapture logs;
+    auto guard_put = h.sink.Put("/api/v1/plugin-config/__guard__/kill-switch?action=push_rules",
+                                R"({"enabled":false,"reason":"x"})");
+    logs.stop();
+    REQUIRE(guard_put);
+    CHECK(guard_put->status == 503);
+    CHECK(logs.text().find("covers a protective action") == std::string::npos);
 
     auto secret_put = h.sink.Put("/api/v1/plugin-config/email/api_key/secret",
                                  R"({"value":"sk_never_committed"})");

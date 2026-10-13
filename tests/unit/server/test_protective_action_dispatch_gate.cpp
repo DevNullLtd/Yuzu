@@ -370,6 +370,18 @@ TEST_CASE("the protective set is tied to the real catalogue rows and the push la
     CHECK(protective == std::set<std::string>{"quarantine.quarantine", "quarantine.unquarantine",
                                              "quarantine.status", "quarantine.whitelist",
                                              "__guard__.push_rules"});
+
+    // The plugin-level label predicate is tied to the same rows: it must be true for
+    // exactly the plugins that carry a protective row, so widening it to a plugin
+    // the set does not cover (or narrowing it away from one it does) fails here.
+    std::set<std::string> protective_plugins;
+    for (const auto& pair : protective)
+        protective_plugins.insert(pair.substr(0, pair.find('.')));
+    for (const auto rows : {capdecls::plugin_action_catalogue_c(),
+                            capdecls::core_dispatch_capabilities()})
+        for (const auto& cap : rows)
+            CHECK(yuzu::protective::plugin_owns_protective_actions(cap.plugin) ==
+                  (protective_plugins.count(std::string(cap.plugin)) != 0));
 }
 
 TEST_CASE("kill_switch_row_covers_protective: labels rows that can never gate dispatch",

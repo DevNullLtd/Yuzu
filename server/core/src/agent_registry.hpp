@@ -1044,7 +1044,10 @@ public:
     void configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl);
 
     /// Injectable presence read (the single `query_live_ids` seam). Tests feed
-    /// a stub; the store overload binds `store->query_live_ids`.
+    /// a stub; the store overload binds `store->query_live_ids`. The reader runs
+    /// under `presence_cache_mu_` (non-recursive), so it must not call back into
+    /// the registry (`all_ids`, `evaluate_scope`, `ids_with_os`,
+    /// `has_remote_presence`) or it self-deadlocks.
     using PresenceReadFn = std::function<
         std::expected<std::vector<PresenceIdentity>, PresenceReadError>(std::chrono::seconds)>;
     /// Test-facing overload: assigns the reader AND the TTL it is called with.

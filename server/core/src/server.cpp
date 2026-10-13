@@ -20741,7 +20741,9 @@ private:
         const auto containment_gate = make_containment_gate(plugin, action);
         // #3424/#3511: same lifecycle as containment_gate — one registry read
         // for this dispatch. BR-009: `classified->wire().plugin()`, not the
-        // raw `plugin` local — see the /api/command sibling site's comment.
+        // raw `plugin` local — see the /api/command sibling site's comment. The wire
+        // action is the protective-set carve-out's input; the behavioural pin is the
+        // protective case in test_command_routes.cpp (this forwarder has no unit harness).
         const auto plugin_missing = registry_.ids_missing_plugin(
             classified->wire().plugin(), classified->wire().action());
         // #5294: per-OS kill-switch ids; a degraded presence read while a
