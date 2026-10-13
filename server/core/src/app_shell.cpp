@@ -275,7 +275,6 @@ constexpr std::string_view kShellScript = R"JS(<script>
     el('nav-user').textContent=name;
     el('context-user').textContent=name;
     el('role-badge').textContent=role;
-    document.body.setAttribute('data-role',role);
     if(d.role!=='admin'&&role!=='Administrator'&&role!=='PlatformEngineer'){
       var sl=el('nav-settings-link');
       if(sl){sl.style.display='none';var g=sl.closest('.shell-grp');if(g)g.style.display='none';}
