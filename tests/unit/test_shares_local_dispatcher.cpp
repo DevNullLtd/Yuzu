@@ -168,6 +168,30 @@ bool share_row_is_wellformed(const std::string& row) {
 
 } // namespace
 
+// MUTATION: flip a leg's declared support without changing the code behind it (macOS or Windows
+// to SUPPORTED while the leg is still the placeholder, Linux to PLANNED) -> the exact-level
+// checks fail. The mechanism/notes prose is not pinned: the capability-matrix check gates it.
+TEST_CASE("shares plugin: the descriptor declares Linux supported and macOS and Windows planned",
+          "[shares][descriptors]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    CHECK(std::string_view{plugin->descriptor->name} == "shares");
+    CHECK(std::string_view{plugin->descriptor->version} == "1.0.0");
+    REQUIRE(plugin->descriptor->action_descriptors != nullptr);
+    REQUIRE(plugin->descriptor->action_descriptor_count == 1);
+    const auto& d = plugin->descriptor->action_descriptors[0];
+    CHECK(std::string_view{d.action} == "list");
+    CHECK(d.linux_leg.support == YUZU_SUPPORT_SUPPORTED);
+    CHECK(d.linux_leg.rung == 1);
+    CHECK(d.macos_leg.support == YUZU_SUPPORT_PLANNED);
+    CHECK(d.macos_leg.rung == 2);
+    CHECK(d.windows_leg.support == YUZU_SUPPORT_PLANNED);
+    CHECK(d.windows_leg.rung == 1);
+}
+
 TEST_CASE("shares plugin: an unknown action is refused with one non-status line",
           "[shares][dispatcher]") {
     auto plugin = load_plugin();

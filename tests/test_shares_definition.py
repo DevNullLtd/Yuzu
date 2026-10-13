@@ -46,5 +46,21 @@ class SharesDefinitionColumns(unittest.TestCase):
         self.assertIn("account", text)
 
 
+class SharesDefinitionContract(unittest.TestCase):
+    def test_identity_platforms_gather_approval_and_compatibility_are_pinned(self):
+        doc = _definition()
+        spec = doc["spec"]
+        self.assertEqual(doc["metadata"]["id"], "crossplatform.network.shares")
+        self.assertEqual(spec["execution"]["plugin"], "shares")
+        self.assertEqual(spec["execution"]["action"], "list")
+        self.assertEqual(spec["platforms"], ["windows", "linux", "darwin"])
+        self.assertEqual(spec["execution"]["concurrency"], "per-device")
+        self.assertEqual(spec["gather"]["ttlSeconds"], 3600)
+        self.assertEqual(spec["approval"]["mode"], "auto")
+        self.assertEqual(spec["permissions"]["executeRoles"], ["endpoint-admin", "endpoint-operator"])
+        self.assertEqual(spec["compatibility"]["requiredPlugins"], ["shares"])
+        self.assertEqual(spec["parameters"]["properties"], {})
+
+
 if __name__ == "__main__":
     unittest.main()

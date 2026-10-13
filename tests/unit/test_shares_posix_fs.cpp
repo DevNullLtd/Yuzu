@@ -4,6 +4,10 @@
  * exercised through the same Paths struct the Linux leg uses. POSIX only; the body
  * is compiled out on Windows (the registration is unconditional).
  *
+ * Real files, not a fake: O_NOFOLLOW/ENOTDIR answers, a FIFO under O_NONBLOCK, dir-fd
+ * confinement across a rename and lstat on an unlistable directory are kernel behaviour no
+ * in-memory fake reproduces; the tree is a few KiB under a yuzu_test_ TempDir.
+ *
  * Provenance: every file is written by the test (a SYNTHETIC tree); the stock-file rows in
  * the end-to-end case are RECONSTRUCTIONS, as in test_shares_parsers.cpp.
  */

@@ -36,9 +36,8 @@ inline std::string ini_trim(std::string_view s) {
 
 /// `[section]` headers, `key = value` (trimmed), `#` / `;` comment lines and blank
 /// lines skipped, CRLF tolerated, never throws. LAST value wins for a repeated
-/// (section, key) and a re-opened section merges: that is how SSSD merges
-/// sssd.conf with conf.d/*.conf (snippets later in byte order override), so
-/// a caller concatenating main + snippets in that order gets the merged view.
+/// (section, key) and a re-opened section merges, so a caller concatenating a main file
+/// with snippets in override order gets the merged view (SSSD conf.d, Samba include order).
 inline IniDoc parse_ini(std::string_view text, KvCanon canon = nullptr) {
     IniDoc doc;
     std::string current;

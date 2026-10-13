@@ -104,7 +104,7 @@ struct Listing {
 
 /// A leg that reads nothing reports `{StatusState::unsupported, <token>, {}}`: ONE
 /// `unsupported` status row and UNAVAILABLE/UNKNOWN carrying the same token. Callers: the
-/// Windows placeholder and execute_list's catch arm (`<os>:leg:exception`).
+/// Windows and macOS placeholders and execute_list's catch arm (`<os>:leg:exception`).
 inline void report_list(yuzu::CommandContext& ctx, const Listing& p) {
     report_list(ctx, p.rows, p.status, p.reason);
 }

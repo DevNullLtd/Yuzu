@@ -395,10 +395,9 @@ inline void parse_exports(std::string_view text, std::string_view source,
             else
                 specs.push_back(detail::parse_spec(t.text, defaults));
         }
-        bool nrs = false;
+        bool nrs = specs.empty() && defaults.root_exposed();
         bool anon = specs.empty();
         Access access = specs.empty() ? defaults.access : Access::unknown;
-        nrs = specs.empty() && defaults.root_exposed();
         for (const auto& sp : specs) {
             access = detail::merge_access(access, sp.access);
             anon = anon || sp.anonymous;
@@ -530,7 +529,8 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
                 out.usershares_off = true;
         }
     }
-    if (const auto* v = detail::find_kv(global, "usersharepath"); v && !v->empty())
+    // An explicit all-zero `usershare max shares` disables usershares whatever the path says.
+    if (const auto* v = detail::find_kv(global, "usersharepath"); v && !v->empty() && !out.usershares_off)
         out.usershares_configured = true;
     if (detail::find_kv(global, "configfile")) // a redirect of the same shape as `include =`
         out.include_present = true;
@@ -539,6 +539,7 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
             out.include_present = true;
 
     constexpr int kMaxCopyDepth = 8;
+    constexpr std::size_t kMaxCopyTargetBytes = 255;
     const auto lookup = [&](const std::string& own_lower, const std::string& key) -> const std::string* {
         std::vector<std::string> visited{own_lower};
         const detail::KvMap* cur = &doc.sections.at(own_lower);
@@ -548,7 +549,7 @@ inline SmbConf parse_smb_conf(std::string_view text, yuzu::shared::RowByteBudget
             const auto* cp = detail::find_kv(*cur, "copy");
             if (cp == nullptr)
                 break;
-            if (cp->size() > 255) { // not a section name: stop before lower-casing it per step
+            if (cp->size() > kMaxCopyTargetBytes) { // not a section name: stop before lower-casing it per step
                 out.copy_unresolved = true;
                 break;
             }

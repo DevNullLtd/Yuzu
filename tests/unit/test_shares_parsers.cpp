@@ -716,6 +716,10 @@ TEST_CASE("shares smb.conf: registry backend, include and usershares are detecte
     CHECK_FALSE(smb("[a]\npath=/a\n").usershares_off); // unset is not off
     const auto p = smb("[global]\nusershare path = /var/lib/samba/us\n");
     CHECK(p.usershares_configured);
+    // An explicit all-zero max wins over a set path: usershares are definitively off.
+    const auto both = smb("[global]\nusershare max shares = 0\nusershare path = /srv/us\n");
+    CHECK(both.usershares_off);
+    CHECK_FALSE(both.usershares_configured);
 }
 
 TEST_CASE("shares smb.conf: continuation, macros kept verbatim, available = no", "[shares]") {
