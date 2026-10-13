@@ -3020,6 +3020,183 @@ TEST_CASE("#3972 chaos: compound jam - a throwing lifecycle head, steady verdict
     CHECK(overtakers <= releases * N + 2); // O2
 }
 
+TEST_CASE("#3972 chaos: identical re-pushes and detach_rules_except under a jammed lifecycle lane "
+          "add no lifecycle entry, lose no verdict, and still never reorder without a counted release",
+          "[spark][guardian][drain][order][.chaos]") {
+    // Hidden: ~4 s of wall clock by design (run it by its name, "#3972 chaos: identical ..."; a
+    // positive tag filter such as '[drain]' or '[order]' includes it, append ~[.] to skip it).
+    //
+    // Covers the interaction of this branch's hold with upstream #4415 (the full_sync re-push
+    // skip): the compound-jam case above only ever arms FRESH rule ids on an always-Healthy
+    // backend, so it never reaches attach_core's reuse path or detach_rules_except with kept rules.
+    // Here a pool of rules is re-pushed with IDENTICAL content over and over (each a skip: no
+    // lifecycle entry, the pending verdict of the rule stays put), a rotating churn rule is armed
+    // and then removed by detach_rules_except (one real `disarmed`), fresh rules carry steady
+    // verdicts, and the link flaps, all while the lifecycle sink throws.
+    //
+    // Oracles (the sink log is the ordered start/end record):
+    //   O1  an OVERTAKER implies cross_lane_order_release_count() >= 1;
+    //   O2  overtakers <= releases * N + 2;
+    //   O3  nothing lost or duplicated, and the lifecycle lane carries EXACTLY one `armed` per fresh
+    //       arm plus one `disarmed` per removal: every skipped re-push added zero entries (a re-push
+    //       that re-armed would break the equality); every verdict is delivered once;
+    //   O4  the worker joins within a bound;
+    //   O5  no entry was ever offered unstamped (seq == 0 fails open and would hide an ordering
+    //       hole), on either lane.
+    // Plus: releases > 0, send_exceptions > 0 and re-pushes > 0 (the ingredients really fired).
+    constexpr std::chrono::milliseconds H = 150ms;
+    constexpr std::size_t N = 8;
+    constexpr int kPool = 6;
+    HoldRig f(20, H, N);
+    f.sink.throws[kLifecycleIdx] = true;
+
+    std::mutex rig_mu; // serialises FakeReader edits and the engine calls driven from threads
+    std::set<std::string, std::less<>> live; // every rule that must survive a detach_rules_except
+    std::atomic<bool> stop{false};
+    std::atomic<int> fresh_arms{0};
+    std::atomic<int> removals{0};
+    std::atomic<int> verdicts{0};
+    std::atomic<int> repushes{0};
+    std::atomic<int> failures{0};
+
+    const auto pool_rule = [](int i) { return "pool" + std::to_string(i); };
+    for (int i = 0; i < kPool; ++i) { // a stuck lifecycle head exists from the first pass
+        REQUIRE(f.arm(pool_rule(i)));
+        live.insert(pool_rule(i));
+        ++fresh_arms;
+    }
+    f.start();
+
+    ChaosThreads chaos{stop};
+    chaos.threads.emplace_back([&] { // steady verdicts on FRESH rules (no coalescing)
+        for (int i = 0; !stop.load(); ++i) {
+            {
+                std::lock_guard<std::mutex> lk{rig_mu};
+                const auto rule = "p" + std::to_string(i);
+                if (f.arm(rule)) {
+                    live.insert(rule);
+                    ++fresh_arms;
+                    f.verdict(rule);
+                    ++verdicts;
+                } else {
+                    ++failures;
+                }
+            }
+            chaos.nap(20ms);
+        }
+    });
+    chaos.threads.emplace_back([&] { // identical re-push of the whole pool, as a full_sync does
+        for (int j = 0; !stop.load(); ++j) {
+            {
+                std::lock_guard<std::mutex> lk{rig_mu};
+                for (int i = 0; i < kPool; ++i) {
+                    if (f.arm(pool_rule(i)))
+                        ++repushes;
+                    else
+                        ++failures;
+                }
+                // A scoped full_sync detach: everything live is kept, nothing may re-arm.
+                f.rt->detach_rules_except(live);
+            }
+            chaos.nap(30ms);
+        }
+    });
+    chaos.threads.emplace_back([&] { // churn: arm c_j, then remove c_{j-1} via detach_rules_except
+        for (int j = 0; !stop.load(); ++j) {
+            {
+                std::lock_guard<std::mutex> lk{rig_mu};
+                const auto cur = "c" + std::to_string(j);
+                if (f.arm(cur)) {
+                    live.insert(cur);
+                    ++fresh_arms;
+                } else {
+                    ++failures;
+                }
+                if (j > 0) {
+                    live.erase("c" + std::to_string(j - 1));
+                    f.rt->detach_rules_except(live);
+                    ++removals;
+                }
+            }
+            chaos.nap(40ms);
+        }
+    });
+    chaos.threads.emplace_back([&] { // link flapper: every phase outlasts H
+        bool up = true;
+        while (!stop.load()) {
+            chaos.nap(300ms);
+            up = !up;
+            f.sink.set_link(up);
+        }
+    });
+
+    REQUIRE(wait_until_time(std::chrono::steady_clock::now() + 4s));
+    stop.store(true);
+    for (auto& t : chaos.threads)
+        t.join();
+    REQUIRE(failures.load() == 0);
+    REQUIRE(verdicts.load() > 0);
+    REQUIRE(repushes.load() > 0);
+
+    f.sink.set_link(true);
+    CHECK(f.sink.n_ended(OutboxDomain::Lifecycle) == 0); // the jam held the whole time
+    const auto stuck_lifecycle = f.rt->lifecycle_front_seq();
+    REQUIRE(stuck_lifecycle.has_value());
+    CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) > 0);
+    CHECK(f.rt->send_exception_count() > 0);
+
+    f.sink.throws[kLifecycleIdx] = false;
+    REQUIRE(spin_until(
+        [&] {
+            return !f.rt->lifecycle_front_seq() && !f.rt->outbox_front_seq() &&
+                   !f.lifecycle().in_flight_snapshot().in_flight &&
+                   !f.compliance().in_flight_snapshot().in_flight;
+        },
+        20s));
+    const auto t_stop = std::chrono::steady_clock::now();
+    f.worker->stop(); // O4
+    CHECK(std::chrono::steady_clock::now() - t_stop < 5s);
+    REQUIRE(spin_until([&] { return f.worker->active_send_workers() == 0; }, 5s));
+
+    struct End {
+        std::size_t lane;
+        std::uint64_t seq;
+        std::size_t at;
+    };
+    std::vector<End> ends;
+    std::set<std::pair<std::size_t, std::uint64_t>> distinct;
+    const auto log = f.sink.snapshot();
+    for (std::size_t i = 0; i < log.size(); ++i)
+        if (log[i].end) {
+            ends.push_back({lane_idx(log[i].domain), log[i].seq, i});
+            distinct.emplace(lane_idx(log[i].domain), log[i].seq);
+        }
+    CHECK(distinct.size() == ends.size()); // nothing delivered twice
+    std::size_t lifecycle_ends = 0;
+    std::size_t compliance_ends = 0;
+    for (const auto& e : ends)
+        (e.lane == kLifecycleIdx ? lifecycle_ends : compliance_ends) += 1;
+    CHECK(compliance_ends == static_cast<std::size_t>(verdicts.load())); // none lost, none extra
+    CHECK(lifecycle_ends == static_cast<std::size_t>(fresh_arms.load() + removals.load())); // O3
+
+    std::size_t overtakers = 0;
+    for (const auto& b : ends)
+        for (const auto& a : ends)
+            if (a.lane != b.lane && a.seq < b.seq && a.at > b.at) {
+                ++overtakers;
+                break;
+            }
+    const auto releases = f.worker->cross_lane_order_release_count();
+    INFO("overtakers " << overtakers << ", releases " << releases << ", repushes " << repushes.load()
+                       << ", fresh arms " << fresh_arms.load() << ", removals " << removals.load());
+    if (overtakers > 0)
+        CHECK(releases >= 1); // O1
+    CHECK(releases > 0);
+    CHECK(overtakers <= releases * N + 2); // O2
+    CHECK(f.worker->unstamped_for_test(OutboxDomain::Lifecycle) == 0); // O5
+    CHECK(f.worker->unstamped_for_test(OutboxDomain::Compliance) == 0);
+}
+
 TEST_CASE("#3972 chaos: a third sender holding the stream write mutex past H - the released send "
           "parks on the mutex, nothing wedges, both sends complete once it is freed",
           "[spark][guardian][drain][order][.chaos]") {
