@@ -5163,7 +5163,8 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
     //    stream_write_mu_ when the hold releases, the released entry can reach the wire first,
     //    and a same-second compliant can then win the server's >= timestamp tie. #5690 (a
     //    server-side tiebreak) is the remaining residual, not closed here;
-    //  - enqueued_ns is system_clock (stamped at the enqueue sites, wall = system_clock::now()):
+    //  - enqueued_ns is system_clock (stamped at the enqueue sites, wall = system_clock::now();
+    //    replayed lifecycle entries keep the original persisted ns):
     //    a backward wall-clock step between an older compliant and a newer errored makes the
     //    errored timestamp earlier, so the server keeps compliant regardless of wire order; the
     //    hold cannot affect this (server-side, #5690);

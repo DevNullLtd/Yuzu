@@ -3029,7 +3029,8 @@ TEST_CASE("#3972 chaos: a third sender holding the stream write mutex past H - t
     // sink models the mutex (HoldSink::stream_mu); this test holds it from the test thread for
     // longer than H. It does NOT assert which send acquires the mutex first: the hand-off order
     // between waiters is OS-dependent, so any order assertion here would be a flake, not a pin.
-    // Hidden: run it by name ("#3972 chaos: ...") or with a '[drain]'/'[order]' positive filter.
+    // Hidden: run it by name ("#3972 chaos: ...") or with a '[drain]'/'[order]' positive filter
+    // (append ~[.] to skip it; about 1 s).
     std::mutex stream_mu;
     HoldRig f(20, kHold, kAllowance);
     f.sink.stream_mu = &stream_mu;

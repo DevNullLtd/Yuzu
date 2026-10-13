@@ -536,8 +536,9 @@ public:
     [[nodiscard]] std::uint64_t releases_for_test(OutboxDomain lane) const noexcept {
         return hold_[lane_of(lane)].releases.load(std::memory_order_relaxed);
     }
-    /// Test-only: entries with seq == 0 offered on that lane (ordering is not enforced for them),
-    /// and blocker reads on that lane that threw (the hold fails open). No production caller.
+    /// Test-only: seq == 0 OFFERS on that lane (ordering is not enforced for them), and blocker
+    /// reads on that lane that threw (the hold fails open). Both count offers, not distinct
+    /// entries: a retained head is re-offered on every drain pass. No production caller.
     [[nodiscard]] std::uint64_t unstamped_for_test(OutboxDomain lane) const noexcept {
         return hold_[lane_of(lane)].unstamped.load(std::memory_order_relaxed);
     }
@@ -655,8 +656,8 @@ private:
         std::atomic<std::uint64_t> last_blocker_seq{0};
         std::atomic<std::uint64_t> denials{0};
         std::atomic<std::uint64_t> releases{0};
-        std::atomic<std::uint64_t> unstamped{0};            ///< seq == 0 entries offered (ordering fails open)
-        std::atomic<std::uint64_t> blocker_read_faults{0};  ///< blocker reads that threw (fails open)
+        std::atomic<std::uint64_t> unstamped{0};            ///< seq == 0 offers (per offer, not per entry; ordering fails open)
+        std::atomic<std::uint64_t> blocker_read_faults{0};  ///< blocker reads that threw (per offer; fails open)
     };
     LaneHold hold_[2];
 
