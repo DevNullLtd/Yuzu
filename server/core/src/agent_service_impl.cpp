@@ -111,7 +111,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                             "agent_id length exceeds 256 chars or empty");
     }
     // Defence in depth: libpq text binds take agent_id as a NUL-terminated string, so an id
-    // containing a NUL byte is refused here as well, instead of relying on the AuthDB-level NUL
+    // containing a NUL byte is refused here as well, instead of relying on the AuthDB agent-id
     // check alone. No legitimate agent produces one. Distinct `reason` label from the length
     // check; the id itself is not logged (client-supplied).
     if (info.agent_id().find('\0') != std::string::npos) {
@@ -2256,8 +2256,12 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
         }
     }
 
+    // The agent id is caller-chosen and unvalidated here (require_positive_ota_identity is
+    // inert unless the listener requires a client certificate), so it is neutralised for the
+    // log line; so is current_version, which the caller also chooses.
     spdlog::info("CheckForUpdate: agent {} v{} -> v{} (eligible={}, mandatory={})",
-                 request->agent_id(), request->current_version(), latest->version, eligible,
+                 ::yuzu::log_id_token(request->agent_id()),
+                 ::yuzu::log_id_token(request->current_version()), latest->version, eligible,
                  latest->mandatory);
     return grpc::Status::OK;
 }
@@ -2488,7 +2492,7 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
     }
 
     spdlog::info("DownloadUpdate: sent {} bytes of v{} to agent {}", offset, pkg->version,
-                 request->agent_id());
+                 ::yuzu::log_id_token(request->agent_id()));
     return grpc::Status::OK;
 }
 

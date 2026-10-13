@@ -135,7 +135,8 @@ void register_custom_properties_routes(HttpRouteSink& sink, Deps deps) {
                           key + ": " + result.error());
             if (is_custom_properties_db_error(result.error())) {
                 spdlog::error("PUT /api/agents/{}/properties/{}: {}",
-                              ::yuzu::log_id_token(agent_id), key, result.error());
+                              ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(key),
+                              result.error());
                 res.status = 503;
                 res.set_content(
                     R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",

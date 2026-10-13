@@ -2110,7 +2110,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                         "claims cluster_id '{}', which differs from this agent's already-bound "
                         "cluster affinity — REFUSING as a likely cross-cluster identity claim "
                         "(#4669), not publishing this placement anywhere",
-                        agent_id, session_id, cluster_id);
+                        ::yuzu::log_id_token(agent_id), session_id, cluster_id);
                     record_directory_desync(metrics_, "announce_connected",
                                             "cluster_affinity_violation");
                     if (audit_store_ && audit_store_->is_open()) {
@@ -2156,7 +2156,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             spdlog::warn("[gateway] NotifyStreamStatus: CONNECTED for session {} (agent {}) is "
                         "no longer the currently-installed session — rejecting the publish "
                         "rather than clobbering a newer registration's placement",
-                        session_id, agent_id);
+                        session_id, ::yuzu::log_id_token(agent_id));
             record_directory_desync(metrics_, "notify_stream_status", "stale_connected_session");
             response->set_acknowledged(false);
             return grpc::Status::OK;
@@ -2241,7 +2241,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                     spdlog::debug(
                         "[gateway] NotifyStreamStatus: cluster_affinity_violation revert "
                         "no-op for agent {} session {} — session already superseded",
-                        agent_id, session_id);
+                        ::yuzu::log_id_token(agent_id), session_id);
                 }
                 if (audit_store_ && audit_store_->is_open()) {
                     AuditEvent ev;
@@ -2314,7 +2314,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                              "not in --gateway-cluster-addr's configured map — commands for this "
                              "agent (and any other agent on this cluster) will be dropped as "
                              "unknown_cluster until it is added",
-                             agent_id, cluster_id);
+                             ::yuzu::log_id_token(agent_id), cluster_id);
             }
             if (cap_reached_transition) {
                 spdlog::warn("[gateway] unmapped cluster_id tracking reached its cap ({} "
@@ -2332,7 +2332,8 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         }
         spdlog::info("[gateway] Agent {} stream CONNECTED at gateway node '{}' ({} wire "
                      "capabilit{})",
-                     agent_id, request->gateway_node(), request->wire_capabilities_size(),
+                     ::yuzu::log_id_token(agent_id), request->gateway_node(),
+                     request->wire_capabilities_size(),
                      request->wire_capabilities_size() == 1 ? "y" : "ies");
         break;
     }
@@ -2460,14 +2461,14 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             gateway_sessions_.erase(session_id);
             lost_race_sessions_.erase(session_id);
         }
-        spdlog::info("[gateway] Agent {} stream DISCONNECTED at gateway node '{}'", agent_id,
-                     request->gateway_node());
+        spdlog::info("[gateway] Agent {} stream DISCONNECTED at gateway node '{}'",
+                     ::yuzu::log_id_token(agent_id), request->gateway_node());
         break;
     }
 
     default:
         spdlog::warn("[gateway] NotifyStreamStatus: unknown event {} for agent {}",
-                     static_cast<int>(request->event()), agent_id);
+                     static_cast<int>(request->event()), ::yuzu::log_id_token(agent_id));
         response->set_acknowledged(false);
         return grpc::Status::OK;
     }
@@ -2500,7 +2501,7 @@ GatewayUpstreamServiceImpl::ForwardGuardianMessage(grpc::ServerContext* context,
     if (!registry_.get_session(agent_id)) {
         spdlog::debug("[gateway] ForwardGuardianMessage: agent {} not in registry "
                       "(accepting anyway — best-effort)",
-                      agent_id);
+                      ::yuzu::log_id_token(agent_id));
     }
 
     const auto& resp = request->response();
@@ -2512,7 +2513,7 @@ GatewayUpstreamServiceImpl::ForwardGuardianMessage(grpc::ServerContext* context,
         // the RPC). A solicited reply reaching this path is a gateway routing bug.
         spdlog::warn("[gateway] ForwardGuardianMessage: not an unsolicited guardian event "
                      "(plugin='{}', command_id='{}') from agent {} — dropping",
-                     resp.plugin(), resp.command_id(), agent_id);
+                     resp.plugin(), resp.command_id(), ::yuzu::log_id_token(agent_id));
         response->set_acknowledged(true);
         return grpc::Status::OK;
     }
@@ -2524,7 +2525,7 @@ GatewayUpstreamServiceImpl::ForwardGuardianMessage(grpc::ServerContext* context,
     } else {
         spdlog::warn("[gateway] ForwardGuardianMessage: no guaranteed-state store wired — "
                      "dropping event from agent {}",
-                     agent_id);
+                     ::yuzu::log_id_token(agent_id));
     }
 
     response->set_acknowledged(true);

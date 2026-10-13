@@ -542,6 +542,11 @@ TEST_CASE("guardian ingest: #4606 the server's other id-printing log lines neutr
               std::string::npos);
         CHECK(cap.text().find("agent x=1") == std::string::npos);
     }
+    // Not covered here, by decision: the "observer threw" warns in the observation path. The
+    // real BlastRadiusDetector and DexAlertRouter catch exceptions from their own callbacks
+    // internally, so ingest's catch-all is not reachable through them, and a throwing stub
+    // would not exercise the production observers. The wraps on those two lines are held by
+    // review and the lexical log-injection tripwire instead.
     {   // Redelivered (debug): event id, agent id and rule id are printed
         const auto resp = make_rule_event("evt r=1", "rule r=1");
         ingest_guardian_response(store, "agent x=1", resp, nullptr, nullptr);

@@ -5133,8 +5133,8 @@ envelope and has not been migrated onto it.
 }
 ```
 
-**Invalid agent id:** an agent id that is empty, longer than 256 bytes or contains a NUL byte
-answers `200` with an empty `properties` list.
+**Invalid agent id:** after the permission check, an agent id longer than 256 bytes or containing
+a NUL byte answers `200` with an empty `properties` list.
 
 ---
 
@@ -5197,8 +5197,8 @@ to be silently treated by the SQLite original as "no schema, accept any value" �
 was already closed by the original Postgres migration (it correctly rejects the write instead of
 accepting it unvalidated); this change only affects which status code that rejection now uses.
 
-**Invalid agent id:** an agent id that is empty, longer than 256 bytes or contains a NUL byte is
-refused with `400` and the body `{"error":"invalid agent id (1-256 bytes, no NUL)"}`.
+**Invalid agent id:** after the permission check, an agent id longer than 256 bytes or containing
+a NUL byte is refused with `400` and the body `{"error":"invalid agent id (1-256 bytes, no NUL)"}`.
 
 ---
 
@@ -5230,8 +5230,8 @@ this route's underlying `delete_property` was deliberately left unwidened — it
 admin/operator-driven delete, not a scope/dispatch-feeding read, matching `custom_properties_store.hpp`'s
 documented posture — so this stays a tracked gap rather than a fixed one.
 
-**Invalid agent id:** an agent id that is empty, longer than 256 bytes or contains a NUL byte answers
-`404` ("property not found"), and the audit record is `not_found`.
+**Invalid agent id:** after the permission check, an agent id longer than 256 bytes or containing a
+NUL byte answers `404` ("property not found"), and the audit record is `not_found`.
 
 ---
 

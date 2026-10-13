@@ -32,6 +32,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <filesystem>
+
 #include "agent_registry.hpp"
 #include "app_usage_store.hpp"
 #include "audit_store.hpp"
@@ -50,6 +52,7 @@
 #include "test_offload_target_store_pg_helper.hpp"
 #include "test_webhook_store_pg_helper.hpp"
 #include "typed_inventory_sources.hpp"
+#include "update_registry.hpp"
 #include "webhook_store.hpp"
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -1269,6 +1272,53 @@ TEST_CASE("ProxyRegister: logs a claimed agent_id with control bytes neutralised
 
     CHECK_FALSE(status.ok());
     CHECK(cap.text().find("enrollment status read failed for agent agent_x_1_fake") !=
+          std::string::npos);
+    CHECK(cap.text().find("agent x=1") == std::string::npos);
+}
+
+TEST_CASE("CheckForUpdate: logs a claimed agent_id and version with control bytes neutralised",
+          "[pg][agent_service][ota][failclosed]") {
+    // With the positive-identity gate off (the default) the agent_id on an OTA request is whatever
+    // the caller sent, so the success-path line must print it neutralised, never raw.
+    // DownloadUpdate's matching line is a server-streaming handler that cannot be driven without a
+    // live gRPC server (see test_ota_download_bound.cpp), so it is held by the log-injection
+    // tripwire instead.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    yuzu::test::TempDir update_dir{"yuzu_test_agent_service_ota-"};
+    std::filesystem::create_directories(update_dir.path);
+    yuzu::server::UpdateRegistry reg{pool, update_dir.path};
+    REQUIRE(reg.is_open());
+
+    yuzu::server::UpdatePackage pkg;
+    pkg.platform = "linux";
+    pkg.arch = "x86_64";
+    pkg.version = "9.9.9";
+    pkg.sha256 = "aabbccdd";
+    pkg.filename = "yuzu-agent-9.9.9-x86_64-linux";
+    pkg.mandatory = false;
+    pkg.rollout_pct = 100;
+    pkg.uploaded_at = "2025-01-01T00:00:00Z";
+    pkg.file_size = 1024;
+    REQUIRE(reg.upsert_package(pkg));
+    h.svc.set_update_registry(&reg);
+
+    apb::CheckForUpdateRequest req;
+    req.set_agent_id("agent x=1\nfake");
+    req.set_current_version("0.0.1 ver=2\nfake");
+    req.mutable_platform()->set_os("linux");
+    req.mutable_platform()->set_arch("x86_64");
+
+    apb::CheckForUpdateResponse resp;
+    grpc::ServerContext ctx;
+    yuzu::test::LogCapture cap;
+    auto status = h.svc.CheckForUpdate(&ctx, &req, &resp);
+    cap.stop();
+
+    REQUIRE(status.ok());
+    CHECK(resp.update_available());
+    CHECK(cap.text().find("CheckForUpdate: agent agent_x_1_fake v0.0.1_ver_2_fake -> v9.9.9") !=
           std::string::npos);
     CHECK(cap.text().find("agent x=1") == std::string::npos);
 }

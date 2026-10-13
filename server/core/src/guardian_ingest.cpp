@@ -362,15 +362,14 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             // agent-supplied field, but that text can in principle quote an offending value
             // (guaranteed_state_events has TEXT columns, BIGINT columns bound from numbers the
             // server formats, and one BOOLEAN (remediation_success) bound from the fixed
-            // literals "true" and "false", with no CHECK or foreign key; embedded NULs are
-            // rejected before the insert ("event field contains an embedded NUL byte"); a
+            // literals "true" and "false", with no CHECK or foreign key). Embedded NULs are
+            // rejected before the insert ("event field contains an embedded NUL byte"). A
             // duplicate event_id is resolved to Redelivered or Conflict before this path unless
-            // the compare SELECT or the ROLLBACK TO SAVEPOINT itself errors ("redelivery compare
-            // failed"), which also returns libpq text; and
-            // detail_json is capped at 16 KiB (kMaxDetailJson, earlier in this function)). So it
-            // is wrapped like the identifiers: log_id_token folds control bytes, spaces, '='
-            // and ',' and caps the length at 256 bytes, keeping the head and the tail of a
-            // longer message.
+            // the compare SELECT or the ROLLBACK TO SAVEPOINT itself errors ("redelivery
+            // compare failed"), which also returns libpq text. detail_json is capped at 16 KiB
+            // (kMaxDetailJson, earlier in this function). So it is wrapped like the
+            // identifiers: log_id_token folds control bytes, spaces, '=' and ',' and caps the
+            // length at 256 bytes, keeping the head and the tail of a longer message.
             spdlog::warn("Guardian: event ingest error (agent={}, rule={}): {}",
                          log_id_token(agent_id), log_id_token(ev_row.rule_id),
                          log_id_token(res.error));

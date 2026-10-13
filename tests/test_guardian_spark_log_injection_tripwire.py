@@ -130,6 +130,19 @@ the wrap happens INSIDE the formatter:
     it gets flagged and a reviewer has to consciously verify the line shape
     rather than inherit a blanket pass.
 
+SECOND, SEPARATE CHECK (#5513): claimed agent ids in four named files outside the
+Guardian/Spark basename family -- server/core/src/agent_service_impl.cpp,
+gateway_service_impl.cpp, custom_properties_store.cpp and custom_properties_routes.cpp
+(AGENT_ID_FILES). It flags a spdlog:: argument that is a request-derived agent id
+(`info.agent_id()`, `request->agent_id()`, `req->agent_id()`, a local alias bound from
+one of those in the same function, or the bare `agent_id` in the custom-properties
+files) and is not wholly a log_id_token / log_key_token / audit_token /
+onbehalf::sanitize_for_log call or the local `safe_agent_id`. It is LEXICAL: it reads
+argument text, not data flow, so an id reaching the log through a variable it cannot
+trace to a request accessor, or a new spelling, is not seen. The exact scope and limits
+are in the block comment above find_agent_id_violations_in_text(). FILE_BASENAME_RE and
+the pattern check above are unchanged and do not apply to these four files.
+
 Wired into tests/meson.build (suite 'docs') and .github/workflows/docs-lint.yml,
 same precedent shape as test_no_connless_pq_escape.py and
 test_split_interlock_tripwire.py. Zero third-party dependencies (stdlib only).
@@ -346,7 +359,7 @@ SENSITIVE_PATTERNS = [
     # spdlog:: sites. agent_id is now wrapped at its 3 real raw sites below.)
     Pattern("event_id={}", "event_id={}"),
     Pattern("event_id {}", "event_id {}"),
-    # Guardian agent_id -- client-supplied at Register (length-checked only,
+    # Guardian agent_id -- client-supplied at Register (length- and NUL-checked,
     # agent_service_impl.cpp), charset-unrestricted, so the same CWE-117
     # forgery threat model as rule_id/event_id applies. guaranteed_state_store
     # .cpp's upsert_rule_status and both insert_event_classified/insert_events
@@ -361,8 +374,8 @@ SENSITIVE_PATTERNS = [
     # and the "agent_id" key spelled with a colon, a quote or a space. Register checks the
     # id's length and NUL bytes at the door; control bytes and ',' are rejected later, in the
     # enrollment store (AuthDB agent_id_ok), so an id is logged before that rejection unless it
-    # is wrapped (CWE-117 log-injection model as above). Class level: any success-path line that
-    # prints an agent id raw is caught by one of these spellings.
+    # is wrapped (CWE-117 log-injection model as above). These spellings cover the shapes seen
+    # so far; the scanner is lexical, so a new spelling needs a new pattern.
     Pattern("agent {}", "agent {}"),
     Pattern("agent={}", "agent={}"),
     Pattern("agent '{}'", "agent '{}'"),
@@ -480,7 +493,13 @@ def _skip_char_literal(s: str, i: int) -> int:
 def find_spdlog_statements(text: str) -> list[str]:
     """Return the full `spdlog::LEVEL(...)` statement text (including the
     call and its balanced closing paren) for every call in `text`."""
-    out: list[str] = []
+    return [stmt for _, stmt in find_spdlog_statements_with_pos(text)]
+
+
+def find_spdlog_statements_with_pos(text: str) -> list[tuple[int, str]]:
+    """As find_spdlog_statements, but each statement comes with its start
+    offset in `text` (the agent-id check needs to look at the code before it)."""
+    out: list[tuple[int, str]] = []
     for m in SPDLOG_CALL_RE.finditer(text):
         start = m.start()
         i = m.end()  # just past the opening '('
@@ -507,7 +526,7 @@ def find_spdlog_statements(text: str) -> list[str]:
             elif c == ")":
                 depth -= 1
             i += 1
-        out.append(text[start:i])
+        out.append((start, text[start:i]))
     return out
 
 
@@ -619,7 +638,7 @@ _SAFE_CALL_NAME_RE = re.compile(
 )
 
 
-def _is_whole_call_wrapped(text: str) -> bool:
+def _is_whole_call_wrapped(text: str, name_re: "re.Pattern[str]" = _SAFE_CALL_NAME_RE) -> bool:
     """True iff `text`, taken as a WHOLE expression (not a substring match
     anywhere within it), is a single call to one of ALL_SAFE_CALLS --
     optionally namespace-qualified, e.g. `::yuzu::log_key_token(w.spark_key)`
@@ -629,7 +648,7 @@ def _is_whole_call_wrapped(text: str) -> bool:
     this is the distinction #4665's Phase-2 adversarial review (CDX-03/K6)
     found the old substring-any check couldn't make."""
     text = text.strip()
-    m = _SAFE_CALL_NAME_RE.match(text)
+    m = name_re.match(text)
     if m is None:
         return False
     i = m.end()  # just past the opening '(' the regex matched.
@@ -773,6 +792,87 @@ def find_violations_in_text(text: str) -> list[tuple[int, str, list[str]]]:
                 line_no = text.count("\n", 0, text.index(stmt)) + 1
                 violations.append((line_no, ", ".join(sorted(set(pattern_names))), stmt))
     return violations
+
+
+# ---------------------------------------------------------------------------
+# Second check: raw CLAIMED AGENT ID in a log call (register path, OTA path,
+# custom-properties). Separate from the rule-id/Spark-key check above: that one
+# is pattern-driven and confined to the Guardian/Spark basename family, which
+# does not include the files below.
+#
+# LEXICAL, and narrow on purpose. It reuses the statement/argument helpers
+# above (no new lexer) and looks at each spdlog call's arguments, not at the
+# format string. It flags an argument that is, or contains, an agent id taken
+# straight from a request, unless the argument is wholly one of the wrap calls
+# (log_id_token / log_key_token / audit_token), onbehalf::sanitize_for_log, or the
+# local `safe_agent_id` that Register / ProxyRegister build once. What counts as
+# "an agent id taken straight from a request":
+#   - a member-accessor spelling, `info.agent_id()`, `request->agent_id()`,
+#     `req->agent_id()` (any receiver), except when it is immediately sized or
+#     emptiness-tested (`.size()`, `.empty()`, `.length()`), which prints no
+#     characters of the id;
+#   - a local alias bound from such an accessor earlier in the SAME function, e.g.
+#     `const auto& agent_id = request->agent_id();` (the function boundary is the
+#     last line that starts with `}` in column 0 before the call);
+#   - in the custom-properties files, the bare name `agent_id`, which there is
+#     always a request-derived parameter or route capture.
+# Not covered, by design: a bare id that reaches the log through a variable the
+# check cannot trace to a request accessor (for example an id read back from a
+# session table), a hostname or other claimed field, an accessor passed as a
+# sub-expression of a larger call, and any new spelling nobody has added here.
+# It is a regression net for the sites fixed under #5513, not proof that no
+# claimed id is ever logged raw.
+# ---------------------------------------------------------------------------
+
+AGENT_ID_FILES: dict[str, tuple[str, ...]] = {
+    # path -> bare names that are ALWAYS a request-derived agent id in that file
+    "server/core/src/agent_service_impl.cpp": (),
+    "server/core/src/gateway_service_impl.cpp": (),
+    "server/core/src/custom_properties_store.cpp": ("agent_id",),
+    "server/core/src/custom_properties_routes.cpp": ("agent_id",),
+}
+
+_RAW_AGENT_ID_ACCESSOR_RE = re.compile(
+    r"\b\w+(?:\.|->)agent_id\(\)(?!\s*\.\s*(?:size|empty|length)\s*\()"
+)
+_AGENT_ID_ALIAS_DECL_RE = re.compile(
+    r"\b(?:const\s+)?(?:auto|std::string)\s*&?\s*(\w+)\s*=\s*\w+(?:\.|->)agent_id\(\)\s*;"
+)
+_SANITIZE_CALL_NAME_RE = re.compile(r"^(?:::)?(?:[A-Za-z_][A-Za-z0-9_]*::)*sanitize_for_log\(")
+
+
+def _agent_id_arg_is_safe(arg: str) -> bool:
+    text = arg.strip()
+    return (
+        text == "safe_agent_id"
+        or argument_is_wrapped(text)
+        or _is_whole_call_wrapped(text, _SANITIZE_CALL_NAME_RE)
+    )
+
+
+def find_agent_id_violations_in_text(
+    text: str, always_bare: tuple[str, ...] = ()
+) -> list[tuple[int, str]]:
+    """Return (1-based line number, statement) for every spdlog call in `text`
+    with an unwrapped request-derived agent-id argument (see the block comment
+    above for exactly what that means)."""
+    out: list[tuple[int, str]] = []
+    for pos, stmt in find_spdlog_statements_with_pos(text):
+        parsed = parse_call(stmt)
+        if parsed is None:
+            continue
+        _, args_text = parsed
+        fn_start = text.rfind("\n}", 0, pos)
+        scope = text[fn_start + 1 if fn_start != -1 else 0 : pos]
+        bare = set(always_bare) | {m.group(1) for m in _AGENT_ID_ALIAS_DECL_RE.finditer(scope)}
+        for arg in split_top_level_args(args_text):
+            raw = _RAW_AGENT_ID_ACCESSOR_RE.search(arg) is not None or any(
+                re.search(r"(?<![\w.>:])" + re.escape(name) + r"\b(?!\s*\()", arg) for name in bare
+            )
+            if raw and not _agent_id_arg_is_safe(arg):
+                out.append((text.count("\n", 0, pos) + 1, stmt))
+                break
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1014,6 +1114,62 @@ def _selfcheck() -> None:
             "should never be flagged regardless of what local variable it prints"
         )
 
+    # 8. The claimed-agent-id check (find_agent_id_violations_in_text).
+    def aflagged(src: str, always: tuple[str, ...] = ()) -> bool:
+        return len(find_agent_id_violations_in_text(src, always)) > 0
+
+    agent_must_match = [
+        ('spdlog::info("peer {} seen", info.agent_id());', ()),
+        ('spdlog::warn("update check: agent {} v{}", request->agent_id(), v);', ()),
+        ('spdlog::info("sent {} bytes to {}", n, req->agent_id());', ()),
+        ('spdlog::info("peer {} and {}", log_id_token(a), info.agent_id());', ()),
+        ('spdlog::info("peer {}", "id=" + info.agent_id());', ()),
+        ('spdlog::info("peer {}", log_id_token(a) + info.agent_id());', ()),
+        ('spdlog::warn("delete failed for agent={}", agent_id);', ("agent_id",)),
+        (
+            "void F() {\n  const auto& agent_id = request->agent_id();\n"
+            '  spdlog::info("peer {}", agent_id);\n}\n',
+            (),
+        ),
+        (
+            "void F() {\n  std::string aid = info.agent_id();\n"
+            '  spdlog::info("peer {}", aid);\n}\n',
+            (),
+        ),
+    ]
+    for src, always in agent_must_match:
+        if not aflagged(src, always):
+            raise SystemExit(f"selfcheck: expected a claimed-agent-id violation, found none: {src!r}")
+    agent_must_not = [
+        ('spdlog::info("peer {} seen", ::yuzu::log_id_token(info.agent_id()));', ()),
+        ('spdlog::info("peer {} seen", audit_token(request->agent_id()));', ()),
+        ('spdlog::warn("x {}", onbehalf::sanitize_for_log(req->agent_id(), 64));', ()),
+        ('spdlog::info("peer {}", safe_agent_id);', ()),
+        ('spdlog::warn("length {} (max {})", info.agent_id().size(), kMax);', ()),
+        ('spdlog::warn("empty? {}", request->agent_id().empty());', ()),
+        ('spdlog::warn("delete failed for agent={}", ::yuzu::log_id_token(agent_id));', ("agent_id",)),
+        ('spdlog::warn("tag sync failed ({})", err);', ("agent_id",)),
+        # A bare name with no accessor alias in scope is not request-derived as far as this
+        # check can tell (session-table ids look like this).
+        ('void F() {\n  std::string agent_id;\n  spdlog::info("hb {}", agent_id);\n}\n', ()),
+        # An alias bound in an EARLIER function must not leak into the next one.
+        (
+            "void F() {\n  const auto& agent_id = request->agent_id();\n}\n"
+            'void G() {\n  std::string agent_id;\n  spdlog::info("hb {}", agent_id);\n}\n',
+            (),
+        ),
+        # A wrapped alias is fine.
+        (
+            "void F() {\n  const auto& agent_id = request->agent_id();\n"
+            '  spdlog::info("peer {}", ::yuzu::log_id_token(agent_id));\n}\n',
+            (),
+        ),
+        ('spdlog::info("n {}", n);', ()),
+    ]
+    for src, always in agent_must_not:
+        if aflagged(src, always):
+            raise SystemExit(f"selfcheck: unexpected claimed-agent-id violation: {src!r}")
+
 
 # ---------------------------------------------------------------------------
 # main
@@ -1044,6 +1200,18 @@ def main() -> int:
         for line_no, pattern_names, stmt in find_violations_in_text(text):
             snippet = " ".join(stmt.split())[:160]
             hits.append(f"{rel}:{line_no}: [{pattern_names}] {snippet}")
+    agent_hits: list[str] = []
+    for rel, always_bare in AGENT_ID_FILES.items():
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            # A rename would otherwise silently shrink this check to nothing.
+            agent_hits.append(f"{rel}: file listed in AGENT_ID_FILES does not exist")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for line_no, stmt in find_agent_id_violations_in_text(text, always_bare):
+            snippet = " ".join(stmt.split())[:160]
+            agent_hits.append(f"{rel}:{line_no}: {snippet}")
+    rc = 0
     if hits:
         print(
             "FAIL: unwrapped rule-id/Spark-key-shaped spdlog:: argument(s) found (#4665 "
@@ -1051,9 +1219,18 @@ def main() -> int:
             "yuzu::log_key_token (common/include/yuzu/log_token.hpp):"
         )
         print("\n".join(hits))
-        return 1
-    print("OK: no unwrapped rule-id/Spark-key-shaped spdlog:: arguments found")
-    return 0
+        rc = 1
+    if agent_hits:
+        print(
+            "FAIL: spdlog:: call prints a request-derived agent id unwrapped (#5513 "
+            "CWE-117 log-injection tripwire). Wrap with ::yuzu::log_id_token(...) "
+            "(common/include/yuzu/log_token.hpp):"
+        )
+        print("\n".join(agent_hits))
+        rc = 1
+    if rc == 0:
+        print("OK: no unwrapped rule-id/Spark-key-shaped or claimed-agent-id spdlog:: arguments found")
+    return rc
 
 
 if __name__ == "__main__":
