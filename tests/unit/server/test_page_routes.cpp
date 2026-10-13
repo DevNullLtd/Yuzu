@@ -162,6 +162,73 @@ TEST_CASE("page_routes: / dashboard CSS keeps the degraded results banner above 
     CHECK(frame > banner);
 }
 
+// ── No hx-on on the dashboard or Result sets ──────────────────────────────
+//
+// htmx compiles `hx-on:*` with `new Function()`, which the shipped CSP (`script-src 'self'
+// 'unsafe-inline'`, no `unsafe-eval`) blocks at runtime, so the handler silently does nothing.
+// Both pages carried one: the dashboard's `clearChartDeck()` on #instr-form and Result sets'
+// create-form reset. They now run from CSP-safe listeners, and nothing in the served HTML,
+// comments included, may carry the token again.
+TEST_CASE("page_routes: / and /result-sets serve no hx-on handler (the CSP has no unsafe-eval)",
+          "[server][routes][page_routes]") {
+    Harness h;
+    h.wire();
+
+    for (const std::string path : {"/", "/result-sets"}) {
+        INFO(path);
+        auto r = h.sink.Get(path);
+        REQUIRE(r);
+        REQUIRE(r->status == 200);
+        CHECK(r->body.find("hx-on") == std::string::npos);
+    }
+}
+
+// The listener that replaces the dashboard's dead attribute. It must call clearChartDeck()
+// for the form's own request, and only that one: the autocomplete input inside #instr-form
+// fires a bubbling htmx:beforeRequest on every keystroke, which must not wipe the chart.
+TEST_CASE("page_routes: / clears the chart deck from the instruction form's beforeRequest listener",
+          "[server][routes][page_routes]") {
+    Harness h;
+    h.wire();
+
+    auto r = h.sink.Get("/");
+    REQUIRE(r);
+    const std::string_view body = r->body;
+    const auto open = body.find("instrForm.addEventListener('htmx:beforeRequest'");
+    REQUIRE(open != std::string_view::npos);
+    const auto close = body.find("});", open);
+    REQUIRE(close != std::string_view::npos);
+    const auto listener = body.substr(open, close - open);
+    CHECK(listener.find("clearChartDeck()") != std::string_view::npos);
+    CHECK(listener.find("e.target === instrForm") != std::string_view::npos);
+    // The call sits behind the target guard, never ahead of it.
+    CHECK(listener.find("clearChartDeck()") > listener.find("e.target === instrForm"));
+}
+
+TEST_CASE("page_routes: /result-sets resets its create form from a delegated afterRequest listener",
+          "[server][routes][page_routes]") {
+    Harness h;
+    h.wire();
+
+    auto r = h.sink.Get("/result-sets");
+    REQUIRE(r);
+    const std::string_view body = r->body;
+    // The form keeps its htmx target and gains the id the listener keys on.
+    CHECK(body.find("id=\"rs-create-form\"") != std::string_view::npos);
+    CHECK(body.find("hx-post=\"/fragments/result-sets/create\"") != std::string_view::npos);
+    CHECK(body.find("hx-target=\"#rs-sidebar\"") != std::string_view::npos);
+    const auto open = body.find("document.body.addEventListener('htmx:afterRequest'");
+    REQUIRE(open != std::string_view::npos);
+    const auto close = body.find("});", open);
+    REQUIRE(close != std::string_view::npos);
+    const auto listener = body.substr(open, close - open);
+    // Only the create form's own successful request resets it; the sidebar's 15 s poll fires
+    // htmx:afterRequest too and must not.
+    CHECK(listener.find("el.id === 'rs-create-form'") != std::string_view::npos);
+    CHECK(listener.find("e.detail.successful") != std::string_view::npos);
+    CHECK(listener.find("el.reset()") != std::string_view::npos);
+}
+
 // ── Legacy redirects (2) ──────────────────────────────────────────────────
 
 TEST_CASE("page_routes: /chargen and /procfetch redirect to /, ungated",
