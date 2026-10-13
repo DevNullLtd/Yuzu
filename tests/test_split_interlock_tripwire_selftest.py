@@ -152,7 +152,8 @@ def main() -> int:
                          " * struct ReleaseLogStore (P7)",
                          '// #include "release_log_store.hpp"',
                          "// CREATE TABLE release_log (id BIGINT)",
-                         "/* CREATE TABLE release_log */"):
+                         "/* CREATE TABLE release_log */",
+                         " * CREATE TABLE release_log (id BIGINT)"):
             if _ere_matches(must_not, _td) is True:
                 _fail(f"release_log_store regex falsely matches unrelated log-handoff code: {must_not!r}", failures)
         for must in ("class ReleaseLogStore {", "struct ReleaseLogStore final {", "class YUZU_API ReleaseLogStore {",
