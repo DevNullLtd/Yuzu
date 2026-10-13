@@ -16,6 +16,8 @@
 -export([client_has_https/1, client_tls_posture/1, servers_have_tls/1]). %% for testing
 -export([evaluate_upstream_posture/2, listener_tls_traps/1]).            %% for testing
 -export([evaluate_mgmt_posture/3]).                                      %% for testing
+-export([evaluate_cluster_id/2, evaluate_cluster_id/3]).                  %% for testing
+-export([apply_env_overrides/1]).                                          %% for testing
 
 %%--------------------------------------------------------------------
 %% application callbacks
@@ -34,6 +36,14 @@ do_start() ->
     %% Apply environment variable overrides (container deployment).
     apply_env_overrides(),
 
+    %% #4632: refuse to boot with a cluster_id that cannot be sent as a protobuf
+    %% string (see check_cluster_id/0), before anything is started.
+    case check_cluster_id() of
+        {error, ClusterReason} -> {error, ClusterReason};
+        ok                     -> do_start_checked()
+    end.
+
+do_start_checked() ->
     %% Log the ACTUAL transport TLS posture. grpcbox reads its own
     %% {grpcbox, client|servers} config at boot and is the source of truth; the
     %% yuzu_gw `tls`/`tls_enabled` env is advisory only (nothing wires it into
@@ -67,6 +77,14 @@ do_start_services() ->
     %% which can start first; the lazy path in yuzu_gw_heartbeat_admission
     %% covers that window.
     ok = yuzu_gw_heartbeat_admission:init_summary_state(),
+    %% The same for the WARN limit of the calls that carry a registration
+    %% request (yuzu_gw_safe_call): a burst of first failures shares one limit.
+    ok = yuzu_gw_safe_call:init_limits(),
+
+    %% TCP_NODELAY on the upstream channel, before the supervision tree below
+    %% (the only caller of the channel) exists: grpcbox already started the
+    %% channel from sys.config, so this restarts it with the rewritten endpoints.
+    ok = yuzu_gw_upstream_channel:apply_nodelay(),
 
     %% Start Prometheus HTTP exporter for /metrics endpoint.
     Port = application:get_env(yuzu_gw, prometheus_port, 9568),
@@ -76,8 +94,14 @@ do_start_services() ->
     logger:info("Heartbeat admission is connection-bound: a heartbeat is "
                 "admitted only on the connection that opened its session"),
 
-    %% Start the supervision tree.
-    yuzu_gw_sup:start_link().
+    %% Start the supervision tree. The crash-report filter goes in first so
+    %% the upstream's first crash is already redacted (it holds registration
+    %% credentials in its mailbox); a tree that does not start removes it again.
+    ok = yuzu_gw_crash_redact:install(),
+    case yuzu_gw_sup:start_link() of
+        {ok, _} = Started -> Started;
+        Other             -> ok = yuzu_gw_crash_redact:remove(), Other
+    end.
 
 %%--------------------------------------------------------------------
 %% Distribution cookie guard (#659)
@@ -203,6 +227,9 @@ stop(_State) ->
         timer:sleep(500)
     end,
 
+    %% The filter outlives the supervision tree (already down by now), so the
+    %% upstream's shutdown reports are redacted too.
+    ok = yuzu_gw_crash_redact:remove(),
     logger:info("Gateway shutdown complete"),
     ok.
 
@@ -236,6 +263,11 @@ drain_pending(Deadline) ->
 %%--------------------------------------------------------------------
 
 apply_env_overrides() ->
+    apply_env_overrides(file:native_name_encoding()).
+
+%% The environment text is interpreted in the node's native name encoding
+%% (yuzu_gw_env:env_utf8_binary/2); the parameter lets a test run both.
+apply_env_overrides(Encoding) ->
     Overrides = [
         {"YUZU_GW_UPSTREAM_ADDR",    upstream_addr,    fun(V) -> V end},
         {"YUZU_GW_UPSTREAM_PORT",    upstream_port,    fun list_to_integer/1},
@@ -251,7 +283,13 @@ apply_env_overrides() ->
         {"YUZU_GW_CB_MAX_RESET_TIMEOUT_MS", circuit_breaker_max_reset_timeout_ms, fun list_to_integer/1},
         %% HA WS-4 4.1 — trust-zone/region cluster id (ADR-2002 §7), stamped
         %% on every StreamStatusNotification (yuzu_gw_upstream:handle_cast/2).
-        {"YUZU_GW_CLUSTER_ID", cluster_id, fun list_to_binary/1},
+        %% The variable's text is read in the node's native name encoding and
+        %% its bytes must be valid UTF-8 (yuzu_gw_env:env_utf8_binary/2: a latin1
+        %% node, the default of the shipped images, gets the bytes one per
+        %% element, a utf8 node the characters). A value that cannot be
+        %% represented is left unset here, without printing it, and refused by
+        %% check_cluster_id/0 (#4632).
+        {"YUZU_GW_CLUSTER_ID", cluster_id, fun(V) -> cluster_id_from_env(V, Encoding) end},
         %% HA WS-4 #4555 — gateway cluster FORMATION config (ADR-2002 §7b).
         {"YUZU_GW_SEED_DNS_NAME", cluster_seed_dns_name, fun list_to_binary/1},
         %% Explicit peer list; when non-empty REPLACES DNS resolution outright
@@ -279,8 +317,14 @@ apply_env_overrides() ->
                     application:set_env(yuzu_gw, AppKey, Parsed),
                     logger:info("ENV override: ~s = ~p", [EnvVar, Parsed])
                 catch
+                    error:invalid_cluster_id ->
+                        %% Never the value: it is the text that could not be
+                        %% represented, and check_cluster_id/0 refuses to boot
+                        %% for it right after the overrides.
+                        logger:warning("ENV override: ~s cannot be represented as UTF-8; "
+                                       "ignoring it (the value is not logged)", [EnvVar]);
                     _:_ ->
-                        logger:warning("ENV override: ~s has invalid value '~s', ignoring",
+                        logger:warning("ENV override: ~s has invalid value '~ts', ignoring",
                                        [EnvVar, Value])
                 end
         end
@@ -314,6 +358,80 @@ apply_env_overrides() ->
 
     %% TLS cert overrides (these set the tls proplist)
     apply_tls_overrides().
+
+cluster_id_from_env(Value, Encoding) ->
+    case yuzu_gw_env:env_utf8_binary(Value, Encoding) of
+        {ok, Bin} -> Bin;
+        error     -> error(invalid_cluster_id)
+    end.
+
+%% @private Fail-closed guard (#4632): refuse to boot if the cluster id cannot be
+%% represented as UTF-8. It is stamped on every stream-status notification as a
+%% protobuf string; a value the encoder rejects would fail every notification,
+%% and a notification that is the half_open probe would keep the breaker from
+%% closing. Refusing at boot is preferred over booting with a different id (the
+%% id pins agents to a trust zone) or one that silently loses every
+%% notification. The message names the source, never the value.
+-spec check_cluster_id() -> ok | {error, {invalid_cluster_id, env | app_env}}.
+check_cluster_id() ->
+    AppValue = application:get_env(yuzu_gw, cluster_id, <<"default">>),
+    case evaluate_cluster_id(AppValue, os:getenv("YUZU_GW_CLUSTER_ID"),
+                             file:native_name_encoding()) of
+        {error, {invalid_cluster_id, Source} = Reason} ->
+            logger:critical(
+                "Refusing to start: the cluster id (~s) cannot be represented as UTF-8 "
+                "(a code point above 16#10FFFF, a surrogate, or bytes that are not "
+                "UTF-8). Set YUZU_GW_CLUSTER_ID, or cluster_id in sys.config, to a "
+                "name made of valid Unicode characters.",
+                [case Source of
+                     env     -> "YUZU_GW_CLUSTER_ID";
+                     app_env -> "the cluster_id application setting"
+                 end]),
+            {error, Reason};
+        ok ->
+            ok
+    end.
+
+%% @doc Pure policy of check_cluster_id/0 (exported for testing). When the
+%% environment variable is set it is what applies (the override replaces the
+%% setting), so only it is checked; otherwise the application setting is.
+%%
+%% The two sources are different kinds of text:
+%%  - the ENVIRONMENT value is os:getenv/1 text, interpreted in the node's native
+%%    name encoding (yuzu_gw_env:env_utf8_binary/2): its bytes must be valid
+%%    UTF-8. Only bytes that are not UTF-8 (or, on a latin1 node, a code point
+%%    above 255) are refused, so a refusal from this source is rare;
+%%  - the APPLICATION setting (sys.config) is Erlang data, converted with
+%%    yuzu_gw_env:utf8_binary/1 and independent of the node's locale. The file is
+%%    read as UTF-8 (file:consult), so the working literals for a non-ASCII name
+%%    are a string (code points: the name typed as UTF-8 text, or "Z\x{FC}rich")
+%%    or a binary with the utf8 modifier (<<"Z\x{FC}rich"/utf8>>). A plain binary
+%%    literal (<<"...">>) is not a working form: it holds ONE BYTE per character,
+%%    and a character above 255 is truncated to its low 8 bits (by the compiler,
+%%    and by file:consult for a sys.config literal). It is accepted only if the
+%%    surviving bytes happen to be valid UTF-8, so the name it holds is generally
+%%    not the one typed (<<"\x{4E2D}">> becomes the single byte 45, a hyphen,
+%%    and is accepted); <<"Z\x{FC}rich">> is the byte 252, not valid UTF-8, and is
+%%    refused. Use the utf8 form. Checked with file:consult and with `erl -config'
+%%    plus application:load/1 under LC_ALL=C and LC_ALL=C.UTF-8: the same bytes
+%%    on both. Most refusals come from this source.
+-spec evaluate_cluster_id(term(), string() | false) ->
+          ok | {error, {invalid_cluster_id, env | app_env}}.
+evaluate_cluster_id(AppValue, EnvValue) ->
+    evaluate_cluster_id(AppValue, EnvValue, file:native_name_encoding()).
+
+-spec evaluate_cluster_id(term(), string() | false, latin1 | utf8) ->
+          ok | {error, {invalid_cluster_id, env | app_env}}.
+evaluate_cluster_id(AppValue, false, _Encoding) ->
+    case yuzu_gw_env:utf8_binary(AppValue) of
+        {ok, _}  -> ok;
+        error    -> {error, {invalid_cluster_id, app_env}}
+    end;
+evaluate_cluster_id(_AppValue, EnvValue, Encoding) ->
+    case yuzu_gw_env:env_utf8_binary(EnvValue, Encoding) of
+        {ok, _}  -> ok;
+        error    -> {error, {invalid_cluster_id, env}}
+    end.
 
 apply_tls_overrides() ->
     Cert = os:getenv("YUZU_GW_TLS_CERTFILE"),

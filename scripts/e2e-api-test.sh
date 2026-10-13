@@ -1147,6 +1147,19 @@ for frag in "${DASH_FRAGMENTS[@]}"; do
     assert_status_any "GET $frag" "$HTTP_STATUS" 200 400 404
 done
 
+# /fragments/executions renders a store degrade as a 200 body carrying data-degraded (the
+# dashboard drops 4xx/5xx bodies), so the loose status list above cannot see one. The
+# admin session this script uses is unconfined and the stack is healthy: require a plain 200
+# with no degrade marker.
+http_get "$SERVER_URL/fragments/executions"
+assert_eq "GET /fragments/executions status" "200" "$HTTP_STATUS"
+TESTS=$((TESTS + 1))
+if [[ "$HTTP_BODY" == *data-degraded=* ]]; then
+    fail "GET /fragments/executions rendered a degrade note (data-degraded)"
+else
+    pass "GET /fragments/executions has no degrade marker"
+fi
+
 log ""
 
 # ══════════════════════════════════════════════════════════════════════

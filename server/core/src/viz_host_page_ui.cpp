@@ -14,8 +14,10 @@
 // fetch round-trip. (Server-side templating is intentional — we do not
 // trust client URL parsing to align with what the server matched.)
 
+#include "app_shell.hpp"
+
 // NOLINTBEGIN(cert-err58-cpp)
-extern const char* const kVizHostPageHtml = R"HTM(<!DOCTYPE html>
+const char* const kVizHostPageTemplate = R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -37,13 +39,7 @@ extern const char* const kVizHostPageHtml = R"HTM(<!DOCTYPE html>
   </script>
 </head>
 <body>
-  <nav class="nav-bar">
-    <a href="/" class="nav-brand">Yuzu</a>
-    <a href="/" class="nav-link">Dashboard</a>
-    <a href="/guardian" class="nav-link">Guardian</a>
-    <a href="/dex" class="nav-link">DEX</a>
-    <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
-  </nav>
+  <!--yuzu:shell--><!--/yuzu:shell-->
 
   <!-- Mount root carries agent_id via data-attribute so the renderer can
        read it deterministically without parsing window.location. The
@@ -54,7 +50,7 @@ extern const char* const kVizHostPageHtml = R"HTM(<!DOCTYPE html>
        graph (top) and TAR tree (bottom). Ratio persists in localStorage
        under yuzuVizHostSplitRatio so an operator's chosen layout sticks
        across page reloads. */
-    #viz-host-root { display: flex; flex-direction: column; height: 100vh; }
+    #viz-host-root { display: flex; flex-direction: column; height: calc(100vh - var(--shell-top-h)); }
     #ipc-graph { flex: 0 0 60%; width: 100%; }
     #tar-tree { flex: 1 1 40%; overflow: auto; }
     #splitter {
@@ -136,4 +132,9 @@ extern const char* const kVizHostPageHtml = R"HTM(<!DOCTYPE html>
 </body>
 </html>
 )HTM";
+
+// The shell (sidebar + header) is rendered into the template once, at static init (app_shell.hpp).
+extern const char* const kVizHostPageHtml =
+    yuzu::server::shell::bake(kVizHostPageTemplate,
+                              {.active_key = "fleet", .title = "Host detail"});
 // NOLINTEND(cert-err58-cpp)

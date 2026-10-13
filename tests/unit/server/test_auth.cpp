@@ -9,6 +9,7 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
+#include "rbac_store.hpp"
 #include "test_auth_db_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -300,6 +301,12 @@ TEST_CASE("remove_user returns false for nonexistent user", "[auth][user]") {
 TEST_CASE("remove_user returns true for a cold-cache DB hit (CC6.8 cold cache)",
           "[pg][auth][user][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     // Seed the row directly through AuthDB, bypassing AuthManager entirely —
     // no AuthManager instance ever caches this username.
@@ -314,6 +321,7 @@ TEST_CASE("remove_user returns true for a cold-cache DB hit (CC6.8 cold cache)",
     // process: its in-memory users_ map has never seen "cora".
     AuthManager cold_mgr;
     cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_rbac_store(&rbac_guard);
 
     REQUIRE(cold_mgr.remove_user("cora"));
 
@@ -325,9 +333,16 @@ TEST_CASE("remove_user returns true for a cold-cache DB hit (CC6.8 cold cache)",
 TEST_CASE("remove_user returns false for a DB miss, no error (cold cache)",
           "[pg][auth][user][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager cold_mgr;
     cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_rbac_store(&rbac_guard);
 
     REQUIRE_FALSE(cold_mgr.remove_user("nonexistent"));
 }
@@ -335,9 +350,16 @@ TEST_CASE("remove_user returns false for a DB miss, no error (cold cache)",
 TEST_CASE("remove_user still succeeds and clears sessions on a warm cache",
           "[pg][auth][user][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "dana" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager mgr;
     mgr.set_auth_db(auth_db.get());
+    mgr.set_rbac_store(&rbac_guard);
 
     // upsert_user goes through AuthManager, so it warms the cache too.
     REQUIRE(mgr.upsert_user("dana", "password1234", Role::user));
@@ -368,6 +390,12 @@ TEST_CASE("remove_user still succeeds and clears sessions on a warm cache",
 TEST_CASE("update_role returns true for a cold-cache DB hit and the DB row reflects the change",
           "[pg][auth][user][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     // Seed the row directly through AuthDB, bypassing AuthManager entirely —
     // no AuthManager instance ever caches this username.
@@ -382,6 +410,7 @@ TEST_CASE("update_role returns true for a cold-cache DB hit and the DB row refle
     // process: its in-memory users_ map has never seen "cora".
     AuthManager cold_mgr;
     cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_rbac_store(&rbac_guard);
 
     REQUIRE(cold_mgr.update_role("cora", Role::admin));
 
@@ -396,9 +425,16 @@ TEST_CASE("update_role returns true for a cold-cache DB hit and the DB row refle
 TEST_CASE("update_role returns false for a DB miss, no error (cold cache)",
           "[pg][auth][user][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager cold_mgr;
     cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_rbac_store(&rbac_guard);
 
     REQUIRE_FALSE(cold_mgr.update_role("nonexistent", Role::admin));
 }
@@ -406,9 +442,16 @@ TEST_CASE("update_role returns false for a DB miss, no error (cold cache)",
 TEST_CASE("update_role still succeeds and clears sessions on a warm cache",
           "[pg][auth][user][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "dana" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager mgr;
     mgr.set_auth_db(auth_db.get());
+    mgr.set_rbac_store(&rbac_guard);
 
     // upsert_user goes through AuthManager, so it warms the cache too.
     REQUIRE(mgr.upsert_user("dana", "password1234", Role::user));
@@ -509,16 +552,23 @@ TEST_CASE("verify_password returns the DB role for a cold-cache DB hit (#4020)",
 
     auto role = cold_mgr.verify_password("cora", "password1234");
     REQUIRE(role.has_value());
-    REQUIRE(*role == Role::admin);
+    REQUIRE(role->role == Role::admin);
     REQUIRE(cold_mgr.get_user_role("cora") == Role::admin); // hydrated
 }
 
 TEST_CASE("cold-cache hydration never resurrects a soft-deleted user (#4020)",
           "[pg][auth][session][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager warm_mgr;
     warm_mgr.set_auth_db(auth_db.get());
+    warm_mgr.set_rbac_store(&rbac_guard);
     REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::user));
     REQUIRE(warm_mgr.remove_user("cora")); // is_active = false
 
@@ -526,6 +576,7 @@ TEST_CASE("cold-cache hydration never resurrects a soft-deleted user (#4020)",
     // account must not come back to life through the hydration path.
     AuthManager cold_mgr;
     cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_rbac_store(&rbac_guard);
     REQUIRE_FALSE(cold_mgr.authenticate("cora", "password1234").has_value());
     REQUIRE_FALSE(cold_mgr.verify_password("cora", "password1234").has_value());
     REQUIRE_FALSE(cold_mgr.get_user_role("cora").has_value()); // nothing cached
@@ -638,14 +689,22 @@ TEST_CASE("a NUL-mangled username never pollutes the cache or matches the real a
 TEST_CASE("get_user_role reflects a cross-manager demotion immediately, no re-login needed",
           "[pg][auth][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager mgr_a;
     mgr_a.set_auth_db(auth_db.get());
+    mgr_a.set_rbac_store(&rbac_guard);
     REQUIRE(mgr_a.upsert_user("cora", "password1234", Role::admin));
     REQUIRE(mgr_a.get_user_role("cora") == Role::admin);
 
     AuthManager mgr_b;
     mgr_b.set_auth_db(auth_db.get());
+    mgr_b.set_rbac_store(&rbac_guard);
     REQUIRE(mgr_b.update_role("cora", Role::user)); // the "other replica" demotes
 
     // No re-login through mgr_a at all - get_user_role() itself must reflect
@@ -656,9 +715,16 @@ TEST_CASE("get_user_role reflects a cross-manager demotion immediately, no re-lo
 TEST_CASE("get_user_role reflects a cross-manager removal immediately, no re-login needed",
           "[pg][auth][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager mgr_a;
     mgr_a.set_auth_db(auth_db.get());
+    mgr_a.set_rbac_store(&rbac_guard);
     yuzu::MetricsRegistry metrics;
     mgr_a.set_metrics_registry(&metrics);
     REQUIRE(mgr_a.upsert_user("cora", "password1234", Role::admin));
@@ -666,6 +732,7 @@ TEST_CASE("get_user_role reflects a cross-manager removal immediately, no re-log
 
     AuthManager mgr_b;
     mgr_b.set_auth_db(auth_db.get());
+    mgr_b.set_rbac_store(&rbac_guard);
     REQUIRE(mgr_b.remove_user("cora"));
 
     REQUIRE_FALSE(mgr_a.get_user_role("cora").has_value());
@@ -734,9 +801,16 @@ TEST_CASE("authenticate mints a session at the CURRENT role after a cross-manage
     // session at their OLD (higher) role, since durable session invalidation only
     // protects ALREADY-issued sessions, not a brand-new one.
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager mgr_a;
     mgr_a.set_auth_db(auth_db.get());
+    mgr_a.set_rbac_store(&rbac_guard);
     REQUIRE(mgr_a.upsert_user("cora", "password1234", Role::admin));
     // Cache mgr_a's copy at admin (this call is what previously would have gone
     // stale) before the demotion below.
@@ -744,6 +818,7 @@ TEST_CASE("authenticate mints a session at the CURRENT role after a cross-manage
 
     AuthManager mgr_b;
     mgr_b.set_auth_db(auth_db.get());
+    mgr_b.set_rbac_store(&rbac_guard);
     REQUIRE(mgr_b.update_role("cora", Role::user)); // the "other replica" demotes
 
     // mgr_a's cache still says admin at this point; the fix must not trust it.
@@ -761,19 +836,27 @@ TEST_CASE("verify_password returns the CURRENT role after a cross-manager demoti
           "(#4020 adversarial-review follow-up)",
           "[pg][auth][session][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager mgr_a;
     mgr_a.set_auth_db(auth_db.get());
+    mgr_a.set_rbac_store(&rbac_guard);
     REQUIRE(mgr_a.upsert_user("cora", "password1234", Role::admin));
     REQUIRE(mgr_a.verify_password("cora", "password1234").has_value()); // caches admin
 
     AuthManager mgr_b;
     mgr_b.set_auth_db(auth_db.get());
+    mgr_b.set_rbac_store(&rbac_guard);
     REQUIRE(mgr_b.update_role("cora", Role::user));
 
     auto role = mgr_a.verify_password("cora", "password1234");
     REQUIRE(role.has_value());
-    REQUIRE(*role == Role::user); // NOT the stale cached admin
+    REQUIRE(role->role == Role::user); // NOT the stale cached admin
     REQUIRE(mgr_a.get_user_role("cora") == Role::user);
 }
 
@@ -790,15 +873,23 @@ TEST_CASE("a cross-manager removal evicts the stale cache entry, not just the lo
     // tokens (auth_routes.cpp's synthesize_token_session falls back to
     // get_user_role() for legacy-role synthesis).
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager mgr_a;
     mgr_a.set_auth_db(auth_db.get());
+    mgr_a.set_rbac_store(&rbac_guard);
     REQUIRE(mgr_a.upsert_user("cora", "password1234", Role::admin));
     REQUIRE(mgr_a.authenticate("cora", "password1234").has_value()); // caches admin
     REQUIRE(mgr_a.get_user_role("cora") == Role::admin);
 
     AuthManager mgr_b;
     mgr_b.set_auth_db(auth_db.get());
+    mgr_b.set_rbac_store(&rbac_guard);
     REQUIRE(mgr_b.remove_user("cora")); // the "other replica" removes the account
 
     // mgr_a's cache still says "active, admin" at this point; both credential
@@ -816,15 +907,23 @@ TEST_CASE("a cross-manager removal evicts the stale cache entry via verify_passw
     // behavior against EACH entry point rather than trusting a single test to
     // stand in for both if they ever diverge again.
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager mgr_a;
     mgr_a.set_auth_db(auth_db.get());
+    mgr_a.set_rbac_store(&rbac_guard);
     REQUIRE(mgr_a.upsert_user("cora", "password1234", Role::admin));
     REQUIRE(mgr_a.verify_password("cora", "password1234").has_value()); // caches admin
     REQUIRE(mgr_a.get_user_role("cora") == Role::admin);
 
     AuthManager mgr_b;
     mgr_b.set_auth_db(auth_db.get());
+    mgr_b.set_rbac_store(&rbac_guard);
     REQUIRE(mgr_b.remove_user("cora"));
 
     REQUIRE_FALSE(mgr_a.verify_password("cora", "password1234").has_value());
@@ -872,16 +971,24 @@ TEST_CASE("a hydrated entry is superseded by a later in-process role change (#40
     // existing user has no route through it, so the reachable "later in-process
     // write supersedes the hydrated cache entry" case is a role change.
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager warm_mgr;
     warm_mgr.set_auth_db(auth_db.get());
+    warm_mgr.set_rbac_store(&rbac_guard);
     REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::user));
 
     AuthManager cold_mgr;
     cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_rbac_store(&rbac_guard);
     auto role = cold_mgr.verify_password("cora", "password1234"); // hydrates
     REQUIRE(role.has_value());
-    REQUIRE(*role == Role::user);
+    REQUIRE(role->role == Role::user);
 
     // A role change through THIS manager replaces the hydrated entry in place
     // (find_user_or_hydrate's try_emplace does not clobber it — update_role
@@ -889,7 +996,7 @@ TEST_CASE("a hydrated entry is superseded by a later in-process role change (#40
     REQUIRE(cold_mgr.update_role("cora", Role::admin));
     role = cold_mgr.verify_password("cora", "password1234");
     REQUIRE(role.has_value());
-    REQUIRE(*role == Role::admin);
+    REQUIRE(role->role == Role::admin);
 }
 
 TEST_CASE("a demote that completed before the recheck starts is correctly "
@@ -906,13 +1013,21 @@ TEST_CASE("a demote that completed before the recheck starts is correctly "
     // masked by a hydrate-time cache value) - the genuine mid-flight race is
     // covered by the row-lock-blocking test below instead.
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager warm_mgr;
     warm_mgr.set_auth_db(auth_db.get());
+    warm_mgr.set_rbac_store(&rbac_guard);
     REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::admin));
 
     AuthManager cold_mgr;
     cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_rbac_store(&rbac_guard);
     cold_mgr.set_role_recheck_race_hook_for_test(
         [&] { REQUIRE(cold_mgr.update_role("cora", Role::user)); });
 
@@ -937,13 +1052,21 @@ TEST_CASE("recheck never trusts a stale in-process cache value, only its own "
     // rewrite has no "trust the cache" path left at all - reproduce a cache
     // that's simply WRONG relative to the DB and confirm recheck ignores it.
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager warm_mgr;
     warm_mgr.set_auth_db(auth_db.get());
+    warm_mgr.set_rbac_store(&rbac_guard);
     REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::admin));
 
     AuthManager cold_mgr;
     cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_rbac_store(&rbac_guard);
     REQUIRE(cold_mgr.authenticate("cora", "password1234").has_value()); // hydrates cache=admin
 
     cold_mgr.set_role_recheck_race_hook_for_test([&] {
@@ -982,13 +1105,21 @@ TEST_CASE("the row lock genuinely blocks a concurrent update_role() until "
     // recheck's transaction commits. This is the row-lock mechanism itself,
     // not an inference from before/after state.
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager warm_mgr;
     warm_mgr.set_auth_db(auth_db.get());
+    warm_mgr.set_rbac_store(&rbac_guard);
     REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::admin));
 
     AuthManager cold_mgr;
     cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_rbac_store(&rbac_guard);
     REQUIRE(cold_mgr.authenticate("cora", "password1234").has_value()); // hydrates cache=admin
 
     // Side connection used ONLY to observe pg_stat_activity - never touches
@@ -1026,6 +1157,9 @@ TEST_CASE("the row lock genuinely blocks a concurrent update_role() until "
             writer_update_ok = cold_mgr.update_role("cora", Role::user);
             writer_finished = true;
         });
+        // (#4966: the writer is now the owner's guarded role write, whose FIRST auth.users
+        // statement is `SELECT role, is_active FROM auth.users ... FOR UPDATE`; the poll
+        // therefore matches that statement as well as a bare `UPDATE auth.users`.)
         // Bounded poll (up to 3s, 5ms interval - authdb Gate 8: padded a
         // beat above kWriteTimeout's own 2s so this poll's own budget can
         // never be the reason a genuinely-blocked writer goes unobserved)
@@ -1049,7 +1183,8 @@ TEST_CASE("the row lock genuinely blocks a concurrent update_role() until "
             yuzu::server::pg::PgResult res = yuzu::server::pg::exec_params(
                 watch_conn.get(),
                 "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-                "AND query ILIKE '%UPDATE auth.users%' AND datname = current_database() "
+                "AND (query ILIKE '%UPDATE auth.users%' OR query ILIKE '%FROM auth.users%FOR UPDATE%') "
+                "AND datname = current_database() "
                 "AND pid <> pg_backend_pid()",
                 std::vector<std::string>{});
             if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1 &&
@@ -1130,13 +1265,21 @@ TEST_CASE("post_mint_role_recheck denies a login when a demote lands strictly "
           "docs/auth-architecture.md already uses for OIDC/SAML)",
           "[pg][auth][session][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "dana" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager warm_mgr;
     warm_mgr.set_auth_db(auth_db.get());
+    warm_mgr.set_rbac_store(&rbac_guard);
     REQUIRE(warm_mgr.upsert_user("dana", "password1234", Role::admin));
 
     AuthManager cold_mgr;
     cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_rbac_store(&rbac_guard);
     REQUIRE(cold_mgr.authenticate("dana", "password1234").has_value()); // hydrates cache=admin
 
     bool demote_ok = false;
@@ -1187,7 +1330,7 @@ TEST_CASE("create_local_session's own post-mint recheck denies a stale-role "
 
     // Mint with a STALE "admin" role, as if an earlier check had returned it
     // before a demote (or simply a bug upstream) landed.
-    auto token = mgr.create_local_session("frank", Role::admin, true);
+    auto token = mgr.create_local_session_for_test("frank", Role::admin, true);
     CHECK(token.empty()); // fail-safe empty-token contract (ADR-0007), same as a durable-write failure
     CHECK(mgr.get_user_role("frank") == Role::user); // DB-authoritative, unaffected
 }
@@ -1301,13 +1444,21 @@ TEST_CASE("a concurrent remove_user() that completes before the recheck "
           "(#4020 Gate 3 re-review, authdb Finding 3 coverage gap)",
           "[pg][auth][session][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager warm_mgr;
     warm_mgr.set_auth_db(auth_db.get());
+    warm_mgr.set_rbac_store(&rbac_guard);
     REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::user));
 
     AuthManager cold_mgr;
     cold_mgr.set_auth_db(auth_db.get());
+    cold_mgr.set_rbac_store(&rbac_guard);
     cold_mgr.set_role_recheck_race_hook_for_test(
         [&] { REQUIRE(cold_mgr.remove_user("cora")); });
 
@@ -1331,9 +1482,16 @@ TEST_CASE("reactivate_user() draws a fresh process-wide version stamp, never a "
     // equal ANY version this process has ever stamped before - not just "not
     // equal to 0."
     yuzu::test::AuthDbPg auth_db;
+    // #4966: update_role/remove_user fail closed without the last-Administrator guard.
+    yuzu::server::RbacStore rbac_guard{auth_db.pool()};
+    REQUIRE(rbac_guard.is_open());
+    // A second active admin so the cases that demote/remove "cora" exercise the write path, not
+    // the last-Administrator refusal.
+    REQUIRE(auth_db->upsert_user("spare_admin", "hash", "salt", Role::admin).has_value());
 
     AuthManager mgr;
     mgr.set_auth_db(auth_db.get());
+    mgr.set_rbac_store(&rbac_guard);
     REQUIRE(mgr.upsert_user("cora", "password1234", Role::admin));
     REQUIRE(mgr.authenticate("cora", "password1234").has_value()); // hydrate + recheck bump
     auto version_before_removal = mgr.cached_role_version_for_test("cora");

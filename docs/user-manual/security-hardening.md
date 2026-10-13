@@ -79,7 +79,7 @@ yuzu-agent --cert-store MY --cert-subject "agent-001"
 | 8443 | TCP | Inbound | HTTPS dashboard | Admin network |
 | 50051 | TCP | Inbound | Agent gRPC | Agent network |
 | 50052 | TCP | Inbound | Management gRPC | Admin network |
-| 50055 | TCP | Inbound | Gateway upstream | Gateway hosts only |
+| 50055 | TCP | Inbound | Gateway upstream (mutual TLS plus an SPKI public-key pin of the gateway's key, or an acknowledged-disabled plaintext rig) | Gateway hosts only |
 | 9568 | TCP | Inbound | Gateway Prometheus | Monitoring network |
 
 **Recommendations:**
@@ -132,7 +132,20 @@ PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
 
 The gateway→server **upstream** hop supports mutual TLS (`gateway/config/sys.config.prod`
 `{https,...}`), and the gateway **fails closed** if that channel is configured `https`
-without `verify_peer`. Direct agent→server connections (no gateway) use TLS. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
+without `verify_peer`. The server's gateway-upstream service additionally requires an
+authorized gateway peer: the gateway's client certificate must carry `serverAuth`, be inside
+its validity window and have a public key that matches a configured SPKI pin (automatic on
+the generated default certificates, explicit with `--gateway-peer-pin` /
+`--gateway-peer-pin-file` otherwise), and the server refuses to start without one unless
+`--insecure-gateway-peer` acknowledges a plaintext rig. The check wraps the service, which the
+server registers on the one gRPC server that also listens for agents and management, so it
+applies on every one of those ports; without it, a caller with no certificate could reach the
+service on the agent port of a default-certificate install, and any holder of a CA-issued
+client certificate (an agent leaf included) could reach it on the strict ports. Keep the
+gateway key readable only by the server and gateway processes: the pin authorizes exactly that
+key, so anyone who can read it can act as the gateway. See
+[Gateway upstream peer authorization](server-admin.md#gateway-upstream-peer-authorization).
+Direct agent→server connections (no gateway) use TLS. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
 "TLS posture" and `docs/pki-architecture.md` "Gateway TLS".
 
 The agent listener authenticates the gateway to agents, not agents to the gateway.
@@ -565,7 +578,13 @@ Two consequences worth planning for:
 - **The quarantine plugin's own actions are exempt** — `quarantine`, `unquarantine`, `status` and
   `whitelist` still reach a contained device, so release stays possible. The exemption is keyed on
   the action, not the plugin, so a future fifth action would be gated until it is deliberately
-  added.
+  added. These four actions, and the Guardian rule push `__guard__.push_rules`, are also exempt
+  from the per-plugin/action kill switch, the per-OS kill switch (and its agent-presence read),
+  the plugin-presence filter and a degraded plugin-config store, so none of them can strand a
+  contained device. A kill-switch row for one of these pairs is still accepted and displayed, but
+  it is informational only and has no dispatch effect. To stop Guardian rule delivery during an
+  incident, disable or remove the rules instead; see
+  [Guaranteed State](guaranteed-state.md#baselines--how-guards-reach-agents).
 - **Four server-internal pushes are also exempt, and you should know they exist.** The TAR
   fleet-topology snapshot request (`tar.fleet_snapshot`), the Guardian rule push
   (`__guard__.push_rules`), the asset-tag sync (`asset_tags.sync`) and the on-demand inventory

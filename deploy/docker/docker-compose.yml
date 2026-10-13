@@ -41,6 +41,15 @@ services:
       YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:-yuzu-app}@postgres:5432/yuzu
     volumes:
       - server-data:/var/lib/yuzu
+      # The internal CA, the default certs and the secrets KEK
+      # (secrets-kek-v<N>.key) live in /etc/yuzu/certs, the server's default
+      # cert dir. The KEK is registered in Postgres, so this directory must
+      # outlive the container exactly as postgres-data does: without the
+      # volume, a recreate (image upgrade, `down && up`, --force-recreate)
+      # loses the key file and the server refuses to boot (kek_unresolvable,
+      # #5370). The image pre-creates the directory owned by `yuzu`, and a new
+      # named volume copies that ownership on first mount.
+      - server-certs:/etc/yuzu/certs
     # File-descriptor headroom mirrors the systemd unit
     # (deploy/systemd/yuzu-server.service). The Docker default is 1024;
     # 65536 absorbs SSE EventSource fan-in + agent gRPC streams + SQLite
@@ -123,6 +132,7 @@ services:
 
 volumes:
   server-data:
+  server-certs:
   postgres-data:
   prometheus-data:
   grafana-data:

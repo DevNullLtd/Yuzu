@@ -27,6 +27,8 @@
 
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "credential_change_owner.hpp"
+#include "session_store.hpp"
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "runtime_config_store.hpp"
@@ -42,11 +44,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -224,13 +228,13 @@ TEST_CASE("POST /api/settings/mfa/init twice returns MfaAlreadyEnrolled with ope
     MfaSettingsHarness h;
     // Stand up an enrolled state through the AuthDB directly so the
     // second init hits the "already enrolled" branch.
-    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
 
     auto res = post_same_origin(h.sink, "/api/settings/mfa/init");
     REQUIRE(res);
@@ -244,13 +248,13 @@ TEST_CASE("POST /api/settings/mfa/recovery-codes regenerates 10 codes + cache he
     MfaSettingsHarness h;
     // Get into enrolled state via the same path the panel uses
     // server-side.
-    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
 
     auto res = post_same_origin(h.sink, "/api/settings/mfa/recovery-codes");
     REQUIRE(res);
@@ -273,7 +277,7 @@ TEST_CASE("POST /api/settings/mfa/verify on an already-enrolled account audits m
     // mfa.enroll.failed (a bad-code attempt) or a store outage, and must tell the
     // operator the true state. Simulate the winner by enrolling admin out-of-band.
     MfaSettingsHarness h;
-    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
     REQUIRE(bytes.has_value());
@@ -281,7 +285,7 @@ TEST_CASE("POST /api/settings/mfa/verify on an already-enrolled account audits m
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
     // Concurrent winner: enroll out-of-band, then drive the settings verify route
     // with the same still-valid code the racing operator would have submitted.
-    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
 
     auto res = post_same_origin(h.sink, "/api/settings/mfa/verify", "code=" + code);
     REQUIRE(res);
@@ -294,16 +298,99 @@ TEST_CASE("POST /api/settings/mfa/verify on an already-enrolled account audits m
     CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
 }
 
+TEST_CASE("Settings MFA init/verify queued behind a password reset refuses with credential_changed "
+          "(#5342 F4)",
+          "[pg][mfa][routes][settings][password]") {
+    // #5342 Gate 8 iteration 3 (F4). A REAL CredentialChangeOwner resets the
+    // admin's password; its pre-commit hook (every lock held, the provisional
+    // secret already wiped but uncommitted) fires the Settings route, waits
+    // until the route's guarded write is queued on the account's row lock,
+    // then lets the reset commit. The write re-evaluates against the committed
+    // row and lands as CredentialChanged: the operator sees "sign in again",
+    // the audit row is mfa.enroll.failed/credential_changed, nothing is
+    // revealed, written or enrolled.
+    MfaSettingsHarness h;
+    SessionStore sessions{h.auth_db.pool()}; // migrates session_store (the owner DELETEs from it)
+    AuditStore audit_store{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    REQUIRE(audit_store.is_open());
+    CredentialChangeOwner owner{h.auth_db.pool(), &audit_store};
+
+    CredentialChangeRequest req;
+    req.kind = CredentialChangeRequest::Kind::kAdminReset;
+    req.username = "admin";
+    auto salt = auth::AuthManager::random_bytes(16);
+    req.new_hash_hex = auth::AuthManager::pbkdf2_sha256("a-brand-new-password-1", salt, 100'000);
+    req.new_salt_hex = auth::AuthManager::bytes_to_hex(salt);
+    req.audit_template.principal = "root";
+    req.audit_template.target_type = "User";
+    req.audit_template.target_id = "admin";
+
+    std::string path;
+    std::string body;
+    std::string waiter_like;
+    SECTION("init") {
+        path = "/api/settings/mfa/init";
+        waiter_like = "%UPDATE auth.users SET mfa_totp_secret%";
+    }
+    SECTION("verify") {
+        auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        auto bytes = mfa::base32_decode(init->secret_base32);
+        REQUIRE(bytes.has_value());
+        std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+        path = "/api/settings/mfa/verify";
+        body = "code=" + mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+        waiter_like = "%UPDATE auth.users SET mfa_enrolled_at%";
+    }
+
+    std::unique_ptr<httplib::Response> racing;
+    std::atomic<bool> fired{false};
+    bool waiter_seen = false;
+    std::jthread racer; // joined on every exit path
+    owner.set_pre_commit_hook_for_test([&] {
+        if (fired.exchange(true))
+            return;
+        racer = std::jthread([&] { racing = post_same_origin(h.sink, path, body); });
+        waiter_seen = yuzu::test::wait_for_pg_lock_waiter(h.auth_db.dsn(), waiter_like);
+    });
+    const auto out = owner.commit(req);
+    if (racer.joinable())
+        racer.join();
+    owner.set_pre_commit_hook_for_test(nullptr); // after the join
+    REQUIRE(fired);
+    REQUIRE(out.result == CredentialChangeResult::kOk);
+    CHECK(waiter_seen);
+
+    REQUIRE(racing);
+    INFO("body=" << racing->body);
+    CHECK(racing->status == 200);
+    CHECK(racing->body.find("Your password changed during enrolment") != std::string::npos);
+    CHECK(racing->body.find("otpauth://") == std::string::npos); // no reveal
+    CHECK(racing->body.find("STORE THESE") == std::string::npos); // no recovery codes
+    CHECK(h.has_audit("mfa.enroll.failed", "error", "admin"));
+    CHECK(h.audit_detail("mfa.enroll.failed") == "credential_changed");
+    CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
+    CHECK_FALSE(h.auth_db->mfa_status("admin")->enrolled);
+    yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(
+        conn.get(), "SELECT (mfa_totp_secret IS NULL)::text FROM auth.users WHERE username='admin'")};
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "true");
+}
+
 TEST_CASE("POST /api/settings/mfa/disable clears state + emits mfa.disabled",
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
-    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
 
     auto res = post_same_origin(h.sink, "/api/settings/mfa/disable");
     REQUIRE(res);
@@ -325,13 +412,13 @@ TEST_CASE("POST /api/settings/mfa/disable is blocked for self under enforcement 
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
     // Enroll admin first.
-    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
 
     // Turn on enforcement (cfg is held by reference by SettingsRoutes).
     h.cfg.mfa_enforcement = "required";
@@ -354,13 +441,13 @@ TEST_CASE("POST /api/settings/mfa/disable under admin-only blocks admins but the
           "role-scoped",
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
-    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
     REQUIRE(bytes.has_value());
     std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
     auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
 
     h.cfg.mfa_enforcement = "admin-only";
     // Admin (session_role defaults to admin) is protected.

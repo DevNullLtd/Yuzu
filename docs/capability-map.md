@@ -31,7 +31,7 @@ Each capability is rated on two axes:
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `194 26 49 269`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> → `192 27 50 269`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
 > awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
 > row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
 > domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
@@ -64,10 +64,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
-Advanced     [========================--------]  129/175 done  (74%) (21 partial)
+Advanced     [=======================---------]  127/175 done  (73%) (22 partial)
 Future       [=========-----------------------]  10/35 done  (29%) (4 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [=======================---------]  194/269 done  (72%) (26 partial)
+Overall      [=======================---------]  192/269 done  (71%) (27 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -93,7 +93,7 @@ Overall      [=======================---------]  194/269 done  (72%) (26 partial
 | 19. Server: Device and Group Management | 7 | 7 | 0 | 0 |
 | 20. Server: Response Collection and Reporting | 8 | 8 | 0 | 0 |
 | 21. Server: Notifications and Audit | 6 | 5 | 0 | 1 |
-| 22. Server: System and Infrastructure | 10 | 6 | 2 | 2 |
+| 22. Server: System and Infrastructure | 10 | 4 | 3 | 3 |
 | 23. Agent-Side Key-Value Storage | 3 | 3 | 0 | 0 |
 | 24. Integration and Extensibility | 11 | 9 | 0 | 2 |
 | 25. Connector Framework | 5 | 0 | 0 | 5 |
@@ -111,9 +111,9 @@ Overall      [=======================---------]  194/269 done  (72%) (26 partial
 | 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
 | 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
-| **Subtotal (domains 1–39)** | **265** | **194** | **26** | **45** |
+| **Subtotal (domains 1–39)** | **265** | **192** | **27** | **46** |
 | 40. Reflex — Agent-Local Automated Response | 4 | 0 | 0 | 4 |
-| **TOTAL** | **269** | **194** | **26** | **49** |
+| **TOTAL** | **269** | **192** | **27** | **50** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -618,7 +618,7 @@ Partial — read-only posture only (Wave 8 PR8.6; refs #282, `docs/roadmap.md` I
 
 ### 10.7 File Permissions Inspection :white_check_mark: `T2`
 
-`filesystem` plugin `get_acl` action. Windows: full DACL enumeration via GetNamedSecurityInfo — returns each ACE with trustee, access mask, and ace type. Linux/macOS: POSIX `stat()` permissions (owner, group, other, special bits).
+`filesystem` plugin `get_acl` action. Windows: full DACL enumeration via GetNamedSecurityInfo — returns each ACE with trustee, access mask, and ace type. Linux/macOS: owner, group and permission bits from `stat()`, plus the extended ACL — the POSIX access/default ACL entries on Linux (`system.posix_acl_*` extended attributes) and the allow/deny entries with principal, rights and inheritance flags on macOS (`acl_get_file`); a filesystem that cannot carry an ACL reports `acl|unsupported`.
 
 ### 10.8 Digital Signature Verification :white_check_mark: `T2`
 
@@ -844,11 +844,11 @@ Trigger engine with `interval` type. Timer-based execution with configurable sec
 
 ### 17.2 File / Directory Change Trigger :large_orange_diamond: `T2` *(verified 2026-09-07)*
 
-**Corrected 2026-09-08 (external audit, Codex Astra residual sweep):** this is a **5-second `last_write_time` poll, not a kernel-backed filesystem watcher.** `TriggerEngine::file_watch_loop()` wakes every 5 seconds and re-checks each watched path's mtime (`agents/core/src/trigger_engine.cpp:313-318`: "Poll every 5 seconds — but wake at once on stop()"). There is zero use of `inotify`, `FSEvents`, or `ReadDirectoryChangesW` anywhere in `trigger_engine.cpp` (confirmed by grep). The real `TriggerType` enum value is `FileChange` (wire string `"filesystem"`, `trigger_engine.hpp:22-28`) — there is no separate `directory_change` type. Detection latency is therefore up to 5 seconds, not near-instant kernel notification — contrast with Guardian's genuinely kernel-backed `guard_file.cpp` (§31.2, Windows only, detect-only). *(Evidence: `trigger_engine.cpp:313-318`; `trigger_engine.hpp:22-28`; previously mis-graded Done — claimed a mechanism the code does not use.)*
+**Corrected 2026-09-08 (external audit, Codex Astra residual sweep):** this is a **5-second `last_write_time` poll, not a kernel-backed filesystem watcher.** `TriggerEngine::file_watch_loop()` wakes every 5 seconds and re-checks each watched path's mtime (`agents/core/src/trigger_engine.cpp:327-332`: "Poll every file_poll_ms_ (5s by default) — but wake at once on stop()"). There is zero use of `inotify`, `FSEvents`, or `ReadDirectoryChangesW` anywhere in `trigger_engine.cpp` (confirmed by grep). The real `TriggerType` enum value is `FileChange` (wire string `"filesystem"`, `trigger_engine.hpp:22-28`) — there is no separate `directory_change` type. Detection latency is therefore up to 5 seconds, not near-instant kernel notification — contrast with Guardian's genuinely kernel-backed `guard_file.cpp` (§31.2, Windows only, detect-only). *(Evidence: `trigger_engine.cpp:327-332`; `trigger_engine.hpp:22-28`; previously mis-graded Done — claimed a mechanism the code does not use.)*
 
 ### 17.3 Service Status Change Trigger :white_check_mark: `T2` *(verified 2026-09-07)*
 
-**Note added 2026-09-08 (external audit, Codex Astra residual sweep):** also a poll, not an SCM/systemd event subscription — `TriggerEngine::service_watch_loop()` wakes every **30 seconds** and re-checks each watched service's state (`agents/core/src/trigger_engine.cpp:376-381`: "Poll every 30 seconds — but wake at once on stop()"). The real `TriggerType` enum value is `ServiceStatus` (wire string `"service"`). Kept at Done because the capability genuinely works end-to-end (a service-state change is reliably detected and fires within 30 seconds), it just isn't the event-driven SCM/systemd-notification mechanism the original prose implied. *(Evidence: `trigger_engine.cpp:376-381`.)*
+**Note added 2026-09-08 (external audit, Codex Astra residual sweep):** also a poll, not an SCM/systemd event subscription — `TriggerEngine::service_watch_loop()` wakes every **30 seconds** and re-checks each watched service's state (`agents/core/src/trigger_engine.cpp:390-395`: "Poll every 30 seconds — but wake at once on stop()"). The real `TriggerType` enum value is `ServiceStatus` (wire string `"service"`). Kept at Done because the capability genuinely works end-to-end (a service-state change is reliably detected and fires within 30 seconds), it just isn't the event-driven SCM/systemd-notification mechanism the original prose implied. *(Evidence: `trigger_engine.cpp:390-395`.)*
 
 ### 17.4 Windows Event Log Trigger :x: `T2` *(verified 2026-09-07)*
 
@@ -1024,9 +1024,9 @@ Every behavioural-PII read (device-live-info, process/network drill, DEX perf, e
 
 Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks store connectivity). Gateway health endpoint with circuit breaker status. Prometheus `/metrics` endpoint exposes server/agent/gateway metrics. `ProcessHealthSampler` provides cross-platform (Linux `/proc/self`, macOS `mach_task_info`/`getrusage`, Windows `GetProcessMemoryInfo`/`GetProcessTimes`) process telemetry sampled every 15s. New Prometheus metrics: `yuzu_server_cpu_usage_percent`, `yuzu_server_memory_bytes{type=rss|vss}`, `yuzu_server_open_connections`, `yuzu_server_command_queue_depth`, `yuzu_server_uptime_seconds`. `/health` endpoint includes `system` object with CPU, memory, connections, queue depth. Health dashboard strip shows CPU% and memory.
 
-### 22.2 System Topology View :white_check_mark: `T2`
+### 22.2 System Topology View :x: `T2`
 
-`topology_ui.cpp` dashboard page at `/topology`. HTMX fragment `/frag/topology-data` (30s poll). Shows server node, gateway badges, management group tree, OS breakdown. REST: `GET /api/v1/topology`.
+No dashboard page. REST only: `GET /api/v1/topology` is a placeholder that returns a static message, not topology data. Regraded ✅ Done → ❌ Not Started. *(Evidence: the `/api/v1/topology` handler in `server/core/src/rest_api_v1.cpp`; no route serves a topology page. The fleet topology view that does exist is §28.7.)*
 
 ### 22.3 License Management :large_orange_diamond: `T2` *(verified 2026-09-07)*
 
@@ -1040,9 +1040,9 @@ Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks stor
 
 Full Erlang/OTP gateway (`gateway/` rebar3 project). `yuzu_gw_agent` manages agent connections, `yuzu_gw_upstream` handles server-side gRPC (batch heartbeat, proxy register, command forwarding). `yuzu_gw_heartbeat_buffer` batches heartbeats for efficiency. Circuit breaker for upstream resilience. Health endpoint with metrics. Supervision tree with restart strategies. EUnit + Common Test suites including scale tests (10K+ agents).
 
-### 22.6 Statistics Dashboard :white_check_mark: `T2`
+### 22.6 Statistics Dashboard :large_orange_diamond: `T2`
 
-`statistics_ui.cpp` dashboard page at `/statistics`. Six HTMX cards (fleet, executions, compliance, top instructions, license, system health) each with independent 60s polling. REST: `GET /api/v1/statistics`.
+No dashboard page. REST only: `GET /api/v1/statistics` returns fleet execution statistics (MCP twin `get_fleet_statistics`). Regraded ✅ Done → 🔶 Partial. *(Evidence: the `/api/v1/statistics` handler in `server/core/src/rest_api_v1.cpp`; no route serves a statistics page.)*
 
 ### 22.7 Binary Resource Distribution :x: `T3`
 
@@ -1222,7 +1222,7 @@ Shipped — this row duplicates §20.7 (same capability, filed under two domains
 
 ### 28.4 TAR Dashboard Page :large_orange_diamond: `T2`
 
-In progress (Phase 15.A retention + 15.D SQL frame; the **15.H process tree viewer shipped 2026-06-18**). A dedicated `/tar` page off the main dashboard nav. Surfaces, in one place, every operator-facing TAR affordance: ad-hoc SQL against agent warehouses with scope-walking-aware results (`save as result set` for downstream narrowing), retention awareness across the fleet, and the **shipped** process tree viewer (Frame 3, §28.5). The consolidation makes TAR — the headline forensics + inventory capability — a discoverable destination rather than a fragment scattered across other pages. Design: `docs/tar-dashboard.md`.
+In progress (Phase 15.A retention + 15.D SQL frame; the **15.H process tree viewer shipped 2026-06-18**). A dedicated `/tar` page in the sidebar's **Posture** group. Surfaces, in one place, every operator-facing TAR affordance: ad-hoc SQL against agent warehouses with scope-walking-aware results (`save as result set` for downstream narrowing), retention awareness across the fleet, and the **shipped** process tree viewer (Frame 3, §28.5). The consolidation makes TAR — the headline forensics + inventory capability — a discoverable destination rather than a fragment scattered across other pages. Design: `docs/tar-dashboard.md`.
 
 ### 28.5 TAR Process Tree Viewer :white_check_mark: `T2`
 
@@ -1664,6 +1664,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | tags | Y | Y | Y | Device Mgmt |
 | printing | Y | Y | Y | Device Mgmt |
 | update_source_trust | - | Y | - | Security |
+| mgmt_posture | - | Y | Y | Security |
 | agent_logging | Y | Y | Y | Agent Mgmt |
 | agent_actions | Y | Y | Y | Agent Mgmt |
 | diagnostics | Y | Y | Y | Agent Mgmt |
@@ -1673,7 +1674,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
 
-**66 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified after merging `origin/dev` (`ls -d agents/plugins/*/` = 68 directories, minus `example` + `chargen` = 66). This recount adds `update_source_trust` (Wave 10 PR10.1-d, Linux apt leg only this PR — macOS, Windows and rpm/dnf follow as their own PRs) on top of the previous recount (65), which itself added both `local_security_policy` (Wave 8 PR8.3, Linux+macOS legs first; its Windows leg and `sudoers` action are added in a follow-up PR) and `privacy_permissions` (Wave 8 PR8.5, Linux leg only this PR — macOS/Windows follow as their own PR), landing together on top of the 2026-09-27 recount (`ls -d agents/plugins/*/` = 65 directories, minus `example` + `chargen` = 63), which itself added `browser_policy` (Wave 10 PR10.2-b, Linux leg only that wave), `system_hardening` (Wave 8 PR8.1-b) and `pkg_inventory` (Wave 10 PR10.1-c) on top of the 2026-09-22 recount (60), which itself caught up `firmware_posture` (Wave 8 PR8.4), `runtimes` (Wave 10 PR10.1-b), `platform_security` (Wave 8 PR8.1-a1), `browser_inventory` (Wave 10 P2a-3, Linux leg only that wave) and `app_control` (Wave 8 PR8.6) on top of the 2026-09-18 recount (55), which itself caught up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. The `privacy_permissions` macOS leg (Wave 8 PR8.5 macOS, TCC.db grant inventory) and Windows leg (ConsentStore registry walk) land separately from this recount — an existing plugin gaining a leg, not a new plugin, so the count stays 66. `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
+**67 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified after merging `origin/dev` (`ls -d agents/plugins/*/` = 69 directories, minus `example` + `chargen` = 67). This recount adds `mgmt_posture` (management-plane posture, Linux sssd/IPA/keytab and macOS MDM enrolment legs; Windows planned) on top of the previous recount (66), which added `update_source_trust` (Wave 10 PR10.1-d, Linux apt leg only this PR — macOS, Windows and rpm/dnf follow as their own PRs) on top of the previous recount (65), which itself added both `local_security_policy` (Wave 8 PR8.3, Linux+macOS legs first; its Windows leg and `sudoers` action are added in a follow-up PR) and `privacy_permissions` (Wave 8 PR8.5, Linux leg only this PR — macOS/Windows follow as their own PR), landing together on top of the 2026-09-27 recount (`ls -d agents/plugins/*/` = 65 directories, minus `example` + `chargen` = 63), which itself added `browser_policy` (Wave 10 PR10.2-b, Linux leg only that wave), `system_hardening` (Wave 8 PR8.1-b) and `pkg_inventory` (Wave 10 PR10.1-c) on top of the 2026-09-22 recount (60), which itself caught up `firmware_posture` (Wave 8 PR8.4), `runtimes` (Wave 10 PR10.1-b), `platform_security` (Wave 8 PR8.1-a1), `browser_inventory` (Wave 10 P2a-3, Linux leg only that wave) and `app_control` (Wave 8 PR8.6) on top of the 2026-09-18 recount (55), which itself caught up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. The `privacy_permissions` macOS leg (Wave 8 PR8.5 macOS, TCC.db grant inventory) and Windows leg (ConsentStore registry walk) land separately from this recount — an existing plugin gaining a leg, not a new plugin, so that recount stayed 66 (the 67 above is that figure plus `mgmt_posture`). `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
 
 ---
 

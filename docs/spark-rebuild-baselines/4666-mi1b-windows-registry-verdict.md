@@ -79,6 +79,10 @@ bash scripts/setup.sh --tests --builddir build-windows-mi1b
 # tags/partition rule per tests/meson.build), and --test-args is exact specifically for
 # shard C (it ANDs against the whole comma-free spec there, unlike shards A/B)
 meson test -C build-windows-mi1b "agent unit tests shard C" --test-args "[multi_image]" -v
+# NOTE (2026-10-04): the [log_handoff] tag, which every [multi_image] case carries, moved from
+# shard C to shard B in the agent-shard re-balance, so the command above now selects ZERO cases and
+# still exits 0 (--allow-running-no-tests). --test-args is exact only for shard C, so to re-run
+# these cases today call the binary directly: build-windows-mi1b/tests/yuzu_agent_tests "[multi_image]"
 
 # linkage corroboration
 meson compile -C build-windows-mi1b yuzu-agent

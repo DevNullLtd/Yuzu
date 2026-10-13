@@ -74,6 +74,12 @@ inline constexpr std::size_t kMaxPluginNameLen = 64;
 /// bytes that would forge log lines / corrupt the error channel. See #822.
 inline constexpr std::string_view kInvalidNameReason = "invalid plugin name";
 
+/// A second file in --plugin-dir declared a name already accepted in this scan;
+/// the first file the directory walk encountered keeps the name (filesystem
+/// order — two files declaring one name is an operator error, remove one), the
+/// later file is rejected before init and never reaches the agent.
+inline constexpr std::string_view kDuplicateNameReason = "duplicate plugin name";
+
 /// Stable reason prefixes for code-signing rejections. The metric label
 /// derives from the prefix so operators can alert distinctly on
 /// "no signature on plugin in require-mode" vs "bad signature" vs

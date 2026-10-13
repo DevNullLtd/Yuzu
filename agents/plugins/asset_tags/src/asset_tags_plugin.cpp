@@ -28,6 +28,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <mutex>
@@ -45,8 +47,17 @@ std::mutex g_mu;
 AssetTagState g_state;
 fs::path g_store_path;
 std::atomic<bool> g_shutdown{false};
+// Wakes the check thread at once on shutdown(), instead of letting it sleep out a 5s chunk and
+// making every plugin unload pay that long in join(). g_shutdown is set UNDER g_stop_mu so a
+// waiter cannot test it (still false), then block after the notify has already fired.
+std::mutex g_stop_mu;
+std::condition_variable g_stop_cv;
 std::thread g_check_thread;
 std::atomic<int> g_check_interval_s{300}; // default 5 minutes
+// Process-lifetime persist-failure visibility (guarded by g_mu; not persisted,
+// reset on restart). The last message is a write error or a write warning.
+std::uint64_t g_persist_failures = 0;
+std::string g_last_persist_error;
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -83,15 +94,13 @@ void load_state() {
 
 void check_thread_fn() {
     while (!g_shutdown.load(std::memory_order_acquire)) {
-        // Sleep in small increments for responsive shutdown
-        auto remaining = std::chrono::seconds{g_check_interval_s.load(std::memory_order_relaxed)};
-        while (remaining.count() > 0 && !g_shutdown.load(std::memory_order_acquire)) {
-            auto sleep_time = std::min(remaining, std::chrono::seconds{5});
-            std::this_thread::sleep_for(sleep_time);
-            remaining -= sleep_time;
+        {
+            std::unique_lock lk(g_stop_mu);
+            if (g_stop_cv.wait_for(
+                    lk, std::chrono::seconds{g_check_interval_s.load(std::memory_order_relaxed)},
+                    [] { return g_shutdown.load(std::memory_order_acquire); }))
+                break;
         }
-        if (g_shutdown.load(std::memory_order_acquire))
-            break;
 
         // Check if tags are stale (no sync within the check interval)
         std::lock_guard lock(g_mu);
@@ -178,7 +187,11 @@ public:
     }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
-        g_shutdown.store(true, std::memory_order_release);
+        {
+            std::lock_guard lk(g_stop_mu);
+            g_shutdown.store(true, std::memory_order_release);
+        }
+        g_stop_cv.notify_all();
         if (g_check_thread.joinable())
             g_check_thread.join();
     }
@@ -215,6 +228,8 @@ private:
         CategoryValues current;
         int64_t last_sync = 0;
         bool persisted = true;
+        bool mode_reassert_failed = false;
+        bool dir_fsync_failed = false;
         {
             // One critical section: mutate, snapshot, and persist under the
             // same lock so the file is always one consistent state and
@@ -231,8 +246,14 @@ private:
                 auto written = write_state_file_atomic(g_store_path, serialize_state(g_state));
                 if (!written) {
                     persisted = false;
+                    ++g_persist_failures;
+                    g_last_persist_error = cap_value(written.error().message);
                     spdlog::warn("asset_tags: state not persisted: {}", written.error().message);
                 } else if (*written) {
+                    mode_reassert_failed = (*written)->mode_reassert_failed;
+                    dir_fsync_failed = (*written)->dir_fsync_failed;
+                    g_last_persist_error = format_write_warning(
+                        mode_reassert_failed, dir_fsync_failed, (*written)->message);
                     spdlog::warn("asset_tags: {}", (*written)->message);
                 }
             }
@@ -257,11 +278,8 @@ private:
 
         // The in-memory state advanced and the rows above are truthful either
         // way; the status tells the caller whether the write reached disk.
-        if (persisted)
-            ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL);
-        else
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "asset_tags:persist_failed");
+        const auto decision = decide_sync_status(persisted, mode_reassert_failed, dir_fsync_failed);
+        ctx.set_result_status(decision.status, decision.completeness, decision.provenance);
         return 0;
     }
 
@@ -276,6 +294,11 @@ private:
         ctx.write_output(std::format("check_interval|{}",
                                      g_check_interval_s.load(std::memory_order_relaxed)));
         ctx.write_output(std::format("change_count|{}", g_state.change_log.size()));
+        ctx.write_output(std::format("persist_failures|{}", g_persist_failures));
+        ctx.write_output(std::format(
+            "last_persist_error|{}",
+            g_last_persist_error.empty() ? std::string{"-"}
+                                         : yuzu::util::safe_output_field(g_last_persist_error)));
         return 0;
     }
 

@@ -38,6 +38,9 @@
     [yuzu, gw, upstream, circuit_state],
     [yuzu, gw, upstream, registration_replay],
     [yuzu, gw, upstream, notify_dropped],
+    [yuzu, gw, upstream, notify_queue],
+    [yuzu, gw, upstream, notify_coalesced],
+    [yuzu, gw, upstream, registration_replay_triggered],
 
     %% Guardian side-channel forwarding (agent drift events -> control plane)
     [yuzu, gw, guardian, forward_accepted],
@@ -46,6 +49,16 @@
     %% Heartbeat admission (connection-bound sessions)
     [yuzu, gw, heartbeat, rejected],
     [yuzu, gw, heartbeat, session_mismatch],
+    [yuzu, gw, heartbeat, unknown_truncated],
+    [yuzu, gw, heartbeat, verdict_dropped],
+    [yuzu, gw, heartbeat, coalesced],
+    [yuzu, gw, heartbeat, buffer_dropped],
+
+    %% Registrations refused by the per-connection session quota
+    [yuzu, gw, session, limit_rejected],
+
+    %% Registers refused at the edge, before any upstream call (#4632)
+    [yuzu, gw, register, refused],
 
     %% Mgmt-plane peer authorization (#1422)
     [yuzu, gw, mgmt_auth, rejected],
@@ -164,7 +177,8 @@ handle_event([yuzu, gw, upstream, circuit_state], #{count := N}, Meta, _Config) 
     prometheus_counter:inc(yuzu_gw_upstream_circuit_transitions_total, [State], N);
 
 %% Gate 7 sre OBS-4 — registration-replay observability. `replayed` counts
-%% agents re-proxied upstream; `queue_depth` is the gauge an operator alerts
+%% registration replay attempts by the drip, any outcome (success, failure,
+%% accepted=false, superseded); `queue_depth` is the gauge an operator alerts
 %% on to spot a replay storm (UP-5) that never drains.
 handle_event([yuzu, gw, upstream, registration_replay],
              #{replayed := N, queue_depth := Q}, _Meta, _Config) ->
@@ -172,17 +186,56 @@ handle_event([yuzu, gw, upstream, registration_replay],
     prometheus_gauge:set(yuzu_gw_registration_replay_queue_depth, [node()], Q);
 
 %% HA WS-4 4.4 round-2 review (Gate 3 finding NEW-1 / Gate 6 COMP-2, NEW-2):
-%% yuzu_gw_upstream:handle_cast({notify_stream_status, ...}) emits this on
-%% BOTH drop paths (circuit_open | at_capacity) — without this clause the
-%% event fires into an unregistered telemetry event and never reaches
-%% Prometheus, same failure shape `forward_dropped` above exists to avoid,
-%% and specifically the failure mode that made the original F2 fix a no-op:
-%% a dropped CONNECTED for an ADOPTED replay session (this slice's
-%% reannounce/2 mechanism) left gateway_node/wire_capabilities/
-%% stream_home_id unconverged with literally zero operator-visible signal.
+%% yuzu_gw_upstream emits this when the notify pending store refuses a new
+%% key because admitting it would reach `notify_pending_max` keys, counting the
+%% key of a half_open probe in flight (#4632: reason is
+%% `at_capacity` only; `circuit_open` is no longer emitted because a notify
+%% arriving with the breaker not closed is now held, not dropped). Without
+%% this clause the event fires into an unregistered telemetry event and never
+%% reaches Prometheus, same failure shape `forward_dropped` below exists to
+%% avoid. The label is a closed set: `at_capacity' is itself, and a missing
+%% reason or any other value (a non-binary included) folds to a pre-seeded
+%% `unknown' series, so a bug cannot widen the label set. Only this metric
+%% pre-seeds its `unknown' series: verdict_dropped and buffer_dropped fold the
+%% same way but their `unknown' series is created on first use.
+%% yuzu_gw_upstream emits only the literal at_capacity today. The handler must never crash: telemetry detaches a handler that
+%% raises, which would silence every metric.
 handle_event([yuzu, gw, upstream, notify_dropped], #{count := N}, Meta, _Config) ->
-    Reason = maps:get(reason, Meta, <<"unknown">>),
+    Reason = case maps:get(reason, Meta, unknown) of
+        <<"at_capacity">> -> <<"at_capacity">>;
+        at_capacity -> <<"at_capacity">>;
+        _ -> <<"unknown">>
+    end,
     prometheus_counter:inc(yuzu_gw_upstream_notify_dropped_total, [Reason], N);
+
+%% #4632: a Register the gateway edge refused itself (an agent id that is empty,
+%% missing, not a binary or over 256 bytes), before any reservation and before
+%% any upstream call. The label is a closed set: `agent_id_length' is itself, and
+%% a missing reason or any other value (a non-binary included) folds to a
+%% pre-seeded `unknown' series, so a caller cannot widen the label set and a bug
+%% cannot crash this handler (telemetry detaches a handler that raises). The
+%% event carries no agent data: the id is the caller's text.
+handle_event([yuzu, gw, register, refused], #{count := N}, Meta, _Config) ->
+    Reason = case maps:get(reason, Meta, unknown) of
+        <<"agent_id_length">> -> <<"agent_id_length">>;
+        agent_id_length       -> <<"agent_id_length">>;
+        _                     -> <<"unknown">>
+    end,
+    prometheus_counter:inc(yuzu_gw_register_refused_total, [Reason], N);
+
+%% #4632: size of the notify pending store and the number of NotifyStreamStatus
+%% workers the upstream gen_server tracks, reported together because every
+%% handler that changes one may change the other. Emitted whenever either
+%% changed and once with zeros from yuzu_gw_upstream:init/1.
+handle_event([yuzu, gw, upstream, notify_queue],
+             #{pending := P, inflight := I}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_upstream_notify_pending, [node()], P),
+    prometheus_gauge:set(yuzu_gw_upstream_notify_inflight, [node()], I);
+
+%% #4632: a held notification replaced by a newer event for the same agent
+%% session (suppression, not delivery).
+handle_event([yuzu, gw, upstream, notify_coalesced], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_upstream_notify_coalesced_total, [], N);
 
 %% Guardian side-channel forwarding. `forward_accepted` is the denominator for a
 %% drop-rate SLO; `forward_dropped` is split by reason (circuit_open | at_capacity).
@@ -228,6 +281,71 @@ handle_event([yuzu, gw, heartbeat, rejected], #{count := N}, Meta, _Config) ->
 handle_event([yuzu, gw, heartbeat, session_mismatch], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
                            [<<"security">>], N);
+
+%% Heartbeat verdict consumer (#1197). `registration_replay_triggered'
+%% counts replays that started, by trigger (breaker | heartbeat); the label is
+%% an atom chosen by yuzu_gw_upstream, never caller-supplied, so a sender
+%% cannot control label cardinality. `unknown_truncated' counts verdicts the
+%% server cut short. `verdict_dropped' counts session ids the verdict named
+%% that were not queued for replay, by reason (malformed | not_local |
+%% circuit_open | queue_full: the replay queue is at its cap, or the upstream
+%% mailbox holds more than 100 messages so the buffer did not cast the ids);
+%% the ids already queued or inside the session guard are deduplicated, not
+%% dropped, and are not counted. A missing label, or one outside these closed
+%% sets (a non-atom included), falls to an `unknown' series that is not
+%% pre-seeded, as buffer_dropped does, rather than guessing, and the handler must
+%% never crash: telemetry detaches a handler that raises, which would silence
+%% every metric.
+handle_event([yuzu, gw, upstream, registration_replay_triggered], #{count := N}, Meta, _Config) ->
+    Trigger = case maps:get(trigger, Meta, unknown) of
+        T when T =:= breaker; T =:= heartbeat -> T;
+        _ -> unknown
+    end,
+    prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total,
+                           [atom_to_binary(Trigger, utf8)], N);
+
+handle_event([yuzu, gw, heartbeat, unknown_truncated], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_heartbeat_unknown_truncated_total, [], N);
+
+handle_event([yuzu, gw, heartbeat, verdict_dropped], #{count := N}, Meta, _Config) ->
+    Reason = case maps:get(reason, Meta, unknown) of
+        R when R =:= malformed; R =:= not_local; R =:= circuit_open;
+               R =:= queue_full -> R;
+        _ -> unknown
+    end,
+    prometheus_counter:inc(yuzu_gw_heartbeat_verdict_dropped_total,
+                           [atom_to_binary(Reason, utf8)], N);
+
+%% Heartbeat buffer bounds. `coalesced' counts a heartbeat merged into the
+%% buffered one of the same session. `buffer_dropped' counts what the buffer
+%% gave up to stay bounded, by the closed reason set buffer_full (a heartbeat
+%% or whole session dropped) | snapshot_oversize (one snapshot larger than a
+%% chunk, heartbeat kept) | snapshot_evicted (oldest snapshot dropped to fit the
+%% byte cap) | heartbeat_oversize (the status tags of a heartbeat with too many
+%% tags, or larger than a chunk, dropped, heartbeat kept) | heartbeat_invalid (a
+%% status tag that is not valid UTF-8 repaired with replacement characters,
+%% heartbeat kept) |
+%% chunk_rejected (one heartbeat the server rejected with a non-transient
+%% status, dropped). The label is an atom chosen by yuzu_gw_heartbeat_buffer; any other
+%% value falls to `unknown' so a bug cannot widen the label set, and the handler
+%% must never crash (telemetry detaches a handler that raises).
+handle_event([yuzu, gw, heartbeat, coalesced], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_heartbeat_coalesced_total, [], N);
+
+handle_event([yuzu, gw, heartbeat, buffer_dropped], #{count := N}, Meta, _Config) ->
+    Reason = case maps:get(reason, Meta, unknown) of
+        R when R =:= buffer_full; R =:= snapshot_oversize; R =:= snapshot_evicted;
+               R =:= heartbeat_oversize; R =:= heartbeat_invalid;
+               R =:= chunk_rejected -> R;
+        _ -> unknown
+    end,
+    prometheus_counter:inc(yuzu_gw_heartbeat_buffer_dropped_total,
+                           [atom_to_binary(Reason, utf8)], N);
+
+%% A Register or Subscribe refused because its connection already holds
+%% `max_sessions_per_connection' agent sessions (yuzu_gw_registry).
+handle_event([yuzu, gw, session, limit_rejected], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_session_limit_rejected_total, [], N);
 
 handle_event([yuzu, gw, cluster, node_up], _Measurements, Meta, _Config) ->
     Node = maps:get(node, Meta, <<"unknown">>),
@@ -322,7 +440,39 @@ declare_metrics() ->
     prometheus_counter:declare([
         {name, yuzu_gw_upstream_rpc_errors_total},
         {labels, [rpc_name, code]},
-        {help, "Upstream RPC errors by method and status code"}]),
+        {help, "Upstream RPC errors by method and status code. code is a gRPC "
+               "status (a binary digit string), a transport error reason, "
+               "exception (an exception out of the client or transport) or "
+               "encode (the request could not be encoded in this gateway, so it "
+               "never left it; the breaker is not touched). encode and exception "
+               "are pre-seeded at 0 for each RPC name that can emit them; a "
+               "sustained encode increase is a systematic local fault that "
+               "leaves the breaker closed and /readyz ready"}]),
+    %% A series that first appears already at 1 is invisible to increase(), so
+    %% the two codes a gateway fault produces (no server answer, so no status
+    %% code) start at 0. The RPC names are the do_rpc/3 tags of yuzu_gw_upstream
+    %% (register, inventory, notify_stream, guardian) and the heartbeat buffer's
+    %% batch_heartbeat, whose marshal failure is counted as code="exception"
+    %% (yuzu_gw_heartbeat_buffer do_flush, the {caught, Class} branch), so only
+    %% exception is seeded for it; an invalid heartbeat is dropped as
+    %% heartbeat_invalid instead. Neither is covered by the encode alert. Status
+    %% codes are never pre-seeded.
+    [prometheus_counter:inc(yuzu_gw_upstream_rpc_errors_total, [Name, Code], 0)
+     || {Name, Code} <- [{N, C} || N <- [<<"register">>, <<"inventory">>,
+                                         <<"notify_stream">>, <<"guardian">>],
+                                   C <- [<<"encode">>, <<"exception">>]]
+                        ++ [{<<"batch_heartbeat">>, <<"exception">>}]],
+    prometheus_counter:declare([
+        {name, yuzu_gw_register_refused_total},
+        {labels, [reason]},
+        {help, "Registers the gateway edge refused itself before any upstream "
+               "call (the agent id is empty, missing, not a binary or longer "
+               "than 256 bytes), answered INVALID_ARGUMENT. The label reason has "
+               "the closed set agent_id_length, plus unknown for any other value, "
+               "which the gateway does not emit today. These refusals never "
+               "reach the circuit breaker or yuzu_gw_upstream_rpc_errors_total."}]),
+    [prometheus_counter:inc(yuzu_gw_register_refused_total, [R], 0)
+     || R <- [<<"agent_id_length">>, <<"unknown">>]],
     prometheus_counter:declare([
         {name, yuzu_gw_upstream_tls_handshake_failures_total},
         {labels, [rpc_name, kind]},
@@ -360,17 +510,32 @@ declare_metrics() ->
     prometheus_counter:declare([
         {name, yuzu_gw_registration_replay_total},
         {labels, []},
-        {help, "Total agents re-proxied upstream by the registration-replay drip"}]),
+        {help, "Total registration replay attempts by the drip, any outcome"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_upstream_notify_dropped_total},
         {labels, [reason]},
-        {help, "Stream-status (CONNECTED/DISCONNECTED) notifications dropped "
-               "before delivery to the C++ server, by reason (circuit_open | "
-               "at_capacity). Includes HA WS-4 4.4's reannounce/2-triggered "
-               "CONNECTED after a replay-adopted session -- a sustained "
-               "non-zero rate here means agents are converging their "
-               "gateway_node placement slower than expected, or not at all, "
-               "during a recovery replay burst."}]),
+        {help, "Stream-status (CONNECTED/DISCONNECTED) notifications lost at "
+               "admission because the pending store was at its cap: a new key is "
+               "admitted only while the held keys plus the key of a half_open "
+               "probe in flight stay below notify_pending_max. The label reason "
+               "has the closed set "
+               "at_capacity, plus unknown for any other value, which the "
+               "gateway does not emit today (the circuit_open value is no longer "
+               "emitted: a notification arriving while the breaker is not closed "
+               "is held). It does not count delivery loss after admission (worker failure, "
+               "gateway shutdown). A sustained non-zero rate means agents are "
+               "converging their gateway_node placement slower than expected, or "
+               "not at all, during a connect burst or recovery replay."}]),
+    %% A series that first appears already at 1 is invisible to increase().
+    [prometheus_counter:inc(yuzu_gw_upstream_notify_dropped_total, [R], 0)
+     || R <- [<<"at_capacity">>, <<"unknown">>]],
+    prometheus_counter:declare([
+        {name, yuzu_gw_upstream_notify_coalesced_total},
+        {labels, []},
+        {help, "Held stream-status notifications replaced by a newer event for "
+               "the same agent session and stream home, or a failed probe "
+               "notification superseded by one"}]),
+    prometheus_counter:inc(yuzu_gw_upstream_notify_coalesced_total, [], 0),
     prometheus_counter:declare([
         {name, yuzu_gw_guardian_forward_accepted_total},
         {labels, []},
@@ -430,6 +595,67 @@ declare_metrics() ->
      || R <- heartbeat_reject_reasons()],
     prometheus_counter:inc(yuzu_gw_heartbeat_session_mismatch_total,
                            [<<"security">>], 0),
+    prometheus_counter:declare([
+        {name, yuzu_gw_registration_replay_triggered_total},
+        {labels, [trigger]},
+        {help, "Registration replays started, by trigger (breaker = the upstream "
+               "recovered from failures, replaying every agent this node holds; "
+               "heartbeat = the server's heartbeat verdict listed sessions it does "
+               "not know, replaying only those)"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_heartbeat_unknown_truncated_total},
+        {labels, []},
+        {help, "BatchHeartbeat responses whose list of unknown sessions the "
+               "server truncated. Sessions beyond the cap may be reported again by "
+               "later heartbeats"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_heartbeat_verdict_dropped_total},
+        {labels, [reason]},
+        {help, "Session ids named by a heartbeat verdict that were not queued "
+               "for replay, by reason (malformed = not a usable session id, "
+               "not_local = this node does not hold the session, circuit_open = "
+               "the upstream circuit breaker is open, queue_full = the replay "
+               "queue is at its cap, or the upstream process already holds more "
+               "than 100 unhandled messages so the ids were not handed to it). "
+               "Ids already queued or replayed within the session guard window "
+               "are not counted"}]),
+    %% Create every series at 0 now (a series that first appears already at 1
+    %% is invisible to increase()).
+    [prometheus_counter:inc(yuzu_gw_registration_replay_triggered_total, [T], 0)
+     || T <- [<<"breaker">>, <<"heartbeat">>]],
+    [prometheus_counter:inc(yuzu_gw_heartbeat_verdict_dropped_total, [R], 0)
+     || R <- [<<"malformed">>, <<"not_local">>, <<"circuit_open">>, <<"queue_full">>]],
+    prometheus_counter:declare([
+        {name, yuzu_gw_heartbeat_buffer_dropped_total},
+        {labels, [reason]},
+        {help, "Heartbeat data the gateway buffer gave up to stay bounded or to "
+               "keep flushing, by reason (buffer_full = a "
+               "heartbeat or whole session dropped because the session count or "
+               "byte cap was reached, snapshot_oversize = one fleet snapshot "
+               "larger than a request chunk was dropped and the heartbeat kept, "
+               "snapshot_evicted = the oldest fleet snapshot was dropped to fit "
+               "the byte cap and the heartbeat kept, heartbeat_oversize = the "
+               "status tags of a heartbeat that had more than 512 tags or was "
+               "larger than a request chunk were dropped and the heartbeat kept, "
+               "heartbeat_invalid = a status tag with invalid UTF-8 was repaired "
+               "with replacement characters, chunk_rejected = a single heartbeat the "
+               "server rejected with a non-transient status was dropped)"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_heartbeat_coalesced_total},
+        {labels, []},
+        {help, "Heartbeats merged into the already buffered heartbeat of the "
+               "same session before a flush (the buffer keeps one per session)"}]),
+    [prometheus_counter:inc(yuzu_gw_heartbeat_buffer_dropped_total, [R], 0)
+     || R <- [<<"buffer_full">>, <<"snapshot_oversize">>, <<"snapshot_evicted">>,
+              <<"heartbeat_oversize">>, <<"heartbeat_invalid">>,
+              <<"chunk_rejected">>]],
+    prometheus_counter:inc(yuzu_gw_heartbeat_coalesced_total, [], 0),
+    prometheus_counter:declare([
+        {name, yuzu_gw_session_limit_rejected_total},
+        {labels, []},
+        {help, "Registrations refused because one connection already holds the "
+               "configured number of agent sessions"}]),
+    prometheus_counter:inc(yuzu_gw_session_limit_rejected_total, [], 0),
     prometheus_counter:declare([
         {name, yuzu_gw_mgmt_auth_pin_unresolved_total},
         {labels, []},
@@ -504,6 +730,23 @@ declare_metrics() ->
         {labels, [node]},
         {help, "Agents still queued for registration replay (0 = idle; "
                "a persistently non-zero value indicates a replay storm)"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_upstream_notify_pending},
+        {labels, [node]},
+        {help, "Stream-status notifications held because the in-flight limit is "
+               "reached or the upstream circuit breaker is not closed; drained "
+               "first in first out (0 = nothing held). The key of a half_open "
+               "probe in flight is not counted here, unless a newer "
+               "notification for the same key has since been held, and the "
+               "key still counts toward the notify_pending_max cap"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_upstream_notify_inflight},
+        {labels, [node]},
+        {help, "NotifyStreamStatus workers tracked by this gateway process (at "
+               "most 10)"}]),
+    %% Series at 0 from startup, before yuzu_gw_upstream:init/1 has reported.
+    prometheus_gauge:set(yuzu_gw_upstream_notify_pending, [node()], 0),
+    prometheus_gauge:set(yuzu_gw_upstream_notify_inflight, [node()], 0),
     prometheus_gauge:declare([
         {name, yuzu_gw_cluster_peers_resolved},
         {labels, [node]},

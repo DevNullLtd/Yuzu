@@ -61,6 +61,7 @@ tus=(
     agents/plugins/tar/src/tar_removable_collector.cpp
     agents/plugins/execution_artifacts/src/execution_artifacts_win.cpp
     agents/plugins/update_source_trust/src/update_source_trust_win.cpp
+    agents/plugins/mgmt_posture/src/mgmt_posture_win.cpp
     agents/plugins/runtimes/src/runtimes_win.cpp
     agents/plugins/runtimes/src/runtimes_linux.cpp # empty on Windows: checks the portable half of the Linux walk header
     agents/core/src/dism_bounded_call.cpp

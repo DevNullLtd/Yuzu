@@ -86,9 +86,9 @@ vendor update service.
 | Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
 | `device.windows_updates.patch_connectivity` | `targets` | string | no | - | - | Comma-separated list of URLs to test connectivity against. If empty, uses platform-default patch servers (e.g. Windows Update endpoints, apt/yum/dnf repos, macOS Software Update). Example: "https://update.microsoft.com,https://download.windowsupdate.com" |
-| `device.windows_updates.patch_connectivity` | `timeout_seconds` | int32 | no | 10 | minimum 1 · maximum 60 | TCP connection timeout per target. Default: 10, min: 1, max: 60. |
+| `device.windows_updates.patch_connectivity` | `timeout_seconds` | int32 | no | 10 | minimum 1 · maximum 60 | TCP connection timeout per target. Default: 10, min: 1, max: 60. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute. |
 | `workflow.patch_connectivity_audit` | `targets` | string | no | - | - | Comma-separated list of patch server URLs to test. Leave empty to use platform defaults. |
-| `workflow.patch_connectivity_audit` | `timeout_seconds` | int32 | no | 10 | minimum 1 · maximum 60 | TCP connection timeout per target. |
+| `workflow.patch_connectivity_audit` | `timeout_seconds` | int32 | no | 10 | minimum 1 · maximum 60 | TCP connection timeout per target, 1-60 seconds. Out-of-range values are rejected with a 400 by POST /api/instructions/{id}/execute. |
 | `workflow.patch_connectivity_audit` | `upload_log_path` | string | no | - | maxLength 4096 | Optional. Path to a local diagnostic log file to upload to the server after the connectivity test. If provided, the log will be uploaded via agent.content_dist.upload_file in a chained step. |
 <!-- END GENERATED -->
 

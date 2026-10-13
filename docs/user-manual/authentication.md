@@ -8,6 +8,8 @@ Yuzu supports multiple authentication methods: local password auth with session 
 
 On first launch, the server prompts interactively for admin credentials. These are stored in `yuzu-server.cfg` with PBKDF2-hashed passwords.
 
+> **The config file is a seed, not the password store.** On the first boot against an empty PostgreSQL `auth` schema the server provisions the config file's admin into the AuthDB (`auth.users`). From then on the AuthDB row is the only credential that is checked at login: editing a hash in `yuzu-server.cfg` (or regenerating the file) no longer changes an existing account's password (#5274). Change or reset passwords in the product instead — see [Changing and resetting a local password](#changing-and-resetting-a-local-password).
+
 ```
 $ ./yuzu-server
 No admin account found. Let's create one.
@@ -45,6 +47,36 @@ curl -s -b cookies.txt http://localhost:8080/api/v1/me
 ```
 
 All REST API v1 responses are wrapped in this envelope. The `data` key holds the payload, and `meta` contains the API version. List endpoints also include a `pagination` key.
+
+### Changing and resetting a local password
+
+Local accounts (created in Settings → User Management, by `POST /api/settings/users`, or the first administrator provisioned from the config file on first boot) have a password that can be changed in the product (#5342). SSO accounts (OIDC/SAML principals) and SCIM-provisioned accounts have no local password; their credentials are managed at the identity provider, and both routes below refuse them with `409` "not a local account". (First-run setup creates the administrator only, and the Windows installer no longer accepts `/OPERATOR_USER`/`/OPERATOR_PASS` (#5343): a second account written to the config file alone is never provisioned into the auth store and cannot sign in. A leftover config entry with no stored account is named in a warning at boot.)
+
+**`yuzu-server.cfg` does not change a password (#5274).** Login reads the PostgreSQL auth store only. The config file seeds the first administrator into an **empty** database and is otherwise ignored for credentials, so editing it, regenerating it, or re-running the Windows installer does not change an existing account's password (the installer refuses `/ADMIN_PASS` on an upgrade). Because it re-seeds an empty database, a rebuild onto a fresh database brings back the password the file holds — change it in the product afterwards.
+
+**Password policy.** A new password must be **12 to 1024 bytes** (UTF-8 bytes, not characters). The same bounds apply to account creation, and `/login` answers a password over 1024 bytes exactly like a wrong one, without hashing it.
+
+**Change your own password.** In the dashboard: Settings → User Management → **Change password** on your own row (current password, new password, confirmation). Over REST: `POST /api/v1/users/me/password` with `{"current_password": "...", "new_password": "..."}`. Only a signed-in **local** dashboard session can do this — an OIDC/SAML session gets `409`, and an API, MCP, engine or service-scoped token gets `403`. If your account has MFA enrolled, a fresh step-up proof is required (see below).
+
+- A wrong current password counts as a failed login attempt for [account lockout](server-admin.md#server-cli-flags), exactly like a wrong password at `/login`. Wrong password and locked account both answer `403` "current password is incorrect" — there is no lock-state oracle; the audit row records which it was. If the password could not be checked at all (the auth store could not be read, or the password changed at that moment), the answer is a retryable `503` and nothing counts toward lockout.
+- **The new password and the sign-out of every session of the account — including the one you are using, and on every server in an HA cluster — happen in one step**, together with the audit record: all of it is saved, or none of it. No replacement session is issued: the response clears your cookie and you sign in again with the new password (the dashboard sends you to the sign-in page). If the change is refused or fails, nothing changed and your session still works. An unfinished MFA enrolment (a TOTP secret issued but never confirmed) is discarded (except the narrow revoked-session window described as R14 in [docs/auth-architecture.md](../auth-architecture.md)); an enrolled second factor is kept. API tokens are not affected.
+- Under `--auth-mode=sso-only` only the configured break-glass account, and only while it is armed, can change its own password; any other local account — or the break-glass account once disarmed — gets `403` without its password being checked.
+
+**Reset another user's password (admin).** In the dashboard: Settings → User Management → **Reset password** on any other local account's row (new password and confirmation). Over REST: `POST /api/v1/users/{username}/password` with `{"new_password": "..."}`. It requires a **durable Administrator**, checked the same way as RBAC role assignment — not an ordinary permission:
+
+- With RBAC off, your own account (re-read from the auth store) must hold the `admin` role. An OIDC session whose admin role comes only from IdP group mapping does not qualify.
+- With RBAC on, you must hold an `Administrator` grant as a user principal. A group-held grant, a JIT elevation, or a custom role holding `UserManagement:Write` does not qualify.
+
+A caller who does not qualify gets `403` (`durable_admin_required`); if the stores cannot confirm your authority, `503`. The same rule applies whatever the target's role. The request must come from an interactive dashboard session — tokens of every kind are refused — and passes the shared MFA step-up gate (a fresh proof when you are MFA-enrolled; a SAML session is refused `403` there, as SAML has no MFA attestation yet).
+
+- You cannot reset your **own** password this way (`403`); use the change route above, which requires your current password.
+- You cannot reset the configured break-glass account (`403`): it is re-keyed out of band, or by signing in as it while armed and changing its own password.
+- In one step, all-or-nothing together with the audit record: the new password is written, every dashboard session of the target is signed out, an unfinished MFA enrolment is discarded (except the narrow revoked-session window described as R14 in [docs/auth-architecture.md](../auth-architecture.md)), and any lockout on the account is cleared (`lockout_cleared` is `true` only when there was a lockout to clear). A refused or failed reset changes nothing. **The target's API tokens are NOT revoked**; the response reports how many are still active (`api_tokens_active`, or `null` with `api_tokens_unknown` when it could not tell), and the dashboard toast says so.
+- **If the account may be compromised**, a reset alone is not enough: an attacker may hold an **enrolled** second factor (a reset deliberately keeps an enrolled TOTP secret and its recovery codes) and API tokens. Also clear MFA on the server host with `yuzu-server --mfa-reset <username>` (see [Emergency MFA disable](../ops-runbooks/auth-db-recovery.md#emergency-mfa-disable-break-glass)) and revoke the account's tokens with `DELETE /api/v1/tokens/{id}`. `--mfa-reset` removes the enrolled second factor and its recovery codes and leaves the account **password-only**: the user is walked through a fresh enrolment at their next sign-in only when `--mfa-enforcement` covers them (`required`, or `admin-only` for an admin account). Under the default `optional` nobody is prompted — an admin re-enrols in Settings → Multi-Factor Authentication, and a non-admin account has no self-service enrolment page (#5353), so it stays password-only until enforcement is turned on.
+
+**Both routes:** the request must come from the dashboard's own origin (`Origin`/`Referer` checked; `403` otherwise) with `Content-Type: application/json` (`415` otherwise); the password is never logged, audited or echoed back. Setting the **same** password as the current one is accepted: it is stored with a fresh salt and, like any change or reset, signs out every session of the account. The change is recorded as `user.password_change` (self) or `user.password_reset` (admin) in the same database transaction as the change: if that audit row cannot be written, nothing is changed and the request fails with `503` (`audit_unavailable`, `Sec-Audit-Failed: true`) — there is no "changed but unrecorded" state. A `503` from either route means nothing was changed unless the server lost contact with the database at the very moment of saving; a successful sign-in with the new password confirms the change, which is then audited too. There is deliberately **no MCP tool** for either action — see `rest-api.md` for the full contract and the parity exception (#5357 tracks a temporary-password reset tool).
+
+Non-admin users cannot open Settings, so for them the self-service change is REST-only today (`POST /api/v1/users/me/password` from a signed-in browser session; #5353 tracks a self-service account page).
 
 ### Multi-Factor Authentication (TOTP)
 
@@ -123,7 +155,7 @@ Every MFA state transition emits an audit row (`docs/user-manual/audit-log.md` l
 
 #### Step-up on high-risk surfaces (PR 2)
 
-Twenty-four REST + Settings endpoints (token mint/revoke/rotate/confirm, admin session revoke, software package create / deployment start, Guardian rule create/update/delete/push, the full engine-principal lifecycle — create/delete, credential mint/rotate/confirm, role grant/revoke, transfer-owner — account unlock, user delete, user role change, and the two JIT admin-elevation endpoints, which use the same gate with the step-up window floored to 300s so elevation always requires a fresh proof) require a fresh MFA proof on the calling session before the mutation lands. If the proof is older than `--mfa-step-up-window-secs`, the endpoint returns HTTP `401` with an A4 envelope:
+Twenty-six REST + Settings endpoints (token mint/revoke/rotate/confirm, admin session revoke, software package create / deployment start, Guardian rule create/update/delete/push, the full engine-principal lifecycle — create/delete, credential mint/rotate/confirm, role grant/revoke, transfer-owner — account unlock, local password change and admin password reset, user delete, user role change, and the two JIT admin-elevation endpoints, which use the same gate with the step-up window floored to 300s so elevation always requires a fresh proof) require a fresh MFA proof on the calling session before the mutation lands. If the proof is older than `--mfa-step-up-window-secs`, the endpoint returns HTTP `401` with an A4 envelope:
 
 ```json
 {
@@ -273,15 +305,16 @@ Example startup:
 ### OIDC Login Flow
 
 1. User clicks "Sign in with SSO" on the login page.
-2. Browser is redirected to `GET /auth/oidc/start`, which generates a PKCE challenge and redirects to the IdP's authorization endpoint.
+2. Browser is redirected to `GET /auth/oidc/start`, which generates a PKCE challenge, sets the browser-binding cookie, and redirects to the IdP's authorization endpoint.
 3. User authenticates at the IdP.
-4. IdP redirects back to `GET /auth/callback` with an authorization code.
-5. Server exchanges the code for tokens, validates the ID token, extracts claims, and creates a local session.
+4. IdP redirects back to `GET /auth/callback` with an authorization code. The browser presents the binding cookie.
+5. Server checks the binding cookie, exchanges the code for tokens, validates the ID token, extracts claims, and creates a local session.
 
 ```
 Browser           Yuzu Server               IdP (Entra ID)
   |                    |                          |
   |-- GET /auth/oidc/start -->                    |
+  |<-- 302 + Set-Cookie (binding) --|             |
   |                    |-- 302 authorize?... ---->|
   |                    |                          |
   |                    |          (user authenticates)
@@ -289,6 +322,17 @@ Browser           Yuzu Server               IdP (Entra ID)
   |                    |<--- 302 /auth/callback --|
   |<-- Set-Cookie -----|                          |
 ```
+
+### Browser binding
+
+The sign-in is bound to the browser that started it. `GET /auth/oidc/start` sets a short-lived (10 minute) `HttpOnly` cookie holding a random secret, and the server keeps only a SHA-256 digest of that secret beside the pending flow. `GET /auth/callback` refuses a request that does not present the matching cookie, so a callback URL only completes in the browser that began the flow. A refused callback does not consume the pending flow, so the original browser can still finish within the 10 minute window; the cookie is cleared once the flow it proved has been used.
+
+- **Cookie name.** `__Host-yuzu_oidc_bind` (`Secure`, `Path=/`) when the server's own listener runs with HTTPS, and `yuzu_oidc_bind` on plain HTTP, the same rule the session cookie follows. A server behind a TLS-terminating proxy that itself listens on plain HTTP therefore uses the unprefixed, non-`Secure` name, the same posture as its session cookie and weaker than SAML's HTTPS-only stance.
+- **Same host name.** The cookie is bound to the host name it was set on, so the sign-in must be started on the same host name as the configured `--oidc-redirect-uri`. A sign-in started on a different host name (an IP address, a short name) is refused with `sso_failed` until it is restarted on the configured host.
+- **`SameSite=Lax`.** The identity provider returns by a top-level GET, which a `Lax` cookie accompanies (SAML needs `None` because its assertion arrives as a POST). This relies on the default `query` response mode, which is what Yuzu requests; it does not request `form_post`.
+- **Multiple replicas.** The pending flow and its digest are held in server memory, so the callback must reach the replica that handled `GET /auth/oidc/start`. Configure session affinity on `GET /auth/oidc/start` and `GET /auth/callback`, as for SAML (see [SAML HA](../auth-architecture.md#ha--multi-replica)).
+- **Restarts and upgrades.** A sign-in started before a server upgrade or restart cannot be completed afterwards; the user restarts it from the login page. Starting a second SSO sign-in in the same browser replaces the cookie, so the earlier unfinished sign-in in that browser must be restarted.
+- **Audit.** Refusals are audited as `auth.oidc_login_failed` with `reason=browser_binding_missing` (no cookie), `reason=browser_binding_mismatch` (a cookie that does not match the flow) or `reason=browser_binding_unavailable` (the server could not compute the digest; the flow stays pending). The browser sees the usual generic `sso_failed` error in every case.
 
 ### Group-to-Role Mapping
 
@@ -716,8 +760,9 @@ Service-scoped tokens:
 - Cannot access any `/api/v1/admin/*` routes (403 Forbidden)
 - Require RBAC to be enabled; rejected if RBAC is disabled (403 Forbidden)
 - Carry a session role floored to the base `user` level regardless of the
-  minting principal's own role — an `ITServiceOwner` RBAC grant is the sole
-  authority ceiling for a service-scoped token, never the minter's role
+  minting principal's own role — an `ITServiceOwner` RBAC grant is the
+  authority ceiling for a service-scoped token, never the minter's role, and
+  it is applied by the permission gates and by the fleet-read gate alike
 
 **Default-deny (guardian-confinement-2298 PR 3 — "the flip").** Holding
 `ITServiceOwner` for a given `securable:operation` is necessary but no
@@ -1179,7 +1224,7 @@ The following audit actions are emitted for authentication and authorization eve
 | `auth.login_failed` | `failure` | Failed login attempt |
 | `auth.logout` | `success` | User-initiated logout |
 | `auth.oidc_login` | `success` | Successful OIDC SSO login |
-| `auth.oidc_login_failed` | `failure` | Failed OIDC login attempt |
+| `auth.oidc_login_failed` | `failure` | Failed OIDC login attempt; a refused browser-binding check carries `reason=browser_binding_missing`, `browser_binding_mismatch` or `browser_binding_unavailable` |
 | `auth.saml_login` | `ok` | Successful SAML 2.0 SSO login |
 | `auth.saml_login_failed` | `error` | Failed SAML login attempt (missing binding cookie, oversize body, missing SAMLResponse, or signature/audience/expiry/replay validation failure) |
 
@@ -1216,7 +1261,7 @@ HTTP status codes:
 |---|---|---|---|
 | `POST` | `/login` | No | Authenticate with username/password; returns JSON `{"status":"ok"}` + session cookie |
 | `POST` | `/logout` | Session | Invalidate current session; returns JSON `{"status":"ok"}` |
-| `GET` | `/auth/oidc/start` | No | Begin OIDC PKCE login flow (302 redirect to IdP) |
+| `GET` | `/auth/oidc/start` | No | Begin OIDC PKCE login flow (302 redirect to IdP); sets the browser-binding cookie that `/auth/callback` requires (refusals: `browser_binding_missing` / `_mismatch` / `_unavailable`) |
 | `GET` | `/auth/callback` | No | OIDC callback (IdP redirects here; creates session, 302 to `/`) |
 | `GET` | `/auth/saml/start` | No | Begin SAML 2.0 SP-initiated login flow (302 redirect to IdP via HTTP-Redirect binding); Linux/macOS only |
 | `POST` | `/saml/acs` | No | SAML Assertion Consumer Service — IdP POSTs the response here; validates and creates session; Linux/macOS only |

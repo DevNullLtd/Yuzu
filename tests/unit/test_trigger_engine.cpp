@@ -11,7 +11,9 @@
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -21,6 +23,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -53,6 +56,36 @@ struct DispatchRecorder {
         return cv.wait_for(lock, timeout, [&]() { return calls.size() >= n; });
     }
 };
+
+/// Keeps moving `file`'s mtime to a fresh future value until `recorder` has a dispatch or
+/// `budget` runs out, and returns whether one arrived. One change is not enough: the first poll
+/// only records the baseline mtime, and a starved runner can delay it past any fixed sleep,
+/// absorbing a one-off change into the baseline. Each bump is a distinct mtime (10 s apart), so
+/// the poll after the baseline always sees one. The mtime is set explicitly because NTFS caching
+/// can delay the natural update. Waits on the recorder's condition variable, so a green run pays
+/// only a few polls.
+bool bump_until_dispatch(DispatchRecorder& recorder, const fs::path& file,
+                         std::chrono::seconds budget) {
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    std::error_code ec;
+    int bumps = 0;
+    bool fired = false;
+    while (!fired && std::chrono::steady_clock::now() < deadline) {
+        ++bumps;
+        {
+            std::ofstream ofs(file, std::ios::trunc);
+            ofs << "modified content " << bumps;
+        }
+        fs::last_write_time(file,
+                            fs::file_time_type::clock::now() + std::chrono::seconds{10 * bumps},
+                            ec);
+        fired = recorder.wait_for(1, std::chrono::milliseconds{150});
+    }
+    // Attached to the next failing assertion, so a red run says how far the loop got.
+    UNSCOPED_INFO("bump_until_dispatch: " << bumps << " bump(s), last last_write_time error: "
+                                          << ec.message());
+    return fired;
+}
 
 } // namespace
 
@@ -291,51 +324,28 @@ TEST_CASE("TriggerEngine: unregister specific trigger leaves others",
 // Minimum interval clamping
 // ═══════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("TriggerEngine: interval < 30 clamped to 30", "[trigger_engine][config]") {
+TEST_CASE("TriggerEngine: an interval below 30s is raised to 30, any other is kept",
+          "[trigger_engine][config]") {
     TriggerEngine engine;
-    DispatchRecorder recorder;
-    engine.set_dispatch(recorder.callback());
 
     TriggerConfig cfg;
     cfg.id = "fast-trigger";
     cfg.type = TriggerType::Interval;
     cfg.plugin = "p1";
     cfg.action = "act";
-    // Below the 30s minimum. 1s is deliberate: interval_loop ticks every 1s, records the first
-    // observation on tick 1 and fires on the first later tick where elapsed >= interval, so an
-    // UNCLAMPED 1s trigger fires at ~2s. The negative window below (3s) therefore goes red if
-    // the clamp is removed. (The old value of 5 only fired at ~6s unclamped, outside the old 3s
-    // window, so that test stayed green with no clamp at all.)
-    cfg.interval_seconds = 1;
+    const int requested = GENERATE(0, 1, 29, 30, 31, 60);
+    cfg.interval_seconds = requested;
 
     engine.register_trigger(cfg);
 
-    // Negative window: with the interval clamped to 30s the trigger must NOT fire. wait_for
-    // returns the instant a dispatch arrives (so a regression goes red fast); a green run pays
-    // the whole window. The window is bounded below by the unclamped fire time (~2s). The
-    // engine's 1s tick is the floor and there is no production seam to shorten it, and no
-    // accessor exposes the clamped config value.
-    engine.start();
-    const bool fired = recorder.wait_for(1, std::chrono::milliseconds{3000});
-    engine.stop();
+    // Read the stored config back: the interval loop fires from exactly this field, so a
+    // removed clamp (below 30) or an over-eager one (30 and above) shows here at once, with no
+    // timed window. The loop itself is covered by the "start/stop no crash" case below.
+    const auto stored = engine.find_trigger("fast-trigger");
+    REQUIRE(stored.has_value());
+    CHECK(stored->interval_seconds == std::max(requested, 30));
 
-    CHECK_FALSE(fired);
-    CHECK(recorder.count() == 0);
-}
-
-TEST_CASE("TriggerEngine: interval of 0 is clamped to 30", "[trigger_engine][config]") {
-    TriggerEngine engine;
-
-    TriggerConfig cfg;
-    cfg.id = "zero-interval";
-    cfg.type = TriggerType::Interval;
-    cfg.plugin = "p1";
-    cfg.action = "act";
-    cfg.interval_seconds = 0;
-
-    // Should not crash; interval is clamped to 30
-    engine.register_trigger(cfg);
-    CHECK(engine.trigger_count() == 1);
+    CHECK_FALSE(engine.find_trigger("missing").has_value());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -446,10 +456,11 @@ TEST_CASE("TriggerEngine: interval trigger registered, start/stop no crash",
     engine.start();
     REQUIRE(engine.is_running());
 
-    // Negative / no-crash window: interval_loop ticks once per second, so 1.2s lets it run its
-    // first tick (first-observation baseline for this trigger) and still be mid-loop at stop().
-    // Anything longer only re-runs the same no-op tick; the 1s tick is the floor.
-    std::this_thread::sleep_for(std::chrono::milliseconds{1200});
+    // Negative / no-crash window: interval_loop ticks once per second. Tick 1 records this
+    // trigger's baseline; tick 2 is the first to evaluate `elapsed >= interval_seconds`, so 2.2s
+    // is the shortest window in which a loop that fired a 30s trigger early would show up here
+    // (the 1s tick is the floor and there is no seam to shorten it).
+    std::this_thread::sleep_for(std::chrono::milliseconds{2200});
 
     engine.stop();
     CHECK_FALSE(engine.is_running());
@@ -488,36 +499,18 @@ TEST_CASE("TriggerEngine: file change trigger fires on modification",
     cfg.watch_path = watch_file.string();
     engine.register_trigger(cfg);
 
+    // 50ms poll (production: 5s). The 5s deadline below is what locks the seam: at the
+    // production 5s poll the first poll only records the baseline and the first detection lands
+    // near 10s, so this fails if the interval stops reaching the loop. 5s is ~30x the measured
+    // 0.16s.
+    engine.set_file_poll_interval_for_test(std::chrono::milliseconds{50});
     engine.start();
 
-    // The file_watch_loop polls every 5 seconds (sleeping in 1-second increments).
-    // First observation records baseline mtime without firing. We need to:
-    //   1. Wait for the first poll to establish baseline (~6s to be safe)
-    //   2. Modify the file
-    //   3. Wait for the second poll to detect the change (~7s more)
-    // Total: ~13 seconds. Use generous timeouts to handle CI/slow machines.
-    std::this_thread::sleep_for(std::chrono::seconds{8});
+    // Negative half first: the file is unchanged, so no poll may dispatch, neither the baseline
+    // poll nor a later one (250ms is five polls).
+    CHECK_FALSE(recorder.wait_for(1, std::chrono::milliseconds{250}));
 
-    // Modify the file — write different content and explicitly set mtime to
-    // a future time to guarantee the change is detectable on all platforms.
-    {
-        std::ofstream ofs(watch_file, std::ios::trunc);
-        ofs << "modified content";
-        ofs.flush();
-    }
-    // On Windows, NTFS timestamp resolution is 100ns but filesystem caching
-    // can delay mtime updates. Explicitly bump last_write_time to ensure
-    // the file watch loop sees a different timestamp.
-    {
-        std::error_code ec;
-        auto current = fs::last_write_time(watch_file, ec);
-        if (!ec) {
-            fs::last_write_time(watch_file, current + std::chrono::seconds{10}, ec);
-        }
-    }
-
-    // Wait for the next poll cycle to detect the change
-    bool fired = recorder.wait_for(1, std::chrono::seconds{12});
+    const bool fired = bump_until_dispatch(recorder, watch_file, std::chrono::seconds{5});
 
     engine.stop();
 
@@ -533,31 +526,50 @@ TEST_CASE("TriggerEngine: file change trigger fires on modification",
     fs::remove_all(tmp_dir, ec);
 }
 
-TEST_CASE("TriggerEngine: file change trigger with empty watch_path starts and stops safely",
+TEST_CASE("TriggerEngine: an empty watch_path does not stop later file triggers being polled",
           "[trigger_engine][filechange]") {
+    yuzu::test::TempDir dir{"yuzu_test_trigger_empty_path_"};
+    fs::create_directories(dir.path);
+    const auto watch_file = dir.path / "watched.txt";
+    {
+        std::ofstream ofs(watch_file);
+        ofs << "initial content";
+    }
+
     TriggerEngine engine;
     DispatchRecorder recorder;
     engine.set_dispatch(recorder.callback());
 
-    TriggerConfig cfg;
-    cfg.id = "empty-path";
-    cfg.type = TriggerType::FileChange;
-    cfg.plugin = "p1";
-    cfg.action = "act";
-    cfg.watch_path = ""; // empty
-    engine.register_trigger(cfg);
+    // The empty-path trigger is registered FIRST, so it sits ahead of the live one in every poll's
+    // snapshot: if skipping it ever became a break or a return, the live trigger below would
+    // never be polled and this case would fail. (The skip versus the failing canonical("") path
+    // cannot be told apart by outcome; this pins the part that can: the loop carries on.)
+    TriggerConfig empty;
+    empty.id = "empty-path";
+    empty.type = TriggerType::FileChange;
+    empty.plugin = "empty_path_plugin";
+    empty.action = "act";
+    empty.watch_path = "";
+    engine.register_trigger(empty);
 
+    TriggerConfig live;
+    live.id = "live-path";
+    live.type = TriggerType::FileChange;
+    live.plugin = "live_path_plugin";
+    live.action = "act";
+    live.watch_path = watch_file.string();
+    engine.register_trigger(live);
+
+    // 20ms poll (production: 5s): every poll walks past the empty path.
+    engine.set_file_poll_interval_for_test(std::chrono::milliseconds{20});
     engine.start();
-    // Negative / no-crash window, honestly bounded: file_watch_loop does its first poll only
-    // after a 5s wait, so no window short of >5s reaches the empty watch_path skip, and the
-    // outcome is the same either way (canonical("") fails and the loop continues; a first
-    // observation never fires). This case therefore proves "registering an empty-path
-    // FileChange trigger and starting/stopping the engine is safe and dispatches nothing". To
-    // exercise the skip itself would need an injectable file-poll interval in TriggerEngine.
-    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    const bool fired = bump_until_dispatch(recorder, watch_file, std::chrono::seconds{5});
     engine.stop();
 
-    CHECK(recorder.count() == 0);
+    CHECK(fired);
+    // Only the live trigger dispatches; the empty-path one has nothing to watch.
+    for (const auto& call : recorder.calls)
+        CHECK(std::get<0>(call) == "live_path_plugin");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

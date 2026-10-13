@@ -3,9 +3,10 @@
 /// @file software_catalog_rollup.hpp
 /// Background driver for the `/inventory` Software-tab catalogue rollup. Owns a single
 /// thread that periodically calls `SoftwareInventoryStore::refresh_catalog_rollup()` —
-/// the one expensive full-table `GROUP BY`, run OFF the request path so page reads hit
-/// only the small precomputed rollup tables. The underlying `installed_software` changes
-/// only on the daily sync, so a periodic recompute is strictly fresh-enough.
+/// the expensive full-table passes (cancellable: it polls `stop_` between batches), run OFF
+/// the request path so page reads hit only the small precomputed rollup tables. The
+/// underlying `installed_software` changes only on the daily sync, so a periodic recompute is
+/// strictly fresh-enough.
 ///
 /// Lifecycle mirrors the app-perf roll-up thread: `start()` spawns the thread and runs
 /// ONE refresh immediately (so the catalogue populates at boot), then refreshes on a
@@ -44,8 +45,9 @@ public:
     /// Signal stop and join the thread (idempotent; also called by the destructor).
     void stop();
     /// Signal stop WITHOUT joining: no new recompute starts; one already in flight
-    /// finishes. Called when the server starts draining (HA WS-8) so a recompute
-    /// cannot begin inside the drain grace and then run after it; stop() joins later.
+    /// is cancelled at its next poll (last-good kept). Called when the server starts
+    /// draining (HA WS-8) so a recompute cannot begin inside the drain grace and then
+    /// run after it; stop() joins later.
     void request_stop() noexcept;
 
 private:

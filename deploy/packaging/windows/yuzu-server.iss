@@ -4,11 +4,28 @@
 ;
 ; Silent parameters:
 ;   /ADMIN_USER=name       Admin username (required on a fresh install)
-;   /ADMIN_PASS=pass       Admin password (min 12 chars). On an upgrade, leave out
-;                          /ADMIN_USER, /ADMIN_PASS and the operator pair to keep
-;                          the existing accounts.
-;   /OPERATOR_USER=name    Operator username (optional; only with /ADMIN_PASS)
-;   /OPERATOR_PASS=pass    Operator password (required with /OPERATOR_USER, min 12 chars)
+;   /ADMIN_PASS=pass       Admin password, FRESH INSTALL ONLY: at least 12
+;                          characters and at most 1024 bytes as UTF-8 (a
+;                          character outside ASCII takes 2 to 4 bytes). It is
+;                          written to yuzu-server.cfg, which only SEEDS the first
+;                          administrator into an EMPTY auth database (#5274); on
+;                          an existing database the stored password wins and a
+;                          rewritten file would be ignored.
+;                          ON AN UPGRADE (yuzu-server.cfg already exists) leave
+;                          out /ADMIN_USER and /ADMIN_PASS:
+;                          the existing accounts are kept, and a non-empty
+;                          /ADMIN_PASS= or /OPERATOR_PASS= is REFUSED with exit
+;                          code 11 before anything changes. Change or reset a
+;                          password in the dashboard (Settings > User Management
+;                          > Change password / Reset password), or follow
+;                          docs/ops-runbooks/auth-db-recovery.md.
+;   /OPERATOR_USER, /OPERATOR_PASS   REMOVED in 0.15.0 (#5343). The second account
+;                          they wrote went to yuzu-server.cfg only and could never
+;                          sign in on PostgreSQL. A non-empty value is REFUSED
+;                          (exit code 7, nothing changed, on a fresh install or on an
+;                          upgrade given /OPERATOR_USER= alone; on an upgrade a non-empty
+;                          /OPERATOR_PASS= is exit code 11, as above). Create further
+;                          accounts in Settings > User Management after the install.
 ;   /POSTGRES_DSN_FILE=f   File holding the PostgreSQL connection string. One of
 ;                          this or /POSTGRES_DSN is required on a fresh install and
 ;                          on an upgrade from any earlier version (none stored one),
@@ -18,6 +35,32 @@
 ;   /POSTGRES_DSN=dsn      The PostgreSQL connection string itself
 ;   /GATEWAY               Enable gateway mode
 ;   /GATEWAY_ADDR=h:p      Gateway command address (default: localhost:50063)
+;   /GATEWAY_PEER_PIN_FILE=f  File naming the gateway(s) the server accepts on its
+;                          gateway-upstream port: PEM certificates, or one SHA-256
+;                          SPKI pin (64 hex characters) per line. Stored as
+;                          certs\gateway-peer-pin and passed to the service as
+;                          --gateway-peer-pin-file on every install. Setup only checks
+;                          that the file is non-empty and not UTF-16 (no NUL bytes);
+;                          the server parses it when it starts.
+;   /GATEWAY_PEER_PIN=hex  One SHA-256 SPKI pin (exactly 64 hex characters, either
+;                          case), stored in the same file (use the FILE form for
+;                          several, or for a certificate). Give either this or
+;                          /GATEWAY_PEER_PIN_FILE, not both. Either one given
+;                          REPLACES the stored certs\gateway-peer-pin.
+;                          /GATEWAY with operator gRPC certificates (/GRPC_CERT or
+;                          /CA_CERT, now or from an earlier install) needs one
+;                          of them, or Setup refuses. With the generated default
+;                          certificates the server pins its own gateway certificate.
+;                          /GATEWAY with /NOTLS passes --insecure-gateway-peer
+;                          (gateway peer authorization disabled; dev only) and
+;                          no pin file, because the server refuses both together.
+;                          Giving /GATEWAY_PEER_PIN or /GATEWAY_PEER_PIN_FILE
+;                          together with /GATEWAY /NOTLS is REFUSED (exit code 7,
+;                          nothing changed): plaintext has nothing to pin.
+;                          The interactive wizard has no page for a pin. Both pin
+;                          parameters are command-line only, in the wizard and in
+;                          a silent install alike; a PEM certificate file given
+;                          with /GATEWAY_PEER_PIN_FILE= is accepted.
 ;   /OIDC_ISSUER=url       OIDC issuer URL
 ;   /OIDC_CLIENT_ID=id     OIDC client ID
 ;   /OIDC_CLIENT_SECRET=s  OIDC client secret
@@ -29,7 +72,9 @@
 ;   /GRPC_KEY=path         PEM private key for agent gRPC
 ;   /CA_CERT=path          PEM CA cert for mTLS agent verification
 ;   /NOHTTPS               Disable HTTPS (dev only)
-;   /NOTLS                 Disable gRPC TLS (dev only)
+;   /NOTLS                 Disable gRPC TLS (dev only). Any /GRPC_CERT, /GRPC_KEY or
+;                          /CA_CERT given with it is ignored and not copied, as in
+;                          the wizard.
 ;   /NOSTART               Do not start service after install
 ;
 ; Exit codes: 0 success; 7 the installation was stopped before any file was
@@ -41,11 +86,20 @@
 ; the abort came before the old directory was moved (it is then restarted). 10
 ; the files were installed but the service could not be registered or its
 ; command line could not be written and confirmed; Setup disables the service
-; if it can, and says whether it did.
+; if it can, and says whether it did. 11 an upgrade (yuzu-server.cfg already
+; exists) was given a non-empty /ADMIN_PASS= or /OPERATOR_PASS=, which can no
+; longer change a stored password (#5274); nothing was stopped or changed, and
+; the reason is in the setup log on a line starting "InitializeSetup:".
+; (Inno Setup's own exit codes are 0-8.)
 ;
 ; THE SETUP LOG RECORDS THE FULL COMMAND LINE, including any /ADMIN_PASS=,
-; /OPERATOR_PASS=, /POSTGRES_DSN= or /OIDC_CLIENT_SECRET= value. Prefer the
+; /POSTGRES_DSN= or /OIDC_CLIENT_SECRET= value. Prefer the
 ; *_FILE parameters, and protect or delete the log.
+;
+; KNOWN ISSUE (#1835, "Windows server binary has the identical SCM control-protocol
+; defect as #1822 (agent)"): this installer registers yuzu-server.exe as the
+; YuzuServer service, and starting that service under the Windows service
+; manager was not tested for this installer because of that issue.
 ;
 ; Secrets are kept in "%ProgramData%\Yuzu Server", locked to Administrators
 ; and SYSTEM; the service's command line (readable by local users) carries
@@ -119,7 +173,6 @@ Type: filesandordirs; Name: "{app}\logs"
 var
   // Wizard pages
   AdminPage: TInputQueryWizardPage;
-  OperatorPage: TInputQueryWizardPage;
   NetworkPage: TWizardPage;
   DatabasePage: TInputQueryWizardPage;
   IdentityPage: TWizardPage;
@@ -218,6 +271,83 @@ begin
                                 'Environment', V) then
       Result := (Pos(Uppercase(Name) + '=', Uppercase(V)) = 1) or
                 (Pos(#0 + Uppercase(Name) + '=', Uppercase(V)) > 0);
+end;
+
+// ── Password rules and the upgrade refusal (#5274, #5342) ────────────────
+
+// The UTF-8 encoded length of S in bytes: the unit the server's password policy
+// measures (at most 1024 bytes, server/core/src/password_policy.hpp), and what
+// generate-config.ps1 hashes. Length() counts UTF-16 code units, so each half
+// of a surrogate pair (one character, 4 bytes in UTF-8) counts 2 here.
+function Utf8ByteLength(const S: string): Integer;
+var
+  I, C: Integer;
+begin
+  Result := 0;
+  for I := 1 to Length(S) do
+  begin
+    C := Ord(S[I]);
+    if C < $80 then
+      Result := Result + 1
+    else if C < $800 then
+      Result := Result + 2
+    else if (C >= $D800) and (C <= $DFFF) then
+      Result := Result + 2
+    else
+      Result := Result + 3;
+  end;
+end;
+
+const
+  MaxPasswordBytes = 1024;
+  // Inno Setup's own exit codes are 0-8; 7 and 10 carry this installer's
+  // meanings (see the header).
+  UpgradePasswordExitCode = 11;
+
+// True when this is an upgrade that keeps the existing accounts: a
+// yuzu-server.cfg is already in the data directory. The same test the wizard
+// and PrepareToInstall use for "there is an existing configuration to keep".
+function ExistingConfig: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{commonappdata}\Yuzu Server\yuzu-server.cfg'));
+end;
+
+procedure ExitProcess(uExitCode: Cardinal);
+  external 'ExitProcess@kernel32.dll stdcall';
+
+// Since #5274 yuzu-server.cfg only SEEDS the first administrator into an
+// empty auth database; on an existing one the stored password wins and a
+// rewritten file is ignored. A new /ADMIN_PASS= or /OPERATOR_PASS= on an
+// upgrade would therefore be dropped without a word -- and a password rotated
+// because it leaked would stay valid. Refused here, before the wizard, before
+// the service is stopped and before anything is written, with its own exit
+// code (11) so an unattended deployment can tell it apart from code 7.
+// Inno Setup has no way to return a custom code from a refusal (its
+// GetCustomSetupExitCode runs only after a successful install), hence
+// ExitProcess: the setup log keeps the "InitializeSetup:" line, but Setup's
+// own temporary folder is left behind in %TEMP%.
+function InitializeSetup(): Boolean;
+var
+  Refusal: string;
+begin
+  Result := True;
+  if ExistingConfig and ((GetCmdParam('ADMIN_PASS') <> '') or (GetCmdParam('OPERATOR_PASS') <> '')) then
+  begin
+    Refusal := 'This is an upgrade (yuzu-server.cfg already exists), and /ADMIN_PASS= or ' +
+               '/OPERATOR_PASS= was given. The installer can no longer change a stored ' +
+               'password: the configuration file only seeds the first administrator into an ' +
+               'empty database, so the new password would be ignored and the old one would ' +
+               'stay valid. Run the installer again without /ADMIN_USER=, /ADMIN_PASS=, ' +
+               '/OPERATOR_USER= and /OPERATOR_PASS= (the existing accounts are kept), then ' +
+               'change or reset the password in the dashboard (Settings > User Management > ' +
+               'Change password / Reset password), or follow ' +
+               'docs/ops-runbooks/auth-db-recovery.md if no administrator can sign in.' + #13#10#13#10 +
+               'Nothing has been changed.';
+    Log('InitializeSetup: ' + Refusal);
+    SuppressibleMsgBox(Refusal, mbCriticalError, MB_OK, IDOK);
+    ExitProcess(UpgradePasswordExitCode);
+    Result := False;
+  end;
 end;
 
 // ── File browse helper ───────────────────────────────────────────────────
@@ -369,31 +499,19 @@ begin
     'Administrator Account',
     'Create the admin account for the Yuzu dashboard.',
     'The admin has full access to all server features including user management, ' +
-    'policy deployment, and agent commands. When upgrading, leave the password blank ' +
-    'to keep the existing accounts.');
+    'policy deployment, and agent commands. This page appears on a fresh install only: ' +
+    'an upgrade keeps the existing accounts, and passwords are changed in the dashboard ' +
+    '(Settings > User Management).');
   AdminPage.Add('Username:', False);
-  AdminPage.Add('Password (minimum 12 characters):', True);
+  AdminPage.Add('Password (at least 12 characters, at most 1024 bytes):', True);
   AdminPage.Add('Confirm password:', True);
   AdminPage.Values[0] := GetCmdParam('ADMIN_USER');
   if AdminPage.Values[0] = '' then AdminPage.Values[0] := 'admin';
   AdminPage.Values[1] := GetCmdParam('ADMIN_PASS');
   AdminPage.Values[2] := GetCmdParam('ADMIN_PASS');
 
-  // ── Page: Operator credentials ──
-  OperatorPage := CreateInputQueryPage(AdminPage.ID,
-    'Operator Account (Optional)',
-    'Create a read-only operator account.',
-    'Operators can view fleet status, query responses, and monitor compliance ' +
-    'but cannot execute instructions or change settings. Leave the username blank to skip.');
-  OperatorPage.Add('Username:', False);
-  OperatorPage.Add('Password (minimum 12 characters):', True);
-  OperatorPage.Add('Confirm password:', True);
-  OperatorPage.Values[0] := GetCmdParam('OPERATOR_USER');
-  OperatorPage.Values[1] := GetCmdParam('OPERATOR_PASS');
-  OperatorPage.Values[2] := GetCmdParam('OPERATOR_PASS');
-
   // ── Page: Network / Gateway ──
-  NetworkPage := CreateCustomPage(OperatorPage.ID,
+  NetworkPage := CreateCustomPage(AdminPage.ID,
     'Network Configuration',
     'Configure gateway mode if you have a Yuzu Gateway on this machine.');
 
@@ -544,12 +662,17 @@ begin
       Result := False;
       Exit;
     end;
-    if (AdminPage.Values[1] = '') and (AdminPage.Values[2] = '') and
-       FileExists(ExpandConstant('{commonappdata}\Yuzu Server\yuzu-server.cfg')) then
-      Exit;  // keep the existing accounts
+    // (On an upgrade this page is skipped: see ShouldSkipPage.)
     if Length(AdminPage.Values[1]) < 12 then
     begin
       MsgBox('Admin password must be at least 12 characters.', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+    if Utf8ByteLength(AdminPage.Values[1]) > MaxPasswordBytes then
+    begin
+      MsgBox('Admin password must be at most 1024 bytes as UTF-8 (a character outside ' +
+             'ASCII takes 2 to 4 bytes).', mbError, MB_OK);
       Result := False;
       Exit;
     end;
@@ -558,33 +681,6 @@ begin
       MsgBox('Admin passwords do not match.', mbError, MB_OK);
       Result := False;
       Exit;
-    end;
-  end;
-
-  // Validate operator credentials (only if username provided)
-  if CurPageID = OperatorPage.ID then
-  begin
-    if OperatorPage.Values[0] <> '' then
-    begin
-      if AdminPage.Values[1] = '' then
-      begin
-        MsgBox('An operator account can only be set together with a new admin password.',
-               mbError, MB_OK);
-        Result := False;
-        Exit;
-      end;
-      if Length(OperatorPage.Values[1]) < 12 then
-      begin
-        MsgBox('Operator password must be at least 12 characters.', mbError, MB_OK);
-        Result := False;
-        Exit;
-      end;
-      if OperatorPage.Values[1] <> OperatorPage.Values[2] then
-      begin
-        MsgBox('Operator passwords do not match.', mbError, MB_OK);
-        Result := False;
-        Exit;
-      end;
     end;
   end;
 
@@ -642,9 +738,13 @@ end;
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   Result := False;
+  // An upgrade keeps the existing accounts: the installer cannot change a
+  // stored password (#5274), so the credential pages are not offered.
+  if (PageID = AdminPage.ID) and ExistingConfig then
+    Result := True;
   if WizardSilent then
   begin
-    if (PageID = AdminPage.ID) or (PageID = OperatorPage.ID) or
+    if (PageID = AdminPage.ID) or
        (PageID = NetworkPage.ID) or (PageID = DatabasePage.ID) or (PageID = IdentityPage.ID) or
        (PageID = TLSPage.ID) then
       Result := True;
@@ -690,11 +790,13 @@ end;
 
 type
   TInstallInputs = record
-    AdminUser, AdminPass, OpUser, OpPass: string;
+    AdminUser, AdminPass: string;
     Dsn, DsnFile: string;
     UseOIDC: Boolean;
     OidcIssuer, OidcClientId, OidcSecret, OidcSecretFile, OidcAdminGroup: string;
     HttpsCert, HttpsKey, GrpcCert, GrpcKey, CaCert: string;
+    // Command-line only (no wizard page): the gateway peer pin, as a file or as one hex pin.
+    GatewayPeerPin, GatewayPeerPinFile: string;
   end;
 
 procedure GetInputs(var R: TInstallInputs);
@@ -703,8 +805,6 @@ begin
   begin
     R.AdminUser := GetCmdParam('ADMIN_USER');
     R.AdminPass := GetCmdParam('ADMIN_PASS');
-    R.OpUser := GetCmdParam('OPERATOR_USER');
-    R.OpPass := GetCmdParam('OPERATOR_PASS');
     R.Dsn := GetCmdParam('POSTGRES_DSN');
     R.UseOIDC := GetCmdParam('OIDC_ISSUER') <> '';
     R.OidcIssuer := GetCmdParam('OIDC_ISSUER');
@@ -716,13 +816,19 @@ begin
     R.GrpcCert := GetCmdParam('GRPC_CERT');
     R.GrpcKey := GetCmdParam('GRPC_KEY');
     R.CaCert := GetCmdParam('CA_CERT');
+    // As in the wizard: with gRPC TLS skipped the certificates are ignored by the
+    // service arguments, so they must not be copied into certs\ either.
+    if HasCmdFlag('NOTLS') then
+    begin
+      R.GrpcCert := '';
+      R.GrpcKey := '';
+      R.CaCert := '';
+    end;
   end
   else
   begin
     R.AdminUser := AdminPage.Values[0];
     R.AdminPass := AdminPage.Values[1];
-    R.OpUser := OperatorPage.Values[0];
-    R.OpPass := OperatorPage.Values[1];
     R.Dsn := DatabasePage.Values[0];
     R.UseOIDC := OIDCCheckbox.Checked;
     R.OidcIssuer := OIDCIssuerEdit.Text;
@@ -750,11 +856,32 @@ begin
   // command line, and so out of a /LOG= file, which records it.
   R.DsnFile := GetCmdParam('POSTGRES_DSN_FILE');
   R.OidcSecretFile := GetCmdParam('OIDC_CLIENT_SECRET_FILE');
+  R.GatewayPeerPin := GetCmdParam('GATEWAY_PEER_PIN');
+  R.GatewayPeerPinFile := GetCmdParam('GATEWAY_PEER_PIN_FILE');
   if not R.UseOIDC then
   begin
     R.OidcSecret := '';
     R.OidcSecretFile := '';
   end;
+end;
+
+// Whether this run installs gateway mode, and whether gRPC TLS is skipped. One
+// definition, used by the service command line and by the pre-flight check, so
+// the two cannot disagree about the configuration the service will boot with.
+function GatewayRequested: Boolean;
+begin
+  if WizardSilent then
+    Result := HasCmdFlag('GATEWAY')
+  else
+    Result := GatewayCheckbox.Checked;
+end;
+
+function GrpcTlsSkipped: Boolean;
+begin
+  if WizardSilent then
+    Result := HasCmdFlag('NOTLS')
+  else
+    Result := NoTLSCheckbox.Checked;
 end;
 
 function ShouldStartService: Boolean;
@@ -821,7 +948,7 @@ begin
     Result := #13#10#13#10 + 'The Yuzu Server service has been stopped and DISABLED (see above).'
   else if StoppedRunningService then
     Result := #13#10#13#10 + 'The existing Yuzu Server service was stopped and has not been ' +
-              'restarted. It will start again at the next reboot, or run: sc start YuzuServer';
+              'restarted. It will start again at the next reboot, or run: sc.exe start YuzuServer';
 end;
 
 // The operator-facing refusal for a directory that is not, or could not be
@@ -1215,6 +1342,12 @@ begin
   if (Result = '') and (Inp.GrpcCert <> '') then Result := CopyInto(Inp.GrpcCert, C + '\grpc-cert.pem');
   if (Result = '') and (Inp.GrpcKey <> '') then Result := CopyInto(Inp.GrpcKey, C + '\grpc-key.pem');
   if (Result = '') and (Inp.CaCert <> '') then Result := CopyInto(Inp.CaCert, C + '\ca-cert.pem');
+  // The gateway peer pin: the server reads it once at start (a pin is not a
+  // secret, but this keeps it in the locked directory beside the certificates).
+  if (Result = '') and (Inp.GatewayPeerPinFile <> '') then
+    Result := CopyInto(Inp.GatewayPeerPinFile, C + '\gateway-peer-pin');
+  if (Result = '') and (Inp.GatewayPeerPin <> '') then
+    Result := WriteSecret(Inp.GatewayPeerPin, '', C + '\gateway-peer-pin');
 end;
 
 // ── Configuration (password hashes) ──────────────────────────────────────
@@ -1269,8 +1402,6 @@ begin
 
   SetEnvironmentVariable('YUZU_SETUP_ADMIN_USER', Inp.AdminUser);
   SetEnvironmentVariable('YUZU_SETUP_ADMIN_PASS', Inp.AdminPass);
-  SetEnvironmentVariable('YUZU_SETUP_OPERATOR_USER', Inp.OpUser);
-  SetEnvironmentVariable('YUZU_SETUP_OPERATOR_PASS', Inp.OpPass);
   try
     Ran := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
                 '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + Cmd + '"',
@@ -1278,8 +1409,6 @@ begin
   finally
     SetEnvironmentVariable('YUZU_SETUP_ADMIN_USER', '');
     SetEnvironmentVariable('YUZU_SETUP_ADMIN_PASS', '');
-    SetEnvironmentVariable('YUZU_SETUP_OPERATOR_USER', '');
-    SetEnvironmentVariable('YUZU_SETUP_OPERATOR_PASS', '');
   end;
 
   if LoadStringFromFile(ReasonFile, ReasonText) then
@@ -1339,32 +1468,134 @@ begin
     Result := 'The file given with /' + Param + '= was not found, or is not a plain file: ' + Path;
 end;
 
+// True when S is exactly 64 hexadecimal digits (a SHA-256 SPKI pin), either case.
+function IsSha256Hex(const S: string): Boolean;
+var
+  I, C: Integer;
+begin
+  Result := Length(S) = 64;
+  if Result then
+    for I := 1 to Length(S) do
+    begin
+      C := Ord(S[I]);
+      if not (((C >= 48) and (C <= 57)) or ((C >= 65) and (C <= 70)) or
+              ((C >= 97) and (C <= 102))) then
+        Result := False;
+    end;
+end;
+
+// Cheap checks on a gateway peer pin file: readable, no NUL byte (a UTF-16 file
+// has them), not blank. Deliberately NOT a PEM or hex parser: the full parse
+// stays in the server (gateway_peer_pinset.cpp), which refuses to start on a
+// pin file it cannot use, so a second parser here could only drift from it.
+function PinFileProblem(const Path: string): string;
+var
+  Content: AnsiString;
+  I: Integer;
+begin
+  Result := '';
+  if not LoadStringFromFile(Path, Content) then
+  begin
+    Result := 'The file given with /GATEWAY_PEER_PIN_FILE= could not be read: ' + Path;
+    Exit;
+  end;
+  for I := 1 to Length(Content) do
+    if Ord(Content[I]) = 0 then
+    begin
+      Result := 'The file given with /GATEWAY_PEER_PIN_FILE= contains NUL bytes (is it UTF-16?). ' +
+                'Save it as ASCII or UTF-8 text: ' + Path;
+      Exit;
+    end;
+  if Trim(String(Content)) = '' then
+    Result := 'The file given with /GATEWAY_PEER_PIN_FILE= is empty: ' + Path;
+end;
+
+// The server refuses to start the gateway-upstream service on operator
+// certificates unless a gateway peer pin is configured (a certificate from the
+// operator's CA does not say which holder is the gateway). GetServiceArgs
+// rebuilds the command line from this run's inputs and the files in certs\ on
+// EVERY run, so an upgrade that re-selects gateway mode on an install carrying
+// operator certificates would otherwise install a service that does not boot.
+// Refused here, before anything changes. A /GATEWAY_PEER_PIN value must be 64
+// hex characters and a pin file passes only the cheap checks above; the server
+// does the full validation when it starts. A pin parameter given together with
+// /GATEWAY and /NOTLS is refused as well: the service would be started with
+// --insecure-gateway-peer and no pin file, so the pin could never be used.
+function CheckGatewayPeer(const Inp: TInstallInputs): string;
+var
+  CertDir: string;
+  OperatorCerts, HavePin: Boolean;
+begin
+  Result := '';
+  if (Inp.GatewayPeerPin <> '') and (Inp.GatewayPeerPinFile <> '') then
+  begin
+    Result := 'Give either /GATEWAY_PEER_PIN= or /GATEWAY_PEER_PIN_FILE=, not both.';
+    Exit;
+  end;
+  if (Inp.GatewayPeerPin <> '') and not IsSha256Hex(Inp.GatewayPeerPin) then
+  begin
+    Result := '/GATEWAY_PEER_PIN= must be exactly 64 hexadecimal characters (the SHA-256 of the ' +
+              'gateway certificate''s public key); the value given is ' +
+              IntToStr(Length(Inp.GatewayPeerPin)) + ' characters long or contains a character ' +
+              'that is not hexadecimal. For several pins, or a certificate, use /GATEWAY_PEER_PIN_FILE=.';
+    Exit;
+  end;
+  if Inp.GatewayPeerPinFile <> '' then
+  begin
+    Result := PinFileProblem(Inp.GatewayPeerPinFile);
+    if Result <> '' then Exit;
+  end;
+  if GatewayRequested and GrpcTlsSkipped and
+     ((Inp.GatewayPeerPin <> '') or (Inp.GatewayPeerPinFile <> '')) then
+  begin
+    Result := 'Gateway mode with /NOTLS (gRPC TLS skipped) runs without gateway peer authorization, ' +
+              'so a gateway peer pin has nothing to check, and the server refuses to start with both. ' +
+              'Leave out /GATEWAY_PEER_PIN= and /GATEWAY_PEER_PIN_FILE=, or leave out /NOTLS.';
+    Exit;
+  end;
+  if (not GatewayRequested) or GrpcTlsSkipped then Exit;
+  CertDir := CertDirPath(DataDirPath);
+  // What GetServiceArgs will pass: --cert/--key from grpc-cert.pem and grpc-key.pem, --ca-cert from ca-cert.pem.
+  OperatorCerts := (Inp.GrpcCert <> '') or (Inp.CaCert <> '') or
+                   FileExists(CertDir + '\grpc-cert.pem') or FileExists(CertDir + '\ca-cert.pem');
+  HavePin := (Inp.GatewayPeerPin <> '') or (Inp.GatewayPeerPinFile <> '') or
+             FileExists(CertDir + '\gateway-peer-pin');
+  if OperatorCerts and not HavePin then
+    Result := 'Gateway mode is selected with operator-supplied gRPC certificates (a gRPC certificate ' +
+              'or CA certificate is given, or is kept from an earlier install), and no gateway peer ' +
+              'pin is stored. The server refuses to start the gateway-upstream service in that ' +
+              'configuration. The pin cannot be entered in the wizard: supply it on the setup command line ' +
+              'with /GATEWAY_PEER_PIN_FILE=<file> (a PEM certificate file of the gateway works, or a ' +
+              'file of 64-hex-character pins) or /GATEWAY_PEER_PIN=<64 hex characters> (the SHA-256 of ' +
+              'the gateway certificate''s public key); it is kept in the data directory and used on ' +
+              'every later install. ' +
+              'If no gateway is used, leave /GATEWAY out. For a development rig, /NOTLS together ' +
+              'with /GATEWAY disables gateway peer authorization.';
+end;
+
 // The wizard pages validate an interactive install; a silent one was not
 // validated at all. Checked before the service is stopped or anything changes.
 function CheckInputs(const Inp: TInstallInputs): string;
 begin
   Result := '';
-  if Inp.AdminPass <> '' then
+  // The second first-run account was removed (#5343): it was written to
+  // yuzu-server.cfg only and could never sign in on PostgreSQL. Read from the
+  // command line (wizard and silent alike) so no run silently ignores it.
+  if (GetCmdParam('OPERATOR_USER') <> '') or (GetCmdParam('OPERATOR_PASS') <> '') then
+    Result := '/OPERATOR_USER= and /OPERATOR_PASS= were removed in 0.15.0 (#5343): the ' +
+              'account they created could never sign in. Run the installer without them, ' +
+              'then create further accounts in Settings > User Management after the install.'
+  else if Inp.AdminPass <> '' then
   begin
     if BadUsername(Inp.AdminUser) then
       Result := 'An admin username is required (/ADMIN_USER=), without '':'' or control characters.'
     else if Length(Inp.AdminPass) < 12 then
       Result := 'The admin password (/ADMIN_PASS=) must be at least 12 characters.'
-    else if Inp.OpUser <> '' then
-    begin
-      if BadUsername(Inp.OpUser) then
-        Result := 'The operator username (/OPERATOR_USER=) may not contain '':'' or control characters.'
-      else if CompareText(Inp.OpUser, Inp.AdminUser) = 0 then
-        Result := 'The operator username must differ from the admin username.'
-      else if Length(Inp.OpPass) < 12 then
-        Result := 'The operator password (/OPERATOR_PASS=) must be at least 12 characters.';
-    end;
+    else if Utf8ByteLength(Inp.AdminPass) > MaxPasswordBytes then
+      Result := 'The admin password (/ADMIN_PASS=) must be at most 1024 bytes as UTF-8.';
   end
   else if WizardSilent and (Inp.AdminUser <> '') then
-    Result := '/ADMIN_USER= was given without /ADMIN_PASS=.'
-  else if Inp.OpUser <> '' then
-    Result := 'An operator account can only be set together with the admin password; leave both ' +
-              'out to keep the existing accounts.';
+    Result := '/ADMIN_USER= was given without /ADMIN_PASS=.';
   if Result = '' then
   begin
     if (Inp.Dsn <> '') and (Inp.DsnFile <> '') then
@@ -1398,6 +1629,8 @@ begin
   if Result = '' then Result := CheckFileParam(Inp.GrpcCert, 'GRPC_CERT');
   if Result = '' then Result := CheckFileParam(Inp.GrpcKey, 'GRPC_KEY');
   if Result = '' then Result := CheckFileParam(Inp.CaCert, 'CA_CERT');
+  if Result = '' then Result := CheckFileParam(Inp.GatewayPeerPinFile, 'GATEWAY_PEER_PIN_FILE');
+  if Result = '' then Result := CheckGatewayPeer(Inp);
   if Result <> '' then
     Result := Result + #13#10#13#10 + 'Nothing has been changed.';
 end;
@@ -1457,18 +1690,12 @@ begin
   GetInputs(Inp);
   DataDir := DataDirPath;
   CertDir := CertDirPath(DataDir);
+  UseGateway := GatewayRequested;
+  SkipTLS := GrpcTlsSkipped;
   if WizardSilent then
-  begin
-    UseGateway := HasCmdFlag('GATEWAY');
-    SkipHTTPS := HasCmdFlag('NOHTTPS');
-    SkipTLS := HasCmdFlag('NOTLS');
-  end
+    SkipHTTPS := HasCmdFlag('NOHTTPS')
   else
-  begin
-    UseGateway := GatewayCheckbox.Checked;
     SkipHTTPS := NoHTTPSCheckbox.Checked;
-    SkipTLS := NoTLSCheckbox.Checked;
-  end;
 
   Result := '--config "' + DataDir + '\yuzu-server.cfg"' +
             ' --data-dir "' + DataDir + '\data"' +
@@ -1499,7 +1726,15 @@ begin
                        ' --https-key "' + CertDir + '\https-key.pem"';
 
   if SkipTLS then
-    Result := Result + ' --no-tls'
+  begin
+    Result := Result + ' --no-tls';
+    // Plaintext has no gateway certificate to pin, and --no-tls is not an
+    // acknowledgement: the server refuses gateway mode without it. A pin file
+    // is NOT passed here, because the server refuses the acknowledgement
+    // together with a pin.
+    if UseGateway then
+      Result := Result + ' --insecure-gateway-peer';
+  end
   else
   begin
     if FileExists(CertDir + '\grpc-cert.pem') and FileExists(CertDir + '\grpc-key.pem') then
@@ -1507,6 +1742,10 @@ begin
                          ' --key "' + CertDir + '\grpc-key.pem"';
     if FileExists(CertDir + '\ca-cert.pem') then
       Result := Result + ' --ca-cert "' + CertDir + '\ca-cert.pem"';
+    // Like ca-cert.pem: used whenever it is in the locked directory, supplied
+    // now or carried from the previous installation.
+    if UseGateway and FileExists(CertDir + '\gateway-peer-pin') then
+      Result := Result + ' --gateway-peer-pin-file "' + CertDir + '\gateway-peer-pin"';
   end;
 
   if Inp.UseOIDC then
@@ -1569,7 +1808,7 @@ begin
         Got := 'The service has been disabled rather than left to run with an old command line.'
       else
         Got := 'The service could NOT be disabled (or is not registered): if it exists, disable ' +
-               'it yourself (sc config YuzuServer start= disabled) until this is fixed.';
+               'it yourself (sc.exe config YuzuServer start= disabled) until this is fixed.';
       Log('CurStepChanged: the YuzuServer service could not be registered, or its command line ' +
           'could not be written and confirmed (security software may have blocked the change). ' +
           Got + ' Setup exits with code 10.');
@@ -1976,7 +2215,7 @@ begin
             Result := Result + ' The old directory could not be put back either: it is now ' +
                       Aside + '. Something else created ' + DataDir + ' in the meantime -- ' +
                       'inspect it. The YuzuServer service has been DISABLED so that it cannot ' +
-                      'start over that directory; re-enable it (sc config YuzuServer start= auto) ' +
+                      'start over that directory; re-enable it (sc.exe config YuzuServer start= auto) ' +
                       'only after moving the old directory back or running the installer again.';
           end;
         end;

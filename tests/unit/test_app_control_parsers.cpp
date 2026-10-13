@@ -337,17 +337,28 @@ TEST_CASE("app_control CIM floor: only the one allowlisted namespace passes",
 }
 
 TEST_CASE("app_control CIM error classification and row mapping", "[app_control][parsers]") {
-    const auto cls = [](const char* t) {
-        return classify_cim_error(std::string{t});
+    const auto cls = [](const char* t, std::size_t rows_before_error = 0) {
+        return classify_cim_error(std::string{t}, rows_before_error);
     };
-    CHECK(classify_cim_error(std::nullopt) == CimOutcome::ok);
+    CHECK(classify_cim_error(std::nullopt, 0) == CimOutcome::ok);
     CHECK(cls("wmi_connect_failed_0x8004100e") == CimOutcome::class_absent);
     CHECK(cls("wmi_query_failed_0x80041010") == CimOutcome::class_absent);
     CHECK(cls("wmi_connect_failed_0x80041003") == CimOutcome::permission_denied);
     CHECK(cls("wmi_query_failed_0x80070005") == CimOutcome::permission_denied);
     CHECK(cls("wmi_next_failed_0x80041003") == CimOutcome::permission_denied);         // the Next() path
     CHECK(cls("wmi_proxy_blanket_failed_0x80070005") == CimOutcome::permission_denied);
-    CHECK(cls("wmi_next_failed_0x80041010") == CimOutcome::class_absent);
+    // Stage-aware (#4895): a missing class surfaces at the FIRST Next(), so INVALID_CLASS there with
+    // no row before it is absence; INVALID_NAMESPACE at Next() is a fault, and INVALID_CLASS after a
+    // returned row is a fault (the class just answered).
+    CHECK(cls("wmi_next_failed_0x80041010", 0) == CimOutcome::class_absent);
+    CHECK(cls("wmi_next_failed_0x80041010", 1) == CimOutcome::failed);
+    CHECK(cls("wmi_next_failed_0x8004100e") == CimOutcome::failed);
+    CHECK(cls("wmi_query_failed_0x8004100e") == CimOutcome::failed);
+    CHECK(cls("wmi_connect_failed_0x80041010") == CimOutcome::failed);
+    CHECK(cls("wmi_connect_failed_0x80041002") == CimOutcome::failed); // NOT_FOUND is never absence
+    CHECK(cls("wmi_proxy_blanket_failed_0x8004100e") == CimOutcome::failed);
+    CHECK(cls("wmi_property_enum_failed_0x80041010") == CimOutcome::failed);
+    CHECK(cls("wmi_property_enum_failed_0x80041003") == CimOutcome::permission_denied);
     CHECK(cls("wbem_locator_failed") == CimOutcome::failed);
     for (const char* t : {"wmi_deadline_exceeded", "com_init_failed", "namespace_not_allowed"})
         CHECK(cls(t) == CimOutcome::failed);
@@ -377,7 +388,7 @@ TEST_CASE("app_control CIM plan: every failure is recorded; SrpV2 runs unless a 
           "[app_control][parsers]") {
     const WmiRow bad{{"Collection", "Exe"}}; // lacks EnforcementMode and RuleCount
 
-    const auto mixed = plan_cim(std::nullopt, {kAssumedCimRow, bad}, false);
+    const auto mixed = plan_cim(std::nullopt, {kAssumedCimRow, bad}, false, 0);
     REQUIRE(mixed.rows.size() == 1);
     CHECK(mixed.rows[0].collection == "Exe");
     CHECK(mixed.rows[0].mode == std::optional<std::uint32_t>{1});
@@ -385,26 +396,39 @@ TEST_CASE("app_control CIM plan: every failure is recorded; SrpV2 runs unless a 
     CHECK(mixed.failures == std::vector<std::string>{"cim_row_unrecognised"});
     CHECK(mixed.use_cim);
 
-    const auto only_bad = plan_cim(std::nullopt, {bad}, false);
+    const auto only_bad = plan_cim(std::nullopt, {bad}, false, 0);
     CHECK(only_bad.rows.empty());
     CHECK(only_bad.failures == std::vector<std::string>{"cim_row_unrecognised"});
     CHECK_FALSE(only_bad.use_cim); // nothing usable: the SrpV2 walk runs
 
-    const auto capped = plan_cim(std::nullopt, {kAssumedCimRow}, true);
+    const auto capped = plan_cim(std::nullopt, {kAssumedCimRow}, true, 0);
     CHECK(capped.failures == std::vector<std::string>{"row_cap"});
     CHECK(capped.use_cim);
 
-    const auto denied = plan_cim(std::string{"wmi_connect_failed_0x80041003"}, {}, false);
+    const auto denied = plan_cim(std::string{"wmi_connect_failed_0x80041003"}, {}, false, 0);
     CHECK(denied.denied);
     CHECK(denied.failures == std::vector<std::string>{"permission_denied"});
     CHECK_FALSE(denied.use_cim);
 
-    const auto deadline = plan_cim(std::string{"wmi_deadline_exceeded"}, {}, false);
+    const auto deadline = plan_cim(std::string{"wmi_deadline_exceeded"}, {}, false, 0);
     CHECK_FALSE(deadline.denied);
     CHECK(deadline.failures == std::vector<std::string>{"wmi_deadline_exceeded"});
     CHECK_FALSE(deadline.use_cim);
 
-    const auto empty = plan_cim(std::nullopt, {}, false); // class present, no rules configured
+    // #4895: wmi_next_failed_0x8004100e is a fault, never "class absent": the failure is recorded.
+    const auto next_ns = plan_cim(std::string{"wmi_next_failed_0x8004100e"}, {}, false, 0);
+    CHECK(next_ns.failures == std::vector<std::string>{"wmi_next_failed_0x8004100e"});
+    CHECK_FALSE(next_ns.use_cim);
+    // A missing class arriving at the first Next() (no rows before it) is the expected absence...
+    const auto next_class0 = plan_cim(std::string{"wmi_next_failed_0x80041010"}, {}, false, 0);
+    CHECK(next_class0.failures.empty());
+    CHECK_FALSE(next_class0.denied);
+    CHECK_FALSE(next_class0.use_cim);
+    // ...but the same HRESULT after a row came back is a fault.
+    const auto next_class1 = plan_cim(std::string{"wmi_next_failed_0x80041010"}, {}, false, 1);
+    CHECK(next_class1.failures == std::vector<std::string>{"wmi_next_failed_0x80041010"});
+
+    const auto empty = plan_cim(std::nullopt, {}, false, 0); // class present, no rules configured
     CHECK(empty.rows.empty());
     CHECK(empty.failures.empty());
     CHECK_FALSE(empty.denied);
@@ -464,10 +488,10 @@ TEST_CASE("app_control real capture: MSFT_ApplockerPolicy probe classifies and m
     const auto probe = parse_wmi_probe_dump(read_capture("applocker_wmi_probe.txt"));
     CHECK_FALSE(probe.acc.any_failure());
     // The rig's answer: the namespace does not exist (WBEM_E_INVALID_NAMESPACE), no rows.
-    CHECK(classify_cim_error(probe.error) == CimOutcome::class_absent);
+    CHECK(classify_cim_error(probe.error, 0) == CimOutcome::class_absent);
     CHECK(probe.rows.empty());
     // The whole decision over that real answer: nothing recorded, the SrpV2 fallback selected.
-    const auto plan = plan_cim(probe.error, probe.rows, false);
+    const auto plan = plan_cim(probe.error, probe.rows, false, 0);
     CHECK(plan.rows.empty());
     CHECK(plan.failures.empty());
     CHECK_FALSE(plan.denied);
@@ -573,7 +597,7 @@ TEST_CASE("app_control settle_applocker: the CIM x SrpV2 product never reads a f
     for (const auto& c : cims) {
         for (const auto& w : walks) {
             INFO("cim=" << c.name << " walk=" << w.name);
-            const auto plan = plan_cim(c.error, c.rows, c.truncated);
+            const auto plan = plan_cim(c.error, c.rows, c.truncated, 0);
             yuzu::shared::ConstraintAccumulator acc;
             bool denied = false;
             bool walked = false;

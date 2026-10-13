@@ -6,6 +6,7 @@
  */
 
 #include "oidc_provider.hpp"
+#include "test_oidc_mock_idp.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -14,7 +15,11 @@
 #include <openssl/rsa.h> // EVP_RSA_gen
 
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -807,7 +812,7 @@ TEST_CASE("OIDC: start_auth_flow generates valid URL", "[oidc]") {
     cfg.token_endpoint = cfg.issuer + "/token";
     OidcProvider provider(std::move(cfg));
 
-    auto url = provider.start_auth_flow();
+    const auto url = provider.start_auth_flow().url;
 
     CHECK(url.starts_with("https://login.example.com/tenant/v2.0/authorize?"));
     CHECK(url.find("client_id=test-client-id") != std::string::npos);
@@ -829,14 +834,14 @@ TEST_CASE("OIDC: cleanup_expired_states removes old entries", "[oidc]") {
     OidcProvider provider(std::move(cfg));
 
     // Start a flow to create a pending challenge
-    auto url = provider.start_auth_flow();
-    (void)url;
+    const auto flow = provider.start_auth_flow();
+    (void)flow;
 
     // Cleanup should not remove it (not yet expired)
     provider.cleanup_expired_states();
 
     // Try handle_callback with a bogus state — should fail with "unknown"
-    auto result = provider.handle_callback("fakecode", "bogus-state");
+    auto result = provider.handle_callback("fakecode", "bogus-state", "any-secret");
     CHECK_FALSE(result.has_value());
     CHECK(result.error().find("unknown") != std::string::npos);
 }
@@ -850,7 +855,7 @@ TEST_CASE("OIDC: handle_callback with unknown state fails", "[oidc]") {
     cfg.token_endpoint = cfg.issuer + "/token";
     OidcProvider provider(std::move(cfg));
 
-    auto result = provider.handle_callback("code", "nonexistent-state");
+    auto result = provider.handle_callback("code", "nonexistent-state", "any-secret");
     CHECK_FALSE(result.has_value());
     CHECK(result.error().find("unknown") != std::string::npos);
 }
@@ -1007,4 +1012,276 @@ TEST_CASE("OIDC: verify_jwt_signature accepts a valid RS256 signature and reject
     auto bad = provider.verify_jwt_signature(forged);
     REQUIRE_FALSE(bad.has_value()); // MUST NOT fail open
     CHECK(bad.error().find("forged") != std::string::npos);
+}
+
+// ── Initiating-browser binding ───────────────────────────────────────────────
+//
+// The callback must come from the browser that started the flow. These cases drive the provider
+// with two "browsers" (two binding secrets) against one pending flow. A refusal must not consume
+// the flow (the legitimate browser can still finish), and the check runs before any token
+// exchange. Cases that reach the real httplib token client (even a refused connection) are
+// compiled out under ThreadSanitizer: that client's glibc getaddrinfo_a worker thread crashes
+// inside TSan's allocator (#438 class), so under TSan only the cases that reach no network run.
+
+namespace {
+
+OidcConfig binding_cfg(const std::string& token_endpoint = "http://127.0.0.1:1/token") {
+    OidcConfig cfg;
+    cfg.issuer = "https://idp.example.test";
+    cfg.client_id = "yuzu-test-client";
+    cfg.redirect_uri = "http://localhost:8443/auth/callback";
+    cfg.authorization_endpoint = cfg.issuer + "/authorize"; // skips discovery
+    cfg.token_endpoint = token_endpoint;                    // :1 = connection refused, instantly
+    return cfg;
+}
+
+bool is_lower_hex_64(const std::string& s) {
+    if (s.size() != 64)
+        return false;
+    for (char c : s)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    return true;
+}
+
+std::string state_of(const OidcProvider::AuthFlowStart& flow) {
+    return yuzu::server::test::url_query_param(flow.url, "state");
+}
+
+/// Makes this provider's binding SHA-256 fail (the broken-crypto-provider branch) and always
+/// restores it, even if an assertion throws.
+struct DigestFailure {
+    explicit DigestFailure(OidcProvider& p) : p_(p) { p_.set_binding_digest_failure_for_test(true); }
+    ~DigestFailure() { p_.set_binding_digest_failure_for_test(false); }
+    DigestFailure(const DigestFailure&) = delete;
+    DigestFailure& operator=(const DigestFailure&) = delete;
+    OidcProvider& p_;
+};
+
+} // namespace
+
+TEST_CASE("OIDC binding: start_auth_flow returns a fresh 256-bit secret that is not in the URL",
+          "[oidc][oidc_binding]") {
+    OidcProvider provider(binding_cfg());
+    const auto a = provider.start_auth_flow();
+    const auto b = provider.start_auth_flow();
+    CHECK(is_lower_hex_64(a.binding_secret));
+    CHECK(is_lower_hex_64(b.binding_secret));
+    CHECK(a.binding_secret != b.binding_secret);
+    // The secret travels only as a cookie: never through the IdP, never in a URL.
+    CHECK(a.url.find(a.binding_secret) == std::string::npos);
+    CHECK(b.url.find(b.binding_secret) == std::string::npos);
+    // ...and it is independent of state and nonce.
+    CHECK(state_of(a) != a.binding_secret);
+    CHECK(yuzu::server::test::url_query_param(a.url, "nonce") != a.binding_secret);
+}
+
+TEST_CASE("OIDC binding: a callback from another browser is refused and the flow stays pending",
+          "[oidc][oidc_binding]") {
+    OidcProvider provider(binding_cfg());
+    const auto flow = provider.start_auth_flow();
+    const auto state = state_of(flow);
+    REQUIRE_FALSE(state.empty());
+
+    // Browser B presents the flow's state with its own secret.
+    for (int i = 0; i < 3; ++i) {
+        bool verified = true;
+        auto b = provider.handle_callback("code", state, std::string(64, 'b'), &verified);
+        REQUIRE_FALSE(b.has_value());
+        CHECK(b.error() == OidcProvider::kBrowserBindingMismatch);
+        CHECK_FALSE(verified);
+    }
+    // Every refusal left the flow in place: it is still "pending" (a mismatch, not "unknown").
+    auto again = provider.handle_callback("code", state, std::string(64, 'c'));
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error() == OidcProvider::kBrowserBindingMismatch);
+}
+
+TEST_CASE("OIDC binding: an empty or near-miss secret never matches", "[oidc][oidc_binding]") {
+    OidcProvider provider(binding_cfg());
+    const auto flow = provider.start_auth_flow();
+    const auto state = state_of(flow);
+    std::string flipped = flow.binding_secret;
+    flipped[0] = flipped[0] == 'a' ? 'b' : 'a';
+    std::string truncated = flow.binding_secret.substr(0, 63);
+    std::string extended = flow.binding_secret + "0";
+    for (const std::string& bad :
+         {std::string{}, std::string(64, '0'), std::string("x"), flipped, truncated, extended}) {
+        CAPTURE(bad);
+        bool verified = true;
+        auto r = provider.handle_callback("code", state, bad, &verified);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == OidcProvider::kBrowserBindingMismatch);
+        CHECK_FALSE(verified);
+    }
+}
+
+TEST_CASE("OIDC binding: a stored hash that is empty is never honoured", "[oidc][oidc_binding]") {
+    OidcProvider provider(binding_cfg());
+    provider.add_test_pending_flow("unbound-state", std::string{});
+    for (const std::string& secret : {std::string{}, std::string("anything")}) {
+        auto r = provider.handle_callback("code", "unbound-state", secret);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == OidcProvider::kBrowserBindingMismatch);
+    }
+}
+
+TEST_CASE("OIDC binding: an unknown state is reported as unknown whatever the secret",
+          "[oidc][oidc_binding]") {
+    OidcProvider provider(binding_cfg());
+    const auto flow = provider.start_auth_flow();
+    bool verified = true;
+    auto r = provider.handle_callback("code", "never-issued", flow.binding_secret, &verified);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == OidcProvider::kUnknownState);
+    CHECK_FALSE(verified);
+    // The refused attempts did not disturb the real pending flow.
+    auto still = provider.handle_callback("code", state_of(flow), std::string(64, 'e'));
+    REQUIRE_FALSE(still.has_value());
+    CHECK(still.error() == OidcProvider::kBrowserBindingMismatch);
+}
+
+TEST_CASE("OIDC binding: a digest failure at start throws and a flow starts again afterwards",
+          "[oidc][oidc_binding][oidc_hash_failure]") {
+    // The seam fires in binding_digest, before sha256_raw runs, so this covers the caller's
+    // fail-closed handling (a digest failure throws, as random_bytes() does). The failure of
+    // each digest stage is covered separately in test_sha256_steps.cpp; the real OpenSSL and CNG
+    // calls themselves cannot be made to fail from a test.
+    OidcProvider provider(binding_cfg());
+    {
+        DigestFailure fail(provider);
+        CHECK_THROWS_AS(provider.start_auth_flow(), std::runtime_error);
+    }
+    const auto flow = provider.start_auth_flow();
+    CHECK(is_lower_hex_64(flow.binding_secret));
+    CHECK(OidcProvider::compute_code_challenge("verifier-one") !=
+          OidcProvider::compute_code_challenge("verifier-two"));
+}
+
+TEST_CASE("OIDC binding: a digest failure while checking the binding refuses and keeps the flow",
+          "[oidc][oidc_binding][oidc_hash_failure]") {
+    OidcProvider provider(binding_cfg());
+    const auto flow = provider.start_auth_flow();
+    const auto state = state_of(flow);
+    {
+        DigestFailure fail(provider);
+        bool verified = true;
+        // Even the CORRECT secret is refused when the digest cannot be computed: fail closed,
+        // no exception escapes.
+        auto r = provider.handle_callback("code", state, flow.binding_secret, &verified);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == OidcProvider::kBrowserBindingUnavailable);
+        CHECK_FALSE(verified);
+    }
+    // The refusal did not consume the flow.
+    auto after = provider.handle_callback("code", state, std::string(64, 'e'));
+    REQUIRE_FALSE(after.has_value());
+    CHECK(after.error() == OidcProvider::kBrowserBindingMismatch);
+}
+
+#ifndef YUZU_OIDC_MOCK_IDP_TSAN
+// These cases reach exchange_code's token client (a loopback MockIdp, or a refused connection),
+// so they are compiled out under ThreadSanitizer (see the section comment above).
+
+TEST_CASE("OIDC binding: the matching secret passes the gate and the flow is single-use",
+          "[oidc][oidc_binding]") {
+    OidcProvider provider(binding_cfg()); // token endpoint refuses the connection instantly
+    const auto flow = provider.start_auth_flow();
+    const auto state = state_of(flow);
+    bool verified = false;
+    auto first = provider.handle_callback("code", state, flow.binding_secret, &verified);
+    REQUIRE_FALSE(first.has_value());
+    CHECK(verified); // a failure AFTER the match leaves the binding cookie spent
+    // Past the binding gate: the failure is the token exchange, not the binding.
+    CHECK(first.error() != OidcProvider::kBrowserBindingMismatch);
+    CHECK(first.error().find("token endpoint") != std::string::npos);
+    // Replay: consumed.
+    auto replay = provider.handle_callback("code", state, flow.binding_secret);
+    REQUIRE_FALSE(replay.has_value());
+    CHECK(replay.error() == OidcProvider::kUnknownState);
+}
+
+TEST_CASE("OIDC binding: end to end against a loopback IdP, a refusal never reaches the IdP and "
+          "does not block the legitimate browser",
+          "[oidc][oidc_binding]") {
+    yuzu::server::test::MockIdp idp;
+    const auto cfg = binding_cfg(idp.token_endpoint());
+    OidcProvider provider(cfg);
+    const auto flow = provider.start_auth_flow();
+    const auto state = state_of(flow);
+    const auto nonce = yuzu::server::test::url_query_param(flow.url, "nonce");
+    REQUIRE_FALSE(nonce.empty());
+    const auto jwt = yuzu::server::test::sign_and_register_rs256(
+        provider, "kid-1", yuzu::server::test::id_token_payload(cfg, nonce));
+    REQUIRE_FALSE(jwt.empty());
+    idp.set_id_token(jwt);
+
+    // A different browser: refused BEFORE any exchange,
+    // with no secret and with a wrong one.
+    for (const std::string& wrong : {std::string{}, std::string(64, 'e')}) {
+        auto b = provider.handle_callback("other-code", state, wrong);
+        REQUIRE_FALSE(b.has_value());
+        CHECK(b.error() == OidcProvider::kBrowserBindingMismatch);
+        CHECK(idp.token_calls.load() == 0);
+    }
+
+    // The initiating browser still completes the SAME flow.
+    bool verified = false;
+    auto a = provider.handle_callback("good-code", state, flow.binding_secret, &verified);
+    REQUIRE(a.has_value());
+    CHECK(verified);
+    CHECK(a->sub == "alice-sub");
+    CHECK(idp.token_calls.load() == 1);
+
+    // Replay of the completed callback: refused, no second exchange.
+    auto replay = provider.handle_callback("good-code", state, flow.binding_secret);
+    REQUIRE_FALSE(replay.has_value());
+    CHECK(replay.error() == OidcProvider::kUnknownState);
+    CHECK(idp.token_calls.load() == 1);
+}
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
+TEST_CASE("OIDC test seams: no production file references set_binding_digest_failure_for_test or "
+          "add_test_pending_flow (source pin)",
+          "[oidc][oidc_binding][source_pin]") {
+    // The seams are public members of the production class and the first makes the binding
+    // digest fail. Their only legitimate callers are tests; any file under server/core/src other
+    // than the provider's own two that names them fails this pin.
+    namespace fs = std::filesystem;
+    static constexpr const char* kSeams[] = {"set_binding_digest_failure_for_test",
+                                             "add_test_pending_flow"};
+    std::size_t scanned = 0;
+    const fs::path src_dir = fs::path(YUZU_SERVER_SRC_DIR);
+    // The public headers live beside src/ (server/core/include/yuzu/server/).
+    const fs::path include_dir = src_dir.parent_path() / "include" / "yuzu" / "server";
+    const fs::path own_cpp = src_dir / "oidc_provider.cpp";
+    const fs::path own_hpp = src_dir / "oidc_provider.hpp";
+    std::vector<fs::path> files;
+    for (const auto& root : {src_dir, include_dir}) {
+        REQUIRE(fs::is_directory(root));
+        for (const auto& e : fs::recursive_directory_iterator(root)) {
+            if (!e.is_regular_file())
+                continue;
+            const auto ext = e.path().extension();
+            if (ext == ".cpp" || ext == ".hpp" || ext == ".h" || ext == ".cc" || ext == ".inc")
+                files.push_back(e.path());
+        }
+    }
+    for (const auto& path : files) {
+        ++scanned;
+        // Exempt the provider's own two files by FULL path, not by basename.
+        if (fs::equivalent(path, own_cpp) || fs::equivalent(path, own_hpp))
+            continue;
+        const auto name = path.filename().string();
+        std::ifstream in(path, std::ios::binary);
+        REQUIRE(in.is_open());
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        const auto text = ss.str();
+        for (const char* seam : kSeams) {
+            INFO(name << " references " << seam);
+            CHECK(text.find(seam) == std::string::npos);
+        }
+    }
+    CHECK(scanned > 100); // non-vacuity
 }

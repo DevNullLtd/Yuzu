@@ -21,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -56,12 +57,14 @@ struct HwHarness {
     bool allow_fleet_read = true;
     bool allow_scoped_perm = true;      // per-device Inventory:Read (the CI record gate)
     bool allow_guaranteed_state = true; // scoped GuaranteedState:Read probe (DEX/Guardian/Live lenses)
+    authz::VisibleSet scope;            // FleetReadGate scope; nullopt = unfiltered, set = confine to these ids
     bool allow_execute = true;          // scoped Execution:Execute probe (sync affordance/actions)
     bool allow_tag_write = true;        // scoped Tag:Write probe (tag controls)
 
     std::vector<InventoryDeviceRow> roster_rows;
     bool roster_ci_degraded = false;
     bool roster_tags_degraded = false;
+    bool roster_degraded = false; // #5531: the durable roster read failed
 
     HardwareCiDetail ci_detail; // configurable per test; default = degraded (the struct's own default)
 
@@ -108,7 +111,7 @@ struct HwHarness {
                 return g; // admitted=false, scope=deny_all() (unused — response already written)
             }
             g.admitted = true;
-            g.scope = std::nullopt; // unfiltered — the only filter under test is the tag/os/status facet
+            g.scope = scope; // default nullopt = unfiltered; a test sets it to exercise confinement
             return g;
         };
         HardwareRoutes::RosterFn roster_fn = [this]() -> InventoryDevicesResult {
@@ -116,6 +119,7 @@ struct HwHarness {
             out.rows = roster_rows;
             out.ci_degraded = roster_ci_degraded;
             out.tags_degraded = roster_tags_degraded;
+            out.roster_degraded = roster_degraded;
             return out;
         };
         HardwareRoutes::CiDetailFn ci_fn = [this](const std::string&) { return ci_detail; };
@@ -166,6 +170,21 @@ struct HwHarness {
 
 } // namespace
 
+// ───────────────────────── Page shell ──────────────────────────────────────────
+
+// Kills: a wrong active_key literal in page_shell() — apply_shell lights nothing and says
+// nothing for an unknown key, so only a test that fetches the page can see it.
+TEST_CASE("route: /hardware lights the Hardware sidebar item and its breadcrumb leaf",
+          "[hardware][route]") {
+    HwHarness h;
+    auto page = h.sink.Get("/hardware");
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+    CHECK(contains(page->body, "/fragments/hardware/list"));
+    CHECK(contains(page->body, "<a class=\"shell-nav on\" href=\"/hardware\" aria-current=\"page\">"));
+    CHECK(contains(page->body, "<span class=\"shell-sep\">/</span><b>Hardware</b>"));
+}
+
 // ───────────────────────── CI list fragment ────────────────────────────────────
 
 TEST_CASE("route: results_only returns ONLY the #hw-results region", "[hardware][route]") {
@@ -188,6 +207,30 @@ TEST_CASE("route: results_only returns ONLY the #hw-results region", "[hardware]
     REQUIRE(contains(full->body, "<h1 class=\"hw-h1\">Hardware</h1>"));
     REQUIRE(contains(full->body, "id=\"hw-q\""));
     REQUIRE(contains(full->body, "HW-RESULTS-HOST"));
+}
+
+// Kills: the route dropping all.tags_degraded / all.ci_degraded on the results_only call, which
+// every htmx control uses, so a degraded read would read as "no tags" / "no CI" after one click.
+TEST_CASE("route: results_only list keeps the degrade banners", "[hardware][route]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "HW-DEGRADE-HOST", "windows", true)};
+
+    auto healthy = h.sink.Get("/fragments/hardware/list?results_only=1");
+    REQUIRE(healthy);
+    REQUIRE_FALSE(contains(healthy->body, "Tags unavailable"));
+    REQUIRE_FALSE(contains(healthy->body, "CI columns unavailable"));
+
+    h.roster_tags_degraded = true;
+    auto tags = h.sink.Get("/fragments/hardware/list?results_only=1");
+    REQUIRE(tags);
+    REQUIRE(tags->body.starts_with("<div id=\"hw-results\""));
+    REQUIRE(contains(tags->body, "Tags unavailable"));
+
+    h.roster_tags_degraded = false;
+    h.roster_ci_degraded = true;
+    auto ci = h.sink.Get("/fragments/hardware/list?results_only=1");
+    REQUIRE(ci);
+    REQUIRE(contains(ci->body, "CI columns unavailable"));
 }
 
 TEST_CASE("route: list — invalid tag key is a 400 (normalise_hardware_query nullopt path)",
@@ -304,6 +347,144 @@ TEST_CASE("route: dex/guardian lenses check scoped GuaranteedState:Read before r
         REQUIRE(contains(denied->body, "GuaranteedState:Read"));
         REQUIRE_FALSE(contains(denied->body, "/fragments/device/" + lens + "?id=agent-1"));
     }
+}
+
+// ───────────────────────── Audit verbs: behavioural-PII tier ───────────────────
+
+TEST_CASE("route: hardware list + CI record emit the inventory.* behavioural-PII verbs",
+          "[hardware][route]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "AUDIT-HOST", "windows", true)};
+    h.ci_detail.identity = make_row("agent-1", "AUDIT-HOST", "windows", true);
+    auto has = [&](const std::string& row) {
+        for (auto& a : h.audit_full)
+            if (a == row)
+                return true;
+        return false;
+    };
+
+    REQUIRE(h.sink.Get("/fragments/hardware/list"));
+    REQUIRE(has("inventory.devices|success|Inventory|fleet"));
+
+    // The verb is inventory.device.ci for every lens EXCEPT software.
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=software"));
+    REQUIRE(has("inventory.device.software|success|Agent|agent-1"));
+    REQUIRE_FALSE(has("inventory.device.ci|success|Agent|agent-1"));
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-1&lens=tags"));
+    REQUIRE(has("inventory.device.ci|success|Agent|agent-1"));
+
+    // The REST twins emit the same tuples. Clear the capture first so the fragment
+    // calls above cannot satisfy these assertions.
+    h.audit_full.clear();
+    auto rest_list = h.sink.Get("/api/v1/hardware");
+    REQUIRE(rest_list);
+    REQUIRE(rest_list->status == 200);
+    REQUIRE(has("inventory.devices|success|Inventory|fleet"));
+
+    h.audit_full.clear();
+    auto rest_ci = h.sink.Get("/api/v1/hardware/agent-1");
+    REQUIRE(rest_ci);
+    REQUIRE(rest_ci->status == 200);
+    REQUIRE(has("inventory.device.ci|success|Agent|agent-1"));
+}
+
+TEST_CASE("route: hardware list + CI record audit-persist failure — fragments set "
+          "Sec-Audit-Failed; REST fails closed",
+          "[hardware][route]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "AUDIT-HOST", "windows", true)};
+    h.ci_detail.identity = make_row("agent-1", "AUDIT-HOST", "windows", true);
+    h.audit_should_fail = true;
+
+    auto frag = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(frag);
+    REQUIRE(frag->status == 200); // set-and-proceed
+    REQUIRE(frag->get_header_value("Sec-Audit-Failed") == "true");
+
+    auto rest = h.sink.Get("/api/v1/hardware");
+    REQUIRE(rest);
+    REQUIRE(rest->status == 503); // fail-closed
+    CHECK(rest->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(contains(rest->body, "AUDIT-HOST")); // nothing served
+
+    auto ci_frag = h.sink.Get("/fragments/hardware/ci?id=agent-1");
+    REQUIRE(ci_frag);
+    REQUIRE(ci_frag->status == 200); // set-and-proceed
+    REQUIRE(ci_frag->get_header_value("Sec-Audit-Failed") == "true");
+
+    auto ci_rest = h.sink.Get("/api/v1/hardware/agent-1");
+    REQUIRE(ci_rest);
+    REQUIRE(ci_rest->status == 503); // fail-closed
+    CHECK(ci_rest->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(contains(ci_rest->body, "AUDIT-HOST")); // nothing served
+}
+
+// ───────────────────────── Gate denial + management-group confinement ──────────
+
+TEST_CASE("route: fleet-read denied — 403; no roster body; no inventory.devices audit row",
+          "[hardware][route]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "DENY-HOST", "windows", true)};
+    h.allow_fleet_read = false;
+
+    for (const char* url : {"/fragments/hardware/list", "/api/v1/hardware"}) {
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK_FALSE(contains(res->body, "DENY-HOST"));
+    }
+    for (auto& a : h.audit_full)
+        CHECK_FALSE(a.starts_with("inventory.devices|"));
+}
+
+TEST_CASE("route: per-device Inventory:Read denied — CI record fragment is 403 and unaudited",
+          "[hardware][route]") {
+    HwHarness h;
+    h.ci_detail.identity = make_row("agent-1", "DENY-CI-HOST", "windows", true);
+    h.allow_scoped_perm = false;
+
+    auto res = h.sink.Get("/fragments/hardware/ci?id=agent-1");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK_FALSE(contains(res->body, "DENY-CI-HOST"));
+    CHECK(h.audit_full.empty());
+}
+
+TEST_CASE("route: management-group scope drops out-of-scope rows (audited) and 404s the REST record",
+          "[hardware][route]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-in", "IN-SCOPE-HOST", "windows", true),
+                     make_row("agent-out", "OUT-SCOPE-HOST", "windows", true)};
+    h.ci_detail.identity = make_row("agent-out", "OUT-SCOPE-HOST", "windows", true);
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+
+    auto frag = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(frag);
+    CHECK(frag->status == 200);
+    CHECK(contains(frag->body, "IN-SCOPE-HOST"));
+    CHECK_FALSE(contains(frag->body, "OUT-SCOPE-HOST"));
+
+    auto rest = h.sink.Get("/api/v1/hardware");
+    REQUIRE(rest);
+    CHECK(rest->status == 200);
+    CHECK(contains(rest->body, "agent-in"));
+    CHECK_FALSE(contains(rest->body, "agent-out"));
+
+    // Both list reads audit the drop count (one row dropped each).
+    std::size_t omitted_rows = 0;
+    for (auto& d : h.audit_details)
+        if (contains(d, "omitted=1"))
+            ++omitted_rows;
+    CHECK(omitted_rows == 2);
+
+    // Out-of-scope id collapses to the same 404 as a nonexistent one; nothing audited for it.
+    h.audit_full.clear();
+    auto out = h.sink.Get("/api/v1/hardware/agent-out");
+    REQUIRE(out);
+    CHECK(out->status == 404);
+    CHECK_FALSE(contains(out->body, "OUT-SCOPE-HOST"));
+    CHECK(h.audit_full.empty());
 }
 
 // ───────────────────────── REST v1: JSON null-vs-value contract ────────────────
@@ -553,4 +734,416 @@ TEST_CASE("route: POST .../sync — audit-store degrade fails CLOSED, no dispatc
     // The whole point of auditing BEFORE dispatch: a degraded audit store must
     // never let the side effect through.
     REQUIRE(h.sync_dispatch_calls == 0);
+}
+
+// ───────────────────────── #5531: failed roster read is never an empty fleet ───
+
+namespace {
+DeviceCiRecord make_ci_rec() {
+    DeviceCiRecord rec;
+    rec.model = "CI-MODEL-5531";
+    rec.serial = "CI-SERIAL-5531";
+    rec.last_seen = 5000;
+    return rec;
+}
+HardwareCiDetail degraded_identity_detail(bool with_ci) {
+    HardwareCiDetail d;
+    d.identity = std::nullopt;
+    d.identity_degraded = true;
+    d.ci = with_ci ? std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+                         std::optional<DeviceCiRecord>(make_ci_rec()))
+                   : std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+                         std::optional<DeviceCiRecord>{});
+    d.software = std::nullopt;
+    d.tags = std::nullopt;
+    return d;
+}
+} // namespace
+
+// Kills: dropping the roster_degraded guard in the list fragment (empty table, no failure audit).
+TEST_CASE("route: list fragment — roster read failure renders the roster-unavailable banner; "
+          "never an empty table; and audits failure",
+          "[hardware][route]") {
+    HwHarness h;
+    h.roster_degraded = true;
+    auto res = h.sink.Get("/fragments/hardware/list?q=abc");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(contains(res->body, "Hardware roster unavailable"));
+    REQUIRE_FALSE(contains(res->body, "<table"));
+    REQUIRE_FALSE(h.audits.empty());
+    REQUIRE(h.audits.back() == "inventory.devices|failure");
+    REQUIRE(contains(h.audit_details.back(), "roster read failed"));
+    REQUIRE_FALSE(res->has_header("Sec-Audit-Failed")); // control: audit persisted
+
+    auto ro = h.sink.Get("/fragments/hardware/list?results_only=1&q=abc");
+    REQUIRE(ro);
+    REQUIRE(ro->body.rfind("<div id=\"hw-results\" data-url=\"", 0) == 0);
+    REQUIRE(contains(ro->body, "q=abc"));
+    REQUIRE(contains(ro->body, "Hardware roster unavailable"));
+    REQUIRE(contains(ro->body, "results_only=1")); // retry must not nest a full page in #hw-results
+
+    // A bad request still precedes the degrade arm.
+    auto bad = h.sink.Get("/fragments/hardware/list?sort=bogus");
+    REQUIRE(bad);
+    REQUIRE(bad->status == 400);
+}
+
+// Kills: reverting the list fragment's roster-failure audit to try_persist_audit (drops the
+// Sec-Audit-Failed signal when the audit store is also degraded).
+TEST_CASE("route: list fragment — roster failure with a degraded audit store keeps the banner and "
+          "sets Sec-Audit-Failed",
+          "[hardware][route][security]") {
+    HwHarness h;
+    h.roster_degraded = true;
+    h.audit_should_fail = true;
+    auto res = h.sink.Get("/fragments/hardware/list?q=abc");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(contains(res->body, "Hardware roster unavailable"));
+    REQUIRE(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+// Kills: dropping the roster_degraded guard in the REST list (200 with an empty data page).
+TEST_CASE("route: GET /api/v1/hardware — roster read failure is 503 with retry_after_ms and no data",
+          "[hardware][route][rest]") {
+    {
+        HwHarness h;
+        h.roster_degraded = true;
+        auto res = h.sink.Get("/api/v1/hardware");
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body["error"]["retry_after_ms"].get<int>() == 5000);
+        REQUIRE_FALSE(body.contains("data"));
+        REQUIRE_FALSE(h.audits.empty());
+        REQUIRE(h.audits.back() == "inventory.devices|failure");
+        REQUIRE_FALSE(res->has_header("Sec-Audit-Failed")); // control: audit persisted
+    }
+    {
+        // Kills: reverting the swap to try_persist_audit — a degraded audit store must still
+        // surface Sec-Audit-Failed on top of the unchanged 503.
+        HwHarness h;
+        h.roster_degraded = true;
+        h.audit_should_fail = true;
+        auto res = h.sink.Get("/api/v1/hardware");
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body["error"]["retry_after_ms"].get<int>() == 5000);
+        REQUIRE(res->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    {
+        // Empty is not failed.
+        HwHarness h;
+        auto res = h.sink.Get("/api/v1/hardware");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body["pagination"]["total"].get<int>() == 0);
+    }
+}
+
+// Kills: reverting the CI fragment's no_record arm to "Device not found".
+TEST_CASE("route: CI fragment — identity_degraded with no readable record says roster unreadable "
+          "and audits failure",
+          "[hardware][route]") {
+    HwHarness h;
+    h.ci_detail = degraded_identity_detail(false);
+    auto res = h.sink.Get("/fragments/hardware/ci?id=agent-x");
+    REQUIRE(res);
+    REQUIRE(contains(res->body, "roster unreadable"));
+    REQUIRE_FALSE(contains(res->body, "Device not found"));
+    REQUIRE_FALSE(h.audits.empty());
+    REQUIRE(h.audits.back() == "inventory.device.ci|failure");
+    REQUIRE(contains(h.audit_details.back(), "state=roster unreadable"));
+}
+
+// Kills: widening the degrade arm to a blanket "roster unreadable" (hides a readable CI record),
+// and dropping the result=failure on a degraded identity.
+TEST_CASE("route: CI fragment — identity_degraded with a readable CI record still renders it "
+          "with the identity note",
+          "[hardware][route]") {
+    HwHarness h;
+    h.ci_detail = degraded_identity_detail(true);
+    auto res = h.sink.Get("/fragments/hardware/ci?id=agent-x");
+    REQUIRE(res);
+    REQUIRE(contains(res->body, "Device identity unavailable"));
+    REQUIRE(contains(res->body, "CI-MODEL-5531"));
+    REQUIRE_FALSE(contains(res->body, "roster unreadable"));
+    REQUIRE_FALSE(contains(res->body, "Device not found"));
+    REQUIRE_FALSE(h.audits.empty());
+    REQUIRE(h.audits.back() == "inventory.device.ci|failure");
+    REQUIRE(contains(h.audit_details.back(), "state=found identity=roster unreadable"));
+
+    auto sw = h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=software&lens_only=1");
+    REQUIRE(sw);
+    REQUIRE(h.audits.back() == "inventory.device.software|failure");
+}
+
+// Kills: letting truly_absent fall through to the existence 404 when identity_degraded.
+TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with nothing else readable is 503 - "
+          "never 404",
+          "[hardware][route][rest]") {
+    {
+        HwHarness h;
+        h.ci_detail = degraded_identity_detail(false);
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body["error"]["retry_after_ms"].get<int>() == 5000);
+        REQUIRE_FALSE(h.audits.empty());
+        REQUIRE(h.audits.back() == "inventory.device.ci|failure");
+        REQUIRE_FALSE(res->has_header("Sec-Audit-Failed")); // control: audit persisted
+    }
+    {
+        // Kills: reverting the swap to try_persist_audit — a degraded audit store must still
+        // surface Sec-Audit-Failed on top of the unchanged 503.
+        HwHarness h;
+        h.ci_detail = degraded_identity_detail(false);
+        h.audit_should_fail = true;
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+        REQUIRE(res->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    {
+        HwHarness h;
+        h.ci_detail = degraded_identity_detail(false);
+        h.ci_detail.identity_degraded = false;
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 404);
+    }
+}
+
+// Kills: moving the scope check below the roster 503 arm (out-of-scope ids would answer
+// 503-vs-404, an existence oracle).
+TEST_CASE("route: GET /api/v1/hardware/{id} - scope 404 precedes the roster 503 arm",
+          "[hardware][route][rest][security]") {
+    HwHarness h;
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    h.ci_detail = degraded_identity_detail(false);
+    auto res = h.sink.Get("/api/v1/hardware/agent-out");
+    REQUIRE(res);
+    REQUIRE(res->status == 404);
+    REQUIRE(h.audits.empty());
+}
+
+// Kills: dropping the audit-trail id floor - a CR/LF id would reach target_id on the
+// roster-failure audit row.
+TEST_CASE("route: hardware record id with control bytes is 400 and never audited",
+          "[hardware][route][rest][security]") {
+    HwHarness h;
+    h.ci_detail = degraded_identity_detail(false);
+    // TestRouteSink does not percent-decode, so pass the raw CR/LF a decoded request carries.
+    const std::string bad_id = "a\r\nb";
+    auto rest = h.sink.Get("/api/v1/hardware/" + bad_id);
+    REQUIRE(rest);
+    REQUIRE(rest->status == 400);
+    auto frag = h.sink.Get("/fragments/hardware/ci?id=" + bad_id);
+    REQUIRE(frag);
+    REQUIRE(frag->status == 400);
+    REQUIRE(h.audits.empty());
+}
+
+// Kills: dropping the LENGTH arm of the audit-trail id floor, or skipping the floor on either
+// route - an over-long id would reach target_id on the audit rows. One byte over the limit.
+TEST_CASE("route: hardware record id one byte over the length limit is 400 and never audited",
+          "[hardware][route][rest][security]") {
+    const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
+    HwHarness h;
+    h.ci_detail = degraded_identity_detail(false);
+    auto rest = h.sink.Get("/api/v1/hardware/" + too_long);
+    REQUIRE(rest);
+    REQUIRE(rest->status == 400);
+    REQUIRE(contains(rest->body, "invalid device id"));
+    REQUIRE(h.audits.empty());
+    auto frag = h.sink.Get("/fragments/hardware/ci?id=" + too_long);
+    REQUIRE(frag);
+    REQUIRE(frag->status == 400);
+    REQUIRE(contains(frag->body, "Invalid device id."));
+    REQUIRE(h.audits.empty());
+}
+
+// Kills: `<` for `<=` on the length arm - an id of exactly the limit is legal, so it must pass the
+// floor on both routes and reach its normal audit row (any status but the floor's 400).
+TEST_CASE("route: hardware record id of exactly the length limit passes the floor and is audited",
+          "[hardware][route][rest][security]") {
+    const std::string at_limit(auth::kMaxAgentIdLength, 'a');
+    const std::string expected_row = "inventory.device.ci|success|Agent|" + at_limit;
+    {
+        HwHarness h;
+        auto rest = h.sink.Get("/api/v1/hardware/" + at_limit);
+        REQUIRE(rest);
+        REQUIRE(rest->status != 400);
+        REQUIRE_FALSE(h.audit_full.empty());
+        REQUIRE(h.audit_full.back() == expected_row);
+    }
+    {
+        HwHarness h;
+        auto frag = h.sink.Get("/fragments/hardware/ci?id=" + at_limit);
+        REQUIRE(frag);
+        REQUIRE(frag->status != 400);
+        REQUIRE_FALSE(h.audit_full.empty());
+        REQUIRE(h.audit_full.back() == expected_row);
+    }
+}
+
+// Kills: an over-strict floor on the accept side (`c <= 0x20` refusing a space, or a signed `char`
+// refusing every byte >= 0x80) and an over-lax one (a threshold under 0x1f letting US through).
+// Accept-side ids are legal on both routes and reach their normal audit row; the reject-side id
+// is the floor's 400 with no audit row. (An embedded NUL is not tested: a std::string URL handed
+// to the sink may truncate at it, which would turn the case into a vacuous accept.)
+TEST_CASE("route: hardware record id floor accepts 0x20 and bytes over 0x7f and refuses 0x1f",
+          "[hardware][route][rest][security]") {
+    for (const auto& id : {std::string("agent 1"), std::string("a\xC3\xA9")}) {
+        CAPTURE(id);
+        const std::string expected_row = "inventory.device.ci|success|Agent|" + id;
+        {
+            HwHarness h;
+            auto rest = h.sink.Get("/api/v1/hardware/" + id);
+            REQUIRE(rest);
+            REQUIRE(rest->status != 400);
+            REQUIRE_FALSE(h.audit_full.empty());
+            REQUIRE(h.audit_full.back() == expected_row);
+        }
+        {
+            HwHarness h;
+            auto frag = h.sink.Get("/fragments/hardware/ci?id=" + id);
+            REQUIRE(frag);
+            REQUIRE(frag->status != 400);
+            REQUIRE_FALSE(h.audit_full.empty());
+            REQUIRE(h.audit_full.back() == expected_row);
+        }
+    }
+    const std::string us = "a\x1f" "b";
+    HwHarness h;
+    h.ci_detail = degraded_identity_detail(false);
+    auto rest = h.sink.Get("/api/v1/hardware/" + us);
+    REQUIRE(rest);
+    REQUIRE(rest->status == 400);
+    auto frag = h.sink.Get("/fragments/hardware/ci?id=" + us);
+    REQUIRE(frag);
+    REQUIRE(frag->status == 400);
+    REQUIRE(h.audits.empty());
+}
+
+// Kills: moving the floor BELOW the scope gate on either route - an invalid id is refused before
+// the scope check, so an out-of-scope (REST) or unpermitted (fragment) caller still sees the
+// floor's 400, never the scope 404 / permission 403.
+TEST_CASE("route: hardware record id floor is applied before the scope gate",
+          "[hardware][route][rest][security]") {
+    const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
+    {
+        HwHarness h;
+        h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+        auto rest = h.sink.Get("/api/v1/hardware/" + too_long);
+        REQUIRE(rest);
+        REQUIRE(rest->status == 400);
+        REQUIRE(h.audits.empty());
+    }
+    {
+        HwHarness h;
+        h.allow_scoped_perm = false;
+        auto frag = h.sink.Get("/fragments/hardware/ci?id=" + too_long);
+        REQUIRE(frag);
+        REQUIRE(frag->status == 400);
+        REQUIRE(h.audits.empty());
+    }
+}
+
+// Kills: skipping the audit-trail id floor on any of the three routes that take a raw device id
+// and audit it (REST sync, Actions lens, result poll) - an over-long or CR/LF id would reach
+// target_id. Each refusal is the floor's own 400 (body-checked, so the pre-existing 400 arms
+// cannot mask a missing floor), writes no audit row, and the sync dispatch is never reached.
+// The scoped-permission gate is set to deny: the floor must run BEFORE it, because a denial
+// audits the raw id (auth_routes.cpp require_scoped_permission). A floor placed after the gate
+// answers 403 here and fails the 400 checks; the fragment responses are also pinned as HTML
+// (text/html + the gp-placeholder div) so a JSON envelope repeating the sentence cannot pass.
+TEST_CASE("route: sync and actions-lens ids are floored: over-length or control byte is 400 and unaudited",
+          "[hardware][route][security]") {
+    const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
+    const std::string ctrl = "a\r\nb";
+    for (const auto& bad_id : {too_long, ctrl}) {
+        HwHarness h;
+        h.allow_scoped_perm = false;
+        auto sync = h.sink.Post("/api/v1/hardware/" + bad_id + "/sync", R"({"source":"all"})");
+        REQUIRE(sync);
+        REQUIRE(sync->status == 400);
+        REQUIRE(contains(sync->body, "invalid device id"));
+        REQUIRE(h.sync_dispatch_calls == 0);
+
+        auto actions = h.sink.Get("/fragments/hardware/ci/actions?id=" + bad_id);
+        REQUIRE(actions);
+        REQUIRE(actions->status == 400);
+        REQUIRE(contains(actions->body, "Invalid device id."));
+        CHECK(actions->get_header_value("Content-Type").find("text/html") != std::string::npos);
+        CHECK(contains(actions->body, "gp-placeholder"));
+
+        auto result = h.sink.Get("/fragments/hardware/ci/result?id=" + bad_id +
+                                 "&plugin=plug&command_id=plug-1");
+        REQUIRE(result);
+        REQUIRE(result->status == 400);
+        REQUIRE(contains(result->body, "Invalid device id."));
+        CHECK(result->get_header_value("Content-Type").find("text/html") != std::string::npos);
+        CHECK(contains(result->body, "gp-placeholder"));
+
+        REQUIRE(h.audits.empty());
+    }
+}
+
+// Pins the documented dual-degraded shape: a degraded CI store alongside a degraded roster
+// defeats truly_absent, so the record is served (200), not 503.
+TEST_CASE("route: GET /api/v1/hardware/{id} — degraded roster AND degraded CI store is 200 with both "
+          "states degraded",
+          "[hardware][route][rest]") {
+    HwHarness h;
+    h.ci_detail = degraded_identity_detail(false);
+    h.ci_detail.ci = std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+        std::unexpected(CiReadError::kDegraded));
+    auto res = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"]["identity_state"].get<std::string>() == "degraded");
+    REQUIRE(body["data"]["ci_state"].get<std::string>() == "degraded");
+    REQUIRE_FALSE(h.audits.empty());
+    REQUIRE(h.audits.back() == "inventory.device.ci|failure");
+    REQUIRE(contains(h.audit_details.back(), "state=store degraded identity=roster unreadable"));
+}
+
+// Kills: dropping identity_state from hardware_ci_json / the failure audit on a served degraded record.
+TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with a readable CI record is 200 "
+          "with identity_state=degraded",
+          "[hardware][route][rest]") {
+    {
+        HwHarness h;
+        h.ci_detail = degraded_identity_detail(true);
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body["data"]["identity_state"].get<std::string>() == "degraded");
+        REQUIRE(body["data"]["ci_state"].get<std::string>() == "found");
+        REQUIRE(body["data"]["hostname"].is_null());
+        REQUIRE_FALSE(h.audits.empty());
+        REQUIRE(h.audits.back() == "inventory.device.ci|failure");
+        REQUIRE(contains(h.audit_details.back(), "identity=roster unreadable"));
+    }
+    {
+        HwHarness h;
+        h.ci_detail.identity = make_row("agent-x", "HOST-X", "linux", true);
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body["data"]["identity_state"].get<std::string>() == "found");
+        REQUIRE_FALSE(h.audits.empty());
+        REQUIRE(h.audits.back() == "inventory.device.ci|success");
+    }
 }

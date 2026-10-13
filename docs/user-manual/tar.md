@@ -440,13 +440,15 @@ If `tar.db` is corrupt **and** cannot be moved aside (read-only mount, locked fi
 
 ## TAR dashboard page
 
-The Yuzu dashboard includes a dedicated TAR page at `/tar`, reachable from the **TAR** entry in the main navigation bar (visible after authentication). The page is the central operator surface for TAR across the fleet. Phase 15.A delivers the retention-paused source list as the first frame; the scope-walking-aware SQL frame and the process tree viewer drop into placeholder slots in subsequent phases.
+The Yuzu dashboard includes a dedicated TAR page at `/tar`, reachable from the **TAR** entry in the sidebar's **Posture** group (visible after authentication). The page is the central operator surface for TAR across the fleet. Phase 15.A delivers the retention-paused source list as the first frame; the scope-walking-aware SQL frame and the process tree viewer drop into placeholder slots in subsequent phases.
 
 ### Retention-paused source list
 
 The first frame surfaces every device × source pair where the collector has been disabled (`<source>_enabled=false`). Rows are sorted paused-longest-first so devices accumulating non-aging data the longest float to the top of the list.
 
 **Columns:** device hostname, source pill, paused since (UTC), paused for (coarse age), live rows count, oldest data age.
+
+**Partial result banner (#4644).** The scan's response read is capped at 10,000 rows and 50 MiB of response payload. When either cap cuts it, the page shows a "Partial result" banner above the table, the header counts ("responded", "have all sources collecting normally") are marked as describing only the responses that were read, and, if no paused rows are in the part that was read, the empty state says the page cannot tell and that Refresh will not change it (the cut repeats), instead of "still in progress" or "running normally". Dropped responses read as agents that never answered, so the banner is NOT confirmation that every collector is running normally: narrow the scan to a smaller management group and scan again. A cut scan does not update the `yuzu_tar_retention_paused_devices` gauge (its partial row set would under-count), so the gauge keeps the last value from an uncut scan and can be stale. The same condition is `result_truncated_by_cap: true` in `GET /api/v1/tar/retention-paused` and the `list_tar_retention_paused` tool, which also set `store_degraded: true` for a cut scan so an older client sees an incomplete result.
 
 **Row states.** Beyond a normal paused row (with a timestamp), the table surfaces two conditions and floats both to the top of the list so they aren't missed:
 

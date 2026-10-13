@@ -38,6 +38,7 @@
 #include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
 #include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
+#include "software_catalogue_model.hpp" // M.9: shared REST+MCP software catalogue model
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
 #include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
@@ -70,6 +71,7 @@
 #include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
 #include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
 #include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution row builders
+#include "response_export_metrics.hpp" // #4644/#4703: param-rejected counter (shared with REST)
 #include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
                                      // response query/aggregate row builders
 #include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
@@ -112,6 +114,7 @@
 #include <cstdio>
 #include <ctime>
 #include <iterator>
+#include <limits> // numeric_limits (query_responses status range, #4644)
 #include <map>
 #include <memory>
 #include <mutex>
@@ -257,6 +260,25 @@ int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0
     return def;
 }
 
+/// Builds the catalogue model's `Params` from the named MCP arguments (strings and integers
+/// only; any other JSON type is left out, and an integer is stringified for every key). Every
+/// caller refuses a wrongly typed argument first, through `strict_args_error` (the two
+/// catalogue twins) or `installed_software_args_error` (query_installed_software), so nothing
+/// is silently dropped or stringified here. MCP and REST parse through the one model.
+software_catalogue::Params catalogue_params(const nlohmann::json& args,
+                                            std::initializer_list<const char*> keys) {
+    software_catalogue::Params p;
+    for (const char* k : keys) {
+        if (!args.contains(k))
+            continue;
+        if (args[k].is_string())
+            p.emplace(k, args[k].get<std::string>());
+        else if (args[k].is_number_integer())
+            p.emplace(k, std::to_string(args[k].get<int64_t>()));
+    }
+    return p;
+}
+
 /// #2970B: `param_int` SILENTLY substitutes `def` when the key is present but
 /// the wrong JSON type — `{"overlap_days": 30.0}` (what a Python or JS client
 /// emits for a float) or `"30"` becomes the default, and any subsequent range
@@ -277,6 +299,13 @@ std::optional<int64_t> param_int_strict(const nlohmann::json& params, const char
     if (!params.contains(key))
         return def;
     if (!params[key].is_number_integer())
+        return std::nullopt;
+    // nlohmann reports is_number_integer() for its UNSIGNED variant too, and
+    // get<int64_t>() wraps a value above INT64_MAX to a negative number (UINT64_MAX
+    // becomes -1, a documented "any" sentinel on several filters). Reject it as the
+    // malformed input it is rather than let it alias a different, valid value.
+    if (params[key].is_number_unsigned() &&
+        params[key].get<uint64_t>() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
         return std::nullopt;
     return params[key].get<int64_t>();
 }
@@ -324,6 +353,14 @@ std::optional<std::string> param_string_strict(const nlohmann::json& params, con
 
 int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
     return static_cast<int>(param_int(params, key, def));
+}
+
+/// Caller-supplied id as it may appear in an audit `detail` (CWE-117): capped at
+/// 128 bytes (a hostile caller must not bloat the audit row) and neutralised by
+/// `audit_token` (space, '=', ',' and control bytes such as CR/LF cannot forge an
+/// adjacent `k=v` field or split the line). Ordinary ids pass through unchanged.
+std::string audit_caller_id(std::string_view id) {
+    return audit_token(id.substr(0, 128));
 }
 
 // B5 (api-parity #2146) — mirrors rest_api_v1.cpp's file-local
@@ -547,9 +584,13 @@ static const ToolDef kTools[] = {
      "(agent, paused source). Requires Infrastructure:Read. Read-only twin of GET "
      "/fragments/tar/retention-paused / GET /api/v1/tar/retention-paused. Returns "
      "scan_id=\"\" when the operator has not dispatched a scan yet (call "
-     "POST /fragments/tar/retention-paused/scan first, dashboard-only today).",
+     "POST /fragments/tar/retention-paused/scan first, dashboard-only today). "
+     "result_truncated_by_cap=true means the scan's response read reached its "
+     "10,000-row / 50 MiB cap, so rows and the counters are PARTIAL (a dropped "
+     "response reads as an agent that never answered); store_degraded is then "
+     "also true, and result_truncated_by_cap tells a cut apart from a failed read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"scan_id":{"type":"string"},"scan_count":{"type":"integer"},"scan_at":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_with_no_paused_sources":{"type":"integer"},"agents_filtered_out_of_scope":{"type":"integer"},"store_degraded":{"type":"boolean"},"rows":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"agent_display":{"type":"string"},"source":{"type":"string"},"paused_at":{"type":"integer"},"live_rows":{"type":"integer"},"oldest_ts":{"type":"integer"},"value_error":{"type":"boolean"},"enabled_raw":{"type":"string"}},"required":["agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"]}}},"required":["scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","rows"]})j"},
+     R"j({"type":"object","properties":{"scan_id":{"type":"string"},"scan_count":{"type":"integer"},"scan_at":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_with_no_paused_sources":{"type":"integer"},"agents_filtered_out_of_scope":{"type":"integer"},"store_degraded":{"type":"boolean"},"result_truncated_by_cap":{"type":"boolean","description":"true when the scan's response read hit the 10,000-row or 50 MiB payload cap: rows and counts are partial"},"rows":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"agent_display":{"type":"string"},"source":{"type":"string"},"paused_at":{"type":"integer"},"live_rows":{"type":"integer"},"oldest_ts":{"type":"integer"},"value_error":{"type":"boolean"},"enabled_raw":{"type":"string"}},"required":["agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"]}}},"required":["scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows"]})j"},
 
     {"get_agent_details",
      "Get detailed info for a single agent including tags and inventory. "
@@ -617,6 +658,10 @@ static const ToolDef kTools[] = {
      "dispatch is still in flight; a result without it (even with zero rows) means "
      "no rows currently match, or (instruction_id-only queries) in-flight-ness "
      "could not be determined. "
+     "status and limit must be JSON integers: a string, float, boolean or null (omit "
+     "the key for the default), a status outside -1..2147483647, or an integer above "
+     "9223372036854775807 is rejected with -32602 invalid params rather than read as "
+     "\"any\"; a limit of 0 or below is served as 1 and one above 1000 as 1000. "
      "Confined by management group: a caller admitted through a management-group "
      "grant sees only their in-scope agents' rows, pushed into the underlying query "
      "before the row-limit cap so a confined caller's page is never truncated by "
@@ -627,8 +672,8 @@ static const ToolDef kTools[] = {
      "(server ingest wall-clock, 0 on legacy pre-v3 rows — distinct from the "
      "agent-claimed timestamp field, useful for spotting agent/server clock drift) "
      "(#2146 A2-R2).",
-     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
-     R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer","description":"The response row's own id"},"instruction_id":{"type":"string"},"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"error_detail":{"type":"string"},"timestamp":{"type":"integer"},"plugin":{"type":"string"},"received_at_ms":{"type":"integer","description":"Server ingest wall-clock in epoch ms; 0 on legacy pre-v3 rows"}},"required":["id","instruction_id","agent_id","execution_id","status","output","error_detail","timestamp","plugin","received_at_ms"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"retry_after_ms":{"type":"integer","description":"Present only when execution_id was supplied and its execution is confirmed non-terminal — minimum ms before polling again"}},"required":["responses"]})j"},
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","minimum":-1,"maximum":2147483647,"description":"CommandResponse status enum; omit or -1 for any. A non-integer, a value below -1 or above 2147483647 (including unsigned values beyond int64) is rejected (invalid params), never read as any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Rows to return, 1..1000 (default 100). A client that validates arguments against this schema rejects a value outside that range before sending it; the server itself clamps one that arrives (below 1 is served as 1, above 1000 as 1000) rather than rejecting it"}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
+     R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer","description":"The response row's own id"},"instruction_id":{"type":"string"},"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"error_detail":{"type":"string"},"timestamp":{"type":"integer"},"plugin":{"type":"string"},"received_at_ms":{"type":"integer","description":"Server ingest wall-clock in epoch ms; 0 on legacy pre-v3 rows"}},"required":["id","instruction_id","agent_id","execution_id","status","output","error_detail","timestamp","plugin","received_at_ms"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) when the served row count equals the effective limit: more rows may exist past it, and a result of exactly the limit also sets it"},"retry_after_ms":{"type":"integer","description":"Present only when execution_id was supplied and its execution is confirmed non-terminal — minimum ms before polling again"}},"required":["responses"]})j"},
 
     {"aggregate_responses",
      "Aggregate response data (COUNT, SUM, AVG, MIN, MAX) grouped by a column. `op_column` picks "
@@ -664,23 +709,37 @@ static const ToolDef kTools[] = {
      "Query the typed installed-software inventory collected by the agent daily-sync framework "
      "(ADR-0016) — machine-wide installed packages per device, fleet-wide. Each row carries name, "
      "version (upstream, release stripped), publisher (rpm PACKAGER / deb Maintainer / Windows "
-     "Publisher), install_date, kind (package|app), ecosystem (rpm|deb|apk|pacman|windows|macos|"
-     "homebrew), epoch, release, arch, signature_status (rpm only, from stored header tags), "
+     "Publisher), install_date, kind (package|app|pkg|feat), "
+     "ecosystem (rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature), "
+     "epoch, release, arch, signature_status (rpm only, from stored header tags), "
      "distro_id and distro_version (/etc/os-release, Linux rows); fields an ecosystem does not "
-     "store are empty strings, never synthesised. Filter by software `name` and/or `agent_id`. "
+     "store are empty strings, never synthesised. Homebrew formulae are kind pkg, casks kind app "
+     "(ecosystem brew), plus one kind app row named homebrew (ecosystem brew) recording that "
+     "Homebrew itself is present; Windows optional features are kind feat with the DISM state in version. "
+     "Filter by software `name` and/or `agent_id`. "
      "This is DISTINCT from "
      "query_inventory/get_agent_inventory, which read the generic per-source blob store on "
      "Infrastructure:Read. Requires Inventory:Read (#3290 Phase 2: the sole gate is the ADR-0017 "
      "admit-then-filter fleet-read gate). Results are scoped to the caller's management groups "
      "AND, for a service-scoped API token, to that token's service-tagged agents (the intersection "
-     "of both when both apply); out-of-scope devices are dropped and counted in devices_omitted "
-     "(a positive value means matching software exists outside your scope — a short result does "
-     "NOT mean the software is absent fleet-wide). A correctly-confined service-scoped token now "
-     "gets a real filtered read here rather than an outright denial. Returns up to `limit` rows "
-     "(max 1000); when result_truncated_by_cap is true more rows exist past the cap (keyset "
-     "pagination is a follow-up).",
-     R"j({"type":"object","properties":{"name":{"type":"string","description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","description":"Exact agent/device filter; omit for fleet-wide"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}}})j",
-     R"j({"type":"object","properties":{"software":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"},"kind":{"type":"string"},"ecosystem":{"type":"string"},"epoch":{"type":"string"},"release":{"type":"string"},"arch":{"type":"string"},"signature_status":{"type":"string"},"distro_id":{"type":"string"},"distro_version":{"type":"string"}},"required":["agent_id","name","version","publisher","install_date","kind","ecosystem","epoch","release","arch","signature_status","distro_id","distro_version"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"devices_omitted":{"type":"integer","description":"Count of devices dropped by the management-group AND service-tag scope filter"}},"required":["software","devices_omitted"]})j"},
+     "of both when both apply): the scope is applied in SQL (up to 10000 visible devices), so a "
+     "confined caller gets COMPLETE pages of its own devices; devices_omitted is 0 there. Above "
+     "that bound the rows are filtered after the read: devices_omitted is then the count of "
+     "distinct out-of-scope devices within the scanned window(s), a bounded and audited signal "
+     "that out-of-scope matches exist, and a page can be EMPTY with a non-null next_cursor (keep "
+     "paging until it is null). A correctly-confined "
+     "service-scoped token gets a real filtered read here rather than an outright denial. Rows "
+     "also carry source (<plugin>.<action>, an open set). Optional `version` (an empty string "
+     "selects the empty-version rows). Returns up to `limit` rows (max 1000; any integer that fits "
+     "int64 is clamped to 1..1000); when "
+     "result_truncated_by_cap is true more rows may exist and next_cursor (also non-null then) "
+     "resumes the keyset walk — pass it back as `cursor`; a malformed cursor or one issued for a "
+     "different filter set is refused with kInvalidParams. A wrongly typed argument (a "
+     "non-string agent_id, name, version or cursor, or a non-integer or int64-overflowing limit) "
+     "is refused with kInvalidParams, never ignored. For the fleet title rollup use "
+     "query_software_catalogue; to list the devices carrying one title, filter here by `name`.",
+     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":1024,"description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","maxLength":256,"description":"Exact agent/device filter; omit for fleet-wide"},"version":{"type":"string","maxLength":1024,"description":"Exact version filter; an empty string selects the empty-version rows"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum rows returned"}}})j",
+     R"j({"type":"object","properties":{"software":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"},"kind":{"type":"string"},"ecosystem":{"type":"string"},"epoch":{"type":"string"},"release":{"type":"string"},"arch":{"type":"string"},"signature_status":{"type":"string"},"distro_id":{"type":"string"},"distro_version":{"type":"string"},"source":{"type":"string"}},"required":["agent_id","name","version","publisher","install_date","kind","ecosystem","epoch","release","arch","signature_status","distro_id","distro_version","source"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows may exist (the page is full or, on a wide scope, the read was cut short)"},"devices_omitted":{"type":"integer","description":"Distinct devices hidden by the in-process scope post-filter within the scanned window (0 under SQL push-down)"},"next_cursor":{"type":["string","null"],"description":"Pass back as cursor for the next page; null when no more rows may exist. A wide-scope page can be empty with a non-null next_cursor"}},"required":["software","devices_omitted","next_cursor"]})j"},
 
     {"get_tags", "Get all tags for a specific agent.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
@@ -1964,8 +2023,12 @@ static const ToolDef kTools[] = {
      "change. "
      "ZERO-AGENTS DISCRIMINATION (#3424/#3511): a SUCCESS envelope with agents_reached=0 also "
      "carries a status enum, not just \"no_agents_reached\" - branch on status, not message text. "
-     "\"invalid_scope\" and \"quarantined\" and \"plugin_not_found\" are PERMANENT: retrying "
-     "the same request will not help (retry_after_ms is null on all three) - \"invalid_scope\" "
+     "\"invalid_scope\" and \"quarantined\" and \"plugin_not_found\" and \"kill_switched_os\" are "
+     "PERMANENT: retrying "
+     "the same request will not help (retry_after_ms is null on all four) - \"kill_switched_os\" "
+     "means every target runs an OS for which a per-OS kill switch is OFF (#5294); "
+     "\"os_gate_unreadable\" is a transient failure to read agent presence while a per-OS "
+     "kill switch is OFF (retry_after_ms 5000) - \"invalid_scope\" "
      "means the scope expression itself could not be parsed, a caller error, not a fleet fact. "
      "\"containment_unreadable\" is a transient systemic gate "
      "failure and \"route_unreadable\" (WS-4 4.2b) is a transient systemic gateway "
@@ -1973,8 +2036,8 @@ static const ToolDef kTools[] = {
      "\"no_agents_reached\" is the generic case (offline "
      "device, or a residual approval-required race) - retry_after_ms is non-null here too, since "
      "the offline-device case within it is retryable and a mixed cause must not be understated as "
-     "permanent. agents_quarantined/agents_unknown_plugin are "
-     "present on every zero-agents response with the exact counts, regardless of which status "
+     "permanent. agents_quarantined/agents_unknown_plugin/agents_kill_switched_os "
+     "are present on every zero-agents response with the exact counts, regardless of which status "
      "matched, for a mixed-cause dispatch.",
      // NOTE (governance): these maxLength/maxItems bounds are the MCP SCHEMA
      // contract (A5 materiality backfill), and since #2437 they are ENFORCED
@@ -2020,17 +2083,19 @@ static const ToolDef kTools[] = {
      // plugin_not_found) - not a generic integer, so a client
      // schema-validating the response catches drift between this contract and
      // the handler the same way `agents_reached`'s own const already does.
-     // agents_quarantined/agents_unknown_plugin ride on every zero-agents
+     // agents_quarantined/agents_unknown_plugin/agents_kill_switched_os ride on every zero-agents
      // branch (not just the one each "belongs" to) so a caller reading a
      // mixed failure never has to infer a count from which branch matched.
      R"j({"oneOf":[)j"
      R"j({"type":"object","properties":{"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":1},"plugin":{"type":"string"},"action":{"type":"string"}},"required":["command_id","execution_id","agents_reached","plugin","action"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"invalid_scope"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"containment_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"route_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"quarantined"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"plugin_not_found"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false})j"
+     R"j({"type":"object","properties":{"status":{"const":"invalid_scope"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"containment_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"route_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"quarantined"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"plugin_not_found"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"kill_switched_os"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"os_gate_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false})j"
      R"j(]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -2632,9 +2697,9 @@ static const ToolDef kTools[] = {
      "Administrator role. A caller may NOT remove their own Administrator assignment through "
      "this tool (self-lockout guard); removing the fleet's LAST remaining authenticatable "
      "Administrator grant is refused even by another admin, by a check in the same "
-     "transaction as the removal. That check does not cover an account created or deactivated "
-     "concurrently, or an Administrator's account deactivated through a separate path, so it "
-     "does not by itself guarantee the fleet keeps one. A grant naming a nonexistent, "
+     "transaction as the removal. That check does not cover an account created concurrently "
+     "for a pre-provisioned grant, so it does not by itself guarantee the fleet keeps one. "
+     "A grant naming a nonexistent, "
      "deactivated, soft-deleted, or group-held "
      "principal is never counted as a surviving Administrator, so a refusal can happen even "
      "when other Administrator grants nominally exist. "
@@ -2701,8 +2766,15 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"scenario":{"type":"string"},"title":{"type":"string"},"category":{"type":"string"},"classification":{"type":"string"},"expected_first_tool":{"type":"string"},"requires_connector":{"type":"string","description":"Empty when the playbook needs no external connector"},"summary":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},"safety":{"type":"array","items":{"type":"string"}}},"required":["scenario","title","category","classification","expected_first_tool","requires_connector","summary","steps","safety"]})j"},
     {"summarize_working_set",
      "Summarize an agent/result-set/execution scope into a model-ready narrative with resource "
-     "links and next tools instead of dumping unbounded rows. Summarization only.",
-     R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string"},"limit":{"type":"integer","default":25,"maximum":100}}})",
+     "links and next tools instead of dumping unbounded rows. Summarization only. "
+     "kind=execution is confined by management group (admit-then-filter via the fleet-read "
+     "gate): counts are computed from only the caller's visible agents, and an execution "
+     "outside the caller's scope reads exactly like a nonexistent one (\"was not found\" "
+     "narrative, not an error). A store degrade returns an error carrying retry_after_ms. "
+     "An id containing a NUL byte is rejected with invalid-params for kind=execution. "
+     "kind=fleet and kind=result_set (and an empty id) return an unscoped whole-registry "
+     "agent count, not narrowed to the caller's scope.",
+     R"({"type":"object","properties":{"kind":{"type":"string","enum":["fleet","agent","execution","result_set"],"default":"fleet"},"id":{"type":"string","maxLength":128},"limit":{"type":"integer","default":25,"maximum":100}}})",
      // #2986: kind/id/limit echo the (possibly-defaulted) input; narrative,
      // resource_links, and recommended_next_tools are always populated
      // (empty id, or the fleet-fallback branch, still produce a narrative).
@@ -2771,8 +2843,28 @@ static const ToolDef kTools[] = {
      R"j(},"required":["username"]})j",
      R"j({"type":"object","properties":{"username":{"type":"string"},"unlocked":{"type":"boolean"},"audit_emitted":{"type":"boolean"}},"required":["username","unlocked","audit_emitted"]})j"},
     {"discover_instructions",
-     "Published (enabled) InstructionDefinition catalog with parameter_schema — the "
-     "commands this worker may dispatch via execute_instruction. Read-only catalog.",
+     "List every enabled InstructionDefinition (the published catalogue) with the schema needed "
+     "to call it. Use it to learn WHICH commands exist and HOW to parameterise them before you "
+     "dispatch; it dispatches nothing and changes nothing. Each entry carries id, name, plugin, "
+     "action, description, platforms, approval_mode, input_schema and parameter_schema. "
+     "input_schema is the canonical JSON Schema the server enforces (an undeclared param is "
+     "refused): build params from it. parameter_schema is the stored YAML-DSL form (int32, "
+     "displayName); prefer input_schema. input_schema null with input_schema_error null means no "
+     "declared parameters; null with a token means none is published "
+     "(parameter_schema_not_canonicalisable: execute refuses the definition; "
+     "input_schema_budget_exceeded: this schema did not fit the request's schema budget, which "
+     "depends on catalogue order (name, then id) and sizes, so retrying does not cure it; "
+     "parameter_schema is still present). A non-null input_schema can still be refused at "
+     "execute, for any reason its validator rejects that canonicalisation does not check (e.g. "
+     "a regex that does not compile). CHAIN: call execute_instruction with the entry's plugin and "
+     "action, params shaped by input_schema but sent as strings (\"24\", \"true\": "
+     "execute_instruction params are string-valued), and agent_ids or scope. The schema is "
+     "enforced only by POST /api/instructions/{id}/execute; execute_instruction looks up no "
+     "definition. There are no filter arguments: the whole catalogue comes back (truncated=true "
+     "at 5000 entries), so filter on plugin/action yourself. count 0 with an empty list means "
+     "no enabled definition is published; it is not an error. Requires "
+     "InstructionDefinition:Read. Read-only and safe to repeat. REST twin: GET "
+     "/api/v1/discover/instructions.",
      R"({"type":"object","properties":{}})",
      // #2986: build_instructions_catalog's envelope is fixed; each entry's
      // parameter_schema is itself an arbitrary nested JSON Schema document
@@ -2781,7 +2873,10 @@ static const ToolDef kTools[] = {
      // discover_routes.cpp's is_object() guard) — genuinely variable BY
      // DESIGN, so it is typed generically rather than pretending to know
      // its shape, same idiom as get_access_review's "campaign":{"type":"object"}.
-     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Nested JSON Schema when the stored value parses as JSON AND is itself an object, else null"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
+     // input_schema is the same kind of document (the canonical form of
+     // parameter_schema), typed the same way; input_schema_error is a fixed
+     // token or null.
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Stored definition schema verbatim (YAML-DSL types such as int32) when the stored value parses as JSON AND is itself an object, else null"},"input_schema":{"type":["object","null"],"description":"Canonical JSON Schema the server enforces on POST /api/instructions/{id}/execute; null when the definition declares no schema or none is published (see input_schema_error)"},"input_schema_error":{"type":["string","null"],"enum":[null,"parameter_schema_not_canonicalisable","input_schema_budget_exceeded"],"description":"Null unless no canonical schema is published for a stored schema: parameter_schema_not_canonicalisable (it cannot be canonicalised) or input_schema_budget_exceeded (the request reached its schema budget)"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","input_schema","input_schema_error","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
     {"discover_routes",
      "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
      "serves. Hand-maintained source, so it can under-report an undocumented route "
@@ -3056,28 +3151,37 @@ static const ToolDef kTools[] = {
 
     {"get_plugin_kill_switch",
      "Read a plugin or plugin-action kill-switch's current display state. Mirrors GET "
-     "/api/v1/plugin-config/{plugin}/kill-switch (?action=). NOT the dispatch-gating "
+     "/api/v1/plugin-config/{plugin}/kill-switch (?action=&os=). NOT the dispatch-gating "
      "decision (PluginConfigStore::action_allowed collapses any store error to disabled, "
      "which this display accessor deliberately does not) — this is the inspection view an "
      "operator reads before deciding whether to flip it. Absence of a prior flip reads as "
-     "enabled=true with no reason/set_by. Requires PluginConfig:Read.",
+     "enabled=true with no reason/set_by. For a protective action (the quarantine plugin's "
+     "quarantine/unquarantine/status/whitelist and __guard__.push_rules) the state shown here is "
+     "informational only: enabled=false can be displayed while dispatch still proceeds. "
+     "Without os this reports the all-OS layer only and "
+     "never reflects a per-OS OFF row. Requires PluginConfig:Read.",
      // plugin maxLength is 68, not 64: parse_kill_switch_scope also accepts a
      // reserved-namespace plugin name (__<identifier>__, #3265), whose total
      // length can reach kMaxIdentifierBytes (64) + 4 sentinel bytes = 68 —
      // this schema must not reject an input the store would accept.
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"}},"required":["plugin"]})j",
-     R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"}},"required":["plugin","action","enabled"]})j"},
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS for a per-OS view; omit for the all-OS switch. With os, enabled is the effective state of the switch row (for a protective action that row never gates dispatch) and reason/set_by/source name the row that produced it. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"}},"required":["plugin"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"os":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"},"source":{"type":"string"}},"required":["plugin","action","enabled"]})j"},
 
     {"set_plugin_kill_switch",
      "Flip a plugin or plugin-action kill switch on or off. Mirrors PUT "
-     "/api/v1/plugin-config/{plugin}/kill-switch (?action=, body {enabled, reason}). Every "
+     "/api/v1/plugin-config/{plugin}/kill-switch (?action=&os=, body {enabled, reason}). Every "
      "dispatch-gating caller that consults this switch fails CLOSED (treats disabled) on any "
      "store error, so throwing this switch is a reliable emergency stop for the named "
      "plugin/action — there is no separate 'force disable' escalation beyond this call. "
-     "Requires PluginConfig:Write.",
+     "Exception: a protective action (the quarantine plugin's quarantine/unquarantine/status/"
+     "whitelist and __guard__.push_rules) is never refused by this switch; a row for one is "
+     "stored and echoed but has no dispatch effect; to stop Guardian rule delivery disable or "
+     "remove the rules instead (disarms them on the agent's next reconcile). "
+     "The result echoes the row written, not the effective state. Requires "
+     "PluginConfig:Write.",
      // plugin maxLength is 68 — see the identical note on get_plugin_kill_switch above.
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
-     R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"}},"required":["plugin","action","enabled"]})j"},
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS to narrow the switch to; omit for the all-OS switch. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed; for a protective action the row is stored but has no dispatch effect"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"},"os":{"type":"string"},"source":{"type":"string"}},"required":["plugin","action","enabled"]})j"},
 
     {"mint_upload_grant",
      "Mint a one-time upload-grant credential authorising ONE agent to push ONE file back to "
@@ -3217,6 +3321,8 @@ static const ToolDef kTools[] = {
      "sparingly). A host that aged out of the live cache but was seen within the last 7 days "
      "still appears, flagged stale=true with empty processes/connections/listeners and ts=0 -- "
      "treat that shape as 'last known identity, no current detail', never as an error. "
+     "When the durable offline-host read itself fails the snapshot is live-only (stale hosts "
+     "missing) and the body carries offline_roster_degraded=true -- not an error. "
      "machines_max bounds the response size (DoS protection, default 5000, ceiling 100000): a "
      "fleet larger than the cap is refused outright, never silently truncated, so a caller "
      "never mistakes a partial view for the whole fleet -- raise machines_max or use "
@@ -3227,7 +3333,7 @@ static const ToolDef kTools[] = {
      "disabled the visualization feature (yuzu_viz_disabled / --viz-disable). Requires "
      "Response:Read.",
      R"j({"type":"object","properties":{"include_vuln":{"type":"boolean","default":false,"description":"Join known-CVE severity onto each process by name (best-effort; often inert if the fleet has no version-bearing inventory match)"},"fresh":{"type":"boolean","default":false,"description":"Force a live re-fetch, invalidating the shared 60s cache for every caller"},"machines_max":{"type":"integer","minimum":1,"maximum":100000,"default":5000,"description":"Refuse (do not truncate) a snapshot with more machines than this"}}})j",
-     R"j({"type":"object","properties":{"schema":{"type":"string"},"schema_minor":{"type":"integer"},"generated_at":{"type":"integer"},"include_vuln":{"type":"boolean"},"machines":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"local_ips":{"type":"array","items":{"type":"string"}},"processes":{"type":"array","items":{"type":"object","properties":{"pid":{"type":"integer"},"ppid":{"type":"integer"},"name":{"type":"string"},"user":{"type":"string"},"category":{"type":"string"},"worst_severity":{"type":"string"},"cve_count":{"type":"integer"}},"required":["pid","ppid","name","user","category"]}},"connections":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"src_pid":{"type":"integer"},"src_addr":{"type":"string"},"src_port":{"type":"integer"},"dst_addr":{"type":"string"},"dst_port":{"type":"integer"},"scope":{"type":"string","enum":["local","internal_fleet","external"]},"state":{"type":"string"},"dst_agent_id":{"type":"string"},"dst_pid":{"type":"integer"}},"required":["proto","src_pid","src_addr","src_port","dst_addr","dst_port","scope","state"]}},"listeners":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"port":{"type":"integer"},"pid":{"type":"integer"},"process_name":{"type":"string"},"local_addr":{"type":"string"}},"required":["proto","port"]}},"stale":{"type":"boolean"},"ts":{"type":"integer"},"truncated_processes":{"type":"boolean"},"truncated_connections":{"type":"boolean"}},"required":["agent_id","hostname","os","local_ips","processes","connections","listeners","stale","ts"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["schema","schema_minor","generated_at","include_vuln","machines"]})j"},
+     R"j({"type":"object","properties":{"schema":{"type":"string"},"schema_minor":{"type":"integer"},"generated_at":{"type":"integer"},"include_vuln":{"type":"boolean"},"machines":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"local_ips":{"type":"array","items":{"type":"string"}},"processes":{"type":"array","items":{"type":"object","properties":{"pid":{"type":"integer"},"ppid":{"type":"integer"},"name":{"type":"string"},"user":{"type":"string"},"category":{"type":"string"},"worst_severity":{"type":"string"},"cve_count":{"type":"integer"}},"required":["pid","ppid","name","user","category"]}},"connections":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"src_pid":{"type":"integer"},"src_addr":{"type":"string"},"src_port":{"type":"integer"},"dst_addr":{"type":"string"},"dst_port":{"type":"integer"},"scope":{"type":"string","enum":["local","internal_fleet","external"]},"state":{"type":"string"},"dst_agent_id":{"type":"string"},"dst_pid":{"type":"integer"}},"required":["proto","src_pid","src_addr","src_port","dst_addr","dst_port","scope","state"]}},"listeners":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"port":{"type":"integer"},"pid":{"type":"integer"},"process_name":{"type":"string"},"local_addr":{"type":"string"}},"required":["proto","port"]}},"stale":{"type":"boolean"},"ts":{"type":"integer"},"truncated_processes":{"type":"boolean"},"truncated_connections":{"type":"boolean"}},"required":["agent_id","hostname","os","local_ips","processes","connections","listeners","stale","ts"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"offline_roster_degraded":{"type":"boolean","description":"Present (true) only when the durable offline-host read failed; machines is then live-only (stale hosts missing), not an error"}},"required":["schema","schema_minor","generated_at","include_vuln","machines"]})j"},
 
     {"get_host_topology",
      "Per-host slice of the fleet topology -- one machine's processes, open connections, and "
@@ -3453,9 +3559,59 @@ static const ToolDef kTools[] = {
      "rbac.assignments.list. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"count":{"type":"integer"},"assignments":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"role_name":{"type":"string"}},"required":["principal_type","principal_id","role_name"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","assignments"]})j"},
+
+    // ── M.9 software catalogue twins — MCP mirrors of GET /api/v1/inventory/software/catalogue
+    // and .../catalogue/versions, shaped by the SAME pure model (software_catalogue_model.hpp)
+    // so the two surfaces cannot drift. Appended at the VERY END of kTools[] per the standing
+    // governance note above.
+    {"query_software_catalogue",
+     "Fleet software title catalogue: one row per title rolled up across the whole fleet "
+     "(installs = distinct devices, versions = distinct versions, ecosystems and kinds present, "
+     "newest_version), ordered by installs descending then name. totals{titles,installs} cover "
+     "EVERY row matching the filters, not just this page, so report 'N of M'. The first page also "
+     "carries kpis (headline numbers from the hourly rollup refresh, plus coverage as counts: "
+     "reporting devices, connected devices, devices not seen in 48 hours); continuation pages "
+     "carry kpis null; kpis.building true means the rollup has never been computed (zero counts, "
+     "not a measured zero) - normally until the first hourly refresh lands, but PERMANENT when the "
+     "refresh cannot complete (a fleet above the ~6000-endpoint refresh ceiling, #5545; a database "
+     "role without TEMPORARY; a deleted catalog_rollup_meta id=1 row), so a building state that "
+     "outlives several refresh cycles is an operator fault that retries will not fix. Page with next_cursor (non-null when the page is full) passed back as "
+     "cursor: a cursor reused with different filters, or one issued before the latest refresh, is "
+     "refused with kInvalidParams and the walk must restart from the first page. agent_id selects "
+     "one device's titles. Requires a GLOBAL Inventory:Read for the fleet view: a "
+     "management-group-confined caller is denied (the rollup is fleet-wide and cannot be "
+     "scoped), but may pass an in-scope agent_id (newest_version is then blank and "
+     "newest_omitted true; an out-of-scope device returns an empty page with devices_omitted 1). "
+     "Service-scoped API tokens are denied. Input is strict: an out-of-range limit or an unknown "
+     "kind/ecosystem is rejected rather than clamped (the REST twin clamps); an empty kind or "
+     "ecosystem is refused too, so omit the key. To drill into one title pass its name to "
+     "get_software_versions, or to query_installed_software for the devices carrying it. A "
+     "degraded store read is a retryable error, never an empty result. Every call that reaches "
+     "the store is audited (mcp.query_software_catalogue).",
+     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
+     R"j({"type":"object","properties":{"titles":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"publisher":{"type":"string"},"installs":{"type":"integer"},"versions":{"type":"integer"},"ecosystems":{"type":"array","items":{"type":"string"}},"kinds":{"type":"array","items":{"type":"string"}},"newest_version":{"type":"string"}},"required":["name","publisher","installs","versions","ecosystems","kinds","newest_version"]}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"totals":{"type":"object","properties":{"titles":{"type":"integer"},"installs":{"type":"integer"}},"required":["titles","installs"]},"kpis":{"type":["object","null"]},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["titles","count","next_cursor","totals","kpis","devices_omitted"]})j"},
+
+    {"get_software_versions",
+     "Installs per version for one software title (distinct devices per version), most-installed "
+     "first, under the same kind/ecosystem/source/agent_id filters as query_software_catalogue; "
+     "newest marks the title's fleet-wide newest version. truncated is true when the limit was "
+     "reached. Same access posture as query_software_catalogue: a global Inventory:Read for the "
+     "fleet view; a confined caller may pass an in-scope agent_id (newest is then false on every "
+     "row and newest_omitted true; an out-of-scope device returns an empty list with "
+     "devices_omitted 1); service-scoped tokens are denied. A degraded store read, and the "
+     "unfiltered fleet read while the catalogue is being built (never refreshed: normally until the "
+     "first hourly refresh, PERMANENT when the refresh cannot complete - see "
+     "query_software_catalogue), are retryable errors, never an empty result. An empty kind or "
+     "ecosystem is refused: omit the key. Take the title name from query_software_catalogue; "
+     "query_installed_software lists the devices carrying a version. Audited as "
+     "mcp.get_software_versions.",
+     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
+     R"j({"type":"object","properties":{"name":{"type":"string"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"installs":{"type":"integer"},"newest":{"type":"boolean"}},"required":["version","installs","newest"]}},"count":{"type":"integer"},"truncated":{"type":"boolean"},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["name","versions","count","truncated","devices_omitted"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
+static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
+              "the catalogue cursor bound must equal the MCP cursor input bound");
 
 // ── Write/execute tools (blocked by read_only_mode) ──────────────────────
 // These tool names perform Write/Execute/Delete operations.
@@ -3654,6 +3810,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_inventory_tables", {"Infrastructure", "Read"}},
     {"get_agent_inventory", {"Infrastructure", "Read"}},
     {"query_installed_software", {"Inventory", "Read", ServiceScopeClass::confined}},
+    // M.9: the catalogue twins read a FLEET-WIDE rollup that cannot be scoped to a service tag,
+    // so they keep the default-deny class (C8 refuses a service-scoped token before the handler).
+    {"query_software_catalogue", {"Inventory", "Read"}},
+    {"get_software_versions", {"Inventory", "Read"}},
     {"get_tags", {"Tag", "Read"}},
     {"search_agents_by_tag", {"Tag", "Read"}},
     {"list_policies", {"Policy", "Read"}},
@@ -4436,6 +4596,8 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_inventory_tables", {ToolEffect::ReadOnly, true, "List inventory tables"}},
     {"get_agent_inventory", {ToolEffect::ReadOnly, true, "Get agent inventory"}},
     {"query_installed_software", {ToolEffect::ReadOnly, true, "Query installed software"}},
+    {"query_software_catalogue", {ToolEffect::ReadOnly, true, "Query the software catalogue"}},
+    {"get_software_versions", {ToolEffect::ReadOnly, true, "Get a title's versions"}},
     {"list_dex_app_perf_devices",
      {ToolEffect::ReadOnly, true, "List devices reporting an app version"}},
     {"get_tags", {ToolEffect::ReadOnly, true, "Get tags"}},
@@ -8148,7 +8310,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     spdlog::debug("get_agent_details: out-of-scope {} -> not found before lookup",
                                   agent_id);
                     mcp_audit("denied", "agent not found or outside caller's fleet-read scope: " +
-                                            agent_id);
+                                            audit_caller_id(agent_id));
                     res.set_content(
                         error_response(id, kInvalidParams, "Agent not found: " + agent_id),
                         "application/json");
@@ -8159,7 +8321,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // masking it as a genuine miss (CDX-P2-04/K4). Reached only AFTER
                     // the in_scope deny above, so an out-of-scope caller still gets the
                     // identical not-found denial with zero backing read (#3564 intact).
-                    mcp_audit("failure", agent_id);
+                    mcp_audit("failure", audit_caller_id(agent_id));
                     res.set_content(
                         error_response(id, kInternalError, "device registry unavailable"),
                         "application/json");
@@ -8169,7 +8331,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     device_api->lookup_device(agent_id);
                 if (!result) { // DeviceReadError::kDegraded — id resolved, tag-store read failed
                                 // (in-scope only reaches here)
-                    mcp_audit("failure", agent_id);
+                    mcp_audit("failure", audit_caller_id(agent_id));
                     res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
                                     "application/json");
                     return;
@@ -8177,7 +8339,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!*result) { // genuine miss — identical denial to the out-of-scope case
                     spdlog::debug("get_agent_details: no match for {}", agent_id);
                     mcp_audit("denied", "agent not found or outside caller's fleet-read scope: " +
-                                            agent_id);
+                                            audit_caller_id(agent_id));
                     res.set_content(
                         error_response(id, kInvalidParams, "Agent not found: " + agent_id),
                         "application/json");
@@ -8594,7 +8756,35 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 ResponseQuery rq;
                 rq.agent_id = param_str(args, "agent_id");
-                rq.status = param_int32(args, "status", -1);
+                // #4644: param_int32 swallowed a wrong-typed status (a string, a float)
+                // into the default and wrapped an out-of-int32 value, so a malformed
+                // filter silently meant "any" or a different status. Strict like
+                // op_column/aggregate on aggregate_responses; -1 is the documented
+                // "any" sentinel, anything below it is neither a status nor "any".
+                const auto status_opt = param_int_strict(args, "status", -1);
+                if (!status_opt || *status_opt < -1 ||
+                    *status_opt > std::numeric_limits<int>::max()) {
+                    // retry-hint-exempt: malformed client input, not a store/query fault --
+                    // resending the same value fails identically.
+                    yuzu::server::count_response_param_rejected(metrics, "mcp");
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "status must be an integer between -1 and 2147483647 (-1 or omitted = any)"),
+                        "application/json");
+                    return;
+                }
+                rq.status = static_cast<int>(*status_opt);
+                const auto limit_opt = param_int_strict(args, "limit", 100);
+                if (!limit_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON type), not a
+                    // store/query fault -- resending the same value fails identically.
+                    yuzu::server::count_response_param_rejected(metrics, "mcp");
+                    res.set_content(a4_error(kInvalidParams,
+                                             "limit must be a JSON integer that fits in a "
+                                             "signed 64-bit value"),
+                                    "application/json");
+                    return;
+                }
                 // Clamp BOTH bounds. Upper alone is insufficient: a negative
                 // limit (or one that wraps negative through param_int32's
                 // int64->int32 cast) binds as SQLite `LIMIT -1`, which means
@@ -8610,8 +8800,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // int64->int cast wraps a limit > INT_MAX negative, which std::clamp
                 // would then pin to 1 (silently under-serving). Read the raw int64,
                 // clamp to [1,1000] first; the result always fits an int.
-                rq.limit = static_cast<int>(
-                    std::clamp<std::int64_t>(param_int(args, "limit", 100), 1, 1000));
+                rq.limit = static_cast<int>(std::clamp<std::int64_t>(*limit_opt, 1, 1000));
                 // When execution_id is supplied, route to the exact-correlation
                 // path so the agentic dispatch->collect loop closes cleanly:
                 // execute_instruction mints the execution_id, stamps it onto
@@ -8780,141 +8969,237 @@ McpServer::HandlerFn McpServer::build_handler(
                             // envelope — the established convention every perm_fn(req,res,...)
                             // call in this file already follows, e.g. require_permission's own
                             // deny branches; cpp-expert confirmed this empirically, #3290 Gate 3)
+                namespace swc = software_catalogue;
+                // A wrongly typed argument is refused, never dropped (version:2.0 would read the
+                // whole fleet) or stringified (agent_id:123); unknown names stay ignored. Input
+                // is judged before the store is consulted.
+                if (const auto bad = swc::installed_software_args_error(args)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
                 if (!software_inventory_store) {
                     res.set_content(
                         error_response(id, kInternalError, "Software inventory store unavailable"),
                         "application/json");
                     return;
                 }
-                SoftwareFleetQuery q;
-                q.agent_id = param_str(args, "agent_id");
-                q.name = param_str(args, "name");
-                // Clamp in 64-bit BEFORE narrowing (same posture as query_responses):
-                // limit:0 reads as "done, no rows"; a negative/wrapped limit binds
-                // unbounded and defeats the cap. No offset — the scope filter runs AFTER
-                // the store LIMIT, so paging would yield unstable windows over a table
-                // that mutates on sync cadence; keyset is the #1634 follow-up.
-                q.limit = static_cast<int>(
-                    std::clamp<std::int64_t>(param_int(args, "limit", 100), 1, 1000));
-                const std::string audit_key = !q.name.empty() ? ("name=" + q.name)
-                                              : !q.agent_id.empty() ? ("agent=" + q.agent_id)
-                                                                    : std::string("fleet");
-                auto rows_opt = software_inventory_store->query_software(q);
-                if (!rows_opt) {
+                auto parsed = swc::parse_devices_params(
+                    catalogue_params(args, {"agent_id", "name", "version", "limit", "cursor"}));
+                if (!parsed) {
+                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const std::string audit_key = swc::audit_target(parsed->query);
+                const bool continuation = !parsed->cursor.empty();
+                // The model decodes the cursor, pushes the scope into SQL up to
+                // kScopePushdownMaxIds (complete pages) and post-filters only a wider scope (the
+                // gate's own composed meet(management-group, service-scope) VisibleSet; the REST
+                // twin calls the same function). devices_omitted is DEFINED as the devices hidden
+                // by that filter: 0 under push-down, where the SQL returned only in-scope rows.
+                const auto read = swc::read_devices_page(
+                    swc::devices_reader(*software_inventory_store), *parsed, gate.scope);
+                if (!read) {
+                    if (read.error()) {
+                        res.set_content(error_response(id, kInvalidParams, std::string(swc::cursor_error_message(*read.error()))), "application/json"); // retry-hint-exempt: caller-input rejection
+                        return;
+                    }
                     // Store degraded (pool/query failure) — surface it, never return
                     // success+[]. A silent empty here reads as "installed nowhere" for a
                     // fleet vuln query (ADR-0016 §7 authoritative-reads; agentic-first A4
-                    // failure-vs-empty). Distinct message from the null-store case above.
-                    // Audit the degraded access (gov compliance CC7.2): a CVE-triage caller
-                    // under a sustained outage must still leave a behavioural trail
-                    // (who/when/what filter), mirroring the success/denied audits below.
+                    // failure-vs-empty). Audit the degraded access (gov compliance CC7.2): a
+                    // CVE-triage caller under a sustained outage must still leave a
+                    // behavioural trail (who/when/what filter).
                     mcp_audit("failure", "store degraded; " + audit_key);
-                    res.set_content(error_response(id, kInternalError,
-                                                   "Software inventory store degraded — query failed"),
+                    res.set_content(a4_error(kInternalError,
+                                             "Software inventory store degraded — query failed",
+                                             "retry the request", mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
-                auto& rows = *rows_opt;
+                const auto& page = *read;
 
-                // Cap hit BEFORE scope filtering → result incomplete (the store's hard
-                // ceiling kFleetQueryRowCap >> 1000, so the binding cap is q.limit).
-                // Captured pre-filter: the filter shrinks `rows`. NOTE: unlike the
-                // correlation-bounded query_responses (which requires execution_id/
-                // instruction_id), an empty-filter call here is an unbounded fleet-wide
-                // scan capped at q.limit on a global ORDER BY *before* the per-agent scope
-                // filter — so a narrow-scope operator may see few of their own rows in one
-                // page, signalled by result_truncated_by_cap. Completeness for a narrow
-                // scope over a wide fleet is the keyset follow-up (#1634).
-                const bool hit_cap = rows.size() == static_cast<std::size_t>(q.limit);
-
-                // Scope filter — the gate's own composed meet(management-group,
-                // service-scope) VisibleSet (#3290, replaces the retired per-row
-                // inventory_scope_fn predicate; mirrors the REST twin exactly,
-                // rest_api_v1.cpp). nullopt (TOP) ⇒ unfiltered — a global grant or
-                // RBAC-off, byte-identical to the pre-#3290 no-op filter path for
-                // that caller class.
-                bool scope_filtered = false;
-                std::size_t dropped_agents = 0;
-                if (gate.scope) {
-                    std::unordered_set<std::string> dropped_ids;
-                    std::vector<SoftwareFleetRow> visible;
-                    visible.reserve(rows.size());
-                    for (auto& r : rows) {
-                        if (authz::in_scope(gate.scope, r.agent_id)) {
-                            visible.push_back(std::move(r));
-                        } else {
-                            scope_filtered = true;
-                            dropped_ids.insert(r.agent_id); // count each DISTINCT dropped device once
-                        }
-                    }
-                    rows.swap(visible);
-                    dropped_agents = dropped_ids.size();
-                }
-
-                JArr arr;
-                for (const auto& r : rows) {
-                    // Blob contract v2 fields ride along; a field the ecosystem
-                    // does not store is "" (honest-empty, never synthesised).
-                    arr.add(JObj()
-                                .add("agent_id", r.agent_id)
-                                .add("name", r.entry.name)
-                                .add("version", r.entry.version)
-                                .add("publisher", r.entry.publisher)
-                                .add("install_date", r.entry.install_date)
-                                .add("kind", r.entry.kind)
-                                .add("ecosystem", r.entry.ecosystem)
-                                .add("epoch", r.entry.epoch)
-                                .add("release", r.entry.release)
-                                .add("arch", r.entry.arch)
-                                .add("signature_status", r.entry.signature_status)
-                                .add("distro_id", r.entry.distro_id)
-                                .add("distro_version", r.entry.distro_version));
-                }
-                // A scope-dropped read is security-relevant — audit it distinctly (mirrors
-                // #1634) with the DISTINCT dropped-device count, and fold its persistence
-                // bool into audit_persisted (a dropped denial-evidence row is the MORE
-                // security-relevant gap).
+                // A post-filter drop is security-relevant — audit it distinctly (mirrors #1634)
+                // with the DISTINCT dropped-device count, and fold its persistence bool into
+                // audit_persisted. `success` is written on EVERY call (continuation pages
+                // tagged page=continuation): the cursor is opaque but unauthenticated.
                 bool denied_ok = true;
-                if (scope_filtered)
-                    denied_ok = mcp_audit(
-                        "denied", "scope: filtered " + std::to_string(dropped_agents) +
-                                      " out-of-scope device(s) (management-group and/or "
-                                      "service-tag axis) for " +
-                                      audit_key);
-                const bool audit_ok = mcp_audit("success", audit_key) && denied_ok;
+                if (const auto denied = swc::denied_detail(page); !denied.empty())
+                    denied_ok = mcp_audit("denied", denied + " for " + audit_key);
+                const bool audit_ok =
+                    mcp_audit("success", audit_key + (continuation ? " page=continuation" : "")) &&
+                    denied_ok;
+                // The same body builder the REST twin uses, so the two cannot drift.
+                // structuredContent carries the schema-conformant object (#2712); content[0].text
+                // stays the legacy bare rows array, and devices_omitted / next_cursor stay
+                // repeated at the result's top level, spliced with .raw() so they are a genuine
+                // JSON integer and string-or-null (only .add() would quote).
+                auto body = swc::devices_response_json(page.rows, page.next_cursor,
+                                                       page.devices_omitted, page.hit_cap);
+                if (!audit_ok)
+                    body["audit_persisted"] = false;
                 JObj result_obj;
                 result_obj.raw("content",
-                               JArr().add(JObj().add("type", "text").add("text", arr.str())).str());
+                               JArr()
+                                   .add(JObj().add("type", "text").add("text",
+                                                                       swc::dump_safe(body["software"])))
+                                   .str());
                 if (!audit_ok)
                     result_obj.raw("audit_persisted", "false");
-                if (hit_cap)
+                if (page.hit_cap)
                     result_obj.raw("result_truncated_by_cap", "true");
-                // Surface the count of devices dropped by the management-group scope filter
-                // (0 when none) so an agentic caller can tell "out of my scope" from "not
-                // installed anywhere" — the partial- and all-out-of-scope false-negative
-                // (gov UP-12 + enterprise SHOULD-1). The audit row carries it too.
-                // devices_omitted is a genuine JSON integer: .raw() splices
-                // std::to_string(dropped_agents)'s digits unquoted (confirmed by
-                // reading JObj::raw() vs JObj::add() - only add() quotes). An
-                // earlier round of this PR wrongly believed this was a string and
-                // filed #2973 on that premise; #2973 is closed as invalid, not
-                // fixed - there was nothing to fix here.
-                result_obj.raw("devices_omitted", std::to_string(dropped_agents));
-                // #2712: structuredContent combines the same rows + the same flags
-                // into ONE schema-conformant object (content[].text above stays the
-                // legacy shape, unchanged). devices_omitted uses .raw() here too,
-                // matching the legacy field's actual (integer) type - using .add()
-                // would quote it into a string, a NEW inconsistency within the same
-                // response that the legacy field never had.
-                JObj structured;
-                structured.raw("software", arr.str());
-                if (!audit_ok)
-                    structured.add("audit_persisted", false);
-                if (hit_cap)
-                    structured.add("result_truncated_by_cap", true);
-                structured.raw("devices_omitted", std::to_string(dropped_agents));
-                result_obj.raw("structuredContent", structured.str());
+                result_obj.raw("devices_omitted", std::to_string(page.devices_omitted));
+                result_obj.raw("next_cursor", page.next_cursor.empty()
+                                                  ? "null"
+                                                  : json_quoted_string(page.next_cursor));
+                result_obj.raw("structuredContent", swc::dump_safe(body));
                 res.set_content(success_response(id, result_obj.str()), "application/json");
+                return;
+            }
+
+            // ── query_software_catalogue / get_software_versions (M.9 twins) ──
+            // Shaped by software_catalogue_model.hpp, the same model the REST twins and the
+            // /inventory page use. fleet_read_fn_ is the SOLE gate. The fleet view needs a
+            // GLOBAL Inventory:Read (the rollup is fleet-wide and cannot be scoped); a confined
+            // caller is denied there but may read an in-scope device. Service-scoped tokens are
+            // refused earlier by C8 (default `denied` class).
+            if (tool_name == "query_software_catalogue" || tool_name == "get_software_versions") {
+                namespace swc = software_catalogue;
+                const bool is_catalogue = tool_name == "query_software_catalogue";
+                if (!fleet_read_fn_) {
+                    spdlog::error("{}: fleet_read_fn_ unwired — misconfigured call site; failing "
+                                  "closed",
+                                  tool_name);
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                if (!software_inventory_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Software inventory store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto reply = [&](nlohmann::json payload, bool audit_ok) {
+                    if (!audit_ok)
+                        payload["audit_persisted"] = false;
+                    res.set_content(success_response(id, tool_result(swc::dump_safe(payload),
+                                                                     kObjectOutputSchema)),
+                                    "application/json");
+                };
+                auto confined_deny = [&](const std::string& target) {
+                    mcp_audit("denied", "scope: confined caller denied the fleet-wide view; " + target);
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "the fleet-wide software catalogue requires a global Inventory:Read "
+                                 "grant; pass agent_id for a per-device view"),
+                        "application/json");
+                };
+                auto degraded = [&](const std::string& target) {
+                    mcp_audit("failure", "store degraded; " + target);
+                    res.set_content(a4_error(kInternalError,
+                                             "software inventory store degraded — query failed",
+                                             "retry the request", mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                };
+                // Never-refreshed rollup: an empty answer would read as "no titles/versions", so
+                // the unfiltered versions read answers the same retryable shape as a degrade.
+                auto building = [&](const std::string& target) {
+                    mcp_audit("failure", "building; " + target);
+                    res.set_content(a4_error(kInternalError,
+                                             "software catalogue is being built; retry",
+                                             "retry the request", mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                };
+                const bool omit_newest = gate.scope.has_value();
+
+                // The input schema is advisory for a read tool, so the strict contract (REST
+                // clamps, MCP refuses) is enforced here, before any parse or store work.
+                if (const auto bad = swc::strict_args_error(args)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!is_catalogue) {
+                    auto parsed = swc::parse_versions_params(catalogue_params(
+                        args, {"name", "kind", "ecosystem", "source", "agent_id", "limit"}));
+                    if (!parsed) {
+                        res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
+                        return;
+                    }
+                    const auto& q = parsed->query;
+                    const bool host = !q.agent_id.empty();
+                    const std::string target = swc::audit_target(q);
+                    if (!host && gate.scope) {
+                        confined_deny(target);
+                        return;
+                    }
+                    if (host && !authz::in_scope(gate.scope, q.agent_id)) {
+                        // devices_omitted 1: an empty list here is not "no installs".
+                        reply(swc::versions_response_json(q.name, {}, false, true, 1),
+                              mcp_audit("denied",
+                                        "scope: device out of the caller's scope; " + target));
+                        return;
+                    }
+                    const auto rows =
+                        swc::read_versions(swc::versions_reads(*software_inventory_store), q);
+                    if (!rows) {
+                        if (rows.error() == swc::VersionsError::kBuilding)
+                            building(target);
+                        else
+                            degraded(target);
+                        return;
+                    }
+                    const bool audit_ok = mcp_audit("success", target);
+                    reply(swc::versions_response_json(q.name, *rows,
+                                                      static_cast<int>(rows->size()) == q.limit,
+                                                      omit_newest, 0),
+                          audit_ok);
+                    return;
+                }
+
+                auto parsed = swc::parse_catalogue_params(catalogue_params(
+                    args, {"q", "kind", "ecosystem", "source", "agent_id", "versions_min", "limit",
+                           "cursor"}));
+                if (!parsed) {
+                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const auto& q = parsed->query;
+                const bool host = !q.agent_id.empty();
+                const bool continuation = !parsed->cursor.empty();
+                const std::string target = swc::audit_target(q);
+                if (!host && gate.scope) {
+                    confined_deny(target);
+                    return;
+                }
+                if (host && !authz::in_scope(gate.scope, q.agent_id)) {
+                    // Deny-all == an empty result: no oracle on whether the device exists.
+                    reply(swc::catalogue_response_json({}, {}, std::nullopt, "", true, 1),
+                          mcp_audit("denied", "scope: device out of the caller's scope; " + target));
+                    return;
+                }
+                const auto io = swc::catalogue_reads(*software_inventory_store, device_api.get());
+                const auto read = swc::read_catalogue_page(
+                    io, *parsed, static_cast<std::int64_t>(std::time(nullptr)));
+                if (!read) {
+                    if (!read.error()) {
+                        degraded(target);
+                        return;
+                    }
+                    res.set_content(error_response(id, kInvalidParams, std::string(swc::cursor_error_message(*read.error()))), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const auto& page = *read;
+                const bool audit_ok = mcp_audit(
+                    "success", target + " titles=" + std::to_string(page.rows.size()) + " totals=" +
+                                   std::to_string(page.totals.titles) + "/" +
+                                   std::to_string(page.totals.installs) +
+                                   (continuation ? " page=continuation" : ""));
+                reply(swc::catalogue_response_json(page.rows, page.totals, page.kpis, page.next_cursor,
+                                                   omit_newest, 0),
+                      audit_ok);
                 return;
             }
 
@@ -10618,6 +10903,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto exec_id = param_str(args, "execution_id");
+                // A NUL byte would make the store lookup (a C-string parameter, truncated at
+                // the NUL) resolve a different id than the audit rows record (the full id):
+                // reject it before any store read (same hazard and wording as
+                // summarize_working_set kind=execution).
+                if (exec_id.find('\0') != std::string::npos) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "id must not contain a NUL byte"),
+                                    "application/json");
+                    return;
+                }
                 // Governance fix (#2146 A2-R1 re-review): was the plain
                 // get_execution(), which collapses "row genuinely absent" and
                 // "read degraded" (pool/query failure) to the same nullopt --
@@ -10665,7 +10960,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     auto agents_opt = execution_tracker->get_agent_statuses_checked(exec_id);
                     if (!agents_opt) {
                         res.set_content(
-                            error_response(id, kInternalError, "execution tracker degraded"),
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                             "application/json");
                         return;
                     }
@@ -10678,7 +10974,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!exec || !visible) {
                     spdlog::debug("get_execution_status: {} exec_id={}",
                                   exec ? "outside caller fleet-read scope" : "no match", exec_id);
-                    mcp_audit("denied", "not found or outside caller's fleet-read scope: " + exec_id);
+                    mcp_audit("denied",
+                              "not found or outside caller's fleet-read scope: " +
+                                  audit_caller_id(exec_id));
                     res.set_content(
                         error_response(id, kInvalidParams, "Execution not found: " + exec_id),
                         "application/json");
@@ -10956,11 +11254,14 @@ McpServer::HandlerFn McpServer::build_handler(
             // fleet_read_fn_. Execution rows carry no single agent_id (they
             // fan out to many), so per-row visible-agent filtering would need
             // a per-execution agent-status lookup per row — an N+1 pattern
-            // (ADR-0017 INV-10). Until a batched version exists, a confined
-            // caller is restricted to their OWN dispatches (`dispatched_by`
-            // pushed into the SQL WHERE, ExecutionQuery::dispatched_by) —
-            // cheap, provably safe (never another operator's execution), and
-            // consistent with the dispatcher-ownership precedent elsewhere.
+            // (ADR-0017 INV-10). A batched status read exists and is used
+            // below to project the counts, but LIST ADMISSION stays owner-only
+            // (no visible-agent disjunct, unlike REST GET /api/v1/executions):
+            // a confined caller is restricted to their OWN dispatches
+            // (`dispatched_by` pushed into the SQL WHERE,
+            // ExecutionQuery::dispatched_by): cheap, provably safe (never
+            // another operator's execution), and consistent with the
+            // dispatcher-ownership precedent elsewhere.
             if (tool_name == "list_executions") {
                 if (!fleet_read_fn_) {
                     spdlog::error("list_executions: fleet_read_fn_ unwired; failing closed");
@@ -11014,7 +11315,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto execs_opt = execution_tracker->query_executions_checked(eq);
                 if (!execs_opt) {
                     res.set_content(
-                        error_response(id, kInternalError, "execution tracker degraded"),
+                        a4_error(kInternalError, "execution tracker degraded", {},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -11037,10 +11339,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     // zeroed every confined row's counts on a degrade
                     // instead of surfacing it.
                     auto statuses_opt =
-                        execution_tracker->get_agent_statuses_for_executions_checked(exec_ids);
+                        execution_tracker->get_agent_statuses_for_executions_checked(
+                            exec_ids,
+                            std::vector<std::string>(gate.scope->begin(), gate.scope->end()));
                     if (!statuses_opt) {
                         res.set_content(
-                            error_response(id, kInternalError, "execution tracker degraded"),
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                             "application/json");
                         return;
                     }
@@ -17565,8 +17870,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     // route_unreadable (WS-4 4.2b Task D, the exact sibling:
                     // a systemic gateway routing-directory failure, not a
                     // per-target fact) — then quarantined — then
-                    // plugin_not_found — then the
-                    // generic catch-all. `> 0`, not `== agent_ids.size()`:
+                    // plugin_not_found — then kill_switched_os (#5294) — then the
+                    // generic catch-all. os_gate_unreadable (#5294) sits with the
+                    // unreadable siblings, after route_unreadable. `> 0`, not `== agent_ids.size()`:
                     // a MIXED failure (some quarantined, some plugin-absent,
                     // some genuinely offline) is still not "just offline",
                     // and understating a permanent reason as retryable is the
@@ -17588,6 +17894,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         // even though both are theoretically possible together
                         // (a bad expression is never evaluated against the
                         // registry, so it cannot be).
+                        // os_gate_unreadable (#5294) is the exception that
+                        // never co-occurs with this: the ladder refuses on the
+                        // presence read BEFORE parsing the scope
+                        // (dispatch_scope_ladder.hpp, wire_and_dispatch_confined),
+                        // so a bad scope with presence down answers
+                        // os_gate_unreadable and scope_parse_error stays unset.
                         zero_status = "invalid_scope";
                         zero_message = "No agents reached: the scope expression could not be "
                                        "parsed (" +
@@ -17625,6 +17937,18 @@ McpServer::HandlerFn McpServer::build_handler(
                             "where to route. Retryable — the directory typically recovers "
                             "within seconds once the store is reachable again.";
                         zero_retry_after_ms_json = "5000";
+                    } else if (dispatch_outcome.os_gate_unreadable) {
+                        // #5294: presence could not be read while a per-OS kill
+                        // switch is OFF -- the dispatch was refused before
+                        // targeting (fail closed), a systemic fact like the
+                        // two unreadable siblings above.
+                        zero_status = "os_gate_unreadable";
+                        zero_message =
+                            "No agents reached: agent presence could not be read while a "
+                            "per-OS kill switch is set, so dispatch is failing closed rather "
+                            "than enforcing the switch on this replica's local agents only. "
+                            "Retryable once the presence store is reachable again.";
+                        zero_retry_after_ms_json = "5000";
                     } else if (dispatch_outcome.denied_quarantined_count > 0) {
                         zero_status = "quarantined";
                         zero_message =
@@ -17642,6 +17966,18 @@ McpServer::HandlerFn McpServer::build_handler(
                             "plugin name — retrying will not help. Check discover_plugins for "
                             "the correct name, or confirm the plugin is installed on the "
                             "target(s).";
+                        zero_retry_after_ms_json = "null";
+                    } else if (dispatch_outcome.kill_switched_os_count > 0) {
+                        // #5294: every reachable target runs an OS whose per-OS
+                        // kill switch is OFF -- a permanent policy withhold until
+                        // an operator flips the switch, not an empty fleet.
+                        zero_status = "kill_switched_os";
+                        zero_message =
+                            "No agents reached: every target runs an OS for which this "
+                            "plugin action is switched off by a per-OS kill switch, so the "
+                            "command was withheld before dispatch. Retrying will not help "
+                            "until an operator re-enables it (get_plugin_kill_switch with "
+                            "the os argument shows the state).";
                         zero_retry_after_ms_json = "null";
                     } else {
                         // Deliberately non-null, unlike its two permanent siblings
@@ -17686,6 +18022,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                  static_cast<int64_t>(dispatch_outcome.denied_quarantined_count))
                             .add("agents_unknown_plugin",
                                  static_cast<int64_t>(dispatch_outcome.unknown_plugin_count))
+                            .add("agents_kill_switched_os",
+                                 static_cast<int64_t>(dispatch_outcome.kill_switched_os_count))
                             .str();
                     mcp_audit("failure", zero_status + " execution_id=" + execution_id);
                     res.set_content(
@@ -18697,17 +19035,18 @@ McpServer::HandlerFn McpServer::build_handler(
                             -> std::pair<std::string, int> {
                             // ReapplyDispatchFn's narrower pair shape is deliberate --
                             // see its own doc comment. `is_quarantine_control_plugin`
-                            // exempts the quarantine plugin's own actions from the
-                            // CONTAINMENT gate only (dispatch_confined_arms.hpp's
-                            // `compose_containment_gate`) -- it does NOT exempt them
-                            // from #3511's plugin-presence filter, which is sourced
-                            // unconditionally from `AgentRegistry::ids_missing_plugin`.
-                            // A reapply to an agent genuinely missing the quarantine
-                            // plugin is still withheld (correctly -- it would fail
-                            // regardless), it just can't be DISCRIMINATED as such
-                            // through this narrower return shape; see the caller's
-                            // `agents_reached == 0` handling, which reads this as an
-                            // ordinary unreached/retry case, not a permanent one.
+                            // is the closed quarantine set inside the shared
+                            // protective predicate (yuzu::protective::
+                            // is_protective_action): these actions are exempt from
+                            // the CONTAINMENT gate, the kill switch, the per-OS
+                            // withhold and #3511's plugin-presence filter
+                            // (`AgentRegistry::ids_missing_plugin` returns nothing
+                            // for them). A reapply to an agent genuinely missing
+                            // the quarantine plugin is therefore delivered and the
+                            // agent answers with its own plugin-not-found; the
+                            // narrower return shape can't discriminate that, so see
+                            // the caller's `agents_reached == 0` handling, which
+                            // reads an unreached result as an ordinary retry case.
                             if (!dispatch_fn)
                                 return {};
                             const auto outcome = dispatch_fn("quarantine", "quarantine", {agent_id},
@@ -19458,10 +19797,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     kind = "fleet";
                 }
                 const std::string target_id = param_str(args, "id");
+                // A NUL byte would make the store lookup (a C string, truncated at the NUL)
+                // resolve a different id than the audit row records (tokenised full id):
+                // reject it before any store read.
+                if (kind == "execution" && target_id.find('\0') != std::string::npos) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "id must not contain a NUL byte"),
+                                    "application/json");
+                    return;
+                }
                 const int limit = std::clamp(param_int32(args, "limit", 25), 1, 100);
                 JArr links;
                 JArr next;
                 std::string narrative;
+                bool execution_not_visible = false; // confined caller: absent OR out of scope => `denied`
                 if (kind == "agent" && !target_id.empty()) {
                     // Group-scope gate (G-S2): an operator scoped to one
                     // management group must not be able to probe arbitrary
@@ -19490,25 +19839,85 @@ McpServer::HandlerFn McpServer::build_handler(
                                     " is not present in the current MCP agent registry.";
                     next.add("get_agent_details").add("get_agent_inventory").add("get_tags");
                 } else if (kind == "execution" && !target_id.empty() && execution_tracker) {
-                    // Execution data is a distinct securable — gate on
-                    // Execution:Read (tier + RBAC), not just the tool's generic
-                    // Infrastructure:Read (G-S2).
-                    if (!tier_allows(tier, "Execution", "Read")) {
-                        res.set_content(a4_error(kTierDenied,
-                                                 "MCP tier does not allow this operation",
-                                                 kTierRemediation),
+                    // Execution data is a distinct securable from the tool's
+                    // generic Infrastructure:Read gate above (G-S2), and it is
+                    // per-agent data: fleet_read_fn_ (require_fleet_read,
+                    // ADR-0017) is the SOLE gate on the (Execution, Read) pair
+                    // here -- tier + RBAC + management-group/service
+                    // confinement in one call, never stacked with a bare
+                    // tier_allows/perm_fn (same gate as get_execution_status,
+                    // but a stricter visibility rule and a success-shaped
+                    // "was not found" narrative where that sibling answers an
+                    // error). The counts below are the caller's confined
+                    // projection, and a confined-out execution reads EXACTLY
+                    // like an absent one (same narrative, denied audit row, no
+                    // success row) so existence is not an oracle (#3564).
+                    //
+                    // ServiceScopeClass stays `denied` for this tool: kind=agent
+                    // and kind=fleet have no mechanism on the service-scope
+                    // axis, and `confined` needs a real downstream mechanism
+                    // for EVERY kind (routed row, service-scope clause 3).
+                    if (!fleet_read_fn_) {
+                        spdlog::error("summarize_working_set(execution): fleet_read_fn_ "
+                                      "unwired; failing closed");
+                        res.set_content(error_response(id, kInternalError, "service unavailable"),
                                         "application/json");
                         return;
                     }
-                    if (!perm_fn(req, res, "Execution", "Read"))
+                    auto gate = fleet_read_fn_(req, res, "Execution", "Read");
+                    if (!gate.admitted)
+                        return; // gate already wrote the response.
+                    // get_execution_checked, not get_execution: a degrade must
+                    // not read as "was not found" (and must not write a denial
+                    // audit row for a legitimate caller).
+                    auto exec_r = execution_tracker->get_execution_checked(target_id);
+                    if (!exec_r) {
+                        res.set_content(
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
                         return;
-                    auto exec = execution_tracker->get_execution(target_id);
-                    if (exec) {
+                    }
+                    const auto& exec = *exec_r;
+                    std::vector<AgentExecStatus> exec_agents;
+                    if (gate.scope) {
+                        // Read whether or not the row exists, so an absent id
+                        // and an invisible one do the same backing work.
+                        // SQL-side agent filter: only the caller's in-scope rows are
+                        // read (execution_visible/confined_projection ignore the rest).
+                        auto agents_opt = execution_tracker->get_agent_statuses_checked(
+                            target_id,
+                            std::vector<std::string>(gate.scope->begin(), gate.scope->end()));
+                        if (!agents_opt) {
+                            res.set_content(a4_error(kInternalError,
+                                                     "execution tracker degraded", {},
+                                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                            "application/json");
+                            return;
+                        }
+                        exec_agents = std::move(*agents_opt);
+                    }
+                    if (exec && execution_visible(*exec, exec_agents, gate.scope,
+                                                  session->username)) {
+                        int agents_targeted = exec->agents_targeted;
+                        int agents_responded = exec->agents_responded;
+                        if (gate.scope) {
+                            const auto counts = confined_projection(exec_agents, gate.scope);
+                            agents_targeted = counts.agents_targeted;
+                            agents_responded = counts.agents_responded;
+                        }
                         narrative = "Execution " + target_id + " is " + exec->status +
-                                    " with targeted=" + std::to_string(exec->agents_targeted) +
-                                    " responded=" + std::to_string(exec->agents_responded) + ".";
+                                    " with targeted=" + std::to_string(agents_targeted) +
+                                    " responded=" + std::to_string(agents_responded) + ".";
                     } else {
                         narrative = "Execution " + target_id + " was not found.";
+                        // Audit `denied` only for a CONFINED caller, whose absent id and
+                        // out-of-scope id must stay indistinguishable. An UNCONFINED
+                        // caller can only miss on a genuinely absent id: no denial
+                        // occurred, so that stays the pre-existing `success` row (no
+                        // SIEM noise). The caller never sees the audit row, so the
+                        // split is not an existence oracle.
+                        execution_not_visible = gate.scope.has_value();
                     }
                     next.add("get_execution_status").add("query_responses");
                 } else {
@@ -19528,7 +19937,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                    .raw("recommended_next_tools", next.str())
                                    .str();
                 auto result = tool_result(payload, kObjectOutputSchema);
-                mcp_audit("success", kind + ":" + target_id);
+                if (execution_not_visible)
+                    // Caller-supplied id: neutralised (CRLF / k=v forgery) and capped.
+                    mcp_audit("denied",
+                              "not found or outside caller's fleet-read scope: " +
+                                  audit_caller_id(target_id));
+                else
+                    // Caller-supplied id (an unconfined absent id reaches here too):
+                    // neutralised (CRLF / k=v forgery) and capped like the denied row above.
+                    mcp_audit("success", kind + ":" +
+                                             audit_caller_id(target_id));
                 res.set_content(success_response(id, result), "application/json");
                 return;
             }
@@ -20435,7 +20853,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const auto plugin = param_str(args, "plugin");
                 const auto action = param_str(args, "action");
-                auto entry = plugin_config_store_->get_kill_switch(plugin, action);
+                // Strict: a present-but-non-string or empty `os` must not
+                // fall through to "" and target the all-OS row (REST parity).
+                const auto os = param_string_strict(args, "os");
+                if (!os || (args.contains("os") && os->empty())) {
+                    res.set_content(a4_error(kInvalidParams, "os must be a non-empty string"),
+                                    "application/json");
+                    return;
+                }
+                auto entry = plugin_config_store_->get_kill_switch(plugin, action, *os);
                 if (!entry) {
                     const auto info = plugin_config_error_info(entry.error());
                     res.set_content(a4_error(info.code, info.message,
@@ -20448,10 +20874,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 JObj payload;
                 payload.add("plugin", entry->plugin)
                     .add("action", entry->action)
+                    .add("os", entry->os)
                     .add("enabled", entry->enabled)
                     .add("reason", entry->reason)
                     .add("set_by", entry->set_by)
-                    .add("updated_at_ms", entry->updated_at_ms);
+                    .add("updated_at_ms", entry->updated_at_ms)
+                    .add("source", entry->source);
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -20483,10 +20911,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto plugin = param_str(args, "plugin");
                 const auto action = param_str(args, "action");
                 const auto reason = param_str(args, "reason");
-                if (!plugin_config::parse_kill_switch_scope(plugin, action) ||
-                    !plugin_config::is_valid_reason(reason) ||
+                const auto os = param_string_strict(args, "os");
+                if (!os || (args.contains("os") && os->empty())) {
+                    res.set_content(a4_error(kInvalidParams, "os must be a non-empty string"),
+                                    "application/json");
+                    return;
+                }
+                const auto scope = plugin_config::parse_kill_switch_scope(plugin, action, *os);
+                if (!scope || !plugin_config::is_valid_reason(reason) ||
                     !plugin_config::is_valid_actor(session->username)) {
-                    res.set_content(a4_error(kInvalidParams, "invalid plugin/action/reason"),
+                    res.set_content(a4_error(kInvalidParams, "invalid plugin/action/os/reason"),
                                     "application/json");
                     return;
                 }
@@ -20495,9 +20929,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 // consequential of the five: it disables a capability
                 // fleet-wide, which is exactly what an incident review needs
                 // evidence of and cannot reconstruct afterwards.
-                const std::string target_id = action.empty() ? plugin : plugin + "." + action;
+                const std::string target_id = plugin_config::kill_switch_scope_key(*scope);
+                // A row on a protective pair is stored but never gates dispatch;
+                // label the evidence so it is never read as proof of a stop.
+                const std::string ks_detail =
+                    plugin_config::kill_switch_set_detail(*scope, enabled);
                 if (!audit_fn(req, "plugin_config.kill_switch.set", "attempted", "PluginConfig",
-                              target_id, std::string("enabled=") + (enabled ? "true" : "false"))) {
+                              target_id, ks_detail)) {
                     res.set_content(
                         a4_error(503, "the audit record could not be persisted; the kill switch was "
                                       "NOT changed — retry once the audit store recovers"),
@@ -20506,9 +20944,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto result = plugin_config_store_->set_kill_switch(plugin, action, enabled, reason,
-                                                                    session->username);
-                const std::string ks_detail =
-                    std::string("enabled=") + (enabled ? "true" : "false");
+                                                                    session->username, *os);
                 if (!result) {
                     plugin_config_outcome("plugin_config.kill_switch.set", false, "PluginConfig",
                                           target_id, ks_detail);
@@ -20522,13 +20958,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 plugin_config_outcome("plugin_config.kill_switch.set", true, "PluginConfig",
                                       target_id, ks_detail);
+                // Warn only once the row is stored, so the log never claims a store
+                // that an audit 503 or a failed write prevented.
+                if (plugin_config::kill_switch_row_covers_protective(*scope)) {
+                    spdlog::warn("plugin_config: kill-switch row {} covers a protective action; "
+                                 "stored, never refuses the protective dispatch",
+                                 target_id);
+                }
                 JObj payload;
                 payload.add("plugin", result->plugin)
                     .add("action", result->action)
+                    .add("os", result->os)
                     .add("enabled", result->enabled)
                     .add("reason", result->reason)
                     .add("set_by", result->set_by)
-                    .add("updated_at_ms", result->updated_at_ms);
+                    .add("updated_at_ms", result->updated_at_ms)
+                    .add("source", result->source);
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -21146,15 +21591,21 @@ McpServer::HandlerFn McpServer::build_handler(
                         metrics->counter("yuzu_viz_cache_miss_total").increment();
                 }
 
-                if (offline_endpoint_store_) {
-                    auto persisted = offline_endpoint_store_->query_stale_within(
+                // #5531: a failed durable read answers live-only + a flag.
+                bool viz_offline_degraded = false;
+                if (offline_roster_fn_) {
+                    auto persisted = offline_roster_fn_(
                         std::chrono::seconds(yuzu::server::VizRoutes::kOfflineStaleWindowSecs));
-                    const auto viz_before = snap->machines.size();
-                    snap = yuzu::server::merge_offline_topology(std::move(snap), persisted);
-                    const auto viz_merged_count = snap->machines.size() - viz_before;
-                    if (viz_merged_count > 0 && metrics)
-                        metrics->counter("yuzu_viz_offline_hosts_total")
-                            .increment(static_cast<double>(viz_merged_count));
+                    if (persisted) {
+                        const auto viz_before = snap->machines.size();
+                        snap = yuzu::server::merge_offline_topology(std::move(snap), *persisted);
+                        const auto viz_merged_count = snap->machines.size() - viz_before;
+                        if (viz_merged_count > 0 && metrics)
+                            metrics->counter("yuzu_viz_offline_hosts_total")
+                                .increment(static_cast<double>(viz_merged_count));
+                    } else {
+                        viz_offline_degraded = true;
+                    }
                 }
 
                 if (static_cast<int>(snap->machines.size()) > machines_max) {
@@ -21176,9 +21627,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "viz.fleet_topology", "success", "FleetTopology", "",
                     "machines=" + std::to_string(snap->machines.size()) +
-                        " include_vuln=" + (include_vuln ? "1" : "0") + " via MCP");
+                        " include_vuln=" + (include_vuln ? "1" : "0") +
+                        (viz_offline_degraded ? " offline_roster_degraded=1" : "") + " via MCP");
                 if (!audit_ok)
                     j["audit_persisted"] = false;
+                if (viz_offline_degraded)
+                    j["offline_roster_degraded"] = true;
                 if (metrics) {
                     const auto viz_elapsed = std::chrono::steady_clock::now() - viz_t_start;
                     metrics->histogram("yuzu_viz_topology_request_seconds")
@@ -21329,7 +21783,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Not found -- unlike get_fleet_topology, this tool does not fall
                 // back to a durable stale placeholder (matches
                 // VizRoutes::handle_host_topology, which never consults
-                // offline_store_ at all).
+                // the offline roster at all).
                 (void)yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "viz.host_topology", "failure", "HostTopology", agent_id,
                     "not_found via MCP");

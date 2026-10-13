@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cctype>
 #include <array>
 #include <chrono>
 #include <functional>
@@ -9,6 +8,8 @@
 #include <string_view>
 #include <unordered_set>
 #include <vector>
+
+#include <yuzu/protective_actions.hpp>
 
 #include "authz_model.hpp"
 #include "dispatch_target_shape.hpp"
@@ -256,6 +257,11 @@ struct ArmDispatchResult {
     /// stronger and more actionable of the two facts, matching the ordering
     /// `denied_quarantined` already uses relative to `not_sent`.
     std::vector<std::string> unknown_plugin;
+    /// #5294: ids that were reachable but withheld because a per-OS kill
+    /// switch is OFF for the target's known agent OS. Checked AFTER `contained`
+    /// (quarantine is the stronger fact) and BEFORE `unknown_plugin`.
+    std::vector<std::string> kill_switched_os;
+    std::size_t kill_switched_os_count = 0;
     /// How many were withheld for plugin absence, always -- same
     /// count-vs-identities split as `denied_quarantined_count`, though unlike
     /// quarantine there is no fail-closed mode here to make the two diverge;
@@ -355,6 +361,15 @@ struct ConfinedDispatchOutcome {
     /// `denied_quarantined_count` exactly; see `ArmDispatchResult::unknown_plugin`.
     std::vector<std::string> unknown_plugin;
     std::size_t unknown_plugin_count = 0;
+    /// #5294: ids withheld by a per-OS kill switch; see
+    /// `ArmDispatchResult::kill_switched_os`.
+    std::vector<std::string> kill_switched_os;
+    std::size_t kill_switched_os_count = 0;
+    /// #5294: presence was degraded while a per-OS switch was OFF, so the
+    /// dispatch was refused BEFORE targeting (fail closed -- never narrowed to
+    /// this replica's local sessions). Like `containment_unreadable` it is a
+    /// distinct cause from "no agents reached".
+    bool os_gate_unreadable = false;
     /// WS-4 4.2b Task C -- mirrors `ArmDispatchResult::route_unreadable`,
     /// threaded out here the same way `containment_unreadable` already is.
     /// See that field's doc comment; only ever set for the Group/Scope/Ids
@@ -363,61 +378,10 @@ struct ConfinedDispatchOutcome {
     bool route_unreadable = false;
 };
 
-/// #881: case-insensitive predicate for the quarantine control-channel
-/// exemption. Pure — no store access — so a test can bind it directly without
-/// a live `QuarantineStore`. Normalises to lowercase itself
-/// (`ServerImpl::dispatch_confined` already lowercases the ACTION at its own
-/// call site, never the plugin) so `"Quarantine"`/`"QUARANTINE"` exempt
-/// exactly like `"quarantine"`.
-///
-/// Keyed on the `(plugin, ACTION)` pair against a CLOSED set — not on the
-/// plugin name alone. All four actions the plugin registers today
-/// (quarantine, unquarantine, status, whitelist) are exempt, deliberately:
-/// narrowing it to `unquarantine` alone would break re-isolation (a fresh
-/// `quarantine` action against an already-contained device), whitelist repair
-/// of a contained device's exceptions, and #3127's retry path — all of which
-/// are the plugin managing its OWN containment state, not an operator
-/// reaching a quarantined agent through some other plugin. Keying on the
-/// plugin alone would have let a FIFTH action added later inherit the bypass
-/// silently, with nothing in review to notice; see the closed-set comment in
-/// the body.
-[[nodiscard]] inline bool is_quarantine_control_plugin(std::string_view plugin,
-                                                       std::string_view action) {
-    constexpr std::string_view kQuarantinePlugin{"quarantine"};
-    auto iequals = [](std::string_view a, std::string_view b) {
-        if (a.size() != b.size())
-            return false;
-        for (std::size_t i = 0; i < a.size(); ++i) {
-            if (std::tolower(static_cast<unsigned char>(a[i])) != b[i])
-                return false;
-        }
-        return true;
-    };
-    if (!iequals(plugin, kQuarantinePlugin))
-        return false;
-
-    // Keyed on the (plugin, ACTION) pair, not the plugin alone.
-    //
-    // Exempting a whole plugin means a FUTURE action inherits the exemption
-    // silently — the plugin declares exactly four today, and a fifth would
-    // arrive already able to bypass containment with nothing in review to
-    // notice. This set is closed against the plugin's declared actions
-    // (`acts[]` in quarantine_plugin.cpp); anything else is gated.
-    //
-    // Why all four are here rather than release alone: `unquarantine` IS the
-    // release path; `status` is read-only and answering it for a contained host
-    // is the point; `whitelist` is how a management path is repaired, and
-    // gating it would make a host whose whitelist is wrong unrecoverable
-    // remotely — the stranding this control exists to avoid; and `quarantine`
-    // on an already-contained host is the re-dispatch #3127 relies on. An
-    // action NOT on this list gets no exemption even on this plugin.
-    for (const auto allowed : {std::string_view{"quarantine"}, std::string_view{"unquarantine"},
-                               std::string_view{"status"}, std::string_view{"whitelist"}}) {
-        if (iequals(action, allowed))
-            return true;
-    }
-    return false;
-}
+// The closed quarantine-control predicate lives in the shared pure header so the
+// agent dispatch gate, which follows, consumes the identical set; re-exported
+// here so existing server-side callers and tests compile unchanged.
+using yuzu::protective::is_quarantine_control_plugin;
 
 /// The bounded-staleness budget (#881 spec item 6): a `nullopt` read served
 /// from the last-known-good snapshot is trusted only while the snapshot is
@@ -689,11 +653,19 @@ struct QuarantineDegradationResult {
 /// function) on an agent with no reported inventory at all, so a
 /// freshly-registered or gateway-relayed agent is never wrongly withheld for
 /// absence of DATA rather than absence of the plugin.
+/// The protective set is carved out inside `ids_missing_plugin` (see its
+/// declaration).
+///
+/// `os_kill_switched` (#5294) follows the identical empty-is-safe argument:
+/// the ids a per-OS kill switch withholds, built once per dispatch by
+/// `AgentRegistry::ids_with_os`. It is checked after containment (quarantine
+/// is the stronger, more actionable fact) and before plugin absence.
 [[nodiscard]] inline ArmDispatchResult
 dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
                        const authz::VisibleSet& exec_visible, bool broadcast_on_none,
                        const ContainmentGate& gate, const ConfinedDispatchSink& sink,
-                       const std::unordered_set<std::string>& plugin_missing = {}) {
+                       const std::unordered_set<std::string>& plugin_missing = {},
+                       const std::unordered_set<std::string>& os_kill_switched = {}) {
     ArmDispatchResult result;
 
     // #881: the ONE per-id containment check every arm applies AFTER the
@@ -729,6 +701,15 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             return true;
         }
         return false;
+    };
+
+    // #5294: the per-OS kill-switch sibling of `contained`, same shape.
+    const auto os_killed = [&](const std::string& aid) -> bool {
+        if (!os_kill_switched.contains(aid))
+            return false;
+        result.kill_switched_os.push_back(aid);
+        ++result.kill_switched_os_count;
+        return true;
     };
 
     // #3424/#3511: the plugin-presence sibling of `contained` above, same
@@ -789,7 +770,8 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
         // non-empty fleet always falls through to the filtered path below.
         auto candidates = authz::filter_to_scope(sink.known_agent_ids(), exec_visible);
         const bool widened = sink.presence_widens ? sink.presence_widens(candidates) : true;
-        if (!exec_visible && !gate.enforced && plugin_missing.empty() && !widened)
+        if (!exec_visible && !gate.enforced && plugin_missing.empty() &&
+            os_kill_switched.empty() && !widened)
             return sink.send_to_all_unfiltered();
         // WS-4 4.2b Task C: same batched-before-the-walk shape Group/Scope/Ids
         // already use — Broadcast/None previously skipped this call on the
@@ -800,7 +782,7 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             result.route_unreadable = sink.prepare_route_fallback(candidates);
         int n = 0;
         for (const auto& aid : candidates)
-            if (!contained(aid) && !plugin_absent(aid) && sink.send_to(aid))
+            if (!contained(aid) && !os_killed(aid) && !plugin_absent(aid) && sink.send_to(aid))
                 ++n;
         return n;
     };
@@ -815,7 +797,7 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             if (sink.prepare_route_fallback)
                 result.route_unreadable = sink.prepare_route_fallback(*targets.group_members);
             for (const auto& aid : *targets.group_members) {
-                if (!authz::in_scope(exec_visible, aid) || contained(aid) || plugin_absent(aid))
+                if (!authz::in_scope(exec_visible, aid) || contained(aid) || os_killed(aid) || plugin_absent(aid))
                     continue;
                 if (sink.send_to(aid))
                     ++result.sent;
@@ -837,7 +819,7 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             if (sink.prepare_route_fallback)
                 result.route_unreadable = sink.prepare_route_fallback(*targets.scope_matched);
             for (const auto& aid : authz::filter_to_scope(*targets.scope_matched, exec_visible)) {
-                if (contained(aid) || plugin_absent(aid))
+                if (contained(aid) || os_killed(aid) || plugin_absent(aid))
                     continue;
                 if (sink.send_to(aid))
                     ++result.sent;
@@ -852,7 +834,7 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
             if (sink.prepare_route_fallback)
                 result.route_unreadable = sink.prepare_route_fallback(*targets.agent_ids);
             for (const auto& aid : authz::filter_to_scope(*targets.agent_ids, exec_visible)) {
-                if (contained(aid) || plugin_absent(aid))
+                if (contained(aid) || os_killed(aid) || plugin_absent(aid))
                     continue;
                 if (sink.send_to(aid))
                     ++result.sent;

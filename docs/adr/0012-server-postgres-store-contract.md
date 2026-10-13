@@ -271,3 +271,42 @@ default cannot serve: a predicate that must be evaluated INSIDE somebody else's 
 own. Adding a third instance of this shape should point back to this paragraph, not merely to
 `kPendingOutboxNotExistsClause`'s doc comment, so the precondition is re-checked each time rather than
 copied as a template.
+
+## Update (2026-10-04) -- a fourth query owner: CredentialChangeOwner
+
+A fourth query owner: `CredentialChangeOwner` (`credential_change_owner.{hpp,cpp}`, #5342), the ONLY
+writer of an existing local account's `auth.users.password_hash` (the self-service change and the
+administrative reset). One `pool.with_txn_for` on one lease, schema-qualified SQL across three
+schemas: `SELECT ... FROM auth.users ... FOR UPDATE` (classification under the lock), the guarded
+credential `UPDATE` (which also wipes a provisional TOTP secret and, for a reset, clears the
+lockout), `DELETE FROM session_store.sessions`, the success audit row(s) in
+`audit_store.audit_events`, and LAST the `session_store.session_meta` write-generation bump (every
+session create/revoke shares that row, so the owner waits on nothing while holding it). The change, the account's
+sessions, its provisional MFA state, its lockout and the audit evidence therefore commit or abort
+together — there is no compensating write.
+
+Two own-schema seams were extracted so the owner reuses, never copies, each store's statements --
+the same shape `rbac_store_sql_helpers.hpp` gives `RbacAdminAuthorityOwner`:
+
+- `session_store_sql_helpers.hpp` (`session_sql::delete_user_sessions_in_txn`,
+  `session_sql::bump_generation_in_txn`, and their composite `session_sql::invalidate_user_in_txn`)
+  -- the ONE "revoke every session of a user" statement pair; `SessionStore::invalidate_user` runs
+  the composite, the owner runs the two halves split around its audit INSERT.
+- `AuditStore::log_in_txn(PGconn*, const AuditEvent&)` -- the same sanitize + INSERT as
+  `AuditStore::log()` (which is now exactly "lease + `log_in_txn` + `count_committed`"), issued on
+  the caller's open transaction; the caller bumps the success bucket via
+  `AuditStore::count_committed` only after its own commit. This is the audit store's section-3
+  seam: any other mutation whose audit row must commit with it uses `log_in_txn` inside its owner's
+  transaction (#5360 tracks moving the remaining "audit after commit + rollback" routes onto it),
+  never a second INSERT.
+
+Lock order (documented in the owner header; a change inverting it can deadlock): the `auth.users`
+row, then `session_store.sessions` rows, then the `audit_store.audit_events` INSERT, then LAST the
+`session_meta` `write_generation` row. It is acyclic against every other holder because no
+`session_store` transaction touches another schema (nothing holds `session_meta` and then waits on
+`auth.users`), no audit writer touches `session_store`, the locking post-mint re-read
+(`AuthDB::recheck_role_locked`) takes `auth.users` only after its own session INSERT has committed,
+and `RbacAdminAuthorityOwner` takes `principal_roles` before `auth.users` and never a session or
+audit lock. Like the RBAC owner, it is correct only because `AuthDB`, `SessionStore` and
+`AuditStore` share ONE pool/database (ADR-0006); a split onto separate databases fails every
+statement closed, never a silent partial write.

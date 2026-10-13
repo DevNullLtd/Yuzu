@@ -31,7 +31,7 @@ The primary integration test runs all three components together:
 ```
 
 This test:
-- Starts the C++ server in gateway mode
+- Starts the C++ server in gateway mode, with `--gateway-upstream` and `--insecure-gateway-peer` (the gateway-upstream service refuses to start without gateway peer authorization or that acknowledgement; the flag disables the check, so this script does not exercise it, and `--tls` does not make the gateway hop mutual TLS). A deferred follow-up is to run the `--tls` branch with a real pinned gateway leaf instead of the acknowledgement
 - Starts the Erlang gateway connecting to the server
 - Starts N C++ agents connecting through the gateway
 - Runs ~20 test scenarios covering connectivity, registration, heartbeats, and stability
@@ -177,6 +177,7 @@ open _build/test/cover/index.html
 - Check gateway logs for connection errors
 - Verify enrollment token is valid
 - Check server is in gateway mode (`--gateway-mode`)
+- If a hand-started server exits at boot with a gateway peer authorization error, it needs `--insecure-gateway-peer` (plaintext rig), a gateway key pin, or the generated default certificates; `scripts/integration-test.sh` passes `--insecure-gateway-peer` itself
 
 ### Tests time out
 - Increase timeouts in test configuration

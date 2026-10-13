@@ -175,6 +175,14 @@ constexpr ExpectedResolution kExpected[] = {
     // inherit this row and falls to the catch-all instead.
     {"PUT",    "/api/v1/rbac/enforcement",                             1u * 1024, false, "rbac_enforcement"},
     {"PUT",    "/api/v1/rbac/enforcement-evil",                        4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp users row — the /api/v1/users REST v1 subtree
+    // (#5342 password routes + unlock + elevation-eligibility). ANY method;
+    // a segment-boundary probe proves "/api/v1/usersevil" does NOT inherit it.
+    {"POST",   "/api/v1/users/me/password",                            16u * 1024, false, "users"},
+    {"POST",   "/api/v1/users/alice/password",                         16u * 1024, false, "users"},
+    {"POST",   "/api/v1/users/alice/unlock",                           16u * 1024, false, "users"},
+    {"POST",   "/api/v1/users/elevation-eligibility",                  16u * 1024, false, "users"},
+    {"POST",   "/api/v1/usersevil",                                    4u * 1024 * 1024, false, "default"},
     // Catch-all default — ordinary JSON/form traffic.
     {"POST",   "/api/v1/some-ordinary-mutation-route",    4u * 1024 * 1024,   false, "default"},
     {"GET",    "/api/v1/devices",                         4u * 1024 * 1024,   false, "default"},
@@ -210,6 +218,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "hardware",
     "rbac_role_assignment",
     "rbac_enforcement",
+    "users",
     "default",
 };
 
@@ -352,8 +361,9 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // twin, governance Gate 2) + rbac_role_assignment(1: A2 global human
     // role assignment, .claude/plans/rbac-industry-leading-DELIVERY-PLAN.md
     // §2) + rbac_enforcement(1: A1 enforcement enable/disable toggle) +
+    // users(1: the /api/v1/users subtree, #5342 password routes) +
     // default(1).
-    CHECK(std::size(kBodyCapTable) == 31);
+    CHECK(std::size(kBodyCapTable) == 32);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──

@@ -696,6 +696,13 @@ bool AgentRegistry::send_to(const std::string& agent_id, const ClassifiedCommand
         auto it = agents_.find(agent_id);
         if (it == agents_.end())
             return false;
+        // #5294: a per-OS kill-switch OFF row is enforced here, at send time,
+        // so every local-session caller (including send_system_reserved) is
+        // covered and a session registered after the dispatch-time snapshot
+        // is still withheld. The set holds only validated windows|linux|darwin
+        // literals, so an empty/unknown session OS never matches.
+        if (cmd.kill_switched_os().contains(it->second->os))
+            return false;
         session = it->second;
     }
     if (!tag_is_valid(cmd.wire(), metrics_, agent_id))
@@ -746,6 +753,9 @@ int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
         return 0;
     int count = 0;
     for (auto& s : snapshot) {
+        // #5294: mirror send_to()'s send-time per-OS enforcement.
+        if (cmd.kill_switched_os().contains(s->os))
+            continue;
         std::lock_guard slock(s->stream_mu);
         // #1004: mirror send_to() — gateway-pending path wins over any
         // Subscribe stream the gateway may also hold for the agent.
@@ -856,6 +866,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "read-only, no subprocess; "
          "other package families are not read, so an empty result on them is not evidence of no "
          "sources"},
+        {"mgmt_posture.posture",
+         "Management-plane posture, facts only: which plane controls the device (none/ad/ipa on "
+         "Linux from sssd/ipa configuration as written), MDM enrolment on macOS; a refused read is "
+         "reported as permission_denied, never as not-joined; read-only, one bounded argv on macOS"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},
@@ -1485,11 +1499,12 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
 std::vector<std::string> AgentRegistry::all_ids() const {
     // HA WS-5: live_presence() is cached (kPresenceCacheTtl) and runs OFF
     // mu_ — the same rule the evaluate_scope preloads follow, never holding
-    // the registry lock across Postgres I/O. A null presence_store_
-    // (unconfigured) makes this call cost nothing beyond the pointer check;
-    // a configured one (the production default — see live_presence()'s own
-    // doc comment for why this is NOT gated behind an HA-only signal) costs
-    // at most one cached-or-fresh read, never a bare per-call round trip.
+    // the registry lock across Postgres I/O. An empty presence_reader_
+    // (unconfigured) makes this call cost one uncontended mutex acquisition plus
+    // the pointer check; a configured one (the production default — see
+    // live_presence()'s own doc comment for why this is NOT gated behind an
+    // HA-only signal) costs at most one cached-or-fresh read, never a bare
+    // per-call round trip.
     //
     // #4981 PR-1: this method's signature/contract predates the typed
     // PresenceReadError split and stays a plain vector — a degraded read
@@ -1532,14 +1547,26 @@ bool AgentRegistry::has_remote_presence(const std::vector<std::string>& ids) con
 }
 
 void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl) {
-    presence_store_ = store;
+    configure_presence(store ? PresenceReadFn{[store](std::chrono::seconds t) {
+                                   return store->query_live_ids(t);
+                               }}
+                             : PresenceReadFn{},
+                       ttl);
+}
+
+void AgentRegistry::configure_presence(PresenceReadFn reader, std::chrono::seconds ttl) {
+    // Wiring and teardown only; locked so a reconfigure can never race an
+    // in-flight read. The cache age resets so the next read hits the new reader.
+    std::lock_guard lock(presence_cache_mu_);
+    presence_reader_ = std::move(reader);
     presence_ttl_ = ttl;
+    presence_cache_at_ = {};
 }
 
 std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::live_presence() const {
-    if (!presence_store_)
-        return std::vector<PresenceIdentity>{};
     std::lock_guard lock(presence_cache_mu_);
+    if (!presence_reader_)
+        return std::vector<PresenceIdentity>{};
     const auto now = std::chrono::steady_clock::now();
     // `presence_cache_at_{}` (default-constructed epoch) is always stale on
     // the first call, so this always fetches at least once before serving a
@@ -1548,7 +1575,7 @@ std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::l
     // not just a success — so a sustained outage pays exactly one real query
     // per kPresenceCacheTtl window, not one per caller.
     if (now - presence_cache_at_ >= kPresenceCacheTtl) {
-        presence_cache_ = presence_store_->query_live_ids(presence_ttl_);
+        presence_cache_ = presence_reader_(presence_ttl_);
         presence_cache_at_ = now;
     }
     return presence_cache_; // copy out under the cache lock, never mu_
@@ -1594,8 +1621,25 @@ std::shared_ptr<AgentSession> AgentRegistry::get_session(const std::string& agen
     return it != agents_.end() ? it->second : nullptr;
 }
 
-std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin) const {
+bool AgentRegistry::session_is(const std::string& agent_id, const std::string& session_id) const {
+    std::lock_guard lock(mu_);
+    auto it = agents_.find(agent_id);
+    return it != agents_.end() && it->second->session_id == session_id;
+}
+
+std::string AgentRegistry::session_id_of(const std::string& agent_id) const {
+    std::lock_guard lock(mu_);
+    auto it = agents_.find(agent_id);
+    return it != agents_.end() ? it->second->session_id : std::string{};
+}
+
+std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin,
+                                                                  std::string_view action) const {
     std::unordered_set<std::string> missing;
+    // Protective-action exemption: protective actions are never withheld on
+    // inventory grounds (see the declaration); decided before taking mu_.
+    if (yuzu::protective::is_protective_action(plugin, action))
+        return missing;
     std::lock_guard lock(mu_);
     for (const auto& [id, s] : agents_) {
         if (s->plugin_names.empty())
@@ -1604,6 +1648,28 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
             missing.insert(id);
     }
     return missing;
+}
+
+std::expected<std::unordered_set<std::string>, PresenceReadError>
+AgentRegistry::ids_with_os(const std::unordered_set<std::string>& os_values) const {
+    std::unordered_set<std::string> out;
+    if (os_values.empty())
+        return out;
+    // live_presence() runs OFF mu_ (same discipline as all_ids / evaluate_scope).
+    auto presence = live_presence();
+    if (!presence)
+        return std::unexpected(presence.error());
+    std::lock_guard lock(mu_);
+    for (const auto& [id, s] : agents_) {
+        if (!s->os.empty() && os_values.contains(s->os))
+            out.insert(id);
+    }
+    for (const auto& p : *presence) {
+        // Local wins: a session on this replica is judged by its own os.
+        if (!agents_.contains(p.agent_id) && !p.os.empty() && os_values.contains(p.os))
+            out.insert(p.agent_id);
+    }
+    return out;
 }
 
 // Collect every from_result_set:<id> reference in a scope expression so the
@@ -2170,12 +2236,20 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     for (const auto& m : kGuardianJournalAgeMetrics)
         metrics.clear_gauge_family(m.gauge);
     // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d; #2993 added a 4th
-    // family, #4783 added the 5th/6th/7th - legacy-sink loss visibility) - same
+    // family, #4783 added the 5th/6th/7th - legacy-sink loss visibility; #5403, #4472 and
+    // #5404 added the Spark rows; kGuardianHealthMetrics is authoritative for the set) - same
     // absent-not-zero rule and same reason it bites hardest here: the writer is
-    // sparse, so a healthy fleet must see all 7 families ABSENT, never a fabricated
-    // 0; an inert (prefer_spark off) fleet still reports the 3 legacy_sink_* families
-    // live (they don't depend on the Spark flip - see guardian_health_fleet_tags.hpp).
+    // sparse, so a healthy fleet must see every family ABSENT, never a fabricated
+    // 0. The 3 legacy_sink_* families do not depend on the Spark flip (prefer_spark),
+    // so they are live on an inert fleet but still sparse: absent while they read 0
+    // (see guardian_health_fleet_tags.hpp).
     for (const auto& m : kGuardianHealthMetrics)
+        metrics.clear_gauge_family(m.gauge);
+    // #5403, #4472: the Spark claim AGE family (MAX): the pending-Disarm age and the
+    // outstanding-compensation age. Same rule: the writer emits each tag only while one
+    // Disarm (or one compensating teardown) is pending, so a fleet with none pending must read
+    // ABSENT, and a stale series from a sweep that did have one must not outlive it.
+    for (const auto& m : kGuardianHealthAgeMetrics)
         metrics.clear_gauge_family(m.gauge);
     // rung 9c PR-3: the arm-ledger re-statable-gauge pair (Decision 1) and the
     // io-ceiling monitor-only counter (Decision 3, Option B). Same absent-not-
@@ -2295,7 +2369,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::array<double, kNGuardianJournalAgeMetrics> gja_max{};
     std::array<bool, kNGuardianJournalAgeMetrics> gja_reported{};
     // Meta-signals ABOUT the rollup (guardian_journal_fleet_tags.hpp). Published
-    // unconditionally, including at 0, unlike the 32 - they are server-owned counts
+    // unconditionally, including at 0, unlike the 33 - they are server-owned counts
     // that always have a true value, so 0 is a measurement, not a fabricated zero.
     // `gj_reporting` is the coverage denominator absence otherwise hides; without it a
     // dark telemetry pipeline is indistinguishable from a healthy quiet fleet.
@@ -2306,7 +2380,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int gj_tag_rejected = 0;
     // std::string twins of the table's C-string tag keys: get_view takes
     // const std::string&, so passing the char* directly would heap-construct a
-    // temporary key per lookup - 32 per agent per sweep. Built once (same pattern,
+    // temporary key per lookup - 33 per agent per sweep. Built once (same pattern,
     // and the same governance finding, as spark_mech_metric_keys above). It IS
     // registered for static destruction (non-trivial destructor), which is safe only
     // because health_recompute_thread_ - the sole production reader - is joined in
@@ -2331,7 +2405,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::array<double, kNGuardianHealthMetrics> gh_sum{};
     std::array<bool, kNGuardianHealthMetrics> gh_reported{};
     // rung 9c PR-3: the arm-ledger pair (Decision 1). SUM accumulate - same
-    // mechanical shape as the 32-row journal counter family (gj_sum above)
+    // mechanical shape as the 33-row journal counter family (gj_sum above)
     // despite being RE-STATABLE gauges rather than monotonic counters on the
     // agent side: this reader only ever sees one CURRENT value per agent per
     // sweep either way, so "sum the current values" is correct regardless of
@@ -2368,6 +2442,20 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             keys[i] = kGuardianHealthMetrics[i].tag;
         return keys;
     }();
+    // #5403, #4472: the health family's AGE rows (kGuardianHealthAgeMetrics) accumulate as
+    // MAX, never SUM, exactly like the journal age family (gja_max): a sum of ages is
+    // meaningless and the question is "how long has the worst endpoint's Disarm (or
+    // compensating teardown) been pending". `reported` gates publish, so
+    // MAX over an empty set is absence, never a fabricated 0.
+    std::array<double, kNGuardianHealthAgeMetrics> gha_max{};
+    std::array<bool, kNGuardianHealthAgeMetrics> gha_reported{};
+    // Same static-destruction-safety rationale as gj_keys above.
+    static const std::array<std::string, kNGuardianHealthAgeMetrics> gha_keys = [] {
+        std::array<std::string, kNGuardianHealthAgeMetrics> keys;
+        for (std::size_t i = 0; i < kNGuardianHealthAgeMetrics; ++i)
+            keys[i] = kGuardianHealthAgeMetrics[i].tag;
+        return keys;
+    }();
     // `yuzu.os` is an agent-CONTROLLED heartbeat tag; using it raw as a metric
     // label lets a malicious/buggy agent spray unbounded {os=...} series (a
     // Prometheus cardinality DoS). Allowlist it to the values a real agent emits
@@ -2384,6 +2472,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int ota_signature_refusing = 0;
     int tar_db_corruption_agents = 0;               // #1567
     std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
+    int sync_skipping = 0; // #5332: agents whose installed_software daily sync is skipping
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -2469,6 +2558,16 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         static const std::string kKeySparkQueuedDropped{kSparkTagQueuedDropped};
         static const std::string kKeySparkConsumerErrors{kSparkTagConsumerErrors};
         static const std::string kKeySparkDisabled{kSparkTagDisabled};
+
+        // #5332: agents whose daily-sync source is skipping (skip_streak > 0). Same
+        // digits-only/>0 rule as the tar total above; its 18-char cap vs the emitter's 6 is
+        // harmless - the value is only counted, never summed or labelled.
+        // One source today (the agent emitter, #5327, is generic over every registered sync
+        // source, but only installed_software sets skip_reason); make this a table when a
+        // second source emits skip_streak.
+        static const std::string kKeySyncSkip{"yuzu.sync.installed_software.skip_streak"};
+        if (parse_tar_corruption_total(get_view(kKeySyncSkip)))
+            ++sync_skipping;
 
         auto os_val = get("yuzu.os");
         if (!os_val.empty())
@@ -2731,6 +2830,24 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         }
         if (health_reported_any)
             ++gh_reporting;
+        // #5403, #4472: the claim ages (pending Disarm, outstanding compensation), MAX
+        // accumulate. Same parse and the same
+        // reject-not-clamp posture as the journal age family: a forged value above the
+        // plausibility ceiling is counted in gh_tag_rejected, never allowed to own the
+        // fleet MAX. DELIBERATELY not fed into health_reported_any/gh_reporting: that
+        // meta-gauge's documented meaning is the counter family's coverage. An absent tag
+        // is skipped and does not contend.
+        for (std::size_t i = 0; i < kNGuardianHealthAgeMetrics; ++i) {
+            const auto raw = get_view(gha_keys[i]);
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_health_count(raw)) {
+                gha_max[i] = std::max(gha_max[i], *v);
+                gha_reported[i] = true;
+            } else {
+                ++gh_tag_rejected;
+            }
+        }
 
         // rung 9c PR-3 (Decision 1): arm-ledger pair. Same absent-vs-rejected
         // split as every family above - an empty view means this agent did not
@@ -2785,6 +2902,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // lexicographic order, the remainder summed under plugin="other".
     metrics.gauge("yuzu_fleet_tar_db_corruption_agents")
         .set(static_cast<double>(tar_db_corruption_agents));
+    // #5332: published every sweep, 0 included (a server-owned count over the reporting
+    // population, like yuzu_fleet_tar_db_corruption_agents above), so the fixed label set
+    // needs no clear_gauge_family.
+    metrics.gauge("yuzu_fleet_inventory_sync_skipping", {{"source", "installed_software"}})
+        .set(static_cast<double>(sync_skipping));
     {
         constexpr std::size_t kMaxPluginLabels = 64;
         std::size_t n = 0;
@@ -2921,7 +3043,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
 
     // Guardian journal rollup (#2298 gate 3). Families were cleared at the top, so a
     // signal NOBODY reported this cycle stays ABSENT - never a fabricated 0. On a
-    // healthy, quiescent or inert fleet that is ALL 30, which is the correct reading:
+    // healthy, quiescent or inert fleet that is ALL 33, which is the correct reading:
     // the journal has nothing to report, and "nothing to report" must not be
     // presentable as "checked and clean".
     for (std::size_t i = 0; i < kNGuardianJournalMetrics; ++i)
@@ -2963,6 +3085,10 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     for (std::size_t i = 0; i < kNGuardianHealthMetrics; ++i)
         if (gh_reported[i])
             metrics.gauge(kGuardianHealthMetrics[i].gauge).set(gh_sum[i]);
+    // #5403, #4472: the AGE rows' fleet MAX, same absent-when-unreported rule.
+    for (std::size_t i = 0; i < kNGuardianHealthAgeMetrics; ++i)
+        if (gha_reported[i])
+            metrics.gauge(kGuardianHealthAgeMetrics[i].gauge).set(gha_max[i]);
     metrics.gauge(kGuardianHealthReportingGauge).set(static_cast<double>(gh_reporting));
     metrics.gauge(kGuardianHealthTagRejectedGauge)
         .set(static_cast<double>(gh_tag_rejected));

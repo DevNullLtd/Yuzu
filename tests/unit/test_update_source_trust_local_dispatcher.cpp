@@ -43,6 +43,7 @@
 #include <filesystem>
 #include <optional>
 #include <sstream>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -172,7 +173,17 @@ std::size_t expected_field_count(const std::string& kind) {
 
 /// The execute-seam probes: a leg that throws, run through the production
 /// execute_sources exactly as the plugin TU wires its host leg.
-int throwing_leg(yuzu::CommandContext&) { throw std::runtime_error("probe: the leg threw"); }
+enum class Throw { std_exception, bad_alloc, foreign };
+Throw g_throw = Throw::std_exception;
+
+int throwing_leg(yuzu::CommandContext&) {
+    switch (g_throw) {
+    case Throw::bad_alloc: throw std::bad_alloc();
+    case Throw::foreign: throw 42;
+    case Throw::std_exception: break;
+    }
+    throw std::runtime_error("probe: the leg threw");
+}
 
 int seam_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /*params*/,
                  std::size_t /*param_count*/) {
@@ -247,7 +258,9 @@ TEST_CASE("update_source_trust plugin: status row first, agrees with the typed r
     // the state comparison on an rpm host. The tripwire itself is pinned by the
     // [seam] cases and the fixture trees in test_update_source_trust_linux_parsers.cpp.
     yuzu::shared::ConstraintAccumulator oracle;
-    const auto oracle_rows = yuzu::update_source_trust::lnx::linux_rows_at("/", oracle);
+    yuzu::update_source_trust::posix_io::InputBudget oracle_budget;
+    const auto oracle_rows =
+        yuzu::update_source_trust::lnx::linux_rows_at("/", oracle, oracle_budget);
     CHECK((status[2] == "constrained") == oracle.any_failure());
     CHECK(status[3] == (oracle.any_failure() ? oracle.reason() : std::string{"-"}));
     const std::vector<std::string> data_rows(rows.begin() + 1, rows.end());
@@ -317,10 +330,26 @@ TEST_CASE("update_source_trust execute seam: a leg that throws is contained as o
     // MUTATION: removing the catch arm lets the exception escape to Catch2 (red);
     // writing `constrained` (the r1 shape) or CONSTRAINED here fails the pair below.
     REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == "status|sources|unsupported|linux:leg:exception");
+    CHECK(rows[0] == "status|sources|unsupported|linux:leg:exception:std_exception");
     CHECK(thrown.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
     CHECK(thrown.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
-    CHECK(thrown.result_provenance == "linux:leg:exception"); // one seam, two views
+    CHECK(thrown.result_provenance == "linux:leg:exception:std_exception"); // one seam, two views
+
+    // The category is the whole exception detail: the three-token grammar, never
+    // what() (the message above must not reach the wire).
+    // MUTATION: dropping the category suffix, or carrying what(), fails these.
+    g_throw = Throw::bad_alloc;
+    const auto oom = dispatcher.run(&descriptor, "sources");
+    g_throw = Throw::foreign;
+    const auto foreign = dispatcher.run(&descriptor, "sources");
+    g_throw = Throw::std_exception;
+    CHECK(captured_rows(oom.captured) ==
+          std::vector<std::string>{"status|sources|unsupported|linux:leg:exception:bad_alloc"});
+    CHECK(oom.result_provenance == "linux:leg:exception:bad_alloc");
+    CHECK(captured_rows(foreign.captured) ==
+          std::vector<std::string>{"status|sources|unsupported|linux:leg:exception:unknown"});
+    CHECK(foreign.result_provenance == "linux:leg:exception:unknown");
+    CHECK(thrown.captured.find("probe") == std::string::npos);
 
     // The unknown-action write sits INSIDE the same try. The request-supplied
     // name goes through safe_output_field, so a pipe and a trailing backslash can

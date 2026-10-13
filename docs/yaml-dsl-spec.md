@@ -146,19 +146,31 @@ Each parameter descriptor supports:
 | `type` | string | Yes | -- | Parameter type. Values: `string`, `boolean`, `int32`, `int64`, `datetime`, `guid`. See [Section 10](#10-parameter-type-system). |
 | `displayName` | string | No | -- | Human-readable label for the dashboard form. |
 | `description` | string | No | `""` | Parameter description. |
-| `default` | varies | No | -- | Default value if not provided. Must match the declared type. |
+| `default` | varies | No | -- | Default value if not provided. Must match the declared type. The server does not inject it into the dispatched parameters; it only satisfies `required` during `POST /api/instructions/{id}/execute` validation. |
 | `validation` | object | No | -- | Validation constraints. See below. Also summarised into the plugin README's Inputs table (Constraints column, e.g. `enum: a, b · minLength 1`) and carried verbatim in the `content/plugin-docs` manifest (`inputs[].constraints`). |
 
 #### `spec.parameters.properties.<name>.validation`
 
 | Field | Type | Applicable Types | Description |
 |---|---|---|---|
-| `maxLength` | integer | `string` | Maximum string length. |
-| `minLength` | integer | `string` | Minimum string length. |
+| `maxLength` | integer | `string` | Maximum string length in bytes (UTF-8). |
+| `minLength` | integer | `string` | Minimum string length in bytes (UTF-8). |
 | `pattern` | string | `string` | Regular expression the value must match. |
 | `enum` | list | `string` | Allowed values. The value must be one of the listed strings. |
 | `minimum` | number | `int32`, `int64` | Minimum numeric value (inclusive). |
 | `maximum` | number | `int32`, `int64` | Maximum numeric value (inclusive). |
+
+#### Constructs shipped definitions use beyond the tables above
+
+The server's parameter-schema canonicaliser accepts these forms and publishes the result as `input_schema` (`GET /api/v1/discover/instructions`, MCP `discover_instructions`):
+
+- `type: integer` is accepted next to `int32`/`int64`. `int32` is a numeric string on the wire (Section 10) but is published as `integer` with the int32 range.
+- `type: array` with `items: {type: string}`.
+- `required: true` on a property is the same as listing it in the root `required`.
+- `maxLength`, `minLength`, `pattern`, `enum`, `minimum` and `maximum` may be written flat on the property; a flat key beats the same key under `validation`.
+- `hidden: true` is accepted as a no-op hint (no effect on validation; not published). `displayName` is dropped from the published schema.
+
+Shipped definitions under `content/definitions/` and `content/packs/` must meet the description-lint floors enforced by `scripts/ci/check-definition-descriptions.py`: `metadata.description` of at least 40 characters (and not just the name or id), every parameter description at least 10 characters, every result column described, and `metadata.tags` non-empty. To fix a baselined failure, edit the YAML and delete the fixed entry from `scripts/ci/definition-descriptions-baseline.json`, otherwise the STALE check fails.
 
 #### `spec.result`
 
@@ -233,7 +245,7 @@ neither controls anything at runtime.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `enabled` | boolean | No | `false` | When `true`, this definition was auto-generated from a plugin descriptor. The parameter schema uses `additionalProperties: {type: string}` (open schema). |
+| `enabled` | boolean | No | `false` | When `true`, this definition was auto-generated from a plugin descriptor. The generated YAML source declares `additionalProperties: {type: string}` (open schema), but the stored `parameter_schema` is `{}`, so these definitions are not validated by `POST /api/instructions/{id}/execute`. |
 
 #### `spec.visualization`
 
@@ -258,7 +270,7 @@ Optional chart configuration consumed by the dashboard's instruction-response vi
 
 > **Multi-chart definitions.** A definition can declare more than one chart by using the canonical plural form `spec.visualizations: [<vis>, ...]`. The singular `spec.visualization: <vis>` is accepted as syntactic sugar for a single-element list and is normalised at ingest. The dashboard renders all charts as a deck (`<div class="yuzu-chart-deck">`); the REST endpoint takes an optional `?index=N` query parameter (default 0) to address individual charts and includes `chart_index` and `chart_count` in every response payload so callers can iterate.
 
-> **Limitations.** The engine caps each chart at 10 000 underlying response rows; when truncated, the response payload includes `rows_capped: true` so the dashboard can show a banner. The engine also caps total distinct labels at 10 000 (defense-in-depth against a misbehaving plugin emitting unbounded label cardinality).
+> **Limitations.** The engine caps each chart at 10 000 underlying response rows; the read is also capped at 50 MiB of response payload. `rows_capped: true` means the row cap cut the read; when either cap cut it the payload also carries `result_truncated_by_cap: true` and `truncation_cause` (`row_cap` or `byte_cap`), and the dashboard shows a "Partial result" notice in the chart card. The engine also caps total distinct labels at 10 000 (defense-in-depth against a misbehaving plugin emitting unbounded label cardinality).
 
 > **Authoring through the dashboard YAML editor strips visualization.** When saving a definition via the dashboard's CodeMirror editor (`POST /api/instructions/yaml`), the schema-aware extractor (`instruction_yaml::parse_definition_yaml`) indexes `id`, `name`, `plugin`, `action`, `type`, `description`, `concurrency`, `approval` from the YAML source (canonical nested or flat schema) but does NOT extract `spec.visualization` into the indexed `visualization_spec` column. The chart spec is preserved in `yaml_source` (verbatim source of truth) but not indexed, so the chart deck does not render the chart until the definition is re-imported via `POST /api/v1/definitions/import` (JSON envelope, full visualization extraction) or until the next server restart triggers the bundled-content auto-import. Author chart-bearing definitions through the JSON import path or the in-tree `content/definitions/` library, not the editor save. Tracked as a known gap pending yaml-cpp Windows MSVC resolution (#625).
 
@@ -1438,14 +1450,14 @@ InstructionDefinition parameters and PolicyFragment inputs use the following typ
 | `datetime` | ISO 8601 timestamp | String | `"2026-03-17T18:20:00Z"` |
 | `guid` | UUID / GUID | String | `"550e8400-e29b-41d4-a716-446655440000"` |
 
-Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. The server validates parameter values against the declared type and constraints before dispatch.
+Parameters are transmitted as `map<string, string>` in the `CommandRequest` protobuf message. `POST /api/instructions/{id}/execute` validates the request's parameter values against the declared type and constraints before dispatch; no other dispatch surface does yet.
 
 ### Validation Constraints
 
 | Constraint | Applicable Types | Description |
 |---|---|---|
-| `maxLength` | `string` | Maximum character count. |
-| `minLength` | `string` | Minimum character count. |
+| `maxLength` | `string` | Maximum length in bytes (UTF-8). |
+| `minLength` | `string` | Minimum length in bytes (UTF-8). |
 | `pattern` | `string` | Regular expression the value must match. |
 | `enum` | `string` | List of allowed values. |
 | `minimum` | `int32`, `int64` | Minimum value (inclusive). |

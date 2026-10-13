@@ -297,6 +297,15 @@ public:
     [[nodiscard]] std::vector<ApiToken>
     list_active_for_principal(const std::string& principal_id) const;
 
+    /// Checked twin of `list_active_for_principal` (#5342 Gate 7): the SAME
+    /// query, but a closed store, a pool-lease timeout or a query failure is
+    /// `unexpected(reason)` instead of an empty vector — so a caller that
+    /// REPORTS the count (the admin password reset's `api_tokens_active`) can
+    /// say "could not confirm" rather than a false "0 active tokens". An empty
+    /// `principal_id` is a genuine empty result (no principal, no tokens).
+    [[nodiscard]] std::expected<std::vector<ApiToken>, std::string>
+    list_active_for_principal_checked(const std::string& principal_id) const;
+
     /// Overlap-pair credential rotation for an engine principal (design doc
     /// §7). `now` is caller-supplied epoch seconds (not read from the wall
     /// clock internally) so callers control the instant every window/floor

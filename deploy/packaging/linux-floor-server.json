@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "name": "server",
+  "description": "Server and gateway (including the bundled OTP/ERTS and crypto.so): the n-2 LTS promise, glibc 2.34 (RHEL/Rocky 9, Ubuntu 22.04, Debian 12) (ADR-2003 (Proposed, PR #5631)). EVP_sm4_* is forbidden because Red Hat's OpenSSL does not export it (#5171). Schema: scripts/ci/check-elf-floor.sh.",
+  "max": {
+    "GLIBC": "2.34",
+    "GLIBCXX": "3.4.29",
+    "CXXABI": "1.3.13",
+    "OPENSSL": "3.0.0",
+    "LIBSYSTEMD": "240",
+    "BLKID": "1.0"
+  },
+  "allow": [],
+  "forbidden_symbols": [
+    "EVP_sm4_*"
+  ],
+  "unlisted_families": "report"
+}

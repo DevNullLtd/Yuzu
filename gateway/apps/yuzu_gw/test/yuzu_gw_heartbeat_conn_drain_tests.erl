@@ -459,7 +459,12 @@ subscribe_def() ->
 setup() ->
     {ok, _} = application:ensure_all_started(grpcbox),
     {ok, _} = application:ensure_all_started(telemetry),
-    ok = yuzu_gw_test_registry:ensure(),
+    %% A pending session must outlive the GOAWAY of its connection until a
+    %% Subscribe on the reconnected channel takes it: a grace far beyond the case,
+    %% on a registry started with it (a reused one may hold another value).
+    PrevGrace = application:get_env(yuzu_gw, dead_connection_grace_ms),
+    application:set_env(yuzu_gw, dead_connection_grace_ms, 60000),
+    ok = yuzu_gw_test_registry:ensure_fresh(),
     AgentSup = case whereis(yuzu_gw_agent_sup) of
         undefined ->
             {ok, P} = yuzu_gw_agent_sup:start_link(),
@@ -489,10 +494,14 @@ setup() ->
                                fun ?MODULE:handle_telemetry/4, Counts),
     {Port, Server} = start_listener(5),
     #{port => Port, server => Server, agent_sup => AgentSup,
-      counts => Counts, handler_id => HandlerId}.
+      counts => Counts, handler_id => HandlerId, prev_grace => PrevGrace}.
 
 cleanup(#{server := Server, agent_sup := AgentSup, handler_id := HandlerId,
-          counts := Counts}) ->
+          counts := Counts, prev_grace := PrevGrace}) ->
+    case PrevGrace of
+        {ok, V}   -> application:set_env(yuzu_gw, dead_connection_grace_ms, V);
+        undefined -> application:unset_env(yuzu_gw, dead_connection_grace_ms)
+    end,
     catch supervisor:terminate_child(grpcbox_services_simple_sup, Server),
     catch telemetry:detach(HandlerId),
     catch ets:delete(Counts),

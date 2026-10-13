@@ -111,6 +111,17 @@ enum class AuthDBError : std::uint8_t {
     /// timeout as `QueryFailed`/`WriteFailed`; they emit no degrade metric, so
     /// the reason split does not reach them — see `is_store_unavailable`.)
     StoreBusy,
+    /// #5342 Gate 8 (F2/F4): an MFA enrolment write (`mfa_init_enrollment`'s
+    /// mint or `mfa_verify_enrollment`'s enrol) found the account's stored
+    /// password hash no longer equals the credential anchor — the caller's
+    /// proven hash (login bootstrap) or the hash read earlier in the SAME call
+    /// (Settings, `std::nullopt`). The password was changed or reset after the
+    /// enrolment's credential was established, or while the write waited on the
+    /// credential change's row lock. A business outcome, NOT a store fault
+    /// (`is_store_unavailable` is false): the caller refuses (generic 401 at
+    /// login, a "sign in again" fragment in Settings), reveals nothing and
+    /// spends any pending token.
+    CredentialChanged,
 };
 
 /// True iff `e` reflects the AuthDB store itself being unavailable (PG
@@ -209,10 +220,18 @@ public:
 
     // ── User Operations ──────────────────────────────────────────────────
 
-    /// Create or update a user.
-    /// Username is validated (alphanumeric + ._- only, 1-64 chars).
-    /// For new users: password_hash and salt_hex are required.
-    /// For existing users: all fields are updated (password + role).
+    /// Create a user. Username is validated (alphanumeric + ._- only, 1-64
+    /// chars); `password_hash` and `salt_hex` are required.
+    ///
+    /// INSERT-ONLY despite the name: the statement is `INSERT ... ON CONFLICT
+    /// (username) DO NOTHING`, so an EXISTING row is never touched — not its
+    /// password, not its role — and the call returns `UserAlreadyExists`.
+    /// (Never DO UPDATE: that reopens the TOCTOU where two concurrent creates
+    /// both pass a `user_exists()` check and one silently overwrites the
+    /// other's credentials.) Role changes go through `update_role()`;
+    /// password changes go through `CredentialChangeOwner`
+    /// (credential_change_owner.hpp, #5342) — the ONLY writer of an existing
+    /// row's `password_hash`; this store has no credential-write method.
     std::expected<void, AuthDBError> upsert_user(
         const std::string& username,
         const std::string& password_hash,
@@ -321,6 +340,12 @@ public:
     /// has already succeeded at the call site).
     void touch_last_login(const std::string& username);
 
+    /// UNGUARDED fixture primitive: production must use AuthManager::remove_user_checked (#4966).
+    /// This writes the soft delete WITHOUT the last-Administrator guard. tests/test_rbac_query_owner_seam.py
+    /// scans server/core/src and server/core/include for calls through a receiver whose name
+    /// contains `db` (or a `(*...)` dereference) outside auth_db.cpp; it is a textual tripwire
+    /// for those spellings, not a proof that no other path reaches this method.
+    ///
     /// Soft-delete a user (sets is_active = false), clears MFA enrollment
     /// state (SOC 2 CC6.8 credential revocation on termination). Does NOT
     /// touch sessions (no session surface on this class — see file header;
@@ -331,6 +356,10 @@ public:
     /// Check if a user exists (active only).
     std::expected<bool, AuthDBError> user_exists(const std::string& username);
 
+    /// UNGUARDED fixture primitive: production must use AuthManager::update_role_checked (#4966).
+    /// This writes the role column WITHOUT the last-Administrator guard; the same seam test scans
+    /// for calls through those receiver spellings (a textual tripwire, not a proof).
+    ///
     /// Change a user's role. ONLY updates the role column — never touches
     /// password_hash or salt_hex. This is critical for security: role changes
     /// must never overwrite credentials (C1 fix, Red Team finding).
@@ -339,8 +368,9 @@ public:
         auth::Role new_role
     );
 
-    /// Row-locked role re-check (#4107): `SELECT role FROM auth.users WHERE
-    /// username = $1 AND is_active FOR UPDATE`, same technique
+    /// Row-locked role + credential re-check (#4107, extended by #5274):
+    /// `SELECT role, password_hash FROM auth.users WHERE username = $1 AND
+    /// is_active FOR UPDATE`, same technique
     /// `mfa_verify_login_code` already uses to close ITS OWN replay race.
     /// Serializes against ANY concurrent `update_role()` write to this row:
     /// if one is already committed, this call's SELECT sees it directly; if
@@ -374,6 +404,19 @@ public:
     /// `reactivate_user()` call starting against an already-inactive row —
     /// there is no lock to contend for at that point.
     ///
+    /// #5274: `under_row_lock` also receives the row's CURRENT
+    /// `password_hash`, read under the same lock, so the credential check can
+    /// deny when the hash it just verified the password against is no longer
+    /// the stored one (a credential change committed between the caller's read
+    /// and this lock — a password change racing a login). The credential
+    /// change (`CredentialChangeOwner`, #5342) holds the same row lock for its
+    /// whole transaction, so the hash seen here is never one another writer's
+    /// in-flight commit can invalidate a moment later — and a caller that
+    /// arrives while that transaction holds the lock WAITS for its commit
+    /// (bounded by this call's txn-scoped `lock_timeout`) and then reads the
+    /// new hash. `AuthManager::post_mint_role_recheck` relies on exactly that
+    /// wait (#5342 Gate 8, M1).
+    ///
     /// `under_row_lock` runs WHILE the row lock is held, immediately before
     /// this call commits (releasing the lock) — use it to update
     /// AuthManager's in-process cache under `mu_` before the lock is
@@ -401,8 +444,9 @@ public:
     /// does). `InvalidUsername` / `QueryFailed` on the usual input/store
     /// failures, callback not invoked either way.
     std::expected<void, AuthDBError>
-    recheck_role_locked(const std::string& username,
-                        const std::function<void(auth::Role)>& under_row_lock);
+    recheck_role_locked(
+        const std::string& username,
+        const std::function<void(auth::Role, const std::string& password_hash)>& under_row_lock);
 
     /// Set/clear the per-user JIT-elevation eligibility flag (SOC 2 CC6.3/CC6.6):
     /// who may activate a time-boxed admin elevation via POST /api/v1/elevate,
@@ -440,6 +484,13 @@ public:
     /// for malformed input.
     std::expected<std::string, AuthDBError>
     get_provisioning_source(const std::string& username);
+
+    /// Read a user's role column REGARDLESS of `is_active` (soft-deleted rows included). SCIM's
+    /// revive path (#4966) reads the tombstone's role BEFORE `reactivate_user`, so an
+    /// out-of-band-elevated account is refused without ever being made active again. UserNotFound
+    /// only when no row (active or not) matched; InvalidUsername for malformed input; QueryFailed
+    /// on a lease/query failure (callers fail closed).
+    std::expected<auth::Role, AuthDBError> get_role_including_inactive(const std::string& username);
 
     /// Set the `identity_source` marker (auth.db migration v6, carried
     /// unchanged into `auth.users`) directly — distinct from
@@ -645,11 +696,24 @@ public:
     /// Generate a fresh TOTP secret and write it as provisional (encrypted).
     /// Returns the base32 form + otpauth URI for the enrollment UI.
     /// Idempotent on provisional rows (reuse, not rotate — see the file
-    /// header MFA note); returns UserAlreadyExists — er, MfaAlreadyEnrolled —
-    /// on already-enrolled rows; returns SecretUnavailable (never a fresh
-    /// mint) if an existing provisional secret fails to decrypt.
+    /// header MFA note); returns MfaAlreadyEnrolled on already-enrolled rows;
+    /// returns SecretUnavailable (never a fresh mint) if an existing
+    /// provisional secret fails to decrypt.
+    ///
+    /// `expected_password_hash_hex` (#5342 Gate 8, F4 — REQUIRED, no default,
+    /// so every caller decides) is the CREDENTIAL ANCHOR: the login bootstrap
+    /// passes the hash its password was proven against; Settings passes
+    /// `std::nullopt`, which anchors to the hash read in this same call. An
+    /// engaged anchor that no longer equals the stored hash is
+    /// `CredentialChanged` BEFORE any reveal or mint, and the mint itself is a
+    /// guarded `UPDATE ... WHERE mfa_totp_secret IS NULL AND mfa_enrolled_at IS
+    /// NULL AND password_hash = <anchor>` — so a mint that waited behind a
+    /// credential change's row lock lands as `CredentialChanged`, never as a
+    /// secret written over the change (and never over a secret a concurrent
+    /// init or verify just wrote).
     std::expected<MfaEnrollmentInit, AuthDBError>
-    mfa_init_enrollment(const std::string& username, std::string_view issuer);
+    mfa_init_enrollment(const std::string& username, std::string_view issuer,
+                        const std::optional<std::string>& expected_password_hash_hex);
 
     /// Verify the first code against the provisional secret. On success,
     /// stamps mfa_enrolled_at = now(), generates 10 recovery codes (returned
@@ -657,8 +721,21 @@ public:
     /// Idempotent on already-enrolled rows: returns MfaAlreadyEnrolled.
     /// Returns SecretUnavailable if the provisional secret fails to decrypt
     /// (never silently rejects the code as wrong).
+    ///
+    /// `expected_password_hash_hex` (#5342 Gate 8, F2/F4 — REQUIRED, no
+    /// default, so every caller decides) is the CREDENTIAL ANCHOR, always
+    /// bound: the guarded enrolment UPDATE requires `password_hash` to still
+    /// equal `expected_password_hash_hex.value_or(<hash read in this call>)`.
+    /// The login-enforcement bootstrap (`POST /login/mfa/enroll`) passes the
+    /// pending login's verified hash, so an enrolment started under a password
+    /// that was since changed or reset cannot complete. The Settings enrolment
+    /// passes `std::nullopt` and anchors to the hash read in this call, so a
+    /// change committed while its UPDATE waited on the credential change's row
+    /// lock is refused too. A 0-row result on an active, un-enrolled row whose
+    /// hash differs from the anchor is `CredentialChanged`.
     std::expected<std::vector<std::string>, AuthDBError>
-    mfa_verify_enrollment(const std::string& username, std::string_view code);
+    mfa_verify_enrollment(const std::string& username, std::string_view code,
+                          const std::optional<std::string>& expected_password_hash_hex);
 
     /// Verify a TOTP code for login or step-up. Persists the matched
     /// counter to mfa_last_counter on success. Returns `true` on match,

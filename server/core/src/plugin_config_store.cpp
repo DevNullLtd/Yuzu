@@ -77,6 +77,9 @@ const std::vector<pg::PgMigration>& migrations() {
          "  set_by TEXT NOT NULL DEFAULT '',"
          "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now());"
          "CREATE INDEX kill_switches_plugin_idx ON kill_switches (plugin);"},
+        // v2 (#5294): per-OS kill-switch rows. scope_key stays the unique
+        // identity (`<plugin>[.<action>][@<os>]`); existing rows read as os=''.
+        {2, "ALTER TABLE kill_switches ADD COLUMN os TEXT NOT NULL DEFAULT '';"},
     };
     return kMigrations;
 }
@@ -126,6 +129,7 @@ PluginConfigStore::KillSwitchEntry kill_switch_row(PGresult* r, int i) {
     e.reason = col_str(r, i, 3);
     e.set_by = col_str(r, i, 4);
     e.updated_at_ms = to_i64(col(r, i, 5));
+    e.os = col_str(r, i, 6);
     return e;
 }
 
@@ -388,64 +392,90 @@ std::expected<void, PluginConfigStore::Error> PluginConfigStore::delete_secret(
 // ── Kill switch ──────────────────────────────────────────────────────────
 
 std::expected<PluginConfigStore::KillSwitchEntry, PluginConfigStore::Error>
-PluginConfigStore::get_kill_switch(std::string_view plugin, std::string_view action) const {
+PluginConfigStore::get_kill_switch(std::string_view plugin, std::string_view action,
+                                   std::string_view os) const {
     if (!open_)
         return std::unexpected(Error::Unavailable);
-    auto scope = plugin_config::parse_kill_switch_scope(plugin, action);
+    auto scope = plugin_config::parse_kill_switch_scope(plugin, action, os);
     if (!scope)
         return std::unexpected(Error::InvalidInput);
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
         return std::unexpected(Error::Unavailable);
 
-    const std::string plugin_key =
-        plugin_config::kill_switch_scope_key({scope->plugin, ""});
-
-    if (!scope->action.empty()) {
-        const std::string action_key = plugin_config::kill_switch_scope_key(*scope);
-        pg::PgResult res = pg::exec_params(
-            lease.get(),
-            "SELECT plugin, action, enabled, reason, set_by, "
-            "(EXTRACT(EPOCH FROM updated_at) * 1000)::bigint "
-            "FROM plugin_config_store.kill_switches WHERE scope_key = $1",
-            std::vector<std::string>{action_key});
-        if (res.status() != PGRES_TUPLES_OK)
-            return std::unexpected(Error::Unavailable);
-        if (PQntuples(res.get()) > 0) {
-            auto entry = kill_switch_row(res.get(), 0);
-            entry.action = scope->action; // echo the requested action
-            return entry;
-        }
-    }
-
+    // One statement over every row that can influence this scope.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT plugin, action, enabled, reason, set_by, "
-        "(EXTRACT(EPOCH FROM updated_at) * 1000)::bigint "
-        "FROM plugin_config_store.kill_switches WHERE scope_key = $1",
-        std::vector<std::string>{plugin_key});
+        "(EXTRACT(EPOCH FROM updated_at) * 1000)::bigint, os "
+        "FROM plugin_config_store.kill_switches "
+        "WHERE plugin = $1 AND (action = '' OR action = $2)",
+        std::vector<std::string>{scope->plugin, scope->action});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(Error::Unavailable);
-    if (PQntuples(res.get()) > 0) {
-        auto entry = kill_switch_row(res.get(), 0);
-        entry.action = scope->action; // echo the requested action, not "" from the inherited row
-        return entry;
-    }
 
-    // No row at either level — the legitimate default state.
-    KillSwitchEntry def;
-    def.plugin = scope->plugin;
-    def.action = scope->action;
-    def.enabled = true;
-    return def;
+    std::vector<PluginConfigStore::KillSwitchEntry> rows;
+    std::vector<plugin_config::KillSwitchRowView> views;
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        rows.push_back(kill_switch_row(res.get(), i));
+    for (const auto& r : rows)
+        views.push_back({r.action, r.os, r.enabled});
+
+    // The effective state comes from the shared pure resolver so display and
+    // enforcement cannot drift.
+    const auto decision = plugin_config::resolve_kill_switch(scope->action, views);
+    const bool effective =
+        decision.has_value() && (scope->os.empty() || !decision->contains(scope->os));
+
+    // Per-layer winners, using the resolver's own fallback inside each layer
+    // (action row, else plugin row). A row that a more specific row of the same
+    // layer overrides never decided anything, so it is never attributed.
+    const auto find = [&rows](std::string_view a,
+                              std::string_view o) -> const PluginConfigStore::KillSwitchEntry* {
+        for (const auto& row : rows)
+            if (row.action == a && row.os == o)
+                return &row;
+        return nullptr;
+    };
+    const auto layer = [&find, &scope](std::string_view o) {
+        const auto* r = find(scope->action, o);
+        return r ? r : find("", o);
+    };
+    const PluginConfigStore::KillSwitchEntry* os_win = scope->os.empty() ? nullptr : layer(scope->os);
+    const PluginConfigStore::KillSwitchEntry* base_win = layer("");
+
+    // Attribute to the first disabling layer (OS layer first) when off, else the
+    // most specific winner.
+    const PluginConfigStore::KillSwitchEntry* pick = nullptr;
+    if (!effective) {
+        if (os_win && !os_win->enabled)
+            pick = os_win;
+        else if (base_win && !base_win->enabled)
+            pick = base_win;
+    } else {
+        pick = os_win ? os_win : base_win;
+    }
+    KillSwitchEntry out;
+    if (pick)
+        out = *pick;
+    out.plugin = scope->plugin;
+    out.action = scope->action; // echo the requested scope, not the inherited row's
+    out.os = scope->os;
+    out.enabled = effective;
+    if (pick) {
+        plugin_config::KillSwitchScope src{pick->plugin, pick->action, pick->os};
+        out.source = plugin_config::kill_switch_scope_key(src);
+    }
+    return out;
 }
 
 std::expected<PluginConfigStore::KillSwitchEntry, PluginConfigStore::Error>
 PluginConfigStore::set_kill_switch(std::string_view plugin, std::string_view action, bool enabled,
-                                   std::string_view reason, std::string_view set_by) {
+                                   std::string_view reason, std::string_view set_by,
+                                   std::string_view os) {
     if (!open_)
         return std::unexpected(Error::Unavailable);
-    auto scope = plugin_config::parse_kill_switch_scope(plugin, action);
+    auto scope = plugin_config::parse_kill_switch_scope(plugin, action, os);
     if (!scope || !plugin_config::is_valid_reason(reason) ||
         !plugin_config::is_valid_actor(set_by))
         return std::unexpected(Error::InvalidInput);
@@ -457,26 +487,29 @@ PluginConfigStore::set_kill_switch(std::string_view plugin, std::string_view act
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO plugin_config_store.kill_switches "
-        "  (scope_key, plugin, action, enabled, reason, set_by) "
-        "VALUES ($1, $2, $3, $4::boolean, $5, $6) "
+        "  (scope_key, plugin, action, enabled, reason, set_by, os) "
+        "VALUES ($1, $2, $3, $4::boolean, $5, $6, $7) "
         "ON CONFLICT (scope_key) DO UPDATE SET "
         "  enabled = EXCLUDED.enabled, reason = EXCLUDED.reason, set_by = EXCLUDED.set_by, "
         "  updated_at = now() "
         "RETURNING plugin, action, enabled, reason, set_by, "
-        "  (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint",
+        "  (EXTRACT(EPOCH FROM updated_at) * 1000)::bigint, os",
         std::vector<std::string>{scope_key, scope->plugin, scope->action,
                                  enabled ? "true" : "false", std::string(reason),
-                                 std::string(set_by)});
+                                 std::string(set_by), scope->os});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::unexpected(Error::WriteFailed);
-    return kill_switch_row(res.get(), 0);
+    auto entry = kill_switch_row(res.get(), 0);
+    entry.source = scope_key;
+    return entry;
 }
 
 bool PluginConfigStore::seed_kill_switch_default_off(std::string_view plugin,
-                                                      std::string_view reason) {
+                                                      std::string_view reason,
+                                                      std::string_view os) {
     if (!open_)
         return false;
-    auto scope = plugin_config::parse_kill_switch_scope(plugin, "");
+    auto scope = plugin_config::parse_kill_switch_scope(plugin, "", os);
     if (!scope || !plugin_config::is_valid_reason(reason) ||
         !plugin_config::is_valid_actor("system"))
         return false;
@@ -491,10 +524,11 @@ bool PluginConfigStore::seed_kill_switch_default_off(std::string_view plugin,
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO plugin_config_store.kill_switches "
-        "  (scope_key, plugin, action, enabled, reason, set_by) "
-        "VALUES ($1, $2, $3, FALSE, $4, 'system') "
+        "  (scope_key, plugin, action, enabled, reason, set_by, os) "
+        "VALUES ($1, $2, $3, FALSE, $4, 'system', $5) "
         "ON CONFLICT (scope_key) DO NOTHING",
-        std::vector<std::string>{scope_key, scope->plugin, scope->action, std::string(reason)});
+        std::vector<std::string>{scope_key, scope->plugin, scope->action, std::string(reason),
+                                 scope->os});
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::error("PluginConfigStore: kill-switch seed for {} failed: {}", plugin,
                       PQresultErrorMessage(res.get()));
@@ -504,65 +538,42 @@ bool PluginConfigStore::seed_kill_switch_default_off(std::string_view plugin,
 }
 
 bool PluginConfigStore::action_allowed(std::string_view plugin, std::string_view action) const {
+    return kill_switch_decision(plugin, action).has_value();
+}
+
+std::optional<std::unordered_set<std::string>>
+PluginConfigStore::kill_switch_decision(std::string_view plugin, std::string_view action) const {
     if (!open_)
-        return false; // degraded/unopened — fail closed, never "enabled"
+        return std::nullopt; // degraded/unopened — fail closed, never "enabled"
     auto scope = plugin_config::parse_kill_switch_scope(plugin, action);
     if (!scope)
-        return false; // an unresolvable scope must never resolve to "allowed"
+        return std::nullopt; // an unresolvable scope must never resolve to "allowed"
 
     auto lease = pool_.try_acquire_for(kKillSwitchCheckTimeout);
     if (!lease)
-        return false; // lease timeout — fail closed
+        return std::nullopt; // lease timeout — fail closed
 
-    const std::string plugin_key = plugin_config::kill_switch_scope_key({scope->plugin, ""});
-
-    if (!scope->action.empty()) {
-        // ONE statement covering both scope levels (not two sequential
-        // ones) — a single SELECT reads a single MVCC snapshot, so a
-        // concurrently-committed action-level disable can never land in a
-        // gap between "checked the action row" and "fell back to the
-        // plugin row" the way two separate autocommitted statements could
-        // (the TOCTOU this function exists to close).
-        const std::string action_key = plugin_config::kill_switch_scope_key(*scope);
-        pg::PgResult res = pg::exec_params(lease.get(),
-                                           "SELECT scope_key, enabled FROM "
-                                           "plugin_config_store.kill_switches "
-                                           "WHERE scope_key = $1 OR scope_key = $2",
-                                           std::vector<std::string>{action_key, plugin_key});
-        if (res.status() != PGRES_TUPLES_OK)
-            return false; // query failure — fail closed
-        bool have_action = false, action_enabled = false;
-        bool have_plugin = false, plugin_enabled = false;
-        const int rows = PQntuples(res.get());
-        for (int i = 0; i < rows; ++i) {
-            const std::string sk = col_str(res.get(), i, 0);
-            const bool enabled = to_bool(col(res.get(), i, 1));
-            if (sk == action_key) {
-                have_action = true;
-                action_enabled = enabled;
-            } else if (sk == plugin_key) {
-                have_plugin = true;
-                plugin_enabled = enabled;
-            }
-        }
-        if (have_action)
-            return action_enabled; // action-level row wins
-        if (have_plugin)
-            return plugin_enabled;
-        return true; // no row at either level — default "not killed"
-    }
-
-    pg::PgResult res =
-        pg::exec_params(lease.get(),
-                        "SELECT enabled FROM plugin_config_store.kill_switches "
-                        "WHERE scope_key = $1",
-                        std::vector<std::string>{plugin_key});
+    // ONE statement covering every scope level (not sequential ones) — a
+    // single SELECT reads a single MVCC snapshot, so a concurrently-committed
+    // disable can never land in a gap between "checked the action row" and
+    // "fell back to the plugin row" (the TOCTOU this function exists to close).
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT action, os, enabled FROM plugin_config_store.kill_switches "
+        "WHERE plugin = $1 AND (action = '' OR action = $2)",
+        std::vector<std::string>{scope->plugin, scope->action});
     if (res.status() != PGRES_TUPLES_OK)
-        return false; // query failure — fail closed
-    if (PQntuples(res.get()) > 0)
-        return to_bool(col(res.get(), 0, 0));
+        return std::nullopt; // query failure — fail closed
 
-    return true; // no row at either level — default "not killed"
+    const int n = PQntuples(res.get());
+    // The views point into `res`, which outlives them; resolve_kill_switch
+    // returns an owning set, so nothing escapes this scope.
+    std::vector<plugin_config::KillSwitchRowView> views;
+    views.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        views.push_back(
+            {col(res.get(), i, 0), col(res.get(), i, 1), to_bool(col(res.get(), i, 2))});
+    return plugin_config::resolve_kill_switch(scope->action, views);
 }
 
 } // namespace yuzu::server

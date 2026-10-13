@@ -520,6 +520,41 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        shipped REST/HTMX surface); wire reference:
        `docs/user-manual/rest-api.md`'s Hardware section.
 
+   - **2026-10-04 — local password change and admin reset
+     (`POST /api/v1/users/me/password`, `POST /api/v1/users/{name}/password`,
+     #5342).** REST-only, no MCP twin — a "no" on Decision 1/4's
+     both-surfaces requirement, recorded per route as `exception:` rows in
+     `scripts/ci/api-parity/rbac.json` (`docs/api-parity-ledger.md`).
+     Recorded rather than fixed pre-merge because:
+     - **Self-service change — a permanent exception.** An MCP caller is a
+       token, not the human. A token that could change its owner's password
+       turns a token leak into an account takeover (the new password locks
+       the owner out and admits the token holder interactively), so the
+       route refuses every token and MCP session (`403 token_session`) and
+       has no twin to build. Revisit only if MCP gains a human-presence
+       proof that a bearer token cannot replay.
+     - **Admin reset — a tracked follow-up, not a permanent exception.**
+       `UserManagement:Write` is approval-gated at the supervised MCP tier,
+       and an approval ticket persists the tool's `canonical_args` in
+       plaintext (`approvals.scope_expression`) and renders them to
+       approvers, so a password argument would be stored and displayed. The
+       twin to build takes no password argument: a server-generated
+       temporary password with a must-change-at-next-sign-in flag (auth
+       schema v3). Tracked as **#5357**; **revisit by 2027-01-04**. Until it
+       lands, this row stands as the open exception.
+     - **The exception relaxes no control.** Both routes accept interactive
+       dashboard sessions only, require a same-site `Origin`/`Referer` and
+       `Content-Type: application/json`, pass MFA step-up, and commit the
+       credential, the deletion of every session of the account and the
+       audit row in ONE transaction (`CredentialChangeOwner`) — an audit
+       failure makes no change. The admin reset is gated on the A2/A1
+       durable-Administrator predicate (`is_rbac_administrator(kRest)` + the
+       current-regime re-check), not an ordinary permission. A4 envelope
+       and OpenAPI entries hold for both (A2/A3 for the REST half).
+     - Design record: `docs/auth-architecture.md` "Local password change and
+       reset (#5342, #5274)"; wire reference: `docs/user-manual/rest-api.md`
+       (`POST /api/v1/users/me/password`).
+
    - **2026-10-04 — `GET /api/v1/network-elements/collector-targets` (ADR-0068 D6/D10, PR
      #5367; design-only until slice 1).** REST-only, no MCP twin, absent from operator route
      discovery — a **permanent** exception, not a tracked follow-up: the route's only caller is
@@ -529,6 +564,41 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      on a dedicated engine-principal predicate, fail-closed, all-or-503, audited per fetch — and
      every operator-facing behaviour of the capability (inventory, state, attachments,
      registration, credentials write-only) has REST + MCP twins.
+
+   - **2026-10-07 — software title catalogue (`GET /api/v1/inventory/software/catalogue`,
+     `GET /api/v1/inventory/software/catalogue/versions`) and its MCP twins
+     (`query_software_catalogue`, `get_software_versions`).**
+     The REST routes merged first and REST-only, a "no" on Decision 1/4's
+     both-surfaces requirement that was recorded rather than fixed pre-merge;
+     the MCP twins then landed over the same pure model, so both surfaces exist
+     now. What stays an exception:
+     - **A build-order gap that has closed, not a boundary.** The catalogue read
+       surface (shared pure model, totals, cursors, CSV export) landed first so
+       the MCP tools are a thin transport over the same model
+       (`docs/api-twin-recipe.md` Rule 1) instead of a second shaper. The
+       `titles` CSV export is REST-only by design (a download, not a structured
+       tool result).
+     - **#3988's remaining disposition is a decision, not this change's merge.**
+       The open P1 issue #3988 ("Inventory catalogue-grain read ... has no
+       REST/MCP twin") is answered on the twin half by the tools above; its
+       confinement criterion is superseded by the refuse-to-confined ruling.
+       **Revisit by 2026-11-07.**
+     - **The raw route's export is REST-only (`#5699`).**
+       `GET /api/v1/inventory/software?format=csv|json` has no MCP tool: an
+       agent pages the same rows through the cursor on `query_installed_software`,
+       and a bulk file is a human/automation convenience. **Revisit by
+       2026-11-07.**
+     - **The raw route's `q`, `kind`, `ecosystem` and `source` filters are
+       REST-only (`#5699`).** `query_installed_software` takes `name`,
+       `agent_id`, `version`, `limit` and `cursor` only; the parity ledger row
+       stays `twinned` on the paged shape and the gap is recorded in
+       `docs/api-parity-ledger.md`. **Revisit by 2026-11-07.**
+     - **The exception relaxes no control.** The fleet view is gated on a
+       global `Inventory:Read` (the per-device view is admitted in scope),
+       denies service-scoped tokens on the catalogue fleet view (the raw route
+       admits them, confined), audits every
+       served page or file, and answers a degraded read with `503`, never an
+       empty `200`; wire reference: `docs/user-manual/rest-api.md`.
 
 ## Interim rules (until the named follow-ups ship)
 

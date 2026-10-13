@@ -87,7 +87,7 @@ When reviewing another agent's Change Summary:
 
 This is the state `main` ships. `meson.build` Windows branch constructs `protobuf_dep` and `grpcpp_dep` from scratch using `find_library()` + `declare_dependency()` — Linux/macOS continue to use `dependency('protobuf', method: 'cmake', ...)` unchanged.
 
-If you are about to (a) remove the static-linkage override in the triplet, or (b) simplify `meson.build`'s Windows branch to use `method: 'cmake'`, **stop and read this section**. We've tried those and they don't work. The long-term escape from this trap is **moving off gRPC entirely — tracked as P1 in #376 (Strategic: Migrate transport off gRPC to QUIC)**.
+If you are about to (a) remove the static-linkage override in the triplet, or (b) simplify `meson.build`'s Windows branch to use `method: 'cmake'`, **stop and read this section**. We've tried those and they don't work. There is no escape hatch: gRPC is the permanent transport (ADR-0066 withdrew the #376 QUIC migration), so this configuration is permanent and load-bearing.
 
 ### Why this rule exists
 
@@ -180,7 +180,7 @@ The approach:
 
 ### Strategic escape: migrate off gRPC
 
-The long-term plan is to **eliminate the gRPC dependency entirely** — see **P1 #376 "Strategic: Migrate transport off gRPC to QUIC"**. QUIC (via MsQuic or similar) gives us the same reliable multiplexed bidirectional streams without the C++ ABI / CMake ecosystem tax, which would make the entire "Windows MSVC static-link history and #375" section obsolete history. It's deferred until current customer commitments ship because the transport rewrite touches agent, server, gateway, and the SDK — multi-week work that can't happen under a rollout pause.
+**Withdrawn (2026-10-08, ADR-0066):** the plan to eliminate the gRPC dependency by moving to QUIC (#376) was abandoned; gRPC is the permanent transport. Treat this section as live guidance, not obsolete-in-waiting history.
 
 ## Windows DLL-boundary absl hash seed mismatch (#501)
 

@@ -318,6 +318,8 @@ last_sync|1710849600
 stale|false
 check_interval|300
 change_count|4
+persist_failures|0
+last_persist_error|-
 ```
 
 **Get a single tag:**

@@ -16,7 +16,7 @@
  *     regenerates a `*_bundle.cpp` exposing the symbol as a
  *     `std::string` (or `std::string_view` for binary). Symbols covered
  *     here: `kEChartsJs`, `kThreeJs`, `kThreeOrbitControlsJs`,
- *     `kYuzuVizJs`, `kInterVariableWoff2`, `kYuzuCss`, `kYuzuChartsJs`.
+ *     `kYuzuVizJs`, the five `kIbmPlex*Woff2` fonts, `kYuzuCss`, `kYuzuChartsJs`.
  *
  * Plus the page HTML constant `kVizFleetPageHtml` from
  * `server/core/src/viz_page_ui.cpp` (separate TU at namespace scope).
@@ -46,7 +46,7 @@ extern const std::string kSseJs;
 
 // External symbols from build-time embed targets (governance Gate 3 QE-B1):
 //   * kEChartsJs            — embed_js.py over server/core/vendor/echarts.min.js
-//   * kInterVariableWoff2   — embed_binary.py over vendor/inter/InterVariable.woff2
+//   * kIbmPlex*Woff2        — embed_binary.py over vendor/ibm-plex/*.woff2 (one per weight)
 //   * kYuzuCss              — embed_js.py over server/core/static/yuzu.css
 //   * kYuzuChartsJs         — server/core/src/charts_js_bundle.cpp (hand-written)
 namespace yuzu::server {
@@ -54,7 +54,11 @@ extern const std::string kEChartsJs;
 extern const std::string kThreeJs;
 extern const std::string kThreeOrbitControlsJs;
 extern const std::string kYuzuVizJs;
-extern const std::string_view kInterVariableWoff2;
+extern const std::string_view kIbmPlexSans400Woff2;
+extern const std::string_view kIbmPlexSans500Woff2;
+extern const std::string_view kIbmPlexSans600Woff2;
+extern const std::string_view kIbmPlexMono400Woff2;
+extern const std::string_view kIbmPlexMono500Woff2;
 extern const std::string kYuzuCss;
 extern const std::string kYuzuChartsJs;
 } // namespace yuzu::server
@@ -70,12 +74,12 @@ namespace {
 constexpr std::size_t kExpectedHtmxBytes = 50918;
 constexpr std::size_t kExpectedSseBytes = 8897;
 // Pinned upstream byte counts. If you intentionally update vendor/, bump
-// these in lock-step. ECharts 5.6.0 minified is 1,034,102 bytes; Inter v4.0
-// variable woff2 is 345,588 bytes; Yuzu CSS bundle is content-addressed by
+// these in lock-step. ECharts 5.6.0 minified is 1,034,102 bytes; the IBM Plex
+// Latin1 woff2 files (IBM's @ibm/plex-sans 1.1.0 and @ibm/plex-mono 2.5.0)
+// are pinned per weight in kExpectedPlex below; Yuzu CSS bundle is content-addressed by
 // the source file and approximate-pinned (a 1% drift tolerance lets the
 // design system iterate without re-flowing this file every commit).
 constexpr std::size_t kExpectedEChartsBytes = 1'034'102;
-constexpr std::size_t kExpectedInterWoff2Bytes = 345'588;
 constexpr std::size_t kYuzuCssMinBytes = 20'000;   // ≥20 KB sanity floor
 constexpr std::size_t kYuzuChartsMinBytes = 6'000; // ≥6 KB adapter floor
 // Three.js r168 ES-module minified bundle + OrbitControls ES module
@@ -1018,25 +1022,50 @@ TEST_CASE("viz page: loads yuzu-viz.js as type=module", "[viz][page]") {
     CHECK_THAT(html, ContainsSubstring("<script type=\"module\" src=\"/static/yuzu-viz.js\">"));
 }
 
-TEST_CASE("viz page: nav highlights Fleet Viz when on the page", "[viz][page]") {
+TEST_CASE("viz page: nav highlights Fleet when on the page", "[viz][page]") {
     std::string html(kVizFleetPageHtml);
-    CHECK_THAT(html, ContainsSubstring("href=\"/viz/fleet\" class=\"nav-link active\""));
+    CHECK_THAT(html, ContainsSubstring("class=\"shell-nav on\" href=\"/viz/fleet\" aria-current=\"page\""));
 }
 
-// ── Inter variable webfont (woff2 binary) ───────────────────────────────────
+// ── IBM Plex webfonts (woff2 binary) ────────────────────────────────────────
 
-TEST_CASE("static_js_bundle: kInterVariableWoff2 has expected pinned size", "[static-js][inter]") {
-    CHECK(yuzu::server::kInterVariableWoff2.size() == kExpectedInterWoff2Bytes);
+namespace {
+struct PlexExpectation {
+    const char* name;
+    const std::string_view* bytes;
+    std::size_t size;
+};
+// Pinned to IBM's own prebuilt split Latin1 files: @ibm/plex-sans 1.1.0 and
+// @ibm/plex-mono 2.5.0 (fonts/split/woff2/*-Latin1.woff2). SHA-256 per file is
+// in server/core/vendor/ibm-plex/ibm-plex-NOTICE.txt.
+const PlexExpectation kExpectedPlex[] = {
+    {"sans-400", &yuzu::server::kIbmPlexSans400Woff2, 20'984},
+    {"sans-500", &yuzu::server::kIbmPlexSans500Woff2, 21'960},
+    {"sans-600", &yuzu::server::kIbmPlexSans600Woff2, 22'260},
+    {"mono-400", &yuzu::server::kIbmPlexMono400Woff2, 17'544},
+    {"mono-500", &yuzu::server::kIbmPlexMono500Woff2, 17'868},
+};
+} // namespace
+
+TEST_CASE("static_js_bundle: IBM Plex woff2 fonts have the expected pinned sizes",
+          "[static-js][plex]") {
+    for (const auto& f : kExpectedPlex) {
+        INFO("font: " << f.name);
+        CHECK(f.bytes->size() == f.size);
+    }
 }
 
-TEST_CASE("static_js_bundle: kInterVariableWoff2 begins with WOFF2 magic", "[static-js][inter]") {
-    REQUIRE(yuzu::server::kInterVariableWoff2.size() >= 4);
-    // WOFF2 file format: signature 0x774F4632 ('wOF2') at offset 0.
-    auto sv = yuzu::server::kInterVariableWoff2;
-    CHECK(static_cast<unsigned char>(sv[0]) == 0x77);
-    CHECK(static_cast<unsigned char>(sv[1]) == 0x4F);
-    CHECK(static_cast<unsigned char>(sv[2]) == 0x46);
-    CHECK(static_cast<unsigned char>(sv[3]) == 0x32);
+TEST_CASE("static_js_bundle: IBM Plex woff2 fonts begin with WOFF2 magic", "[static-js][plex]") {
+    for (const auto& f : kExpectedPlex) {
+        INFO("font: " << f.name);
+        REQUIRE(f.bytes->size() >= 4);
+        // WOFF2 file format: signature 0x774F4632 ('wOF2') at offset 0.
+        auto sv = *f.bytes;
+        CHECK(static_cast<unsigned char>(sv[0]) == 0x77);
+        CHECK(static_cast<unsigned char>(sv[1]) == 0x4F);
+        CHECK(static_cast<unsigned char>(sv[2]) == 0x46);
+        CHECK(static_cast<unsigned char>(sv[3]) == 0x32);
+    }
 }
 
 // ── Yuzu Design System CSS bundle ───────────────────────────────────────────
@@ -1054,7 +1083,49 @@ TEST_CASE("static_js_bundle: kYuzuCss carries the design-system token layer",
                ContainsSubstring("--mds-color-theme-accent-primary-normal"));
     CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("--mds-color-chart-1"));
     CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("@font-face"));
-    CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'Inter'"));
+    CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'IBM Plex Sans'"));
+    CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'IBM Plex Mono'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuCss variant hovers set an explicit colour and keep a page recolour",
+          "[static-js][yuzu-css]") {
+    // The variant hover rules (0,4,0) outrank a page's own one-class recolour
+    // (instruction_ui.cpp: .btn-danger{background:red;color:dark}). A hover
+    // that omits `color` leaves dark text on a 12% tint (1.25:1), and one
+    // that sets any background turns a green Execute blue. The primary hover
+    // therefore brightens with a filter and touches no background property,
+    // and the design bans gradients, so none may creep back into a hover.
+    // (The cascade itself is observed in a browser, not here; this pins the
+    // shape of the rules.)
+    auto block = [](std::string_view selector) {
+        const std::string& css = yuzu::server::kYuzuCss;
+        const auto at = css.find(selector);
+        REQUIRE(at != std::string::npos);
+        const auto end = css.find('}', at);
+        REQUIRE(end != std::string::npos);
+        return css.substr(at, end - at);
+    };
+    const std::string danger = block(":is(.btn-danger, .btn.danger):hover:not(:disabled) {");
+    CHECK_THAT(danger, ContainsSubstring(" color: var(--bad)"));
+    CHECK_THAT(danger, !ContainsSubstring("gradient"));
+    const std::string primary =
+        block(":is(.btn-primary, .btn-success, .btn.primary):hover:not(:disabled) {");
+    CHECK_THAT(primary, ContainsSubstring(" color: var(--on-primary)"));
+    // 1.1, not 1.2: at 1.2 a page-local green (#3dd68c) clamps to neon #49ffa8
+    // and the unstyled blue drifts towards cyan.
+    CHECK_THAT(primary, ContainsSubstring("filter: brightness(1.1)"));
+    CHECK_THAT(primary, !ContainsSubstring("background"));  // background, -color, -image
+    CHECK_THAT(primary, !ContainsSubstring("gradient"));
+    // The neutral hover (0,3,0) must skip the primary, or its `background`
+    // shorthand repaints a page-recoloured primary.
+    const std::string neutral = block(
+        ":is(.btn, .btn-secondary, .btn-danger, .btn-ghost, .btn-sm):hover:not(:disabled");
+    CHECK_THAT(neutral, ContainsSubstring(".btn-primary, .btn-success, .primary)"));
+    CHECK_THAT(neutral, !ContainsSubstring("gradient"));
+    // An armed button stays solid on hover: its own rule cancels the primary
+    // hover's filter.
+    const std::string armed = block(".btn-confirming.btn-confirming:hover:not(:disabled) {");
+    CHECK_THAT(armed, ContainsSubstring("filter: none"));
 }
 
 TEST_CASE("static_js_bundle: kYuzuCss has no embedded NULs", "[static-js][yuzu-css]") {
@@ -1086,6 +1157,21 @@ TEST_CASE("static_js_bundle: kYuzuChartsJs reads design-system chart tokens",
                ContainsSubstring("--mds-color-theme-background-solid-primary"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuChartsJs fallbacks are the slate values and the Plex stack",
+          "[static-js][yuzu-charts]") {
+    // tok(name, fallback) only falls back when yuzu.css failed to load, so
+    // nothing else observes these literals. They mirror the slate tokens
+    // (chart-1 blue, chart-grid, chart-tooltip-bg) and the IBM Plex stack.
+    const auto& js = yuzu::server::kYuzuChartsJs;
+    CHECK_THAT(js, ContainsSubstring("#4c9aff"));
+    CHECK_THAT(js, ContainsSubstring("#2a303a"));
+    CHECK_THAT(js, ContainsSubstring("#2b313c"));
+    CHECK_THAT(js, ContainsSubstring("'IBM Plex Sans',system-ui"));
+    // The previous palette and font fallback must be gone.
+    CHECK_THAT(js, !ContainsSubstring("#58a6ff"));
+    CHECK_THAT(js, !ContainsSubstring("BlinkMacSystemFont"));
+}
+
 TEST_CASE("static_js_bundle: kYuzuChartsJs has no embedded NULs", "[static-js][yuzu-charts]") {
     CHECK(yuzu::server::kYuzuChartsJs.find('\0') == std::string::npos);
 }
@@ -1098,6 +1184,57 @@ TEST_CASE("static_js_bundle: kYuzuChartsJs renders an empty-state message on no 
     // can't silently remove it.
     CHECK_THAT(yuzu::server::kYuzuChartsJs, ContainsSubstring("No data to plot."));
     CHECK_THAT(yuzu::server::kYuzuChartsJs, ContainsSubstring("isEmptyData"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuChartsJs surfaces a cut visualization result in-card",
+          "[static-js][yuzu-charts]") {
+    // The visualization route stamps rows_capped (row cap only) and
+    // result_truncated_by_cap + truncation_cause (row_cap | byte_cap) on a cut
+    // payload. The chart is fetched independently of the results table, so the
+    // adapter is the only place an operator can see that the picture is partial.
+    // Pin that it consumes all three fields and renders the notice with
+    // textContent (never innerHTML) from the payload.
+    const auto& js = yuzu::server::kYuzuChartsJs;
+    CHECK_THAT(js, ContainsSubstring("function truncationNotice"));
+    CHECK_THAT(js, ContainsSubstring("data.result_truncated_by_cap"));
+    CHECK_THAT(js, ContainsSubstring("data.rows_capped"));
+    CHECK_THAT(js, ContainsSubstring("data.truncation_cause"));
+    CHECK_THAT(js, ContainsSubstring("yuzu-chart-truncated"));
+    CHECK_THAT(js, ContainsSubstring("result-degrade-banner"));
+    CHECK_THAT(js, ContainsSubstring("note.textContent = msg"));
+    CHECK_THAT(js, ContainsSubstring("Partial result:"));
+    // The call itself: a defined-but-never-invoked helper must not satisfy this test.
+    // Anchored to a line start so a commented-out call does not satisfy it.
+    CHECK_THAT(js, ContainsSubstring("\n    truncationNotice(target, data);"));
+    // The call must also be REACHED. render() has exactly two legitimate early exits before
+    // it (the null guard and the deferred-until-echarts-loads branch); any further `return`
+    // between the function's opening line and the call would make the notice dead code while
+    // the string checks above stayed green (a `return;` inserted there did exactly that).
+    // Limit, stated plainly: this pins the known set of early exits in the source text. It
+    // does not execute the JS, so a throw or an always-false branch before the call would
+    // not be caught; the ad hoc headless-Chrome check in the commit notes covers behaviour.
+    {
+        const std::string open_marker = "\n  function render(target, data) {";
+        const std::string call_marker = "\n    truncationNotice(target, data);";
+        const auto open_at = js.find(open_marker);
+        const auto call_at = js.find(call_marker);
+        REQUIRE(open_at != std::string::npos);
+        REQUIRE(call_at != std::string::npos);
+        REQUIRE(open_at < call_at);
+        const std::string span = js.substr(open_at, call_at - open_at);
+        std::size_t returns = 0;
+        for (auto at = span.find("return"); at != std::string::npos;
+             at = span.find("return", at + 1))
+            ++returns;
+        CHECK(returns == 2);
+        // And the notice runs before the error and empty-state branches, which return.
+        const auto error_at = js.find("\n    if (data.error) {", call_at);
+        REQUIRE(error_at != std::string::npos);
+        CHECK(call_at < error_at);
+    }
+    // CSP is script-src 'self' 'unsafe-inline' with no unsafe-eval.
+    CHECK_THAT(js, !ContainsSubstring("new Function("));
+    CHECK_THAT(js, !ContainsSubstring("eval("));
 }
 
 // ── Per-host page shell (PR 9-pre, /viz/host/<agent_id>) ────────────────────

@@ -279,7 +279,8 @@ std::string_view dbus_error_name(const sd_bus_error& err) {
 bool handle_fwupd_failure(FirmwareReport& report, std::string_view dbus_name, int neg_rc,
                           std::string_view what) {
     const int e = neg_rc < 0 ? -neg_rc : EIO;
-    return apply_fwupd_failure(report, classify_fwupd_error(dbus_name, e), what, errno_token(e));
+    return apply_fwupd_failure(report, classify_fwupd_error(dbus_name, e), what, errno_token(e),
+                               dbus_name);
 }
 
 /// Reads a device array (reply signature 'aa{sv}', table rows 1-2) into
@@ -368,8 +369,8 @@ void query_upgrades(sd_bus* bus, FwupdBudget& budget, FirmwareReport& report, Fw
                                       &uerr.err, &ureply.m, "s", device_id.c_str());
     if (rc < 0) {
         // NothingToDo (no upgrade offered) -> HasUpgrades=false; anything else records a token.
-        if (apply_upgrades_failure(report, classify_fwupd_error(dbus_error_name(uerr.err), -rc),
-                                   errno_token(-rc)))
+        const auto uname = dbus_error_name(uerr.err);
+        if (apply_upgrades_failure(report, classify_fwupd_error(uname, -rc), errno_token(-rc), uname))
             dev["HasUpgrades"] = "false";
         return;
     }

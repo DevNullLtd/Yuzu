@@ -338,10 +338,35 @@ enum class KeyFormat { armored, binary, empty, unmodelled };
     return yuzu::util::safe_output_field(s);
 }
 
-[[nodiscard]] inline std::string url_field(std::string_view v) {
+/// `field` that also adds to `altered` the number of bytes scrub_wire_bytes replaced
+/// in what it emits (a NUL or a byte outside well-formed UTF-8).
+[[nodiscard]] inline std::string field(std::string_view v, std::size_t& altered) {
+    altered += yuzu::shared::count_invalid_wire_bytes(v);
+    return field(v);
+}
+
+/// A URL-bearing field, with `altered` counting only the replaced bytes that REACH
+/// THE WIRE. Userinfo is redacted first, so a bad byte inside it is gone before the
+/// scrub and is not counted. When bytes do need replacing, the conservative
+/// redact_after_last_at fallback runs, and only what survives it (the text after
+/// each word's last '@') is counted. Word boundaries are ASCII whitespace, which
+/// scrub_wire_bytes never alters, so the words before and after scrubbing are the
+/// same and the per-word count is exact.
+[[nodiscard]] inline std::string url_field(std::string_view v, std::size_t& altered) {
     std::string s = redact_url_userinfo(v);
-    if (yuzu::shared::scrub_wire_bytes(s) != 0)
+    std::size_t n = yuzu::shared::count_invalid_wire_bytes(s);
+    if (n != 0) {
+        n = 0;
+        for (const auto w : split_apt_words(s)) {
+            const std::size_t at = w.rfind('@');
+            n += yuzu::shared::count_invalid_wire_bytes(at == std::string_view::npos
+                                                            ? w
+                                                            : w.substr(at + 1));
+        }
+        yuzu::shared::scrub_wire_bytes(s);
         s = redact_after_last_at(s);
+    }
+    altered += n;
     return field(s);
 }
 
@@ -663,21 +688,24 @@ struct AptParseResult {
 }
 
 [[nodiscard]] inline std::string format_apt_source_row(std::string_view file, AptFormat fmt,
-                                                       const AptSourceFacts& f) {
+                                                       const AptSourceFacts& f,
+                                                       std::size_t* altered = nullptr) {
+    std::size_t local = 0;
+    std::size_t& a = altered != nullptr ? *altered : local;
     std::string out = "apt_source|";
-    out += field(file);
+    out += field(file, a);
     out += '|';
     out.append(apt_format_token(fmt));
     out += '|';
-    out += field(f.types);
+    out += field(f.types, a);
     out += '|';
-    out += url_field(f.uris);
+    out += url_field(f.uris, a);
     out += '|';
-    out += url_field(f.suites);
+    out += url_field(f.suites, a);
     out += '|';
-    out += url_field(f.components);
+    out += url_field(f.components, a);
     out += '|';
-    out += url_field(f.signed_by);
+    out += url_field(f.signed_by, a);
     out += '|';
     out.append(tri_token(f.trusted));
     out += '|';
@@ -716,17 +744,10 @@ struct AptParseResult {
                                                     std::string_view text,
                                                     std::vector<std::string>& rows,
                                                     std::size_t* altered = nullptr) {
-    using yuzu::shared::count_invalid_wire_bytes;
     const AptParseResult parsed =
         fmt == AptFormat::deb822 ? parse_apt_deb822(text) : parse_apt_one_line(text);
-    for (const auto& s : parsed.sources) {
-        if (altered != nullptr)
-            *altered += count_invalid_wire_bytes(logical_file) + count_invalid_wire_bytes(s.types) +
-                        count_invalid_wire_bytes(s.uris) + count_invalid_wire_bytes(s.suites) +
-                        count_invalid_wire_bytes(s.components) +
-                        count_invalid_wire_bytes(s.signed_by);
-        rows.push_back(format_apt_source_row(logical_file, fmt, s));
-    }
+    for (const auto& s : parsed.sources)
+        rows.push_back(format_apt_source_row(logical_file, fmt, s, altered));
     return parsed.malformed;
 }
 

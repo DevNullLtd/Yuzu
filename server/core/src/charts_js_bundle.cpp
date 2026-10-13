@@ -43,31 +43,31 @@ extern const std::string kYuzuChartsJs = R"JS((function () {
 
   function palette() {
     return [
-      tok('--mds-color-chart-1',  '#58a6ff'),
-      tok('--mds-color-chart-2',  '#04a77b'),
-      tok('--mds-color-chart-3',  '#9c5bd9'),
-      tok('--mds-color-chart-4',  '#f7b500'),
-      tok('--mds-color-chart-5',  '#e93e69'),
-      tok('--mds-color-chart-6',  '#6fbf40'),
-      tok('--mds-color-chart-7',  '#58c9f3'),
-      tok('--mds-color-chart-8',  '#c8208e'),
-      tok('--mds-color-chart-9',  '#ed7d31'),
-      tok('--mds-color-chart-10', '#8e51c8'),
-      tok('--mds-color-chart-11', '#b5bc36'),
-      tok('--mds-color-chart-12', '#ff6b81'),
+      tok('--mds-color-chart-1',  '#4c9aff'),
+      tok('--mds-color-chart-2',  '#2dd4bf'),
+      tok('--mds-color-chart-3',  '#f5c542'),
+      tok('--mds-color-chart-4',  '#ff6b7a'),
+      tok('--mds-color-chart-5',  '#a78bfa'),
+      tok('--mds-color-chart-6',  '#5cc8ff'),
+      tok('--mds-color-chart-7',  '#ff9f43'),
+      tok('--mds-color-chart-8',  '#3dd68c'),
+      tok('--mds-color-chart-9',  '#7ab6ff'),
+      tok('--mds-color-chart-10', '#67e8f9'),
+      tok('--mds-color-chart-11', '#c4b5fd'),
+      tok('--mds-color-chart-12', '#ff8fa0'),
     ];
   }
 
   function themeOption() {
-    var fg     = tok('--mds-color-theme-text-secondary', '#c9d1d9');
-    var muted  = tok('--mds-color-theme-text-tertiary',  '#8b949e');
-    var axis   = tok('--mds-color-chart-axis',           '#8b949e');
-    var grid   = tok('--mds-color-chart-grid',           '#30363d');
-    var tipBg  = tok('--mds-color-chart-tooltip-bg',     '#1c232c');
-    var tipFg  = tok('--mds-color-chart-tooltip-fg',     '#f4f5f6');
-    var tipBd  = tok('--mds-color-chart-tooltip-border', '#30363d');
+    var fg     = tok('--mds-color-theme-text-secondary', '#c4cad3');
+    var muted  = tok('--mds-color-theme-text-tertiary',  '#9aa2ae');
+    var axis   = tok('--mds-color-chart-axis',           '#9aa2ae');
+    var grid   = tok('--mds-color-chart-grid',           '#2a303a');
+    var tipBg  = tok('--mds-color-chart-tooltip-bg',     '#2b313c');
+    var tipFg  = tok('--mds-color-chart-tooltip-fg',     '#e9ecf0');
+    var tipBd  = tok('--mds-color-chart-tooltip-border', '#3c4452');
     var family = tok('--mds-font-family-default',
-                     '-apple-system,BlinkMacSystemFont,sans-serif');
+                     "'IBM Plex Sans',system-ui,sans-serif");
     return {
       color: palette(),
       backgroundColor: 'transparent',
@@ -124,13 +124,13 @@ extern const std::string kYuzuChartsJs = R"JS((function () {
         avoidLabelOverlap: true,
         itemStyle: {
           borderColor: tok('--mds-color-theme-background-solid-primary',
-                           '#161b22'),
+                           '#1b1f26'),
           borderWidth: 2, borderRadius: 4,
         },
-        label: { color: tok('--mds-color-theme-text-secondary', '#c9d1d9'),
+        label: { color: tok('--mds-color-theme-text-secondary', '#c4cad3'),
                  fontSize: 11 },
         labelLine: { lineStyle: { color: tok('--mds-color-chart-axis',
-                                              '#8b949e') } },
+                                              '#9aa2ae') } },
         data: pts,
       }],
     };
@@ -244,7 +244,7 @@ extern const std::string kYuzuChartsJs = R"JS((function () {
 
   function emptyState(target, msg) {
     target.innerHTML = '<div class="yuzu-chart-empty" style="padding:24px;'
-      + 'text-align:center;color:var(--mds-color-theme-text-tertiary,#888);'
+      + 'text-align:center;color:var(--mds-color-theme-text-tertiary,#9aa2ae);'
       + 'font:13px var(--mds-font-family-default,sans-serif);">'
       + escapeHtml(msg) + '</div>';
   }
@@ -253,6 +253,38 @@ extern const std::string kYuzuChartsJs = R"JS((function () {
     return String(s).replace(/[&<>"']/g, function (c) {
       return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]);
     });
+  }
+
+  // A chart built from a cut result is a wrong picture, not a smaller one.
+  // The visualization route says so with rows_capped (row cap only) and
+  // result_truncated_by_cap + truncation_cause (row_cap | byte_cap). Show it
+  // in the chart deck on its own full-width row directly above the card (the CSS
+  // rule for .yuzu-chart-truncated lives in dashboard_ui.cpp), and clear it on a
+  // re-render that is not cut.
+  // textContent only: nothing from the payload is interpreted as markup.
+  function truncationNotice(target, data) {
+    var prior = target.previousElementSibling;
+    if (prior && prior.classList && prior.classList.contains('yuzu-chart-truncated')) {
+      prior.parentNode.removeChild(prior);
+    }
+    var cut = !!(data && (data.result_truncated_by_cap || data.rows_capped));
+    if (!cut || !target.parentNode) return;
+    var msg;
+    if (data.truncation_cause === 'byte_cap') {
+      msg = 'Partial result: this chart was built from responses cut at the '
+          + '50 MiB payload cap, so some agents are missing from it.';
+    } else {
+      var n = Number(data.rows_cap);
+      msg = 'Partial result: this chart was built from the first '
+          + (n > 0 ? n.toLocaleString('en-US') : 'capped number of') + ' rows only, '
+          + 'so some agents are missing from it.';
+    }
+    var note = document.createElement('div');
+    note.className = 'result-degrade-banner yuzu-chart-truncated';
+    note.setAttribute('data-chart-truncated',
+        data.truncation_cause === 'byte_cap' ? 'byte_cap' : 'row_cap');
+    note.textContent = msg;
+    target.parentNode.insertBefore(note, target);
   }
 
   function chartHostHeight(target) {
@@ -271,6 +303,7 @@ extern const std::string kYuzuChartsJs = R"JS((function () {
       setTimeout(function () { render(target, data); }, 50);
       return;
     }
+    truncationNotice(target, data);
     if (data.error) { emptyState(target, data.error); return; }
     if (!data.chart_type) { emptyState(target, 'No chart type configured.'); return; }
 

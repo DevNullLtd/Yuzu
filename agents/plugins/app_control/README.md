@@ -92,6 +92,8 @@ Pipe-delimited rows via `write_output()`, the first field naming the row kind (`
 
 ### Result status
 
+`applocker_policy` falls back to the `SrpV2` registry walk only when the CIM answer is `class_absent`, and that is stage-aware: only `WBEM_E_INVALID_NAMESPACE` (`0x8004100e`) from `wmi_connect_failed_*`, or `WBEM_E_INVALID_CLASS` (`0x80041010`) from `wmi_query_failed_*` or from a `wmi_next_failed_*` that struck before any row was returned, is absence. The same HRESULT at any other stage (for example `wmi_next_failed_0x8004100e`, or `wmi_next_failed_0x80041010` after a row came back) is a fault and stays `CONSTRAINED`; `WBEM_E_NOT_FOUND` (`0x80041002`) is always a fault.
+
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
 | `OK` | FULL | `registry_ci_policy` | `wdac_policy`: every read succeeded |

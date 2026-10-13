@@ -312,6 +312,55 @@ TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave
     CHECK(description.find("all-time") == std::string::npos);
 }
 
+TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query parameter and "
+          "response shape (#5294)",
+          "[openapi][plugin_config][5294]") {
+    const auto& spec_json = yuzu::server::openapi_spec_json();
+    json spec = json::parse(spec_json, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/plugin-config/{plugin}/kill-switch"));
+    const auto& path_obj = spec["paths"]["/plugin-config/{plugin}/kill-switch"];
+
+    for (const char* method : {"get", "put"}) {
+        INFO("method: " << method);
+        REQUIRE(path_obj.contains(method));
+        const auto& op = path_obj[method];
+
+        const json* os_param = nullptr;
+        for (const auto& p : op["parameters"])
+            if (p.value("name", "") == "os")
+                os_param = &p;
+        REQUIRE(os_param != nullptr);
+        CHECK((*os_param)["in"] == "query");
+        CHECK((*os_param)["required"] == false);
+        CHECK((*os_param)["schema"]["enum"] == json::array({"windows", "linux", "darwin"}));
+
+        const std::string ok = op["responses"]["200"].value("description", "");
+        CHECK(ok.find("os") != std::string::npos);
+        CHECK(ok.find("source") != std::string::npos);
+
+        // The protective-set caveat is part of the published contract.
+        const std::string desc = op.value("description", "");
+        CHECK(desc.find("__guard__.push_rules") != std::string::npos);
+        CHECK(desc.find("unquarantine") != std::string::npos);
+        CHECK(desc.find(std::string(method) == "get" ? "dispatch still proceeds"
+                                                      : "no dispatch effect") !=
+              std::string::npos);
+
+        // ...and so are the parameter-level caveats: GET's `os` description and PUT's
+        // `enabled` property.
+        if (std::string(method) == "get") {
+            const std::string os_desc = (*os_param).value("description", "");
+            CHECK(os_desc.find("never gates dispatch") != std::string::npos);
+        } else {
+            const auto& enabled =
+                op["requestBody"]["content"]["application/json"]["schema"]["properties"]["enabled"];
+            const std::string enabled_desc = enabled.value("description", "");
+            CHECK(enabled_desc.find("no dispatch effect") != std::string::npos);
+        }
+    }
+}
+
 TEST_CASE("openapi_spec_json(): every $ref (including discriminator.mapping "
           "values) resolves to an existing component",
           "[openapi][refs]") {

@@ -1063,24 +1063,37 @@ ApiTokenStore::get_token(const std::string& token_id) const {
 
 std::vector<ApiToken>
 ApiTokenStore::list_active_for_principal(const std::string& principal_id) const {
+    // Both failure arms of the checked twin collapse to an empty vector here:
+    // this accessor's positive-read contract (rotation_confirm_state.hpp) is
+    // that an empty vector is indistinguishable from a genuine
+    // zero-active-credentials read by ANY caller. That is fine for a
+    // destructive in-transaction consumer (stays retryable), but #2443's
+    // precondition caller has no other signal to notice a persistent fault
+    // here — the warn line the checked twin writes is that signal for
+    // on-call, since the caller itself denies-without-consuming either way
+    // and cannot distinguish the causes from the return value alone. A caller
+    // that must tell "none" from "could not read" uses
+    // list_active_for_principal_checked directly (#5342 Gate 7).
+    auto checked = list_active_for_principal_checked(principal_id);
+    if (!checked)
+        return {};
+    return std::move(*checked);
+}
+
+std::expected<std::vector<ApiToken>, std::string>
+ApiTokenStore::list_active_for_principal_checked(const std::string& principal_id) const {
     std::vector<ApiToken> result;
-    if (!open_ || principal_id.empty())
+    if (!open_)
+        return std::unexpected(std::string("token store is not open"));
+    if (principal_id.empty())
         return result;
 
-    // Both early returns below share rotation_confirm_state.hpp's positive-read
-    // contract: an empty vector here is indistinguishable from a genuine
-    // zero-active-credentials read by ANY caller of this public accessor. That
-    // is fine for a destructive in-transaction consumer (stays retryable), but
-    // #2443's precondition caller has no other signal to notice a persistent
-    // fault here — the warn line is that signal for on-call, since the caller
-    // itself denies-without-consuming either way and cannot distinguish the
-    // causes from the return value alone.
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         spdlog::warn("ApiTokenStore::list_active_for_principal: pool lease timed out for "
                      "principal_id={}",
                      principal_id);
-        return result;
+        return std::unexpected(std::string("pool lease timed out"));
     }
 
     const auto now = now_epoch();
@@ -1095,7 +1108,7 @@ ApiTokenStore::list_active_for_principal(const std::string& principal_id) const 
         spdlog::warn("ApiTokenStore::list_active_for_principal: query failed for "
                      "principal_id={}: {}",
                      principal_id, PQerrorMessage(lease.get()));
-        return result;
+        return std::unexpected(std::string("query failed"));
     }
 
     const int rows = PQntuples(res.get());

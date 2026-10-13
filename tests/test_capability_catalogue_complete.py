@@ -94,6 +94,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_privacy_permissions.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_system_hardening.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_pkg_inventory.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_mgmt_posture.hpp",
 ]
 CORE_FILE = "server/core/src/capability_decls/core_dispatch_capabilities.hpp"
 

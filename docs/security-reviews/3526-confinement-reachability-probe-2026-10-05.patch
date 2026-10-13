@@ -1,0 +1,529 @@
+diff --git a/tests/meson.build b/tests/meson.build
+index 5a525b4ee..f239079f2 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -1526,6 +1526,7 @@ if build_server
+       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
+       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
+       'unit/server/test_authz_gates.cpp', # service-scope-confinement PR2: require_fleet_read / confine_agent_target
++      'unit/server/test_zz_confinement_probe.cpp', # TEMP PROBE - never commit
+       'unit/server/test_agent_properties_scope_authz.cpp', # #3700: require_scoped_permission on /api/agents/:id/properties
+       'unit/server/test_authz_topology_floor.cpp', # #2376: the RBAC-off legacy-fallback topology floor (AccessReview/UserManagement/EnginePrincipal Read)
+       'unit/server/test_body_cap_policy.cpp', # #2407: pre-auth request-body cap policy table (method+segment-boundary path -> cap/requires_measurable/metric label)
+--- /dev/null	2026-09-30 14:57:23.753781275 +0100
++++ b/tests/unit/server/test_zz_confinement_probe.cpp	2026-10-04 22:38:56.928665861 +0100
+@@ -0,0 +1,514 @@
++// TEMPORARY Step-0 reachability probe (#3526 / #4644 execution-surface confinement).
++// NOT TO BE COMMITTED. Drives the REAL AuthRoutes::require_permission /
++// require_fleet_read / require_auth over a real RbacStore + ManagementGroupStore +
++// ApiTokenStore + TagStore + ExecutionTracker + ResponseStore, through:
++//   (1) WorkflowRoutes GET /fragments/executions          (plain perm_fn)
++//   (2) McpServer tools/call summarize_working_set kind=execution (plain perm_fn)
++//   (3) response::register_response_routes legacy GET /api/responses/{id}[/aggregate]
++// and compares against the v1 twins (RestApiV1 GET /api/v1/executions, /api/v1/responses/{id}).
++
++#include "audit_store.hpp"
++#include "auth_routes.hpp"
++#include "authz_gates.hpp"
++#include "engine_principal_store.hpp"
++#include "execution_tracker.hpp"
++#include "instruction_store.hpp"
++#include "management_group_store.hpp"
++#include "mcp_server.hpp"
++#include "oidc_provider.hpp"
++#include "pg/pg_pool.hpp"
++#include "pg/pg_raii.hpp"
++#include "rbac_store.hpp"
++#include "response_routes.hpp"
++#include "response_store.hpp"
++#include "rest_api_v1.hpp"
++#include "service_scope_policy.hpp"
++#include "tag_store.hpp"
++#include "test_api_token_pg_helper.hpp"
++#include "test_mgmt_group_pg_helper.hpp"
++#include "test_route_sink.hpp"
++#include "workflow_routes.hpp"
++
++#include "../test_helpers.hpp"
++
++#include <yuzu/server/auth.hpp>
++#include <yuzu/server/server.hpp>
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <httplib.h>
++#include <nlohmann/json.hpp>
++
++#include <chrono>
++#include <fstream>
++#include <memory>
++#include <shared_mutex>
++#include <string>
++#include <unordered_set>
++#include <vector>
++
++using namespace yuzu::server;
++namespace pg = yuzu::server::pg;
++using pg::PgPool;
++
++namespace {
++
++yuzu::test::PgTestTemplate confprobe_tpl{"confprobe_all", [](const std::string& dsn) {
++    PgPool pool{{.conninfo = dsn, .size = 1}};
++    RbacStore rbac{pool};
++    if (!rbac.is_open())
++        throw std::runtime_error("confprobe tpl: rbac");
++    TagStore tags{pool};
++    if (!tags.is_open())
++        throw std::runtime_error("confprobe tpl: tags");
++    ExecutionTracker et{pool};
++    if (!et.is_open())
++        throw std::runtime_error("confprobe tpl: exec tracker");
++    ResponseStore rs{pool, 0};
++    if (!rs.is_open())
++        throw std::runtime_error("confprobe tpl: response store");
++    InstructionStore is{pool};
++    if (!is.is_open())
++        throw std::runtime_error("confprobe tpl: instruction store");
++    AuditStore as{pool};
++    if (!as.is_open())
++        throw std::runtime_error("confprobe tpl: audit store");
++}};
++
++int64_t now_epoch() {
++    return std::chrono::duration_cast<std::chrono::seconds>(
++               std::chrono::system_clock::now().time_since_epoch())
++        .count();
++}
++
++void out_line(const std::string& s) {
++    std::ofstream f(std::string(std::getenv("HOME")) + "/yuzu-scratch/confinement-probe/probe-results.txt",
++                    std::ios::app);
++    f << s << "\n";
++}
++
++struct AuditRow {
++    std::string action, result, target_type, target_id, detail;
++};
++
++struct Rig {
++    Config cfg{};
++    auth::AuthManager auth_mgr{};
++    PgPool pool;
++    RbacStore rbac;
++    yuzu::test::ManagementGroupStorePg mgmt_bundle;
++    ManagementGroupStore& mgmt = *mgmt_bundle;
++    yuzu::test::ApiTokenStorePg api_tokens;
++    TagStore tags;
++    PgPool audit_pool;
++    AuditStore audit_store;
++    std::shared_mutex oidc_mu;
++    std::unique_ptr<oidc::OidcProvider> oidc_provider;
++    std::unique_ptr<AuthRoutes> ar;
++    ExecutionTracker tracker;
++    ResponseStore responses;
++
++    std::string gG, gO; // G = the confined group (a_in); O = other group (a_out)
++    std::string x1, x2; // execution ids
++    std::vector<AuditRow> audits;
++    bool audit_ok{true};
++
++    explicit Rig(const std::string& dsn)
++        : pool{{.conninfo = dsn, .size = 6}}, rbac{pool}, tags{pool},
++          audit_pool{{.conninfo = dsn, .size = 2}}, audit_store{audit_pool}, tracker{pool},
++          responses{pool, 0} {
++        REQUIRE(rbac.is_open());
++        REQUIRE(tracker.is_open());
++        REQUIRE(responses.is_open());
++        rbac.set_rbac_enabled(true);
++
++        for (auto [role, type] : std::vector<std::pair<std::string, std::string>>{
++                 {"ExecReadG", "Execution"}, {"RespReadG", "Response"}, {"InfraReadG", "Infrastructure"}}) {
++            REQUIRE(rbac.create_role({role, "", false, 0}).has_value());
++            REQUIRE(rbac.set_permission({role, type, "Read", "allow"}).has_value());
++        }
++        // gary: GLOBAL Execution:Read + Response:Read + Infrastructure:Read.
++        for (auto role : {"ExecReadG", "RespReadG", "InfraReadG"})
++            REQUIRE(rbac.assign_role({"user", "gary", role}).has_value());
++        // bob: ONLY Infrastructure:Read globally (MCP generic gate); Execution:Read and
++        // Response:Read ONLY through management group G.
++        REQUIRE(rbac.assign_role({"user", "bob", "InfraReadG"}).has_value());
++
++        gG = mk_group("G");
++        gO = mk_group("O");
++        REQUIRE(mgmt.add_member(gG, "a_in").has_value());
++        REQUIRE(mgmt.add_member(gO, "a_out").has_value());
++        REQUIRE(mgmt.assign_role({gG, "user", "bob", "ExecReadG"}).has_value());
++        REQUIRE(mgmt.assign_role({gG, "user", "bob", "RespReadG"}).has_value());
++
++        REQUIRE(tags.set_tag("a_in", "service", "printers").has_value());
++
++        REQUIRE(auth_mgr.upsert_user("gary", "correct-horse-battery-staple", auth::Role::user));
++        REQUIRE(auth_mgr.upsert_user("bob", "correct-horse-battery-staple", auth::Role::user));
++
++        ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(), &audit_store,
++                                          &mgmt, &tags, nullptr, oidc_mu, oidc_provider);
++        seed();
++    }
++
++    std::string mk_group(const std::string& name) {
++        ManagementGroup g;
++        g.name = name;
++        g.membership_type = "static";
++        auto id = mgmt.create_group(g);
++        REQUIRE(id.has_value());
++        return *id;
++    }
++
++    void seed() {
++        // X1: fans out to a_in (success) AND a_out (failure, secret error)
++        {
++            Execution e;
++            e.definition_id = "def-MIXED";
++            e.dispatched_by = "carol";
++            e.status = "completed";
++            e.dispatched_at = 1735689600;
++            e.agents_targeted = 2;
++            auto id = tracker.create_execution(e);
++            REQUIRE(id.has_value());
++            x1 = *id;
++            AgentExecStatus a;
++            a.agent_id = "a_in";
++            a.status = "success";
++            a.completed_at = 1735689610;
++            tracker.update_agent_status(x1, a);
++            AgentExecStatus b;
++            b.agent_id = "a_out";
++            b.status = "failure";
++            b.completed_at = 1735689620;
++            b.error_detail = "SECRET-OUT-ERR-X1";
++            tracker.update_agent_status(x1, b);
++        }
++        // X2: ONLY a_out (completely outside G)
++        {
++            Execution e;
++            e.definition_id = "def-OUTONLY";
++            e.dispatched_by = "carol";
++            e.status = "completed";
++            e.dispatched_at = 1735689601;
++            e.agents_targeted = 1;
++            auto id = tracker.create_execution(e);
++            REQUIRE(id.has_value());
++            x2 = *id;
++            AgentExecStatus b;
++            b.agent_id = "a_out";
++            b.status = "failure";
++            b.completed_at = 1735689630;
++            b.error_detail = "SECRET-OUT-ERR-X2";
++            tracker.update_agent_status(x2, b);
++        }
++        // legacy responses (instruction_id "cmd-1")
++        StoredResponse r1;
++        r1.instruction_id = "cmd-1";
++        r1.agent_id = "a_in";
++        r1.timestamp = 1735689610;
++        r1.output = "IN-OUTPUT";
++        r1.status = 0;
++        responses.store(r1);
++        StoredResponse r2 = r1;
++        r2.agent_id = "a_out";
++        r2.output = "SECRET-OUT-OUTPUT";
++        responses.store(r2);
++    }
++
++    std::string mint(const std::string& user, const std::string& scope_service = {},
++                     const std::string& tier = {}) {
++        auto raw = api_tokens->create_token("probe", user, now_epoch() + 3600, scope_service, tier);
++        REQUIRE(raw.has_value());
++        return *raw;
++    }
++
++    // adapters wired exactly as server.cpp does
++    auto auth_fn() {
++        return [this](const httplib::Request& req,
++                      httplib::Response& res) -> std::optional<auth::Session> {
++            return ar->require_auth(req, res);
++        };
++    }
++    auto perm_fn() {
++        return [this](const httplib::Request& req, httplib::Response& res, const std::string& t,
++                      const std::string& o) -> bool { return ar->require_permission(req, res, t, o); };
++    }
++    auto fleet_read_fn() {
++        return [this](const httplib::Request& req, httplib::Response& res, const std::string& t,
++                      const std::string& o) -> authz::FleetReadGate {
++            auto result = ar->require_fleet_read(req, res, t, o);
++            if (!result)
++                return {};
++            return {true, result->visible_for_query()};
++        };
++    }
++    auto audit_fn() {
++        return [this](const httplib::Request&, const std::string& a, const std::string& r,
++                      const std::string& tt, const std::string& ti, const std::string& d) -> bool {
++            audits.push_back({a, r, tt, ti, d});
++            return audit_ok;
++        };
++    }
++};
++
++struct Resp {
++    int status{0};
++    std::string body;
++};
++
++std::string describe_scope(const authz::FleetReadGate& g) {
++    if (!g.admitted)
++        return "DENIED";
++    if (!g.scope)
++        return "ADMIT-ALL(unfiltered)";
++    std::string s = "SCOPED{";
++    for (auto& a : *g.scope)
++        s += a + ",";
++    return s + "}";
++}
++
++// --- surface callers ------------------------------------------------------
++
++Resp call_fragment(Rig& r, const std::string& token) {
++    yuzu::server::test::TestRouteSink sink;
++    WorkflowRoutes routes;
++    WorkflowRoutes::Deps d;
++    d.auth_fn = r.auth_fn();
++    d.perm_fn = r.perm_fn();
++    d.fleet_read_fn = r.fleet_read_fn();
++    d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
++                    const std::string&, const std::string&, const std::string&) {};
++    d.execution_tracker = &r.tracker;
++    routes.register_routes(sink, std::move(d));
++    auto res = sink.dispatch("GET", "/fragments/executions", {}, "application/json",
++                             {{"Authorization", "Bearer " + token}});
++    REQUIRE(res);
++    return {res->status, res->body};
++}
++
++Resp call_mcp_summarize(Rig& r, const std::string& token, const std::string& exec_id) {
++    yuzu::server::mcp::McpServer mcp;
++    bool read_only = false, mcp_disabled = false;
++    auto handler = mcp.build_handler(
++        r.auth_fn(), r.perm_fn(),
++        [&r](const httplib::Request& q, const std::string& a, const std::string& re,
++             const std::string& tt, const std::string& ti, const std::string& d) -> bool {
++            return r.audit_fn()(q, a, re, tt, ti, d);
++        },
++        []() -> nlohmann::json { return nlohmann::json::array(); }, &r.rbac,
++        /*instruction_store=*/nullptr, &r.tracker, &r.responses,
++        /*audit_store=*/nullptr, /*tag_store=*/&r.tags, /*inventory_store=*/nullptr,
++        /*policy_store=*/nullptr, &r.mgmt, /*approval_manager=*/nullptr,
++        /*schedule_engine=*/nullptr, read_only, mcp_disabled);
++    httplib::Request req;
++    req.method = "POST";
++    req.path = "/mcp/v1/";
++    req.body = std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"summarize_working_set","arguments":{"kind":"execution","id":")") +
++               exec_id + R"("}}})";
++    req.set_header("Content-Type", "application/json");
++    req.set_header("Authorization", "Bearer " + token);
++    httplib::Response res;
++    res.status = 200;
++    handler(req, res);
++    return {res.status, res.body};
++}
++
++struct V1 {
++    yuzu::server::test::TestRouteSink sink;
++    RestApiV1 api;
++    explicit V1(Rig& r) {
++        api.register_routes(sink, r.auth_fn(), r.perm_fn(), r.audit_fn(),
++                            /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
++                            /*quarantine_store=*/nullptr, &r.responses,
++                            /*instruction_store=*/nullptr, &r.tracker,
++                            /*schedule_engine=*/nullptr, /*approval_manager=*/nullptr,
++                            /*tag_store=*/nullptr, /*audit_store=*/nullptr,
++                            /*service_group_fn=*/{}, /*tag_push_fn=*/{}, /*inventory_store=*/nullptr,
++                            /*product_pack_store=*/nullptr, /*sw_deploy_store=*/nullptr,
++                            /*device_token_store=*/nullptr, /*license_store=*/nullptr,
++                            /*guaranteed_state_store=*/nullptr, /*metrics_registry=*/nullptr,
++                            /*session_revoke_fn=*/{}, /*execution_event_bus=*/nullptr,
++                            /*result_set_store=*/nullptr, /*command_dispatch_fn=*/{},
++                            /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{},
++                            /*network_api=*/{}, /*lockout_clear_fn=*/{}, /*baseline_store=*/nullptr,
++                            /*scoped_perm_fn=*/{}, /*software_inventory_store=*/nullptr,
++                            /*response_scope_fn=*/{}, /*engine_principal_store=*/nullptr,
++                            /*access_review_store=*/nullptr, /*auth_db=*/nullptr,
++                            /*directory_sync=*/nullptr, /*stream_budget=*/nullptr,
++                            /*exec_visible_fn=*/{}, /*list_read_fn=*/{},
++                            /*fleet_read_fn=*/r.fleet_read_fn());
++    }
++    Resp get(const std::string& path, const std::string& token) {
++        auto res = sink.dispatch("GET", path, {}, "application/json",
++                                 {{"Authorization", "Bearer " + token}});
++        REQUIRE(res);
++        return {res->status, res->body};
++    }
++};
++
++Resp call_legacy_resp(Rig& r, const std::string& path, const std::string& token) {
++    yuzu::server::test::TestRouteSink sink;
++    response::Deps d;
++    d.fleet_read_fn = r.fleet_read_fn();
++    d.audit_fn = r.audit_fn();
++    d.store = &r.responses;
++    response::register_response_routes(sink, std::move(d));
++    auto res =
++        sink.dispatch("GET", path, {}, "application/json", {{"Authorization", "Bearer " + token}});
++    REQUIRE(res);
++    return {res->status, res->body};
++}
++
++bool has(const std::string& hay, const std::string& needle) {
++    return hay.find(needle) != std::string::npos;
++}
++
++struct Principal {
++    std::string name, token;
++};
++
++void probe_principal(Rig& r, const std::string& mode, const Principal& p) {
++    httplib::Request req;
++    req.set_header("Authorization", "Bearer " + p.token);
++    httplib::Response res_plain;
++    const bool plain = r.ar->require_permission(req, res_plain, "Execution", "Read");
++    httplib::Response res_fleet;
++    auto fgate = r.fleet_read_fn()(req, res_fleet, "Execution", "Read");
++
++    auto frag = call_fragment(r, p.token);
++    auto mcp_x2 = call_mcp_summarize(r, p.token, r.x2);
++    auto mcp_missing = call_mcp_summarize(r, p.token, "no-such-exec");
++    V1 v1{r};
++    auto v1list = v1.get("/api/v1/executions", p.token);
++
++    auto leaks = [](const Resp& x) {
++        return has(x.body, "SECRET-OUT") || has(x.body, "def-OUTONLY") || has(x.body, "carol") ||
++               has(x.body, "targeted=1");
++    };
++    out_line("[" + mode + "] principal=" + p.name + " plain(Execution:Read)=" +
++             (plain ? "ADMIT" : "DENY(" + std::to_string(res_plain.status) + ")") +
++             " fleet_read=" + describe_scope(fgate) + "(" + std::to_string(res_fleet.status) + ")");
++    out_line("    (1) fragment: status=" + std::to_string(frag.status) +
++             " out_of_scope_data=" + (leaks(frag) ? "YES" : "no") +
++             " rows_def-OUTONLY=" + (has(frag.body, "def-OUTONLY") ? "yes" : "no") +
++             " SECRET-OUT-ERR=" + (has(frag.body, "SECRET-OUT-ERR") ? "yes" : "no"));
++    out_line("    (2) mcp summarize(X2 out-of-scope-only): status=" + std::to_string(mcp_x2.status) +
++             " reveals_exec=" + (has(mcp_x2.body, "is failure") || has(mcp_x2.body, "targeted=") ? "YES" : "no") +
++             " vs not-found=" + (has(mcp_missing.body, "was not found") ? "oracle-distinguishable" : "n/a") +
++             " | body=" + mcp_x2.body.substr(0, 220));
++    out_line("    (v1 twin) GET /api/v1/executions: status=" + std::to_string(v1list.status) +
++             " includes_def-OUTONLY=" + (has(v1list.body, "def-OUTONLY") ? "yes" : "no") +
++             " SECRET-OUT-ERR=" + (has(v1list.body, "SECRET-OUT-ERR") ? "yes" : "no"));
++}
++
++} // namespace
++
++TEST_CASE("confprobe: RBAC ON matrix (fragment / MCP / v1 twin)", "[pg][confprobe]") {
++    YUZU_REQUIRE_PG_DB_TPL(db, confprobe_tpl);
++    Rig r{db.dsn()};
++    out_line("=== RBAC ON ===");
++
++    std::vector<Principal> ps{
++        {"P_global(gary)", r.mint("gary")},
++        {"P_scoped(bob)", r.mint("bob")},
++        {"P_service(bob,svc=printers)", r.mint("bob", "printers")},
++        {"P_service(gary,svc=printers)", r.mint("gary", "printers")},
++        {"P_mcp_readonly(bob)", r.mint("bob", {}, "readonly")},
++        {"P_mcp_operator(bob)", r.mint("bob", {}, "operator")},
++        {"P_mcp_supervised(bob)", r.mint("bob", {}, "supervised")},
++        {"P_mcp_readonly(gary)", r.mint("gary", {}, "readonly")},
++        {"P_mcp_svc(bob,readonly,svc)", r.mint("bob", "printers", "readonly")},
++    };
++    for (auto& p : ps)
++        probe_principal(r, "RBAC-ON", p);
++
++    // ---- assertions (the headline claims) ----
++    auto frag_bob = call_fragment(r, ps[1].token);
++    CHECK(frag_bob.status == 403); // scoped-only principal DENIED by plain gate
++    auto frag_gary = call_fragment(r, ps[0].token);
++    CHECK(frag_gary.status == 200);
++    CHECK(has(frag_gary.body, "def-OUTONLY"));
++    auto frag_svc = call_fragment(r, ps[2].token);
++    CHECK(frag_svc.status == 403);
++    auto mcp_bob = call_mcp_summarize(r, ps[4].token, r.x2);
++    CHECK(mcp_bob.status == 403);
++    CHECK_FALSE(has(mcp_bob.body, "targeted="));
++}
++
++TEST_CASE("confprobe: RBAC OFF matrix", "[pg][confprobe]") {
++    YUZU_REQUIRE_PG_DB_TPL(db, confprobe_tpl);
++    Rig r{db.dsn()};
++    r.rbac.set_rbac_enabled(false);
++    out_line("=== RBAC OFF ===");
++    std::vector<Principal> ps{
++        {"P_global(gary)", r.mint("gary")},
++        {"P_scoped(bob)", r.mint("bob")},
++        {"P_service(bob,svc=printers)", r.mint("bob", "printers")},
++        {"P_mcp_readonly(bob)", r.mint("bob", {}, "readonly")},
++    };
++    for (auto& p : ps)
++        probe_principal(r, "RBAC-OFF", p);
++}
++
++TEST_CASE("confprobe: legacy /api/responses audit asymmetry vs v1 twin", "[pg][confprobe]") {
++    YUZU_REQUIRE_PG_DB_TPL(db, confprobe_tpl);
++    Rig r{db.dsn()};
++    out_line("=== LEGACY RESPONSES AUDIT ===");
++    auto bob = r.mint("bob");
++    auto gary = r.mint("gary");
++
++    for (auto [who, tok] : std::vector<std::pair<std::string, std::string>>{{"bob(scoped)", bob},
++                                                                            {"gary(global)", gary}}) {
++        for (bool audit_ok : {true, false}) {
++            r.audit_ok = audit_ok;
++            for (std::string path : {"/api/responses/cmd-1", "/api/responses/cmd-1/aggregate"}) {
++                r.audits.clear();
++                auto lg = call_legacy_resp(r, path, tok);
++                std::string rows;
++                for (auto& a : r.audits)
++                    rows += a.action + "/" + a.result + "(" + a.detail + ") ";
++                out_line("legacy " + path + " principal=" + who + " audit_persists=" +
++                         (audit_ok ? "yes" : "NO") + " -> status=" + std::to_string(lg.status) +
++                         " out_of_scope_data=" + (has(lg.body, "SECRET-OUT") ? "YES" : "no") +
++                         " in_scope_data=" + (has(lg.body, "IN-OUTPUT") || has(lg.body, "groups") ? "yes" : "no") +
++                         " audit_rows=[" + rows + "]");
++                std::string v1path = path.rfind("/aggregate") != std::string::npos
++                                         ? "/api/v1/responses/cmd-1/aggregate"
++                                         : "/api/v1/responses/cmd-1";
++                r.audits.clear();
++                V1 v1{r};
++                auto vr = v1.get(v1path, tok);
++                rows.clear();
++                for (auto& a : r.audits)
++                    rows += a.action + "/" + a.result + "(" + a.detail + ") ";
++                out_line("  v1 twin " + v1path + " principal=" + who + " audit_persists=" +
++                         (audit_ok ? "yes" : "NO") + " -> status=" + std::to_string(vr.status) +
++                         " out_of_scope_data=" + (has(vr.body, "SECRET-OUT") ? "YES" : "no") +
++                         " audit_rows=[" + rows + "]");
++            }
++        }
++    }
++}
++
++TEST_CASE("confprobe: engine principals (RBAC ON)", "[pg][confprobe]") {
++    YUZU_REQUIRE_PG_DB_TPL(db, confprobe_tpl);
++    Rig r{db.dsn()};
++    EnginePrincipalStore eps{r.pool};
++    REQUIRE(eps.is_open());
++    r.ar->set_engine_principal_store(&eps);
++    r.api_tokens->set_engine_referent_check(
++        [&](const std::string& id) { return eps.get_for_auth(id).status; });
++    {auto c = eps.create("Probe A", "gary", "probe", "internal", "admin", "engine:probea"); const std::string cerr_ = c ? std::string{} : c.error(); INFO(cerr_); REQUIRE(c.has_value());}
++    REQUIRE(eps.create("Probe B", "gary", "probe", "internal", "admin", "engine:probeb").has_value());
++    // B holds a GLOBAL Execution:Read grant, A holds nothing.
++    REQUIRE(r.rbac.assign_role({"engine", "engine:probeb", "ExecReadG"}).has_value());
++    REQUIRE(r.rbac.assign_role({"engine", "engine:probeb", "InfraReadG"}).has_value());
++    auto ta = r.api_tokens->create_token("e", "engine:probea", now_epoch() + 3600, "", "readonly", "engine");
++    auto tb = r.api_tokens->create_token("e", "engine:probeb", now_epoch() + 3600, "", "readonly", "engine");
++    REQUIRE(ta.has_value());
++    REQUIRE(tb.has_value());
++    out_line("=== ENGINE (RBAC ON) ===");
++    probe_principal(r, "RBAC-ON", {"P_engine(no grant)", *ta});
++    probe_principal(r, "RBAC-ON", {"P_engine(global Execution:Read)", *tb});
++}

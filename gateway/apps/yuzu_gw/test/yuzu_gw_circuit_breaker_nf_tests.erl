@@ -124,19 +124,19 @@ poll_state(Want, Deadline) ->
 
 %% Right after a trip: the breaker scheduled `ScheduledMs` and stores `NextMs`
 %% as the backoff the NEXT trip will use (#state.cb_cur_timeout). The record is
-%% private to yuzu_gw_upstream, so it is read by position. The size, the tag,
-%% and the base/max fields pinned to setup/0's 100/500 make a record change fail
-%% loudly as "record changed" rather than as an apparent backoff bug.
+%% private to yuzu_gw_upstream, so its fields are read by NAME: state_field/2
+%% takes the field order from the record definition in the source, so adding or
+%% moving a field cannot break this test, while renaming or removing one of the
+%% fields below fails loudly as "no_such_state_field" rather than as an
+%% apparent backoff bug. The base/max fields stay pinned to setup/0's 100/500.
 check_backoff(ScheduledMs, NextMs) ->
     S = sys:get_state(yuzu_gw_upstream),
-    %% #state{} = {state, notify_pids, cb_state, cb_failures, cb_threshold,
-    %%   cb_base_timeout, cb_max_timeout, cb_cur_timeout, cb_timer,
-    %%   replay_spacing, replay_queue, guardian_pids, cluster_id}
-    ?assertMatch({13, state, 100, 500},
-                 {tuple_size(S), element(1, S), element(6, S), element(7, S)}),
-    ?assert(lists:member(element(3, S), [closed, open, half_open])),
-    ?assertEqual(NextMs, element(8, S)),
-    case element(9, S) of
+    ?assertEqual(state, element(1, S)),
+    ?assertEqual({100, 500},
+                 {state_field(cb_base_timeout, S), state_field(cb_max_timeout, S)}),
+    ?assert(lists:member(state_field(cb_state, S), [closed, open, half_open])),
+    ?assertEqual(NextMs, state_field(cb_cur_timeout, S)),
+    case state_field(cb_timer, S) of
         TRef when is_reference(TRef) ->
             case erlang:read_timer(TRef) of
                 false -> ok;   % already fired
@@ -145,6 +145,24 @@ check_backoff(ScheduledMs, NextMs) ->
         undefined ->
             ok                 % already fired and handled (half_open)
     end.
+
+%% The value of the named #state{} field of yuzu_gw_upstream in the tuple S.
+state_field(Field, S) ->
+    Names = state_field_names(),
+    case [I || {I, Name} <- lists:zip(lists:seq(2, length(Names) + 1), Names), Name =:= Field] of
+        [Index] -> element(Index, S);
+        []      -> erlang:error({no_such_state_field, Field, Names})
+    end.
+
+state_field_names() ->
+    Src = filename:join([code:lib_dir(yuzu_gw), "src", "yuzu_gw_upstream.erl"]),
+    {ok, Forms} = epp:parse_file(Src, []),
+    [Fields] = [Fs || {attribute, _, record, {state, Fs}} <- Forms],
+    [record_field_name(F) || F <- Fields].
+
+record_field_name({typed_record_field, F, _Type}) -> record_field_name(F);
+record_field_name({record_field, _, {atom, _, Name}}) -> Name;
+record_field_name({record_field, _, {atom, _, Name}, _Default}) -> Name.
 
 %%%===================================================================
 %%% Tests

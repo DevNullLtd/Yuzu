@@ -381,6 +381,15 @@ generates a fresh keypair + CSR and the server issues a **new** leaf with a
 (`GET /api/v1/ca/issued`) as an orphaned row that no live agent holds — this is
 harmless, but if you reconcile the inventory you should expect one orphan per
 key-loss event and may revoke it for tidiness. No manual re-enrollment is needed.
+The same happens when the key is unreadable or unparseable at startup, or when
+`agent-client.pem` no longer matches `agent-client.key` (an interrupted renewal
+replaced the key but not the leaf): the agent logs `agent_csr: ... treating the
+credential as missing`, enrols without a client certificate (accepted under
+gradual enforcement) and receives a new leaf. A transient read failure of the key
+file triggers this too. After upgrading to this version, any agent already
+holding a mismatched pair re-enrols once on its first restart; the signer applies
+a per-agent 30 s floor and no global limit, so expect one issued row per such
+agent.
 
 > **Revocation is not bypassable by key deletion.** Auto-re-provisioning applies
 > only when the agent's prior cert was *not* revoked. If you **revoke** an
@@ -398,7 +407,7 @@ key-loss event and may revoke it for tidiness. No manual re-enrollment is needed
 > off the data plane — the server never sees the agent's leaf on the
 > gateway→server hop. To decommission a gateway-proxied agent promptly, also
 > disconnect it at the gateway/management layer. Through-gateway cryptographic
-> revocation is planned with the QUIC transport migration. See
+> revocation is tracked in #5578 (no committed release). See
 > `docs/auth-architecture.md` "Gateway-proxied agents: revocation scope".
 
 ### Windows Certificate Store Integration

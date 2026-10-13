@@ -20,6 +20,7 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::agent {
@@ -55,11 +56,17 @@ using SyncPluginMap = std::map<std::string, const YuzuPluginDescriptor*, std::le
 /// Result of a pure action adapter. `ok` with zero entries is a legitimate
 /// answer ("brew present, no formulae"); `unsupported` = the action answered
 /// "not on this OS" (skipped silently); `failed` = skip the whole cycle.
+/// `ok` with a non-empty `reason` = constrained managers answer whose present
+/// row is kept. Collector rules: constrained managers with a present Homebrew row
+/// is ok (zero present rows still fails; another OS's managers leg maps its own
+/// rows and must decide its own constrained rule); typed PARTIAL completeness
+/// skips the cycle unless the action opts in (an in-band `unsupported` answer
+/// wins first); an absent plugin is warned.
 struct AdaptedRows {
     enum class Status { ok, unsupported, failed };
     Status status{Status::ok};
     std::vector<SwEntry> entries;
-    std::string reason; // failed: why (logged)
+    std::string reason; // failed: why (logged); ok: the constraint token of the kept row
 };
 
 /// Parse `installed_apps` `list_inventory` output (pipe-delimited
@@ -92,6 +99,10 @@ YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& o
 /// `feature|unavailable|<token>` or no feature rows at all -> failed.
 YUZU_EXPORT AdaptedRows parse_windows_optional_features_output(const std::string& out);
 
+/// The action table's (plugin, action) names in table order, as views into static literals —
+/// for the descriptor pin test (tests/unit/test_inventory_sync_action_table.cpp).
+YUZU_EXPORT std::vector<std::pair<std::string_view, std::string_view>> installed_software_actions();
+
 /// Canonical wire blob: sorted + deduped; fields unit-separated (0x1F), entries
 /// record-separated (0x1E); fields truncated to the server's cap. MUST be
 /// byte-identical to the server's reconstruction (ADR-0016 §4 /
@@ -100,10 +111,18 @@ YUZU_EXPORT AdaptedRows parse_windows_optional_features_output(const std::string
 YUZU_EXPORT std::string installed_software_canonical_blob(std::vector<SwEntry> entries);
 
 /// Build the `installed_software` SyncSource. `plugins` maps `descriptor->name`
-/// to the loaded descriptor; an absent key = plugin not loaded on this OS (e.g.
-/// `build_agent=false`, or windows_optional_features on macOS) -> that action is
-/// skipped, except installed_apps: without it the source stays idle (it anchors
-/// the report, UP-IN6). A failing action skips the cycle (nothing is deleted).
+/// to the loaded descriptor; an absent key = plugin not loaded (it failed init, was
+/// refused by the allowlist or signature check, or is not shipped in a trimmed
+/// install) -> that action is skipped with a warning, except installed_apps: without
+/// it the source stays idle (it anchors the report, UP-IN6). A failing action skips the cycle
+/// (nothing is deleted), as does typed PARTIAL completeness unless the action
+/// opts in (pkg_inventory managers).
+///
+/// The source opts into SyncSource::skip_backoff and sets skip_reason to the
+/// token of the most recent skip ("<plugin>.<action>:rc=<n>", ":truncated",
+/// ":row_cap", ":partial", ":<adapter reason>", "installed_apps:not_loaded",
+/// "installed_software:no_rows|entry_cap|blob_cap"), "" after a success. (`no_rows` is
+/// defensive: the anchor adapter fails an empty listing first.)
 YUZU_EXPORT SyncSource make_installed_software_source(SyncPluginMap plugins);
 
 } // namespace yuzu::agent

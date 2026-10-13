@@ -52,6 +52,9 @@
 #include <string_view>
 #include <vector>
 
+// The /guardian page shell (defined in guardian_ui.cpp).
+extern const char* const kGuardianHtml;
+
 using namespace yuzu::server;
 
 namespace {
@@ -251,9 +254,11 @@ struct Harness {
     // RestGsHarness::seed_status in test_rest_guaranteed_state.cpp. event_type
     // drives the derived state per event_state_from_type (guaranteed_state_
     // store.cpp): "guard.compliant"/"drift.remediated" -> compliant,
-    // "drift.detected" -> drifted, "guard.unhealthy" -> errored. The upsert
-    // keeps a row only when the new updated_at >= the existing one, so reuse a
-    // strictly increasing ts per (agent, rule) across multiple seeds.
+    // "drift.detected" -> drifted, "remediation.failed"/"guard.unhealthy"/
+    // "guard.errored" -> errored. The upsert keeps a row only when the new
+    // updated_at >= the existing one: an EQUAL timestamp overwrites (the later
+    // arrival wins) and an earlier one is silently dropped, so use a strictly
+    // increasing ts per (agent, rule) across multiple seeds.
     void seed_status(const std::string& event_id, const std::string& agent_id,
                      const std::string& rule_id, const std::string& event_type,
                      const std::string& ts = "2026-09-01T00:00:00Z") {
@@ -909,6 +914,38 @@ TEST_CASE("guard/baseline detail page shells serve the shell with the fragment U
     CHECK(b->body.find("/fragments/guardian/baseline/bl1/page") != std::string::npos);
 }
 
+// The slate restyle changed two things an operator sees and no assertion pinned either, so a
+// revert would have passed: the header's primary action is the solid btn-primary, and a guard's
+// state reads "Enabled"/"Disabled" (it was upper-case).
+TEST_CASE("/guardian shell: the New Guard header action is btn-primary",
+          "[guardian_routes][page]") {
+    const std::string_view shell{kGuardianHtml};
+    const auto label = shell.find("+ New Guard");
+    REQUIRE(label != std::string_view::npos);
+    const auto open = shell.rfind("<button", label);
+    REQUIRE(open != std::string_view::npos);
+    const auto tag = shell.substr(open, label - open);
+    CHECK(tag.find("btn-primary") != std::string_view::npos);
+    CHECK(tag.find("btn-secondary") == std::string_view::npos);
+}
+
+TEST_CASE("guards fragment: a guard state reads Enabled or Disabled and never upper-case",
+          "[pg][guardian_routes][page]") {
+    Harness h;
+    h.seed_guard("g-on", "GuardOn");
+    auto off = make_rule("g-off", "GuardOff");
+    off.enabled = false;
+    h.seed_rule(off);
+
+    auto g = h.sink.dispatch("GET", "/fragments/guardian/guards", "", "");
+    REQUIRE(g != nullptr);
+    CHECK(g->status == 200);
+    CHECK(g->body.find(">Enabled</span>") != std::string::npos);
+    CHECK(g->body.find(">Disabled</span>") != std::string::npos);
+    CHECK(g->body.find("ENABLED") == std::string::npos);
+    CHECK(g->body.find("DISABLED") == std::string::npos);
+}
+
 // Governance sec-H1: the Guard page renders `severity` into a CSS class attribute.
 // A hostile severity (seeded straight into the store, bypassing create-time enum
 // validation) must be html-escaped at the output, never reflected raw.
@@ -1166,6 +1203,32 @@ TEST_CASE("#4252: a real Linux Service status row is never ALSO folded into "
         const std::string& body = res->body;
         CHECK(body.find("50%") != std::string::npos);
         CHECK(body.find("Not implemented") == std::string::npos);
+    }
+}
+
+TEST_CASE("a guard.errored lifecycle event renders the pair as errored on the overview and "
+          "the guard detail page (C-1)",
+          "[pg][guardian_routes][census]") {
+    Harness h;
+    auto rule = make_rule_with_spark("svc1", "ServiceGuard", "service-status-change");
+    h.seed_rule(rule);
+    deploy_via_baseline(h, "svc1");
+    h.agents_json = R"([{"agent_id":"lin-1","hostname":"linuxbox","os":"linux"}])";
+    h.seed_status("e1", "lin-1", "svc1", "guard.errored");
+
+    SECTION("fleet overview: Unhealthy Guards is 1 and the worst-of badge is Action required") {
+        auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+        REQUIRE(res != nullptr);
+        const std::string& body = res->body;
+        CHECK(body.find("<div class=\"stat-num bad\">1</div><div class=\"stat-label\">"
+                        "Unhealthy Guards</div>") != std::string::npos);
+        CHECK(body.find("Action required") != std::string::npos);
+        CHECK(body.find("All compliant") == std::string::npos);
+    }
+    SECTION("guard detail page lists the device as errored") {
+        auto res = h.sink.Get("/fragments/guardian/guard/svc1/page");
+        REQUIRE(res != nullptr);
+        CHECK(res->body.find("&#9679; errored") != std::string::npos);
     }
 }
 

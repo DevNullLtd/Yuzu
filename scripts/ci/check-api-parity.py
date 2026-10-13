@@ -37,6 +37,14 @@ WHAT IT CHECKS
      under server/core/src/*.cpp has a corresponding row in exactly one
      scripts/ci/api-parity/<domain>.json ledger file, keyed by (method,
      canonical path - see `canonicalize()`).
+  1b. A ledger row keyed on a route that is not a registered fragment/
+     legacy route is either status "retire" (stale), OR - the ONE other
+     legal shape (#5342) - a registered `/api/v1/*` route ledgered with an
+     `exception:` status: a REST v1 capability that deliberately has NO MCP
+     twin (ADR-1005 requires one by default, so the reviewed reason is
+     recorded here rather than left implicit). A v1-keyed row with any other
+     status is an error - v1 routes are otherwise tracked by check 3, not
+     the ledger.
   2. Every ledger row whose status is "twinned" names a `rest_v1_twin`
      and/or `mcp_twin` that actually exists in the CURRENT extraction (a
      twin claim referencing a renamed/removed route or tool is a lie, and
@@ -156,7 +164,41 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # /api/approvals/pending/count -> GET /api/v1/approvals/pending/count +
 # get_pending_approval_count) -- measured post-build at 203 (205 - 2), not
 # hand-picked.
-BASELINE_UNTWINNED = 203
+#
+# #5342 (local-account password change + admin reset): +2 rows, both
+# `exception:` rows keyed on the new REST v1 routes POST /api/v1/users/me/
+# password and POST /api/v1/users/{param}/password in rbac.json - the first
+# use of the v1-exception shape check 1b now admits (a REST v1 capability
+# with a deliberate, reviewed "no MCP twin" reason). They are genuinely new
+# routes, never expected to flip to "twinned", so the count rises 203 -> 205
+# by design rather than regressing.
+#
+# 2026-10-06 (legacy /inventory fragment removal): the four dead
+# /fragments/inventory/{devices,device,find,find/results} rows are deleted along
+# with their routes (two `planned:#2146`, two `composed-of:`), so the count
+# falls 205 -> 201 -- the value the checker itself reported after the deletion.
+#
+# Software catalogue REST routes: get.fragments-inventory-software-versions
+# flips "planned:#2146" -> "twinned" (GET /api/v1/inventory/software/catalogue/versions;
+# MCP twin get_software_versions, added with the MCP twins) and the title-catalogue row
+# get.fragments-inventory-software is repointed at GET /api/v1/inventory/software/catalogue
+# (already "twinned", count unchanged). The catalogue route's format=csv titles export is REST-only by design: a CSV
+# body is a download for a person or a pipeline, not a structured tool result (the JSON route
+# is the structured surface; its MCP twin, query_software_catalogue, now exists, and the
+# remaining exception is recorded under ADR-1005 as #5699).
+# Measured post-flip at 204 (205 - 1), not hand-picked.
+#
+# Merge of the two changes above: 205 - 4 (legacy rows deleted) - 1 (versions row twinned)
+# = 200, the value the checker itself reported on the merged tree.
+#
+# MCP twins + raw-route exports (the second PR of the software catalogue): the
+# get.fragments-inventory-software-devices row flips "planned:#2146" -> "twinned" (GET
+# /api/v1/inventory/software + MCP query_installed_software, which gains version/cursor/source);
+# the title-catalogue row gains its MCP twin query_software_catalogue and the versions row
+# get_software_versions (both already "twinned", count unchanged). The raw route's
+# format=csv|json export is REST-only by design, like the catalogue's CSV: an agent pages the
+# same data through the MCP cursor. Measured post-flip at 199 (200 - 1), not hand-picked.
+BASELINE_UNTWINNED = 199
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
@@ -732,6 +774,33 @@ def render_doc():
     return 0
 
 
+def unmatched_ledger_row_errors(ledger_rows, bucket_a, bucket_b):
+    """Check 1b as a pure function (selftested): every ledger row whose key is
+    NOT a registered fragment/legacy route must be either status "retire", or
+    an `exception:` row keyed on a registered /api/v1/* route (a v1
+    capability with a recorded no-MCP-twin reason, #5342). Returns a list of
+    error strings (empty = clean)."""
+    errors = []
+    for key, row in ledger_rows.items():
+        if key in bucket_a:
+            continue
+        status = row["status"]
+        if key in bucket_b:
+            if not status.startswith("exception:"):
+                errors.append(f"{row['_file']}: ledger row {key[0]} {key[1]} is "
+                              f"keyed on a REST v1 route - the only legal status "
+                              f"for a v1-keyed row is \"exception:<reason>\" (a "
+                              f"deliberate no-MCP-twin record); v1 routes are "
+                              f"otherwise covered by the OpenAPI check, not the "
+                              f"ledger")
+            continue
+        if status != "retire":
+            errors.append(f"{row['_file']}: ledger row {key[0]} {key[1]} no "
+                          f"longer matches any registered route - mark status "
+                          f"\"retire\" or remove the row")
+    return errors
+
+
 def run_check():
     bucket_a, bucket_b = extract_all_routes()
     openapi_paths, _spec = extract_openapi_paths()
@@ -753,16 +822,11 @@ def run_check():
         ok = False
 
     # 1b. stale ledger rows (route no longer registered) must be marked
-    #     retire, not silently left twinned/planned against nothing.
-    for key, row in ledger_rows.items():
-        if key in bucket_a:
-            continue
-        if row["status"] != "retire":
-            gh("error", f"check-api-parity: {row['_file']}: ledger row "
-                        f"{key[0]} {key[1]} no longer matches any "
-                        f"registered route - mark status \"retire\" or "
-                        f"remove the row")
-            ok = False
+    #     retire, not silently left twinned/planned against nothing; a
+    #     v1-keyed row must be an `exception:` record (#5342).
+    for err in unmatched_ledger_row_errors(ledger_rows, bucket_a, bucket_b):
+        gh("error", f"check-api-parity: {err}")
+        ok = False
 
     # 2. twinned rows must reference twins that actually exist.
     all_extracted = set(bucket_a) | set(bucket_b)
@@ -993,6 +1057,23 @@ def _selftest():
           "canonicalize: OpenAPI {id}-style segment")
     check(canonicalize("/api/v1/plain") == "/api/v1/plain",
           "canonicalize: no-capture-group path is unchanged")
+
+    # -- unmatched_ledger_row_errors: check 1b's legal shapes (#5342) -------
+    def _row(status):
+        return {"status": status, "_file": "x.json"}
+    frag = ("GET", "/fragments/a")
+    v1 = ("POST", "/api/v1/users/me/password")
+    gone = ("GET", "/fragments/gone")
+    errs = unmatched_ledger_row_errors(
+        {frag: _row("planned:#1"), v1: _row("exception:no MCP twin"), gone: _row("retire")},
+        {frag: []}, {v1: []})
+    check(errs == [], f"1b: fragment/v1-exception/retire rows must be clean, got {errs}")
+    errs = unmatched_ledger_row_errors({v1: _row("twinned")}, {}, {v1: []})
+    check(len(errs) == 1 and "REST v1" in errs[0],
+          f"1b: a v1-keyed row that is not exception: must be an error, got {errs}")
+    errs = unmatched_ledger_row_errors({gone: _row("exception:x")}, {}, {})
+    check(len(errs) == 1 and "retire" in errs[0],
+          f"1b: an exception row on an UNREGISTERED route must still be stale, got {errs}")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")

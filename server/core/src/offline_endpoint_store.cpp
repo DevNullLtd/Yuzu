@@ -4,6 +4,7 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "pg/pg_retention_guard.hpp"
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
@@ -27,6 +28,15 @@ constexpr const char* kStoreName = "endpoint_state";
 // The read is a user-facing /viz request and can wait a little longer.
 constexpr std::chrono::milliseconds kUpsertAcquireTimeout{250};
 constexpr std::chrono::milliseconds kQueryAcquireTimeout{2000};
+// Retention-prune guard constants (#5678 / #1545 UP-4; see run_retention_prune).
+// big step floor 7 d: the prune runs hourly per replica, and a weekend/holiday
+// shutdown of a lab server must not decline — 7 d is still far below the 37 d
+// window. Implausibility 1 d: the prune keys on last_seen_at (PG-authored, so
+// never future-dated), and only a small forward skew is tolerated in the
+// would-wipe denominator.
+constexpr std::int64_t kPruneBigStepFloorMs = 7LL * 24 * 3600 * 1000;
+constexpr std::int64_t kPruneImplausibilityMs = 24LL * 3600 * 1000;
+constexpr std::int64_t kPruneMinPlausibleMs = 946'684'800'000LL; // 2000-01-01
 // kQueryRowCap moved to OfflineEndpointStore::kQueryRowCap (public,
 // offline_endpoint_store.hpp) so query_live_ids's truncation test (#4981
 // PR-1) can size its fixture against the real value.
@@ -50,17 +60,22 @@ const std::vector<pg::PgMigration>& migrations() {
         {2,
          "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS agent_version TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS arch TEXT NOT NULL DEFAULT '';"},
-        // HA WS-5 (ADR-2002 §7a): `session_id` guards a targeted delete on
-        // graceful disconnect (remove_if_session) so a stale session's
+        // HA WS-5 (ADR-2002 §7a): `session_id` guards a targeted session clear on
+        // graceful disconnect (remove_if_session; the row is kept for the
+        // offline roster, #5678) so a stale session's
         // teardown can't clobber a newer re-registration's row; `last_seen_at`
         // is a PG-authored (`now()` in-SQL) liveness clock, separate from the
         // pre-existing `last_heartbeat_ms` replica-clock column (which stays
-        // exactly as-is for the viz path — see query_stale_within).
+        // exactly as-is for the roster path — see query_stale_within).
         {3,
          "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS session_id TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL "
          "DEFAULT now();"
          "CREATE INDEX IF NOT EXISTS endpoints_last_seen_idx ON endpoints (last_seen_at);"},
+        // #5678 / #1545 UP-4: retention_meta backs pg::run_clock_guarded_prune
+        // (anchor + bootstrap-settled + anomaly-facts rows) for the endpoint prune.
+        {4, "CREATE TABLE IF NOT EXISTS retention_meta ("
+            "key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
     };
     return kMigrations;
 }
@@ -130,19 +145,26 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
     }
     // Single-statement autocommit upsert; RETURNING carries the result in the
     // step status (no sqlite3_changes()-style mutate-and-count race, #1033).
-    // agent_version/arch: a blank incoming value preserves the existing column
-    // (CASE ... THEN endpoints.x) — see the header doc comment — while
-    // hostname/os/last_heartbeat_ms/agent_ts stay an unconditional EXCLUDED
-    // write (pre-v2 behaviour, unchanged). session_id (HA WS-5) is likewise
-    // unconditional EXCLUDED — an empty incoming value (a heartbeat that raced
-    // session lookup, same race the agent_version/arch blank-preserve comment
-    // above describes) blanking a previously-known session_id is harmless:
-    // `remove_if_session` only ever matches a NON-empty caller-supplied value
-    // against it, so a blanked column just means the NEXT disconnect's
-    // session-guarded delete no-ops and the row waits out the TTL instead —
-    // always safe (over-inclusion grants no dispatch authority). last_seen_at
-    // is PG-authored (`now()` in-SQL, never the replica's `system_clock` —
-    // the #3715 precedent) on every call, whether the row is new or existing.
+    // agent_version/arch/os: a blank incoming value preserves the existing
+    // column (CASE ... THEN endpoints.x) — see the header doc comment — while
+    // last_heartbeat_ms/agent_ts stay an unconditional EXCLUDED write
+    // (pre-v2 behaviour, unchanged). hostname blank-preserves too (HA WS-5): a
+    // replica holding no local AgentSession for a gateway-fronted agent
+    // ingests its heartbeat with a blank hostname, which must not erase the
+    // owning replica's value. os blank-preserves (#5294): the
+    // per-OS kill-switch filter reads it for remote ids, and a heartbeat that
+    // missed the session lookup must not erase a known OS. session_id (HA WS-5)
+    // blank-preserves too (#5678): a heartbeat that raced the session lookup on
+    // a LIVE agent keeps its stored session_id, so it stays present. A blank
+    // session on a NEW or just-departed row leaves session_id '' — the agent is
+    // NOT present (query_live_ids requires a non-blank session_id) until a
+    // session-carrying heartbeat; the accepted fail-closed residual. The same
+    // holds for a departed gateway agent that reconnects through a replica whose
+    // session-directory lookup is degraded: it stays absent from presence for
+    // the duration of the degradation.
+    // last_seen_at is PG-authored (`now()` in-SQL, never the replica's
+    // `system_clock` — the #3715 precedent) on every call, whether the row is
+    // new or existing.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO endpoint_state.endpoints "
@@ -150,12 +172,16 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
         "last_seen_at) "
         "VALUES ($1, $2, $3, $4::bigint, $5::bigint, $6, $7, $8, now()) "
         "ON CONFLICT (agent_id) DO UPDATE SET "
-        "  hostname = EXCLUDED.hostname, os = EXCLUDED.os, "
+        "  hostname = CASE WHEN EXCLUDED.hostname = '' THEN endpoints.hostname "
+        "                  ELSE EXCLUDED.hostname END, "
+        "  os = CASE WHEN EXCLUDED.os = '' THEN endpoints.os ELSE EXCLUDED.os END, "
         "  last_heartbeat_ms = EXCLUDED.last_heartbeat_ms, agent_ts = EXCLUDED.agent_ts, "
         "  agent_version = CASE WHEN EXCLUDED.agent_version = '' THEN endpoints.agent_version "
         "                       ELSE EXCLUDED.agent_version END, "
         "  arch = CASE WHEN EXCLUDED.arch = '' THEN endpoints.arch ELSE EXCLUDED.arch END, "
-        "  session_id = EXCLUDED.session_id, last_seen_at = EXCLUDED.last_seen_at "
+        "  session_id = CASE WHEN EXCLUDED.session_id = '' THEN endpoints.session_id "
+        "                    ELSE EXCLUDED.session_id END, "
+        "  last_seen_at = EXCLUDED.last_seen_at "
         "RETURNING agent_id",
         std::vector<std::string>{std::string(agent_id), std::string(hostname), std::string(os),
                                  std::to_string(last_heartbeat_ms), std::to_string(agent_ts),
@@ -192,6 +218,7 @@ OfflineEndpointStore::query_live_ids(std::chrono::seconds ttl) {
         lease.get(),
         "SELECT agent_id, hostname, os, agent_version, arch FROM endpoint_state.endpoints "
         "WHERE last_seen_at >= now() - ($1::bigint * interval '1 second') "
+        "  AND session_id <> '' "
         "ORDER BY last_seen_at DESC LIMIT $2::bigint",
         std::vector<std::string>{std::to_string(ttl.count()),
                                  std::to_string(kQueryRowCap + 1)});
@@ -233,17 +260,18 @@ bool OfflineEndpointStore::remove_if_session(std::string_view agent_id,
         record_presence_store_failure(metrics_, "remove_if_session", /*had_lease=*/false);
         return false;
     }
-    // RETURNING, not a bare DELETE: a DELETE with a WHERE clause that matches
-    // ZERO rows (the session mismatch this method exists to guard against)
-    // still reports PGRES_COMMAND_OK — "the command succeeded" is not "a row
-    // was deleted". RETURNING turns this into a TUPLES_OK read whose row
-    // count is the actual outcome, the same idiom upsert() already uses and
-    // the #1033-banning rule this codebase holds generally (never infer a
-    // mutation's effect from the command status alone).
+    // Presence CLEAR, not a delete (#5678): the row stays so the offline-
+    // inclusive /hardware roster keeps listing the device with its real last
+    // heartbeat; blanking session_id removes it from query_live_ids.
+    // RETURNING, not a bare UPDATE: an UPDATE matching ZERO rows (the session
+    // mismatch this method exists to guard against) still reports
+    // PGRES_COMMAND_OK, so RETURNING turns the outcome into a row count (the
+    // same idiom upsert() uses; never infer a mutation's effect from the
+    // command status alone, #1033).
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "DELETE FROM endpoint_state.endpoints WHERE agent_id = $1 AND session_id = $2 "
-        "RETURNING agent_id",
+        "UPDATE endpoint_state.endpoints SET session_id = '' "
+        "WHERE agent_id = $1 AND session_id = $2 RETURNING agent_id",
         std::vector<std::string>{std::string(agent_id), std::string(session_id)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("OfflineEndpointStore: remove_if_session failed for agent={}: {}", agent_id,
@@ -256,15 +284,76 @@ bool OfflineEndpointStore::remove_if_session(std::string_view agent_id,
     return PQntuples(res.get()) > 0;
 }
 
-std::vector<OfflineEndpoint> OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {
-    std::vector<OfflineEndpoint> out;
+int OfflineEndpointStore::run_retention_prune(std::chrono::seconds roster_window) {
     if (!open_)
-        return out;
+        return -1;
+    // #5678 / #1545 UP-4: clock-guarded capped retention. Missing-anchor =
+    // Decline: a device's last-seen evidence is non-regenerable, so a
+    // from-boot skewed clock must not delete it (preflight_run_store's answer).
+    // Window, clock domains and cadence: docs/clock-guarded-retention.md register row.
+    // The timestamp is last_seen_at (PG now() on every upsert), NOT the roster's
+    // replica-authored last_heartbeat_ms: column and cutoff then share the PG
+    // clock domain, so a lagging or future-stamped replica clock can neither
+    // expire a live row nor make a dead one immortal. The epoch-ms expression
+    // cannot use endpoints_last_seen_idx (hourly seq scan over a fleet-bounded
+    // table, bounded by the pool's statement_timeout).
+    const auto window_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(roster_window + kPruneMargin)
+            .count();
+    const pg::ClockGuardedPruneSpec spec{
+        .store_label = kStoreName,
+        .target_table = "endpoint_state.endpoints",
+        .ts_column = "(EXTRACT(EPOCH FROM last_seen_at)*1000)::bigint",
+        .now_expr = "(EXTRACT(EPOCH FROM now())*1000)::bigint",
+        .meta_table = "endpoint_state.retention_meta",
+        .anchor_key = "endpoints_prune_last_pass_now",
+        .settled_key = "endpoints_prune_bootstrap_settled",
+        .facts_key = "endpoints_prune_last_anomaly_facts",
+        .advisory_lock_key = "hashtext('endpoint_state:endpoints_prune')",
+        .retention_window = static_cast<std::int64_t>(window_ms),
+        .big_step_floor = kPruneBigStepFloorMs,
+        .implausibility_bound = kPruneImplausibilityMs,
+        .min_plausible_reading = kPruneMinPlausibleMs,
+        .cap_per_pass = kPruneCapPerPass,
+        .missing_anchor = pg::MissingAnchorPolicy::Decline,
+    };
+    const auto r = pg::run_clock_guarded_prune(pool_, spec, kQueryAcquireTimeout);
+    return r.error ? -1 : r.deleted;
+}
+
+bool OfflineEndpointStore::delete_agent(std::string_view agent_id) {
+    if (!open_ || agent_id.empty())
+        return false;
+    // An operator request, not the heartbeat path: the longer user-facing bound.
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
-        spdlog::debug("OfflineEndpointStore: query skipped, no connection in time ({})",
-                      pool_.last_error());
-        return out;
+        spdlog::debug("OfflineEndpointStore: delete_agent skipped for agent={}, no connection in "
+                      "time ({})",
+                      agent_id, pool_.last_error());
+        return false;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "DELETE FROM endpoint_state.endpoints WHERE agent_id = $1 RETURNING agent_id",
+        std::vector<std::string>{std::string(agent_id)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::debug("OfflineEndpointStore: delete_agent failed for agent={}: {}", agent_id,
+                      PQerrorMessage(lease.get()));
+        return false;
+    }
+    return true;
+}
+
+std::expected<std::vector<OfflineEndpoint>, PresenceReadError>
+OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {
+    std::vector<OfflineEndpoint> out;
+    if (!open_)
+        return std::unexpected(PresenceReadError::StoreUnavailable);
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        spdlog::warn("OfflineEndpointStore: query_stale_within failed, no connection in time ({})",
+                     pool_.last_error());
+        record_presence_store_failure(metrics_, "query_stale_within", /*had_lease=*/false);
+        return std::unexpected(PresenceReadError::StoreUnavailable);
     }
     const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::system_clock::now().time_since_epoch())
@@ -284,8 +373,10 @@ std::vector<OfflineEndpoint> OfflineEndpointStore::query_stale_within(std::chron
         "LIMIT $2::bigint",
         std::vector<std::string>{std::to_string(since), std::to_string(kQueryRowCap)});
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::debug("OfflineEndpointStore: query failed: {}", PQerrorMessage(lease.get()));
-        return out;
+        spdlog::warn("OfflineEndpointStore: query_stale_within failed: {}",
+                     PQerrorMessage(lease.get()));
+        record_presence_store_failure(metrics_, "query_stale_within", /*had_lease=*/true);
+        return std::unexpected(PresenceReadError::DbError);
     }
     const int rows = PQntuples(res.get());
     out.reserve(static_cast<std::size_t>(rows));

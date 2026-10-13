@@ -254,7 +254,10 @@ TEST_CASE("HA WS-5: a graceful disconnect's remove_if_session prevents zero-mono
     AgentRegistry registry(bus, metrics);
     registry.configure_presence(&store, std::chrono::hours(1));
 
-    REQUIRE(store.upsert("departed-agent", "h", "linux", 0, 0, "", "", "sess-departed"));
+    const auto hb_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    REQUIRE(store.upsert("departed-agent", "h", "linux", hb_ms, 0, "", "", "sess-departed"));
     REQUIRE(store.remove_if_session("departed-agent", "sess-departed")); // the disconnect handler's call
 
     auto parsed = yuzu::scope::parse(R"(ostype == "linux")");
@@ -262,12 +265,26 @@ TEST_CASE("HA WS-5: a graceful disconnect's remove_if_session prevents zero-mono
     auto matched = registry.evaluate_scope(*parsed, nullptr);
     REQUIRE(matched.has_value());
     CHECK_FALSE(contains(*matched, "departed-agent"));
+
+    // #5678: the clear keeps the roster row (so /hardware lists the device
+    // offline), but the online population is all_ids() ∩ roster, and all_ids()
+    // is local sessions plus cached durable presence (live_presence(), <= 3 s
+    // kPresenceCacheTtl). The cleared row is excluded from presence, so a
+    // departed device is not online once that cache refreshes; the cache is
+    // unpopulated in this test, so all_ids() excludes it outright.
+    bool on_roster = false;
+    const auto roster = store.query_stale_within(std::chrono::hours(1));
+    REQUIRE(roster.has_value()); // #5531: the roster read is typed
+    for (const auto& e : *roster)
+        on_roster = on_roster || e.agent_id == "departed-agent";
+    CHECK(on_roster);
+    CHECK_FALSE(contains(registry.all_ids(), "departed-agent"));
 }
 
 // External review hardening (2026-09-22, @Doomgoose) — 3 more BLOCKING bugs
 // in the same "silently narrower dispatch target set" class, found after the
 // first governance round. Direct coverage for the two AgentRegistry-level
-// fixes (has_any_reachable, remove_agent_if_session's gated durable delete);
+// fixes (has_any_reachable, remove_agent_if_session's gated durable presence clear);
 // forward_legacy_command's route_unreadable branch fix is HTTP-handler-level
 // and shares the same already-tested dispatch_confined_arms machinery, so is
 // not independently re-tested here.
@@ -322,11 +339,11 @@ TEST_CASE("HA WS-5: remove_agent_if_session reports whether it removed the CURRE
     }
 
     SECTION("a stale/mismatched session_id no-ops and returns false — "
-            "the exact case the durable-presence-delete gate depends on") {
+            "the exact case the durable-presence-clear gate depends on") {
         // Simulates: agent-x reconnects under a NEW session (sess-2) on the
         // SAME replica before sess-1's disconnect handler runs. sess-1's
         // late cleanup must not report "removed" (which would otherwise
-        // trigger a durable presence delete for a still-live agent).
+        // trigger a durable presence clear for a still-live agent).
         (void)registry.register_agent(make_agent_info("agent-x", "linux", "host-x"));
         registry.map_session("sess-2", "agent-x");
 
@@ -602,8 +619,9 @@ TEST_CASE("HA WS-5: evaluate_scope ABORTS PresenceDegraded when query_live_ids r
 
     SECTION("kQueryRowCap + 1 rows: PresenceDegraded, never a silently-partial match set") {
         std::string sql =
-            "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms) "
-            "SELECT 'cap-'||g, 'h', 'linux', 0 FROM generate_series(1, " +
+            "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms, "
+            "session_id) "
+            "SELECT 'cap-'||g, 'h', 'linux', 0, 's' FROM generate_series(1, " +
             std::to_string(OfflineEndpointStore::kQueryRowCap + 1) + ") g";
         PgResult ins{PQexec(conn.get(), sql.c_str())};
         REQUIRE(ins.ok());
@@ -615,8 +633,9 @@ TEST_CASE("HA WS-5: evaluate_scope ABORTS PresenceDegraded when query_live_ids r
 
     SECTION("exactly kQueryRowCap rows: succeeds normally") {
         std::string sql =
-            "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms) "
-            "SELECT 'cap-'||g, 'h', 'linux', 0 FROM generate_series(1, " +
+            "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms, "
+            "session_id) "
+            "SELECT 'cap-'||g, 'h', 'linux', 0, 's' FROM generate_series(1, " +
             std::to_string(OfflineEndpointStore::kQueryRowCap) + ") g";
         PgResult ins{PQexec(conn.get(), sql.c_str())};
         REQUIRE(ins.ok());

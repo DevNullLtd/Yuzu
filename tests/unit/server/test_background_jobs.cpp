@@ -48,7 +48,7 @@ TEST_CASE("background-job table classifies every audited pass correctly",
     // Count tripwire — forces a conscious table update when a pass is added or
     // removed (a silent count change is exactly what WS-10 exists to prevent).
     // Update this number ONLY alongside a real classification change.
-    CHECK(kBackgroundJobs.size() == 45);
+    CHECK(kBackgroundJobs.size() == 46);
 
     // The load-bearing per-pass calls — a regression here is the WS-10 hazard.
     SECTION("MUST-run-per-replica passes are ReplicaSafe, never leader-gated") {
@@ -76,6 +76,12 @@ TEST_CASE("background-job table classifies every audited pass correctly",
             REQUIRE(j != nullptr);
             CHECK(j->cls == BackgroundJobClass::ReplicaSafe);
         }
+    }
+    SECTION("#5678: the endpoint_state prune is ReplicaSafe on preflight_runner_thread_, never the health tick") {
+        auto* j = find("offline_endpoint_store.run_retention_prune");
+        REQUIRE(j != nullptr);
+        CHECK(j->cls == BackgroundJobClass::ReplicaSafe);
+        CHECK(j->owning_thread == "preflight_runner_thread_");
     }
     SECTION("WS-4 4.2a: the gateway route directory reaper is ReplicaSafe, on result_set_maint_thread_") {
         auto* j = find("gateway_route_store.reap_stale_routes");

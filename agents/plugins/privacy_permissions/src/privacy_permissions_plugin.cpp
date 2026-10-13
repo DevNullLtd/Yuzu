@@ -79,8 +79,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
       "under SeBackup/SeRestore (a UNC, non-fixed-drive, reparse-point or reparse-ancestor, "
       "redirected, oversized or foreign-owned hive file is refused, and one whose identity changes "
       "across the load is unloaded unread); a ConsentStore change RegNotifyChangeKeyValue reports "
-      "during the read refuses that source, never guessed; HKLM Deny overrides a profile (most "
-      "restrictive wins); per-app NonPackaged rows carry last-used times but no decision; a "
+      "during the read is walked once more, and a source that changed again, or whose deadline "
+      "left no time for the re-walk, is refused, never guessed; HKLM Deny overrides a profile "
+      "(most restrictive wins); per-app NonPackaged rows carry last-used times but no decision; a "
       "cooperative 15 s deadline and a 16 MiB output budget"}},
 };
 

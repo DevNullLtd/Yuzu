@@ -24,6 +24,7 @@
 #include <spdlog/spdlog.h>
 
 #include <yuzu/metrics.hpp>
+#include <yuzu/protective_actions.hpp>
 #include "agent.grpc.pb.h"
 #include "command_capability.hpp"
 #include "command_capability_parsers.hpp"
@@ -106,7 +107,8 @@ enum class DispatchDenialReason : uint8_t {
     KillSwitched,      ///< Classified and authorized, but the per-action kill
                        ///< switch is OFF for this `plugin.action` (or the config
                        ///< store is degraded, which `action_allowed` reports as
-                       ///< disabled — never as enabled). Deliberately DISTINCT
+                       ///< disabled — never as enabled; never a protective
+                       ///< action — `yuzu::protective`). Deliberately DISTINCT
                        ///< from `Forbidden`: this is an operator-thrown
                        ///< emergency stop, not an authorization verdict, and an
                        ///< incident review needs to tell the two apart.
@@ -304,6 +306,14 @@ compute_dispatch_tag(const CommandCapability& cap, std::string_view plugin, std:
         compute_plan_hash(plugin, action, parameters, target_arm, execution_id));
 }
 
+/// The injected kill-switch decision (#5294). `nullopt` = killed for every OS
+/// OR degraded (the store performs the fail-closed collapse); a value =
+/// allowed, holding the agent OS values whose per-OS switch is OFF (empty = no
+/// OS withheld). The production binders wrap
+/// `PluginConfigStore::kill_switch_decision`.
+using KillSwitchFn = std::function<std::optional<std::unordered_set<std::string>>(
+    std::string_view plugin, std::string_view action)>;
+
 class ClassifiedCommand; // Forward decl — completed below; needed as an
                          // incomplete type by the declaration immediately
                          // following.
@@ -315,7 +325,7 @@ class ClassifiedCommand; // Forward decl — completed below; needed as an
 /// second default-argument set on the same declaration is ill-formed).
 [[nodiscard]] inline std::expected<ClassifiedCommand, DispatchDenial> finalize_classified_command(
     const CommandCapability& cap,
-    const std::function<bool(std::string_view plugin, std::string_view action)>& action_allowed,
+    const KillSwitchFn& action_allowed,
     std::string_view raw_plugin, std::string_view raw_action, const std::string& command_id,
     const std::unordered_map<std::string, std::string>& parameters = {},
     const std::string& payload = {}, int stagger_seconds = 0, int delay_seconds = 0,
@@ -341,18 +351,28 @@ public:
     /// `pb::CommandRequest` at a call site that forgot which type it held.
     [[nodiscard]] const pb::CommandRequest& wire() const noexcept { return cmd_; }
 
+    /// Agent OS values whose per-OS kill switch is OFF for this command's
+    /// plugin/action (#5294); empty = no OS withheld. Dispatch turns this
+    /// into a per-target filter via `AgentRegistry::ids_with_os`.
+    [[nodiscard]] const std::unordered_set<std::string>& kill_switched_os() const noexcept {
+        return kill_switched_os_;
+    }
+
 private:
     friend class yuzu::server::ServerImpl;
     friend struct ClassifiedCommandTestAccess;
     friend std::expected<ClassifiedCommand, DispatchDenial> finalize_classified_command(
-        const CommandCapability&, const std::function<bool(std::string_view, std::string_view)>&,
+        const CommandCapability&, const KillSwitchFn&,
         std::string_view, std::string_view, const std::string&,
         const std::unordered_map<std::string, std::string>&, const std::string&, int, int,
         const std::string&, const std::string&);
 
-    explicit ClassifiedCommand(pb::CommandRequest cmd) : cmd_(std::move(cmd)) {}
+    explicit ClassifiedCommand(pb::CommandRequest cmd,
+                               std::unordered_set<std::string> kill_switched_os = {})
+        : cmd_(std::move(cmd)), kill_switched_os_(std::move(kill_switched_os)) {}
 
     pb::CommandRequest cmd_;
+    std::unordered_set<std::string> kill_switched_os_;
 };
 
 /// #3687 (Gate 6 governance fix): the per-action kill-switch DECISION
@@ -369,30 +389,47 @@ private:
 ///
 /// `action_allowed`'s contract is IDENTICAL to `classify_and_authorize_
 /// dispatch`'s `has_permission`: injected, not looked up — the production
-/// binder wraps `PluginConfigStore::action_allowed`, fail-closed by that
-/// store's own contract (a closed store, a lease timeout, or a query failure
-/// all report "not allowed"). An empty/unset callback means no kill-switch
+/// binders bind `PluginConfigStore::kill_switch_decision` (the one-statement
+/// read `action_allowed` itself wraps), fail-closed by that store's own
+/// contract (a closed store, a lease timeout, or a query failure all return
+/// nullopt, i.e. "not allowed"). An empty/unset callback means no kill-switch
 /// store is wired at all (legacy-open for THIS gate ONLY, mirroring how an
 /// absent `plugin_config_store_` behaves in `server.cpp`) — never call this
 /// with a callback that unconditionally returns `true` "to be safe"; that
 /// reintroduces exactly the ZERO-callers gap `finalize_classified_command`'s
 /// own extraction (M6, wave1 remediation) closed.
 ///
-/// Returns `std::nullopt` when the action is allowed (including when
-/// `action_allowed` is unset — legacy-open); a populated `DispatchDenial`
-/// (always `DispatchDenialReason::KillSwitched`) otherwise. Every caller of
+/// Returns the OS values withheld by a per-OS switch (empty when none, and
+/// when `action_allowed` is unset — legacy-open) when the action is allowed;
+/// a populated `DispatchDenial` (always `DispatchDenialReason::KillSwitched`)
+/// otherwise. Every caller of
 /// `classify_and_authorize_dispatch` that also needs the kill-switch
 /// dimension — today `finalize_classified_command` and the MCP pre-dispatch
 /// dry run (server.cpp's `authorize_dispatch_fn_` production closure) — calls
 /// this directly rather than re-deriving the condition.
-[[nodiscard]] inline std::optional<DispatchDenial> kill_switch_denial(
-    const CommandCapability& cap,
-    const std::function<bool(std::string_view plugin, std::string_view action)>& action_allowed) {
-    if (action_allowed && !action_allowed(cap.plugin, cap.action)) {
-        return DispatchDenial{DispatchDenialReason::KillSwitched, std::string(cap.securable),
-                              cap.operation};
+///
+/// Protective-action exemption: a PROTECTIVE action
+/// (`yuzu::protective::is_protective_action` — the quarantine plugin's four
+/// actions plus `__guard__.push_rules`) is never refused here: the callback is
+/// not consulted (so a degraded store's nullopt cannot refuse it) and the
+/// returned OS set is empty, which means no `ids_with_os` presence read and no
+/// send-time OS withhold downstream.
+[[nodiscard]] inline std::expected<std::unordered_set<std::string>, DispatchDenial>
+kill_switch_denial(const CommandCapability& cap, const KillSwitchFn& action_allowed) {
+    // Protective-action exemption: a protective action is never refused by
+    // enablement. Decided before `action_allowed` is consulted so a
+    // switched-off row, a per-OS row and a degraded store (nullopt) all yield
+    // "allowed, no OS withheld".
+    if (yuzu::protective::is_protective_action(cap.plugin, cap.action))
+        return std::unordered_set<std::string>{};
+    if (!action_allowed)
+        return std::unordered_set<std::string>{};
+    auto decision = action_allowed(cap.plugin, cap.action);
+    if (!decision) {
+        return std::unexpected(DispatchDenial{DispatchDenialReason::KillSwitched,
+                                              std::string(cap.securable), cap.operation});
     }
-    return std::nullopt;
+    return std::move(*decision);
 }
 
 /// The composition step `ServerImpl::build_classified_command` runs AFTER
@@ -417,13 +454,14 @@ private:
 ///    it as part of an unrelated extraction.
 [[nodiscard]] inline std::expected<ClassifiedCommand, DispatchDenial> finalize_classified_command(
     const CommandCapability& cap,
-    const std::function<bool(std::string_view plugin, std::string_view action)>& action_allowed,
+    const KillSwitchFn& action_allowed,
     std::string_view raw_plugin, std::string_view raw_action, const std::string& command_id,
     const std::unordered_map<std::string, std::string>& parameters,
     const std::string& payload, int stagger_seconds, int delay_seconds,
     const std::string& target_arm, const std::string& execution_id) {
-    if (auto denial = kill_switch_denial(cap, action_allowed)) {
-        return std::unexpected(*denial);
+    auto kill_switched_os = kill_switch_denial(cap, action_allowed);
+    if (!kill_switched_os) {
+        return std::unexpected(kill_switched_os.error());
     }
 
     pb::CommandRequest cmd;
@@ -443,7 +481,7 @@ private:
     cmd.set_dispatch_tag(
         compute_dispatch_tag(cap, raw_plugin, raw_action, ordered_params, target_arm, execution_id));
 
-    return ClassifiedCommand(std::move(cmd));
+    return ClassifiedCommand(std::move(cmd), std::move(*kill_switched_os));
 }
 
 /// Test-only door to the private constructor above (#2367 pattern — mirrors
@@ -467,7 +505,8 @@ private:
 /// (`test_dispatch_confined_arms.cpp`'s K-1 case) keeps compiling against
 /// `send_to`'s narrowed signature.
 struct ClassifiedCommandTestAccess {
-    [[nodiscard]] static ClassifiedCommand make(pb::CommandRequest cmd);
+    [[nodiscard]] static ClassifiedCommand make(pb::CommandRequest cmd,
+                                                std::unordered_set<std::string> kill_switched_os = {});
 };
 
 // -- Plugin metadata ----------------------------------------------------------
@@ -495,12 +534,18 @@ struct PluginMeta {
 // the trio published together by set_gateway_route, M1 review fix +
 // #4324; an earlier revision wrote gateway_node under the registry mu_
 // instead, which both raced stream_mu's readers and contradicted this
-// comment) and the atomic last_activity_epoch_ms. (Governance G3
-// cpp-safety — keep it true.)
+// comment) and the atomic last_activity_epoch_ms. `session_id` is ALSO
+// rewritten in place after publication, by AgentRegistry::map_session under
+// AgentRegistry::mu_ (an exception to the identity-field rule above): read
+// it only through session_is()/session_id_of(), never through a
+// get_session()/find_by_session() pointer after the lock is released (#5684).
+// (Governance G3 cpp-safety — keep it true.)
 
 struct AgentSession {
     std::string agent_id;
-    std::string session_id; // Unique per connection — used to prevent stale cleanup races
+    // Unique per connection — used to prevent stale cleanup races. Rewritten in place by
+    // map_session under AgentRegistry::mu_: read only via session_is()/session_id_of().
+    std::string session_id;
     std::string hostname;
     std::string os;
     std::string arch;
@@ -635,16 +680,17 @@ public:
     ///
     /// HA WS-5 governance hardening (external review finding, 2026-09-22):
     /// the return value is load-bearing for the caller's durable-presence
-    /// mirror (agent_service_impl.cpp / gateway_service_impl.cpp), which
+    /// mirror (presence_departure.hpp, used by agent_service_impl.cpp /
+    /// gateway_service_impl.cpp), which
     /// must fire OfflineEndpointStore::remove_if_session ONLY when this
     /// returns true. The durable row's own session_id column is
     /// heartbeat-driven, not registration-driven (see heartbeat_ingestion.cpp)
     /// — so on an ordinary same-replica reconnect (S1 disconnects, S2
     /// registers, S2 hasn't heartbeated yet), the durable row can still read
     /// S1's session_id even though S1 is already locally superseded by S2.
-    /// A caller that fires the durable delete unconditionally (using S1's
+    /// A caller that fires the durable clear unconditionally (using S1's
     /// own session_id, which still legitimately matches the stale row) would
-    /// delete a LIVE agent's presence row — a false-negative other replicas'
+    /// clear a LIVE agent's presence — a false-negative other replicas'
     /// evaluate_scope()/all_ids() would silently inherit. Bool was `void`
     /// before this fix; every caller was already local to this repo (grep
     /// verified two call sites, both updated in the same change).
@@ -1004,6 +1050,16 @@ public:
     // pre-WS-5. Non-owning — the caller (ServerImpl) outlives this registry.
     void configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl);
 
+    /// Injectable presence read (the single `query_live_ids` seam). Tests feed
+    /// a stub; the store overload binds `store->query_live_ids`. The reader runs
+    /// under `presence_cache_mu_` (non-recursive), so it must not call back into
+    /// the registry (`all_ids`, `evaluate_scope`, `ids_with_os`,
+    /// `has_remote_presence`) or it self-deadlocks.
+    using PresenceReadFn = std::function<
+        std::expected<std::vector<PresenceIdentity>, PresenceReadError>(std::chrono::seconds)>;
+    /// Test-facing overload: assigns the reader AND the TTL it is called with.
+    void configure_presence(PresenceReadFn reader, std::chrono::seconds ttl);
+
     // Look up the agent_id that was registered for a given Subscribe call.
     std::string find_agent_by_stream(
         grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) const;
@@ -1019,6 +1075,13 @@ public:
     // Get a session by agent_id (for scope evaluation).
     std::shared_ptr<AgentSession> get_session(const std::string& agent_id) const;
 
+    /// True iff the registry's current session for `agent_id` carries `session_id`.
+    /// Compares under `mu_` — reading `get_session(...)->session_id` after the lock is
+    /// released races the owner's session replacement.
+    [[nodiscard]] bool session_is(const std::string& agent_id, const std::string& session_id) const;
+    /// Copy of the current session id for `agent_id` (empty if none), read under `mu_`.
+    [[nodiscard]] std::string session_id_of(const std::string& agent_id) const;
+
     // #3424/#3511: ids POSITIVELY known to lack `plugin`, for
     // dispatch_confined_arms's plugin-presence filter. One locked pass over
     // every session, same shape as all_ids() above. An agent with an EMPTY
@@ -1033,7 +1096,26 @@ public:
     // agent's self-reported inventory and never refreshed until the agent's
     // next re-register -- a plugin installed since is not visible here until
     // then; documented at the call site, not re-litigated per caller.
-    std::unordered_set<std::string> ids_missing_plugin(std::string_view plugin) const;
+    //
+    // Protective-action exemption: a protective (plugin, action) pair
+    // (yuzu::protective) always yields the empty set -- the registration-time
+    // inventory is stale until reconnect, so it must never strand a
+    // quarantine/Guardian dispatch; a device that genuinely lacks the plugin
+    // answers "plugin not found" itself, which is observable, unlike a
+    // server-side withhold.
+    std::unordered_set<std::string> ids_missing_plugin(std::string_view plugin,
+                                                       std::string_view action) const;
+
+    // #5294: ids whose KNOWN agent OS (local session `os`, else the
+    // cross-replica presence row's `os`; local wins) is in `os_values` -- the
+    // targets a per-OS kill switch withholds. Empty `os_values` -> empty set
+    // with NO presence read (zero cost for every dispatch without a per-OS
+    // row). An id with an empty `os` everywhere is never included (absence of
+    // data is not a killed OS). A degraded presence read with a non-empty
+    // `os_values` returns the error: the caller refuses the dispatch rather
+    // than silently narrowing enforcement to this replica's local sessions.
+    [[nodiscard]] std::expected<std::unordered_set<std::string>, PresenceReadError>
+    ids_with_os(const std::unordered_set<std::string>& os_values) const;
 
     // Evaluate a scope expression against all agents (local + cross-replica
     // presence), return matching agent IDs. `rs_store` resolves the
@@ -1142,17 +1224,20 @@ private:
     EventBus& bus_;
     yuzu::MetricsRegistry& metrics_;
 
-    /// HA WS-5 (ADR-2002 §7a). Non-owning; null = presence unconfigured
-    /// (local-only behavior, unchanged from pre-WS-5). Set once via
-    /// configure_presence during server wiring, read (without mu_ held — a
-    /// Postgres round trip must never run under the same lock
-    /// register_agent/send_to/evaluate_scope contend on) by all_ids() and
-    /// evaluate_scope().
-    OfflineEndpointStore* presence_store_{nullptr};
+    /// HA WS-5 (ADR-2002 §7a). Empty = presence unconfigured (local-only
+    /// behavior, unchanged from pre-WS-5). Set once via configure_presence
+    /// during server wiring, read (without mu_ held — a Postgres round trip
+    /// must never run under the same lock register_agent/send_to/
+    /// evaluate_scope contend on) by all_ids() and evaluate_scope(). The
+    /// production binding borrows the `OfflineEndpointStore*` non-owning:
+    /// server teardown nulls it via `configure_presence(nullptr, ...)` BEFORE
+    /// `offline_endpoint_store_.reset()` (test_store_wiring_order.cpp).
+    /// Protective-action exemption: the one `query_live_ids` caller path.
+    PresenceReadFn presence_reader_;
     std::chrono::seconds presence_ttl_{90};
 
     /// HA WS-5 governance hardening (Gate 3 performance + sre, 2026-09-22):
-    /// a bare `presence_store_->query_live_ids(...)` on every all_ids()/
+    /// a bare `query_live_ids(...)` on every all_ids()/
     /// evaluate_scope() call put a synchronous Postgres round trip on paths
     /// that were previously pure in-memory on EVERY deployment — presence is
     /// wired unconditionally at boot whenever `OfflineEndpointStore`
@@ -1167,7 +1252,7 @@ private:
     /// `presence_ttl_`, itself ~90s) — a few extra seconds of read staleness
     /// on top of that is a negligible relative addition, never a new
     /// correctness class. `live_presence()` is the ONLY caller of
-    /// `presence_store_->query_live_ids`; all_ids()/evaluate_scope() must
+    /// `query_live_ids` (via `presence_reader_`); all_ids()/evaluate_scope() must
     /// route through it, never call query_live_ids directly.
     ///
     /// #4981 PR-1 (Finding B2): the cache holds the `std::expected` itself,
@@ -1186,10 +1271,11 @@ private:
 
     /// Returns the cached (or freshly-fetched, if stale/first-call) live
     /// presence set — or the cached/fresh `PresenceReadError` on a degraded
-    /// read (#4981 PR-1 Finding B). Success-empty immediately, no lock taken,
-    /// when presence is unconfigured (`presence_store_ == nullptr`) — the
-    /// common single-replica case pays only the pointer check, and can never
-    /// fail this way.
+    /// read (#4981 PR-1 Finding B). Always acquires `presence_cache_mu_` first, so
+    /// `configure_presence` can never race a read; when presence is unconfigured
+    /// (`presence_reader_` empty) it then returns success-empty — the common
+    /// single-replica case pays one uncontended mutex acquisition plus the
+    /// pointer check, and can never fail this way.
     std::expected<std::vector<PresenceIdentity>, PresenceReadError> live_presence() const;
 
     // #4981 PR-1 (Finding B4): which agent population evaluate_scope_impl

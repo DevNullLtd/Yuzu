@@ -62,6 +62,9 @@ Not a retention problem, and much louder than one:
 PostgreSQL (schema `audit_store`) at all. Behavioural-PII REST routes
 are fail-closed, so they are returning `503` while this persists, and the
 evidence for whatever is happening right now is not being recorded.
+The response reads (`response.read`, on `/api/responses/*` and `/api/v1/responses/*`) are among them,
+and every served read there adds one audit INSERT, so a polling script on those routes raises audit
+volume; the audit reaper's retention cap is the only backpressure.
 
 Check, in order: `/healthz` `stores.audit` (a failed migration or an
 unreachable `--postgres-dsn` closes the store — the log says so explicitly);
@@ -371,6 +374,13 @@ migration transaction (ADR-0040), so a missing index means the migration
 itself failed or was interrupted mid-build — not a best-effort background
 build that silently degraded. Treat a missing index as a migration-integrity
 problem, not a performance tuning task.
+
+An exclusive lock on `audit_store.audit_events` (a migration, `VACUUM FULL`, a
+manual `LOCK TABLE`) makes every password change or reset fail closed with 503
+`audit_unavailable` within ~1.5 s (nothing changes; retry after the lock lifts).
+It also stalls every other request that writes an audit row, sign-ins on any
+account included: their audit INSERT waits on the lock for up to the database
+connection's 10 s `lock_timeout`. Schedule it outside sign-in peaks.
 
 ## YuzuAuditRetentionNeverRan
 

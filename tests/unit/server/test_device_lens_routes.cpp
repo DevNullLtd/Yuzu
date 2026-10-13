@@ -474,6 +474,43 @@ TEST_CASE("device lenses: Guardian lens renders known guards incl. an orphan-rul
                        "<td class=\"gp-mute\">2026-04-19T14:00:00Z</td></tr>") != std::string::npos);
 }
 
+TEST_CASE("device lenses: Guardian lens: a guard.errored lifecycle event shows the rule as errored "
+          "(C-1)",
+          "[pg][device][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    const std::string agent = "guardian-errored-1";
+    REQUIRE(store.create_rule(make_lens_rule("r-err", "Errored Guard")));
+    // Compliant first, then the guard itself errors (guard.errored, NOT guard.unhealthy):
+    // the census keeps the later verdict, so the lens must render "errored", not "compliant".
+    REQUIRE(store.insert_event(make_drift_event("evt-ok", "r-err", agent, "guard.compliant",
+                                                "2026-04-19T12:00:00Z")));
+    REQUIRE(store.insert_event(make_drift_event("evt-err", "r-err", agent, "guard.errored",
+                                                "2026-04-19T13:00:00Z")));
+
+    auto dex_api = make_local_dex_api(&store, {});
+    auto guardian_api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
+    auto okScoped = [](const httplib::Request&, httplib::Response&, const std::string&,
+                       const std::string&, const std::string&) { return true; };
+    yuzu::server::test::TestRouteSink sink;
+    DeviceLensRoutes routes;
+    routes.register_routes(sink, okScoped, dex_api, guardian_api);
+
+    auto r = sink.Get("/fragments/device/guardian?id=" + agent + "&bare=1");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    // errored badge is red (#ff5765) and carries the later event's timestamp.
+    CHECK(r->body.find("<tr><td class=\"name\">Errored Guard</td><td><span "
+                       "style=\"font-size:.6rem;font-weight:700;border-radius:.3rem;padding:.05rem "
+                       ".4rem;color:#06121f;background:#ff5765\">errored</span></td>"
+                       "<td class=\"gp-mute\">2026-04-19T13:00:00Z</td></tr>") != std::string::npos);
+    // errored does not count as compliant: 0 of 1 guards.
+    CHECK(r->body.find("<div class=\"n warn\">0%</div><div class=\"l\">Compliant</div>"
+                       "<div class=\"sx\">0 of 1 guards</div>") != std::string::npos);
+    CHECK(r->body.find(">compliant</span>") == std::string::npos);
+}
+
 TEST_CASE("device lenses: Guardian lens — zero statuses renders the honest-empty message",
           "[pg][device][routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);

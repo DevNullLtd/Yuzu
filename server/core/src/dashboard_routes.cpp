@@ -25,6 +25,7 @@
 #include "http_route_sink.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
+#include "response_query_params.hpp" // export_body_byte_cap (#4644 Gate 7, row 6a)
 #include "response_store.hpp"
 #include "response_templates_engine.hpp"
 #include "visualization_engine.hpp"
@@ -218,7 +219,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
             "counter");
         metrics_->describe(
             "yuzu_tar_retention_paused_devices",
-            "Number of devices currently reporting a paused TAR source, by source name.",
+            "Number of devices currently reporting a paused TAR source, by source name. "
+            "Holds the last complete scan's value: a scan cut by the response-read cap does "
+            "not update it.",
             "gauge");
         metrics_->describe(
             "yuzu_tar_scan_dispatched_total",
@@ -748,7 +751,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (instruction.empty()) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         " class=\"result-context is-error\">"
                          "No instruction entered.</span>",
                          "text/html; charset=utf-8");
                      return;
@@ -789,7 +792,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      html += "<tbody id=\"results-tbody\" hx-swap-oob=\"innerHTML\">"
                              + rows_only + "</tbody>";
                      html += "<span id=\"result-context\" hx-swap-oob=\"true\""
-                             " style=\"font-size:0.75rem;color:#8b949e\">"
+                             " class=\"result-context\">"
                              + html_escape(context) + "</span>";
                      html += "<strong id=\"row-count\" hx-swap-oob=\"true\">"
                              + std::to_string(row_count) + "</strong>";
@@ -818,7 +821,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // overlaid on a stale chart.
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:var(--mds-color-theme-indicator-error)\">"
+                         " class=\"result-context is-error\">"
                          "Unknown command: &quot;" + html_escape(instruction) +
                          "&quot;. Type &quot;help&quot; to list all commands.</span>"
                          "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
@@ -896,7 +899,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  } else if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         " class=\"result-context is-error\">"
                          "No target selected. Choose agents, or pick All agents "
                          "to reach the fleet.</span>",
                          "text/html; charset=utf-8");
@@ -955,7 +958,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                        onbehalf::sanitize_for_log(action, 128));
                          res.set_content(
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
-                             " style=\"font-size:0.75rem;color:#f85149\">"
+                             " class=\"result-context is-error\">"
                              "Command classification is unavailable. Cannot dispatch.</span>"
                              "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
                              "text/html; charset=utf-8");
@@ -1034,7 +1037,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          // mirrors the unknown-command arm above.
                          res.set_content(
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
-                             " style=\"font-size:0.75rem;color:#f85149\">" +
+                             " class=\"result-context is-error\">" +
                                  html_escape(std::string(gate.refusal_message)) +
                                  "</span>"
                                  "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
@@ -1105,7 +1108,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                            onbehalf::sanitize_for_log(action, 128));
                              res.set_content(
                                  "<span id=\"result-context\" hx-swap-oob=\"true\""
-                                 " style=\"font-size:0.75rem;color:#f85149\">" +
+                                 " class=\"result-context is-error\">" +
                                      html_escape(std::string(
                                          yuzu::server::kDestructiveNoVisibleAgentMessage)) +
                                      "</span>"
@@ -1151,16 +1154,26 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          message = "The gateway routing directory could not be read for one "
                                     "or more targets — dispatch is failing closed rather than "
                                     "guessing where to route.";
+                     } else if (dispatch_outcome.os_gate_unreadable) {
+                         // #5294: presence unreadable while a per-OS kill
+                         // switch is OFF -- transient, fails closed.
+                         message = "Agent presence could not be read while a per-OS kill "
+                                    "switch is set — dispatch is failing closed and reaching "
+                                    "no agent; retry shortly.";
                      } else if (dispatch_outcome.denied_quarantined_count > 0) {
                          message = "Every target is quarantined — dispatch was withheld, "
                                     "not attempted.";
                      } else if (dispatch_outcome.unknown_plugin_count > 0) {
                          message = "The dispatched plugin is not in any target's reported "
                                     "inventory — dispatch was withheld, not attempted.";
+                     } else if (dispatch_outcome.kill_switched_os_count > 0) {
+                         // #5294
+                         message = "Every target runs an OS for which this plugin action is "
+                                    "switched off — dispatch was withheld, not attempted.";
                      }
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">" +
+                         " class=\"result-context is-error\">" +
                              html_escape(message) + "</span>",
                          "text/html; charset=utf-8");
                      return;
@@ -1199,7 +1212,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  // OOB: result context (only set here, no SSE race)
                  html += "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#8b949e\">" +
+                         " class=\"result-context\">" +
                          html_escape(instruction) + " &rarr; " +
                          std::to_string(sent) + " agent" +
                          (sent != 1 ? "s" : "") + "</span>";
@@ -1269,7 +1282,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto sql = req.get_param_value("sql");
                  if (sql.empty()) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                     " style=\"font-size:0.75rem;color:#f85149\">"
+                                     " class=\"result-context is-error\">"
                                      "Missing SQL query.</span>",
                                      "text/html; charset=utf-8");
                      return;
@@ -1278,7 +1291,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // M5: Server-side SQL validation with keyword blocklist (defense in depth)
                  if (sql.size() > 4096) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                     " style=\"font-size:0.75rem;color:#f85149\">"
+                                     " class=\"result-context is-error\">"
                                      "SQL query exceeds 4KB limit.</span>",
                                      "text/html; charset=utf-8");
                      return;
@@ -1289,7 +1302,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      size_t start = upper.find_first_not_of(" \t\r\n");
                      if (start == std::string::npos || !upper.substr(start).starts_with("SELECT")) {
                          res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                         " style=\"font-size:0.75rem;color:#f85149\">"
+                                         " class=\"result-context is-error\">"
                                          "Only SELECT queries are allowed.</span>",
                                          "text/html; charset=utf-8");
                          return;
@@ -1302,7 +1315,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      for (auto kw = blocked; *kw; ++kw) {
                          if (upper.find(*kw) != std::string::npos) {
                              res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                             " style=\"font-size:0.75rem;color:#f85149\">"
+                                             " class=\"result-context is-error\">"
                                              "Query contains forbidden keyword.</span>",
                                              "text/html; charset=utf-8");
                              return;
@@ -1336,7 +1349,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  } else if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         " class=\"result-context is-error\">"
                          "No target selected. Choose agents, or pick All agents "
                          "to reach the fleet.</span>",
                          "text/html; charset=utf-8");
@@ -1358,7 +1371,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  if (sent == 0) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                     " style=\"font-size:0.75rem;color:#f85149\">"
+                                     " class=\"result-context is-error\">"
                                      "No agents connected.</span>",
                                      "text/html; charset=utf-8");
                      return;
@@ -1370,13 +1383,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          "<tr><th class=\"col-agent\">Agent</th>"
                          "<th>Waiting for schema...</th></tr></thead>";
                  html += "<tbody id=\"results-tbody\" hx-swap-oob=\"innerHTML\">"
-                         "<tr id=\"empty-row\"><td colspan=\"99\" style=\"text-align:center;"
-                         "color:#8b949e;padding:2rem 0\">"
+                         "<tr id=\"empty-row\"><td colspan=\"99\" class=\"empty-state\">"
                          "Waiting for results...</td></tr></tbody>";
                  html += "<span id=\"status-badge\" class=\"badge-running\""
                          " hx-swap-oob=\"outerHTML\">RUNNING</span>";
                  html += "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#8b949e\">TAR SQL &rarr; " +
+                         " class=\"result-context\">TAR SQL &rarr; " +
                          std::to_string(sent) + " agent" +
                          (sent != 1 ? "s" : "") + "</span>";
                  html += "<strong id=\"row-count\" hx-swap-oob=\"true\">0</strong>";
@@ -2212,13 +2224,25 @@ std::string DashboardRoutes::render_results(
     // sites below (tbody empty-state, #result-summary) so an operator sees "store
     // degraded, not zero matches" rather than a silently wrong "no results".
     bool store_degraded = false;
+    // #4644 Gate 7 (row 6a): set when the unfiltered read below was cut by the row or the
+    // byte cap, so the render says "partial" instead of presenting a cut result as complete.
+    bool result_truncated = false;
     if (filters.empty()) {
-        // No filters — load all responses for this instruction
+        // No filters — load all responses for this instruction. Byte-aware: the 50 MiB
+        // payload cap is applied in SQL (ResponseStore::query_bounded), so the fetch never
+        // materialises up to 10,000 full rows (each output is cut to 2 MiB at ingest) while
+        // holding a lease on the shared Postgres pool. The scope is still applied below,
+        // after the fetch, exactly as before: a cut is therefore reported even when every
+        // dropped row happened to be out of this caller's scope (conservative, never silent).
         ResponseQuery q;
         q.limit = 10000; // upper bound
-        auto responses_opt = response_store_->query(command_id, q);
-        store_degraded = !responses_opt.has_value();
-        responses = responses_opt.value_or(std::vector<StoredResponse>{});
+        auto bounded_opt = response_store_->query_bounded(command_id, q, std::nullopt,
+                                                          export_body_byte_cap().load());
+        store_degraded = !bounded_opt.has_value();
+        if (bounded_opt) {
+            result_truncated = bounded_opt->row_cap_hit || bounded_opt->byte_cap_hit;
+            responses = std::move(bounded_opt->rows);
+        }
         total_agent_count = static_cast<int64_t>(responses.size());
     } else {
         // Use faceted index to get matching response IDs, then load them
@@ -2491,6 +2515,11 @@ std::string DashboardRoutes::render_results(
                 (total_lines != 1 ? "s" : "") + " across " +
                 std::to_string(total_agent_count) + " agent" +
                 (total_agent_count != 1 ? "s" : "");
+        if (result_truncated) {
+            html += " <span class=\"result-degrade-banner\" data-result-truncated=\"true\">"
+                    "truncated: the 10,000-row / 50 MiB read cap was reached, so these "
+                    "rows and counts are partial</span>";
+        }
 
         // Confined-caller withhold (Gate 6 enterprise-readiness finding, this
         // round): /fragments/create-group-form and /api/dashboard/group-from-
@@ -2523,6 +2552,12 @@ std::string DashboardRoutes::render_results(
                     "Create Group from " + std::to_string(total_agent_count) +
                     " Agent" + (total_agent_count != 1 ? "s" : "") + "</button>";
         }
+    } else if (result_truncated) {
+        // Nothing parsed into a visible line, but the read itself was cut: do not let an empty
+        // summary read as "complete, no results".
+        html += "<span class=\"result-degrade-banner\" data-result-truncated=\"true\">"
+                "truncated: the 10,000-row / 50 MiB read cap was reached, so these rows "
+                "and counts are partial</span>";
     }
     html += "</div>";
 
@@ -2817,7 +2852,7 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
                 if (selected == id) html += " selected";
                 html += "\" data-scope=\"" + html_escape(id) +
                         "\" onclick=\"selectScope(this)\">"
-                        "<span class=\"scope-item-name\"><span class=\"online-dot\"></span>" +
+                        "<span class=\"scope-item-name\"><span class=\"online-dot\" title=\"Online\" role=\"img\" aria-label=\"Online\"></span>" +
                         html_escape(hostname.empty() ? id : hostname) +
                         "</span><span class=\"scope-item-meta\">" +
                         html_escape(short_id) + " &middot; " +
@@ -2828,7 +2863,7 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 
             // OOB: agent count badge
             auto count = agents_arr.size();
-            html += "<span id=\"agent-count\" hx-swap-oob=\"true\">" +
+            html += "<span id=\"agent-count\" class=\"scope-count\" hx-swap-oob=\"true\">" +
                     std::to_string(count) + " agent" +
                     (count != 1u ? "s" : "") + "</span>";
 
@@ -2909,11 +2944,22 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username,
     // empty-state render so "store couldn't be read" doesn't get reported as
     // "every collector is running normally" — the operator-facing claim this
     // view exists to make.
+    //
+    // #4644 Gate 7 (row 6a): the read is byte-aware (ResponseStore::query_bounded applies the
+    // 50 MiB payload cap in SQL), because a buggy or hostile agent can store many large
+    // responses under one command_id. A cut is NOT silent: dropped rows would read as agents
+    // that never answered, i.e. as "collecting normally", so `result_truncated_by_cap` is set
+    // and every surface (HTML banner, REST/MCP JSON) reports the result as partial.
     ResponseQuery q;
     q.limit = 10000;
-    auto responses_opt = response_store_->query(scan.scan_id, q);
-    scan.store_degraded = !responses_opt.has_value();
-    auto responses = responses_opt.value_or(std::vector<StoredResponse>{});
+    auto bounded_opt = response_store_->query_bounded(scan.scan_id, q, std::nullopt,
+                                                      export_body_byte_cap().load());
+    scan.store_degraded = !bounded_opt.has_value();
+    std::vector<StoredResponse> responses;
+    if (bounded_opt) {
+        scan.result_truncated_by_cap = bounded_opt->row_cap_hit || bounded_opt->byte_cap_hit;
+        responses = std::move(bounded_opt->rows);
+    }
 
     // Each response is from one agent. Parse each line for
     //   config|<source>_enabled|<value>
@@ -3060,7 +3106,13 @@ std::string DashboardRoutes::render_tar_retention_paused(
     // already-iterated row set, clearing the gauge family first so an
     // operator's narrowed-by-visibility view doesn't leave stale values
     // when their group composition shrinks.
-    if (metrics_) {
+    //
+    // A scan whose response read was cut by the row / byte cap has dropped whole
+    // responses, so its row set UNDER-counts (it can read 0 with paused sources
+    // present on the dropped agents). Overwriting the gauge from it would publish
+    // that under-count as fleet posture, so a cut scan leaves the last good value
+    // in place (stale beats wrong; the page's own banner carries the cut signal).
+    if (metrics_ && !scan.result_truncated_by_cap) {
         std::unordered_map<std::string, int64_t> per_source_counts{
             {"process", 0}, {"tcp", 0}, {"service", 0}, {"user", 0}};
         for (const auto& r : rows) {
@@ -3078,17 +3130,22 @@ std::string DashboardRoutes::render_tar_retention_paused(
     // visibility-bounded view.
     std::string html;
     html.reserve(2048);
-    html += "<div style=\"margin-bottom:0.75rem;font-size:0.8rem;color:#8b949e\">";
+    html += "<div class=\"tar-meta\">";
     html += std::format(
         "Scan <code>{}</code> &middot; dispatched to <strong>{}</strong> "
         "agent{} in your scope {} &middot; <strong>{}</strong> in-scope "
         "responded &middot; <strong>{}</strong> have all sources collecting "
-        "normally",
+        "normally{}",
         html_escape(scan_id),
         scan_count, scan_count == 1 ? "" : "s",
         format_age(scan_at, now),
         agents_responded,
-        agents_with_no_paused_sources);
+        agents_with_no_paused_sources,
+        // A cut read drops whole responses, so these counts describe only the
+        // responses that were read.
+        scan.result_truncated_by_cap
+            ? " <em>in the responses read (partial result, see below)</em>"
+            : "");
     if (agents_filtered_out_of_scope > 0) {
         html += std::format(" &middot; <strong>{}</strong> out-of-scope "
                             "agent{} dropped",
@@ -3096,13 +3153,35 @@ std::string DashboardRoutes::render_tar_retention_paused(
                             agents_filtered_out_of_scope == 1 ? "" : "s");
     }
     html += "</div>";
+    if (scan.result_truncated_by_cap) {
+        // A cut read drops whole responses, which reads as agents that never answered, i.e. as
+        // "collecting normally". Say the picture is partial (#4644 Gate 7, row 6a).
+        html += "<div class=\"result-degrade-banner\" data-result-truncated=\"true\">"
+                "<b>Partial result.</b> The scan's response read reached its "
+                "10,000-row / 50 MiB cap, so some agents' responses are missing "
+                "below. This is <b>not</b> confirmation that every collector is "
+                "running normally.</div>";
+    }
 
     if (rows.empty()) {
         // Distinguish "scan still in progress" from "scan complete and clean"
         // from "the store couldn't be read" — conflating the last with either
         // of the first two tells the operator every collector is fine (or
         // just slow) when the truth is the read failed.
-        if (store_degraded) {
+        if (scan.result_truncated_by_cap) {
+            // The cut persists across Refresh (the read is capped the same way each
+            // time), so neither "still in progress" nor "all clear" is true: say the
+            // page cannot tell, and what to do.
+            html += "<div class=\"empty-state result-degrade-banner\">"
+                    "<b>No paused sources in the partial result.</b> The response "
+                    "read was cut at its cap, so this page cannot tell whether "
+                    "paused sources exist on the agents whose responses were "
+                    "dropped. This is <b>not</b> confirmation that every "
+                    "collector is running normally, and Refresh will not change "
+                    "it. Narrow the scan to a smaller management group and "
+                    "scan again."
+                    "</div>";
+        } else if (store_degraded) {
             html += "<div class=\"empty-state result-degrade-banner\">"
                     "<b>Retention state unavailable.</b> The response store "
                     "could not be read (Postgres pool/query degraded). This is "
@@ -3148,7 +3227,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
             "<th>Source</th>"
             "<th>Paused since</th>"
             "<th>Paused for</th>"
-            "<th style=\"text-align:right\">Live rows</th>"
+            "<th class=\"r\">Live rows</th>"
             "<th>Oldest data</th>"
             "<th></th>"
             "</tr></thead><tbody>";
@@ -3175,7 +3254,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // the operator knows the row needs the agent upgraded rather than reading
         // "—" as "unknown / not paused".
         if (r.value_error) {
-            html += "<td colspan=\"2\"><span style=\"color:#8b949e\">reported <code>" +
+            html += "<td colspan=\"2\"><span class=\"tar-tree-mute\">reported <code>" +
                     html_escape(r.enabled_raw) + "</code></span></td>";
         } else if (r.paused_at == 0) {
             html += "<td colspan=\"2\"><span class=\"badge badge-warning\" title=\"this agent "
@@ -3185,9 +3264,9 @@ std::string DashboardRoutes::render_tar_retention_paused(
             html += "<td>" + format_utc(r.paused_at) + "</td>";
             html += "<td>" + format_age(r.paused_at, now) + "</td>";
         }
-        html += "<td style=\"text-align:right\">";
+        html += "<td class=\"r\">";
         if (r.live_rows < 0) {
-            html += "<span style=\"color:#8b949e\">—</span>";
+            html += "<span class=\"tar-tree-mute\">—</span>";
         } else {
             html += std::format("{}", r.live_rows);
         }
@@ -3209,11 +3288,10 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // authoritative, but only render an action the viewer can actually use —
         // Re-enable needs Execution:Execute, Purge needs the higher Infrastructure:
         // Delete. A read-only / Execute-only operator sees no destructive button.
-        html += "<td style=\"text-align:right;white-space:nowrap\">";
+        html += "<td class=\"r\">";
         if (can_execute) {
             html += std::format(
-                "<button class=\"btn-secondary\" style=\"padding:0.2rem 0.6rem;"
-                "font-size:0.75rem\" "
+                "<button class=\"btn-secondary btn-sm\" "
                 "hx-post=\"/fragments/tar/retention-paused/reenable\" "
                 "hx-vals='{{\"device_id\":\"{}\",\"source\":\"{}\"}}' "
                 "hx-target=\"closest tr\" hx-swap=\"delete\" "
@@ -3228,8 +3306,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
             // native prompt) gates it — no hx-confirm. Data via HTML-escaped
             // data-* attrs (read by the JS), never interpolated into script.
             html += std::format(
-                "<button class=\"btn-danger\" style=\"padding:0.2rem 0.6rem;"
-                "font-size:0.75rem\" "
+                "<button class=\"btn-danger btn-sm\" "
                 "data-device=\"{}\" data-host=\"{}\" data-source=\"{}\" "
                 "onclick=\"tarPurgeConfirm(this)\" "
                 "title=\"Permanently delete this source's stored data (source stays "
@@ -3248,7 +3325,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
 
     if (agents_responded < scan_count) {
         html += std::format(
-            "<div style=\"margin-top:0.75rem;font-size:0.75rem;color:#8b949e\">"
+            "<div class=\"tar-meta\">"
             "{} of {} agent{} still pending — click "
             "<strong>Refresh</strong> to pick up additional responses.</div>",
             scan_count - agents_responded, scan_count,

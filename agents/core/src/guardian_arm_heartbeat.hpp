@@ -9,7 +9,7 @@
 /// are RE-STATABLE GAUGES, not monotonic per-sweep counters rolled up into a fleet
 /// sum. A nearby row in docs/spark-legacy-delta-registry.md (the counter-rollup
 /// families) uses the opposite shape - copying that by analogy would silently break
-/// the K-bound safety argument the whole mechanism rests on, since a cleared
+/// the safety argument the whole mechanism rests on, since a cleared
 /// wedge (PR-5) would never be reflected by a monotonic counter.
 ///
 /// GuardianArmStats is assembled by GuardianEngine::arm_stats() from
@@ -46,7 +46,7 @@ struct GuardianArmStats {
     /// incarnation is later ADOPTED by the runtime (PR-5d's own concern 1 - a late
     /// success on a still-desired wedged claim) is detected by drain_locked()'s
     /// own recovery scan (GuardianSparkRuntime::receipt_recovery_status(), rung
-    /// 9c PR-5e's atomic combination of receipt_recovered() with the K-eligibility
+    /// 9c PR-5e's atomic combination of receipt_recovered() with the outstanding-wedge
     /// probe - see that accessor's own doc comment) and its
     /// contribution here is cleared - every OTHER non-Committed status (Failed,
     /// CongestionExpired, Withdrawn, Stopped) still only ever increments this
@@ -54,8 +54,16 @@ struct GuardianArmStats {
     /// whenever decide_retry() returns Reapply on a generation that previously
     /// failed, which begins a FRESH application via begin_application() - that
     /// Reapply path is driven by the existing ~25s full_sync retry cadence and
-    /// predates PR-5d. Recovery is scoped to THIS application's own bookkeeping
-    /// only (see Application::failed_receipts' own doc comment) - a durable,
+    /// predates PR-5d. A HELD WEDGE is the exception (#5459): while a wedge is
+    /// outstanding decide_retry() Suppresses the identical retry, so the application
+    /// is NOT replaced and this field holds steady while the wedge is held. The
+    /// safety valve (kWedgeSuppressMaxDecisions) forces a Reapply that may dip it
+    /// within one application, but the dip is normally not visible at the heartbeat
+    /// cadence (the drain runs before the sample); it falls when the claim pops or
+    /// the recovery scan clears the wedge, or when the hold ends by a full push that
+    /// omits or re-keys the wedged rule and the new application has no other failure.
+    /// Recovery is scoped to THIS application's
+    /// own bookkeeping only (see Application::failed_receipts' own doc comment) - a durable,
     /// cross-application "last known outcome for every currently-desired rule"
     /// gauge is a separate, stronger semantic 5e's own scope owns, not delivered
     /// here. Zero failed does not itself mean compliant or enforced - latched_

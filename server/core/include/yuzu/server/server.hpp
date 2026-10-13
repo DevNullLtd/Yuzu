@@ -164,6 +164,13 @@ struct Config {
     std::string gateway_command_address;  // Gateway ManagementService for command forwarding
     bool gateway_mode{false};             // When true, relax peer-mismatch in Subscribe
 
+    // Gateway-upstream peer authorization (see gateway_peer_resolution.hpp and
+    // server_gateway_peer_options.hpp). Raw operator input: normalised once at boot by
+    // normalize_gateway_peer_options, resolved against the live TLS posture in run().
+    std::vector<std::string> gateway_peer_pins;      // --gateway-peer-pin, 64-hex SPKI SHA-256
+    std::vector<std::string> gateway_peer_pin_files; // --gateway-peer-pin-file, PEM or hex lines
+    bool insecure_gateway_peer{false};               // --insecure-gateway-peer: ack, peer authz OFF
+
     // HA WS-4 4.3: per-cluster ManagementService addresses for cross-cluster
     // command fan-out (`--gateway-cluster-addr cluster_id=host:port`, comma-
     // repeatable). Empty (the default) means single-cluster mode:

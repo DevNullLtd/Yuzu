@@ -126,7 +126,7 @@ TEST_CASE("AuthManager+SessionStore: create_local_session → validate round-tri
     auto mgr = make_mgr(store);
     REQUIRE(mgr->is_session_store_ok());
 
-    auto token = mgr->create_local_session("alice", Role::admin, /*mfa_verified=*/true);
+    auto token = mgr->create_local_session_for_test("alice", Role::admin, /*mfa_verified=*/true);
     REQUIRE_FALSE(token.empty());
 
     auto s = mgr->validate_session(token);
@@ -153,7 +153,7 @@ TEST_CASE("AuthManager+SessionStore: a session survives on a fresh replica",
     REQUIRE(store.is_open());
 
     auto a = make_mgr(store);
-    auto token = a->create_local_session("bob", Role::user, /*mfa_verified=*/false);
+    auto token = a->create_local_session_for_test("bob", Role::user, /*mfa_verified=*/false);
     REQUIRE_FALSE(token.empty());
 
     // A fresh AuthManager sharing the same store = a second replica / a restart:
@@ -173,7 +173,7 @@ TEST_CASE("AuthManager+SessionStore: elevation persists and is honored on a fres
     REQUIRE(store.is_open());
 
     auto a = make_mgr(store);
-    auto token = a->create_local_session("carol", Role::user, /*mfa_verified=*/true);
+    auto token = a->create_local_session_for_test("carol", Role::user, /*mfa_verified=*/true);
     REQUIRE_FALSE(token.empty());
 
     // Base role is user until elevated.
@@ -219,7 +219,7 @@ TEST_CASE("AuthManager+SessionStore: invalidate deletes the durable session",
     REQUIRE(store.is_open());
 
     auto a = make_mgr(store);
-    auto token = a->create_local_session("dave", Role::admin, /*mfa_verified=*/true);
+    auto token = a->create_local_session_for_test("dave", Role::admin, /*mfa_verified=*/true);
     REQUIRE(a->validate_session(token).has_value());
 
     CHECK(a->invalidate_session(token)); // happy path: durable delete persisted
@@ -238,9 +238,9 @@ TEST_CASE("AuthManager+SessionStore: invalidate_user_sessions kills every device
     REQUIRE(store.is_open());
 
     auto a = make_mgr(store);
-    auto t1 = a->create_local_session("erin", Role::user, false);
-    auto t2 = a->create_local_session("erin", Role::user, false);
-    auto other = a->create_local_session("frank", Role::user, false);
+    auto t1 = a->create_local_session_for_test("erin", Role::user, false);
+    auto t2 = a->create_local_session_for_test("erin", Role::user, false);
+    auto other = a->create_local_session_for_test("frank", Role::user, false);
 
     auto res = a->invalidate_user_sessions("erin");
     CHECK(res.db_persisted);
@@ -261,7 +261,7 @@ TEST_CASE("AuthManager+SessionStore: a role change durably wipes the user's sess
 
     auto a = make_mgr_with_config(store);
     REQUIRE(a->upsert_user("gina", "secret123456", Role::user));
-    auto token = a->create_local_session("gina", Role::user, false);
+    auto token = a->create_local_session_for_test("gina", Role::user, false);
     REQUIRE(a->validate_session(token).has_value());
 
     // Promote gina → the stale-role session must not survive on any replica:
@@ -283,7 +283,7 @@ TEST_CASE("AuthManager+SessionStore: a durable-clear failure fails revoke CLOSED
     REQUIRE(store.is_open());
 
     auto a = make_mgr(store);
-    auto token = a->create_local_session("jack", Role::user, /*mfa_verified=*/true);
+    auto token = a->create_local_session_for_test("jack", Role::user, /*mfa_verified=*/true);
     REQUIRE(a->elevate_session(token, std::chrono::seconds(120)).has_value());
     REQUIRE(is_elevated(*a->validate_session(token))); // live elevation, cached on `a`
 
@@ -317,7 +317,7 @@ TEST_CASE("AuthManager+SessionStore: a failed single-session invalidate reports 
     REQUIRE(store.is_open());
 
     auto a = make_mgr(store);
-    auto token = a->create_local_session("kate", Role::user, /*mfa_verified=*/false);
+    auto token = a->create_local_session_for_test("kate", Role::user, /*mfa_verified=*/false);
     REQUIRE(a->validate_session(token).has_value());
 
     // Fault-inject: drop the schema so the durable DELETE fails.
@@ -353,7 +353,7 @@ TEST_CASE("AuthRoutes /logout: success clears the cookie; a durable-delete failu
     LogoutHarness h{store};
 
     SECTION("success — HTMX: cookie cleared + HX-Redirect to /login") {
-        auto tok = h.mgr->create_local_session("htmx-ok", Role::user, /*mfa=*/false);
+        auto tok = h.mgr->create_local_session_for_test("htmx-ok", Role::user, /*mfa=*/false);
         auto res = h.sink.dispatch("POST", "/logout", "", "application/json", cookie_hdrs(tok, true));
         REQUIRE(res);
         CHECK(res->status == 200);
@@ -363,7 +363,7 @@ TEST_CASE("AuthRoutes /logout: success clears the cookie; a durable-delete failu
     }
 
     SECTION("success — non-HTMX: cookie cleared + {\"status\":\"ok\"}") {
-        auto tok = h.mgr->create_local_session("json-ok", Role::user, /*mfa=*/false);
+        auto tok = h.mgr->create_local_session_for_test("json-ok", Role::user, /*mfa=*/false);
         auto res = h.sink.dispatch("POST", "/logout", "", "application/json", cookie_hdrs(tok, false));
         REQUIRE(res);
         CHECK(res->status == 200);
@@ -373,7 +373,7 @@ TEST_CASE("AuthRoutes /logout: success clears the cookie; a durable-delete failu
     }
 
     SECTION("durable-delete failure — HTMX fails CLOSED (503, cookie kept, no redirect)") {
-        auto tok = h.mgr->create_local_session("htmx-degrade", Role::user, /*mfa=*/false);
+        auto tok = h.mgr->create_local_session_for_test("htmx-degrade", Role::user, /*mfa=*/false);
         REQUIRE(h.mgr->validate_session(tok).has_value());
         drop_session_schema(pool); // the DELETE inside invalidate_session now fails
         auto res = h.sink.dispatch("POST", "/logout", "", "application/json", cookie_hdrs(tok, true));
@@ -385,7 +385,7 @@ TEST_CASE("AuthRoutes /logout: success clears the cookie; a durable-delete failu
     }
 
     SECTION("durable-delete failure — non-HTMX fails CLOSED (503, cookie kept, partial)") {
-        auto tok = h.mgr->create_local_session("json-degrade", Role::user, /*mfa=*/false);
+        auto tok = h.mgr->create_local_session_for_test("json-degrade", Role::user, /*mfa=*/false);
         REQUIRE(h.mgr->validate_session(tok).has_value());
         drop_session_schema(pool);
         auto res = h.sink.dispatch("POST", "/logout", "", "application/json", cookie_hdrs(tok, false));
@@ -418,7 +418,7 @@ TEST_CASE("AuthManager+SessionStore: the validate cache is trusted only after th
 
     SECTION("confirmed view rides a PG brownout within the stale-serve bound") {
         auto a = make_mgr(store);
-        auto tok = a->create_local_session("kate", Role::user, /*mfa=*/false);
+        auto tok = a->create_local_session_for_test("kate", Role::user, /*mfa=*/false);
         // First validate on a healthy store CONFIRMS the generation view and
         // re-caches the row (session_gen_valid_ = true, anchor = now).
         REQUIRE(a->validate_session(tok).has_value());
@@ -447,7 +447,7 @@ TEST_CASE("AuthManager+SessionStore: the validate cache is trusted only after th
         // create_local_session caches the row but does NOT confirm the
         // generation view (no read_generation), so session_gen_valid_ stays
         // false. The row sits in this manager's cache.
-        auto tok = a->create_local_session("nick", Role::user, /*mfa=*/false);
+        auto tok = a->create_local_session_for_test("nick", Role::user, /*mfa=*/false);
         // Degrade before any validate confirms the view. An unconfirmed view is
         // distrusted, so validate bypasses the (populated) cache, goes
         // authoritative, and fails closed on the degraded store — proving the

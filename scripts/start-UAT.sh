@@ -698,11 +698,15 @@ start_all() {
     # Rate limits are bumped well above production defaults so the /test
     # Phase 5 fan-out (instructions runner with parallelism=4, parallel
     # security E2E logins, etc.) doesn't trip 429s/401s. (#1006, #1007)
+    # Plaintext rig: --insecure-gateway-peer explicitly acknowledges that peer
+    # authorization on the gateway-upstream service is disabled. Not for
+    # production.
     "$BUILDDIR/server/core/yuzu-server" \
         --no-tls \
         --no-https \
         --listen 0.0.0.0:50054 \
         --gateway-upstream 0.0.0.0:50055 \
+        --insecure-gateway-peer \
         --gateway-mode \
         --gateway-command-addr localhost:50063 \
         --web-address 0.0.0.0 \

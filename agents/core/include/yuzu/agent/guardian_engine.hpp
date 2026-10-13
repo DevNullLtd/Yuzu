@@ -37,7 +37,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <yuzu/agent/kv_store.hpp> // kKvStoreStopBusyTimeout (#5604)
 #include <yuzu/agent/guard.hpp>  // IGuard, GuardDrift (guard abstraction)
+#include <yuzu/agent/guardian_preserved_tally.hpp> // #4415: per-full_sync skipped-rule record
 #include <yuzu/agent/spark.hpp> // SparkType (for the classify() capability set)
 
 namespace yuzu::agent {
@@ -70,9 +72,11 @@ class GuardianArmAckLedger;
 class ConvergenceScheduler;
 class GuardianOutboxDrainWorker;
 class GuardianLifecycleJournal;
+class GuardianBaselinePersister;
 struct GuardianJournalStats;
 struct GuardianJournalAgeStats;
 struct GuardianArmStats;
+struct GuardianHealthStats;
 class GuardianStateReader;
 class GuardianSparkEngineBackend;
 class GuardianLegacySinkExecutor;
@@ -311,6 +315,72 @@ public:
     /// outbox_backpressure_drops()'s own shape.
     [[nodiscard]] std::uint64_t io_ceiling_rejections() const;
 
+    /// #4045: cumulative-since-boot count of the channels by which a Spark baseline capture
+    /// failed to reach (or may not reach) the #4021 KV record: failed persist passes (one per
+    /// pass, however many of its writes failed), throws firewalled around a pass (engine
+    /// and drain worker), staging attempts that failed (an allocation failure, once per
+    /// attempt) or displaced a capture (a retarget that replaced a still-unpersisted capture;
+    /// GuardianSparkRuntime::staged_baseline_drops), and passes that found a capture staged
+    /// with no KV store to write it to. A stop-time loss that is not a failed write (the stop
+    /// flush ran out of wall budget, or was skipped because it started late AND this stop had
+    /// shown a slow store) is logged, NOT counted here. A capture that could not be
+    /// staged again at stop IS counted (per failed attempt, like any staging failure) and
+    /// logged, but the count dies with the exiting process, so the log line is the evidence;
+    /// the same holds for a flush cut short by a firewalled throw (counted in the persister's
+    /// firewalled-exception count, and logged). A stop cut off by the shutdown watchdog leaves
+    /// not even a log line (exit code 4). Zero while
+    /// healthy, quiescent, or inert (prefer_spark off). Surfaced SPARSELY as
+    /// `yuzu.guardian_baseline_persist_failures` via emit_guardian_baseline_persist_heartbeat_tags.
+    /// Spark path ONLY: a legacy FileGuard persist failure is logged, not counted. Because it
+    /// is cumulative, a non-zero value says a failure or loss HAPPENED in this process, not
+    /// that one is still open; a failed capture stays staged and is retried (a crash, a
+    /// displaced capture and the stop-time losses above lose one), and the rule keeps
+    /// enforcing on its in-memory baseline meanwhile.
+    /// This accessor takes no lock (atomics only, never mtx_). The heartbeat thread's other
+    /// GuardianEngine getters (policy_generation(), journal_stats(), ...) DO take mtx_, so the
+    /// tick as a whole can still wait behind apply_rules; only this read cannot.
+    [[nodiscard]] std::uint64_t baseline_persist_failures() const;
+    /// #4045: cumulative count of staged captures the #4021 overwrite guard REFUSED to write
+    /// because a same-target record already existed (first capture wins). Not a failure and not
+    /// part of baseline_persist_failures(). DIAGNOSTIC accessor with no production consumer and
+    /// no heartbeat tag. It is an UPPER BOUND on "the live baseline differs from the durable
+    /// record" and has two causes: a seed read that failed at arm while a valid record existed
+    /// (the rule is judged against re-captured content until its next re-arm; the record is
+    /// intact), and a benign duplicate (an erase threw after a successful write, so the next
+    /// pass re-wrote the same capture and the guard refused it). Lock-free.
+    [[nodiscard]] std::uint64_t baseline_persist_refusals() const;
+    /// TEST-ONLY: how many times stop() logged that its final Spark baseline flush was
+    /// incomplete (the ERROR line docs/user-manual/metrics.md names). No production caller.
+    [[nodiscard]] std::uint64_t baseline_stop_incomplete_logs_for_test() const noexcept {
+        return baseline_stop_incomplete_logs_.load(std::memory_order_relaxed);
+    }
+    /// TEST-ONLY: how many times stop() logged that committed captures could not be staged again
+    /// at stop (the ERROR line docs/user-manual/metrics.md names). No production caller.
+    [[nodiscard]] std::uint64_t baseline_stop_unstaged_logs_for_test() const noexcept {
+        return baseline_stop_unstaged_logs_.load(std::memory_order_relaxed);
+    }
+    /// TEST-ONLY: how many times stop() logged that its Stop pass threw before writing, or that
+    /// its staging sweep threw (the firewalled catches docs/user-manual/metrics.md names). No
+    /// production caller.
+    [[nodiscard]] std::uint64_t baseline_stop_flush_threw_logs_for_test() const noexcept {
+        return baseline_stop_flush_threw_logs_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t baseline_stop_sweep_threw_logs_for_test() const noexcept {
+        return baseline_stop_sweep_threw_logs_.load(std::memory_order_relaxed);
+    }
+    /// How many times stop() logged that lifecycle-journal records were still unpersisted after
+    /// its final journal flush (0 or 1). stop() reads it as the once-only latch for that line;
+    /// tests read it to count the line. No other production caller.
+    [[nodiscard]] std::uint64_t journal_stop_pending_logs_for_test() const noexcept {
+        return journal_stop_pending_logs_.load(std::memory_order_relaxed);
+    }
+    /// The exact ERROR line stop() logs when `pending` lifecycle-journal records remain unpersisted
+    /// after the stop-time flush `stage`. They are audit evidence held only in memory, so they
+    /// are lost with the process. Count and stage only: no rule id, path or record content. Pure
+    /// and static so a test can pin the text without capturing spdlog.
+    [[nodiscard]] static std::string stop_journal_pending_log_line(std::size_t pending,
+                                                                   const char* stage);
+
     /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was
     /// edge-suppressed (M1). Surfaced sparsely on the heartbeat as
     /// `yuzu.guardian_unhealthy_suppressed` so a rule stuck errored is observable
@@ -330,6 +400,56 @@ public:
     /// counter). Surfaced as `yuzu.guardian_outbox_backpressure_drops`. Zero when
     /// prefer_spark is off / no runtime.
     [[nodiscard]] std::uint64_t outbox_backpressure_drops() const;
+
+    /// #5403: Spark Disarm claims observed pending longer than
+    /// GuardianSparkRuntime::kDisarmPendingObserveThreshold, counted once per claim
+    /// (GuardianSparkRuntime::disarm_deadline_elapsed()). Surfaced sparsely as
+    /// `yuzu.guardian_disarm_deadline_elapsed`. Observation only; zero when no runtime.
+    [[nodiscard]] std::uint64_t disarm_deadline_elapsed() const;
+    /// #5403: age, in whole seconds (floored), of the oldest Spark Disarm claim still pending
+    /// (GuardianSparkRuntime::oldest_pending_disarm_age()), or nullopt when none is. Surfaced
+    /// as `yuzu.guardian_disarm_pending_age_seconds` via emit_guardian_health_age_tags,
+    /// which emits nothing for nullopt, so "no Disarm pending" is an ABSENCE, never a 0. It
+    /// measures "pending too long", not proof of a hang, and does not see a compensating
+    /// disarm, direct_disarm_fallback(), the synchronous residue fallback in
+    /// detach_rule_locked, or inline-type teardown. `now` defaults to the steady clock; a test
+    /// passes a later reading to age a claim without sleeping. Takes mtx_ then the runtime's
+    /// registry_mu_, the same order attach_rule/detach_rule already use.
+    [[nodiscard]] std::optional<std::uint64_t> oldest_pending_disarm_age_seconds(
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
+
+    /// #4472: age, in whole seconds (floored), of the oldest compensating teardown still
+    /// outstanding (GuardianSparkRuntime::oldest_outstanding_compensation_age()), measured from
+    /// the instant the compensation became owed, or nullopt when none is. Surfaced as
+    /// `yuzu.guardian_compensation_pending_age_seconds` via
+    /// emit_guardian_health_age_tags, which emits nothing for nullopt, so "none
+    /// outstanding" is an ABSENCE, never a 0. It measures "teardown pending too long", not proof
+    /// of a hang; while a teardown is outstanding its generation is held (nothing
+    /// acknowledges it, #5459) and identical re-pushes are suppressed. Observation only.
+    /// `now` defaults to the steady clock; a test passes a later reading to age a claim
+    /// without sleeping. Takes mtx_ then the runtime's registry_mu_, the same order
+    /// attach_rule/detach_rule already use.
+    [[nodiscard]] std::optional<std::uint64_t> oldest_outstanding_compensation_age_seconds(
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const;
+
+    /// #5404 (gate rows P1/P2): the Spark claim-lifecycle values, as a GuardianHealthStats with
+    /// only these fields set: the twelve runtime values (including #5403's
+    /// disarm_deadline_elapsed and #4472's compensation_deadline_elapsed;
+    /// guardian_health_heartbeat.hpp's guardian_spark_claim_health_stats holds the
+    /// runtime-accessor -> field mapping) plus ack_maint_exceptions, which is filled here. All
+    /// zero when no runtime is wired (the runtime fields only; ack_maint_exceptions is engine
+    /// state and still counts). Surfaced sparsely through the same emitter as the other health
+    /// counters. `retained_tombstones` is an O(claims) scan under the runtime's registry_mu_
+    /// (taken after mtx_, the order attach_rule/detach_rule already use): heartbeat cadence
+    /// only, never per event.
+    [[nodiscard]] GuardianHealthStats spark_claim_health_stats() const;
+    /// #5404 (P2): throws caught by the ack-bookkeeping maintenance firewall - the heartbeat
+    /// thread's ack drain / generation advance in journal_maintenance_tick, and the content-id
+    /// hash and begin_application preamble in apply_rules. A throw that recurs every tick
+    /// repeats the skip of that tick's remaining ack drain. Lock-free; zero is steady state.
+    [[nodiscard]] std::uint64_t ack_maint_exceptions() const noexcept {
+        return ack_maint_exceptions_.load(std::memory_order_relaxed);
+    }
 
     /// #4783 commit 4: cumulative count of legacy-sink events this engine could not
     /// deliver (RefusedCapacity/RefusedAdmission/WriteFailed/a throwing send — see
@@ -432,17 +552,61 @@ public:
     /// mech_unsupported_total heartbeat tag.
     [[nodiscard]] std::map<SparkType, std::uint64_t> unsupported_counts_by_type() const;
 
-    /// Current policy generation — monotonically increasing; bumped on
-    /// every successful apply_rules call. Persisted across restarts.
+    /// The policy generation REPORTED to the server (the heartbeat's yuzu.guardian_generation
+    /// tag, via generation_report() below, and the `__guard__ push_rules` reply text). Reads 0
+    /// while a boot re-arm is unresolved (boot_rearm_unresolved(), #5513): a boot re-arm that
+    /// failed at an already-acknowledged generation would otherwise leave the agent reporting
+    /// that generation while the rule is not armed, and the server's heartbeat reconcile only
+    /// pushes while the reported value is BEHIND its current. This accessor is const and pure:
+    /// it reads 0 for the WHOLE unresolved window. The heartbeat's own report,
+    /// generation_report(), is the one exception: after a failed catch-up it reports the real
+    /// value for a bounded number of heartbeats (the #5513 back-off, see boot_report_holdoff_).
+    /// Only the INTERNAL value (policy_generation_, the one persisted under kKeyGen) is
+    /// monotonically increasing and bumped on a successful apply_rules call; this REPORTED
+    /// value is not monotonic by design (it drops to 0 on an unresolved boot re-arm and
+    /// returns to the internal value when a clean application clears it). Persisted across
+    /// restarts is the internal value only.
     std::uint64_t policy_generation() const;
 
-    /// Cumulative count of reconcile (arm) ATTEMPTS that threw and were firewalled in
-    /// apply_rules — a rule that persisted but did not arm. This counts attempts, NOT
-    /// distinct rules: one persistently-failing rule increments it once per push (so it
-    /// is a rate signal / "a gap is open", not "how many rules are gapped"). A nonzero
-    /// value means an enforcement gap is (or was) open on this endpoint; surfaced via the
-    /// heartbeat by item 9 so a persistent gap stays fleet-visible even after the
-    /// generation later advances past it (rung 7.7b PR-1 item 3 / Sol B1). Lock-free.
+    /// The reported generation and the boot-re-arm flag read under ONE mtx_ acquisition, so a
+    /// heartbeat that ships both tags can never pair a value from before an apply_rules clear
+    /// with a flag from after it (#5513). `reported` is what policy_generation() would return at
+    /// the same instant, EXCEPT during the back-off: while the boot re-arm is unresolved and
+    /// boot_report_holdoff_ is positive, `reported` is the real persisted generation while
+    /// `boot_rearm_unresolved` stays true. Only an agent whose persisted generation EQUALS the
+    /// server's current generation is left alone by the server for that many heartbeats; one
+    /// whose persisted generation is behind the server's (or is 0) is still re-pushed at the
+    /// server's 25 s per-agent limit (the pre-existing held-generation retry, unchanged).
+    ///
+    /// NOT const, and NOT idempotent: each call is exactly ONE heartbeat's report and consumes
+    /// one unit of holdoff, so it must be called once per heartbeat (agent.cpp does) and never
+    /// as a read-only probe. Use policy_generation() / boot_rearm_unresolved() to observe.
+    struct GenerationReport {
+        std::uint64_t reported{0};
+        bool boot_rearm_unresolved{false};
+    };
+    [[nodiscard]] GenerationReport generation_report();
+
+    /// The most heartbeats one failed catch-up can make generation_report() report the real
+    /// generation (the back-off ceiling; the 5th and later failed catch-ups all get this).
+    static constexpr std::uint32_t kBootReportBackoffMaxHeartbeats = 10;
+
+    /// True while a boot re-arm is unresolved (#5513): start_local()'s walk failed to re-arm a
+    /// cached rule (a returned Failed or a throw), or a boot-application receipt later drained
+    /// as a failure, and no clean application has cleared it since. In-memory only: a restart
+    /// rebuilds it from the walk, so the persisted generation is never rewritten for it. Takes
+    /// mtx_.
+    [[nodiscard]] bool boot_rearm_unresolved() const;
+
+    /// Cumulative count of reconcile (arm) ATTEMPTS that threw or returned Failed and were
+    /// firewalled in apply_rules (and full_sync sweep/teardown failures), plus failed boot
+    /// re-arms (start_local's walk, #5513) and arm receipts that resolved to a failure in the maintenance tick's drain — a rule that persisted but did
+    /// not arm. This counts attempts, NOT distinct rules: one persistently-failing rule
+    /// increments it once per push (so it is a rate signal / "a gap is open", not "how many
+    /// rules are gapped"). A nonzero value means an enforcement gap is (or was) open on this
+    /// endpoint. NOT surfaced anywhere today: it has no production caller (no heartbeat tag,
+    /// no metric; tracked by #4062), so it is readable only from tests, and must not be cited
+    /// as fleet-visible evidence (rung 7.7b PR-1 item 3 / Sol B1). Lock-free.
     [[nodiscard]] std::uint64_t arm_failure_count() const noexcept {
         return arm_failures_.load(std::memory_order_relaxed);
     }
@@ -518,6 +682,20 @@ public:
     /// accessor that reads engine-owned state). No production caller.
     [[nodiscard]] std::size_t ack_pending_count_for_test() const;
 
+    /// TEST-ONLY: the current application's retained failed-receipt count (see
+    /// GuardianArmAckLedger::failed_receipt_count_for_test) - lets a test assert that a drained
+    /// wedge was RETAINED (kept recoverable) before it releases the late outcome (#5513).
+    /// Defined out-of-line like ack_pending_count_for_test(); takes mtx_. No production caller.
+    [[nodiscard]] std::size_t ack_failed_receipt_count_for_test() const;
+
+    /// TEST-ONLY: the #5513 back-off state, read WITHOUT consuming holdoff (generation_report()
+    /// consumes it, so it cannot be used to observe it). boot_catchup_failures_for_test() is
+    /// the saturating count of failed catch-up applications; boot_report_holdoff_for_test() is
+    /// the number of upcoming heartbeat reports that will carry the real generation. Take
+    /// mtx_. No production caller.
+    [[nodiscard]] std::uint32_t boot_catchup_failures_for_test() const;
+    [[nodiscard]] std::uint32_t boot_report_holdoff_for_test() const;
+
     /// TEST-ONLY: the spark drain worker / convergence scheduler, for started-state
     /// introspection (#2238, fixes BLOCKING-2b). wire_spark_engine() constructs both
     /// unconditionally but starts them only under prefer_spark_ — journal_age_stats()
@@ -529,6 +707,11 @@ public:
     /// runs. No production caller.
     [[nodiscard]] GuardianOutboxDrainWorker* drain_worker_for_test() {
         return spark_drain_worker_.get();
+    }
+    /// TEST-ONLY (#4045): the engine-owned persister of Spark's staged baseline captures.
+    /// Null until wire_spark_engine runs. No production caller.
+    [[nodiscard]] GuardianBaselinePersister* baseline_persister_for_test() {
+        return baseline_persister_.get();
     }
     [[nodiscard]] ConvergenceScheduler* convergence_scheduler_for_test() {
         return spark_scheduler_.get();
@@ -580,8 +763,8 @@ public:
     /// TEST-ONLY: if set, invoked inside start_local()'s re-arm walk once per cached
     /// enabled rule, immediately BEFORE reconcile_rule_locked() — so a throw from the
     /// hook simulates the failure class the surrounding catch exists for (a legacy
-    /// guard's std::thread ctor throwing std::system_error under thread/handle
-    /// exhaustion), aimed at exactly one rule by rule_id. Deliberately NOT fired from
+    /// guard's std::thread ctor throwing std::system_error on thread-creation
+    /// failure), aimed at exactly one rule by rule_id. Deliberately NOT fired from
     /// inside reconcile_rule_locked() itself, which would also fire on the apply_rules
     /// path this seam is not meant to touch.
     ///
@@ -602,6 +785,60 @@ public:
         assert((!hook || !started_) &&
                "set_rearm_fault_hook_for_test: arming a hook must happen before start_local()");
         rearm_fault_hook_for_test_ = std::move(hook);
+    }
+
+    /// TEST-ONLY (#4045): fires inside apply_rules, with mtx_ HELD, immediately after the
+    /// staged-baseline drain and before any teardown or re-arm. It is the deterministic stand-in
+    /// for "an in-flight evaluation of the OLD generation stages its capture after the drain":
+    /// the body may call runtime methods (spark_runtime_for_test()->evaluate_key) but must not
+    /// re-enter the engine (same-thread std::mutex relock, a silent hang). Null = no-op.
+    /// No production caller.
+    void set_apply_post_drain_hook_for_test(std::function<void()> hook) {
+        std::lock_guard lock(mtx_);
+        apply_post_drain_hook_for_test_ = std::move(hook);
+    }
+
+    /// TEST-ONLY (#4045): fires inside stop(), mtx_ HELD, at the START of each stop() stage
+    /// ("journal_flush_1", "worker_join", "ledger", "journal_flush_2"), after the stage's start
+    /// is read from the persister's clock and before its body runs: a test advances an injected
+    /// clock here to make that stage look slow. The three store stages feed the late-start
+    /// skip's evidence; "worker_join" is a thread join and does not. Same CONTRACT as
+    /// set_apply_post_drain_hook_for_test. No production caller.
+    void set_stop_stage_hook_for_test(std::function<void(const char* stage)> hook) {
+        std::lock_guard lock(mtx_);
+        stop_stage_hook_for_test_ = std::move(hook);
+    }
+    /// TEST-ONLY (#5604): the busy budget stop() lowers the KvStore to (default
+    /// kKvStoreStopBusyTimeout, 1 s), so a test can inject a budget short enough to keep the
+    /// case under a second. Call before stop(); atomic, so it never races it. No production
+    /// caller.
+    void set_stop_busy_timeout_for_test(std::chrono::milliseconds budget) noexcept {
+        stop_busy_timeout_ms_.store(budget.count(), std::memory_order_relaxed);
+    }
+    /// TEST-ONLY (#4045): forget the published persister pointer, as if stop() had read it just
+    /// before wire_spark_engine published it. The heartbeat getters then read 0. No production
+    /// caller.
+    void unpublish_baseline_persister_for_test() noexcept {
+        baseline_persister_published_.store(nullptr, std::memory_order_release);
+    }
+
+    /// TEST-ONLY (#4045): fires inside reconcile_rule_locked, with mtx_ HELD and (under
+    /// prefer_spark) the baseline-persister's seed fence held, immediately after a
+    /// baseline-on-arm rule's seed read and before the attach. The deterministic stand-in for
+    /// "an evaluation stages after the seed read but before the attach detaches the old
+    /// generation". Same CONTRACT as set_apply_post_drain_hook_for_test. No production caller.
+    void set_seed_read_hook_for_test(std::function<void(const std::string& rule_id)> hook) {
+        std::lock_guard lock(mtx_);
+        seed_read_hook_for_test_ = std::move(hook);
+    }
+
+    /// TEST-ONLY (#4045): fires inside reconcile_rule_locked, mtx_ HELD and the seed fence still
+    /// held, immediately AFTER attach_rule returns (so after attach_core's staged read) and
+    /// before its result is examined. Pins that the fence spans the attach, not only the seed
+    /// read. Same CONTRACT as set_apply_post_drain_hook_for_test. No production caller.
+    void set_post_attach_hook_for_test(std::function<void(const std::string& rule_id)> hook) {
+        std::lock_guard lock(mtx_);
+        post_attach_hook_for_test_ = std::move(hook);
     }
 
     /// TEST-ONLY (#4783 Gate 8 re-review): arms legacy_sink_persist_race_hook_for_test_ -
@@ -655,6 +892,12 @@ public:
         std::uint64_t edge_count{0}; ///< how many genuine (logged) Unsupported edges so far
     };
     [[nodiscard]] UnsupportedLogRecord last_unsupported_log_for_test() const;
+
+    /// TEST-ONLY (#4415): the exact `Guardian: full_sync preserved N rule(s) ...` line the most
+    /// recent full_sync apply_rules emitted (empty before the first). Recorded at the point of
+    /// emission, not observed via spdlog, for the same cross-image reason as the accessors above.
+    /// Locked, returned by value. No production caller.
+    [[nodiscard]] std::string last_full_sync_preserved_line_for_test() const;
 
     /// #4021: the `expected_hash` a file-hash-equals rule's most recent legacy arm
     /// attempt ended up with — empty if never armed as file-hash-equals, the
@@ -776,9 +1019,56 @@ private:
     bool started_{false};
     bool stopped_{false};
     std::uint64_t policy_generation_{0};
+    /// #5513: true while a boot re-arm is unresolved; policy_generation() then reports 0, and
+    /// generation_report() reports 0 except during the back-off holdoff below
+    /// (policy_generation_ itself is never touched, so the persisted value and the two
+    /// `> policy_generation_` advance gates are unchanged). Set by
+    /// note_boot_rearm_failure_locked() (start_local's walk) and by the maintenance tick when a
+    /// receipt of the still-open boot application drains as a failure; cleared by any clean
+    /// application (apply_rules' tail, or the tick's can_advance() block). Under mtx_, no atomics.
+    bool boot_unresolved_{false};
+    /// #5513 back-off (governance finding P-1): the number of catch-up applications (apply_rules
+    /// calls that reached the tail) that finished with boot_unresolved_ still set, saturating at
+    /// kBootCatchupFailuresCap. Drives boot_report_holdoff_. Reset to 0 whenever the flag clears
+    /// (apply_rules' tail or the tick's can_advance() block). Under mtx_, no atomics.
+    std::uint32_t boot_catchup_failures_{0};
+    /// Saturation point of boot_catchup_failures_: keeps the increment overflow-free and the
+    /// holdoff shift (failures - 1 <= 15) well defined.
+    static constexpr std::uint32_t kBootCatchupFailuresCap = 16;
+    /// #5513 back-off: the number of upcoming generation_report() calls (one per heartbeat) that
+    /// report the REAL persisted generation instead of 0 while boot_unresolved_ is set. Without
+    /// it an unresolved boot re-arm reports 0 on every heartbeat, so the server re-pushes a full
+    /// sync about every heartbeat forever if the rule keeps failing. The back-off bites only
+    /// when the persisted generation equals the server's current one and the failed catch-up
+    /// reaches apply_rules' tail: a push that returns before the tail earns no holdoff, a
+    /// Suppress repeat under prefer_spark_ does not extend it, and an agent whose persisted
+    /// generation is behind the server's keeps being re-pushed at the server's 25 s per-agent
+    /// limit (the pre-existing held-generation retry; a generic server-side back-off for it is
+    /// a follow-up). Set by a failed catch-up to
+    /// min(2^(boot_catchup_failures_-1), kBootReportBackoffMaxHeartbeats) (1, 2, 4, 8, 10, 10,
+    /// ...), consumed one per generation_report(), reset to 0 when the flag clears. Touches
+    /// neither policy_generation_ (the persisted and internal value is never altered) nor
+    /// boot_unresolved_ (the companion tag stays set during holdoff), nor policy_generation()
+    /// (the __guard__ reply text keeps reading 0). Under mtx_, no atomics.
+    std::uint32_t boot_report_holdoff_{0};
+    /// #5513: true from the boot application's begin_application() succeeding until
+    /// apply_rules' own begin_application() succeeds (which supersedes it) or stop(). Only the
+    /// SET side (boot_unresolved_ from a drained failure) reads it, so an ordinary held push's
+    /// failure never reports 0. Under mtx_, no atomics.
+    bool boot_app_open_{false};
     std::size_t rule_count_{0};
-    std::atomic<std::uint64_t> arm_failures_{0}; ///< reconcile-throw count (item 3 / Sol B1)
+    /// Cumulative arm-failure count (item 3 / Sol B1): reconcile throws and returned-Failed
+    /// arms, full_sync sweep/teardown failures, boot-walk failures and drained async arm
+    /// failures. Not fleet-visible (#4062).
+    std::atomic<std::uint64_t> arm_failures_{0};
 
+    /// #5513: the ONE place a boot re-arm failure is recorded, shared by start_local's
+    /// returned-Failed arm and both catch arms. mtx_ held. noexcept and allocation-free: it
+    /// runs inside the exhaustion catch. Sets boot_unresolved_, counts the failure into
+    /// arm_failures_, and latches the boot application (a no-op when begin_application failed:
+    /// no current application) so the tick's can_advance() cannot clear the flag before the
+    /// server's catch-up push has applied cleanly.
+    void note_boot_rearm_failure_locked() noexcept;
     bool put_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void refresh_count_locked();
     /// Persists `gen` to the policy-generation KV key. Returns kv_->set()'s own
@@ -806,6 +1096,33 @@ private:
     /// apply_rules, and both shutdown flushes) passes unbounded because each has to
     /// drain what it was given.
     void persist_lifecycle_journal_locked(std::size_t max_batches, std::size_t max_records);
+    /// stop() only (mtx_ held, noexcept): one unbounded journal flush, timed and reported to the
+    /// baseline persister as store-trouble evidence for the late-start skip (stage name `stage`
+    /// is for the test hook). `final_flush` marks the last one: if records are still pending
+    /// after it, ONE ERROR line names their count (they are lost with the process).
+    void stop_journal_flush_locked(const char* stage, bool final_flush) noexcept;
+    /// stop() only: bracket one store stage. begin returns the persister clock's reading (a
+    /// default time_point when no persister is wired). The hook runs the test hook, right after
+    /// begin and BEFORE the stage body, so a test can make the body look slow by advancing an
+    /// injected clock there. end records store trouble when the stage took at least
+    /// kBaselineStopTroubleThreshold (750 ms, the stop busy budget less a measurement slack); a
+    /// stage that failed fast is not trouble (see the persister).
+    [[nodiscard]] std::chrono::steady_clock::time_point stop_stage_begin_locked() const noexcept;
+    void stop_stage_hook_locked(const char* stage) noexcept;
+    void stop_stage_end_locked(std::chrono::steady_clock::time_point began) noexcept;
+
+    /// #4045: drain Spark's staged baseline-on-arm captures into the #4021 KV record via the
+    /// engine-owned GuardianBaselinePersister. mtx_ held. Gated EXACTLY like the journal
+    /// persist (prefer_spark_ && spark_runtime_ && persister wired), so it is inert at
+    /// prefer_spark_=false. FIREWALLED (noexcept): reached from stop(), which the
+    /// destructor calls; a throw is counted by the persister (note_firewalled_exception).
+    /// Called ONLY from apply_rules (before any teardown/re-arm, so the new generation's seed
+    /// read observes the prior capture; `at_stop` false, Trigger::Forced) and stop() (after the
+    /// worker join; `at_stop` true, Trigger::Stop: tighter budget, skipped only when it starts
+    /// late AND this stop has shown a slow store); the third persister caller is the drain
+    /// worker (Trigger::Worker). NOT from journal_maintenance_tick: it runs only on a live
+    /// connection and could not cover a pre-network boot re-arm.
+    void persist_staged_baselines_locked(bool at_stop) noexcept;
 
     /// Step 4: arm (or re-arm) the on-box guard for a rule. Reads the rule's
     /// spark type to pick the guard: file-change to FileGuard,
@@ -1031,6 +1348,22 @@ private:
     /// (#2298) prune/page throws are counted on the drain worker instead; journal_stats() sums
     /// both into the single operator-facing guardian_journal_maint_exceptions tag.
     std::atomic<std::uint64_t> journal_maint_exceptions_{0};
+    /// #4045: the persister, published for lock-free readers (baseline_persist_failures /
+    /// baseline_persist_refusals). Stored with release by wire_spark_engine (under mtx_) right
+    /// after the persister is constructed, never cleared or replaced (wire is once-only and
+    /// rollback_spark_wiring_locked leaves the persister alone), and the object lives until
+    /// this engine's destructor, so an acquire load that sees non-null may dereference it for
+    /// as long as the engine is alive. Every other member read still needs mtx_.
+    std::atomic<GuardianBaselinePersister*> baseline_persister_published_{nullptr};
+    /// TEST-ONLY (#4045): see set_apply_post_drain_hook_for_test / set_seed_read_hook_for_test.
+    /// mtx_-guarded; null = no-op.
+    std::function<void()> apply_post_drain_hook_for_test_;
+    std::function<void(const char*)> stop_stage_hook_for_test_;
+    /// #5604: the budget stop() lowers kv_ to. Atomic because the seam may be set from a test
+    /// thread while stop() reads it before taking mtx_. Production never writes it.
+    std::atomic<std::int64_t> stop_busy_timeout_ms_{kKvStoreStopBusyTimeout.count()};
+    std::function<void(const std::string&)> seed_read_hook_for_test_;
+    std::function<void(const std::string&)> post_attach_hook_for_test_;
     /// TEST-ONLY drain-worker timing overrides (see set_drain_worker_timing_for_test);
     /// 0 / zero-duration means "keep the production default".
     std::uint64_t test_periodic_bound_ms_{0};
@@ -1047,6 +1380,11 @@ private:
     std::string last_rearm_degrade_message_for_test_;
     /// TEST-ONLY (see last_unsupported_log_for_test); default level None = never logged.
     UnsupportedLogRecord last_unsupported_log_for_test_;
+    /// #4415: rules the current apply_rules skipped re-arming (mtx_-guarded; reset at the start
+    /// of each apply_rules' rule loop, filled by reconcile_rule_locked).
+    GuardianPreservedTally preserved_tally_;
+    /// TEST-ONLY (see last_full_sync_preserved_line_for_test); empty = none emitted yet.
+    std::string last_full_sync_preserved_line_for_test_;
     /// TEST-ONLY (see last_file_expected_hash_for_test); empty = no file-hash-equals
     /// arm attempt has run yet.
     std::string last_file_expected_hash_for_test_;
@@ -1108,6 +1446,25 @@ private:
     /// (#2298 governance A4). The declaration order below is still the tidy one, but it is
     /// no longer load-bearing.
     std::shared_ptr<GuardianLifecycleJournal> lifecycle_journal_;
+    std::shared_ptr<GuardianBaselinePersister> baseline_persister_; ///< #4045; borrows kv_
+    /// #4045: stop()'s final baseline flush has run once (mtx_-guarded): the destructor's second
+    /// stop() must not flush, or log the skip, again.
+    bool baseline_stop_flush_done_{false};
+    /// TEST-ONLY: "final flush incomplete" ERROR lines emitted by stop() (the log has no
+    /// cross-image capture), see baseline_stop_incomplete_logs_for_test().
+    std::atomic<std::uint64_t> baseline_stop_incomplete_logs_{0};
+    /// TEST-ONLY: "could not be staged at stop" ERROR lines, see
+    /// baseline_stop_unstaged_logs_for_test().
+    std::atomic<std::uint64_t> baseline_stop_unstaged_logs_{0};
+    /// TEST-ONLY: the two firewalled-throw ERROR lines of stop() (the Stop pass threw before
+    /// its first write; the staging sweep threw from its lock), see
+    /// baseline_stop_flush_threw_logs_for_test() / baseline_stop_sweep_threw_logs_for_test().
+    std::atomic<std::uint64_t> baseline_stop_flush_threw_logs_{0};
+    std::atomic<std::uint64_t> baseline_stop_sweep_threw_logs_{0};
+    /// The "journal records pending after the stop flush" ERROR line, see
+    /// journal_stop_pending_logs_for_test(). At most one per engine (mtx_-guarded); stop()
+    /// checks it before logging, so a second stop() (the destructor's) stays silent.
+    std::atomic<std::uint64_t> journal_stop_pending_logs_{0};
     std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
     std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
 };

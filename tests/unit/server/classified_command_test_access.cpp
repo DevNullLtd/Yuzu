@@ -19,8 +19,9 @@
 
 namespace yuzu::server::detail {
 
-ClassifiedCommand ClassifiedCommandTestAccess::make(pb::CommandRequest cmd) {
-    return ClassifiedCommand(std::move(cmd));
+ClassifiedCommand ClassifiedCommandTestAccess::make(pb::CommandRequest cmd,
+                                                    std::unordered_set<std::string> kill_switched_os) {
+    return ClassifiedCommand(std::move(cmd), std::move(kill_switched_os));
 }
 
 } // namespace yuzu::server::detail

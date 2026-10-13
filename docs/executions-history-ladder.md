@@ -187,6 +187,19 @@ column). Full design: `docs/auth-architecture.md`'s "Fourth migration (#3789)" /
 `docs/adr/0017-management-group-confinement-list-reads.md`'s "Executions (legacy pre-v1 routes)"
 bullet.
 
+**#3526 / #4753 (executions LIST fragment, `summarize_working_set` `kind=execution`):** the
+dashboard executions LIST fragment (`GET /fragments/executions`) also pushes the caller's scope
+into SQL before its `LIMIT`, through `query_executions_checked`. `get_agent_statuses_checked` and
+`get_agent_statuses_for_executions_checked` take an optional `visible_agents` (`agent_id =
+ANY($n::text[])`): engaged-empty is deny-all, `nullopt` is unfiltered. It bounds the READ only, so
+a confined caller does not pull every agent row of a fleet-wide execution; `execution_visible` and
+`confined_projection` still do the redaction, and the served result is identical because both
+ignore out-of-scope rows. **Never use a filtered read where the complete cohort is needed**
+(`admit_confined_mutation` must see every agent row to decide a mutation). Service-scoped sessions
+get no owner disjunct on the fragment, because a service-scoped token's session username is its
+minter; the other surfaces that read the disjunct still show a minter's executions to a
+service-scoped token (#5557). Full account: `docs/auth-architecture.md`'s "Sixth migration".
+
 ## PR 3 — SSE live updates
 
 `ExecutionEventBus` (`server/core/src/execution_event_bus.{hpp,cpp}`) is the

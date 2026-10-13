@@ -413,20 +413,20 @@ struct JitHarness {
     }
 
     void enroll_mfa(const std::string& u) {
-        auto init = auth_db->mfa_init_enrollment(u, "Yuzu");
+        auto init = auth_db->mfa_init_enrollment(u, "Yuzu", std::nullopt);
         REQUIRE(init.has_value());
         auto bytes = mfa::base32_decode(init->secret_base32);
         REQUIRE(bytes.has_value());
         std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
         auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-        REQUIRE(auth_db->mfa_verify_enrollment(u, code).has_value());
+        REQUIRE(auth_db->mfa_verify_enrollment(u, code, std::nullopt).has_value());
     }
 
     // A cookie session for `u`. fresh_mfa=true stamps mfa_verified_at=now so the
     // elevation step-up passes; false leaves the epoch sentinel (stale) to
     // exercise the step-up challenge.
     std::string session_for(const std::string& u, Role r = Role::user, bool fresh_mfa = true) {
-        return auth_mgr.create_local_session(u, r, fresh_mfa);
+        return auth_mgr.create_local_session_for_test(u, r, fresh_mfa);
     }
 
     // An OIDC-authenticated cookie session whose display name is `u`. NOTE: post

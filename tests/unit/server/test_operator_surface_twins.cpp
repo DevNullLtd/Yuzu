@@ -604,6 +604,11 @@ constexpr TwinRow kExpectedTwins[] = {
     // twins' tier_allows/perm_fn calls enforce.
     {"list_pending_approvals", "Approval", "Read", true},
     {"get_pending_approval_count", "Approval", "Read", true},
+    // M.9 software catalogue twins, pinned against
+    // GET /api/v1/inventory/software/catalogue{,/versions} (rest_api_v1.cpp): the same
+    // Inventory:Read gate the REST routes take through require_fleet_read.
+    {"query_software_catalogue", "Inventory", "Read", true},
+    {"get_software_versions", "Inventory", "Read", true},
 };
 
 } // namespace

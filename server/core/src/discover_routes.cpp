@@ -3,12 +3,14 @@
 #include "agent_registry.hpp"
 #include "bundled_content.hpp"
 #include "http_route_sink.hpp"
+#include "instruction_param_schema.hpp" // canonicalise_param_schema: the enforced shape, published as input_schema
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "openapi_spec_access.hpp"
 #include "rest_a4_envelope_http.hpp"
 
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 #include <unordered_map>
 
 namespace yuzu::server {
@@ -221,7 +223,8 @@ DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store, bool include_roles
 
 // ── /discover/instructions ─────────────────────────────────────────────────
 
-DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
+DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store,
+                                        std::size_t canonical_budget_bytes) {
     InstructionQuery q;
     q.enabled_only = true; // "published" == invokable; a disabled definition with
                            // no visible flag would be the misleading option here.
@@ -238,6 +241,15 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
     const auto& defs = *defs_result;
 
     json arr = json::array();
+    // Stored schema bytes canonicalised so far in THIS request (see kDiscoveryCanonicalBudgetBytes).
+    std::size_t canonical_bytes = 0;
+    // Definitions published without an input_schema because of the budget or because their stored
+    // schema cannot be canonicalised: counted so one warning per build tells an operator it is
+    // happening (the shipped catalogue never triggers either).
+    std::size_t budget_exceeded = 0;
+    std::size_t not_canonicalisable = 0;
+    std::string first_budget_id;
+    std::string first_uncanonicalisable_id;
     for (const auto& d : defs) {
         // #2437-class guard: parameter_schema is stored VERBATIM at write
         // time (instruction_store.cpp import path) with no depth check
@@ -265,6 +277,49 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
         if (!parsed.is_discarded() && parsed.is_object())
             param_schema = std::move(parsed);
 
+        // input_schema: the canonical JSON Schema the execute route enforces, produced by the
+        // SAME canonicaliser prepare_param_validator uses (it does not compile RE2). Nothing is
+        // cached, so the stored bytes canonicalised per request are budgeted: a definition whose
+        // schema would take the running total past the budget publishes the budget token instead.
+        // null with a null input_schema_error = no schema stored (nothing is enforced); null with
+        // a token = no canonical schema is published for this definition.
+        //
+        // Two kinds of row cost nothing against the budget: one that canonicalises to "no schema"
+        // (empty, or `{}` modulo JSON whitespace; the whitespace scan only runs on text of at most
+        // 64 bytes, anything longer is charged), and one over kMaxParameterSchemaBytes, which the
+        // canonicaliser rejects on its raw length before reading it (a legacy row; the write gate
+        // keeps new ones out). Such a row goes straight to the canonicaliser, so it is labelled
+        // parameter_schema_not_canonicalisable and cannot starve the definitions after it.
+        json input_schema;
+        json input_schema_error;
+        const std::string& stored = d.parameter_schema;
+        const bool within_cap = stored.size() <= instr::kMaxParameterSchemaBytes;
+        bool trivially_absent = stored.empty() || stored == "{}";
+        if (!trivially_absent && stored.size() <= 64) {
+            std::string compact;
+            for (const char c : stored)
+                if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+                    compact.push_back(c);
+            trivially_absent = compact.empty() || compact == "{}";
+        }
+        const bool charged = within_cap && !trivially_absent;
+        if (charged && stored.size() > canonical_budget_bytes - canonical_bytes) {
+            input_schema_error = "input_schema_budget_exceeded";
+            if (budget_exceeded++ == 0)
+                first_budget_id = d.id;
+        } else {
+            if (charged)
+                canonical_bytes += stored.size();
+            if (auto canonical = instr::canonicalise_param_schema(stored)) {
+                if (*canonical)
+                    input_schema = std::move(**canonical);
+            } else {
+                input_schema_error = "parameter_schema_not_canonicalisable";
+                if (not_canonicalisable++ == 0)
+                    first_uncanonicalisable_id = d.id;
+            }
+        }
+
         arr.push_back({
             {"id", d.id},
             {"name", d.name},
@@ -272,9 +327,41 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
             {"action", d.action},
             {"description", d.description},
             {"parameter_schema", std::move(param_schema)},
+            {"input_schema", std::move(input_schema)},
+            {"input_schema_error", std::move(input_schema_error)},
             {"platforms", d.platforms},
             {"approval_mode", d.approval_mode},
         });
+    }
+
+    // One warning per CHANGE, not per build: this runs on every MCP call and every 304
+    // revalidation (the ETag is compared after the catalogue is built), so a steady state of
+    // one starved definition would otherwise log on every request. The signature is the two
+    // counts plus the first affected id of each kind; a build with nothing to report clears it,
+    // so a recurrence warns again. Process-wide, guarded by a mutex (handlers run on a pool).
+    {
+        static std::mutex warn_mu;
+        static std::string last_warned;
+        const std::string signature =
+            (budget_exceeded == 0 && not_canonicalisable == 0)
+                ? std::string()
+                : std::to_string(budget_exceeded) + "|" + first_budget_id + "|" +
+                      std::to_string(not_canonicalisable) + "|" + first_uncanonicalisable_id +
+                      "|" + std::to_string(canonical_budget_bytes);
+        bool warn = false;
+        {
+            std::lock_guard lk(warn_mu);
+            warn = !signature.empty() && signature != last_warned;
+            last_warned = signature;
+        }
+        if (warn) {
+            spdlog::warn("discover/instructions: {} definition(s) published without an "
+                         "input_schema because the {}-byte canonicalisation budget was exhausted "
+                         "(first: '{}') and {} because their stored schema cannot be "
+                         "canonicalised (first: '{}'); logged once until this changes",
+                         budget_exceeded, canonical_budget_bytes, first_budget_id,
+                         not_canonicalisable, first_uncanonicalisable_id);
+        }
     }
 
     json body = {
@@ -282,8 +369,20 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
         {"description",
          "Published (enabled) InstructionDefinition catalog — the commands an "
          "agentic worker may dispatch via execute_instruction / "
-         "POST /api/v1/instructions/execute. parameter_schema is a nested JSON "
-         "Schema object when the stored value parses, else null."},
+         "POST /api/instructions/{id}/execute. parameter_schema is the stored "
+         "definition schema, verbatim (YAML-DSL types such as int32 and displayName), "
+         "when it parses as a JSON object, else null. input_schema is the canonical "
+         "JSON Schema the server enforces on POST /api/instructions/{id}/execute: "
+         "shape params with it. It is null when the definition declares no parameters "
+         "(input_schema_error is then null), when the stored schema cannot be "
+         "canonicalised (input_schema_error is parameter_schema_not_canonicalisable and "
+         "execute refuses it), or when canonicalising this schema would have taken the "
+         "per-request canonicalisation budget over its limit (input_schema_error is "
+         "input_schema_budget_exceeded; the test is per definition, so a smaller later one can "
+         "still get an input_schema, and parameter_schema is still present). A non-null "
+         "input_schema can still be refused at execute, for any reason the execute-side "
+         "validator rejects that canonicalisation does not check (for example a regex that "
+         "does not compile)."},
         {"count", arr.size()},
         {"truncated", defs.size() >= static_cast<std::size_t>(q.limit)},
         {"instructions", std::move(arr)},
@@ -564,8 +663,11 @@ DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& ag
          "(deduplicated by plugin name; the richest reported action list wins). "
          "NOT a build-time manifest — a plugin no currently-connected agent "
          "reports is absent from this list. To dispatch an action, call "
-         "execute_instruction / POST /api/v1/instructions/execute with its "
+         "execute_instruction / POST /api/command with its "
          "plugin+action; supply the params from parameter_schema where present. "
+         "POST /api/command refuses an approval-gated action for a caller without approval "
+         "(a non-admin caller, or any caller for an always-approval action): dispatch it via "
+         "POST /api/instructions/{id}/execute instead. "
          "Each plugin's docs field is a documentation summary {summary, kind, platforms, "
          "readme, resource} when the plugin has adopted the README standard, else "
          "null; resource names that plugin's own GET /discover/plugin-docs/<name> / "

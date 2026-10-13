@@ -55,7 +55,7 @@
   ],
   "caveats": [
     "**`wake` needs no elevated privilege.** The plugin opens a plain `SOCK_DGRAM`/`IPPROTO_UDP` broadcast socket on every OS (`wol_plugin.cpp:215`) — no `SOCK_RAW`, so no `cap_net_raw` or root; `docs/agent-privilege-model.md:120` states the same. Earlier revisions of that row claimed a `cap_net_raw` grant; treat any remaining reference to it elsewhere as stale.",
-    "**`check` accepts an undeclared `timeout_ms` parameter.** The code reads `timeout_ms` (default `1000` ms, clamped 100-5000; `wol_plugin.cpp:290-298`), but `content/definitions/wol.yaml`'s `check` parameters declare only `host` and `count` — an operator calling through the definition schema has no way to set it, and it silently stays at 1000 ms.",
+    "**`check`'s `timeout_ms` is reset, not clamped, outside 100-5000.** The code reads `timeout_ms` (default `1000` ms; a value outside 100-5000, or one that does not parse, is replaced by `1000`; `wol_plugin.cpp:290-298`). `content/definitions/wol.yaml` declares it with the range 100-5000, so a call through `POST /api/instructions/{id}/execute` gets a 400 for an out-of-range value instead of the silent reset; a caller that bypasses that route still gets the reset.",
     "**`wake`'s success-path output was never captured.** Both fixture runs deliberately rejected `wake` for a missing `mac` (an Irreversible, AdminOrApproval-gated action), so the `port`/`bytes_sent` field shapes in this README are derived from source (`wol_plugin.cpp:248-249`), not observed in any sample — the Outputs table marks those examples as such rather than showing a captured value.",
     "**The Linux sample ran as root, not the unprivileged path `check`'s fallback exists for.** `linux.txt` was captured at euid 0 in a container, so the ICMP-denied → TCP-fallback branch (`net.ipv4.ping_group_range`) was never actually exercised by any sample; every OS sample shows the same plain-ICMP-succeeds path.",
     "**The historic shelled-out `ping` is gone; do not reintroduce it.** `check` used to spawn a system `ping` via `popen` (rung 3); the migration to native ICMP + TCP-connect fallback removed the last subprocess spawn from this plugin (`changelog.d/20260818-wave2-network-actions-wol-services-native-argv.changed.md`). `icmp_probe.hpp`'s own header comment (lines 6-10) is stale — it still describes `wol.check` as an unmigrated shell-out that \"still spawns the system `ping` binary\"; the plugin's actual behaviour is the native path in `wol_plugin.cpp`."
@@ -129,6 +129,18 @@
       "name": "count",
       "required": false,
       "type": "string"
+    },
+    {
+      "constraints": {
+        "maximum": 5000,
+        "minimum": 100
+      },
+      "default": 1000,
+      "definition_id": "device.wol.check",
+      "description": "Per-sample probe timeout in milliseconds (100-5000). Default: 1000. The server rejects a value outside the range with a 400; the plugin on its own would silently reset it to 1000.\n",
+      "name": "timeout_ms",
+      "required": false,
+      "type": "int32"
     },
     {
       "constraints": {

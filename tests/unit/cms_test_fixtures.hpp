@@ -18,11 +18,18 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
+#include <thread>
+#include <type_traits>
+#include <utility>
 
 #include <openssl/bio.h>
 #include <openssl/pem.h>
@@ -217,6 +224,36 @@ inline SigningFixtures build_signing_fixtures() {
     write_cms_signature(f.sig_file, f.artifact_file, leaf_cert.get(), leaf_key.get());
 
     return f;
+}
+
+/// Run `fn` on a worker thread and wait at most `limit` for it (#5249 Gate 7).
+///
+/// For tests proving a call no longer BLOCKS (a FIFO trust bundle with no
+/// writer). Returns `fn()`'s result, or `std::nullopt` on timeout — the caller
+/// then FAILs. On timeout `on_timeout` runs first (it should try to unblock the
+/// worker, e.g. by opening the FIFO's write end) and the worker is DETACHED, so
+/// a regression reports a failure in bounded time instead of hanging the suite.
+/// `fn` is moved into the worker: capture everything it needs BY VALUE.
+template <typename Fn, typename OnTimeout>
+std::optional<std::invoke_result_t<Fn&>> run_bounded(Fn fn, std::chrono::milliseconds limit,
+                                                     OnTimeout on_timeout) {
+    using R = std::invoke_result_t<Fn&>;
+    auto promise = std::make_shared<std::promise<R>>();
+    auto done = promise->get_future();
+    std::thread worker([promise, fn = std::move(fn)]() mutable {
+        try {
+            promise->set_value(fn());
+        } catch (...) {
+            promise->set_exception(std::current_exception());
+        }
+    });
+    if (done.wait_for(limit) != std::future_status::ready) {
+        on_timeout();
+        worker.detach();
+        return std::nullopt;
+    }
+    worker.join();
+    return done.get();
 }
 
 } // namespace yuzu::test::cms

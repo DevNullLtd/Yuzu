@@ -1254,6 +1254,37 @@ TEST_CASE("local_security_policy Tally: a byte budget bounds output independentl
     CHECK(total <= kMaxRowBytes + 64);
 }
 
+TEST_CASE("local_security_policy Tally: the byte boundary is exact (bytes + size == cap is "
+          "admitted)",
+          "[local_security_policy][parsers][tally]") {
+    detail::Tally t;
+    const std::size_t big = 4000; // each admitted row is accounted at size + 1 (its newline)
+    const std::size_t n = kMaxRowBytes / (big + 1);
+    for (std::size_t i = 0; i < n; ++i) t.row(std::string(big, 'x'));
+    const std::size_t last = kMaxRowBytes - n * (big + 1); // bytes + last == kMaxRowBytes exactly
+    REQUIRE(last > 0);
+    t.row(std::string(last, 'y'));
+    CHECK_FALSE(t.capped);
+    CHECK(t.rows.size() == n + 1);
+    t.row("z"); // one more byte no longer fits
+    CHECK(t.capped);
+    CHECK(t.acc.reason() == "row_cap");
+}
+
+TEST_CASE("local_security_policy Tally: the byte cap is not sticky -- a smaller row after the "
+          "marker is still admitted",
+          "[local_security_policy][parsers][tally]") {
+    detail::Tally t;
+    t.row(std::string(kMaxRowBytes - 20, 'x')); // leaves 19 bytes
+    t.row(std::string(100, 'y')); // refused: pushes the marker
+    REQUIRE(t.capped);
+    const std::size_t after_marker = t.rows.size();
+    t.row("0123456789"); // 10 bytes still fit under the cap
+    CHECK(t.rows.size() == after_marker + 1);
+    CHECK(t.rows.back() == "0123456789");
+    CHECK(t.acc.reason() == "row_cap");
+}
+
 TEST_CASE("local_security_policy sudoers: the row cap emits the 7-field marker through collect_file_policy",
           "[local_security_policy][parsers][sudoers]") {
     std::string text;
