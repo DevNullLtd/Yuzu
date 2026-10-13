@@ -58,6 +58,29 @@ std::string make_boot_nonce() {
     return s;
 }
 
+/// #4415: identity of the content a push asks for, for the skip decision in attach_core. Every
+/// RuleAssertion field that changes what the rule enforces or reports, length-prefixed so no two
+/// field splits collide. expected_hash is deliberately absent: attach_core compares it against the
+/// LIVE effective baseline instead (a baseline-on-arm rule's authored hash is empty and its seed
+/// differs push to push). rule_id is the lookup key, never content.
+[[nodiscard]] std::string assertion_content_id(const RuleAssertion& a, bool emit_compliant_edge) {
+    std::string id;
+    const auto put = [&id](std::string_view v) {
+        id += std::to_string(v.size());
+        id += ':';
+        id += v;
+    };
+    put(std::to_string(static_cast<int>(a.kind)));
+    put(a.rule_name);
+    put(std::to_string(a.debounce_ms));
+    put(a.expect_present ? "1" : "0");
+    put(std::to_string(a.max_bytes));
+    put(a.expected_value);
+    put(a.value_name);
+    put(emit_compliant_edge ? "1" : "0");
+    return id;
+}
+
 } // namespace
 
 GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
@@ -2160,18 +2183,39 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         // expose a receipt for later polling, so there is nothing to wait on: the
         // wedge is already a known, resolved-shaped fact. Do NOT wait on or
         // re-abandon core.claim - this call owns nothing, it only observed.
-        if (core.claim->outcome)
-            return *core.claim->outcome;
+        {
+            // #4415: an identical attach can also re-observe this rule's own LIVE claim, which
+            // has no outcome yet. Wait for one without abandoning it: this call owns nothing,
+            // and abandon_claim_locked (wait_for_claim's deadline path) would cancel the first
+            // caller's arm. A retained wedge's outcome is already set, so it returns at once.
+            std::unique_lock<std::mutex> lk{registry_mu_};
+            if (!core.claim->outcome && !is_retained_wedge(*core.claim)) {
+                claim_cv_.wait_for(lk, cfg_.backend_op_deadline, [&] {
+                    return core.claim->outcome.has_value() || core.claim->commit_exception ||
+                           stopping_;
+                });
+                if (core.claim->commit_exception) {
+                    const std::exception_ptr e = core.claim->commit_exception;
+                    lk.unlock();
+                    std::rethrow_exception(e);
+                }
+                if (!core.claim->outcome)
+                    return std::unexpected(std::string{stopping_ ? "stopping" : "arm still in flight"});
+            }
+            if (core.claim->outcome)
+                return *core.claim->outcome;
+        }
         return std::unexpected(std::string{kSparkKeyWedged}); // defensive: outcome
                                                                // should always be set
                                                                // for a retained wedge
     }
 
     // The bounded wait for THIS call's own claim (PR-1's synchronous contract: a
-    // caller - GuardianEngine::apply_rules/start_local, still holding mtx_ for its
-    // whole body - waits at most cfg_.backend_op_deadline for this rule's arm to
-    // resolve; a non-waiting entry point removes this wait entirely). Nothing here
-    // waits on a prior generation's disarm, or on a RETAINED disarm at the head of the
+    // caller waits at most cfg_.backend_op_deadline for this rule's arm to resolve; a
+    // non-waiting entry point removes this wait entirely). GuardianEngine::apply_rules and
+    // start_local use that NonWaiting overload, so nothing holding mtx_ and no mechanism
+    // worker may call this blocking one. Nothing here waits on a prior generation's disarm,
+    // or on a RETAINED disarm at the head of the
     // target key (Gate 4 hp-1): attach_core() only submits those off-lock
     // (submit_disarm_off_lock() returns once the disarm is ADMITTED, not finished), so
     // the time an own arm claim spends queued behind one counts against this single
@@ -2426,7 +2470,7 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
     switch (core.state) {
     case AttachCoreState::Armed:
         return ArmOutcome{.kind = ArmOutcomeKind::Armed, .generation = core.generation,
-                          .receipt = {}};
+                          .receipt = {}, .skipped = core.skipped};
     case AttachCoreState::Failed:
         // rung 9c PR-5c round 2 (#4221): carry attach_core()'s own
         // prior_state_preserved bit through to the caller - see ArmError's doc
@@ -2462,7 +2506,7 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
         // changes an already-settled `end`, short of a genuinely different
         // rule_id/spec reaching this key.
         return ArmOutcome{.kind = ArmOutcomeKind::Accepted, .generation = 0,
-                          .receipt = ArmReceipt{core.claim}};
+                          .receipt = ArmReceipt{core.claim}, .skipped = core.skipped};
     }
 
     // Astra opine review, Blocker 1 step 3: "Reacquire registry_mu_ and inspect this
@@ -2897,6 +2941,134 @@ bool GuardianSparkRuntime::is_dead_claim(const KeyClaim& claim) noexcept {
            static_cast<bool>(claim.commit_exception);
 }
 
+std::optional<GuardianSparkRuntime::AttachCoreResult>
+GuardianSparkRuntime::reuse_existing_locked(const std::string& key, const std::string& rule_id,
+                                            const SparkSpec& spec,
+                                            const RuleGeneration& pushed,
+                                            const std::optional<KeyHealthProbe>& probe) const noexcept {
+    // Every term below is load-bearing: a skip asserts the rule is healthy, so a term that is
+    // missing turns "rebuild what is wrong" into "leave what is wrong" (#4415).
+    const auto cit = claims_.find(key);
+    if (cit != claims_.end() && !cit->second.fifo.empty()) {
+        // A key with ANY claim never takes the committed path below (a disarm, a parked or
+        // retained arm and a committed-unpublished head all need the existing queueing). The one
+        // reuse here is this rule's own LIVE arm: Case 0's candidate predicate (withdraw_rule_after_
+        // wedge_sweep_locked) with end == None and an identical content id, so a claim Case 0 would
+        // withdraw and re-queue is re-observed instead. A retained wedge is waiter_abandoned and
+        // never matches (attach_core's own branch owns it).
+        for (const auto& c : cit->second.fifo) {
+            if (c->kind != ClaimKind::Arm || c->rule_id != rule_id || is_dead_claim(*c) ||
+                !c->index_held || c->end != ClaimEnd::None)
+                continue;
+            if (c->spec == spec && c->content_id == pushed.content_id &&
+                c->pushed_hash == pushed.assertion.expected_hash &&
+                index_->owns(key, rule_id, c->generation))
+                return AttachCoreResult{.state = AttachCoreState::Reobserved, .generation = 0,
+                                        .error = {}, .claim = c};
+            return std::nullopt; // same rule, different content: the new push replaces it
+        }
+        return std::nullopt;
+    }
+
+    const auto rit = rules_.find(rule_id);
+    const auto kit = keys_.find(key);
+    if (rit == rules_.end() || kit == keys_.end())
+        return std::nullopt;
+    const RuleGeneration& live = *rit->second;
+    if (!live.active || live.content_id != pushed.content_id || live.eval.in_unknown ||
+        kit->second->faulted || !(kit->second->spec == spec) ||
+        !index_->owns(key, rule_id, live.generation))
+        return std::nullopt;
+    // The recorded bit above depends on an event having been delivered, and one can be lost (a
+    // full queued channel, or a Faulted that arrived before keys_ held the key). The backend's
+    // own answer, taken against THIS subscription, is the authority: anything but Healthy, an
+    // absent probe or a probe of a different subscription rebuilds.
+    if (!probe || probe->subscription != kit->second->subscription ||
+        probe->health != SubscriptionHealth::Healthy)
+        return std::nullopt;
+    if (pushed.assertion.kind == AssertionKind::FileHashEquals) {
+        // The pushed hash is the post-seed expected hash (authored, or the persisted baseline the
+        // engine read). It must equal what the live rule actually compares against, which is its
+        // authored/inherited hash or else the baseline it captured (the evaluator's own rule). An
+        // empty seed, or a live rule that has not captured yet, rebuilds: the capture then comes
+        // from the inherit path, exactly as before, so the AC-10 exposure window is not widened.
+        const std::string& live_hash = !live.assertion.expected_hash.empty()
+                                           ? live.assertion.expected_hash
+                                       : live.eval.baseline_set ? live.eval.baseline_hash
+                                                                : live.assertion.expected_hash;
+        if (pushed.assertion.expected_hash.empty() || pushed.assertion.expected_hash != live_hash)
+            return std::nullopt;
+    }
+    return AttachCoreResult{.state = AttachCoreState::Armed, .generation = live.generation,
+                            .error = {}, .claim = nullptr};
+}
+
+std::optional<GuardianSparkRuntime::KeyHealthProbe>
+GuardianSparkRuntime::probe_key_health(const std::string& key, const std::string& rule_id) {
+    std::uint64_t subscription = 0;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (stopping_ || !rules_.contains(rule_id))
+            return std::nullopt;
+        if (const auto cit = claims_.find(key); cit != claims_.end() && !cit->second.fifo.empty())
+            return std::nullopt; // a key with a claim never takes the committed skip
+        const auto kit = keys_.find(key);
+        if (kit == keys_.end())
+            return std::nullopt;
+        subscription = kit->second->subscription;
+    }
+    // registry_mu_ released: the backend takes its own lock (see revalidate_subscriptions).
+    try {
+        return KeyHealthProbe{.subscription = subscription,
+                              .health = backend_->subscription_health(subscription)};
+    } catch (...) {
+        return std::nullopt; // unknown health is not healthy: the rule is rebuilt
+    }
+}
+
+void GuardianSparkRuntime::sweep_key_health(bool report_dead) {
+    std::vector<std::pair<std::string, std::uint64_t>> snapshot;
+    try {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (stopping_)
+            return;
+        snapshot.reserve(keys_.size());
+        for (const auto& [key, pk] : keys_)
+            snapshot.emplace_back(key, pk->subscription);
+    } catch (...) {
+        return; // best-effort: the caller's teardown must still run (same posture as the probe)
+    }
+    for (const auto& [key, subscription_id] : snapshot) {
+        std::optional<SubscriptionHealth> health;
+        try {
+            health = backend_->subscription_health(subscription_id);
+        } catch (...) {
+            // unknown health is not healthy; the loop goes on to the other keys
+        }
+        if (report_dead && health == SubscriptionHealth::Dead) {
+            on_subscription_lost(key, subscription_id,
+                                 "detected dead by the poll backstop "
+                                 "(revalidate_subscriptions) - no push notification ever "
+                                 "confirmed, or one was silently dropped");
+            continue;
+        }
+        // #4415: the scoped detach tears a key down when this marks it, so a Dead or unknown
+        // answer counts there exactly as a Faulted one does: a key shared by kept rules must not
+        // be rejoined by each of them (revalidate reports a Dead one itself, above). The write is
+        // SET-ONLY: a Faulted event delivered between the read above and this write must not be
+        // overwritten by the older answer. A stale set bit costs one rebuild of the key, whose
+        // fresh PerKey starts clear; a Recovered event clears it earlier.
+        const bool unhealthy = health == SubscriptionHealth::Faulted ||
+                               (!report_dead && (!health || *health == SubscriptionHealth::Dead));
+        if (!unhealthy)
+            continue;
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (const auto kit = keys_.find(key);
+            kit != keys_.end() && kit->second->subscription == subscription_id)
+            kit->second->faulted = true; // a write naming a superseded subscription is dropped
+    }
+}
+
 GuardianSparkRuntime::AttachCoreResult
 GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, SparkSpec spec,
                                   RuleAssertion assertion, bool emit_compliant_edge,
@@ -2921,6 +3093,10 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
     const std::string rule_name = assertion.rule_name;
     const char* guard_type = guard_type_for(assertion.kind);
     auto rg = std::make_shared<RuleGeneration>();
+    rg->content_id = assertion_content_id(assertion, emit_compliant_edge); // before the move below
+    // The hash this push carried, before the baseline inherit below may overwrite it: claims are
+    // compared on it too, because content_id leaves expected_hash out (see assertion_content_id).
+    const std::string pushed_hash = assertion.expected_hash;
     rg->active = true;
     rg->emit_compliant_edge = emit_compliant_edge;
     rg->assertion = std::move(assertion);
@@ -2929,6 +3105,11 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
     std::uint64_t gen = 0;
     std::shared_ptr<KeyClaim> to_dispatch;  // set iff this call must dispatch it
     std::shared_ptr<KeyClaim> head_to_drive; // a retained disarm at the head to redrive first
+
+    // #4415: the backend's health for the committed key, asked BEFORE registry_mu_ is taken (one
+    // lock-only query; nullopt, so no query, for a first attach or a key with a claim). The
+    // locked skip decision below revalidates it against the subscription it sees.
+    const std::optional<KeyHealthProbe> health_probe = probe_key_health(key, rule_id);
 
     {
         std::unique_lock<std::mutex> lk{registry_mu_};
@@ -2981,7 +3162,9 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         // backstop - see the UP-1 fix's own precedent immediately below).
         if (const auto pre_cit = claims_.find(key);
             io_class && pre_cit != claims_.end() && !pre_cit->second.fifo.empty()) {
-            const auto& pre_head = pre_cit->second.fifo.front();
+            // By value: the Case 0 withdrawal below can erase a follower mid-deque, which
+            // invalidates a reference to the front.
+            const auto pre_head = pre_cit->second.fifo.front();
             if (is_retained_wedge(*pre_head) && pre_head->rule_id != rule_id) {
                 wedged_refusals_.fetch_add(1, std::memory_order_relaxed);
                 // detach_rule_locked(rule_id) has NOT run yet - rule_id's prior
@@ -2990,8 +3173,28 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                                         .error = std::string{kSparkKeyWedged},
                                         .prior_state_preserved = true, .claim = nullptr};
             }
+            // #5512: only an IDENTICAL push re-observes the wedge. The same rule and spec with
+            // CHANGED content is neither a re-observation (the new content would be discarded)
+            // nor a different claimant (the refusal): it falls through and queues as a follower
+            // behind the wedge, replacing this rule's older claim through detach_rule_locked.
             if (is_retained_wedge(*pre_head) && pre_head->rule_id == rule_id &&
-                pre_head->spec == spec) {
+                pre_head->spec == spec && pre_head->content_id == rg->content_id &&
+                pre_head->pushed_hash == pushed_hash) {
+                // One desired incarnation per rule_id: the last push names the head's content,
+                // so a live follower this rule queued with different content is withdrawn now
+                // (Case 0, without the candidacy sweep: the head regains it just below).
+                // Left alone it would commit its content at the head's late success.
+                // Guarded by the candidate test: with none, the helper would fall through to
+                // rule_id's CONFIRMED state, which a re-observation must not touch.
+                const bool has_follower = std::ranges::any_of(
+                    pre_cit->second.fifo, [&](const std::shared_ptr<KeyClaim>& c) {
+                        return c->kind == ClaimKind::Arm && c->rule_id == rule_id &&
+                               !c->withdrawn && !c->waiter_abandoned && !c->outcome &&
+                               c->index_held && c->end != ClaimEnd::Committed;
+                    });
+                if (has_follower) {
+                    (void)withdraw_rule_after_wedge_sweep_locked(rule_id, "disarmed"); // Case 0: nullptr
+                }
                 wedged_reobservations_.fetch_add(1, std::memory_order_relaxed);
                 // #4508: re-observation proves this exact rule/spec is desired,
                 // including after a full-sync withdrawal. Preserve W1 by sweeping
@@ -3006,6 +3209,24 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                 return AttachCoreResult{.state = AttachCoreState::Reobserved, .generation = 0,
                                         .error = {}, .claim = pre_head};
             }
+        }
+
+        // #4415: a push that asks for exactly what this rule already is (healthy, committed,
+        // unchanged) or already has in flight is not a reason to tear anything down. Placed after
+        // the retained-wedge pre-check above, which keeps its own re-observation and refusal
+        // behaviour untouched, and before the first mutation below (the prior-disarm rollback,
+        // the baseline inherit, detach_rule_locked, ++gen_counter_), so a skip leaves no
+        // incarnation, no lifecycle record and no claim behind.
+        // A probe that found the key Faulted also repairs the recorded bit a lost event left
+        // clear, so the full_sync scoped detach and every sibling on the key see it.
+        if (health_probe && health_probe->health == SubscriptionHealth::Faulted) {
+            if (const auto kit = keys_.find(key);
+                kit != keys_.end() && kit->second->subscription == health_probe->subscription)
+                kit->second->faulted = true;
+        }
+        if (auto reuse = reuse_existing_locked(key, rule_id, spec, *rg, health_probe)) {
+            reuse->skipped = true; // reported up so apply_rules can name the preserved rule
+            return std::move(*reuse);
         }
 
         // PR #3821 review (fjarvis, cpp-safety re-review): armed BEFORE
@@ -3031,10 +3252,10 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             }
         };
 
-        // Fresh generation: drop any prior mapping for this rule first. This
-        // rebuilds eval state from scratch on every push, identical re-push
-        // included - there is no diff-skip that preserves it (matches the legacy
-        // path's own tear-down-and-rebuild-every-push behavior). If a prior
+        // Fresh generation: drop any prior mapping for this rule first. This rebuilds eval
+        // state from scratch; an identical re-push of a healthy rule never gets here
+        // (reuse_existing_locked above, #4415), but a changed, unhealthy or baseline-less one
+        // does. If a prior
         // generation existed, this already enqueued its "disarmed" lifecycle entry
         // (and, #2233 item 3, may return a disarm claim driven off-lock either
         // way: prior_disarm_rollback above fires it on an early return/throw,
@@ -3183,7 +3404,10 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             // abandonment releases the index unconditionally in the ordinary case,
             // but the existing fault seam can make that release fail and leave
             // index_held true; that seam must never corrupt this classification.
-            if (retained_wedge) {
+            if (retained_wedge && head->rule_id == rule_id && head->spec == spec &&
+                (head->content_id != rg->content_id || head->pushed_hash != pushed_hash)) {
+                // #5512: changed content over this rule's own wedge: queue as a follower below.
+            } else if (retained_wedge) {
                 if (head->rule_id == rule_id && head->spec == spec) {
                     // Re-observe: return the EXISTING claim's receipt, construct
                     // nothing new. Must not reset outcome, abandonment, dispatch
@@ -3243,6 +3467,8 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             c->rule_id = rule_id;
             c->generation = gen;
             c->spec = spec;
+            c->content_id = rg->content_id;
+            c->pushed_hash = pushed_hash;
             c->rg = std::move(rg);
             c->rule_name = rule_name;
             c->guard_type = guard_type;
@@ -3405,9 +3631,16 @@ void GuardianSparkRuntime::detach_rule(const std::string& rule_id) {
         outbox_waker();
 }
 
-void GuardianSparkRuntime::detach_all() {
+void GuardianSparkRuntime::detach_all() { detach_rules_except({}); }
+
+void GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::less<>>& keep) {
     std::function<void()> outbox_waker;
     std::vector<std::shared_ptr<KeyClaim>> works;
+    // #4415: the faulted bit below decides which kept rules are torn down with their key, and a
+    // lost Faulted event leaves it clear. Refresh it from the backend first (registry_mu_ is not
+    // held yet). Nothing is kept for detach_all(), so it pays nothing there.
+    if (!keep.empty())
+        sweep_key_health(/*report_dead=*/false);
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
         // R5.7 application fence (docs/spark-stage2-guardian-consumer-design.md):
@@ -3437,14 +3670,27 @@ void GuardianSparkRuntime::detach_all() {
         for (const auto& [k, entry] : claims_)
             for (const auto& c : entry.fifo)
                 if (c->kind == ClaimKind::Arm && !c->withdrawn && !c->waiter_abandoned &&
-                    !c->outcome)
+                    !c->outcome && !keep.contains(c->rule_id))
                     claimed.push_back(c->rule_id);
         for (const auto& rid : claimed)
             (void)withdraw_rule_after_wedge_sweep_locked(rid, "disarmed");
         std::vector<std::string> rule_ids;
         rule_ids.reserve(rules_.size());
-        for (const auto& [rid, rg] : rules_)
-            rule_ids.push_back(rid);
+        for (const auto& [rid, rg] : rules_) {
+            // A kept rule on a key the mechanism reported faulted is detached too. Every rule on
+            // a key shares its bit, so the key's refcount reaches zero and its deaf watcher is
+            // torn down and re-armed, as detach_all() did. Left kept, two rules sharing the key
+            // would each rejoin the same faulted watcher (the per-rule reconcile cannot skip
+            // them, but a refcount of 2 stops its detach from dropping the watcher).
+            bool rebuild_key = false;
+            if (keep.contains(rid)) {
+                const auto key = index_->key_for_rule(rid);
+                const auto kit = key ? keys_.find(*key) : keys_.end();
+                rebuild_key = kit != keys_.end() && kit->second->faulted;
+            }
+            if (!keep.contains(rid) || rebuild_key)
+                rule_ids.push_back(rid);
+        }
         works.reserve(rule_ids.size()); // Astra opine review Blocker 4: "detach_all()
                                         // currently accumulates returned claims in a
                                         // vector after individual mutations... If
@@ -3476,6 +3722,8 @@ void GuardianSparkRuntime::detach_all() {
         // (docs/spark-rebuild-baselines/fullsync_blackout_diag.py's T0D_RE) -
         // change both together.
         try {
+            // #4415: the line keeps its shape (T0D_RE) when `keep` is non-empty; its counts are
+            // then the rules this call detached, not every rule the runtime holds.
             spdlog::info("Guardian spark: detach_all complete (epoch={}, incarnation_floor={}, "
                          "detached_rules={}, withdrawn_claims={})",
                          detach_epoch_, gen_counter_, rule_ids.size(), claimed.size());
@@ -3912,6 +4160,8 @@ void GuardianSparkRuntime::on_subscription_faulted(const std::string& key,
         const auto kit = keys_.find(key);
         if (kit == keys_.end() || kit->second->subscription != subscription_id)
             return; // stale - same guard as on_subscription_lost
+        // #4415: record it so an identical re-push does not skip a rule whose watch is deaf.
+        kit->second->faulted = faulted; // a recovered edge clears it
         const auto now_wall = std::chrono::system_clock::now().time_since_epoch();
         const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now_wall).count();
         const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(now_wall).count();
@@ -3945,22 +4195,7 @@ void GuardianSparkRuntime::revalidate_subscriptions() {
     // locks). on_subscription_lost re-validates staleness itself before acting, so a
     // fresh re-arm landing between this snapshot and that call is still handled
     // correctly - no duplicated detach logic here.
-    std::vector<std::pair<std::string, std::uint64_t>> snapshot;
-    {
-        std::lock_guard<std::mutex> lk{registry_mu_};
-        if (stopping_)
-            return;
-        snapshot.reserve(keys_.size());
-        for (const auto& [key, pk] : keys_)
-            snapshot.emplace_back(key, pk->subscription);
-    }
-    for (const auto& [key, subscription_id] : snapshot) {
-        if (backend_->subscription_health(subscription_id) == SubscriptionHealth::Dead)
-            on_subscription_lost(key, subscription_id, "detected dead by the poll backstop "
-                                                        "(revalidate_subscriptions) - no push "
-                                                        "notification ever confirmed, or one "
-                                                        "was silently dropped");
-    }
+    sweep_key_health(/*report_dead=*/true);
 }
 
 void GuardianSparkRuntime::on_event(const SparkEvent& ev) {

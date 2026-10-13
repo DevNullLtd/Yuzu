@@ -436,6 +436,9 @@ rules for the `viz_routes.cpp::handle_topology` merge:
   `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`.
 - **`yuzu_viz_offline_hosts_total`** counts offline nodes merged (described in
   the `server.cpp` viz metric block — keep it described, `promtool`-clean).
+  Since #5678 a gracefully departed host keeps its roster row, so it is merged
+  as a stale-flagged offline node for the 7-day viz stale window
+  (`kOfflineStaleWindowSecs`) and this counter rises accordingly.
 - **`/readyz` and a Postgres outage.** The substrate `pg_pool` readyz row
   reads the connect-breaker, which can momentarily read closed between backoff
   windows during a sustained outage (a deliberate tradeoff: don't evict a

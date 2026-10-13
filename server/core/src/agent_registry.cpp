@@ -1499,11 +1499,12 @@ std::string AgentRegistry::palette_html(std::string_view query) const {
 std::vector<std::string> AgentRegistry::all_ids() const {
     // HA WS-5: live_presence() is cached (kPresenceCacheTtl) and runs OFF
     // mu_ — the same rule the evaluate_scope preloads follow, never holding
-    // the registry lock across Postgres I/O. A null presence_store_
-    // (unconfigured) makes this call cost nothing beyond the pointer check;
-    // a configured one (the production default — see live_presence()'s own
-    // doc comment for why this is NOT gated behind an HA-only signal) costs
-    // at most one cached-or-fresh read, never a bare per-call round trip.
+    // the registry lock across Postgres I/O. An empty presence_reader_
+    // (unconfigured) makes this call cost one uncontended mutex acquisition plus
+    // the pointer check; a configured one (the production default — see
+    // live_presence()'s own doc comment for why this is NOT gated behind an
+    // HA-only signal) costs at most one cached-or-fresh read, never a bare
+    // per-call round trip.
     //
     // #4981 PR-1: this method's signature/contract predates the typed
     // PresenceReadError split and stays a plain vector — a degraded read
@@ -1546,14 +1547,26 @@ bool AgentRegistry::has_remote_presence(const std::vector<std::string>& ids) con
 }
 
 void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl) {
-    presence_store_ = store;
+    configure_presence(store ? PresenceReadFn{[store](std::chrono::seconds t) {
+                                   return store->query_live_ids(t);
+                               }}
+                             : PresenceReadFn{},
+                       ttl);
+}
+
+void AgentRegistry::configure_presence(PresenceReadFn reader, std::chrono::seconds ttl) {
+    // Wiring and teardown only; locked so a reconfigure can never race an
+    // in-flight read. The cache age resets so the next read hits the new reader.
+    std::lock_guard lock(presence_cache_mu_);
+    presence_reader_ = std::move(reader);
     presence_ttl_ = ttl;
+    presence_cache_at_ = {};
 }
 
 std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::live_presence() const {
-    if (!presence_store_)
-        return std::vector<PresenceIdentity>{};
     std::lock_guard lock(presence_cache_mu_);
+    if (!presence_reader_)
+        return std::vector<PresenceIdentity>{};
     const auto now = std::chrono::steady_clock::now();
     // `presence_cache_at_{}` (default-constructed epoch) is always stale on
     // the first call, so this always fetches at least once before serving a
@@ -1562,7 +1575,7 @@ std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::l
     // not just a success — so a sustained outage pays exactly one real query
     // per kPresenceCacheTtl window, not one per caller.
     if (now - presence_cache_at_ >= kPresenceCacheTtl) {
-        presence_cache_ = presence_store_->query_live_ids(presence_ttl_);
+        presence_cache_ = presence_reader_(presence_ttl_);
         presence_cache_at_ = now;
     }
     return presence_cache_; // copy out under the cache lock, never mu_
@@ -1620,8 +1633,13 @@ std::string AgentRegistry::session_id_of(const std::string& agent_id) const {
     return it != agents_.end() ? it->second->session_id : std::string{};
 }
 
-std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin) const {
+std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin,
+                                                                  std::string_view action) const {
     std::unordered_set<std::string> missing;
+    // Protective-action exemption: protective actions are never withheld on
+    // inventory grounds (see the declaration); decided before taking mu_.
+    if (yuzu::protective::is_protective_action(plugin, action))
+        return missing;
     std::lock_guard lock(mu_);
     for (const auto& [id, s] : agents_) {
         if (s->plugin_names.empty())

@@ -1867,6 +1867,9 @@ groups:
             quarantine.reapply verb (system principal, detail carries
             record_id + command_id + trigger=tick|heartbeat, or "CONFIRMED
             record_id=... command_id=..." on success).
+            This alert also fires when the device's agent lacks the
+            quarantine plugin: the dispatch is accepted but never
+            confirmed, so upgrade the agent.
 
       - alert: YuzuDispatchTargetRejected
         expr: |
