@@ -1,16 +1,17 @@
 #include "list_keyset.hpp"
 
-#include <algorithm>
 #include <charconv>
 #include <limits>
+#include <utility>
 
 namespace yuzu::server::keyset {
 
 namespace {
 
-// base64url (RFC 4648 section 5), no padding.
 constexpr std::string_view kB64 =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+} // namespace
 
 std::string b64url_encode(std::string_view in) {
     std::string out;
@@ -29,8 +30,6 @@ std::string b64url_encode(std::string_view in) {
     return out;
 }
 
-// Alphabet only (no padding, no skipped bytes) and a tail length of 1 mod 4 is never valid.
-// Non-canonical trailing bits are caught by the caller's re-encode comparison.
 std::optional<std::string> b64url_decode(std::string_view in) {
     if (in.size() % 4 == 1 || in.find_first_not_of(kB64) != std::string_view::npos)
         return std::nullopt;
@@ -47,8 +46,6 @@ std::optional<std::string> b64url_decode(std::string_view in) {
     }
     return out;
 }
-
-} // namespace
 
 std::optional<std::int64_t> parse_int(std::string_view s, std::int64_t lo, std::int64_t hi) {
     if (s.empty())

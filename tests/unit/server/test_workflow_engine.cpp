@@ -1073,6 +1073,10 @@ TEST_CASE("build_execution_page_sql: the unfiltered newest-first statement is pi
     CHECK(b.sql == std::string(kListSelectHead) +
                        " ORDER BY e.started_at DESC, e.id DESC LIMIT $1::bigint");
     CHECK(b.params == std::vector<std::string>{"51"}); // limit 50 + the sentinel row
+    // The read's statement bound comes from the builder, not from a literal in the shell. This
+    // pins the text only: that the shell RUNS it (a lock-held read ending at 1.5 s) needs a second
+    // connection and ~1.5 s of wall time, and is not covered by a DB-free test.
+    CHECK(b.statement_timeout_sql == "SET LOCAL statement_timeout = '1500ms'");
 }
 
 TEST_CASE("build_execution_page_sql: every filter binds a parameter and nothing is spliced",
@@ -1143,13 +1147,16 @@ TEST_CASE("build_execution_page_sql: latest-per-workflow orders by workflow and 
 
 TEST_CASE("build_execution_page_sql: limit is clamped to 1..500 before the sentinel is added",
           "[workflow_engine][list][sql]") {
-    WorkflowExecutionListQuery q;
-    q.limit = 0;
-    CHECK(build_execution_page_sql(q, std::nullopt).params.back() == "2");
-    q.limit = -5;
-    CHECK(build_execution_page_sql(q, std::nullopt).params.back() == "2");
-    q.limit = 100000;
-    CHECK(build_execution_page_sql(q, std::nullopt).params.back() == "501");
+    // One field feeds both bounds: the statement selects `limit + 1`, the store trims to `limit`.
+    for (const auto& [asked, want] : std::vector<std::pair<int, int>>{
+             {0, 1}, {-5, 1}, {1, 1}, {500, 500}, {501, 500}, {100000, 500}}) {
+        INFO("asked " << asked);
+        WorkflowExecutionListQuery q;
+        q.limit = asked;
+        const auto b = build_execution_page_sql(q, std::nullopt);
+        CHECK(b.limit == want);
+        CHECK(b.params.back() == std::to_string(want + 1));
+    }
 }
 
 TEST_CASE("WorkflowEngine::query_executions_page: a keyset walk over same-second ties skips and "
@@ -1299,7 +1306,11 @@ TEST_CASE("WorkflowEngine::query_executions_page: the SQL visibility predicate e
         {"duplicates", R"(["a1","a1","a1"])"},
         {"leading-space-id", R"([" a1"])"},
         {"case-differs", R"(["A1"])"},
-        {"unicode-escape-in", R"(["a1"])"}, // decodes to "a1" on both sides
+        // A raw string keeps the backslashes, so the JSON text really holds \u0061\u0031; both
+        // parsers decode it to "a1". (A plain string literal would need the backslashes doubled.)
+        {"unicode-escape-in", R"(["\u0061\u0031"])"},
+        {"surrogate-pair-in", R"(["\uD83D\uDE00"])"}, // one astral id, U+1F600, as a surrogate pair
+        {"lone-surrogate", R"(["a1","\uD83D"])"},      // both parsers refuse the WHOLE document
         {"unicode-id-in", "[\"\xc3\xa9" "1\"]"},        // "e-acute 1", also an in-scope id below
         {"quote-and-backslash-in", R"(["a\"b","c\\d"])"},
         {"whitespace-padded-json", " \n[ \"a1\" ]\t"},
@@ -1322,8 +1333,9 @@ TEST_CASE("WorkflowEngine::query_executions_page: the SQL visibility predicate e
         {"a\"b"},
         {"c\\d", "z9"},
         {"\xc3\xa9" "1"},
+        {"\xF0\x9F\x98\x80"}, // U+1F600
         {"7", "true"},
-        {"a1", "b1", "z9", "y8", "A1", " a1", "a\"b", "c\\d", "\xc3\xa9" "1"},
+        {"a1", "b1", "z9", "y8", "A1", " a1", "a\"b", "c\\d", "\xc3\xa9" "1", "\xF0\x9F\x98\x80"},
     };
     for (const auto& scope_vec : scopes) {
         authz::VisibleSet vs{std::unordered_set<std::string>(scope_vec.begin(), scope_vec.end())};
@@ -1354,8 +1366,9 @@ TEST_CASE("WorkflowEngine::query_executions_page: a NUL escape is refused by the
     PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
     REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
     // jsonb rejects \u0000 outright, so the whole document is "invalid" to the SQL predicate while
-    // nlohmann parses it and would admit the in-scope "a1". The only divergence between the two
-    // images: it hides a run the detail route would show, never the reverse.
+    // nlohmann parses it and would admit the in-scope "a1": the list hides a run the detail route
+    // would show (the safe direction). The other divergences, including the one that goes the
+    // other way, are pinned in the divergence case below.
     const std::string json = R"(["a1","\u0000"])";
     seed_run(conn.get(), "nul-mixed", wf, 10, json);
     WorkflowExecution we;
@@ -1368,6 +1381,76 @@ TEST_CASE("WorkflowEngine::query_executions_page: a NUL escape is refused by the
     auto open = engine.query_executions_page({}, std::nullopt);
     REQUIRE(open.has_value());
     CHECK(ids_of(*open) == std::vector<std::string>{"nul-mixed"});
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: the documented SQL-vs-C++ visibility "
+          "divergences keep their direction",
+          "[workflow_engine][pg][list][confinement]") {
+    // jsonb and nlohmann accept different JSON, so these cannot sit in the equality corpus above.
+    // Only a write that bypasses the engine can store either shape (execute() dumps a
+    // vector<string>). Each row names the direction; if a probe shows PostgreSQL decides
+    // differently, the row's expectation is what is wrong, not the predicate.
+    struct Divergence {
+        std::string label;
+        std::string json;
+        bool sql_shows;    // the list admits the run to a caller whose scope is {"a1"}
+        bool oracle_shows; // workflow_execution_visible() admits it to the same caller
+    };
+    const std::vector<Divergence> rows{
+        // jsonb takes any number numeric can hold; nlohmann rejects a double overflow and
+        // discards the WHOLE document. The list shows a run whose detail read says not-visible; the
+        // run does name the in-scope "a1", so nothing out of scope is exposed.
+        {"number-past-double-range", R"(["a1",1e400])", true, false},
+        // jsonb refuses a byte-order mark where nlohmann skips it: hidden here, shown there.
+        {"utf8-bom-prefix", "\xEF\xBB\xBF[\"a1\"]", false, true},
+    };
+    WORKFLOW_ENGINE(engine);
+    const auto wf = *engine.create_workflow(wf_yaml("divergence"));
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    int64_t t = 10;
+    for (const auto& r : rows)
+        seed_run(conn.get(), r.label, wf, t++, r.json);
+
+    const authz::VisibleSet vs{std::unordered_set<std::string>{"a1"}};
+    auto page = engine.query_executions_page({}, Scope{std::vector<std::string>{"a1"}});
+    REQUIRE(page.has_value()); // neither shape may error the statement
+    const auto got = ids_of(*page);
+    for (const auto& r : rows) {
+        INFO(r.label);
+        WorkflowExecution we;
+        we.agent_ids_json = r.json;
+        CHECK(workflow_execution_visible(we, vs) == r.oracle_shows);
+        CHECK((std::find(got.begin(), got.end(), r.label) != got.end()) == r.sql_shows);
+    }
+}
+
+TEST_CASE("WorkflowEngine::query_executions_page: the store clamps limit itself, never an empty "
+          "page or the sentinel row",
+          "[workflow_engine][pg][list]") {
+    WORKFLOW_ENGINE(engine);
+    const auto wf = *engine.create_workflow(wf_yaml("clamp"));
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    // 502 runs, so even the largest clamped page (500) has a successor. Ids sort with started_at.
+    for (int i = 0; i < 502; ++i) {
+        const auto n = std::to_string(i);
+        seed_run(conn.get(), "r-" + std::string(3 - n.size(), '0') + n, wf, i, "[]");
+    }
+    for (const auto& [asked, want] :
+         std::vector<std::pair<int, std::size_t>>{{0, 1}, {-1, 1}, {501, 500}, {100000, 500}}) {
+        INFO("asked " << asked);
+        WorkflowExecutionListQuery q;
+        q.limit = asked;
+        auto page = engine.query_executions_page(q, std::nullopt);
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == want); // also guards the back() below
+        CHECK(page->rows.front().id == "r-501");
+        REQUIRE(page->next.has_value());
+        // The cursor is the last row RETURNED, never the 501st (sentinel) row.
+        CHECK(page->next->id == page->rows.back().id);
+        CHECK(page->next->key == page->rows.back().started_at);
+    }
 }
 
 TEST_CASE("WorkflowEngine::query_executions_page: invisible runs never consume a page slot or "

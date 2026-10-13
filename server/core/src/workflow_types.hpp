@@ -88,10 +88,10 @@ struct WorkflowQuery {
     int limit{100};
 };
 
-/// One row of the workflow-execution LIST (`GET /api/v1/workflow-executions` / MCP
-/// `list_workflow_executions`). Metadata only: deliberately no `agent_ids` (can be ~100k ids and
-/// names the fleet), no step results and no `agents_reached` — a list row never discloses fleet
-/// size or out-of-scope agent ids to a confined caller.
+/// One row of the workflow-execution LIST (`WorkflowEngine::query_executions_page`). Metadata
+/// only: deliberately no `agent_ids` (can be ~100k ids and names the fleet), no step results and
+/// no `agents_reached` — a list row never discloses fleet size or out-of-scope agent ids to a
+/// confined caller.
 struct WorkflowExecutionSummary {
     std::string id;
     std::string workflow_id;
@@ -103,9 +103,9 @@ struct WorkflowExecutionSummary {
     int64_t completed_at{0};
 };
 
-/// Filters, paging and mode of one workflow-execution list read. Pure data — validated by
-/// `parse_workflow_execution_list_params`/`_args` (workflow_execution_list_model.hpp) before it
-/// reaches a store; the store clamps `limit` again as defence in depth.
+/// Filters, paging and mode of one workflow-execution list read. Pure data — the caller validates
+/// it (strict keys, bounds, cursor) before it reaches the store; the store clamps `limit` again as
+/// defence in depth.
 struct WorkflowExecutionListQuery {
     std::string workflow_id;             // exact filter; empty = every workflow
     std::string status;                  // exact filter; empty = every status
