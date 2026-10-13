@@ -450,6 +450,22 @@ deadline_test_() ->
                {Commands, _} = yuzu_grpc_stream_h:info(1, grpc_deadline, St),
                assert_refused(4, {Commands, undefined})
            end),
+     %% #5591: the request's DATA reaching the gateway after the deadline fired
+     %% must never run a handler (grpcbox discarded the ended state, so it did)
+     ?CASE("DATA that arrives after the deadline is dropped and runs no handler (#5591)",
+           with_dropped_events(fun() ->
+               {[], St} = init(req(?HEARTBEAT, #{<<"grpc-timeout">> => <<"1H">>}), env(Routes)),
+               {_, Ended} = yuzu_grpc_stream_h:info(1, grpc_deadline, St),
+               Linked = links(),
+               Frame = hb_frame(<<"late">>),
+               {Commands, Ended2} = yuzu_grpc_stream_h:data(1, fin, Frame, Ended),
+               ?assertEqual([{flow, byte_size(Frame)}], Commands),
+               ?assertEqual({byte_size(Frame), stream_ended}, dropped_event()),
+               ?assertEqual(Ended, Ended2),
+               %% nothing was spawned or linked, and no handler was started
+               ?assertEqual(Linked, links()),
+               receive {probe_started, _, _, _} -> error(handler_started) after 0 -> ok end
+           end)),
      ?CASE("the deadline while the handler runs sends the trailers and stops the stream",
            begin
                {Handler, St} = start_unary(Routes),
