@@ -10,8 +10,12 @@ const char* const kHelpPageTemplate = R"HTM(<!DOCTYPE html>
 <title>Yuzu — Help</title>
 <link rel="stylesheet" href="/static/yuzu.css">
 <style>
-.help-content{max-width:800px;margin:1.5rem auto;padding:0 1.5rem}
-h1{border-bottom:1px solid var(--border);padding-bottom:.5rem}
+.help-content{padding:22px 28px 36px}
+.help-content h1{font-size:24px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
+.help-content p{max-width:70ch;margin-top:4px;color:var(--mut)}
+.help-content a{color:var(--primary);text-decoration:none}
+.help-content a:hover{text-decoration:underline}
+.help-content a:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
 </style>
 </head><body>
 

@@ -15,139 +15,169 @@ const char* const kInstructionPageTemplate =
 <script src="/static/htmx.js"></script>
 <style>
 body{padding:0}
-a{color:var(--accent)}h1{border-bottom:1px solid var(--border);padding-bottom:.5rem}
-.tabs{display:flex;gap:.5rem;margin-bottom:1rem;border-bottom:1px solid var(--border);padding-bottom:.5rem}
-.tab{padding:.4rem 1rem;cursor:pointer;border:1px solid transparent;border-radius:6px 6px 0 0;color:var(--muted)}
-.tab.active,.tab:hover{color:var(--fg);border-color:var(--border);background:var(--surface)}
+button,input,select,textarea{font:inherit;color:inherit}
+code{font-family:var(--mds-font-family-mono);font-size:12.5px}
+/* page frame */
+.pg{padding:22px 28px 36px;display:flex;flex-direction:column;gap:20px}
+.ph h1{font-size:24px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
+.ph p{color:var(--mut);margin-top:4px;max-width:70ch}
+.tabs{display:flex;flex-wrap:wrap;gap:2px;border-bottom:1px solid var(--line)}
+.tab{padding:8px 14px;cursor:pointer;color:var(--mut);border-bottom:2px solid transparent;margin-bottom:-1px;font-weight:500;transition:color .12s}
+.tab:hover{color:var(--ink)}
+.tab.active{color:var(--ink);border-bottom-color:var(--hl);font-weight:600}
+/* panel: a bordered region, not a floating card */
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel);min-width:0}
+.panel+.panel{margin-top:22px}
+.panel>.hd{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:12px 16px;border-bottom:1px solid var(--line)}
+.panel>.hd h2{font-size:14px;font-weight:600;color:var(--ink)}
+.panel>.hd .end{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.panel>.pb{padding:16px}
+.tw{overflow-x:auto}
+.empty-state{color:var(--mut);text-align:center;padding:32px 16px;font-size:13.5px;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
+.panel .empty-state,.exec-detail .empty-state{background:none;border:0}
+.exec-detail .empty-state{padding:12px}
+.note{margin-bottom:12px;padding:12px 14px;border:1px solid var(--line2);border-radius:var(--rad-panel);background:var(--surface2);color:var(--ink2);font-size:13.5px}
+.note.warn{border-color:color-mix(in srgb,var(--warn) 50%,var(--line2))}
+.hint{color:var(--mut);font-size:12.5px}
+/* tables */
 table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:.4rem .6rem;border-bottom:1px solid var(--border);font-size:.8rem}
-th{color:var(--muted);font-weight:600}
-.empty-state{color:var(--muted);text-align:center;padding:2rem}
-.status-badge{display:inline-block;padding:.1rem .5rem;border-radius:1rem;font-size:.7rem;font-weight:600}
-.status-pending{background:var(--yellow);color: var(--mds-color-theme-background-canvas)}
-.status-running{background:var(--mds-color-theme-accent-primary-active);color:var(--mds-color-text-on-accent)}
-.status-completed{background:var(--green);color:var(--mds-color-text-on-accent)}
-/* PR 3 hardening (ca-PR3-7): per-agent renderer + SSE swap canonicalised
-   on DOM vocabulary status-{succeeded,failed,running,pending}. .status-succeeded
-   is the canonical agent/exec success class going forward; .status-completed
-   stays for backwards-compat on existing fragments. */
-.status-succeeded{background:var(--green);color:var(--mds-color-text-on-accent)}
-.status-cancelled{background:var(--subtle);color:var(--mds-color-text-on-accent)}
-.status-failed{background:var(--red);color:var(--mds-color-text-on-accent)}
-.status-approved{background:var(--green);color:var(--mds-color-text-on-accent)}
-.status-rejected{background:var(--red);color:var(--mds-color-text-on-accent)}
-/* Instruction-page button overrides (smaller, denser) */
-.btn{height:auto;padding:.3rem .8rem;font-size:.75rem;margin-right:.3rem}
-.btn-primary{background:var(--green);color:var(--mds-color-text-on-accent)}
-.btn-secondary{background:var(--surface);color:var(--fg);border:1px solid var(--border)}
-.btn-danger{background:var(--red);color:var(--mds-color-text-on-accent)}
-.btn-sm{padding:.2rem .5rem;font-size:.7rem}
-.progress-bar{width:80px;height:8px;background:var(--border);border-radius:4px;display:inline-block;vertical-align:middle}
-.progress-fill{height:100%;background:var(--green);border-radius:4px}
-code{background:var(--surface);padding:.1rem .3rem;border-radius:4px;font-size:.75rem}
-.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:.8rem}
-.role-badge{display:inline-block;padding:.1rem .4rem;border-radius:4px;font-size:.65rem;
-  font-weight:600;background:var(--mds-color-theme-accent-primary-active);color:var(--mds-color-text-on-accent);margin-left:.5rem;vertical-align:middle}
-/* Editor panel */
-.editor-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem;margin-bottom:1rem;display:none}
-.editor-panel.active{display:block}
-.editor-tabs{display:flex;gap:.3rem;margin-bottom:1rem}
-.editor-tab{padding:.3rem .8rem;cursor:pointer;border:1px solid var(--border);border-radius:4px;
-  font-size:.75rem;color:var(--muted);background:transparent}
-.editor-tab.active{color:var(--fg);background:var(--border)}
-.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:.8rem}
-.form-group{display:flex;flex-direction:column;gap:.2rem}
+th{text-align:left;font-size:12.5px;font-weight:500;color:var(--mut);padding:8px 16px;background:var(--surface2);border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:var(--cell-y) 16px;border-bottom:1px solid var(--line);color:var(--ink2)}
+tr:last-child>td{border-bottom:0}
+tbody tr:hover>td{background:var(--surface2)}
+td strong{color:var(--ink);font-weight:600}
+td.act{text-align:right;white-space:nowrap}
+.sub-id{display:block;font-size:12px;color:var(--faint)}
+.legacy-badge{font-size:12px;background:var(--surface2);color:var(--mut);padding:0 6px;border-radius:3px;margin-left:6px}
+/* buttons (all reachable controls are .btn) */
+.btn{height:var(--ctl);padding:0 14px;border-radius:var(--rad-ctl);border:1px solid var(--line2);background:var(--raise);color:var(--ink);font-size:14px;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:6px;white-space:nowrap;transition:background .12s,border-color .12s}
+.btn:hover:not(:disabled){background:var(--surface2);border-color:var(--mut);opacity:1}
+.btn-secondary{background:var(--raise);color:var(--ink);border-color:var(--line2)}
+.btn-primary{background:var(--primary);color:var(--on-primary);border-color:var(--primary);font-weight:600}
+.btn-primary:hover:not(:disabled){background:var(--primary-h);border-color:var(--primary-h)}
+.btn-danger{background:var(--raise);color:var(--bad);border-color:color-mix(in srgb,var(--bad) 45%,var(--line2))}
+.btn-danger:hover:not(:disabled){background:color-mix(in srgb,var(--bad) 12%,transparent);border-color:var(--bad)}
+.btn-sm{height:28px;padding:0 10px;font-size:13px}
+/* forms */
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(220px,100%),1fr));gap:16px}
+.form-group{display:flex;flex-direction:column;gap:5px;min-width:0}
 .form-group.full{grid-column:1/-1}
-label{font-size:.75rem;color:var(--muted);font-weight:600}
-input,select,textarea{background:var(--bg);border:1px solid var(--border);border-radius:4px;
-  padding:.4rem .6rem;color:var(--fg);font-size:.8rem;font-family:inherit}
-textarea{font-family:var(--font-mono);min-height:300px;resize:vertical;tab-size:2}
-input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
-/* Syntax token colors — GitHub-dark-inspired */
-.yk{color: var(--mds-color-indicator-info-bright)}                     /* YAML key */
-.yv{color:var(--mds-color-indicator-info-bright)} /* YAML string value */
-.yc{color: var(--mds-color-theme-text-tertiary);font-style:italic}   /* comment */
-.ya{color: var(--mds-color-indicator-special)}                     /* apiVersion / kind (schema keywords) */
-.yt-q{color: var(--mds-color-indicator-success-bright)}                   /* type: question — green (safe, read-only) */
-.yt-a{color: var(--mds-color-indicator-attention);font-weight:700}   /* type: action — orange bold (privileged, modifying) */
-.yap{color: var(--mds-color-indicator-error-bright);font-weight:700}    /* approval: always — red bold (requires sign-off) */
-.yap-auto{color: var(--mds-color-indicator-success-bright)}              /* approval: auto — green (no gate) */
-.ycc{color: var(--mds-color-theme-indicator-warning)}                    /* concurrency mode — amber */
-.yn{color: var(--mds-color-indicator-info-bright)}                     /* numeric values */
-.yb{color: var(--mds-color-indicator-error-bright)}                     /* boolean values */
-.yd{color: var(--mds-color-theme-text-tertiary)}                     /* dashes (list markers) */
-/* Legend */
-.yaml-legend{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:.5rem;font-size:.7rem}
-.yaml-legend span{display:flex;align-items:center;gap:.3rem}
+label{display:block;font-size:13px;font-weight:500;color:var(--ink2)}
+input,select,textarea{height:var(--ctl);padding:0 10px;border-radius:var(--rad-ctl);background:var(--bg);border:1px solid var(--line2);color:var(--ink);min-width:0}
+select{width:100%}
+input::placeholder,textarea::placeholder{color:var(--faint)}
+input:focus,select:focus,textarea:focus{border-color:var(--primary)}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+textarea{height:auto;padding:8px 10px;min-height:84px;resize:vertical;font-family:var(--mds-font-family-mono);font-size:12.5px;tab-size:2}
+.form-actions{margin-top:16px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+/* status pills (the .status-* vocabulary is shared with the SSE swap below) */
+.status-badge{display:inline-flex;align-items:center;padding:1px 8px;border-radius:3px;font-size:12.5px;font-weight:500;white-space:nowrap;color:var(--mut);background:var(--surface2)}
+.status-pending{color:var(--warn);background:var(--mds-color-bg-warning-tinted)}
+.status-running{color:var(--info);background:var(--mds-color-bg-info-tinted)}
+.status-completed,.status-succeeded,.status-approved{color:var(--ok);background:var(--mds-color-bg-success-tinted)}
+.status-failed,.status-rejected{color:var(--bad);background:var(--mds-color-bg-error-tinted)}
+.status-cancelled,.status-idle{color:var(--mut);background:var(--surface2)}
+.role-badge{display:inline-flex;padding:1px 8px;border-radius:3px;font-size:12.5px;font-weight:500;color:var(--mut);background:var(--surface2)}
+.alert{padding:12px 14px;border-radius:var(--rad-panel);font-size:13.5px;margin-bottom:12px;background:var(--surface2);color:var(--ink2);border:1px solid var(--line2)}
+.alert strong{color:var(--ink)}
+.alert ul{margin-left:18px}
+.alert-error{border-color:var(--bad)}
+.alert-success{border-color:var(--ok)}
+.alert-warning{border-color:var(--warn)}
+/* execute form */
+.exec-form{display:grid;grid-template-columns:minmax(0,1fr) 260px;gap:20px;padding:16px}
+.exec-main>*+*{margin-top:12px}
+.def-info{background:var(--bg);border:1px solid var(--line);border-radius:var(--rad-ctl);padding:12px}
+.def-info-top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:4px}
+.def-info-top strong{color:var(--ink);font-weight:600}
+.def-info-top code{color:var(--faint)}
+.def-info-desc{color:var(--mut);font-size:13px;margin-bottom:4px}
+.def-info-meta{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:13px;color:var(--mut)}
+.params label{margin-bottom:5px}
+#exec-status{font-size:13px;color:var(--mut)}
+.agent-list:empty{display:none}
+.agent-list{max-height:300px;overflow-y:auto;border:1px solid var(--line);border-radius:var(--rad-ctl);font-size:12.5px;margin-top:8px}
+/* editor panel */
+.editor-panel{display:none}
+.editor-panel.active{display:block}
+.editor-tabs{display:inline-flex;gap:2px;margin-bottom:16px;padding:2px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg)}
+.editor-tab{height:calc(var(--ctl) - 8px);min-height:26px;padding:0 12px;border-radius:2px;display:flex;align-items:center;cursor:pointer;color:var(--mut);font-weight:500}
+.editor-tab:hover{color:var(--ink)}
+.editor-tab.active{background:var(--raise);color:var(--ink);box-shadow:inset 0 0 0 1px var(--line2);font-weight:600}
+.yaml-split textarea,.yaml-preview{font-size:12.5px}
+.yaml-legend{display:flex;gap:6px 16px;flex-wrap:wrap;margin-bottom:8px;font-size:12.5px;color:var(--mut)}
+.yaml-legend span{display:flex;align-items:center;gap:6px}
 .yaml-legend .swatch{width:10px;height:10px;border-radius:2px;display:inline-block}
-.form-actions{margin-top:1rem;display:flex;gap:.5rem}
-/* alert overrides (shared .alert base from yuzu.css, page-specific padding) */
-.alert{padding:.5rem 1rem;font-size:.8rem;margin-bottom:.8rem}
-.legacy-badge{font-size:.65rem;background:var(--mds-color-theme-outline-secondary);color:var(--mds-color-text-on-accent);padding:.05rem .4rem;border-radius:3px}
-/* Executions tab — clickable rows + per-execution detail drawer.
-   Information-design conventions:
-     - Status as hue + icon + row stripe (two channels for colorblind safety).
-     - Sparkbar widths = counts (length channel); hue = status (hue channel).
-     - KPI strip carries the headline; tables carry the long tail.
-     - Agent grid is small-multiples; one cell per agent, color by status. */
-.exec-table{width:100%}
+.yt{white-space:pre-wrap;overflow-wrap:anywhere}
+.yk{color:var(--info)}.yv{color:var(--ink2)}.yc{color:var(--faint);font-style:italic}.ya{color:var(--ink);font-weight:600}
+.yq{color:var(--ok)}.yact{color:var(--warn);font-weight:600}.yar{color:var(--bad);font-weight:600}.ycc{color:var(--warn)}
+.yn,.yb{color:var(--c2)}.yd{color:var(--faint)}
+/* Executions tab: clickable rows + per-execution detail drawer. Status is hue + a row stripe
+   (two channels); the KPI strip carries the headline, the tables the long tail. */
 .exec-row{cursor:pointer}
-.exec-row:hover{background:var(--mds-color-state-hover)}
-.exec-row.expanded{background:var(--mds-color-state-selected)}
-.exec-row--failed>td:first-child{box-shadow:inset 3px 0 0 var(--mds-color-theme-indicator-error)}
-.exec-row--running>td:first-child{box-shadow:inset 3px 0 0 var(--mds-color-theme-indicator-stable)}
-.exec-row:focus{outline:2px solid var(--accent);outline-offset:-2px}
-.exec-def-name{font-weight:600}
-.exec-agent-count{font-size:.7rem;color:var(--muted);white-space:nowrap}
-.exec-error-preview{font-family:var(--font-mono);font-size:.7rem;color:var(--mds-color-theme-indicator-error);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.exec-time{font-size:.7rem;color:var(--muted);white-space:nowrap}
+.exec-table>tbody>tr:nth-last-child(2)>td{border-bottom:0}
+.exec-table>tbody>tr.expanded:nth-last-child(2)>td{border-bottom:1px solid var(--line)}
+.exec-row.expanded>td{background:var(--mds-color-state-selected)}
+.exec-row--failed>td:first-child{box-shadow:inset 3px 0 0 var(--bad)}
+.exec-row--running>td:first-child{box-shadow:inset 3px 0 0 var(--info)}
+.exec-row.expanded>td:first-child{box-shadow:inset 3px 0 0 var(--hl)}
+.exec-row:focus-visible{outline-offset:-2px}
+.exec-def-name{font-weight:600;color:var(--ink)}
+.exec-agent-count,.exec-time{font-size:13px;color:var(--mut);white-space:nowrap}
+.exec-error-preview{font-family:var(--mds-font-family-mono);font-size:12px;color:var(--bad);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .status-sparkbar{display:block}
 .exec-detail{display:none}
 .exec-detail.open{display:table-row}
-.exec-detail>td{padding:1rem!important;background:var(--mds-color-theme-bg-secondary,var(--bg))}
-.exec-detail-grid{display:grid;gap:1rem;grid-template-columns:1fr minmax(220px,320px)}
-@media (max-width:900px){.exec-detail-grid{grid-template-columns:1fr}}
-.exec-detail-grid h4{margin:0 0 .3rem 0;font-size:.7rem;color:var(--mds-color-theme-text-tertiary);text-transform:uppercase;letter-spacing:.05em}
-.exec-kpi-strip{display:flex;flex-wrap:wrap;gap:1.5rem;grid-column:1/-1;padding-bottom:.5rem;border-bottom:1px solid var(--border)}
-.exec-kpi{min-width:7rem}
-.exec-kpi-value{font-size:1.5rem;font-weight:600;line-height:1.1}
-.exec-kpi-value--ok{color:var(--green)}
-.exec-kpi-value--err{color:var(--red)}
-.exec-kpi-label{font-size:.65rem;color:var(--mds-color-theme-text-tertiary);text-transform:uppercase;letter-spacing:.05em;margin-top:.2rem}
+.exec-detail>td,tbody tr.exec-detail:hover>td{padding:16px;background:var(--bg)}
+.exec-detail-grid{display:grid;gap:16px;grid-template-columns:1fr minmax(220px,320px)}
+.exec-detail-grid h4{margin:0 0 6px;font-size:13px;font-weight:600;color:var(--ink)}
+.exec-kpi-strip{display:flex;flex-wrap:wrap;grid-column:1/-1;border:1px solid var(--line);border-radius:var(--rad-panel);background:var(--surface)}
+.exec-kpi{flex:1 1 120px;min-width:0;padding:12px 16px;border-left:1px solid var(--line)}
+.exec-kpi:first-child{border-left:0}
+.exec-kpi-value{font-size:22px;font-weight:500;letter-spacing:-.02em;line-height:1.15;color:var(--ink)}
+.exec-kpi-value--ok{color:var(--ok)}
+.exec-kpi-value--err{color:var(--bad)}
+.exec-kpi-label{font-size:13px;color:var(--mut);margin-top:2px}
 .agent-grid-wrap{grid-column:1/-1}
 .agent-grid{display:grid;grid-template-columns:repeat(auto-fill,12px);gap:2px;max-height:200px;overflow-y:auto}
 .agent-cell{width:12px;height:12px;border-radius:2px;cursor:pointer}
-.agent-cell--bucket{width:auto;height:18px;display:flex;align-items:center;justify-content:center;font-size:.65rem;color:var(--mds-color-text-on-accent);padding:0 .3rem;border-radius:3px}
-.agent-cell--succeeded{background:var(--mds-color-bg-success-emphasis,var(--green))}
-.agent-cell--failed{background:var(--mds-color-theme-indicator-error,var(--red))}
-.agent-cell--running{background:var(--mds-color-theme-indicator-stable,var(--accent))}
-.agent-cell--pending{background:var(--mds-color-theme-text-tertiary,var(--muted));opacity:.4}
-.per-agent-table-wrap{grid-column:1}
-.per-agent-table{font-size:.75rem}
+.agent-cell--bucket{width:auto;height:18px;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--bg);padding:0 6px;border-radius:3px}
+.agent-cell--succeeded{background:var(--ok)}
+.agent-cell--failed{background:var(--bad)}
+.agent-cell--running{background:var(--info)}
+.agent-cell--pending{background:var(--mut);opacity:.4}
+.per-agent-table-wrap,.per-agent-responses-wrap{grid-column:1;min-width:0}
+.per-agent-table th,.per-agent-table td,.per-agent-responses-table th,.per-agent-responses-table td{padding:6px 12px;font-size:13px}
 .per-agent-table td{vertical-align:middle}
-.duration-bar{height:6px;border-radius:3px;display:inline-block;vertical-align:middle;min-width:1px}
-.duration-bar--succeeded{background:var(--mds-color-bg-success-emphasis,var(--green))}
-.duration-bar--failed{background:var(--mds-color-theme-indicator-error,var(--red))}
-.duration-bar--running{background:var(--mds-color-theme-indicator-stable,var(--accent))}
-.duration-bar--pending{background:var(--mds-color-theme-text-tertiary,var(--muted));opacity:.4}
-.duration-text{font-size:.65rem;color:var(--muted);margin-left:.3rem}
-.per-agent-row-highlight{background:var(--mds-color-state-selected)!important;transition:background .3s}
-.per-agent-responses-wrap{grid-column:1}
-.per-agent-responses summary{cursor:pointer;font-size:.75rem;color:var(--muted);padding:.3rem 0}
-.per-agent-responses-table{font-size:.7rem}
-.resp-output pre{margin:.3rem 0;padding:.3rem;background:var(--bg);border-radius:3px;max-height:200px;overflow:auto;white-space:pre-wrap}
-.exec-detail-sidebar{grid-column:2;font-size:.75rem}
-@media (max-width:900px){.exec-detail-sidebar{grid-column:1}}
-.exec-detail-sidebar>div{margin-bottom:.5rem}
-.exec-detail-meta-id{font-family:var(--font-mono);font-size:.65rem;color:var(--muted)}
-.exec-detail-scope,.exec-detail-params{display:block;font-size:.7rem;background:var(--bg);padding:.3rem;border-radius:3px;white-space:pre-wrap;word-break:break-all}
+/* yuzu.css sets white-space:nowrap on `.panel table td` / `.tw table td`. In the drawer that runs long errors under
+   the sidebar and lets the duration text spill over the Error column, so drawer cells wrap again and agent ids
+   (td>code) stay on one line. It also pushed a long approval scope (and the Approve/Reject buttons) out of view. */
+.exec-table .exec-detail td{white-space:normal}
+.exec-table .exec-detail td>code{white-space:nowrap}
+.exec-table .exec-detail td td:last-child{overflow-wrap:anywhere}
+#tab-approvals td>code{white-space:normal}
+.duration-bar{height:6px;border-radius:2px;display:inline-block;vertical-align:middle;min-width:1px}
+.duration-bar--succeeded{background:var(--ok)}
+.duration-bar--failed{background:var(--bad)}
+.duration-bar--running{background:var(--info)}
+.duration-bar--pending{background:var(--mut);opacity:.4}
+.duration-text{font-size:12px;color:var(--mut);margin-left:6px}
+.per-agent-row-highlight>td{background:var(--mds-color-state-selected)!important}
+.per-agent-responses summary{cursor:pointer;font-size:13px;color:var(--mut);padding:6px 0}
+.resp-output pre{margin:6px 0;padding:8px;background:var(--bg);border:1px solid var(--line);border-radius:var(--rad-ctl);max-height:200px;overflow:auto;white-space:pre-wrap;font-family:var(--mds-font-family-mono);font-size:12.5px}
+.exec-detail-sidebar{grid-column:2;grid-row:3/span 2;font-size:13px}
+.exec-detail-sidebar>div{margin-bottom:8px}
+.exec-detail-meta-id{font-size:12px;color:var(--faint)}
+.exec-detail-scope,.exec-detail-params{display:block;font-size:12.5px;background:var(--bg);border:1px solid var(--line);padding:6px 8px;border-radius:var(--rad-ctl);white-space:pre-wrap;word-break:break-all}
+@media (max-width:900px){.pg{padding:16px}.exec-form,.exec-detail-grid{grid-template-columns:1fr}.exec-detail-sidebar{grid-column:1;grid-row:auto}}
 </style>
 </head><body>
 
   <!--yuzu:shell--><!--/yuzu:shell-->
 
-<div style="padding:2rem">
-<h1>Instructions</h1>
+)HTM"
+    R"HTM(<div class="pg">
+<header class="ph"><div><h1>Instructions</h1><p>Author, validate and dispatch instructions.</p></div></header>
 <div class="tabs">
     <div class="tab active" onclick="showTab('definitions',this)">Definitions</div>
     <div class="tab" onclick="showTab('executions',this)">Executions</div>
@@ -160,56 +190,58 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 </div>
 <div id="tab-executions" style="display:none">
     <!-- Execute form — pick instruction, set params, choose scope, dispatch -->
-    <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem;margin-bottom:1.5rem">
-      <h3 style="margin:0 0 .8rem 0;font-size:.9rem;border:none;padding:0">Execute Instruction</h3>
-      <div style="display:grid;grid-template-columns:1fr 260px;gap:1.2rem">
-        <div>
-          <div class="form-group" style="margin-bottom:.8rem">
+    <section class="panel">
+      <div class="hd"><h2>Execute Instruction</h2></div>
+      <div class="exec-form">
+        <div class="exec-main">
+          <div class="form-group">
             <label>Instruction Definition</label>
-            <select id="exec-def-select" style="width:100%"
-                    onchange="onDefSelected(this.value)">
+            <select id="exec-def-select" onchange="onDefSelected(this.value)">
               <option value="">— Select an instruction —</option>
             </select>
           </div>
-          <div id="exec-def-info" style="display:none;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:.8rem;margin-bottom:.8rem">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.3rem">
-              <strong id="exec-def-name" style="font-size:.85rem"></strong>
-              <code id="exec-def-id" style="font-size:.6rem;color:var(--muted)"></code>
+          <div id="exec-def-info" class="def-info" style="display:none">
+            <div class="def-info-top">
+              <strong id="exec-def-name"></strong>
+              <code id="exec-def-id"></code>
             </div>
-            <div id="exec-def-desc" style="font-size:.75rem;color:var(--muted);margin-bottom:.3rem"></div>
-            <div style="display:flex;gap:1rem;font-size:.7rem">
+            <div id="exec-def-desc" class="def-info-desc"></div>
+            <div class="def-info-meta">
               <span>Plugin: <code id="exec-def-plugin"></code></span>
               <span>Action: <code id="exec-def-action"></code></span>
               <span>Type: <code id="exec-def-type"></code></span>
             </div>
           </div>
-          <div id="exec-params-area" style="display:none;margin-bottom:.8rem">
+          <div id="exec-params-area" class="params" style="display:none">
             <label>Parameters</label>
-            <div id="exec-params-fields" class="form-grid" style="margin-top:.3rem"></div>
+            <div id="exec-params-fields" class="form-grid"></div>
           </div>
-          <div>
+          <div class="form-actions">
             <button class="btn btn-primary" onclick="executeInstruction()" id="exec-btn" disabled>
               Execute
             </button>
-            <span id="exec-status" style="font-size:.75rem;color:var(--muted);margin-left:.8rem"></span>
+            <span id="exec-status"></span>
           </div>
-          <div id="exec-result" style="margin-top:.5rem"></div>
+          <div id="exec-result"></div>
         </div>
         <div>
-          <label>Scope</label>
-          <select id="exec-scope" style="width:100%;margin-top:.3rem;margin-bottom:.5rem">
-            <option value="__all__">All agents</option>
-          </select>
-          <div id="exec-agent-list" style="max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;font-size:.7rem">
+          <div class="form-group">
+            <label>Scope</label>
+            <select id="exec-scope">
+              <option value="__all__">All agents</option>
+            </select>
           </div>
+          <div id="exec-agent-list" class="agent-list"></div>
         </div>
       </div>
-    </div>
+    </section>
     <!-- Execution history — loaded via HTMX fragment -->
-    <h3 style="font-size:.9rem;margin-bottom:.5rem;border:none;padding:0">Execution History</h3>
-    <div id="exec-history" hx-get="/fragments/executions" hx-trigger="revealed" hx-swap="innerHTML">
-      <div class="empty-state">Loading...</div>
-    </div>
+    <section class="panel">
+      <div class="hd"><h2>Execution History</h2></div>
+      <div id="exec-history" hx-get="/fragments/executions" hx-trigger="revealed" hx-swap="innerHTML">
+        <div class="empty-state">Loading...</div>
+      </div>
+    </section>
 </div>
 <div id="tab-schedules" style="display:none" hx-get="/fragments/schedules" hx-trigger="revealed" hx-swap="innerHTML">
     <div class="empty-state">Loading...</div>
@@ -221,7 +253,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 <!-- YAML Authoring Panel — rendered by /fragments/instructions/editor -->
 <div id="editor-host"></div>
 
-</div><!-- /padding wrapper -->
+</div><!-- /page body -->
 
 <div id="toast-container" class="toast-container"></div>
 )HTM"
@@ -831,14 +863,13 @@ extern const char* const kInstructionPageHtml =
 // Rendered by the server with user role check. Only shown to
 // PlatformEngineer and Administrator roles.
 extern const char* const kInstructionEditorHtml = R"HTM(
-<div class="editor-panel active">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.8rem">
-        <div>
-            <strong>{{TITLE}}</strong>
-            <span class="role-badge">Platform Engineer</span>
-        </div>
-        <button class="btn btn-secondary btn-sm" onclick="closeEditor()">Close</button>
+<div class="editor-panel panel active">
+    <div class="hd">
+        <h2>{{TITLE}}</h2>
+        <span class="role-badge">Platform Engineer</span>
+        <div class="end"><button class="btn btn-secondary btn-sm" onclick="closeEditor()">Close</button></div>
     </div>
+    <div class="pb">
     <div id="editor-alerts"></div>
     <div class="editor-tabs">
         <div class="editor-tab active" onclick="switchEditorMode('form',this)">Form</div>
@@ -913,12 +944,12 @@ extern const char* const kInstructionEditorHtml = R"HTM(
             <div class="form-group full">
                 <label>YAML Source (apiVersion: yuzu.io/v1alpha1)</label>
                 <div class="yaml-legend">
-                    <span><span class="swatch" style="background: var(--mds-color-indicator-success-bright)"></span> question (read-only)</span>
-                    <span><span class="swatch" style="background: var(--mds-color-indicator-attention)"></span> action (privileged)</span>
-                    <span><span class="swatch" style="background: var(--mds-color-indicator-error-bright)"></span> approval required</span>
-                    <span><span class="swatch" style="background: var(--mds-color-theme-indicator-warning)"></span> concurrency</span>
-                    <span><span class="swatch" style="background: var(--mds-color-indicator-info-bright)"></span> keys</span>
-                    <span><span class="swatch" style="background: var(--mds-color-indicator-special)"></span> schema</span>
+                    <span><span class="swatch" style="background:var(--ok)"></span> question (read-only)</span>
+                    <span><span class="swatch" style="background:var(--warn)"></span> action (privileged)</span>
+                    <span><span class="swatch" style="background:var(--bad)"></span> approval required</span>
+                    <span><span class="swatch" style="background:var(--warn)"></span> concurrency</span>
+                    <span><span class="swatch" style="background:var(--info)"></span> keys</span>
+                    <span><span class="swatch" style="background:var(--ink)"></span> schema</span>
                 </div>
                 <div class="yaml-split">
                     <textarea id="yaml-editor" name="yaml_source"
@@ -929,7 +960,7 @@ extern const char* const kInstructionEditorHtml = R"HTM(
                               spellcheck="false"
                               placeholder="Paste or type YAML here...">{{YAML_SOURCE}}</textarea>
                     <div id="yaml-preview" class="yaml-preview">
-                        <span style="color:var(--muted)">Preview will appear as you type...</span>
+                        <span class="hint">Preview will appear as you type...</span>
                     </div>
                 </div>
                 <div id="yaml-errors" class="yaml-errors"></div>
@@ -943,6 +974,7 @@ extern const char* const kInstructionEditorHtml = R"HTM(
                 <button type="button" class="btn btn-secondary" onclick="closeEditor()">Cancel</button>
             </div>
         </form>
+    </div>
     </div>
 </div>
 )HTM";
