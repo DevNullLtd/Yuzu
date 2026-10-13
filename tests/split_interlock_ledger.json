@@ -48,7 +48,7 @@
     "engine_principal_store": {"cell": "a", "regex": "engine_principal_store"},
     "principal_quota": {"cell": "m", "regex": "class PrincipalQuota"},
     "use_case_run_id": {"cell": "c", "regex": "use_case_run_id"},
-    "release_log_store": {"cell": "d", "regex": "(class|struct)[[:space:]]+([A-Za-z_]+[[:space:]]+)?ReleaseLog|release_log_store|CREATE TABLE[^;]*release_log"},
+    "release_log_store": {"cell": "d", "regex": "(class|struct)[[:space:]]+([A-Za-z_]+[[:space:]]+)?ReleaseLog|release_log_store|CREATE[[:space:]]+TABLE[^;]{0,200}release_log"},
     "evaluate_as_operator": {"cell": "b", "regex": "evaluate_as_operator"},
     "capability_registry": {"cell": "h", "regex": "register_securable|create_securable|ratified_mapping"}
   },
