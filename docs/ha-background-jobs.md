@@ -36,7 +36,7 @@ runs ~11 (the per-replica poll, several advisory-locked reaps, gauge refreshes) 
 re-publish, a per-replica stream teardown, the two per-replica MCP maintenance
 passes (bridge sweep + session gc), and (since #5513) the per-replica, in-memory
 `guardian_reconcile_gate.sweep` of the Guardian heartbeat-reconcile claim table
-(ReplicaSafe: it touches no store and each replica owns its own claims). The same reconcile's policy-generation cache and rule-bundle cache are per-replica in-memory state too: their invalidation hooks (rule and Baseline mutation, and the push fan-out) fire only on the replica that served the mutation, and the other replicas rely on the bundle `max_age` (60 s) and the generation cache's ~2 s TTL. Classifying a thread wholesale would falsely
+(ReplicaSafe: it touches no store and each replica owns its own claims). The same reconcile's policy-generation cache and rule-bundle cache are per-replica in-memory state too: their invalidation hooks (rule and Baseline mutation, and the push fan-out) fire only on the replica that served the mutation, and the other replicas miss a held bundle at once after a successful bump (it is keyed by generation), rely on its `max_age` (60 s) only when the bump failed, and see a new generation after the generation cache's ~2 s TTL plus its idle gap. Classifying a thread wholesale would falsely
 certify an unsafe pass riding a mostly-safe thread, so each `kBackgroundJobs` entry is
 one unit of work — with the caveat that the many trivially-identical read-only gauge
 passes on `health_recompute_thread_` are folded into a single

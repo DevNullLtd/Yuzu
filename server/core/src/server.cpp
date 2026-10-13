@@ -21234,9 +21234,12 @@ private:
     // commits and its generation bump was attempted), the BaselineStore baseline-mutation
     // hook (after a Baseline update, delete or deployed create commits, BEFORE the caller's own
     // bump), and the guardian_push_fn_ fan-out (after its scope parsed, BEFORE it reads the
-    // generation, the rules and the deployed set). Both caches go together: the bundle cache's epoch is what
-    // makes a reconcile that is already running withhold its push, and the generation cache is
-    // what stops the next admission decision from using a value up to its TTL old. Ordering
+    // generation, the rules and the deployed set). Both caches go together: the bundle cache's
+    // epoch is what makes a reconcile that is already running withhold its push, and the
+    // generation cache is what stops the next admission decision from using a value up to its
+    // TTL old. The generation cache is invalidated first, then the bundle cache; the instant
+    // between the two calls is the already-documented gap between a change and a reconcile's
+    // epoch check, and the order is not load-bearing. Ordering
     // matters at every call site: the invalidation must come after the change it announces
     // has committed and before any read that is meant to see it. A new writer of rule or
     // deployed-Baseline state calls this, it does not repeat the two calls.

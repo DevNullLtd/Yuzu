@@ -14,10 +14,16 @@ guard and this gate is the cheap tripwire that stays beside it):
 
   FLOW = the body of `void run(` in server/core/src/guardian_reconcile_flow.hpp (comments
   removed, string-literal contents reduced to [A-Za-z0-9_], whitespace collapsed): invariants
-  a-h, j-o, r, s below.
+  a-h, j-o, r, s, w below.
   WIRING = server.cpp: the `set_guardian_reconcile_fn(` call, the `GuardianReconcileFlowDeps`
-  construction feeding it, the maintenance tick, and the store's rule-mutation hook: invariants
-  i, o (second half), p, q, t, u, v.
+  construction feeding it, the maintenance tick, the cache-invalidation wrapper, the two stores'
+  post-mutation hooks and the push fan-out: invariants i, o (second half), p, q, t, u, v, x, y,
+  z.
+  WRITERS = server/core/src/baseline_store.cpp: the BaselineStore writer guard, "bw" below.
+
+LETTERS. "p" names two invariants over server.cpp (the fan-out invalidates; where it does so);
+both report as "(p)". The BaselineStore writer guard is "bw", not "b", because "b" is the Shed
+invariant of the FLOW.
 
 Invariants over the FLOW:
 
@@ -172,7 +178,7 @@ Invariants over the WIRING (server.cpp):
      `.has_value()`, `== false`, braced or split over lines), BEFORE the wrapper call, which
      comes BEFORE the generation read (`current_policy_generation(`): an invalid-scope push must
      not withhold in-flight reconciles, and the fan-out order stays safe.
-  b. BaselineStore writer drift guard (baseline_store.cpp, `baseline_writer_problems`): every
+  bw. BaselineStore writer drift guard (baseline_store.cpp, `baseline_writer_problems`): every
      function that writes `baseline_store.baselines` (UPDATE, DELETE FROM, INSERT INTO) calls
      `notify_baseline_mutation()` or is on BASELINE_WRITER_ALLOWLIST with a reason (set_members
      and set_assignment stamp updated_at only, and are red the moment they name lifecycle or
@@ -184,12 +190,17 @@ Invariants over the WIRING (server.cpp):
      BaselineStore method is red too. The runtime half (the hook fires once per committed
      update, delete and deployed create, never on a failed one, holds no lease, cannot break the
      mutation) is pinned by the [baseline_hook] cases in tests/unit/server/test_baseline_store.cpp.
-     Accepted limits of (b), lexical only, no code for them: it can be falsely RED on
+     Accepted limits of (bw), lexical only, no code for them: it can be falsely RED on
      `if (auto it = f(); cond) return x;` and on `for (;;) return ...` (the statement head is cut
      at the last `;`, so the conditional is not seen). It can be falsely GREEN on a bare
      `{ return; }` block, a `throw`, a `goto`, `if (true) return`, a conditional return after
      the commit that skips the notify, and a notify placed before an explicit COMMIT after a
-     future PgTxn refactor. The [baseline_hook] runtime cases are the backstop for those.
+     future PgTxn refactor. It also only sees what it can match: a raw string literal
+     `R"sql(UPDATE baseline_store.baselines ...)sql"` (lex() blanks raw strings), lowercase
+     `update ...`, `delete from ...` or `insert into ...` (the write pattern is case-sensitive)
+     and a literal split in two (`"UPDATE " "baseline_store.baselines"`) are not recognised as
+     writes. baseline_store.cpp is the only source that names the table today. The
+     [baseline_hook] runtime cases are the backstop for all of these.
 
 LEXICAL ONLY. It cannot see a relocation that keeps the tokens but changes control flow (that
 stays review-enforced), and the behavioural guarantees are the building blocks' own unit tests.
@@ -571,7 +582,7 @@ _STAMP_ONLY = ("set_members", "set_assignment")
 
 
 def baseline_writer_problems(src):
-    """(b) Drift guard for BaselineStore (#5513): every function that writes the baselines table
+    """(bw) Drift guard for BaselineStore (#5513): every function that writes the baselines table
     (UPDATE, DELETE FROM or INSERT INTO baseline_store.baselines) must call
     notify_baseline_mutation(), or sit on BASELINE_WRITER_ALLOWLIST with a reason. A new writer
     that forgets the hook would let a reconcile send the old deployed set under the unchanged
@@ -591,12 +602,12 @@ def baseline_writer_problems(src):
         if end >= 0:
             spans.append((m.group(1), open_idx, end))
     if not spans:
-        return ["baseline_store.cpp no longer has any parseable BaselineStore:: method definitions (b)"]
+        return ["baseline_store.cpp no longer has any parseable BaselineStore:: method definitions (bw)"]
     writers = {}
     for w in _BASELINE_WRITE.finditer(t):
         owner = [sp for sp in spans if sp[1] < w.start() < sp[2]]
         if not owner:
-            out.append("a write to baseline_store.baselines sits outside every BaselineStore method (b)")
+            out.append("a write to baseline_store.baselines sits outside every BaselineStore method (bw)")
             continue
         writers.setdefault(owner[0][0], owner[0])
     for name, (_n, lo, hi) in writers.items():
@@ -605,18 +616,18 @@ def baseline_writer_problems(src):
         if name in BASELINE_WRITER_ALLOWLIST:
             if name in _STAMP_ONLY and re.search(r'"[^"]*(?<![A-Za-z0-9])(?:lifecycle|deployed_snapshot)(?![A-Za-z0-9])[^"]*"', body):
                 out.append(f"BaselineStore::{name} is allowlisted as an updated_at-only writer but now names "
-                           f"lifecycle or deployed_snapshot: it must fire notify_baseline_mutation() (b)")
+                           f"lifecycle or deployed_snapshot: it must fire notify_baseline_mutation() (bw)")
             continue
         if not notifies:
             out.append(f"BaselineStore::{name} writes baseline_store.baselines but never calls "
-                       f"notify_baseline_mutation(), and is not on the allowlist (b)")
+                       f"notify_baseline_mutation(), and is not on the allowlist (bw)")
             continue
         last_write = max(w2.start() for w2 in _BASELINE_WRITE.finditer(body))
         for nm in re.finditer(r"\bnotify_baseline_mutation\( ?\) ?;", body):
             before = body[:nm.start()]
             if nm.start() < last_write:
                 out.append(f"BaselineStore::{name} calls notify_baseline_mutation() before its write to "
-                           f"baseline_store.baselines: it would announce a change that has not committed (b)")
+                           f"baseline_store.baselines: it would announce a change that has not committed (bw)")
             # An unconditional `return` between the write and the notify makes the notify unreachable.
             running = 0
             depth_at = []
@@ -635,29 +646,29 @@ def baseline_writer_problems(src):
                 d_r = depth_at[r_pos - 1] if r_pos else 0
                 if min(depth_at[r_pos:], default=d_r) >= d_r:
                     out.append(f"BaselineStore::{name} has an unconditional `return` between its write and "
-                               f"notify_baseline_mutation(): the notify is unreachable (b)")
+                               f"notify_baseline_mutation(): the notify is unreachable (bw)")
                     break
             if not re.search(r"\blease ?\. ?reset\( ?\) ?;", before):
                 out.append(f"BaselineStore::{name} calls notify_baseline_mutation() before lease.reset(): the hook "
-                           f"would run with the pool lease held (b)")
+                           f"would run with the pool lease held (bw)")
             if under_dead_condition(t, braces, lo + nm.start()):
-                out.append(f"BaselineStore::{name} calls notify_baseline_mutation() under a dead condition (b)")
+                out.append(f"BaselineStore::{name} calls notify_baseline_mutation() under a dead condition (bw)")
             depth = before.count("{") - before.count("}")
             head = before[max(before.rfind(";"), before.rfind("{"), before.rfind("}")) + 1:]
             if re.search(r"\b(?:if|else|for|while|switch)\b|\?", head):
                 out.append(f"BaselineStore::{name} calls notify_baseline_mutation() as the body of a conditional "
-                           f"statement (b)")
+                           f"statement (bw)")
             if name == "create_baseline":
                 if depth != 2 or not re.search(r"\bif ?\( ?lifecycle ?== ?kBaselineDeployed ?\) ?\{ ?(?:[^{}]*;)? ?$", before):
                     out.append("BaselineStore::create_baseline must fire the hook only inside "
                                "`if (lifecycle == kBaselineDeployed) { ... }` (a draft create stays silent, a "
-                               "deployed one changes the deployed set) (b)")
+                               "deployed one changes the deployed set) (bw)")
             elif depth != 1:
                 out.append(f"BaselineStore::{name} calls notify_baseline_mutation() inside a branch: it must fire on "
-                           f"every committed {name} (b)")
+                           f"every committed {name} (bw)")
     for name in ("create_baseline", "update_baseline", "delete_baseline"):
         if name not in writers:
-            out.append(f"BaselineStore::{name} no longer writes baseline_store.baselines where expected (b)")
+            out.append(f"BaselineStore::{name} no longer writes baseline_store.baselines where expected (bw)")
     return out
 
 
@@ -1633,30 +1644,30 @@ CRE = "std::expected<std::string, std::string> BaselineStore::create_baseline"
 LEASE_NOTIFY = "lease.reset(); // no pool lease held while the hook runs\n    notify_baseline_mutation();"
 BASELINE_WRITER_MUTATIONS = [
     ("a return before the deployed block makes create_baseline's notify unreachable",
-     _in_fn(CRE, "    if (lifecycle == kBaselineDeployed) {\n        lease.reset();", "    return id;\n    if (lifecycle == kBaselineDeployed) {\n        lease.reset();"), "(b)"),
+     _in_fn(CRE, "    if (lifecycle == kBaselineDeployed) {\n        lease.reset();", "    return id;\n    if (lifecycle == kBaselineDeployed) {\n        lease.reset();"), "(bw)"),
     ("a return before the notify makes update_baseline's notify unreachable",
-     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    return {};\n    notify_baseline_mutation();"), "(b)"),
+     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    return {};\n    notify_baseline_mutation();"), "(bw)"),
     ("update_baseline announces the change before the write",
-     _in_fn(UPD, "    if (!open_)", "    notify_baseline_mutation();\n    if (!open_)"), "(b)"),
+     _in_fn(UPD, "    if (!open_)", "    notify_baseline_mutation();\n    if (!open_)"), "(bw)"),
     ("update_baseline fires the hook before releasing the lease",
-     _in_fn(UPD, LEASE_NOTIFY, "notify_baseline_mutation();\n    lease.reset();"), "(b)"),
+     _in_fn(UPD, LEASE_NOTIFY, "notify_baseline_mutation();\n    lease.reset();"), "(bw)"),
     ("update_baseline fires the hook under if (false)",
-     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    if (false) notify_baseline_mutation();"), "(b)"),
+     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    if (false) notify_baseline_mutation();"), "(bw)"),
     ("update_baseline fires the hook only for some updates",
-     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    if (b.lifecycle == kBaselineDeployed) notify_baseline_mutation();"), "(b)"),
+     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    if (b.lifecycle == kBaselineDeployed) notify_baseline_mutation();"), "(bw)"),
     ("update_baseline fires the hook inside a nested block",
-     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    { notify_baseline_mutation(); }"), "(b)"),
+     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    { notify_baseline_mutation(); }"), "(bw)"),
     ("a deployed create_baseline no longer fires the hook",
-     _in_fn(CRE, "    if (lifecycle == kBaselineDeployed) {\n        lease.reset(); // no pool lease held while the hook runs\n        notify_baseline_mutation();\n    }\n", ""), "(b)"),
+     _in_fn(CRE, "    if (lifecycle == kBaselineDeployed) {\n        lease.reset(); // no pool lease held while the hook runs\n        notify_baseline_mutation();\n    }\n", ""), "(bw)"),
     ("create_baseline fires the hook for every create (drafts too)",
      _in_fn(CRE, "    if (lifecycle == kBaselineDeployed) {\n        lease.reset(); // no pool lease held while the hook runs\n        notify_baseline_mutation();\n    }\n",
-            "    lease.reset();\n    notify_baseline_mutation();\n"), "(b)"),
+            "    lease.reset();\n    notify_baseline_mutation();\n"), "(bw)"),
     ("create_baseline fires the hook before releasing the lease",
-     _in_fn(CRE, "        lease.reset(); // no pool lease held while the hook runs\n        notify_baseline_mutation();", "        notify_baseline_mutation();"), "(b)"),
+     _in_fn(CRE, "        lease.reset(); // no pool lease held while the hook runs\n        notify_baseline_mutation();", "        notify_baseline_mutation();"), "(bw)"),
     ("create_baseline fires on the wrong condition",
-     _in_fn(CRE, "if (lifecycle == kBaselineDeployed) {\n        lease.reset();", "if (lifecycle == kBaselineDraft) {\n        lease.reset();"), "(b)"),
-    ("update_baseline stops firing the hook", _upd_without_notify, "(b)"),
-    ("delete_baseline stops firing the hook", _delete_without_notify, "(b)"),
+     _in_fn(CRE, "if (lifecycle == kBaselineDeployed) {\n        lease.reset();", "if (lifecycle == kBaselineDraft) {\n        lease.reset();"), "(bw)"),
+    ("update_baseline stops firing the hook", _upd_without_notify, "(bw)"),
+    ("delete_baseline stops firing the hook", _delete_without_notify, "(bw)"),
     ("a new writer function that is not allowlisted",
      lambda s: s + """
 std::expected<void, std::string> BaselineStore::undeploy_baseline(const std::string& baseline_id) {
@@ -1665,18 +1676,18 @@ std::expected<void, std::string> BaselineStore::undeploy_baseline(const std::str
                     std::vector<std::string>{baseline_id});
     return {};
 }
-""", "(b)"),
+""", "(bw)"),
     ("a writer outside every BaselineStore method",
      lambda s: s + """
 static void raw_write(PGconn* c) {
     pg::exec_params(c, "DELETE FROM baseline_store.baselines", std::vector<std::string>{});
 }
-""", "(b)"),
+""", "(bw)"),
     ("set_members starts rewriting the deployed snapshot",
      _sub("UPDATE baseline_store.baselines SET updated_at = $1::bigint ",
-          "UPDATE baseline_store.baselines SET deployed_snapshot = '[]', updated_at = $1::bigint "), "(b)"),
+          "UPDATE baseline_store.baselines SET deployed_snapshot = '[]', updated_at = $1::bigint "), "(bw)"),
     ("update_baseline no longer writes the table",
-     _sub("UPDATE baseline_store.baselines SET name = $1", "UPDATE baseline_store.baseline_x SET name = $1"), "(b)"),
+     _sub("UPDATE baseline_store.baselines SET name = $1", "UPDATE baseline_store.baseline_x SET name = $1"), "(bw)"),
 ]
 
 BENIGN_BASELINE = [
