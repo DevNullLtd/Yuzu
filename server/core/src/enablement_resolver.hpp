@@ -4,8 +4,8 @@
  * enablement_resolver.hpp — the pure enablement resolver (ADR-3006, PM1.1a).
  *
  * resolve(rules, overlay, agent_os, view) answers, for ONE endpoint, which
- * units are off and why. No I/O, no clock, no store; the only allocations are
- * the scope evaluator's own and the result.
+ * units are off and why. Pure: no I/O, no clock, no globals, no shared mutable
+ * state.
  *
  * DRIFT CONTRACT. The attribute view is the caller's: a plain
  * `scope::AttributeResolver` produced by the shared per-identity resolver.
@@ -61,6 +61,7 @@
 
 #include "dispatch_target_shape.hpp"
 #include "enablement_units.hpp"
+#include "plugin_config_parsers.hpp"
 #include "scope_engine.hpp"
 
 namespace yuzu::server::enablement {
@@ -75,6 +76,9 @@ enum class Reason : std::uint8_t {
 };
 
 struct Rule {
+    /// Not required to be unique here: matches are keyed on the full
+    /// (rule_id, provenance) pair and the output is canonical either way.
+    /// Uniqueness is the PM1.1b store's primary key, not a precondition.
     std::string id;
     std::vector<std::string> units;
     /// nullopt = fleet-wide (authored as `__all__`).
@@ -92,6 +96,9 @@ struct OffUnit {
     std::string unit;
     Reason reason;
     std::vector<Match> matches;
+    /// The unit's DIRECTLY-required units that are off. A plugin-level edge
+    /// records this on the plugin only: its contained actions go
+    /// OffRequirement and inherit `matches` but carry an empty required_off.
     std::vector<std::string> required_off;
     bool operator==(const OffUnit&) const = default;
 };
@@ -104,10 +111,28 @@ struct Resolution {
 
 // -- Authoring ----------------------------------------------------------------
 
+/// A `tag:`/`props.` key: 1-64 chars of [A-Za-z0-9_.:-]. Mirrors
+/// TagStore::validate_key (tag_store.cpp) and CustomPropertiesStore::validate_key
+/// (custom_properties_store.cpp), which are the same grammar but not reachable
+/// here without a store dependency. A tokenizer-legal `*` is no stored key.
+[[nodiscard]] constexpr bool is_valid_selector_key(std::string_view key) {
+    if (key.empty() || key.size() > 64)
+        return false;
+    for (const char c : key)
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '_' || c == '-' || c == '.' || c == ':'))
+            return false;
+    return true;
+}
+
 /// Refuse the first condition attribute that matches no catalog kind. A kind
 /// containing '<' is a prefix kind (`tag:<key>`, `props.<key>`): the attribute
-/// must start with the text before '<' and carry a non-empty key. Any other
-/// kind matches exactly. Synthetic LEN/STARTSWITH forms are decoded first.
+/// must start with the text before '<' and carry a key legal for a stored tag or
+/// property. Any other kind matches exactly. Synthetic LEN/STARTSWITH forms are
+/// decoded first. Value domains are NOT validated, with ONE exception: `ostype`
+/// is closed (windows|linux|darwin), so an `==`, `!=` or `IN` value outside it
+/// (compared case-insensitively, as the evaluator does) is refused. LIKE,
+/// MATCHES, CONTAINS, EXISTS and the ordering operators stay unvalidated.
 [[nodiscard]] inline std::expected<void, std::string>
 validate_selector_attributes(const scope::Expression& expr,
                              std::span<const std::string_view> kinds) {
@@ -120,13 +145,28 @@ validate_selector_attributes(const scope::Expression& expr,
                 known = real == kind;
             } else {
                 const auto prefix = kind.substr(0, lt);
-                known = real.size() > prefix.size() && real.starts_with(prefix);
+                known = real.starts_with(prefix) &&
+                        is_valid_selector_key(real.substr(prefix.size()));
             }
             if (known)
                 break;
         }
         if (!known)
             return std::unexpected("unknown selector attribute: " + std::string(real));
+        if (cond->attribute == "ostype" && (cond->op == scope::CompOp::Eq ||
+                                            cond->op == scope::CompOp::Neq ||
+                                            cond->op == scope::CompOp::In)) {
+            const auto bad_os = [](std::string v) {
+                for (auto& c : v)
+                    if (c >= 'A' && c <= 'Z')
+                        c = static_cast<char>(c + ('a' - 'A'));
+                return !plugin_config::is_valid_agent_os(v);
+            };
+            const std::vector<std::string> one{cond->value};
+            for (const auto& v : cond->op == scope::CompOp::In ? cond->values : one)
+                if (bad_os(v))
+                    return std::unexpected("selector ostype: unknown OS value \"" + v + "\"");
+        }
         // An unrunnable MATCHES pattern evaluates false forever: a durable rule
         // that silently never matches. Refuse it here.
         if (cond->op == scope::CompOp::Matches)
@@ -144,7 +184,9 @@ validate_selector_attributes(const scope::Expression& expr,
 }
 
 /// The attribute kinds a durable rule may use: the scope kind catalog minus
-/// from_result_set:<id>. Views alias `catalog`, which must outlive the result.
+/// from_result_set:<id>. The views alias `catalog`: it must outlive the returned
+/// vector, and both must outlive the make_rule call that consumes them (the Rule
+/// owns its own parsed strings).
 template <typename Catalog>
 [[nodiscard]] std::vector<std::string_view> durable_attribute_kinds(const Catalog& catalog) {
     std::vector<std::string_view> out;
@@ -185,7 +227,8 @@ make_rule(std::string id, std::vector<std::string> units, std::string_view selec
 // -- Resolution ---------------------------------------------------------------
 
 /// Error iff `agent_os` is outside the closed vocabulary (a fault: the caller
-/// must not treat it as an empty off-set).
+/// must not treat it as an empty off-set). `agent_os` and `view` must describe
+/// ONE endpoint identity: the caller derives both from the same session.
 [[nodiscard]] inline std::expected<Resolution, std::string>
 resolve(std::span<const Rule> rules, const UnitOverlay& overlay, std::string_view agent_os,
         const scope::AttributeResolver& view) {
@@ -244,6 +287,7 @@ resolve(std::span<const Rule> rules, const UnitOverlay& overlay, std::string_vie
                 continue;
             const std::set<Match> inherited = req->second.matches; // the unit may alias `required`
             changed |= mark(*unit, false, inherited);
+            // Direct requirement only: a plugin's fanned-out actions get no entry.
             changed |= marks[name].required_off.insert(required).second;
         }
     }

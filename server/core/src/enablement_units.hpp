@@ -432,6 +432,11 @@ build_unit_overlay(std::initializer_list<std::span<const CommandCapability>> sou
                     os_used[i] = true;
                     break;
                 }
+            // Validated wherever a row exists, unit or not: a protective row's
+            // mask is as much a data-table error as a switchable one's.
+            if (hit)
+                if (const auto bits = os_rows[*hit].os; bits == 0 || (bits & ~kAllOs) != 0)
+                    return Err("os row has no valid OS bits: " + name);
             if (non) {
                 out.non_units.push_back({name, *non});
                 if (!acc.has_reason) {
@@ -444,8 +449,6 @@ build_unit_overlay(std::initializer_list<std::span<const CommandCapability>> sou
                 return Err("catalogue unit has no kUnitOs row: " + name +
                            " - add it to kUnitOs in server/core/src/enablement_units.hpp (mask "
                            "from the docs/os-capability-matrix.md generated block)");
-            if (const auto bits = os_rows[*hit].os; bits == 0 || (bits & ~kAllOs) != 0)
-                return Err("os row has no valid OS bits: " + name);
             out.units.push_back({name, std::string(row.plugin), std::string(row.action),
                                  UnitKind::Action, os_rows[*hit].os});
             acc.os |= os_rows[*hit].os;

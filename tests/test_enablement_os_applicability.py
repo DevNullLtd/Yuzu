@@ -76,7 +76,11 @@ class EnablementOsApplicability(unittest.TestCase):
 
     def test_masks_match_the_matrix(self):
         h, m = header_rows(), matrix_rows()
-        bad = {f"{p}.{a}": (h[(p, a)], m[(p, a)]) for (p, a) in h if (p, a) in m and h[(p, a)] != m[(p, a)]}
+        bad = {
+            f"{p}.{a}": (h[(p, a)], m[(p, a)])
+            for (p, a) in h
+            if (p, a) in m and h[(p, a)] != m[(p, a)]
+        }
         self.assertEqual(
             bad, {},
             "kUnitOs mask != matrix applicable set (header, matrix) - fix the row in kUnitOs in "

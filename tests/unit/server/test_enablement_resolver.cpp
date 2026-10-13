@@ -35,7 +35,7 @@ constexpr CommandCapability row(std::string_view plugin, std::string_view action
                              .execute_gate = ExecuteGate::None};
 }
 
-constexpr std::array<CommandCapability, 12> kFixtureRows{{
+constexpr std::array<CommandCapability, 18> kFixtureRows{{
     row("p", "x"),
     row("p", "y"),
     row("p", "z"),
@@ -48,9 +48,15 @@ constexpr std::array<CommandCapability, 12> kFixtureRows{{
     row("s", "m"),
     row("s", "n"),
     row("quarantine", "unquarantine"),
+    row("u", "v"), // 2-cycle with u.w, and a self-edged u.s
+    row("u", "w"),
+    row("u", "s"),
+    row("k", "a"), // plugin-level dependent of plugin j
+    row("k", "b"),
+    row("j", "a"),
 }};
 
-constexpr std::array<UnitOsRow, 11> kFixtureOs{{
+constexpr std::array<UnitOsRow, 17> kFixtureOs{{
     {"p", "x", kAllOs},
     {"p", "y", kAllOs},
     {"p", "z", kAllOs},
@@ -62,16 +68,27 @@ constexpr std::array<UnitOsRow, 11> kFixtureOs{{
     {"r", "w", kWin},
     {"s", "m", kWin}, // heterogeneous masks under one plugin: s.m win-only, s.n everywhere
     {"s", "n", kAllOs},
+    {"u", "v", kAllOs},
+    {"u", "w", kAllOs},
+    {"u", "s", kAllOs},
+    {"k", "a", kAllOs},
+    {"k", "b", kAllOs},
+    {"j", "a", kAllOs},
 }};
 
 // Diamond q.b -> {p, r}; chain t.c -> t.b -> t.a, listed dependent-first so a
-// single pass over the edges cannot reach the fixpoint.
-constexpr std::array<RequirementEdge, 5> kFixtureEdges{{
+// single pass over the edges cannot reach the fixpoint. u.v <-> u.w is a cycle,
+// u.s requires itself, and plugin k requires plugin j (a plugin-level edge).
+constexpr std::array<RequirementEdge, 9> kFixtureEdges{{
     {"q.a", "p"},
     {"q.b", "p"},
     {"q.b", "r"},
     {"t.c", "t.b"},
     {"t.b", "t.a"},
+    {"u.v", "u.w"},
+    {"u.w", "u.v"},
+    {"u.s", "u.s"},
+    {"k", "j"},
 }};
 
 const UnitOverlay& overlay() {
@@ -259,6 +276,19 @@ TEST_CASE("enablement resolver: != and NOT agree on an absent tag (known-none)",
     CHECK(run({{"n", {"p.x"}, R"(NOT tag:lab == "yes")"}}, "linux", lab).off.empty());
 }
 
+TEST_CASE("enablement resolver: absent props is known-none too", "[enablement][scope]") {
+    CHECK_FALSE(run({{"n", {"p.x"}, R"(NOT props.owner == "x")"}}, "linux").off.empty());
+    CHECK(run({{"n", {"p.x"}, R"(NOT props.owner == "x")"}}, "linux", {{"props.owner", "x"}})
+              .off.empty());
+}
+
+TEST_CASE("enablement resolver: durable kinds drop only from_result_set", "[enablement][scope]") {
+    const auto& catalog = yuzu::server::detail::scope_kind_catalog();
+    CHECK(kinds().size() == catalog.size() - 1);
+    for (const auto k : kinds())
+        CHECK_FALSE(k.starts_with("from_result_set"));
+}
+
 TEST_CASE("enablement resolver: absent tag is known-none inside a conjunction",
           "[enablement][scope]") {
     const std::vector<Spec> specs{{"s", {"p.x"}, R"(ostype == "linux" AND NOT tag:lab == "yes")"}};
@@ -286,6 +316,40 @@ TEST_CASE("enablement resolver: authoring validates attributes against the real 
     const auto err = make_rule("r", {"p.x"}, R"(colour == "red")", Op, overlay(), kinds());
     REQUIRE_FALSE(err.has_value());
     CHECK(err.error().find("colour") != std::string::npos);
+
+    SECTION("ostype is a closed domain for ==, != and IN, compared case-insensitively") {
+        const auto plan9 = make_rule("r", {"p.x"}, R"(ostype == "plan9")", Op, overlay(), kinds());
+        REQUIRE_FALSE(plan9.has_value());
+        CHECK(plan9.error().find("plan9") != std::string::npos);
+        CHECK_FALSE(make_rule("r", {"p.x"}, R"(ostype != "macos")", Op, overlay(), kinds())
+                        .has_value());
+        const auto in = make_rule("r", {"p.x"}, R"(ostype IN ("windows", "plan9"))", Op, overlay(),
+                                  kinds());
+        REQUIRE_FALSE(in.has_value());
+        CHECK(in.error().find("plan9") != std::string::npos);
+        // The evaluator folds case, so these select real endpoints.
+        CHECK(make_rule("r", {"p.x"}, R"(ostype == "Linux")", Op, overlay(), kinds()).has_value());
+        CHECK(make_rule("r", {"p.x"}, R"(ostype IN ("WINDOWS", "darwin"))", Op, overlay(), kinds())
+                  .has_value());
+        // Other operators are not value-validated.
+        CHECK(make_rule("r", {"p.x"}, R"(ostype LIKE "win%")", Op, overlay(), kinds()).has_value());
+    }
+    SECTION("a tag or props key must be a stored-key shape") {
+        const std::string long_key(65, 'k');
+        for (const std::string& bad :
+             {std::string(R"(tag:* == "1")"), std::string(R"(props.* == "1")"),
+              "tag:" + long_key + " == \"1\""}) {
+            INFO(bad);
+            const auto r = make_rule("r", {"p.x"}, bad, Op, overlay(), kinds());
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error().find("unknown selector attribute") != std::string::npos);
+        }
+        CHECK(make_rule("r", {"p.x"}, "tag:" + std::string(64, 'k') + " == \"1\"", Op, overlay(),
+                        kinds())
+                  .has_value());
+        CHECK(make_rule("r", {"p.x"}, R"(tag:a.b-c:d == "1")", Op, overlay(), kinds()).has_value());
+        CHECK(make_rule("r", {"p.x"}, R"(props.owner == "1")", Op, overlay(), kinds()).has_value());
+    }
 }
 
 TEST_CASE("enablement resolver: a MATCHES pattern the evaluator cannot run is refused",
@@ -434,6 +498,56 @@ TEST_CASE("enablement resolver: requirement closure", "[enablement][scope]") {
         CHECK(tc->required_off == Names{"t.b"});
         CHECK(tb->matches == Matches{{"L", Op}});
         CHECK(tc->matches == Matches{{"L", Op}});
+    }
+    SECTION("a requirement cycle terminates; both ends are off, in every rule order") {
+        const std::vector<Spec> specs{{"C1", {"u.w"}, "__all__"},
+                                      {"C2", {"p.z"}, "__all__"},
+                                      {"C3", {"t.a"}, "__all__"}};
+        auto order = identity(specs.size());
+        const auto reference = run_rules(build_all(specs, order), "linux", {});
+        const auto* uv = find_off(reference, "u.v");
+        const auto* uw = find_off(reference, "u.w");
+        REQUIRE((uv && uw));
+        CHECK(uv->reason == Reason::OffRequirement);
+        CHECK(uv->required_off == Names{"u.w"});
+        CHECK(uv->matches == Matches{{"C1", Op}});
+        CHECK(uw->reason == Reason::OffByRule);
+        CHECK(uw->required_off == Names{"u.v"});
+        CHECK(uw->matches == Matches{{"C1", Op}});
+        do {
+            CHECK(run_rules(build_all(specs, order), "linux", {}) == reference);
+        } while (std::next_permutation(order.begin(), order.end()));
+    }
+    SECTION("a self-requiring unit terminates and is off by rule, in every rule order") {
+        // Only termination, reason and order-invariance are contract; the shape of
+        // a self-edge's required_off is a data-table error, deliberately unpinned.
+        const std::vector<Spec> specs{{"S1", {"u.s"}, "__all__"}, {"S2", {"p.z"}, "__all__"}};
+        auto order = identity(specs.size());
+        const auto reference = run_rules(build_all(specs, order), "linux", {});
+        const auto* us = find_off(reference, "u.s");
+        REQUIRE(us != nullptr);
+        CHECK(us->reason == Reason::OffByRule);
+        CHECK(us->matches == Matches{{"S1", Op}});
+        do {
+            CHECK(run_rules(build_all(specs, order), "linux", {}) == reference);
+        } while (std::next_permutation(order.begin(), order.end()));
+    }
+    SECTION("a plugin-level edge records required_off on the plugin only") {
+        const auto r = run({{"J", {"j"}, "__all__"}}, "linux");
+        CHECK(off_names(r) == Names{"j", "j.a", "k", "k.a", "k.b"});
+        const auto* k = find_off(r, "k");
+        REQUIRE(k != nullptr);
+        CHECK(k->reason == Reason::OffRequirement);
+        CHECK(k->required_off == Names{"j"});
+        CHECK(k->matches == Matches{{"J", Op}});
+        for (const auto* action : {"k.a", "k.b"}) {
+            INFO(action);
+            const auto* a = find_off(r, action);
+            REQUIRE(a != nullptr);
+            CHECK(a->reason == Reason::OffRequirement);
+            CHECK(a->required_off.empty());
+            CHECK(a->matches == Matches{{"J", Op}});
+        }
     }
     SECTION("a chain resolves identically in every rule order") {
         const std::vector<Spec> specs{{"X", {"t.a"}, "__all__"},

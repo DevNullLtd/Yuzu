@@ -270,6 +270,27 @@ TEST_CASE("ScopeEngine: eval MATCHES invalid regex returns false", "[scope][eval
     CHECK(evaluate(*expr, resolver) == false);
 }
 
+TEST_CASE("ScopeEngine: eval MATCHES over-cap pattern returns false", "[scope][eval]") {
+    // Over kMaxRegexPattern the evaluator refuses to compile, even where the
+    // pattern would match; at the cap it still runs.
+    std::unordered_map<std::string, std::string> attrs = {{"hostname", std::string(300, 'a')}};
+    auto resolver = make_resolver(attrs);
+
+    auto at_cap = parse("hostname MATCHES \"" + std::string(kMaxRegexPattern, 'a') + "\"");
+    REQUIRE(at_cap.has_value());
+    CHECK(evaluate(*at_cap, resolver) == true);
+    auto over_cap = parse("hostname MATCHES \"" + std::string(kMaxRegexPattern + 1, 'a') + "\"");
+    REQUIRE(over_cap.has_value());
+    CHECK(evaluate(*over_cap, resolver) == false);
+}
+
+TEST_CASE("ScopeEngine: validate_regex mirrors what evaluate can run", "[scope][eval]") {
+    CHECK(validate_regex("^web-\\d+$").has_value());
+    CHECK(validate_regex(std::string(kMaxRegexPattern, 'a')).has_value());
+    CHECK_FALSE(validate_regex(std::string(kMaxRegexPattern + 1, 'a')).has_value());
+    CHECK_FALSE(validate_regex("[invalid").has_value());
+}
+
 TEST_CASE("ScopeEngine: eval MATCHES case insensitive", "[scope][eval]") {
     std::unordered_map<std::string, std::string> attrs = {{"hostname", "WEB-PROD-01"}};
     auto resolver = make_resolver(attrs);
