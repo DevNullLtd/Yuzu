@@ -1975,7 +1975,7 @@ class GuardianReconcileWiringLexical(unittest.TestCase):
         self.assertEqual({m[2] for m in MUTATIONS}, flow_set | server_set)
         self.assertEqual({m[2] for m in FLOW_MUTATIONS}, flow_set)
         self.assertEqual(set(SERVER_LETTERS), server_set)
-        # The (aa) order mutations are a separate list with their own expectation, not lettered.
+        # The (aa) order mutations are a separate list, not lettered; each is asserted to produce exactly the findings it lists.
         self.assertTrue(ORDER_MUTATIONS)
         flow_letters = {m[2] for m in FLOW_MUTATIONS}
         direct = {m[2] for m in SERVER_MUTATIONS} - set(SERVER_LETTERS)  # appended to SERVER_MUTATIONS directly

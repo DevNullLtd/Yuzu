@@ -215,9 +215,10 @@ TEST_CASE("HeartbeatIngestion: a throwing quarantine reconcile fn does not abort
     CHECK_NOTHROW(ingestion.ingest(make_hb("", /*set_tag=*/false), "agent-x", "direct"));
 }
 
-// #5513: the guardian reconcile hook is caught at the ingestion call site exactly like the
-// quarantine hook, and the rest of ingestion still runs. Evidence that it ran: the quarantine
-// hook (which executes after the guardian hook) is still invoked.
+// #5513: the guardian reconcile hook is caught at the ingestion call site like the quarantine
+// hook (and additionally catch(...) and token-neutralised logging), and the rest of ingestion
+// still runs. Evidence that it ran: the quarantine hook (which executes after the guardian
+// hook) is still invoked.
 TEST_CASE("HeartbeatIngestion: a throwing guardian reconcile fn does not abort ingestion (#5513)",
           "[heartbeat_ingestion][reconcile]") {
     yuzu::MetricsRegistry metrics;
