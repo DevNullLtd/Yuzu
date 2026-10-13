@@ -18,7 +18,7 @@
 %%%     handler's error status reaches the trailers.
 %%%
 %%% The tests need a curl that speaks HTTP/2 (`curl --version' lists HTTP2).
-%%% Without one they are SKIPPED with a line saying so; with
+%%% Without one (or off a POSIX shell, i.e. on Windows) they are SKIPPED with a line saying so; with
 %%% YUZU_REQUIRE_CURL_H2_TEST=1 a missing curl is a failure, so CI can insist.
 %%% @end
 %%%-------------------------------------------------------------------
@@ -110,7 +110,13 @@ error_status(Curl, Port) ->
 
 %% {ok, CurlPath} when curl is there and lists HTTP2, else {error, Why}.
 curl_h2() ->
-    case os:find_executable("curl") of
+    case os:type() of
+        {unix, _} -> curl_h2_unix(os:find_executable("curl"));
+        _ -> {error, "needs a POSIX shell"}   %% call/4 builds a shell line for os:cmd/1
+    end.
+
+curl_h2_unix(Found) ->
+    case Found of
         false ->
             {error, "curl is not installed"};
         Curl ->

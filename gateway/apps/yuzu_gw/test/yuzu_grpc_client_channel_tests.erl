@@ -49,8 +49,16 @@
 -define(SVC, 'yuzu.agent.v1.AgentService').
 -define(HEARTBEAT, <<"/yuzu.agent.v1.AgentService/Heartbeat">>).
 %% A call that is answered at once or not at all must not wait for its timeout.
--define(FAST_MS, 1000).
+%% Windows reports a refused connect only after its SYN retries (about 2 s), so the
+%% bound there is looser, but still under the 5000 ms the calls are given.
+-define(FAST_MS, (fast_ms())).
 -define(WAIT_ATTEMPTS, 600).
+
+fast_ms() ->
+    case os:type() of
+        {win32, _} -> 4500;
+        _          -> 1000
+    end.
 
 %%%===================================================================
 %%% backoff_ms/1
@@ -312,7 +320,9 @@ reconnects_when_listener_appears(#{name := Name} = S) ->
     Port = yuzu_gw_test_listener:probe_free_port(),
     start(Name, Port, #{pool_size => 1}),
     ok = wait_for(fun() -> last_error(Name) =:= econnrefused end),
-    ?assertEqual({error, econnrefused}, yuzu_grpc_client_channel:pick(Name, 1000)),
+    %% the pick may wait for a connection attempt already under way, which on
+    %% Windows outlasts a second
+    ?assertEqual({error, econnrefused}, yuzu_grpc_client_channel:pick(Name, 5000)),
     start_listener(S, Port),
     ok = wait_for(fun() -> length(up_slots(Name)) =:= 1 end),
     ?assertMatch({ok, #{acknowledged := true}, _}, heartbeat(Name)).
