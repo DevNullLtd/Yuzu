@@ -24,6 +24,8 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1901,6 +1903,65 @@ TEST_CASE("#3980: while the compliance lane still HAS a head, an uncounted in-fl
     CHECK(f.worker.send_stall_count() == 0);
 }
 
+TEST_CASE("CH-6: stop() raced against the loop-tail orphan reclaim never hangs or leaks a send "
+          "worker",
+          "[spark][guardian][drain][.stress]") {
+    // The #3980 probe reaps a finished orphan from the drain thread's loop tail, and stop()
+    // joins that same thread from another. Each iteration parks a compliance send, withdraws its
+    // verdict (an orphan on an EMPTIED lane), waits for the first offer() to give up on it, then
+    // races two actors from a start barrier: one releases the send and kicks the loop (so the
+    // tail's probe has a finished slot to reclaim), the other calls stop(). Each actor first
+    // yields a random number of times, so over the run the stop lands before, inside and after
+    // the reclaim. Event-driven throughout: no sleep, only the barrier and yields. The 200 ms
+    // offer wait inside each fixture is the iteration floor (an orphan cannot exist earlier).
+    // Hidden: it is a stress run (~100 x 0.25 s), not a per-commit pin; run it by name.
+    constexpr int kIterations = 100;
+    const auto seed = std::random_device{}();
+    INFO("seed " << seed);
+    std::mt19937 rng{seed};
+    int reclaimed_by_end = 0;
+    for (int it = 0; it < kIterations; ++it) {
+        INFO("iteration " << it);
+        OrphanFixture f;
+        REQUIRE(f.wait_parked());
+        f.rig.rt->detach_rule("cmp");
+        REQUIRE(f.rig.rt->outbox_size() == 0);
+        // The first offer() has returned (cycles are counted at the loop tail): the parked send
+        // is now an orphan on an emptied lane, reapable only by the tail probe.
+        REQUIRE(spin_until([&] { return f.worker.loop_cycles_for_test() >= 1; }, 5s));
+
+        const int yields_release = static_cast<int>(rng() % 400);
+        const int yields_stop = static_cast<int>(rng() % 400);
+        std::atomic<int> arrived{0};
+        const auto rendezvous = [&] {
+            arrived.fetch_add(1);
+            while (arrived.load() < 2)
+                std::this_thread::yield();
+        };
+        std::thread releaser([&] {
+            rendezvous();
+            for (int i = 0; i < yields_release; ++i)
+                std::this_thread::yield();
+            f.sink.open();
+            f.worker.notify();
+        });
+        rendezvous();
+        for (int i = 0; i < yields_stop; ++i)
+            std::this_thread::yield();
+        const auto t_stop = std::chrono::steady_clock::now();
+        f.worker.stop();
+        const auto stop_took = std::chrono::steady_clock::now() - t_stop;
+        releaser.join();
+
+        // CHECK from here on: nothing may unwind past a joined thread.
+        CHECK(stop_took < 5s);
+        CHECK(spin_until([&] { return f.worker.active_send_workers() == 0; }, 5s));
+        reclaimed_by_end += !f.compliance().in_flight_snapshot().in_flight;
+    }
+    WARN("CH-6: " << reclaimed_by_end << " of " << kIterations
+                  << " iterations had the orphan reclaimed before stop() returned");
+}
+
 // ---------------------------------------------------------------------------
 // #3972: the bounded SYMMETRIC seq-ordered cross-lane launch hold.
 //
@@ -1933,7 +1994,7 @@ struct HoldSink {
     std::condition_variable cv;
     int permits[2]{-1, -1};                 ///< per lane; -1 = open, 0 = park, n = let n through
     std::chrono::milliseconds delay[2]{0ms, 0ms};
-    bool throws[2]{false, false};
+    std::atomic<bool> throws[2]{false, false}; ///< atomic: CH-1 clears it while the worker runs
     bool link_up{true};                     ///< false: every send Retains (never logged as started)
     std::size_t retained[2]{0, 0};
     std::vector<Ev> log;
@@ -2535,6 +2596,49 @@ TEST_CASE("#3972 T7: a permanently throwing lifecycle head holds compliance for 
     CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
 }
 
+TEST_CASE("CH-4: the hold clock is per LANE and cumulative - a head swap inside the episode "
+          "does not restart it",
+          "[spark][guardian][drain][order]") {
+    // PINS THE INTENDED SEMANTICS (design v3 2.3 / 2.7, the UP-3 bound), not an accident: the
+    // clock measures how long the LANE has been continuously denied, from its first denial in
+    // the episode. It is reset only by (a) no blocker, (b) the lane EMPTYING (epoch change) or
+    // (c) a release; wrapped_send() sets it on the first denial only (`if (!h.held_since)`) and
+    // keys nothing on the head's identity. So when the held head C(a) is withdrawn late in the
+    // episode and a younger C(b) takes its place WITHOUT the lane ever emptying, C(b) is released
+    // after the REMAINDER of H, not after a fresh H. A per-entry clock would let a producer that
+    // keeps replacing the head postpone the release indefinitely.
+    //
+    // WHEN the swap lands: a pass costs ~200 ms (the lifecycle offer waits out the parked send
+    // before the compliance phase runs), so a swap at 0.9 H would be followed by no denial at all
+    // before the release instant, and a clock that restarted on a new head could not be told
+    // apart. The swap is therefore anchored on the 4th denial (~0.65 H of the cumulative clock),
+    // which leaves at least one more denied pass on the NEW head before H runs out.
+    constexpr std::chrono::milliseconds H = 1000ms;
+    HoldRig f(20, H);
+    f.sink.set_permits(kLifecycleIdx, 0); // the blocker: an OLDER lifecycle send parked forever
+    f.lifecycle_only("L");
+    f.drift("a"); // C(a): the head that will be withdrawn
+    f.drift("b"); // C(b): younger, same lane, stays pending
+    const auto t0 = std::chrono::steady_clock::now(); // before the first denial
+    f.start();
+    REQUIRE(spin_until([&] { return f.worker->denials_for_test(OutboxDomain::Compliance) >= 4; }));
+    REQUIRE(f.sink.n_started(OutboxDomain::Compliance) == 0);
+    REQUIRE(f.worker->releases_for_test(OutboxDomain::Compliance) == 0);
+
+    const auto t_swap = std::chrono::steady_clock::now();
+    f.rt->detach_rule("a"); // drop_rule removes C(a); C(b) remains, so the lane never empties
+    REQUIRE(f.rt->outbox_size() == 1);
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) == 1; }, 3 * H));
+    const auto released = f.sink.nth_start(OutboxDomain::Compliance, 0);
+    CHECK(released->rule == "b");
+    CHECK(released->at - t0 >= H); // never before a full cumulative H
+    // The remainder, not a fresh H: a clock restarted by the swap would release >= H after it.
+    // Expected gap: the rest of the episode plus at most one pass (~0.2 s each); 0.75 H leaves
+    // room either side of a fresh H (>= 1 H) and of that expectation.
+    CHECK(released->at - t_swap < H * 3 / 4);
+    CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
+}
+
 TEST_CASE("#3972 T8: link down - nothing overtakes; link up - wire order is enqueue order",
           "[spark][guardian][drain][order]") {
     HoldRig f;
@@ -2699,6 +2803,179 @@ TEST_CASE("#3972 T11b: a Health entry is held, denied and released on the COMPLI
     CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
     CHECK(f.worker->releases_for_test(OutboxDomain::Lifecycle) == 0);
     CHECK(f.worker->cross_lane_order_release_count() == 1);
+}
+
+namespace {
+
+/// Joins its threads on scope exit after raising `stop`, so a REQUIRE unwind in the test body
+/// can never destroy state the threads still read. Declare it AFTER everything they capture.
+struct ChaosThreads {
+    std::atomic<bool>& stop;
+    std::vector<std::thread> threads;
+    explicit ChaosThreads(std::atomic<bool>& s) : stop(s) {}
+    ~ChaosThreads() {
+        stop.store(true);
+        for (auto& t : threads)
+            if (t.joinable())
+                t.join();
+    }
+    /// A pause that notices `stop` within 10 ms (pacing, not a wait for an event).
+    void nap(std::chrono::milliseconds total) const {
+        for (auto left = total; left.count() > 0 && !stop.load(); left -= 10ms)
+            std::this_thread::sleep_for(10ms);
+    }
+};
+
+} // namespace
+
+TEST_CASE("CH-1: compound jam - a throwing lifecycle head, steady verdicts, a flapping link and "
+          "arm/detach churn never reorder the wire without a counted release",
+          "[spark][guardian][drain][order][.chaos]") {
+    // Hidden: ~5 s of wall clock by design (run it by name). H is small (150 ms) and the
+    // link-down phases (300 ms) outlast it, so releases fire under every ingredient at once.
+    //
+    // Oracles (the log is the sink's ordered start/end record; "written" = the send's END, which
+    // the sink logs after its Sent):
+    //   O1  an OVERTAKER (an entry that ended before some OLDER entry of the other lane) implies
+    //       cross_lane_order_release_count() >= 1;
+    //   O2  overtakers <= releases * N + 2 (N per release, plus the one in-flight send per lane);
+    //   O3  no entry lost or duplicated: every (lane, seq) ends at most once, nothing in the
+    //       lifecycle lane ends while the throw persists, an entry still pending when the jam is
+    //       cleared is delivered afterwards, and the counts match what the threads enqueued;
+    //   O4  the worker joins within a bound.
+    // Plus: releases > 0 and send_exceptions > 0 (the ingredients really fired).
+    constexpr std::chrono::milliseconds H = 150ms;
+    constexpr std::size_t N = 8;
+    HoldRig f(20, H, N);
+    f.sink.throws[kLifecycleIdx] = true;
+
+    // Everything the threads capture is declared before `chaos`, which joins them.
+    std::mutex rig_mu; // serialises FakeReader edits and the engine calls driven from threads
+    std::atomic<bool> stop{false};
+    std::atomic<int> arms{0};
+    std::atomic<int> detaches{0};
+    std::atomic<int> verdicts{0};
+    std::atomic<int> arm_failures{0};
+
+    REQUIRE(f.arm("seed")); // a stuck lifecycle head exists from the first pass
+    ++arms;
+    f.start();
+
+    ChaosThreads chaos{stop};
+    chaos.threads.emplace_back([&] { // steady compliance verdicts, one fresh rule each (no coalescing)
+        for (int i = 0; !stop.load(); ++i) {
+            {
+                std::lock_guard<std::mutex> lk{rig_mu};
+                const auto rule = "p" + std::to_string(i);
+                if (f.arm(rule)) {
+                    ++arms;
+                    f.verdict(rule);
+                    ++verdicts;
+                } else {
+                    ++arm_failures;
+                }
+            }
+            chaos.nap(20ms);
+        }
+    });
+    chaos.threads.emplace_back([&] { // link flapper: every phase outlasts H
+        bool up = true;
+        while (!stop.load()) {
+            chaos.nap(300ms);
+            up = !up;
+            f.sink.set_link(up);
+        }
+    });
+    chaos.threads.emplace_back([&] { // churn on OTHER rules: arm one, detach the previous
+        for (int j = 0; !stop.load(); ++j) {
+            {
+                std::lock_guard<std::mutex> lk{rig_mu};
+                if (f.arm("c" + std::to_string(j)))
+                    ++arms;
+                else
+                    ++arm_failures;
+                if (j > 0) {
+                    f.rt->detach_rule("c" + std::to_string(j - 1));
+                    ++detaches;
+                }
+            }
+            chaos.nap(40ms);
+        }
+    });
+
+    REQUIRE(wait_until_time(std::chrono::steady_clock::now() + 5s));
+    stop.store(true);
+    for (auto& t : chaos.threads)
+        t.join();
+    REQUIRE(arm_failures.load() == 0);
+    REQUIRE(verdicts.load() > 0);
+
+    // The jam is still on: the lifecycle lane has delivered nothing, and its head is stuck.
+    f.sink.set_link(true);
+    CHECK(f.sink.n_ended(OutboxDomain::Lifecycle) == 0);
+    const auto stuck_lifecycle = f.rt->lifecycle_front_seq();
+    REQUIRE(stuck_lifecycle.has_value());
+    const auto pending_compliance = f.rt->outbox_front_seq(); // may legitimately be empty
+    CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) > 0);
+    CHECK(f.rt->send_exception_count() > 0);
+
+    // Clear the jam and let everything drain through the (still running) gate.
+    f.sink.throws[kLifecycleIdx] = false;
+    const auto t_drain = std::chrono::steady_clock::now();
+    REQUIRE(spin_until(
+        [&] {
+            return !f.rt->lifecycle_front_seq() && !f.rt->outbox_front_seq() &&
+                   !f.lifecycle().in_flight_snapshot().in_flight &&
+                   !f.compliance().in_flight_snapshot().in_flight;
+        },
+        20s));
+    INFO("drain took " << std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t_drain).count() << " ms");
+    const auto t_stop = std::chrono::steady_clock::now();
+    f.worker->stop(); // O4
+    CHECK(std::chrono::steady_clock::now() - t_stop < 5s);
+    REQUIRE(spin_until([&] { return f.worker->active_send_workers() == 0; }, 5s));
+
+    // O3 / O1 / O2 over the complete log.
+    struct End {
+        std::size_t lane;
+        std::uint64_t seq;
+        std::size_t at;
+    };
+    std::vector<End> ends;
+    std::set<std::pair<std::size_t, std::uint64_t>> distinct;
+    const auto log = f.sink.snapshot();
+    for (std::size_t i = 0; i < log.size(); ++i)
+        if (log[i].end) {
+            ends.push_back({lane_idx(log[i].domain), log[i].seq, i});
+            distinct.emplace(lane_idx(log[i].domain), log[i].seq);
+        }
+    CHECK(distinct.size() == ends.size()); // nothing delivered twice
+    CHECK(distinct.count({kLifecycleIdx, *stuck_lifecycle}) == 1); // the stuck head was delivered
+    if (pending_compliance)
+        CHECK(distinct.count({kComplianceIdx, *pending_compliance}) == 1);
+    std::size_t lifecycle_ends = 0;
+    std::size_t compliance_ends = 0;
+    for (const auto& e : ends)
+        (e.lane == kLifecycleIdx ? lifecycle_ends : compliance_ends) += 1;
+    CHECK(compliance_ends == static_cast<std::size_t>(verdicts.load())); // none lost, none extra
+    CHECK(lifecycle_ends == static_cast<std::size_t>(arms.load() + detaches.load()));
+
+    std::size_t overtakers = 0;
+    for (const auto& b : ends) {
+        for (const auto& a : ends) {
+            if (a.lane != b.lane && a.seq < b.seq && a.at > b.at) {
+                ++overtakers;
+                break;
+            }
+        }
+    }
+    const auto releases = f.worker->cross_lane_order_release_count();
+    INFO("overtakers " << overtakers << ", releases " << releases << ", ends " << ends.size());
+    if (overtakers > 0)
+        CHECK(releases >= 1); // O1
+    CHECK(releases > 0);
+    CHECK(overtakers <= releases * N + 2); // O2
 }
 
 TEST_CASE("#3972: the production defaults of the cross-lane hold are 1 s and 64 launches",
