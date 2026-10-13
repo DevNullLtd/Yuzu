@@ -582,27 +582,19 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
 
     URL_COMPONENTS uc = {};
     uc.dwStructSize = sizeof(uc);
-    wchar_t host[256] = {}, path[2048] = {}, extra[2048] = {};
+    wchar_t host[256] = {}, path[2048] = {};
     uc.lpszHostName = host;
     uc.dwHostNameLength = 256;
+    // With no extra-info buffer WinHttpCrackUrl keeps the query ("?...") in the path component, so
+    // a token endpoint with a query is requested as `path?query`; a test pins what the IdP receives
+    // (including an empty path with a query, which arrives as `/?x=1`).
     uc.lpszUrlPath = path;
     uc.dwUrlPathLength = 2048;
-    // The query ("?...") is returned separately from the path; without this buffer it is dropped.
-    uc.lpszExtraInfo = extra;
-    uc.dwExtraInfoLength = 2048;
 
     if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) {
         spdlog::error("WinHTTP: failed to crack URL: {}", ::yuzu::log_key_token(url));
         return {};
     }
-
-    // The request target, built BEFORE any handle is opened (an allocation failure here must not
-    // leak one): path + query. Both buffers are zero-initialized and NUL-terminated by the crack.
-    // An empty path with a query (`https://host?x=1`) must still start with '/': the request
-    // target is `/?x=1`, as split_http_url builds it on the other platforms.
-    std::wstring target = std::wstring(path) + extra;
-    if (path[0] == 0 && extra[0] != 0)
-        target.insert(0, L"/");
 
     HINTERNET session = WinHttpOpen(L"Yuzu-Server/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -619,8 +611,8 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
     }
 
     DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET request = WinHttpOpenRequest(connect, L"POST", target.c_str(), nullptr,
-                                           WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    HINTERNET request = WinHttpOpenRequest(connect, L"POST", path, nullptr, WINHTTP_NO_REFERER,
+                                           WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!request) {
         spdlog::error("WinHTTP: WinHttpOpenRequest failed: {}", GetLastError());
         WinHttpCloseHandle(connect);
