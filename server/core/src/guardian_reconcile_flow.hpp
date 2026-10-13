@@ -263,15 +263,16 @@ public:
         const DurationObserver duration_observer{reconcile_duration_,
                                                  std::chrono::steady_clock::now()};
 
-        // Counter + durable audit for an aborted (degraded) reconcile. Gate 6
-        // compliance: an aborted enforcement convergence for a BEHIND agent is a
-        // security-relevant non-event - SIEM must see it, not just a metric/log
-        // (the REST push twin audits `denied`; the success re-push below audits
-        // `success`). Every caller is past the claim and the admission budget, so
-        // it inherits the same at-most-one-row-per-agent-per-interval dedup as the
-        // success path, no audit storm. (The earlier generation-unreadable gate is
-        // pre-dedup and coarse, counter-only there, plus the persistent degraded
-        // gauge tracked in #2662.)
+        // Durable audit for an aborted reconcile, shared by abort_degraded (a store could
+        // not be read; counted as result="degraded") and abort_invalidated (a rule or policy
+        // change landed mid-reconcile; counted on its own counter). Gate 6 compliance: an
+        // aborted enforcement convergence for a BEHIND agent is a security-relevant non-event -
+        // SIEM must see it, not just a metric/log (the REST push twin audits `denied`; the
+        // success re-push below audits `success`). Every caller is past the claim and the
+        // admission budget, so it inherits the same at-most-one-row-per-agent-per-interval
+        // dedup as the success path, no audit storm. (The earlier generation-unreadable gate is
+        // pre-dedup and coarse, counter-only there, plus the persistent degraded gauge tracked
+        // in #2662.)
         auto audit_abort = [&](std::string_view what, const std::string& err) {
             AuditEvent ev;
             ev.timestamp =
@@ -483,9 +484,10 @@ public:
         // reconciles from a fresh load. It writes the same ABORTED audit row as the store
         // aborts but is counted on its own counter, not as result="degraded" (no store
         // failed). It is conservative: an invalidation that merely overlapped this
-        // reconcile aborts it even when the bundle was in fact loaded afterwards. It does not close the gap between a committed edit and the
-        // hook that follows it (an edit whose hook has not yet run is invisible to this
-        // comparison), nor an invalidation that lands after this line and before the send.
+        // reconcile aborts it even when the bundle was in fact loaded afterwards. It does not
+        // close the gap between a committed edit and the hook that follows it (an edit whose
+        // hook has not yet run is invisible to this comparison), nor an invalidation that
+        // lands after this line and before the send.
         if (guardian_rule_bundle_cache_.epoch() != bundle_epoch) {
             spdlog::info("Guardian heartbeat reconcile: a rule or policy change landed while "
                          "this re-push was being prepared - withholding it for agent_id={} "

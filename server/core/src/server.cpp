@@ -6908,10 +6908,8 @@ public:
                 // guaranteed_state_store_, so they are destroyed first; the hook only
                 // fires from a mutation, and stop() clears it (after the HTTP/MCP surfaces
                 // are quiesced) before it resets the store.
-                guaranteed_state_store_->set_on_rule_mutation([this] {
-                    guardian_generation_cache_.invalidate();
-                    guardian_rule_bundle_cache_.invalidate();
-                });
+                guaranteed_state_store_->set_on_rule_mutation(
+                    [this] { invalidate_guardian_reconcile_caches(); });
                 spdlog::info("GuaranteedStateStore initialized (schema guaranteed_state_store; "
                              "retention={}d)",
                              cfg_.guardian_event_retention_days);
@@ -7033,10 +7031,8 @@ public:
                 // deployed set under the unchanged generation label. Same two invalidations as
                 // the rule-mutation hook; both caches are members declared AFTER baseline_store_
                 // (destroyed first), the hook only fires from a mutation, and stop() clears it.
-                baseline_store_->set_on_baseline_mutation([this] {
-                    guardian_generation_cache_.invalidate();
-                    guardian_rule_bundle_cache_.invalidate();
-                });
+                baseline_store_->set_on_baseline_mutation(
+                    [this] { invalidate_guardian_reconcile_caches(); });
             }
         }
 
@@ -19667,8 +19663,7 @@ private:
                 // delete through BaselineStore::set_on_baseline_mutation (both wired where the
                 // store is constructed), because they do not pass through here before their own
                 // bump. These come BEFORE the generation, rules and deployed-set reads below.
-                guardian_generation_cache_.invalidate();
-                guardian_rule_bundle_cache_.invalidate();
+                invalidate_guardian_reconcile_caches();
                 const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
                                        std::chrono::system_clock::now().time_since_epoch())
                                        .count();
@@ -21231,6 +21226,22 @@ private:
     // scope_expr parsed once) memoised per policy generation. Scope MEMBERSHIP is deliberately
     // not cached: tags, properties and session attributes change with no generation bump.
     guardian::GuardianRuleBundleCache guardian_rule_bundle_cache_;
+
+    // THE one place that drops the heartbeat reconcile's two caches (#5513). Called by exactly
+    // these: the GuaranteedStateStore rule-mutation hook (after a rule create/update/delete
+    // commits and its generation bump was attempted), the BaselineStore baseline-mutation
+    // hook (after a Baseline update or delete commits, BEFORE the caller's own bump), and the
+    // guardian_push_fn_ fan-out (after its scope parsed, BEFORE it reads the generation, the
+    // rules and the deployed set). Both caches go together: the bundle cache's epoch is what
+    // makes a reconcile that is already running withhold its push, and the generation cache is
+    // what stops the next admission decision from using a value up to its TTL old. Ordering
+    // matters at every call site: the invalidation must come after the change it announces
+    // has committed and before any read that is meant to see it. A new writer of rule or
+    // deployed-Baseline state calls this, it does not repeat the two calls.
+    void invalidate_guardian_reconcile_caches() {
+        guardian_generation_cache_.invalidate();
+        guardian_rule_bundle_cache_.invalidate();
+    }
 
     // The Baseline gate's input: the union of member-Guard rule_ids across all
     // *deployed* Baselines, sourced from each Baseline's deployed_snapshot (what

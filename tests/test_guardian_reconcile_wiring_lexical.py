@@ -94,8 +94,8 @@ Invariants over the WIRING (server.cpp):
   i. `guardian_last_reconcile_` and `guardian_reconcile_mu_` no longer exist; the claim-map sweep
      (`guardian_reconcile_gate_.sweep(`) is called; and the pre-seed loop for
      `yuzu_server_guardian_reconciles_total` includes "shed".
-  p. The body of the `guardian_push_fn_` lambda (not merely anywhere else) invalidates both
-     reconcile caches.
+  p. The body of the `guardian_push_fn_` lambda (not merely anywhere else) invalidates the
+     reconcile caches, through the wrapper of (z) (see the second `p.` below for the placement).
   q. The 15 s maintenance tick publishes the three saturation gauges
      (`yuzu_server_guardian_reconcile_in_flight`, `..._budget_balance_ms`, `..._claims`) from the
      gate and budget in their OWN try block with both catch arms (`std::exception`, named or not,
@@ -144,25 +144,42 @@ Invariants over the WIRING (server.cpp):
      `!= nullptr` against an implicit bool test, `const auto` against `auto`, optional braces
      around a single statement, and any names for the callable's own parameters (the pins follow
      the names the lambda declares).
-  v. `GuaranteedStateStore::set_on_rule_mutation(` is called with a lambda whose body invalidates
-     BOTH reconcile caches (`guardian_generation_cache_` and `guardian_rule_bundle_cache_`) and
-     does nothing else: a rule create/update/delete whose best-effort generation bump failed
-     leaves the generation unchanged, so without this hook a held rule bundle is served to a new
-     agent for up to its max_age (chaos-F1). The store-side half (the hook fires after the commit
-     and after the bump attempt on all three mutation paths, never throws, holds no lease) is
-     pinned by the [rule_hook] cases in tests/unit/server/test_guaranteed_state_store.cpp, which
-     need a Postgres.
-
+  z. ONE owner for "drop the reconcile caches": `ServerImpl::invalidate_guardian_reconcile_caches()` is
+     defined once and its body calls BOTH `guardian_generation_cache_.invalidate()` and
+     `guardian_rule_bundle_cache_.invalidate()`; those two direct calls appear nowhere else in
+     server.cpp, so a writer that repeats the pair, or forgets one cache, is red.
+  v. `GuaranteedStateStore::set_on_rule_mutation(` is wired exactly once, with a lambda whose body is
+     exactly one call to that wrapper, not under a constant-false `if`, and cleared again with
+     `set_on_rule_mutation({})` exactly once at stop() time: a rule create/update/delete whose
+     best-effort generation bump failed leaves the generation unchanged, so without this hook a held
+     rule bundle is served to a new agent for up to its max_age (chaos-F1). The store-side half (the
+     hook fires after the commit and after the bump attempt on all three mutation paths, never
+     throws, holds no lease) is pinned by the [rule_hook] cases in
+     tests/unit/server/test_guaranteed_state_store.cpp, which need a Postgres.
   x. `GuardianRoutes` baseline deploy/delete reach the reconcile caches BEFORE their own policy
-     bump: `BaselineStore::set_on_baseline_mutation(` is wired exactly once, with a lambda that
-     invalidates both caches and nothing else (a deploy writes the new deployed snapshot, then
-     takes a second lease for the bump; a reconcile in that gap would send the old deployed set
-     under the unchanged label). The pre-seed of `yuzu_server_guardian_reconcile_invalidated_total`
-     is present.
-  y. Inside the `guardian_push_fn_` body the explicit scope is parsed (`scope::parse(scope)`,
-     refused with `return -1`) BEFORE the two cache invalidations, and the invalidations come
-     BEFORE the generation read (`current_policy_generation(`): an invalid-scope push must not
-     withhold in-flight reconciles, and the fan-out order stays safe.
+     bump: `BaselineStore::set_on_baseline_mutation(` is wired exactly once with the same
+     one-wrapper-call lambda, not under a constant-false `if`, and cleared at stop() time (a
+     deploy writes the new deployed snapshot, then takes a second lease for the bump; a
+     reconcile in that gap would send the old deployed set under the unchanged label). The
+     pre-seed of `yuzu_server_guardian_reconcile_invalidated_total` is present exactly once and
+     not under a constant-false `if`.
+  p (placement). Inside the `guardian_push_fn_` body the wrapper is called exactly once, at the lambda's own
+     brace depth and not as the body of an `if`/`else`/loop, so every path that reaches the
+     reads has invalidated first.
+  y. In the same body the explicit scope is parsed first, under exactly
+     `if (!scope.empty() && !(scope.starts_with("group:") && mgmt_group_store_))`, and an
+     unparseable scope is refused with `return -1` (tolerated spellings: `if (!parsed)`,
+     `.has_value()`, `== false`, braced or split over lines), BEFORE the wrapper call, which
+     comes BEFORE the generation read (`current_policy_generation(`): an invalid-scope push must
+     not withhold in-flight reconciles, and the fan-out order stays safe.
+  b. BaselineStore writer drift guard (baseline_store.cpp, `baseline_writer_problems`): every
+     function that writes `baseline_store.baselines` (UPDATE, DELETE FROM, INSERT INTO) calls
+     `notify_baseline_mutation()` or is on BASELINE_WRITER_ALLOWLIST with a reason
+     (create_baseline: route-created Baselines are always drafts; set_members and set_assignment
+     stamp updated_at only, and are red the moment they name lifecycle or deployed_snapshot). A
+     write outside every BaselineStore method is red too. The runtime half (the hook fires once
+     per committed update and delete, never on a failed one, holds no lease, cannot break the
+     mutation) is pinned by the [baseline_hook] cases in tests/unit/server/test_baseline_store.cpp.
 
 LEXICAL ONLY. It cannot see a relocation that keeps the tokens but changes control flow (that
 stays review-enforced), and the behavioural guarantees are the building blocks' own unit tests.
@@ -175,6 +192,7 @@ tests/test_guardian_heartbeat_wiring_lexical.py. Sources are read as UTF-8. Pyth
 the other no-build lexical gates (#5428).
 
 Usage: python3 tests/test_guardian_reconcile_wiring_lexical.py
+       LEXICAL_GATE_PART=light|heavy python3 -I tests/test_guardian_reconcile_wiring_lexical.py   (CI halves)
        SERVER_CPP=<path> FLOW_HPP=<path> PUSH_BUILDER_CPP=<path> \\
            python3 -I tests/test_guardian_reconcile_wiring_lexical.py        (point at copies)
 """
@@ -189,6 +207,8 @@ SERVER_CPP = Path(os.environ.get("SERVER_CPP", ROOT / "server" / "core" / "src" 
 FLOW_HPP = Path(os.environ.get("FLOW_HPP", ROOT / "server" / "core" / "src" / "guardian_reconcile_flow.hpp"))
 PUSH_BUILDER_CPP = Path(os.environ.get(
     "PUSH_BUILDER_CPP", ROOT / "server" / "core" / "src" / "guardian_push_builder.cpp"))
+BASELINE_STORE_CPP = Path(os.environ.get(
+    "BASELINE_STORE_CPP", ROOT / "server" / "core" / "src" / "baseline_store.cpp"))
 TAG = "test_guardian_reconcile_wiring_lexical"
 HINT = (" (this gate pins the #5513 Guardian reconcile flow and wiring; if server.cpp or "
         "guardian_reconcile_flow.hpp was legitimately restructured, update "
@@ -527,6 +547,88 @@ def flow_problems(src):
     return out
 
 
+# Writers of baseline_store.baselines that may skip the post-mutation hook, each with the reason.
+# create_baseline: a route-created Baseline is always a draft (guardian_routes.cpp
+# create_baseline_from_form), and a draft is not part of the deployed set. set_members and
+# set_assignment only stamp `updated_at`: neither touches `lifecycle` or `deployed_snapshot`.
+BASELINE_WRITER_ALLOWLIST = {
+    "create_baseline": "a route-created Baseline is always a draft; a caller that creates a deployed one must fire the hook",
+    "set_members": "stamps updated_at only, never lifecycle or deployed_snapshot",
+    "set_assignment": "stamps updated_at only, never lifecycle or deployed_snapshot",
+}
+_BASELINE_WRITE = re.compile(r"(?<![A-Za-z0-9])(?:UPDATE|DELETE_FROM|INSERT_INTO)_baseline_store_baselines(?![A-Za-z0-9])")
+_STAMP_ONLY = ("set_members", "set_assignment")
+
+
+def baseline_writer_problems(src):
+    """(b) Drift guard for BaselineStore (#5513): every function that writes the baselines table
+    (UPDATE, DELETE FROM or INSERT INTO baseline_store.baselines) must call
+    notify_baseline_mutation(), or sit on BASELINE_WRITER_ALLOWLIST with a reason. A new writer
+    that forgets the hook would let a reconcile send the old deployed set under the unchanged
+    generation label, the exact defect the hook exists to close."""
+    t, out = lex(src), []
+    spans = []  # (name, body_start, body_end)
+    for m in re.finditer(r"\bBaselineStore::(~?\w+) ?\(", t):
+        close = match_close(t, m.end() - 1, "(", ")")
+        if close < 0:
+            continue
+        rest = re.match(r" ?(?:const)? ?(?:noexcept)? ?(?::[^{;]*)?\{", t[close + 1:])
+        if not rest:
+            continue  # a call, not a definition
+        open_idx = close + 1 + rest.end() - 1
+        end = match_close(t, open_idx, "{", "}")
+        if end >= 0:
+            spans.append((m.group(1), open_idx, end))
+    if not spans:
+        return ["baseline_store.cpp no longer has any parseable BaselineStore:: method definitions (b)"]
+    writers = {}
+    for w in _BASELINE_WRITE.finditer(t):
+        owner = [sp for sp in spans if sp[1] < w.start() < sp[2]]
+        if not owner:
+            out.append("a write to baseline_store.baselines sits outside every BaselineStore method (b)")
+            continue
+        writers.setdefault(owner[0][0], owner[0])
+    for name, (_n, lo, hi) in writers.items():
+        body = t[lo:hi + 1]
+        notifies = re.search(r"\bnotify_baseline_mutation\( ?\) ?;", body) is not None
+        if name in BASELINE_WRITER_ALLOWLIST:
+            if name in _STAMP_ONLY and re.search(r'"[^"]*(?<![A-Za-z0-9])(?:lifecycle|deployed_snapshot)(?![A-Za-z0-9])[^"]*"', body):
+                out.append(f"BaselineStore::{name} is allowlisted as an updated_at-only writer but now names "
+                           f"lifecycle or deployed_snapshot: it must fire notify_baseline_mutation() (b)")
+            continue
+        if not notifies:
+            out.append(f"BaselineStore::{name} writes baseline_store.baselines but never calls "
+                       f"notify_baseline_mutation(), and is not on the allowlist (b)")
+    for name in ("update_baseline", "delete_baseline"):
+        if name not in writers:
+            out.append(f"BaselineStore::{name} no longer writes baseline_store.baselines where expected (b)")
+    return out
+
+
+_DEAD_COND = re.compile(r"\b(?:if|while) ?\( ?(?:false|0|nullptr) ?\) ?$|\bif constexpr ?\( ?false ?\) ?$")
+_DEAD_ANY = re.compile(r"\bif ?\( ?(?:false|0|nullptr) ?\)")
+
+
+def under_dead_condition(t, braces, idx):
+    """True when t[idx] is dominated by a constant-false `if`/`while`: inside a block opened right
+    after one, or an unbraced statement that follows one. `braces` is [(pos, '{' or '}')]."""
+    import bisect
+    k = bisect.bisect_left(braces, (idx, "")) - 1
+    depth = 0
+    while k >= 0:
+        pos, ch = braces[k]
+        if ch == "}":
+            depth += 1
+        elif depth:
+            depth -= 1
+        else:
+            if _DEAD_COND.search(t[max(0, pos - 40):pos].rstrip()):
+                return True
+        k -= 1
+    start = max(t.rfind(";", 0, idx), t.rfind("{", 0, idx), t.rfind("}", 0, idx))
+    return bool(_DEAD_ANY.search(t[start + 1:idx]))
+
+
 def problems(src):
     """One message per violated WIRING invariant (server.cpp), lettered; [] when clean."""
     t, out = lex(src), []
@@ -667,7 +769,28 @@ def problems(src):
 
     out.extend(move_filter_problems(t, "server.cpp"))
 
-    # (p) the bump fan-out drops both reconcile caches, INSIDE the guardian_push_fn_ body.
+    # (z) ONE owner for "drop the reconcile caches": the wrapper member holds BOTH direct calls and
+    # nothing else in server.cpp makes a direct call, so a hook or the fan-out that forgets one cache,
+    # or repeats the pair instead of calling the wrapper, is red.
+    wrap_calls = r"(?:this ?-> ?)?invalidate_guardian_reconcile_caches\( ?\) ?;"
+    wrappers = [m.end() - 1 for m in re.finditer(r"\bvoid invalidate_guardian_reconcile_caches\( ?\) ?\{", t)]
+    if len(wrappers) != 1:
+        out.append("server.cpp no longer defines exactly one invalidate_guardian_reconcile_caches() member (z)")
+    else:
+        wend = match_close(t, wrappers[0], "{", "}")
+        wbody = "" if wend < 0 else t[wrappers[0]:wend + 1]
+        for cache in ("guardian_generation_cache_", "guardian_rule_bundle_cache_"):
+            if not re.search(r"\b" + cache + r" ?\. ?invalidate\( ?\) ?;", wbody):
+                out.append(f"invalidate_guardian_reconcile_caches() no longer calls {cache}.invalidate() (z)")
+    for cache in ("guardian_generation_cache_", "guardian_rule_bundle_cache_"):
+        n = len(re.findall(r"\b" + cache + r" ?\. ?invalidate\( ?\)", t))
+        if n != 1:
+            out.append(f"{cache}.invalidate() is called {n} times in server.cpp: only the wrapper may call it, "
+                       f"every writer calls invalidate_guardian_reconcile_caches() (z)")
+    braces = [(m.start(), m.group()) for m in re.finditer(r"[{}]", t)]
+
+    # (p)/(y) the fan-out: ONE wrapper call at the lambda's own depth, scope parsed first, wrapper before the
+    # generation read.
     push_fn = re.search(r"\bguardian_push_fn_ = \[this\]\([^)]*\) -> int ?\{", t)
     push_body = None
     if push_fn:
@@ -676,56 +799,70 @@ def problems(src):
     if push_body is None:
         out.append("could not isolate the guardian_push_fn_ lambda body (p)")
     else:
-        for cache in ("guardian_generation_cache_", "guardian_rule_bundle_cache_"):
-            if not re.search(cache + r"\.invalidate\(\)", push_body):
-                out.append(f"guardian_push_fn_ no longer calls {cache}.invalidate() (p)")
-        # (y) order inside the body: scope parse (refused with -1) < invalidations < generation read.
+        calls = list(re.finditer(wrap_calls, push_body))
         parses = list(re.finditer(r"\bscope::parse\( ?scope ?\)", push_body))
-        invs = list(re.finditer(r"\bguardian_(?:generation|rule_bundle)_cache_\.invalidate\(\)", push_body))
         gen_read = re.search(r"\bcurrent_policy_generation\(", push_body)
+        if len(calls) != 1:
+            out.append("guardian_push_fn_ no longer calls invalidate_guardian_reconcile_caches() exactly once (p)")
+        else:
+            depth = push_body[:calls[0].start()].count("{") - push_body[:calls[0].start()].count("}")
+            if depth != 1:
+                out.append("the guardian_push_fn_ cache invalidation is nested inside a branch or lambda (depth "
+                           f"{depth}, want 1): it must run on every path that reaches the reads (p)")
+            head = push_body[:calls[0].start()]
+            stmt_start = max(head.rfind(";"), head.rfind("{"), head.rfind("}"))
+            if re.search(r"\b(?:if|else|for|while|switch)\b|\?", head[stmt_start + 1:]):
+                out.append("the guardian_push_fn_ cache invalidation is the body of a conditional statement: it must "
+                           "run on every path that reaches the reads (p)")
+        cond = re.search(r"\bstd::optional<yuzu::scope::Expression> parsed_scope ?; ?if ?\( ?! ?scope\. ?empty\( ?\) ?&& ?"
+                         r"! ?\( ?scope\. ?starts_with\( ?\"group_\" ?\) ?&& ?mgmt_group_store_ ?\) ?\) ?\{", push_body)
+        if not cond:
+            out.append("the hoisted explicit-scope parse is no longer guarded by exactly "
+                       "`if (!scope.empty() && !(scope.starts_with(\"group:\") && mgmt_group_store_))` (y)")
         if len(parses) != 1:
             out.append("guardian_push_fn_ no longer parses the explicit scope exactly once up front "
                        "(scope::parse(scope)) (y)")
-        elif not re.search(r"scope::parse\( ?scope ?\) ?;[^;]*?\bif ?\( ?! ?\w+ ?\) ?return -1 ?;", push_body[parses[0].start():]):
-            out.append("guardian_push_fn_ no longer refuses an unparseable scope with `return -1` right "
-                       "after parsing it (y)")
-        if invs and parses and not parses[0].start() < invs[0].start():
-            out.append("the guardian_push_fn_ cache invalidations run BEFORE the scope parse: an invalid-scope "
+        else:
+            refuse = (r"scope::parse\( ?scope ?\) ?; ?if ?\( ?(?:! ?\w+(?: ?\. ?has_value\( ?\))?|\w+ ?\. ?has_value\( ?\) ?== ?false) ?\) ?"
+                      r"(?:\{ ?)?return -1 ?; ?(?:\} ?)?\w+ ?= ?std::move\( ?\* ?\w+ ?\) ?;")
+            if not re.search(refuse, push_body[parses[0].start():]):
+                out.append("guardian_push_fn_ no longer refuses an unparseable scope with `return -1` right "
+                           "after parsing it (y)")
+            if cond and not cond.start() < parses[0].start():
+                out.append("the scope parse is not inside its guarding condition (y)")
+        if calls and parses and not parses[0].start() < calls[0].start():
+            out.append("the guardian_push_fn_ cache invalidation runs BEFORE the scope parse: an invalid-scope "
                        "push would withhold every in-flight reconcile for nothing (y)")
-        if invs and gen_read and not invs[-1].start() < gen_read.start():
-            out.append("the guardian_push_fn_ cache invalidations no longer come BEFORE the generation read (y)")
+        if calls and gen_read and not calls[-1].start() < gen_read.start():
+            out.append("the guardian_push_fn_ cache invalidation no longer comes BEFORE the generation read (y)")
 
-    # (v) a rule create/update/delete on this replica drops both reconcile caches (chaos-F1).
-    hooks = [m.end() - 1 for m in re.finditer(r"\bset_on_rule_mutation\((?= ?\[)", t)]
-    if len(hooks) != 1:
-        out.append("server.cpp no longer wires exactly one GuaranteedStateStore::set_on_rule_mutation( lambda (v)")
-    else:
-        end = match_close(t, hooks[0], "(", ")")
-        arg = "" if end < 0 else t[hooks[0] + 1:end]
-        body = block_after(arg, "]") or ""
-        inv = r"(?:this ?-> ?)?%s ?\. ?invalidate\( ?\) ?;"
-        gen, bun = inv % "guardian_generation_cache_", inv % "guardian_rule_bundle_cache_"
-        if not (re.search(r"^\{ ?" + gen + " ?" + bun + r" ?\}$", body.strip()) or
-                re.search(r"^\{ ?" + bun + " ?" + gen + r" ?\}$", body.strip())):
-            out.append("the set_on_rule_mutation lambda no longer does exactly "
-                       "{ guardian_generation_cache_.invalidate(); guardian_rule_bundle_cache_.invalidate(); } (v)")
-
-    # (x) a committed Baseline update/delete drops both reconcile caches before the caller's own bump.
-    bhooks = [m.end() - 1 for m in re.finditer(r"\bset_on_baseline_mutation\((?= ?\[)", t)]
-    if len(bhooks) != 1:
-        out.append("server.cpp no longer wires exactly one BaselineStore::set_on_baseline_mutation( lambda (x)")
-    else:
-        end = match_close(t, bhooks[0], "(", ")")
-        arg = "" if end < 0 else t[bhooks[0] + 1:end]
-        body = block_after(arg, "]") or ""
-        inv = r"(?:this ?-> ?)?%s ?\. ?invalidate\( ?\) ?;"
-        gen, bun = inv % "guardian_generation_cache_", inv % "guardian_rule_bundle_cache_"
-        if not (re.search(r"^\{ ?" + gen + " ?" + bun + r" ?\}$", body.strip()) or
-                re.search(r"^\{ ?" + bun + " ?" + gen + r" ?\}$", body.strip())):
-            out.append("the set_on_baseline_mutation lambda no longer does exactly "
-                       "{ guardian_generation_cache_.invalidate(); guardian_rule_bundle_cache_.invalidate(); } (x)")
-    if not re.search(r'metrics_\.counter\( ?"yuzu_server_guardian_reconcile_invalidated_total" ?\) ?;', t):
-        out.append("yuzu_server_guardian_reconcile_invalidated_total is no longer pre-seeded (x)")
+    # (v)/(x) the two post-mutation hooks: each wired exactly once, with a lambda that does nothing but call the
+    # wrapper, not under a dead condition; and cleared again at stop() time.
+    for setter, what, letter in (("set_on_rule_mutation", "GuaranteedStateStore::set_on_rule_mutation", "(v)"),
+                                 ("set_on_baseline_mutation", "BaselineStore::set_on_baseline_mutation", "(x)")):
+        hooks = [m.end() - 1 for m in re.finditer(r"\b" + setter + r"\((?= ?\[)", t)]
+        if len(hooks) != 1:
+            out.append(f"server.cpp no longer wires exactly one {what}( lambda {letter}")
+        else:
+            end = match_close(t, hooks[0], "(", ")")
+            arg = "" if end < 0 else t[hooks[0] + 1:end]
+            body = block_after(arg, "]") or ""
+            if not re.search(r"^\{ ?" + wrap_calls + r" ?\}$", body.strip()):
+                out.append(f"the {setter} lambda no longer does exactly "
+                           f"{{ invalidate_guardian_reconcile_caches(); }} {letter}")
+            if under_dead_condition(t, braces, hooks[0]):
+                out.append(f"the {setter} wiring sits under a dead condition {letter}")
+        clears = [m.start() for m in re.finditer(r"\b" + setter + r"\( ?\{ ?\} ?\) ?;", t)]
+        if len(clears) != 1:
+            out.append(f"server.cpp no longer clears the {setter} hook exactly once at stop() time (it captures "
+                       f"`this`) {letter}")
+        elif under_dead_condition(t, braces, clears[0]):
+            out.append(f"the {setter}({{}}) clear sits under a dead condition {letter}")
+    preseed = [m.start() for m in re.finditer(r'metrics_\.counter\( ?"yuzu_server_guardian_reconcile_invalidated_total" ?\) ?;', t)]
+    if len(preseed) != 1:
+        out.append("yuzu_server_guardian_reconcile_invalidated_total is no longer pre-seeded exactly once (x)")
+    elif under_dead_condition(t, braces, preseed[0]):
+        out.append("the yuzu_server_guardian_reconcile_invalidated_total pre-seed sits under a dead condition (x)")
 
     # (q) the saturation gauges and the claim sweep (see q_problems).
     out.extend(q_problems(t))
@@ -1037,13 +1174,6 @@ MUTATIONS += [
      _sub("guardian::load_reconcile_bundle(", "guardian::make_bundle("), "(o)"),
     ("filter and std::move combined in one statement",
      (lambda s: s + "\nauto b = guardian::make_bundle(guardian::filter_deployed_members(r, d), std::move(*deployed_result));\n"), "(o)"),
-    ("bump fan-out stops dropping the generation cache",
-     _after("guardian_push_fn_ = [this]", "guardian_generation_cache_.invalidate();", "(void)0;"), "(p)"),
-    ("bump fan-out stops dropping the bundle cache",
-     _after("guardian_push_fn_ = [this]", "guardian_rule_bundle_cache_.invalidate();", "(void)0;"), "(p)"),
-    ("invalidate moved out of the push fn into unrelated code",
-     lambda s: _after("guardian_push_fn_ = [this]", "guardian_generation_cache_.invalidate();", "(void)0;")(s)
-     + "\nvoid elsewhere() { guardian_generation_cache_.invalidate(); }\n", "(p)"),
     ("in-flight gauge no longer published in the gauge block",
      _resub(r'metrics_\s*\.gauge\("yuzu_server_guardian_reconcile_in_flight"\)\s*\.set\(static_cast<double>\(guardian_reconcile_gate_\.in_flight\(\)\)\);',
             "(void)0;"), "(q)"),
@@ -1097,7 +1227,7 @@ MUTATIONS += [
 ]
 
 # Invariants that live in server.cpp; every other lettered entry above mutates the flow header.
-SERVER_LETTERS = ("(i)", "(p)", "(q)", "(x)", "(y)")
+SERVER_LETTERS = ("(i)", "(p)", "(q)", "(v)", "(x)", "(y)", "(z)")
 
 # (w) the bundle epoch check.
 EPOCH_READ = "const auto bundle_epoch = guardian_rule_bundle_cache_.epoch();"
@@ -1134,36 +1264,85 @@ MUTATIONS += [
          "if (send_push_(agent_id, command_id, push.SerializeAsString())) { if (guardian_rule_bundle_cache_.epoch() != bundle_epoch) { abort_invalidated(\"rule bundle invalidated during load\", \"x\"); return; }", 1), "(w)"),
 ]
 
-# (x)/(y): the baseline hook and the push fan-out ordering (server.cpp).
-BH = "set_on_baseline_mutation([this] {"
+# (v)/(x)/(y)/(z): the cache-invalidation owner, both hooks and the push fan-out ordering (server.cpp).
+WRAPPER_CALL = "invalidate_guardian_reconcile_caches();"
+RULE_HOOK = "set_on_rule_mutation( [this] { invalidate_guardian_reconcile_caches(); });"
+BASE_HOOK = "set_on_baseline_mutation( [this] { invalidate_guardian_reconcile_caches(); });"
+GEN_DIRECT = "guardian_generation_cache_.invalidate();"
+BUN_DIRECT = "guardian_rule_bundle_cache_.invalidate();"
+PUSH_ANCHOR = "                invalidate_guardian_reconcile_caches();\n                const auto now_s"
 def _scope_parse_block(s):
     m = re.search(r"[ \t]*std::optional<yuzu::scope::Expression> parsed_scope;.*?parsed_scope = std::move\(\*parsed\);\n\s*\}\n", s, re.S)
     assert m, "scope parse block not found (stale pattern)"
     return s[:m.start()] + s[m.end():], m.group(0)
 def _invalidate_before_parse(s):
     s, blk = _scope_parse_block(s)
-    anchor = "                guardian_generation_cache_.invalidate();\n                guardian_rule_bundle_cache_.invalidate();\n"
+    anchor = "                invalidate_guardian_reconcile_caches();\n"
     i = s.index(anchor, s.index("guardian_push_fn_ = [this]"))
     return s[:i + len(anchor)] + blk + s[i + len(anchor):]
 def _invalidate_after_generation_read(s):
-    anchor = "                guardian_generation_cache_.invalidate();\n                guardian_rule_bundle_cache_.invalidate();\n"
+    anchor = "                invalidate_guardian_reconcile_caches();\n"
     i = s.index(anchor, s.index("guardian_push_fn_ = [this]"))
     s = s[:i] + s[i + len(anchor):]
     j = s.index("const std::uint64_t generation = *generation_opt;", i)
     return s[:j] + anchor + s[j:]
+def _wrapper_body_sub(old, new):
+    def mut(s):
+        i = s.index("void invalidate_guardian_reconcile_caches() {")
+        j = s.index(old, i)
+        return s[:j] + new + s[j + len(old):]
+    return mut
 MUTATIONS += [
-    ("baseline-mutation hook is never wired",
-     _wafter(BH, "guardian_generation_cache_.invalidate(); guardian_rule_bundle_cache_.invalidate(); });", "});"), "(x)"),
-    ("baseline-mutation hook forgets the rule bundle cache",
-     _wafter(BH, "guardian_rule_bundle_cache_.invalidate();", "(void)0;"), "(x)"),
-    ("baseline-mutation hook forgets the generation cache",
-     _wafter(BH, "guardian_generation_cache_.invalidate();", "(void)0;"), "(x)"),
+    # (z) the wrapper
+    ("wrapper forgets the generation cache", _wrapper_body_sub(GEN_DIRECT, "(void)0;"), "(z)"),
+    ("wrapper forgets the rule bundle cache", _wrapper_body_sub(BUN_DIRECT, "(void)0;"), "(z)"),
+    ("wrapper is split in two (a second direct call appears elsewhere)",
+     lambda s: s + "\nvoid again() { guardian_generation_cache_.invalidate(); }\n", "(z)"),
+    # (v) rule hook
+    ("rule-mutation hook is never wired", _wsub(RULE_HOOK, "(void)0;"), "(v)"),
+    ("rule-mutation hook repeats the pair instead of calling the wrapper",
+     _wsub(RULE_HOOK, "set_on_rule_mutation( [this] { " + GEN_DIRECT + " " + BUN_DIRECT + " });"), "(v)"),
+    ("rule-mutation hook calls only one cache directly",
+     _wsub(RULE_HOOK, "set_on_rule_mutation( [this] { " + GEN_DIRECT + " });"), "(v)"),
+    ("rule-mutation hook calls the wrapper only conditionally",
+     _wsub(RULE_HOOK, "set_on_rule_mutation( [this] { if (cfg_.guardian_reconcile_max_per_s > 0) invalidate_guardian_reconcile_caches(); });"), "(v)"),
+    ("rule-mutation hook is no longer cleared at stop()",
+     _sub("guaranteed_state_store_->set_on_rule_mutation({}); // hook captures `this` (#5513)", "(void)0;"), "(v)"),
+    ("rule-mutation hook wiring under if (false)", _wsub("guaranteed_state_store_->" + RULE_HOOK, "if (false) guaranteed_state_store_->" + RULE_HOOK), "(v)"),
+    # (x) baseline hook, counter pre-seed
+    ("baseline-mutation hook is never wired", _wsub(BASE_HOOK, "(void)0;"), "(x)"),
+    ("baseline-mutation hook repeats the pair instead of calling the wrapper",
+     _wsub(BASE_HOOK, "set_on_baseline_mutation( [this] { " + GEN_DIRECT + " " + BUN_DIRECT + " });"), "(x)"),
+    ("baseline-mutation hook calls only the rule bundle cache directly",
+     _wsub(BASE_HOOK, "set_on_baseline_mutation( [this] { " + BUN_DIRECT + " });"), "(x)"),
+    ("baseline-mutation hook is no longer cleared at stop()",
+     _sub("baseline_store_->set_on_baseline_mutation({}); // hook captures `this` (#5513)", "(void)0;"), "(x)"),
+    ("baseline-mutation hook wiring under if (false)", _wsub("baseline_store_->" + BASE_HOOK, "if (false) baseline_store_->" + BASE_HOOK), "(x)"),
     ("invalidated counter no longer pre-seeded",
      _sub('metrics_.counter("yuzu_server_guardian_reconcile_invalidated_total");', "(void)0;"), "(x)"),
+    ("invalidated counter pre-seed under if (false)",
+     _sub('metrics_.counter("yuzu_server_guardian_reconcile_invalidated_total");',
+          'if (false) metrics_.counter("yuzu_server_guardian_reconcile_invalidated_total");'), "(x)"),
+    # (p)/(y) the fan-out
+    ("push fan-out stops dropping the caches", _sub(PUSH_ANCHOR, "                const auto now_s"), "(p)"),
+    ("push fan-out repeats the pair instead of calling the wrapper",
+     _sub(PUSH_ANCHOR, "                " + GEN_DIRECT + " " + BUN_DIRECT + "\n                const auto now_s"), "(p)"),
+    ("push fan-out calls the wrapper only conditionally",
+     _sub(PUSH_ANCHOR, "                if (full_sync) " + WRAPPER_CALL + "\n                const auto now_s"), "(p)"),
+    ("push fan-out calls the wrapper inside a nested block",
+     _sub(PUSH_ANCHOR, "                { " + WRAPPER_CALL + " }\n                const auto now_s"), "(p)"),
+    ("push fan-out calls the wrapper twice",
+     _sub(PUSH_ANCHOR, "                " + WRAPPER_CALL + " " + WRAPPER_CALL + "\n                const auto now_s"), "(p)"),
     ("push fan-out invalidates before parsing the scope", _invalidate_before_parse, "(y)"),
     ("push fan-out invalidates after the generation read", _invalidate_after_generation_read, "(y)"),
     ("push fan-out no longer refuses an unparseable scope up front",
      _resub(r"(auto parsed = yuzu::scope::parse\(scope\);\s*)if \(!parsed\)\s*return -1;", r"\1"), "(y)"),
+    ("hoisted scope parse is dead (if (false))",
+     _sub("if (!scope.empty() && !(scope.starts_with(\"group:\") && mgmt_group_store_)) {", "if (false) {"), "(y)"),
+    ("hoisted scope parse runs only for non-empty scopes (group: scopes parsed too)",
+     _sub("if (!scope.empty() && !(scope.starts_with(\"group:\") && mgmt_group_store_)) {", "if (!scope.empty()) {"), "(y)"),
+    ("hoisted scope parse always runs (an empty scope would be refused)",
+     _sub("if (!scope.empty() && !(scope.starts_with(\"group:\") && mgmt_group_store_)) {", "if (true) {"), "(y)"),
 ]
 
 # (s) the delivered-push branch.
@@ -1261,18 +1440,6 @@ SERVER_MUTATIONS = [m for m in MUTATIONS if m[2] in SERVER_LETTERS] + [
     ("push dependency reports success without waiting for the send",
      _wafter(FLOW_CTOR, "forward_gateway_pending(); return true; } return false;",
              "forward_gateway_pending(); } return true;"), "(u)"),
-    # (v) the rule-mutation hook.
-    ("rule-mutation hook is never wired",
-     _wafter("set_on_rule_mutation([this] {",
-             "guardian_generation_cache_.invalidate(); guardian_rule_bundle_cache_.invalidate(); });",
-             "});"), "(v)"),
-    ("rule-mutation hook forgets the rule bundle cache",
-     _wafter("set_on_rule_mutation([this] {", "guardian_rule_bundle_cache_.invalidate();", "(void)0;"), "(v)"),
-    ("rule-mutation hook forgets the generation cache",
-     _wafter("set_on_rule_mutation([this] {", "guardian_generation_cache_.invalidate();", "(void)0;"), "(v)"),
-    ("rule-mutation hook invalidates only when something else holds",
-     _wafter("set_on_rule_mutation([this] {", "guardian_generation_cache_.invalidate();",
-             "if (cfg_.guardian_reconcile_max_per_s > 0) guardian_generation_cache_.invalidate();"), "(v)"),
 ]
 
 # Mutations over guardian_push_builder.cpp (the bundle loader's evaluation order).
@@ -1339,10 +1506,21 @@ BENIGN_SERVER = [
     ("send_push parameters renamed",
      _wafter(FLOW_CTOR, "[this](const std::string& agent_id, const std::string& command_id, const std::string& push_bytes) -> bool { auto classified = build_classified_command( yuzu::server::DispatchCaller{.system = true}, \"__guard__\", \"push_rules\", command_id, /*parameters=*/{}, push_bytes); if (classified && send_system_reserved( agent_id, *classified,",
              "[this](const std::string& target, const std::string& cid, const std::string& bytes) -> bool { auto classified = build_classified_command( yuzu::server::DispatchCaller{.system = true}, \"__guard__\", \"push_rules\", cid, /*parameters=*/{}, bytes); if (classified && send_system_reserved( target, *classified,")),
-    ("rule-mutation hook with the invalidations in the other order and a this-> prefix",
-     _wafter("set_on_rule_mutation([this] {",
-             "guardian_generation_cache_.invalidate(); guardian_rule_bundle_cache_.invalidate();",
-             "this->guardian_rule_bundle_cache_.invalidate(); this->guardian_generation_cache_.invalidate();")),
+    ("rule-mutation hook calling the wrapper through this->",
+     _wafter("set_on_rule_mutation(",
+             "invalidate_guardian_reconcile_caches();", "this->invalidate_guardian_reconcile_caches();")),
+    ("baseline-mutation hook calling the wrapper through this->",
+     _wafter("set_on_baseline_mutation(",
+             "invalidate_guardian_reconcile_caches();", "this->invalidate_guardian_reconcile_caches();")),
+    # (y) tolerated spellings of the scope refusal.
+    ("scope refusal braced",
+     _resub(r"if \(!parsed\)\s*return -1;", "if (!parsed) { return -1; }")),
+    ("scope refusal braced and split over lines",
+     _resub(r"if \(!parsed\)\s*return -1;", "if (!parsed)\n {\n return -1;\n }")),
+    ("scope refusal through has_value()",
+     _resub(r"if \(!parsed\)\s*return -1;", "if (!parsed.has_value()) return -1;")),
+    ("scope refusal through has_value() == false",
+     _resub(r"if \(!parsed\)\s*return -1;", "if (parsed.has_value() == false) return -1;")),
     ("session lookup with braces around the early return",
      _wafter(FLOW_CTOR, "if (!sess) return std::nullopt;", "if (!sess) { return std::nullopt; }")),
     # (q) must accept restructurings that keep the invariant: the gate is about order and
@@ -1374,11 +1552,82 @@ BENIGN_SERVER = [
 ]
 
 
+def _upd_without_notify(s):
+    i = s.index("std::expected<void, std::string> BaselineStore::update_baseline")
+    j = s.index("notify_baseline_mutation();", i)
+    return s[:j] + "(void)0;" + s[j + len("notify_baseline_mutation();"):]
+
+
+def _delete_without_notify(s):
+    i = s.index("std::expected<void, std::string> BaselineStore::delete_baseline")
+    j = s.index("notify_baseline_mutation();", i)
+    return s[:j] + "(void)0;" + s[j + len("notify_baseline_mutation();"):]
+
+
+BASELINE_WRITER_MUTATIONS = [
+    ("update_baseline stops firing the hook", _upd_without_notify, "(b)"),
+    ("delete_baseline stops firing the hook", _delete_without_notify, "(b)"),
+    ("a new writer function that is not allowlisted",
+     lambda s: s + """
+std::expected<void, std::string> BaselineStore::undeploy_baseline(const std::string& baseline_id) {
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    pg::exec_params(lease.get(), "UPDATE baseline_store.baselines SET lifecycle = 'draft' WHERE baseline_id = $1",
+                    std::vector<std::string>{baseline_id});
+    return {};
+}
+""", "(b)"),
+    ("a writer outside every BaselineStore method",
+     lambda s: s + """
+static void raw_write(PGconn* c) {
+    pg::exec_params(c, "DELETE FROM baseline_store.baselines", std::vector<std::string>{});
+}
+""", "(b)"),
+    ("set_members starts rewriting the deployed snapshot",
+     _sub("UPDATE baseline_store.baselines SET updated_at = $1::bigint ",
+          "UPDATE baseline_store.baselines SET deployed_snapshot = '[]', updated_at = $1::bigint "), "(b)"),
+    ("update_baseline no longer writes the table",
+     _sub("UPDATE baseline_store.baselines SET name = $1", "UPDATE baseline_store.baseline_x SET name = $1"), "(b)"),
+]
+
+BENIGN_BASELINE = [
+    ("a comment mentions a write and the hook",
+     _sub("std::expected<void, std::string> BaselineStore::delete_baseline",
+          "// UPDATE baseline_store.baselines is not issued here; notify_baseline_mutation() is.\n"
+          "std::expected<void, std::string> BaselineStore::delete_baseline")),
+    ("the notify call is re-wrapped and commented",
+     _resub(r"notify_baseline_mutation\(\);", "notify_baseline_mutation( /* hook */ );")),
+    ("a write to the member table of another name is not flagged",
+     lambda s: s + """
+std::size_t BaselineStore::drop_stray_members() {
+    pg::exec_params(nullptr, "DELETE FROM baseline_store.baseline_rules", std::vector<std::string>{});
+    return 0;
+}
+"""),
+    ("the delete statement is reflowed over two literals",
+     _sub('lease.get(), "DELETE FROM baseline_store.baselines WHERE baseline_id = $1 RETURNING baseline_id",',
+          'lease.get(), "DELETE FROM baseline_store.baselines "\n "WHERE baseline_id = $1 RETURNING baseline_id",')),
+]
+
+
+# The sweep over every server.cpp wiring mutation costs most of the run (about 10 s of 13), so CI runs
+# this file as two meson tests, LEXICAL_GATE_PART=light (everything else) and LEXICAL_GATE_PART=heavy
+# (that sweep), each under the 30 s budget. Unset runs everything. A new test method
+# lands in "light" by default, so nothing can silently fall out of both.
+_HEAVY_TESTS = frozenset({"test_wiring_mutations_are_caught"})
+_PART = os.environ.get("LEXICAL_GATE_PART", "all")
+
+
 class GuardianReconcileWiringLexical(unittest.TestCase):
     def setUp(self):
+        if _PART not in ("all", "light", "heavy"):
+            self.fail(f"LEXICAL_GATE_PART must be all, light or heavy, not {_PART!r}")
+        heavy = self._testMethodName in _HEAVY_TESTS
+        if (_PART == "light" and heavy) or (_PART == "heavy" and not heavy):
+            self.skipTest(f"runs in the other LEXICAL_GATE_PART (this one is {_PART})")
         self.src = SERVER_CPP.read_text(encoding="utf-8")
         self.flow_src = FLOW_HPP.read_text(encoding="utf-8")
         self.push_src = PUSH_BUILDER_CPP.read_text(encoding="utf-8")
+        self.baseline_src = BASELINE_STORE_CPP.read_text(encoding="utf-8")
 
     def _check_clean(self, found):
         for m in found:
@@ -1428,6 +1677,19 @@ class GuardianReconcileWiringLexical(unittest.TestCase):
                 mutated = mutate(self.src)
                 self.assertNotEqual(mutated, self.src, "benign edit changed nothing (stale pattern)")
                 self.assertEqual(problems(mutated), [])
+
+    def test_baseline_writers_are_clean(self):
+        self._check_clean(baseline_writer_problems(self.baseline_src))
+
+    def test_baseline_writer_mutations_are_caught(self):
+        self._check_caught(BASELINE_WRITER_MUTATIONS, self.baseline_src, baseline_writer_problems)
+
+    def test_benign_baseline_text_is_not_flagged(self):
+        for name, mutate in BENIGN_BASELINE:
+            with self.subTest(benign=name):
+                mutated = mutate(self.baseline_src)
+                self.assertNotEqual(mutated, self.baseline_src, "benign edit changed nothing (stale pattern)")
+                self.assertEqual(baseline_writer_problems(mutated), [])
 
     def test_a_commented_out_decide_does_not_satisfy_the_gate(self):
         # Comment stripping must remove the call entirely, not merely hide it from one regex.

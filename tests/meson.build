@@ -3416,9 +3416,20 @@ test('guardian heartbeat generation wiring lexical gate (#5513)',
 # (test_guardian_reconcile_flow.cpp); the wiring lives inside ServerImpl, which no unit test
 # constructs. Carries its own in-memory mutation self-test. No build required. Suite 'docs', like the
 # gateway-upstream gate above: assert-suite-cover.py has no bare 'server' entry for no-build gates.
+# Run as two halves (LEXICAL_GATE_PART) so each stays inside the 30 s budget on the slowest CI
+# host: 'heavy' is the sweep over every server.cpp wiring mutation (about 10 s of the 13 s),
+# 'light' is everything else. A new test method defaults to 'light'.
 test('guardian reconcile wiring lexical gate (#5513)',
   _python3_test,
   args: [files('test_guardian_reconcile_wiring_lexical.py')],
+  env: {'LEXICAL_GATE_PART': 'light'},
+  suite: 'docs',
+  timeout: 30,
+)
+test('guardian reconcile wiring lexical gate, server.cpp mutations (#5513)',
+  _python3_test,
+  args: [files('test_guardian_reconcile_wiring_lexical.py')],
+  env: {'LEXICAL_GATE_PART': 'heavy'},
   suite: 'docs',
   timeout: 30,
 )

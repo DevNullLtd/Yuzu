@@ -1007,13 +1007,15 @@ TEST_CASE("GuardianReconcileFlow: C1, an invalidation during the fresh generatio
             rig.bundle_cache.invalidate();  // the fresh generation read
         return 7;
     };
-    rig.run("agent-1", 0);
+    // A NONZERO agent generation, so an audit row that reported the wrong generation (the
+    // fresh one, or none) is caught on this family too.
+    rig.run("agent-1", 3);
     CHECK(rig.sent.empty());
     CHECK(rig.count("degraded") == 0.0);
     CHECK(rig.invalidated() == 1.0);
     CHECK(rig.gate.in_flight() == 0);
     REQUIRE(rig.audits.size() == 1);
-    CHECK(rig.audits[0].detail == invalidated_abort(0));
+    CHECK(rig.audits[0].detail == invalidated_abort(3));
 }
 
 TEST_CASE("GuardianReconcileFlow: C1, an invalidation during scope evaluation also aborts",
@@ -1024,7 +1026,7 @@ TEST_CASE("GuardianReconcileFlow: C1, an invalidation during scope evaluation al
     rig.set_rules({rule("open"), rule("scoped", "", "tag:grp == inside")});
     rig.scope_outcomes["inside"] = ScopeOutcome::Member;
     rig.eval_hook = [&] { rig.bundle_cache.invalidate(); };
-    rig.run("agent-1", 0);
+    rig.run("agent-1", 5);
     REQUIRE(rig.eval_calls == 1);  // the push was fully prepared...
     CHECK(rig.sent.empty());       // ...and then withheld
     CHECK(rig.count("degraded") == 0.0);
@@ -1032,7 +1034,7 @@ TEST_CASE("GuardianReconcileFlow: C1, an invalidation during scope evaluation al
     CHECK(rig.count("sent") == 0.0);
     CHECK(rig.gate.in_flight() == 0);
     REQUIRE(rig.audits.size() == 1);
-    CHECK(rig.audits[0].detail == invalidated_abort(0));
+    CHECK(rig.audits[0].detail == invalidated_abort(5));
 }
 
 TEST_CASE("GuardianReconcileFlow: C1, an invalidation BEFORE the reconcile starts does not abort it",
@@ -1071,14 +1073,19 @@ TEST_CASE("GuardianReconcileFlow: C1, the owner of a detached load and a waiter 
         // Bounded so a regression fails the test instead of hanging it.
         cv.wait_for(lk, 10s, [&] { return release; });
     };
-    // The waiter's SECOND bundle-cache clock read is the one taken right after it joined the
-    // flight and before it blocks. The hook only signals it: the cache must not be re-entered
-    // from its own clock, so the test thread does the invalidate.
+    // The waiter's SECOND bundle-cache clock read is `t0`, taken right after it joined the flight
+    // and before it blocks. The Rig reads the manual clock BEFORE it runs this hook, so `t0`
+    // is already fixed when the hook advances time: the advance below is therefore seen only
+    // by the waiter's post-wait read, on the waiter's own thread and in program order (no race
+    // with `t0`), and its `waited` is exactly 1 s as in production. The hook then signals; the
+    // cache must not be re-entered from its own clock, so the test thread does the invalidate.
     rig.bundle_clock_hook = [&] {
         if (std::this_thread::get_id() != waiter_thread.load())
             return;
-        if (++waiter_clock_calls == 2)
+        if (++waiter_clock_calls == 2) {
+            rig.clock.advance(1s);
             joined.set_value();
+        }
     };
 
     std::jthread owner([&] { rig.run("agent-owner", 0); });
@@ -1088,10 +1095,10 @@ TEST_CASE("GuardianReconcileFlow: C1, the owner of a detached load and a waiter 
         rig.run("agent-waiter", 0);
     });
     REQUIRE(joined_f.wait_for(10s) == std::future_status::ready);
-    // The waiter has joined the owner's flight and is about to block. Time passes while it
-    // blocks, as in production, so its `waited` is not zero: a waiter must abort exactly like
-    // the owner (a check that only the zero-wait owner performs would leave it sending).
-    rig.clock.advance(1s);
+    // The waiter has joined the owner's flight, is about to block, and 1 s has passed on the
+    // manual clock (advanced by the hook), so its `waited` is not zero: a waiter must abort
+    // exactly like the owner (a check that only the zero-wait owner performs would leave it
+    // sending).
     rig.bundle_cache.invalidate();
     {
         std::lock_guard lk(m);
