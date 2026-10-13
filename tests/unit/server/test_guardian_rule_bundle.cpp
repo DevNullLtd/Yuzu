@@ -458,7 +458,10 @@ TEST_CASE("GuardianRuleBundleCache: a throwing or missing loader becomes an erro
 
 TEST_CASE("GuardianRuleBundleCache: concurrent callers for one generation share one load",
           "[guardian][rule_bundle]") {
-    GuardianRuleBundleCache cache;
+    // CountingClock proves every follower has joined the flight before the loader is released:
+    // the owner reads the clock once, each follower twice (the lock, then t0 before it blocks).
+    CountingClock clk;
+    GuardianRuleBundleCache cache({.max_wait = 60'000ms}, clk.fn());
     Event entered, release;
     std::atomic<int> calls{0};
     const GuardianRuleBundleCache::LoaderFn slow = [&] {
@@ -468,22 +471,64 @@ TEST_CASE("GuardianRuleBundleCache: concurrent callers for one generation share 
         return std::expected<Bundle, BundleLoadError>(make_bundle({rule("x", "")}, {"x"}));
     };
 
-    std::vector<std::shared_ptr<const Bundle>> got(8);
+    constexpr std::size_t kCallers = 8;
+    // Results are stored and asserted on the main thread: an unwrapped error inside a jthread
+    // body would terminate the binary instead of failing the test.
+    std::vector<GuardianRuleBundleCache::Result> got(kCallers, std::shared_ptr<const Bundle>{});
     std::vector<std::jthread> ts;
-    ts.emplace_back([&] { got[0] = cache.get(4, slow).value(); });
+    ts.emplace_back([&] { got[0] = cache.get(4, slow); });
     REQUIRE(entered.wait());  // the flight is registered before the loader body runs
-    for (std::size_t i = 1; i < got.size(); ++i)
-        ts.emplace_back([&, i] { got[i] = cache.get(4, slow).value(); });
+    for (std::size_t i = 1; i < kCallers; ++i)
+        ts.emplace_back([&, i] { got[i] = cache.get(4, slow); });
+    const bool followers_joined = clk.wait_for_calls(1 + 2 * static_cast<int>(kCallers - 1));
     release.set();
     for (auto& t : ts)
         t.join();
+    REQUIRE(followers_joined);
     CHECK(calls.load() == 1);
     CHECK(cache.loads() == 1);
-    for (const auto& p : got) {
-        REQUIRE(p != nullptr);
-        CHECK(p.get() == got[0].get());
-        CHECK(p->generation == 4);
+    for (const auto& r : got) {
+        REQUIRE(r.has_value());
+        REQUIRE(*r != nullptr);
+        CHECK(r->get() == got[0]->get());
+        CHECK((*r)->generation == 4);
     }
+}
+
+TEST_CASE("GuardianRuleBundleCache: invalidate() and a replacing install release the held bundle",
+          "[guardian][rule_bundle]") {
+    // The cache moves the old held bundle out and lets it die after mu_ is released. The lock
+    // state at destruction is not observable from here (Bundle has no destructor hook); this
+    // pins the part that is: the cache keeps no extra reference, so the bundle really is
+    // released once the caller drops its own, whether it was dropped or replaced.
+    GuardianRuleBundleCache cache;
+    std::atomic<int> calls{0};
+
+    std::weak_ptr<const Bundle> first;
+    {
+        auto r = cache.get(1, counting_loader(calls, "one"));
+        REQUIRE(r.has_value());
+        first = *r;
+    }
+    CHECK_FALSE(first.expired());  // still held by the cache
+    cache.invalidate();
+    CHECK(first.expired());
+    CHECK_FALSE(cache.held_generation().has_value());
+
+    std::weak_ptr<const Bundle> second;
+    {
+        auto r = cache.get(2, counting_loader(calls, "two"));
+        REQUIRE(r.has_value());
+        second = *r;
+    }
+    CHECK_FALSE(second.expired());
+    {
+        auto r = cache.get(3, counting_loader(calls, "three"));  // replaces generation 2
+        REQUIRE(r.has_value());
+        CHECK((*r)->generation == 3);
+    }
+    CHECK(second.expired());
+    CHECK(cache.held_generation() == 3);
 }
 
 TEST_CASE("GuardianRuleBundleCache: a request for another generation does not wait on a running load",
@@ -495,8 +540,8 @@ TEST_CASE("GuardianRuleBundleCache: a request for another generation does not wa
         release.wait();
         return std::expected<Bundle, BundleLoadError>(make_bundle({rule("slow", "")}, {"slow"}));
     };
-    std::shared_ptr<const Bundle> slow_result;
-    std::jthread t([&] { slow_result = cache.get(1, slow).value(); });
+    GuardianRuleBundleCache::Result slow_got = std::shared_ptr<const Bundle>{};
+    std::jthread t([&] { slow_got = cache.get(1, slow); });
     REQUIRE(entered.wait());
 
     std::atomic<int> calls{0};
@@ -506,6 +551,8 @@ TEST_CASE("GuardianRuleBundleCache: a request for another generation does not wa
 
     release.set();
     t.join();
+    REQUIRE(slow_got.has_value());
+    const std::shared_ptr<const Bundle> slow_result = *slow_got;
     REQUIRE(slow_result != nullptr);
     CHECK(slow_result->generation == 1);  // each caller got the bundle for ITS generation
     CHECK(slow_result->rules[0].rule_id == "slow");
@@ -626,8 +673,8 @@ TEST_CASE("GuardianRuleBundleCache: a waiter gives up after max_wait while the l
         release.wait();
         return std::expected<Bundle, BundleLoadError>(make_bundle({rule("x", "")}, {"x"}));
     };
-    std::shared_ptr<const Bundle> loaded;
-    std::jthread t([&] { loaded = cache.get(4, slow).value(); });
+    GuardianRuleBundleCache::Result loaded_got = std::shared_ptr<const Bundle>{};
+    std::jthread t([&] { loaded_got = cache.get(4, slow); });
     REQUIRE(entered.wait());
 
     auto waiter = cache.get(4, slow);
@@ -638,6 +685,8 @@ TEST_CASE("GuardianRuleBundleCache: a waiter gives up after max_wait while the l
 
     release.set();
     t.join();
+    REQUIRE(loaded_got.has_value());
+    const std::shared_ptr<const Bundle> loaded = *loaded_got;
     REQUIRE(loaded != nullptr);
     CHECK(loaded->generation == 4);
     CHECK(cache.get(4, slow).has_value());  // the load installed

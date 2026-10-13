@@ -52,6 +52,11 @@ struct CountingClock {
         cv.notify_all();
         return t;
     }
+    // The number of reads so far (a baseline for wait_for_calls once a thread is parked).
+    int read_count() {
+        std::lock_guard lk(m);
+        return calls;
+    }
     // Bounded for the same reason as Event::wait: returns false on timeout.
     bool wait_for_calls(int n, std::chrono::milliseconds bound = 30'000ms) {
         std::unique_lock lk(m);
@@ -226,7 +231,10 @@ TEST_CASE("GuardianGenerationCache: a backwards clock keeps the entry fresh",
 
 TEST_CASE("GuardianGenerationCache: single flight, concurrent callers share one fetch",
           "[guardian][generation_cache]") {
-    ManualClock clk;
+    // CountingClock proves every follower has joined the flight before the fetch is released:
+    // each caller reads the clock once, inside the critical section in which it joins (or
+    // starts) the flight.
+    CountingClock clk;
     Event entered, release;
     std::atomic<int> calls{0};
     GuardianGenerationCache c(
@@ -236,17 +244,22 @@ TEST_CASE("GuardianGenerationCache: single flight, concurrent callers share one 
             release.wait();
             return 42;
         },
-        {}, clk.fn());
+        {.max_wait = 60'000ms}, clk.fn());
 
-    std::vector<std::uint64_t> got(8, 0);
+    constexpr std::size_t kCallers = 8;
+    // value_or, not value(): a regression must fail the CHECKs below, not throw out of a
+    // jthread body (std::terminate).
+    std::vector<std::uint64_t> got(kCallers, 0);
     std::vector<std::jthread> ts;
-    ts.emplace_back([&] { got[0] = c.get().value(); });
+    ts.emplace_back([&] { got[0] = c.get().value_or(0); });
     REQUIRE(entered.wait());  // the flight is registered before the fetch body runs
-    for (std::size_t i = 1; i < got.size(); ++i)
-        ts.emplace_back([&, i] { got[i] = c.get().value(); });
+    for (std::size_t i = 1; i < kCallers; ++i)
+        ts.emplace_back([&, i] { got[i] = c.get().value_or(0); });
+    const bool followers_joined = clk.wait_for_calls(static_cast<int>(kCallers));
     release.set();
     for (auto& t : ts)
         t.join();
+    REQUIRE(followers_joined);
     CHECK(calls.load() == 1);
     for (auto v : got)
         CHECK(v == 42);
@@ -271,7 +284,7 @@ TEST_CASE("GuardianGenerationCache: a stale success is served while a refresh is
     clk.advance(3s);  // expired
 
     std::uint64_t refreshed = 0;
-    std::jthread leader([&] { refreshed = c.get().value(); });
+    std::jthread leader([&] { refreshed = c.get().value_or(0); });
     REQUIRE(entered.wait());
     CHECK(c.get().value() == 5);  // returns immediately with the previous value
     CHECK(calls.load() == 2);
@@ -284,7 +297,7 @@ TEST_CASE("GuardianGenerationCache: a stale success is served while a refresh is
 
 TEST_CASE("GuardianGenerationCache: a stale success is NOT served after an error",
           "[guardian][generation_cache]") {
-    ManualClock clk;
+    CountingClock clk;
     Event entered, release;
     std::atomic<int> calls{0};
     GuardianGenerationCache c(
@@ -300,21 +313,31 @@ TEST_CASE("GuardianGenerationCache: a stale success is NOT served after an error
                 return 9;
             }
         },
-        {}, clk.fn());
+        {.max_wait = 60'000ms}, clk.fn());
     REQUIRE(c.get().value() == 5);
-    clk.advance(3s);
+    clk.base.advance(3s);
     REQUIRE_FALSE(c.get().has_value());  // outage begins
-    clk.advance(2s);                     // negative entry expired
+    clk.base.advance(2s);                // negative entry expired
 
+    // value_or, not value(): a regression must fail the CHECKs below, not throw out of a
+    // jthread body (std::terminate).
     std::uint64_t leader_got = 0, waiter_got = 0;
-    std::jthread leader([&] { leader_got = c.get().value(); });
+    std::jthread leader([&] { leader_got = c.get().value_or(0); });
     REQUIRE(entered.wait());
-    std::jthread waiter([&] { waiter_got = c.get().value(); });
+    // The leader is parked in the fetch. The waiter reads the clock once, inside the critical
+    // section in which it joins the flight, so seeing that read proves it is a follower.
+    const int base = clk.read_count();
+    std::jthread waiter([&] { waiter_got = c.get().value_or(0); });
+    const bool waiter_joined = clk.wait_for_calls(base + 1);
     release.set();
     leader.join();
     waiter.join();
+    REQUIRE(waiter_joined);
     CHECK(leader_got == 9);
     CHECK(waiter_got == 9);  // never the pre-outage 5
+    // Initial read, the failing read, and ONE refresh: the waiter joined the leader's flight
+    // instead of starting a fetch of its own.
+    CHECK(calls.load() == 3);
 }
 
 TEST_CASE("GuardianGenerationCache: an invalidate during a flight is not undone by it",
@@ -333,7 +356,7 @@ TEST_CASE("GuardianGenerationCache: an invalidate during a flight is not undone 
         },
         {}, clk.fn());
     std::uint64_t older = 0;
-    std::jthread leader([&] { older = c.get().value(); });
+    std::jthread leader([&] { older = c.get().value_or(0); });
     REQUIRE(entered.wait());
     c.invalidate();
     release.set();
@@ -398,8 +421,9 @@ TEST_CASE("GuardianGenerationCache: get_fresh bypasses the TTL and installs the 
 
 TEST_CASE("GuardianGenerationCache: a stale cached generation never labels a push",
           "[guardian][generation_cache]") {
-    // GuardianReconcileFlow::run decides from get() and labels from get_fresh(). Model that: after a
-    // bump the cached value is lower than the store's, and the two reads must disagree.
+    // The reconcile flow (GuardianReconcileFlow::run, added with the reconcile wire-up) is meant
+    // to decide from get() and label from get_fresh(). Model that: after a bump the cached
+    // value is lower than the store's, and the two reads must disagree.
     ManualClock clk;
     ScriptedFetch f;
     GuardianGenerationCache c(f.fn(), {}, clk.fn());
@@ -462,7 +486,7 @@ TEST_CASE("GuardianGenerationCache: an older read finishing last does not overwr
         {}, clk.fn());
 
     std::uint64_t older = 0;
-    std::jthread t([&] { older = c.get_fresh().value(); });
+    std::jthread t([&] { older = c.get_fresh().value_or(0); });
     REQUIRE(older_entered.wait());
     clk.advance(1s);  // the second read starts strictly later
     REQUIRE(c.get_fresh().value() == 8);
@@ -505,7 +529,7 @@ TEST_CASE("GuardianGenerationCache: an invalidate during get_fresh is not undone
         },
         {}, clk.fn());
     std::uint64_t older = 0;
-    std::jthread t([&] { older = c.get_fresh().value(); });
+    std::jthread t([&] { older = c.get_fresh().value_or(0); });
     REQUIRE(entered.wait());
     c.invalidate();
     release.set();
@@ -541,7 +565,7 @@ TEST_CASE("GuardianGenerationCache: a waiter gives up after max_wait while the f
         {.max_wait = 10ms}, clk.fn());
 
     std::uint64_t leader_got = 0;
-    std::jthread leader([&] { leader_got = c.get().value(); });
+    std::jthread leader([&] { leader_got = c.get().value_or(0); });
     REQUIRE(entered.wait());
     // No cached value, so this caller waits on the flight and must time out.
     auto waiter = c.get();

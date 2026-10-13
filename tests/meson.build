@@ -2850,10 +2850,14 @@ if build_server
 
     # ── #5513 Guardian single-flight cache allocation-failure sweep ──────────
     # Fails every allocation inside GuardianGenerationCache / GuardianRuleBundleCache
-    # get() in turn and checks the NEXT call is not wedged (FlightGuard / noexcept
-    # install / run_fetch / run_loader). Replaces the global operator new, so: its own
-    # binary, absent from sanitizer builds, Linux-only (same reasons as the probe above).
-    # Both caches are header-only and self-contained: nothing from yuzu_server_core.
+    # get() (and GuardianReconcileGate::decide()) in turn and checks the NEXT call is not
+    # wedged (FlightGuard / noexcept install / run_fetch / run_loader). Replaces the global
+    # operator new, so: its own binary, absent from sanitizer builds, Linux-only (same
+    # reasons as the probe above).
+    # The caches, the budget and the gate are header-only and self-contained: nothing from
+    # yuzu_server_core. The binary links only Catch2 and builds only because make_bundle
+    # (inline, calls scope::parse from scope_engine.cpp) is never called here: do not call
+    # make_bundle in this binary.
     guardian_cache_alloc_sweep_exe = executable(
       'yuzu_guardian_cache_alloc_sweep_tests',
       files('unit/server/test_guardian_cache_alloc_sweep.cpp'),

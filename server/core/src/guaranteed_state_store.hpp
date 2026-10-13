@@ -402,9 +402,9 @@ public:
     /// Set once during single-threaded wiring, before the store is shared; it is not
     /// synchronised against concurrent mutation. NOT invoked by bump_policy_generation().
     /// Baseline deploy, delete and a deployed create commit in BaselineStore, which has its own
-    /// hook of the same shape (BaselineStore::set_on_baseline_mutation, to be wired by the reconcile wire-up to
-    /// the same invalidations through one ServerImpl wrapper), so they are covered before the caller's
-    /// own bump and fan-out run.
+    /// hook of the same shape (BaselineStore::set_on_baseline_mutation, to be wired by the
+    /// reconcile wire-up to the same invalidations through one ServerImpl wrapper), so they
+    /// are covered before the caller's own bump and fan-out run.
     void set_on_rule_mutation(std::function<void()> hook);
 
     // Observability — lock-free cumulative counters for Prometheus scraping.

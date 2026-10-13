@@ -37,13 +37,14 @@
 /// bump that FAILED after its mutation committed: the generation stays `g` while the rules
 /// are newer, and a bundle held for `g` would be served until `max_age`. Two backstops, with
 /// different reach. (1) On the replica that took a rule create/update/delete, the store's
-/// post-mutation hook (`GuaranteedStateStore::set_on_rule_mutation`, wired in `server.cpp` by the reconcile wire-up)
-/// calls `invalidate()` after the bump attempt whether or not the bump succeeded, so the
-/// next reconcile reloads at once; a Baseline update, delete or deployed create on that replica
-/// does the same through `BaselineStore::set_on_baseline_mutation`, which fires after the commit
-/// and BEFORE the caller's own bump (a separate lease) and fan-out, and so does every
-/// fanned-out push (`guardian_push_fn_`). Once wired, all three reach one `ServerImpl` wrapper that
-/// drops both caches.
+/// post-mutation hook (`GuaranteedStateStore::set_on_rule_mutation`, to be wired in
+/// `server.cpp` by the reconcile wire-up) calls `invalidate()` after the bump attempt whether
+/// or not the bump succeeded, so the next reconcile reloads at once; a Baseline update, delete
+/// or deployed create on that replica does the same through
+/// `BaselineStore::set_on_baseline_mutation`, which fires after the commit and BEFORE the
+/// caller's own bump (a separate lease) and fan-out, and so does every fanned-out push
+/// (`guardian_push_fn_`). Once wired, all three reach one `ServerImpl` wrapper that drops both
+/// caches.
 /// (2) `max_age` bounds everything the hook cannot see: another replica's edit, or a double
 /// fault. A held bundle older than it is a miss and is reloaded. NOTE what `max_age` heals and
 /// what it does not: it heals the MEMO. An agent that was already reconciled from a stale
@@ -54,9 +55,10 @@
 /// A reconcile that is ALREADY RUNNING when the hook invalidates is a third case. `get()` hands
 /// a load that `invalidate()` detached to its own caller and to the waiters that had joined it
 /// (see SHAPE), so that result can predate an edit whose bump failed while the generation label
-/// the caller holds did not move. `epoch()` is the signal: `GuardianReconcileFlow` (added with the reconcile wire-up) reads it
-/// before the fresh generation read and compares it just before the send, and sends NOTHING
-/// when it advanced (see guardian_reconcile_flow.hpp). That closes the same-replica case and
+/// the caller holds did not move. `epoch()` is the signal: `GuardianReconcileFlow` (added with
+/// the reconcile wire-up) reads it before the fresh generation read and compares it just
+/// before the send, and sends NOTHING when it advanced (guardian_reconcile_flow.hpp, added
+/// with the reconcile wire-up). That closes the same-replica case and
 /// no more: it does not see an edit that has committed but whose hook has not yet run, an
 /// invalidation that lands between the comparison and the send, another replica's edit, or an
 /// agent that converged before the edit.
@@ -64,7 +66,9 @@
 /// SHAPE.
 ///   - ONE bundle is held (the most recently loaded). A request for a different
 ///     generation reloads and replaces it, including a LOWER generation (a store reset
-///     is not hidden).
+///     is not hidden). The install is deliberately not monotonic (unlike the generation
+///     cache): a slow load for an older generation can replace a newer held bundle, which
+///     costs at most one extra reload; `get(g)` still returns only generation g.
 ///   - A failed load is never INSTALLED as the held bundle. Every waiter of that load
 ///     receives the error. The error carries which read degraded so the caller can take its
 ///     existing per-source degraded branch and audit wording. The failure IS remembered for a
@@ -276,8 +280,11 @@ public:
     /// own callers still receive its result, but it installs nothing (neither a bundle nor a
     /// remembered failure), and the next get() starts a fresh load rather than joining it.
     void invalidate() {
+        // Declared BEFORE the lock so a held bundle that this call drops is destroyed after
+        // mu_ is released (a Bundle destructor must not run under the cache mutex).
+        std::shared_ptr<const Bundle> dropped;
         std::lock_guard lk(mu_);
-        held_.reset();
+        dropped = std::move(held_);
         failed_.reset();
         inflight_.clear();
         ++epoch_;
@@ -324,13 +331,23 @@ private:
     }
 
     // Never throws: a failure here only means the next get() loads again.
+    //
+    // Unlike GuardianGenerationCache::install (MONOTONIC INSTALL), this install is DELIBERATELY
+    // not monotonic: a slow load for an older generation that finishes last can replace a
+    // newer held bundle. The cost is at most one extra reload, and get(g) still returns only a
+    // bundle for generation g (it checks `held_->generation`), so no caller is ever handed a
+    // bundle for the wrong generation.
     void install(const Result& r, std::uint64_t generation, Clock::time_point started,
                  std::uint64_t epoch) noexcept {
+        // Declared BEFORE the try/lock so the replaced bundle is destroyed after mu_ is
+        // released (a Bundle destructor must not run under the cache mutex).
+        std::shared_ptr<const Bundle> replaced;
         try {
             std::lock_guard lk(mu_);
             if (epoch != epoch_)
                 return;  // invalidate() ran during the load: its rows may predate the edit
             if (r.has_value()) {
+                replaced = std::move(held_);
                 held_ = *r;
                 held_at_ = started;
                 failed_.reset();

@@ -36,8 +36,10 @@
  * (thread_local), so allocation inside Catch2 itself is never failed. No Catch2 assertion
  * runs while armed.
  *
- * The two caches are header-only and self-contained, so this binary links nothing from
- * libyuzu_server_core.
+ * The caches, the budget and the gate are header-only and self-contained, so this binary links
+ * nothing from libyuzu_server_core (only Catch2). It builds only because make_bundle (inline,
+ * calls scope::parse from scope_engine.cpp) is never called here: do not call make_bundle in
+ * this binary, it needs scope_engine.cpp.
  */
 
 #include "../../../server/core/src/guardian_generation_cache.hpp"
@@ -115,8 +117,10 @@ constexpr long kSweepCeiling = 2000;
 // One sweep configuration: whether the first fetch/load fails, and the fewest allocation
 // points the sweep must have exercised. A sweep that ends sooner ran against code that
 // allocates less than expected, i.e. the injector is not reaching it and the test would be
-// vacuous. The floors sit below the counts measured on libstdc++ (reported in the PR) so a
-// compiler/library difference in make_shared/std::function placement does not trip them.
+// vacuous. The floors sit below the counts measured on libstdc++ (allocation points swept,
+// failing-first / succeeding-first: generation cache get() and invalidate-after-get 6 / 3,
+// get_fresh() 1 / 0, rule bundle get() and invalidate-after-get 7 / 12, gate decide() 2) so
+// a compiler/library difference in make_shared/std::function placement does not trip them.
 using SweepSpec = std::pair<bool, long>;
 
 constexpr std::uint64_t kGoodValue = 7;
