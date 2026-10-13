@@ -1304,6 +1304,11 @@ TEST_CASE("WorkflowEngine::query_executions_page: the SQL visibility predicate e
         {"quote-and-backslash-in", R"(["a\"b","c\\d"])"},
         {"whitespace-padded-json", " \n[ \"a1\" ]\t"},
         {"nul-only", R"(["\u0000"])"}, // jsonb refuses \u0000; both sides still say not visible
+        // Non-string elements are ignored even when their TEXT equals an in-scope id ("7", "true"):
+        // dropping the SQL jsonb_typeof(...) = 'string' test would admit these.
+        {"number-element", "[7]"},
+        {"bool-element", "[true]"},
+        {"string-seven", R"(["7"])"},
     };
     int64_t t = 1000;
     for (const auto& [label, json] : corpus)
@@ -1317,6 +1322,7 @@ TEST_CASE("WorkflowEngine::query_executions_page: the SQL visibility predicate e
         {"a\"b"},
         {"c\\d", "z9"},
         {"\xc3\xa9" "1"},
+        {"7", "true"},
         {"a1", "b1", "z9", "y8", "A1", " a1", "a\"b", "c\\d", "\xc3\xa9" "1"},
     };
     for (const auto& scope_vec : scopes) {
