@@ -1598,6 +1598,7 @@ if build_server
       'unit/server/test_body_cap_policy.cpp', # #2407: pre-auth request-body cap policy table (method+segment-boundary path -> cap/requires_measurable/metric label)
       'unit/server/test_body_cap_route_inventory.cpp', # #2407: architect-mandated route-inventory coverage — every ACTUALLY REGISTERED POST/PUT/PATCH route resolves to a deliberate class, mechanically scanned from server/core/src at test run time
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
+      'unit/server/test_presence_departure.cpp', # #5678: the one departure->presence mirror both disconnect paths share (pure helper cases)
       'unit/server/test_shutdown_join_order.cpp', # #3495: agent_server_->Shutdown(deadline) runs before the policy-eval/pre-flight/quarantine/schedule joins + the heartbeat fn-null wait, mechanically scanned from server.cpp at test run time
       'unit/server/test_store_worker_pool.cpp', # #3261: StoreWorkerPool submit/quiesce/backpressure/exception-firewall, no HTTP (avoids the unrelated TSan/glibc crash #2504)
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
@@ -3352,6 +3353,19 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   _python3_test,
   args: [files('test_agent_ota_wiring_lexical.py')],
   suite: 'agent',
+  timeout: 30,
+)
+
+# #5678: static lexical gate pinning that BOTH disconnect paths (direct Subscribe in
+# agent_service_impl.cpp, gateway DISCONNECTED in gateway_service_impl.cpp) mirror a departure into
+# durable presence only through mirror_departure_to_presence() with the real gate; the direct path
+# has no unit harness (bidi stream). Carries its own in-memory mutation self-test. No build required.
+# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
+# no-build gate labelled 'server' fails that check on the Windows legs (see the gateway-upstream gate below).
+test('presence departure wiring lexical gate (#5678)',
+  _python3_test,
+  args: [files('test_presence_departure_wiring_lexical.py')],
+  suite: 'docs',
   timeout: 30,
 )
 

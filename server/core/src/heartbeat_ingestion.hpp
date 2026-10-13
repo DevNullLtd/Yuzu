@@ -67,8 +67,8 @@ public:
     void set_offline_endpoint_store(OfflineEndpointStore* s) { offline_store_ = s; }
 
     /// HA WS-5 (ADR-2002 §7a): lets a disconnect handler reach the same
-    /// durable presence store this class writes, for a session-guarded
-    /// delete (`OfflineEndpointStore::remove_if_session`) — reusing the
+    /// durable presence store this class writes, for the session-guarded
+    /// presence clear (presence_departure.hpp) — reusing the
     /// existing wiring rather than threading a second pointer through
     /// `AgentServiceImpl`/`GatewayUpstreamServiceImpl`. May be null.
     [[nodiscard]] OfflineEndpointStore* offline_endpoint_store() const { return offline_store_; }
