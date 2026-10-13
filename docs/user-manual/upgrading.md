@@ -260,7 +260,8 @@ is accepted and matches the same rows as omitting it. On the auth-sample export 
 and is unchanged.
 
 The same strictness now covers the dashboard fragments' `page`/`per_page`, the software
-inventory, DEX perf, network quality, hardware and CA-issued lists, the notification, webhook and
+inventory (the three software fragments answer `200` with an `inv-caveat` note for a malformed
+`limit` and ignore a well-formed one, which uses a fixed page size), DEX perf, network quality, hardware and CA-issued lists, the notification, webhook and
 offload delivery lists, the DEX, network and result-set `limit` and the Guaranteed State events `limit`/`offset` (trailing characters are `400`; an integer outside the result-set page range still uses the default page size),
 the pre-flight run list `limit`, the pre-flight run form's `min_gib` and `window` (a malformed value
 or a negative `min_gib` is `400`; an empty field keeps its default; a `window` of zero or below uses 30
@@ -271,7 +272,10 @@ integer is `400`; see [Pre-flight](preflight.md)), the hardware sync poll's `awa
 `Last-Event-ID` header is served live only (nothing replayed, never the whole buffer) rather than
 a `400`, and `-1` and `5abc` are never accepted as cursors (`5abc` used to replay from 5). On the
 query-parameter routes, a parameter that is present but empty (`?limit=`) is malformed, not
-absent, `GET /api/v1/audit` `limit` included. The verify fragment's `window`
+absent, `GET /api/v1/audit` `limit` included, except `limit` on the software list and catalogue
+routes and fragments, where an empty `limit=` means the default (see
+[the software installs read](#behaviour-change-the-software-installs-read-validates-its-inputs-and-audits-an-out-of-scope-target)).
+The verify fragment's `window`
 is refused with its usual `200` note instead of a `4xx` (the dashboard drops `4xx` bodies).
 
 Four admin forms stop silently saving a different value than the one typed. A malformed

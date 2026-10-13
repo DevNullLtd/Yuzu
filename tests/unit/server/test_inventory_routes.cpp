@@ -974,11 +974,48 @@ TEST_CASE("software routes: a malformed limit is refused, not read as the defaul
         REQUIRE(cat);
         CHECK(cat->status == 200);
         CHECK(contains(cat->body, "inv-caveat"));
+        CHECK(contains(cat->body, "invalid limit")); // the style block alone names inv-caveat
         auto dev = h.sink.Get(std::string(kDevices) + "?name=Chrome&limit=" + bad);
         REQUIRE(dev);
         CHECK(dev->status == 200);
         CHECK(contains(dev->body, "inv-caveat"));
+        CHECK(contains(dev->body, "invalid limit")); // the style block alone names inv-caveat
+        auto ver = h.sink.Get(std::string(kVersions) + "?name=Chrome&limit=" + bad);
+        REQUIRE(ver);
+        CHECK(ver->status == 200);
+        CHECK(contains(ver->body, "inv-caveat"));
+        CHECK(contains(ver->body, "invalid limit")); // the style block alone names inv-caveat
     }
     CHECK_FALSE(h.last_catalog_query.has_value());
+    CHECK_FALSE(h.last_versions_query.has_value());
     CHECK_FALSE(h.last_fleet_query.has_value());
+}
+
+// Positive control for the refusal above: a well-formed `limit` is validated, then ignored (the
+// fragments use a fixed page size), and an EMPTY `limit=` means the default, not a refusal. Both
+// reach the store and render without the caveat, so the malformed case is not refused merely
+// because every `limit` is.
+TEST_CASE("software routes: a well-formed or empty limit reads the store without a caveat",
+          "[inventory][route][numeric_params]") {
+    for (const char* lim : {"50", ""}) {
+        INFO("limit=" << lim);
+        InvHarness h;
+        auto cat = h.sink.Get(std::string(kSoftware) + "?limit=" + lim);
+        REQUIRE(cat);
+        CHECK(cat->status == 200);
+        CHECK_FALSE(contains(cat->body, "invalid limit"));
+        REQUIRE(h.last_catalog_query);
+        CHECK(h.last_catalog_query->limit == 100); // fixed page size, whatever was asked
+        auto ver = h.sink.Get(std::string(kVersions) + "?name=Chrome&limit=" + lim);
+        REQUIRE(ver);
+        CHECK(ver->status == 200);
+        CHECK_FALSE(contains(ver->body, "invalid limit"));
+        REQUIRE(h.last_versions_query);
+        CHECK(h.last_versions_query->limit == 200);
+        auto dev = h.sink.Get(std::string(kDevices) + "?name=Chrome&limit=" + lim);
+        REQUIRE(dev);
+        CHECK(dev->status == 200);
+        CHECK_FALSE(contains(dev->body, "invalid limit"));
+        CHECK(h.last_fleet_query.has_value());
+    }
 }
