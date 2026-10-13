@@ -5179,7 +5179,7 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
     //  - a pending head that is link-down-Retained or persistently throwing still blocks while
     //    pending (it holds the other lane for H, then N launches per H).
     // `running` stays true through journaled_send's mark_batch_sent KV write after the wire
-    // write (guardian_engine.cpp:3666-3670): a longer hold, never a shorter one.
+    // write (`journaled_send` in guardian_engine.cpp): a longer hold, never a shorter one.
     std::lock_guard<std::mutex> dg{drain_mu_};
     DrainOutcome out;
 
