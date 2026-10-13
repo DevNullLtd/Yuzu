@@ -596,6 +596,14 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
         return {};
     }
 
+    // The request target, built BEFORE any handle is opened (an allocation failure here must not
+    // leak one): path + query. Both buffers are zero-initialized and NUL-terminated by the crack.
+    // An empty path with a query (`https://host?x=1`) must still start with '/': the request
+    // target is `/?x=1`, as split_http_url builds it on the other platforms.
+    std::wstring target = std::wstring(path) + extra;
+    if (path[0] == 0 && extra[0] != 0)
+        target.insert(0, L"/");
+
     HINTERNET session = WinHttpOpen(L"Yuzu-Server/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) {
@@ -611,12 +619,6 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
     }
 
     DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-    // Both buffers are zero-initialized and NUL-terminated by the crack: path + query.
-    std::wstring target = std::wstring(path) + extra;
-    // An empty path with a query (`https://host?x=1`) must still start with '/': the request
-    // target is `/?x=1`, as split_http_url builds it on the other platforms.
-    if (path[0] == 0 && extra[0] != 0)
-        target.insert(0, L"/");
     HINTERNET request = WinHttpOpenRequest(connect, L"POST", target.c_str(), nullptr,
                                            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!request) {

@@ -3014,6 +3014,9 @@ TEST_CASE("OIDC: an authorization endpoint whose query uses a name Yuzu appends 
     CHECK(refused("https://idp.test/a?Client_Id=x"));
     CHECK(refused("https://idp.test/a?x=1&STATE=x"));
     CHECK(refused("https://idp.test/a?st%41te=x")); // %41 is 'A'
+    // An escape that ends the name or the whole string is still decoded (bounds edge).
+    CHECK(refused("https://idp.test/a?client_i%64=x"));
+    CHECK(refused("https://idp.test/a?x=1&client_i%64"));
 
     // Not reserved: a longer name, ordinary IdP hints, a B2C policy, a ';' pair.
     for (const char* ok : {"https://idp.test/a?client_idx=1", "https://idp.test/a?ui_locales=en",
