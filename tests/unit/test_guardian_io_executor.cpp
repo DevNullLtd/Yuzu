@@ -409,6 +409,7 @@ TEST_CASE("run: a late result after Timeout is delivered to on_abandoned exactly
     REQUIRE(spin_until([&] { return abandoned_calls->load() == 1; }));
     CHECK(abandoned_value->load() == 99);
     CHECK(spin_until([&] { return ex.active_worker_count() == 0; }));
+    CHECK(abandoned_calls->load() == 1); // still exactly once after the worker has drained
     CHECK(ex.stats().counters[kFile].timed_out == 1);
     CHECK(ex.stats().counters[kFile].abandoned == 1);
 }

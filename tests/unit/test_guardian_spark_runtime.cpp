@@ -259,13 +259,13 @@ struct FakeBackend : ISparkBackend {
         arm_park.maybe_park(lane);
         if (throw_arm.load()) throw std::runtime_error("arm boom");
         if (fail_arm.load()) return std::unexpected(std::string{"no mechanism"});
-        arms.fetch_add(1);
         const std::uint64_t id = next.fetch_add(1);
         {
             std::lock_guard<std::mutex> lk{ids_mu_};
             armed_ids_.push_back(id);
             id_lane_[id] = lane;
         }
+        arms.fetch_add(1); // after the id is recorded: a reader that saw the count sees the id
         return id;
     }
     void disarm(std::uint64_t sub) override {
@@ -6719,9 +6719,10 @@ TEST_CASE("rung 9c R5.2 (adversarial review C1/K1'): an adopted commit is publis
     rt->detach_rule("r2");
     // rung 9c PR-2 Unit 3: the ->0 edge's disarm dispatches off-lock through
     // non-blocking submit_disarm_off_lock() - observed asynchronously.
-    REQUIRE(yuzu::test::spin_until([&] { return b->disarm_entries.load() == 1; },
+    // Spin on the recorded id itself: disarm_entries is bumped on ENTRY, before the id is
+    // pushed, so a reader that saw entries == 1 could still find disarmed_ids() empty.
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarmed_ids().size() == 1; },
                                    std::chrono::seconds(10)));
-    REQUIRE(b->disarmed_ids().size() == 1);
     CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
     CHECK(rt->armed_key_count() == 0);
 }
