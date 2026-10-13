@@ -21205,7 +21205,11 @@ private:
     // --guardian-reconcile-* flags). In memory and per replica: it protects per-replica
     // resources, so store load is the budget times the replica count.
     // DECLARATION ORDER IS LOAD-BEARING: the gate holds a reference to the budget, so the
-    // budget is declared first (destroyed last).
+    // budget is declared first (destroyed last). The four members below (budget, gate, generation
+    // cache, rule bundle cache) are also referenced by the flow that heartbeat_ingestion_ holds, so
+    // heartbeat_ingestion_ must stay declared BELOW them (destroyed first), and the two stores
+    // above (guaranteed_state_store_, baseline_store_) must stay declared above the caches.
+    // Invariant (aa) of tests/test_guardian_reconcile_wiring_lexical.py pins all of it.
     GuardianReconcileBudget guardian_reconcile_budget_{GuardianReconcileBudgetConfig{
         .budget_ms_per_s = cfg_.guardian_reconcile_budget_ms_per_s,
         .burst_ms = cfg_.guardian_reconcile_burst_ms,
@@ -21423,6 +21427,10 @@ private:
     /// after fleet_topology_store_ + health_store_ + metrics are wired;
     /// injected into AgentServiceImpl and GatewayUpstreamServiceImpl so
     /// both ingestion paths funnel through one entry point.
+    /// Must stay declared BELOW the guardian reconcile members (guardian_reconcile_budget_,
+    /// guardian_reconcile_gate_, guardian_generation_cache_, guardian_rule_bundle_cache_): the
+    /// reconcile flow its lambda holds references them, so this must be destroyed first (pinned
+    /// by invariant (aa) of tests/test_guardian_reconcile_wiring_lexical.py).
     std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_;
     std::unique_ptr<VizRoutes> viz_routes_;
     /// Atomic kill-switch consulted by VizRoutes on every request. Defaults

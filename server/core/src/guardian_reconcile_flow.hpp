@@ -7,16 +7,13 @@
 /// tested (tests/unit/server/test_guardian_reconcile_flow.cpp) instead of being guarded only by
 /// the lexical gate (tests/test_guardian_reconcile_wiring_lexical.py).
 ///
-/// THIS IS A MOVE, NOT A REWRITE. `run()` is the former lambda body, statement for statement.
-/// The collaborators that were `ServerImpl` members keep their member NAMES here
-/// (`guardian_reconcile_gate_`, `guardian_generation_cache_`, `guardian_rule_bundle_cache_`,
-/// `guardian_reconcile_budget_`, `metrics_`) so the moved lines read identically and
-/// `git diff --color-moved` shows the move. Only the dependencies that are NOT header-only
-/// value collaborators are injected, as nine callables (`store_wired`, `list_rules`,
-/// `deployed_ids`, `session_os`, `eval_scope`, `send_push`, `audit`, `random_suffix`, `now`)
-/// plus the `duration` histogram pointer. `now` is the one injected clock, and it drives the
-/// shed-log throttle only: the `DurationObserver` reads `steady_clock::now()` directly (and
-/// observes into `duration`), and the audit timestamps read `system_clock::now()` directly.
+/// `run()` is the control flow of that lambda, extracted so it can be unit tested. Only the
+/// dependencies that are NOT header-only value collaborators are injected, as nine callables
+/// (`store_wired`, `list_rules`, `deployed_ids`, `session_os`, `eval_scope`, `send_push`,
+/// `audit`, `random_suffix`, `now`) plus the `duration` histogram pointer. `now` is the one
+/// injected clock, and it drives the shed-log throttle only: the `DurationObserver` reads
+/// `steady_clock::now()` directly (and observes into `duration`), and the audit timestamps read
+/// `system_clock::now()` directly.
 ///
 /// WHAT STAYS IN server.cpp (deliberately, because it is security-relevant wiring and not
 /// control flow): the `DispatchCaller{.system = true}` construction and the
@@ -28,7 +25,9 @@
 ///
 /// LIFETIME. Every reference handed to the constructor must outlive the flow. In production
 /// they are `ServerImpl` members, which outlive `heartbeat_ingestion_` (the only holder of the
-/// flow, through the lambda) for the same reason they outlived the old lambda.
+/// flow, through the lambda) because `heartbeat_ingestion_` is declared BELOW them and so is
+/// destroyed first. That declaration order is pinned by invariant (aa) of
+/// tests/test_guardian_reconcile_wiring_lexical.py.
 ///
 /// Thread-safe to the extent its collaborators are: `run()` is called concurrently from every
 /// heartbeat thread and holds no state of its own except the shed-log throttle atomic.
@@ -186,7 +185,7 @@ public:
         // per-agent claim (#1209 hardening: sec-MED1/perf-S1/S2) is taken under
         // the lock BEFORE any work so concurrent heartbeats from the same agent
         // can't both reconcile, and a stuck/hostile agent can't turn every
-        // heartbeat into a registry scan. Wall-clock based so it self-heals a
+        // heartbeat into a registry scan. Steady-clock based so it self-heals a
         // re-registered/wiped agent after the interval. A SHED never writes the
         // claim, so the agent earns no holdoff for a push that never happened.
         GuardianReconcileGate::ShedCause shed_cause =
@@ -230,13 +229,17 @@ public:
                     spdlog::warn("Guardian heartbeat reconcile: in-flight reconcile "
                                  "cap reached, shedding re-pushes (agents retry on "
                                  "their next heartbeat; {} shed so far; this line is "
-                                 "logged at most once a minute)",
+                                 "logged at most once a minute); see "
+                                 "yuzu_server_guardian_reconcile_in_flight",
                                  shed_so_far);
                 else
                     spdlog::warn("Guardian heartbeat reconcile: admission budget or "
                                  "per-second ceiling exhausted, shedding re-pushes "
                                  "(agents retry on their next heartbeat; {} shed so "
-                                 "far; this line is logged at most once a minute)",
+                                 "far; this line is logged at most once a minute); see "
+                                 "--guardian-reconcile-budget-ms-per-s, "
+                                 "--guardian-reconcile-max-per-s and "
+                                 "yuzu_server_guardian_reconcile_budget_balance_ms",
                                  shed_so_far);
             }
             return;
@@ -395,14 +398,14 @@ public:
             const auto& err = bundle_result.error();
             switch (err.source) {
             case guardian::BundleLoadError::Source::rules:
-                spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) — "
+                spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) - "
                              "aborting re-push for agent_id={}",
                              err.detail, ::yuzu::log_id_token(agent_id));
                 abort_degraded("rule store degraded", err.detail);
                 break;
             case guardian::BundleLoadError::Source::deployed:
                 spdlog::warn("Guardian heartbeat reconcile: deployed_member_rule_ids "
-                             "degraded ({}) — aborting re-push for agent_id={}",
+                             "degraded ({}) - aborting re-push for agent_id={}",
                              err.detail, ::yuzu::log_id_token(agent_id));
                 abort_degraded("baseline store degraded", err.detail);
                 break;
@@ -438,7 +441,10 @@ public:
         // which sent a NARROWED full_sync and silently disarmed the rule on this
         // agent. It now sets scope_degraded and the reconcile is aborted below
         // through the degraded branch (counter, ABORTED audit row, log), sending
-        // NOTHING; the agent keeps its current rules and is retried.
+        // NOTHING; the agent keeps its current rules and is retried. The same holds
+        // for EVERY error kind except Unresolvable (none of them means "zero
+        // matches", see scope_eval_error.hpp), so a kind added to the enum later is
+        // an abort until it is deliberately classified here.
         bool scope_degraded = false;
         std::string scope_degraded_detail;
         std::unordered_map<std::string, bool> scope_member;
@@ -455,14 +461,15 @@ public:
                     const auto eval = eval_scope_(agent_id, *parsed);
                     if (eval) {
                         member = *eval;
-                    } else if (eval.error().kind == ScopeEvalError::Kind::StoreDegraded) {
+                    } else if (eval.error().kind != ScopeEvalError::Kind::Unresolvable) {
                         scope_degraded = true;
                         scope_degraded_detail = to_string(eval.error().kind);
                         if (!eval.error().detail.empty())
                             scope_degraded_detail += ": " + eval.error().detail;
                         return false;
                     }
-                    // Any other error kind (Unresolvable): not a member.
+                    // Unresolvable (an atom that cannot be resolved at this call site):
+                    // not a member.
                 }
                 scope_member.emplace(expr, member);
                 return member;

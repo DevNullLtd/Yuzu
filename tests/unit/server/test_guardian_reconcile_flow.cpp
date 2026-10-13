@@ -91,7 +91,17 @@ struct RigOptions {
     std::uint64_t store_generation{7};
 };
 
-enum class ScopeOutcome { Member, NotMember, Unresolvable, StoreDegraded };
+enum class ScopeOutcome {
+    Member,
+    NotMember,
+    Unresolvable,
+    StoreDegraded,
+    // The remaining ScopeEvalError kinds. The local evaluator the server wires never returns
+    // them today; the flow must still treat each as an untrusted read and abort.
+    PrincipalUnresolved,
+    OwnerCheckFailed,
+    PresenceDegraded
+};
 
 struct SentPush {
     std::string agent_id;
@@ -205,6 +215,8 @@ public:
                 return deployed;
             },
             .session_os = [this](const std::string& agent_id) -> std::optional<std::string> {
+                if (session_hook)
+                    session_hook();
                 std::lock_guard lk(fx_mu);
                 note("session");
                 session_agents.push_back(agent_id);
@@ -234,17 +246,30 @@ public:
                 case ScopeOutcome::StoreDegraded:
                     return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::StoreDegraded,
                                                           "tag store down"});
+                case ScopeOutcome::PrincipalUnresolved:
+                    return std::unexpected(
+                        ScopeEvalError{ScopeEvalError::Kind::PrincipalUnresolved, "no principal"});
+                case ScopeOutcome::OwnerCheckFailed:
+                    return std::unexpected(
+                        ScopeEvalError{ScopeEvalError::Kind::OwnerCheckFailed, "rs-1"});
+                case ScopeOutcome::PresenceDegraded:
+                    return std::unexpected(
+                        ScopeEvalError{ScopeEvalError::Kind::PresenceDegraded, "presence down"});
                 }
                 return false;
             },
             .send_push = [this](const std::string& agent_id, const std::string& command_id,
                                 const std::string& bytes) {
+                if (send_hook)
+                    send_hook();
                 std::lock_guard lk(fx_mu);
                 note("send_push");
                 sent.push_back({agent_id, command_id, bytes});
                 return send_result;
             },
             .audit = [this](const AuditEvent& ev) {
+                if (audit_hook)
+                    audit_hook();
                 // Two flows can abort at once in the two-thread tests; note() takes the same
                 // (recursive) lock.
                 std::lock_guard lk(fx_mu);
@@ -252,6 +277,8 @@ public:
                 audits.push_back(ev);
             },
             .random_suffix = [this] {
+                if (suffix_hook)
+                    suffix_hook();
                 std::lock_guard lk(fx_mu);
                 return "sfx" + std::to_string(suffix_base + ++suffix_calls);
             },
@@ -316,6 +343,11 @@ public:
     bool send_result{true};
     std::function<void()> list_hook;
     std::function<void()> eval_hook;
+    // Run at the top of the matching stub, before it records anything; a test makes one throw.
+    std::function<void()> session_hook;
+    std::function<void()> send_hook;
+    std::function<void()> audit_hook;
+    std::function<void()> suffix_hook;
     std::function<void()> bundle_clock_hook;
     // Guards every recorded effect below against two concurrent flows (the two-thread test).
     // Never held across a hook, so a flow blocked in list_hook cannot stall the other one.
@@ -741,6 +773,43 @@ TEST_CASE("GuardianReconcileFlow: an unresolvable scope is not a member, the pus
     CHECK(rule_ids(parse_push(rig.sent[0].bytes)) == std::vector<std::string>{"open", "scoped-in"});
     CHECK(rig.count("sent") == 1.0);
     CHECK(rig.count("degraded") == 0.0);
+}
+
+TEST_CASE("GuardianReconcileFlow: any scope error kind except Unresolvable aborts like a degraded store",
+          "[guardian][reconcile_flow]") {
+    // `Unresolvable` alone means "not a member" (previous test). Every other kind is an untrusted
+    // read, so it must withhold the WHOLE push, never narrow it.
+    struct Kind {
+        const char* name;
+        ScopeOutcome outcome;
+        const char* expected_error;  // "<to_string(kind)>: <detail>" as the stub raises it
+    };
+    const Kind kinds[] = {
+        {"presence_degraded", ScopeOutcome::PresenceDegraded, "presence_degraded: presence down"},
+        {"principal_unresolved", ScopeOutcome::PrincipalUnresolved,
+         "principal_unresolved: no principal"},
+        {"owner_check_failed", ScopeOutcome::OwnerCheckFailed, "owner_check_failed: rs-1"},
+    };
+    for (const auto& k : kinds) {
+        DYNAMIC_SECTION(k.name) {
+            Rig rig;
+            rig.set_rules({rule("open"), rule("scoped-a", "", "tag:grp == alpha"), rule("open2")});
+            rig.scope_outcomes["alpha"] = k.outcome;
+            rig.run();
+            CHECK(rig.count("degraded") == 1.0);
+            CHECK(rig.total() == 1.0);
+            REQUIRE(rig.audits.size() == 1);
+            CHECK(rig.audits[0].detail == aborted("scope store degraded", k.expected_error));
+            CHECK(rig.audits[0].result == "degraded");
+            CHECK(rig.sent.empty());  // NOT a narrowed push of the unscoped rules
+            CHECK(rig.dispatched() == 0.0);
+            CHECK(rig.generation_gauge() == 0.0);
+            CHECK(rig.gate.claims_size() == 1);  // the claim is KEPT, as for a degraded store
+            CHECK(rig.gate.in_flight() == 0);
+            CHECK(rig.duration_count() == 1);
+            CHECK(rig.eval_agents == std::vector<std::string>{"agent-1"});
+        }
+    }
 }
 
 TEST_CASE("GuardianReconcileFlow: scope membership is evaluated once per distinct expression per reconcile",
@@ -1440,6 +1509,104 @@ TEST_CASE("GuardianReconcileFlow: every exit path makes at most one result incre
             CHECK(rig.duration_count() - durations_before == (sc.admitted ? 1u : 0u));
             CHECK(rig.budget.admitted_total() - admitted_before == (sc.admitted ? 1u : 0u));
             CHECK(rig.gate.in_flight() == held);  // only a slot the test itself holds remains
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// A dependency that throws after admission. The flow has no catch of its own, so the exception
+// PROPAGATES to the caller (the heartbeat thread); what the flow guarantees on the unwind is
+// that the RAII pieces still run: the in-flight slot is released, the measured time is debited,
+// the duration is observed once, and the claim Admit wrote stays (so the agent is not
+// re-admitted on its next heartbeat inside the interval).
+// ---------------------------------------------------------------------------------------
+
+namespace {
+
+struct ThrowCase {
+    const char* name;
+    std::function<void(Rig&)> arm;     // make one dependency throw
+    std::function<void(Rig&)> disarm;  // undo it, for the recovery run
+    double sent_label;                 // result="sent" increments before the throw
+    double degraded_label;             // result="degraded" increments before the throw
+    std::size_t pushes;                // pushes recorded as delivered before the throw
+};
+
+const auto kBoom = [] { throw std::runtime_error("injected dependency failure"); };
+
+std::vector<ThrowCase> throwing_dependencies() {
+    return {
+        {"session_os throws",
+         [](Rig& r) { r.session_hook = kBoom; },
+         [](Rig& r) { r.session_hook = nullptr; }, 0.0, 0.0, 0},
+        {"eval_scope throws",
+         [](Rig& r) {
+             r.set_rules({rule("scoped", "", "tag:grp == alpha")});
+             r.eval_hook = kBoom;
+         },
+         [](Rig& r) { r.eval_hook = nullptr; }, 0.0, 0.0, 0},
+        {"random_suffix throws",
+         [](Rig& r) { r.suffix_hook = kBoom; },
+         [](Rig& r) { r.suffix_hook = nullptr; }, 0.0, 0.0, 0},
+        {"send_push throws",
+         [](Rig& r) { r.send_hook = kBoom; },
+         [](Rig& r) { r.send_hook = nullptr; }, 0.0, 0.0, 0},
+        // The send already happened and was counted when the success audit row throws.
+        {"audit throws on the success row",
+         [](Rig& r) { r.audit_hook = kBoom; },
+         [](Rig& r) { r.audit_hook = nullptr; }, 1.0, 0.0, 1},
+        // abort_degraded counts first, then audits.
+        {"audit throws on an ABORTED row",
+         [](Rig& r) {
+             r.rules_error = "list_rules sql error";
+             r.audit_hook = kBoom;
+         },
+         [](Rig& r) {
+             r.rules_error = std::nullopt;
+             r.audit_hook = nullptr;
+         },
+         0.0, 1.0, 0},
+    };
+}
+
+}  // namespace
+
+TEST_CASE("GuardianReconcileFlow: a dependency that throws after admission still releases its slot, "
+          "debits the budget, observes the duration once and keeps the claim",
+          "[guardian][reconcile_flow]") {
+    for (const auto& c : throwing_dependencies()) {
+        DYNAMIC_SECTION(c.name) {
+            Rig rig;
+            c.arm(rig);
+            const double balance_before = rig.budget.balance_ms();
+
+            CHECK_THROWS_AS(rig.run(), std::runtime_error);
+
+            CHECK(rig.gate.in_flight() == 0);  // the Scoped slot is released on unwind
+            CHECK(rig.budget.admitted_total() == 1);
+            // The clock is static, so the balance moves only by the debit: min_cost (1 ms).
+            CHECK(balance_before - rig.budget.balance_ms() == Catch::Approx(1.0).margin(0.01));
+            CHECK(rig.duration_count() == 1);  // observed once, by the destructor
+            CHECK(rig.gate.claims_size() == 1);  // the claim Admit wrote is kept
+            CHECK(rig.count("sent") == c.sent_label);
+            CHECK(rig.count("degraded") == c.degraded_label);
+            CHECK(rig.total() == c.sent_label + c.degraded_label);
+            CHECK(rig.sent.size() == c.pushes);
+            CHECK(rig.audits.empty());  // the throwing sink recorded nothing
+
+            // The failure left nothing stuck: the kept claim limits the next heartbeat, and once
+            // the interval has passed the same agent is admitted and pushed again.
+            c.disarm(rig);
+            rig.clock.advance(1s);
+            rig.run();
+            CHECK(rig.count("rate_limited") == 1.0);
+            CHECK(rig.duration_count() == 1);  // a rate-limited exit is not an admitted one
+            rig.clock.advance(30s);
+            rig.run();
+            CHECK(rig.budget.admitted_total() == 2);
+            CHECK(rig.duration_count() == 2);
+            CHECK(rig.sent.size() == c.pushes + 1);
+            CHECK(rig.gate.in_flight() == 0);
         }
     }
 }

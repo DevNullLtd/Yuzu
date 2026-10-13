@@ -3417,7 +3417,7 @@ test('guardian heartbeat generation wiring lexical gate (#5513)',
 # constructs. Carries its own in-memory mutation self-test. No build required. Suite 'docs', like the
 # gateway-upstream gate above: assert-suite-cover.py has no bare 'server' entry for no-build gates.
 # Run as two halves (LEXICAL_GATE_PART) so each stays inside the 30 s budget on the slowest CI
-# host: 'heavy' is the sweep over every server.cpp wiring mutation (about 10 s of the 13 s),
+# host: 'heavy' is the sweep over every server.cpp wiring mutation (about 11 s of the 17 s),
 # 'light' is everything else. A new test method defaults to 'light'.
 test('guardian reconcile wiring lexical gate (#5513)',
   _python3_test,

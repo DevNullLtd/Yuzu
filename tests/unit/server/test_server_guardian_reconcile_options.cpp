@@ -123,10 +123,43 @@ TEST_CASE("Guardian reconcile options: zero and negative values are refused at p
     CHECK_FALSE(parse({"--guardian-reconcile-max-per-s=0"}, cfg));
 }
 
+TEST_CASE("Guardian reconcile options: what the CLI parser itself lets through or refuses",
+          "[guardian][reconcile][options]") {
+    // Measured against the CLI11 in use, not assumed: NaN passes CLI::PositiveNumber (so only
+    // guardian_reconcile_options_error() stops it); infinity, a negative value, a value that does
+    // not fit the unsigned --guardian-reconcile-max-per-s, and a fraction for it are all refused
+    // by the parser itself.
+    {
+        Config cfg;
+        REQUIRE(parse({"--guardian-reconcile-budget-ms-per-s=nan"}, cfg));
+        CHECK(std::isnan(cfg.guardian_reconcile_budget_ms_per_s));
+        CHECK(guardian_reconcile_options_error(cfg).find("--guardian-reconcile-budget-ms-per-s") !=
+              std::string::npos);
+    }
+    {
+        Config cfg;
+        REQUIRE(parse({"--guardian-reconcile-burst-ms=nan"}, cfg));
+        CHECK(guardian_reconcile_options_error(cfg).find("--guardian-reconcile-burst-ms") !=
+              std::string::npos);
+    }
+    {
+        Config cfg;
+        CHECK_FALSE(parse({"--guardian-reconcile-budget-ms-per-s=inf"}, cfg));
+        CHECK_FALSE(parse({"--guardian-reconcile-burst-ms=inf"}, cfg));
+    }
+    {
+        Config cfg;
+        CHECK_FALSE(parse({"--guardian-reconcile-max-per-s=-1"}, cfg));
+        CHECK_FALSE(parse({"--guardian-reconcile-max-per-s=4294967296"}, cfg));  // 2^32
+        CHECK_FALSE(parse({"--guardian-reconcile-max-per-s=1.5"}, cfg));
+    }
+}
+
 TEST_CASE("Guardian reconcile options: the post-parse check also refuses NaN and infinity",
           "[guardian][reconcile][options]") {
-    // CLI::PositiveNumber lets these through (std::stod accepts them); the second line of defence
-    // is guardian_reconcile_options_error().
+    // CLI::PositiveNumber lets NaN through at parse time (the next test pins that against the real
+    // parser); the second line of defence is guardian_reconcile_options_error(). These cases fill
+    // Config directly, so they also cover infinity regardless of what the parser does with it.
     Config cfg;
     cfg.guardian_reconcile_budget_ms_per_s = std::numeric_limits<double>::quiet_NaN();
     CHECK(guardian_reconcile_options_error(cfg).find("--guardian-reconcile-budget-ms-per-s") !=

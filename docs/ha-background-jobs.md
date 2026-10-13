@@ -60,7 +60,8 @@ an earlier revision missed eight of these; later additions are recorded in that 
   ReplicaSafe ones (the event-outbox poll, the three retention prunes, the app_perf
   rollup upsert, and the must-run-per-replica / shared-PG-writing passes the sweep
   added: cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
-  projector, MCP bridge sweep + session gc, store-worker delivery pools, the HA WS-8
+  projector, MCP bridge sweep + session gc, the Guardian reconcile claim sweep
+  `guardian_reconcile_gate.sweep` (#5513), store-worker delivery pools, the HA WS-8
   Postgres reachability probe).
 - That proves **named⇒classified** for those sites. It does **not** yet prove
   **pass⇒named** for every dispatch site — a `consteval`/CI sweep visiting *all* of
