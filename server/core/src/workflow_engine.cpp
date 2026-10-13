@@ -1158,9 +1158,11 @@ namespace {
 //     listed run's detail read can answer not-visible. The run still names an in-scope agent, so
 //     nothing out of scope is exposed. In latest-per-workflow mode it can change which run is a
 //     workflow's latest.
-//   - Reasoning only, not probed: an array nested thousands of levels deep may hit PostgreSQL's
-//     stack-depth guard, a hard error `pg_input_is_valid` does not trap. The statement then fails
-//     and every confined list answers the typed degrade (503, never rows) until the row is gone.
+//   - Probed on PostgreSQL 18.6 (default max_stack_depth, 2 MB): an array nested about 18,700 levels
+//     deep (a document of about 37 KB) hits the stack-depth guard, a hard error `pg_input_is_valid`
+//     does not trap; 18,650 levels is accepted. A stored row that deep fails the statement, so
+//     every confined list answers the typed degrade (503, never rows) until the row is gone. The
+//     engine only ever writes a flat array of strings, so only a bypassing write can store one.
 constexpr const char* kGuardedAgentIdsJsonb =
     "CASE WHEN pg_input_is_valid(e.agent_ids_json, 'jsonb') "
     "THEN (CASE WHEN jsonb_typeof(e.agent_ids_json::jsonb) = 'array' "
