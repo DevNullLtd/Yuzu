@@ -1,4 +1,4 @@
-## Review — approving (no CRITICAL/HIGH); one Should-fix before the F14 flip
+## Review - approving (no CRITICAL/HIGH); one Should-fix before the F14 flip
 
 Range 0a4b60ac5..bab909086 (6 local commits, #3972 + #3980). Both reviewers (Kimi K3 dynamic, Codex Sol high) built the tree, ran the targeted agent and server suites, and reached the same verdict independently. No CRITICAL/HIGH finding. One MEDIUM contract defect found by both; three LOWs.
 
