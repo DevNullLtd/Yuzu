@@ -151,124 +151,90 @@ extern const char* const kResultSetsPageHtml = R"HTM(<!DOCTYPE html>
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="/static/htmx.js"></script>
   <style>
-    body { display: flex; flex-direction: column; min-height: 100vh; }
-    .rs-content {
-      max-width: 1200px;
-      margin: 1rem auto;
-      padding: 0 1.5rem 2rem 1.5rem;
-      width: 100%;
-      box-sizing: border-box;
-      flex: 1;
-    }
-    .rs-content h1 {
-      font-size: 1.4rem;
-      margin: 0.25rem 0 0.4rem 0;
-      border-bottom: 1px solid var(--border);
-      padding-bottom: 0.5rem;
-    }
-    .rs-subtitle {
-      color: var(--mds-color-theme-text-tertiary);
-      font-size: 0.85rem;
-      margin: 0 0 1.25rem 0;
-    }
-    .rs-layout { display: flex; gap: 1.25rem; align-items: flex-start; }
-    .rs-rail { flex: 0 0 320px; }
-    .rs-main { flex: 1; min-width: 0; }
-    .rs-panel {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 0.5rem;
-      overflow: hidden;
-    }
-    .rs-panel-header {
-      padding: 0.6rem 0.85rem;
-      font-size: 0.85rem;
-      font-weight: 600;
-      border-bottom: 1px solid var(--border);
-      background: var(--mds-color-state-hover);
-    }
-    .rs-panel-body { padding: 0.5rem; }
-    .rs-item {
-      padding: 0.55rem 0.6rem;
-      border-radius: 0.3rem;
-      cursor: pointer;
-      border: 1px solid transparent;
-    }
-    .rs-item:hover { background: var(--mds-color-state-hover); }
-    .rs-item.active {
-      background: var(--mds-color-state-selected);
-      border-color: var(--accent);
-    }
-    .rs-item-top { display: flex; align-items: center; gap: 0.35rem; }
-    .rs-pin { color: var(--yellow); font-size: 0.8rem; }
-    .rs-name { font-size: 0.85rem; font-weight: 600; color: var(--fg);
+    button, input, textarea { font: inherit; color: inherit; }
+    code { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
+    :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+    .rs-content { padding: 22px 28px 36px; min-height: calc(100vh - var(--shell-top-h, 0px)); }
+    .rs-content h1 { font-size: 24px; font-weight: 600; letter-spacing: -.015em;
+                     line-height: 1.2; color: var(--ink); }
+    .rs-subtitle { color: var(--mut); margin: 4px 0 22px 0; max-width: 70ch; }
+    .rs-subtitle code { color: var(--ink2); }
+    .rs-layout { display: flex; flex-wrap: wrap; gap: 22px; align-items: flex-start; }
+    .rs-rail { flex: 1 1 320px; max-width: 360px; min-width: 0; }
+    .rs-main { flex: 999 1 560px; min-width: 0; }
+    .rs-panel { background: var(--surface); border: 1px solid var(--line);
+                border-radius: var(--rad-panel); min-width: 0; }
+    .rs-panel-header { padding: 12px 16px; font-size: 14px; font-weight: 600;
+                       color: var(--ink); border-bottom: 1px solid var(--line); }
+    .rs-detail-body { padding: 16px; }
+    .rs-item { padding: 10px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
+    .rs-item:last-child { border-bottom: 0; }
+    .rs-item:hover { background: var(--surface2); }
+    .rs-item.active { background: var(--mds-color-state-selected);
+                      box-shadow: inset 3px 0 0 var(--hl); }
+    .rs-item-top { display: flex; align-items: center; gap: 6px; }
+    .rs-pin { color: var(--info); font-size: 13px; }
+    .rs-name { font-size: 14px; font-weight: 600; color: var(--ink);
                white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .rs-item-meta {
-      display: flex; align-items: center; gap: 0.5rem;
-      margin-top: 0.2rem; font-size: 0.72rem;
-      color: var(--mds-color-theme-text-tertiary);
-    }
-    .rs-empty, .rs-detail-empty {
-      padding: 2rem 1rem; text-align: center;
-      color: var(--mds-color-theme-text-tertiary); font-size: 0.85rem;
-    }
-    .rs-badge {
-      display: inline-block; padding: 0.05rem 0.4rem; border-radius: 0.75rem;
-      font-size: 0.65rem; font-weight: 600;
-    }
-    .rs-badge-pending { background: var(--mds-color-bg-warning-tinted);
-                        color: var(--mds-color-indicator-warning-bright); }
-    .rs-badge-failed { background: var(--mds-color-bg-error-tinted);
-                       color: var(--mds-color-theme-indicator-error); }
-    .rs-badge-pinned { background: var(--mds-color-bg-warning-tinted);
-                       color: var(--mds-color-indicator-warning-bright); }
-    .rs-detail-head { display: flex; align-items: center; gap: 0.6rem;
-                      margin-bottom: 0.75rem; }
-    .rs-detail-head h2 { font-size: 1.1rem; margin: 0; }
-    .rs-breadcrumb { display: flex; flex-wrap: wrap; align-items: center;
-                     gap: 0.35rem; margin-bottom: 1rem; font-size: 0.8rem; }
-    .rs-bc-node { color: var(--mds-color-theme-text-tertiary); }
-    .rs-bc-node.current { color: var(--fg); font-weight: 600; }
-    .rs-bc-sep { color: var(--accent); }
-    .rs-stats { display: flex; gap: 1.5rem; margin-bottom: 1rem;
-                flex-wrap: wrap; }
-    .rs-stats > div { display: flex; flex-direction: column; }
-    .rs-stat-k { font-size: 0.65rem; text-transform: uppercase;
-                 letter-spacing: 0.05em; color: var(--mds-color-theme-text-tertiary); }
-    .rs-stat-v { font-size: 1rem; font-weight: 600; color: var(--fg); }
-    .rs-token-row { margin-bottom: 1rem; }
-    .rs-token-label { display: block; font-size: 0.65rem; text-transform: uppercase;
-                      letter-spacing: 0.05em; color: var(--mds-color-theme-text-tertiary);
-                      margin-bottom: 0.3rem; }
-    .rs-token { display: flex; align-items: center; gap: 0.5rem; }
-    .rs-token code {
-      flex: 1; background: var(--bg); border: 1px solid var(--border);
-      border-radius: 0.3rem; padding: 0.4rem 0.6rem; font-family: var(--mds-font-family-mono);
-      font-size: 0.8rem; color: var(--accent); overflow-x: auto;
-    }
+    .rs-item-meta { display: flex; align-items: center; gap: 8px; margin-top: 2px;
+                    font-size: 13px; color: var(--mut); }
+    .rs-empty, .rs-detail-empty { padding: 32px 16px; text-align: center;
+                                  color: var(--mut); font-size: 13.5px; }
+    .rs-badge { display: inline-flex; align-items: center; padding: 1px 8px;
+                border-radius: 3px; font-size: 12.5px; font-weight: 500; white-space: nowrap; }
+    .rs-badge-pending { background: var(--mds-color-bg-warning-tinted); color: var(--warn); }
+    .rs-badge-failed { background: var(--mds-color-bg-error-tinted); color: var(--bad); }
+    .rs-badge-pinned { background: var(--mds-color-bg-info-tinted); color: var(--info); }
+    .rs-detail-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
+                      margin-bottom: 12px; }
+    .rs-detail-head h2 { font-size: 16px; font-weight: 600; color: var(--ink); }
+    .rs-breadcrumb { display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+                     margin-bottom: 16px; font-size: 13px; }
+    .rs-bc-node { color: var(--mut); }
+    .rs-bc-node.current { color: var(--ink); font-weight: 600; }
+    .rs-bc-sep { color: var(--faint); }
+    .rs-stats { margin-bottom: 16px; border: 1px solid var(--line);
+                border-radius: var(--rad-panel); }
+    .rs-stats > div { display: flex; justify-content: space-between; gap: 16px;
+                      padding: 9px 16px; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+    .rs-stats > div:last-child { border-bottom: 0; }
+    .rs-stat-k { color: var(--mut); }
+    .rs-stat-v { color: var(--ink); font-weight: 500; text-align: right; }
+    .rs-token-row { margin-bottom: 16px; }
+    .rs-token-label { display: block; font-size: 13px; font-weight: 500; color: var(--ink2);
+                      margin-bottom: 5px; }
+    .rs-token { display: flex; align-items: center; gap: 8px; }
+    .rs-token code { flex: 1; min-width: 0; display: flex; align-items: center;
+                     height: var(--ctl); padding: 0 10px; background: var(--bg);
+                     border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+                     color: var(--ink); overflow-x: auto; white-space: nowrap; }
     .rs-copy, .rs-btn {
-      padding: 0.35rem 0.85rem; font-size: 0.8rem; border-radius: 0.25rem;
-      cursor: pointer; border: 1px solid var(--border); background: var(--surface);
-      color: var(--fg);
+      height: var(--ctl); padding: 0 14px; font-size: 14px; font-weight: 500;
+      border-radius: var(--rad-ctl); cursor: pointer; border: 1px solid var(--line2);
+      background: var(--raise); color: var(--ink); display: inline-flex; align-items: center;
+      gap: 6px; white-space: nowrap; transition: background .12s, border-color .12s;
     }
-    .rs-copy:hover, .rs-btn:hover { background: var(--mds-color-state-hover); }
-    .rs-actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
-    .rs-btn-danger { color: var(--mds-color-theme-indicator-error);
-                     border-color: var(--mds-color-theme-indicator-error); }
-    .rs-create { padding: 0.6rem; border-bottom: 1px solid var(--border); }
+    .rs-copy:hover, .rs-btn:hover { background: var(--surface2); border-color: var(--mut); }
+    .rs-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .rs-btn-danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line2)); }
+    .rs-btn-danger:hover { background: color-mix(in srgb, var(--bad) 12%, transparent);
+                           border-color: var(--bad); }
+    .rs-create { display: grid; gap: 8px; padding: 16px; border-bottom: 1px solid var(--line); }
     .rs-create input, .rs-create textarea {
-      width: 100%; box-sizing: border-box; margin-bottom: 0.4rem;
-      background: var(--bg); border: 1px solid var(--border); border-radius: 0.3rem;
-      color: var(--fg); font-size: 0.8rem; padding: 0.35rem 0.5rem;
-      font-family: inherit;
+      width: 100%; height: var(--ctl); padding: 0 10px; background: var(--bg);
+      border: 1px solid var(--line2); border-radius: var(--rad-ctl); color: var(--ink);
     }
-    .rs-create textarea { resize: vertical; min-height: 3rem;
-                          font-family: var(--mds-font-family-mono); }
+    .rs-create input::placeholder, .rs-create textarea::placeholder { color: var(--faint); }
+    .rs-create input:focus, .rs-create textarea:focus { border-color: var(--primary); }
+    .rs-create textarea { height: auto; padding: 8px 10px; min-height: 72px; resize: vertical;
+                          font-family: var(--mds-font-family-mono); font-size: 12.5px; }
     .rs-create button {
-      width: 100%; padding: 0.4rem; font-size: 0.8rem; cursor: pointer;
-      background: var(--accent); color: var(--mds-color-text-on-accent);
-      border: none; border-radius: 0.25rem;
+      height: var(--ctl); font-weight: 600; cursor: pointer; background: var(--primary);
+      color: var(--on-primary); border: 1px solid var(--primary); border-radius: var(--rad-ctl);
+      transition: background .12s, border-color .12s;
     }
+    .rs-create button:hover { background: var(--primary-h); border-color: var(--primary-h); }
+    @media (max-width: 900px) { .rs-content { padding: 16px; } .rs-rail { max-width: none; } }
   </style>
 </head>
 <body>
@@ -333,7 +299,7 @@ extern const char* const kResultSetsPageHtml = R"HTM(<!DOCTYPE html>
       <div class="rs-main">
         <div class="rs-panel">
           <div class="rs-panel-header">Detail</div>
-          <div class="rs-panel-body" id="rs-detail" style="padding:1rem">
+          <div class="rs-panel-body rs-detail-body" id="rs-detail">
             <div class="rs-detail-empty">
               <p>Select a result set to view its lineage and scope token.</p>
             </div>
