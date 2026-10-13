@@ -9,6 +9,7 @@ const char* const kHelpPageTemplate = R"HTM(<!DOCTYPE html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Yuzu — Help</title>
 <link rel="stylesheet" href="/static/yuzu.css">
+<script src="/static/htmx.js"></script>
 <style>
 .help-content{max-width:800px;margin:1.5rem auto;padding:0 1.5rem}
 h1{border-bottom:1px solid var(--border);padding-bottom:.5rem}
