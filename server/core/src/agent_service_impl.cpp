@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <string_view>
 
+#include <yuzu/log_token.hpp>
+
 #include <grpc/grpc_security_constants.h>
 
 #include <chrono>
@@ -109,15 +111,18 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                             "agent_id length exceeds 256 chars or empty");
     }
     // Defence in depth: libpq text binds take agent_id as a NUL-terminated string, so an id
-    // containing a NUL byte is refused here as well, instead of relying on the earlier
-    // pending-status check alone. No legitimate agent produces one. Distinct `reason` label
-    // from the length check; the id itself is not logged (client-supplied).
+    // containing a NUL byte is refused here as well, instead of relying on the AuthDB-level NUL
+    // check alone. No legitimate agent produces one. Distinct `reason` label from the length
+    // check; the id itself is not logged (client-supplied).
     if (info.agent_id().find('\0') != std::string::npos) {
         spdlog::warn("Register rejected: agent_id contains an embedded NUL");
         metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "nul"}}).increment();
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                             "agent_id contains an embedded NUL");
     }
+    // The enrollment store rejects control bytes and ',' in an agent_id later (get_pending_status),
+    // so every log line below prints the id neutralised, never raw.
+    const std::string safe_agent_id = ::yuzu::log_id_token(info.agent_id());
 
     // PR3: Register is bootstrap-exempt. A first-enrollment agent presents NO
     // client cert (it obtains one via this very call), so a no-cert Register is
@@ -139,13 +144,13 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 !peer_cert_recognizer_ || peer_cert_recognizer_(peer_pem);
             if (treat_as_identity) {
                 if (!peer_identity_matches_agent_id(*context, info.agent_id())) {
-                    spdlog::warn("mTLS identity mismatch: claimed agent_id={}", info.agent_id());
+                    spdlog::warn("mTLS identity mismatch: claimed agent_id={}", safe_agent_id);
                     return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
                                         "agent_id must match client certificate identity (CN/SAN)");
                 }
                 if (revocation_checker_ && !peer_pem.empty() && revocation_checker_(peer_pem)) {
                     spdlog::warn("Register rejected: revoked client cert for agent {}",
-                                 info.agent_id());
+                                 safe_agent_id);
                     return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
                                         "client certificate is revoked");
                 }
@@ -166,12 +171,12 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         // rejection to the agent, agent.cpp:1649-1657 — #3401).
         auto prior_result = auth_mgr_.get_pending_status(info.agent_id());
         if (!prior_result) {
-            spdlog::error("Register: enrollment status read failed for agent {}", info.agent_id());
+            spdlog::error("Register: enrollment status read failed for agent {}", safe_agent_id);
             return enrollment_store_status(prior_result.error());
         }
         const auto& prior = *prior_result;
         if (prior && *prior == auth::PendingStatus::approved) {
-            spdlog::info("Agent {} re-registering (already enrolled)", info.agent_id());
+            spdlog::info("Agent {} re-registering (already enrolled)", safe_agent_id);
             is_reauth = true;
             goto enrolled;
         }
@@ -200,7 +205,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                          {{"source", "direct"}, {"event", "security"}})
                 .increment();
             spdlog::warn("Register rejected: agent {} is admin-denied (no token consumed)",
-                         info.agent_id());
+                         safe_agent_id);
             response->set_accepted(false);
             response->set_reject_reason("enrollment denied by administrator");
             response->set_enrollment_status("denied");
@@ -221,7 +226,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             // shape, wrong/expired/race-lost".
             if (enrollment_token.size() > auth::kMaxEnrollmentTokenLength) {
                 spdlog::warn("Agent {} presented oversize enrollment token ({} chars > {})",
-                             info.agent_id(), enrollment_token.size(),
+                             safe_agent_id, enrollment_token.size(),
                              auth::kMaxEnrollmentTokenLength);
                 metrics_
                     .counter("yuzu_enrollment_token_rejected_total",
@@ -275,7 +280,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                               .token_error = auth::EnrollmentTokenError::not_found,
                               .already_consumed_by = {}}};
             if (!consumed) {
-                spdlog::error("Register: enrollment consume failed for agent {}", info.agent_id());
+                spdlog::error("Register: enrollment consume failed for agent {}", safe_agent_id);
                 return enrollment_store_status(consumed.error());
             }
             if (consumed->kind == auth::ConsumeEnrollResult::Kind::admin_denied) {
@@ -294,7 +299,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 auto variant = yuzu::server::enrollment_rejection_variant_name(err);
                 auto metric_name = yuzu::server::enrollment_rejection_metric_name(err);
                 spdlog::warn("Agent {} enrollment-token consume rejected: variant={}",
-                             info.agent_id(), variant);
+                             safe_agent_id, variant);
                 // High-signal counter for race-lost; low-signal bucket for
                 // everything else. enrollment_rejection_metric_name does
                 // the variant→metric mapping in one place.
@@ -391,8 +396,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             // ONE store transaction (consume_and_enroll), so the success audit row
             // below only ever describes a completed enrollment.
             const auto& claim = consumed->claim;
-            spdlog::info("Agent {} auto-enrolled via enrollment token id={} ({}/{})",
-                         info.agent_id(), claim.token_id, claim.use_count_after,
+            spdlog::info("Agent {} auto-enrolled via enrollment token id={} ({}/{})", safe_agent_id,
+                         claim.token_id, claim.use_count_after,
                          claim.max_uses == 0 ? -1 : claim.max_uses);
 
             // Success audit row — same action/target as the failure path so
@@ -456,7 +461,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
 
             auto matched_rule = auto_approve_.evaluate(approval_ctx);
             if (!matched_rule.empty()) {
-                spdlog::info("Agent {} auto-approved by policy: {}", info.agent_id(), matched_rule);
+                spdlog::info("Agent {} auto-approved by policy: {}", safe_agent_id, matched_rule);
                 // Persist enrollment so reconnections skip enrollment entirely.
                 // Returns false if admin-denied — admin denials outrank auto-approve.
                 auto enrolled_auto = auth_mgr_.ensure_enrolled(
@@ -467,7 +472,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     yuzu::server::sanitize_enrollment_text("auto-approve:" + matched_rule));
                 if (!enrolled_auto) {
                     spdlog::error("Register: auto-approve enroll failed for agent {}",
-                                  info.agent_id());
+                                  safe_agent_id);
                     return enrollment_store_status(enrolled_auto.error());
                 }
                 if (!*enrolled_auto) {
@@ -482,7 +487,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 auto pending_result = auth_mgr_.get_pending_status(info.agent_id());
                 if (!pending_result) {
                     spdlog::error("Register: pending-status read failed for agent {}",
-                                  info.agent_id());
+                                  safe_agent_id);
                     return enrollment_store_status(pending_result.error());
                 }
                 const auto& pending_status = *pending_result;
@@ -495,7 +500,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                         yuzu::server::sanitize_enrollment_text(info.platform().arch()),
                         yuzu::server::sanitize_enrollment_text(info.agent_version()));
                     if (!added) {
-                        spdlog::error("Register: add_pending failed for agent {}", info.agent_id());
+                        spdlog::error("Register: add_pending failed for agent {}", safe_agent_id);
                         return enrollment_store_status(added.error());
                     }
 
@@ -509,7 +514,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                         return grpc::Status::OK;
                     }
                     bus_.publish("pending-agent", info.agent_id());
-                    spdlog::info("Agent {} placed in pending approval queue", info.agent_id());
+                    spdlog::info("Agent {} placed in pending approval queue", safe_agent_id);
                     if (auto analytics_store = analytics_store_.lock()) {
                         AnalyticsEvent ae;
                         ae.event_type = "agent.enrollment_pending";
@@ -547,7 +552,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     return grpc::Status::OK;
 
                 case auth::PendingStatus::approved:
-                    spdlog::info("Agent {} enrolled (admin-approved)", info.agent_id());
+                    spdlog::info("Agent {} enrolled (admin-approved)", safe_agent_id);
                     // Fall through to normal registration
                     break;
                 }
@@ -564,7 +569,7 @@ enrolled:
     // agent treats as a PERMANENT rejection, agent.cpp:1649-1657) so the agent retries with its
     // normal reconnect backoff. The PG failure detail stays server-side (spdlog only).
     if (auto reg_result = registry_.register_agent(info); !reg_result) {
-        spdlog::error("Register: register_agent failed for '{}': {}", info.agent_id(),
+        spdlog::error("Register: register_agent failed for '{}': {}", safe_agent_id,
                       reg_result.error());
         return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                             "registration temporarily unavailable");
@@ -654,7 +659,7 @@ enrolled:
         if (auto sync = tag_store_->sync_agent_tags(info.agent_id(), tags); !sync) {
             spdlog::warn("Register({}): tag sync failed ({}) — prior tag set retained, agent "
                          "re-syncs on next Register",
-                         info.agent_id(), sync.error());
+                         safe_agent_id, sync.error());
         }
     }
 
@@ -678,17 +683,16 @@ enrolled:
             issued = agent_cert_signer_(request->csr_pem(), info.agent_id(),
                                         CertIssuanceSource::Direct);
         } catch (const std::exception& e) {
-            spdlog::error("Register: signer threw for agent {}: {}", info.agent_id(), e.what());
+            spdlog::error("Register: signer threw for agent {}: {}", safe_agent_id, e.what());
         } catch (...) {
-            spdlog::error("Register: signer threw a non-std exception for agent {}",
-                          info.agent_id());
+            spdlog::error("Register: signer threw a non-std exception for agent {}", safe_agent_id);
         }
         if (issued) {
             response->set_issued_certificate(issued->first);
             response->set_issued_ca_chain(issued->second);
-            spdlog::info("Issued per-agent client cert for {}", info.agent_id());
+            spdlog::info("Issued per-agent client cert for {}", safe_agent_id);
         } else {
-            spdlog::warn("Register: client-cert signing failed for agent {}", info.agent_id());
+            spdlog::warn("Register: client-cert signing failed for agent {}", safe_agent_id);
         }
     }
 

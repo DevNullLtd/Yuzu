@@ -56,6 +56,7 @@
 #include <yuzu/server/auto_approve.hpp>
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -1219,6 +1220,57 @@ TEST_CASE("ProxyRegister: rejects an agent_id with an embedded NUL with INVALID_
     yuzu::Labels labels{{"reason", "nul"}, {"source", "gateway_proxy"}};
     CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", labels).value() == 1.0);
     CHECK(h.registry.trusted_gateway_peer_count() == 0);
+}
+
+TEST_CASE("Register: logs a claimed agent_id with control bytes neutralised",
+          "[pg][agent_service][register][failclosed]") {
+    // The enrollment store rejects control bytes in an agent_id only after the claimed id has
+    // reached Register, so the lines Register writes first must print it neutralised, never raw.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("agent x=1\nfake");
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+
+    apb::RegisterResponse resp;
+    yuzu::test::LogCapture cap;
+    auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+    cap.stop();
+
+    CHECK_FALSE(status.ok());
+    CHECK(cap.text().find("enrollment status read failed for agent agent_x_1_fake") !=
+          std::string::npos);
+    CHECK(cap.text().find("agent x=1") == std::string::npos);
+}
+
+TEST_CASE("ProxyRegister: logs a claimed agent_id with control bytes neutralised",
+          "[pg][agent_service][register][gateway][failclosed]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("agent x=1\nfake");
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+
+    apb::RegisterResponse resp;
+    yuzu::test::LogCapture cap;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+    cap.stop();
+
+    CHECK_FALSE(status.ok());
+    CHECK(cap.text().find("enrollment status read failed for agent agent_x_1_fake") !=
+          std::string::npos);
+    CHECK(cap.text().find("agent x=1") == std::string::npos);
 }
 
 TEST_CASE("ProxyRegister: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 R2 / UP-H1)",

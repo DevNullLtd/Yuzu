@@ -7,6 +7,7 @@
 #include "pg/pg_raii.hpp"
 #include "utf8_sanitize.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
@@ -32,13 +33,13 @@ constexpr const char* kStoreName = "custom_properties_store";
 // wait a little; none may block unboundedly on a saturated pool.
 constexpr std::chrono::milliseconds kAcquireTimeout{2000};
 
-// agent_id guard (reads AND writes). The same predicate as tag_store.cpp's valid_agent_id (file-local there;
-// duplicated rather than shared so the two stores stay independent): libpq's text binds are
-// C strings, so an id containing a NUL byte cannot be represented at the DB seam. A malformed
-// id has no properties by definition, so the reads below answer empty /
-// nullopt instead of touching the database, and the writes refuse (set_property returns an
-// error, delete_property answers not-found, delete_all_properties is a logged no-op), exactly
-// as TagStore's write seams do. Length cap matches the REST/gRPC agent_id bound (256).
+// agent_id guard (reads AND writes). The same predicate as tag_store.cpp's valid_agent_id
+// (file-local there; duplicated rather than shared so the two stores stay independent): libpq's
+// text binds are C strings, so an id containing a NUL byte cannot be represented at the DB seam.
+// A malformed id has no properties by definition, so the reads below answer empty / nullopt
+// instead of touching the database, and the writes refuse (set_property returns an error,
+// delete_property answers not-found, delete_all_properties is a logged no-op), exactly as
+// TagStore's write seams do. Length cap matches the REST/gRPC agent_id bound (256).
 bool valid_agent_id(const std::string& agent_id) {
     return !agent_id.empty() && agent_id.size() <= 256 &&
            agent_id.find('\0') == std::string::npos;
@@ -511,7 +512,7 @@ void CustomPropertiesStore::delete_all_properties(const std::string& agent_id) {
         std::vector<std::string>{agent_id});
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::warn("CustomPropertiesStore::delete_all_properties: delete failed for agent={}: {}",
-                    agent_id, PQerrorMessage(lease.get()));
+                     ::yuzu::log_id_token(agent_id), PQerrorMessage(lease.get()));
     }
 }
 

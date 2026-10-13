@@ -363,10 +363,10 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             // (guaranteed_state_events has TEXT columns, BIGINT columns bound from numbers the
             // server formats, and one BOOLEAN (remediation_success) bound from the fixed
             // literals "true" and "false", with no CHECK or foreign key; embedded NULs are
-            // rejected before the insert (guaranteed_state_store.cpp:858); a duplicate
-            // event_id is resolved to Redelivered or Conflict before this path unless the
-            // compare SELECT or the ROLLBACK TO SAVEPOINT itself errors
-            // (guaranteed_state_store.cpp:912-919), which also returns libpq text; and
+            // rejected before the insert ("event field contains an embedded NUL byte"); a
+            // duplicate event_id is resolved to Redelivered or Conflict before this path unless
+            // the compare SELECT or the ROLLBACK TO SAVEPOINT itself errors ("redelivery compare
+            // failed"), which also returns libpq text; and
             // detail_json is capped at 16 KiB (kMaxDetailJson, earlier in this function)). So it
             // is wrapped like the identifiers: log_id_token folds control bytes, spaces, '='
             // and ',' and caps the length at 256 bytes, keeping the head and the tail of a

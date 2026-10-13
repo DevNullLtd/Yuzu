@@ -531,6 +531,17 @@ TEST_CASE("guardian ingest: #4606 the server's other id-printing log lines neutr
         // free text in the log line.
         CHECK(cap.text().find("): event_field_contains_an_embedded_NUL_byte") != std::string::npos);
     }
+    { // an action other than "event" is ignored (debug): the action name and the agent id are
+        // printed
+        apb::CommandResponse other;
+        other.set_action("sta tus=1");
+        yuzu::test::LogCapture cap;
+        ingest_guardian_response(store, "agent x=1", other, nullptr, nullptr);
+        cap.stop();
+        CHECK(cap.text().find("ignoring __guard__ action 'sta_tus_1' from agent agent_x_1") !=
+              std::string::npos);
+        CHECK(cap.text().find("agent x=1") == std::string::npos);
+    }
     {   // Redelivered (debug): event id, agent id and rule id are printed
         const auto resp = make_rule_event("evt r=1", "rule r=1");
         ingest_guardian_response(store, "agent x=1", resp, nullptr, nullptr);

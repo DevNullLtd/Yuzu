@@ -6,6 +6,8 @@
 #include <chrono>
 #include <string_view>
 
+#include <yuzu/log_token.hpp>
+
 #include <nlohmann/json.hpp>
 
 #include "agent_service_impl.hpp"
@@ -622,6 +624,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                             "agent_id contains an embedded NUL");
     }
+    // As in AgentServiceImpl::Register: log the id neutralised, never raw.
+    const std::string safe_agent_id = ::yuzu::log_id_token(info.agent_id());
 
     // -- Tiered enrollment (same logic as AgentServiceImpl::Register) ----------
     //
@@ -653,12 +657,12 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
         auto prior_result = auth_mgr_.get_pending_status(info.agent_id());
         if (!prior_result) {
             spdlog::error("[gateway] Register: enrollment status read failed for agent {}",
-                          info.agent_id());
+                          safe_agent_id);
             return enrollment_store_status(prior_result.error());
         }
         const auto& prior = *prior_result;
         if (prior && *prior == auth::PendingStatus::approved) {
-            spdlog::info("[gateway] Agent {} re-registering (already enrolled)", info.agent_id());
+            spdlog::info("[gateway] Agent {} re-registering (already enrolled)", safe_agent_id);
             goto gw_enrolled;
         }
         // #1067: reject an admin-DENIED agent BEFORE consuming any enrollment
@@ -676,8 +680,9 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                               {{"source", "gateway_proxy"}, {"event", "security"}})
                     .increment();
             }
-            spdlog::warn("[gateway] Register rejected: agent {} is admin-denied (no token consumed)",
-                         info.agent_id());
+            spdlog::warn(
+                "[gateway] Register rejected: agent {} is admin-denied (no token consumed)",
+                safe_agent_id);
             response->set_accepted(false);
             response->set_reject_reason("enrollment denied by administrator");
             response->set_enrollment_status("denied");
@@ -693,7 +698,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             if (enrollment_token.size() > auth::kMaxEnrollmentTokenLength) {
                 spdlog::warn(
                     "[gateway] Agent {} presented oversize enrollment token ({} chars > {})",
-                    info.agent_id(), enrollment_token.size(), auth::kMaxEnrollmentTokenLength);
+                    safe_agent_id, enrollment_token.size(), auth::kMaxEnrollmentTokenLength);
                 if (metrics_) {
                     metrics_
                         ->counter("yuzu_enrollment_token_rejected_total",
@@ -744,7 +749,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                               .already_consumed_by = {}}};
             if (!consumed) {
                 spdlog::error("[gateway] Register: enrollment consume failed for agent {}",
-                              info.agent_id());
+                              safe_agent_id);
                 return enrollment_store_status(consumed.error());
             }
             if (consumed->kind == auth::ConsumeEnrollResult::Kind::admin_denied) {
@@ -765,7 +770,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 auto variant = yuzu::server::enrollment_rejection_variant_name(err);
                 auto metric_name = yuzu::server::enrollment_rejection_metric_name(err);
                 spdlog::warn("[gateway] Agent {} enrollment-token consume rejected: variant={}",
-                             info.agent_id(), variant);
+                             safe_agent_id, variant);
                 if (metrics_) {
                     if (err == auth::EnrollmentTokenError::already_consumed) {
                         metrics_->counter(std::string(metric_name), {}).increment();
@@ -844,7 +849,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             // completed enrollment.
             const auto& claim = consumed->claim;
             spdlog::info("[gateway] Agent {} auto-enrolled via enrollment token id={} ({}/{})",
-                         info.agent_id(), claim.token_id, claim.use_count_after,
+                         safe_agent_id, claim.token_id, claim.use_count_after,
                          claim.max_uses == 0 ? -1 : claim.max_uses);
 
             bool enroll_audit_ok = true;
@@ -900,7 +905,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
 
             auto matched_rule = auto_approve_.evaluate(approval_ctx);
             if (!matched_rule.empty()) {
-                spdlog::info("[gateway] Agent {} auto-approved by policy: {}", info.agent_id(),
+                spdlog::info("[gateway] Agent {} auto-approved by policy: {}", safe_agent_id,
                              matched_rule);
                 auto enrolled_auto = auth_mgr_.ensure_enrolled(
                     info.agent_id(), yuzu::server::sanitize_enrollment_text(info.hostname()),
@@ -910,7 +915,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     yuzu::server::sanitize_enrollment_text("auto-approve:" + matched_rule));
                 if (!enrolled_auto) {
                     spdlog::error("[gateway] Register: auto-approve enroll failed for agent {}",
-                                  info.agent_id());
+                                  safe_agent_id);
                     return enrollment_store_status(enrolled_auto.error());
                 }
                 if (!*enrolled_auto) {
@@ -924,7 +929,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 auto pending_result = auth_mgr_.get_pending_status(info.agent_id());
                 if (!pending_result) {
                     spdlog::error("[gateway] Register: pending-status read failed for agent {}",
-                                  info.agent_id());
+                                  safe_agent_id);
                     return enrollment_store_status(pending_result.error());
                 }
                 const auto& pending_status = *pending_result;
@@ -937,7 +942,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                         yuzu::server::sanitize_enrollment_text(info.agent_version()));
                     if (!added) {
                         spdlog::error("[gateway] Register: add_pending failed for agent {}",
-                                      info.agent_id());
+                                      safe_agent_id);
                         return enrollment_store_status(added.error());
                     }
 
@@ -947,7 +952,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     if (!*added)
                         return grpc::Status::OK; // queued concurrently: the winner publishes
                     bus_.publish("pending-agent", info.agent_id());
-                    spdlog::info("[gateway] Agent {} placed in pending queue", info.agent_id());
+                    spdlog::info("[gateway] Agent {} placed in pending queue", safe_agent_id);
                     return grpc::Status::OK;
                 }
 
@@ -963,7 +968,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     response->set_enrollment_status("denied");
                     return grpc::Status::OK;
                 case auth::PendingStatus::approved:
-                    spdlog::info("[gateway] Agent {} enrolled (admin-approved)", info.agent_id());
+                    spdlog::info("[gateway] Agent {} enrolled (admin-approved)", safe_agent_id);
                     break;
                 }
             }
@@ -1032,9 +1037,9 @@ gw_enrolled:
         if (!is_server_minted_session_id(presented_session)) {
             record_directory_desync(metrics_, "proxy_register", "malformed_session_id");
             spdlog::warn("[gateway] ProxyRegister: presented session id {} for agent {} is not a "
-                        "server-minted session id — refusing the replay so the gateway forces the "
-                        "agent to reconnect fresh",
-                        onbehalf::sanitize_for_log(presented_session, 64), info.agent_id());
+                         "server-minted session id — refusing the replay so the gateway forces the "
+                         "agent to reconnect fresh",
+                         onbehalf::sanitize_for_log(presented_session, 64), safe_agent_id);
             return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                                 "invalid session id; reconnect");
         }
@@ -1089,8 +1094,9 @@ gw_enrolled:
                 // disconnect-and-force-reconnect path.
                 record_route_store_failure(metrics_, "renew_leases", renew_res.error());
                 spdlog::warn("[gateway] ProxyRegister: degraded renew_leases during replay-adopt "
-                            "decision for agent {} — refusing (fail-closed) rather than adopting "
-                            "an unverified session", info.agent_id());
+                             "decision for agent {} — refusing (fail-closed) rather than adopting "
+                             "an unverified session",
+                             safe_agent_id);
                 return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                                     "routing directory unavailable");
             } else if (*renew_res >= 1) {
@@ -1113,9 +1119,9 @@ gw_enrolled:
                     record_route_store_failure(metrics_, "reclaim_tombstoned_session",
                                                reclaim_res.error());
                     spdlog::warn("[gateway] ProxyRegister: degraded reclaim_tombstoned_session "
-                                "during replay-adopt decision for agent {} — refusing "
-                                "(fail-closed) rather than adopting an unverified session",
-                                info.agent_id());
+                                 "during replay-adopt decision for agent {} — refusing "
+                                 "(fail-closed) rather than adopting an unverified session",
+                                 safe_agent_id);
                     return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                                         "routing directory unavailable");
                 } else {
@@ -1143,19 +1149,20 @@ gw_enrolled:
 
         if (held_by_other_agent) {
             record_directory_desync(metrics_, "proxy_register", "session_held_by_other_agent");
-            spdlog::warn("[gateway] ProxyRegister: presented session {} for agent {} is already "
-                        "held by a different agent's directory row — refusing the replay (a forged "
-                        "or colliding session id; expected never)",
-                        onbehalf::sanitize_for_log(presented_session, 64), info.agent_id());
+            spdlog::warn(
+                "[gateway] ProxyRegister: presented session {} for agent {} is already "
+                "held by a different agent's directory row — refusing the replay (a forged "
+                "or colliding session id; expected never)",
+                onbehalf::sanitize_for_log(presented_session, 64), safe_agent_id);
             return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                                 "session held by another agent; reconnect");
         }
         if (!adopt) {
             record_directory_desync(metrics_, "proxy_register", "session_superseded");
             spdlog::warn("[gateway] ProxyRegister: presented session {} for agent {} is "
-                        "superseded by a different live session — refusing the replay so the "
-                        "gateway forces the agent to reconnect fresh",
-                        onbehalf::sanitize_for_log(presented_session, 64), info.agent_id());
+                         "superseded by a different live session — refusing the replay so the "
+                         "gateway forces the agent to reconnect fresh",
+                         onbehalf::sanitize_for_log(presented_session, 64), safe_agent_id);
             return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                                 "session superseded; reconnect");
         }
@@ -1186,7 +1193,7 @@ gw_enrolled:
     // reconnect backoff.
     auto reg_result = registry_.register_agent(info);
     if (!reg_result) {
-        spdlog::error("ProxyRegister: register_agent failed for '{}': {}", info.agent_id(),
+        spdlog::error("ProxyRegister: register_agent failed for '{}': {}", safe_agent_id,
                       reg_result.error());
         return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                             "registration temporarily unavailable");
@@ -1225,8 +1232,8 @@ gw_enrolled:
         // tombstoned/zombie row go unnoticed. When no store is configured
         // there is nothing to renew.
         spdlog::debug("[gateway] ProxyRegister: adopted presented session {} for agent {} "
-                     "(store-confirmed={})",
-                     session_id, info.agent_id(), store_confirmed_adopt);
+                      "(store-confirmed={})",
+                      session_id, safe_agent_id, store_confirmed_adopt);
     } else {
         // -- Fresh registration (unchanged behavior) --------------------------
         session_id =
@@ -1278,7 +1285,7 @@ gw_enrolled:
                 lost_epoch_race = true;
                 spdlog::debug("[gateway] ProxyRegister: register_fresh for agent {} session {} "
                               "lost the epoch race to a newer connection",
-                              info.agent_id(), session_id);
+                              safe_agent_id, session_id);
             }
         }
     }
@@ -1319,21 +1326,21 @@ gw_enrolled:
             issued = agent_cert_signer_(request->csr_pem(), info.agent_id(),
                                         CertIssuanceSource::GatewayProxy);
         } catch (const std::exception& e) {
-            spdlog::error("[gateway] ProxyRegister: signer threw for agent {}: {}",
-                          info.agent_id(), e.what());
+            spdlog::error("[gateway] ProxyRegister: signer threw for agent {}: {}", safe_agent_id,
+                          e.what());
         } catch (...) {
             // Non-std throw (foreign exception across a plugin/.so boundary, etc.)
             // must not escape the sync handler either (gov #1273 Hermes).
             spdlog::error("[gateway] ProxyRegister: signer threw a non-std exception for agent {}",
-                          info.agent_id());
+                          safe_agent_id);
         }
         if (issued) {
             response->set_issued_certificate(issued->first);
             response->set_issued_ca_chain(issued->second);
-            spdlog::info("[gateway] Issued per-agent client cert for {}", info.agent_id());
+            spdlog::info("[gateway] Issued per-agent client cert for {}", safe_agent_id);
         } else {
             spdlog::warn("[gateway] ProxyRegister: client-cert signing failed for agent {}",
-                         info.agent_id());
+                         safe_agent_id);
         }
     }
 
@@ -1362,7 +1369,7 @@ gw_enrolled:
         }
     }
 
-    spdlog::info("[gateway] ProxyRegister succeeded: agent={}, session={}", info.agent_id(),
+    spdlog::info("[gateway] ProxyRegister succeeded: agent={}, session={}", safe_agent_id,
                  session_id);
     return grpc::Status::OK;
 }

@@ -336,6 +336,28 @@ TEST_CASE("CustomPropertiesStore: writes reject an agent_id with an embedded NUL
     }
 }
 
+TEST_CASE("CustomPropertiesStore: reads answer empty for an invalid agent_id",
+          "[pg][custom_props][crud][failclosed]") {
+    // The same guard as the write seams: an id that is empty, contains a NUL byte or is longer
+    // than 256 bytes has no properties by definition, so every read answers empty / nullopt and
+    // never returns the rows of the id before the NUL (the text bind would stop at the NUL).
+    PROPS_SHARED(store, pool);
+    require_ok(store.set_property("agent-a", "owner", "alice"));
+    // Control: the valid id does see its row through each read.
+    REQUIRE(require_ok(store.get_properties("agent-a")).size() == 1);
+    REQUIRE(require_ok(store.get_property("agent-a", "owner")).has_value());
+    REQUIRE(require_ok(store.get_property_map("agent-a")).size() == 1);
+
+    const std::vector<std::string> bad_ids{std::string("agent-a\0x", 9), std::string(),
+                                           std::string(257, 'a')};
+    for (const auto& bad : bad_ids) {
+        INFO("agent_id size " << bad.size());
+        CHECK(require_ok(store.get_properties(bad)).empty());
+        CHECK_FALSE(require_ok(store.get_property(bad, "owner")).has_value());
+        CHECK(require_ok(store.get_property_map(bad)).empty());
+    }
+}
+
 TEST_CASE("CustomPropertiesStore: get_properties lists all for agent",
           "[pg][custom_props][crud]") {
     PROPS_SHARED(store, pool);

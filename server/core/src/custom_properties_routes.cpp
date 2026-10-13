@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp>
 
 #include <string>
 
@@ -133,8 +134,8 @@ void register_custom_properties_routes(HttpRouteSink& sink, Deps deps) {
             deps.audit_fn(req, "custom_property.set", "failure", "Agent", agent_id,
                           key + ": " + result.error());
             if (is_custom_properties_db_error(result.error())) {
-                spdlog::error("PUT /api/agents/{}/properties/{}: {}", agent_id, key,
-                              result.error());
+                spdlog::error("PUT /api/agents/{}/properties/{}: {}",
+                              ::yuzu::log_id_token(agent_id), key, result.error());
                 res.status = 503;
                 res.set_content(
                     R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
