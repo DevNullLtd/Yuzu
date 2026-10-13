@@ -42,6 +42,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <optional>
 #include <string>
 #include <vector>
@@ -776,7 +777,12 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: overlap_expires_at describes th
     auto token_id = h.create_token_for("alice", "alice-key");
     h.session_user = "alice";
 
-    const int64_t before = now_epoch();
+    // The handler stamps now = std::time(nullptr). On MSVC that is the coarse system
+    // time, which reads up to ~15 ms (measured on a real host) behind system_clock
+    // after each second boundary. Take the lower reference from the same source so
+    // the bound below cannot fail by one second; the upper bound stays on the newer
+    // clock.
+    const int64_t before = static_cast<int64_t>(std::time(nullptr));
     auto res = h.rotate(token_id, /*overlap_secs=*/86400);
     REQUIRE(res);
     REQUIRE(res->status == 200);

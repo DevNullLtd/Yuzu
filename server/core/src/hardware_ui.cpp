@@ -12,6 +12,7 @@
 
 #include <cctype>
 #include <charconv>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -378,12 +379,22 @@ std::string sync_button(const std::string& agent_id, const char* source, const c
     return h;
 }
 
-std::string render_hardware_results_region(const HardwareListPage& page, bool ci_degraded) {
+std::string render_hardware_results_region(const HardwareListPage& page, bool ci_degraded,
+                                           bool tags_degraded) {
     const HardwareListQuery& q = page.query;
     // data-url: the bulk-tag action bar re-fetches this exact view (with the live q
     // included) after applying tags to the selection, so the refreshed list reflects
     // the SAME filter/sort/page the operator was looking at.
     std::string h = "<div id=\"hw-results\" data-url=\"" + esc(list_url(q, true, true)) + "\">";
+    // The degrade banners live INSIDE the swap target: every htmx control re-renders
+    // only #hw-results (results_only=1), so a banner in the page shell would vanish on
+    // the first refresh and leave a blank cell reading as "no CI" / "no tags".
+    if (ci_degraded)
+        h += "<div class=\"hw-degrade\"><b>CI columns unavailable.</b> The device-CI store could not "
+             "be read &mdash; a blank cell here is not \"no CI\", it is a degraded read.</div>";
+    if (tags_degraded)
+        h += "<div class=\"hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
+             "&mdash; a blank Tags column here is not \"no tags\", it is a degraded read.</div>";
     // Sticky bulk-tag action bar (round-3 item 7) — hidden by CSS until a row is
     // checked (hwSelRender toggles a `show` class); JS lives in guardian_page_ui.cpp.
     // Applying loops the EXISTING single-agent /api/tags/set|delete per selected
@@ -444,8 +455,17 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
 std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_degraded,
                                           bool roster_unavailable, bool results_only,
                                           bool tags_degraded) {
+    constexpr const char* kRosterBanner =
+        "<div class=\"hw-degrade\"><b>Hardware roster unavailable.</b> The device roster could "
+        "not be read. This is <b>not</b> \"no devices\" &mdash; reads here are authoritative, so "
+        "this banner is shown instead of an empty table. Retry shortly.</div>";
+    // #5531: the banner must also replace a results_only re-render, keeping the
+    // #hw-results swap target (and its data-url) alive for the next retry.
+    if (roster_unavailable && results_only)
+        return "<div id=\"hw-results\" data-url=\"" + esc(list_url(page.query, true, true)) +
+               "\">" + kRosterBanner + "</div>";
     if (results_only)
-        return render_hardware_results_region(page, ci_degraded);
+        return render_hardware_results_region(page, ci_degraded, tags_degraded);
 
     std::string h = hw_style();
     h += "<div class=\"hw-wrap\">";
@@ -453,19 +473,12 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
     h += "<div class=\"hw-sub\">Configuration items across the fleet &mdash; search, filter, sort.</div>";
 
     if (roster_unavailable) {
-        h += "<div class=\"hw-degrade\"><b>Hardware roster unavailable.</b> The device roster could "
-             "not be read. This is <b>not</b> \"no devices\" &mdash; reads here are authoritative, so "
-             "this banner is shown instead of an empty table. Retry shortly.</div></div>";
+        h += kRosterBanner;
+        h += "</div>";
         return h;
     }
 
     h += kpis_html(page.kpis, ci_degraded);
-    if (ci_degraded)
-        h += "<div class=\"hw-degrade\"><b>CI columns unavailable.</b> The device-CI store could not "
-             "be read &mdash; a blank cell here is not \"no CI\", it is a degraded read.</div>";
-    if (tags_degraded)
-        h += "<div class=\"hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
-             "&mdash; a blank Tags column here is not \"no tags\", it is a degraded read.</div>";
 
     const HardwareListQuery& q = page.query;
     h += "<div class=\"hw-ctrls\">";
@@ -482,14 +495,22 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
          "hx-trigger=\"keyup changed delay:400ms, search\" hx-sync=\"this:replace\">";
     h += "</div>";
 
-    h += render_hardware_results_region(page, ci_degraded);
+    h += render_hardware_results_region(page, ci_degraded, tags_degraded);
     h += "</div>";
     return h;
 }
 
 std::string render_hardware_not_found(const std::string& agent_id) {
     return hw_style() + "<div class=\"hw-wrap\"><div class=\"gp-placeholder\"><b>Device not found.</b> "
-           "'" + esc(agent_id) + "' has not been seen in the last 30 days, or does not exist.</div></div>";
+           "'" + esc(agent_id) + "' has not been seen in the last " +
+           std::to_string(std::chrono::duration_cast<std::chrono::days>(kHardwareRosterWindow).count()) +
+           " days, or does not exist.</div></div>";
+}
+
+std::string render_hardware_roster_unreadable(const std::string& agent_id) {
+    return hw_style() + "<div class=\"hw-wrap\"><div class=\"gp-placeholder\"><b>Device roster "
+           "unreadable.</b> The device roster could not be read, so '" + esc(agent_id) +
+           "' cannot be looked up &mdash; this is not \"not found\". Retry shortly.</div></div>";
 }
 
 std::string render_hardware_lens_body(const std::string& agent_id, const HardwareCiDetail& detail,
@@ -554,6 +575,10 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
             h += "<div><span class=\"ci-lab\">Agent version: </span>" + ci_disp(version) + "</div>";
             h += "<div><span class=\"ci-lab\">Architecture: </span>" + ci_disp(arch) + "</div>";
             h += "</div></div>";
+        } else if (detail.identity_degraded) {
+            h += "<div class=\"hw-degrade\"><b>Device identity unavailable.</b> The device roster "
+                 "could not be read &mdash; the agent id is shown in place of the hostname, OS is "
+                 "omitted and last-seen is unknown; this is not \"not found\".</div>";
         }
         if (!detail.ci.has_value()) {
             h += "<div class=\"hw-degrade\"><b>CI record unavailable.</b> The device-CI store could "
@@ -634,10 +659,10 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
 std::string render_hardware_ci_fragment(const std::string& agent_id, const HardwareCiDetail& detail,
                                         const std::string& lens, std::int64_t now_secs,
                                         const HwCiAffordances& aff) {
-    if (!detail.identity && !detail.ci.has_value())
-        return render_hardware_not_found(agent_id);
-    if (!detail.identity && detail.ci.has_value() && !detail.ci->has_value())
-        return render_hardware_not_found(agent_id);
+    const bool no_record = !detail.identity && (!detail.ci.has_value() || !detail.ci->has_value());
+    if (no_record)
+        return detail.identity_degraded ? render_hardware_roster_unreadable(agent_id)
+                                        : render_hardware_not_found(agent_id);
 
     const std::string hostname = detail.identity && !detail.identity->hostname.empty()
                                       ? detail.identity->hostname

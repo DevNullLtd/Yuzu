@@ -269,7 +269,7 @@ use-after-free guard any shutdown refactor must preserve.
 > than `fixing_stale_seconds` (default 1800s) — not immediately, and not tied
 > to any restart.
 >
-> **High Availability (HA): manual remediation is now safe on multi-replica servers.** Each target
+> **High Availability (HA): manual remediation is safe on multi-replica servers once the safe-to-scale gate lifts (ADR-2002 §7c); exactly one server replica is supported today.** Each target
 > is claimed durably before the fix is dispatched, so two replicas cannot independently remediate
 > the same agent. If a target has already exhausted its fix-retry cap for the policy, the
 > remediation request is refused with HTTP 409 and the message "remediation already in flight or

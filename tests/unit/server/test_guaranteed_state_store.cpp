@@ -2901,6 +2901,96 @@ TEST_CASE("GuaranteedStateStore: per-(agent,rule) compliance census (Slice B)",
     }
 }
 
+TEST_CASE("GuaranteedStateStore: guard.errored maps to the errored census state (C-1)",
+          "[pg][guaranteed_state_store][census]") {
+    // guard.errored is the #2818 spark subscription-death detach lifecycle event. It
+    // must set the per-(agent, rule) census state to "errored" exactly as
+    // guard.unhealthy does. The upsert is ordered by updated_at with `>=` (equal
+    // timestamps overwrite), so D4 characterises that existing tie behaviour.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store{pool, /*retention_days=*/30};
+    REQUIRE(store.is_open());
+
+    auto ev = [&](std::string id, std::string rule, std::string agent, std::string type,
+                  std::string ts) {
+        auto e = make_event(std::move(id), std::move(rule), std::move(agent), "high", std::move(ts));
+        e.event_type = std::move(type);
+        return e;
+    };
+    auto census = [&] {
+        std::map<std::pair<std::string, std::string>, std::string> m;
+        auto rows = store.agent_rule_statuses();
+        REQUIRE(rows.has_value());
+        for (auto& s : *rows)
+            m[{s.agent_id, s.rule_id}] = s.state;
+        return m;
+    };
+
+    SECTION("D1: a later guard.errored replaces a compliant verdict") {
+        REQUIRE(store.insert_event(ev("d1a", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d1b", "r1", "a1", "guard.errored", "2026-06-04T10:01:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "errored");
+    }
+    SECTION("D2: a later guard.compliant recovers an errored pair") {
+        REQUIRE(store.insert_event(ev("d2a", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "errored");
+        REQUIRE(store.insert_event(ev("d2b", "r1", "a1", "guard.compliant", "2026-06-04T10:01:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "compliant");
+    }
+    SECTION("D3: an OLDER guard.errored does not regress a newer compliant verdict") {
+        REQUIRE(store.insert_event(ev("d3a", "r1", "a1", "guard.compliant", "2026-06-04T10:02:00Z")));
+        REQUIRE(store.insert_event(ev("d3b", "r1", "a1", "guard.errored", "2026-06-04T10:01:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "compliant");
+    }
+    SECTION("D4: equal timestamps, distinct event ids: the later arrival wins (existing >=)") {
+        REQUIRE(store.insert_event(ev("d4a", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d4b", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "errored");
+
+        REQUIRE(store.insert_event(ev("d4c", "r2", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d4d", "r2", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
+        CHECK(census()[{"a1", "r2"}] == "compliant");
+    }
+    SECTION("D5: an exact redelivery of the errored event never reaches the census write") {
+        // Equal timestamps (compliant arrives after errored, so it wins the >= tie): had the
+        // redelivery reached the upsert, the tie would flip the row to errored, so the final
+        // census assertion can observe a reached census write.
+        const auto errored = ev("d5x", "r1", "a1", "guard.errored", "2026-06-04T10:00:00Z");
+        CHECK(store.insert_event_classified(errored).outcome == EventInsertOutcome::Inserted);
+        REQUIRE(store.insert_event(ev("d5y", "r1", "a1", "guard.compliant", "2026-06-04T10:00:00Z")));
+        CHECK(census()[{"a1", "r1"}] == "compliant");
+        CHECK(store.insert_event_classified(errored).outcome == EventInsertOutcome::Redelivered);
+        CHECK(census()[{"a1", "r1"}] == "compliant");
+    }
+    SECTION("D6: the batch path applies the mapping inside its transaction") {
+        std::vector<GuaranteedStateEventRow> batch = {
+            ev("d6a", "r1", "a1", "guard.compliant", "2026-06-04T11:00:00Z"),
+            ev("d6b", "r1", "a1", "guard.errored", "2026-06-04T11:01:00Z"),
+        };
+        REQUIRE(store.insert_events(batch));
+        CHECK(census()[{"a1", "r1"}] == "errored");
+    }
+    SECTION("D7: the reserved ruleless sentinel never gets a census row from guard.errored") {
+        REQUIRE(store.insert_event(
+            ev("d7a", "__observation__", "a1", "guard.errored", "2026-06-04T10:00:00Z")));
+        std::vector<GuaranteedStateEventRow> batch = {
+            ev("d7b", "__observation__", "a2", "guard.errored", "2026-06-04T10:00:00Z"),
+        };
+        REQUIRE(store.insert_events(batch));
+        auto sentinel = store.agent_rule_statuses("__observation__");
+        REQUIRE(sentinel.has_value());
+        CHECK(sentinel->empty());
+        CHECK(census().empty());
+    }
+    SECTION("D8: guard.armed, guard.disarmed and guard.healthy remain no-census-change") {
+        REQUIRE(store.insert_event(ev("d8a", "r1", "a1", "guard.armed", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d8b", "r2", "a1", "guard.disarmed", "2026-06-04T10:00:00Z")));
+        REQUIRE(store.insert_event(ev("d8c", "r3", "a1", "guard.healthy", "2026-06-04T10:00:00Z")));
+        CHECK(census().empty());
+    }
+}
+
 TEST_CASE("GuaranteedStateStore::errored_rule_count — ADR-0017 INV-3 SQL-level confinement",
           "[pg][guaranteed_state_store][adr0017]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);

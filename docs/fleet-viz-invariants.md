@@ -18,12 +18,13 @@ rule). Loaded by `security-guardian` + `docs-writer` during governance.
 
 `get_fleet_topology`/`get_host_topology` (`mcp_server.cpp`) are the MCP twins
 of the REST endpoints below, wired via `McpServer::set_viz_deps()` (passes the
-SAME `fleet_topology_store_`/`offline_endpoint_store_`/`viz_disabled_`
-instances REST's `VizRoutes` registration uses, so the two surfaces cannot
-disagree about cache state). Every invariant in this doc (kill-switch
-ordering, the DoS cap, the offline-merge rule) applies identically to both
-surfaces - a change to one that doesn't preserve parity with the other is a
-regression, not a stylistic difference. That equal treatment does not extend
+SAME `fleet_topology_store_`/`viz_disabled_` instances and the same
+`OfflineEndpointStore` (via an `OfflineRosterFn` closure) REST's `VizRoutes`
+registration uses, so the two surfaces cannot disagree about cache state).
+Every invariant in this doc (kill-switch ordering, the DoS cap, the
+offline-merge rule) applies identically to both surfaces - a change to one
+that doesn't preserve parity with the other is a regression, not a stylistic
+difference. That equal treatment does not extend
 to confinement: **neither surface confines results to the caller's
 management-group scope** - a caller with `Response:Read` sees every connected
 agent's process/connection/listener data fleet-wide on both REST and MCP
@@ -427,12 +428,19 @@ rules for the `viz_routes.cpp::handle_topology` merge:
 - **The DoS cap counts merged nodes.** `machines_max` is enforced on the
   merged total (`live + offline`), so the offline merge can never smuggle the
   response past the cap.
-- **Fail-soft, and currently silent.** A PG error on the offline query returns
-  an empty set → the page renders live-only with no stale cubes and **no
-  operator-visible signal** (the known UP-13 gap; a degraded-marker/metric is a
-  tracked follow-up). Do not "fix" this by hard-failing the request.
+- **Typed read, live-only on failure (UP-13, closed by #5531 for
+  REST/MCP/audit/metric consumers; the 3D page itself shows no indicator,
+  deliberately out of scope).** The offline read is typed; a failure still
+  renders live-only (do not "fix" this by hard-failing the request) but sets
+  `offline_roster_degraded: true` in the `fleet_topology.v1` envelope on REST
+  and MCP, appends `offline_roster_degraded=1` to the `viz.fleet_topology` audit
+  detail, and increments
+  `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`.
 - **`yuzu_viz_offline_hosts_total`** counts offline nodes merged (described in
   the `server.cpp` viz metric block — keep it described, `promtool`-clean).
+  Since #5678 a gracefully departed host keeps its roster row, so it is merged
+  as a stale-flagged offline node for the 7-day viz stale window
+  (`kOfflineStaleWindowSecs`) and this counter rises accordingly.
 - **`/readyz` and a Postgres outage.** The substrate `pg_pool` readyz row
   reads the connect-breaker, which can momentarily read closed between backoff
   windows during a sustained outage (a deliberate tradeoff: don't evict a

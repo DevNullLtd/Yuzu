@@ -543,6 +543,7 @@ yuzu_server_core_lib = static_library(
     'src/hardware_actions_ui.cpp',
     'src/sle_routes.cpp',
     'src/software_catalog_rollup.cpp',
+    'src/software_catalogue_model.cpp',
     'src/preflight_routes.cpp',
     'src/preflight_ui.cpp',
     'src/preflight_eval.cpp',

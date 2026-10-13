@@ -752,11 +752,12 @@ struct RestGsHarness {
 
     // Seed one device's reported verdict for a Guard via the status feed
     // (insert_event → upsert_rule_status). event_type maps to state per
-    // event_state_from_type: guard.compliant→compliant, drift.detected→drifted,
-    // guard.unhealthy→errored. NOTE: the upsert keeps the row only when
-    // excluded.updated_at >= the existing updated_at, so re-seeding the same
-    // (agent, rule_id) with an EARLIER (or equal-then-different-state) timestamp
-    // is silently dropped — use strictly increasing ts when overwriting a verdict.
+    // event_state_from_type: guard.compliant/drift.remediated→compliant,
+    // drift.detected→drifted, remediation.failed/guard.unhealthy/guard.errored→errored.
+    // NOTE: the upsert keeps the row only when excluded.updated_at >= the existing
+    // updated_at, so re-seeding the same (agent, rule_id) with an EARLIER timestamp is
+    // silently dropped, while an EQUAL timestamp overwrites (the later arrival wins);
+    // use strictly increasing ts when overwriting a verdict to keep the result obvious.
     void seed_status(const std::string& event_id, const std::string& agent,
                      const std::string& rule_id, const std::string& event_type,
                      const std::string& ts) {
@@ -1969,6 +1970,28 @@ TEST_CASE("REST gs.status/{agent_id}: errored_rules is real, scoped to this agen
     CHECK(h.audit_log[0].action == "guardian.device.view");
     CHECK(h.audit_log[0].result == "success");
     CHECK(h.audit_log[0].target_id == "WS-1");
+}
+
+TEST_CASE("REST gs.status: a guard.errored lifecycle event counts as an errored rule (C-1)",
+          "[pg][rest][guaranteed_state][status]") {
+    // guard.errored (the #2818 spark subscription-death detach) must reach errored_rules
+    // on both the fleet and the per-agent status routes, exactly like guard.unhealthy.
+    RestGsHarness h;
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r1", "rule-1"))
+                ->status == 201);
+    h.seed_status("e1", "WS-1", "r1", "guard.errored", "2026-06-20T10:00:00Z");
+
+    auto fleet = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(fleet);
+    CHECK(fleet->status == 200);
+    CHECK(nlohmann::json::parse(fleet->body)["data"]["errored_rules"].get<int>() == 1);
+
+    auto agent = h.sink.Get("/api/v1/guaranteed-state/status/WS-1");
+    REQUIRE(agent);
+    CHECK(agent->status == 200);
+    auto j = nlohmann::json::parse(agent->body);
+    CHECK(j["data"]["errored_rules"].get<int>() == 1);
+    CHECK(j["data"]["compliant_rules"].get<int>() == 0);
 }
 
 TEST_CASE("REST gs.status/{agent_id}: an errored census row for a DELETED rule is excluded",
@@ -4366,6 +4389,43 @@ TEST_CASE("REST gs.device-compliance: verdicts are isolated per agent (WHERE age
     CHECK(d2["errored"].get<int>() == 2);
     CHECK(d2["compliant"].get<int>() == 0);
     CHECK(d2["pending"].get<int>() == 0);
+}
+
+TEST_CASE("REST gs.device-compliance: a guard.errored lifecycle event reports the guard as errored (C-1)",
+          "[pg][rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "Firewall on");
+    h.seed_deployed_baseline("B", {"r1"});
+    // WS-1: compliant, then the guard itself errors (guard.errored, NOT guard.unhealthy).
+    // The census must keep the LATER errored verdict, not the earlier compliant one.
+    h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-1", "r1", "guard.errored", "2026-06-20T10:01:00Z");
+    // WS-2: compliant only -- must stay compliant (per-agent isolation).
+    h.seed_status("e3", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["total_guards"].get<int>() == 1);
+    CHECK(d["errored"].get<int>() == 1);
+    CHECK(d["compliant"].get<int>() == 0);
+    CHECK(d["drifted"].get<int>() == 0);
+    CHECK(d["pending"].get<int>() == 0);
+    REQUIRE(d["guards"].is_array());
+    REQUIRE(d["guards"].size() == 1);
+    CHECK(d["guards"][0]["rule_id"].get<std::string>() == "r1");
+    CHECK(d["guards"][0]["status"].get<std::string>() == "errored");
+    CHECK(d["guards"][0]["updated_at"].get<std::string>() == "2026-06-20T10:01:00Z");
+
+    auto res2 = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS-2");
+    REQUIRE(res2);
+    auto d2 = nlohmann::json::parse(res2->body)["data"];
+    CHECK(d2["total_guards"].get<int>() == 1);
+    CHECK(d2["errored"].get<int>() == 0);
+    CHECK(d2["compliant"].get<int>() == 1);
+    REQUIRE(d2["guards"].size() == 1);
+    CHECK(d2["guards"][0]["status"].get<std::string>() == "compliant");
 }
 
 TEST_CASE("REST gs.device-compliance: a reported guard NOT in the deployed snapshot is excluded",

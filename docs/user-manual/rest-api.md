@@ -62,6 +62,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
 - [REST API v1 Endpoints](#rest-api-v1-endpoints)
   - [Current User](#current-user)
   - [Devices](#devices)
+  - [Hardware](#hardware)
   - [Management Groups](#management-groups)
   - [API Tokens](#api-tokens)
   - [Engine Principals](#engine-principals)
@@ -442,7 +443,7 @@ List every device visible to the caller.
 
 `devices_omitted` counts agents dropped by the caller's management-group/service-scope
 confinement (0 when unfiltered or nothing was dropped) — the same "out of my scope" vs. "not
-present" signal `GET /api/v1/inventory/software`'s `devices_omitted` field carries.
+present" signal `GET /api/v1/inventory/software`'s `devices_omitted` field used to carry (on that route it now counts only devices hidden by the post-filter and is `0` under SQL push-down — see its section).
 
 ---
 
@@ -475,6 +476,57 @@ of an unwired TagStore). A device outside the caller's fleet-read scope returns 
 genuinely nonexistent `agent_id` — an out-of-scope match is never distinguishable from "does not
 exist" in the response body (matches the pre-existing MCP `get_agent_details` tool's
 existence-oracle closure exactly).
+
+---
+
+### Hardware
+
+The Hardware CI list and single-device CI record: the two read routes of the OpenAPI tag `Hardware`, followed by a short entry for the on-demand sync `POST /api/v1/hardware/{id}/sync`. Both read routes are audited on a served read, and with `result=failure` when the device roster could not be read.
+
+#### `GET /api/v1/hardware`
+
+The Hardware list: the device roster (identity fields as for `/devices`) plus device-CI columns, a per-page DEX score, claimed IPs and tags.
+
+**Permission:** `Inventory:Read`, via `require_fleet_read` (admit-then-filter).
+
+**Query parameters:** `q`, `os`, `status`, `sort`, `dir`, `tag`, `offset`, `limit`. An unrecognised `sort`, `os` or `status` token, or an invalid `tag` key, is a `400`; any `dir` other than `desc` sorts ascending.
+
+**Response:** `{ "data": { "devices": [...], "count", "total_matching", "devices_omitted", "ci_degraded", "tags_degraded", "kpis", "query" }, "pagination", "meta" }`.
+
+| Status | Meaning |
+|---|---|
+| `200` | The roster was read. `ci_degraded` / `tags_degraded` are `true` when the CI or tag store could not be read, so those columns are blank rather than genuinely absent. At most the 100,000 most recently seen endpoints within the 30-day window are served, with no truncation signal yet. While `tags_degraded` is `true`, a `tag` filter (or a tag match in `q`) sees no tags and answers an empty list. |
+| `400` | Unrecognised `sort`, `os` or `status` token, or an invalid `tag` key. |
+| `403` | Caller lacks `Inventory:Read`. |
+| `503` | Route misconfigured (roster provider unwired), the device roster could not be read (`retry_after_ms` set), the audit row could not be persisted, or the authorization store is unavailable (`retry_after_ms` 5000). A failed roster read is never a `200` with an empty list. |
+
+**Audit:** `inventory.devices`; `result=success` on a served page, `result=failure` (detail `hardware roster read failed`) when the roster could not be read. A persist failure on the success row fails the request closed with `503`.
+
+---
+
+#### `GET /api/v1/hardware/{id}`
+
+One device's CI record: identity, device-CI blob, installed software and tags, each read independently so a degraded read is distinguishable from an absent one.
+
+**Permission:** `Inventory:Read`, via `require_fleet_read`. An id outside the caller's fleet-read scope returns the same `404` as a nonexistent id.
+
+**Response:** `{ "data": { "agent_id", "hostname", "os", "online", "last_seen", "identity_state", "ci", "ci_state", "software", "tags", ... }, "meta" }`. `identity_state` is `found`, `degraded` (the device roster could not be read) or `absent`; `ci_state` is `found`, `absent` or `degraded`. `agent_id`, `hostname`, `os` and `last_seen` are `null` (and `online` is `false`) unless `identity_state` is `found`.
+
+| Status | Meaning |
+|---|---|
+| `200` | The record. A degraded CI store alongside a degraded roster is still a `200` carrying `identity_state` and `ci_state` as `degraded`. |
+| `400` | Device id longer than 256 bytes or containing a byte below `0x20`. Checked after the `Inventory:Read` check and before the scope check. Registration applies the same 256-byte limit and refuses an id with a byte below `0x20` (through its enrollment check), so any id that agent registration accepts passes and a registered device is not affected. |
+| `403` | Caller lacks `Inventory:Read`. |
+| `404` | Not found, or outside the caller's fleet-read scope (indistinguishable by design). |
+| `503` | Route misconfigured, audit row not persisted, the authorization store unavailable (`retry_after_ms` 5000), or the device roster could not be read (`retry_after_ms` set) and the device was not otherwise found (CI record readable-and-absent, no software, no tags). Never a `404`. |
+
+**Audit:** `inventory.device.ci`; `result=failure` when the roster read failed (detail `state=roster unreadable` on the `503`, `state=<...> identity=roster unreadable` on a served `200`).
+
+---
+
+#### `POST /api/v1/hardware/{id}/sync`
+
+Requests an on-demand agent sync for one device. **Permission:** `Execution:Execute` scoped to the device. The body, the `202` and the `409` are described in the OpenAPI document. A device id longer than 256 bytes or containing a byte below `0x20` is a `400`, answered before the permission check and with no audit row (the same id rule as `GET /api/v1/hardware/{id}`, including the registration note there). **Audit:** `inventory.sync.request` (see [audit-log.md](audit-log.md)).
 
 ---
 
@@ -2870,7 +2922,7 @@ structural exclusion — a genuine SAML-authenticated Administrator has no
 set never contains them, and this route is refused unconditionally
 regardless of any staleness. This is a real, fail-safe (over-restrictive,
 never permissive) side effect, not a bug — see
-[#4966](https://github.com/Tr3kkR/Yuzu/issues/4966), which also tracks the
+[#5182](https://github.com/Tr3kkR/Yuzu/issues/5182), which also tracks the
 identical SAML gap in the last-Administrator guard. Audited `rbac.role.assigned` — see
 `docs/user-manual/audit-log.md`.
 
@@ -2893,7 +2945,7 @@ above (including the MCP-tier-token structural denial), plus MFA step-up.
 **Errors:** `401` — not authenticated, or MFA step-up not satisfied; `403` —
 the caller does not hold a durable Administrator role, does not hold
 authority under the regime that is durably true right now (A1: same fresh
-re-check as the `POST` route above, including its SAML #4966 structural
+re-check as the `POST` route above, including its SAML #5182 structural
 exclusion), is a service-scoped/engine session, presented an MCP-tier bearer
 token of any tier (use the `unassign_rbac_role` MCP tool instead), or
 (`{name}=="Administrator"` only) is attempting to remove their **own**
@@ -3637,8 +3689,8 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `api_token.create` | API token created |
 | `api_token.revoke` | API token revoked. Can carry `result=success` (token was revoked) or `result=denied` (a non-owner without the admin role attempted a cross-user revoke). Denied events include `detail=owner=<real owner>` so forensics can tell a legitimate self-revoke from an enumeration probe. |
 | `user.create` | Local account created. `result` ∈ {`success`, `denied`}. Denied detail values: `duplicate_username` (409 — attempted create on an existing name), `weak_password` (400 — fewer than 12 bytes), `too_long` (400 — more than 1024 bytes, #5342). The `role` field is ignored on create — new users always land as `user`. To change role, use the dedicated `POST /api/settings/users/{username}/role` endpoint (audit action `user.role_change`). |
-| `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`success`, `denied`, `no_op`}. Denied detail values: `self_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `db_failure` (500). `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role — recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
-| `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404). |
+| `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`success`, `denied`, `no_op`, `failure`, `partial`}. Denied detail values: `self_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `last_administrator_blocked` (409), `inactive_promotion_refused` (409). `result=failure` with detail `store_failure` (503, no retry hint) when the guarded write did not complete (this replaces the former `denied` / `db_failure` 500), and `result=partial` with detail `role_changed session_wipe_failed=true old_role=<role> new_role=<role>` (503, no retry hint) when the role changed but session cleanup failed. `inactive_promotion_refused` is a store-level rule: the route answers `user_not_found` (404) for an inactive account, so the 409 can occur only when the account is deactivated between the route's lookup and the write. `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role - recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
+| `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`, `failure`, `partial`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404), `owns_active_engine_principal` (409), `last_administrator_blocked` (409, nothing revoked: the early form). The LATE form is `result=partial` (credentials were revoked and the account stays active), detail `last_administrator_blocked credentials_revoked_before_refusal=true account_remains_active=true` followed by the revoke summary. `failure` detail `store_failure ...` (503), or `identity_link_resolution_failed` / `api_token_store_unavailable`; `partial` detail `account_deactivated session_wipe_failed=true ...` (503) or the revoke summary with `api_tokens_db_error=true` (500). |
 | `user.password_change` | Local account changed its own password via `POST /api/v1/users/me/password` (#5342). `target_type=User`, `target_id=<caller>`; the principal is the caller on every row, including those written after its own session was revoked. `result` ∈ {`ok`, `denied`, `error`}. Success detail `self_service sessions_revoked=<N> provisional_mfa_cleared=<true\|false>`, written in the same transaction as the change (no separate `session.revoke_all` row). Denied/error detail tokens: `token_session`, `not_local`, `csrf`, `wrong_current`, `account_locked`, `sso_only_local_disabled`, `verify_transient`, `not_found`, `conflict`, `store_unavailable`, `audit_unavailable`. A malformed body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. Never carries the password or its length. |
 | `user.password_reset` | Admin reset another local account's password via `POST /api/v1/users/{name}/password` (#5342). `target_type=User`, `target_id=<target>`, principal = the caller. `result` ∈ {`ok`, `denied`, `error`}. Success detail `admin_reset target_role=<admin\|user> sessions_revoked=<N> provisional_mfa_cleared=<true\|false>` (no separate `session.revoke_all` row), plus — only when a lockout existed — an `auth.lockout.cleared` row (`result=ok`, `detail=password_reset`), both in the same transaction as the reset. Denied/error detail tokens: `token_session`, `csrf`, `durable_admin_required`, `admin_gate_unavailable`, `self_target`, `break_glass_target`, `not_found`, `not_local`, `store_unavailable`, `audit_unavailable`. A malformed username or body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. |
 | `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. |
@@ -6894,9 +6946,17 @@ Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareIn
 |---|---|---|---|
 | `name` | string | No | Exact software-name filter |
 | `agent_id` | string | No | Exact agent filter |
-| `limit` | integer | No | Max rows (default 100, min 1, max 1000) |
+| `version` | string | No | Exact version filter. A **present-empty** value (`?version=`) selects only the rows with an empty version; omit the parameter for any version |
+| `q` | string | No | Case-insensitive literal substring over name, publisher, ecosystem and source (`%`/`_` are not wildcards; clamped to 128 bytes) |
+| `kind` / `ecosystem` | string | No | Exact filters; an empty value means no filter |
+| `source` | string | No | Exact source filter. `source` is an **open set** (`<plugin>.<action>`), never an enum |
+| `limit` | integer | No | Max rows (default 100, min 1, max 1000). In export mode it is the **total** cap (default and max 10000) |
+| `cursor` | string | No | Opaque `next_cursor` from the previous page (see below) |
+| `format` | `json` \| `csv` | No | Selects **export mode**: a single response of up to 10000 rows |
 
-Omit both `name` and `agent_id` for a fleet-wide scan.
+`q`, `kind`, `ecosystem` and `source` are **REST-only** on this route: its MCP twin `query_installed_software` takes `name`, `agent_id`, `version`, `limit` and `cursor` only (see [mcp.md](mcp.md)).
+
+Omit `name` and `agent_id` for a fleet-wide scan. A parameter that is not valid UTF-8 or contains a NUL byte, an `agent_id`/`kind`/`ecosystem`/`source` over 256 bytes, a `name`/`version` over 1024 bytes, a non-integer `limit`, an unknown `format` or a refused `cursor` is a `400` (never a retryable `503`). An unknown `kind` or `ecosystem` value is not refused: it matches nothing and returns an empty `200` (the OpenAPI enum is descriptive, not enforced).
 
 **Response (200):**
 
@@ -6907,12 +6967,14 @@ Omit both `name` and `agent_id` for a fleet-wide scan.
       {"agent_id": "agent-001", "name": "bash", "version": "5.2.21", "publisher": "Fedora Project",
        "install_date": "2026-01-15", "kind": "package", "ecosystem": "rpm", "epoch": "0",
        "release": "3.fc40", "arch": "x86_64", "signature_status": "signed",
-       "distro_id": "fedora", "distro_version": "40"},
+       "distro_id": "fedora", "distro_version": "40", "source": "pkg_inventory.packages"},
       {"agent_id": "agent-002", "name": "Google Chrome", "version": "124.0", "publisher": "Google LLC",
        "install_date": "2026-01-15", "kind": "app", "ecosystem": "windows", "epoch": "",
-       "release": "", "arch": "", "signature_status": "", "distro_id": "", "distro_version": ""}
+       "release": "", "arch": "", "signature_status": "", "distro_id": "", "distro_version": "",
+       "source": "installed_apps.list_inventory"}
     ],
     "count": 2,
+    "next_cursor": "d2:0f3a9c1d5b7e2a64:MzpnaXQfOTphZ2VudC0wMDIfMTo1HzE6MB8",
     "devices_omitted": 0,
     "result_truncated_by_cap": true
   },
@@ -6922,20 +6984,116 @@ Omit both `name` and `agent_id` for a fleet-wide scan.
 
 Every row carries the **blob-v2 package fields** (`kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`) alongside the original four. A field the source ecosystem does not store is `""` — **never synthesised** (a Windows/macOS app row is honestly empty on every NEVRA/signature/distro field, as in the second example above). These 8 keys are **always present in every row** (never absent) — integration code should test for an empty-string value, not key absence. See `docs/user-manual/inventory.md` for the full per-ecosystem availability matrix.
 
-`devices_omitted` is always present (0 when no scope filtering occurred). `result_truncated_by_cap` is present only when `count == limit` and more rows may exist past the cap (keyset pagination is a follow-up, #1634). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
+Every row carries `source` — the `<plugin>.<action>` that produced it (an **open set**; `""` for rows ingested before the field existed). Rows therefore have **14 fields**.
 
-Results carry a **per-agent scope drop filter** — the `require_fleet_read` gate's own composed `meet(management-group, service-scope)` visibility set (#3290): out-of-scope devices are dropped and their distinct count returned in `devices_omitted`. A positive `devices_omitted` means matching software exists **outside** your scope — an empty or short result does **not** mean the software is absent fleet-wide. This confinement is now **effective**, not a foundation: a management-group-confined operator and a correctly-confined service-scoped token both see a genuinely narrowed result, matching the ADR-0017 admit-then-filter model this route was the first to adopt in Phase 2.
+**Pagination (keyset).** `next_cursor` is non-null when more rows may exist (`result_truncated_by_cap: true` is set at the same moment — also in export mode); pass it back as `cursor` to continue. The cursor is **opaque** — never parse it. It is bound to the filter set: a malformed cursor, or one issued for a different filter set, is a `400` (`invalid cursor` / `cursor was issued for a different filter set`), never a silent restart. Under push-down the cursor is the last row of the page. When the page was post-filtered (below), a page can be short or empty while `next_cursor` is non-null — keep paging until `next_cursor` is `null`; that cursor never names a row you were not served (see the Scope paragraph).
+
+**Scope (`devices_omitted` — re-specified).** The gate's composed `meet(management-group, service-scope)` visibility set is **pushed into SQL** (`agent_id = ANY(...)`) for up to 10 000 visible devices, so a confined caller (management-group-confined operator or a correctly-confined service-scoped token) gets **complete pages of its own devices** and nothing is hidden. `devices_omitted` is the count of distinct devices hidden by the **in-process post-filter** used only for a scope wider than that bound. It is `0` under push-down, so there an empty page means no matching software in your scope. Above 10 000 visible devices it is a distinct-device count **within the scanned window(s)** and still signals that out-of-scope matches exist (bounded and audited). A `denied` audit row is written when it is greater than `0`, or when the request names an `agent_id` outside the caller's scope (the response is then empty with `devices_omitted` unchanged; the row says `agent_id outside the caller's scope`). On a wide scope the page is refilled with at most four bounded store reads, so a page can be empty with a non-null `next_cursor`; the cursor then re-anchors at the last row **you were served** (or at the start) and carries a count of the rows scanned since, which the next request passes over — no identifier, name or version of an out-of-scope row is ever in it. A row inserted inside that skipped span during a walk can be missed or repeated, the same class as the `install_id` churn already noted for concurrent resyncs; a wide-scope walk is best-effort under concurrent change, because the count is of positions: deleting an out-of-scope row inside the skipped span between pages, or widening the caller's scope between pages, can make the next page skip or repeat a row. A long run of out-of-scope rows costs proportionally more to resume, and a statement timeout there degrades the page to a 503 (tracked in #5698). An export on a wide scope reads at most four bounded windows, so it can hold fewer than `limit` rows with `X-Result-Truncated-By-Cap` set. `result_truncated_by_cap` is present only when more rows may exist (push-down: `count == limit`; wide scope: the page filled early or the read bound was reached). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
+
+**Export mode.** `format=csv` returns `text/csv; charset=utf-8` with `Content-Disposition: attachment; filename="software-installs.csv"` and the header row `agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,arch,signature_status,distro_id,distro_version,source`; `format=json` returns the usual object. `limit` is the **total** row cap (default and maximum 10000); when more rows may exist the response carries `X-Result-Truncated-By-Cap: true` and `X-Next-Cursor: <cursor>` (CSV, whose body then ends with a `# result_truncated_by_cap cause=row_cap` trailer record of 14 fields) or `result_truncated_by_cap: true` and `next_cursor` (JSON); pass the cursor back as `cursor` with the same `format` to read on. Exports are audited as `inventory.software.export` and are REST-only (an agent pages the same data through the MCP cursor). Service-scoped tokens stay admitted — confined — on this route, **including export**, unlike the two catalogue routes below.
+
+**Audit.** Every call that is served writes a `success` row — `inventory.software.query`, or `inventory.software.export` in export mode (continuation pages carry `page=continuation` in the detail), with the target `fleet` / `agent=<id>` / `name=<n>` (`name=<n>;agent=<id>` when both are set) plus the active filters; a `400` writes nothing. Because the cursor is opaque but unauthenticated (a hand-made well-formed cursor is accepted), per-call audit is what keeps a forged cursor from walking the fleet unrecorded.
+
+**Behaviour changes in this release.** `limit` is now parsed with a strict full-consume integer parse: `limit=12abc` is a `400` (it was previously accepted as `12`), and an empty `limit=` now means the default (it was a `400`). A parameter holding a NUL byte or invalid UTF-8, or an over-long `name`/`agent_id`/`version`/`cursor`, is now a `400` (it was a retryable `503`). A `denied` audit row is now also written for an explicit `agent_id` outside the caller's scope. Repeated query parameters keep the **first** value on this route (unchanged); the two catalogue routes below reject a repeated parameter with `400` instead.
 
 **Error responses:**
 
 | Status | Condition |
 |---|---|
-| 400 | `limit` is not a valid integer |
+| 400 | `limit` is not a valid integer, `format` is not `json`/`csv`, or the `cursor` is malformed / was issued for a different filter set; a parameter that is not valid UTF-8 or contains a NUL byte; or an over-long value (`agent_id`/`kind`/`ecosystem`/`source` over 256 bytes, `name`/`version` over 1024 bytes) |
 | 401 | Unauthenticated |
 | 403 | No management-group grant for `Inventory:Read`; or a service-scoped token whose RBAC/ITServiceOwner grant is missing, or whose RBAC enforcement is disabled fleet-wide (a service-scoped token always hard-denies when RBAC is off) |
 | 503 | The gate's own RBAC/tag-store lookup is unavailable or degraded (including a failed read of the `ITServiceOwner` ceiling for a service-scoped token), the software inventory store is unavailable or degraded, or the `require_fleet_read` gate itself is unwired (server misconfiguration) — all A4 envelope with `correlation_id`, `retry_after_ms: 5000` where retryable — **never an empty 200** |
 
 On a `503` the store (or the confinement check itself) could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
+
+#### `GET /api/v1/inventory/software/catalogue`
+
+The **fleet software title catalogue**: one row per title rolled up across the whole fleet from the precomputed catalogue rollup (refreshed hourly), ordered by installs descending then name. MCP twin: `query_software_catalogue` — both are shaped by one shared model, so the JSON cannot drift.
+
+**Permission:** a **global** `Inventory:Read` (via `require_fleet_read`). The rollup is fleet-wide and cannot be scoped, so a management-group-confined caller gets `403` (`permission: "Inventory:Read"`, audited `denied`) on the fleet view — but may pass `agent_id` for a per-device view of an in-scope device (see below). **Service-scoped API tokens are denied** (`403`, no `permission` field — no grant would admit them), unlike the raw `GET /api/v1/inventory/software` above, which keeps admitting them confined: the asymmetry is deliberate.
+
+**Query parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `q` | string | Case-insensitive literal substring over title name, publisher, ecosystems and sources (clamped to 128 bytes) |
+| `kind`, `ecosystem` | string | Exact filters (closed vocabulary — see [inventory.md](inventory.md)); empty means no filter |
+| `source` | string | Exact source filter (open set, `<plugin>.<action>`); empty means no filter |
+| `agent_id` | string | Per-device view: that device's titles (installs are `1`) |
+| `versions_min` | integer | Only titles with at least this many distinct versions (0–100000) |
+| `limit` | integer | Page size (default 100, 1–1000, clamped); with `format=csv` it is the **total** export cap (default and max 10000) |
+| `cursor` | string | Opaque `next_cursor` from the previous page |
+| `format` | `json` \| `csv` | `csv` exports the titles (REST-only) |
+
+A repeated parameter, a parameter that is not valid UTF-8 or contains a NUL byte, a `kind`/`ecosystem`/`source`/`agent_id` over 256 bytes, a non-integer `limit`/`versions_min`, an unknown `format`, a cursor over 2048 bytes, or a `cursor` sent with `format=csv` (an export is one whole walk and takes no continuation) is a `400`. An empty `kind`/`ecosystem`/`source` means "no filter", so those values cannot be selected as `''`.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "titles": [
+      {"name": "git", "publisher": "Git SCM", "installs": 3, "versions": 3,
+       "ecosystems": ["brew", "macos_pkgutil", "rpm"], "kinds": ["package", "pkg"],
+       "newest_version": "2.41"}
+    ],
+    "count": 1,
+    "next_cursor": "c1:9a1c0e5d7b3f2a68:1790000000:Mx9naXQ",
+    "totals": {"titles": 2, "installs": 4},
+    "kpis": {
+      "titles": 2, "publishers": 2, "installs": 4,
+      "installs_by_os": {"windows": 0, "macos": 3, "linux": 1, "other": 0},
+      "os_pct": {"windows": 0, "macos": 75, "linux": 25, "other": 0},
+      "stay_current": {"current_installs": 2, "total_installs": 4, "titles": 2, "pct": 50},
+      "sprawl": {"titles": 1, "pct": 50.0},
+      "rpm": {"total": 1, "unsigned": 0},
+      "coverage": {"reporting": 3, "connected": 5, "stale": 0},
+      "avg_installs_per_device": 1,
+      "refreshed_at": 1790000000,
+      "building": false
+    },
+    "devices_omitted": 0
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+- `totals{titles,installs}` cover **every row matching the filters**, not just this page (same predicate as the rows), so a client can say "N of M". `installs` sums each title's exact distinct-device count (a device carrying two matching titles counts twice); unfiltered, it equals `kpis.installs`.
+- `kpis` is present on the **first fleet page only** — it is `null` on continuation pages and on the per-device view. The headline numbers come from the hourly refresh; percentages are derived (`os_pct` of installs, rounded; `stay_current.pct` is `null` when no title has a known version; `sprawl.pct` to one decimal). `coverage` is **counts**, not a ratio: `reporting` = devices with stored inventory, `connected` = devices currently connected (a registry read, `null` when unavailable), `stale` = devices not seen in 48 hours (`null` when that bounded count is unavailable). There is deliberately no coverage percentage — no honest denominator exists. `building: true` with zero counts means the rollup has never been computed: the JSON page is still a `200` (the page must render), but the fleet `format=csv` export is a `503` until the first refresh lands, because an empty file would read as "no titles" (the per-device export's rows and counts do not depend on the rollup and it still answers `200`; its `newest_version` column is blank until the first refresh). If the `503` persists past one hourly refresh the catalogue is not building but failing (a fleet above the ~6,000-endpoint refresh ceiling, #5545, or a database role without `TEMPORARY`): see [inventory.md](inventory.md) "Scale ceiling" and `yuzu_inventory_catalog_rollup_total{outcome="error"}`, and do not retry in a loop.
+- **Cursor.** `next_cursor` is non-null when the page is full. It is bound to the filter set **and to the catalogue refresh generation** (`kpis.refreshed_at`, 1-second granularity — two refreshes inside one second share a generation). A malformed cursor, a cursor from a different filter set, or one issued **before the latest refresh** is a `400` (`invalid cursor` / `cursor was issued for a different filter set` / `cursor predates the current catalogue refresh; restart from the first page`) — a client holding a stale cursor restarts from the first page. If a refresh lands *during* a first-page read the server re-reads once; a second move is a `503`.
+- **Per-device view** (`agent_id`): admitted for an in-scope device. For a confined caller `newest_version` is blank and `newest_omitted: true` (the newest version is a fleet-wide fact). A device outside the caller's scope returns an empty page with `devices_omitted: 1` and a `denied` audit row (no oracle on whether the device exists).
+- **Export** (`format=csv`): `text/csv; charset=utf-8`, `Content-Disposition: attachment; filename="software-titles.csv"`, header `name,publisher,installs,versions,ecosystems,kinds,newest_version` (lists `;`-joined). `limit` is the total cap (default and max 10000); `X-Result-Truncated-By-Cap: true` when the walk reached the cap (rows may have been left behind). A cell starting with `=`, `+`, `-`, `@`, tab or CR is prefixed with `'` (spreadsheet formula neutralisation), so a CSV `name` may need that prefix stripped before it is passed to the versions route. Audited as `inventory.software.export` (`rows=` is the number of titles written). **Set-and-proceed:** `Sec-Audit-Failed: true` is set, and the export is still served, when the export audit row did not persist (also set when only the paired `denied` row failed to persist) (machine-scope data, not behavioural PII).
+- **Audit.** Every call that serves a page writes `inventory.software.catalog` `success` — first **and** continuation pages (the latter tagged `page=continuation`) — with detail `titles=N totals=T/I`. An out-of-scope per-device read writes `denied` only (on `format=csv`, `denied` plus an empty-file `inventory.software.export` `success`). A `400` writes nothing; a confined or service-scoped refusal writes `denied`; the `Inventory:Read` gate's own refusal is audited as `auth.fleet_read_required`. See [audit-log.md](audit-log.md) for the SIEM keying. `audit_persisted: false` is added when the row could not be persisted, including the `denied` row.
+
+**Error responses** (A4 envelope with `correlation_id`):
+
+| Status | Condition |
+|---|---|
+| 400 | Repeated/malformed parameter, unknown `format`, a `cursor` with `format=csv`, or a refused cursor (see above) |
+| 401 | Unauthenticated |
+| 403 | Confined caller on the fleet view (`permission: "Inventory:Read"`), or a service-scoped token |
+| 503 | A degraded rows, totals or refresh-metadata read, or (fleet `format=csv`) a catalogue not yet built — `retry_after_ms: 5000`; **never an empty 200**. A degraded totals read fails the whole page. An absent store or an unwired gate (server misconfiguration) is a `503` **without** `retry_after_ms` |
+
+#### `GET /api/v1/inventory/software/catalogue/versions`
+
+Installs per version for one title: distinct devices per version, most-installed first. MCP twin: `get_software_versions`.
+
+**Permission and posture:** identical to the catalogue — a global `Inventory:Read` for the fleet view (`403` for a confined caller), the per-device view for an in-scope device (`newest` is `false` on every row and `newest_omitted: true` for a confined caller; an out-of-scope device returns an empty list with `devices_omitted: 1` and a `denied` audit row), service-scoped tokens denied.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `name` | string | **Required** exact title name, at most 1024 bytes (`400 name is required`) |
+| `kind`, `ecosystem`, `source`, `agent_id` | string | Same filters as the catalogue |
+| `limit` | integer | Default 200, 1–1000 (clamped) |
+
+```json
+{"data": {"name": "git", "versions": [{"version": "2.40", "installs": 1, "newest": false},
+                                      {"version": "2.41", "installs": 1, "newest": true}],
+          "count": 2, "truncated": false, "devices_omitted": 0}, "meta": {"api_version": "v1"}}
+```
+
+`newest` marks the title's fleet-wide newest version; `truncated` is `true` when the limit was reached; `devices_omitted` is `1` when the per-device view named a device outside the caller's scope (the empty list is then "hidden", not "no installs"), else `0`. Every call that serves a page is audited as `inventory.software.versions` (`success`); an out-of-scope per-device read writes a `denied` row only, a `400` writes none, a confined or service-scoped refusal writes `denied`, and the `Inventory:Read` gate's own refusal is audited as `auth.fleet_read_required`. The **unfiltered** read (no `kind`, `ecosystem`, `source` or `agent_id`) serves the precomputed version rollup, so before the first catalogue refresh it is a `503` with `retry_after_ms` and a `failure` audit row rather than an empty list; filtered and per-device reads do not depend on the rollup for their rows and counts (`newest` is `false` until the first refresh). Errors: `400` (missing `name`, repeated parameter, an over-long value, invalid UTF-8 or a NUL byte), `401`, `403`, `503` (`retry_after_ms: 5000` on a degraded or not-yet-built read, never an empty `200`; no hint where the store or gate is absent).
 
 ---
 
@@ -7169,7 +7327,7 @@ One device's per-executable last-used projection — the per-agent drill. Becaus
 | 503 + `Sec-Audit-Failed` | The per-open audit row could not persist — fail-closed, no data served |
 | 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
 
-Decommissioning the agent erases this store's rows too — see [Software Licensing (SLE)](#software-licensing-sle)'s `DELETE /api/v1/sle/agents/{agent_id}` (the six-store cascade).
+Decommissioning the agent erases this store's rows too — see [Software Licensing (SLE)](#software-licensing-sle)'s `DELETE /api/v1/sle/agents/{agent_id}` (the seven-store cascade).
 
 ---
 
@@ -7218,13 +7376,13 @@ A genuinely licence-free (or unknown) device is `200` with `count: 0`; a `503` m
 
 #### `DELETE /api/v1/sle/agents/{agent_id}`
 
-**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all six per-agent stores** (generic inventory, installed-software, device-CI, app-perf, detected-licence, and app-usage), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
+**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **the seven stores in the cascade** (generic inventory, installed-software, device-CI, app-perf, detected-licence, app-usage, and the `endpoint_state` presence row that holds the device's last-known hostname, OS, agent version and architecture), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired whole-device erasure path for those seven stores (GDPR Art. 17); per-agent stores outside the cascade are not erased by it, and row-level / per-subject DSAR erasure is a stated gap (#1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
 
 **Permission:** a single **per-device-scoped `Decommission:Delete`** securable (ADR-0024 Decision 9, amended Wave 7 PR7.2) — one grant authorizing for the cascade's whole blast radius, replacing the earlier per-store conjunction. A role lacking it is `403`'d, naming `Decommission:Delete` (the seeded Administrator/ITServiceOwner roles hold it by default; a custom role that had assembled the old per-store `Delete` grants must be granted this securable too — the three old grants no longer suffice).
 
 Two durable audit events: `sle.agent.decommission|attempt` is written **before** the erasure and **fails closed** — if it cannot persist, nothing is erased (`503` + `Sec-Audit-Failed`); the outcome row (`success`/`partial`) follows with the per-store breakdown.
 
-**Response (200)** — every store's delete committed:
+**Response (200)** — every configured store's delete committed:
 
 ```json
 {
@@ -7233,8 +7391,9 @@ Two durable audit events: `sle.agent.decommission|attempt` is written **before**
     "decommissioned": true,
     "stores": {"inventory": "deleted", "software_inventory": "deleted",
                "app_perf_daily": "deleted", "device_inventory": "skipped",
-               "software_licensing": "deleted", "app_usage": "deleted"},
-    "deleted": 5,
+               "software_licensing": "deleted", "app_usage": "deleted",
+               "offline_endpoint": "deleted"},
+    "deleted": 6,
     "skipped": 1,
     "failed": 0
   },
@@ -7250,11 +7409,17 @@ Per-store outcomes: `deleted` (the DELETE **committed**), `skipped` (store not c
 |---|---|
 | 401 | Unauthenticated |
 | 403 | Caller lacks the per-device-scoped `Decommission:Delete` permission |
-| 500 | One or more stores `failed` — the A4 body carries the per-store breakdown in `error.details.stores`; the cascade is **idempotent**, re-issue the DELETE to retry the failures |
+| 500 | One or more stores `failed` — the A4 body carries the per-store breakdown in `error.details.stores`; the cascade is **idempotent**, re-issue the DELETE to retry the failures. The server log line ``AgentDecommission: store '<name>' delete_agent reported failure for agent=<id> (delete did not commit — recorded Failed, not Deleted)`` names the failing store; the most frequent root cause is PostgreSQL availability (see the `yuzu_pg_*` metrics). A store that throws instead logs ``AgentDecommission: store '<name>' delete_agent threw for agent=<id>: <what>`` |
 | 503 + `Sec-Audit-Failed` | The attempt audit row could not persist — fail-closed, **nothing was erased** |
 | 503 | Scope gate or cascade not configured (A4 envelope) |
 
-A `200` with `decommissioned: true` is confirmed erasure across every configured store; deleting an unknown `agent_id` is a no-op `200` (nothing to erase). Erasure does not unenroll the agent — a still-enrolled device re-syncs on its next daily cycle, so decommission the device first. This guarantee is scoped to the stores the cascade actually fans across — a leftover legacy `inventory.db` on disk (only possible outside ADR-0009's "no fleet ever ran pre-Postgres" assumption) was never part of it: `InventoryStore::delete_agent()` stopped scrubbing that file when its one-time backfill was retired (#3623), since the erasure branch existed only to serve the backfill.
+A `200` with `decommissioned: true` is confirmed erasure for the stores in the cascade of the replica that answered (a store reported `skipped` was not erased); deleting an unknown `agent_id` is a no-op `200` (nothing to erase). The `deleted` count reaches 7 (it reached 6 before the `offline_endpoint` store joined the cascade) when every store is configured. During a rolling upgrade, a DELETE served by a replica that has not been upgraded runs the old cascade and returns `200` without erasing the presence row: a response whose `stores` map has no `offline_endpoint` key did not erase it, and the `sle.agent.decommission` success audit row that replica writes lists its own stores (no `offline_endpoint`), so it is not evidence that the presence row was erased. Re-issue the DELETE once every replica runs this version.
+
+Erasure does not unenroll the agent: a still-enrolled device re-syncs on its next daily cycle and re-creates its `offline_endpoint` presence row on its next heartbeat. Erasure is therefore point-in-time; an `offline_endpoint=deleted` entry in the success audit row's store breakdown proves the row was deleted at commit, not that it stayed deleted. Stop or uninstall the agent first: revoking its certificate does not cut off an agent connected through a gateway (#5578), which must be disconnected at the gateway layer as well (see Device Management: [Per-agent mTLS auto-provisioning](device-management.md#per-agent-mtls-auto-provisioning-pki)). If you also revoke its certificate, look up the serial with `GET /api/v1/ca/issued` (needs `Security:Read`), call `POST /api/v1/ca/revoke` (`Security:Delete`), and wait about 15 s for the next revocation sweep to drop a directly connected agent's stream before you issue the DELETE. Revocation cannot be undone through the API: the server refuses to issue a new certificate for that agent id while the revoked certificate is unexpired (audit `ca.cert.reissue_blocked`), so do not revoke a device you intend to re-enrol.
+
+To confirm the erasure, wait at least one heartbeat interval (30 s) with the agent stopped and then read `/hardware`; a still-running agent re-creates the row on its next heartbeat, in which case re-issue the DELETE (it is idempotent). `/hardware` reads the table directly (no cache), but it lists only rows seen in the last 30 days (for a device last seen more than 30 days ago `/hardware` cannot confirm erasure, because the row is hidden both before and after the DELETE, so the response's `offline_endpoint: "deleted"` entry is the only confirmation) and needs fleet-scoped `Inventory:Read`; a management-group-confined operator cannot tell "erased" from "out of scope", so confirm with a fleet-scoped reader. Each replica also keeps a liveness cache of about 3 s (used for scope evaluation and dispatch targeting, not by `/hardware`) that the decommission does not invalidate on any replica, including the one that served the DELETE, so the device may still count as present in scope evaluation for up to about 3 s. The `endpoint_state` row holds a hostname, which can identify a person on a personally-assigned device, so treat its erasure as personal-data erasure.
+
+This guarantee is scoped to the stores the cascade actually fans across: a leftover legacy `inventory.db` on disk (only possible outside ADR-0009's "no fleet ever ran pre-Postgres" assumption) was never part of it, because `InventoryStore::delete_agent()` stopped scrubbing that file when its one-time backfill was retired (#3623), since the erasure branch existed only to serve the backfill.
 
 ---
 
@@ -8164,7 +8329,7 @@ Returns the full topology as JSON.
 
 | Status | When | Body |
 |---|---|---|
-| `200` | Success | `fleet_topology.v1` JSON envelope (see schema below) |
+| `200` | Success | `fleet_topology.v1` JSON envelope (see schema below). If the durable offline-host read failed, the live fleet is still returned and the envelope carries `offline_roster_degraded: true` (absent on success) |
 | `400` | `machines_max` non-numeric, out of `[1, 100000]`, or overflows `int` | `{"error":{"code":400,"message":"..."}, "meta":{"api_version":"v1"}}` |
 | `403` | RBAC denied | Standard auth error envelope |
 | `413` | Snapshot exceeds `machines_max` | `{"error":{"code":413,"message":"fleet topology exceeds machines_max..."}, "meta":{"api_version":"v1"}}` |
@@ -8175,7 +8340,7 @@ Returns the full topology as JSON.
 ```json
 {
   "schema": "fleet_topology.v1",
-  "schema_minor": 3,
+  "schema_minor": 4,
   "generated_at": 1715299200,
   "include_vuln": false,
   "machines": [
@@ -8207,6 +8372,8 @@ Returns the full topology as JSON.
 ```
 
 `schema_minor` is bumped (not `schema`) on additive evolution; renderers MUST ignore unknown keys.
+
+Optional top-level key `offline_roster_degraded: true` is present only when the durable offline-host read failed; `machines` is then live-only. It is a request-time, envelope-level annotation like the MCP twin's `audit_persisted` (set per request, outside the cached snapshot document), not a `schema_minor` change.
 
 **`schema_minor` history:**
 
@@ -9298,7 +9465,11 @@ The `role` field must be exactly `admin` or `user`.
 
 - **Response (404):** `:username` does not match any persisted user. Audit `user.role_change / denied / user_not_found`.
 
-- **Response (500):** AuthDB write failed. Audit `user.role_change / denied / db_failure`.
+- **Response (409):** The guarded write refused the change (nothing changed, the sessions of the target are untouched):
+  - `last_administrator_blocked` - demoting `:username` would leave no active local `admin` account (the last-Administrator guard, see `docs/user-manual/rbac.md` "Last-Administrator guard for account deactivation and demotion"). `HX-Trigger: {"showToast":{"message":"Cannot demote: this account is the fleet's last administrator","level":"error"}}` and an A4 error body with the same message. Audit `user.role_change / denied / last_administrator_blocked`. Counted on `yuzu_server_rbac_last_admin_guard_refused_total{transport="dashboard"}`.
+  - `inactive_promotion_refused` - `:username` was deactivated between the route's account lookup and the write, and `admin` was requested ("Cannot promote an inactive account"). An account that is ALREADY inactive when the request arrives never reaches this: the route answers `404` "User not found" first. Audit `user.role_change / denied / inactive_promotion_refused`.
+
+- **Response (503):** The guarded role write did not complete (store fault, or the last-Administrator guard is not wired, which fails closed instead of writing unguarded). NO `Retry-After` and no `retry_after_ms` (the A4 body carries neither): the change may or may not have been applied (a lost commit acknowledgement is possible, and the failure path's durable session wipe may itself have failed), and a repeat after a commit is a `200` "Role unchanged" no-op that does not redo the wipe. The message tells the operator to check the user's role and revoke the user's sessions; no convergence is claimed. Audit `user.role_change / failure / store_failure`. A `503` with the message "Role updated, but session cleanup failed" has the same shape: the role **is** changed but a session at the old role may survive, and repeating the request is a `200` "Role unchanged" no-op that does not redo the cleanup. Revoke the user's sessions instead (`DELETE /api/v1/sessions?username=<name>`); audit `user.role_change / partial` with `old_role` and `new_role`.
 
 **Example — promote `bob` to admin:**
 
@@ -9325,6 +9496,10 @@ Delete the named account.
 
   Audit event recorded as `user.delete / denied / self_delete_blocked`. The rejected attempt is logged at warn level on the server. To delete the account you are signed in as, create a second admin, sign out, sign in as the second admin, then delete the original.
 
+- **Response (409) last administrator:** `:name` is the last member of a protected administrator population (the last-Administrator guard, see `docs/user-manual/rbac.md` "Last-Administrator guard for account deactivation and demotion"). Counted on `yuzu_server_rbac_last_admin_guard_refused_total{transport="dashboard"}`. There are two forms, and they differ in what already happened:
+  - **Early refusal** - a read-only check, made before anything is revoked, showed the account is the last one. Nothing was changed or revoked. `HX-Trigger: {"showToast":{"message":"Cannot delete: this account is the fleet's last administrator","level":"error"}}`, an A4 error body with the same message, audit `user.delete / denied / last_administrator_blocked`.
+  - **Late refusal** - the early check passed (or could not answer) and the guard refused afterwards. The account's linked credentials (API tokens and sessions, including those of linked SSO identities) were **already revoked** and the account **remains active**. The toast and the A4 message read "Cannot delete: this account is the fleet's last administrator. Its credentials were revoked before the refusal; the account remains active", and the audit row is `user.delete / partial` with detail `last_administrator_blocked credentials_revoked_before_refusal=true account_remains_active=true` followed by the revoke summary (`partial` because the credentials were revoked).
+- **Response (503):** The guarded delete did not complete. `Retry-After: 2` and an A4 body with `retry_after_ms: 2000`. Audit `user.delete / failure / store_failure ...` (the linked credentials were already revoked; the account may or may not be deactivated because a lost commit acknowledgement cannot be ruled out, and a repeat re-runs the guarded write and the session wipe, and the repeat that completes answers `404`). The message "User deactivated, but session cleanup failed" means the account **is** deactivated but a session may survive: repeat the delete (it answers `404` once the session cleanup completes) or revoke the user's sessions with `DELETE /api/v1/sessions?username=<name>`; audit `user.delete / partial`.
 - **Response (401):** Defensive — admin gate passed but session not re-resolvable.
 - **Response (500):** Defensive — session resolved with empty username.
 
@@ -9333,6 +9508,8 @@ Delete the named account.
 | 200 | Account deleted successfully |
 | 400 | Username failed the allowlist regex |
 | 404 | No persisted user matched `:name` |
+| 409 | `:name` is the last member of a protected administrator population (early or late form above) |
+| 503 | The guarded delete did not complete, or the account is deactivated but its session cleanup failed |
 | 403 | Target equals the caller's own username (self-delete guard) |
 | 403 | Caller is not an admin (rejected by admin gate before handler) |
 | 401 | Defensive — admin gate / session callbacks disagree |
@@ -11474,6 +11651,12 @@ are tolerated and ignored).
 |---|---|---|
 | `201` + `Location` + `ETag` | Created | SCIM User representation |
 | `409` (`scim_type=uniqueness`) | `userName` already provisioned on a **currently-active** account | SCIM error envelope |
+| `404` | The `userName` already holds an `Administrator` grant, or names a deactivated record whose role is not `user` (nothing is created or reactivated; the answer is a side-effect-free signal to the SCIM bearer holder, not an existence-free one) | SCIM error envelope |
+| `409` (`scim_type=mutability`) | `active:false` on create was refused by the last-Administrator guard (the new account stays active and mapped) | SCIM error envelope |
+| `500` | A deactivated record's role could not be read, a half-finished create could not be undone (`scim.user.compensation_failed`, state per outcome, see `rbac.md`), or the underlying account write failed | SCIM error envelope |
+| `503` + `Retry-After: 2` | The authorization store was unavailable (the Administrator-grant read failed, or the guarded deactivation for `active:false` timed out or lost its store). The body is the plain SCIM error (no `retry_after_ms` member); the detail says the account state may be indeterminate. After a grant-read failure nothing was created and a retry is safe; after a failed `active:false` deactivation the new account stays active and mapped and a retry of the `POST` answers the userName `409`, so it does not converge | SCIM error envelope |
+
+SCIM provisioning now reads the RBAC store (the `Administrator` grant check) even when RBAC enforcement is off.
 
 Created with a discarded CSPRNG password — the account authenticates via
 SSO, never a local password. Role defaults to `user`, recomputed
@@ -11513,6 +11696,9 @@ connectors issue `PUT` rather than `PATCH` for lifecycle changes.
 | `200` | Replaced — SCIM User representation |
 | `400` (`scim_type=mutability`) | Body includes a `userName` change — rename is out of scope this slice |
 | `404` | Unknown `id`, or the provenance/role guard rejects the target (see below) |
+| `409` (`scim_type=mutability`) | `active:false` would remove the fleet's last protected administrator (see "Last-administrator refusal" below) |
+| `500` | The account was deactivated but its durable session wipe failed (an IdP retry is not promised to repeat the wipe, #5214), or another account write failed |
+| `503` + `Retry-After: 2` | The guarded deactivation timed out or lost its store (the linked credentials were already revoked; the detail says the account state may be indeterminate), or `active:true` could not read the Administrator grants. A retry finishes the job only when the cause was a lock timeout in which nothing committed; it does not converge after a lost commit acknowledgement (the retry meets the `404` of the role guard on the now-deactivated account, #5214) |
 
 #### `PATCH /scim/v2/Users/{id}`
 
@@ -11528,11 +11714,57 @@ and explicit `{"path":"active","value":false}` PatchOp forms are accepted.
 |---|---|
 | `200` | Applied — SCIM User representation |
 | `404` | Unknown `id`, or the provenance/role guard rejects the target (see below) |
+| `409` (`scim_type=mutability`) | `active:false` would remove the fleet's last protected administrator (see "Last-administrator refusal" below) |
+| `500` / `503` | As for `PUT` above |
+
+`active:true` applies the same pre-checks as `POST` on a revive (behaviour change: such a request used to reactivate the account): a deactivated record whose role is not `user`, or a username that now holds an `Administrator` grant, is `404` (nothing reactivated), audited as `scim.user.provenance_denied`. A tombstone whose role cannot be read answers `500` and an unreadable grant answer is the `503` above (audit `scim.user.reactivated` / `failure`: `tombstone role unreadable before reactivation` or `administrator grant check unavailable`). Every `404` bumps `yuzu_scim_provenance_denied_total`, which the shipped alert describes as a compromised-IdP signal: this benign case also fires it. An elevated tombstone cannot be re-enabled through SCIM or the dashboard until its role is cleared (see `rbac.md`, "SCIM specifics"); SCIM can deactivate the holder of an `Administrator` grant but cannot reactivate it until the grant is removed.
 
 #### `DELETE /scim/v2/Users/{id}`
 
 Deprovision (equivalent to `PATCH`/`PUT active:false` for IdPs that issue a
-hard delete). `204` on success; `404` if unknown or guard-rejected.
+hard delete). `204` on success; `404` if unknown or guard-rejected; `409`
+(`scim_type=mutability`) under the last-administrator refusal below; `500`
+(account deactivated but its durable session wipe failed) or `503` +
+`Retry-After: 2` (the guarded write timed out or lost its store), as for `PUT`.
+
+#### Last-administrator refusal
+
+`PUT`/`PATCH` `active:false`, `DELETE`, and `POST` with `active:false` answer
+`409` with `scim_type=mutability` when the deprovision would remove the last
+member of a protected administrator population (the last-Administrator
+guard; see `docs/user-manual/rbac.md` "Last-Administrator guard for account
+deactivation and demotion"). Because the provenance/role guard above already
+`404`s any account whose role is not `user`, a SCIM request reaches this
+refusal only for a `role=user` account that holds the fleet's sole
+`Administrator` grant, under RBAC enforcement on. Two forms:
+
+- **Early:** the `detail` is "cannot deactivate: this account is the fleet's
+  last administrator". Nothing was revoked or changed.
+- **Late:** the `detail` adds that the account's linked credentials (API
+  tokens and sessions, including linked OIDC/SAML identities) were revoked
+  before the refusal and that the account remains active. The credentials-first
+  order is deliberate (ADR-2001).
+
+Each refusal is audited as `scim.user.last_administrator_refused` (result
+`denied` for an early refusal and for a refused group-derived demotion;
+`partial` for a late refusal, because the credentials were revoked) and counted on
+`yuzu_server_rbac_last_admin_guard_refused_total{transport="scim"}`. A refused
+deprovision also raises a critical analytics event: the person was terminated
+at the IdP but their account stays active (and, after an early refusal, their
+API tokens and sessions stay live too), so an operator has to act. The audit
+detail states what was left in place. If the guarded write itself cannot
+complete (a lock wait that expired, an unavailable store) the answer is `503`
+with `Retry-After: 2` (header only; the SCIM error body has no `retry_after_ms`
+member), not a refusal, and it is counted on
+`yuzu_server_rbac_lifecycle_store_failure_total{op="deactivate"}`. A `409`
+does not prove that an IdP stops retrying: expect the same request again on
+the next sync cycle. The audit row and counter are written every time; the
+server log line is limited to one warning per username per minute. A
+group-derived **demotion** that the guard refuses does not fail the Group
+request; the account keeps its role and the same audit action is recorded.
+On `POST /scim/v2/Users`, a username whose deactivated record carries a role
+other than `user`, or that already holds an `Administrator` grant, is refused
+`404` before anything is created or reactivated.
 
 #### Provenance guard
 
@@ -11572,6 +11804,11 @@ Create a group. Body: `displayName` (required), optional `members[]`
 | `201` + `Location` + `ETag` | Created | SCIM Group representation |
 | `409` (`scim_type=uniqueness`) | `displayName` already in use | SCIM error envelope |
 
+The success audit row (`scim.group.created`) records `recompute=complete` when
+every affected member's role was recomputed as intended, otherwise
+`recompute=incomplete` (the status stays `201`); see `scim.group.recompute_incomplete`
+below.
+
 #### `GET /scim/v2/Groups/{id}`
 
 Read a single group by its SCIM `id`. `200` + Group representation, or
@@ -11589,17 +11826,22 @@ rejected `400` (`scim_type=invalidFilter`).
 
 Replace a group (`displayName`, `members[]`). `200` + Group representation;
 `404` if unknown; `409` (`scim_type=uniqueness`) if the replace would rename
-onto a `displayName` already used by a different group.
+onto a `displayName` already used by a different group. The success audit row
+(`scim.group.updated`) records `recompute=complete` or `recompute=incomplete`
+(the status stays `200`).
 
 #### `PATCH /scim/v2/Groups/{id}`
 
 Add/remove members — RFC 7644 §3.5.2 PatchOp on the `members` path
 (`"op": "add"` / `"op": "remove"`, `"path": "members"`). `200` + Group
-representation, or `404` if unknown.
+representation, or `404` if unknown. The success audit row (`scim.group.updated`)
+records `recompute=complete` or `recompute=incomplete` (the status stays `200`).
 
 #### `DELETE /scim/v2/Groups/{id}`
 
-Delete a group. `204` on success; `404` if unknown.
+Delete a group. `204` on success; `404` if unknown. The success audit row
+(`scim.group.deleted`) records `recompute=complete` or `recompute=incomplete`
+(the status stays `204`).
 
 Any Group `POST`/`PUT`/`PATCH`/`DELETE` that changes a user's membership of
 the `--scim-admin-group` group recomputes that user's role immediately
@@ -11614,14 +11856,17 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 |---|---|---|
 | `scim.user.provisioned` | `success` / `denied` / `failure` | `POST` succeeds (incl. a revived reprovision) / rejected `409` against an active account / rolls back `500` |
 | `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500` |
-| `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write itself could not persist |
-| `scim.user.reactivated` | `success` / `failure` | `PATCH`/`PUT` sets `active:true`; `failure` on an audit-write error (set-and-proceed) |
-| `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed) |
-| `scim.user.provenance_denied` | `denied` | A mutating call targets an account failing the provenance or role guard |
+| `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write itself could not persist. (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`) |
+| `scim.user.reactivated` | `success` / `failure` | `PATCH`/`PUT` sets `active:true`. `failure` causes: the tombstone's role could not be read (`500`, detail `tombstone role unreadable before reactivation`), the Administrator-grant read was unavailable (`503`, detail `administrator grant check unavailable`), the account or mirror write failed (`500`). An elevated tombstone or a name holding an Administrator grant is NOT a `reactivated` row: it is `scim.user.provenance_denied` (`404`) |
+| `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed). (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`) |
+| `scim.user.provenance_denied` | `denied` | A mutating call targets an account failing the provenance or role guard, or a `POST` or an `active:true` reactivation names a tombstone whose role is not `user` / a username that already holds an `Administrator` grant (the latter two also fire for a benign re-enable of an account an operator elevated or granted outside SCIM) |
+| `scim.user.last_administrator_refused` | `denied` / `partial` | The last-Administrator guard refused a deactivation, delete, `POST` with `active:false` or group-derived demotion (`409` `mutability` on the Users routes; a refused group-derived demotion is not a `409`: the Group request keeps its `2xx` and the member keeps the role). On the Users routes `detail` carries `attempted_action=...`, `early_refusal=true\|false`, `credentials_revoked_before_refusal=true\|false`, `account_remains_active=true` and `live_api_tokens_slug=<n>` (the username's own live tokens; `unknown` if the store could not answer), plus `sessions_not_revoked=true` on an early refusal or `identity_links_unchanged=true` and the revoke summary on a late one; a LATE refusal is `partial` (credentials were revoked), an early one and a refused group-derived demotion are `denied`. `live_api_tokens_slug` is followed by `linked_principals_not_walked=true`: linked OIDC/SAML principals' tokens are not counted. The `revoked_principals=` list is lossy: `,`, space, `=`, control bytes and every byte >= 0x80 become `_`, so two distinct principals can collapse into one token (the exact identity stays in `identity_links`). For a refused group-derived demotion it carries `attempted_action=scim.user.role_changed` and `role_unchanged=true`. Every refusal, including a refused demotion, also raises a critical analytics event |
+| `scim.group.recompute_incomplete` | `partial` | (target type `Group`) A Group request's role recompute did not apply every member as intended (a refused or failed demotion, an undetermined member whose read failed, or promotions skipped after a failed guarded write): `detail` carries `members=<n>` and, per non-empty class, `refused`, `failed`, `undetermined` or `skipped_promotions` with the count and up to 20 usernames (the first 20 are named; the count is exact), then the trigger. Counted on `yuzu_scim_group_recompute_skipped_total{cause}`. The Group request's own status is unchanged, and its `scim.group.created`/`updated`/`deleted` success row says `recompute=incomplete`. A failed demotion is also a `scim.user.role_changed` `failure` row plus a critical analytics event |
+| `scim.user.compensation_failed` | `failure` | The guarded undo of a half-finished create/revive was refused or failed; the request answered `500`. `outcome=guard_refused_last_administrator` leaves the account active; `deactivated_but_session_wipe_failed` leaves it deactivated with a possibly live session; `store_failure` leaves its state indeterminate, so check the account. A critical analytics event and `yuzu_scim_compensation_failed_total{outcome}` accompany it |
 | `scim.auth.denied` | `denied` | Bearer-auth validation fails on any `/scim/v2/*` route, including discovery |
-| `scim.group.created` | `success` / `denied` / `failure` | `POST /scim/v2/Groups` succeeds / rejected `409` — `displayName` collision / rolls back `500` |
-| `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` — rename onto an existing `displayName` / fails `500` |
-| `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed) |
+| `scim.group.created` | `success` / `denied` / `failure` | `POST /scim/v2/Groups` succeeds / rejected `409` - `displayName` collision / rolls back `500`. On `success`, `detail` is `recompute=complete` or `recompute=incomplete` |
+| `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` - rename onto an existing `displayName` / fails `500`. On `success`, `detail` is `recompute=complete` or `recompute=incomplete` |
+| `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed). On `success`, `detail` is `recompute=complete` or `recompute=incomplete` |
 | `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value on user create or a Group create/replace/patch/delete (records `old_role`→`new_role`, `reason=group`) |
 | `scim.user.deprovision_role_refused_with_link` | `failure` | ADR-2001 D1: a role-refused deprovision (`deprovision_role_ok` 404 — the slug's role is not `user`) for a slug with ≥1 active linked OIDC identity, whose tokens are therefore NOT auto-revoked. Always written alongside `yuzu_scim_deprovision_role_refused_with_active_link_total` — see `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
 | `auth.oidc.deprovisioned_denied` | `failure` | ADR-2001 §4/PR3: an OIDC login was refused because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the store could not answer — fail-closed). Emitted from `GET /auth/callback`, not a `/scim/v2/*` route — listed here because it is part of the same ADR-2001 linkage. `detail` carries `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource (deactivated, or orphaned by a hard-deleted `scim_resources` row) drove the denial, or `reason=scim_store_unavailable` when the store could not answer (fail-closed — no `scim_id` to name); and — only on the post-mint re-check path (a concurrent deprovision landed after the primary check) — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). The two `reason` values keep a genuine deprovision (CC6.8 evidence) distinguishable from a store outage. Pairs with `yuzu_auth_oidc_deprovisioned_denied_total`. |

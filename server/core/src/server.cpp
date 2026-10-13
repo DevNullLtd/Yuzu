@@ -1981,23 +1981,85 @@ public:
                                   "generation_refresh_failed", "generation_refresh_failed_within_bound",
                                   "rbac_enabled_non_canonical", "stale_beyond_accepted_bound"})
             metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
-        // A2 last-Administrator guard refusal (governance SHOULD #9,
-        // full-pipeline review on 765bc7ec1) — how often an operator's
-        // unassign attempt was refused because it would leave the fleet
-        // with zero authenticatable Administrators (RbacStore::
-        // unassign_role's guard, rbac_admin_authority_owner.cpp). Zero-seeded per transport
-        // so an idle server carries both closed series from boot.
+        // Last-Administrator guard refusals: A2's role-unassign guard
+        // (RbacStore::unassign_role) and, since #4966, the account-lifecycle guard
+        // (RbacStore::deactivate_account / set_local_role: a deactivation or a demotion
+        // that would remove the last member of a protected administrator population). Both
+        // mean an operator (or an IdP) tried to remove the fleet's last administrator, not a
+        // store fault. Zero-seeded per transport so an idle server carries every closed
+        // series from boot.
         metrics_.describe("yuzu_server_rbac_last_admin_guard_refused_total",
-                          "RBAC role-unassign requests refused by the last-remaining-"
-                          "Administrator guard (POST/DELETE /api/v1/rbac/roles/{name}/"
-                          "assignments and its MCP twins), by transport. A sustained "
-                          "non-zero rate is an operator repeatedly trying to remove the "
-                          "fleet's last administrator, not a store fault - compare "
-                          "against yuzu_server_rbac_read_degrade_total to rule that out.",
+                          "Requests refused by a last-remaining-Administrator guard: RBAC "
+                          "role-unassign (POST/DELETE /api/v1/rbac/roles/{name}/assignments "
+                          "and its MCP twins) and account deactivation or demotion (dashboard "
+                          "Settings and SCIM), by transport. A sustained non-zero rate is an "
+                          "operator or IdP repeatedly trying to remove the fleet's last "
+                          "administrator, not a store fault - compare against "
+                          "yuzu_server_rbac_read_degrade_total to rule that out. A SCIM "
+                          "compensation undo the guard refused is NOT counted here (it is not "
+                          "an IdP removal attempt); see yuzu_scim_compensation_failed_total. "
+                          "Every refusal is counted, including repeats; a critical analytics "
+                          "event accompanies each SCIM refusal (a no-op under "
+                          "--no-analytics; the audit row and this counter still fire).",
                           "counter");
-        for (const auto transport : {"rest", "mcp"})
+        for (const auto transport : {"rest", "mcp", "dashboard", "scim"})
             metrics_.counter("yuzu_server_rbac_last_admin_guard_refused_total",
                              {{"transport", transport}});
+        // #4966: a store fault inside the account-lifecycle guard (a lock wait that expired, a
+        // lost connection, an unwired guard), by the guarded operation. NOT a refusal: the
+        // request was neither allowed nor judged. Counted in AuthManager, so the dashboard, SCIM
+        // and every other caller through it share one series. No alert rule ships with it yet
+        // (a later change owns the alerts).
+        metrics_.describe("yuzu_server_rbac_lifecycle_store_failure_total",
+                          "Store faults inside the account-lifecycle last-Administrator guard, "
+                          "by operation (deactivate: account removal; set_role: role write; "
+                          "would_strand: the advisory pre-check, after which the request still "
+                          "proceeds to the guarded write; grant_read: the SCIM "
+                          "pre-provisioning Administrator-grant read). The unwired fail-closed "
+                          "arm also counts, for deactivate and set_role only. A sustained "
+                          "non-zero rate means deprovisioning or role changes are being "
+                          "answered with a store-unavailable error rather than judged, except "
+                          "for would_strand, which never stops the request (SCIM answers 503 "
+                          "with Retry-After; the dashboard role route gives no retry hint): "
+                          "look at yuzu_pg_pool_waiters and "
+                          "yuzu_pg_acquire_wait_seconds, and for a stuck rbac_enabled row lock "
+                          "holder.",
+                          "counter");
+        for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read"})
+            metrics_.counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}});
+        // #4966: a SCIM same-request compensation (the guarded undo of a just-created or
+        // just-revived account) that did NOT complete. Written beside the
+        // scim.user.compensation_failed audit row and critical event.
+        metrics_.describe("yuzu_scim_compensation_failed_total",
+                          "SCIM provisioning compensations (the guarded undo of an account "
+                          "created or revived earlier in the same request) that did not "
+                          "complete, by outcome (guard_refused_last_administrator: the account "
+                          "is left active; deactivated_but_session_wipe_failed: deactivated, a "
+                          "session may survive; store_failure: state indeterminate). Every "
+                          "increment needs operator attention: check the account. The "
+                          "critical analytics event that accompanies it is a no-op "
+                          "under --no-analytics; the audit row and this counter still fire.",
+                          "counter");
+        for (const auto outcome : {"guard_refused_last_administrator",
+                                   "deactivated_but_session_wipe_failed", "store_failure"})
+            metrics_.counter("yuzu_scim_compensation_failed_total", {{"outcome", outcome}});
+        // #4966: SCIM Group role-recompute members NOT applied in one Group request. Promotions
+        // after the first failed guarded write of the request are skipped (the fail-safe
+        // direction); a member whose reads failed is "undetermined" (its role was left untouched).
+        // Demotions are always attempted, so there is no demotion series. Both series are seeded
+        // so a zero is visible and stays seeded as evidence.
+        metrics_.describe("yuzu_scim_group_recompute_skipped_total",
+                          "SCIM Group role-recompute members not applied in one Group request, "
+                          "by cause. promotion: skipped after the first failed guarded write "
+                          "of the request. undetermined: a read the decision needed failed, so "
+                          "the member's role was left untouched and it is unknown whether an "
+                          "administrator was kept. Each increment is recorded by one "
+                          "scim.group.recompute_incomplete audit row naming the members (first 20 "
+                          "named; the count is exact); there is no automatic repair (see the "
+                          "SCIM provisioning guide, Known limits).",
+                          "counter");
+        for (const auto cause : {"promotion", "undetermined"})
+            metrics_.counter("yuzu_scim_group_recompute_skipped_total", {{"cause", cause}});
         // #2703 Gate 7 merge-slice item 1 commit C. Neither metric duplicates the
         // existing shared-pool signals (yuzu_pg_acquire_wait_seconds,
         // yuzu_pg_pool_in_use — both already cover every RbacStore acquire, since
@@ -3465,8 +3527,11 @@ public:
         metrics_.describe("yuzu_scim_provenance_denied_total",
                           "Total SCIM mutations refused because the target account's "
                           "provisioning_source is not 'scim' (or its role was elevated outside "
-                          "SCIM's ownership) - SCIM attempting to touch an account it does not "
-                          "own is a misconfigured-IdP or compromised-IdP signal",
+                          "SCIM's ownership), or (#4966) a POST or active:true reactivation "
+                          "named a username that already holds an Administrator grant or whose "
+                          "deactivated record has a non-user role - SCIM attempting to touch "
+                          "an account it does not own is a misconfigured-IdP or compromised-IdP "
+                          "signal",
                           "counter");
         // SCIM v2 Groups->role application core (#2021). Bumped only when
         // recompute_scim_user_role ACTUALLY changes a role (promotion or
@@ -3487,9 +3552,10 @@ public:
         // a durable role change that could not be applied, distinct from
         // yuzu_scim_role_changes_total's success path.
         metrics_.describe("yuzu_scim_role_change_failures_total",
-                          "Total SCIM-driven role changes that failed to write to AuthDB during "
-                          "group-membership recompute - a sustained non-zero rate means role "
-                          "changes are silently not taking effect",
+                          "Total SCIM-driven role changes that did not complete during "
+                          "group-membership recompute: the guarded write failed, or the role "
+                          "changed but its durable session wipe failed - a sustained non-zero "
+                          "rate means role changes are not taking effect cleanly",
                           "counter");
         // ADR-2001 D1/D2 (governance Gate 7 BLOCKING fix, #3): describe()'d
         // unconditionally here rather than left to lazily create at first
@@ -3677,6 +3743,8 @@ public:
         metrics_.counter("yuzu_scim_deprovision_role_refused_with_active_link_total");
         metrics_.counter("yuzu_scim_deprovision_unlinked_total");
         metrics_.counter("yuzu_scim_provenance_denied_total");
+        metrics_.counter("yuzu_scim_role_changes_total");
+        metrics_.counter("yuzu_scim_role_change_failures_total");
         metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
         metrics_.counter("yuzu_scim_saml_link_write_failures_total");
         metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_total");
@@ -6609,7 +6677,32 @@ public:
                     {"rbac_config", "securable_types", "operations", "roles", "role_permissions",
                      "principal_roles", "groups", "group_members"});
                 spdlog::info("RbacStore initialized (schema rbac_store)");
+                // #4966: the last-Administrator guard for account lifecycle
+                // (deactivation + role writes). AuthManager borrows the store and reaches
+                // the guard through its thin wrappers; auth_db_ and rbac_store_ share
+                // pg_pool_ (the one-pool assumption the owner's cross-schema transaction
+                // needs). Wired here, not beside set_credential_change_owner: rbac_store_
+                // does not exist until this block. Nulled at teardown beside
+                // set_credential_change_owner(nullptr).
+                auth_mgr_.set_rbac_store(rbac_store_.get());
             }
+        }
+        // #4966 boot self-check: an AuthDB without the guard would leave
+        // AuthManager::remove_user_checked / update_role_checked failing closed on
+        // every call (they never fall back to the unguarded AuthDB write). Refuse to
+        // start instead of serving a console where no account can be removed or
+        // re-roled. Exactly that condition, via the SAME decision the runtime arms use;
+        // a store that failed to open already set startup_failed_ above.
+        if (!startup_failed_ &&
+            auth::AuthManager::lifecycle_guard_unwired(auth_mgr_.auth_db_ptr() != nullptr,
+                                                       auth_mgr_.has_rbac_store())) {
+            spdlog::error("[PG] Refusing to start: AuthDB is configured but the RbacStore "
+                          "last-Administrator guard is not wired to AuthManager (#4966). The "
+                          "RbacStore failed to open or the wiring is missing: see the RbacStore "
+                          "error logged above this line (a migration or database fault); the "
+                          "guard cannot run without it and no account can be removed or "
+                          "re-roled while it is absent");
+            startup_failed_ = true;
         }
 
         // Engine-principal namespace collision-scan preflight (design doc
@@ -9838,6 +9931,7 @@ public:
             .device_inventory = device_inventory_store_.get(),
             .software_licensing = software_licensing_store_.get(),
             .app_usage = app_usage_store_.get(),
+            .offline_endpoint = offline_endpoint_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }
@@ -10339,6 +10433,8 @@ public:
         // pg_pool_ + audit_store_, both reset below).
         auth_mgr_.set_credential_change_owner(nullptr);
         credential_change_owner_.reset();
+        // #4966: same contract for the borrowed RbacStore (reset further below).
+        auth_mgr_.set_rbac_store(nullptr);
 
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
@@ -16117,12 +16213,16 @@ private:
             .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
         });
         preflight_runner_thread_ = std::thread([this]() {
-            spdlog::info("Pre-flight runner thread started (cadence=60s, retention=14d)");
+            spdlog::info("Pre-flight runner thread started (cadence=60s, retention=14d; "
+                         "endpoint_state prune hourly)");
+            std::uint64_t tick = 0;
+            constexpr int kOfflineEndpointPruneEveryNTicks = 60; // ~1h at 60s/tick
             while (!stop_requested_.load(std::memory_order_acquire)) {
                 for (int i = 0; i < 12 && !stop_requested_.load(std::memory_order_acquire); ++i)
                     std::this_thread::sleep_for(std::chrono::seconds{5});
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
+                ++tick;
                 if (preflight_runner_) {
                     // tick() touches JSON, PG and gRPC dispatch — any can throw; an
                     // escaping exception would std::terminate the process, so a bad
@@ -16153,6 +16253,49 @@ private:
                         spdlog::error("deployment prune threw ({}) — thread continuing", e.what());
                     } catch (...) {
                         spdlog::error("deployment prune threw unknown exception — continuing");
+                    }
+                }
+                // #5678 / #1545 UP-4: hourly clock-guarded prune of endpoint_state rows
+                // unseen for roster window + margin. Hosted on THIS thread, not
+                // health_recompute_thread_: the health tick's serial budget is shared
+                // with the revocation sweep, and this thread already hosts the two
+                // WS-10 prunes and nothing security-sensitive. ReplicaSafe — no
+                // leader_gate call. The window is the roster's own (kHardwareRosterWindow);
+                // the prune cutoff is that window + kPruneMargin on the PG-authored
+                // last_seen_at. The roster still reads last_heartbeat_ms on the replica
+                // clock, so the prune cannot reach a row the roster shows only while
+                // replica/PG clock skew stays under the 7 d margin.
+                // Cadence: first pass on the first tick (the bootstrap decline persists the
+                // anchor), then hourly — so the first real delete is the hourly pass ~1 h
+                // later and a server restarted more often than hourly still prunes once per
+                // boot. A prior pass may have held this thread up to the statement timeout,
+                // so re-check stop_requested_ before starting (stop() joins this thread
+                // before offline_endpoint_store_ is reset).
+                if (offline_endpoint_store_ && !stop_requested_.load(std::memory_order_acquire) &&
+                    tick % kOfflineEndpointPruneEveryNTicks == 1) {
+                    try {
+                        YUZU_ASSERT_BACKGROUND_JOB("offline_endpoint_store.run_retention_prune");
+                        // Bounded backlog drain, mirroring the app_perf prune above: a pass
+                        // that hit the cap may have more, so re-arm immediately (at most 12
+                        // passes = 12 * kPruneCapPerPass rows per replica per hour). Any
+                        // non-cap result — under-cap, a decline (0) or an error (-1) — stops
+                        // the drain until the next hourly tick.
+                        for (int drain = 0;
+                             drain < 12 && !stop_requested_.load(std::memory_order_acquire);
+                             ++drain) {
+                            const int pruned =
+                                offline_endpoint_store_->run_retention_prune(kHardwareRosterWindow);
+                            if (pruned < 0)
+                                spdlog::warn("endpoint_state prune did not run (store not open or "
+                                             "no connection/transaction); retrying next hour");
+                            if (pruned != OfflineEndpointStore::kPruneCapPerPass)
+                                break;
+                        }
+                    } catch (const std::exception& e) {
+                        spdlog::error("endpoint_state prune threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        spdlog::error("endpoint_state prune threw unknown exception — continuing");
                     }
                 }
             }
@@ -17621,12 +17764,11 @@ private:
 
         // InventoryRoutes — /software: the SOFTWARE inventory list (fleet catalogue +
         // installs-per-version drill + "devices >" expansion) over SoftwareInventoryStore,
-        // gated on the GLOBAL Inventory:Read (the catalogue aggregates are NOT mgmt-group
-        // scoped — ADR-0017 confinement inert under the global gate, caveated in the UI;
-        // the expansion applies a per-row Inventory:Read drop filter). Reuses the shared
-        // auth/perm/audit closures + a fail-closed check_scoped_permission predicate
-        // (below). The REST /api/v1/inventory/software route and MCP tool have since
-        // migrated onto require_fleet_read; this page has not, so it does not match them.
+        // gated solely on fleet_read_fn (ADR-0017 admit-then-filter, the same gate as the REST
+        // route and MCP tool): the catalogue and version aggregates cannot be narrowed to a
+        // management group, so a confined caller is refused them; the host view and the
+        // devices tables are admitted and narrowed by the gate's own scope. Reuses the shared
+        // auth/audit closures.
         auto inv_human_age = [](std::int64_t ms) -> std::string {
             if (ms < 0)
                 ms = 0;
@@ -17653,17 +17795,23 @@ private:
             // Persisted endpoints within a 30-day window — OFFLINE-INCLUSIVE (the whole
             // point of the device tab: readable when a device is offline). Aged-out hosts
             // beyond the window are withheld so the list doesn't accrete dead hosts forever.
-            auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
+            auto eps = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
+            if (!apply_roster_read(result, eps)) // #5531: unread, not empty — no enrichment
+                return result;
             // currently-connected agents (live registry). all_ids() copies only the ids
             // under the registry lock — NOT to_json_obj()'s full 5-field-per-agent JSON
             // serialisation under the heartbeat/dispatch hot-path mutex (gov perf-S2).
+            // all_ids() is this replica's local sessions UNION the cached durable presence
+            // (live_presence(), refreshed at most every kPresenceCacheTtl = 3 s): a device
+            // gracefully departed from another replica can still read online here for up to
+            // that TTL (#5678), after which its cleared session_id drops it from presence.
             // unordered_set: O(1) membership over up to fleet-size ids (gov perf-N2).
             auto online_ids = registry_.all_ids();
             std::unordered_set<std::string> online(online_ids.begin(), online_ids.end());
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
-            for (const auto& e : eps) {
+            for (const auto& e : *eps) {
                 InventoryDeviceRow r;
                 r.agent_id = e.agent_id;
                 r.hostname = e.hostname;
@@ -17675,7 +17823,7 @@ private:
                 r.arch = e.arch;
                 r.online = online.count(e.agent_id) > 0;
                 const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
-                r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000); // matches the inventory stale window
+                r.stale = age_ms > kHardwareStaleAfterMs; // matches the inventory stale window
                 r.last_seen = r.online ? std::string("now") : inv_human_age(age_ms);
                 r.last_seen_ms = r.online ? now_ms : e.last_heartbeat_ms;
                 out.push_back(std::move(r));
@@ -17688,9 +17836,8 @@ private:
             // UNFILTERED roster — confinement is HardwareRoutes' `scoped_roster` on the
             // FleetReadGate scope, downstream of this join; attach_device_ci only ever
             // looks up by an agent_id already in `out`, never re-deriving
-            // visibility. A degrade (nullopt) leaves CI columns
-            // blank — the roster itself is still shown (this list is best-effort, unlike
-            // the Software tab's authoritative reads; see the existing empty-roster note).
+            // visibility. A CI-join degrade (nullopt) leaves CI columns
+            // blank; the roster read itself is typed and handled by apply_roster_read above.
             // KNOWN FOLLOW-UP (#1783 — gov Gate 3 performance + architect + Gate 5 chaos
             // review): this reads the WHOLE fleet's CI on every render regardless of how
             // few devices are visible, unlike the Software tab's hourly rollup
@@ -17748,20 +17895,10 @@ private:
                 }
             }
             if (tag_store_) {
-                const auto keys = tag_store_->get_distinct_keys().value_or(std::vector<std::string>{});
-                auto values_res = tag_store_->get_values_for_keys(keys);
-                if (values_res) {
-                    for (auto& r : out) {
-                        auto it = values_res->find(r.agent_id);
-                        if (it == values_res->end())
-                            continue;
-                        r.tags.reserve(it->second.size());
-                        for (const auto& [k, v] : it->second)
-                            r.tags.emplace_back(k, v);
-                    }
-                } else {
-                    result.tags_degraded = true;
-                }
+                apply_tag_read(result, tag_store_->get_distinct_keys(),
+                               [this](const std::vector<std::string>& keys) {
+                                   return tag_store_->get_values_for_keys(keys);
+                               });
             } else {
                 result.tags_degraded = true;
             }
@@ -17774,7 +17911,7 @@ private:
         // (#1783-adjacent) — a per-open O(fleet) scan is acceptable for a CI record
         // page (opened far less often than the list re-renders).
         auto hw_identity_fn = [this, inv_human_age](const std::string& agent_id)
-            -> std::optional<InventoryDeviceRow> {
+            -> std::expected<std::optional<InventoryDeviceRow>, PresenceReadError> {
             if (auto sess = registry_.get_session(agent_id)) {
                 InventoryDeviceRow r;
                 r.agent_id = agent_id;
@@ -17792,28 +17929,12 @@ private:
                 return r;
             }
             if (!offline_endpoint_store_)
-                return std::nullopt;
-            auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
+                return std::optional<InventoryDeviceRow>{};
+            const auto eps = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
-            for (const auto& e : eps) {
-                if (e.agent_id != agent_id)
-                    continue;
-                InventoryDeviceRow r;
-                r.agent_id = e.agent_id;
-                r.hostname = e.hostname;
-                r.os = e.os;
-                r.agent_version = e.agent_version;
-                r.arch = e.arch;
-                r.online = false;
-                const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
-                r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000);
-                r.last_seen = inv_human_age(age_ms);
-                r.last_seen_ms = e.last_heartbeat_ms;
-                return r;
-            }
-            return std::nullopt;
+            return offline_identity_row(eps, agent_id, now_ms, inv_human_age);
         };
         // The full per-device CI record composition — ONE closure shared verbatim
         // by the dashboard fragment and the REST twin, so the two can never drift
@@ -17822,7 +17943,7 @@ private:
         // one was already wired).
         auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
             HardwareCiDetail detail;
-            detail.identity = hw_identity_fn(agent_id);
+            apply_identity_read(detail, hw_identity_fn(agent_id));
             if (auto sess = registry_.get_session(agent_id))
                 detail.agent_version = sess->agent_version; // immutable identity field, lock-free
             detail.ci = device_inventory_store_
@@ -17848,75 +17969,84 @@ private:
         };
         inventory_routes_ = std::make_unique<InventoryRoutes>();
         inventory_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn,
-            [this](const SoftwareCatalogQuery& q)
-                -> std::optional<std::vector<SoftwareCatalogRow>> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->software_catalog(q);
-            },
-            [this]() -> std::optional<CatalogRollupMeta> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->catalog_rollup_meta();
-            },
-            [this](const std::string& name,
-                   int limit) -> std::optional<std::vector<SoftwareVersionCount>> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->software_versions(
-                    SoftwareVersionsQuery{.name = name, .limit = limit});
-            },
-            [this](const SoftwareFleetQuery& q) -> std::optional<std::vector<SoftwareFleetRow>> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->query_software(q);
-            },
-            // "devices >" per-row Inventory:Read management-group scope predicate — the SAME
-            // check_scoped_permission chokepoint.
-            // FAIL-CLOSED on a corrupt/load-failed rbac.db (#1717): gates on
-            // rbac_enforcement_in_effect, NOT raw !is_rbac_enabled() (which fails OPEN — a
-            // null db reads as "RBAC off → no filter" → cross-operator IDOR). Mirrors
-            // response_agent_in_scope (server.cpp). The REST/MCP siblings have since moved
-            // onto require_fleet_read (ADR-0017); this page still gates on the global
-            // Inventory:Read, so this per-row filter does not narrow results today.
-            [this](const std::string& username, const std::string& agent_id) -> bool {
-                if (!rbac_enforcement_in_effect(rbac_store_.get()))
-                    return true; // loaded & explicitly disabled → legacy-open
-                return rbac_store_ && rbac_store_->check_scoped_permission(
-                                          username, "Inventory", "Read", agent_id,
-                                          mgmt_group_store_.get());
-            },
-            // Freshness KPI: current stale count (nullopt on degrade → "—" in the UI).
-            // SAME 2-missed-cycles window as the metrics sweep.
-            [this]() -> std::optional<std::int64_t> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                constexpr std::int64_t kWin = 2 * 24 * 60 * 60;
-                const std::int64_t cutoff = std::chrono::duration_cast<std::chrono::seconds>(
-                                                std::chrono::system_clock::now().time_since_epoch())
-                                                .count() -
-                                            kWin;
-                return software_inventory_store_->count_stale_agents(cutoff);
-            },
-            audit_fn,
-            // Round-3 item 8: agent_id -> hostname for the Software page's
-            // "devices ›" expansion. One bulk read per render (never per-row) —
-            // endpoint_state's hostname column is written on every heartbeat
-            // regardless of online/offline, so this single 30-day window read
-            // covers both, mirroring hw_identity_fn's offline-store fallback
-            // tier without needing the registry-first tier here (a stale-by-a-
-            // few-seconds hostname on an online device is immaterial for this
-            // display-only lookup).
-            [this]() -> std::unordered_map<std::string, std::string> {
-                std::unordered_map<std::string, std::string> out;
-                if (!offline_endpoint_store_)
+            *web_server_,
+            InventoryRoutes::Deps{
+                .auth_fn = auth_fn,
+                // The Software fragments' SOLE gate (ADR-0017).
+                .fleet_read_fn = fleet_read_fn,
+                .catalog_fn = [this](const SoftwareCatalogQuery& q)
+                    -> std::optional<std::vector<SoftwareCatalogRow>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->software_catalog(q);
+                },
+                .catalog_meta_fn = [this]() -> std::optional<CatalogRollupMeta> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->catalog_rollup_meta();
+                },
+                .totals_fn = [this](const SoftwareCatalogQuery& q)
+                    -> std::optional<SoftwareCatalogTotals> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->software_catalog_totals(q);
+                },
+                .versions_fn = [this](const SoftwareVersionsQuery& q)
+                    -> std::optional<std::vector<SoftwareVersionCount>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->software_versions(q);
+                },
+                .fleet_fn = [this](const SoftwareFleetQuery& q)
+                    -> std::optional<std::vector<SoftwareFleetRow>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->query_software(q);
+                },
+                // Freshness KPI: current stale count (nullopt on degrade -> "—" in the UI).
+                // The SAME 48 h window as the REST/MCP catalogue's coverage.stale.
+                .stale_fn = [this]() -> std::optional<std::int64_t> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    const std::int64_t cutoff =
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() -
+                        software_catalogue::kStaleWindowSecs;
+                    return software_inventory_store_->count_stale_agents(cutoff);
+                },
+                // ponytail: O(fleet) registry walk per full-page render (the REST twin does the
+                // same); an O(1) connected-count when the 2M-endpoint target bites.
+                .connected_fn = [device_api]() -> std::optional<std::int64_t> {
+                    if (!device_api)
+                        return std::nullopt;
+                    return static_cast<std::int64_t>(device_api->list_devices().size());
+                },
+                // agent_id -> hostname for the host type-ahead / devices tables. One bulk read
+                // per render; endpoint_state's hostname is written on every heartbeat whether
+                // the device is online or not, so the 30-day window covers both.
+                .hostnames_fn = [this]() -> std::unordered_map<std::string, std::string> {
+                    std::unordered_map<std::string, std::string> out;
+                    if (!offline_endpoint_store_)
+                        return out;
+                    // #5531 exception: display-only; a failed read leaves hostnames
+                    // unresolved and the page falls back to the agent_id.
+                    for (auto& e : offline_endpoint_store_->query_stale_within(
+                                       kHardwareRosterWindow)
+                                       .value_or(std::vector<OfflineEndpoint>{}))
+                        out.emplace(std::move(e.agent_id), std::move(e.hostname));
                     return out;
-                for (auto& e : offline_endpoint_store_->query_stale_within(
-                         std::chrono::hours(24 * 30)))
-                    out.emplace(std::move(e.agent_id), std::move(e.hostname));
-                return out;
-            });
+                },
+                // Last synced column: the same datum the Hardware record shows as
+                // `software_last_seen`, read in bulk for one devices page.
+                .last_synced_fn = [this](const std::vector<std::string>& ids)
+                    -> std::optional<std::unordered_map<std::string, std::int64_t>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->source_last_seen_bulk("installed_software",
+                                                                            ids);
+                },
+                .audit_fn = audit_fn});
 
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
         // Software lives at /software; /inventory redirects here.
@@ -18349,10 +18479,16 @@ private:
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
+        // One definition for both the viz routes and the MCP get_fleet_topology
+        // tool so the two offline-roster surfaces cannot drift.
+        const OfflineRosterFn offline_roster =
+            offline_endpoint_store_
+                ? OfflineRosterFn{[this](std::chrono::seconds w) { return offline_endpoint_store_->query_stale_within(w); }}
+                : OfflineRosterFn{};
         viz_routes_ = std::make_unique<VizRoutes>();
         viz_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
                                      fleet_topology_store_.get(), &metrics_, &viz_disabled_,
-                                     offline_endpoint_store_.get());
+                                     offline_roster);
 
         // DashboardRoutes — /fragments/results, /fragments/results/filter-bar,
         //                   /fragments/create-group-form, /api/dashboard/group-from-results
@@ -20176,8 +20312,7 @@ private:
             // route) before any member destructs, so no handler runs past
             // that join -- same discipline as gateway_route_store_/
             // mgmt_group_store_ etc. (cpp-safety gov finding).
-            mcp_server_->set_viz_deps(fleet_topology_store_.get(), offline_endpoint_store_.get(),
-                                      &viz_disabled_);
+            mcp_server_->set_viz_deps(fleet_topology_store_.get(), offline_roster, &viz_disabled_);
             mcp_server_->set_upload_grant_ops(
                 upload_grant_store_.get(),
                 // SAME logic as the REST list_read_fn wired at the

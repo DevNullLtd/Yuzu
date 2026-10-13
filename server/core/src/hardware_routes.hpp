@@ -112,6 +112,10 @@ std::string render_hardware_tags_lens(const std::string& agent_id,
 
 std::string render_hardware_not_found(const std::string& agent_id);
 
+/// #5531: the roster read FAILED and nothing else about the device is readable —
+/// distinct from `render_hardware_not_found`.
+std::string render_hardware_roster_unreadable(const std::string& agent_id);
+
 /// One plugin's advertised actions, as reported by a connected agent — a light
 /// mirror of `AgentRegistry::PluginMeta` that keeps gRPC/registry headers out of
 /// this header (only the .cpp wiring in server.cpp touches `AgentRegistry`
@@ -191,6 +195,9 @@ public:
     /// up on `FleetReadFn`'s own scope (silently reconciling two different scope
     /// predicates is exactly the class of bug `FleetReadFn`'s doc comment warns
     /// about). Empty closure = route renders "unavailable" and 503s on the REST twin.
+    /// A FAILED roster read (#5531) returns `roster_degraded = true` with empty
+    /// rows: the fragment renders the roster-unavailable banner (still 200, htmx
+    /// does not swap a 5xx) and the REST twin 503s — never an empty page.
     using RosterFn = std::function<InventoryDevicesResult()>;
 
     /// The full per-device CI record composition (identity + CI blob + software +

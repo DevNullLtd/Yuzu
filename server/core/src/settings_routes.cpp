@@ -146,6 +146,50 @@ std::string auto_approve_audit_value(const std::string& s) {
     return audit_token(std::string_view(s).substr(0, kMax));
 }
 
+// #4966: the ONE dashboard answer to a last-Administrator refusal (delete AND demote): 409 with
+// the A4 envelope, the HX-Trigger toast, and the `transport="dashboard"` refusal counter. `message`
+// is always a code-authored constant (never caller bytes), so it is safe in the hand-built toast
+// JSON, which follows this file's `{"showToast":{"message":...,"level":...}}` idiom. The caller
+// writes its own audit row (the detail differs between the early and the late delete refusal).
+void respond_last_administrator_refused(httplib::Response& res, yuzu::MetricsRegistry* metrics,
+                                        std::string_view message) {
+    if (metrics) {
+        metrics
+            ->counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                      {{"transport", "dashboard"}})
+            .increment();
+    }
+    res.status = 409;
+    res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::string(message) +
+                                     R"(","level":"error"}})");
+    res.set_content(detail::a4_error(res, message), "application/json");
+}
+
+// #4966: the retryable store-fault answer of the guarded DELETE: 503 with `Retry-After: 2` and a
+// matching `retry_after_ms`, like the token-revoke route's store-fault arm. The role writes use
+// `respond_committed_no_retry` instead (a store failure there may have committed).
+void respond_lifecycle_store_unavailable(httplib::Response& res, std::string_view message) {
+    res.status = 503;
+    res.set_header("Retry-After", "2");
+    res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::string(message) +
+                                     R"(","level":"error"}})");
+    res.set_content(detail::a4_error(res, message, {.retry_after_ms = 2000}),
+                    "application/json");
+}
+
+// #4966: the answer for "the change COMMITTED but the durable session wipe failed" AND for the
+// role route's indeterminate StoreFailure (the commit may have been acknowledged-lost and the
+// failure path's wipe may have failed). A plain 503 with NO retry hint (no `Retry-After`, no
+// `retry_after_ms`): a repeat of the role POST finds the role already set and answers 200 "Role
+// unchanged" WITHOUT redoing the wipe, so telling a client to retry would promise a convergence
+// the route does not provide. The operator finishes it by revoking the user's sessions.
+void respond_committed_no_retry(httplib::Response& res, std::string_view message) {
+    res.status = 503;
+    res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::string(message) +
+                                     R"(","level":"error"}})");
+    res.set_content(detail::a4_error(res, message), "application/json");
+}
+
 std::string highlight_yaml_value(const std::string& val) {
     if (val.empty())
         return {};
@@ -5169,6 +5213,20 @@ void SettingsRoutes::register_routes(
                 return;
             }
         }
+        // #4966 - BEST-EFFORT early refusal, BEFORE any credential is revoked: if removing this
+        // account would exhaust a protected administrator population right now, answer 409 with
+        // nothing changed. This is advisory, not the authority: the read takes no lock, so a
+        // concurrent grant removal or demotion can invalidate either answer, and the guard inside
+        // `remove_user_checked` below still decides. `nullopt` (not answerable: no store wired or
+        // a store fault) proceeds and lets that guard decide.
+        if (auth_mgr_->would_strand_last_administrator(username).value_or(false)) {
+            audit_fn_(req, "user.delete", "denied", "User", username,
+                      "last_administrator_blocked");
+            respond_last_administrator_refused(
+                res, metrics_registry_,
+                "Cannot delete: this account is the fleet's last administrator");
+            return;
+        }
         // ADR-2001 §§1,3 — credentials-FIRST revoke across the resolved
         // principal set (the deleted username + every OIDC identity linked
         // to it via SCIM, if any) BEFORE the account is removed. Mirrors
@@ -5272,7 +5330,8 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        if (auth_mgr_->remove_user(username)) {
+        switch (auth_mgr_->remove_user_checked(username)) {
+        case auth::RemoveUserOutcome::Removed:
             if (!auth_mgr_->save_config()) {
                 spdlog::error("Failed to save config after user removal");
             }
@@ -5282,10 +5341,51 @@ void SettingsRoutes::register_routes(
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
             return;
+        case auth::RemoveUserOutcome::LastAdministratorRefused:
+            // The LATE refusal: the advisory check above passed (or could not answer), the
+            // credentials were already revoked (ADR-2001 credentials-first, kept on purpose:
+            // reversing the order would leave linked federated credentials live at full role
+            // until a retry), and the guard then refused. Never imply "nothing changed".
+            spdlog::warn("DELETE /api/settings/users: '{}' is the last protected administrator; "
+                         "refused after its credentials were revoked",
+                         username);
+            // `partial`, not `denied`: the credentials WERE revoked (a change was made) and
+            // the account stays active, so the audit result must not read as "nothing happened".
+            audit_fn_(req, "user.delete", "partial", "User", username,
+                      "last_administrator_blocked credentials_revoked_before_refusal=true "
+                      "account_remains_active=true " +
+                          revoke_detail);
+            respond_last_administrator_refused(
+                res, metrics_registry_,
+                "Cannot delete: this account is the fleet's last administrator. Its credentials "
+                "were revoked before the refusal; the account remains active");
+            return;
+        case auth::RemoveUserOutcome::StoreFailure:
+            // The row may or may not be deactivated (a lost COMMIT ack, or a fail-closed arm):
+            // say only that the delete may not have completed; repeating the DELETE re-runs the
+            // guarded write and the session wipe.
+            audit_fn_(req, "user.delete", "failure", "User", username,
+                      "store_failure credentials_revoked_before_failure=true " + revoke_detail);
+            respond_lifecycle_store_unavailable(
+                res, "User store unavailable; the delete may not have completed. Linked "
+                     "credentials were revoked. Try again");
+            return;
+        case auth::RemoveUserOutcome::RemovedSessionWipeFailed:
+            // The account IS deactivated (committed) but the durable session wipe failed, so a
+            // live session may survive: a repeated DELETE finishes the wipe.
+            if (!auth_mgr_->save_config()) {
+                spdlog::error("Failed to save config after user removal");
+            }
+            audit_fn_(req, "user.delete", "partial", "User", username,
+                      "account_deactivated session_wipe_failed=true " + revoke_detail);
+            respond_lifecycle_store_unavailable(
+                res, "User deactivated, but session cleanup failed. Repeat the delete to finish");
+            return;
+        case auth::RemoveUserOutcome::NotFound:
+            break;
         }
-        // remove_user() returns false when the username is not in the
-        // user store. A no-op DELETE is still a privileged-mutation
-        // attempt and must surface in the audit chain.
+        // NotFound: the username is not in the user store (or is already inactive). A no-op
+        // DELETE is still a privileged-mutation attempt and must surface in the audit chain.
         audit_fn_(req, "user.delete", "denied", "User", username, "user_not_found");
         res.status = 404;
         res.set_header("HX-Trigger",
@@ -5419,14 +5519,64 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        // Perform role change (AuthManager.update_role() handles DB + session invalidation)
-        if (!auth_mgr_->update_role(target_username, new_role)) {
-            spdlog::error("Failed to update role for '{}'", target_username);
-            audit_fn_(req, "user.role_change", "denied", "User", target_username, "db_failure");
-            res.status = 500;
+        // Perform role change (AuthManager::update_role_checked() runs the #4966 guarded write,
+        // then handles the cache + session invalidation after the commit). There is no
+        // pre-write revoke on this path, so a refusal changed nothing at all.
+        switch (auth_mgr_->update_role_checked(target_username, new_role)) {
+        case auth::UpdateRoleOutcome::Updated:
+            break;
+        case auth::UpdateRoleOutcome::LastAdministratorRefused:
+            spdlog::warn("POST /api/settings/users/:username/role: '{}' is the last protected "
+                         "administrator; demotion refused",
+                         target_username);
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "last_administrator_blocked");
+            respond_last_administrator_refused(
+                res, metrics_registry_,
+                "Cannot demote: this account is the fleet's last administrator");
+            return;
+        case auth::UpdateRoleOutcome::InactivePromotionRefused:
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "inactive_promotion_refused");
+            res.status = 409;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Cannot promote an inactive account","level":"error"}})");
+            res.set_content(detail::a4_error(res, "Cannot promote an inactive account"),
+                            "application/json");
+            return;
+        case auth::UpdateRoleOutcome::NotFound:
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "user_not_found");
+            res.status = 404;
             res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"Failed to update role","level":"error"}})");
-            res.set_content(detail::a4_error(res, "Failed to update role"), "application/json");
+                           R"({"showToast":{"message":"User not found","level":"error"}})");
+            res.set_content(detail::a4_error(res, "User not found"), "application/json");
+            return;
+        case auth::UpdateRoleOutcome::UpdatedSessionWipeFailed:
+            // The role IS changed (committed) but a session at the old role may survive. No
+            // retry hint: a repeat answers 200 "Role unchanged" and never redoes the wipe.
+            audit_fn_(req, "user.role_change", "partial", "User", target_username,
+                      "role_changed session_wipe_failed=true old_role=" +
+                          auth::role_to_string(old_role) +
+                          " new_role=" + auth::role_to_string(new_role));
+            respond_committed_no_retry(
+                res,
+                "Role updated, but session cleanup failed. Revoke the user's sessions to finish");
+            return;
+        case auth::UpdateRoleOutcome::StoreFailure:
+            spdlog::error("Failed to update role for '{}'", target_username);
+            audit_fn_(req, "user.role_change", "failure", "User", target_username,
+                      "store_failure");
+            // The owner outcome does not distinguish "nothing committed" from "committed but the
+            // commit acknowledgement was lost", and the failure path's durable session wipe may
+            // itself have failed. A repeat of this POST would then find the role already set and
+            // answer 200 "Role unchanged" WITHOUT redoing the wipe, so no retry is promised:
+            // the operator checks the role and revokes the sessions.
+            respond_committed_no_retry(
+                res,
+                "Role store unavailable; the change may or may not have been applied. Check the "
+                "user's role and revoke the user's sessions");
             return;
         }
 

@@ -519,12 +519,18 @@ struct PluginMeta {
 // the trio published together by set_gateway_route, M1 review fix +
 // #4324; an earlier revision wrote gateway_node under the registry mu_
 // instead, which both raced stream_mu's readers and contradicted this
-// comment) and the atomic last_activity_epoch_ms. (Governance G3
-// cpp-safety — keep it true.)
+// comment) and the atomic last_activity_epoch_ms. `session_id` is ALSO
+// rewritten in place after publication, by AgentRegistry::map_session under
+// AgentRegistry::mu_ (an exception to the identity-field rule above): read
+// it only through session_is()/session_id_of(), never through a
+// get_session()/find_by_session() pointer after the lock is released (#5684).
+// (Governance G3 cpp-safety — keep it true.)
 
 struct AgentSession {
     std::string agent_id;
-    std::string session_id; // Unique per connection — used to prevent stale cleanup races
+    // Unique per connection — used to prevent stale cleanup races. Rewritten in place by
+    // map_session under AgentRegistry::mu_: read only via session_is()/session_id_of().
+    std::string session_id;
     std::string hostname;
     std::string os;
     std::string arch;
@@ -659,16 +665,17 @@ public:
     ///
     /// HA WS-5 governance hardening (external review finding, 2026-09-22):
     /// the return value is load-bearing for the caller's durable-presence
-    /// mirror (agent_service_impl.cpp / gateway_service_impl.cpp), which
+    /// mirror (presence_departure.hpp, used by agent_service_impl.cpp /
+    /// gateway_service_impl.cpp), which
     /// must fire OfflineEndpointStore::remove_if_session ONLY when this
     /// returns true. The durable row's own session_id column is
     /// heartbeat-driven, not registration-driven (see heartbeat_ingestion.cpp)
     /// — so on an ordinary same-replica reconnect (S1 disconnects, S2
     /// registers, S2 hasn't heartbeated yet), the durable row can still read
     /// S1's session_id even though S1 is already locally superseded by S2.
-    /// A caller that fires the durable delete unconditionally (using S1's
+    /// A caller that fires the durable clear unconditionally (using S1's
     /// own session_id, which still legitimately matches the stale row) would
-    /// delete a LIVE agent's presence row — a false-negative other replicas'
+    /// clear a LIVE agent's presence — a false-negative other replicas'
     /// evaluate_scope()/all_ids() would silently inherit. Bool was `void`
     /// before this fix; every caller was already local to this repo (grep
     /// verified two call sites, both updated in the same change).
@@ -1042,6 +1049,13 @@ public:
 
     // Get a session by agent_id (for scope evaluation).
     std::shared_ptr<AgentSession> get_session(const std::string& agent_id) const;
+
+    /// True iff the registry's current session for `agent_id` carries `session_id`.
+    /// Compares under `mu_` — reading `get_session(...)->session_id` after the lock is
+    /// released races the owner's session replacement.
+    [[nodiscard]] bool session_is(const std::string& agent_id, const std::string& session_id) const;
+    /// Copy of the current session id for `agent_id` (empty if none), read under `mu_`.
+    [[nodiscard]] std::string session_id_of(const std::string& agent_id) const;
 
     // #3424/#3511: ids POSITIVELY known to lack `plugin`, for
     // dispatch_confined_arms's plugin-presence filter. One locked pass over

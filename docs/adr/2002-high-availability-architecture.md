@@ -501,10 +501,12 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
   (see `gateway_route_store.hpp`'s file-header FORWARD NOTE). The `duplicate_connected` positive
   tripwire on `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` that #4324's own issue
   checklist deferred is tracked separately as `#4464`.
-- **The re-announce/"known-session" check is PER-REPLICA in-memory** (`gateway_sessions_`) (#4246 #3 —
-  **DEFERRED**, re-homed to its own slice under WS-5 shared agent presence, ADR §7a); under
-  active-active a replay routed to a non-owning replica always takes the fresh branch. A durable
-  cross-replica session lookup is required before the guarantee holds on more than one replica.
+- **The re-announce/"known-session" check is PER-REPLICA in-memory** (`gateway_sessions_`) on the
+  `ProxyRegister` replay branch (#4246 #3). *Update 2026-10-11: the `BatchHeartbeat` /
+  `ProxyInventory` / `NotifyStreamStatus` session resolution is now directory-authoritative — see §7f
+  (merged as PR #5694, 2026-10-12); the `ProxyRegister` known-session
+  check itself is unchanged.* Under active-active a replay routed to a non-owning replica still takes
+  the fresh branch until the safe-to-scale gate work lands.
 - **Re-announce refreshes LIVENESS (lease), not PLACEMENT** — `cluster_id`/`gateway_node` are not
   re-read on the replay branch, and a fresh re-register COALESCE-preserves the OLD cluster/node until a
   CONNECTED `announce_connected` lands; a 4.2 reader must not trust placement from a replay/fail-open
@@ -578,12 +580,12 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
   DURABLE `(agent_id, session_id)` binding already stored in the directory is the trust anchor, so a
   correlation is deliberately checked against it rather than trusting any caller-supplied value; the
   wire's `HeartbeatRequest` carries no `agent_id` at all (only `session_id`), so `BatchHeartbeat`
-  resolves it from the SAME per-replica in-memory `gateway_sessions_` map the #4246 #3 known-session
-  check above already uses. This means #10's correlation inherits THAT bullet's limitation, not a new
-  one: a heartbeat for a session this replica doesn't locally know is excluded from the renew batch
+  resolved it, when this slice landed, from the per-replica in-memory `gateway_sessions_` map. A
+  heartbeat for a session the answering replica did not know was excluded from the renew batch
   (surfaced via `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}`,
-  new in this slice, rather than silently dropped) and stays that way until the #4246 #3 durable
-  cross-replica session lookup lands under WS-5. Reached after a server-only restart (observed on one
+  new in this slice, rather than silently dropped). *Superseded 2026-10-11 (§7f): resolution is now a
+  batched durable-directory read, so a non-owning replica renews the lease; `unknown_session` counts
+  directory-unknown ids only.* Reached after a server-only restart (observed on one
   rig; superseded, see the 2026-10-04 update in this section and "What happens when the server restarts" in `docs/user-manual/gateway.md`).
 - **Ship the write-failure fail-closed posture + alert rule** (#4246 #1 — **CLOSED, 4.2b**). The flip
   landed as a **per-site contract, not a uniform flip**: `record_route_store_failure`'s six call sites
@@ -1123,7 +1125,8 @@ so a wrong disposition is never edited in place, only superseded by a later row 
 "remaining 4.4 scope" in §7b's `#4555` decision text) is judged OUT of WS-4 4.4's actual scope: the
 WS-4 gate exists because "commands can't reach agents" (`docs/ha-delivery-matrix.md`), and gossip-based
 peer health/rebalancing is a capacity/load-balancing feature, not a reachability one. Tracked separately,
-not a WS-4 gate item.
+not a WS-4 gate item: as of 2026-10-13 that tracker is **WS-15** in `docs/ha-delivery-matrix.md`
+(roadmap 7.1.1, #5759), paired with WS-13's agent-side failover (roadmap 14.2, #291).
 
 **Update (2026-10-01, #1197 - server-side unknown-session verdict; INERT until the gateway consumes it).**
 `BatchHeartbeatResponse` gained `repeated string unknown_session_ids = 2` and
@@ -1136,10 +1139,14 @@ sessions until the gateway-side replay lands. An old gateway ignores the new fie
 fields), so the wire is unchanged in behaviour. There is deliberately no presence marker: a server that
 predates the fields and a server with nothing unknown are indistinguishable, and the gateway's only
 correct action in both cases is today's behaviour (no replay).
-- **What the list means.** It is the per-replica "I do not hold this session" verdict: the distinct
-  session ids in this batch that THIS replica's in-memory `gateway_sessions_` does not hold. It says
-  nothing about the other replicas or about the durable `GatewayRouteStore` directory. It is reported
-  whether or not a route store is wired.
+- **What the list means.** *(Updated 2026-10-11, §7f.)* The distinct session ids in this batch that
+  the answering replica does not hold: either the durable `GatewayRouteStore` directory does not know
+  them, or the directory knows them but this replica has no local `gateway_sessions_` entry for them
+  (a store-only resolution, e.g. after a server-only restart; the gateway replays `ProxyRegister` to
+  rebuild the local registry). A session whose directory read failed and that this replica holds no
+  local hint for, and a session id matching more than one directory row, is neither acked nor listed
+  (a locally hinted session is still acked during a failed read). Without a route store it is the
+  original per-replica in-memory verdict.
 - **Bounds.** At most `kMaxUnknownSessionIdsPerResponse` = 4096 ids are listed (about 260 KiB at 64
   bytes each); past that `unknown_session_ids_truncated` is set and one warn names listed/total. The
   listed subset is unordered-set order, deliberately not sorted, so an omitted id is typically reported
@@ -1147,7 +1154,7 @@ correct action in both cases is today's behaviour (no replay).
   guaranteed when a batch carries a very large number of distinct unknown ids (only 4096 are listed per
   response, an arbitrary subset; the gateway forwards agent heartbeats verbatim, so one agent can
   contribute many ids). The 64-byte per-id cap
-  (`kMaxGatewaySessionIdLen`) is applied only AFTER the `gateway_sessions_` lookup misses: a
+  (`kMaxGatewaySessionIdLen`) is applied only AFTER the local/directory lookup misses: a
   reclaim-absent `ProxyRegister` adopts a gateway-presented id of any length, so capping first would
   silently stop ingesting a known session. An empty unknown id is skipped; an over-length unknown id is
   never listed and is counted per entry under
@@ -1560,6 +1567,60 @@ one core replica a server-only restart now recovers through the replay described
   are planned follow-ups with no issue numbers yet. Rig pass 6 (`c518edd93`, simulated agents, loopback) registered 1000, 2000 and 5000 agents in 1.89 s, 4.16 s and 12.08 s with the shipped setting. Detail:
   `docs/user-manual/gateway.md`, "Registration rate per gateway".
 
+**Update (2026-10-06, #4632 - the gateway holds stream-status notifications instead of dropping them).**
+`yuzu_gw_upstream` no longer drops a `CONNECTED` or `DISCONNECTED` notification when 10 are already in
+flight or the circuit breaker is not closed. It holds it in a bounded, memory-only store keyed by
+`{agent, session, stream home}` (a newer event for a held key replaces the held one and keeps its place, except that a newer event for the
+half open probe's own key is held at the tail and supersedes the probe's older event if the probe fails;
+`notify_pending_max`, default 10000, caps the keys) and sends the held entries first in first out, at most 10 at a time. The
+earlier text of this section is left as written; the points below say what it no longer describes.
+- **Emission is at most once per session; delivery is not.** The "AT MOST ONE `CONNECTED(S)` and one
+  `DISCONNECTED(S)` per session" statement in the 4.4 status paragraph above describes what
+  `yuzu_gw_agent` emits. While the breaker is half open exactly one held notification is sent as the probe
+  and a probe that times out may already have reached the server, so it is sent again after it goes back to
+  the head: probe delivery is at least once (OBSERVED on a rig: one `DISCONNECTED` reached the server 3 times
+  after two timed-out probes and 6 times after five; one `CONNECTED` used as the probe, twice; the server
+  handled every copy without error).
+- **Retired clause.** "a `DISCONNECTED(S)` that `yuzu_gw_upstream` drops (circuit-open, or the
+  `MAX_NOTIFY_INFLIGHT` inflight cap) leaves it to lease-expiry + the stale-lease reaper", and the #1197
+  update's statement that an open breaker "drops stream-status notifications", no longer hold: such a
+  notification is held and delivered when the probe succeeds. What is still lost is a notification for a
+  new key when the store is full (counted as `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`),
+  one whose worker failed after taking it (not counted, not retried), a held probe that is evicted because it cannot
+  be encoded or is retired by a server status that means the request itself was wrong (a WARN is logged; see
+  the Known limits in `docs/user-manual/gateway.md`), and everything held when the upstream client process or the
+  gateway stops (the store is volatile). A lost `DISCONNECTED` still leaves the agent
+  listed as online in the server's registry and its route row routable until the lease expires, as before.
+- **Superseded pointer.** "The in-flight notification limit behind it is tracked in #4632" (the "What it does
+  not promise" bullet above) is closed by this change; the series still has no agent label and an agent
+  whose `CONNECTED` was lost at the cap still stays acknowledged but unreachable until its next reconnect.
+- **New invariant.** The head held notification is the breaker probe, so a notification that fails
+  deterministically on its own payload would block the queue and keep the breaker cycling against a healthy
+  server. Fields that an agent controls are therefore sanitised at admission; the agent-supplied peer address
+  is the only one today (found in review: a value that is not valid UTF-8 cannot be encoded).
+- **Narrowed by the Gate 8 re-review (same update).** The invariant above is now enforced at one more layer:
+  a failure of the gateway's own request encoder (the request never left the gateway) is a local error that
+  feeds the breaker neither as a success nor as a failure, and a held notification whose probe ends that way is
+  evicted with a warning and the next head is probed at once, so such a notification no longer blocks the queue.
+  A server answer, a transport error and a killed probe worker still count as before. `cluster_id` is converted
+  with the unicode conversion and the gateway refuses to start when it cannot be represented. The peer address
+  stays sanitised so its notification is sent instead of evicted. Details: Known limits in
+  `docs/user-manual/gateway.md` and the evidence record.
+- **Narrowed again by the second re-review (2026-10-06, fix round 3).** The invariant now also covers a
+  server status that means the request itself was wrong. The gateway refuses an agent id outside 1 to
+  256 bytes at the edge (the same bound the server applies) before any upstream call, and server statuses
+  such as `INVALID_ARGUMENT` no longer count as breaker failures, so a registration the server refuses cannot
+  move the breaker; statuses that mean an unhealthy or unusable upstream still count. The `cluster_id`
+  environment text is interpreted in the VM's native name encoding (latin1 in the shipped images), because
+  the round above had assumed Unicode code points; the refusal to start for an unrepresentable value is
+  unchanged. Details: Known limits in `docs/user-manual/gateway.md` and the evidence record.
+- **Residuals** are the ones listed under Known limits in `docs/user-manual/gateway.md`, among them: a probe
+  success proves only the notification path, not registration; the synchronous RPCs still run inside the one
+  upstream process, so casts queue in its mailbox while one runs; retry or breaker feedback for an ordinary
+  notification worker that fails is a follow-up.
+The measured evidence (rig runs against the previous build and with TLS, the governance run and the
+adversarial review) is `docs/security-reviews/gateway-notify-pending-store-2026-10-05.md`.
+
 ### 7d. Cross-cluster gateway fan-out — "rest of 4.3" (WS-4, 2026-09-21)
 
 **Status: CLOSED.** The last named WS-4 4.3 gap: 4.3a (§ above) built INTRA-cluster routing (agent on a
@@ -1841,6 +1902,177 @@ unusable-pool short-circuit above it (now resolved through the same helper, pr-r
 FortitudeEtc/Codex+Kimi, SHOULD, 2026-09-22). One path remains genuinely open, not silently: a clean
 `Finish()` with zero response frames never resolves (#4691, filed, not fixed here) — "every time" describes
 every branch this PR's own scope covers, not that one.
+
+### 7f. Durable cross-replica gateway session resolution (WS-5 slice 2, `#4246` item #3, 2026-10-11)
+
+**Status: merged as PR #5694 (`eabc2b639`, 2026-10-12). THE SAFE-TO-SCALE GATE IS NOT
+LIFTED** — this closes one more `#4246` gap; it does not make a second replica safe (WS-6 6.1b/6.3, WS-13
+for gateway-fronted fleets, WS-5's remaining slice-1 scope and the WS-9 scenarios are still open — see
+`docs/ha-delivery-matrix.md`). Run exactly ONE server replica (§7c).
+
+**Problem.** `GatewayUpstreamServiceImpl` resolved a gateway `session_id` to an `agent_id` only through
+the per-replica in-memory `gateway_sessions_` map. A replica that did not process the agent's
+`ProxyRegister` could not resolve that agent's `BatchHeartbeat` / `ProxyInventory` /
+`NotifyStreamStatus` traffic and answered "unknown session" — a gateway re-register storm, dropped
+inventory, and rejected stream notifications.
+
+**Mechanism.** `GatewayRouteStore::lookup_by_sessions(span<string>)` de-duplicates the presented ids,
+drops empty ids and ids longer than 64 bytes (the caller counts those as malformed), and reads
+`SELECT ... WHERE session_id = ANY($1::text[]) ORDER BY agent_id` in chunks of 1,024 ids, all on one
+pooled connection; it returns `store_unavailable` on degrade. **Read bound:** the 500 ms hot-path
+timeout bounds only the wait to ACQUIRE that connection. A batch of n distinct ids then issues
+ceil(n/1024) statements on the one lease, each bounded by the pool's `statement_timeout` (30 s by
+default), with no aggregate deadline across them. The server puts no id-count cap on a batch; the
+shipped gateway sends one `BatchHeartbeat` per buffer chunk (about 3 MiB) and keeps one buffered entry
+per session up to `max_heartbeat_buffer` (default 10,000), so a default gateway's batch carries at most
+10,000 ids, i.e. at most 10 statements. Tombstoned rows (`session_id` NULL) never match. The private
+`GatewayUpstreamServiceImpl::resolve_sessions` is store-AUTHORITATIVE whenever the route store is
+configured; the local `gateway_sessions_` map is only a degrade-time hint (and a lost-race fallback).
+The `agent_routes_session_id_idx` index is non-unique, so a `session_id` matching more than one row is
+REFUSED as ambiguous (desync metric `op=session_lookup`, `outcome=ambiguous_session`); a degraded read
+is counted under route-store failure op `session_lookup`.
+
+- **BatchHeartbeat** ingests and renews leases for every resolvable entry. `unknown_session_ids` lists a
+  session id when the directory does not know it OR when the directory knows it but this replica holds
+  no local gateway-session entry for it (a *store-only* resolution — see "Local hydration" below).
+  The `renew_leases/unknown_session` desync counter moves for directory-unknown ids only. A session
+  whose read FAILED and that this replica holds no local hint for, and a session matching more than
+  one row, is neither acked nor listed (the gateway does not re-register in a storm). Heartbeat
+  resolution is **fail-soft**: on a degraded read, pairs the local `gateway_sessions_` map hints at
+  are still acknowledged, ingested and lease-renewed.
+- **ProxyInventory** works on a non-owning replica. An id the directory does not know keeps
+  `received=false` (the agent's retry nack; a local hint helps only on a degraded read or for a
+  lost-race id); a degraded read WITH a local hint ingests; an
+  ambiguous id is refused. Degrades are counted distinctly.
+- **NotifyStreamStatus.** CONNECTED: the guard reads `lookup_route(agent_id)`. On a SUCCESSFUL read
+  the local-map fallback is permitted only when the row is absent/tombstoned or the session id is in
+  `lost_race_sessions_`; a row carrying a DIFFERENT non-null `session_id` rejects the notification
+  (`notify_stream_status/stale_connected_session`). On a DEGRADED `lookup_route`, CONNECTED is
+  accepted only when this replica holds the matching local session (`gateway_sessions_[session]` names
+  the agent AND the registry's current session for the agent is that session — local state the
+  directory verified at `ProxyRegister`, which is sound only for a single replica; see "Deferred, not
+  silent"); otherwise it is refused and counted
+  `notify_stream_status/connected_unverified`. DISCONNECTED proceeds on the local-map check when the
+  directory read fails (it is a teardown, not an admission), and its presence-row delete (#5678: now
+  a session clear; the row is kept for the roster) is gated on
+  `removed_current_session || store_removed`. A CONNECTED on a replica with a directory row but no
+  local `AgentSession` skips the registry `set_gateway_route`/unpublish (nothing local to update) and
+  still announces.
+- **Presence correctness (§7a).** `OfflineEndpointStore::upsert` blank-preserves `hostname`
+  (newly; `os` has been blank-preserved since #5294, as were `agent_version`/`arch`) and, since
+  #5678 (2026-10-12), `session_id`: a blank incoming value never overwrites a known non-blank one.
+  A graceful disconnect (`remove_if_session`) clears ONLY the row's `session_id` (session-guarded
+  `UPDATE`, #5678); `hostname` and the other fields survive so the offline-inclusive `/hardware`
+  roster keeps listing the device with its real last-seen time. Rows are aged out by a clock-guarded
+  hourly per-replica prune (`pg::run_clock_guarded_prune` on `preflight_runner_thread_`, keyed on the
+  PG-authored `last_seen_at`: 37 d = the 30 d roster window + a 7 d margin, advisory-locked, up to 12
+  passes of 1000 rows per hourly tick) (#5678, 2026-10-12), and the decommission cascade below deletes
+  a decommissioned agent's row explicitly, so a presence row's `hostname` is never cleared by an
+  upsert and goes away only when one of those two deletes removes the row. Gap recorded when this
+  bullet was written (pre-existing, not introduced by WS-5): `OfflineEndpointStore` had no
+  `delete_agent` and was not a member of the decommission cascade (`AgentDecommissionStores`), so a
+  decommissioned agent's `endpoint_state.endpoints` row (including its `hostname`) persisted
+  indefinitely, because the only delete was the session-guarded `remove_if_session`, reached from a
+  DISCONNECTED the decommissioned agent never sends. **Closed by #5682:**
+  `OfflineEndpointStore::delete_agent` deletes the row whatever its `session_id`, and it is the
+  cascade's seventh member (`offline_endpoint`), so `DELETE /api/v1/sle/agents/{id}` erases it on the
+  shared Postgres, visible to every replica's next presence read (the registry's 3 s
+  `kPresenceCacheTtl` read cache aside). A still-enrolled agent that heartbeats again re-creates the
+  row, the same "erasure does not unenroll" posture as every other cascade store. A device that is
+  never decommissioned ages out through the prune above (#5678). Reads filter by TTL or stale window,
+  so a departed row is flagged stale on `/viz` for 7 days and is invisible to scope evaluation.
+  `HeartbeatIngestion::ingest` takes the resolved session id, so a heartbeat on a non-owning replica
+  (no local `AgentSession`) cannot blank the presence row's `session_id`.
+
+**Local hydration (server-only restart).** The directory rows survive a server restart but the local
+registry and `gateway_sessions_` do not, and the gateway only replays `ProxyRegister` for ids the
+server LISTS. A purely store-authoritative answer would therefore list nothing and the local registry
+would stay empty until each agent re-registered — zero devices in `/api/agents` and the dashboard,
+`yuzu_agents_connected` = 0 (`YuzuAgentFleetDrop` fires), and the guardian heartbeat reconcile
+reporting `no_session`. So a store-only resolution is still ingested and renewed AND added to
+`unknown_session_ids`; the gateway's existing #1197 reconcile replays `ProxyRegister` and the
+existing replay-adopt path rebuilds the local session. That path never calls `register_fresh`, never
+mints an epoch and never flips `cluster_id`. Convergence is bounded, not instantaneous: the replay is
+paced (`registration_replay_session_guard_ms` default 10 s per session, drip spacing 20 ms by default —
+about 8.3 agents/s at 100 ms, so 10,000 agents take ~1,200 s; `replay_queue_max` 10,000), and
+each response lists at most 4,096 ids (`kMaxUnknownSessionIdsPerResponse`; the truncation flag is
+set). Heartbeats are acked and leases renewed throughout, so nothing is reaped meanwhile. This
+requires a gateway carrying the #1197 reconcile; an old gateway paired with this server gets the
+"without the reconcile" behaviour (no replay; local state stays empty until agents re-register).
+In a multi-replica future the same mechanism hydrates a non-owning replica with bounded churn;
+that is NOT validated here.
+
+**Deliberate deviation — `routable` is not consulted.** A UNIQUE session match resolves regardless of
+the row's computed `routable` flag (lease freshness). A heartbeat IS the lease-renewal path
+(`renew_leases`); refusing a lease-stale row would turn a short Postgres blip into a fleet-wide
+re-register storm. Tombstoned rows still never match.
+
+**Decision — degraded-read posture is per site, and is not uniformly fail-closed.** CONNECTED on a
+degraded `lookup_route` is accepted only when this replica holds the matching local session (single
+replica: that local state was directory-verified at `ProxyRegister`, and `set_gateway_route` still
+rejects a superseded session) and is refused otherwise (`acknowledged=false`,
+`notify_stream_status/connected_unverified`); the same WS-4 4.4 F1 principle as the `ProxyRegister`
+decide path — never admit what nothing has verified. The gateway does not retry a refused CONNECTED
+(it ignores `acknowledged=false`) and `yuzu_gw_upstream_notify_dropped_total` does NOT count it, so the
+server-side `connected_unverified` counter is the signal; a refused session stays registered but
+without dispatch placement until the agent reconnects. The degraded read itself is also counted under
+`write_failed{op="session_lookup"}`. BatchHeartbeat and DISCONNECTED are deliberately fail-soft
+because refusing them would cause the storm or the teardown loss this design exists to prevent. A
+Postgres outage longer than the 90 s lease plus 180 s grace (270 s) tombstones the rows; recovery is
+automatic (renewal shortfall → `unknown_session` → gateway replay), with a
+`renew_leases/unknown_session` spike. `yuzu_server_gateway_route_degraded_renewal_total{op="batch_heartbeat"}`
+counts BATCHES, not pairs: it rises once per `BatchHeartbeat` whose directory read degraded and that
+renewed at least one locally hinted pair, after the renewal write succeeded.
+
+**Security notes (CC6.6).** The session id is gateway-asserted; agent identity always comes from the
+directory row, never from a wire field. A multi-row match is refused. An unreadable directory is
+never treated as "unknown" for replay or listing purposes (a degraded DISCONNECTED for a session
+this replica holds no local entry for is still counted `notify_stream_status/unknown_session`, with
+nothing to tear down); a session this replica itself registered (a local hint) is still
+acknowledged, lease-renewed and ingested during the degrade, which suspends the ambiguity refusal for
+that window. The gateway-to-server hop is protected by the gateway peer mTLS plus SPKI pin. Evidence
+for these decisions is metrics and server logs only — there is no per-event audit row (volume is
+unbounded). The `ProxyRegister` adopt path rejects a presented session id that is not `gw-session-`
+plus 32 lowercase hex characters (`proxy_register/malformed_session_id`), and refuses to adopt an id
+that a different agent's COMMITTED directory row already holds (`proxy_register/session_held_by_other_agent`,
+expected rate zero, alert `YuzuGatewaySessionHeldByOtherAgent`). That guard is a same-statement
+`NOT EXISTS`, not a lock: two CONCURRENT adopts of one id for different agents can both land (measured
+against live Postgres), and the ambiguity refusal (`YuzuGatewaySessionAmbiguous`) is the backstop
+until the deferred UNIQUE partial index. It also cannot see a victim row that is already tombstoned
+(an outage past 270 s): a presenter of that id can reclaim it, and the id then resolves to the
+presenter until the victim's stream reconnects. If the victim was already listed for replay, its
+replay is refused and forces that reconnect; otherwise the window lasts until the victim's next
+reconnect for any other reason. Presenting another agent's id
+takes a compromised pinned gateway, which can already assert heartbeat and inventory content for every
+session it proxies. An ambiguity therefore means duplicate placement, a concurrent-adopt race or a
+forged presented id; both alerts are the signal to investigate the adopt path and the presenting
+gateway.
+
+**Rolling deploy.** An OLD replica answering a batch reports directory-known sessions as unknown
+(its local map is empty after restart), so the gateway re-registers those agents. Drain old replicas
+first; the supported topology remains exactly one replica until the safe-to-scale gate lifts (§7c).
+No migration, flag or proto field is involved, the gateway needs no restart, and rollback is safe.
+
+**Validation evidence.** The `[ws5]`, `[gateway_route_wiring]` and `[heartbeat_ingestion]` unit
+tags, including a restart-reconcile case (a non-owning replica lists the store-only session, the
+lease advances, `ProxyRegister` adoption populates the local session, and the next batch lists
+nothing). The WS-9 failover/restart validation script is NOT yet written (follow-on PR-B); that
+leaves no automated failover/restart recovery evidence beyond the unit tests (SOC 2 A1.2 gap, stated
+honestly).
+
+**Deferred, not silent.** hp-1 (a local session with an empty `gateway_node` and no
+stream shadows the directory fallback in `GatewayRouteFallback::prepare`; reachable only with a second
+replica, which the gate forbids) and hp-2, both #5685; a UNIQUE partial index on `agent_routes(session_id)` (#5683, own
+migration — the cross-agent `NOT EXISTS` adopt guard plus the ambiguity refusal are the interim
+guards, see Security notes); the local-only surfaces that still read only
+the local registry (`to_json_obj()`, `agent_count()`, the guardian heartbeat reconcile) on a replica
+that has not yet been hydrated; the degraded-read CONNECTED local acceptance, which is sound only
+for one replica (a supersede handled on another replica is invisible to this replica's
+`gateway_sessions_` and `session_is`, so on a degraded read this replica can re-publish its
+in-memory placement for the superseded session; the durable row is untouched because the write is
+session-guarded) and must be revisited with hp-1 before the gate lifts (#5685); TSan coverage of the new
+paths (not landed with this change; #5278); and the WS-9 validation script (follow-on PR-B). The
+local-only surfaces and the WS-9 script are tracked in the WS-5 row of `docs/ha-delivery-matrix.md`.
 
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced *(the

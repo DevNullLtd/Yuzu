@@ -569,6 +569,16 @@ because the routing directory itself was degraded at that moment is not
 retried within that recovery cycle and can strand an agent server-unknown
 until its own next reconnect (`#4634`).
 
+Update (#4632, 2026-10-05): a gateway that includes #4632 holds a
+re-announcement it cannot send at once (10 notifications already in flight, or
+the circuit breaker not closed) and sends it first in first out, instead of
+dropping it as described above. It is lost at admission, and counted in
+`yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`, only when the
+store is full: `notify_pending_max` keys are held, counting the key of a half
+open probe that is out. A notification lost after admission (a failed or killed
+worker, or a gateway stop with entries held) is not counted there. See
+"Stream Status Notification" in [gateway.md](gateway.md#stream-status-notification).
+
 ### vNEXT — multi-cluster gateway mode now binds each agent to its own cluster, closing a claim-then-answer hijack (#4669; NOT breaking, gateway-fronted multi-cluster deployments only)
 
 New, non-breaking, purely additive. No operator action required for single-gateway (non-multi-cluster) deployments — read on only if you run `--gateway-cluster-addr` (multi-cluster gateway mode).
@@ -843,7 +853,7 @@ through a durable per-`(policy, agent)` row in `PolicyStore`
 (`policy_status.remediation_claim_at`), instead of an in-process-only guard.
 This closes the cross-replica gap noted in the ADR-0056 Follow-ups: two
 replicas racing a remediate call for the same policy/agent can no longer both
-dispatch a fix.
+dispatch a fix. (This is the guarantee for when the safe-to-scale gate lifts, ADR-2002 §7c; exactly one server replica is supported today.)
 
 **Scope of the guarantee.** This holds between replicas running the **same
 schema version**. A rolling upgrade across the migration boundary can
@@ -2278,7 +2288,7 @@ MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` 
 
 ### vNEXT — `GET /api/v1/inventory/software` and MCP `query_installed_software` diverge from the rest of the service-scoped-deny family: filtered data, not a 403 (#3290 Phase 2) (still in this vNEXT batch)
 
-**What changed.** Both notes immediately above this one (PR 2's enumerated fixes, then "the flip") describe `GET /api/v1/inventory/software` and MCP `query_installed_software` as denying a service-scoped API token outright (`403`). This still-unreleased batch changes that a second time, before either prior note has shipped: both surfaces now migrate onto `AuthRoutes::require_fleet_read`, a real per-request confinement gate — a correctly-confined service-scoped token gets a **filtered `200`** (rows limited to its own service-tagged agents, intersected with any management-group grant), not a `403`. This is a least-privilege improvement, not a widening: no caller sees any *row* it did not already hold a grant for. (A service-scoped caller's `devices_omitted` count can now be nonzero when a name-filtered query matches software outside its own scope — a bounded existence-only signal, reviewed and accepted, see `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`'s UP-2 ruling — not a row-level disclosure.) The two prior notes' own routes/tools are otherwise unaffected — only this one route pair's end-state changes. Because all three notes land in the same unreleased version, an operator reading only the two notes above would be told to expect a permanent `403` from these two surfaces that will not, in fact, occur. Full behavior table (every caller class, not just this one):
+**What changed.** Both notes immediately above this one (PR 2's enumerated fixes, then "the flip") describe `GET /api/v1/inventory/software` and MCP `query_installed_software` as denying a service-scoped API token outright (`403`). This still-unreleased batch changes that a second time, before either prior note has shipped: both surfaces now migrate onto `AuthRoutes::require_fleet_read`, a real per-request confinement gate — a correctly-confined service-scoped token gets a **filtered `200`** (rows limited to its own service-tagged agents, intersected with any management-group grant), not a `403`. This is a least-privilege improvement, not a widening: no caller sees any *row* it did not already hold a grant for. (A service-scoped caller's `devices_omitted` count is `0` while its scope is within the SQL push-down bound of 10 000 visible devices; only for a wider scope can it be nonzero, as the count of distinct out-of-scope devices within the scanned window(s) when a name-filtered query matches software outside its own scope — a bounded, audited existence-only signal, reviewed and accepted, see `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`'s UP-2 ruling — not a row-level disclosure.) The two prior notes' own routes/tools are otherwise unaffected — only this one route pair's end-state changes. Because all three notes land in the same unreleased version, an operator reading only the two notes above would be told to expect a permanent `403` from these two surfaces that will not, in fact, occur. Full behavior table (every caller class, not just this one):
 `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`.
 
 **Who this affects.** Any integration using a service-scoped API token against these two specific surfaces. If it was built to expect (or work around) the `403` the notes above describe, it will now receive real data instead — code that specifically branches on a `403` here to mean "not available to this token" should be updated; code that simply surfaces the error to an operator needs no change, since the success case is a strict improvement.
@@ -3124,9 +3134,9 @@ On the generated default certificates every replica auto-pins its own `default-g
 
 **Withdrawing a gateway key.** Remove the pin from every pin source and restart every serving replica. There is no reload and no revocation check on this path: revoking the certificate's serial in the CA store does **not** remove a key pin, and a certificate reissued over the same key is still admitted. If the key itself is compromised, replace it as well as withdrawing the pin, since a copied credential stays valid until its pin is gone from every replica.
 
-**Incident runbook: gateway refused, then corrected.** A pin mismatch is not a connection failure. The TLS session completes and the server answers each call with gRPC status 16 (`UNAUTHENTICATED`), which the gateway reports as upstream RPC errors rather than TLS-handshake failures. A refused `NotifyStreamStatus` is logged by the gateway as `Failed to notify stream status for <agent>: ...` and is **never retried**, so a session whose CONNECTED notice was refused can stay without its placement after the cause is fixed when the server keeps its record of that session: heartbeats for a session the server already knows are acknowledged and trigger no replay. A server that restarted has no record of the gateway's sessions, reports them unknown in its heartbeat replies, and a gateway that includes the #1197 heartbeat-verdict consumer (#5383) replays them; an older gateway does not act on the verdict until it is upgraded (see [Upgrading](upgrading.md), "`BatchHeartbeatResponse` gains `unknown_session_ids`"). Recovery therefore needs an operator decision, and which one depends on where the cause is (the cause classes below).
+**Incident runbook: gateway refused, then corrected.** A pin mismatch is not a connection failure. The TLS session completes and the server answers each call with gRPC status 16 (`UNAUTHENTICATED`), which the gateway reports as upstream RPC errors rather than TLS-handshake failures. A refused `NotifyStreamStatus` is logged by the gateway as `Failed to notify stream status for <agent>: ...` and an ordinary notification worker does not retry it, so a session whose CONNECTED notice was refused can stay without its placement after the cause is fixed when the server keeps its record of that session: heartbeats for a session the server already knows are acknowledged and trigger no replay. The exception is a gateway that includes #4632 while its circuit breaker is open: the head held notification is the half open probe, a refused probe goes back to the head of the held store and is sent again at the next probe, so it is delivered once the cause is fixed. A server that restarted has no record of the gateway's sessions, reports them unknown in its heartbeat replies, and a gateway that includes the #1197 heartbeat-verdict consumer (#5383) replays them; an older gateway does not act on the verdict until it is upgraded (see [Upgrading](upgrading.md), "`BatchHeartbeatResponse` gains `unknown_session_ids`"). Recovery therefore needs an operator decision, and which one depends on where the cause is (the cause classes below).
 
-**What a refusal window costs.** While the gateway is refused: sessions whose CONNECTED notice was refused stay unplaced (above); `ForwardGuardianMessage` frames dropped in the window are never replayed; a refused DISCONNECTED notice leaves a stale placement; and the gateway retries heartbeats every second and logs a WARN each time (noise, not a fault). Agent `Register` calls through the gateway fail with `INTERNAL` (`Upstream registration failed: ...`) from the FIRST refusal (`yuzu_gw_agent_service.erl`), not only once the breaker has opened, and those refused registrations count toward the gateway's circuit breaker. Only `ProxyRegister` (a replay registration included) and `ProxyInventory` results feed the breaker: a refused `BatchHeartbeat`, `NotifyStreamStatus` or `ForwardGuardianMessage` does not (`yuzu_gw_upstream.erl`; [Gateway](gateway.md), "Replay failures feed the shared circuit breaker"). So **the breaker can stay closed, and the gateway's `/readyz` can answer 200, while every heartbeat is refused**; that is what a window with no registering agents looks like. When the breaker does open, `/readyz` answers 503 (its `circuit_breaker` check) and stream-status notifications are dropped (`yuzu_gw_upstream_notify_dropped_total{reason="circuit_open"}`). There is no breaker state gauge, and `/readyz` alone does not tell you the state: `circuit_breaker` is true for both closed and half open, and 503 is also returned when any other readiness check fails. The signals are the gateway log lines `Circuit breaker: OPEN (will probe in <ms>ms)` and `Circuit breaker: half_open -> closed (probe succeeded)`, and the counter `yuzu_gw_upstream_circuit_transitions_total{state}`. Status 16 is an RPC result and the gateway never redials by itself, so an open breaker whose cause is on the gateway side does not close by waiting (inferred from reading the gateway code, not tested).
+**What a refusal window costs.** While the gateway is refused: sessions whose CONNECTED notice was refused stay unplaced (above); `ForwardGuardianMessage` frames dropped in the window are never replayed; a refused DISCONNECTED notice leaves a stale placement; and the gateway retries heartbeats every second and logs a WARN each time (noise, not a fault). Agent `Register` calls through the gateway fail with `INTERNAL` (`Upstream registration failed: ...`) from the FIRST refusal (`yuzu_gw_agent_service.erl`), not only once the breaker has opened, and those refused registrations count toward the gateway's circuit breaker. Only `ProxyRegister` (a replay registration included), `ProxyInventory` and, on a gateway that includes #4632, the half open probe (a held `NotifyStreamStatus`: a refused probe reopens the breaker, a successful one closes it) feed the breaker: a refused `BatchHeartbeat`, `ForwardGuardianMessage` or ordinary `NotifyStreamStatus` does not (`yuzu_gw_upstream.erl`; [Gateway](gateway.md), "Replay failures feed the shared circuit breaker"). So **the breaker can stay closed, and the gateway's `/readyz` can answer 200, while every heartbeat is refused**; that is what a window with no registering agents looks like. When the breaker does open, `/readyz` answers 503 (its `circuit_breaker` check) and a gateway that includes #4632 holds stream-status notifications (`yuzu_gw_upstream_notify_pending` rises) and sends them first in first out once the half open probe succeeds; a notification is lost at admission only when the store is full, counted in `yuzu_gw_upstream_notify_dropped_total{reason="at_capacity"}`. A gateway without #4632 drops them and counts `reason="circuit_open"`. There is no breaker state gauge, and `/readyz` alone does not tell you the state: `circuit_breaker` is true for both closed and half open, and 503 is also returned when any other readiness check fails. The signals are the gateway log lines `Circuit breaker: OPEN (will probe in <ms>ms)` and `Circuit breaker: half_open -> closed (probe succeeded)`, and the counter `yuzu_gw_upstream_circuit_transitions_total{state}`. Status 16 is an RPC result and the gateway never redials by itself, so an open breaker whose cause is on the gateway side does not close by waiting (inferred from reading the gateway code, not tested).
 
 **Three cause classes decide what happens to the gateways.** The circuit state alone never decides it.
 
@@ -3145,7 +3155,7 @@ On the generated default certificates every replica auto-pins its own `default-g
      ```
 
      Sum across **all** gateway nodes and **all** serving replicas, and use the `job` name your Prometheus gives the server. `yuzu_gw_agents_current` is a gauge sampled every 10 s. The server's gauge counts agents that connect directly as well as those behind a gateway, so zero or below is what convergence looks like, and it can hide a gateway-fronted shortfall as large as the number of direct agents. A result that stays above zero means the gateways hold sessions the servers do not count. `yuzu_agents_connected` counts REGISTRATION (`ProxyRegister`).
-   - **Placement.** Placement (the route to the gateway that holds an agent) is set by `NotifyStreamStatus`, separately from registration, and a refused or dropped CONNECTED notice leaves an agent counted but unreachable for commands ([Gateway](gateway.md), "Dispatch reachability after the session is adopted"). Over the recovery window there should be no rise in the raw `yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"}` or `yuzu_gw_upstream_notify_dropped_total` (neither series has a sample until its first event, so an absent series means none). Then dispatch a read-only command to a sample agent and read its result. Dispatch with `POST /api/command` and a body such as `{"plugin":"hardware","action":"manufacturer","agent_ids":["<agent-id>"]}` (`hardware.manufacturer` is a read-only `Inventory:Read` action; the caller needs `Execution:Execute`). A `200` carrying `"agents_reached":1` shows only that the server accepted the command: for a gateway-attached agent the server merely queues it for the gateway, so the proof is the agent's own result, read with `GET /api/v1/responses/<command_id>?agent_id=<agent-id>` (the `command_id` is in the dispatch response; `Response:Read`), which must return a row with `status` 1 within a few seconds. An agent that is registered but has no placement is expected to be refused with `503` and `failed to send command to any agent`; `503` with `no agent connected` is the answer when the server holds no reachable agent at all (both read from `command_routes.cpp` and `agent_registry.cpp`, not run). No endpoint reports which gateway node holds an agent, so test several agents spread across the fleet and, where you know which agents dial which gateway node, behind every node: a pass on a few agents does not prove that all are placed.
+   - **Placement.** Placement (the route to the gateway that holds an agent) is set by `NotifyStreamStatus`, separately from registration, and a refused or dropped CONNECTED notice leaves an agent counted but unreachable for commands ([Gateway](gateway.md), "Dispatch reachability after the session is adopted"). Over the recovery window there should be no rise in the raw `yuzu_gw_upstream_rpc_errors_total{rpc_name="notify_stream",code="16"}` or `yuzu_gw_upstream_notify_dropped_total` (the `code="16"` series has no sample until its first event, so an absent series means none; a gateway with #4632 creates `yuzu_gw_upstream_notify_dropped_total` at 0 for `reason="at_capacity"` and `reason="unknown"`, so there a flat 0 means none and an absent series means an older gateway, where the series likewise has no sample until its first drop). Then dispatch a read-only command to a sample agent and read its result. Dispatch with `POST /api/command` and a body such as `{"plugin":"hardware","action":"manufacturer","agent_ids":["<agent-id>"]}` (`hardware.manufacturer` is a read-only `Inventory:Read` action; the caller needs `Execution:Execute`). A `200` carrying `"agents_reached":1` shows only that the server accepted the command: for a gateway-attached agent the server merely queues it for the gateway, so the proof is the agent's own result, read with `GET /api/v1/responses/<command_id>?agent_id=<agent-id>` (the `command_id` is in the dispatch response; `Response:Read`), which must return a row with `status` 1 within a few seconds. An agent that is registered but has no placement is expected to be refused with `503` and `failed to send command to any agent`; `503` with `no agent connected` is the answer when the server holds no reachable agent at all (both read from `command_routes.cpp` and `agent_registry.cpp`, not run). No endpoint reports which gateway node holds an agent, so test several agents spread across the fleet and, where you know which agents dial which gateway node, behind every node: a pass on a few agents does not prove that all are placed.
    - **Breaker.** Read it from the log lines and the transitions counter described above, not from `/readyz` alone.
 
    **Timing allowances (read from the gateway code and `gateway.md`, not measured here).** The 300 s cap applies only if the breaker opened (the open period doubles from 10 s to 300 s). The unknown-session verdict arrives only when the agent's heartbeat appears in a gateway flush: up to one agent heartbeat interval (30 s by default) plus one flush (1 s by default). The replay then runs as a drip of `registration_replay_spacing_ms` (20 ms by default) per agent plus the RPC time of each, so 10,000 agents take at least 200 s. Allow for all of it before judging, and note that a first successful registration or inventory call after failures also starts a replay of the gateway's registrations (`yuzu_gw_upstream.erl`, `on_success`). **Verify:** the registration expression settles at zero or below within those allowances, the placement checks pass, and `yuzu_server_gateway_peer_denied_total` stays flat.
@@ -3254,7 +3264,10 @@ The server emits an audit event on every branch:
 | Missing `role` field | `denied` | `missing_role` |
 | Invalid role value | `denied` | `invalid_role` |
 | User not found | `denied` | `user_not_found` |
-| DB write failed | `denied` | `db_failure` |
+| Would leave no active local admin (last administrator) | `denied` | `last_administrator_blocked` (HTTP 409) |
+| Account deactivated between the route's lookup and the write, `admin` requested | `denied` | `inactive_promotion_refused` (HTTP 409; an account already inactive when the request arrives is `user_not_found`, HTTP 404) |
+| Role store unavailable, or the guard is not wired | `failure` | `store_failure` (HTTP 503, no retry hint: the change may or may not have been applied, so check the user's role and revoke the user's sessions) |
+| Role changed but session cleanup failed | `partial` | `role_changed session_wipe_failed=true old_role=<r> new_role=<r>` (HTTP 503, no retry hint: revoke the user's sessions) |
 
 > **You cannot change your own role.** The endpoint rejects self-target
 > with HTTP 403, audited as `denied:self_role_change_blocked`. The same
@@ -3264,6 +3277,14 @@ The server emits an audit event on every branch:
 > **Active sessions are invalidated atomically.** After a successful
 > `user.role_change`, every active session for the target user is
 > destroyed; the user must re-authenticate to pick up the new role.
+
+> **The last administrator cannot be demoted.** Demoting the only active
+> local `admin` account is refused with HTTP 409 and the toast "Cannot
+> demote: this account is the fleet's last administrator"; nothing changes.
+> Create or promote a second admin first. This is a recovery rule, not a
+> proof that anyone can sign in (lockout, MFA, `sso-only` deployments and
+> identity-provider state are outside it). See `docs/user-manual/rbac.md`,
+> "Last-Administrator guard for account deactivation and demotion".
 
 ### Deleting a User
 
@@ -3281,6 +3302,51 @@ The server emits an audit event on every branch:
 > until the process is restarted against its on-disk config. To remove
 > the account you are signed in as, first create a second admin, log
 > out, log in as the second admin, and delete the original.
+
+> **The last administrator cannot be deleted.** Deleting the only active
+> local `admin` account (and, with RBAC enforcement on, the holder of the
+> fleet's only `Administrator` grant) is refused with HTTP 409 and the toast
+> "Cannot delete: this account is the fleet's last administrator". The server
+> first runs a read-only early check and, when it already shows the account
+> is the last one, refuses before revoking anything. That check takes no
+> lock and is best-effort. If the guard refuses after it, the toast says
+> that the account's linked credentials (API tokens and sessions, including
+> linked SSO identities) **were already revoked** and that the account
+> **remains active**; the account's holder must sign in again and re-create
+> any API tokens. Credentials are revoked before the delete on purpose, so a
+> completed deprovision never leaves live credentials behind (an early
+> refusal revokes nothing, so those credentials stay live). An early refusal is audited
+> as `user.delete` / `denied` / `last_administrator_blocked`, a late one as
+> `user.delete` / `partial` (credentials were revoked), and both are counted on
+> `yuzu_server_rbac_last_admin_guard_refused_total{transport="dashboard"}`.
+> If the delete cannot complete because the store is unavailable, the answer
+> is HTTP 503 with `Retry-After: 2`; a repeat re-runs the guarded write and
+> the session wipe (on an already-deactivated account it answers 404 after
+> re-running the wipe).
+>
+> **Operator notes.** Every guarded delete and role change takes the same
+> database row lock, waiting at most 2000 ms, so a burst of SCIM
+> deprovisions queues on it and some requests can time out (dashboard `503`
+> with `Retry-After: 2`, SCIM `503` with `Retry-After: 2`; the dashboard role
+> change answers `503` with no retry hint) with the account itself unchanged
+> after a lock timeout (its credentials were already revoked, see above). A
+> SCIM retry finishes the job only after a lock timeout in which nothing
+> committed; it does not converge after a lost commit acknowledgement, a
+> failed session wipe, or a `POST` with `active:false`
+> ([#5214](https://github.com/Tr3kkR/Yuzu/issues/5214)). Each request keeps a pooled PostgreSQL connection while it waits
+> (default pool 16, `--postgres-pool-size`; a deactivation can wait up to four
+> times 2000 ms), so watch `yuzu_pg_pool_waiters`,
+> `yuzu_pg_acquire_wait_seconds` and
+> `yuzu_server_rbac_lifecycle_store_failure_total{op}`; the full capacity and
+> stuck-lock procedure is in `docs/user-manual/rbac.md`, "Last-Administrator
+> guard for account deactivation and demotion". A refused SCIM deprovision
+> leaves the person's account (and, after an early refusal, their tokens and
+> sessions) live and raises a critical analytics event: an operator has to
+> act. No alert rule ships for these series yet (tracked in
+> #5673). A replica
+> running a build without this rule does not enforce it, so drain old
+> replicas during a rolling upgrade. A server with an authentication
+> database but no RBAC store refuses to start.
 
 ### Changing and resetting passwords
 
@@ -4195,7 +4261,7 @@ Held-open SSE streams also lease this pool: each re-validates its credential eve
 
 **Bootstrap-time floor (default-cert generation, ADR-0053).** First-boot (or self-heal) default-cert generation takes the `yuzu:default_certs_bootstrap` Postgres advisory lock for the duration of its critical section, holding one pool lease for that whole window while the CA-store writes it performs inside the lock each draw their own nested per-call lease from the SAME pool — an N-way race at this one boot-time code path needs roughly N+1 simultaneous connections. At the allowed minimum `--postgres-pool-size=1` this is not merely "can self-contend under a race" — it fails **every** boot that needs to generate certs, deterministically, zero racers required, since the outer lease alone exhausts a pool of size 1. It fails closed and loudly (a nested-acquire timeout surfaces as an ordinary `record_issued` failure → refuse to start), never a hang or silent corruption, but a pool sized at the bare minimum for steady-state heartbeat/SSE traffic above can still be too small for this one-time bootstrap path — size for at least 2 even on the smallest deployments.
 
-**`endpoint_state` is reconstructible.** The `endpoint_state` schema (last-known offline-host display) is pure cache — the server repopulates it from heartbeats within one cycle (~30 s). A targeted restore may safely omit it; only the secret-bearing schemas and live operational data need the paired key-directory restore above.
+**`endpoint_state` holds last-seen history for departed devices.** For a connected agent the identity fields (hostname, OS, agent version, architecture) are repopulated from its next heartbeat. The schema is also the only record of every device that has since disconnected: `/hardware` lists those devices as Offline, with their real last-seen time, for 30 days, and the retention prune's clock anchor is stored beside the rows (`endpoint_state.retention_meta`). Neither regenerates from heartbeats, so include the schema in a full restore; a targeted restore that omits it loses the Offline history until each device reconnects. Retention: a row is deleted 37 days after its device was last seen (the 30-day roster window plus a 7-day margin). Each replica runs the prune hourly and removes at most 12,000 rows per hour. The first pass runs about a minute after the server starts. On the first start after the upgrade it only records its clock anchor, so deletions begin with the next hourly pass; on every later start it already deletes; a backlog inherited from an older release (for example 100,000 rows) drains at that rate, in about 8 hours. A decommissioned device's row is erased by the decommission route (#5682); a device that is never decommissioned ages out under the same 37-day rule.
 
 ### Provisioning a native (non-container) install
 
