@@ -553,8 +553,8 @@ def flow_problems(src):
 
 # Writers of baseline_store.baselines that may skip the post-mutation hook, each with the reason.
 # set_members and set_assignment only stamp `updated_at`: neither touches `lifecycle` or
-# `deployed_snapshot`. create_baseline is NOT allowlisted any more: it fires the hook when it
-# commits a DEPLOYED baseline (a route-created one is always a draft, guardian_routes.cpp
+# `deployed_snapshot`. create_baseline is not allowlisted: it must fire the hook when it commits
+# a DEPLOYED baseline (a route-created one is always a draft, guardian_routes.cpp
 # create_baseline_from_form, and a draft create stays silent), and the sweep pins that shape.
 BASELINE_WRITER_ALLOWLIST = {
     "set_members": "stamps updated_at only, never lifecycle or deployed_snapshot",
@@ -605,8 +605,32 @@ def baseline_writer_problems(src):
             out.append(f"BaselineStore::{name} writes baseline_store.baselines but never calls "
                        f"notify_baseline_mutation(), and is not on the allowlist (b)")
             continue
+        last_write = max(w2.start() for w2 in _BASELINE_WRITE.finditer(body))
         for nm in re.finditer(r"\bnotify_baseline_mutation\( ?\) ?;", body):
             before = body[:nm.start()]
+            if nm.start() < last_write:
+                out.append(f"BaselineStore::{name} calls notify_baseline_mutation() before its write to "
+                           f"baseline_store.baselines: it would announce a change that has not committed (b)")
+            # An unconditional `return` between the write and the notify makes the notify unreachable.
+            running, dip_floor = 0, {}
+            depth_at = []
+            for ch in body[:nm.start()]:
+                if ch == "{":
+                    running += 1
+                elif ch == "}":
+                    running -= 1
+                depth_at.append(running)
+            for rt in re.finditer(r"\breturn\b", body[last_write:nm.start()]):
+                r_pos = last_write + rt.start()
+                rhead = body[:r_pos]
+                rhead = rhead[max(rhead.rfind(";"), rhead.rfind("{"), rhead.rfind("}")) + 1:]
+                if re.search(r"\b(?:if|else|for|while|switch)\b|\?", rhead):
+                    continue  # a conditional return does not dominate the notify
+                d_r = depth_at[r_pos - 1] if r_pos else 0
+                if min(depth_at[r_pos:], default=d_r) >= d_r:
+                    out.append(f"BaselineStore::{name} has an unconditional `return` between its write and "
+                               f"notify_baseline_mutation(): the notify is unreachable (b)")
+                    break
             if not re.search(r"\blease ?\. ?reset\( ?\) ?;", before):
                 out.append(f"BaselineStore::{name} calls notify_baseline_mutation() before lease.reset(): the hook "
                            f"would run with the pool lease held (b)")
@@ -1602,6 +1626,12 @@ UPD = "std::expected<void, std::string> BaselineStore::update_baseline"
 CRE = "std::expected<std::string, std::string> BaselineStore::create_baseline"
 LEASE_NOTIFY = "lease.reset(); // no pool lease held while the hook runs\n    notify_baseline_mutation();"
 BASELINE_WRITER_MUTATIONS = [
+    ("a return before the deployed block makes create_baseline's notify unreachable",
+     _in_fn(CRE, "    if (lifecycle == kBaselineDeployed) {\n        lease.reset();", "    return id;\n    if (lifecycle == kBaselineDeployed) {\n        lease.reset();"), "(b)"),
+    ("a return before the notify makes update_baseline's notify unreachable",
+     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    return {};\n    notify_baseline_mutation();"), "(b)"),
+    ("update_baseline announces the change before the write",
+     _in_fn(UPD, "    if (!open_)", "    notify_baseline_mutation();\n    if (!open_)"), "(b)"),
     ("update_baseline fires the hook before releasing the lease",
      _in_fn(UPD, LEASE_NOTIFY, "notify_baseline_mutation();\n    lease.reset();"), "(b)"),
     ("update_baseline fires the hook under if (false)",
@@ -1644,6 +1674,10 @@ static void raw_write(PGconn* c) {
 ]
 
 BENIGN_BASELINE = [
+    ("a conditional early return before the notify",
+     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    if (b.name.empty()) return {};\n    notify_baseline_mutation();")),
+    ("an early return inside a closed error block before the notify",
+     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    if (b.name.empty()) {\n        return {};\n    }\n    notify_baseline_mutation();")),
     ("create_baseline hook condition on one line with a comment",
      _in_fn(CRE, "if (lifecycle == kBaselineDeployed) {", "if (lifecycle == kBaselineDeployed) { // deployed only\n")),
     ("a comment mentions a write and the hook",

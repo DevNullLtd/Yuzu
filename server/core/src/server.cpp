@@ -7024,8 +7024,8 @@ public:
                     cfg_.db_dir() / "guardian-baselines.db", "BaselineStore",
                     {"guaranteed_state_baselines", "guaranteed_state_baseline_rules",
                      "guaranteed_state_baseline_groups"});
-                // #5513: a committed Baseline update (a deploy rewrites the deployed snapshot)
-                // or delete drops the heartbeat reconcile's cached generation and held bundle
+                // #5513: a committed Baseline update (a deploy rewrites the deployed snapshot),
+                // delete or deployed create drops the heartbeat reconcile's cached generation and held bundle
                 // immediately, BEFORE the caller's own policy-generation bump (its own lease)
                 // and fan-out. Without it a reconcile running in that gap could send the old
                 // deployed set under the unchanged generation label. Same two invalidations as
@@ -19659,10 +19659,11 @@ private:
                 // the heartbeat reconcile's cached generation (about 2 s stale) and held bundle
                 // so the next heartbeat decides from the post-bump state instead of waiting out the TTL.
                 // Rule create/update/delete on this replica reach the same two invalidations
-                // through GuaranteedStateStore::set_on_rule_mutation, and a Baseline update or
-                // delete through BaselineStore::set_on_baseline_mutation (both wired where the
-                // store is constructed), because they do not pass through here before their own
-                // bump. These come BEFORE the generation, rules and deployed-set reads below.
+                // through GuaranteedStateStore::set_on_rule_mutation, and a Baseline update,
+                // delete or deployed create through BaselineStore::set_on_baseline_mutation
+                // (both wired where the store is constructed), because they do not pass through
+                // here before their own bump. These come BEFORE the generation, rules and
+                // deployed-set reads below.
                 invalidate_guardian_reconcile_caches();
                 const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
                                        std::chrono::system_clock::now().time_since_epoch())
@@ -21230,7 +21231,8 @@ private:
     // THE one place that drops the heartbeat reconcile's two caches (#5513). Called by exactly
     // these: the GuaranteedStateStore rule-mutation hook (after a rule create/update/delete
     // commits and its generation bump was attempted), the BaselineStore baseline-mutation
-    // hook (after a Baseline update or delete commits, BEFORE the caller's own bump), and the
+    // hook (after a Baseline update, delete or deployed create commits, BEFORE the caller's own
+    // bump), and the
     // guardian_push_fn_ fan-out (after its scope parsed, BEFORE it reads the generation, the
     // rules and the deployed set). Both caches go together: the bundle cache's epoch is what
     // makes a reconcile that is already running withhold its push, and the generation cache is
