@@ -395,6 +395,7 @@ TEST_CASE("plugin_config_routes: kill-switch PUT flips the switch and is audited
     CHECK(h.audits[0].action == "plugin_config.kill_switch.set");
     CHECK(h.audits[0].result == "attempted");
     CHECK(h.audits[0].target_id == "firewall.block");
+    CHECK(h.audits[0].detail == "enabled=false"); // ordinary pair: no protective label
     CHECK(h.audits[1].result == "success");
     CHECK(h.audits[1].target_id == "firewall.block");
 
@@ -427,6 +428,12 @@ TEST_CASE("plugin_config_routes: kill-switch PUT writes and reads the reserved-n
     REQUIRE(put);
     CHECK(put->status == 200);
     CHECK(body(put->body)["data"]["enabled"] == false);
+
+    // The audit evidence says the row is inert for dispatch: a stored OFF row
+    // on a protective pair must never read as proof of a stop.
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].detail == "enabled=false, protective_exempt=true");
+    CHECK(h.audits[1].detail == "enabled=false, protective_exempt=true");
 
     // Proven against the real store accessor, not the echoed response (the
     // stored row, not the dispatch decision: a protective pair is exempt).

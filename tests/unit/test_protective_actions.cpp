@@ -6,12 +6,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <string_view>
 
 using yuzu::protective::is_protective_action;
 using yuzu::protective::is_quarantine_control_plugin;
 
-TEST_CASE("is_quarantine_control_plugin: the closed four-action set, case-insensitive",
+TEST_CASE("is_quarantine_control_plugin: the closed four-action set (case-insensitive)",
           "[protective][security]") {
     for (const auto plugin : {"quarantine", "Quarantine", "QUARANTINE"}) {
         for (const auto action : {"quarantine", "unquarantine", "status", "whitelist", "Status"})

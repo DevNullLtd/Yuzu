@@ -1786,7 +1786,9 @@ groups:
             on correct behaviour (the #2553/observability-conventions.md
             lesson already applied to reason="quarantined" dispatch
             denials) - that population is dashboard material, not an
-            alert. Check yuzu_server_quarantine_reconciler_tick_healthy first
+            alert. This also fires when the device's agent lacks the
+            quarantine plugin - the dispatch is accepted but never
+            confirmed; upgrade the agent. Check yuzu_server_quarantine_reconciler_tick_healthy first
             - if 0, the reconciler's own reads are currently failing and this
             alert's source gauge is frozen at a stale value, not necessarily
             an accurate one; triage the reconciler itself before this alert's

@@ -3134,7 +3134,7 @@ static const ToolDef kTools[] = {
      // reserved-namespace plugin name (__<identifier>__, #3265), whose total
      // length can reach kMaxIdentifierBytes (64) + 4 sentinel bytes = 68 —
      // this schema must not reject an input the store would accept.
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS for a per-OS view; omit for the all-OS switch. With os, enabled is the EFFECTIVE state of the switch row (which never gates a protective action) and reason/set_by/source name the row that produced it. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"}},"required":["plugin"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"os":{"type":"string","enum":["windows","linux","darwin"],"description":"Agent OS for a per-OS view; omit for the all-OS switch. With os, enabled is the effective state of the switch row (for a protective action that row never gates dispatch) and reason/set_by/source name the row that produced it. Within the OS layer an action@os ON row overrides a plugin@os OFF row, but a per-OS row never widens past the all-OS layer"}},"required":["plugin"]})j",
      R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"os":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"},"source":{"type":"string"}},"required":["plugin","action","enabled"]})j"},
 
     {"set_plugin_kill_switch",
@@ -3145,7 +3145,8 @@ static const ToolDef kTools[] = {
      "plugin/action — there is no separate 'force disable' escalation beyond this call. "
      "Exception: a protective action (the quarantine plugin's quarantine/unquarantine/status/"
      "whitelist and __guard__.push_rules) is never refused by this switch; a row for one is "
-     "stored and echoed but has no dispatch effect. "
+     "stored and echoed but has no dispatch effect; to stop Guardian rule delivery disable or "
+     "remove the rules instead (disarms them on the agent's next reconcile). "
      "The result echoes the row written, not the effective state. Requires "
      "PluginConfig:Write.",
      // plugin maxLength is 68 — see the identical note on get_plugin_kill_switch above.
@@ -20747,8 +20748,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 // fleet-wide, which is exactly what an incident review needs
                 // evidence of and cannot reconstruct afterwards.
                 const std::string target_id = plugin_config::kill_switch_scope_key(*scope);
+                // A row on a protective pair is stored but never gates dispatch;
+                // label the evidence so it is never read as proof of a stop.
+                std::string ks_detail = std::string("enabled=") + (enabled ? "true" : "false");
+                if (plugin_config::kill_switch_row_covers_protective(*scope)) {
+                    ks_detail += ", protective_exempt=true";
+                    spdlog::warn("plugin_config: kill-switch row {} is a protective action; "
+                                 "stored but never refuses dispatch",
+                                 target_id);
+                }
                 if (!audit_fn(req, "plugin_config.kill_switch.set", "attempted", "PluginConfig",
-                              target_id, std::string("enabled=") + (enabled ? "true" : "false"))) {
+                              target_id, ks_detail)) {
                     res.set_content(
                         a4_error(503, "the audit record could not be persisted; the kill switch was "
                                       "NOT changed — retry once the audit store recovers"),
@@ -20758,8 +20768,6 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto result = plugin_config_store_->set_kill_switch(plugin, action, enabled, reason,
                                                                     session->username, *os);
-                const std::string ks_detail =
-                    std::string("enabled=") + (enabled ? "true" : "false");
                 if (!result) {
                     plugin_config_outcome("plugin_config.kill_switch.set", false, "PluginConfig",
                                           target_id, ks_detail);

@@ -8,9 +8,12 @@
  */
 
 #include "agent_registry.hpp"
+#include "capability_decls/core_dispatch_capabilities.hpp"
+#include "capability_decls/plugin_action_catalogue_c.hpp"
 #include "dispatch_confined_arms.hpp"
 #include "dispatch_scope_ladder.hpp"
 #include "event_bus.hpp"
+#include "plugin_config_parsers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -21,6 +24,7 @@
 #include <expected>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -93,7 +97,7 @@ agent_pb::AgentInfo make_info(const std::string& id, const std::string& os,
 
 ClassifiedCommand finalize(const CommandCapability& cap, const KillSwitchFn& fn) {
     auto r = yuzu::server::detail::finalize_classified_command(
-        cap, fn, cap.plugin, cap.action, "pm01-cmd", {}, {}, 0, 0, {}, {});
+        cap, fn, cap.plugin, cap.action, "protective-cmd", {}, {}, 0, 0, {}, {});
     REQUIRE(r.has_value());
     return std::move(*r);
 }
@@ -138,7 +142,7 @@ yuzu::server::ConfinedDispatchOutcome wire(AgentRegistry& registry, const Classi
     auto noop = [](const std::string&, const std::string&, const std::string&,
                    const std::string&) {};
     return yuzu::server::wire_and_dispatch_confined(
-        registry, nullptr, nullptr, nullptr, nullptr, nullptr, noop, noop, "pm01-cmd", "exec-1", "",
+        registry, nullptr, nullptr, nullptr, nullptr, nullptr, noop, noop, "protective-cmd", "exec-1", "",
         ids, "", std::nullopt, false, ContainmentGate::exempt_control_plugin(), cmd);
 }
 
@@ -205,7 +209,7 @@ TEST_CASE("ids_missing_plugin: protective pairs are never reported missing",
 }
 
 TEST_CASE("wire_and_dispatch_confined: protective dispatch reaches every target past an OS-off "
-          "row, a stale inventory and a >100k presence read; tar.sql does not",
+          "row and a stale inventory and a >100k presence read; tar.sql does not",
           "[server][dispatch][protective][security]") {
     EventBus bus;
     yuzu::MetricsRegistry metrics;
@@ -255,7 +259,7 @@ TEST_CASE("wire_and_dispatch_confined: a degraded store never stops a protective
 
     // tar.sql never reaches the wire.
     CHECK_FALSE(yuzu::server::detail::finalize_classified_command(
-                    kTarSql, degraded.fn(), "tar", "sql", "pm01-cmd", {}, {}, 0, 0, {}, {})
+                    kTarSql, degraded.fn(), "tar", "sql", "protective-cmd", {}, {}, 0, 0, {}, {})
                     .has_value());
 
     for (const auto& [plugin, action] : kProtectiveWire) {
@@ -334,4 +338,72 @@ TEST_CASE("every other action is still refused at each gate (regression guard)",
     CountingSwitch no_os{IdSet{}};
     const auto absent = wire(registry, finalize(kTarSql, no_os.fn()), ids);
     CHECK(absent.unknown_plugin == std::vector<std::string>{"dev-A"});
+}
+
+TEST_CASE("the protective set is tied to the real catalogue rows and the push label",
+          "[server][dispatch][protective][security]") {
+    using yuzu::protective::is_protective_action;
+    namespace capdecls = yuzu::server::capdecls;
+
+    // Every system-reserved push label is "<plugin>.<action>"; only the Guardian
+    // rule push is protective. A rename on either side fails here.
+    for (const auto push : yuzu::server::kSystemReservedPushes) {
+        const auto label = yuzu::server::system_reserved_push_label(push);
+        const auto dot = label.find('.');
+        REQUIRE(dot != std::string_view::npos);
+        CHECK(is_protective_action(label.substr(0, dot), label.substr(dot + 1)) ==
+              (push == yuzu::server::SystemReservedPush::guardian_push_rules));
+    }
+
+    // The real rows that carry a protective pair: exactly the quarantine
+    // plugin's four actions plus __guard__.push_rules.
+    std::set<std::string> protective;
+    for (const auto rows : {capdecls::plugin_action_catalogue_c(),
+                            capdecls::core_dispatch_capabilities()})
+        for (const auto& cap : rows)
+            if (is_protective_action(cap.plugin, cap.action))
+                protective.insert(std::string(cap.plugin) + "." + std::string(cap.action));
+    CHECK(protective == std::set<std::string>{"quarantine.quarantine", "quarantine.unquarantine",
+                                             "quarantine.status", "quarantine.whitelist",
+                                             "__guard__.push_rules"});
+}
+
+TEST_CASE("kill_switch_row_covers_protective: labels rows that can never gate dispatch",
+          "[server][dispatch][protective][security]") {
+    using yuzu::server::plugin_config::KillSwitchScope;
+    using yuzu::server::plugin_config::kill_switch_row_covers_protective;
+    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"quarantine", "unquarantine", ""}));
+    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"quarantine", "status", "windows"}));
+    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"__guard__", "push_rules", ""}));
+    // Plugin-level rows for the two plugins that own protective actions.
+    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"quarantine", "", ""}));
+    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"__guard__", "", "linux"}));
+    // Everything else is an ordinary, effective row.
+    CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"__guard__", "get_status", ""}));
+    CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "", ""}));
+    CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"tar", "sql", ""}));
+}
+
+TEST_CASE("configure_presence: reconfiguring resets the cache age so the next read uses the "
+          "new reader",
+          "[server][dispatch][protective][registry]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+
+    PresenceStub first;
+    first.truncated = false;
+    registry.configure_presence(first.fn(), kTtl);
+    (void)registry.all_ids();
+    CHECK(*first.calls >= 1);
+    CHECK(*first.ttl == kTtl);
+
+    PresenceStub second;
+    second.truncated = false;
+    registry.configure_presence(second.fn(), std::chrono::seconds{91});
+    const int first_calls = *first.calls;
+    (void)registry.all_ids();
+    CHECK(*second.calls == 1);
+    CHECK(*second.ttl == std::chrono::seconds{91});
+    CHECK(*first.calls == first_calls);
 }

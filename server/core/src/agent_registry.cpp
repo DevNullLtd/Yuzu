@@ -1554,14 +1554,18 @@ void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono:
 }
 
 void AgentRegistry::configure_presence(PresenceReadFn reader, std::chrono::seconds ttl) {
+    // Wiring and teardown only; locked so a reconfigure can never race an
+    // in-flight read. The cache age resets so the next read hits the new reader.
+    std::lock_guard lock(presence_cache_mu_);
     presence_reader_ = std::move(reader);
     presence_ttl_ = ttl;
+    presence_cache_at_ = {};
 }
 
 std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::live_presence() const {
+    std::lock_guard lock(presence_cache_mu_);
     if (!presence_reader_)
         return std::vector<PresenceIdentity>{};
-    std::lock_guard lock(presence_cache_mu_);
     const auto now = std::chrono::steady_clock::now();
     // `presence_cache_at_{}` (default-constructed epoch) is always stale on
     // the first call, so this always fetches at least once before serving a

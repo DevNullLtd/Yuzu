@@ -578,8 +578,9 @@ TEST_CASE("#3265: __guard__.push_rules (a reserved-namespace, system_reserved di
     CHECK(w.store.action_allowed("__guard__", "")); // whole-plugin form too
 }
 
-TEST_CASE("#3265: an explicitly-set kill switch on __guard__/push_rules still blocks the "
-          "dispatch — the reserved-namespace grammar fix must not make the switch INERT",
+TEST_CASE("#3265: an explicitly-set kill switch row on __guard__/push_rules is stored and "
+          "reported by the store accessor — the reserved-namespace grammar fix must not make "
+          "the row unaddressable",
           "[pg][store][plugin_config][killswitch]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
     Wired w{db.dsn()};
@@ -588,7 +589,7 @@ TEST_CASE("#3265: an explicitly-set kill switch on __guard__/push_rules still bl
                 .has_value());
     CHECK_FALSE(w.store.action_allowed("__guard__", "push_rules"));
 
-    // Re-enabling restores delivery.
+    // Re-enabling flips the accessor back.
     REQUIRE(
         w.store.set_kill_switch("__guard__", "push_rules", true, "resolved", "alice").has_value());
     CHECK(w.store.action_allowed("__guard__", "push_rules"));
@@ -684,8 +685,9 @@ TEST_CASE("A degraded/unopened store makes action_allowed return false, never tr
     CHECK_FALSE(store.action_allowed("firewall", "block"));
     CHECK_FALSE(store.action_allowed("email", ""));
     // #3265 governance Gate 5 (chaos-injector): the reserved-namespace path
-    // inherits the SAME fail-closed collapse under a degraded store — a
-    // transient PG stall during a Guardian push must never read as allowed.
+    // inherits the SAME fail-closed collapse in the ACCESSOR under a degraded
+    // store. The Guardian push itself is a protective action and never reads
+    // this accessor at the dispatch chokepoint.
     CHECK_FALSE(store.action_allowed("__guard__", "push_rules"));
 
     // The display accessor surfaces the degradation as a typed error rather

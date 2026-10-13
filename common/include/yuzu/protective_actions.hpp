@@ -9,8 +9,8 @@
 // The set is the quarantine plugin's own four actions plus the Guardian rule
 // push (`__guard__.push_rules`). It is CLOSED: widening it is a security
 // decision (see the quarantine row of .claude/routed-concerns.md), never a
-// drive-by edit. Consumed by the server dispatch chokepoint today and by the
-// agent dispatch gate next, so both sides share ONE list.
+// drive-by edit. Lives in common/include so the agent can include the same
+// list the server dispatch chokepoint uses.
 //
 // Pure: no I/O, no store or wire types, so it stays inside the
 // common/include firewall and tests bind it directly.

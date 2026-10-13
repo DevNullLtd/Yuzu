@@ -3,7 +3,8 @@
 /// @file plugin_config_parsers.hpp
 /// PURE parsing/validation for the plugin config/secret plane + kill switch
 /// (PR1.5b). Zero includes of any store, httplib, or pg header — this file
-/// depends on nothing but the standard library, so `plugin_config_store.cpp`
+/// depends on nothing but the standard library and the pure
+/// `yuzu/protective_actions.hpp` list, so `plugin_config_store.cpp`
 /// and `plugin_config_routes.cpp` share exactly ONE grammar/validation
 /// definition instead of two drifting copies (the class of bug #1647 exists
 /// to prevent for audit helpers; the same reasoning applies to key grammar).
@@ -32,6 +33,8 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+
+#include <yuzu/protective_actions.hpp>
 
 namespace yuzu::server::plugin_config {
 
@@ -220,6 +223,19 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
     if (!scope.os.empty())
         key += "@" + scope.os;
     return key;
+}
+
+/// True iff a kill-switch row at `scope` (any OS layer) is inert for dispatch
+/// because it covers a protective action (`yuzu/protective_actions.hpp`): an
+/// action-level row for a protective pair, or a plugin-level row for a plugin
+/// that owns protective actions (`quarantine`, `__guard__`). The write
+/// surfaces use it to label the audit evidence so a stored OFF row is never
+/// read as proof of a stop. One list: the pairs come from the shared header.
+[[nodiscard]] inline bool kill_switch_row_covers_protective(const KillSwitchScope& scope) {
+    if (scope.action.empty())
+        return yuzu::protective::detail::iequals(scope.plugin, "quarantine") ||
+               yuzu::protective::detail::iequals(scope.plugin, "__guard__");
+    return yuzu::protective::is_protective_action(scope.plugin, scope.action);
 }
 
 /// One stored kill-switch row of a single plugin, as the resolver sees it.

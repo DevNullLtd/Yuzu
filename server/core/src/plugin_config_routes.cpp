@@ -346,8 +346,15 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                 }
 
                 const std::string target_id = plugin_config::kill_switch_scope_key(*scope);
-                const std::string detail_str =
-                    std::string("enabled=") + (enabled ? "true" : "false");
+                std::string detail_str = std::string("enabled=") + (enabled ? "true" : "false");
+                // A row on a protective pair is stored but never gates dispatch;
+                // label the evidence so it is never read as proof of a stop.
+                if (plugin_config::kill_switch_row_covers_protective(*scope)) {
+                    detail_str += ", protective_exempt=true";
+                    spdlog::warn("plugin_config: kill-switch row {} is a protective action; "
+                                 "stored but never refuses dispatch",
+                                 target_id);
+                }
                 if (!audit_or_503(deps.audit_fn, req, res, "plugin_config.kill_switch.set",
                                   "PluginConfig", target_id, detail_str))
                     return;

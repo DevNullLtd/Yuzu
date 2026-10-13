@@ -107,7 +107,8 @@ enum class DispatchDenialReason : uint8_t {
     KillSwitched,      ///< Classified and authorized, but the per-action kill
                        ///< switch is OFF for this `plugin.action` (or the config
                        ///< store is degraded, which `action_allowed` reports as
-                       ///< disabled — never as enabled). Deliberately DISTINCT
+                       ///< disabled — never as enabled; never a protective
+                       ///< action — `yuzu::protective`). Deliberately DISTINCT
                        ///< from `Forbidden`: this is an operator-thrown
                        ///< emergency stop, not an authorization verdict, and an
                        ///< incident review needs to tell the two apart.

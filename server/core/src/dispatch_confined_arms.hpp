@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cctype>
 #include <array>
 #include <chrono>
 #include <functional>
