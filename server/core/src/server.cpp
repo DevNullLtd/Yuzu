@@ -9931,6 +9931,7 @@ public:
             .device_inventory = device_inventory_store_.get(),
             .software_licensing = software_licensing_store_.get(),
             .app_usage = app_usage_store_.get(),
+            .offline_endpoint = offline_endpoint_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }
@@ -16212,12 +16213,16 @@ private:
             .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
         });
         preflight_runner_thread_ = std::thread([this]() {
-            spdlog::info("Pre-flight runner thread started (cadence=60s, retention=14d)");
+            spdlog::info("Pre-flight runner thread started (cadence=60s, retention=14d; "
+                         "endpoint_state prune hourly)");
+            std::uint64_t tick = 0;
+            constexpr int kOfflineEndpointPruneEveryNTicks = 60; // ~1h at 60s/tick
             while (!stop_requested_.load(std::memory_order_acquire)) {
                 for (int i = 0; i < 12 && !stop_requested_.load(std::memory_order_acquire); ++i)
                     std::this_thread::sleep_for(std::chrono::seconds{5});
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
+                ++tick;
                 if (preflight_runner_) {
                     // tick() touches JSON, PG and gRPC dispatch — any can throw; an
                     // escaping exception would std::terminate the process, so a bad
@@ -16248,6 +16253,49 @@ private:
                         spdlog::error("deployment prune threw ({}) — thread continuing", e.what());
                     } catch (...) {
                         spdlog::error("deployment prune threw unknown exception — continuing");
+                    }
+                }
+                // #5678 / #1545 UP-4: hourly clock-guarded prune of endpoint_state rows
+                // unseen for roster window + margin. Hosted on THIS thread, not
+                // health_recompute_thread_: the health tick's serial budget is shared
+                // with the revocation sweep, and this thread already hosts the two
+                // WS-10 prunes and nothing security-sensitive. ReplicaSafe — no
+                // leader_gate call. The window is the roster's own (kHardwareRosterWindow);
+                // the prune cutoff is that window + kPruneMargin on the PG-authored
+                // last_seen_at. The roster still reads last_heartbeat_ms on the replica
+                // clock, so the prune cannot reach a row the roster shows only while
+                // replica/PG clock skew stays under the 7 d margin.
+                // Cadence: first pass on the first tick (the bootstrap decline persists the
+                // anchor), then hourly — so the first real delete is the hourly pass ~1 h
+                // later and a server restarted more often than hourly still prunes once per
+                // boot. A prior pass may have held this thread up to the statement timeout,
+                // so re-check stop_requested_ before starting (stop() joins this thread
+                // before offline_endpoint_store_ is reset).
+                if (offline_endpoint_store_ && !stop_requested_.load(std::memory_order_acquire) &&
+                    tick % kOfflineEndpointPruneEveryNTicks == 1) {
+                    try {
+                        YUZU_ASSERT_BACKGROUND_JOB("offline_endpoint_store.run_retention_prune");
+                        // Bounded backlog drain, mirroring the app_perf prune above: a pass
+                        // that hit the cap may have more, so re-arm immediately (at most 12
+                        // passes = 12 * kPruneCapPerPass rows per replica per hour). Any
+                        // non-cap result — under-cap, a decline (0) or an error (-1) — stops
+                        // the drain until the next hourly tick.
+                        for (int drain = 0;
+                             drain < 12 && !stop_requested_.load(std::memory_order_acquire);
+                             ++drain) {
+                            const int pruned =
+                                offline_endpoint_store_->run_retention_prune(kHardwareRosterWindow);
+                            if (pruned < 0)
+                                spdlog::warn("endpoint_state prune did not run (store not open or "
+                                             "no connection/transaction); retrying next hour");
+                            if (pruned != OfflineEndpointStore::kPruneCapPerPass)
+                                break;
+                        }
+                    } catch (const std::exception& e) {
+                        spdlog::error("endpoint_state prune threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        spdlog::error("endpoint_state prune threw unknown exception — continuing");
                     }
                 }
             }
@@ -17716,12 +17764,11 @@ private:
 
         // InventoryRoutes — /software: the SOFTWARE inventory list (fleet catalogue +
         // installs-per-version drill + "devices >" expansion) over SoftwareInventoryStore,
-        // gated on the GLOBAL Inventory:Read (the catalogue aggregates are NOT mgmt-group
-        // scoped — ADR-0017 confinement inert under the global gate, caveated in the UI;
-        // the expansion applies a per-row Inventory:Read drop filter). Reuses the shared
-        // auth/perm/audit closures + a fail-closed check_scoped_permission predicate
-        // (below). The REST /api/v1/inventory/software route and MCP tool have since
-        // migrated onto require_fleet_read; this page has not, so it does not match them.
+        // gated solely on fleet_read_fn (ADR-0017 admit-then-filter, the same gate as the REST
+        // route and MCP tool): the catalogue and version aggregates cannot be narrowed to a
+        // management group, so a confined caller is refused them; the host view and the
+        // devices tables are admitted and narrowed by the gate's own scope. Reuses the shared
+        // auth/audit closures.
         auto inv_human_age = [](std::int64_t ms) -> std::string {
             if (ms < 0)
                 ms = 0;
@@ -17754,6 +17801,10 @@ private:
             // currently-connected agents (live registry). all_ids() copies only the ids
             // under the registry lock — NOT to_json_obj()'s full 5-field-per-agent JSON
             // serialisation under the heartbeat/dispatch hot-path mutex (gov perf-S2).
+            // all_ids() is this replica's local sessions UNION the cached durable presence
+            // (live_presence(), refreshed at most every kPresenceCacheTtl = 3 s): a device
+            // gracefully departed from another replica can still read online here for up to
+            // that TTL (#5678), after which its cleared session_id drops it from presence.
             // unordered_set: O(1) membership over up to fleet-size ids (gov perf-N2).
             auto online_ids = registry_.all_ids();
             std::unordered_set<std::string> online(online_ids.begin(), online_ids.end());
@@ -17918,78 +17969,84 @@ private:
         };
         inventory_routes_ = std::make_unique<InventoryRoutes>();
         inventory_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn,
-            [this](const SoftwareCatalogQuery& q)
-                -> std::optional<std::vector<SoftwareCatalogRow>> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->software_catalog(q);
-            },
-            [this]() -> std::optional<CatalogRollupMeta> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->catalog_rollup_meta();
-            },
-            [this](const std::string& name,
-                   int limit) -> std::optional<std::vector<SoftwareVersionCount>> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->software_versions(
-                    SoftwareVersionsQuery{.name = name, .limit = limit});
-            },
-            [this](const SoftwareFleetQuery& q) -> std::optional<std::vector<SoftwareFleetRow>> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                return software_inventory_store_->query_software(q);
-            },
-            // "devices >" per-row Inventory:Read management-group scope predicate — the SAME
-            // check_scoped_permission chokepoint.
-            // FAIL-CLOSED on a corrupt/load-failed rbac.db (#1717): gates on
-            // rbac_enforcement_in_effect, NOT raw !is_rbac_enabled() (which fails OPEN — a
-            // null db reads as "RBAC off → no filter" → cross-operator IDOR). Mirrors
-            // response_agent_in_scope (server.cpp). The REST/MCP siblings have since moved
-            // onto require_fleet_read (ADR-0017); this page still gates on the global
-            // Inventory:Read, so this per-row filter does not narrow results today.
-            [this](const std::string& username, const std::string& agent_id) -> bool {
-                if (!rbac_enforcement_in_effect(rbac_store_.get()))
-                    return true; // loaded & explicitly disabled → legacy-open
-                return rbac_store_ && rbac_store_->check_scoped_permission(
-                                          username, "Inventory", "Read", agent_id,
-                                          mgmt_group_store_.get());
-            },
-            // Freshness KPI: current stale count (nullopt on degrade → "—" in the UI).
-            // SAME 2-missed-cycles window as the metrics sweep.
-            [this]() -> std::optional<std::int64_t> {
-                if (!software_inventory_store_)
-                    return std::nullopt;
-                constexpr std::int64_t kWin = 2 * 24 * 60 * 60;
-                const std::int64_t cutoff = std::chrono::duration_cast<std::chrono::seconds>(
-                                                std::chrono::system_clock::now().time_since_epoch())
-                                                .count() -
-                                            kWin;
-                return software_inventory_store_->count_stale_agents(cutoff);
-            },
-            audit_fn,
-            // Round-3 item 8: agent_id -> hostname for the Software page's
-            // "devices ›" expansion. One bulk read per render (never per-row) —
-            // endpoint_state's hostname column is written on every heartbeat
-            // regardless of online/offline, so this single 30-day window read
-            // covers both, mirroring hw_identity_fn's offline-store fallback
-            // tier without needing the registry-first tier here (a stale-by-a-
-            // few-seconds hostname on an online device is immaterial for this
-            // display-only lookup).
-            [this]() -> std::unordered_map<std::string, std::string> {
-                std::unordered_map<std::string, std::string> out;
-                if (!offline_endpoint_store_)
+            *web_server_,
+            InventoryRoutes::Deps{
+                .auth_fn = auth_fn,
+                // The Software fragments' SOLE gate (ADR-0017).
+                .fleet_read_fn = fleet_read_fn,
+                .catalog_fn = [this](const SoftwareCatalogQuery& q)
+                    -> std::optional<std::vector<SoftwareCatalogRow>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->software_catalog(q);
+                },
+                .catalog_meta_fn = [this]() -> std::optional<CatalogRollupMeta> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->catalog_rollup_meta();
+                },
+                .totals_fn = [this](const SoftwareCatalogQuery& q)
+                    -> std::optional<SoftwareCatalogTotals> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->software_catalog_totals(q);
+                },
+                .versions_fn = [this](const SoftwareVersionsQuery& q)
+                    -> std::optional<std::vector<SoftwareVersionCount>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->software_versions(q);
+                },
+                .fleet_fn = [this](const SoftwareFleetQuery& q)
+                    -> std::optional<std::vector<SoftwareFleetRow>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->query_software(q);
+                },
+                // Freshness KPI: current stale count (nullopt on degrade -> "—" in the UI).
+                // The SAME 48 h window as the REST/MCP catalogue's coverage.stale.
+                .stale_fn = [this]() -> std::optional<std::int64_t> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    const std::int64_t cutoff =
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() -
+                        software_catalogue::kStaleWindowSecs;
+                    return software_inventory_store_->count_stale_agents(cutoff);
+                },
+                // ponytail: O(fleet) registry walk per full-page render (the REST twin does the
+                // same); an O(1) connected-count when the 2M-endpoint target bites.
+                .connected_fn = [device_api]() -> std::optional<std::int64_t> {
+                    if (!device_api)
+                        return std::nullopt;
+                    return static_cast<std::int64_t>(device_api->list_devices().size());
+                },
+                // agent_id -> hostname for the host type-ahead / devices tables. One bulk read
+                // per render; endpoint_state's hostname is written on every heartbeat whether
+                // the device is online or not, so the 30-day window covers both.
+                .hostnames_fn = [this]() -> std::unordered_map<std::string, std::string> {
+                    std::unordered_map<std::string, std::string> out;
+                    if (!offline_endpoint_store_)
+                        return out;
+                    // #5531 exception: display-only; a failed read leaves hostnames
+                    // unresolved and the page falls back to the agent_id.
+                    for (auto& e : offline_endpoint_store_->query_stale_within(
+                                       kHardwareRosterWindow)
+                                       .value_or(std::vector<OfflineEndpoint>{}))
+                        out.emplace(std::move(e.agent_id), std::move(e.hostname));
                     return out;
-                // #5531 exception: display-only; a failed read leaves hostnames
-                // unresolved and the page falls back to the agent_id.
-                for (auto& e : offline_endpoint_store_->query_stale_within(
-                                   kHardwareRosterWindow)
-                                   .value_or(std::vector<OfflineEndpoint>{}))
-                    out.emplace(std::move(e.agent_id), std::move(e.hostname));
-                return out;
-            });
+                },
+                // Last synced column: the same datum the Hardware record shows as
+                // `software_last_seen`, read in bulk for one devices page.
+                .last_synced_fn = [this](const std::vector<std::string>& ids)
+                    -> std::optional<std::unordered_map<std::string, std::int64_t>> {
+                    if (!software_inventory_store_)
+                        return std::nullopt;
+                    return software_inventory_store_->source_last_seen_bulk("installed_software",
+                                                                            ids);
+                },
+                .audit_fn = audit_fn});
 
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
         // Software lives at /software; /inventory redirects here.

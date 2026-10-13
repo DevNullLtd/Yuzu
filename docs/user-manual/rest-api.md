@@ -387,7 +387,7 @@ List every device visible to the caller.
 
 `devices_omitted` counts agents dropped by the caller's management-group/service-scope
 confinement (0 when unfiltered or nothing was dropped) — the same "out of my scope" vs. "not
-present" signal `GET /api/v1/inventory/software`'s `devices_omitted` field carries.
+present" signal `GET /api/v1/inventory/software`'s `devices_omitted` field used to carry (on that route it now counts only devices hidden by the post-filter and is `0` under SQL push-down — see its section).
 
 ---
 
@@ -6883,9 +6883,17 @@ Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareIn
 |---|---|---|---|
 | `name` | string | No | Exact software-name filter |
 | `agent_id` | string | No | Exact agent filter |
-| `limit` | integer | No | Max rows (default 100, min 1, max 1000) |
+| `version` | string | No | Exact version filter. A **present-empty** value (`?version=`) selects only the rows with an empty version; omit the parameter for any version |
+| `q` | string | No | Case-insensitive literal substring over name, publisher, ecosystem and source (`%`/`_` are not wildcards; clamped to 128 bytes) |
+| `kind` / `ecosystem` | string | No | Exact filters; an empty value means no filter |
+| `source` | string | No | Exact source filter. `source` is an **open set** (`<plugin>.<action>`), never an enum |
+| `limit` | integer | No | Max rows (default 100, min 1, max 1000). In export mode it is the **total** cap (default and max 10000) |
+| `cursor` | string | No | Opaque `next_cursor` from the previous page (see below) |
+| `format` | `json` \| `csv` | No | Selects **export mode**: a single response of up to 10000 rows |
 
-Omit both `name` and `agent_id` for a fleet-wide scan.
+`q`, `kind`, `ecosystem` and `source` are **REST-only** on this route: its MCP twin `query_installed_software` takes `name`, `agent_id`, `version`, `limit` and `cursor` only (see [mcp.md](mcp.md)).
+
+Omit `name` and `agent_id` for a fleet-wide scan. A parameter that is not valid UTF-8 or contains a NUL byte, an `agent_id`/`kind`/`ecosystem`/`source` over 256 bytes, a `name`/`version` over 1024 bytes, a non-integer `limit`, an unknown `format` or a refused `cursor` is a `400` (never a retryable `503`). An unknown `kind` or `ecosystem` value is not refused: it matches nothing and returns an empty `200` (the OpenAPI enum is descriptive, not enforced).
 
 **Response (200):**
 
@@ -6896,12 +6904,14 @@ Omit both `name` and `agent_id` for a fleet-wide scan.
       {"agent_id": "agent-001", "name": "bash", "version": "5.2.21", "publisher": "Fedora Project",
        "install_date": "2026-01-15", "kind": "package", "ecosystem": "rpm", "epoch": "0",
        "release": "3.fc40", "arch": "x86_64", "signature_status": "signed",
-       "distro_id": "fedora", "distro_version": "40"},
+       "distro_id": "fedora", "distro_version": "40", "source": "pkg_inventory.packages"},
       {"agent_id": "agent-002", "name": "Google Chrome", "version": "124.0", "publisher": "Google LLC",
        "install_date": "2026-01-15", "kind": "app", "ecosystem": "windows", "epoch": "",
-       "release": "", "arch": "", "signature_status": "", "distro_id": "", "distro_version": ""}
+       "release": "", "arch": "", "signature_status": "", "distro_id": "", "distro_version": "",
+       "source": "installed_apps.list_inventory"}
     ],
     "count": 2,
+    "next_cursor": "d2:0f3a9c1d5b7e2a64:MzpnaXQfOTphZ2VudC0wMDIfMTo1HzE6MB8",
     "devices_omitted": 0,
     "result_truncated_by_cap": true
   },
@@ -6911,15 +6921,23 @@ Omit both `name` and `agent_id` for a fleet-wide scan.
 
 Every row carries the **blob-v2 package fields** (`kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`) alongside the original four. A field the source ecosystem does not store is `""` — **never synthesised** (a Windows/macOS app row is honestly empty on every NEVRA/signature/distro field, as in the second example above). These 8 keys are **always present in every row** (never absent) — integration code should test for an empty-string value, not key absence. See `docs/user-manual/inventory.md` for the full per-ecosystem availability matrix.
 
-`devices_omitted` is always present (0 when no scope filtering occurred). `result_truncated_by_cap` is present only when `count == limit` and more rows may exist past the cap (keyset pagination is a follow-up, #1634). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
+Every row carries `source` — the `<plugin>.<action>` that produced it (an **open set**; `""` for rows ingested before the field existed). Rows therefore have **14 fields**.
 
-Results carry a **per-agent scope drop filter** — the `require_fleet_read` gate's own composed `meet(management-group, service-scope)` visibility set (#3290): out-of-scope devices are dropped and their distinct count returned in `devices_omitted`. A positive `devices_omitted` means matching software exists **outside** your scope — an empty or short result does **not** mean the software is absent fleet-wide. This confinement is now **effective**, not a foundation: a management-group-confined operator and a correctly-confined service-scoped token both see a genuinely narrowed result, matching the ADR-0017 admit-then-filter model this route was the first to adopt in Phase 2.
+**Pagination (keyset).** `next_cursor` is non-null when more rows may exist (`result_truncated_by_cap: true` is set at the same moment — also in export mode); pass it back as `cursor` to continue. The cursor is **opaque** — never parse it. It is bound to the filter set: a malformed cursor, or one issued for a different filter set, is a `400` (`invalid cursor` / `cursor was issued for a different filter set`), never a silent restart. Under push-down the cursor is the last row of the page. When the page was post-filtered (below), a page can be short or empty while `next_cursor` is non-null — keep paging until `next_cursor` is `null`; that cursor never names a row you were not served (see the Scope paragraph).
+
+**Scope (`devices_omitted` — re-specified).** The gate's composed `meet(management-group, service-scope)` visibility set is **pushed into SQL** (`agent_id = ANY(...)`) for up to 10 000 visible devices, so a confined caller (management-group-confined operator or a correctly-confined service-scoped token) gets **complete pages of its own devices** and nothing is hidden. `devices_omitted` is the count of distinct devices hidden by the **in-process post-filter** used only for a scope wider than that bound. It is `0` under push-down, so there an empty page means no matching software in your scope. Above 10 000 visible devices it is a distinct-device count **within the scanned window(s)** and still signals that out-of-scope matches exist (bounded and audited). A `denied` audit row is written when it is greater than `0`, or when the request names an `agent_id` outside the caller's scope (the response is then empty with `devices_omitted` unchanged; the row says `agent_id outside the caller's scope`). On a wide scope the page is refilled with at most four bounded store reads, so a page can be empty with a non-null `next_cursor`; the cursor then re-anchors at the last row **you were served** (or at the start) and carries a count of the rows scanned since, which the next request passes over — no identifier, name or version of an out-of-scope row is ever in it. A row inserted inside that skipped span during a walk can be missed or repeated, the same class as the `install_id` churn already noted for concurrent resyncs; a wide-scope walk is best-effort under concurrent change, because the count is of positions: deleting an out-of-scope row inside the skipped span between pages, or widening the caller's scope between pages, can make the next page skip or repeat a row. A long run of out-of-scope rows costs proportionally more to resume, and a statement timeout there degrades the page to a 503 (tracked in #5698). An export on a wide scope reads at most four bounded windows, so it can hold fewer than `limit` rows with `X-Result-Truncated-By-Cap` set. `result_truncated_by_cap` is present only when more rows may exist (push-down: `count == limit`; wide scope: the page filled early or the read bound was reached). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
+
+**Export mode.** `format=csv` returns `text/csv; charset=utf-8` with `Content-Disposition: attachment; filename="software-installs.csv"` and the header row `agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,arch,signature_status,distro_id,distro_version,source`; `format=json` returns the usual object. `limit` is the **total** row cap (default and maximum 10000); when more rows may exist the response carries `X-Result-Truncated-By-Cap: true` and `X-Next-Cursor: <cursor>` (CSV, whose body then ends with a `# result_truncated_by_cap cause=row_cap` trailer record of 14 fields) or `result_truncated_by_cap: true` and `next_cursor` (JSON); pass the cursor back as `cursor` with the same `format` to read on. Exports are audited as `inventory.software.export` and are REST-only (an agent pages the same data through the MCP cursor). Service-scoped tokens stay admitted — confined — on this route, **including export**, unlike the two catalogue routes below.
+
+**Audit.** Every call that is served writes a `success` row — `inventory.software.query`, or `inventory.software.export` in export mode (continuation pages carry `page=continuation` in the detail), with the target `fleet` / `agent=<id>` / `name=<n>` (`name=<n>;agent=<id>` when both are set) plus the active filters; a `400` writes nothing. Because the cursor is opaque but unauthenticated (a hand-made well-formed cursor is accepted), per-call audit is what keeps a forged cursor from walking the fleet unrecorded.
+
+**Behaviour changes in this release.** `limit` is now parsed with a strict full-consume integer parse: `limit=12abc` is a `400` (it was previously accepted as `12`), and an empty `limit=` now means the default (it was a `400`). A parameter holding a NUL byte or invalid UTF-8, or an over-long `name`/`agent_id`/`version`/`cursor`, is now a `400` (it was a retryable `503`). A `denied` audit row is now also written for an explicit `agent_id` outside the caller's scope. Repeated query parameters keep the **first** value on this route (unchanged); the two catalogue routes below reject a repeated parameter with `400` instead.
 
 **Error responses:**
 
 | Status | Condition |
 |---|---|
-| 400 | `limit` is not a valid integer |
+| 400 | `limit` is not a valid integer, `format` is not `json`/`csv`, or the `cursor` is malformed / was issued for a different filter set; a parameter that is not valid UTF-8 or contains a NUL byte; or an over-long value (`agent_id`/`kind`/`ecosystem`/`source` over 256 bytes, `name`/`version` over 1024 bytes) |
 | 401 | Unauthenticated |
 | 403 | No management-group grant for `Inventory:Read`; or a service-scoped token whose RBAC/ITServiceOwner grant is missing, or whose RBAC enforcement is disabled fleet-wide (a service-scoped token always hard-denies when RBAC is off) |
 | 503 | The gate's own RBAC/tag-store lookup is unavailable or degraded (including a failed read of the `ITServiceOwner` ceiling for a service-scoped token), the software inventory store is unavailable or degraded, or the `require_fleet_read` gate itself is unwired (server misconfiguration) — all A4 envelope with `correlation_id`, `retry_after_ms: 5000` where retryable — **never an empty 200** |
@@ -6928,7 +6946,7 @@ On a `503` the store (or the confinement check itself) could not be read; do **n
 
 #### `GET /api/v1/inventory/software/catalogue`
 
-The **fleet software title catalogue**: one row per title rolled up across the whole fleet from the precomputed catalogue rollup (refreshed hourly), ordered by installs descending then name.
+The **fleet software title catalogue**: one row per title rolled up across the whole fleet from the precomputed catalogue rollup (refreshed hourly), ordered by installs descending then name. MCP twin: `query_software_catalogue` — both are shaped by one shared model, so the JSON cannot drift.
 
 **Permission:** a **global** `Inventory:Read` (via `require_fleet_read`). The rollup is fleet-wide and cannot be scoped, so a management-group-confined caller gets `403` (`permission: "Inventory:Read"`, audited `denied`) on the fleet view — but may pass `agent_id` for a per-device view of an in-scope device (see below). **Service-scoped API tokens are denied** (`403`, no `permission` field — no grant would admit them), unlike the raw `GET /api/v1/inventory/software` above, which keeps admitting them confined: the asymmetry is deliberate.
 
@@ -6996,7 +7014,7 @@ A repeated parameter, a parameter that is not valid UTF-8 or contains a NUL byte
 
 #### `GET /api/v1/inventory/software/catalogue/versions`
 
-Installs per version for one title: distinct devices per version, most-installed first.
+Installs per version for one title: distinct devices per version, most-installed first. MCP twin: `get_software_versions`.
 
 **Permission and posture:** identical to the catalogue — a global `Inventory:Read` for the fleet view (`403` for a confined caller), the per-device view for an in-scope device (`newest` is `false` on every row and `newest_omitted: true` for a confined caller; an out-of-scope device returns an empty list with `devices_omitted: 1` and a `denied` audit row), service-scoped tokens denied.
 
@@ -7244,7 +7262,7 @@ One device's per-executable last-used projection — the per-agent drill. Becaus
 | 503 + `Sec-Audit-Failed` | The per-open audit row could not persist — fail-closed, no data served |
 | 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
 
-Decommissioning the agent erases this store's rows too — see [Software Licensing (SLE)](#software-licensing-sle)'s `DELETE /api/v1/sle/agents/{agent_id}` (the six-store cascade).
+Decommissioning the agent erases this store's rows too — see [Software Licensing (SLE)](#software-licensing-sle)'s `DELETE /api/v1/sle/agents/{agent_id}` (the seven-store cascade).
 
 ---
 
@@ -7293,13 +7311,13 @@ A genuinely licence-free (or unknown) device is `200` with `count: 0`; a `503` m
 
 #### `DELETE /api/v1/sle/agents/{agent_id}`
 
-**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all six per-agent stores** (generic inventory, installed-software, device-CI, app-perf, detected-licence, and app-usage), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
+**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **the seven stores in the cascade** (generic inventory, installed-software, device-CI, app-perf, detected-licence, app-usage, and the `endpoint_state` presence row that holds the device's last-known hostname, OS, agent version and architecture), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired whole-device erasure path for those seven stores (GDPR Art. 17); per-agent stores outside the cascade are not erased by it, and row-level / per-subject DSAR erasure is a stated gap (#1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
 
 **Permission:** a single **per-device-scoped `Decommission:Delete`** securable (ADR-0024 Decision 9, amended Wave 7 PR7.2) — one grant authorizing for the cascade's whole blast radius, replacing the earlier per-store conjunction. A role lacking it is `403`'d, naming `Decommission:Delete` (the seeded Administrator/ITServiceOwner roles hold it by default; a custom role that had assembled the old per-store `Delete` grants must be granted this securable too — the three old grants no longer suffice).
 
 Two durable audit events: `sle.agent.decommission|attempt` is written **before** the erasure and **fails closed** — if it cannot persist, nothing is erased (`503` + `Sec-Audit-Failed`); the outcome row (`success`/`partial`) follows with the per-store breakdown.
 
-**Response (200)** — every store's delete committed:
+**Response (200)** — every configured store's delete committed:
 
 ```json
 {
@@ -7308,8 +7326,9 @@ Two durable audit events: `sle.agent.decommission|attempt` is written **before**
     "decommissioned": true,
     "stores": {"inventory": "deleted", "software_inventory": "deleted",
                "app_perf_daily": "deleted", "device_inventory": "skipped",
-               "software_licensing": "deleted", "app_usage": "deleted"},
-    "deleted": 5,
+               "software_licensing": "deleted", "app_usage": "deleted",
+               "offline_endpoint": "deleted"},
+    "deleted": 6,
     "skipped": 1,
     "failed": 0
   },
@@ -7325,11 +7344,17 @@ Per-store outcomes: `deleted` (the DELETE **committed**), `skipped` (store not c
 |---|---|
 | 401 | Unauthenticated |
 | 403 | Caller lacks the per-device-scoped `Decommission:Delete` permission |
-| 500 | One or more stores `failed` — the A4 body carries the per-store breakdown in `error.details.stores`; the cascade is **idempotent**, re-issue the DELETE to retry the failures |
+| 500 | One or more stores `failed` — the A4 body carries the per-store breakdown in `error.details.stores`; the cascade is **idempotent**, re-issue the DELETE to retry the failures. The server log line ``AgentDecommission: store '<name>' delete_agent reported failure for agent=<id> (delete did not commit — recorded Failed, not Deleted)`` names the failing store; the most frequent root cause is PostgreSQL availability (see the `yuzu_pg_*` metrics). A store that throws instead logs ``AgentDecommission: store '<name>' delete_agent threw for agent=<id>: <what>`` |
 | 503 + `Sec-Audit-Failed` | The attempt audit row could not persist — fail-closed, **nothing was erased** |
 | 503 | Scope gate or cascade not configured (A4 envelope) |
 
-A `200` with `decommissioned: true` is confirmed erasure across every configured store; deleting an unknown `agent_id` is a no-op `200` (nothing to erase). Erasure does not unenroll the agent — a still-enrolled device re-syncs on its next daily cycle, so decommission the device first. This guarantee is scoped to the stores the cascade actually fans across — a leftover legacy `inventory.db` on disk (only possible outside ADR-0009's "no fleet ever ran pre-Postgres" assumption) was never part of it: `InventoryStore::delete_agent()` stopped scrubbing that file when its one-time backfill was retired (#3623), since the erasure branch existed only to serve the backfill.
+A `200` with `decommissioned: true` is confirmed erasure for the stores in the cascade of the replica that answered (a store reported `skipped` was not erased); deleting an unknown `agent_id` is a no-op `200` (nothing to erase). The `deleted` count reaches 7 (it reached 6 before the `offline_endpoint` store joined the cascade) when every store is configured. During a rolling upgrade, a DELETE served by a replica that has not been upgraded runs the old cascade and returns `200` without erasing the presence row: a response whose `stores` map has no `offline_endpoint` key did not erase it, and the `sle.agent.decommission` success audit row that replica writes lists its own stores (no `offline_endpoint`), so it is not evidence that the presence row was erased. Re-issue the DELETE once every replica runs this version.
+
+Erasure does not unenroll the agent: a still-enrolled device re-syncs on its next daily cycle and re-creates its `offline_endpoint` presence row on its next heartbeat. Erasure is therefore point-in-time; an `offline_endpoint=deleted` entry in the success audit row's store breakdown proves the row was deleted at commit, not that it stayed deleted. Stop or uninstall the agent first: revoking its certificate does not cut off an agent connected through a gateway (#5578), which must be disconnected at the gateway layer as well (see Device Management: [Per-agent mTLS auto-provisioning](device-management.md#per-agent-mtls-auto-provisioning-pki)). If you also revoke its certificate, look up the serial with `GET /api/v1/ca/issued` (needs `Security:Read`), call `POST /api/v1/ca/revoke` (`Security:Delete`), and wait about 15 s for the next revocation sweep to drop a directly connected agent's stream before you issue the DELETE. Revocation cannot be undone through the API: the server refuses to issue a new certificate for that agent id while the revoked certificate is unexpired (audit `ca.cert.reissue_blocked`), so do not revoke a device you intend to re-enrol.
+
+To confirm the erasure, wait at least one heartbeat interval (30 s) with the agent stopped and then read `/hardware`; a still-running agent re-creates the row on its next heartbeat, in which case re-issue the DELETE (it is idempotent). `/hardware` reads the table directly (no cache), but it lists only rows seen in the last 30 days (for a device last seen more than 30 days ago `/hardware` cannot confirm erasure, because the row is hidden both before and after the DELETE, so the response's `offline_endpoint: "deleted"` entry is the only confirmation) and needs fleet-scoped `Inventory:Read`; a management-group-confined operator cannot tell "erased" from "out of scope", so confirm with a fleet-scoped reader. Each replica also keeps a liveness cache of about 3 s (used for scope evaluation and dispatch targeting, not by `/hardware`) that the decommission does not invalidate on any replica, including the one that served the DELETE, so the device may still count as present in scope evaluation for up to about 3 s. The `endpoint_state` row holds a hostname, which can identify a person on a personally-assigned device, so treat its erasure as personal-data erasure.
+
+This guarantee is scoped to the stores the cascade actually fans across: a leftover legacy `inventory.db` on disk (only possible outside ADR-0009's "no fleet ever ran pre-Postgres" assumption) was never part of it, because `InventoryStore::delete_agent()` stopped scrubbing that file when its one-time backfill was retired (#3623), since the erasure branch existed only to serve the backfill.
 
 ---
 

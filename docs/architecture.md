@@ -444,7 +444,7 @@ campaign's inline-route-extraction goal is complete.
 | Agent identity | SQLite (`agent.db`) | Persistent agent_id, enrollment state |
 | Agent KV storage | SQLite (`agent.db`) | Cross-instruction persistent state |
 | Server substrate | **PostgreSQL** (shared `PgPool`) | Server storage substrate (ADR-0006/0007); server **fails closed** without it |
-| Server offline-endpoint state | **PostgreSQL** (`endpoint_state`) | Last-known per-agent identity + last-seen; renders offline hosts stale-flagged on `/viz/fleet` (first born-on-Postgres store) |
+| Server offline-endpoint state | **PostgreSQL** (`endpoint_state`) | Last-known per-agent identity + last-seen; renders offline hosts stale-flagged on `/viz/fleet` (first born-on-Postgres store); erased per device by the decommission cascade (#5682) |
 | Server responses | **PostgreSQL** (shared `PgPool`) | Command response persistence with TTL |
 | Server audit | **PostgreSQL** (shared `PgPool`) | User action audit trail |
 | Server identity/auth | **PostgreSQL** (`auth` + `scim_store` schemas) + config files (`.cfg`) | Users, tokens, enrollment, settings |

@@ -27,14 +27,48 @@
          execute_command/2,
          report_inventory/2]).
 
+%% The bound on a Register's agent id, the same condition the server applies in
+%% GatewayUpstreamServiceImpl::ProxyRegister (and in the direct Register) before
+%% anything else: `info.agent_id().empty() || info.agent_id().size() >
+%% auth::kMaxAgentIdLength' (server/core/src/gateway_service_impl.cpp, the check
+%% under the "agent_id length bound" comment; kMaxAgentIdLength = 256 in
+%% server/core/include/yuzu/server/auth.hpp). Bytes, not characters. The gateway
+%% forwards the agent's RegisterRequest as it is, so without the same bound here
+%% a request the server refuses as wrong would be forwarded, and a request fault
+%% must not count against the circuit breaker. A change to the server's constant
+%% must change this one.
+-define(MAX_AGENT_ID_BYTES, 256).
+
 %%--------------------------------------------------------------------
 %% Register — proxy to C++ server
 %%--------------------------------------------------------------------
 
 register(Ctx, RegisterReq) ->
+    case check_agent_id(RegisterReq) of
+        ok ->
+            register_checked(Ctx, RegisterReq);
+        {refused, Size} ->
+            %% Answered here, before a reservation and before any upstream call:
+            %% the server would answer the same status, and the gateway used to
+            %% count that answer as a failure of the upstream (see
+            %% ?MAX_AGENT_ID_BYTES). The line carries the size, never the id.
+            telemetry:execute([yuzu, gw, register, refused],
+                              #{count => 1}, #{reason => <<"agent_id_length">>}),
+            yuzu_gw_safe_call:warn_limited(
+              register_refused,
+              "Register refused: the agent id is empty or longer than ~b bytes (size ~b bytes)",
+              [?MAX_AGENT_ID_BYTES, Size]),
+            {grpc_error, {?GRPC_STATUS_INVALID_ARGUMENT,
+                          <<"agent_id length exceeds 256 bytes or is empty">>}}
+    end.
+
+register_checked(Ctx, RegisterReq) ->
     Headers = grpcbox_metadata:from_incoming_ctx(Ctx),
-    PeerAddr = maps:get(<<":authority">>, Headers,
-                        maps:get(<<"x-forwarded-for">>, Headers, <<"unknown">>)),
+    AgentInfo0 = maps:get(info, RegisterReq, maps:get(<<"info">>, RegisterReq, #{})),
+    %% Agent supplied, and held in the pending store, logged and sent upstream
+    %% later: sanitised here, at the source (see yuzu_gw_peer_addr). A change is
+    %% logged once, with the agent and the original size.
+    PeerAddr = register_peer_addr(Headers, extract_agent_id(AgentInfo0)),
 
     %% A slot on the connection is RESERVED before the registration goes
     %% upstream: the check and the claim are one step in the registry, so
@@ -42,7 +76,6 @@ register(Ctx, RegisterReq) ->
     %% refused one leaves nothing on the server. The reservation becomes the
     %% pending row in store_pending/3 and is released here on every other way out
     %% (a reservation of a crashed handler is swept after the pending TTL).
-    AgentInfo0 = maps:get(info, RegisterReq, maps:get(<<"info">>, RegisterReq, #{})),
     case yuzu_gw_registry:reserve_session(yuzu_gw_conn:key_from_ctx(Ctx),
                                           extract_agent_id(AgentInfo0)) of
         {ok, Reservation} ->
@@ -86,7 +119,8 @@ register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
                                   registered_at => erlang:system_time(millisecond)},
                                 Reservation) of
                 ok ->
-                    logger:info("Agent ~s registered, awaiting Subscribe", [AgentId]),
+                    logger:info("Agent ~s registered, awaiting Subscribe",
+                                [yuzu_gw_env:log_text(AgentId)]),
                     {ok, Response, Ctx};
                 {error, superseded} ->
                     %% A newer Register of this agent id on the connection
@@ -110,12 +144,14 @@ register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
         {ok, _NotAMap} ->
             %% An OK whose message is not a decoded response: the same failure
             %% as an RPC error, with no body in the log or in the error.
-            logger:warning("Upstream Register failed: answer is not a response message"),
+            yuzu_gw_safe_call:warn_limited(
+              register_failed, "Upstream Register failed: answer is not a response message", []),
             {grpc_error, {?GRPC_STATUS_INTERNAL,
                           <<"Upstream registration failed: malformed response">>}};
 
         {error, Reason} ->
-            logger:warning("Upstream Register failed: ~p", [Reason]),
+            yuzu_gw_safe_call:warn_limited(register_failed,
+                                           "Upstream Register failed: ~p", [Reason]),
             {grpc_error, {?GRPC_STATUS_INTERNAL,
                           iolist_to_binary(
                               io_lib:format("Upstream registration failed: ~p", [Reason]))}}
@@ -152,7 +188,7 @@ subscribe(Ref, State) ->
 
                 undefined ->
                     logger:warning("Subscribe: no pending registration for session ~s",
-                                   [SessionId]),
+                                   [yuzu_gw_env:log_text(SessionId)]),
                     throw({grpc_error, {?GRPC_STATUS_NOT_FOUND,
                                         <<"No pending registration for session">>}});
 
@@ -199,7 +235,7 @@ subscribe(Ref, State) ->
 
                         {error, Reason} ->
                             logger:error("Failed to start agent process for ~s: ~p",
-                                         [AgentId, Reason]),
+                                         [yuzu_gw_env:log_text(AgentId), Reason]),
                             throw({grpc_error, {?GRPC_STATUS_INTERNAL,
                                                 <<"Internal: agent process start failed">>}})
                     end
@@ -308,7 +344,8 @@ report_inventory(Ctx, InventoryReport) ->
         {ok, Response} ->
             {ok, Response, Ctx};
         {error, Reason} ->
-            logger:warning("Upstream ReportInventory failed: ~p", [Reason]),
+            yuzu_gw_safe_call:warn_limited(inventory_failed,
+                                           "Upstream ReportInventory failed: ~p", [Reason]),
             {grpc_error, {?GRPC_STATUS_INTERNAL,
                           iolist_to_binary(
                               io_lib:format("Upstream inventory report failed: ~p", [Reason]))}}
@@ -318,6 +355,30 @@ report_inventory(Ctx, InventoryReport) ->
 %% Internal
 %%--------------------------------------------------------------------
 
+%% The peer address of a Register: the :authority header (else x-forwarded-for),
+%% made safe by yuzu_gw_peer_addr. When that changed the value (an address that
+%% is not UTF-8, or one over the limit) the operator is told once, with the agent
+%% and the original size, never the bytes: the address reads `invalid' or is cut
+%% in the logs and in the server, and this is the only place that says why.
+register_peer_addr(Headers, AgentId) ->
+    Raw = maps:get(<<":authority">>, Headers,
+                   maps:get(<<"x-forwarded-for">>, Headers, <<"unknown">>)),
+    PeerAddr = yuzu_gw_peer_addr:sanitize(Raw),
+    case PeerAddr =:= Raw of
+        true ->
+            ok;
+        false ->
+            yuzu_gw_safe_call:warn_limited(
+              register_peer_addr,
+              "Register from agent ~s: the peer address was replaced or cut "
+              "to fit (original size ~b bytes)",
+              [yuzu_gw_env:log_text(AgentId), raw_size(Raw)])
+    end,
+    PeerAddr.
+
+raw_size(Raw) when is_binary(Raw) -> byte_size(Raw);
+raw_size(_Raw) -> 0.
+
 %% The answer to a session refused by the per-connection quota: UNAVAILABLE, the
 %% retryable status (the agent backs off and registers again; the quota frees as
 %% the connection's other sessions end). No request in it, and no id.
@@ -325,6 +386,30 @@ session_limit_error() ->
     {grpc_error, {?GRPC_STATUS_UNAVAILABLE,
                   <<"Too many agent sessions on this connection">>}}.
 
+%% The bound of ?MAX_AGENT_ID_BYTES, on the id as the request carries it, before
+%% any fallback: a missing `info', a missing id and a value that is not a binary
+%% are all "empty" (a request that came off the wire always has the id, <<>> when
+%% the agent sent none; only a hand built request can lack it). Returns the size
+%% to report (0 for a value that is not a binary).
+check_agent_id(RegisterReq) when is_map(RegisterReq) ->
+    Info = maps:get(info, RegisterReq, maps:get(<<"info">>, RegisterReq, #{})),
+    Raw = case is_map(Info) of
+              true  -> maps:get(<<"agent_id">>, Info, maps:get(agent_id, Info, undefined));
+              false -> undefined
+          end,
+    case Raw of
+        Id when is_binary(Id), byte_size(Id) >= 1, byte_size(Id) =< ?MAX_AGENT_ID_BYTES ->
+            ok;
+        Id when is_binary(Id) ->
+            {refused, byte_size(Id)};
+        _NotABinary ->
+            {refused, 0}
+    end;
+check_agent_id(_NotAMap) ->
+    {refused, 0}.
+
+%% The id as a log and registry key once the bound has passed. The fallback is
+%% only reachable for an `info' without the id, which check_agent_id/1 refuses.
 extract_agent_id(AgentInfo) ->
     maps:get(<<"agent_id">>, AgentInfo,
              maps:get(agent_id, AgentInfo, <<"unknown">>)).

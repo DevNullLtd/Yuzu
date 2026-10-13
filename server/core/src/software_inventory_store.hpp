@@ -38,6 +38,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu {
@@ -243,6 +244,12 @@ struct SoftwareFleetQuery {
     /// install_id churns when an agent's list is fully replaced, so a walk concurrent with
     /// one agent's resync can repeat or skip that agent's same-name rows.
     std::optional<SoftwareCursor> after;
+    /// Rows to pass over AFTER `after` (SQL OFFSET, only when > 0) - the skipped rows never cross
+    /// the wire. Used by the post-filtered scope walk to re-anchor at the last row it served.
+    /// It counts positions, so that walk is best-effort under concurrent change: deleting an
+    /// out-of-scope row in the skipped span, or widening the caller's scope, between pages can
+    /// make the next page skip or repeat a row (same class as the install_id churn above).
+    std::int64_t skip{0};
 };
 
 class SoftwareInventoryStore {
@@ -313,6 +320,15 @@ public:
     /// row yet (never synced). Backs the Hardware CI record's "Sync now" poll.
     [[nodiscard]] std::optional<std::int64_t> source_last_seen(std::string_view agent_id,
                                                                std::string_view source);
+
+    /// `source_last_seen` for a page of agents in one read: agent_id -> server-receipt
+    /// epoch-seconds of its last accepted `source` report (the value the Hardware record
+    /// shows as `software_last_seen`). An agent with no row is ABSENT from the map (never a
+    /// 0). Empty `source`/`agent_ids` -> empty map (precondition miss).
+    /// AUTHORITATIVE read: `std::nullopt` on a degrade. The caller bounds `agent_ids` (the
+    /// Software page passes at most one page, 100 ids); nothing here caps it.
+    [[nodiscard]] std::optional<std::unordered_map<std::string, std::int64_t>>
+    source_last_seen_bulk(std::string_view source, const std::vector<std::string>& agent_ids);
 
     /// Fleet-wide query ("which agents run X"). Capped at a hard ceiling regardless
     /// of `limit`. AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure

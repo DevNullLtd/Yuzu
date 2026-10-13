@@ -23,7 +23,8 @@
 #include "typed_inventory_sources.hpp"
 #include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
-#include "offline_endpoint_store.hpp" // HA WS-5: remove_if_session on disconnect
+#include "offline_endpoint_store.hpp" // HA WS-5: presence session clear on disconnect
+#include "presence_departure.hpp"
 #include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
@@ -148,12 +149,12 @@ bool is_server_minted_session_id(std::string_view id) {
 // One WARN per 5s per key: a counter carries the magnitude, so a store outage must
 // not turn into one log line per heartbeat batch. Per-key slots so a heartbeat-path
 // degrade cannot mask a fail-closed register/adopt one; unlisted keys share the last.
-constexpr std::array<std::string_view, 9> kWarnSlotKeys{
+constexpr std::array<std::string_view, 10> kWarnSlotKeys{
     "register_fresh",         "announce_connected",
     "deregister",             "renew_leases",
     "reclaim_tombstoned_session", "cluster_affinity_check",
     "session_lookup",         "ambiguous_session",
-    "connected_unverified"};
+    "connected_unverified",   "presence_upsert_skipped"};
 
 bool warn_slot_due(std::string_view key) {
     static std::array<std::atomic<std::int64_t>, kWarnSlotKeys.size() + 1> last_warn_ms{};
@@ -303,6 +304,40 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "counter");
         metrics_->counter("yuzu_server_gateway_route_degraded_renewal_total",
                           {{"op", "batch_heartbeat"}});
+        metrics_->describe(
+            "yuzu_server_gateway_batch_heartbeat_duration_seconds",
+            "#5686: BatchHeartbeat handler duration in seconds, from after the on-behalf "
+            "check to the response, by outcome. outcome=\"degraded\" means at least one "
+            "Postgres-backed step of the batch degraded: the session_id directory read, the "
+            "lease renewal, or a presence upsert; outcome=\"ok\" otherwise. The directory read "
+            "and the renewal each bound their pool acquire at 500 ms and a failing presence "
+            "upsert at 250 ms. After a failed presence upsert later upserts in that batch are "
+            "skipped EXCEPT probes: the entry right after the first failure is attempted and "
+            "the spacing doubles on each further consecutive failure, so under total "
+            "saturation (every attempt fails) a batch makes at most floor(log2 N)+1 attempts "
+            "(N = batch size), each waiting at most its 250 ms pool acquire (an attempt "
+            "stalled on a row lock is bounded by the pool lock_timeout instead); a "
+            "success resets the spacing. A batch "
+            "that waited out one or both 500 ms acquires lands just above 0.5 s or 1 s.",
+            "histogram");
+        for (const char* outcome : {"ok", "degraded"})
+            metrics_->histogram("yuzu_server_gateway_batch_heartbeat_duration_seconds",
+                                {{"outcome", outcome}});
+        metrics_->describe(
+            "yuzu_server_agent_presence_upsert_skipped_total",
+            "#5686: BatchHeartbeat entries whose presence upsert was skipped because an earlier "
+            "presence upsert in the same batch had failed (skipped except for probes: the entry "
+            "right after the first failure is attempted and the spacing doubles on each "
+            "further consecutive failure; attempts that fail are counted in "
+            "yuzu_server_agent_presence_store_failed_total{op=\"upsert\"}). The heartbeat is "
+            "still acknowledged and its lease renewed; once the presence store recovers (a "
+            "later probe in the same batch or the next batch then refreshes the row) the row "
+            "is current again. Under total saturation (every attempt fails) a batch makes at "
+            "most floor(log2 N)+1 attempts, each waiting at most its 250 ms pool acquire (an "
+            "attempt stalled on a row lock is bounded by the pool lock_timeout instead); a "
+            "success resets the spacing.",
+            "counter");
+        metrics_->counter("yuzu_server_agent_presence_upsert_skipped_total");
         metrics_->describe(
             "yuzu_server_gateway_route_desync_total",
             "HA WS-4 4.2a: GatewayRouteStore session-guard writes (announce_connected/"
@@ -1328,6 +1363,7 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                                                         gw::BatchHeartbeatResponse* response) {
     // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp.
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
+    const auto started = std::chrono::steady_clock::now();
 
     // Gateway contract (yuzu_gw_heartbeat_buffer, #1197): the gateway treats the
     // gRPC statuses RESOURCE_EXHAUSTED and INVALID_ARGUMENT on BatchHeartbeat as
@@ -1363,6 +1399,10 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                 ids.push_back(hb.session_id());
         resolution = resolve_sessions(ids);
     }
+    bool store_degraded = resolution.degraded;
+    // #5686: a failed presence upsert trips the batch; later upserts are skipped except
+    // for half-open probes (the entry right after the first failure, then doubling spacing).
+    HeartbeatIngestion::PresenceBatch presence_batch;
     for (const auto& hb : request->heartbeats()) {
         std::string agent_id;
         bool store_resolved = false;
@@ -1409,7 +1449,8 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
             try {
                 heartbeat_ingestion_->ingest(hb, agent_id, "gateway",
                                              store_resolved ? std::string_view{hb.session_id()}
-                                                            : std::string_view{});
+                                                            : std::string_view{},
+                                             &presence_batch);
             } catch (const std::exception& ex) {
                 spdlog::warn("[gateway] BatchHeartbeat: ingest threw for agent {} — "
                              "skipping entry, batch continues: {}",
@@ -1541,6 +1582,7 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                 // (thousands of agents) over one renew failure would be a
                 // much larger blast radius than the staleness it avoids.
                 record_route_store_failure(metrics_, "renew_leases", res.error());
+                store_degraded = true;
             } else {
                 if (resolution.degraded && *res > 0 && metrics_) {
                     metrics_->counter("yuzu_server_gateway_route_degraded_renewal_total",
@@ -1600,10 +1642,35 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
         record_directory_desync(metrics_, "batch_heartbeat", "malformed_session_id",
                                 static_cast<double>(malformed_session_ids));
     }
+    if (presence_batch.skipped > 0 && metrics_) {
+        metrics_->counter("yuzu_server_agent_presence_upsert_skipped_total")
+            .increment(static_cast<double>(presence_batch.skipped));
+    }
+    // #5686: trigger on any failed attempt (not only a trip still open at the
+    // end), so a failure on the last entry, or one a later probe recovered
+    // from, is also logged.
+    if (presence_batch.failed > 0 && warn_slot_due("presence_upsert_skipped")) {
+        spdlog::warn("[gateway] BatchHeartbeat from node '{}': presence store degraded: {} of {} "
+                     "heartbeats not persisted this batch ({} upsert attempts failed, {} "
+                     "skipped); heartbeats still acked, leases renewed (logged at most once per "
+                     "5s; see yuzu_server_agent_presence_store_failed_total{{op=\"upsert\"}} and "
+                     "yuzu_server_agent_presence_upsert_skipped_total)",
+                     onbehalf::sanitize_for_log(request->gateway_node(), 64),
+                     presence_batch.failed + presence_batch.skipped, request->heartbeats_size(),
+                     presence_batch.failed, presence_batch.skipped);
+    }
 
     response->set_acknowledged_count(acked);
     spdlog::debug("[gateway] BatchHeartbeat from node '{}': {}/{} acked", request->gateway_node(),
                   acked, request->heartbeats_size());
+    if (metrics_) {
+        const bool degraded = store_degraded || presence_batch.failed > 0;
+        metrics_
+            ->histogram("yuzu_server_gateway_batch_heartbeat_duration_seconds",
+                        {{"outcome", degraded ? "degraded" : "ok"}})
+            .observe(
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
+    }
     return grpc::Status::OK;
 }
 
@@ -2328,6 +2395,13 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         registry_.clear_stream_if_session(agent_id, session_id);
         const bool removed_current_session =
             registry_.remove_agent_if_session(agent_id, session_id);
+        // Parity with the direct path's evict_pushed (agent_service_impl.cpp), but
+        // gated: a gateway DISCONNECTED can be stale/reordered (#4324 fence above).
+        // Before the presence DB write so no DB wait sits between the registry
+        // decision and the evict. Residual: an S2 that pushed in that gap loses
+        // its slot until its next heartbeat re-pushes (same on the direct path).
+        if (removed_current_session && fleet_topology_store_)
+            fleet_topology_store_->evict_pushed(agent_id);
         // HA WS-4 4.1: mirror the DISCONNECTED fact into the durable routing
         // directory too — session-guarded (gateway_route_store.hpp), so a
         // DIFFERENT, superseded session's DISCONNECTED can't tear down a newer
@@ -2360,16 +2434,22 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                 store_removed = true;
             }
         }
-        // HA WS-5 (ADR-2002 §7a): session-guarded presence-row delete, so a
-        // graceful disconnect cannot leave a stale row matched by scope
-        // evaluation until the TTL expires. Gated on proof this session was
-        // current (local removal, or the directory deregister matching) —
-        // an unconditional delete could remove a LIVE agent's row on a
-        // reconnect. A non-owning replica removes no local session, so the
-        // directory result is its only proof.
-        if ((removed_current_session || store_removed) && heartbeat_ingestion_)
-            if (auto* offline = heartbeat_ingestion_->offline_endpoint_store())
-                offline->remove_if_session(agent_id, session_id);
+        // HA WS-5 (ADR-2002 §7a) + #5678: session-guarded presence CLEAR (row kept
+        // for the offline roster) via the shared helper. Gated on
+        // `removed_current_session` (this replica held the session) OR
+        // `store_removed` (this session owned the gateway directory entry — a
+        // non-owning replica removes no local session, so that is its only
+        // proof). An ungated clear could drop a LIVE agent from presence on a
+        // reconnect. `store_removed` proves directory ownership, NOT the
+        // absence of a newer DIRECT local session: a gateway-S1 -> direct-S2
+        // re-home followed by a late DISCONNECTED(S1) can clear the row's S1
+        // before S2's first heartbeat. Under-inclusion only, bounded by one
+        // heartbeat interval (the next heartbeat re-writes S2), dispatch-inert,
+        // and inherited unchanged from the #5694 delete gate.
+        mirror_departure_to_presence(
+            removed_current_session || store_removed,
+            heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr,
+            agent_id, session_id);
         {
             std::lock_guard lock(sessions_mu_);
             gateway_sessions_.erase(session_id);

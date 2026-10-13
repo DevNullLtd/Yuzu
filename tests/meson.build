@@ -1528,6 +1528,7 @@ if build_server
       'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
       'unit/server/test_inventory_routes.cpp',
+      'unit/server/test_software_page_ui.cpp',
       'unit/server/test_inventory_store.cpp',
       'unit/server/test_data_inventory_routes.cpp', # #2542 PR-11: the 3-route generic plugin-data Inventory API, extracted onto the HttpRouteSink seam
       'unit/server/test_sle_routes.cpp',
@@ -1546,6 +1547,7 @@ if build_server
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_dex_stability_score.cpp', # pure application/version stability score (dex_stability_score.hpp) - no store, no PG
       'unit/server/test_dex_stats.cpp', # pure known-answer statistics (dex_stats.hpp): no store, no I/O, no [pg]
+      'unit/server/test_dex_score_policy.cpp', # pure DEX score policy + resolver (dex_score_policy.hpp): no store, no I/O, no [pg]
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
       'unit/server/test_verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
@@ -1598,6 +1600,7 @@ if build_server
       'unit/server/test_body_cap_policy.cpp', # #2407: pre-auth request-body cap policy table (method+segment-boundary path -> cap/requires_measurable/metric label)
       'unit/server/test_body_cap_route_inventory.cpp', # #2407: architect-mandated route-inventory coverage — every ACTUALLY REGISTERED POST/PUT/PATCH route resolves to a deliberate class, mechanically scanned from server/core/src at test run time
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
+      'unit/server/test_presence_departure.cpp', # #5678: the one departure->presence mirror both disconnect paths share (pure helper cases)
       'unit/server/test_shutdown_join_order.cpp', # #3495: agent_server_->Shutdown(deadline) runs before the policy-eval/pre-flight/quarantine/schedule joins + the heartbeat fn-null wait, mechanically scanned from server.cpp at test run time
       'unit/server/test_store_worker_pool.cpp', # #3261: StoreWorkerPool submit/quiesce/backpressure/exception-firewall, no HTTP (avoids the unrelated TSan/glibc crash #2504)
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
@@ -1700,7 +1703,7 @@ if build_server
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_software_catalog_rules.cpp',
-      'unit/server/test_software_catalogue_model.cpp',   # pure shared catalogue model
+      'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
       'unit/server/test_vuln_finding_store.cpp',
       'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_product_normalize.cpp',
@@ -3352,6 +3355,19 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   _python3_test,
   args: [files('test_agent_ota_wiring_lexical.py')],
   suite: 'agent',
+  timeout: 30,
+)
+
+# #5678: static lexical gate pinning that BOTH disconnect paths (direct Subscribe in
+# agent_service_impl.cpp, gateway DISCONNECTED in gateway_service_impl.cpp) mirror a departure into
+# durable presence only through mirror_departure_to_presence() with the real gate; the direct path
+# has no unit harness (bidi stream). Carries its own in-memory mutation self-test. No build required.
+# Suite 'docs': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a
+# no-build gate labelled 'server' fails that check on the Windows legs (see the gateway-upstream gate below).
+test('presence departure wiring lexical gate (#5678)',
+  _python3_test,
+  args: [files('test_presence_departure_wiring_lexical.py')],
+  suite: 'docs',
   timeout: 30,
 )
 

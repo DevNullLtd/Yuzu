@@ -359,19 +359,23 @@ The **`query_installed_software`** MCP tool exposes the same data to agentic
 workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
 
 - Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan.
-- Returns up to `limit` rows (max 1000). When `result_truncated_by_cap` is
-  `true`, more rows exist past the cap (this raw rows route has no keyset pagination; the title
-  catalogue routes below do).
-- **A per-agent scope drop filter is applied** — out-of-scope devices are
-  dropped (and the omission audited), with the count returned as
-  `devices_omitted` (absent when zero). This confinement is **effective**: the
-  gate composes management-group visibility with the caller's service-scope tag
+- Returns up to `limit` rows (max 1000; any integer that fits int64 is clamped to 1..1000).
+  When `result_truncated_by_cap` is `true` more rows may exist: pass `next_cursor` back as
+  `cursor` to continue the keyset walk (the cursor is opaque and bound to the filter set).
+  Optional `version` filter; each row also carries `source`. A wrongly typed argument (a
+  non-string `agent_id`, `name`, `version` or `cursor`, or a non-integer `limit`) is refused
+  with `kInvalidParams`, never ignored or converted.
+- **The caller's scope is applied in SQL** — the gate composes management-group
+  visibility with the caller's service-scope tag
   (`meet(management-group, service-scope)`), so a management-group-confined
   operator and a correctly-confined service-scoped API token both get a real
   filtered result — a service-scoped token is no longer denied outright as it
-  was before #3290. When present, a positive `devices_omitted` means matching
-  software exists outside your scope — an empty or short result does
-  **not** mean the software is absent fleet-wide. This is distinct from the generic
+  was before #3290. `devices_omitted` is `0` under push-down (up to 10 000
+  visible devices), where the result is complete for the caller's own devices. Above that,
+  the rows are filtered after the read and `devices_omitted` is the count of distinct
+  out-of-scope devices within the scanned window(s), a bounded and audited signal that
+  out-of-scope matches exist. A page there can be empty with a non-null `next_cursor`: keep
+  paging until it is `null`. This is distinct from the generic
   `query_inventory` / `get_agent_inventory` tools, which read a *separate*
   generic blob store on `Infrastructure:Read` and do **not** surface this typed
   software data.
@@ -398,24 +402,31 @@ curl -H "Authorization: Bearer $TOKEN" \
   "$SERVER/api/v1/inventory/software?agent_id=<agent-id>"
 ```
 
-- Query params: `name` (exact), `agent_id` (exact), `limit` (max 1000). Omit both
-  `name` and `agent_id` for a fleet-wide scan.
+- Query params: `name` (exact), `agent_id` (exact), `version` (exact; present-empty
+  selects the empty-version rows), `q` (case-insensitive literal substring), `kind`,
+  `ecosystem`, `source` (exact), `limit` (max 1000; 10000 with `format`), `cursor` and `format` (`json` or
+  `csv`: an export). Omit `name` and `agent_id` for a fleet-wide scan. The full parameter
+  and error tables are in [rest-api.md](rest-api.md); `q`, `kind`, `ecosystem` and
+  `source` are REST-only (the MCP tool takes `name`, `agent_id`, `version`, `limit` and
+  `cursor`).
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, ...},
-  "meta": {"api_version": "v1"}}`. Each row is
-  `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
-  release, arch, signature_status, distro_id, distro_version}` — the v2 fields
-  are `""` where the ecosystem does not store them (see the availability matrix
-  above). The MCP tool's rows carry the identical field set.
-- **Carries the same per-agent scope drop filter as the MCP tool**
-  (out-of-scope devices dropped, omission audited, `devices_omitted` reports the
-  count) — the SAME `require_fleet_read` gate, so REST and MCP cannot observe a
-  different admit/filter decision for the same caller (see the MCP note above).
-  When present, a positive `devices_omitted` means matching software exists
-  outside your scope — an empty or short result does **not** mean the software
-  is absent fleet-wide.
-- `result_truncated_by_cap: true` (present only when set) means more rows exist past
-  `limit` (this raw rows route has no keyset pagination, #1634; the title catalogue routes
-  below are keyset-paginated).
+  "meta": {"api_version": "v1"}}`. Each row has 14 fields: `{agent_id, name, version,
+  publisher, install_date, kind, ecosystem, epoch, release, arch, signature_status,
+  distro_id, distro_version, source}` — the v2 fields are `""` where the ecosystem does not
+  store them (see the availability matrix above), and `source` is the
+  `<plugin>.<action>` that produced the row. The MCP tool's rows carry the identical
+  field set.
+- **Carries the same scope push-down as the MCP tool** — the SAME
+  `require_fleet_read` gate, so REST and MCP cannot observe a different
+  admit/filter decision for the same caller (see the MCP note above). A positive
+  `devices_omitted` appears only on the wide-scope post-filter path and is
+  audited as `denied`; an explicit `agent_id` outside the caller's scope is also audited as
+  `denied`, with an empty page.
+- `result_truncated_by_cap: true` (present only when set) means more rows may exist; continue
+  with `next_cursor` (keyset pagination, opaque cursor bound to the filter set). A
+  `format=csv` export carries its continuation in the `X-Next-Cursor` response header, with
+  `X-Result-Truncated-By-Cap: true` and a trailing `# result_truncated_by_cap` record; a
+  wide-scope export can hold fewer than `limit` rows and still be capped.
 - **On store degradation** the endpoint returns **`503`** (an A4 error envelope with a
   `correlation_id`), **never** an empty `200` — so a vulnerability query cannot read a
   transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads).
@@ -426,15 +437,19 @@ curl -H "Authorization: Bearer $TOKEN" \
   degrade, not an authorization problem; retry once it clears (sre, governance run
   2026-08-20).
 
-**Narrow scope on a large fleet (applies to *both* the MCP tool and the REST
-endpoint).** The 1000-row cap is applied by the store *before* the management-group
-scope filter runs. So a narrow-scope operator querying a popular title across a large
-fleet can see `result_truncated_by_cap: true` together with few — or **zero** — of
-their own rows, because the cap was consumed by out-of-scope devices that sort ahead
-of yours. **That is "incomplete", not "absent in your scope."** Until keyset
-pagination lands on this route (#1634), narrow the query: pass `agent_id` (`?agent_id=<id>` on REST,
-the `agent_id` arg on MCP) to read a specific device, or a more selective `name`
-filter, so your in-scope rows fit under the cap.
+**Scope is applied in SQL.** A confined caller's visible-device set is pushed into the query
+for up to 10 000 devices, so it gets **complete pages of its own devices** — the old
+"the cap was consumed by out-of-scope devices" short page no longer occurs, and
+`devices_omitted` is `0`. Only a scope wider than 10 000 devices falls back to the in-process
+post-filter, where `devices_omitted` is a distinct-device count within the scanned window(s)
+and still signals that out-of-scope matches exist. The page is refilled with at most four
+bounded reads, so it can be empty with a non-null `next_cursor`; that cursor re-anchors at
+the last row you were served and skips the rows already scanned (a row inserted or deleted inside
+that span, or a scope that widens between pages, can make a walk miss or repeat a row, the
+same class as the `install_id` churn noted for a concurrent resync). A continuation's skip is
+a position count, so a long run of out-of-scope rows costs proportionally more to resume, and
+a statement timeout there degrades the page to a 503 (tracked in #5698). Keep paging until
+`next_cursor` is `null`.
 
 ### REST: software title catalogue
 
@@ -525,42 +540,75 @@ place, **Hardware** and **Software**, each its own page:
     records that the *result view* was shown to the operator, not whether the
     underlying action itself succeeded) — see [Audit log](audit-log.md).
 
-- **`/software`** — the fleet software catalogue. A background thread still precomputes
-  the per-title/per-version counts hourly (the mechanics changed — see "Catalogue rollup
-  grain and KPIs" under the rollup metrics below), the KPI strip still shows Titles /
-  Devices reporting / Stale / an "updated N ago" (or "building") stamp for the catalogue,
-  and the counts are still **fleet-wide, not management-group scoped** — the same ADR-0017
-  gap the REST/MCP section above describes. Three things changed:
-  - The search box is now a **real server round-trip matching title, publisher, ecosystem or source**
-    (was client-side and title-only), using the same debounced/narrow-swap-target
-    pattern as the Hardware list's search box.
-  - Each row grows a **"devices ›"** control that expands inline — independent of the
-    row's own click-to-drill-into-**installs-per-version** action — to list every device
-    running that title: hostname (linking to its Hardware CI record), version,
-    publisher, install date, signature status, ecosystem, and architecture, with its own
-    client-side filter for a popular title with many installs. The expansion carries a
-    per-row management-group drop, a 1000-row cap and the `inventory.software.query`
-    audit verb, but that per-row filter does not narrow the result today: the page sits
-    behind the global `Inventory:Read` gate, so a group-confined operator is denied before
-    the filter runs and a global operator's filter is a no-op. The page says so in its
-    own scope caveat.
+- **`/software`** — installed software by application, version and device, rebuilt on the
+  catalogue model that the REST and MCP twins (`GET /api/v1/inventory/software/catalogue`,
+  `query_software_catalogue`) share, so the page, the API and the agent tools cannot
+  disagree.
+  - **Metrics strip.** Inventory coverage (devices reporting software, devices connected
+    now, devices not seen in 48 hours), Titles and publishers, Installs with a
+    Windows/macOS/Linux bar and the average per device, Stay current (installs on their
+    title's newest version seen in the fleet, a proxy and not a vendor feed), Version
+    sprawl (titles on three or more versions; click it to filter to just those) and
+    Unsigned packages (rpm only). Figures that cannot be computed show a dash, never a
+    guess. A link under the strip reveals five faded tiles for metrics that need data
+    Yuzu does not hold yet (end-of-support, unused, unauthorised, new titles,
+    normalisation). The strip is the fleet-wide hourly rollup and does not change with
+    the filters.
+  - **Search and filters.** One search box matches title, publisher, ecosystem or the
+    source that found the software; chips narrow by kind, ecosystem and found-by; a host
+    type-ahead shows a single device's software. The type-ahead lists the first 1,000
+    named hosts by name and says so when the fleet has more; a name it does not list
+    cannot be selected, so open that device from Hardware instead. Two devices that share a
+    hostname resolve to the first one listed; open the other from Hardware. Active filters appear
+    as pills with a Clear all, the URL hash carries them (so a view can be bookmarked or shared), and the
+    exact REST call the view corresponds to is shown with a copy button. The filter box on an
+    expanded devices table filters only the rows already loaded; the catalogue search
+    and chips are server-side.
+  - **The table** lists titles most-installed first, 100 at a time with a keyset
+    **Load more**. **Installs** is the exact number of distinct devices carrying the
+    title under the active filters (a device carrying one title through two sources
+    counts once), and the count line gives the exact totals across every page. Click a
+    row for **installs per version** (share bars and a "newest in fleet" mark; the 200 most-installed versions, and the table says when a title may have more) inline, and
+    **devices** on a title or on one version for the hosts running it. The devices table
+    links each host to its Hardware record and shows OS, version, ecosystem and source,
+    install date and **Last synced** — the device's installed-software sync time, the same
+    value the Hardware record and `GET /api/v1/hardware/{id}` show. It pages 100 at a
+    time and gains a filter box once more than eight hosts are loaded; the filter applies
+    to the loaded rows only.
+  - **Exports** are plain download links to the REST routes: the matching install rows as
+    JSON or CSV (up to 10,000; the file says if it was cut off) and the titles as CSV.
+    The sprawl filter is not applied to install exports.
+  - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
+    a management group, so the fleet view, the strip and the version counts need an
+    unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused
+    (audited as denied); the notice points to Hardware and carries a
+    **Clear all filters and reload** link. A scoped account can still use the host view
+    and the devices tables for devices in its scope, but only through a hand-typed
+    `/software#host=<agent_id>` address, which has no host-name type-ahead; there the "newest in fleet" mark is
+    blanked, no fleet
+    figures are read, and device counts omit "of M". A scope wider than 10,000 devices is
+    applied after the read in at most four bounded reads, so a devices page can come back short or
+    even empty while **Load more** is still offered; keep loading. Service-scoped API
+    tokens are denied outright.
+  - **Audit.** Every call that serves data (or is refused on scope) is audited, not only the first page: `inventory.software.catalog`
+    (title pages), `inventory.software.versions` and `inventory.software.query` (devices
+    tables). A continuation page is tagged `page=continuation`; a degraded read is
+    `failure`; a refused caller is `denied`, as is a devices page that drops devices through the
+    scope post-filter or names an `agent_id` outside the caller's scope. See [Audit log](audit-log.md).
+  - **Degraded or refused.** A store that cannot answer shows an unavailable banner with
+    a Retry button on the catalogue and a plain retry notice on the version and device tables, never an empty table. A malformed filter in the URL shows a notice
+    and reads nothing; use the **Clear all filters and reload** link, which drops the
+    stored filters. A Load-more token from a different filter set or from before the
+    latest hourly refresh shows a notice and reads nothing; reload the page to restart
+    from the first page.
+  - **Removed routes.** The standalone **Find software** tab and the old Devices-tab
+    fragments are gone: `/fragments/inventory/find`, `/fragments/inventory/find/results`,
+    `/fragments/inventory/devices` and `/fragments/inventory/device` return `404` for an
+    authenticated caller (an unauthenticated request is redirected to the login page
+    first, like any other dashboard path); `/inventory` itself still redirects (`302`) to
+    `/hardware`.
 
-  The expansion replaces the standalone **Find software** tab and the old Devices-tab
-  fragments. Their routes (`/fragments/inventory/find`, `/fragments/inventory/find/results`,
-  `/fragments/inventory/devices`, `/fragments/inventory/device`) were removed and now
-  return `404` for an authenticated caller (an unauthenticated request is redirected to
-  the login page first, like any other dashboard path); `/inventory` itself still
-  redirects (`302`) to `/hardware`.
-
-  - The catalogue store now serves exact numbers under filters: **Installs is the exact
-    number of distinct devices** carrying the title under any kind/ecosystem/source
-    filter combination the store is given (a device carrying one title through two sources
-    counts once), and **search selects titles** — a matched title keeps its whole filtered slice. `%` and `_` in a
-    search term are literal characters, the term is clamped to 128 bytes, and a search that
-    exceeds its 5 s execution bound reports the catalogue as unavailable rather than showing
-    an empty table. The store's version drill now accepts the catalogue filters and a host.
-
-**On store degradation** the **`/software`** catalogue, its **devices ›** expansion, and
+**On store degradation** the **`/software`** catalogue, its inline version and devices tables, and
 the CI record's **Installed software** lens — the *authoritative* reads — show an
 explicit **"unavailable"** banner rather than an empty table, because an empty table
 would read as "installed nowhere", the fail-open the authoritative-read contract
@@ -587,9 +635,17 @@ conflated.
 
 The Hardware list and its KPI strip serve at most the 100,000 most recently seen
 endpoints within the 30-day window; a fleet above that sees a capped list without a
-warning (a truncation signal is tracked in #5712). The per-device record's offline
+warning (a truncation signal is tracked in #5712). The cap counts distinct enrolled
+`agent_id`s seen in the window: a device that disconnects cleanly stays listed as
+Offline for the full 30 days (#5678), and a device re-enrolled under a new `agent_id`
+appears as two rows until the old one ages out. The per-device record's offline
 identity fallback reads the same capped set, so an offline device outside it shows no
 identity and, with nothing else synced, reads as not found.
+
+A decommissioned device is removed from the roster when `DELETE /api/v1/sle/agents/{id}`
+deletes its stored record (#5682); a still-enrolled agent that heartbeats again re-creates
+it. A device that is never decommissioned stays listed as Offline for the 30-day window,
+and its stored record is deleted 37 days after its last contact.
 
 ## Access control
 
