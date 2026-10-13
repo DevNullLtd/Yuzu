@@ -533,7 +533,7 @@ public:
             ev.result = "success";
             audit_(ev);
             spdlog::info("Guardian: reconciled agent {} (generation {} -> {})",
-                         agent_id, agent_gen, fresh_generation);
+                         ::yuzu::log_id_token(agent_id), agent_gen, fresh_generation);
         }
     }
 

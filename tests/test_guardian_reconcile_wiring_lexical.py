@@ -174,11 +174,15 @@ Invariants over the WIRING (server.cpp):
      not withhold in-flight reconciles, and the fan-out order stays safe.
   b. BaselineStore writer drift guard (baseline_store.cpp, `baseline_writer_problems`): every
      function that writes `baseline_store.baselines` (UPDATE, DELETE FROM, INSERT INTO) calls
-     `notify_baseline_mutation()` or is on BASELINE_WRITER_ALLOWLIST with a reason
-     (create_baseline: route-created Baselines are always drafts; set_members and set_assignment
-     stamp updated_at only, and are red the moment they name lifecycle or deployed_snapshot). A
-     write outside every BaselineStore method is red too. The runtime half (the hook fires once
-     per committed update and delete, never on a failed one, holds no lease, cannot break the
+     `notify_baseline_mutation()` or is on BASELINE_WRITER_ALLOWLIST with a reason (set_members
+     and set_assignment stamp updated_at only, and are red the moment they name lifecycle or
+     deployed_snapshot). Where it calls it, the call comes AFTER `lease.reset()` (the hook must
+     not run with the pool lease held), is not under a constant-false `if`, and is not the body
+     of a conditional: update_baseline and delete_baseline fire unconditionally (brace depth 1),
+     and create_baseline fires only inside `if (lifecycle == kBaselineDeployed) { ... }` (a
+     draft create, which is all the routes ever do, stays silent). A write outside every
+     BaselineStore method is red too. The runtime half (the hook fires once per committed
+     update, delete and deployed create, never on a failed one, holds no lease, cannot break the
      mutation) is pinned by the [baseline_hook] cases in tests/unit/server/test_baseline_store.cpp.
 
 LEXICAL ONLY. It cannot see a relocation that keeps the tokens but changes control flow (that
@@ -548,11 +552,11 @@ def flow_problems(src):
 
 
 # Writers of baseline_store.baselines that may skip the post-mutation hook, each with the reason.
-# create_baseline: a route-created Baseline is always a draft (guardian_routes.cpp
-# create_baseline_from_form), and a draft is not part of the deployed set. set_members and
-# set_assignment only stamp `updated_at`: neither touches `lifecycle` or `deployed_snapshot`.
+# set_members and set_assignment only stamp `updated_at`: neither touches `lifecycle` or
+# `deployed_snapshot`. create_baseline is NOT allowlisted any more: it fires the hook when it
+# commits a DEPLOYED baseline (a route-created one is always a draft, guardian_routes.cpp
+# create_baseline_from_form, and a draft create stays silent), and the sweep pins that shape.
 BASELINE_WRITER_ALLOWLIST = {
-    "create_baseline": "a route-created Baseline is always a draft; a caller that creates a deployed one must fire the hook",
     "set_members": "stamps updated_at only, never lifecycle or deployed_snapshot",
     "set_assignment": "stamps updated_at only, never lifecycle or deployed_snapshot",
 }
@@ -567,6 +571,7 @@ def baseline_writer_problems(src):
     that forgets the hook would let a reconcile send the old deployed set under the unchanged
     generation label, the exact defect the hook exists to close."""
     t, out = lex(src), []
+    braces = [(m.start(), m.group()) for m in re.finditer(r"[{}]", t)]
     spans = []  # (name, body_start, body_end)
     for m in re.finditer(r"\bBaselineStore::(~?\w+) ?\(", t):
         close = match_close(t, m.end() - 1, "(", ")")
@@ -599,7 +604,28 @@ def baseline_writer_problems(src):
         if not notifies:
             out.append(f"BaselineStore::{name} writes baseline_store.baselines but never calls "
                        f"notify_baseline_mutation(), and is not on the allowlist (b)")
-    for name in ("update_baseline", "delete_baseline"):
+            continue
+        for nm in re.finditer(r"\bnotify_baseline_mutation\( ?\) ?;", body):
+            before = body[:nm.start()]
+            if not re.search(r"\blease ?\. ?reset\( ?\) ?;", before):
+                out.append(f"BaselineStore::{name} calls notify_baseline_mutation() before lease.reset(): the hook "
+                           f"would run with the pool lease held (b)")
+            if under_dead_condition(t, braces, lo + nm.start()):
+                out.append(f"BaselineStore::{name} calls notify_baseline_mutation() under a dead condition (b)")
+            depth = before.count("{") - before.count("}")
+            head = before[max(before.rfind(";"), before.rfind("{"), before.rfind("}")) + 1:]
+            if re.search(r"\b(?:if|else|for|while|switch)\b|\?", head):
+                out.append(f"BaselineStore::{name} calls notify_baseline_mutation() as the body of a conditional "
+                           f"statement (b)")
+            if name == "create_baseline":
+                if depth != 2 or not re.search(r"\bif ?\( ?lifecycle ?== ?kBaselineDeployed ?\) ?\{ ?(?:[^{}]*;)? ?$", before):
+                    out.append("BaselineStore::create_baseline must fire the hook only inside "
+                               "`if (lifecycle == kBaselineDeployed) { ... }` (a draft create stays silent, a "
+                               "deployed one changes the deployed set) (b)")
+            elif depth != 1:
+                out.append(f"BaselineStore::{name} calls notify_baseline_mutation() inside a branch: it must fire on "
+                           f"every committed {name} (b)")
+    for name in ("create_baseline", "update_baseline", "delete_baseline"):
         if name not in writers:
             out.append(f"BaselineStore::{name} no longer writes baseline_store.baselines where expected (b)")
     return out
@@ -1564,7 +1590,35 @@ def _delete_without_notify(s):
     return s[:j] + "(void)0;" + s[j + len("notify_baseline_mutation();"):]
 
 
+def _in_fn(fn_marker, old, new):
+    def mut(s):
+        i = s.index(fn_marker)
+        j = s.index(old, i)
+        return s[:j] + new + s[j + len(old):]
+    return mut
+
+
+UPD = "std::expected<void, std::string> BaselineStore::update_baseline"
+CRE = "std::expected<std::string, std::string> BaselineStore::create_baseline"
+LEASE_NOTIFY = "lease.reset(); // no pool lease held while the hook runs\n    notify_baseline_mutation();"
 BASELINE_WRITER_MUTATIONS = [
+    ("update_baseline fires the hook before releasing the lease",
+     _in_fn(UPD, LEASE_NOTIFY, "notify_baseline_mutation();\n    lease.reset();"), "(b)"),
+    ("update_baseline fires the hook under if (false)",
+     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    if (false) notify_baseline_mutation();"), "(b)"),
+    ("update_baseline fires the hook only for some updates",
+     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    if (b.lifecycle == kBaselineDeployed) notify_baseline_mutation();"), "(b)"),
+    ("update_baseline fires the hook inside a nested block",
+     _in_fn(UPD, LEASE_NOTIFY, "lease.reset();\n    { notify_baseline_mutation(); }"), "(b)"),
+    ("a deployed create_baseline no longer fires the hook",
+     _in_fn(CRE, "    if (lifecycle == kBaselineDeployed) {\n        lease.reset(); // no pool lease held while the hook runs\n        notify_baseline_mutation();\n    }\n", ""), "(b)"),
+    ("create_baseline fires the hook for every create (drafts too)",
+     _in_fn(CRE, "    if (lifecycle == kBaselineDeployed) {\n        lease.reset(); // no pool lease held while the hook runs\n        notify_baseline_mutation();\n    }\n",
+            "    lease.reset();\n    notify_baseline_mutation();\n"), "(b)"),
+    ("create_baseline fires the hook before releasing the lease",
+     _in_fn(CRE, "        lease.reset(); // no pool lease held while the hook runs\n        notify_baseline_mutation();", "        notify_baseline_mutation();"), "(b)"),
+    ("create_baseline fires on the wrong condition",
+     _in_fn(CRE, "if (lifecycle == kBaselineDeployed) {\n        lease.reset();", "if (lifecycle == kBaselineDraft) {\n        lease.reset();"), "(b)"),
     ("update_baseline stops firing the hook", _upd_without_notify, "(b)"),
     ("delete_baseline stops firing the hook", _delete_without_notify, "(b)"),
     ("a new writer function that is not allowlisted",
@@ -1590,6 +1644,8 @@ static void raw_write(PGconn* c) {
 ]
 
 BENIGN_BASELINE = [
+    ("create_baseline hook condition on one line with a comment",
+     _in_fn(CRE, "if (lifecycle == kBaselineDeployed) {", "if (lifecycle == kBaselineDeployed) { // deployed only\n")),
     ("a comment mentions a write and the hook",
      _sub("std::expected<void, std::string> BaselineStore::delete_baseline",
           "// UPDATE baseline_store.baselines is not issued here; notify_baseline_mutation() is.\n"
@@ -1617,10 +1673,20 @@ _HEAVY_TESTS = frozenset({"test_wiring_mutations_are_caught"})
 _PART = os.environ.get("LEXICAL_GATE_PART", "all")
 
 
+def heavy_names_missing(cls, names=_HEAVY_TESTS):
+    """The names in `names` that are not test methods of `cls`. A renamed heavy test would otherwise
+    leave the `heavy` half running zero tests and exiting 0."""
+    return sorted(n for n in names if not callable(getattr(cls, n, None)))
+
+
 class GuardianReconcileWiringLexical(unittest.TestCase):
     def setUp(self):
         if _PART not in ("all", "light", "heavy"):
             self.fail(f"LEXICAL_GATE_PART must be all, light or heavy, not {_PART!r}")
+        missing = heavy_names_missing(type(self))
+        if missing:
+            self.fail(f"_HEAVY_TESTS names no such test method(s): {missing} (a rename would make the heavy "
+                      f"half run nothing)")
         heavy = self._testMethodName in _HEAVY_TESTS
         if (_PART == "light" and heavy) or (_PART == "heavy" and not heavy):
             self.skipTest(f"runs in the other LEXICAL_GATE_PART (this one is {_PART})")
@@ -1677,6 +1743,12 @@ class GuardianReconcileWiringLexical(unittest.TestCase):
                 mutated = mutate(self.src)
                 self.assertNotEqual(mutated, self.src, "benign edit changed nothing (stale pattern)")
                 self.assertEqual(problems(mutated), [])
+
+    def test_the_heavy_half_names_real_tests(self):
+        self.assertEqual(heavy_names_missing(type(self)), [])
+        # The check itself: a name that is not a test method is reported.
+        self.assertEqual(heavy_names_missing(type(self), {"test_wiring_mutations_are_caught", "test_renamed"}),
+                         ["test_renamed"])
 
     def test_baseline_writers_are_clean(self):
         self._check_clean(baseline_writer_problems(self.baseline_src))
