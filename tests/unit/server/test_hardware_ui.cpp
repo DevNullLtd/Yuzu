@@ -248,7 +248,7 @@ TEST_CASE("hardware row: DEX badge for a scored row; honest dash for the -1 sent
 
 // Kills: swapping or dropping the DEX tone classes, or moving a threshold (>=90 ok, >=75 warn,
 // else bad). The score text alone survives all of those.
-TEST_CASE("hardware row: DEX badge tone — ok from 90, warn from 75, bad below",
+TEST_CASE("hardware row: DEX badge tone — ok from 90 and warn from 75 and bad below",
           "[hardware][ui]") {
     const std::pair<int, const char*> cases[] = {
         {95, "ok"}, {90, "ok"}, {82, "warn"}, {75, "warn"}, {74, "bad"}, {60, "bad"}};
@@ -266,7 +266,7 @@ TEST_CASE("hardware row: DEX badge tone — ok from 90, warn from 75, bad below"
 
 // Kills: dropping or swapping the status pill tone, or collapsing the stale branch into offline.
 // Online wins over stale; offline (not stale) is the neutral pill with no tone class.
-TEST_CASE("hardware row: status pill — online ok, stale warn, offline neutral",
+TEST_CASE("hardware row: status pill — online ok and stale warn and offline neutral",
           "[hardware][ui]") {
     InventoryDeviceRow row;
     row.agent_id = "a1";
@@ -560,7 +560,7 @@ TEST_CASE("hardware CI fragment: identity_degraded + no record -> roster unreada
 
 // Kills: dropping the CI header's online/offline text pill (status must never be colour alone), or
 // inverting its tone. The header has no stale state: anything not online reads "offline".
-TEST_CASE("hardware CI fragment: header status pill — online ok, otherwise neutral offline",
+TEST_CASE("hardware CI fragment: header status pill — online ok and otherwise neutral offline",
           "[hardware][ui]") {
     HwCiAffordances aff;
     InventoryDeviceRow identity;
