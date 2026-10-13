@@ -2438,6 +2438,48 @@ TEST_CASE("OIDC: a callback whose claims carry the Unicode line breaks logs them
         check_no_unicode_breaks(claims.error());
     }
 }
+TEST_CASE("OIDC: token-endpoint answers carrying line breaks reach the log and the error "
+          "neutralized",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    auto cfg = discovery_cfg(idp);
+    OidcProvider provider(cfg);
+    const auto flow = provider.start_auth_flow();
+    const auto state = yuzu::server::test::url_query_param(flow.url, "state");
+    const std::string breaks = kUnicodeBreaks;
+
+    std::string expect_in_log;
+    SECTION("an HTTP error status with a body holding LF, CR and the Unicode breaks") {
+        idp.with([&](MockIdp& m) {
+            m.token_status = 500;
+            m.token_body = "boom\nFAKELINE [error] injected\r" + breaks;
+        });
+        expect_in_log = "OIDC token exchange: status=500";
+    }
+    SECTION("a 200 body that is not JSON and names the breaks in the parser's error text") {
+        idp.with([&](MockIdp& m) { m.token_body = "{\"a\":\"" + breaks; });
+        expect_in_log = "OIDC token exchange: parse error";
+    }
+    SECTION("an OAuth error and error_description holding LF and the Unicode breaks") {
+        nlohmann::json err;
+        err["error"] = "bad\nFAKELINE [error] injected" + breaks;
+        err["error_description"] = "why\nFAKELINE [error] injected" + breaks;
+        idp.with([&](MockIdp& m) { m.token_body = err.dump(); });
+        expect_in_log = "OIDC token exchange error";
+    }
+
+    yuzu::test::LogCapture cap;
+    auto r = provider.handle_callback("the-code", state, flow.binding_secret);
+    cap.stop();
+    REQUIRE_FALSE(r.has_value());
+    const auto logs = cap.text();
+    CHECK(logs.find(expect_in_log) != std::string::npos);
+    CHECK(logs.find("\nFAKELINE") == std::string::npos);
+    check_no_unicode_breaks(logs);
+    CHECK(r.error().find('\n') == std::string::npos);
+    check_no_unicode_breaks(r.error());
+}
+
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
 
 TEST_CASE("OIDC discovery: a refused connection fails closed", "[oidc][oidc_discovery][security]") {

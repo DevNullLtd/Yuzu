@@ -37,6 +37,8 @@
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
 
+#include "../test_log_capture.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
@@ -126,6 +128,34 @@ TEST_CASE("AuthDB::upsert_sso_identity rejects a non-principal, non-username str
     // No reserved prefix and fails the strict local charset (':').
     CHECK_FALSE(db->upsert_sso_identity("not:reserved", "https://idp/", "sub", "x", "oidc")
                     .has_value());
+}
+
+TEST_CASE("AuthDB::upsert_sso_identity and AuthManager::provision_sso_identity neutralize the "
+          "principal in their rejection logs",
+          "[pg][sso][authdb][log_fold][security]") {
+    yuzu::test::AuthDbPg db;
+    const std::string breaks = "\xC2\x85\xE2\x80\xA8\xE2\x80\xA9";
+    // The quote makes is_valid_principal refuse it; the breaks are what is under test.
+    const std::string bad = "oidc:https://idp.example.com/#s'ub" + breaks;
+
+    yuzu::test::LogCapture cap;
+    CHECK_FALSE(
+        db->upsert_sso_identity(bad, "https://idp.example.com/", "s'ub", "x", "oidc").has_value());
+    CHECK_FALSE(
+        db->upsert_sso_identity("engine:" + breaks, "https://idp/", "s", "x", "oidc").has_value());
+    yuzu::server::auth::AuthManager mgr;
+    mgr.set_auth_db(db.get());
+    mgr.provision_sso_identity(bad, "https://idp.example.com/", "s'ub", "x");
+    cap.stop();
+
+    const auto logs = cap.text();
+    CAPTURE(logs);
+    CHECK(logs.find("rejected invalid principal") != std::string::npos);
+    CHECK(logs.find("rejected reserved 'engine:' principal") != std::string::npos);
+    CHECK(logs.find("provision_sso_identity failed for") != std::string::npos);
+    CHECK(logs.find("\xC2\x85") == std::string::npos);
+    CHECK(logs.find("\xE2\x80\xA8") == std::string::npos);
+    CHECK(logs.find("\xE2\x80\xA9") == std::string::npos);
 }
 
 TEST_CASE("AuthDB::upsert_sso_identity rejects an 'engine:'-prefixed principal",

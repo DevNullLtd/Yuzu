@@ -84,6 +84,9 @@ struct MockIdp {
     int trickle_interval_ms{40};
     int trickle_chunks{100};
     std::string jwks_body; ///< non-empty = GET /jwks serves this verbatim (a malformed JWKS)
+    // Non-empty `token_body` = POST /token answers it verbatim, with `token_status`.
+    std::string token_body;
+    int token_status{200};
     std::atomic<int> trickle_chunks_sent{0}; ///< bytes a trickle has written so far (all GETs)
     std::string last_discovery_path; ///< the request path of the last discovery GET
     std::mutex trickle_mu;
@@ -189,6 +192,11 @@ struct MockIdp {
             std::string tok;
             {
                 std::lock_guard lk(mu);
+                if (!token_body.empty()) {
+                    res.status = token_status;
+                    res.set_content(token_body, "application/json");
+                    return;
+                }
                 tok = id_token;
                 if (tok.empty()) {
                     oidc::OidcConfig c;
