@@ -351,8 +351,8 @@ TEST_CASE("hardware CI overview lens: CPU cores/threads and RAM humanised; unkno
     HwCiAffordances aff;
 
     const auto html = render_hardware_lens_body("a1", detail, /*lens=*/"", /*now_secs=*/0, aff);
-    CHECK(html.find("Cores / threads: </span>8c/16t") != std::string::npos);
-    CHECK(html.find("Memory: </span>16.0 GB") != std::string::npos);
+    CHECK(html.find("Cores / threads</span>8c/16t") != std::string::npos);
+    CHECK(html.find("Memory</span>16.0 GB") != std::string::npos);
 
     DeviceCiRecord unk;
     unk.cpu_cores = "unknown";
@@ -363,9 +363,9 @@ TEST_CASE("hardware CI overview lens: CPU cores/threads and RAM humanised; unkno
     const auto unk_html = render_hardware_lens_body("a1", unk_detail, "", 0, aff);
     CHECK(unk_html.find("8c/16t") == std::string::npos);
     CHECK(unk_html.find(" GB") == std::string::npos);
-    CHECK(unk_html.find("Cores / threads: </span><span class=\"inv-grey\">&mdash;</span>") !=
+    CHECK(unk_html.find("Cores / threads</span><span class=\"inv-grey\">&mdash;</span>") !=
           std::string::npos);
-    CHECK(unk_html.find("Memory: </span><span class=\"inv-grey\">&mdash;</span>") !=
+    CHECK(unk_html.find("Memory</span><span class=\"inv-grey\">&mdash;</span>") !=
           std::string::npos);
 }
 
@@ -409,7 +409,7 @@ TEST_CASE("hardware CI record: store degrade, not-yet-synced and found render di
 TEST_CASE("hardware lens bar: id, fixed 7-tab order, active class, oob gated on the parameter",
           "[hardware][ui]") {
     const auto html = render_hardware_lens_bar("a1", "dex", /*oob=*/false);
-    REQUIRE(html.find("<div class=\"hw-lens\" id=\"hw-lens-bar\">") != std::string::npos);
+    REQUIRE(html.find("<div class=\"gp-subnav\" id=\"hw-lens-bar\">") != std::string::npos);
     CHECK(html.find("hx-swap-oob") == std::string::npos);
 
     // Fixed order + exact labels.
@@ -476,10 +476,10 @@ TEST_CASE("hardware lens body (overview): General block renders agent identity f
 
     const auto html = render_hardware_lens_body("agent-42", detail, /*lens=*/"", 0, aff);
     CHECK(html.find("<h4>General</h4>") != std::string::npos);
-    CHECK(html.find("Agent id: </span>agent-42") != std::string::npos);
-    CHECK(html.find("OS: </span>Linux") != std::string::npos); // os_label("linux")
-    CHECK(html.find("Agent version: </span>0.14.2") != std::string::npos);
-    CHECK(html.find("Architecture: </span>x86_64") != std::string::npos);
+    CHECK(html.find("Agent id</span>agent-42") != std::string::npos);
+    CHECK(html.find("OS</span>Linux") != std::string::npos); // os_label("linux")
+    CHECK(html.find("Agent version</span>0.14.2") != std::string::npos);
+    CHECK(html.find("Architecture</span>x86_64") != std::string::npos);
 }
 
 // ── #5531: failed roster read is never an empty fleet / "not found" ───────────
@@ -517,10 +517,10 @@ TEST_CASE("hardware CI fragment: identity_degraded + no record -> roster unreada
 }
 
 // Kills: rendering the KPI strip (all zeros) above the roster-unavailable banner. The marker is
-// the class-use `<div class="hw-kpis">`, not `hw-kpi`, which the inlined CSS rule also contains.
+// the class-use `<div class="gp-tiles">`.
 TEST_CASE("hardware list fragment: a degraded full-form list renders no KPI strip",
           "[hardware][ui]") {
-    const std::string marker = "<div class=\"hw-kpis\">";
+    const std::string marker = "<div class=\"gp-tiles\">";
     const auto degraded = render_hardware_list_fragment(HardwareListPage{}, false, true, false);
     CHECK(degraded.find("Hardware roster unavailable") != std::string::npos);
     CHECK(degraded.find(marker) == std::string::npos);
