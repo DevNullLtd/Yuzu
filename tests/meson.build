@@ -1531,6 +1531,7 @@ if build_server
       'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
       'unit/server/test_inventory_routes.cpp',
       'unit/server/test_software_page_ui.cpp',
+      'unit/server/test_auto_fragments_ui.cpp',
       'unit/server/test_inventory_store.cpp',
       'unit/server/test_data_inventory_routes.cpp', # #2542 PR-11: the 3-route generic plugin-data Inventory API, extracted onto the HttpRouteSink seam
       'unit/server/test_sle_routes.cpp',

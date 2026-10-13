@@ -305,6 +305,22 @@ TEST_CASE("perf fragment: real aggregations, suppression text, Performance tab",
     CHECK(html.find("/fragments/dex/perf/devices?metric=cpu") != std::string::npos); // drill
 }
 
+namespace {
+// Exactly one <style> block, and it carries the DEX sheet (a known .dx- rule).
+bool one_dx_style(const std::string& h) {
+    const auto open = h.find("<style>");
+    if (open == std::string::npos || h.find("<style>", open + 1) != std::string::npos)
+        return false;
+    const auto close = h.find("</style>", open);
+    const auto rule = h.find(".dx-ctl{", open);
+    return close != std::string::npos && rule != std::string::npos && rule < close;
+}
+} // namespace
+
+TEST_CASE("perf fragment: carries exactly one DEX style block", "[dex][perf][render]") {
+    CHECK(one_dx_style(render_dex_perf_fragment(two_cohorts(12, 4), 7)));
+}
+
 TEST_CASE("perf fragment: App Performance is a top-level tab, and the buried "
           "inline CTA is now a plain cross-reference to it",
           "[dex][perf][render]") {
