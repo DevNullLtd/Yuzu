@@ -9931,6 +9931,7 @@ public:
             .device_inventory = device_inventory_store_.get(),
             .software_licensing = software_licensing_store_.get(),
             .app_usage = app_usage_store_.get(),
+            .offline_endpoint = offline_endpoint_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }
