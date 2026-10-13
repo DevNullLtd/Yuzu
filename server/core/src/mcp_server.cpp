@@ -1762,7 +1762,10 @@ static const ToolDef kTools[] = {
      "previous_version (the next older returned version; null for the oldest returned "
      "row and for the unknown version; exact conditional interval; upper is null with "
      "unbounded=true when the previous version saw no exposed events). "
-     "exposure_below_floor=true withholds the exposed figures. exposure_basis "
+     "exposure_below_floor=true withholds the exposed figures; it is false also when "
+     "exposure_devices is null (unknown). The exposed counts and the rate are floored on "
+     "exposure_devices, not on the exposed devices that failed, so they can reflect events "
+     "from 1 to 9 devices. exposure_basis "
      "resource_significant: exposure is the daily top-N consumers, not a census. "
      "stat_failures counts statistics that returned nothing on valid input (expected 0). "
      "Mirrors GET /api/v1/dex/perf/app. Requires GuaranteedState:Read.",
