@@ -21,8 +21,8 @@ guard and this gate is the cheap tripwire that stays beside it):
   z.
   WRITERS = server/core/src/baseline_store.cpp: the BaselineStore writer guard, "bw" below.
 
-LETTERS. "p" names two invariants over server.cpp (the fan-out invalidates; where it does so);
-both report as "(p)". The BaselineStore writer guard is "bw", not "b", because "b" is the Shed
+LETTERS. "p" names two invariants over server.cpp, "p (invalidation)" (the fan-out invalidates) and
+"p (placement)" (where it does so); both report as "(p)". The BaselineStore writer guard is "bw", not "b", because "b" is the Shed
 invariant of the FLOW.
 
 Invariants over the FLOW:
@@ -100,8 +100,8 @@ Invariants over the WIRING (server.cpp):
   i. `guardian_last_reconcile_` and `guardian_reconcile_mu_` no longer exist; the claim-map sweep
      (`guardian_reconcile_gate_.sweep(`) is called; and the pre-seed loop for
      `yuzu_server_guardian_reconciles_total` includes "shed".
-  p. The body of the `guardian_push_fn_` lambda (not merely anywhere else) invalidates the
-     reconcile caches, through the wrapper of (z) (see the second `p.` below for the placement).
+  p (invalidation). The body of the `guardian_push_fn_` lambda (not merely anywhere else) invalidates the
+     reconcile caches, through the wrapper of (z) (see `p (placement)` below).
   q. The 15 s maintenance tick publishes the three saturation gauges
      (`yuzu_server_guardian_reconcile_in_flight`, `..._budget_balance_ms`, `..._claims`) from the
      gate and budget in their OWN try block with both catch arms (`std::exception`, named or not,
@@ -178,6 +178,9 @@ Invariants over the WIRING (server.cpp):
      `.has_value()`, `== false`, braced or split over lines), BEFORE the wrapper call, which
      comes BEFORE the generation read (`current_policy_generation(`): an invalid-scope push must
      not withhold in-flight reconciles, and the fan-out order stays safe.
+
+Invariants over the WRITERS (baseline_store.cpp):
+
   bw. BaselineStore writer drift guard (baseline_store.cpp, `baseline_writer_problems`): every
      function that writes `baseline_store.baselines` (UPDATE, DELETE FROM, INSERT INTO) calls
      `notify_baseline_mutation()` or is on BASELINE_WRITER_ALLOWLIST with a reason (set_members

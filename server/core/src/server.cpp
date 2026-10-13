@@ -21239,10 +21239,10 @@ private:
     // generation cache is what stops the next admission decision from using a value up to its
     // TTL old. The generation cache is invalidated first, then the bundle cache; the instant
     // between the two calls is the already-documented gap between a change and a reconcile's
-    // epoch check, and the order is not load-bearing. Ordering
-    // matters at every call site: the invalidation must come after the change it announces
-    // has committed and before any read that is meant to see it. A new writer of rule or
-    // deployed-Baseline state calls this, it does not repeat the two calls.
+    // epoch check. The order of these two calls is not load-bearing; the ordering that matters
+    // at every call site is invalidate-before-the-reads: the invalidation must come after the
+    // change it announces has committed and before any read that is meant to see it. A new
+    // writer of rule or deployed-Baseline state calls this, it does not repeat the two calls.
     void invalidate_guardian_reconcile_caches() {
         guardian_generation_cache_.invalidate();
         guardian_rule_bundle_cache_.invalidate();
