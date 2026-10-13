@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_enablement_os_applicability.py — ADR-3006 PM1.1a drift gate.
+"""test_enablement_os_applicability.py — ADR-3006 drift gate.
 
 `kUnitOs` in server/core/src/enablement_units.hpp (one row per plugin.action:
 which agent OSes the switchable unit is applicable on) must equal what the

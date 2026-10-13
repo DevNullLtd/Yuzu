@@ -2964,7 +2964,7 @@ test('capability catalogue completeness',
   timeout: 30,
 )
 
-# ADR-3006 PM1.1a: kUnitOs in enablement_units.hpp == the os-capability-matrix generated block,
+# ADR-3006: kUnitOs in enablement_units.hpp == the os-capability-matrix generated block,
 # both directions. Hermetic - reads sources only.
 test('enablement os applicability',
   _python3_test,

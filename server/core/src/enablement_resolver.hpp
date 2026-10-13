@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * enablement_resolver.hpp — the pure enablement resolver (ADR-3006, PM1.1a).
+ * enablement_resolver.hpp — the pure enablement resolver (ADR-3006).
  *
  * resolve(rules, overlay, agent_os, view) answers, for ONE endpoint, which
  * units are off and why. Pure: no I/O, no clock, no globals, no shared mutable
@@ -9,8 +9,9 @@
  *
  * DRIFT CONTRACT. The attribute view is the caller's: a plain
  * `scope::AttributeResolver` produced by the shared per-identity resolver.
- * This header has no attribute-name branches and never grows a third copy of
- * the agent_registry.cpp resolver lambdas. An absent `tag:`/`props.` value is
+ * resolve() has no attribute-name branches and never grows a third copy of the
+ * agent_registry.cpp resolver lambdas; the authoring half validates against
+ * the catalog kinds and the closed ostype domain only. An absent `tag:`/`props.` value is
  * the known value "" (known-none): `!=` and `NOT ==` both match it.
  *
  * Fleet-wide is the ONE spelling `kBroadcastScope` ("__all__",
@@ -32,6 +33,14 @@
  *    are off;
  *  - a rule naming a non-unit (protective, reserved) has no effect but still
  *    appears in matched_rules;
+ *  - a rule naming a unit that is neither a unit nor a recorded non-unit (a
+ *    unit removed or renamed since the rule was authored) switches nothing off
+ *    and is reported in `unresolved_units`, so "rule exists, nothing happens"
+ *    is visible; it is collected from every rule whether or not its selector
+ *    matches, so the answer is the same on every endpoint;
+ *  - consumers key on (plugin, action), never on the plugin entry alone: a
+ *    plugin unit that contains protective (non-unit) actions is off while those
+ *    actions stay on, so the plugin entry is not a blanket block;
  *  - an unknown agent OS is a fault, not an answer: resolve() returns an error
  *    naming the OS before any rule is evaluated, so "nothing is off" can never
  *    also mean "could not tell".
@@ -75,10 +84,15 @@ enum class Reason : std::uint8_t {
     OffRequirement,
 };
 
+/// A Rule must be built via make_rule: resolve() trusts that the selector's
+/// attributes were validated, and the evaluator answers "" for an unknown
+/// attribute, so `!=`/NOT on an unvalidated (for example renamed) kind would
+/// match every endpoint. A loader re-validates every persisted rule through
+/// make_rule, with durable_attribute_kinds, on every load.
 struct Rule {
     /// Not required to be unique here: matches are keyed on the full
     /// (rule_id, provenance) pair and the output is canonical either way.
-    /// Uniqueness is the PM1.1b store's primary key, not a precondition.
+    /// Uniqueness is the persisting caller's responsibility, not a precondition.
     std::string id;
     std::vector<std::string> units;
     /// nullopt = fleet-wide (authored as `__all__`).
@@ -106,6 +120,9 @@ struct OffUnit {
 struct Resolution {
     std::vector<OffUnit> off;
     std::vector<Match> matched_rules;
+    /// Sorted, deduped names that rules reference but the overlay knows neither
+    /// as a unit nor as a recorded non-unit. Independent of the endpoint.
+    std::vector<std::string> unresolved_units;
     bool operator==(const Resolution&) const = default;
 };
 
@@ -129,10 +146,11 @@ struct Resolution {
 /// containing '<' is a prefix kind (`tag:<key>`, `props.<key>`): the attribute
 /// must start with the text before '<' and carry a key legal for a stored tag or
 /// property. Any other kind matches exactly. Synthetic LEN/STARTSWITH forms are
-/// decoded first. Value domains are NOT validated, with ONE exception: `ostype`
-/// is closed (windows|linux|darwin), so an `==`, `!=` or `IN` value outside it
-/// (compared case-insensitively, as the evaluator does) is refused. LIKE,
-/// MATCHES, CONTAINS, EXISTS and the ordering operators stay unvalidated.
+/// decoded first. Two value domains are validated: `ostype` is closed
+/// (windows|linux|darwin), so an `==`, `!=` or `IN` value outside it (compared
+/// case-insensitively, as the evaluator does) is refused; and a MATCHES pattern
+/// must pass the length cap and RE2 compile (scope::validate_regex). LIKE,
+/// CONTAINS, EXISTS and the ordering operators stay unvalidated.
 [[nodiscard]] inline std::expected<void, std::string>
 validate_selector_attributes(const scope::Expression& expr,
                              std::span<const std::string_view> kinds) {
@@ -195,6 +213,9 @@ template <typename Catalog>
             out.push_back(info.kind);
     return out;
 }
+// A temporary catalog would leave the returned views dangling: refuse it.
+template <typename Catalog>
+void durable_attribute_kinds(const Catalog&&) = delete;
 
 [[nodiscard]] inline std::expected<Rule, std::string>
 make_rule(std::string id, std::vector<std::string> units, std::string_view selector_text,
@@ -266,7 +287,12 @@ resolve(std::span<const Rule> rules, const UnitOverlay& overlay, std::string_vie
     };
 
     std::set<Match> matched;
+    std::set<std::string> unresolved;
     for (const auto& rule : rules) {
+        // Before the selector test: independent of the endpoint.
+        for (const auto& name : rule.units)
+            if (!overlay.find(name) && !overlay.find_non_unit(name))
+                unresolved.insert(name);
         if (rule.selector && !scope::evaluate(*rule.selector, view))
             continue;
         const Match m{rule.id, rule.provenance};
@@ -297,6 +323,7 @@ resolve(std::span<const Rule> rules, const UnitOverlay& overlay, std::string_vie
                                   {m.matches.begin(), m.matches.end()},
                                   {m.required_off.begin(), m.required_off.end()}});
     res.matched_rules.assign(matched.begin(), matched.end());
+    res.unresolved_units.assign(unresolved.begin(), unresolved.end());
     return res;
 }
 

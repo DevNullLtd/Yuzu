@@ -1,6 +1,6 @@
 /**
  * test_enablement_resolver.cpp — truth tables and properties of the pure
- * enablement resolver (enablement_resolver.hpp, ADR-3006 PM1.1a, V7).
+ * enablement resolver (enablement_resolver.hpp, ADR-3006).
  *
  * The overlay is a small fixture (not the real catalogue; that composition is
  * test_enablement_units.cpp). Endpoint views are map-backed. Pure: no I/O, no
@@ -10,7 +10,9 @@
 #include "agent_registry.hpp" // detail::scope_kind_catalog (authoring refusals)
 #include "dispatch_confined_arms.hpp"
 #include "enablement_resolver.hpp"
+#include "custom_properties_store.hpp"
 #include "enablement_units.hpp"
+#include "tag_store.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -154,6 +156,11 @@ Resolution run(const std::vector<Spec>& specs, std::string_view os, const Attrs&
     return run_rules(build_all(specs, identity(specs.size())), os, attrs);
 }
 
+// Protective by a local predicate: only zz.a, so plugin zz is a mixed plugin.
+bool zz_a_is_protective(std::string_view plugin, std::string_view action) {
+    return plugin == "zz" && action == "a";
+}
+
 const OffUnit* find_off(const Resolution& r, std::string_view unit) {
     for (const auto& o : r.off)
         if (o.unit == unit)
@@ -175,7 +182,7 @@ constexpr auto Op = Provenance::Operator;
 
 } // namespace
 
-TEST_CASE("enablement resolver: V7 truth table is order-independent", "[enablement][scope]") {
+TEST_CASE("enablement resolver: order-independence truth table", "[enablement][scope]") {
     const std::vector<Spec> specs{
         {"r1", {"p.x"}, R"(ostype == "linux")"},
         {"r2", {"p.y"}, "__all__"},
@@ -205,7 +212,7 @@ TEST_CASE("enablement resolver: V7 truth table is order-independent", "[enableme
     CHECK(find_off(both, "p.y")->matches == Matches{{"r2", Op}});
 }
 
-TEST_CASE("enablement resolver: V7 property, random rule orderings", "[enablement][scope]") {
+TEST_CASE("enablement resolver: order-independence over random rule orderings", "[enablement][scope]") {
     const std::vector<Spec> specs{
         {"a", {"p.x"}, R"(ostype == "linux")"},
         {"b", {"p"}, R"(tag:lab == "yes")"},
@@ -242,7 +249,7 @@ TEST_CASE("enablement resolver: off wins and lists every matching rule", "[enabl
     CHECK(r.matched_rules == Matches{{"m1", Op}, {"m2", Op}, {"m3", Op}});
 }
 
-TEST_CASE("enablement resolver: provenance keys the match, not the id alone",
+TEST_CASE("enablement resolver: provenance keys the match and not the id alone",
           "[enablement][scope]") {
     SECTION("a rule naming only a non-unit still appears in matched_rules") {
         const auto r = run({{"only-non", {"quarantine"}, "__all__"}}, "linux");
@@ -428,14 +435,14 @@ TEST_CASE("enablement resolver: plugin fan-out skips actions not applicable on t
     CHECK(direct.matched_rules == Matches{{"d", Op}});
 }
 
-TEST_CASE("enablement resolver: per-OS applicability and unknown OS", "[enablement][scope]") {
+TEST_CASE("enablement resolver: per-OS applicability", "[enablement][scope]") {
     const std::vector<Spec> specs{{"r", {"r.w"}, "__all__"}};
     CHECK(off_names(run(specs, "windows")) == Names{"r.w"});
     CHECK(run(specs, "linux").off.empty());
     CHECK(off_names(run(specs, "darwin")).empty());
 }
 
-TEST_CASE("enablement resolver: an unknown agent OS is a fault, not an empty off-set",
+TEST_CASE("enablement resolver: an unknown agent OS is a fault and not an empty off-set",
           "[enablement][scope]") {
     const auto rules = build_all({{"r", {"r.w"}, "__all__"}}, {0});
     for (const char* os : {"plan9", "", "Linux"}) {
@@ -569,7 +576,100 @@ TEST_CASE("enablement resolver: requirement closure", "[enablement][scope]") {
     }
 }
 
-TEST_CASE("enablement resolver: nothing matches, nothing happens", "[enablement][scope]") {
+TEST_CASE("enablement resolver: a plugin entry is not a blanket block over its protective actions",
+          "[enablement][scope]") {
+    const std::array<CommandCapability, 2> frag{row("zz", "a"), row("zz", "b")};
+    const std::array<UnitOsRow, 2> os{{{"zz", "a", kAllOs}, {"zz", "b", kAllOs}}};
+    auto ov = build_unit_overlay({std::span<const CommandCapability>{frag}}, &zz_a_is_protective,
+                                 os, {});
+    REQUIRE(ov.has_value());
+    const auto* protective = ov->find_non_unit("zz.a");
+    REQUIRE(protective != nullptr);
+    CHECK(protective->reason == NonUnitReason::Protective);
+
+    auto rule = make_rule("r", {"zz"}, "__all__", Op, *ov, kinds());
+    REQUIRE(rule.has_value());
+    std::vector<Rule> rules;
+    rules.push_back(std::move(*rule));
+    const auto res = resolve(rules, *ov, "linux", [](std::string_view) { return std::string{}; });
+    REQUIRE(res.has_value());
+    // The plugin entry and its switchable action are off; the protective action
+    // is not, so a consumer must key on (plugin, action).
+    CHECK(off_names(*res) == Names{"zz", "zz.b"});
+    CHECK(find_off(*res, "zz.a") == nullptr);
+}
+
+TEST_CASE("enablement resolver: a requirement edge from a unit inapplicable on the OS is inert",
+          "[enablement][scope]") {
+    // s.m is windows-only: with p off it must be off by requirement on windows
+    // and absent (not even a required_off entry) on linux.
+    const std::array<RequirementEdge, 1> edges{{{"s.m", "p"}}};
+    auto ov = build_unit_overlay({std::span<const CommandCapability>{kFixtureRows}},
+                                 &is_quarantine_control_plugin, kFixtureOs, edges);
+    REQUIRE(ov.has_value());
+    auto rule = make_rule("r", {"p"}, "__all__", Op, *ov, kinds());
+    REQUIRE(rule.has_value());
+    std::vector<Rule> rules;
+    rules.push_back(std::move(*rule));
+    const auto view = [](std::string_view) { return std::string{}; };
+
+    const auto lin = resolve(rules, *ov, "linux", view);
+    REQUIRE(lin.has_value());
+    CHECK(find_off(*lin, "s.m") == nullptr);
+    for (const auto& o : lin->off)
+        CHECK(std::find(o.required_off.begin(), o.required_off.end(), "p") == o.required_off.end());
+
+    const auto win = resolve(rules, *ov, "windows", view);
+    REQUIRE(win.has_value());
+    const auto* sm = find_off(*win, "s.m");
+    REQUIRE(sm != nullptr);
+    CHECK(sm->reason == Reason::OffRequirement);
+    CHECK(sm->required_off == Names{"p"});
+}
+
+TEST_CASE("enablement resolver: a rule naming a vanished unit is reported and switches nothing",
+          "[enablement][scope]") {
+    // Built by aggregate init, as a stale persisted rule would be after a unit
+    // was removed: make_rule would refuse these names today.
+    std::vector<Rule> rules;
+    rules.push_back(Rule{"g1", {"gone.x", "p.y"}, std::nullopt, Provenance::Operator});
+    auto windows_only = build({"g2", {"p.x"}, R"(ostype == "windows")"});
+    windows_only.units.push_back("gone.z");
+    windows_only.units.push_back("gone.x"); // duplicate across rules: listed once
+    rules.push_back(std::move(windows_only));
+    rules.push_back(Rule{"g3", {"quarantine"}, std::nullopt, Provenance::Operator});
+
+    // g2's selector does not match a linux endpoint, yet its stale name is
+    // reported: the answer is the same on every endpoint.
+    for (const char* os : {"linux", "windows"}) {
+        INFO(os);
+        const auto r = run_rules(rules, os, {{"ostype", os}});
+        CHECK(r.unresolved_units == Names{"gone.x", "gone.z"}); // quarantine is a known non-unit
+        CHECK(find_off(r, "p.y") != nullptr);
+        CHECK(find_off(r, "gone.x") == nullptr);
+    }
+}
+
+TEST_CASE("enablement resolver: the selector key alphabet AGREES with both stores",
+          "[enablement][scope][pin]") {
+    // is_valid_selector_key copies the TagStore / CustomPropertiesStore key
+    // grammar (the stores are not reachable from the header). Drift in any of
+    // the three fails here.
+    const std::vector<std::string> keys{"model", "a.b:c-d_e", "Az09", "", std::string(64, 'k'),
+                                        std::string(65, 'k'), "has space", "*", "a*", "a/b",
+                                        "tab\t", "caf\xc3\xa9", "a=b", "a\"b"};
+    for (const auto& key : keys) {
+        INFO(key);
+        const bool mine = is_valid_selector_key(key);
+        CHECK(mine == TagStore::validate_key(key));
+        CHECK(mine == CustomPropertiesStore::validate_key(key));
+    }
+    CHECK(is_valid_selector_key("a.b:c-d_e"));
+    CHECK_FALSE(is_valid_selector_key(""));
+    CHECK_FALSE(is_valid_selector_key("*"));
+}
+
+TEST_CASE("enablement resolver: nothing matches so nothing happens", "[enablement][scope]") {
     CHECK(run(std::vector<Spec>{}, "linux") == Resolution{});
     const auto r = run({{"n", {"p.x"}, R"(ostype == "windows")"}}, "linux", {{"ostype", "linux"}});
     CHECK(r.off.empty());

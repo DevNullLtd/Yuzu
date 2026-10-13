@@ -1,6 +1,6 @@
 /**
  * test_enablement_units.cpp — invariants of the switchable-unit overlay
- * (enablement_units.hpp, ADR-3006 PM1.1a) over the REAL capability catalogue,
+ * (enablement_units.hpp, ADR-3006) over the REAL capability catalogue,
  * composed from all 27 fragments exactly as test_capability_catalogue.cpp does
  * (test_real_capability_registry.hpp omits two fragments, #5131).
  *
@@ -216,7 +216,7 @@ TEST_CASE("enablement units: requirement edges", "[enablement][catalogue]") {
     }
 }
 
-TEST_CASE("enablement units: a catalogue row with no os row fails the build, naming it",
+TEST_CASE("enablement units: a catalogue row with no os row fails the build - naming it",
           "[enablement][catalogue]") {
     static constexpr std::array<CommandCapability, 1> extra{CommandCapability{
         .plugin = "zz", .action = "new", .execute_gate = ExecuteGate::None}};
@@ -227,7 +227,7 @@ TEST_CASE("enablement units: a catalogue row with no os row fails the build, nam
     CHECK(r.error().find("enablement_units.hpp") != std::string::npos);
 }
 
-TEST_CASE("enablement units: a stale os row fails the build, naming it",
+TEST_CASE("enablement units: a stale os row fails the build - naming it",
           "[enablement][catalogue]") {
     std::vector<UnitOsRow> rows(kUnitOs.begin(), kUnitOs.end());
     rows.push_back({"zz", "gone", kAllOs});
@@ -236,7 +236,7 @@ TEST_CASE("enablement units: a stale os row fails the build, naming it",
     CHECK(r.error().find("zz.gone") != std::string::npos);
 }
 
-TEST_CASE("enablement units: the protective predicate is the caller's, not a hard-coded set",
+TEST_CASE("enablement units: the protective predicate is the caller's and not a hard-coded set",
           "[enablement][catalogue]") {
     const std::array<CommandCapability, 2> frag{cap("zz", "a"), cap("zz", "b")};
     const std::array<UnitOsRow, 2> os{{{"zz", "a", kAllOs}, {"zz", "b", kWin}}};
@@ -263,7 +263,7 @@ TEST_CASE("enablement units: the protective predicate is the caller's, not a har
     }
 }
 
-TEST_CASE("enablement units: build_unit_overlay refuses malformed inputs, naming them",
+TEST_CASE("enablement units: build_unit_overlay refuses malformed inputs - naming them",
           "[enablement][catalogue]") {
     struct Case {
         const char* what;
@@ -305,6 +305,18 @@ TEST_CASE("enablement units: build_unit_overlay refuses malformed inputs, naming
          {},
          &zz_is_protective,
          "zz.a"},
+        {"a dotted plugin name would make the unit name ambiguous",
+         {cap("z.z", "a")},
+         {{"z.z", "a", kAllOs}},
+         {},
+         pred,
+         "not a legal unit name: z.z.a"},
+        {"a dotted action name would make the unit name ambiguous",
+         {cap("zz", "a.b")},
+         {{"zz", "a.b", kAllOs}},
+         {},
+         pred,
+         "not a legal unit name: zz.a.b"},
         {"os row with bits above kAllOs",
          ok_rows,
          {{"zz", "a", kAllOs}, {"zz", "b", static_cast<std::uint8_t>(kWin | 0x80)}},
