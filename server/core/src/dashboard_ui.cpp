@@ -211,8 +211,9 @@ extern const char* const kDashboardIndexHtml =
     }
     #results-table td.empty-state strong { color: var(--ink); }
     /* #2691 finding 7: an honest "store degraded, not zero matches" banner —
-       amber (temporarily unavailable, retrying), never alarm-red. */
-    .result-degrade-banner {
+       amber (temporarily unavailable, retrying), never alarm-red. The td form
+       must outrank #results-table td.empty-state, which the banner row also is. */
+    .result-degrade-banner, #results-table td.result-degrade-banner {
       padding: 8px 12px; font-size: 13.5px; color: var(--ink2); background: var(--surface2);
       border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--line2)); border-radius: var(--rad-panel);
     }
