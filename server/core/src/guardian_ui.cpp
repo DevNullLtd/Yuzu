@@ -29,138 +29,173 @@ extern const char* const kGuardianHtml =
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="/static/htmx.js"></script>
   <style>
-    body { min-height: 100vh; }
-
     /* ── Content ───────────────────────────────────────────── */
-    .content {
-      max-width: 1200px; margin: 1.5rem auto; padding: 0 1.5rem;
-    }
+    .content { padding: 22px 28px 36px; }
 
     /* ── Page header ──────────────────────────────────────── */
     .page-header {
-      display: flex; align-items: center; justify-content: space-between;
-      margin-bottom: 1.5rem; padding-bottom: 0.75rem;
-      border-bottom: 1px solid var(--border);
+      display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between;
+      gap: 12px 24px; margin-bottom: 22px;
     }
-    .page-header h1 { font-size: 1.1rem; font-weight: 700; }
-    .page-header .subtitle { font-size: 0.75rem; color: var(--muted); margin-top: 0.15rem; }
-    .page-header .header-actions { display: flex; gap: 0.5rem; align-items: center; }
+    .page-header h1 { font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2; }
+    .page-header .subtitle { color: var(--mut); margin-top: 4px; max-width: 70ch; }
+    .page-header .header-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 
-    /* ── Section cards ─────────────────────────────────────── */
+    /* ── Panels: bordered regions, not floating cards ──────── */
     .section {
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 0.5rem; margin-bottom: 1.5rem; overflow: hidden;
+      background: var(--surface); border: 1px solid var(--line);
+      border-radius: var(--rad-panel); margin-bottom: 22px; min-width: 0; overflow: hidden;
     }
     .section-header {
-      padding: 0.75rem 1rem; font-size: 0.85rem; font-weight: 600;
-      border-bottom: 1px solid var(--border);
-      display: flex; align-items: center; gap: 0.5rem;
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
+      padding: 12px 16px; font-size: 14px; font-weight: 600;
+      border-bottom: 1px solid var(--line);
     }
-    .section-body { padding: 1rem; }
+    .section-body { padding: 16px; }
+    .section-body.flush { padding: 0; }
+    .gs-meta { font-size: 12.5px; font-weight: 400; color: var(--mut); }
+    .gs-push { margin-left: auto; }
+    .gs-hd-note { margin-left: auto; font-size: 12.5px; font-weight: 400; color: var(--mut); }
+    .gs-hd-search {
+      margin-left: auto; height: 28px; max-width: 190px; padding: 0 10px; font-size: 13px;
+      color: var(--ink); background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+    }
+    /* Fleet Status leads the page: no box, a top rule only (the design's flat panel). */
+    .section.flat {
+      background: none; border-width: 1px 0 0; border-radius: 0;
+      border-color: var(--line2); overflow: visible;
+    }
+    .section.flat .section-header { padding-left: 0; padding-right: 0; border-bottom: 0; }
+    .section.flat .section-body { padding: 0 0 4px; }
 
-    /* ── Summary stat cards ────────────────────────────────── */
-    .stat-cards { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: stretch; }
-    .stat-card {
-      flex: 1 1 110px; min-width: 96px;
-      background: var(--bg); border: 1px solid var(--border);
-      border-radius: 0.5rem; padding: 0.75rem 1rem; text-align: center;
+    /* ── Readout row (summary figures): one bordered region, 1px rules between ── */
+    .stat-cards {
+      display: flex; flex-wrap: wrap; gap: 1px; overflow: hidden; background: var(--line);
+      border: 1px solid var(--line); border-radius: var(--rad-panel);
     }
-    .stat-num { font-size: 1.6rem; font-weight: 700; line-height: 1; }
-    .stat-label {
-      font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.05em;
-      color: var(--muted); margin-top: 0.35rem;
-    }
-    .stat-num.good { color: var(--green); }
-    .stat-num.warn { color: var(--yellow); }
-    .stat-num.bad  { color: var(--red); }
-    .stat-num.info { color: var(--accent); }
-    .stat-num.mute { color: var(--muted); }
+    .stat-card { flex: 1 1 170px; min-width: 0; padding: 14px 18px; background: var(--surface); }
+    .stat-num { font-size: 26px; font-weight: 500; letter-spacing: -.02em; line-height: 1.15; color: var(--ink); }
+    .stat-label { color: var(--mut); font-size: 13px; margin-top: 2px; }
+    .stat-sub { color: var(--mut); font-size: 12.5px; margin-top: 4px; }
+    .stat-num.good { color: var(--ok); }
+    .stat-num.warn { color: var(--warn); }
+    .stat-num.bad  { color: var(--bad); }
+    .stat-num.info { color: var(--primary-h); }
+    .stat-num.mute { color: var(--mut); }
     /* Clickable Fleet stat cards (navigate into the matching status sub-view). */
-    .stat-card-nav { transition: border-color 0.12s; }
-    .stat-card-nav:hover { border-color: var(--accent); }
+    .stat-card-nav { cursor: pointer; transition: background-color .12s; }
+    .stat-card-nav:hover { background: var(--surface2); }
+    .gs-sech { font-size: 14px; font-weight: 600; color: var(--ink); margin: 22px 0 8px; }
+    .gs-worst { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+
+    /* Status text + banners (sentence-case; status colour only on status) */
+    .gs-ok, .gs-warn, .gs-bad, .gs-ni { font-weight: 500; }
+    .gs-ok { color: var(--ok); } .gs-warn { color: var(--warn); } .gs-bad { color: var(--bad); }
+    .gs-ni { color: var(--c5); }
+    .gs-banner {
+      max-width: 640px; margin-bottom: 12px; padding: 12px 14px; font-size: 13.5px; color: var(--ink2);
+      background: var(--surface2); border: 1px solid var(--line2); border-radius: var(--rad-panel);
+    }
+    .gs-banner b { color: var(--ink); }
+    .gs-banner.warn { border-color: color-mix(in srgb, var(--warn) 50%, var(--line2)); }
+    .gs-banner.err  { border-color: color-mix(in srgb, var(--bad) 50%, var(--line2)); }
+    .gs-banner.ni   { border-color: color-mix(in srgb, var(--c5) 50%, var(--line2)); }
+    .section-body.flush .gs-banner { margin: 12px 16px 0; }
+
+    /* Fleet census bar, legend and 7-day remediation trend (flat fills) */
+    .gs-cbar { display: flex; gap: 2px; height: 20px; max-width: 520px; border-radius: 3px; overflow: hidden; background: var(--bg); }
+    .gs-cbar > div { display: flex; align-items: center; justify-content: center; overflow: hidden;
+                     white-space: nowrap; font-size: 11px; font-weight: 600; color: var(--on-primary); }
+    .gs-leg { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 8px; font-size: 13px; color: var(--mut); }
+    .gs-leg i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+    .gs-leg b { color: var(--ink); font-weight: 600; }
+    .gs-trend { display: flex; align-items: flex-end; gap: 6px; height: 84px; margin-top: 6px; }
+    .gs-trend > div { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; }
+    .gs-trend .bar { width: 60%; display: flex; flex-direction: column-reverse; min-height: 2px;
+                     border-radius: 2px 2px 0 0; overflow: hidden; }
+    .gs-trend small { font-size: 12px; color: var(--mut); }
 
     /* Fleet worst-of badge — the single most-severe state present. */
     .worst-badge {
-      display: inline-flex; align-items: center; gap: 0.4rem;
-      padding: 0.25rem 0.7rem; border-radius: 1rem;
-      font-size: 0.75rem; font-weight: 700;
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 1px 8px; border-radius: 3px; font-size: 12.5px; font-weight: 500;
     }
-    .worst-good { background: var(--mds-color-bg-success-tinted); color: var(--green); }
-    .worst-warn { background: var(--mds-color-bg-warning-tinted); color: var(--yellow); }
-    .worst-bad  { background: var(--mds-color-bg-error-tinted);   color: var(--red); }
+    .worst-good { background: color-mix(in srgb, var(--ok) 14%, transparent);   color: var(--ok); }
+    .worst-warn { background: color-mix(in srgb, var(--warn) 15%, transparent); color: var(--warn); }
+    .worst-bad  { background: color-mix(in srgb, var(--bad) 14%, transparent);  color: var(--bad); }
 
     /* ── Guard status badges (full taxonomy) ───────────────── */
     .gs-badge {
-      display: inline-block; padding: 0.1rem 0.5rem;
-      border-radius: 1rem; font-size: 0.68rem; font-weight: 600;
-      white-space: nowrap;
+      display: inline-block; padding: 1px 8px; border-radius: 3px;
+      font-size: 12.5px; font-weight: 500; white-space: nowrap;
     }
-    .gs-compliant         { background: var(--mds-color-bg-success-tinted); color: var(--green); }
-    .gs-drifted           { background: var(--mds-color-bg-warning-tinted); color: var(--yellow); }
-    .gs-remediation_failed{ background: var(--mds-color-bg-error-tinted);   color: var(--red); }
-    .gs-errored           { background: var(--mds-color-bg-error-tinted);   color: var(--red); }
-    .gs-exempt            { background: var(--mds-color-state-selected);    color: var(--muted); }
-    .gs-stale             { background: var(--mds-color-state-hover);       color: var(--muted); border: 1px dashed var(--border); }
+    .gs-compliant          { background: color-mix(in srgb, var(--ok) 14%, transparent);   color: var(--ok); }
+    .gs-drifted            { background: color-mix(in srgb, var(--warn) 15%, transparent); color: var(--warn); }
+    .gs-remediation_failed { background: color-mix(in srgb, var(--bad) 14%, transparent);  color: var(--bad); }
+    .gs-errored            { background: color-mix(in srgb, var(--bad) 14%, transparent);  color: var(--bad); }
+    .gs-exempt, .gs-stale  { background: var(--surface2); color: var(--mut); }
 
     /* guard_healthy signal — distinct from compliance state. */
-    .health-ok   { color: var(--green); }
-    .health-bad  { color: var(--red); }
-    .health-dot  { font-size: 0.7rem; }
+    .health-ok   { color: var(--ok); }
+    .health-bad  { color: var(--bad); }
+    .health-dot  { font-size: 11px; }
 
-    /* ── View switcher (fleet / guard / agent / mgroup / baseline) ── */
-    .view-switch { display: flex; gap: 0; flex-wrap: wrap; margin-bottom: 1rem; }
-    .view-btn {
-      padding: 0.35rem 0.8rem; font-size: 0.75rem; cursor: pointer;
-      background: var(--surface); color: var(--muted);
-      border: 1px solid var(--border); border-right: none;
+    /* ── Segmented controls: view switcher (fleet / guard / baseline) + state chips ── */
+    .view-switch, .gs-chips {
+      display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 2px; background: var(--bg);
+      border: 1px solid var(--line2); border-radius: var(--rad-ctl);
     }
-    .view-btn:first-child { border-radius: 0.4rem 0 0 0.4rem; }
-    .view-btn:last-child  { border-radius: 0 0.4rem 0.4rem 0; border-right: 1px solid var(--border); }
-    .view-btn.active { background: var(--mds-color-state-selected); color: var(--fg); font-weight: 600; }
-    .view-btn:hover  { color: var(--fg); }
+    .view-switch { margin-bottom: 16px; }
+    .view-btn, .gs-chip {
+      display: flex; align-items: center; gap: 6px; height: calc(var(--ctl) - 8px); min-height: 26px;
+      padding: 0 12px; font: inherit; font-weight: 500; color: var(--mut); white-space: nowrap;
+      cursor: pointer; background: none; border: 0; border-radius: 2px;
+    }
+    .view-btn:hover, .gs-chip:hover { color: var(--ink); }
+    .view-btn.active, .gs-chip.on {
+      color: var(--ink); font-weight: 600; background: var(--raise); box-shadow: inset 0 0 0 1px var(--line2);
+    }
 
     /* ── Two-column grid: guards | events ──────────────────── */
     .gs-grid {
-      display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem;
+      display: grid; grid-template-columns: 1fr 1fr; gap: 22px; align-items: start; margin-bottom: 22px;
     }
+    .gs-grid > .section { margin-bottom: 0; }
     @media (max-width: 900px) { .gs-grid { grid-template-columns: 1fr; } }
 
     /* ── Guard list ────────────────────────────────────────── */
-    .guard-list { display: flex; flex-direction: column; gap: 0.5rem; }
-    .guard-item {
-      border: 1px solid var(--border); border-radius: 0.4rem;
-      padding: 0.6rem 0.75rem; cursor: pointer; background: var(--bg);
-    }
-    .guard-item:hover { background: var(--mds-color-state-hover); }
-    .guard-item-top { display: flex; align-items: center; gap: 0.5rem; }
-    .guard-name { font-weight: 600; font-size: 0.82rem; }
+    .guard-list { display: flex; flex-direction: column; }
+    .guard-item { padding: 12px 16px; cursor: pointer; border-bottom: 1px solid var(--line); transition: background-color .12s; }
+    .guard-item:last-child { border-bottom: 0; }
+    .guard-item:hover { background: var(--surface2); }
+    .guard-item-top { display: flex; align-items: center; gap: 8px; }
+    .guard-name { font-weight: 600; color: var(--ink); }
     .guard-os {
-      font-size: 0.6rem; font-family: var(--mono); color: var(--muted);
-      border: 1px solid var(--border); border-radius: 0.25rem; padding: 0 0.25rem;
+      font-family: var(--mds-font-family-mono); font-size: 11.5px; color: var(--mut);
+      border: 1px solid var(--line2); border-radius: 3px; padding: 0 5px;
     }
-    .guard-meta { font-size: 0.72rem; color: var(--muted); margin-top: 0.3rem;
-                  display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+    .guard-meta { font-size: 13px; color: var(--mut); margin-top: 4px;
+                  display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 
     /* ── Guard item: left content column + right control column ─ */
-    .gi-main { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
+    .gi-main { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
     .gi-left { min-width: 0; }
-    .gi-row1 { display: flex; align-items: center; gap: 0.6rem; }
-    .gi-meta { font-size: 0.72rem; color: var(--muted); margin-top: 0.45rem;
-               display: flex; gap: 0.85rem; align-items: center; flex-wrap: wrap; }
-    .gi-mode { font-weight: 700; font-size: 0.86rem; }
-    .gi-mode.observe { color: #a5d6ff; }       /* very light blue */
-    .gi-mode.enforce { color: var(--yellow); } /* dashboard gold */
-    .gi-right { display: flex; flex-direction: column; align-items: flex-end;
-                gap: 0.4rem; flex: none; }
-    .gi-state { font-size: 0.62rem; font-weight: 700; letter-spacing: 0.03em; }
-    .gi-state.on  { color: var(--green); }
-    .gi-state.off { color: var(--muted); }
-    .gi-act { width: 74px; text-align: center; padding: 0.12rem 0; font-size: 0.72rem; }
-    .gi-deploy { margin-top: 0.65rem; font-size: 0.74rem; }
-    .gi-dep-on  { color: #7be3a3; font-weight: 600; } /* lighter green */
-    .gi-dep-off { color: var(--muted); }
-    .gi-bl { color: #ffffff; text-decoration: underline; cursor: pointer; }
-    .gi-bl:hover { color: var(--accent); }
+    .gi-row1 { display: flex; align-items: center; gap: 10px; }
+    .gi-meta { font-size: 13px; color: var(--mut); margin-top: 4px;
+               display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+    .gi-mode { font-weight: 500; font-size: 13px; }
+    .gi-mode.observe { color: var(--mut); }
+    .gi-mode.enforce { color: var(--info); }
+    .gi-right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex: none; }
+    .gi-state { font-size: 12.5px; font-weight: 500; }
+    .gi-state.on  { color: var(--ok); }
+    .gi-state.off { color: var(--mut); }
+    .btn.gi-act { min-width: 74px; justify-content: center; height: 28px; padding: 0 10px; font-size: 13px; }
+    .gi-deploy { margin-top: 10px; font-size: 13px; }
+    .gi-dep-on  { color: var(--ok); font-weight: 500; }
+    .gi-dep-off { color: var(--mut); }
+    .gi-bl { color: var(--primary); cursor: pointer; }
+    .gi-bl:hover { text-decoration: underline; }
 )HTM"
     // Split point 0 (MSVC C2026 — string too big): the <style> block crossed 16 KB
     // after the guard-item CSS grew. Adjacent string literals concatenate at compile
@@ -168,220 +203,202 @@ extern const char* const kGuardianHtml =
     R"HTM(
     /* ── Event timeline ────────────────────────────────────── */
     .event-list { display: flex; flex-direction: column; }
-    .event-item {
-      padding: 0.5rem 0; border-bottom: 1px solid var(--border);
-      font-size: 0.78rem;
-    }
+    .event-item { padding: 10px 16px; border-bottom: 1px solid var(--line); font-size: 13.5px; }
     .event-item:last-child { border-bottom: none; }
-    .event-top { display: flex; align-items: center; gap: 0.5rem; }
-    .event-time { font-family: var(--mono); font-size: 0.7rem; color: var(--muted); }
-    .event-type {
-      font-size: 0.62rem; font-weight: 700; text-transform: uppercase;
-      letter-spacing: 0.04em; padding: 0.05rem 0.4rem; border-radius: 0.25rem;
-    }
-    .et-drift_detected      { background: var(--mds-color-bg-warning-tinted); color: var(--yellow); }
-    .et-drift_remediated    { background: var(--mds-color-bg-success-tinted); color: var(--green); }
-    .et-remediation_failed  { background: var(--mds-color-bg-error-tinted);   color: var(--red); }
-    .et-guard_armed         { background: var(--mds-color-state-selected);    color: var(--accent); }
-    .et-guard_unhealthy     { background: var(--mds-color-bg-error-tinted);   color: var(--red); }
-    .et-resilience_escalated{ background: var(--mds-color-bg-warning-tinted); color: var(--yellow); }
-    .et-generic             { background: var(--mds-color-state-hover);       color: var(--muted); }
-    .event-detail { color: var(--muted); margin-top: 0.2rem; }
-    .event-detail strong { color: var(--fg); font-weight: 500; }
+    .event-top { display: flex; align-items: center; gap: 8px; }
+    .event-time { font-family: var(--mds-font-family-mono); font-size: 12.5px; color: var(--mut); }
+    .event-type { padding: 1px 8px; border-radius: 3px; font-size: 12.5px; font-weight: 500; }
+    .et-drift_detected, .et-resilience_escalated { background: color-mix(in srgb, var(--warn) 15%, transparent); color: var(--warn); }
+    .et-drift_remediated    { background: color-mix(in srgb, var(--ok) 14%, transparent);   color: var(--ok); }
+    .et-remediation_failed, .et-guard_unhealthy { background: color-mix(in srgb, var(--bad) 14%, transparent); color: var(--bad); }
+    .et-guard_armed         { background: color-mix(in srgb, var(--info) 14%, transparent); color: var(--info); }
+    .et-generic             { background: var(--surface2); color: var(--mut); }
+    .event-detail { color: var(--mut); margin-top: 4px; }
+    .event-detail strong { color: var(--ink); font-weight: 600; }
 
-    /* ── Baseline cards ────────────────────────────────────── */
-    .baseline-card {
-      border: 1px solid var(--border); border-radius: 0.4rem;
-      padding: 0.75rem; margin-bottom: 0.6rem; background: var(--bg);
-    }
-    .baseline-top { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
-    .baseline-name { font-weight: 600; font-size: 0.85rem; }
-    .baseline-scope { font-size: 0.72rem; color: var(--muted); font-family: var(--mono); margin-top: 0.25rem; }
-    .lifecycle-draft    { color: var(--muted); }
-    .lifecycle-deployed { color: var(--green); }
+    /* ── Baseline rows ─────────────────────────────────────── */
+    .baseline-card { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+    .baseline-card:last-child { border-bottom: 0; }
+    .baseline-top { display: flex; align-items: center; gap: 12px; }
+    .baseline-name { font-weight: 600; color: var(--ink); text-decoration: none; cursor: pointer; }
+    .baseline-name:hover { color: var(--primary-h); }
+    .baseline-state { font-size: 13px; font-weight: 500; }
+    .baseline-pending { font-size: 12.5px; font-weight: 500; color: var(--warn); }
+    .baseline-scope { font-size: 13px; color: var(--mut); margin-top: 4px; }
+    .lifecycle-draft    { color: var(--mut); }
+    .lifecycle-deployed { color: var(--ok); }
 
-    /* ── By-Guard / By-Baseline LIST cards + filter (view-switch) ───────── */
-    .gs-filterbar {
-      display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;
-      background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem;
-      padding: 0.5rem 0.65rem; margin-bottom: 0.8rem;
+    /* ── By-Guard / By-Baseline LIST rows + filter (view-switch) ───────── */
+    .gs-filterbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    .gs-filterbar input[type="search"], .gs-filterbar select {
+      height: var(--ctl); padding: 0 10px; font-size: 14px; color: var(--ink);
+      background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
     }
-    .gs-filterbar input[type="search"] {
-      flex: 1; min-width: 200px; background: var(--surface); border: 1px solid var(--border);
-      border-radius: 0.4rem; color: var(--fg); padding: 0.32rem 0.55rem; font-size: 0.76rem;
-    }
-    .gs-filterbar select {
-      background: var(--surface); border: 1px solid var(--border); border-radius: 0.4rem;
-      color: var(--fg); padding: 0.32rem 0.45rem; font-size: 0.74rem;
-    }
-    .gs-chips { display: flex; gap: 0.35rem; flex-wrap: wrap; }
-    .gs-chip {
-      font-size: 0.7rem; padding: 0.22rem 0.55rem; border-radius: 0.35rem;
-      border: 1px solid var(--border); color: var(--muted); background: var(--surface);
-      cursor: pointer; white-space: nowrap;
-    }
-    .gs-chip.on { color: var(--fg); border-color: var(--accent); }
-    .gs-rescount { font-size: 0.7rem; color: var(--muted); margin-left: auto; }
+    .gs-filterbar input[type="search"] { flex: 1; min-width: 200px; }
+    .gs-rescount { font-size: 12.5px; color: var(--mut); margin-left: auto; }
 
-    .gs-list { display: flex; flex-direction: column; gap: 0.55rem; }
+    .gs-list { display: flex; flex-direction: column; background: var(--surface);
+               border: 1px solid var(--line); border-radius: var(--rad-panel); overflow: hidden; }
     .gs-card {
-      display: grid; grid-template-columns: 1.6fr 1.9fr 1fr; gap: 1rem;
-      background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem;
-      padding: 0.75rem 0.85rem; cursor: pointer; text-decoration: none; color: inherit;
+      display: grid; grid-template-columns: 1.6fr 1.9fr 1fr; gap: 16px; padding: 12px 16px;
+      cursor: pointer; text-decoration: none; color: inherit; border-bottom: 1px solid var(--line);
+      transition: background-color .12s;
     }
-    .gs-card:hover { border-color: var(--accent); }
-    .gs-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-    .gs-card-name { font-weight: 700; font-size: 0.9rem; color: var(--fg); }
-    .gs-card-sub { font-size: 0.7rem; color: var(--muted); margin-top: 0.25rem; }
-    .gs-cpills { display: flex; gap: 0.35rem; align-items: center; margin-top: 0.45rem; flex-wrap: wrap; }
+    .gs-card:last-child { border-bottom: 0; }
+    .gs-card:hover { background: var(--surface2); }
+    .gs-card:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+    .gs-card-name { font-weight: 600; color: var(--ink); }
+    .gs-card-sub { font-size: 13px; color: var(--mut); margin-top: 4px; }
+    .gs-cpills { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
     .gs-cpill {
-      font-size: 0.6rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em;
-      border-radius: 0.25rem; padding: 0.05rem 0.35rem; border: 1px solid var(--border);
+      font-size: 12.5px; font-weight: 500; border-radius: 3px; padding: 1px 8px;
+      color: var(--mut); background: var(--surface2);
     }
-    .gs-cpill.sev-critical, .gs-cpill.sev-high { color: var(--red); border-color: rgba(255,87,101,0.5); }
-    .gs-cpill.sev-medium { color: var(--yellow); border-color: rgba(255,204,0,0.45); }
-    .gs-cpill.sev-low { color: #a5d6ff; }
-    .gs-cpill.observe { color: #a5d6ff; }
-    .gs-cpill.enforce { color: var(--yellow); border-color: rgba(255,204,0,0.45); }
-    .gs-cpill.on { color: var(--green); }
-    .gs-cpill.off { color: var(--muted); }
-    .gs-pbar { display: flex; height: 16px; border-radius: 4px; overflow: hidden; border: 1px solid var(--border); }
-    .gs-pbar > span { display: flex; align-items: center; justify-content: center; font-size: 0.56rem; color: #04101f; font-weight: 700; }
-    .gs-legend { font-size: 0.68rem; color: var(--muted); margin-top: 0.35rem; }
-    .gs-cr { text-align: right; font-size: 0.7rem; color: var(--muted); }
-    .gs-cr .big { font-size: 1.15rem; font-weight: 700; color: var(--fg); line-height: 1.1; }
-    .gs-view { color: var(--accent); font-size: 0.72rem; font-weight: 600; margin-top: 0.35rem; }
+    .gs-cpill.sev-critical, .gs-cpill.sev-high { color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, transparent); }
+    .gs-cpill.sev-medium { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); }
+    .gs-cpill.sev-low, .gs-cpill.enforce { color: var(--info); background: color-mix(in srgb, var(--info) 14%, transparent); }
+    .gs-cpill.on { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+    .gs-pbar { display: flex; gap: 2px; height: 12px; border-radius: 3px; overflow: hidden; background: var(--bg); }
+    .gs-pbar > span { display: flex; align-items: center; justify-content: center; font-size: 11px; color: var(--on-primary); font-weight: 600; }
+    .gs-legend { font-size: 13px; color: var(--mut); margin-top: 6px; }
+    .gs-cr-gap { margin-top: 4px; }
+    .gs-row-acts { display: flex; gap: 6px; }
+    .gs-cr { text-align: right; font-size: 12.5px; color: var(--mut); }
+    .gs-cr .big { font-size: 20px; font-weight: 500; letter-spacing: -.02em; color: var(--ink); line-height: 1.15; }
+    .gs-view { color: var(--primary); font-size: 13px; font-weight: 500; margin-top: 6px; }
     @media (max-width: 760px) { .gs-card { grid-template-columns: 1fr; } }
 
     /* ── Detail panel ──────────────────────────────────────── */
-    .detail-panel {
-      margin-top: 0.5rem; padding: 1rem;
-      background: var(--bg); border: 1px solid var(--border);
-      border-radius: 0.5rem;
-    }
-    .detail-panel h3 { font-size: 0.9rem; margin-bottom: 0.5rem;
-                       display: flex; align-items: center; gap: 0.5rem; }
-    .kv { display: grid; grid-template-columns: 130px 1fr; gap: 0.3rem 1rem;
-          font-size: 0.78rem; margin-bottom: 0.75rem; }
-    .kv .k { color: var(--muted); }
+    .detail-panel { margin-top: 8px; padding: 16px; background: var(--surface);
+                    border: 1px solid var(--line); border-radius: var(--rad-panel); }
+    .detail-panel h3 { font-size: 14px; font-weight: 600; margin-bottom: 8px;
+                       display: flex; align-items: center; gap: 8px; }
+    .kv { display: grid; grid-template-columns: 130px 1fr; gap: 6px 16px;
+          font-size: 13.5px; margin-bottom: 12px; }
+    .kv .k { color: var(--mut); }
+    .gs-mono { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
     /* let long unbreakable values (registry key paths) wrap instead of clipping */
     .kv > div { min-width: 0; overflow-wrap: anywhere; }
-    .detail-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+    .detail-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
     .detail-table th {
-      text-align: left; padding: 0.35rem 0.5rem;
-      border-bottom: 2px solid var(--border); color: var(--muted);
-      font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
+      text-align: left; padding: 8px 12px; font-size: 12.5px; font-weight: 500; color: var(--mut);
+      background: var(--surface2); border-bottom: 1px solid var(--line);
     }
-    .detail-table td { padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border); }
-    .detail-table tr:hover { background: var(--mds-color-state-hover); }
+    .detail-table td { padding: 8px 12px; border-bottom: 1px solid var(--line); }
+    .detail-table tr:hover td { background: var(--surface2); }
     pre.yaml {
-      background: var(--bg); border: 1px solid var(--border); border-radius: 0.4rem;
-      padding: 0.75rem; font-family: var(--mono); font-size: 0.72rem;
-      overflow-x: auto; white-space: pre; color: var(--fg);
+      background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+      padding: 12px; font-family: var(--mds-font-family-mono); font-size: 12.5px;
+      overflow-x: auto; white-space: pre; color: var(--ink);
     }
 
     /* ── Forms (create Guard / Baseline, push) ─────────────── */
-    .gs-form label { display: block; font-size: 0.72rem; color: var(--muted);
-                     margin: 0.6rem 0 0.2rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    .gs-form label { display: block; font-size: 13px; font-weight: 500; color: var(--ink2); margin: 12px 0 4px; }
+    .gs-modal-body > label:first-child { margin-top: 0; }
     .gs-form input, .gs-form select, .gs-form textarea {
-      width: 100%; background: var(--bg); color: var(--fg);
-      border: 1px solid var(--border); border-radius: 0.3rem; padding: 0.4rem 0.5rem;
-      font-size: 0.8rem; font-family: inherit;
+      width: 100%; height: var(--ctl); padding: 0 10px; font: inherit; color: var(--ink);
+      background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
     }
-    .gs-form textarea { font-family: var(--mono); min-height: 80px; }
-    .form-row { display: flex; gap: 0.75rem; }
+    .gs-form input[type="radio"], .gs-form input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--primary); }
+    .gs-form textarea { height: auto; min-height: 84px; padding: 8px 10px;
+                        font-family: var(--mds-font-family-mono); font-size: 12.5px; }
+    .form-row { display: flex; gap: 16px; }
     .form-row > div { flex: 1; }
-    .form-actions { margin-top: 1rem; display: flex; gap: 0.5rem; }
+    .form-actions { margin-top: 16px; display: flex; gap: 8px; }
 
     /* ── Push panel ────────────────────────────────────────── */
-    .push-row { display: flex; gap: 0.75rem; align-items: flex-end; flex-wrap: wrap; }
+    .push-row { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; }
     .push-row > div { flex: 1; min-width: 220px; }
 
     /* ── Empty / loading states ────────────────────────────── */
-    .empty-state { text-align: center; padding: 2rem 1rem; color: var(--subtle); font-size: 0.85rem; }
-    .mock-note {
-      font-size: 0.68rem; color: var(--subtle); font-style: italic;
-      margin-top: 0.5rem;
-    }
+    .empty-state { text-align: center; padding: 32px 16px; color: var(--mut); font-size: 13.5px; }
+    .empty-state b { display: block; color: var(--ink); font-weight: 600; margin-bottom: 4px; }
+    .mock-note { font-size: 12.5px; color: var(--mut); margin-top: 8px; }
 
     /* ── Buttons ───────────────────────────────────────────── */
-    .btn { height: auto; padding: 0.3rem 0.8rem; font-size: 0.75rem; border: none; cursor: pointer; }
-    .btn-secondary { background: var(--surface); color: var(--fg); border: 1px solid var(--border); }
-    .btn-sm { padding: 0.2rem 0.5rem; font-size: 0.7rem; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 6px; height: var(--ctl); padding: 0 14px;
+      font-size: 14px; font-weight: 500; white-space: nowrap; cursor: pointer; color: var(--ink);
+      background: var(--raise); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+      transition: background-color .12s, border-color .12s;
+    }
+    .btn:hover:not(:disabled) { background: var(--surface2); border-color: var(--mut); opacity: 1; }
+    .btn-primary, .btn-primary:hover:not(:disabled) { color: var(--on-primary); background: var(--primary); border-color: var(--primary); font-weight: 600; }
+    .btn-primary:hover:not(:disabled) { background: var(--primary-h); border-color: var(--primary-h); }
+    .btn-secondary { color: var(--ink); background: var(--raise); border: 1px solid var(--line2); }
+    .btn-sm { height: 28px; padding: 0 10px; font-size: 13px; }
 
-    .htmx-indicator { display: none; color: var(--muted); font-size: 0.75rem; }
+    .htmx-indicator { display: none; color: var(--mut); font-size: 13px; }
     .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { display: inline; }
 
     /* ── New Guard modal ───────────────────────────────────── */
     .gs-modal-overlay {
-      position: fixed; inset: 0; background: rgba(0,0,0,0.62);
+      position: fixed; inset: 0; background: var(--mds-color-state-overlay-scrim);
       display: none; align-items: flex-start; justify-content: center;
-      z-index: 1000; padding: 3rem 1rem; overflow-y: auto;
+      z-index: 1000; padding: 48px 16px; overflow-y: auto;
     }
     .gs-modal-overlay.open { display: flex; }
     .gs-modal-card {
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 0.6rem; width: 100%; max-width: 560px;
+      background: var(--raise); border: 1px solid var(--line2);
+      border-radius: var(--rad-over); width: 100%; max-width: 560px;
       display: flex; flex-direction: column; overflow: hidden;
-      box-shadow: 0 12px 48px rgba(0,0,0,0.55);
+      box-shadow: var(--shadow);
       /* No height cap: the card grows to its content and the overlay
          (overflow-y:auto, top-aligned) scrolls the whole modal when tall — so
          the surface always covers every field and nothing is clipped. */
     }
     .gs-modal-header, .gs-modal-footer {
-      display: flex; align-items: center; padding: 0.8rem 1.1rem; flex: none;
+      display: flex; align-items: center; padding: 12px 16px; flex: none;
     }
-    .gs-modal-header { justify-content: space-between; border-bottom: 1px solid var(--border); }
-    .gs-modal-header h3 { font-size: 0.95rem; font-weight: 700; }
-    .gs-modal-footer { justify-content: flex-end; gap: 0.5rem; border-top: 1px solid var(--border); }
-    .gs-modal-body { padding: 1.1rem; }
+    .gs-modal-header { justify-content: space-between; border-bottom: 1px solid var(--line2); }
+    .gs-modal-header h3 { font-size: 16px; font-weight: 600; }
+    .gs-modal-footer { justify-content: flex-end; gap: 8px; border-top: 1px solid var(--line2); }
+    .gs-modal-body { padding: 16px; }
     .gs-modal-close {
-      background: none; border: none; color: var(--muted);
-      font-size: 1.4rem; line-height: 1; cursor: pointer; padding: 0 0.2rem;
+      background: none; border: none; color: var(--mut);
+      font-size: 22px; line-height: 1; cursor: pointer; padding: 0 4px;
     }
-    .gs-modal-close:hover { color: var(--fg); }
+    .gs-modal-close:hover { color: var(--ink); }
 
     /* Schema-driven form helpers */
-    .gs-field { margin-bottom: 0.6rem; }
-    .gs-hint { color: var(--subtle); font-size: 0.68rem; margin-top: 0.2rem; line-height: 1.35; }
+    .gs-field { margin-bottom: 10px; }
+    .gs-hint { color: var(--mut); font-size: 12.5px; margin-top: 4px; line-height: 1.4; }
     .gs-trigger-fields {
-      border: 1px solid var(--border); border-radius: 0.4rem;
-      padding: 0.7rem 0.8rem; margin: 0.5rem 0;
+      border: 1px solid var(--line2); border-radius: var(--rad-panel);
+      padding: 12px 14px; margin: 8px 0;
     }
     .gs-trigger-fields[hidden], .gs-res-field[hidden] { display: none; }
-    .gs-advanced { margin: 0.6rem 0; }
+    .gs-advanced { margin: 10px 0; }
     .gs-advanced > summary {
-      cursor: pointer; font-size: 0.74rem; color: var(--muted);
-      padding: 0.3rem 0; user-select: none; list-style: none;
+      cursor: pointer; font-size: 13px; color: var(--mut);
+      padding: 4px 0; user-select: none; list-style: none;
     }
     .gs-advanced > summary::-webkit-details-marker { display: none; }
     .gs-advanced > summary::before { content: "\25B8\00a0"; }
     .gs-advanced[open] > summary::before { content: "\25BE\00a0"; }
-    .gs-advanced[open] > summary { color: var(--fg); }
-    .gs-radio-row { display: flex; gap: 1.2rem; margin: 0.3rem 0 0.2rem; }
+    .gs-advanced[open] > summary { color: var(--ink); }
+    .gs-radio-row { display: flex; gap: 20px; margin: 4px 0 2px; }
     .gs-radio {
-      display: flex; align-items: center; gap: 0.35rem; margin: 0;
-      font-size: 0.82rem; cursor: pointer; text-transform: none; letter-spacing: normal;
-      color: var(--fg);
+      display: flex; align-items: center; gap: 6px; margin: 0;
+      font-size: 14px; font-weight: 400; cursor: pointer; color: var(--ink);
     }
     .gs-radio input { width: auto; }
 
     /* New Baseline — member-guards typeahead + chips */
-    .bl-guard-picker { display: flex; gap: 0.5rem; align-items: center; }
+    .bl-guard-picker { display: flex; gap: 8px; align-items: center; }
     .bl-guard-picker input { flex: 1 1 auto; width: auto; min-width: 0; }
     .bl-guard-picker .btn { flex: none; }
-    .bl-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.5rem; }
+    .bl-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
     .bl-chip {
-      display: inline-flex; align-items: center; gap: 0.3rem;
-      background: var(--mds-color-state-selected); color: var(--fg);
-      border: 1px solid var(--border); border-radius: 1rem;
-      padding: 0.15rem 0.3rem 0.15rem 0.6rem; font-size: 0.75rem;
+      display: inline-flex; align-items: center; gap: 4px; color: var(--ink);
+      background: var(--surface2); border: 1px solid var(--line2); border-radius: 3px;
+      padding: 2px 4px 2px 10px; font-size: 13px;
     }
     .bl-chip-x {
-      background: none; border: none; color: var(--muted);
-      cursor: pointer; font-size: 0.95rem; line-height: 1; padding: 0 0.2rem;
+      background: none; border: none; color: var(--mut);
+      cursor: pointer; font-size: 15px; line-height: 1; padding: 0 4px;
     }
-    .bl-chip-x:hover { color: var(--red); }
+    .bl-chip-x:hover { color: var(--bad); }
   </style>
 )HTM"
     // Split point 1 (MSVC C2026 — see file header). Adjacent literals concat.
@@ -423,7 +440,7 @@ extern const char* const kGuardianHtml =
         <div class="subtitle">Guaranteed State enforcement &mdash; live status, Guards &amp; Baselines</div>
       </div>
       <div class="header-actions">
-        <button class="btn btn-secondary"
+        <button class="btn btn-primary"
                 onclick="guardianOpenModal()"
                 hx-get="/fragments/guardian/guard-form"
                 hx-target="#guardian-modal-content" hx-swap="innerHTML">
@@ -438,16 +455,14 @@ extern const char* const kGuardianHtml =
         <button class="btn btn-secondary"
                 hx-get="/fragments/guardian/status?view=fleet"
                 hx-target="#guardian-status" hx-swap="innerHTML">
-          <svg class="icon" style="width:14px;height:14px"><use href="/static/icons.svg#refresh-cw"></use></svg>
           Refresh
         </button>
       </div>
     </div>
 
     <!-- ── Status overview (view-switchable rollup) ─────────── -->
-    <div class="section">
+    <div class="section flat">
       <div class="section-header">
-        <svg class="icon"><use href="/static/icons.svg#shield"></use></svg>
         Fleet Status
         <span class="htmx-indicator" style="margin-left:auto">Refreshing&hellip;</span>
       </div>
@@ -475,10 +490,9 @@ extern const char* const kGuardianHtml =
     <div class="gs-grid">
       <div class="section">
         <div class="section-header">
-          <svg class="icon"><use href="/static/icons.svg#list"></use></svg>
           Guards
         </div>
-        <div class="section-body">
+        <div class="section-body flush">
           <div id="guardian-guards"
                hx-get="/fragments/guardian/guards"
                hx-trigger="load" hx-swap="innerHTML">
@@ -489,14 +503,12 @@ extern const char* const kGuardianHtml =
 
       <div class="section">
         <div class="section-header">
-          <svg class="icon"><use href="/static/icons.svg#activity"></use></svg>
           Recent Events
-          <input type="search" id="gs-event-q" placeholder="Filter events&hellip;"
-                 oninput="gsEventFilter()" aria-label="Filter recent events"
-                 style="margin-left:auto;background:var(--surface);border:1px solid var(--border);border-radius:0.4rem;color:var(--fg);padding:0.2rem 0.45rem;font-size:0.72rem;max-width:170px">
+          <input type="search" id="gs-event-q" class="gs-hd-search" placeholder="Filter events&hellip;"
+                 oninput="gsEventFilter()" aria-label="Filter recent events">
           <span class="htmx-indicator">&middot;&middot;&middot;</span>
         </div>
-        <div class="section-body">
+        <div class="section-body flush">
           <div id="guardian-events"
                hx-get="/fragments/guardian/events"
                hx-trigger="load, every 5s" hx-swap="innerHTML">
@@ -509,13 +521,12 @@ extern const char* const kGuardianHtml =
     <!-- ── Baselines ────────────────────────────────────────── -->
     <div class="section">
       <div class="section-header">
-        <svg class="icon"><use href="/static/icons.svg#layers"></use></svg>
         Baselines
-        <span style="margin-left:auto;font-size:0.7rem;font-weight:400;color:var(--muted)">
+        <span class="gs-hd-note">
           deploy is Baseline-level
         </span>
       </div>
-      <div class="section-body">
+      <div class="section-body flush">
         <div id="guardian-baselines"
              hx-get="/fragments/guardian/baselines"
              hx-trigger="load" hx-swap="innerHTML">
@@ -701,7 +712,7 @@ extern const char* const kGuardianHtml =
       t.textContent = message;
       var close = document.createElement('button');
       close.textContent = '×';
-      close.style.cssText = 'background:none;border:none;color:var(--muted);cursor:pointer;margin-left:auto;font-size:1.2rem;padding:0 0 0 var(--sp-3);';
+      close.style.cssText = 'background:none;border:none;color:var(--mut);cursor:pointer;margin-left:auto;font-size:1.2rem;padding:0 0 0 var(--sp-3);';
       close.onclick = function() { t.remove(); };
       t.style.display = 'flex';
       t.style.alignItems = 'center';

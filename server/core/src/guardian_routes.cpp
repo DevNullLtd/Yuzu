@@ -154,16 +154,12 @@ std::string status_badge(const std::string& status) {
 // render is wrapped in an unmistakable banner so it can never be read as live
 // fleet state.
 std::string demo_banner(const std::string& what) {
-    return "<div style=\"background:rgba(255,176,32,0.12);border:1px solid var(--yellow);"
-           "color:var(--yellow);padding:0.45rem 0.7rem;border-radius:0.4rem;margin-bottom:0.6rem;"
-           "font-size:0.72rem;font-weight:600\">&#9888; DEMO DATA &mdash; " +
-           what + ". Not live fleet state.</div>";
+    return "<div class=\"gs-banner warn\"><b>DEMO DATA</b> &mdash; " + what +
+           ". Not live fleet state.</div>";
 }
 
 std::string empty_state(const std::string& title, const std::string& hint) {
-    return "<div style=\"text-align:center;color:var(--muted);padding:1.6rem 1rem;font-size:0.8rem\">"
-           "<div style=\"font-weight:600;color:var(--fg);margin-bottom:0.25rem\">" +
-           title + "</div>" + hint + "</div>";
+    return "<div class=\"empty-state\"><b>" + title + "</b>" + hint + "</div>";
 }
 
 // Normalise an event_type ("drift.detected") to a CSS-safe suffix
@@ -205,7 +201,7 @@ std::string render_assertion_values(const nlohmann::json& asrt, const std::strin
     };
     auto row = [&](const std::string& label, const std::string& val, bool highlight) {
         return "<div class=\"k\">" + html_escape(label) + "</div><div" +
-               (highlight ? (" style=\"color:" + hi + ";font-weight:700\"") : std::string{}) + ">" +
+               (highlight ? (" style=\"color:" + hi + ";font-weight:600\"") : std::string{}) + ">" +
                html_escape(val) + "</div>";
     };
     std::string out;
@@ -239,7 +235,7 @@ std::string render_assertion_values(const nlohmann::json& asrt, const std::strin
 // green/grey so it can never read as compliant or as a stale-offline "unknown" — used
 // by the fleet census, the By-Guard/By-Baseline "N not impl" tags, and the per-device
 // drill-down.
-constexpr const char* kNotImplColor = "#a78bfa";  // violet
+constexpr const char* kNotImplColor = "var(--c5)";  // violet
 
 // agent_id -> raw platform token ("windows"|"linux"|"darwin"|...) for currently-
 // connected agents, parsed from the registry JSON (registry_.to_json()). Used both to
@@ -620,15 +616,14 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     }
 
     auto sech = [](const std::string& t) {
-        return "<div style=\"font-size:0.66rem;text-transform:uppercase;letter-spacing:0.06em;"
-               "color:var(--muted);font-weight:700;margin:0.9rem 0 0.4rem\">" + t + "</div>";
+        return "<div class=\"gs-sech\">" + t + "</div>";
     };
     auto card = [](const std::string& num, const char* tone, const std::string& label,
                    const std::string& sub) {
         std::string h = "<div class=\"stat-card\"><div class=\"stat-num " + std::string(tone) +
                         "\">" + num + "</div><div class=\"stat-label\">" + label + "</div>";
         if (!sub.empty())
-            h += "<div style=\"font-size:0.62rem;color:var(--muted);margin-top:0.15rem\">" + sub + "</div>";
+            h += "<div class=\"stat-sub\">" + sub + "</div>";
         return h + "</div>";
     };
     // Clickable variant: a Fleet stat card that doubles as navigation into the
@@ -636,11 +631,11 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     // pre-applies a filter). Plain onclick — CSP-safe, see project memory on hx-on.
     auto navcard = [](const std::string& num, const char* tone, const std::string& label,
                       const std::string& sub, const std::string& onclick) {
-        std::string h = "<div class=\"stat-card stat-card-nav\" style=\"cursor:pointer\" onclick=\"" +
+        std::string h = "<div class=\"stat-card stat-card-nav\" onclick=\"" +
                         onclick + "\"><div class=\"stat-num " + std::string(tone) + "\">" + num +
                         "</div><div class=\"stat-label\">" + label + "</div>";
         if (!sub.empty())
-            h += "<div style=\"font-size:0.62rem;color:var(--muted);margin-top:0.15rem\">" + sub + "</div>";
+            h += "<div class=\"stat-sub\">" + sub + "</div>";
         return h + "</div>";
     };
 
@@ -682,19 +677,19 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
                 };
                 std::string sum;
                 if (s.err > 0)
-                    sum = "<span style=\"color:var(--red);font-weight:600\">enforcement failing on " +
+                    sum = "<span class=\"gs-bad\">enforcement failing on " +
                           std::to_string(s.err) + "</span>";
                 else if (s.drift > 0)
-                    sum = "<span style=\"color:var(--yellow);font-weight:600\">drifted on " +
+                    sum = "<span class=\"gs-warn\">drifted on " +
                           std::to_string(s.drift) + " of " + std::to_string(tot) + " agents</span>";
                 else
-                    sum = "<span style=\"color:var(--green);font-weight:600\">compliant &middot; " +
+                    sum = "<span class=\"gs-ok\">compliant &middot; " +
                           std::to_string(s.ok) + " / " + std::to_string(tot) + "</span>";
                 if (s.notimpl > 0)  // macOS/Linux agents the guard targets but can't arm (acb332a)
-                    sum += " <span style=\"color:" + std::string(kNotImplColor) + ";font-weight:600\">&middot; " +
+                    sum += " <span class=\"gs-ni\">&middot; " +
                            std::to_string(s.notimpl) + " not impl</span>";
-                mid = "<div class=\"gs-pbar\">" + seg("var(--green)", s.ok) + seg("var(--yellow)", s.drift) +
-                      seg("var(--red)", s.err) + seg("#5b6b80", s.unk) + seg(kNotImplColor, s.notimpl) +
+                mid = "<div class=\"gs-pbar\">" + seg("var(--ok)", s.ok) + seg("var(--warn)", s.drift) +
+                      seg("var(--bad)", s.err) + seg("var(--faint)", s.unk) + seg(kNotImplColor, s.notimpl) +
                       "</div><div class=\"gs-legend\">" + sum + "</div>";
             }
 
@@ -710,7 +705,7 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
             std::string right = "<div class=\"big\">" +
                 (enforcing ? std::to_string(a ? a->remediated : 0) : std::to_string(a ? a->detected : 0)) +
                 "</div><div>" + (enforcing ? "remediated" : "detected") + " &middot; 7d</div>"
-                "<div style=\"margin-top:0.35rem\">" +
+                "<div class=\"gs-cr-gap\">" +
                 (dep ? std::to_string(deployed_by_rule[r.rule_id].size()) + " Baseline(s)" : "not deployed") +
                 "</div><div class=\"gs-view\">View &rarr;</div>";
 
@@ -779,33 +774,31 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
                     return "<span style=\"width:" + std::to_string((n * 100) / tot) + "%;background:" + col + "\"></span>";
                 };
                 const int pct = static_cast<int>((bc.ok * 100) / tot);
-                mid = "<div class=\"gs-pbar\">" + seg("var(--green)", bc.ok) + seg("var(--yellow)", bc.drift) +
-                      seg("var(--red)", bc.err) + seg("#5b6b80", bc.unk) + seg(kNotImplColor, bc.notimpl) +
+                mid = "<div class=\"gs-pbar\">" + seg("var(--ok)", bc.ok) + seg("var(--warn)", bc.drift) +
+                      seg("var(--bad)", bc.err) + seg("var(--faint)", bc.unk) + seg(kNotImplColor, bc.notimpl) +
                       "</div><div class=\"gs-legend\">" +
-                      std::to_string(pct) + "% compliant &middot; <span style=\"color:var(--yellow)\">" +
+                      std::to_string(pct) + "% compliant &middot; <span class=\"gs-warn\">" +
                       std::to_string(guards_drifting) + " of " + std::to_string(members.size()) +
                       " guards drifting</span>" +
-                      (bc.notimpl > 0 ? " <span style=\"color:" + std::string(kNotImplColor) + "\">&middot; " +
+                      (bc.notimpl > 0 ? " <span class=\"gs-ni\">&middot; " +
                                             std::to_string(bc.notimpl) + " not impl</span>"
                                       : std::string{}) +
                       "</div>";
             }
 
             std::string right = "<div class=\"big\">" + std::to_string(members.size()) +
-                "</div><div>guards</div><div style=\"margin-top:0.35rem\">" + std::to_string(det) +
-                " drift events &middot; 7d</div><div style=\"margin-top:0.2rem\">" +
+                "</div><div>guards</div><div class=\"gs-cr-gap\">" + std::to_string(det) +
+                " drift events &middot; 7d</div><div class=\"gs-cr-gap\">" +
                 (deployed && b.deployed_at > 0
                      ? "deployed " + html_escape(format_iso_utc(b.deployed_at).substr(0, 10))
                      : "never deployed") +
                 "</div><div class=\"gs-view\">View &rarr;</div>";
 
-            const std::string life = "<span class=\"gs-cpill\" style=\"border:none;padding-left:0;color:" +
-                std::string(deployed ? "var(--green)" : "var(--muted)") + "\">" +
+            const std::string life = std::string("<span class=\"gs-cpill") + (deployed ? " on" : "") + "\">" +
                 (deployed ? "&#9679; deployed" : "&#9675; draft") + "</span>";
             const std::string pending =
                 baseline_members_drifted(b)
-                    ? "<span class=\"gs-cpill\" style=\"color:var(--yellow);border-color:rgba(255,204,0,0.45)\">"
-                      "&#9888; changes pending</span>"
+                    ? "<span class=\"gs-cpill sev-medium\">changes pending</span>"
                     : "";
 
             cards += "<a class=\"gs-card\" href=\"/guardian/baseline/" + bid +
@@ -870,11 +863,11 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     const int success_pct = (rem + fail > 0) ? static_cast<int>((rem * 100) / (rem + fail)) : 100;
 
     std::string html;
-    html += "<div style=\"display:flex;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:0.5rem\">"
+    html += "<div class=\"gs-worst\">"
             "<span class=\"worst-badge " +
             std::string(worst_badge_class(guards_drifting, static_cast<int>(fail), guards_errored)) + "\">" +
             worst_badge_label(guards_drifting, static_cast<int>(fail), guards_errored) +
-            "</span><span style=\"font-size:0.7rem;color:var(--muted)\">activity window: last 7 days</span></div>";
+            "</span><span class=\"gs-meta\">activity window: last 7 days</span></div>";
 
     // Honesty banner: guard support is per GUARD TYPE, not a blanket "Windows
     // only" (Registry/File are Windows-only; Service also runs on Linux, but not
@@ -892,9 +885,7 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
             if (!breakdown.empty()) breakdown += " &middot; ";
             breakdown += html_escape(name) + " " + std::to_string(n);
         }
-        html += "<div style=\"background:#241b3a;border:1px solid " + std::string(kNotImplColor) +
-                ";color:var(--fg);padding:0.5rem 0.75rem;border-radius:0.4rem;margin-bottom:0.6rem;"
-                "font-size:0.74rem;max-width:560px\">&#9888; <b>" + std::to_string(notimpl_agent_total) +
+        html += "<div class=\"gs-banner ni\"><b>" + std::to_string(notimpl_agent_total) +
                 "</b> connected agent(s) have a deployed Guard that can't arm on their platform (" +
                 breakdown + ") &mdash; those Guards are <b>no-ops</b> there, so they are "
                 "<b>not enforced</b> and never count as compliant. Registry and File Guards run on "
@@ -921,7 +912,7 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     // each Guard's last reported state, not a live probe.
     html += sech("Compliance &mdash; as of last check-in");
     if (cc_total == 0) {
-        html += "<div style=\"font-size:0.72rem;color:var(--muted);max-width:520px\">No device "
+        html += "<div class=\"gs-hint\">No device "
                 "check-ins recorded yet &mdash; as deployed agents report each Guard's state (on change, "
                 "piggybacked on the heartbeat) the breakdown appears here.</div>";
     } else {
@@ -929,37 +920,32 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
         // flex:N segments fill the bar exactly in proportion — no integer-% rounding gap.
         auto seg = [](int64_t n, const char* col, const std::string& inner) -> std::string {
             if (n <= 0) return std::string{};
-            return "<div style=\"flex:" + std::to_string(n) + ";background:" + col +
-                   ";display:flex;align-items:center;justify-content:center;overflow:hidden;"
-                   "white-space:nowrap;font-size:0.6rem;color:#04101f;font-weight:700\">" + inner +
+            return "<div style=\"flex:" + std::to_string(n) + ";background:" + col + "\">" + inner +
                    "</div>";
         };
-        html += "<div style=\"display:flex;height:20px;border-radius:4px;overflow:hidden;"
-                "border:1px solid rgba(255,255,255,0.1);max-width:520px\">";
-        html += seg(cc_ok, "var(--green)", std::to_string(ok_pct) + "% compliant");
-        html += seg(cc_drift, "var(--yellow)", "");
-        html += seg(cc_err, "var(--red)", "");
-        html += seg(cc_unk, "#5b6b80", "");
+        html += "<div class=\"gs-cbar\">";
+        html += seg(cc_ok, "var(--ok)", std::to_string(ok_pct) + "% compliant");
+        html += seg(cc_drift, "var(--warn)", "");
+        html += seg(cc_err, "var(--bad)", "");
+        html += seg(cc_unk, "var(--faint)", "");
         html += seg(cc_notimpl, kNotImplColor, "");
         html += "</div>";
         auto leg = [](const char* col, const char* lbl, int64_t n, const std::string& extra) {
-            return "<span><i style=\"display:inline-block;width:.55rem;height:.55rem;border-radius:2px;"
-                   "margin-right:.3rem;vertical-align:middle;background:" + std::string(col) + "\"></i>" +
-                   lbl + " <b style=\"color:var(--fg)\">" + std::to_string(n) + "</b>" + extra + "</span>";
+            return "<span><i style=\"background:" + std::string(col) + "\"></i>" +
+                   lbl + " <b>" + std::to_string(n) + "</b>" + extra + "</span>";
         };
-        html += "<div style=\"display:flex;flex-wrap:wrap;gap:1rem;margin-top:0.45rem;"
-                "font-size:0.66rem;color:var(--muted)\">";
-        html += leg("var(--green)", "Compliant", cc_ok, "");
-        html += leg("var(--yellow)", "Drifted", cc_drift, "");
-        html += leg("var(--red)", "Error", cc_err, "");
-        html += leg("#5b6b80", "Unknown", cc_unk,
-                    " <span style=\"color:var(--muted)\">(agent offline &mdash; last state stale)</span>");
+        html += "<div class=\"gs-leg\">";
+        html += leg("var(--ok)", "Compliant", cc_ok, "");
+        html += leg("var(--warn)", "Drifted", cc_drift, "");
+        html += leg("var(--bad)", "Error", cc_err, "");
+        html += leg("var(--faint)", "Unknown", cc_unk,
+                    " <span>(agent offline &mdash; last state stale)</span>");
         if (cc_notimpl > 0)
             html += leg(kNotImplColor, "Not implemented", cc_notimpl,
-                        " <span style=\"color:var(--muted)\">(macOS / Linux &mdash; guard is a no-op on the "
+                        " <span>(macOS / Linux &mdash; guard is a no-op on the "
                         "agent)</span>");
         html += "</div>";
-        html += "<div style=\"font-size:0.62rem;color:var(--muted);margin-top:0.3rem\">" +
+        html += "<div class=\"gs-hint\">" +
                 std::to_string(cc_total) + " device-guard checks across " + std::to_string(agents) +
                 " online agent(s), as of each Guard's last reported change." +
                 (cc_notimpl > 0 ? " The compliant share is of all targeted device-guard pairs, "
@@ -1008,21 +994,18 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
         buckets.push_back({iso.substr(5, 5), r, f});  // MM-DD
     }
     html += sech("Remediations trend (7d)");
-    html += "<div style=\"display:flex;align-items:flex-end;gap:0.4rem;height:84px;margin-top:0.3rem\">";
+    html += "<div class=\"gs-trend\">";
     for (const auto& b : buckets) {
         const int h = static_cast<int>(((b.rem + b.fail) * 72) / dmax);
         const int rh = (b.rem + b.fail) ? static_cast<int>((b.rem * 100) / (b.rem + b.fail)) : 0;
-        html += "<div style=\"flex:1;display:flex;flex-direction:column;align-items:center;gap:0.2rem\">"
-                "<div style=\"width:60%;height:" + std::to_string(h) + "px;display:flex;"
-                "flex-direction:column-reverse;border-radius:2px 2px 0 0;overflow:hidden;min-height:2px\">"
-                "<div style=\"height:" + std::to_string(rh) + "%;background:var(--green)\"></div>"
-                "<div style=\"height:" + std::to_string(100 - rh) + "%;background:var(--red)\"></div></div>"
-                "<small style=\"font-size:0.56rem;color:var(--muted)\">" + b.label + "</small></div>";
+        html += "<div><div class=\"bar\" style=\"height:" + std::to_string(h) + "px\">"
+                "<div style=\"height:" + std::to_string(rh) + "%;background:var(--ok)\"></div>"
+                "<div style=\"height:" + std::to_string(100 - rh) + "%;background:var(--bad)\"></div></div>"
+                "<small>" + b.label + "</small></div>";
     }
     html += "</div>";
-    html += "<div style=\"font-size:0.62rem;color:var(--muted);margin-top:0.3rem\">"
-            "<span style=\"color:var(--green)\">&#9632;</span> enforced &nbsp; "
-            "<span style=\"color:var(--red)\">&#9632;</span> failed</div>";
+    html += "<div class=\"gs-leg\"><span><i style=\"background:var(--ok)\"></i>enforced</span>"
+            "<span><i style=\"background:var(--bad)\"></i>failed</span></div>";
 
     // Data-source honesty: compliance is the per-(agent,rule) status feed (agents
     // report a Guard's state only when it CHANGES — nothing in steady state, so it is
@@ -1098,7 +1081,7 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
                 // are outside it, so they keep their own click behaviour.
                 html += "<div class=\"guard-item\">"
                         "<div class=\"gi-main\">"
-                        "<div class=\"gi-left\" style=\"cursor:pointer\" "
+                        "<div class=\"gi-left\" "
                         "onclick=\"window.location='/guardian/guard/" + rid + "'\">"
                         "<div class=\"gi-row1\">"
                         "<span class=\"guard-name\">" + html_escape(r.name) + "</span>"
@@ -1110,7 +1093,7 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
                         "</div></div>"
                         "<div class=\"gi-right\">"
                         "<span class=\"gi-state " + std::string(on ? "on" : "off") + "\">" +
-                        (on ? "ENABLED" : "DISABLED") + "</span>"
+                        (on ? "Enabled" : "Disabled") + "</span>"
                         "<button class=\"btn btn-secondary gi-act\" "
                         "hx-post=\"/fragments/guardian/guard/" + rid + "/enabled?value=" +
                         (on ? "0" : "1") +
@@ -1137,12 +1120,12 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
             if (!status_filter.empty() && status_filter != g.status) continue;
             const char* health_cls = g.healthy ? "health-ok" : "health-bad";
             const char* health_lbl = g.healthy ? "&#9679; healthy" : "&#9679; unhealthy";
-            html += "<div class=\"guard-item\" style=\"cursor:pointer\" "
+            html += "<div class=\"guard-item\" "
                     "onclick=\"window.location='/guardian/guard/" + std::string(g.id) + "'\">"
                     "<div class=\"guard-item-top\">"
                     "<span class=\"guard-name\">" + std::string(g.name) + "</span>"
                     "<span class=\"guard-os\">" + std::string(g.os) + "</span>"
-                    "<span style=\"margin-left:auto\">" + status_badge(g.status) + "</span>"
+                    "<span class=\"gs-push\">" + status_badge(g.status) + "</span>"
                     "</div>"
                     "<div class=\"guard-meta\">"
                     "<span>" + std::string(g.severity) + "</span>"
@@ -1166,9 +1149,7 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
     // S1). 200 + banner + list keeps the list visible and shows what failed.
     auto fail = [this, &res](const std::string& msg) {
         res.status = 200;
-        res.set_content("<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
-                        "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
-                        "margin-bottom:0.5rem;font-size:0.78rem\">&#9888; " +
+        res.set_content("<div class=\"gs-banner err\">" +
                             html_escape(msg) + "</div>" + render_guards_fragment(""),
                         "text/html; charset=utf-8");
     };
@@ -1210,9 +1191,7 @@ void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib
     // is a known wart (the form re-renders blank); the banner names what to fix.
     auto fail = [&res](const std::string& msg) {
         res.status = 200;
-        const std::string banner = "<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
-                                   "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
-                                   "margin-bottom:0.6rem;font-size:0.78rem\">&#9888; " +
+        const std::string banner = "<div class=\"gs-banner err\">" +
                                    html_escape(msg) + "</div>";
         res.set_content(guardian::render_guard_form(banner), "text/html; charset=utf-8");
     };
@@ -1323,7 +1302,7 @@ void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib
         "<div class=\"k\">Name</div><div>" +
         html_escape(row.name) +
         "</div>"
-        "<div class=\"k\">ID</div><div style=\"font-family:var(--mono);font-size:0.75rem\">" +
+        "<div class=\"k\">ID</div><div class=\"gs-mono\">" +
         html_escape(row.rule_id) +
         "</div>"
         "<div class=\"k\">Trigger</div><div>" +
@@ -1353,9 +1332,7 @@ void GuardianRoutes::create_baseline_from_form(const httplib::Request& req,
         if (store_ && store_->is_open())
             for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
                 names.push_back(r.name);
-        const std::string banner = "<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
-                                   "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
-                                   "margin-bottom:0.6rem;font-size:0.78rem\">&#9888; " +
+        const std::string banner = "<div class=\"gs-banner err\">" +
                                    html_escape(msg) + "</div>";
         res.status = 200;
         // render_baseline_form has no error slot; prepend the banner to its body.
@@ -1567,9 +1544,7 @@ void GuardianRoutes::update_baseline_from_form(const httplib::Request& req, http
     // Re-render the edit form (pre-filled from the store's current state) with an
     // inline banner on error — htmx won't swap a 4xx body.
     auto fail = [this, &res, &baseline_id](const std::string& msg) {
-        const std::string banner = "<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
-                                   "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
-                                   "margin-bottom:0.6rem;font-size:0.78rem\">&#9888; " +
+        const std::string banner = "<div class=\"gs-banner err\">" +
                                    html_escape(msg) + "</div>";
         res.status = 200;
         res.set_content(banner + render_baseline_edit_form_fragment(baseline_id),
@@ -1800,22 +1775,20 @@ std::string GuardianRoutes::render_baselines_fragment() const {
         // "changes pending" marker beside the lifecycle badge.
         const std::string pending =
             drifted ? "<span title=\"Member Guards changed since last deploy — Re-deploy to apply\" "
-                      "style=\"font-size:0.66rem;font-weight:600;color:var(--yellow);"
-                      "margin-left:0.4rem\">&#9888; changes pending</span>"
+                      "class=\"baseline-pending\">changes pending</span>"
                     : "";
         html += "<div class=\"baseline-card\">"
                 "<div class=\"baseline-top\">"
-                "<a class=\"baseline-name\" href=\"/guardian/baseline/" + rid +
-                "\" style=\"color:inherit;text-decoration:none;cursor:pointer\">" + html_escape(b.name) +
+                "<a class=\"baseline-name\" href=\"/guardian/baseline/" + rid + "\">" + html_escape(b.name) +
                 "</a>"
-                "<span class=\"lifecycle-" + std::string(deployed ? "deployed" : "draft") +
-                "\" style=\"font-size:0.72rem;font-weight:600\">" +
+                "<span class=\"baseline-state lifecycle-" + std::string(deployed ? "deployed" : "draft") +
+                "\">" +
                 (deployed ? "&#9679; deployed" : "&#9675; draft") + "</span>" + pending +
                 "</div>"
                 "<div class=\"baseline-scope\">" + target + "</div>"
                 "<div class=\"guard-meta\">"
                 "<span>" + std::to_string(members) + " Guards</span>"
-                "<span style=\"margin-left:auto;display:flex;gap:0.4rem\">"
+                "<span class=\"gs-push gs-row-acts\">"
                 // Edit opens the authoring form (a modal); Deploy posts and lets the
                 // handler's out-of-band response refresh both lists in place (hx-swap
                 // none) — no detail modal. The name links to the full Baseline page.
@@ -1978,10 +1951,8 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
          "agents on the next reconcile.',go:'/guardian'})\">Delete</button></div></div>";
 
     if (baseline_members_drifted(*b))
-        h += "<div style=\"background:rgba(255,176,32,0.12);border:1px solid var(--yellow);"
-             "color:var(--yellow);padding:0.5rem 0.7rem;border-radius:0.4rem;margin-top:0.8rem;"
-             "font-size:0.76rem;font-weight:600\">&#9888; Member Guards changed since last deploy &mdash; "
-             "<strong>Re-deploy</strong> to apply to agents.</div>";
+        h += "<div class=\"gp-banner\">Member Guards changed since last deploy &mdash; "
+             "<b>Re-deploy</b> to apply to agents.</div>";
 
     // Compliance hero.
     h += "<div class=\"gp-sech\">Compliance &mdash; as of last check-in</div>";
@@ -1998,13 +1969,13 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
         h += "<div class=\"gp-hero\"><div class=\"gp-pct\">" + std::to_string(pct) +
              "%<small>compliant &middot; " + std::to_string(agents) + " agent(s)</small></div>"
              "<div style=\"flex:1;min-width:320px\"><div class=\"gp-bar\">" +
-             seg("var(--green)", total.ok) + seg("var(--yellow)", total.drift) +
-             seg("var(--red)", total.err) + seg("#5b6b80", total.unk) + seg(kNotImplColor, total.notimpl) +
+             seg("var(--ok)", total.ok) + seg("var(--warn)", total.drift) +
+             seg("var(--bad)", total.err) + seg("var(--faint)", total.unk) + seg(kNotImplColor, total.notimpl) +
              "</div><div class=\"gp-legend\">"
-             "<span><i style=\"background:var(--green)\"></i>Compliant <b>" + std::to_string(total.ok) +
-             "</b></span><span><i style=\"background:var(--yellow)\"></i>Drifted <b>" +
-             std::to_string(total.drift) + "</b></span><span><i style=\"background:var(--red)\"></i>Error <b>" +
-             std::to_string(total.err) + "</b></span><span><i style=\"background:#5b6b80\"></i>Unknown <b>" +
+             "<span><i style=\"background:var(--ok)\"></i>Compliant <b>" + std::to_string(total.ok) +
+             "</b></span><span><i style=\"background:var(--warn)\"></i>Drifted <b>" +
+             std::to_string(total.drift) + "</b></span><span><i style=\"background:var(--bad)\"></i>Error <b>" +
+             std::to_string(total.err) + "</b></span><span><i style=\"background:var(--faint)\"></i>Unknown <b>" +
              std::to_string(total.unk) + "</b></span>" +
              (total.notimpl > 0 ? "<span><i style=\"background:" + std::string(kNotImplColor) +
                                       "\"></i>Not implemented <b>" + std::to_string(total.notimpl) + "</b></span>"
@@ -2113,15 +2084,15 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     }
 
     // Assignment (deferred until management groups land).
-    h += "<div class=\"gp-sech\">Assignment <span style=\"font-weight:400;color:var(--muted);"
-         "text-transform:none;letter-spacing:0\">(management groups)</span></div>";
+    h += "<div class=\"gp-sech\">Assignment <span class=\"gp-mute\" style=\"font-weight:400\">"
+         "(management groups)</span></div>";
     if (assign.empty()) {
         h += "<div class=\"gp-placeholder\"><b>Targeting not available yet</b>"
              "Management-group targeting (included / excluded groups) lands when the global "
              "management-group feature is ready. Deploy currently applies this Baseline's enabled "
              "Guards fleet-wide (all agents, OS-filtered per Guard).</div>";
     } else {
-        h += "<ul style=\"margin:0;padding-left:1.1rem;font-size:0.8rem\">";
+        h += "<ul class=\"gp-list\">";
         for (const auto& a : assign)
             h += "<li>" + html_escape(a.disposition) + ": <code>" + html_escape(a.group_id) + "</code></li>";
         h += "</ul>";
@@ -2174,7 +2145,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
     const std::string spark_type = spec_poisoned ? std::string{} : spark_type_of(spec_json);
 
     const std::string mode = enforcing ? "Enforce" : "Observe";
-    const std::string mode_color = enforcing ? "var(--yellow)" : "#a5d6ff";
+    const std::string mode_color = enforcing ? "var(--info)" : "var(--ink)";
 
     // Which DEPLOYED Baselines deliver this guard (link to their pages).
     std::string delivered = "<span class=\"gp-mute\">not in a deployed Baseline</span>";
@@ -2311,13 +2282,12 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
     if (!severity.empty())
         h += "<span class=\"gp-pill " + sevclass + "\">" + html_escape(severity) + "</span>";
     h += "<span class=\"gp-pill " + std::string(enforcing ? "enforce" : "observe") + "\">" + mode +
-         "</span><span class=\"gp-pill\" style=\"color:" +
-         std::string(enabled ? "var(--green)" : "var(--muted)") + "\">" +
+         "</span><span class=\"gp-pill" + std::string(enabled ? " dep" : "") + "\">" +
          (enabled ? "&#9679; enabled" : "&#9675; disabled") + "</span></div>"
-         "<div class=\"gp-sub\">Delivered by <b style=\"color:#a5d6ff\">" + std::to_string(baseline_count) +
+         "<div class=\"gp-sub\">Delivered by <b>" + std::to_string(baseline_count) +
          " Baseline(s)</b> &middot; " + delivered + " &middot; reports on change (heartbeat)</div></div>"
          "<div class=\"gp-actions\">"
-         "<button class=\"gp-btn accent\" onclick=\"location.reload()\">&#10227; Refresh</button>"
+         "<button class=\"gp-btn accent\" onclick=\"location.reload()\">Refresh</button>"
          "<button class=\"gp-btn\" onclick=\"gpAction('POST','/fragments/guardian/guard/" +
          html_escape(guard_id) + "/enabled?value=" + (enabled ? "0" : "1") + "')\">" +
          (enabled ? "Disable" : "Enable") + "</button></div></div>";
@@ -2334,7 +2304,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         h += "<div class=\"gp-note\">This Guard's structured spec is not available.</div>";
     } else {
         h += "<div class=\"gp-spec\"><div class=\"k\">Mode</div><div style=\"color:" + mode_color +
-             ";font-weight:700\">" + mode + "</div><div class=\"k\">OS target</div><div>" + html_escape(os) +
+             ";font-weight:600\">" + mode + "</div><div class=\"k\">OS target</div><div>" + html_escape(os) +
              "</div>" + values_html + "</div>";
     }
 
@@ -2353,12 +2323,12 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         h += "<div class=\"gp-hero\"><div class=\"gp-pct\">" + std::to_string(pct) +
              "%<small>compliant &middot; " + std::to_string(d_total) + " device(s)</small></div>"
              "<div style=\"flex:1;min-width:320px\"><div class=\"gp-bar\">" +
-             seg("var(--green)", d_ok) + seg("var(--yellow)", d_drift) + seg("var(--red)", d_err) +
-             seg("#5b6b80", d_unk) + seg(kNotImplColor, d_notimpl) + "</div><div class=\"gp-legend\">"
-             "<span><i style=\"background:var(--green)\"></i>Compliant <b>" + std::to_string(d_ok) +
-             "</b></span><span><i style=\"background:var(--yellow)\"></i>Drifted <b>" + std::to_string(d_drift) +
-             "</b></span><span><i style=\"background:var(--red)\"></i>Error <b>" + std::to_string(d_err) +
-             "</b></span><span><i style=\"background:#5b6b80\"></i>Unknown <b>" + std::to_string(d_unk) +
+             seg("var(--ok)", d_ok) + seg("var(--warn)", d_drift) + seg("var(--bad)", d_err) +
+             seg("var(--faint)", d_unk) + seg(kNotImplColor, d_notimpl) + "</div><div class=\"gp-legend\">"
+             "<span><i style=\"background:var(--ok)\"></i>Compliant <b>" + std::to_string(d_ok) +
+             "</b></span><span><i style=\"background:var(--warn)\"></i>Drifted <b>" + std::to_string(d_drift) +
+             "</b></span><span><i style=\"background:var(--bad)\"></i>Error <b>" + std::to_string(d_err) +
+             "</b></span><span><i style=\"background:var(--faint)\"></i>Unknown <b>" + std::to_string(d_unk) +
              "</b></span>" +
              (d_notimpl > 0 ? "<span><i style=\"background:" + std::string(kNotImplColor) +
                                   "\"></i>Not implemented <b>" + std::to_string(d_notimpl) + "</b></span>"
@@ -2384,8 +2354,8 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
              "to Enforce and a remediation-effectiveness block appears here.</div>";
 
     // Per-device census (filterable, on-demand).
-    h += "<div class=\"gp-sech\">Per-device status <span style=\"font-weight:400;color:var(--muted);"
-         "text-transform:none;letter-spacing:0\">&mdash; on-demand census</span></div>";
+    h += "<div class=\"gp-sech\">Per-device status <span class=\"gp-mute\" style=\"font-weight:400\">"
+         "&mdash; on-demand census</span></div>";
     if (d_total == 0) {
         h += "<div class=\"gp-note\">No device reports yet.</div>";
     } else {
@@ -2415,7 +2385,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
                             : d.state == "errored"   ? "gp-err" : "gp-unk";
             const std::string statecell =
                 ni ? "<span style=\"color:" + std::string(kNotImplColor) +
-                         ";font-weight:600\">&#9679; not yet implemented</span>"
+                         ";font-weight:500\">&#9679; not yet implemented</span>"
                    : "<span class=\"" + std::string(cls) + "\">&#9679; " + html_escape(d.state) + "</span>";
             // not-impl rows carry the platform display name in `updated`, not a timestamp.
             const std::string as_of =
@@ -2425,11 +2395,11 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
             h += "<tr data-gpf=\"d\" data-gpstate=\"" + rowstate + "\" data-gpname=\"" +
                  html_escape(lower(d.host)) + "\"><td class=\"" + std::string(d.online ? "" : "gp-mute") +
                  "\"><a href=\"/viz/host/" + html_escape(d.agent_id) +
-                 "\" style=\"color:inherit;text-decoration:none\" title=\"Open host detail\">" +
+                 "\" title=\"Open host detail\">" +
                  html_escape(d.host) + "</a>" +
-                 (d.online ? "" : " <span style=\"font-size:0.66rem\">(offline)</span>") +
+                 (d.online ? "" : " <span class=\"gp-mute\">(offline)</span>") +
                  "</td><td>" + statecell + "</td>"
-                 "<td class=\"gp-mute\" style=\"font-size:0.72rem\">" + as_of + "</td></tr>";
+                 "<td class=\"gp-mute\">" + as_of + "</td></tr>";
         }
         h += "</tbody></table>";
         h += "<div class=\"gp-note\">The census is a scoped, on-demand re-check &mdash; it loads when you open "
