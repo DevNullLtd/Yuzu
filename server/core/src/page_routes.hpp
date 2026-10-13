@@ -99,7 +99,7 @@ struct Deps {
     const yuzu::server::detail::AgentRegistry* registry{nullptr};
 };
 
-/// Register all 25 page-shell / static-asset routes against `sink`.
+/// Register all 29 page-shell / static-asset routes against `sink`.
 void register_page_routes(HttpRouteSink& sink, Deps deps);
 
 } // namespace page

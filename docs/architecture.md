@@ -300,7 +300,7 @@ in-process-untestable handler is an authorization/CSRF/scope-check blind spot) i
 surfaces this prose previously credited to this inline count have moved to their own
 `HttpRouteSink` modules: `POST /api/command` is `command_routes.cpp` (#2557); the
 page-shell/static-asset surface — `/static/*`, `/`, `/chargen`, `/procfetch`, `/api/help*`,
-`/help`, `/tar`, `/result-sets`, `/viz/fleet`, `/viz/host/:id`, `/instructions`; 25 routes — is
+`/help`, `/tar`, `/result-sets`, `/viz/fleet`, `/viz/host/:id`, `/instructions`; 29 routes — is
 `page_routes.{hpp,cpp}` (#2542 PR-2); a #2542 follow-up split 10 further scattered routes into
 `dashboard_api_routes.{hpp,cpp}` (`/api/me`, `/api/agents`, `/api/audit`, `POST
 /api/export/json-to-csv`, `POST /api/scope/validate`, `/api/analytics/{status,recent}`; 7 routes)

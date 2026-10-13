@@ -15215,7 +15215,7 @@ private:
             return get_visible_agents_json(username);
         };
 
-        // #2542: page-shell/static-asset routes (25), extracted onto inline_sink
+        // #2542: page-shell/static-asset routes (29), extracted onto inline_sink
         // (this call's own HttpRouteSink seam) rather than any per-owner sink —
         // these routes are pure page-shell/static-asset serving with no owning
         // store of their own.

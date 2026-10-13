@@ -1085,6 +1085,34 @@ TEST_CASE("static_js_bundle: kYuzuCss carries the design-system token layer",
     CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'IBM Plex Mono'"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuCss variant hovers set an explicit colour and keep a page recolour",
+          "[static-js][yuzu-css]") {
+    // The variant hover rules (0,4,0) outrank a page's own one-class recolour
+    // (instruction_ui.cpp: .btn-danger{background:red;color:dark}). A hover
+    // that omits `color` leaves dark text on a 12% tint (1.25:1), and one
+    // that swaps background-color turns a green Execute blue.
+    auto block = [](std::string_view selector) {
+        const std::string& css = yuzu::server::kYuzuCss;
+        const auto at = css.find(selector);
+        REQUIRE(at != std::string::npos);
+        const auto end = css.find('}', at);
+        REQUIRE(end != std::string::npos);
+        return css.substr(at, end - at);
+    };
+    const std::string danger = block(":is(.btn-danger, .btn.danger):hover:not(:disabled) {");
+    CHECK_THAT(danger, ContainsSubstring(" color: var(--bad)"));
+    const std::string primary =
+        block(":is(.btn-primary, .btn-success, .btn.primary):hover:not(:disabled) {");
+    CHECK_THAT(primary, ContainsSubstring(" color: var(--on-primary)"));
+    CHECK_THAT(primary, !ContainsSubstring("background:"));
+    CHECK_THAT(primary, !ContainsSubstring("background-color"));
+    // The neutral hover (0,3,0) must skip the primary, or its `background`
+    // shorthand repaints a page-recoloured primary.
+    const std::string neutral = block(
+        ":is(.btn, .btn-secondary, .btn-danger, .btn-ghost, .btn-sm):hover:not(:disabled");
+    CHECK_THAT(neutral, ContainsSubstring(".btn-primary, .btn-success, .primary)"));
+}
+
 TEST_CASE("static_js_bundle: kYuzuCss has no embedded NULs", "[static-js][yuzu-css]") {
     CHECK(yuzu::server::kYuzuCss.find('\0') == std::string::npos);
     // (See kEChartsJs counterpart — stray-delimiter check is tautological
