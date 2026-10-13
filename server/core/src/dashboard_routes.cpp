@@ -751,7 +751,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (instruction.empty()) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         " class=\"result-context is-error\">"
                          "No instruction entered.</span>",
                          "text/html; charset=utf-8");
                      return;
@@ -792,7 +792,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      html += "<tbody id=\"results-tbody\" hx-swap-oob=\"innerHTML\">"
                              + rows_only + "</tbody>";
                      html += "<span id=\"result-context\" hx-swap-oob=\"true\""
-                             " style=\"font-size:0.75rem;color:#8b949e\">"
+                             " class=\"result-context\">"
                              + html_escape(context) + "</span>";
                      html += "<strong id=\"row-count\" hx-swap-oob=\"true\">"
                              + std::to_string(row_count) + "</strong>";
@@ -821,7 +821,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // overlaid on a stale chart.
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:var(--mds-color-theme-indicator-error)\">"
+                         " class=\"result-context is-error\">"
                          "Unknown command: &quot;" + html_escape(instruction) +
                          "&quot;. Type &quot;help&quot; to list all commands.</span>"
                          "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
@@ -899,7 +899,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  } else if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         " class=\"result-context is-error\">"
                          "No target selected. Choose agents, or pick All agents "
                          "to reach the fleet.</span>",
                          "text/html; charset=utf-8");
@@ -958,7 +958,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                        onbehalf::sanitize_for_log(action, 128));
                          res.set_content(
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
-                             " style=\"font-size:0.75rem;color:#f85149\">"
+                             " class=\"result-context is-error\">"
                              "Command classification is unavailable. Cannot dispatch.</span>"
                              "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
                              "text/html; charset=utf-8");
@@ -1037,7 +1037,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          // mirrors the unknown-command arm above.
                          res.set_content(
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
-                             " style=\"font-size:0.75rem;color:#f85149\">" +
+                             " class=\"result-context is-error\">" +
                                  html_escape(std::string(gate.refusal_message)) +
                                  "</span>"
                                  "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
@@ -1108,7 +1108,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                            onbehalf::sanitize_for_log(action, 128));
                              res.set_content(
                                  "<span id=\"result-context\" hx-swap-oob=\"true\""
-                                 " style=\"font-size:0.75rem;color:#f85149\">" +
+                                 " class=\"result-context is-error\">" +
                                      html_escape(std::string(
                                          yuzu::server::kDestructiveNoVisibleAgentMessage)) +
                                      "</span>"
@@ -1173,7 +1173,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">" +
+                         " class=\"result-context is-error\">" +
                              html_escape(message) + "</span>",
                          "text/html; charset=utf-8");
                      return;
@@ -1212,7 +1212,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  // OOB: result context (only set here, no SSE race)
                  html += "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#8b949e\">" +
+                         " class=\"result-context\">" +
                          html_escape(instruction) + " &rarr; " +
                          std::to_string(sent) + " agent" +
                          (sent != 1 ? "s" : "") + "</span>";
@@ -1282,7 +1282,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto sql = req.get_param_value("sql");
                  if (sql.empty()) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                     " style=\"font-size:0.75rem;color:#f85149\">"
+                                     " class=\"result-context is-error\">"
                                      "Missing SQL query.</span>",
                                      "text/html; charset=utf-8");
                      return;
@@ -1291,7 +1291,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // M5: Server-side SQL validation with keyword blocklist (defense in depth)
                  if (sql.size() > 4096) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                     " style=\"font-size:0.75rem;color:#f85149\">"
+                                     " class=\"result-context is-error\">"
                                      "SQL query exceeds 4KB limit.</span>",
                                      "text/html; charset=utf-8");
                      return;
@@ -1302,7 +1302,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      size_t start = upper.find_first_not_of(" \t\r\n");
                      if (start == std::string::npos || !upper.substr(start).starts_with("SELECT")) {
                          res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                         " style=\"font-size:0.75rem;color:#f85149\">"
+                                         " class=\"result-context is-error\">"
                                          "Only SELECT queries are allowed.</span>",
                                          "text/html; charset=utf-8");
                          return;
@@ -1315,7 +1315,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      for (auto kw = blocked; *kw; ++kw) {
                          if (upper.find(*kw) != std::string::npos) {
                              res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                             " style=\"font-size:0.75rem;color:#f85149\">"
+                                             " class=\"result-context is-error\">"
                                              "Query contains forbidden keyword.</span>",
                                              "text/html; charset=utf-8");
                              return;
@@ -1349,7 +1349,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  } else if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         " class=\"result-context is-error\">"
                          "No target selected. Choose agents, or pick All agents "
                          "to reach the fleet.</span>",
                          "text/html; charset=utf-8");
@@ -1371,7 +1371,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  if (sent == 0) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                     " style=\"font-size:0.75rem;color:#f85149\">"
+                                     " class=\"result-context is-error\">"
                                      "No agents connected.</span>",
                                      "text/html; charset=utf-8");
                      return;
@@ -1383,13 +1383,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          "<tr><th class=\"col-agent\">Agent</th>"
                          "<th>Waiting for schema...</th></tr></thead>";
                  html += "<tbody id=\"results-tbody\" hx-swap-oob=\"innerHTML\">"
-                         "<tr id=\"empty-row\"><td colspan=\"99\" style=\"text-align:center;"
-                         "color:#8b949e;padding:2rem 0\">"
+                         "<tr id=\"empty-row\"><td colspan=\"99\" class=\"empty-state\">"
                          "Waiting for results...</td></tr></tbody>";
                  html += "<span id=\"status-badge\" class=\"badge-running\""
                          " hx-swap-oob=\"outerHTML\">RUNNING</span>";
                  html += "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#8b949e\">TAR SQL &rarr; " +
+                         " class=\"result-context\">TAR SQL &rarr; " +
                          std::to_string(sent) + " agent" +
                          (sent != 1 ? "s" : "") + "</span>";
                  html += "<strong id=\"row-count\" hx-swap-oob=\"true\">0</strong>";
@@ -2853,7 +2852,7 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
                 if (selected == id) html += " selected";
                 html += "\" data-scope=\"" + html_escape(id) +
                         "\" onclick=\"selectScope(this)\">"
-                        "<span class=\"scope-item-name\"><span class=\"online-dot\"></span>" +
+                        "<span class=\"scope-item-name\"><span class=\"online-dot\" title=\"Online\" role=\"img\" aria-label=\"Online\"></span>" +
                         html_escape(hostname.empty() ? id : hostname) +
                         "</span><span class=\"scope-item-meta\">" +
                         html_escape(short_id) + " &middot; " +
@@ -2864,7 +2863,7 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 
             // OOB: agent count badge
             auto count = agents_arr.size();
-            html += "<span id=\"agent-count\" hx-swap-oob=\"true\">" +
+            html += "<span id=\"agent-count\" class=\"scope-count\" hx-swap-oob=\"true\">" +
                     std::to_string(count) + " agent" +
                     (count != 1u ? "s" : "") + "</span>";
 
