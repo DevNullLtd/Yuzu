@@ -342,7 +342,10 @@ std::expected<IdTokenClaims, std::string> OidcProvider::parse_id_token(const std
     try {
         j = nlohmann::json::parse(payload_json);
     } catch (const nlohmann::json::parse_error& e) {
-        return std::unexpected(std::string("JWT payload parse error: ") + e.what());
+        // The parser's text quotes the bytes it was reading (IdP-controlled): neutralize here, at
+        // the point the string is built, so every sink that logs it is safe.
+        return std::unexpected(std::string("JWT payload parse error: ") +
+                               ::yuzu::log_key_token(e.what()));
     }
 
     // Every claim is read through a type guard. A signature-valid token
@@ -586,7 +589,7 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
     uc.dwUrlPathLength = 2048;
 
     if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) {
-        spdlog::error("WinHTTP: failed to crack URL: {}", url);
+        spdlog::error("WinHTTP: failed to crack URL: {}", ::yuzu::log_key_token(url));
         return {};
     }
 
@@ -658,7 +661,7 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
     WinHttpCloseHandle(connect);
     WinHttpCloseHandle(session);
 
-    spdlog::info("WinHTTP: POST {} -> {} bytes", url, response.size());
+    spdlog::info("WinHTTP: POST {} -> {} bytes", ::yuzu::log_key_token(url), response.size());
     return response;
 }
 #endif
@@ -873,7 +876,7 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     }
     if (status_code != 200) {
         spdlog::error("OIDC token exchange: status={} body={}", status_code,
-                      body_copy.substr(0, 500));
+                      ::yuzu::log_key_token(body_copy.substr(0, 500)));
         return std::unexpected("token endpoint returned " + std::to_string(status_code));
     }
     response_body = std::move(body_copy);
@@ -885,16 +888,22 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     try {
         j = nlohmann::json::parse(response_body);
     } catch (const nlohmann::json::parse_error& e) {
-        spdlog::error("OIDC token exchange: parse error: {} body={}", e.what(),
-                      response_body.substr(0, 500));
-        return std::unexpected(std::string("token response parse error: ") + e.what());
+        // The parser's text quotes IdP bytes, and so does the body: neutralize both.
+        const auto what = ::yuzu::log_key_token(e.what());
+        spdlog::error("OIDC token exchange: parse error: {} body={}", what,
+                      ::yuzu::log_key_token(response_body.substr(0, 500)));
+        return std::unexpected(std::string("token response parse error: ") + what);
     }
 
     if (j.contains("error")) {
         auto err = j["error"].get<std::string>();
         auto desc = j.value("error_description", "");
-        spdlog::error("OIDC token exchange error: {} - {}", err, desc.substr(0, 300));
-        return std::unexpected("token endpoint error: " + err);
+        // `error` and `error_description` are IdP-controlled. Fold `err` where the returned string
+        // is built so the caller's "OIDC callback failed: {}" line and the audit detail are safe.
+        const auto safe_err = ::yuzu::log_key_token(err);
+        spdlog::error("OIDC token exchange error: {} - {}", safe_err,
+                      ::yuzu::log_key_token(desc.substr(0, 300)));
+        return std::unexpected("token endpoint error: " + safe_err);
     }
 
     if (!j.contains("id_token") || !j["id_token"].is_string())

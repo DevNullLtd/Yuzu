@@ -1,5 +1,6 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/log_token.hpp> // log_key_token — IdP-controlled values in sign-in log lines
 #include <yuzu/metrics.hpp>
 
 #include "oidc_principal.hpp" // oidc_principal_id — ADR-2001 §5 single principal-string builder
@@ -613,8 +614,8 @@ bool AuthManager::persist_new_session(const std::string& raw_token,
         key = p.token_hash;
         auto r = session_store_->create(p);
         if (!r) {
-            spdlog::error("AuthManager: durable session create failed for '{}': {}", s.username,
-                          r.error().message);
+            spdlog::error("AuthManager: durable session create failed for '{}': {}",
+                          ::yuzu::log_key_token(s.username), r.error().message);
             note_session_store_degrade("create");
             return false; // fail closed — login not honored (ADR-0007)
         }
@@ -2469,12 +2470,18 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     // authoring) — pass it through; the epoch sentinel maps to 0 (no proof).
     params.mfa_verified_ms_abs = ms_from_tp(mfa_verified_at);
     if (!persist_new_session(token, params)) {
-        spdlog::error("create_oidc_session: durable persist failed for '{}'", stable_username);
+        spdlog::error("create_oidc_session: durable persist failed for '{}'",
+                      ::yuzu::log_key_token(stable_username));
         return {}; // fail-safe empty token (ADR-0007)
     }
 
+    // Display name, email, sub and `iss` are IdP-controlled: fold the LOG copies only (a line
+    // break in one would forge a second log line). The session and the stored row keep the
+    // original bytes.
     spdlog::info("OIDC session created for '{}' (display={}, email={}, sub={}, role={})",
-                 stable_username, resolved_display, email, oidc_sub, role_to_string(role));
+                 ::yuzu::log_key_token(stable_username), ::yuzu::log_key_token(resolved_display),
+                 ::yuzu::log_key_token(email), ::yuzu::log_key_token(oidc_sub),
+                 role_to_string(role));
     return token;
 }
 
@@ -2493,7 +2500,7 @@ void AuthManager::provision_sso_identity(const std::string& principal, const std
     if (!result) {
         spdlog::warn("provision_sso_identity failed for '{}': error={} (login proceeds; this "
                      "principal cannot elevate until a future login provisions it)",
-                     principal, static_cast<int>(result.error()));
+                     ::yuzu::log_key_token(principal), static_cast<int>(result.error()));
         return;
     }
     // governance round (sec-LOW/UP-5) — observable IdP-provisioning volume.
