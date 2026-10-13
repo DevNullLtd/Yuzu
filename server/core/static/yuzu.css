@@ -572,26 +572,15 @@ td > .bar { min-width: 110px; }
   font-size: 11px; font-family: var(--font-mono); color: var(--mut);
 }
 
-/* Responsive */
+/* Responsive. The dashboard's own breakpoints live in dashboard_ui.cpp (its
+   "Narrow windows" block); the old .main-grid / .dashboard-grid / .history
+   rules that sat here matched no element once the dashboard moved to
+   .dash-grid and were removed. The rule below is kept as it was: .scope is no
+   longer a dashboard panel (that is .scope-panel), but the DEX trends OS cards
+   (dex_routes.cpp, guardian_page_ui.cpp) still carry a .scope element, so it
+   is not provably dead. */
 @media (max-width: 1440px) {
-  .history { width: 180px !important; }
   .scope { width: 220px !important; }
-}
-@media (max-width: 1280px) {
-  .main-grid { grid-template-columns: 1fr !important; }
-  /* Keep the agent/scope panel visible on narrow screens - it is how the
-     operator targets devices, so hiding it breaks the dashboard. Collapse
-     only the optional history rail and reflow the dashboard to two columns
-     so the scope panel is never clipped. (Was: hid .history AND .scope,
-     which made agents disappear on any window <=1280px.) */
-  .history { display: none !important; }
-  .dashboard-grid {
-    grid-template-columns: minmax(0, 1fr) 220px !important;
-    grid-template-areas:
-      "instrbar scope"
-      "results  scope"
-      "footer   scope" !important;
-  }
 }
 
 /* YAML split-panel editor */
