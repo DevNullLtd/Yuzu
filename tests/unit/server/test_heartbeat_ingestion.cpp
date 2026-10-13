@@ -17,6 +17,7 @@
 #include "pg/pg_pool.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include "agent.pb.h"
 
@@ -24,6 +25,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -213,6 +215,34 @@ TEST_CASE("HeartbeatIngestion: a throwing quarantine reconcile fn does not abort
     // Must not propagate — a bad reconcile must not knock the rest of
     // ingestion (or the gRPC handler thread) over.
     CHECK_NOTHROW(ingestion.ingest(make_hb("", /*set_tag=*/false), "agent-x", "direct"));
+}
+
+// #5513: the quarantine hook's catch log neutralises the agent id and the exception text with
+// ::yuzu::log_id_token, like the guardian hook's catch. Control bytes in either must not reach
+// the log line (one warn call -> exactly one line, no raw ESC / CR / embedded LF).
+TEST_CASE("HeartbeatIngestion: a throwing quarantine reconcile fn logs neutralised text (#5513)",
+          "[heartbeat_ingestion][quarantine]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics};
+
+    ingestion.set_quarantine_reconcile_fn(
+        [](std::string_view) { throw std::runtime_error("boom\nFORGED-LINE\r\x1b[31m"); });
+
+    std::string logs;
+    {
+        yuzu::test::LogCapture capture{spdlog::level::warn};
+        CHECK_NOTHROW(ingestion.ingest(make_hb("", /*set_tag=*/false), "agent\nx\x1b", "direct"));
+        capture.stop();
+        logs = capture.text();
+    }
+    CHECK(logs.find("agent_x_") != std::string::npos);
+    CHECK(logs.find("boom_FORGED-LINE__[31m") != std::string::npos);
+    CHECK(logs.find('\x1b') == std::string::npos);
+    CHECK(logs.find('\r') == std::string::npos);
+    // The single trailing eol is the only newline.
+    CHECK(std::count(logs.begin(), logs.end(), '\n') == 1);
 }
 
 // #5513: the guardian reconcile hook is caught at the ingestion call site like the quarantine

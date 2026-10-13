@@ -154,7 +154,7 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
                 quarantine_reconcile_fn_(agent_id_str);
             } catch (const std::exception& e) {
                 spdlog::warn("[{}] Heartbeat quarantine reconcile threw for agent={}: {}", via_str,
-                            agent_id_str, e.what());
+                             ::yuzu::log_id_token(agent_id_str), ::yuzu::log_id_token(e.what()));
             }
         }
     }
