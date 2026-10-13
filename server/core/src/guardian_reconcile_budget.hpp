@@ -60,7 +60,8 @@ namespace yuzu::server {
 
 /// Budget configuration (namespace scope so it can be a default argument; see the
 /// class comment for clamping). The defaults are provisional starting values, not
-/// derived from fleet measurement: the server flags own the real values.
+/// derived from fleet measurement: the server flags will own the real values once the
+/// reconcile wire-up adds them.
 struct GuardianReconcileBudgetConfig {
     /// Reconcile-milliseconds replenished per wall second.
     double budget_ms_per_s{100.0};

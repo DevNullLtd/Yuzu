@@ -243,6 +243,29 @@ void check_equivalent(const AgentRegistry& registry, const std::string& text, co
         ++stats.selective;
 }
 
+// An INDEPENDENT oracle for the shared resolver. check_equivalent compares the single-agent
+// path with evaluate_scope_local, which resolve every atom through the same function, so a
+// resolver bug moves both together. This checks both against a hard-coded id list derived by
+// hand from the fixture arithmetic (make_info / populate_stores), not from the evaluator.
+void check_exact(const AgentRegistry& registry, const std::string& text, const TagStore* tags,
+                 const CustomPropertiesStore* props, const std::set<std::string>& expected) {
+    INFO("scope expression: " << text);
+    const auto expr = parse_ok(text);
+    auto fleet = registry.evaluate_scope_local(expr, tags, props);
+    REQUIRE(fleet.has_value());
+    CHECK(std::set<std::string>(fleet->begin(), fleet->end()) == expected);
+    CHECK(fleet->size() == expected.size());
+    auto ids = registered_ids();
+    for (const auto& g : ghost_ids())
+        ids.push_back(g);
+    for (const auto& id : ids) {
+        auto single = registry.evaluate_scope_for_agent(id, expr, tags, props);
+        INFO("agent: " << id);
+        REQUIRE(single.has_value());
+        CHECK(*single == expected.contains(id));
+    }
+}
+
 void check_catalog_covered() {
     std::set<std::string> covered{"from_result_set:<id>"};
     for (const auto& k : kind_exprs())
@@ -293,6 +316,37 @@ TEST_CASE("evaluate_scope_for_agent: equals fleet membership for the session-ide
     // Most expressions must actually split the fleet, or the equivalence above
     // is vacuous (all-false == all-false).
     CHECK(stats.selective * 10 >= stats.exprs * 7);
+}
+
+TEST_CASE("evaluate_scope_for_agent: matches hard-coded expected ids (independent oracle) "
+          "with no store wired",
+          "[server][agent_registry][scope]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    register_fleet(registry);
+
+    // linux is i%3==0, prod (scopable) is i%5==0, arm64 is i%4==0: i%60==0.
+    check_exact(registry, R"X(ostype == "linux" AND tag:env == "prod" AND arch == "arm64")X",
+                nullptr, nullptr, {"agent-000", "agent-060", "agent-120", "agent-180"});
+    // gold (scopable) is i%7==0, darwin is i%3==2: i%21==14.
+    check_exact(registry, R"X(tag:tier == "gold" AND ostype == "darwin")X", nullptr, nullptr,
+                {"agent-014", "agent-035", "agent-056", "agent-077", "agent-098", "agent-119",
+                 "agent-140", "agent-161", "agent-182", "agent-203", "agent-224"});
+    // env=dev is i%5==1, version 0.14.0-rc1 is (i/3)%3==2.
+    check_exact(registry, R"X(tag:env == "dev" AND agent_version == "0.14.0-rc1")X", nullptr,
+                nullptr,
+                {"agent-006", "agent-016", "agent-026", "agent-051", "agent-061", "agent-071",
+                 "agent-096", "agent-106", "agent-116", "agent-141", "agent-151", "agent-161",
+                 "agent-186", "agent-196", "agent-206", "agent-231"});
+    // linux hostnames are "lnx-<i%23>"; 10..19 match the regex; arm64 (i%4==0) is excluded.
+    check_exact(registry, R"X(hostname MATCHES "^lnx-1[0-9]$" AND arch != "arm64")X", nullptr,
+                nullptr,
+                {"agent-015", "agent-018", "agent-033", "agent-039", "agent-042", "agent-057",
+                 "agent-063", "agent-081", "agent-087", "agent-102", "agent-105", "agent-111",
+                 "agent-126", "agent-129", "agent-150", "agent-153", "agent-171", "agent-174",
+                 "agent-177", "agent-195", "agent-198", "agent-201", "agent-219", "agent-222",
+                 "agent-225"});
 }
 
 TEST_CASE("evaluate_scope_for_agent: an agent with no session on this replica is not a member, "
@@ -416,6 +470,36 @@ TEST_CASE("evaluate_scope_for_agent: equals fleet membership for EVERY scope kin
 
     CHECK(stats.exprs >= 35);
     CHECK(stats.selective * 10 >= stats.exprs * 7);
+}
+
+TEST_CASE("evaluate_scope_for_agent: matches hard-coded expected ids (independent oracle) with "
+          "real TagStore and CustomPropertiesStore rows",
+          "[pg][server][agent_registry][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scope_for_agent_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    TagStore tags{pool};
+    CustomPropertiesStore props{pool};
+    REQUIRE(tags.is_open());
+    REQUIRE(props.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    register_fleet(registry);
+    populate_stores(tags, props);
+
+    // Store env=staging is i%10==0 (it overrides the scopable prod), owner alice is i%4==0:
+    // i%20==0. The ghost ids carry rows too but have no session, so they are never members.
+    check_exact(registry, R"X(tag:env == "staging" AND props.owner == "alice")X", &tags, &props,
+                {"agent-000", "agent-020", "agent-040", "agent-060", "agent-080", "agent-100",
+                 "agent-120", "agent-140", "agent-160", "agent-180", "agent-200", "agent-220"});
+    // Owner bob is i%4==2, tier "22" is i%3==1: i%12==10.
+    check_exact(registry, R"X(props.owner == "bob" AND props.tier == "22")X", &tags, &props,
+                {"agent-010", "agent-022", "agent-034", "agent-046", "agent-058", "agent-070",
+                 "agent-082", "agent-094", "agent-106", "agent-118", "agent-130", "agent-142",
+                 "agent-154", "agent-166", "agent-178", "agent-190", "agent-202", "agent-214",
+                 "agent-226", "agent-238"});
 }
 
 TEST_CASE("evaluate_scope_for_agent: store-first tag precedence (#3295), including an engaged "
@@ -589,10 +673,9 @@ TEST_CASE("a NUL-bearing agent id is rejected before any store read",
     const std::string nul_id("agent-a\0x", 9);
 
     SECTION("the tag store answers empty for the malformed id") {
-        // The custom-properties store's own read guard for such an id ships separately from the
-        // evaluator, so this section asserts only what the tag store and the evaluator
-        // guarantee on their own; the evaluator section below never reaches the properties
-        // store for the malformed id.
+        // This section asserts only what the tag store guarantees on its own; it makes no
+        // claim about how the custom-properties store answers a malformed id. The evaluator
+        // section below never reaches either store for the malformed id.
         auto tm = tags.get_tag_map(nul_id);
         REQUIRE(tm.has_value());
         CHECK(tm->empty());

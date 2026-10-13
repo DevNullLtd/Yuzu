@@ -33,7 +33,12 @@
 ///     outcome was a success. That value is stale by `ttl` plus the idle gap (nothing
 ///     starts a refresh at expiry: the fetch begins when the first caller arrives after
 ///     the entry expired, so an entry nobody asked for stays cached however old it is)
-///     plus the fetch time, not by `ttl` plus the fetch time alone. If there is no
+///     plus the fetch time, not by `ttl` plus the fetch time alone. NOTHING BOUNDS that
+///     while the owner's fetch stays blocked (a blackholed store): an expired held success
+///     keeps being served for as long as the fetch runs, because `max_wait` bounds only
+///     the waiters that have no success to serve. A caller that needs a bound on staleness uses
+///     `get_fresh()` (which blocks for the duration of its own fetch) or a store-side
+///     timeout on the fetch function. If there is no
 ///     value, or the last outcome was an error, the caller waits on the in-flight fetch
 ///     through a `std::shared_future` for at most `max_wait` and receives its result, or
 ///     an error naming the timeout (the loader thread is unaffected; a blackholed store

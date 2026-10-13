@@ -560,7 +560,9 @@ TEST_CASE("GuardianReconcileGate: thread-safety smoke", "[guardian][reconcile_ga
     // Tight enough that some decisions shed, loose enough that some admit.
     GuardianReconcileBudget budget(
         {.budget_ms_per_s = 1000.0, .burst_ms = 50.0, .max_per_s = 1'000'000}, clk.fn());
-    GuardianReconcileGate gate(budget, clk.fn());
+    // small_table(): no constructor reserve, so the table has few buckets and the final
+    // bounded sweep below can cover all of it in one call.
+    GuardianReconcileGate gate(budget, clk.fn(), std::chrono::seconds(25), small_table());
 
     constexpr int kThreads = 8;
     constexpr int kIters = 4000;
@@ -605,7 +607,13 @@ TEST_CASE("GuardianReconcileGate: thread-safety smoke", "[guardian][reconcile_ga
           static_cast<std::uint64_t>(kThreads) * kIters);
     CHECK(budget.admitted_total() == admits.load());
     CHECK(budget.shed_total() == sheds.load());
-    CHECK(gate.claims_size() <= 64);
+    // Once the clock is past 2x min_interval a single sweep drains whatever the concurrent
+    // run left behind: a table corrupted by a race (a lost erase, a torn node) shows up as a
+    // count mismatch.
+    const std::size_t left = gate.claims_size();
+    clk.advance(60s);
+    CHECK(gate.sweep() == left);
+    CHECK(gate.claims_size() == 0);
     CHECK(admits.load() > 0);
     CHECK(converged.load() > 0);
 }
