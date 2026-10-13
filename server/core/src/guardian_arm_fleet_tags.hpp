@@ -22,7 +22,7 @@
 /// path.
 ///
 /// ── SHAPE: SUM, NOT MAX - THESE ARE GAUGES, NOT COUNTERS ────────────────────────
-/// Unlike the journal family (32 monotonic per-sweep counters) or the age family
+/// Unlike the journal family (33 monotonic per-sweep counters) or the age family
 /// (staleness - rolls up as MAX), arm_pending/arm_failed are RE-STATABLE GAUGES:
 /// each agent reports its CURRENT count, not a cumulative total, so the fleet
 /// question ("how many accepted arms are outstanding/failed RIGHT NOW across the
