@@ -68,7 +68,7 @@ EXPECTED_SUBSTRATE_MARKERS = {
     "engine_principal_store": {"cell": "a", "regex": "engine_principal_store"},
     "principal_quota": {"cell": "m", "regex": "class PrincipalQuota"},
     "use_case_run_id": {"cell": "c", "regex": "use_case_run_id"},
-    "release_log_store": {"cell": "d", "regex": "(class|struct)[[:space:]]+([A-Za-z_]+[[:space:]]+)?ReleaseLog|release_log_store|CREATE[[:space:]]+TABLE[^;]{0,200}release_log"},
+    "release_log_store": {"cell": "d", "regex": "^[[:space:]]*(class|struct)[[:space:]]+([A-Za-z_]+[[:space:]]+)?ReleaseLog(Store)?([^A-Za-z0-9_]|$)|^[[:space:]]*#[[:space:]]*include[[:space:]]+[<\"][^>\"]*release_log_store|^[^/*]*CREATE[[:space:]]+TABLE[^;]{0,200}release_log"},
     "evaluate_as_operator": {"cell": "b", "regex": "evaluate_as_operator"},
     "capability_registry": {"cell": "h", "regex": "register_securable|create_securable|ratified_mapping"},
 }
@@ -141,13 +141,25 @@ def main() -> int:
         return rc == 0
 
     with tempfile.TemporaryDirectory(prefix="yuzu_test_") as _td:
+        # Over-matching is the hazard: RULE 2 fails CLOSED when the marker is absent, but a marker that
+        # matches a lookalike lets a green (d) pass with no store. So pin the lookalike shapes too:
+        # a longer identifier, a different declaration kind, and a comment or include in a comment.
         for must_not in ("inline void release_log_handoff_from_this_image(LogHandoff& h) noexcept {",
-                         "release_log_handoff_from_this_image(h_);"):
+                         "release_log_handoff_from_this_image(h_);",
+                         "class ReleaseLogger {", "class ReleaseLogHelper final {",
+                         "enum class ReleaseLogLevel { Info };",
+                         "// TODO: class ReleaseLogStore lands in P7",
+                         " * struct ReleaseLogStore (P7)",
+                         '// #include "release_log_store.hpp"',
+                         "// CREATE TABLE release_log (id BIGINT)",
+                         "/* CREATE TABLE release_log */"):
             if _ere_matches(must_not, _td) is True:
                 _fail(f"release_log_store regex falsely matches unrelated log-handoff code: {must_not!r}", failures)
         for must in ("class ReleaseLogStore {", "struct ReleaseLogStore final {", "class YUZU_API ReleaseLogStore {",
                      '#include "release_log_store.hpp"', "CREATE TABLE IF NOT EXISTS release_log (id BIGINT)",
-                     "CREATE  TABLE release_log_entries ("):
+                     "CREATE  TABLE release_log_entries (", "class ReleaseLog {", "    class ReleaseLog final {",
+                     'R"sql(CREATE TABLE release_log (id BIGINT))sql"', '"CREATE TABLE IF NOT EXISTS release_log ("',
+                     "#include <yuzu/server/release_log_store.hpp>"):
             if _ere_matches(must, _td) is False:
                 _fail(f"release_log_store regex misses a plausible real release-log store: {must!r}", failures)
 
