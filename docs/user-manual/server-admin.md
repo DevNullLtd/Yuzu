@@ -3992,7 +3992,7 @@ Tag compliance data is also available via the REST API (`GET /api/v1/tag-complia
 
 ## OIDC SSO Configuration
 
-Yuzu supports OpenID Connect (OIDC) for single sign-on with an external identity provider that serves OpenID Connect Discovery. Verified end to end against Keycloak 26.4.0. Microsoft Entra ID is supported by the standard (endpoints and keys come from its discovery document) but has not been verified end to end by the project; see [Authentication](authentication.md#manual-verification-against-a-real-idp) for the manual procedure and the sign-in troubleshooting log lines.
+Yuzu supports OpenID Connect (OIDC) for single sign-on with an external identity provider that serves OpenID Connect Discovery. Verified end to end against Keycloak 26.4.0 (Linux test host, plain `http` and `https` via a TLS-terminating proxy). Microsoft Entra ID is supported by the standard (endpoints and keys come from its discovery document) but has not been verified end to end by the project; see [Authentication](authentication.md#manual-verification-against-a-real-idp) for the manual procedure and the sign-in troubleshooting log lines.
 
 ### Configuration
 
