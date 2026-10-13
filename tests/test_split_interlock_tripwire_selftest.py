@@ -68,7 +68,7 @@ EXPECTED_SUBSTRATE_MARKERS = {
     "engine_principal_store": {"cell": "a", "regex": "engine_principal_store"},
     "principal_quota": {"cell": "m", "regex": "class PrincipalQuota"},
     "use_case_run_id": {"cell": "c", "regex": "use_case_run_id"},
-    "release_log_store": {"cell": "d", "regex": "class ReleaseLog|release_log_store"},
+    "release_log_store": {"cell": "d", "regex": "(class|struct)[[:space:]]+([A-Za-z_]+[[:space:]]+)?ReleaseLog|release_log_store|CREATE TABLE[^;]*release_log"},
     "evaluate_as_operator": {"cell": "b", "regex": "evaluate_as_operator"},
     "capability_registry": {"cell": "h", "regex": "register_securable|create_securable|ratified_mapping"},
 }
@@ -119,6 +119,27 @@ def main() -> int:
         _fail("engine_path_markers (keys+regexes) drifted from the frozen set", failures)
     if ledger.get("substrate_markers") != EXPECTED_SUBSTRATE_MARKERS:
         _fail("substrate_markers (keys/cells/regexes) drifted from the frozen set", failures)
+
+    # 3b. the release_log_store regex's BEHAVIOUR, not just its pinned text. The pin above
+    #     cannot tell a regex that matches the right things from one that matches the wrong
+    #     things: the original `release_log|ReleaseLog` matched the unrelated agent log-handoff
+    #     helper (agents/core/src/agent_log_wiring.hpp, `release_log_handoff_from_this_image`),
+    #     which made RULE 2 inert for cell (d). Evaluate with `grep -E` — the same POSIX ERE
+    #     dialect `git grep -E` uses in the tripwire (python `re` lacks [[:space:]]).
+    rl_regex = ledger.get("substrate_markers", {}).get("release_log_store", {}).get("regex", "")
+
+    def _ere_matches(line: str) -> bool:
+        return subprocess.run(["grep", "-E", "-e", rl_regex], input=line + "\n",
+                              capture_output=True, text=True).returncode == 0
+
+    for must_not in ("inline void release_log_handoff_from_this_image(LogHandoff& h) noexcept {",
+                     "release_log_handoff_from_this_image(h_);"):
+        if _ere_matches(must_not):
+            _fail(f"release_log_store regex falsely matches unrelated log-handoff code: {must_not!r}", failures)
+    for must in ("class ReleaseLogStore {", "struct ReleaseLogStore final {", "class YUZU_API ReleaseLogStore {",
+                 '#include "release_log_store.hpp"', "CREATE TABLE IF NOT EXISTS release_log (id BIGINT)"):
+        if not _ere_matches(must):
+            _fail(f"release_log_store regex misses a plausible real release-log store: {must!r}", failures)
 
     # 4. every gate-set cell has a substrate marker (UP-2 / hp-1) — a markerless gate
     #    cell can be flipped green with no RULE 2 absence check.
