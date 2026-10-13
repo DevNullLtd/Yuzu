@@ -271,7 +271,7 @@ CustomPropertiesStore::get_properties(const std::string& agent_id) const {
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_props_sampler))
             spdlog::warn("CustomPropertiesStore::get_properties: query failed: {}",
-                        PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     std::vector<CustomProperty> results;
@@ -313,7 +313,7 @@ CustomPropertiesStore::get_property(const std::string& agent_id, const std::stri
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_prop_sampler))
             spdlog::warn("CustomPropertiesStore::get_property: query failed: {}",
-                        PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     if (PQntuples(res.get()) == 0)
@@ -360,7 +360,7 @@ CustomPropertiesStore::get_property_map(const std::string& agent_id) const {
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_map_sampler))
             spdlog::warn("CustomPropertiesStore::get_property_map: query failed: {}",
-                        PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     std::unordered_map<std::string, std::string> result;
@@ -398,7 +398,7 @@ CustomPropertiesStore::get_values_for_keys(const std::vector<std::string>& keys)
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, g_values_for_keys_sampler))
             spdlog::warn("CustomPropertiesStore::get_values_for_keys: query failed: {}",
-                        PQerrorMessage(lease.get()));
+                         ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     const int rows = PQntuples(res.get());
@@ -487,7 +487,7 @@ bool CustomPropertiesStore::delete_property(const std::string& agent_id, const s
         std::vector<std::string>{agent_id, key});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("CustomPropertiesStore::delete_property: query failed: {}",
-                      PQerrorMessage(lease.get()));
+                      ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return false;
     }
     return PQntuples(res.get()) > 0;
@@ -512,7 +512,8 @@ void CustomPropertiesStore::delete_all_properties(const std::string& agent_id) {
         std::vector<std::string>{agent_id});
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::warn("CustomPropertiesStore::delete_all_properties: delete failed for agent={}: {}",
-                     ::yuzu::log_id_token(agent_id), PQerrorMessage(lease.get()));
+                     ::yuzu::log_id_token(agent_id),
+                     ::yuzu::log_key_token(PQerrorMessage(lease.get())));
     }
 }
 
@@ -535,7 +536,7 @@ std::vector<CustomPropertySchema> CustomPropertiesStore::list_schemas() const {
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("CustomPropertiesStore::list_schemas: query failed: {}",
-                      PQerrorMessage(lease.get()));
+                      ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return results;
     }
     const int rows = PQntuples(res.get());
@@ -571,7 +572,7 @@ CustomPropertiesStore::get_schema(const std::string& key) const {
         std::vector<std::string>{key});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("CustomPropertiesStore::get_schema: query failed: {}",
-                      PQerrorMessage(lease.get()));
+                      ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     if (PQntuples(res.get()) == 0)
@@ -643,7 +644,7 @@ CustomPropertiesStore::delete_schema(const std::string& key) {
         std::vector<std::string>{key});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("CustomPropertiesStore::delete_schema: query failed: {}",
-                      PQerrorMessage(lease.get()));
+                      ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     return PQntuples(res.get()) > 0;

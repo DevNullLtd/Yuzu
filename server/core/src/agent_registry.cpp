@@ -27,6 +27,8 @@
 #include "tag_store.hpp"
 #include "web_utils.hpp"
 
+#include <yuzu/log_token.hpp>
+
 namespace yuzu::server::detail {
 
 // Bring html_escape into scope for the HTML rendering methods.
@@ -57,6 +59,10 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     session->os = info.platform().os();
     session->arch = info.platform().arch();
     session->agent_version = info.agent_version();
+    // Every log line in this function prints the agent-supplied id and free text neutralised,
+    // never raw (CWE-117); the gateway path reaches here without the direct path's enrollment
+    // checks.
+    const std::string safe_agent_id = ::yuzu::log_id_token(info.agent_id());
     // Ingest filter (#3295): validated and non-service, mirroring TagStore's
     // own sync_agent_tags gate (tag_store.cpp) so a service claim or an
     // oversized/malformed key never reaches scope-DSL evaluation via the
@@ -65,7 +71,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         if (authz::is_service_tag_key(k)) {
             spdlog::info("AgentRegistry::register_agent({}): dropping self-reported "
                          "'service' tag from session scopable_tags (#3295)",
-                         info.agent_id());
+                         safe_agent_id);
             // Gate 6 hardening: the store-side purge (tag_store.cpp,
             // sync_agent_tags) has yuzu_server_tag_store_agent_service_purge_total;
             // this session-level drop is the ONLY signal for a gateway-proxied
@@ -78,7 +84,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         if (!TagStore::validate_key(k) || !TagStore::validate_value(v)) {
             spdlog::info("AgentRegistry::register_agent({}): dropping invalid scopable_tag "
                          "'{}' at ingest",
-                         info.agent_id(), k);
+                         safe_agent_id, ::yuzu::log_key_token(k));
             continue;
         }
         session->scopable_tags[k] = v;
@@ -141,7 +147,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         if (!revoked) {
             spdlog::error("AgentRegistry::register_agent: device token revoke-by-device failed "
                           "for '{}', refusing registration: {}",
-                          info.agent_id(), revoked.error());
+                          safe_agent_id, revoked.error());
             metrics_
                 .counter("yuzu_agents_registration_refused_total",
                          {{"reason", "device_token_revoke_failed"}})
@@ -183,7 +189,7 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
             spdlog::warn("AgentRegistry::register_agent: superseded by a concurrent "
                          "registration for '{}', not installing (this call's revoke already "
                          "committed)",
-                         info.agent_id());
+                         safe_agent_id);
             metrics_
                 .counter("yuzu_agents_registration_refused_total",
                          {{"reason", "superseded_by_concurrent_registration"}})
@@ -197,8 +203,8 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
     metrics_.counter("yuzu_agents_registered_total").increment();
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
     bus_.publish("agent-online", info.agent_id());
-    spdlog::info("Agent registered: id={}, hostname={}, plugins={}", info.agent_id(),
-                 info.hostname(), info.plugins_size());
+    spdlog::info("Agent registered: id={}, hostname='{}', plugins={}", safe_agent_id,
+                 ::yuzu::log_key_token(info.hostname()), info.plugins_size());
     return session;
 }
 

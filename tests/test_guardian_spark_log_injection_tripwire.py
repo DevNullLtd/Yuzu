@@ -142,6 +142,9 @@ argument text, not data flow, so an id reaching the log through a variable it ca
 trace to a request accessor, or a new spelling, is not seen. The exact scope and limits
 are in the block comment above find_agent_id_violations_in_text(). FILE_BASENAME_RE and
 the pattern check above are unchanged and do not apply to these four files.
+A third, narrower rule (PQ_ERROR_FILES) requires every spdlog:: argument that contains a
+PQerrorMessage( call in custom_properties_store.cpp to be wrapped (libpq error text can quote
+the claimed agent id).
 
 Wired into tests/meson.build (suite 'docs') and .github/workflows/docs-lint.yml,
 same precedent shape as test_no_connless_pq_escape.py and
@@ -936,6 +939,26 @@ def find_agent_id_violations_in_text(
     return out
 
 
+# Third, narrower rule: libpq error text (`PQerrorMessage`) can quote the statement
+# parameters, i.e. the claimed agent id, so in the custom-properties store every spdlog
+# argument that contains a `PQerrorMessage(` call must be wholly one wrap call. Lexical,
+# like the check above; it covers only this one file.
+PQ_ERROR_FILES: tuple[str, ...] = ("server/core/src/custom_properties_store.cpp",)
+
+
+def find_pq_error_violations_in_text(text: str) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    for pos, stmt in find_spdlog_statements_with_pos(text):
+        parsed = parse_call(stmt)
+        if parsed is None:
+            continue
+        for arg in split_top_level_args(parsed[1]):
+            if "PQerrorMessage(" in arg and not argument_is_wrapped(arg):
+                out.append((text.count("\n", 0, pos) + 1, stmt))
+                break
+    return out
+
+
 # ---------------------------------------------------------------------------
 # _selfcheck()
 # ---------------------------------------------------------------------------
@@ -1254,6 +1277,16 @@ def _selfcheck() -> None:
         if aflagged(src, always):
             raise SystemExit(f"selfcheck: unexpected claimed-agent-id violation: {src!r}")
 
+    # 9. The libpq-error rule (find_pq_error_violations_in_text).
+    pq_must_match = 'spdlog::warn("query failed: {}", PQerrorMessage(lease.get()));'
+    if not find_pq_error_violations_in_text(pq_must_match):
+        raise SystemExit(f"selfcheck: expected a PQerrorMessage violation: {pq_must_match!r}")
+    pq_must_not = (
+        'spdlog::warn("query failed: {}", ::yuzu::log_key_token(PQerrorMessage(lease.get())));'
+    )
+    if find_pq_error_violations_in_text(pq_must_not):
+        raise SystemExit(f"selfcheck: unexpected PQerrorMessage violation: {pq_must_not!r}")
+
 
 # ---------------------------------------------------------------------------
 # main
@@ -1295,6 +1328,15 @@ def main() -> int:
         for line_no, stmt in find_agent_id_violations_in_text(text, always_bare):
             snippet = " ".join(stmt.split())[:160]
             agent_hits.append(f"{rel}:{line_no}: {snippet}")
+    for rel in PQ_ERROR_FILES:
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            agent_hits.append(f"{rel}: file listed in PQ_ERROR_FILES does not exist")
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for line_no, stmt in find_pq_error_violations_in_text(text):
+            snippet = " ".join(stmt.split())[:160]
+            agent_hits.append(f"{rel}:{line_no}: {snippet}")
     rc = 0
     if hits:
         print(
@@ -1306,8 +1348,9 @@ def main() -> int:
         rc = 1
     if agent_hits:
         print(
-            "FAIL: spdlog:: call prints a request-derived agent id unwrapped (#5513 "
-            "CWE-117 log-injection tripwire). Wrap with ::yuzu::log_id_token(...) "
+            "FAIL: spdlog:: call prints a request-derived agent id or raw libpq error text "
+            "unwrapped (#5513 CWE-117 log-injection tripwire). Wrap with ::yuzu::log_id_token(...) "
+            "/ ::yuzu::log_key_token(...) "
             "(common/include/yuzu/log_token.hpp):"
         )
         print("\n".join(agent_hits))
