@@ -2733,9 +2733,9 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   `upsert_rule_status` (`guard.errored` versus a delayed `guard.compliant`), can leave the
   server holding a false `compliant`. #5690 is open and gates the flip. Correlate with
   `yuzu.guardian_send_stalls` / send exceptions on the same endpoint
-  (`docs/user-manual/metrics.md`). The gauge is an unlabelled fleet sum, so until the per-agent
-  axis (`docs/prometheus/yuzu-alerts.yml` prerequisite (a)) exists and there is no operator surface
-  for per-agent heartbeat tags yet, search collected `agent.log` for `launch hold released`
+  (`docs/user-manual/metrics.md`). The gauge is an unlabelled fleet sum and there is no
+  operator surface for per-agent heartbeat tags yet (`docs/prometheus/yuzu-alerts.yml`
+  prerequisite (a)); until one exists, search collected `agent.log` for `launch hold released`
   (logged once per lane per process by a per-lane `logged_release` latch; later releases are
   count-only); that first-release line is the per-endpoint evidence.
 - Ruling (owner, 2026-10-12): the bounded symmetric hold is accepted as #3972's "or
