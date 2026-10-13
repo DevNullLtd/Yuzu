@@ -342,6 +342,11 @@ TEST_CASE("instruction_fragment_routes: GET renders the definitions table, escap
     REQUIRE(admin_res);
     CHECK(admin_res->body.find("New Definition") != std::string::npos);
     CHECK(admin_res->body.find("data-def-id=") != std::string::npos); // Edit button present
+    // The restyled Delete button keeps its htmx wiring: the DELETE route and the confirm prompt.
+    CHECK(admin_res->body.find("hx-delete=\"/api/instructions/" + *created + "\"") !=
+          std::string::npos);
+    CHECK(admin_res->body.find("hx-confirm=\"Delete definition 'Get Hostname'?\"") !=
+          std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

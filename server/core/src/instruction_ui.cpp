@@ -147,6 +147,13 @@ textarea{height:auto;padding:8px 10px;min-height:84px;resize:vertical;font-famil
 .per-agent-table-wrap,.per-agent-responses-wrap{grid-column:1;min-width:0}
 .per-agent-table th,.per-agent-table td,.per-agent-responses-table th,.per-agent-responses-table td{padding:6px 12px;font-size:13px}
 .per-agent-table td{vertical-align:middle}
+/* yuzu.css sets white-space:nowrap on `.panel table td` / `.tw table td`. In the drawer that runs long errors under
+   the sidebar and lets the duration text spill over the Error column, so drawer cells wrap again and agent ids
+   (td>code) stay on one line. It also pushed a long approval scope (and the Approve/Reject buttons) out of view. */
+.exec-table .exec-detail td{white-space:normal}
+.exec-table .exec-detail td>code{white-space:nowrap}
+.exec-table .exec-detail td td:last-child{overflow-wrap:anywhere}
+#tab-approvals td>code{white-space:normal}
 .duration-bar{height:6px;border-radius:2px;display:inline-block;vertical-align:middle;min-width:1px}
 .duration-bar--succeeded{background:var(--ok)}
 .duration-bar--failed{background:var(--bad)}
