@@ -397,8 +397,10 @@ TEST_CASE("run: a late result after Timeout is delivered to on_abandoned exactly
             return 99;
         },
         [abandoned_calls, abandoned_value](int&& v) {
-            abandoned_calls->fetch_add(1);
+            // Publish the value BEFORE the count the test spins on, so a reader that
+            // observed the count never sees the value still at its sentinel.
             abandoned_value->store(v);
+            abandoned_calls->fetch_add(1);
         });
     CHECK_FALSE(r.has_value());
     CHECK(r.error() == IoFailure::Timeout);
@@ -434,8 +436,8 @@ TEST_CASE("run: a late FAILED (not thrown) result also reaches on_abandoned, cou
             return std::unexpected(std::string{"backend arm failed"});
         },
         [abandoned_calls, abandoned_had_value](T&& v) {
-            abandoned_calls->fetch_add(1);
             abandoned_had_value->store(v.has_value());
+            abandoned_calls->fetch_add(1);
         });
     CHECK_FALSE(r.has_value());
     CHECK(r.error() == IoFailure::Timeout);
