@@ -117,22 +117,22 @@ struct RevokeResult {
 /// wrapper; downloads link to the public REST endpoints.
 std::string render_ca_fragment(CaStore* ca_store) {
     if (!ca_store || !ca_store->is_open())
-        return "<span style=\"color:#484f58\">Certificate authority unavailable.</span>";
+        return "<span class=\"muted\">Certificate authority unavailable.</span>";
     auto root_or_err = ca_store->get_root();
     if (!root_or_err)
-        return "<span style=\"color:#f85149\">Certificate authority store error.</span>";
+        return "<span class=\"feedback-error\">Certificate authority store error.</span>";
     auto& root = *root_or_err;
     std::string html;
     if (!root) {
-        html += "<p style=\"color:#484f58\">No internal CA on this install (operator-supplied "
+        html += "<p class=\"muted\">No internal CA on this install (operator-supplied "
                 "certificates, or TLS disabled).</p>";
         return html;
     }
 
-    html += "<div style=\"margin-bottom:0.75rem;font-size:0.8rem\">"
+    html += "<div style=\"margin-bottom:0.75rem\">"
             "<div><strong>Algorithm:</strong> " +
             html_escape(root->algo) + "</div>"
-            "<div><strong>SHA-256:</strong> <code style=\"font-size:0.7rem\">" +
+            "<div><strong>SHA-256:</strong> <code>" +
             html_escape(root->fingerprint_sha256) + "</code></div>"
             "<div><strong>Expires:</strong> " + fmt_epoch(root->not_after) + " UTC</div>"
             "<div><strong>Trust mode:</strong> <span class=\"role-badge " +
@@ -141,9 +141,9 @@ std::string render_ca_fragment(CaStore* ca_store) {
             "</span></div>"
             "</div>"
             "<div style=\"margin-bottom:1rem;display:flex;gap:0.5rem;flex-wrap:wrap\">"
-            "<a class=\"btn\" style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+            "<a class=\"btn btn-secondary btn-sm\" "
             "href=\"/api/v1/ca/root\">Download CA certificate</a>"
-            "<a class=\"btn\" style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+            "<a class=\"btn btn-secondary btn-sm\" "
             "href=\"/api/v1/ca/crl\">Download CRL</a>"
             "</div>";
 
@@ -154,64 +154,62 @@ std::string render_ca_fragment(CaStore* ca_store) {
     // operator-controlled value is echoed back into this fragment, so there is no
     // injection surface here (the PEMs go to the wrapper, not into the HTML).
     if (root->mode == CaMode::Subordinate) {
-        html += "<details style=\"margin-bottom:1rem;font-size:0.78rem\">"
+        html += "<details style=\"margin-bottom:1rem\">"
                 "<summary style=\"cursor:pointer\">Enterprise subordination</summary>"
-                "<p style=\"color:var(--mds-color-theme-text-tertiary);margin:0.4rem 0\">"
+                "<p class=\"hint\" style=\"margin:0.4rem 0\">"
                 "This issuing CA is an intermediate signed by your enterprise root; issued "
                 "certificates chain to that root. To re-subordinate, export a fresh CSR below and "
                 "import the newly signed intermediate.</p>";
     } else {
-        html += "<details style=\"margin-bottom:1rem;font-size:0.78rem\">"
+        html += "<details style=\"margin-bottom:1rem\">"
                 "<summary style=\"cursor:pointer\">Subordinate this CA to your enterprise root "
                 "(optional)</summary>"
-                "<p style=\"color:var(--mds-color-theme-text-tertiary);margin:0.4rem 0\">"
+                "<p class=\"hint\" style=\"margin:0.4rem 0\">"
                 "Export this CA's signing request, have your enterprise root sign it as a "
                 "subordinate CA (basicConstraints CA:TRUE), then import the signed intermediate "
                 "plus the parent chain. The signing key is unchanged, so already-issued "
                 "certificates keep working.</p>";
     }
-    html += "<a class=\"btn\" style=\"padding:0.2rem 0.6rem;font-size:0.7rem;margin-bottom:0.5rem;"
-            "display:inline-block\" href=\"/api/v1/ca/root-csr\">Download CA signing request "
+    html += "<a class=\"btn btn-secondary btn-sm\" style=\"margin-bottom:0.5rem\" "
+            "href=\"/api/v1/ca/root-csr\">Download CA signing request "
             "(CSR)</a>"
             "<form hx-post=\"/api/settings/ca/import-chain\" hx-target=\"#ca-section\" "
             "hx-swap=\"innerHTML\" "
             "hx-confirm=\"Switch this CA's trust root to the imported enterprise chain?\">"
             "<textarea name=\"intermediate_pem\" rows=\"4\" "
             "placeholder=\"-----BEGIN CERTIFICATE----- (enterprise-signed intermediate over THIS "
-            "CA's key)\" style=\"width:100%;font-family:monospace;font-size:0.68rem;"
-            "margin-bottom:0.3rem\"></textarea>"
+            "CA's key)\" style=\"width:100%;margin-bottom:0.3rem\"></textarea>"
             "<textarea name=\"chain_pem\" rows=\"4\" "
             "placeholder=\"-----BEGIN CERTIFICATE----- (parent chain: enterprise root [+ "
-            "intermediates])\" style=\"width:100%;font-family:monospace;font-size:0.68rem;"
-            "margin-bottom:0.3rem\"></textarea>"
-            "<button class=\"btn\" style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+            "intermediates])\" style=\"width:100%;margin-bottom:0.3rem\"></textarea>"
+            "<button class=\"btn btn-secondary\" "
             "type=\"submit\">Import signed chain</button></form></details>";
 
     constexpr int kPanelLimit = 500;
     auto issued_or_err = ca_store->list_issued(kPanelLimit, 0);
     if (!issued_or_err)
-        return html + "<p style=\"color:#f85149\">Certificate inventory unavailable "
+        return html + "<p class=\"feedback-error\">Certificate inventory unavailable "
                       "(store error).</p>";
     auto& issued = *issued_or_err;
     html += "<table class=\"user-table\">"
             "<thead><tr><th>Serial</th><th>Subject</th><th>Purpose</th><th>Expires</th>"
             "<th>Status</th><th></th></tr></thead><tbody>";
     if (issued.empty()) {
-        html += "<tr><td colspan=\"6\" style=\"color:#484f58\">No certificates issued yet</td></tr>";
+        html += "<tr><td colspan=\"6\" class=\"muted\">No certificates issued yet</td></tr>";
     } else {
         for (const auto& c : issued) {
             const bool revoked = c.status == CertStatus::Revoked;
             const std::string short_serial =
                 c.serial_hex.size() > 16 ? c.serial_hex.substr(0, 16) + "…" : c.serial_hex;
-            html += "<tr><td><code style=\"font-size:0.7rem\" title=\"" +
+            html += "<tr><td><code title=\"" +
                     html_escape(c.serial_hex) + "\">" + html_escape(short_serial) +
                     "</code></td>"
                     "<td>" + html_escape(c.subject) + "</td>"
                     "<td>" + html_escape(c.purpose) + "</td>"
-                    "<td style=\"font-size:0.75rem\">" + fmt_epoch(c.not_after) +
+                    "<td>" + fmt_epoch(c.not_after) +
                     "</td>"
                     "<td><span class=\"role-badge " +
-                    (revoked ? "role-user\">Revoked" : "role-admin\">Active") + "</span></td><td>";
+                    (revoked ? "role-user\">Revoked" : "role-ok\">Active") + "</span></td><td>";
             if (!revoked) {
                 // Carry the serial in a hidden input rather than a JSON hx-vals
                 // attribute: simpler, and it avoids JSON-inside-an-HTML-attribute
@@ -232,9 +230,8 @@ std::string render_ca_fragment(CaStore* ca_store) {
                         // decommission) — stored as revocation_reason.
                         "<input type=\"text\" name=\"reason\" maxlength=\"256\" "
                         "placeholder=\"reason (optional)\" "
-                        "style=\"padding:0.15rem 0.4rem;font-size:0.7rem;width:9rem\">"
+                        "style=\"width:9rem\">"
                         "<button class=\"btn btn-danger\" "
-                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
                         "type=\"submit\">Revoke</button></form>";
             }
             html += "</td></tr>";
@@ -245,13 +242,12 @@ std::string render_ca_fragment(CaStore* ca_store) {
     // more — say so + point at the paginated REST endpoint, so certs beyond the
     // cap aren't silently invisible/unrevocable from the dashboard.
     if (static_cast<int>(issued.size()) >= kPanelLimit) {
-        html += "<p style=\"font-size:0.72rem;color:#d29922;margin-top:0.5rem\">Showing the first " +
+        html += "<p class=\"section-note\" style=\"color:var(--warn)\">Showing the first " +
                 std::to_string(kPanelLimit) +
                 " certificates. Use <code>GET /api/v1/ca/issued?offset=</code> to page through the "
                 "full inventory.</p>";
     }
-    html += "<p style=\"font-size:0.72rem;color:var(--mds-color-theme-text-tertiary);"
-            "margin-top:0.75rem\">To replace the default certificates with operator- or "
+    html += "<p class=\"section-note\">To replace the default certificates with operator- or "
             "HSM-issued material, use <strong>TLS / mTLS Configuration</strong> above. "
             "Revocation takes effect immediately server-side; the public CRL is republished "
             "automatically.</p>";
@@ -982,7 +978,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                           "cross-origin or header-less dashboard revoke refused"))
                 res.set_header("Sec-Audit-Failed", "true");
             res.status = 403;
-            res.set_content("<span style=\"color:#f85149\">Cross-origin request refused.</span>",
+            res.set_content("<span class=\"feedback-error\">Cross-origin request refused.</span>",
                             "text/html; charset=utf-8");
             return;
         }
@@ -993,7 +989,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         // panel until reload — #1241 happy/UP-6).
         auto error_panel = [&](int status, const std::string& msg) {
             res.status = status;
-            res.set_content("<div class=\"alert alert-danger\" style=\"margin-bottom:0.75rem\">" +
+            res.set_content("<div class=\"alert alert-error\" style=\"margin-bottom:0.75rem\">" +
                                 html_escape(msg) + "</div>" + render_ca_fragment(ca_store),
                             "text/html; charset=utf-8");
         };
@@ -1050,7 +1046,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                           res.set_header("Sec-Audit-Failed", "true");
                       res.status = 403;
                       res.set_content(
-                          "<span style=\"color:#f85149\">Cross-origin request refused.</span>",
+                          "<span class=\"feedback-error\">Cross-origin request refused.</span>",
                           "text/html; charset=utf-8");
                       return;
                   }
@@ -1059,7 +1055,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                   auto error_panel = [&](int status, const std::string& msg) {
                       res.status = status;
                       res.set_content(
-                          "<div class=\"alert alert-danger\" style=\"margin-bottom:0.75rem\">" +
+                          "<div class=\"alert alert-error\" style=\"margin-bottom:0.75rem\">" +
                               html_escape(msg) + "</div>" + render_ca_fragment(ca_store),
                           "text/html; charset=utf-8");
                   };
