@@ -1903,7 +1903,7 @@ TEST_CASE("#3980: while the compliance lane still HAS a head, an uncounted in-fl
     CHECK(f.worker.send_stall_count() == 0);
 }
 
-TEST_CASE("CH-6: stop() raced against the loop-tail orphan reclaim never hangs or leaks a send "
+TEST_CASE("#3972 stress: stop() raced against the loop-tail orphan reclaim never hangs or leaks a send "
           "worker",
           "[spark][guardian][drain][.stress]") {
     // The #3980 probe reaps a finished orphan from the drain thread's loop tail, and stop()
@@ -1914,7 +1914,9 @@ TEST_CASE("CH-6: stop() raced against the loop-tail orphan reclaim never hangs o
     // yields a random number of times, so over the run the stop lands before, inside and after
     // the reclaim. Event-driven throughout: no sleep, only the barrier and yields. The 200 ms
     // offer wait inside each fixture is the iteration floor (an orphan cannot exist earlier).
-    // Hidden: it is a stress run (~100 x 0.25 s), not a per-commit pin; run it by name.
+    // Hidden: it is a stress run (~100 x 0.25 s), not a per-commit pin; run it by its new
+    // name ("#3972 stress: ..."). A positive tag filter such as '[drain]' includes the hidden
+    // cases (this one and the chaos case); append ~[.] to skip them (about +25 s together).
     constexpr int kIterations = 100;
     const auto seed = std::random_device{}();
     INFO("seed " << seed);
@@ -1958,7 +1960,7 @@ TEST_CASE("CH-6: stop() raced against the loop-tail orphan reclaim never hangs o
         CHECK(spin_until([&] { return f.worker.active_send_workers() == 0; }, 5s));
         reclaimed_by_end += !f.compliance().in_flight_snapshot().in_flight;
     }
-    WARN("CH-6: " << reclaimed_by_end << " of " << kIterations
+    WARN("#3972 stress: " << reclaimed_by_end << " of " << kIterations
                   << " iterations had the orphan reclaimed before stop() returned");
 }
 
@@ -1994,7 +1996,7 @@ struct HoldSink {
     std::condition_variable cv;
     int permits[2]{-1, -1};                 ///< per lane; -1 = open, 0 = park, n = let n through
     std::chrono::milliseconds delay[2]{0ms, 0ms};
-    std::atomic<bool> throws[2]{false, false}; ///< atomic: CH-1 clears it while the worker runs
+    std::atomic<bool> throws[2]{false, false}; ///< atomic: the #3972 chaos case clears it while the worker runs
     bool link_up{true};                     ///< false: every send Retains (never logged as started)
     std::size_t retained[2]{0, 0};
     std::vector<Ev> log;
@@ -2599,7 +2601,9 @@ TEST_CASE("#3972 T7: a permanently throwing lifecycle head holds compliance for 
 TEST_CASE("CH-4: the hold clock is per LANE and cumulative - a head swap inside the episode "
           "does not restart it",
           "[spark][guardian][drain][order]") {
-    // PINS THE INTENDED SEMANTICS (design v3 2.3 / 2.7, the UP-3 bound), not an accident: the
+    // PINS THE INTENDED SEMANTICS (the GUARANTEE comment in
+    // GuardianSparkRuntime::drain_bounded(), guardian_spark_runtime.cpp, and the comment in
+    // GuardianOutboxDrainWorker::wrapped_send()), not an accident: the
     // clock measures how long the LANE has been continuously denied, from its first denial in
     // the episode. It is reset only by (a) no blocker, (b) the lane EMPTYING (epoch change) or
     // (c) a release; wrapped_send() sets it on the first denial only (`if (!h.held_since)`) and
@@ -2633,9 +2637,10 @@ TEST_CASE("CH-4: the hold clock is per LANE and cumulative - a head swap inside 
     CHECK(released->rule == "b");
     CHECK(released->at - t0 >= H); // never before a full cumulative H
     // The remainder, not a fresh H: a clock restarted by the swap would release >= H after it.
-    // Expected gap: the rest of the episode plus at most one pass (~0.2 s each); 0.75 H leaves
-    // room either side of a fresh H (>= 1 H) and of that expectation.
-    CHECK(released->at - t_swap < H * 3 / 4);
+    // Expected gap: the rest of the episode plus at most one pass (~0.2 s each); 0.875 H leaves
+    // room either side of a fresh H (>= 1 H) and of that expectation. (A mutation that restarts
+    // the clock on a head change releases about 1.3 s after the swap, so it still fails.)
+    CHECK(released->at - t_swap < H * 7 / 8);
     CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
 }
 
@@ -2828,10 +2833,12 @@ struct ChaosThreads {
 
 } // namespace
 
-TEST_CASE("CH-1: compound jam - a throwing lifecycle head, steady verdicts, a flapping link and "
+TEST_CASE("#3972 chaos: compound jam - a throwing lifecycle head, steady verdicts, a flapping link and "
           "arm/detach churn never reorder the wire without a counted release",
           "[spark][guardian][drain][order][.chaos]") {
-    // Hidden: ~5 s of wall clock by design (run it by name). H is small (150 ms) and the
+    // Hidden: ~5 s of wall clock by design (run it by its new name, "#3972 chaos: ..."). A
+    // positive tag filter such as '[drain]' or '[order]' includes the hidden cases; append
+    // ~[.] to skip them. H is small (150 ms) and the
     // link-down phases (300 ms) outlast it, so releases fire under every ingredient at once.
     //
     // Oracles (the log is the sink's ordered start/end record; "written" = the send's END, which
@@ -2980,8 +2987,10 @@ TEST_CASE("CH-1: compound jam - a throwing lifecycle head, steady verdicts, a fl
 
 TEST_CASE("#3972: the production defaults of the cross-lane hold are 1 s and 64 launches",
           "[spark][guardian][drain][order]") {
-    // The HELP text, metrics.md, the flip-gate doc and the changelog fragment hardcode these
-    // numbers (see the comment at the constants); this is the tripwire that makes a change here
+    // The HELP text, metrics.md, the flip-gate doc, the design doc
+    // (docs/yuzu-guardian-design-v1.1.md), the GUARANTEE comment in
+    // GuardianSparkRuntime::drain_bounded() (guardian_spark_runtime.cpp) and the changelog
+    // fragment hardcode these numbers (see the comment at the constants); this is the tripwire that makes a change here
     // visible to whoever edits them.
     CHECK(kGuardianCrossLaneOrderHold == 1000ms);
     CHECK(kGuardianCrossLaneReleaseAllowance == 64);

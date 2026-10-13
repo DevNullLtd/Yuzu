@@ -380,10 +380,11 @@ public:
     // (test_guardian_outbox_drain_worker.cpp): that test's whole point is proving the
     // loop re-arms a forced page from its OWN internal logic with NO external wake, and
     // an unrelated wake source let it pass for the wrong reason. Fixed instead with
-    // has_in_flight_send() (below) plus a WAIT clamp on the drain worker's own side
-    // (guardian_outbox_drain_worker.cpp's loop()) - the drain worker polls it after
-    // every pass and shortens its OWN wait while anything is in flight, rather than this
-    // class waking the drain worker itself. Closes the same cadence cliff (a send
+    // a WAIT clamp on the drain worker's own side (guardian_outbox_drain_worker.cpp's
+    // loop(), fed by in_flight_snapshot() below; has_in_flight_send() is used by tests,
+    // the drain loop uses in_flight_snapshot()) - the drain worker reads it after every
+    // pass and shortens its OWN wait while anything is in flight, rather than this class
+    // waking the drain worker itself. Closes the same cadence cliff (a send
     // finishing between offer()'s bounded wait and the drain worker's periodic bound
     // used to wait out the whole bound before being noticed) without adding a wake
     // source, so R4 is untouched.
@@ -405,8 +406,7 @@ public:
     /// in_flight, so this reads true in either (#3953 item 3: the caller cannot
     /// tell them apart from offer()'s return value alone, since wrapped_send()'s
     /// `.value_or(SendResult::Retain)` collapses both to the same value). Used by
-    /// the drain worker's loop() to re-check sooner than the full periodic bound
-    /// while something is genuinely in flight on this lane.
+    /// tests; the drain loop uses in_flight_snapshot().
     [[nodiscard]] bool has_in_flight_send() const {
         std::lock_guard<std::mutex> lk{state_->mu};
         return state_->in_flight;

@@ -3025,7 +3025,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
 
     // Guardian journal rollup (#2298 gate 3). Families were cleared at the top, so a
     // signal NOBODY reported this cycle stays ABSENT - never a fabricated 0. On a
-    // healthy, quiescent or inert fleet that is ALL 30, which is the correct reading:
+    // healthy, quiescent or inert fleet that is ALL 33, which is the correct reading:
     // the journal has nothing to report, and "nothing to report" must not be
     // presentable as "checked and clean".
     for (std::size_t i = 0; i < kNGuardianJournalMetrics; ++i)

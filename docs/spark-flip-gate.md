@@ -2722,8 +2722,8 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 **#3972** (cross-lane wire reordering, #3953 item 5) - implemented in PR #TBD, awaiting merge and flip-time soak (merge SHA/date: fill post-merge); residual #5690
 - Detection signal: `yuzu.guardian_send_order_hold_releases` heartbeat tag /
   `yuzu_fleet_guardian_send_order_hold_releases` (monitor-only, sparse: absent until an agent
-  reports a nonzero count; one increment per bounded reordering window opened, both lanes
-  summed; no alert rule - the family's monitor-only reasons are in the `yuzu-guardian-journal`
+  reports a nonzero count; one increment per hold expiry (a bounded overtake permission; counted even if that call
+  launches nothing), both lanes summed; no alert rule - the family's monitor-only reasons are in the `yuzu-guardian-journal`
   preamble of `docs/prometheus/yuzu-alerts.yml`).
 - Operator action: a nonzero count means that, on at least one endpoint, a hold EXPIRED and the
   lane was permitted to overtake an older entry in the other lane, so events may have reached
@@ -2734,13 +2734,16 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   server holding a false `compliant`. #5690 is open and gates the flip. Correlate with
   `yuzu.guardian_send_stalls` / send exceptions on the same endpoint
   (`docs/user-manual/metrics.md`). The gauge is an unlabelled fleet sum, so until the per-agent
-  axis (`docs/prometheus/yuzu-alerts.yml` prerequisite (a)) exists, identify the endpoint from
-  its own heartbeat tags or its `agent.log` line `launch hold released` (logged once per lane
-  per process by a per-lane `logged_release` latch; later releases are count-only), so that
-  first-release line is the per-endpoint evidence.
-- Ruling: the bounded symmetric hold is accepted as #3972's "or equivalent" (owner ruling,
-  2026-10-12); #3972 is NOT closed "with rationale", and #5690 stays open as the named
-  server-side dependency.
+  axis (`docs/prometheus/yuzu-alerts.yml` prerequisite (a)) exists and there is no operator surface
+  for per-agent heartbeat tags yet, search collected `agent.log` for `launch hold released`
+  (logged once per lane per process by a per-lane `logged_release` latch; later releases are
+  count-only); that first-release line is the per-endpoint evidence.
+- Ruling (owner, 2026-10-12): the bounded symmetric hold is accepted as #3972's "or
+  equivalent". It is weaker than the issue's first criterion (ordering matches enqueue order
+  within a pass), which is NOT met; the gap is carried by #5690, which stays open, so #3972 is
+  not closed on this rationale alone. Recorded in
+  `governance.d/3972-3980-outbox-send-lanes.hGwmA3.jsonl` (finding
+  `g8-owner-ruling-3972-or-equivalent`).
 - Compensating control: the bounded symmetric seq-ordered launch hold in
   `GuardianOutboxDrainWorker::wrapped_send()` (H = 1 s, N = 64, the
   `GuardianMaintenanceConfig` knobs `cross_lane_order_hold` / `cross_lane_release_allowance`);
@@ -2764,14 +2767,14 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   relaunch of the released head consumes one unit), so after reconnect a lane may overtake an
   older entry, bounded by the remaining allowance - the same #5690 residual class;
   (iii) throughput under a persistent jam: sends are single-flight per lane, so the released
-  lane's rate is N / (H + N * t), about 32 per second at t = 16 ms per send, not N / H, and
+  lane's rate is N / (H + N * t), about 32 per second at an illustrative t = 16 ms per send (assumed, not measured), not N / H, and
   every isolated compliance burst behind a jammed older head pays about H once.
 - Owner: not assigned in source material.
 - Milestone: PR #TBD.
-- Revisit trigger: PR-5 (F14 flip) soak. During the first flip soak, graph
-  `send_order_hold_releases`, `send_stalls` and `send_exceptions` per endpoint (agent heartbeat
-  tags / `agent.log`) on the pilot cohort and record the observed values here; the gauge itself
-  is an unlabelled fleet sum. The agent-side hold itself is implemented and awaiting merge.
+- Revisit trigger: PR-5 (F14 flip) soak. During the first flip soak, inspect
+  `send_order_hold_releases`, `send_stalls` and `send_exceptions` per endpoint on the pilot
+  cohort (agent heartbeat tags / `agent.log`) and record the observed values here; the gauge
+  itself is an unlabelled fleet sum. The agent-side hold itself is implemented and awaiting merge.
   Residual #5690 remains a pre-flip register item (C-1 residual (c)). The original `p3-up11-cross-lane-wire-reordering` ledger row's claim
   that drain()'s comment "already discloses this exact residual" was an overclaim (only the
   sequential/next-pass cases were named, not this same-pass mechanism); filing #3972 rather

@@ -314,15 +314,14 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "- see the alerting note; a nonzero value means at least one endpoint's outbox "
      "delivery is running slow, not necessarily failing"},
     {"yuzu.guardian_send_order_hold_releases", "yuzu_fleet_guardian_send_order_hold_releases",
-     "Fleet sum of GuardianOutboxDrainWorker cross-lane order-hold RELEASES (#3972, either "
-     "lane): a lane held behind an older entry in the other lane waited out the hold (1 s) "
-     "and was permitted to overtake it, up to 64 launches; events may have reached the "
-     "stream out of enqueue order (a release is counted even if the call launches nothing). "
-     "Not a loss, but a later-launched sender overtaking an older one can, with the "
-     "server's same-second >= tie in upsert_rule_status, keep a false compliant (#5690, "
-     "open, gates the flip). MONITOR-ONLY - see the alerting note; correlate with "
-     "send_stalls / send_exceptions on the same endpoint, which is what usually caused "
-     "the hold"},
+     "Fleet sum of drain-worker cross-lane order-hold RELEASES (#3972, either lane): a lane "
+     "that waited out the 1 s hold behind an older entry in the other lane may overtake it "
+     "(up to 64 launches), so events may reach the stream out of order (counted even if "
+     "nothing launches). Not a loss, but an overtaking sender can, through the "
+     "server's same-second timestamp tie (guard.errored versus a delayed guard.compliant), "
+     "leave a false compliant (#5690, open, a prerequisite for enabling the spark backend). "
+     "MONITOR-ONLY - see the alerting note. Compare send_stalls / send_exceptions; no "
+     "per-agent tag surface yet: search collected agent.log for 'launch hold released'"},
 };
 
 /// Derived with std::size, never a literal and never sizeof-arithmetic: the sibling

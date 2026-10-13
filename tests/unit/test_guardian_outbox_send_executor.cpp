@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1097,7 +1098,7 @@ TEST_CASE("R5: GuardianDetachedWorkerRole clears on every exit path, including a
           "[spark][guardian][send_executor]") {
     // The RAII marker itself, on a thread of its own so a failure cannot leak into the runner's
     // threads: set inside the scope, cleared after a normal exit, cleared after an exception
-    // unwinds through it, and a nested scope does not clear the outer one early.
+    // unwinds through it.
     std::atomic<int> inside{-1}, after_normal{-1}, after_throw{-1}, thrown{0};
     std::thread t([&] {
         {
@@ -1126,10 +1127,11 @@ TEST_CASE("destroying the executor while its detached worker is still parked is 
           "[spark][guardian][send_executor][chaos]") {
     // GuardianOutboxSendExecutor has no destructor of its own: the worker holds the shared State
     // and never `this`. Destroy the executor with the worker CV-parked inside send(), release it,
-    // and wait for the worker's closure (and so its AliveTicket) to be destroyed. ASan/TSan turn
-    // any use of a freed executor or State into a failure; a plain run proves the worker still
-    // completes. The weak_ptr is the worker-finished signal: the executor cannot be asked once
-    // it is gone, and the worker's closure holds the only strong reference.
+    // and wait for the send capture to be destroyed. ASan/TSan turn any use of a freed executor
+    // or State into a failure; a plain run proves the worker still completes its send. The
+    // weak_ptr expiring means only that the send capture is destroyed (it is destroyed before
+    // the worker's ticket and state reference), not that the worker has finished: the executor
+    // cannot be asked once it is gone, and the send capture holds the only strong reference.
     struct Gate {
         std::mutex mu;
         std::condition_variable cv;
@@ -1137,7 +1139,7 @@ TEST_CASE("destroying the executor while its detached worker is still parked is 
         std::atomic<int> invocations{0};
     };
     auto gate = std::make_shared<Gate>();
-    std::weak_ptr<int> worker_closure; // expires when the worker's closure is destroyed
+    std::weak_ptr<int> worker_closure; // expires when the send capture is destroyed
     ScopeExit release_on_exit{[&] {
         {
             std::lock_guard<std::mutex> lk{gate->mu};
@@ -1159,7 +1161,7 @@ TEST_CASE("destroying the executor while its detached worker is still parked is 
             return SendResult::Sent;
         };
         CHECK_FALSE(exec->offer(lifecycle_entry("e1"), parked, 20ms).has_value());
-    } // `parked` is gone: the worker's closure holds the only remaining reference to the sentinel
+    } // `parked` is gone: the worker's send capture holds the only remaining reference to the sentinel
     REQUIRE(spin_until([&] { return gate->invocations.load() == 1; }));
     CHECK_FALSE(worker_closure.expired());
     CHECK(exec->active_worker_count() == 1);
@@ -1171,6 +1173,6 @@ TEST_CASE("destroying the executor while its detached worker is still parked is 
         gate->open = true;
     }
     gate->cv.notify_all();
-    // The worker publishes into the surviving State, destroys its closure, and exits.
+    // The worker publishes into the surviving State; the send capture is then destroyed.
     CHECK(spin_until([&] { return worker_closure.expired(); }, 5s));
 }

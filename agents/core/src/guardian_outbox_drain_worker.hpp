@@ -203,9 +203,11 @@ inline constexpr std::chrono::milliseconds kGuardianSendRecheckInterval{200};
 /// GuardianMaintenanceConfig knobs below, consumed by wrapped_send()'s symmetric hold.
 /// The values are hardcoded as "1 s" / "64" in the HELP text of
 /// server/core/src/guardian_journal_fleet_tags.hpp, docs/user-manual/metrics.md,
-/// docs/spark-flip-gate.md and changelog.d/3972-guardian-outbox-send-order-hold.fixed.md; they
-/// must move together (the default-pin test in test_guardian_outbox_drain_worker.cpp covers
-/// only these two constants).
+/// docs/spark-flip-gate.md, docs/yuzu-guardian-design-v1.1.md (the "default H = 1 s, N = 64"
+/// sentence), the GUARANTEE comment in GuardianSparkRuntime::drain_bounded()
+/// (guardian_spark_runtime.cpp) and changelog.d/3972-guardian-outbox-send-order-hold.fixed.md;
+/// they must move together (the default-pin test in test_guardian_outbox_drain_worker.cpp
+/// covers only these two constants).
 inline constexpr std::chrono::milliseconds kGuardianCrossLaneOrderHold{1'000};
 inline constexpr std::size_t kGuardianCrossLaneReleaseAllowance{64};
 
@@ -514,8 +516,8 @@ public:
 
     /// #3972: fleet sum of both lanes' hold RELEASES (a lane waited out cross_lane_order_hold
     /// behind an older entry in the other lane and was released to overtake up to
-    /// cross_lane_release_allowance entries). One increment per bounded reordering window
-    /// opened. Relaxed atomics, lock-free: safe to read from the heartbeat thread.
+    /// cross_lane_release_allowance entries). One increment per hold expiry (a bounded
+    /// overtake permission; counted even if that call launches nothing). Relaxed atomics, lock-free: safe to read from the heartbeat thread.
     [[nodiscard]] std::uint64_t cross_lane_order_release_count() const noexcept {
         return hold_[0].releases.load(std::memory_order_relaxed) +
                hold_[1].releases.load(std::memory_order_relaxed);

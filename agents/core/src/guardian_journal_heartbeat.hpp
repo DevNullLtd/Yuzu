@@ -79,8 +79,8 @@ struct GuardianJournalStats {
     // #3972 (GuardianOutboxDrainWorker, both lanes summed). Monitor-only, not a loss channel.
     /// A lane held behind the other lane's older entry waited out cross_lane_order_hold and was
     /// released to overtake up to cross_lane_release_allowance entries. One increment per
-    /// bounded reordering window opened (counted at the expiry decision, even when that call
-    /// launches nothing).
+    /// hold expiry (a bounded overtake permission; counted at the expiry decision, even when
+    /// that call launches nothing).
     std::uint64_t send_order_hold_releases{0};
 };
 
