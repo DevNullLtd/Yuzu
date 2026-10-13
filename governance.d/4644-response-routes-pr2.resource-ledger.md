@@ -1,6 +1,6 @@
 # Resource Ledger: strict numeric-parse sweep, response routes PR2 (branch fix/4644-strict-parse-sweep)
 
-Range `git diff origin/dev...HEAD` (merge-base `00dbb90c0`; 65 commits including this ledger commit, 2 merge commits; counts taken against `origin/dev` as fetched 2026-10-13). The range changes 146 files:
+Range `git diff origin/dev...HEAD` (merge-base `00dbb90c0`; 65 commits through the last code commit `2c12ad369`, plus the ledger commits that record them, 2 merge commits; counts taken against `origin/dev` as fetched 2026-10-13). The range changes 146 files:
 58 under `server/`, 61 under `tests/`, 19 under `docs/`, 6 changelog fragments, and the committed run ledger `governance.d/4644-response-routes-pr2.gZNeXu.jsonl`.
 A Resource Ledger is required on a C++ diff (governance SKILL.md Gate 1).
 
