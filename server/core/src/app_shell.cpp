@@ -108,6 +108,13 @@ std::optional<Found> find_item(std::string_view key) {
 
 constexpr std::string_view kChevron =
     R"(<svg class="shell-cv" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>)";
+constexpr std::string_view kSearchButton =
+    R"(<button class="shell-search" id="shell-search" type="button" aria-keyshortcuts="Control+K">)"
+    R"(<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 4a7 7 0 100 14 7 7 0 000-14z M21 21l-4.3-4.3"/></svg>)"
+    R"(<span>Search devices, instructions, help</span><kbd>Ctrl K</kbd></button>)";
+// Hidden until the first /api/health answer fills the count (kShellScript).
+constexpr std::string_view kOnlineCounter =
+    R"(<span class="shell-live" id="shell-online" hidden><i></i><b id="shell-online-n"></b> online</span>)";
 constexpr std::string_view kUserIcon =
     R"(<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 100-8 4 4 0 000 8z M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg>)";
 
@@ -175,7 +182,10 @@ void append_header(std::string& out, const ShellCtx& ctx) {
         out += yuzu::server::html_escape(trail[i]);
         out += leaf ? "</b>" : "</span>";
     }
-    out += R"(</nav><div class="shell-acct"><span class="shell-user">)";
+    out += "</nav>";
+    out += kSearchButton;
+    out += kOnlineCounter;
+    out += R"(<div class="shell-acct"><span class="shell-user">)";
     out += kUserIcon;
     out += R"(<span id="context-user"></span></span>)"
            R"(<button class="shell-out" type="button" hx-post="/logout">Sign out</button></div></header>)";
@@ -210,12 +220,22 @@ html body{padding-left:var(--shell-side-w)}
 .shell-crumb{display:flex;align-items:center;gap:8px;color:var(--mut);font-size:13px}
 .shell-crumb b{color:var(--ink);font-weight:600}
 .shell-sep{color:var(--faint)}
-.shell-acct{display:flex;align-items:center;gap:12px;margin-left:auto;color:var(--ink2);font-size:13px}
+.shell-search{display:flex;flex:0 1 380px;align-items:center;gap:8px;height:var(--ctl);margin-left:auto;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--mut);font:inherit;text-align:left;cursor:pointer}
+.shell-search:hover{border-color:var(--mut)}
+.shell-search svg{flex:0 0 16px;width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round}
+.shell-search span{flex:1;min-width:0;overflow:hidden;color:var(--faint);text-overflow:ellipsis;white-space:nowrap}
+.shell-search kbd{padding:1px 6px;border:1px solid var(--line2);border-radius:3px;background:var(--surface2);color:var(--mut);font-family:var(--mds-font-family-mono);font-size:11px}
+.shell-live{display:flex;align-items:center;gap:6px;color:var(--mut);font-size:13px;white-space:nowrap}
+.shell-live[hidden]{display:none}
+.shell-live i{width:7px;height:7px;background:var(--ok)}
+.shell-live b{color:var(--ink);font-weight:600}
+.shell-acct{display:flex;align-items:center;gap:12px;color:var(--ink2);font-size:13px}
 .shell-user{display:inline-flex;align-items:center;gap:8px}
 .shell-user svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
 .shell-out{height:var(--ctl);padding:0 14px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--raise);color:var(--ink);font:inherit;font-size:13px;font-weight:500;cursor:pointer}
 .shell-out:hover{background:var(--surface2);border-color:var(--mut)}
-.shell-side a:focus-visible,.shell-out:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
+.toast-container{top:calc(var(--shell-top-h) + var(--sp-4))}
+.shell-side a:focus-visible,.shell-search:focus-visible,.shell-out:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
 @media (max-width:820px){
 html body{padding-left:0}
 .shell-side{position:static;flex:0 0 auto;width:auto;flex-direction:row;flex-wrap:wrap;align-items:center;gap:4px 8px;padding:8px 12px;overflow:visible;border-right:0;border-bottom:1px solid var(--line)}
@@ -223,12 +243,22 @@ html body{padding-left:0}
 .shell-grp,.shell-sub{flex-direction:row;flex-wrap:wrap;align-items:center;margin:0;padding:0;border:0}
 .shell-gt,.shell-me,.shell-cv{display:none}
 .shell-top{padding:10px 16px}
+.shell-search{flex-basis:100%;margin-left:0}
 }
 </style>)CSS";
 
 // What each page used to do for itself: fill the signed-in user and hide Settings
 // from non-admins. The Settings group is hidden with its entry so no empty
 // heading is left behind.
+//
+// Search is the existing dashboard Ctrl+K command palette, nothing new: on `/` a
+// synthetic Ctrl+K keydown goes to `document` (the dashboard's own handler); anywhere
+// else the click sets a sessionStorage flag and goes to `/`, where this same script
+// opens the palette once the page has loaded. If sessionStorage is unavailable the
+// dashboard's `?palette=1` hand-off is used instead.
+//
+// The online count is `agents.online` from GET /api/health, refreshed every 30 s; the
+// counter stays hidden until the first answer and a failed poll keeps the last number.
 constexpr std::string_view kShellScript = R"JS(<script>
 (function(){
   function el(i){return document.getElementById(i);}
@@ -243,6 +273,34 @@ constexpr std::string_view kShellScript = R"JS(<script>
       if(sl){sl.style.display='none';var g=sl.closest('.shell-grp');if(g)g.style.display='none';}
     }
   }).catch(function(){});
+
+  var FLAG='yuzu.shell.openPalette';
+  function openPalette(){
+    document.dispatchEvent(new KeyboardEvent('keydown',{key:'k',ctrlKey:true,bubbles:true,cancelable:true}));
+  }
+  var search=el('shell-search');
+  if(search)search.addEventListener('click',function(){
+    if(location.pathname==='/'){openPalette();return;}
+    try{sessionStorage.setItem(FLAG,'1');location.href='/';}
+    catch(e){location.href='/?palette=1';}
+  });
+  if(location.pathname==='/'){
+    var pending=false;
+    try{pending=sessionStorage.getItem(FLAG)==='1';sessionStorage.removeItem(FLAG);}catch(e){}
+    if(pending)window.addEventListener('load',function(){setTimeout(openPalette,100);});
+  }
+
+  function pollOnline(){
+    if(document.hidden)return;
+    fetch('/api/health').then(function(r){return r.json();}).then(function(d){
+      var n=d&&d.agents&&d.agents.online;
+      if(typeof n!=='number')return;
+      el('shell-online-n').textContent=String(n);
+      el('shell-online').hidden=false;
+    }).catch(function(){});
+  }
+  pollOnline();
+  setInterval(pollOnline,30000);
 })();
 </script>)JS";
 

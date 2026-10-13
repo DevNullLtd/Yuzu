@@ -210,7 +210,9 @@ TEST_CASE("app shell: styles come from tokens, never hex literals", "[nav][shell
     const auto html = render_shell({.active_key = "dashboard"});
     CHECK_FALSE(std::regex_search(html, hex));
     CHECK_THAT(html, !ContainsSubstring("box-shadow"));
-    CHECK_THAT(html, !ContainsSubstring("font-family"));
+    // Fonts only ever come from the page's font tokens.
+    static const std::regex literal_family(R"(font-family:\s*(?!var\())");
+    CHECK_FALSE(std::regex_search(html, literal_family));
     CHECK_THAT(html, !ContainsSubstring("text-transform"));
 }
 
@@ -219,6 +221,43 @@ TEST_CASE("app shell: each raw literal in the renderer stays under MSVC's string
     // The CSS and script are separate literals (C2026 at 16,380 bytes); the whole block must
     // at least not approach that as a single piece.
     CHECK(render_shell({.active_key = "dashboard"}).size() < 16000);
+}
+
+TEST_CASE("app shell: header search is the existing Ctrl+K palette, not a new search",
+          "[nav][shell]") {
+    const auto html = render_shell({.active_key = "dashboard"});
+    CHECK(count_of(html, "id=\"shell-search\"") == 1);
+    CHECK_THAT(html, ContainsSubstring("aria-keyshortcuts=\"Control+K\""));
+    CHECK_THAT(html, ContainsSubstring("<span>Search devices, instructions, help</span><kbd>Ctrl K</kbd>"));
+    // It is a button (nothing to type into), wired in the shell's own script.
+    CHECK_THAT(html, ContainsSubstring("<button class=\"shell-search\""));
+    CHECK_THAT(html, !ContainsSubstring("<input"));
+    // On `/`: a synthetic Ctrl+K on document (the dashboard's own handler).
+    CHECK_THAT(html, ContainsSubstring("new KeyboardEvent('keydown',{key:'k',ctrlKey:true,bubbles:true,cancelable:true})"));
+    CHECK_THAT(html, ContainsSubstring("location.pathname==='/'"));
+    // Elsewhere: a sessionStorage flag then `/`, opened on load; `?palette=1` if storage throws.
+    CHECK_THAT(html, ContainsSubstring("sessionStorage.setItem(FLAG,'1');location.href='/';"));
+    CHECK_THAT(html, ContainsSubstring("sessionStorage.removeItem(FLAG)"));
+    CHECK_THAT(html, ContainsSubstring("window.addEventListener('load',function(){setTimeout(openPalette,100);})"));
+    CHECK_THAT(html, ContainsSubstring("location.href='/?palette=1'"));
+}
+
+TEST_CASE("app shell: online counter is hidden until /api/health answers, polls every 30 s",
+          "[nav][shell]") {
+    const auto html = render_shell({.active_key = "dashboard"});
+    CHECK_THAT(html, ContainsSubstring("<span class=\"shell-live\" id=\"shell-online\" hidden><i></i><b id=\"shell-online-n\"></b> online</span>"));
+    CHECK_THAT(html, ContainsSubstring(".shell-live[hidden]{display:none}"));
+    CHECK_THAT(html, ContainsSubstring("fetch('/api/health')"));
+    CHECK_THAT(html, ContainsSubstring("d.agents.online"));
+    CHECK_THAT(html, ContainsSubstring("setInterval(pollOnline,30000)"));
+    // A failed poll is silent and keeps the last number.
+    CHECK_THAT(html, ContainsSubstring(".catch(function(){});\n  }\n  pollOnline();"));
+    // Only a number reveals the counter.
+    CHECK_THAT(html, ContainsSubstring("if(typeof n!=='number')return;"));
+}
+
+TEST_CASE("app shell: toasts sit below the header so one never covers Sign out", "[nav][shell]") {
+    CHECK_THAT(render_shell({}), ContainsSubstring(".toast-container{top:calc(var(--shell-top-h) + var(--sp-4))}"));
 }
 
 // ── apply_shell / bake ──────────────────────────────────────────────────────
