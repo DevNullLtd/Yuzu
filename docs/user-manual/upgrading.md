@@ -304,6 +304,28 @@ plugin and action rows read back unchanged, so nothing flips on upgrade.
   zero-reach branch. The kill-switch REST responses gain additive `os` and `source` fields,
   and the `/api/command` response gains `withheld_kill_switched_os`.
 
+## Behaviour change: Guardian full_sync agent log lines and in-place `rule:` rows (#4415)
+
+Three changes are live on every agent on upgrade, on both detection paths. The skip of healthy,
+unchanged rules that motivated them runs only on the Spark path, which production does not enable
+(`prefer_spark` is off); see the [Spark flip gate](../spark-flip-gate.md) AC-18.
+
+- **Log line renamed.** `Guardian: full_sync cleared N prior rule(s)` is now
+  `Guardian: full_sync removed N prior rule(s) absent from the push`, and it is not logged when no
+  stored row is removed. Log rules or dashboards keyed on the old string go silent. Do not use the
+  old line as a "a full push happened" marker.
+- **New line on every full push.** `Guardian: full_sync preserved N rule(s) (skipped re-arm) ids=[...] more=M`
+  is logged by every agent on every full push that reaches the end of its rule loop. Use it as the
+  full-push marker instead. Legacy-path agents always log `preserved 0`.
+- **Rows updated in place.** The agent's stored `rule:` rows are no longer cleared and reinserted
+  on a full push: only the rows for rules the push omits are deleted, and a row whose bytes are
+  unchanged is not rewritten. A crash after the omitted rows are removed and before the carried
+  rules are rewritten leaves the previous rows for carried rules until the next push (a restart then
+  re-arms those, including a rule the push had disabled or changed).
+- **Rollback.** The row format is unchanged. An older agent reads the rows without complaint, and
+  its own full_sync clear-and-reinsert restores the old write pattern. A newer agent rewrites any
+  row whose bytes differ. There is no migration and a downgrade is safe.
+
 ## ⚠️ Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it (0.14.0 → 0.14.1, #5370)
 
 **Who this affects.** Affected: a 0.14.0 Docker Compose stack whose server has no named volume on `/etc/yuzu/certs` while Postgres has one — `deploy/docker/docker-compose.yml` (the 0.14.0 README quickstart), `docker-compose.uat.yml`, `docker-compose.full-uat.yml`, `docker-compose.viz-uat.yml`, `docker-compose.demo.yml` used with `--keep`, any compose copied from them, and Compose Wizard output from before 0.14.1 in Plaintext mode, with 'Persist generated certs' unticked, or with named volumes off and an external Postgres. Not affected: `docker-compose.reference.yml` (which the README quickstart saves as `docker-compose.yml` since #5419) and `docker-compose.reference-gateway.yml` (their `certs` volume).
@@ -4061,7 +4083,7 @@ Before upgrading any component:
     and ignores them).
   - **At the Spark flip (not part of this upgrade), upgraded agents.** They hold the policy generation and keep being re-pushed while a
     wedged rule or a compensating teardown is outstanding (each re-push writes a `guaranteed_state.reconcile` audit row, about once per
-    heartbeat per held agent; the agent suppresses the identical re-pushes and applies one in full about every 330 s; if a healthy rule of the hung call's mechanism type is in the push, every re-push after the first of those is applied in full; see the Same-type condition in the wedged-rule hold note of [Guaranteed State](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only)).
+    heartbeat per held agent; the agent suppresses the identical re-pushes and applies one in full about every 330 s; if a rule of the hung call's mechanism type that the push changes, or that is not healthy, is in the push, every re-push after the first of those is applied in full (a healthy, unchanged rule is skipped since #4415); see the Same-type condition in the wedged-rule hold note of [Guaranteed State](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only)).
   - **At the Spark flip, agents without the #5459 retry suppression.** Every agent built from PR #4529 up to the #5459 change carries the
     earlier three-re-apply waiver; builds from before PR #4529 (release 0.13.0 and earlier) have no waiver and no acknowledgment ledger at all.
     Such an agent can acknowledge the generation after three re-applies of a wedged rule (and, without the

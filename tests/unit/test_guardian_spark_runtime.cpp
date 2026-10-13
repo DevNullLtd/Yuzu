@@ -419,6 +419,15 @@ RuleAssertion file_exists_rule(const std::string& rule_id, bool present = true) 
     a.expect_present = present;
     return a;
 }
+// #4415: an identical re-attach of a healthy rule is a skip (see
+// test_guardian_spark_reapply_skip_runtime.cpp), so a test that needs a REPLACEMENT of a rule on
+// the same key (the Case 0 withdraw-and-requeue, a redeploy, a supersede) must change its content.
+// The name is content (RuleAssertion::rule_name) but not part of the spark key.
+RuleAssertion file_exists_rule_redeployed(const std::string& rule_id) {
+    RuleAssertion a = file_exists_rule(rule_id);
+    a.rule_name = "redeployed";
+    return a;
+}
 // #4045: a file-hash-equals rule. Empty `expected_hash` = baseline-on-arm (the capture the
 // runtime stages for the engine-owned persister); a non-empty one is an authored hash.
 RuleAssertion file_hash_rule(const std::string& rule_id, const std::string& expected_hash = "") {
@@ -976,8 +985,9 @@ TEST_CASE("re-attach supersedes the old generation and purges its stale entry", 
     rt->evaluate_key(key, EvalReason::Initial);
     REQUIRE(rt->outbox_size() == 1);
 
-    // Re-attach (same rule) -> a new generation; the stale gen-1 entry is purged.
-    const auto gen2 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    // Re-attach (same rule, changed content: an identical one is a skip, #4415) -> a new
+    // generation; the stale gen-1 entry is purged.
+    const auto gen2 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule_redeployed("r1"), true);
     REQUIRE(gen2.value() > gen1.value());
     REQUIRE(rt->outbox_size() == 0);
 
@@ -6048,8 +6058,8 @@ TEST_CASE("rung 9c R5.2: a same-key REDEPLOY queues its own rearm behind its own
     REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
 
     b->hang_next_disarm.store(true);
-    QueuedAttach re1; // r1 re-pushed onto the SAME key
-    re1.t = std::thread{[&] { re1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    QueuedAttach re1; // r1 re-pushed onto the SAME key, with changed content (an identical one is a skip, #4415)
+    re1.t = std::thread{[&] { re1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule_redeployed("r1"), true); }};
     struct Cleanup {
         FakeBackend* backend;
         ~Cleanup() { backend->release_disarm_hang(); }
@@ -8644,8 +8654,9 @@ TEST_CASE("#5322: a same-rule re-attach under the sticky seam leaves no residue 
     f.rt->set_index_remove_fault_count_for_test(-1);
     const auto failures_before = f.rt->claim_index_release_failures();
     // Case 0 withdraws generation 1 in place (its release fails: 1), generation 2 queues and
-    // add() transfers the mapping to it.
-    auto g2 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule("r"), true);
+    // add() transfers the mapping to it. Generation 2 carries changed content: an identical
+    // attach re-observes generation 1's live claim instead (#4415).
+    auto g2 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule_redeployed("r"), true);
     REQUIRE(g2.has_value());
     CHECK(f.rt->claim_index_release_failures() == failures_before + 1);
 
@@ -8677,8 +8688,9 @@ TEST_CASE("#5322: releasing a claim that no longer owns its mapping cannot fail"
     f.rt->set_index_remove_fault_count_for_test(-1);
     const auto failures_before = f.rt->claim_index_release_failures();
     // Case 0 withdraws generation 1 in the MIDDLE of the fifo (its release fails: 1),
-    // generation 2 queues behind it and the mapping transfers.
-    auto g2 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule("r"), true);
+    // generation 2 queues behind it and the mapping transfers. Generation 2 carries changed
+    // content: an identical attach re-observes generation 1's queued claim instead (#4415).
+    auto g2 = f.rt->attach_rule(RT::NonWaiting{}, "r", file_spec("/a"), file_exists_rule_redeployed("r"), true);
     REQUIRE(g2.has_value());
     CHECK(f.rt->claim_index_release_failures() == failures_before + 1);
 
