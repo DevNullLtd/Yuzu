@@ -440,10 +440,10 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
                     alert_router->observe(obs_type, subject, safe_agent, now);
             } catch (const std::exception& e) {
                 spdlog::warn("Guardian ingest: observer threw for {} from agent {}: {}", obs_type,
-                             safe_agent, e.what());
+                             log_id_token(safe_agent), e.what());
             } catch (...) {
                 spdlog::warn("Guardian ingest: observer threw (non-std) for {} from agent {}",
-                             obs_type, safe_agent);
+                             obs_type, log_id_token(safe_agent));
             }
         }
         return;
@@ -454,7 +454,7 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
     // enters the response store / executions drawer.
     spdlog::debug("Guardian: ignoring __guard__ action '{}' from agent {} (only 'event' ingested "
                   "in A1)",
-                  resp.action(), agent_id);
+                  log_key_token(resp.action()), log_id_token(agent_id));
 }
 
 } // namespace yuzu::server::detail

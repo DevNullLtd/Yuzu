@@ -355,6 +355,14 @@ SENSITIVE_PATTERNS = [
     # by Phase-3 governance cpp-safety review (2026-09-25) as a sibling-field
     # miss the original #4665 sweep left open under a miscited #489 deferral.
     Pattern("agent_id={}", "agent_id={}"),
+    # The same agent_id printed under the other two spellings the Guardian sources use:
+    # "agent {}" (guardian_ingest.cpp's "ignoring __guard__ action '{}' from agent {}") and
+    # "agent={}" (the T_server line). Register only length- and NUL-checks the id (CWE-117
+    # log-injection model as above); found by the round-3 security review of #5513, where a
+    # success-path info line of this shape
+    # printed it raw.
+    Pattern("agent {}", "agent {}"),
+    Pattern("agent={}", "agent={}"),
     # Unquoted key=value path/service forms in the "guard armed" summary lines
     # -- guardian_engine.cpp.
     Pattern("path={}", "path={}"),
@@ -797,6 +805,10 @@ def _selfcheck() -> None:
         # version, proving the widened SPDLOG_CALL_RE actually opens this
         # statement rather than silently skipping it as before).
         'logger->info("Guardian T_server event_id={} agent={} rule={}", event_id, agent_id, rule_id);',
+        # #5513: the two raw agent_id shapes the round-3 security review found.
+        'spdlog::info("Guardian: reconciled agent {} (generation {} -> {})", agent_id, agent_gen, fresh_generation);',
+        'spdlog::debug("Guardian: ignoring __guard__ action \'{}\' from agent {} (only \'event\' ingested in A1)", ::yuzu::log_key_token(resp.action()), agent_id);',
+        'spdlog::info("Guardian peer agent={} seen", agent_id);',
     ]
     for src in must_match:
         if not flagged(src):
@@ -843,6 +855,9 @@ def _selfcheck() -> None:
         # #4666 PR-4: the REAL guardian_ingest.cpp T_server shape (bound
         # logger handle, all three ids wrapped) -- correctly unflagged.
         'logger->info("Guardian T_server event_id={} agent={} rule={} recv_ns={} committed_ns={} agent_ns={} store_ms={}", log_id_token(ev_row.event_id), log_id_token(agent_id), log_id_token(ev_row.rule_id), recv_wall_ns, res.committed_wall_ns, agent_ns, store_ms);',
+        # #5513: both agent_id shapes, wrapped.
+        'spdlog::info("Guardian: reconciled agent {} (generation {} -> {})", ::yuzu::log_id_token(agent_id), agent_gen, fresh_generation);',
+        'spdlog::debug("Guardian: ignoring __guard__ action \'{}\' from agent {} (only \'event\' ingested in A1)", ::yuzu::log_key_token(resp.action()), ::yuzu::log_id_token(agent_id));',
     ]
     for src in must_not:
         if flagged(src):
