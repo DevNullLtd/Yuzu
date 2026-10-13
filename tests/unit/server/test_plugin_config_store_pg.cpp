@@ -626,9 +626,9 @@ TEST_CASE("#3265: __guard__.push_rules survives the real classify+finalize dispa
     CHECK(finalized->wire().action() == "push_rules");
 }
 
-TEST_CASE("#3265: the real chokepoint composition DOES still deny __guard__.push_rules once an "
-          "operator explicitly sets the kill switch — proving the fix isn't a bypass",
-          "[pg][store][plugin_config][killswitch][dispatch]") {
+TEST_CASE("#3265: a stored kill-switch row for __guard__.push_rules is informational - the real "
+          "chokepoint composition still delivers the push (protective action)",
+          "[pg][store][plugin_config][killswitch][dispatch][protective]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
     Wired w{db.dsn()};
     REQUIRE(w.store.set_kill_switch("__guard__", "push_rules", false, "incident", "alice")
@@ -649,10 +649,20 @@ TEST_CASE("#3265: the real chokepoint composition DOES still deny __guard__.push
             return w.store.kill_switch_decision(p, a);
         };
 
+    // The row is real and in force in the store (the display/decision accessors
+    // still read it) ...
+    CHECK_FALSE(w.store.action_allowed("__guard__", "push_rules"));
+
+    // ... but the Guardian rule push is a protective action: enablement never
+    // refuses it, so the real chokepoint composition still finalizes it. This
+    // is the deliberate reversal of the original emergency-stop behaviour
+    // (ADR-3005 dated update); the operator lever is disabling the rules.
     auto finalized = yuzu::server::detail::finalize_classified_command(
         *classified, action_allowed, "__guard__", "push_rules", "cmd-2");
-    REQUIRE_FALSE(finalized.has_value());
-    CHECK(finalized.error().reason == yuzu::server::detail::DispatchDenialReason::KillSwitched);
+    REQUIRE(finalized.has_value());
+    CHECK(finalized->wire().plugin() == "__guard__");
+    CHECK(finalized->wire().action() == "push_rules");
+    CHECK(finalized->kill_switched_os().empty());
 }
 
 // ── Fail-closed evaluation on a degraded store (no live Postgres needed —

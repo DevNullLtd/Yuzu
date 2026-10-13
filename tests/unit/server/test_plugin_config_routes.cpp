@@ -407,10 +407,11 @@ TEST_CASE("plugin_config_routes: kill-switch PUT flips the switch and is audited
 // a dedicated reserved-namespace regression test during an earlier fix round
 // (test_mcp_server.cpp) — this REST route shares the identical
 // parse_kill_switch_scope pre-validation but had no equivalent case, the same
-// coverage gap in a different transport.
-TEST_CASE("plugin_config_routes: kill-switch PUT reaches the real dispatch chokepoint for "
-          "the reserved-namespace __guard__.push_rules capability, not just an ordinary "
-          "plugin.action",
+// coverage gap in a different transport. The row is stored and echoed but has
+// no dispatch effect for push_rules (a protective action).
+TEST_CASE("plugin_config_routes: kill-switch PUT writes and reads the reserved-namespace "
+          "__guard__.push_rules row through the real store (addressability only - not the "
+          "dispatch decision - see test_protective_action_dispatch_gate.cpp)",
           "[pg][server][routes][config][killswitch]") {
     YUZU_REQUIRE_PG_DB_TPL(db, route_tpl);
     PgWired w{db.dsn()};
@@ -427,7 +428,8 @@ TEST_CASE("plugin_config_routes: kill-switch PUT reaches the real dispatch choke
     CHECK(put->status == 200);
     CHECK(body(put->body)["data"]["enabled"] == false);
 
-    // Proven against the real chokepoint, not the echoed response.
+    // Proven against the real store accessor, not the echoed response (the
+    // stored row, not the dispatch decision: a protective pair is exempt).
     CHECK_FALSE(w.store.action_allowed("__guard__", "push_rules"));
 
     auto put_on = h.sink.Put("/api/v1/plugin-config/__guard__/kill-switch?action=push_rules",

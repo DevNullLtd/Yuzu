@@ -338,6 +338,14 @@ TEST_CASE("openapi_spec_json(): the kill-switch routes document the per-OS query
         const std::string ok = op["responses"]["200"].value("description", "");
         CHECK(ok.find("os") != std::string::npos);
         CHECK(ok.find("source") != std::string::npos);
+
+        // PM0.1: the protective-set caveat is part of the published contract.
+        const std::string desc = op.value("description", "");
+        CHECK(desc.find("__guard__.push_rules") != std::string::npos);
+        CHECK(desc.find("unquarantine") != std::string::npos);
+        CHECK(desc.find(std::string(method) == "get" ? "dispatch still proceeds"
+                                                      : "no dispatch effect") !=
+              std::string::npos);
     }
 }
 

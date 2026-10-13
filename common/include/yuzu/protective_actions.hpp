@@ -15,21 +15,26 @@
 // Pure: no I/O, no store or wire types, so it stays inside the
 // common/include firewall and tests bind it directly.
 
-#include <cctype>
 #include <cstddef>
 #include <string_view>
 
 namespace yuzu::protective {
 
 namespace detail {
+/// Explicit A-Z fold, never `std::tolower`: that depends on the process C
+/// locale, and this list is an identifier check where under-exempting is the
+/// dangerous direction.
+[[nodiscard]] constexpr char to_lower_ascii(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
 /// Case-insensitive (ASCII-fold) equality. The one comparison both predicates
 /// below share.
 [[nodiscard]] inline bool iequals(std::string_view a, std::string_view b) {
     if (a.size() != b.size())
         return false;
     for (std::size_t i = 0; i < a.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(a[i])) !=
-            std::tolower(static_cast<unsigned char>(b[i])))
+        if (to_lower_ascii(a[i]) != to_lower_ascii(b[i]))
             return false;
     }
     return true;

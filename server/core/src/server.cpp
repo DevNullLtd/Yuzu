@@ -12415,8 +12415,10 @@ private:
         // exists. `action_allowed` is fail-closed by contract — a closed store, a
         // lease timeout or a query failure all return false — so a degraded
         // config store disables the action rather than silently permitting it
-        // (ADR-0036). It is checked on EVERY dispatch and never memoized: an
-        // emergency stop that takes effect on the next cache expiry is not one.
+        // (ADR-0036). It is checked on EVERY dispatch (except a protective pair,
+        // which kill_switch_denial exempts before consulting the store) and never
+        // memoized: an emergency stop that takes effect on the next cache expiry
+        // is not one.
         auto finalized = yuzu::server::detail::finalize_classified_command(
             cap,
             plugin_config_store_ != nullptr

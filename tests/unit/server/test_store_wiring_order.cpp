@@ -406,10 +406,12 @@ TEST_CASE("server.cpp: registry_.configure_presence runs after "
     CHECK(construct_line < wire_line);
 
     // The teardown null-out (`registry_.configure_presence(nullptr, ...)`)
-    // must run BEFORE offline_endpoint_store_.reset() destroys the object
-    // presence_store_ borrows — the inverse ordering requirement stop()
-    // exists to satisfy (see agent_registry.hpp's presence_store_ doc
-    // comment and the comment on this call site in server.cpp).
+    // must run BEFORE offline_endpoint_store_.reset() destroys the object the
+    // presence reader lambda captures (`offline_endpoint_store_`, bound by
+    // configure_presence(OfflineEndpointStore*, ttl) into `presence_reader_`;
+    // see that member's doc comment in agent_registry.hpp and the call site in
+    // server.cpp). This pins the SOURCE order of the wiring/teardown calls,
+    // not thread quiescence.
     static const std::regex null_wire_re(R"(registry_\.configure_presence\(\s*nullptr\s*,)");
     std::smatch null_wire_match;
     REQUIRE(std::regex_search(text, null_wire_match, null_wire_re));

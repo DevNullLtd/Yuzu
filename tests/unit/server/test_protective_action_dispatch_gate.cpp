@@ -259,7 +259,8 @@ TEST_CASE("wire_and_dispatch_confined: a degraded store never stops a protective
                     .has_value());
 
     for (const auto& [plugin, action] : kProtectiveWire) {
-        const auto out = wire(registry, finalize(protective_cap(plugin, action), degraded.fn()), ids);
+        const auto out =
+            wire(registry, finalize(protective_cap(plugin, action), degraded.fn()), ids);
         CHECK(out.sent == 2);
         CHECK(drained(registry) == ids);
     }
