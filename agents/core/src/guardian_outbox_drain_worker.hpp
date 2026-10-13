@@ -201,6 +201,11 @@ inline constexpr std::chrono::milliseconds kGuardianSendRecheckInterval{200};
 
 /// #3972 cross-lane launch hold and its release allowance. Defaults for the
 /// GuardianMaintenanceConfig knobs below, consumed by wrapped_send()'s symmetric hold.
+/// The values are hardcoded as "1 s" / "64" in the HELP text of
+/// server/core/src/guardian_journal_fleet_tags.hpp, docs/user-manual/metrics.md,
+/// docs/spark-flip-gate.md and changelog.d/3972-guardian-outbox-send-order-hold.fixed.md; they
+/// must move together (the default-pin test in test_guardian_outbox_drain_worker.cpp covers
+/// only these two constants).
 inline constexpr std::chrono::milliseconds kGuardianCrossLaneOrderHold{1'000};
 inline constexpr std::size_t kGuardianCrossLaneReleaseAllowance{64};
 
@@ -250,7 +255,11 @@ struct GuardianMaintenanceConfig {
         GuardianOutboxSendExecutor::kGuardianSendStallThreshold};
     /// #3972: how long a lane's head may be held behind an OLDER entry (lower OutboxEntry::seq)
     /// in the other lane before the lane is released to overtake it, and how many entries may
-    /// then overtake before a further hold is needed (see wrapped_send()).
+    /// then overtake before a further hold is needed (see wrapped_send()). Edge values: a
+    /// hold <= 0 means one launch denial and then an immediate release on the next check; an
+    /// allowance of 0 behaves as 1, because the release block sets permitted=true for the
+    /// releasing launch itself whatever the allowance (so 0 and 1 both permit exactly one
+    /// overtaking launch per release).
     std::chrono::milliseconds cross_lane_order_hold{kGuardianCrossLaneOrderHold};
     std::size_t cross_lane_release_allowance{kGuardianCrossLaneReleaseAllowance};
 };
@@ -601,8 +610,20 @@ private:
 
     /// The two drain lanes. Health shares the Compliance lane (see wrapped_send()).
     enum Lane : std::size_t { kLifecycleLane = 0, kComplianceLane = 1 };
+    /// Enumerator-exhaustive, no `default` (#3953 item 4): a new OutboxDomain value added without
+    /// updating this routing warns under -Wswitch on GCC/Clang (this repo builds with
+    /// werror=false project-wide, and MSVC's equivalent C4062 is not enabled, so the warning does
+    /// not fail the build). The trailing return is the pre-switch default for an out-of-range
+    /// value.
     [[nodiscard]] static constexpr Lane lane_of(OutboxDomain d) noexcept {
-        return d == OutboxDomain::Lifecycle ? kLifecycleLane : kComplianceLane;
+        switch (d) {
+        case OutboxDomain::Lifecycle:
+            return kLifecycleLane;
+        case OutboxDomain::Compliance:
+        case OutboxDomain::Health:
+            return kComplianceLane;
+        }
+        return kComplianceLane;
     }
     [[nodiscard]] GuardianOutboxSendExecutor& exec_of(Lane l) noexcept {
         return l == kLifecycleLane ? lifecycle_send_exec_ : compliance_send_exec_;

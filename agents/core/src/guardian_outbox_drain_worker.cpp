@@ -51,7 +51,7 @@ std::int64_t steady_now_ms() {
 
 /// #3953 item 3 / #3980: the send-driven part of the loop's next wait, as a clamp on top of the
 /// periodic bound (nullopt = no send-driven clamp). A WAIT clamp only: it shortens how long the
-/// loop's OWN cv.wait_for blocks and is never a wake source (R4 depends on that).
+/// loop's OWN cv.wait_for blocks and is never a wake source (the R4 test depends on that).
 ///  - a send in flight that has NOT been counted as a stall re-checks every
 ///    kGuardianSendRecheckInterval - the item-3 cliff fix, unchanged below the threshold;
 ///  - EXCEPT a compliance send on an EMPTIED lane (an orphan: its head was withdrawn, so no
@@ -319,8 +319,13 @@ SendResult GuardianOutboxDrainWorker::wrapped_send(const OutboxEntry& entry) {
     // or running in its executor. The running term covers an orphan (head withdrawn by
     // detach_rule, send still inside send()). seq == 0 on either side fails open. The reads are
     // strictly sequential (outbox_mu_, then the other executor's mutex), never nested, and their
-    // staleness is one-directional: the other lane's head is popped only by this thread, a running
-    // send can only finish, a concurrent enqueue carries a higher seq. Any throw fails open.
+    // staleness is one-directional: only the owning lane's drain pass pops its head via
+    // pop_front_if, but the compliance lane's head can also be withdrawn by drop_rule /
+    // purge_stale or re-stamped by a coalesce on other threads (the lifecycle log coalesces and
+    // purges nothing). A stale read of such a head only over-holds, by at most H; the one case
+    // an older entry stays invisible is the coalesced-head item in drain_bounded()'s NOT GIVEN
+    // list. A running send can only finish, a concurrent enqueue carries a higher seq. Any throw
+    // fails open.
     bool blocked = false;
     bool blocker_running = false;
     std::uint64_t blocker_seq = 0;
@@ -357,7 +362,10 @@ SendResult GuardianOutboxDrainWorker::wrapped_send(const OutboxEntry& entry) {
                 // was granted for, a different set of entries, so start over. epoch_at_hold is
                 // sampled at the episode's first denial and not re-sampled at a release. A
                 // coalesce never empties a lane, so it never resets it. A throw from the epoch
-                // read fails toward clearing.
+                // read fails toward clearing: it resets the hold clock and the allowance, so the
+                // lane waits a fresh H rather than being released. The epoch read takes the same
+                // mutex (outbox_mu_) as the blocker reads above, so a persistent fault throws
+                // there first, which leaves `blocked` false (fails open).
                 const auto epoch =
                     x == kLifecycleLane ? rt_.lifecycle_empty_epoch() : rt_.outbox_empty_epoch();
                 if (epoch != h.epoch_at_hold) {
@@ -380,8 +388,8 @@ SendResult GuardianOutboxDrainWorker::wrapped_send(const OutboxEntry& entry) {
                 if (!h.logged_release) {
                     h.logged_release = true;
                     try {
-                        spdlog::warn("Guardian drain worker: {} lane launch hold released after {} ms behind an "
-                                     "older entry (blocker seq {}, held seq {}); up to {} entries may now "
+                        spdlog::warn("Guardian drain worker: {} lane launch hold released after the {} ms cumulative "
+                                     "hold behind an older entry (blocker seq {}, held seq {}); up to {} entries may now "
                                      "overtake it. Further releases counted only.",
                                      x == kLifecycleLane ? "lifecycle" : "compliance",
                                      maint_.cross_lane_order_hold.count(), blocker_seq, entry.seq,
@@ -409,6 +417,9 @@ SendResult GuardianOutboxDrainWorker::wrapped_send(const OutboxEntry& entry) {
             try {
                 h.epoch_at_hold = x == kLifecycleLane ? rt_.lifecycle_empty_epoch() : rt_.outbox_empty_epoch();
             } catch (...) {
+                // epoch_at_hold keeps the previous episode's value: if the lane has emptied
+                // since that sample, the next check's epoch comparison differs and clears the
+                // clock (fails toward clearing); otherwise the stale value is still the true one.
             }
         }
         h.denied_this_pass = true;

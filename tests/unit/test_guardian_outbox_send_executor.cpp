@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -836,7 +837,10 @@ TEST_CASE("#3980 probe_orphan(): reclaims a done orphan only for an empty lane; 
 TEST_CASE("#3980 probe_orphan(): an orphan on an emptied lane is reclaimed with no new offer(), "
           "counting a stall first and a thrown result once; the slot then launches again",
           "[spark][guardian][send_executor][chaos]") {
-    GuardianOutboxSendExecutor exec{50ms};
+    // 300 ms, like the sibling case above: the "stall not counted yet" check below must survive a
+    // 20 ms-bounded offer() taking much longer than 20 ms on a loaded runner, since an offer()
+    // that returns past the threshold would count the stall itself.
+    GuardianOutboxSendExecutor exec{300ms};
     StallingSend send;
     ScopeExit release_on_exit{[&] {
         send.release();
@@ -1045,4 +1049,128 @@ TEST_CASE("R5: the detached send worker wears GuardianDetachedWorkerRole; the ca
     CHECK(role_inside_send.load() == 1);
     CHECK_FALSE(on_guardian_detached_worker_thread()); // still unmarked after offer() returns
     CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
+}
+
+TEST_CASE("R5: a throwing send under the detached-worker marker is re-thrown to the caller, "
+          "and neither thread is left marked",
+          "[spark][guardian][send_executor][chaos]") {
+    GuardianOutboxSendExecutor exec;
+    std::atomic<int> role_inside_send{-1};
+    auto throwing = [&](const OutboxEntry&) -> SendResult {
+        role_inside_send.store(on_guardian_detached_worker_thread() ? 1 : 0);
+        throw std::runtime_error("marked boom");
+    };
+    auto entry = lifecycle_entry("e1");
+
+    CHECK_FALSE(on_guardian_detached_worker_thread());
+    bool rethrown = false;
+    REQUIRE(spin_until([&] {
+        try {
+            (void)exec.offer(entry, throwing, 200ms);
+        } catch (const std::runtime_error&) {
+            rethrown = true;
+        }
+        return rethrown;
+    }));
+    CHECK(role_inside_send.load() == 1);                // the throw happened under the marker
+    CHECK_FALSE(on_guardian_detached_worker_thread());  // and never leaked onto the caller
+    REQUIRE(spin_until([&] { return exec.active_worker_count() == 0; }));
+
+    // The marker is a one-shot thread-local on a fresh detached thread per launch, so a later
+    // launch cannot inherit anything from the throwing one: it is marked on its own.
+    std::atomic<int> second_role{-1};
+    auto probe_role = [&](const OutboxEntry&) -> SendResult {
+        second_role.store(on_guardian_detached_worker_thread() ? 1 : 0);
+        return SendResult::Sent;
+    };
+    std::optional<SendResult> r;
+    REQUIRE(spin_until([&] {
+        r = exec.offer(lifecycle_entry("e2"), probe_role, 200ms);
+        return r.has_value();
+    }));
+    CHECK(*r == SendResult::Sent);
+    CHECK(second_role.load() == 1);
+    CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
+}
+
+TEST_CASE("R5: GuardianDetachedWorkerRole clears on every exit path, including an unwinding throw",
+          "[spark][guardian][send_executor]") {
+    // The RAII marker itself, on a thread of its own so a failure cannot leak into the runner's
+    // threads: set inside the scope, cleared after a normal exit, cleared after an exception
+    // unwinds through it, and a nested scope does not clear the outer one early.
+    std::atomic<int> inside{-1}, after_normal{-1}, after_throw{-1}, thrown{0};
+    std::thread t([&] {
+        {
+            const GuardianDetachedWorkerRole role;
+            inside.store(on_guardian_detached_worker_thread() ? 1 : 0);
+        }
+        after_normal.store(on_guardian_detached_worker_thread() ? 1 : 0);
+        try {
+            const GuardianDetachedWorkerRole role;
+            throw std::runtime_error("unwind");
+        } catch (const std::runtime_error&) {
+            thrown.store(1);
+        }
+        after_throw.store(on_guardian_detached_worker_thread() ? 1 : 0);
+    });
+    t.join();
+    CHECK(inside.load() == 1);
+    CHECK(after_normal.load() == 0);
+    CHECK(thrown.load() == 1);
+    CHECK(after_throw.load() == 0);
+    CHECK_FALSE(on_guardian_detached_worker_thread());
+}
+
+TEST_CASE("destroying the executor while its detached worker is still parked is safe once the "
+          "worker is released (State outlives the executor)",
+          "[spark][guardian][send_executor][chaos]") {
+    // GuardianOutboxSendExecutor has no destructor of its own: the worker holds the shared State
+    // and never `this`. Destroy the executor with the worker CV-parked inside send(), release it,
+    // and wait for the worker's closure (and so its AliveTicket) to be destroyed. ASan/TSan turn
+    // any use of a freed executor or State into a failure; a plain run proves the worker still
+    // completes. The weak_ptr is the worker-finished signal: the executor cannot be asked once
+    // it is gone, and the worker's closure holds the only strong reference.
+    struct Gate {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool open{false};
+        std::atomic<int> invocations{0};
+    };
+    auto gate = std::make_shared<Gate>();
+    std::weak_ptr<int> worker_closure; // expires when the worker's closure is destroyed
+    ScopeExit release_on_exit{[&] {
+        {
+            std::lock_guard<std::mutex> lk{gate->mu};
+            gate->open = true;
+        }
+        gate->cv.notify_all();
+        CHECK(spin_until([&] { return worker_closure.expired(); }, 5s));
+    }};
+
+    auto exec = std::make_unique<GuardianOutboxSendExecutor>();
+    {
+        auto sentinel = std::make_shared<int>(0);
+        worker_closure = sentinel;
+        const GuardianOutboxSendExecutor::SendFn parked = [gate, sentinel = std::move(sentinel)](
+                                                              const OutboxEntry&) -> SendResult {
+            gate->invocations.fetch_add(1);
+            std::unique_lock<std::mutex> lk{gate->mu};
+            gate->cv.wait(lk, [&] { return gate->open; });
+            return SendResult::Sent;
+        };
+        CHECK_FALSE(exec->offer(lifecycle_entry("e1"), parked, 20ms).has_value());
+    } // `parked` is gone: the worker's closure holds the only remaining reference to the sentinel
+    REQUIRE(spin_until([&] { return gate->invocations.load() == 1; }));
+    CHECK_FALSE(worker_closure.expired());
+    CHECK(exec->active_worker_count() == 1);
+
+    exec.reset(); // destroyed with the worker alive and parked inside send()
+
+    {
+        std::lock_guard<std::mutex> lk{gate->mu};
+        gate->open = true;
+    }
+    gate->cv.notify_all();
+    // The worker publishes into the surviving State, destroys its closure, and exits.
+    CHECK(spin_until([&] { return worker_closure.expired(); }, 5s));
 }

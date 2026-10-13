@@ -15,6 +15,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -2209,9 +2210,11 @@ TEST_CASE("#3972 T2b: an arm and verdict injected from inside a compliance send 
     // The injection runs on the detached send worker while that send sits inside its offer wait
     // (it takes only registry_mu_/outbox_mu_, never the engine mtx_, so it is legal there). The
     // new rule's `armed` (lifecycle, younger than the running verdict) must not overtake it.
+    // Declared BEFORE the rig: the rig's destructor waits the detached send out, and that send's
+    // on_compliance_start reads `injected`, so it must outlive the rig.
+    std::atomic<bool> injected{false};
     HoldRig f;
     f.sink.delay[kComplianceIdx] = 100ms;
-    std::atomic<bool> injected{false};
     f.sink.on_compliance_start = [&](const OutboxEntry&) {
         if (injected.exchange(true))
             return;
@@ -2297,7 +2300,10 @@ TEST_CASE("#3972 T4: a release is an ALLOWANCE of N launches that persists acros
     CHECK(c1 - t0 >= kHold);
     REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) >= 2; }));
     const auto c2 = f.sink.nth_start(OutboxDomain::Compliance, 1)->at;
-    CHECK(c2 - c1 < kHold - 20ms * kSpinScale); // the allowance carried over: no second H
+    // The allowance carried over: no second H. c2 starts about one 300 ms send plus a pass after
+    // c1; without the carry-over c2 would wait a further kHold after c1's send ends. A bound of
+    // the form kHold - x shrinks as kSpinScale grows, kHold + 200 ms does not.
+    CHECK(c2 - c1 < kHold + 200ms);
     CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
 
     REQUIRE(spin_until([&] { return f.sink.n_ended(OutboxDomain::Compliance) >= 2; }));
@@ -2377,6 +2383,41 @@ TEST_CASE("#3972 T4c: a leftover allowance is cleared when the held lane EMPTIES
     REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) == 2; }));
     CHECK(f.sink.nth_start(OutboxDomain::Compliance, 1)->at - t_pre >= kHold);
     CHECK(f.worker->cross_lane_order_release_count() == 2);
+}
+
+TEST_CASE("#3972 T4d: a leftover allowance is cleared by the no-blocker branch itself, with the "
+          "lane never emptying",
+          "[spark][guardian][drain][order]") {
+    // T4b cannot pin the `!blocked` clear: its lane empties between the release and the new
+    // blocker, so the epoch clause would clear the allowance even if the branch did not. Here the
+    // lifecycle lane is driven call by call with hand-fed entries, which never move the real
+    // empty epoch, so only the no-blocker branch can clear the leftover unit (H = 0, N = 3).
+    HoldRig f(20, 0ms, 3);
+    f.sink.set_permits(kComplianceIdx, 0);
+    const auto c5 = hand_entry(OutboxDomain::Compliance, 5, "c-5");
+    CHECK(f.worker->wrapped_send_for_test(c5) == SendResult::Retain); // older compliance send parks
+
+    const auto l7 = hand_entry(OutboxDomain::Lifecycle, 7, "l-7");
+    CHECK(f.worker->wrapped_send_for_test(l7) == SendResult::Retain); // denied: hold clock starts
+    CHECK(f.worker->wrapped_send_for_test(l7) == SendResult::Sent);   // released: allowance 3 -> 2
+    CHECK(f.worker->releases_for_test(OutboxDomain::Lifecycle) == 1);
+
+    f.sink.set_permits(kComplianceIdx, -1); // the blocker finishes and is consumed
+    CHECK(f.worker->wrapped_send_for_test(c5) == SendResult::Sent);
+    // No blocker now: this launch must clear the leftover allowance.
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Lifecycle, 8, "l-8")) ==
+          SendResult::Sent);
+
+    // A NEW older compliance send parks; a younger lifecycle entry behind it must be denied, not
+    // let through on the allowance left over from the earlier episode.
+    f.sink.set_permits(kComplianceIdx, 0);
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Compliance, 9, "c-9")) ==
+          SendResult::Retain);
+    const auto d0 = f.worker->denials_for_test(OutboxDomain::Lifecycle);
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Lifecycle, 10, "l-10")) ==
+          SendResult::Retain);
+    CHECK(f.worker->denials_for_test(OutboxDomain::Lifecycle) == d0 + 1);
+    CHECK(f.worker->releases_for_test(OutboxDomain::Lifecycle) == 1); // no second release yet
 }
 
 TEST_CASE("#3972 T5: a lane that EMPTIES mid-episode restarts its hold clock",
@@ -2634,6 +2675,42 @@ TEST_CASE("#3972 T11: denials are counted per lane and every release increments 
     CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
     CHECK(f.worker->releases_for_test(OutboxDomain::Lifecycle) == 1);
     CHECK(f.worker->cross_lane_order_release_count() == 2); // both lanes summed
+}
+
+TEST_CASE("#3972 T11b: a Health entry is held, denied and released on the COMPLIANCE lane",
+          "[spark][guardian][drain][order]") {
+    // lane_of() maps Health to the compliance lane (it shares outbox_ with Compliance). An OLDER
+    // lifecycle send parks; a younger Health entry is denied behind it, and every per-lane
+    // counter lands on the compliance lane, none on the lifecycle lane.
+    HoldRig f(20, 0ms, kAllowance);
+    f.sink.set_permits(kLifecycleIdx, 0);
+    CHECK(f.worker->wrapped_send_for_test(hand_entry(OutboxDomain::Lifecycle, 5, "l-5")) ==
+          SendResult::Retain); // the older lifecycle send parks
+
+    const auto h = hand_entry(OutboxDomain::Health, 7, "h-7");
+    CHECK(f.worker->wrapped_send_for_test(h) == SendResult::Retain); // denied behind l-5
+    CHECK(f.worker->denials_for_test(OutboxDomain::Health) == 1);
+    CHECK(f.worker->denials_for_test(OutboxDomain::Compliance) == 1);
+    CHECK(f.worker->last_blocker_seq_for_test(OutboxDomain::Compliance) == 5);
+    CHECK(f.worker->denials_for_test(OutboxDomain::Lifecycle) == 0);
+
+    CHECK(f.worker->wrapped_send_for_test(h) == SendResult::Sent); // released: one overtake
+    CHECK(f.worker->releases_for_test(OutboxDomain::Health) == 1);
+    CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
+    CHECK(f.worker->releases_for_test(OutboxDomain::Lifecycle) == 0);
+    CHECK(f.worker->cross_lane_order_release_count() == 1);
+}
+
+TEST_CASE("#3972: the production defaults of the cross-lane hold are 1 s and 64 launches",
+          "[spark][guardian][drain][order]") {
+    // The HELP text, metrics.md, the flip-gate doc and the changelog fragment hardcode these
+    // numbers (see the comment at the constants); this is the tripwire that makes a change here
+    // visible to whoever edits them.
+    CHECK(kGuardianCrossLaneOrderHold == 1000ms);
+    CHECK(kGuardianCrossLaneReleaseAllowance == 64);
+    const GuardianMaintenanceConfig cfg;
+    CHECK(cfg.cross_lane_order_hold == kGuardianCrossLaneOrderHold);
+    CHECK(cfg.cross_lane_release_allowance == kGuardianCrossLaneReleaseAllowance);
 }
 
 // ---------------------------------------------------------------------------

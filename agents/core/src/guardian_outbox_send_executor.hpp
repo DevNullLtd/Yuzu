@@ -64,7 +64,10 @@
  * done orphan's slot leaves active_worker_count() exactly as it was. The detached worker
  * lambda wears GuardianDetachedWorkerRole as its first statement (guardian_detached_worker_
  * role.hpp), like the sibling executors, so an engine mtx_ acquisition inside `send` aborts in
- * debug/sanitizer builds.
+ * debug/sanitizer builds. The marker is narrower than GuardianIoExecutor's: its workers
+ * destroy their owned user callables inside the marked scope, whereas here the `send` and
+ * `entry` captures are destroyed with the closure by io_detail::detached_trampoline after the
+ * role has cleared, so the marker covers send(entry) itself and not those destructors.
  */
 
 #include "guardian_detached_worker_role.hpp" // GuardianDetachedWorkerRole
@@ -787,7 +790,7 @@ private:
                 post_admission_race_hook_for_test_();
             auto st = state_;
             auto worker = [st, ticket, entry, send]() mutable noexcept {
-                // First statement (R5, #3972/#3980): marks this detached worker so
+                // First statement (#3972/#3980): marks this detached worker so
                 // GuardianEngine::WorkerHostileMutex aborts in debug/sanitizer builds if
                 // `send` ever takes mtx_ (lock-vs-lifetime, guardian_detached_worker_role.hpp).
                 // The production send takes only stream_write_mu_ and KvStore's own mutex
