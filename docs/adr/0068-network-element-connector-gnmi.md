@@ -3,7 +3,7 @@ status: accepted
 date: 2026-10-03
 owner: Nathan Dornbrook
 deciders: Nathan Dornbrook (project owner) — grilling session 2026-10-02/03; governance run PR #5367 (2026-10-04, two rounds, 76 + 33 findings folded)
-amends: 0031-presentation-core-engine-decomposition.md Decision 8 (seam inventory: B8 core → network collector)
+amends: 0031-presentation-core-engine-decomposition.md Decision 8 (seam inventory: B8 core → network collector); and the engine-principal rule "no built-in role, ever" (engine-principal design §4.2, enforced in `RbacStore::assign_role`) by exactly ONE named exception, `NetworkCollector` (D5)
 depends-on: ADR-0067 (co-determination purview + Incident — the purview clauses of D5/D7/D10 bind only once it is accepted), ADR-1005 Decision 2 (connectors are core — appendix verdict 2026-10-03), ADR-0010 (SecretCodec), ADR-0012 (Postgres store author contract), ADR-2002 §3/§6/§10 (fenced leader), `0031-engine-principal-store.md` (engine principals), `0031-presentation-core-engine-decomposition.md` Decision 8 (seam inventory — amended by this ADR, see Consequences)
 related: ADR-0044 (DiscoveryStore), `0016-agent-daily-sync-framework.md` (`last_seen` is server receipt time), ADR-0033 §4/§10 (approval primitive; Execution Plans — the reserved write path), ADR-1006 (service-scope default-deny), ADR-0017 (confinement), ADR-3005 (`PluginConfigStore` write-only pattern), `docs/pki-architecture.md` (non-agent client certs deferred), `docs/clock-guarded-retention.md`, roadmap Phase 9
 scope: platform — first connector; network-element model; gNMI adapter via gnmic; Prometheus and MCP surfaces
@@ -150,15 +150,29 @@ annotations D10 states — they write Yuzu's own store, never an element.
 
 - New securable **`NetworkElement`** with operations `Read`, `Write`, `Delete`, `Collect`.
   Seeded: `Read`/`Write`/`Delete` to Administrator (it **joins the Administrator CRUD loop** in
-  `rbac_store.cpp` — which also seeds `Execute`/`Approve` on every type it iterates; both are
-  unconsumed here, the Decommission precedent) and to a new **`NetworkEngineer`** role; `Collect`
-  is **excluded from `crud_ops` and from the Administrator loop** (the `Push`/`Attest`/`Rotate`
-  precedent) and seeded to **no role at all**. Engine principals are granted roles, and
-  `assign_role` refuses every seeded (`is_system`) role to an engine principal, so the collector's
-  role is an **operator-created custom role, `NetworkCollector` by convention, holding exactly
-  `NetworkElement:Collect`** — created by the bootstrap runbook (D11), never seeded, never
-  human-assignable. Every closed list the securable and operation must join is a slice-1
-  consequence, enumerated under Consequences.
+  `rbac_store.cpp` — which also seeds `Execute`/`Approve` on every type it iterates; this ADR
+  consumes both, **only** for the purview override below, and `NetworkEngineer` holds neither) and
+  to a new **`NetworkEngineer`** role; `Collect` is **excluded from `crud_ops` and from the
+  Administrator loop** (the `Push`/`Attest`/`Rotate` precedent) and seeded to **exactly one role**,
+  a new **`NetworkCollector`**: a seeded system role whose whole permission set is
+  `NetworkElement:Collect`, absent from `kRbacAssignableRoles` (never human-assignable).
+- **Collector role provisioning — a seeded role plus one named exception, not a role-creation
+  surface.** `RbacStore::create_role` and `set_permission` have no production route callers
+  (`rbac_assignable_roles.hpp` says so itself), and a general custom-role administration surface
+  is a privilege-minting primitive this connector does not need. But `assign_role` refuses every
+  `is_system` role to an engine principal ("no built-in role, ever"), so a seeded
+  `NetworkCollector` is unassignable as the rule stands. The engine-principal guard therefore
+  gains a **closed, one-entry allow-list** (`NetworkCollector`): EXTEND-never-fork, and widening it
+  is a security decision, not a routine edit. Slice 1 ships tests pinning that the list is exactly
+  that one entry, that the role's permission set is exactly `NetworkElement:Collect`, that
+  `NetworkEngineer` holds neither `Execute` nor `Approve`, and that no human-assignable list
+  contains `NetworkCollector`. A system role cannot be removed by `delete_role` (which refuses
+  `is_system`), so the "never delete the role" footgun disappears; an operator who strips `Collect`
+  from it makes the collector 403 fail-closed, observable via `NetworkCollectorFetchRejected`. The
+  collector principal is then an ordinary engine principal (existing `/api/v1/engine-principals`
+  routes) granted that role through the existing `/engine-principals/{id}/roles` route — **no new
+  provisioning surface**. This is a slice-1 dependency; the rest of the closed lists the
+  securable and operation must join are enumerated under Consequences.
 - **The whole table is deliberate (owner decision, 2026-10-04).** Global `NetworkElement:Read`
   grants an element's complete FDB, ARP and LLDP tables. A complete inventory of everything
   attached to the network — agent-managed or not — is the point of the connector, so the table is
@@ -177,15 +191,19 @@ annotations D10 states — they write Yuzu's own store, never an element.
   panel. (If a floor is ever wanted it is applied to both, via `authz_topology_floor.hpp`, never a
   second list.)
 - **Audit verbs, separately countable** (works-council rule): `network_element.view` (inventory
-  list/get — not behavioural), `network_element.state.view` (interfaces, LLDP, system — asset
-  topology, not behavioural), **`network_element.presence.view`** (FDB/ARP/neighbour subtrees of
-  `Get` — presence data, through the behavioural-read gate), **`network_element.attachment.view`**
+  list/get — not behavioural), `network_element.state.view` (interfaces, system, platform and the
+  element-to-element LLDP edges — asset topology, not behavioural), **`network_element.presence.view`**
+  (the `fdb`, `arp_nd` and raw `lldp` facts of `Get` — presence data, through the behavioural-read
+  gate), **`network_element.attachment.view`**
   (the attachments join — presence data, through the behavioural-read gate),
   `network_element.register`,
   `network_element.update`, `network_element.delete` (its cascade purges that element's edges and
   observations), `network_element.credential.set` (a rotation is a second `set`),
+  `network_element.destination.change` (D6: a new address together with a new credential; a
+  `credential.set` row is written in the same transaction),
   `network_element.observations.erase` (the DSAR/decommission erasure, with a row count),
-  `network_element.purview.override` (this is ADR-0067's `purview.override` — one verb, one name),
+  `network_element.purview.override` (this is ADR-0067's `purview.override` — one verb, one name;
+  a protection-reducing override's row carries both requester and approver),
   `network_element.profile.override`, and `network_element.collector.fetch` (D6, with
   `result=success|denied|degraded` and, on `degraded`, the offending element id — an id is not a
   secret). The two presence verbs are the ones ADR-0067's gate set is derived from.
@@ -193,12 +211,35 @@ annotations D10 states — they write Yuzu's own store, never an element.
   **not** device-CI tier. `device_ci` is current-state, one row per agent, replaced on sync; the
   observations table is a **presence-over-time log of every device on every switch — agent,
   non-agent, visitor** — behavioural-adjacent and works-council-relevant by the SOC 2 doc's own
-  reasoning for `netconn`, and personal data under GDPR where MAC → person is resolvable. LLDP
-  edges are asset topology, not personal. The two presence verbs above route through ADR-0067's
+  reasoning for `netconn`, and personal data under GDPR where MAC → person is resolvable.
+  **LLDP is classified by who the neighbour is, not by the protocol.** An adjacency between two
+  *registered network elements* is asset topology, not personal. A neighbour that does **not**
+  resolve to a registered element — an IP phone, an access point, a host running an LLDP agent,
+  whose chassis-id is often its MAC — is **presence-bearing**, exactly like an FDB row. The
+  stored model follows (D7): element-to-element adjacencies are *edges*; unresolved neighbours are
+  *observations*. The raw `lldp` cache fact can carry both and the cache is not split per
+  neighbour, so the whole fact reads under `network_element.presence.view`, while
+  `list_network_element_neighbors` returns element-to-element edges only, under `state.view` (D10).
+  The two presence verbs above route through ADR-0067's
   pre-read behavioural gate; until ADR-0067 ships they are audited like `device_ci`. An element's
-  purview is **derived at read time** (in purview if its tables can reveal in-purview devices'
-  presence, evaluated against current group membership, never cached) and admin-overridable.
-  **In an EU co-determination deployment the works-council agreement precedes the first
+  purview is **derived at read time** (in purview if its tables — FDB, ARP, unresolved LLDP
+  neighbours — can reveal in-purview devices' presence, evaluated against current group
+  membership, never cached) and overridable **only** through the authority below.
+- **Purview override authority — its own verb, never a field of `update_network_element`.**
+  `NetworkEngineer` holds `Write`; if the override rode on `update_network_element`, a network
+  engineer could take an element out of purview. It is instead
+  `set_network_element_purview_override` (`PUT /api/v1/network-elements/{id}/purview-override`,
+  value `in | out | none`, justification required), gated on **`NetworkElement:Execute`** —
+  Administrator only — and audited `network_element.purview.override` (old value, new value,
+  justification). A **protection-reducing** override — any change *to* `out`, or `in` → `none` —
+  additionally **parks for approval** through the one core-owned approval primitive (ADR-0033 §4,
+  not a new gate): the approver holds `NetworkElement:Approve`, completes an MFA step-up, and is a
+  distinct human root from the requester; the approved request binds the element id and target
+  value, requester authority is re-checked at execution (§8), and the audit row carries both
+  principals. A protection-*increasing* change (`none | out` → `in`, `out` → `none`) takes effect
+  on the requester's authority alone, since it only narrows reads. `Write` is deliberately not
+  sufficient: the override changes who may be watched, not what is inventoried.
+- **In an EU co-determination deployment the works-council agreement precedes the first
   `network_element.register` and the first `NetworkCollector` grant** — those two audit rows are
   the evidence of that decision — **and the collector is not enabled before ADR-0067's
   deployment-wide default flip ships** (ADR-0067 D5; restated in `upgrading.md`).
@@ -218,13 +259,19 @@ annotations D10 states — they write Yuzu's own store, never an element.
 - gnmic's HTTP target loader polls **`GET /api/v1/network-elements/collector-targets`** over TLS,
   authenticating as a **collector principal**: an engine principal
   (`0031-engine-principal-store.md`)
-  holding exactly `NetworkElement:Collect`. **Admission is a dedicated predicate, never
+  granted the seeded `NetworkCollector` role (D5), whose whole permission set is
+  `NetworkElement:Collect`. **Admission is a dedicated predicate, never
   `require_permission`'s generic path** (the `rbac_admin_predicate.hpp` "instead of perm_fn"
   shape): the route admits a session iff `principal_kind == "engine"`, `is_elevated` is false,
-  `token_scope_service` and `mcp_tier` are empty, AND a **direct** `RbacStore::check_permission`
-  (503 on store degrade) resolves `NetworkElement:Collect` — so an elevated human session (which
-  `require_permission` short-circuits) and an RBAC-off Administrator (which the legacy branch
-  admits for non-`Read` operations) are **denied explicitly**, not merely logged. The route is
+  `token_scope_service` and `mcp_tier` are empty, `rbac_enforcement_in_effect()` is true (the
+  explicit RBAC-enabled check — `check_permission` never consults the flag, so it cannot be the
+  gate), AND — through the `*_checked` readers, which can tell a degrade from a deny —
+  `get_principal_roles_checked("engine", <id>)` is exactly `{NetworkCollector}` and
+  `get_role_permissions_checked("NetworkCollector")` is exactly `{NetworkElement:Collect}`. A
+  degraded read of either is **503** (audited `degraded`); a mismatch, or RBAC off, is **403**
+  (audited `denied`) — so an elevated human session (which `require_permission` short-circuits)
+  and an RBAC-off Administrator (which the legacy branch admits for non-`Read` operations) are
+  **denied explicitly**, not merely logged. The route is
   registered only when HTTPS is enabled — the collector feature refuses to start under
   `--no-https` (the `--scim-enable requires HTTPS` boot-time precedent), since httplib gives a
   route no per-request listener identity. Because engine
@@ -246,15 +293,47 @@ annotations D10 states — they write Yuzu's own store, never an element.
   offending element id in its audit row, `get_network_element` exposes a non-secret
   `credential_status: ok|unreadable`, and the runbook says to re-enter or delete each unreadable
   element — otherwise one undecryptable row stalls the whole list until it is fixed.
-- **Collector-principal integrity check**: `validate_assignment` rejects only the literal admin
-  role names; a custom all-permission role is auditor-detected, not prevented. So core verifies at
-  **every fetch, from the effective permission set, never from a cached verdict**, that the
-  calling collector principal holds **exactly** `NetworkElement:Collect`; the route fails closed
-  (403, audited `denied`) for a principal that holds anything else. One collector principal per
+- **Collector-principal integrity check**: "holds exactly `Collect`" is not a property a gate can
+  observe, so the route *computes* it. The predicate above is the integrity check: it runs at
+  **every fetch, from the effective role and permission sets, never from a cached verdict**. The
+  engine guard in `assign_role` admits no role but `NetworkCollector` (D5), so the check's job is
+  the case the guard cannot see — an out-of-band grant (direct SQL) of an extra role, or an extra
+  permission on `NetworkCollector` itself; the route fails closed (403, audited `denied`) for a
+  principal or role that holds anything else. One collector principal per
   collector instance. A second source address on one principal within an interval is a
   **signal** — it is audited and counted (`result=success`, the address in the audit row, never a
   label) and surfaced to the operator, but it does not deny: NAT hides a stolen token behind the
   collector's own address and a rescheduled collector legitimately changes address.
+- **A stored credential never follows a changed destination.** The *destination* is
+  `(management address including port, adapter)`; a credential is entered for one destination.
+  The destination changes only through `set_network_element_destination`
+  (`PUT /api/v1/network-elements/{id}/destination`, `NetworkElement:Write`, audited
+  `network_element.destination.change`), which **requires a new credential in the same request**
+  and replaces the stored one in the same transaction; the audit row names the old and new
+  address (not secrets) and never a credential, and the mutation is refused if its audit row
+  cannot be persisted (ADR-0033 §9). There is no way to change the address while keeping the old
+  secret, so a `Write` holder who re-points an element can only deliver a secret they already
+  know — which is why `Write` is sufficient authority: the operation discloses nothing that was
+  stored. `update_network_element` carries no address field, and the store exposes **one** write
+  method for the (address, credential) pair, so the invariant has one home; a unit test pins that
+  no other store method writes the address column. The targets route reads each element's
+  (address, credential) in a single snapshot, so a mismatched pair is never published. **Trust
+  material is not per-element data**: core's published target carries no
+  `tls-ca`/`tls-cert`/`tls-key`/`skip-verify`; the device trust bundle and any client certificate
+  are the collector deployment's own configuration (mechanism fixed in slice 1), so changing a
+  trust anchor is a deployment change outside Yuzu's API, not an action a `Write` holder can
+  take. **Residual, stated**: an attacker with Postgres write access can alter an address out of
+  band, and `SecretCodec`'s AAD is the `(schema, table, column, primary key)` tuple, so it cannot
+  also bind the destination; that case is bounded by database-access controls, not by
+  cryptography. Device accounts are read-only by profile prerequisite (D11), which bounds what a
+  disclosed credential can do.
+- **A collector secret-egress threat model is a slice-1 entry criterion** — written and reviewed
+  before the route is implemented (a document under `docs/security-reviews/`; name final in
+  slice 1). ADR-3005's `PluginConfigStore` is a write-only *storage* precedent and its explicit
+  threat-model prerequisite concerns delivery to an *agent*; neither covers a decrypt route. The
+  model must cover: destination and profile changes, fetch authorization, audit failure,
+  rotation, revocation (bearer and element), credentials retained by the collector (memory,
+  logs, disk, backups), and bearer theft.
 - Bearer lifetime and rotation use the existing `engine_principal.credential.rotate`/`.reveal`
   verbs and procedure; the user manual states the rotation steps and that a rotated device
   password reaches gnmic on its next poll (≤ 60s) and applies on that target's next reconnect.
@@ -269,7 +348,8 @@ annotations D10 states — they write Yuzu's own store, never an element.
   every element credential in one call.* Owner: the Security Lead (the SOC 2 doc's register
   owner). Likelihood: low (single-purpose bearer, mounted secret, RBAC-on only). Impact: high
   (every registered element's management credential). Mitigations: single-purpose principal + the
-  per-fetch integrity check; fail-closed fetch audit; the `result=denied` alert and the
+  per-fetch integrity check; credentials that never follow a destination change (no `Write` holder
+  can redirect a stored secret); fail-closed fetch audit; the `result=denied` alert and the
   source-change signal; bearer lifetime bounded by the engine-principal credential policy and
   rotated via the existing verbs; RBAC-enabled precondition. Review cadence: quarterly with the
   register, with every ADR that touches D6, and before any write path (D4). The entry is
@@ -289,9 +369,11 @@ annotations D10 states — they write Yuzu's own store, never an element.
   **natural key** is `(management address, adapter)`, unique: registration is an **upsert by
   natural key** that returns the existing id, so a retried `register_network_element` is
   genuinely idempotent (`idempotentHint: true` is truthful) and never mints a second element,
-  credential or gnmic target. A **re-address is `update_network_element` with a new
-  `management_address`** (uniqueness-checked), never a second registration; the id keeps
-  `SecretCodec`'s row-PK-bound AAD stable across it. Learned chassis serial and LLDP chassis-id
+  credential or gnmic target. A **re-address is `set_network_element_destination`** (D6) — a new
+  address **and a new credential in one request**, uniqueness-checked on the natural key — never a
+  second registration and never a stored credential carried to the new address; the id is
+  unchanged, so edges and observations stay attached (the `identity_change` check below still
+  applies when the learned identity differs). Learned chassis serial and LLDP chassis-id
   form a **second uniqueness key**. Identity is *learned* after the target is dialled, so the
   collision surfaces on the new element's first sync, not at registration: it is audited
   `duplicate_identity`, the new element is forced to `disabled` and omitted from the next
@@ -303,9 +385,14 @@ annotations D10 states — they write Yuzu's own store, never an element.
   re-keyed to `address:<retired>` so the natural key is free, then disabled).
 - **`NetworkElementStore`**, born on Postgres (ADR-0012): the element row (id, display name,
   learned vendor/model/OS, management address, adapter, vendor-profile family + override, purview
-  override, enabled, `state`, `last_seen`); **interfaces**; **LLDP neighbours as edges**
-  (`first_seen`, `last_seen`, `retired_at`); and the **FDB/ARP tables as observations**
-  (`first_seen`/`last_seen`). Edges and observations are **separate tables**, so the service
+  override, enabled, `state`, `last_seen`); **interfaces**; **element-to-element LLDP adjacencies
+  as edges** (both ends registered elements; `first_seen`, `last_seen`, `retired_at`); and, as
+  **observations**, the **FDB/ARP tables and every LLDP neighbour that does not resolve to a
+  registered element** (`first_seen`/`last_seen`). A neighbour resolves to an element by the
+  second uniqueness key (learned chassis-id/serial); classification is re-evaluated at each sync,
+  so a neighbour that later becomes a registered element is promoted to an edge and its
+  observation rows age out under the observations window, while an unresolvable one stays
+  presence data. Edges and observations are **separate tables**, so the service
   diagram can query adjacency without touching presence data (D5). `state` is a closed enum:
   `registered` (no data yet) · `no_profile` · `reachable` · `unreachable` · `disabled`.
   `last_seen` advances **only** on the per-target liveness signal (D9), never on stream health.
@@ -513,17 +600,28 @@ subscriptions only; there is no on-demand device RPC. So under D3 there is no *l
 - Read tools (each with a REST twin, A1–A5, `ServiceScopeClass::denied`, `openWorldHint: false`
   per the house rule that the managed estate is a closed world):
   `list_network_elements`, `get_network_element` (`NetworkElement:Read`, audited
-  `network_element.view`); `list_network_element_neighbors` (edges, flagged when retired;
-  `network_element.state.view`); `list_network_element_attachments` (D7 shape; agent-side
-  confined; `network_element.attachment.view` through the behavioural-read gate);
-  `get_network_element_state` (cache `Get` by fact; `network_element.state.view` for
-  `interfaces`/`lldp`/`system`/`platform`, `network_element.presence.view` for `fdb`/`arp_nd`).
+  `network_element.view`); `list_network_element_neighbors` (**element-to-element edges only**,
+  flagged when retired; `network_element.state.view` — a neighbour that is not a registered
+  element is presence data and is never returned here); `list_network_element_attachments` (D7
+  shape; agent-side confined; `network_element.attachment.view` through the behavioural-read
+  gate); `get_network_element_state` (cache `Get` by fact; `network_element.state.view` for
+  `interfaces`/`system`/`platform`, `network_element.presence.view` for `fdb`/`arp_nd`/`lldp` —
+  the cached `lldp` fact carries unresolved neighbours as well as element peers and cannot be
+  split per neighbour, so the whole fact is presence data).
 - Write surfaces (`NetworkElement:Write`/`Delete`, in `kWriteTools`, `destructiveHint: false`
-  except delete, `idempotentHint: true` by the D7 upsert): `register_network_element`
+  except delete and destination change, `idempotentHint: true` by the D7 upsert):
+  `register_network_element`
   (`POST /api/v1/network-elements`), `update_network_element` (`PATCH …/{id}` — display name,
-  enabled, purview override, profile override), `delete_network_element` (`DELETE …/{id}`,
+  enabled, profile override; **no address and no purview override**),
+  `delete_network_element` (`DELETE …/{id}`,
   `destructiveHint: true`), `set_network_element_credential` (`PUT …/{id}/credential` —
-  write-only; no tool ever returns a credential). `GET /api/v1/network-elements/collector-targets`
+  write-only; no tool ever returns a credential), and `set_network_element_destination`
+  (`PUT …/{id}/destination` — new address plus a required new credential, D6;
+  `destructiveHint: true` because it discards the stored credential, `idempotentHint: true`).
+  `set_network_element_purview_override` (`PUT …/{id}/purview-override`) is **not** a `Write`
+  tool: it is gated on `NetworkElement:Execute` and, when protection-reducing, parks for approval
+  and returns a pending state over MCP (D5; `destructiveHint: false`, `idempotentHint: true`).
+  `GET /api/v1/network-elements/collector-targets`
   is **REST-only by design** (gnmic is the caller) and is recorded as a dated entry in ADR-1005's
   D1 exception ledger with this ADR.
 - `retry_after_ms` on a `Get` that finds gnmic unreachable is derived from the D9 backoff state,
@@ -562,10 +660,10 @@ subscriptions only; there is no on-demand device RPC. So under D3 there is no *l
   re-pin; customers scan it as a third-party image (Yuzu's release SBOM/cosign covers Yuzu images
   only). gnmic's REST API server is disabled; its gNMI server is reachable from core only.
 - **Bootstrap order** (slice-1 deliverable, runbook in `server-admin.md`): core up with RBAC
-  enabled → an admin creates the custom `NetworkCollector` role (exactly `NetworkElement:Collect`)
-  and the collector engine principal, and grants the role (the runbook says never to delete that
-  role — `principal_roles` has no FK, so deletion leaves an inert grant and the collector 403s,
-  observable via `NetworkCollectorFetchRejected`) →
+  enabled → an admin creates the collector engine principal and grants it the **seeded**
+  `NetworkCollector` role through the existing engine-principal role route (D5 — no role is
+  created, so there is none to forget or delete; if an operator strips `Collect` from it the
+  collector 403s fail-closed, observable via `NetworkCollectorFetchRejected`) →
   the bearer is minted and mounted as a secret → gnmic starts with the Yuzu-shipped reference
   config; on a 401/503 or an empty list at first boot gnmic simply has no targets and polls again.
   Core learns the gnmic endpoint and its client mTLS material from `--netcollector-endpoint` /
@@ -630,16 +728,28 @@ subscriptions only; there is no on-demand device RPC. So under D3 there is no *l
   the data plane may be an external, non-Yuzu process); the 9.x sketches remain sketches.
 - **Closed lists that gain entries in slice 1** (each a build/test failure if missed):
   `rbac_store.cpp` securable `types[]` and `ops[]` (+ the Administrator loop for
-  Read/Write/Delete, `Collect` excluded), `kRbacSecurables`/`kRbacOps` in `mcp_server.cpp`,
+  Read/Write/Delete, `Collect` excluded), the seeded `roles` array (+ `NetworkEngineer`,
+  + `NetworkCollector`, with every seeded-role count in code and docs) and the `NetworkCollector`
+  seed grant of exactly `Collect`, the one-entry engine allow-list in `assign_role` (D5),
+  `kRbacSecurables`/`kRbacOps` in `mcp_server.cpp`,
   `kSeededSecurableTypes`/`kSeededOperations` in `test_capability_catalogue.cpp`, the
   `test_rbac_store.cpp` binding test, `kRbacAssignableRoles` (`rbac_assignable_roles.hpp`) and its
-  MCP schema enum for `NetworkEngineer` (and **not** for `NetworkCollector`, which is a custom
-  role and never human-assignable), the "securable types" counts in
+  MCP schema enum for `NetworkEngineer` (and **not** for `NetworkCollector`, which is granted to
+  engine principals only, through the engine-principal route), the "securable types" counts in
   `docs/user-manual/rbac.md` and `docs/auth-architecture.md`, `/api/v1/discover/permissions` (store-
   derived, automatic), and the audit-verb table in `docs/user-manual/audit-log.md` (D5's verbs).
+- **Slice-1 entry criteria decided here, built there** (each a contract this ADR fixes; none is
+  implemented by this documentation PR): (1) the seeded `NetworkCollector` role and the
+  one-entry engine allow-list, with the pinning tests (D5); (2) the single (address, credential)
+  write method behind `set_network_element_destination` and the unit test that no other method
+  writes the address (D6); (3) the purview-override verb on `Execute`/`Approve`, with its
+  approval parking and the test that `NetworkEngineer` holds neither (D5); (4) the collector
+  secret-egress threat model, reviewed before the route (D6); (5) ingest-time LLDP
+  classification into edges vs observations (D7).
 - **SOC 2** (`docs/enterprise-readiness-soc2-first-customer.md`): the "Data Inventory —
   server-side PostgreSQL stores" table gains
-  `network_element_store` (edges: asset topology; observations: **presence-over-time, new
+  `network_element_store` (edges: element-to-element asset topology; observations: FDB, ARP and
+  unresolved LLDP neighbours — **presence-over-time, new
   category, behavioural-adjacent**, DSAR erasure source, decommission-cascade member, retention per
   D7) and `network_element_credentials` (secret, `SecretCodec`); the "Behavioral telemetry (DEX)"
   section's channel list gains `network_element.presence.view` and
@@ -648,9 +758,11 @@ subscriptions only; there is no on-demand device RPC. So under D3 there is no *l
   records Yuzu = control plane, customer = gnmic hosting, device certs, device-side AAA.
   **Questionnaire answers — true once slice 1 ships, not before**: device credentials are stored in
   Postgres under `SecretCodec` envelope encryption; they are readable in the clear only by
-  collector-class engine principals holding exactly `NetworkElement:Collect`, through one audited
+  collector-class engine principals holding the `NetworkCollector` role (exactly
+  `NetworkElement:Collect`), through one audited
   route, and they then live in the collector process's memory and transit the F1 response body
-  over TLS; rotation is a credential `set` that reaches the collector on its next poll; a
+  over TLS; a stored credential is never delivered to a changed address (a re-address requires
+  entering a new credential); rotation is a credential `set` that reaches the collector on its next poll; a
   customer-hosted secrets manager (reference mode) is a tracked roadmap item (#5408); device-side TLS verifies against the customer's CA bundle with customer-issued client
   certificates where the device requires them, and `skip-verify` is refused.
 - **Documentation deliverables (slice 1)**: `docs/user-manual/network-elements.md` (collector

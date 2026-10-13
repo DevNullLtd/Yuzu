@@ -40,7 +40,8 @@ deciding which subjects are which.
 1. **Purview is an operator-declared marker on a subject.** For person-assigned devices it is
    declared on a **management group** (the unit the SOC 2 doc already names for per-group
    toggles). For a **network element** (ADR-0068) it is **derived** — in purview if its tables can
-   reveal in-purview devices' presence — and admin-overridable. **Derivation is evaluated at read
+   reveal in-purview devices' presence — and overridable only by an administrator, a
+   protection-reducing override needing a distinct approver (ADR-0068 D5). **Derivation is evaluated at read
    time against current group membership; there is no cached verdict**, so a device joining an
    in-purview group is covered on the next read.
 2. **Purview follows the person, not the geography.** A German employee's laptop abroad stays in
@@ -72,17 +73,22 @@ deciding which subjects are which.
    `incident.expire` (written by the gate at the first post-lapse evaluation or by a sweep,
    whichever comes first; the export derives expiry from `expires_at` regardless), `purview.set`
    and `network_element.purview.override` (every purview change — the element verb is ADR-0068's,
-   one name), every stamped read (its own verb + `incident_id`), and every **denial** during the
+   one name; a protection-reducing one carries requester and approver), every stamped read (its own verb + `incident_id`), and every **denial** during the
    window. The export is
    generated from audit rows only, retained ≥ 365 days with the audit store, and its generation is
    itself an audit row carrying the export's content hash. **An unrecordable read is not made:**
    an audit-persist failure denies the read even under an Incident, and on an **audit-off**
    deployment (`audit_fn` absent, where the funnel's kernel returns `true` today) in-purview reads
-   are refused outright and a purview declaration (`purview.set`, a write on the management-group
-   row the pre-read gate never sees) is refused on its own write path — there is no Incident
-   without evidence. Because declarations are refused, an audit-off deployment holds every subject
-   out of purview under Decision 4's "today's behaviour"; the read refusal is reachable only
-   through Decision 5's deployment-wide default flip.
+   are refused outright — there is no Incident without evidence — and any change to a purview
+   declaration (`purview.set` in either direction, a write on the management-group row the
+   pre-read gate never sees) is refused on its own write path. The two rules compose by *when
+   audit went off*, and a declaration's classification is **never reinterpreted**: a deployment
+   that **already holds declarations** and later turns audit off keeps every one — protected
+   reads on those subjects are denied without evidence (declared in the response, counted) and
+   do **not** silently become out of purview. A deployment that **never had audit** can hold no
+   declaration, so every subject there is out of purview under Decision 4's "today's behaviour"
+   until Decision 5's deployment-wide default flip, from which point the read refusal applies to
+   all of them. Turning audit back on restores Incident-gated access; nothing is re-declared.
 7. **Enforced by a pre-read, deny-capable decision in front of the single funnel.**
    `emit_behavioral_audit` (`rest_audit.hpp`) is an audit *wrapper*: it returns a persist bool,
    REST fails closed on it, the dashboard and MCP proceed by design, MCP wraps the kernel itself,
@@ -124,6 +130,11 @@ a Warsaw laptop's process tree (out of purview): permitted, audited, no Incident
 
 - Purview store: a column on the management-group row vs a separate declaration table; the
   element derivation query (it needs ADR-0068's attachments query owner); the override's audit.
+- **Authority to change purview, generally.** ADR-0068 D5 sets the shape for an element override:
+  an administrator-class gate, and a protection-reducing change (a subject moving out of purview)
+  parks for a distinct approver through the one core-owned approval primitive, while a
+  protection-increasing one does not. Whether a management-group declaration (`purview.set`)
+  follows the same rule, and which securable carries it, is part of the mechanism design here.
 - **How a read binds to its Incident** — parameter, header, or session-scoped — and how the gate
   learns the binding before the fetch; the `requested → approved` transition's own audit and the
   sweep that writes `incident.expire`.
