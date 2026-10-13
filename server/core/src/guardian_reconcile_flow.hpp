@@ -345,7 +345,7 @@ public:
         if (!fresh_res) {
             spdlog::warn("Guardian heartbeat reconcile: policy generation unreadable "
                          "({}) - aborting re-push for agent_id={}",
-                         fresh_res.error(), ::yuzu::log_token(agent_id));
+                         fresh_res.error(), ::yuzu::log_id_token(agent_id));
             abort_degraded("policy generation unreadable", fresh_res.error());
             return;
         }
@@ -397,19 +397,19 @@ public:
             case guardian::BundleLoadError::Source::rules:
                 spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) — "
                              "aborting re-push for agent_id={}",
-                             err.detail, ::yuzu::log_token(agent_id));
+                             err.detail, ::yuzu::log_id_token(agent_id));
                 abort_degraded("rule store degraded", err.detail);
                 break;
             case guardian::BundleLoadError::Source::deployed:
                 spdlog::warn("Guardian heartbeat reconcile: deployed_member_rule_ids "
                              "degraded ({}) — aborting re-push for agent_id={}",
-                             err.detail, ::yuzu::log_token(agent_id));
+                             err.detail, ::yuzu::log_id_token(agent_id));
                 abort_degraded("baseline store degraded", err.detail);
                 break;
             case guardian::BundleLoadError::Source::other:
                 spdlog::warn("Guardian heartbeat reconcile: rule bundle load failed "
                              "({}) - aborting re-push for agent_id={}",
-                             err.detail, ::yuzu::log_token(agent_id));
+                             err.detail, ::yuzu::log_id_token(agent_id));
                 abort_degraded("rule bundle load failed", err.detail);
                 break;
             }
@@ -471,7 +471,7 @@ public:
         if (scope_degraded) {
             spdlog::warn("Guardian heartbeat reconcile: scope evaluation store degraded "
                          "({}) - aborting re-push for agent_id={}",
-                         scope_degraded_detail, ::yuzu::log_token(agent_id));
+                         scope_degraded_detail, ::yuzu::log_id_token(agent_id));
             abort_degraded("scope store degraded", scope_degraded_detail);
             return;  // send NOTHING: a narrowed full_sync would disarm the rule
         }
@@ -492,7 +492,7 @@ public:
             spdlog::info("Guardian heartbeat reconcile: a rule or policy change landed while "
                          "this re-push was being prepared - withholding it for agent_id={} "
                          "(retried on a later heartbeat)",
-                         ::yuzu::log_token(agent_id));
+                         ::yuzu::log_id_token(agent_id));
             abort_invalidated("rule bundle invalidated during load",
                               "a rule or policy change landed while the re-push was being "
                               "prepared; retried on a later heartbeat");
