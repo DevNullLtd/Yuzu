@@ -7025,9 +7025,9 @@ public:
                     {"guaranteed_state_baselines", "guaranteed_state_baseline_rules",
                      "guaranteed_state_baseline_groups"});
                 // #5513: a committed Baseline update (a deploy rewrites the deployed snapshot),
-                // delete or deployed create drops the heartbeat reconcile's cached generation and held bundle
-                // immediately, BEFORE the caller's own policy-generation bump (its own lease)
-                // and fan-out. Without it a reconcile running in that gap could send the old
+                // delete or deployed create drops the heartbeat reconcile's cached generation
+                // and held bundle immediately, BEFORE the caller's own policy-generation bump
+                // (its own lease) and fan-out. Without it a reconcile running in that gap could send the old
                 // deployed set under the unchanged generation label. Same two invalidations as
                 // the rule-mutation hook; both caches are members declared AFTER baseline_store_
                 // (destroyed first), the hook only fires from a mutation, and stop() clears it.

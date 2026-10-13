@@ -184,6 +184,12 @@ Invariants over the WIRING (server.cpp):
      BaselineStore method is red too. The runtime half (the hook fires once per committed
      update, delete and deployed create, never on a failed one, holds no lease, cannot break the
      mutation) is pinned by the [baseline_hook] cases in tests/unit/server/test_baseline_store.cpp.
+     Accepted limits of (b), lexical only, no code for them: it can be falsely RED on
+     `if (auto it = f(); cond) return x;` and on `for (;;) return ...` (the statement head is cut
+     at the last `;`, so the conditional is not seen). It can be falsely GREEN on a bare
+     `{ return; }` block, a `throw`, a `goto`, `if (true) return`, a conditional return after
+     the commit that skips the notify, and a notify placed before an explicit COMMIT after a
+     future PgTxn refactor. The [baseline_hook] runtime cases are the backstop for those.
 
 LEXICAL ONLY. It cannot see a relocation that keeps the tokens but changes control flow (that
 stays review-enforced), and the behavioural guarantees are the building blocks' own unit tests.
@@ -612,7 +618,7 @@ def baseline_writer_problems(src):
                 out.append(f"BaselineStore::{name} calls notify_baseline_mutation() before its write to "
                            f"baseline_store.baselines: it would announce a change that has not committed (b)")
             # An unconditional `return` between the write and the notify makes the notify unreachable.
-            running, dip_floor = 0, {}
+            running = 0
             depth_at = []
             for ch in body[:nm.start()]:
                 if ch == "{":
