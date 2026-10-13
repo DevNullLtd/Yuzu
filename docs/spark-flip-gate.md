@@ -1576,17 +1576,27 @@ flip, with a red-first test each:
     `armed_faulted > 0` alert (its group in `docs/prometheus/yuzu-alerts.yml` is commented out);
     (b) a bounded per-rule rebuild-reason INFO log and, optionally, a skip counter (the
     unhappy-path SRE-1 finding: with the skip, an operator cannot tell from the agent log why a
-    given rule was or was not rebuilt); (c) PARTLY DONE: a release-build A/B (base `45f727420` against branch tip
-    `3f8dd8d0d`, uncommitted throwaway harness) ran on a loaded Linux box (S0, S5 and S3s at
-    R up to 5000 and S1d up to R=1000 with fake mechanisms; the real Linux Service mechanism up to R=400) and on
-    weecolin (S0, S5, S3s up to R=5000 with fake mechanisms; the real SCM Service, File and
-    Registry mechanisms up to R=1000): zero watch and unwatch calls and zero un-armed pushes
-    on a skipped re-push (with the real Registry mechanism after the first few pushes, while
-    the initial real arms of 400 to 1000 rules complete; the baseline never converged there),
-    and an engine health-probe call of about 70 to 100 ns. Counts are
-    exact, wall times are not (the Linux box was shared). Still NOT done: a quiet-box run, a
-    shared-faulted-key cell, the engine `mtx_` hold time recorded directly, a real mechanism
-    on macOS, and an isolated probe on/off measurement (the probe cost above is a bound); (d) an explicit census resync mechanism for
+    given rule was or was not rebuilt); (c) MEASURED, release build (base `45f727420` against branch tip
+    `3f8dd8d0d`, uncommitted throwaway harness; counts are exact, wall times are not): Linux
+    (shared box; the cells that waited for a 1-minute load of 8 or less recorded it, the box
+    never went below about 4) S0, S5 and S3s at R up to 5000 and S1d up to R=1000 with fake
+    mechanisms, and the real Linux Service mechanism up to R=400; weecolin S0, S5 and S3s up to
+    R=5000 with fake mechanisms and the real SCM Service, File and Registry mechanisms up to
+    R=1000. A skipped re-push makes zero watch and unwatch calls and leaves no rule un-armed
+    (with the real Registry mechanism after the first few pushes, while the initial real arms of
+    400 to 1000 rules complete; the baseline never converged there). Shared faulted key (50
+    percent of the rules on one key, fault injected, 30 identical pushes, R=100/500/1000): the
+    branch rebuilds the key once on the first push (2 backend calls) and makes 0 backend calls
+    on pushes 2 to 30, while the baseline tears everything down every push (1,002 calls per
+    push at R=1000). The engine `mtx_`, seen as the longest wait of a contending
+    `rule_count()` call during a push (an upper-bound proxy; the probe perturbs timing): 543 ms
+    to 10 ms at R=1000 and 2,565 ms to 50 ms at R=5000 (S0). The health probe, isolated by a
+    throwaway tree that skips only the per-rule backend call: +0.1 to +0.5 microseconds per
+    skipped rule, indistinguishable from zero at R=1000 (per-rep standard deviation 0.5 to
+    1.4 microseconds); the per-key sweep stays enabled in both. There is no mechanism on macOS
+    to measure (the File, Registry and Service factories return nothing there). Not done: a
+    run on a quiet box, and the real Linux Service mechanism above R=400 (D-Bus match-rule
+    limit); (d) an explicit census resync mechanism for
     server-state loss (loss (1); #5718); (e) a per-mechanism deaf-watch test (watched directory
     deleted and recreated, stale handle) proving each shipped mechanism calls `fault()` (loss (6);
     #5719); items (b) and (e) are tracked together in #5719.
