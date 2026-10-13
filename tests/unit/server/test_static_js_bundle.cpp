@@ -1092,7 +1092,11 @@ TEST_CASE("static_js_bundle: kYuzuCss variant hovers set an explicit colour and 
     // The variant hover rules (0,4,0) outrank a page's own one-class recolour
     // (instruction_ui.cpp: .btn-danger{background:red;color:dark}). A hover
     // that omits `color` leaves dark text on a 12% tint (1.25:1), and one
-    // that swaps background-color turns a green Execute blue.
+    // that sets any background turns a green Execute blue. The primary hover
+    // therefore brightens with a filter and touches no background property,
+    // and the design bans gradients, so none may creep back into a hover.
+    // (The cascade itself is observed in a browser, not here; this pins the
+    // shape of the rules.)
     auto block = [](std::string_view selector) {
         const std::string& css = yuzu::server::kYuzuCss;
         const auto at = css.find(selector);
@@ -1103,16 +1107,23 @@ TEST_CASE("static_js_bundle: kYuzuCss variant hovers set an explicit colour and 
     };
     const std::string danger = block(":is(.btn-danger, .btn.danger):hover:not(:disabled) {");
     CHECK_THAT(danger, ContainsSubstring(" color: var(--bad)"));
+    CHECK_THAT(danger, !ContainsSubstring("gradient"));
     const std::string primary =
         block(":is(.btn-primary, .btn-success, .btn.primary):hover:not(:disabled) {");
     CHECK_THAT(primary, ContainsSubstring(" color: var(--on-primary)"));
-    CHECK_THAT(primary, !ContainsSubstring("background:"));
-    CHECK_THAT(primary, !ContainsSubstring("background-color"));
+    CHECK_THAT(primary, ContainsSubstring("filter: brightness("));
+    CHECK_THAT(primary, !ContainsSubstring("background"));  // background, -color, -image
+    CHECK_THAT(primary, !ContainsSubstring("gradient"));
     // The neutral hover (0,3,0) must skip the primary, or its `background`
     // shorthand repaints a page-recoloured primary.
     const std::string neutral = block(
         ":is(.btn, .btn-secondary, .btn-danger, .btn-ghost, .btn-sm):hover:not(:disabled");
     CHECK_THAT(neutral, ContainsSubstring(".btn-primary, .btn-success, .primary)"));
+    CHECK_THAT(neutral, !ContainsSubstring("gradient"));
+    // An armed button stays solid on hover: its own rule cancels the primary
+    // hover's filter.
+    const std::string armed = block(".btn-confirming.btn-confirming:hover:not(:disabled) {");
+    CHECK_THAT(armed, ContainsSubstring("filter: none"));
 }
 
 TEST_CASE("static_js_bundle: kYuzuCss has no embedded NULs", "[static-js][yuzu-css]") {

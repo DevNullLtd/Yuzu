@@ -324,18 +324,16 @@ a:where(:not([class])):hover { color: var(--primary-h); }
   height: var(--ctl); padding: 0 14px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
   font: inherit; font-weight: 500; text-decoration: none; cursor: pointer;
   color: var(--ink); background: var(--raise); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
-  transition: background-color .12s, border-color .12s, color .12s; }
+  transition: background-color .12s, border-color .12s, color .12s, filter .12s; }
 :is(.btn, .btn-secondary, .btn-danger, .btn-ghost, .btn-sm):hover:not(:disabled, .btn-primary, .btn-success, .primary) { background: var(--surface2); border-color: var(--mut); }
 :is(.btn, .btn-primary, .btn-secondary, .btn-success, .btn-danger, .btn-ghost, .btn-sm):disabled { opacity: 0.4; cursor: not-allowed; }
 :is(.btn, .btn-primary, .btn-secondary, .btn-success, .btn-danger, .btn-ghost, .btn-sm):focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .btn-primary, .btn-success, .btn.primary { background: var(--primary); color: var(--on-primary); border-color: var(--primary); font-weight: 600; }
 /* Variant hovers outrank a page's own one-class recolour (.btn-primary{background:green}),
-   so each sets an explicit colour, and the primary hover lifts with a translucent layer
-   rather than swapping background-color (the neutral hover above skips it): a
+   so each sets an explicit colour, and the primary hover brightens the whole button with a
+   filter rather than swapping the background (the neutral hover above skips it): a
    page-recoloured button keeps its hue and stays legible. */
-:is(.btn-primary, .btn-success, .btn.primary):hover:not(:disabled) {
-  background-image: linear-gradient(rgb(255 255 255 / .26), rgb(255 255 255 / .26));
-  border-color: var(--primary-h); color: var(--on-primary); }
+:is(.btn-primary, .btn-success, .btn.primary):hover:not(:disabled) { filter: brightness(1.2); color: var(--on-primary); }
 .btn-danger, .btn.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line2)); }
 :is(.btn-danger, .btn.danger):hover:not(:disabled) { background: color-mix(in srgb, var(--bad) 12%, transparent); border-color: var(--bad); color: var(--bad); }
 .btn-ghost { background: transparent; border-color: transparent; color: var(--mut); }
@@ -347,7 +345,7 @@ a:where(:not([class])):hover { color: var(--primary-h); }
 /* Two-click confirm (armed): solid red until it fires or times out. A static
    state - no pulse. The doubled class lets the hover rule outrank the
    -primary / -danger hover rules the armed button also carries. */
-.btn-confirming, .btn-confirming.btn-confirming:hover:not(:disabled) { background: var(--bad); border-color: var(--bad); color: var(--on-primary); }
+.btn-confirming, .btn-confirming.btn-confirming:hover:not(:disabled) { background: var(--bad); border-color: var(--bad); color: var(--on-primary); filter: none; }
 .rowact { display: flex; gap: 4px; justify-content: flex-end; }
 
 /* -- Segmented control: <div class="seg"> of buttons (.on) or radio labels -- */
