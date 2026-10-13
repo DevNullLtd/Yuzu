@@ -3030,7 +3030,8 @@ TEST_CASE("#3972 chaos: identical re-pushes and detach_rules_except under a jamm
     // skip): the compound-jam case above only ever arms FRESH rule ids on an always-Healthy
     // backend, so it never reaches attach_core's reuse path or detach_rules_except with kept rules.
     // Here a pool of rules is re-pushed with IDENTICAL content over and over (each a skip: no
-    // lifecycle entry, the pending verdict of the rule stays put), a rotating churn rule is armed
+    // lifecycle entry, a queued verdict of the rule stays put: the last few verdict-carrying
+    // rules are re-pushed too), a rotating churn rule is armed
     // and then removed by detach_rules_except (one real `disarmed`), fresh rules carry steady
     // verdicts, and the link flaps, all while the lifecycle sink throws.
     //
@@ -3039,7 +3040,10 @@ TEST_CASE("#3972 chaos: identical re-pushes and detach_rules_except under a jamm
     //   O2  overtakers <= releases * N + 2;
     //   O3  nothing lost or duplicated, and the lifecycle lane carries EXACTLY one `armed` per fresh
     //       arm plus one `disarmed` per removal: every skipped re-push added zero entries (a re-push
-    //       that re-armed would break the equality); every verdict is delivered once;
+    //       that re-armed would break the equality, and one that re-armed a drifted rule would also
+    //       withdraw its queued verdict, breaking the verdict count); every verdict is delivered
+    //       once. O3 is the ONLY check that a re-push was a skip (`repushes` counts successful
+    //       attaches, not skips);
     //   O4  the worker joins within a bound;
     //   O5  no entry was ever offered unstamped (seq == 0 fails open and would hide an ordering
     //       hole), on either lane.
@@ -3052,6 +3056,7 @@ TEST_CASE("#3972 chaos: identical re-pushes and detach_rules_except under a jamm
 
     std::mutex rig_mu; // serialises FakeReader edits and the engine calls driven from threads
     std::set<std::string, std::less<>> live; // every rule that must survive a detach_rules_except
+    std::vector<std::string> verdict_rules;  // rules carrying a verdict, oldest first
     std::atomic<bool> stop{false};
     std::atomic<int> fresh_arms{0};
     std::atomic<int> removals{0};
@@ -3077,6 +3082,7 @@ TEST_CASE("#3972 chaos: identical re-pushes and detach_rules_except under a jamm
                     live.insert(rule);
                     ++fresh_arms;
                     f.verdict(rule);
+                    verdict_rules.push_back(rule);
                     ++verdicts;
                 } else {
                     ++failures;
@@ -3091,6 +3097,14 @@ TEST_CASE("#3972 chaos: identical re-pushes and detach_rules_except under a jamm
                 std::lock_guard<std::mutex> lk{rig_mu};
                 for (int i = 0; i < kPool; ++i) {
                     if (f.arm(pool_rule(i)))
+                        ++repushes;
+                    else
+                        ++failures;
+                }
+                // The most recent verdict-carrying rules (a queued verdict may still be pending).
+                for (std::size_t k = verdict_rules.size() > 3 ? verdict_rules.size() - 3 : 0;
+                     k < verdict_rules.size(); ++k) {
+                    if (f.arm(verdict_rules[k]))
                         ++repushes;
                     else
                         ++failures;
