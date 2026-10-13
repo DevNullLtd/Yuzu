@@ -3130,7 +3130,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
     // visibility-bounded view.
     std::string html;
     html.reserve(2048);
-    html += "<div style=\"margin-bottom:0.75rem;font-size:0.8rem;color:#8b949e\">";
+    html += "<div class=\"tar-meta\">";
     html += std::format(
         "Scan <code>{}</code> &middot; dispatched to <strong>{}</strong> "
         "agent{} in your scope {} &middot; <strong>{}</strong> in-scope "
@@ -3227,7 +3227,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
             "<th>Source</th>"
             "<th>Paused since</th>"
             "<th>Paused for</th>"
-            "<th style=\"text-align:right\">Live rows</th>"
+            "<th class=\"r\">Live rows</th>"
             "<th>Oldest data</th>"
             "<th></th>"
             "</tr></thead><tbody>";
@@ -3254,7 +3254,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // the operator knows the row needs the agent upgraded rather than reading
         // "—" as "unknown / not paused".
         if (r.value_error) {
-            html += "<td colspan=\"2\"><span style=\"color:#8b949e\">reported <code>" +
+            html += "<td colspan=\"2\"><span class=\"tar-mute\">reported <code>" +
                     html_escape(r.enabled_raw) + "</code></span></td>";
         } else if (r.paused_at == 0) {
             html += "<td colspan=\"2\"><span class=\"badge badge-warning\" title=\"this agent "
@@ -3264,9 +3264,9 @@ std::string DashboardRoutes::render_tar_retention_paused(
             html += "<td>" + format_utc(r.paused_at) + "</td>";
             html += "<td>" + format_age(r.paused_at, now) + "</td>";
         }
-        html += "<td style=\"text-align:right\">";
+        html += "<td class=\"r\">";
         if (r.live_rows < 0) {
-            html += "<span style=\"color:#8b949e\">—</span>";
+            html += "<span class=\"tar-mute\">—</span>";
         } else {
             html += std::format("{}", r.live_rows);
         }
@@ -3288,11 +3288,10 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // authoritative, but only render an action the viewer can actually use —
         // Re-enable needs Execution:Execute, Purge needs the higher Infrastructure:
         // Delete. A read-only / Execute-only operator sees no destructive button.
-        html += "<td style=\"text-align:right;white-space:nowrap\">";
+        html += "<td class=\"r\">";
         if (can_execute) {
             html += std::format(
-                "<button class=\"btn-secondary\" style=\"padding:0.2rem 0.6rem;"
-                "font-size:0.75rem\" "
+                "<button class=\"btn-secondary\" "
                 "hx-post=\"/fragments/tar/retention-paused/reenable\" "
                 "hx-vals='{{\"device_id\":\"{}\",\"source\":\"{}\"}}' "
                 "hx-target=\"closest tr\" hx-swap=\"delete\" "
@@ -3307,8 +3306,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
             // native prompt) gates it — no hx-confirm. Data via HTML-escaped
             // data-* attrs (read by the JS), never interpolated into script.
             html += std::format(
-                "<button class=\"btn-danger\" style=\"padding:0.2rem 0.6rem;"
-                "font-size:0.75rem\" "
+                "<button class=\"btn-danger\" "
                 "data-device=\"{}\" data-host=\"{}\" data-source=\"{}\" "
                 "onclick=\"tarPurgeConfirm(this)\" "
                 "title=\"Permanently delete this source's stored data (source stays "
@@ -3327,7 +3325,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
 
     if (agents_responded < scan_count) {
         html += std::format(
-            "<div style=\"margin-top:0.75rem;font-size:0.75rem;color:#8b949e\">"
+            "<div class=\"tar-meta\">"
             "{} of {} agent{} still pending — click "
             "<strong>Refresh</strong> to pick up additional responses.</div>",
             scan_count - agents_responded, scan_count,
