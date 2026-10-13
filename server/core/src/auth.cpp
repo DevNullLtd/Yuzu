@@ -725,7 +725,7 @@ AuthManager::find_user_or_hydrate(const std::string& username) {
         // made it DB-first), so the old "on a cold cache" wording was false.
         spdlog::error("AuthManager: AuthDB credential read for '{}' failed - failing closed "
                       "(transient store error, not a credential verdict)",
-                      username);
+                      ::yuzu::log_key_token(username));
         return std::unexpected(UserLookupMiss::DbError);
     }
 
@@ -2299,8 +2299,8 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
             if (db_user.error() != yuzu::server::AuthDBError::UserNotFound &&
                 db_user.error() != yuzu::server::AuthDBError::InvalidUsername) {
                 spdlog::error("get_user_role: AuthDB lookup for '{}' failed (store error, not "
-                             "a genuine miss) - returning nullopt",
-                             username);
+                              "a genuine miss) - returning nullopt",
+                              ::yuzu::log_key_token(username));
                 // Gate 5 chaos-injector CH-3/UP-6 follow-up: a log line alone is
                 // invisible exactly while the store is already stressed (the
                 // scenario that matters). This is the ONLY caller-visible signal

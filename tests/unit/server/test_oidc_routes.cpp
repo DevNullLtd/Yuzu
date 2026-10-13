@@ -29,6 +29,7 @@
 #include "test_oidc_mock_idp.hpp"
 #include "test_route_sink.hpp"
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
 #include <yuzu/metrics.hpp>
@@ -37,6 +38,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -169,6 +171,45 @@ TEST_CASE("OIDC callback — IdP error response increments yuzu_auth_oidc_login_
     REQUIRE_FALSE(events.empty());
     CHECK(events.front().action == "auth.oidc_login_failed");
     CHECK(events.front().result == "error");
+}
+
+TEST_CASE("OIDC callback — an IdP error with line breaks cannot forge a log line or an audit "
+          "detail, and the response is unchanged",
+          "[pg][oidc][auth_routes][log_fold][security]") {
+    OidcRoutesFixture fix;
+    fix.oidc_provider = std::make_unique<oidc::OidcProvider>(make_minimal_oidc_config());
+    REQUIRE(fix.oidc_provider->is_enabled());
+
+    // Unauthenticated, no IdP involved: both parameters are attacker-chosen. The error carries
+    // LF plus the audit detail's own separators; the description carries LF and the Unicode breaks.
+    yuzu::test::LogCapture cap;
+    auto res = fix.sink.dispatch(
+        "GET", "/auth/callback?error=x%0AFORGED%3Brole%3Dadmin&error_description=a%0Ab%C2%85c"
+               "%E2%80%A8d%E2%80%A9e");
+    cap.stop();
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 302);
+    CHECK(res->get_header_value("Location") == "/login?error=sso_denied");
+    CHECK(res->body.empty());
+
+    const auto logs = cap.text();
+    CAPTURE(logs);
+    const auto at = logs.find("OIDC error from IdP");
+    REQUIRE(at != std::string::npos);
+    const auto rest = logs.substr(at);
+    CHECK(std::count(rest.begin(), rest.end(), '\n') == 1); // only the terminator
+    CHECK(logs.find("\nFORGED") == std::string::npos);
+    CHECK(logs.find("\xC2\x85") == std::string::npos);
+    CHECK(logs.find("\xE2\x80\xA8") == std::string::npos);
+    CHECK(logs.find("\xE2\x80\xA9") == std::string::npos);
+
+    const auto events = fix.audit_events();
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.oidc_login_failed");
+    CHECK(events.front().result == "error");
+    CAPTURE(events.front().detail);
+    CHECK(events.front().detail == "idp error: x_FORGED_role_admin");
+    CHECK(events.front().detail.find('\n') == std::string::npos);
 }
 
 TEST_CASE("OIDC callback — missing code/state increments "

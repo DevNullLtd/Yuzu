@@ -859,7 +859,8 @@ std::expected<auth::UserEntry, AuthDBError> AuthDB::get_user(const std::string& 
     // and its reserved-prefix branch explicitly rejects every byte < 0x20
     // (NUL included) plus a control/shell-metacharacter set.
     if (!is_valid_principal(username)) {
-        spdlog::warn("get_user rejected invalid username/principal: '{}'", username);
+        spdlog::warn("get_user rejected invalid username/principal: '{}'",
+                     ::yuzu::log_key_token(username));
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     auto lease = impl_->pool.try_acquire_for(kReadTimeout);

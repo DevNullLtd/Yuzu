@@ -1,5 +1,6 @@
 #include "auth_routes.hpp"
 
+#include <yuzu/log_token.hpp> // log_key_token: the IdP callback error parameters in a log line
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
@@ -3381,11 +3382,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto error = req.get_param_value("error");
         if (!error.empty()) {
             auto desc = req.get_param_value("error_description");
-            spdlog::warn("OIDC error from IdP: {} - {}", error, desc);
+            spdlog::warn("OIDC error from IdP: {} - {}", ::yuzu::log_key_token(error),
+                         ::yuzu::log_key_token(desc));
             // cons-S1: mirror the SAML ACS early-error branches — emit an
             // audit row, not just a metric bump, so an IdP-side denial shows
             // up in Yuzu's own audit trail.
-            audit_log(req, "auth.oidc_login_failed", "error", {}, {}, "idp error: " + error);
+            audit_log(req, "auth.oidc_login_failed", "error", {}, {},
+                      "idp error: " + detail::sanitize_detail_value(error));
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
             }

@@ -146,6 +146,8 @@ TEST_CASE("AuthDB::upsert_sso_identity and AuthManager::provision_sso_identity n
     yuzu::server::auth::AuthManager mgr;
     mgr.set_auth_db(db.get());
     mgr.provision_sso_identity(bad, "https://idp.example.com/", "s'ub", "x");
+    // A read of an invalid principal (quote refuses it, the Unicode breaks ride along).
+    CHECK_FALSE(db->get_user(bad).has_value());
     cap.stop();
 
     const auto logs = cap.text();
@@ -153,9 +155,43 @@ TEST_CASE("AuthDB::upsert_sso_identity and AuthManager::provision_sso_identity n
     CHECK(logs.find("rejected invalid principal") != std::string::npos);
     CHECK(logs.find("rejected reserved 'engine:' principal") != std::string::npos);
     CHECK(logs.find("provision_sso_identity failed for") != std::string::npos);
+    CHECK(logs.find("get_user rejected invalid username/principal") != std::string::npos);
     CHECK(logs.find("\xC2\x85") == std::string::npos);
     CHECK(logs.find("\xE2\x80\xA8") == std::string::npos);
     CHECK(logs.find("\xE2\x80\xA9") == std::string::npos);
+}
+
+TEST_CASE("AuthDB::upsert_sso_identity stores a principal and display name with Unicode line "
+          "breaks unchanged (only log copies are folded)",
+          "[pg][sso][authdb][log_fold][security]") {
+    yuzu::test::AuthDbPg db;
+    const std::string breaks = "\xC2\x85\xE2\x80\xA8\xE2\x80\xA9";
+    const std::string sub = "sub" + breaks + "x";
+    const std::string principal = "oidc:https://idp.example.com/#" + sub;
+    const std::string display = "Zed" + breaks + "Quux";
+
+    REQUIRE(db->upsert_sso_identity(principal, "https://idp.example.com/", sub, display, "oidc")
+                .has_value());
+
+    // The principal is found by its exact original bytes.
+    auto entry = db->get_user(principal);
+    REQUIRE(entry.has_value());
+    CHECK(entry->username == principal);
+    CHECK(entry->identity_source == "oidc");
+
+    // AuthDB has no display-name accessor; read the columns straight from auth.users.
+    yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    const char* values[] = {principal.c_str()};
+    yuzu::server::pg::PgResult res{PQexecParams(
+        conn.get(),
+        "SELECT username, display_name, external_sub FROM auth.users WHERE username = $1", 1,
+        nullptr, values, nullptr, nullptr, 0)};
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(res.get()) == 1);
+    CHECK(std::string(PQgetvalue(res.get(), 0, 0)) == principal);
+    CHECK(std::string(PQgetvalue(res.get(), 0, 1)) == display);
+    CHECK(std::string(PQgetvalue(res.get(), 0, 2)) == sub);
 }
 
 TEST_CASE("AuthDB::upsert_sso_identity rejects an 'engine:'-prefixed principal",

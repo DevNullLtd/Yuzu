@@ -418,6 +418,20 @@ TEST_CASE("OIDC: parse malformed JWT — invalid base64url payload", "[oidc]") {
     CHECK(result.error().find("parse error") != std::string::npos);
 }
 
+TEST_CASE("OIDC: a JWT payload parse error does not carry the payload's Unicode line breaks",
+          "[oidc][log_fold][security]") {
+    // The JSON parser's message quotes the bytes it was reading (IdP-controlled); the returned
+    // string reaches log lines and the persisted login-failure analytics attribute.
+    const std::string breaks = "\xC2\x85\xE2\x80\xA8\xE2\x80\xA9";
+    auto result = OidcProvider::parse_id_token(make_test_jwt("{\"a" + breaks + "b\" x"));
+    REQUIRE_FALSE(result.has_value());
+    CAPTURE(result.error());
+    CHECK(result.error().find("JWT payload parse error") != std::string::npos);
+    CHECK(result.error().find("\xC2\x85") == std::string::npos);
+    CHECK(result.error().find("\xE2\x80\xA8") == std::string::npos);
+    CHECK(result.error().find("\xE2\x80\xA9") == std::string::npos);
+}
+
 // ── Claim validation ─────────────────────────────────────────────────────────
 
 TEST_CASE("OIDC: validate_claims — valid", "[oidc]") {
@@ -2059,7 +2073,9 @@ TEST_CASE("OIDC discovery: the JWKS fetch is bounded the same way against a drip
 // the child, which then ran Catch2's teardown and dropped the parent's templates) and, under
 // AddressSanitizer, passed without running its body. Linux only, and not under ASan: the ASan
 // runtime's own pipe() during pthread_create gets EMFILE with 0-2 spare descriptors and the
-// helper cannot run its scenario. ThreadSanitizer keeps the guard of the mock IdP above.
+// helper cannot run its scenario. These cases use TlsDripServer, not the mock IdP, and are not
+// verified under ThreadSanitizer, by choice; YUZU_OIDC_MOCK_IDP_TSAN is only this file's TSan
+// detector, so the guard below reuses it to leave them out of a TSan build.
 #if defined(__SANITIZE_ADDRESS__)
 #define YUZU_OIDC_TEST_ASAN 1
 #elif defined(__has_feature)

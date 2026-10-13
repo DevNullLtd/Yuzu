@@ -316,6 +316,7 @@ TEST_CASE("AuthManager: the OIDC session-created log line neutralizes IdP line b
     auto sess = mgr.validate_session(token);
     REQUIRE(sess.has_value());
     CHECK(sess->username == "oidc:" + iss + "#" + sub);
+    CHECK(sess->oidc_sub == sub);
     CHECK(sess->display_name == (name.empty() ? email : name));
 }
 
