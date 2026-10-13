@@ -31,10 +31,6 @@ extern const char* const kGuardianDetailPageHtml;
 
 namespace yuzu::server {
 
-// Defined below (public, shared with dex_perf_ui/dex_app_perf_ui/network_ui): the
-// DEX-only rules every DEX/Network fragment carries on top of the shell's .gp-* core.
-std::string dex_fragment_style();
-
 namespace {
 
 // Minimal HTML-escape — every value below originates from agent-reported data
@@ -447,14 +443,9 @@ input.dx-ctl{min-width:220px}
 
 std::string dex_fragment_style() {
     static const std::string css = [] {
-        std::string out = "<style>";
-        std::string_view rest = kDexCss;
-        while (!rest.empty()) {
-            const auto nl = rest.find('\n');
-            out += rest.substr(0, nl);
-            rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
-        }
-        return out + "</style>";
+        std::string s = kDexCss;
+        std::erase(s, '\n');
+        return "<style>" + s + "</style>";
     }();
     return css;
 }
