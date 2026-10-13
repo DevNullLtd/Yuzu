@@ -2769,6 +2769,18 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   (iii) throughput under a persistent jam: sends are single-flight per lane, so the released
   lane's rate is N / (H + N * t), about 32 per second at an illustrative t = 16 ms per send (assumed, not measured), not N / H, and
   every isolated compliance burst behind a jammed older head pays about H once.
+- Not given by the hold (UP-13, UP-14; both accepted residuals carried by #5690, stated in the
+  `GuardianSparkRuntime::drain_bounded()` NOT GIVEN list, characterised but not closed by this
+  PR). UP-13: the hold gates LAUNCH, not the wire write. An older compliant send that launched
+  but is stalled before it acquires `stream_write_mu_` (held by a third sender) can lose the
+  mutex to a younger errored send released after H, so the errored reaches the wire first.
+  UP-14: `enqueued_ns` is `system_clock`; a backward wall-clock step between an older compliant
+  and a newer errored gives the errored an earlier timestamp, so the server keeps the compliant
+  whatever the wire order, and the hold cannot touch it (server side). Note on #5690's
+  acceptance options (factual, not a ruling): a same-second tie policy closes UP-13 but not
+  UP-14; receipt-sequence ordering closes UP-14 but worsens UP-13; only terminal precedence
+  closes both. The test `#3972 chaos: a third sender holding the stream write mutex ...`
+  (hidden `[.chaos]`) characterises UP-13 and deliberately asserts no order.
 - Owner: not assigned in source material.
 - Milestone: PR #TBD.
 - Revisit trigger: PR-5 (F14 flip) soak. During the first flip soak, inspect
@@ -2813,6 +2825,22 @@ launch attempt, for up to N = 64 launches; a further overtake needs a further H;
 `GuardianSparkRuntime::drain_bounded()` comment) but do not remove the re-derivation
 obligation. This is the pointer that was missing when `g6-ledger-row23-no-revisit-trigger`
 was raised (`governance.d/3953-3966-outbox-hardening.T6I4sf.jsonl` line 15).
+
+**Flip-rollback mechanism (flip-gate obligation, owner decision required before PR-5; tracked in
+#? (follow-up issue B)).** `prefer_spark_` is `const` and fixed at construction
+(`guardian_engine.hpp`: "IMMUTABLE for object lifetime"), and `agent.cpp` constructs
+`GuardianEngine` with the default (`guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(),
+cfg_.agent_id)`, no third argument), so there is no runtime switch for it. A regression of the
+spark path after the flip is therefore mitigated only by a binary rollback. The owner must decide
+a runtime off-switch versus binary rollback before PR-5 and record the decision here; section 6
+(`--spark-disable`) is the existing rollback drill and should be read against that decision.
+
+**Engine-level TSan run of the real `journaled_send` (flip-gate line; tracked in #? (follow-up
+issue A)).** The production send path is `journaled_send` (`guardian_engine.cpp`, the send callback given to the
+spark runtime), whose detached send workers wear `GuardianDetachedWorkerRole`
+(`WorkerHostileMutex`'s second role). The #3972/#3980 tests drive the drain worker with a test
+sink, so nothing yet runs the real `journaled_send` through that role marker under ThreadSanitizer
+at engine level. That run is a flip-gate line, not a merge gate for #3972.
 
 **#4665** (agent log lines print operator-authored rule ids and Spark keys as authored, #4606 / PR #4657)
 - Detection signal: none - a forged physical line is indistinguishable from a real one in the agent
