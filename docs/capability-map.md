@@ -1026,7 +1026,7 @@ Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks stor
 
 ### 22.2 System Topology View :white_check_mark: `T2`
 
-`topology_ui.cpp` dashboard page at `/topology`. HTMX fragment `/frag/topology-data` (30s poll). Shows server node, gateway badges, management group tree, OS breakdown. REST: `GET /api/v1/topology`.
+No dashboard page: the `/topology` page template (`topology_ui.cpp`) was never routed and was deleted when the app shell replaced the per-page chrome. REST: `GET /api/v1/topology`.
 
 ### 22.3 License Management :large_orange_diamond: `T2` *(verified 2026-09-07)*
 
@@ -1042,7 +1042,7 @@ Full Erlang/OTP gateway (`gateway/` rebar3 project). `yuzu_gw_agent` manages age
 
 ### 22.6 Statistics Dashboard :white_check_mark: `T2`
 
-`statistics_ui.cpp` dashboard page at `/statistics`. Six HTMX cards (fleet, executions, compliance, top instructions, license, system health) each with independent 60s polling. REST: `GET /api/v1/statistics`.
+No dashboard page: the `/statistics` page template (`statistics_ui.cpp`) was never routed and was deleted when the app shell replaced the per-page chrome. REST: `GET /api/v1/statistics`.
 
 ### 22.7 Binary Resource Distribution :x: `T3`
 

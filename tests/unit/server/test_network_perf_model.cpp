@@ -370,6 +370,7 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
         CHECK(page->body.find("<a href=\"/network\" class=\"on\" aria-current=\"page\">Network</a>") !=
               std::string::npos);
         CHECK(page->body.find("class=\"shell-nav on\" href=\"/dex\"") == std::string::npos);
+        CHECK(page->body.find("<span class=\"shell-sep\">/</span><b>Network</b>") != std::string::npos);
     }
 }
 

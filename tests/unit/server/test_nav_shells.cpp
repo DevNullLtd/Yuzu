@@ -21,6 +21,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // Full-page templates (defined at global scope in the *_ui.cpp translation units).
@@ -218,9 +219,19 @@ TEST_CASE("app shell: styles come from tokens, never hex literals", "[nav][shell
 
 TEST_CASE("app shell: each raw literal in the renderer stays under MSVC's string limit",
           "[nav][shell]") {
-    // The CSS and script are separate literals (C2026 at 16,380 bytes); the whole block must
-    // at least not approach that as a single piece.
-    CHECK(render_shell({.active_key = "dashboard"}).size() < 16000);
+    // The CSS and the script are the two large literals (C2026 at 16,380 bytes); each renders
+    // verbatim between its own tags, so measure each one, not the whole block. 16,000 is the
+    // same bound `wt.sh rawcheck` enforces.
+    const auto html = render_shell({.active_key = "dashboard"});
+    for (const auto& [open, close] : {std::pair<std::string_view, std::string_view>{"<style>", "</style>"},
+                                      {"<script>", "</script>"}}) {
+        INFO(open);
+        const auto b = html.find(open);
+        const auto e = html.find(close);
+        REQUIRE(b != std::string::npos);
+        REQUIRE(e != std::string::npos);
+        CHECK(e + close.size() - b < 16000);
+    }
 }
 
 TEST_CASE("app shell: header search is the existing Ctrl+K palette, not a new search",

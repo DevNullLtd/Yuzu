@@ -1303,6 +1303,10 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") 
         REQUIRE(page);
         CHECK(page->status == 200);
         CHECK(page->body.find("/fragments/dex/overview") != std::string::npos);
+        // The route's active_key lights the DEX sidebar item and ends the breadcrumb on it.
+        CHECK(page->body.find("<a class=\"shell-nav on\" href=\"/dex\" aria-current=\"page\">") !=
+              std::string::npos);
+        CHECK(page->body.find("<span class=\"shell-sep\">/</span><b>DEX</b>") != std::string::npos);
 
         auto ov = sink.Get("/fragments/dex/overview?window=7d");
         REQUIRE(ov);
