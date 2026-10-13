@@ -553,8 +553,10 @@ class AssertGatewayTests(unittest.TestCase):
     def test_ci_setup_beam_isolates_the_tool_cache_for_trusted_forks(self):
         # setup-beam on a self-hosted pool installs erl into RUNNER_TOOL_CACHE,
         # which later normal jobs on the same agent execute. A trusted-fork run
-        # must get a per-run temp dir instead (#4852). Both ci.yml legs that
-        # install Erlang must switch on trusted_execution.
+        # must get a per-run temp dir instead (#4852). Every ci.yml leg that
+        # installs Erlang with setup-beam must switch on trusted_execution. The
+        # macOS leg no longer uses setup-beam: it downloads a hash-pinned OTP into
+        # RUNNER_TEMP, which is per agent and per job.
         import yaml
         with open(os.path.join(ROOT, '.github', 'workflows', 'ci.yml'), encoding='utf-8') as f:
             doc = yaml.safe_load(f)
@@ -567,7 +569,7 @@ class AssertGatewayTests(unittest.TestCase):
                         cache = str((step.get('env') or {}).get('RUNNER_TOOL_CACHE', ''))
                         self.assertIn('trusted_execution', cache)
                         self.assertIn('runner.temp', cache)
-        self.assertEqual(legs, {'linux', 'macos'})
+        self.assertEqual(legs, {'linux'})
 
 
 if __name__ == '__main__':

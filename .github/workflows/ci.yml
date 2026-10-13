@@ -2268,31 +2268,60 @@ jobs:
           # at meson configure time for the content embed.
           pip3 install --break-system-packages --require-hashes -r requirements-ci.txt
 
-      # OTP + rebar3 for the gateway build and its eunit/ct tests, identical pin to
-      # the Linux leg (and release.yml's gateway job) so an OTP bump moves every
-      # leg together. Until #4841 this job had NO Erlang: meson's
-      # find_program('rebar3', required: false) silently skipped the gateway, so
-      # macOS stayed green without ever compiling or testing it. The Configure step
-      # below now runs scripts/ci/assert-gateway-tests.py, which fails the leg when
-      # the gateway tests were not registered.
-      # ImageOS is required because setup-beam cannot auto-detect a self-hosted
-      # runner's OS; macos26 matches the BigMags Mac Minis (macOS 26, arm64).
-      # Step-scoped so the rest of the job does not see it.
-      # RUNNER_TOOL_CACHE is re-pointed for this step only. Both BigMags agents
-      # share /opt/ci/tool_cache, and setup-beam populates it with rmRF + copy, so a
-      # concurrent debug/release pair on one box could race while populating or
-      # copying from the shared cache (the OTP each job then RUNS is its own copy
-      # under RUNNER_TEMP): scope it per agent. A trusted-fork run must not write
-      # a persistent erl into a cache later normal jobs execute (the "Do not read
-      # or write runner.tool_cache" rule above), so it gets a per-run temp dir.
+      # OTP + rebar3 for the gateway build and its eunit/ct tests, the same OTP 28 /
+      # rebar3 3.24 pin as the Linux leg (and release.yml's gateway job). Until #4841
+      # this job had NO Erlang: meson's find_program('rebar3', required: false)
+      # silently skipped the gateway, so macOS stayed green without ever compiling or
+      # testing it. The Configure step below runs scripts/ci/assert-gateway-tests.py,
+      # which fails the leg when the gateway tests were not registered.
+      # NOT erlef/setup-beam on this leg. Both BigMags agents share
+      # /opt/ci/tool_cache and setup-beam rmRF's and re-copies
+      # /opt/ci/tool_cache/otp/macOS-26/OTP-<ver>/arm64 on every run, so a debug +
+      # release pair starting together raced on that one directory (EEXIST on the
+      # epmd symlink, ENOENT mid-copy, "Unable to locate executable file: erl"; 36 of
+      # the 79 macOS job failures 2026-10-03..10-13). A step-level RUNNER_TOOL_CACHE
+      # cannot isolate it: the failing logs show the per-agent value in the step env
+      # while the EEXIST path is still under the shared /opt/ci/tool_cache.
+      # Instead: download the pinned prebuilt OTP (the same erlef/otp_builds asset
+      # setup-beam fetches) and the rebar3 escript into RUNNER_TEMP, which is per
+      # agent and per job, verify both against pinned SHA-256s, and put them on PATH.
+      # Nothing is shared between agents and nothing persists between jobs, so a
+      # trusted-fork run cannot leave an erl behind for later jobs (the "Do not read
+      # or write runner.tool_cache" rule above). The tarball is flat (no version
+      # directory) and relocatable. To bump OTP: take the new tag's
+      # otp-aarch64-apple-darwin.tar.gz sha256 from
+      # https://github.com/erlef/otp_builds/blob/main/builds/aarch64-apple-darwin.csv,
+      # and move the Linux leg and release.yml together.
       - name: Install Erlang/OTP and rebar3
-        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         env:
-          ImageOS: macos26
-          RUNNER_TOOL_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-beam-{1}', runner.temp, github.run_id) || format('{0}/setup-beam/{1}', runner.tool_cache, runner.name) }}
-        with:
-          otp-version: '28'
-          rebar3-version: '3.24'
+          OTP_VERSION: 28.5.0.7
+          OTP_SHA256: bab4cdc47104e2c6fae4b4b1cf9fe0444b23c19f127ba4345796e1e06ff58a6e
+          REBAR3_VERSION: 3.24.0
+          REBAR3_SHA256: d2d31cfb98904b8e4917300a75f870de12cb5167cd6214d1043e973a56668a54
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/erlang"
+          rm -rf "$root"
+          mkdir -p "$root/otp" "$root/bin"
+          curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 \
+            -o "$root/otp.tar.gz" \
+            "https://github.com/erlef/otp_builds/releases/download/OTP-${OTP_VERSION}/otp-aarch64-apple-darwin.tar.gz"
+          echo "${OTP_SHA256}  $root/otp.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$root/otp.tar.gz" -C "$root/otp"
+          rm -f "$root/otp.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 \
+            -o "$root/bin/rebar3" \
+            "https://github.com/erlang/rebar3/releases/download/${REBAR3_VERSION}/rebar3"
+          echo "${REBAR3_SHA256}  $root/bin/rebar3" | shasum -a 256 -c -
+          chmod 755 "$root/bin/rebar3"
+          got="$(cat "$root/otp/releases/28/OTP_VERSION")"
+          test "$got" = "$OTP_VERSION" || { echo "::error::unpacked OTP is '$got', expected $OTP_VERSION"; exit 1; }
+          echo "$root/bin" >> "$GITHUB_PATH"
+          echo "$root/otp/bin" >> "$GITHUB_PATH"
+          # GITHUB_PATH only takes effect from the next step, and rebar3's shebang is
+          # `#!/usr/bin/env escript`, so run both checks through absolute paths.
+          "$root/otp/bin/erl" -version
+          "$root/otp/bin/escript" "$root/bin/rebar3" version
 
       # ccache cache lives at ~/Library/Caches/ccache on the self-hosted
       # BigMags runner, which persists in the runner user's home between
