@@ -68,7 +68,7 @@ EXPECTED_SUBSTRATE_MARKERS = {
     "engine_principal_store": {"cell": "a", "regex": "engine_principal_store"},
     "principal_quota": {"cell": "m", "regex": "class PrincipalQuota"},
     "use_case_run_id": {"cell": "c", "regex": "use_case_run_id"},
-    "release_log_store": {"cell": "d", "regex": "release_log|ReleaseLog"},
+    "release_log_store": {"cell": "d", "regex": "^[[:space:]]*(class|struct)[[:space:]]+([A-Za-z_]+[[:space:]]+)?ReleaseLog(Store)?([[:space:]]+final)?[[:space:]]*([{:]|$)|^[[:space:]]*#[[:space:]]*include[[:space:]]+[<\"][^>\"]*release_log_store\\.h|^[^/*#-]*CREATE[[:space:]]+TABLE[^;(]{0,60}release_log"},
     "evaluate_as_operator": {"cell": "b", "regex": "evaluate_as_operator"},
     "capability_registry": {"cell": "h", "regex": "register_securable|create_securable|ratified_mapping"},
 }
@@ -120,6 +120,55 @@ def main() -> int:
     if ledger.get("substrate_markers") != EXPECTED_SUBSTRATE_MARKERS:
         _fail("substrate_markers (keys/cells/regexes) drifted from the frozen set", failures)
 
+    # 3b. the release_log_store regex's BEHAVIOUR, not just its pinned text. The pin above
+    #     cannot tell a regex that matches the right things from one that matches the wrong
+    #     things: the original `release_log|ReleaseLog` matched the unrelated agent log-handoff
+    #     helper (agents/core/src/agent_log_wiring.hpp, `release_log_handoff_from_this_image`),
+    #     which made RULE 2 inert for cell (d). Evaluated with `git grep --no-index -E` on a
+    #     scratch file: the SAME engine/dialect the tripwire uses, and git is already a hard
+    #     dependency of the tripwire (no separate `grep` binary needed on Windows CI legs).
+    rl_regex = ledger.get("substrate_markers", {}).get("release_log_store", {}).get("regex", "")
+
+    def _ere_matches(line: str, td: str) -> "bool | None":
+        probe = os.path.join(td, "yuzu_test_regex_probe.txt")
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        rc = subprocess.run(["git", "grep", "--no-index", "-qE", "-e", rl_regex, "--", "yuzu_test_regex_probe.txt"],
+                            cwd=td, capture_output=True, text=True).returncode
+        if rc not in (0, 1):  # 1 = no match; anything else (e.g. 128/2) is an engine/regex ERROR, not "no match"
+            _fail(f"git grep -E errored (rc={rc}) evaluating the release_log_store regex against {line!r}", failures)
+            return None
+        return rc == 0
+
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_") as _td:
+        # Over-matching is the hazard: RULE 2 fails CLOSED when the marker is absent, but a marker that
+        # matches a lookalike lets a green (d) pass with no store. So pin the lookalike shapes too:
+        # a longer identifier, a different declaration kind, and a comment or include in a comment.
+        for must_not in ("inline void release_log_handoff_from_this_image(LogHandoff& h) noexcept {",
+                         "release_log_handoff_from_this_image(h_);",
+                         "class ReleaseLogger {", "class ReleaseLogHelper final {",
+                         "enum class ReleaseLogLevel { Info };",
+                         "// TODO: class ReleaseLogStore lands in P7",
+                         " * struct ReleaseLogStore (P7)",
+                         '// #include "release_log_store.hpp"',
+                         "// CREATE TABLE release_log (id BIGINT)",
+                         "/* CREATE TABLE release_log */",
+                         " * CREATE TABLE release_log (id BIGINT)",
+                         "class ReleaseLogStore;", "struct ReleaseLog;", "class ReleaseLogStore ;  // fwd",
+                         "-- CREATE TABLE release_log (id BIGINT)", "# CREATE TABLE release_log (id BIGINT)",
+                         "CREATE TABLE audit_events (release_log_id BIGINT)",
+                         '#include "release_log_store_test_helpers.hpp"'):
+            if _ere_matches(must_not, _td) is True:
+                _fail(f"release_log_store regex falsely matches unrelated log-handoff code: {must_not!r}", failures)
+        for must in ("class ReleaseLogStore {", "struct ReleaseLogStore final {", "class YUZU_API ReleaseLogStore {",
+                     '#include "release_log_store.hpp"', "CREATE TABLE IF NOT EXISTS release_log (id BIGINT)",
+                     "CREATE  TABLE release_log_entries (", "class ReleaseLog {", "    class ReleaseLog final {", "class ReleaseLogStore",
+                     "class ReleaseLogStore final : public IStore {", "class ReleaseLogStore : public IStore {",
+                     'R"sql(CREATE TABLE release_log (id BIGINT))sql"', '"CREATE TABLE IF NOT EXISTS release_log ("',
+                     "#include <yuzu/server/release_log_store.hpp>"):
+            if _ere_matches(must, _td) is False:
+                _fail(f"release_log_store regex misses a plausible real release-log store: {must!r}", failures)
+
     # 4. every gate-set cell has a substrate marker (UP-2 / hp-1) — a markerless gate
     #    cell can be flipped green with no RULE 2 absence check.
     marked_cells = {spec["cell"] for spec in ledger.get("substrate_markers", {}).values()}
@@ -158,6 +207,19 @@ def main() -> int:
         rc = _run_tripwire(_write(fc, "false_cert.json", td))
         if rc != TRIPWIRE_VIOLATION:
             _fail(f"tripwire did not DETECT a false certification (got {rc}, want {TRIPWIRE_VIOLATION})", failures)
+
+        # RULE 2 binds on the LIVE tree with the REAL regex. The false-cert leg above neuters the
+        # regex, so it can never notice the marker going inert (the original defect: a stray
+        # unrelated match made a green (d) pass). Force (d) green, keep the real regex, and require
+        # a violation. This intentionally fails the day the real P7 release-log store lands -
+        # the author must then flip (d) green and retire this control in the same reviewed change.
+        lt = json.loads(json.dumps(ledger))
+        lt["cells"]["d"]["status"] = "green"
+        rc = _run_tripwire(_write(lt, "live_tree_false_cert.json", td))
+        if rc != TRIPWIRE_VIOLATION:
+            _fail(f"RULE 2 did not fire for a green (d) with the REAL release_log_store regex on the live tree "
+                  f"(got {rc}, want {TRIPWIRE_VIOLATION}) - the marker has gone inert (an unrelated match in the "
+                  f"scanned tree), or the real release-log store has landed and this control must be retired", failures)
 
         # Excluded-rationale guard: blank a rationale.
         br = json.loads(json.dumps(ledger))

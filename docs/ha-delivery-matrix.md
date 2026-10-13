@@ -3,7 +3,8 @@
 The delivery spine for **ADR-2002 (High Availability Architecture)**. ADR-2002 records the *model and
 principles*; this matrix tracks *what ships, in what order, who reviews it, and how we know it's done*.
 Workstreams WS-0…WS-10 come from ADR-2002 §Decomposition; WS-11…WS-14 are delivery/ops workstreams the
-three-model adversarial review (Fable + gpt-5.6-sol + Kimi-K2.7) surfaced as missing. If a row here
+three-model adversarial review (Fable + gpt-5.6-sol + Kimi-K2.7) surfaced as missing; WS-15 (gateway
+failback/rebalance, roadmap 7.1.1, #5759) was added 2026-10-13 as the pair to WS-13. If a row here
 disagrees with ADR-2002, the ADR wins.
 
 **Verified 2026-10-13 (status re-stamp against `origin/dev` at `d81109688`, with `gh`):** the WS-5 row
@@ -20,7 +21,7 @@ this matrix *shares*, not duplicates).
 
 ## Two independent axes (read first)
 
-- **Server-tier HA** — N presentation + core replicas (WS-0…WS-6, WS-8, WS-10, WS-11, WS-13).
+- **Server-tier HA** — N presentation + core replicas (WS-0…WS-6, WS-8, WS-10, WS-11, WS-13, WS-15).
 - **Storage HA** — HA Postgres (WS-7). A single Postgres is a valid, supported deployment; **server-tier
   HA does not require it.**
 
@@ -103,8 +104,9 @@ column — distinct from Prio).
 | **WS-10** | **Background-job replica-safety classification** — checked-in, CI-auditable table (job → fenced-leader-only / independently-replica-safe / disabled-until-fixed); bring #2508 wall-clock passes to clock-guard | **10.1**: `background_jobs.hpp` `kBackgroundJobs` classifies all 40 server background passes (exhaustive sweep 2026-09-07), catastrophic-class + must-run-per-replica sites `consteval`-gated; **10.2**: `app_perf_fleet_store`/`preflight_run_store`/`deployment_run_store` prunes now run through the shared `pg::run_clock_guarded_prune` (advisory-locked, PG-clock). The concurrency reconciler gained the same advisory-lock single-writer (its OWN `pg_try_advisory_xact_lock`) but **NOT** the shared clock — its clock authority stays replica-local (`now_epoch()`/caller `now`, #4093), so it is classed **DisabledUntilFixed** (not ReplicaSafe) for a 2nd replica, same posture as `nvd_sync` | audit + `disable-until-fixed` need nothing; **`fenced-leader-only` ENFORCEMENT (10.3) is delivered by WS-3 3.2** (the `leader_gate.hpp` runtime gate consumes this table's classification) | **Y** | `cpp-safety`+`sre`+`compliance-officer` | P0 | **10.1/10.2 done (#4092); 10.3 enforcement wired by WS-3 3.2** |
 | **WS-11** | **HA-state observability** (NEW): leader identity/epoch, replica lag, quorum state, outbox backlog, failover duration, routing re-homes, split-brain alerts — Prometheus metrics + alert rules | None; ADR gestures at DB-clock monitoring (§4) + gauge coherence (§7a) only | WS-3, WS-7 | N, except the leader-observability subset (#4014: leader/epoch metrics + split-brain alert), which **gates** a 2nd replica (decided 2026-10-13); the rest ships *with* it — operating blind otherwise | `sre`+`docs-writer` (+ the alert-rule gate, `docs/observability-conventions.md`) | P1 | planned |
 | **WS-12** | **Single→HA cutover + DR (NEW):** runbook to move an existing single-Postgres/single-server deployment to shipped HA-PG + gateway-front reconfiguration rollout; **backup/PITR/WAL under HA-PG** (replaces the superseded `disaster-recovery.md`) | ADR supersedes `disaster-recovery.md` but nothing replaces backup/PITR | WS-7 | N | `release-deploy`+`sre`+`docs-writer` | P1 | planned |
-| **WS-13** | **Agent-side gateway failover rollout (NEW):** agent endpoint discovery/failover (agent takes one `server_address` → one channel, `agent.cpp:1583`) + fleet rollout flipping direct-connect fleets to gateway-front | Single configured endpoint; no failover. Gateway heartbeat admission (#3869) is node-local and connection-bound, so failover must keep one channel per agent to one node for the life of a session (a failover that re-registers on a new channel mints a new session and is compatible), and an agent's `Heartbeat` must reach the node that holds its `Subscribe` stream (per-connection sticky L4, no per-RPC balancing) | WS-4 | Y (for gateway-fronted fleets) | `cross-platform`+`security-guardian` (agent) | P1 | planned |
+| **WS-13** | **Agent-side gateway failover rollout (NEW):** agent endpoint discovery/failover (agent takes one `server_address` → one channel, `agent.cpp:1583`) + fleet rollout flipping direct-connect fleets to gateway-front | Single configured endpoint; no failover. Gateway heartbeat admission (#3869) is node-local and connection-bound, so failover must keep one channel per agent to one node for the life of a session (a failover that re-registers on a new channel mints a new session and is compatible), and an agent's `Heartbeat` must reach the node that holds its `Subscribe` stream (per-connection sticky L4, no per-RPC balancing). **Tracker: #291** (roadmap 14.2 "Multi-Gateway Topology", rewritten 2026-10-13 to track WS-13). Failover alone is one-way: survivors keep the extra load until **WS-15** (#5759) rebalances. A mass failover also hits the CONNECTED-notice admission burst (`yuzu_gw_upstream.erl` `notify_pending_max`/`?MAX_NOTIFY_INFLIGHT`), so the failed-over agents must still converge `gateway_node` | WS-4 | Y (for gateway-fronted fleets) | `cross-platform`+`security-guardian` (agent) | P1 | planned |
 | **WS-14** | **Coordination-substrate security & capacity review (NEW):** threat review of advisory locks / etcd / Patroni / HAProxy / fencing tokens; capacity + failure-domain + sync-quorum latency validation | None | WS-3, WS-7 | N | `security-guardian`+`sre` | P2 | planned |
+| **WS-15** | **Gateway adjacency, load shedding, failback + rebalance (NEW, 2026-10-13):** roadmap **7.1.1** (**#5759**): per-node adjacency table (peer agent count, CPU/memory, inter-node RTT, drain state), rate-limited + jittered GOAWAY shedding (overload / drain / new-or-recovered node), gradual failback, cooldown + hysteresis, optional latency affinity; the pair to WS-13, together delivering roadmap **14.2** (#291) | Not implemented: `yuzu_gw_cluster.erl` absent; only an unemitted counter `yuzu_gw_cluster_rebalanced_agents_total` (`yuzu_gw_telemetry.erl:70`). Design `docs/erlang-gateway-blueprint.md` "Gateway Adjacency and Latency-Based Agent Redistribution". Descoped from WS-4 as capacity-not-reachability (ADR-2002 §7, `yuzu_gw_cluster` paragraph). Shedding must honour WS-13's one-channel-per-session rule (a shed agent re-registers and mints a new session; never move a live session) | WS-4, WS-13 | N (capacity, not safety) | `gateway-erlang`+`sre`+`architect` | P2 | planned |
 
 ## Delivery phases (dependency-ordered)
 
@@ -121,7 +123,7 @@ Prio is build-effort; the **safe-to-scale gate** above is the real constraint. P
    proceeds on the monolith track.
 3. **Phase C — Enable, validate, operate:**
    flip on the second replica; `WS-9` runs continuously throughout B/C; `WS-11` (observability) ships
-   *with* the second replica; `WS-12` (cutover/DR), `WS-14` (security/capacity). `WS-2b` (spine) and
+   *with* the second replica; `WS-12` (cutover/DR), `WS-14` (security/capacity), `WS-15` (gateway failback/rebalance, paired with WS-13). `WS-2b` (spine) and
    `WS-8` tier-split readyz land with the ADR-1005 split.
 
 ## Shared with ADR-1005 (do not duplicate)

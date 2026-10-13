@@ -112,6 +112,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 6.5 | [#188](https://github.com/Tr3kkR/Yuzu/issues/188) | File System Advanced Operations | Done |
 | | 6.6 | [#192](https://github.com/Tr3kkR/Yuzu/issues/192) | Registry Change Trigger | Done |
 | **7** | 7.1 | [#185](https://github.com/Tr3kkR/Yuzu/issues/185) | Gateway Node Implementation | Done |
+| | 7.1.1 | [#5759](https://github.com/Tr3kkR/Yuzu/issues/5759) | Gateway Adjacency, Load Shedding, and Latency-Based Redistribution (HA WS-15) | Open |
 | | 7.2 | [#187](https://github.com/Tr3kkR/Yuzu/issues/187) | System Health Monitoring and Statistics | Done |
 | | 7.3 | [#190](https://github.com/Tr3kkR/Yuzu/issues/190) | Runtime Configuration API | Done |
 | | 7.4 | [#191](https://github.com/Tr3kkR/Yuzu/issues/191) | System Notifications | Done |
@@ -834,7 +835,7 @@ Remaining work:
 **Files:** `gateway/` (Erlang/OTP, rebar3), `proto/yuzu/gateway/v1/gateway.proto`, `server/core/src/server.cpp` (GatewayUpstream handlers)
 
 ### Issue 7.1.1: Gateway Adjacency, Load Shedding, and Latency-Based Redistribution
-**Capability:** 22.5 | **Scope:** Erlang gateway (`gateway/`)
+**Capability:** 22.5 | **Scope:** Erlang gateway (`gateway/`) | **Issue:** #5759 (HA WS-15, `docs/ha-delivery-matrix.md`)
 **Depends on:** 7.1
 
 Implement cluster-aware agent redistribution so gateway nodes can dynamically
@@ -1582,7 +1583,7 @@ Agent mesh for peer content sharing within subnets:
 **Files:** New `agents/core/src/p2p_mesh.cpp`, `agents/plugins/content_dist/src/content_dist_plugin.cpp`
 
 ### Issue 14.2: Multi-Gateway Topology
-**Capability:** 22.5 (extension) | **Scope:** Gateway + Server | **Status:** Open
+**Capability:** 22.5 (extension) | **Scope:** Gateway + Server | **Status:** Open | **Issue:** #291 (HA WS-13, `docs/ha-delivery-matrix.md`)
 **Depends on:** 7.1, 7.1.1
 
 Server supports multiple concurrent gateway registrations:
