@@ -11790,8 +11790,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                nlohmann::json payload{{"executions", workflow_execution_rows_json(*page)},
-                                       {"next_cursor", workflow_execution_next_cursor_json(*page)}};
+                // (assigned key by key: a line opening `{"name",` is read by
+                // check-mcp-retry-hints.py as a new kTools entry)
+                nlohmann::json payload = nlohmann::json::object();
+                payload["executions"] = workflow_execution_rows_json(*page);
+                payload["next_cursor"] = workflow_execution_next_cursor_json(*page);
                 if (page->truncated_by_cap)
                     payload["result_truncated_by_cap"] = true;
                 mcp_audit("success");
