@@ -306,8 +306,13 @@ TEST_CASE("AuthManager: the OIDC session-created log line neutralizes IdP line b
     const auto at = logs.find("OIDC session created for");
     REQUIRE(at != std::string::npos);
     // The session-created line is ONE physical line: its only LF is the terminator.
-    const auto rest = logs.substr(at);
-    CHECK(std::count(rest.begin(), rest.end(), '\n') == 1);
+    auto rest = logs.substr(at);
+    // spdlog ends a line with the platform's terminator (CRLF on Windows): drop exactly that one.
+    if (rest.ends_with("\r\n"))
+        rest.resize(rest.size() - 2);
+    else if (rest.ends_with('\n'))
+        rest.pop_back();
+    CHECK(std::count(rest.begin(), rest.end(), '\n') == 0);
     CHECK(rest.find('\r') == std::string::npos);
     CHECK(logs.find("\nFAKELINE") == std::string::npos);
     check_no_line_breaks(logs);

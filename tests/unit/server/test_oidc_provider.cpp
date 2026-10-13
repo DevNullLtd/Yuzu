@@ -2489,7 +2489,13 @@ TEST_CASE("OIDC: token-endpoint answers carrying line breaks reach the log and t
             m.token_status = 500;
             m.token_body = "boom\nFAKELINE [error] injected\r" + breaks;
         });
+#ifdef _WIN32
+        // winhttp_post hands back the body whatever the status, so the (non-JSON) body reaches the
+        // parser instead of the status line.
+        expect_in_log = "OIDC token exchange: parse error";
+#else
         expect_in_log = "OIDC token exchange: status=500";
+#endif
     }
     SECTION("a 200 body that is not JSON and names the breaks in the parser's error text") {
         idp.with([&](MockIdp& m) { m.token_body = "{\"a\":\"" + breaks; });
