@@ -398,6 +398,9 @@ public:
     /// and commits against the same subscription when it lands, never a redundant
     /// backend arm and never a fail-fast. Interval/Startup/Disk stay synchronous/
     /// inline (never blocking OS watches).
+    /// Blocking overload: it waits for its own claim, so it must never be called under
+    /// GuardianEngine::mtx_ or from a mechanism worker. The engine's apply_rules/start_local
+    /// use the NonWaiting overload below; this one is for tests and direct callers.
     std::expected<std::uint64_t, std::string> attach_rule(std::string rule_id, SparkSpec spec,
                                                           RuleAssertion assertion,
                                                           bool emit_compliant_edge);
@@ -414,6 +417,17 @@ public:
     /// revisits. Equivalent to calling detach_rule() for every attached rule_id,
     /// but atomic under one registry_mu_ acquisition.
     void detach_all();
+
+    /// #4415: detach every attached rule whose id is NOT in `keep` - detach_all()'s body
+    /// minus the kept ids (detach_all() is this with an empty set). For the full_sync branch:
+    /// an id the push omits is withdrawn here, an id it still carries is left to the per-rule
+    /// reconcile (attach_rule), which either skips it as healthy and unchanged or rebuilds
+    /// it. The epoch bump and the GLOBAL wedge-candidate sweep still cover every rule, kept
+    /// ones included: a kept rule that still holds a retained wedge regains its candidacy
+    /// when attach_rule re-observes it. A kept rule whose key is faulted (reported, or found so
+    /// by the backend health check) or dead is detached as well, so a key shared by several rules
+    /// is torn down and re-armed rather than rejoined by each of them.
+    void detach_rules_except(const std::set<std::string, std::less<>>& keep);
 
     /// The queued-handler body: resolve `ev.key` to its rules and run one
     /// evaluate_key(Event) pass. Safe to call on a detached thread post-shutdown
@@ -449,9 +463,11 @@ public:
     ///       what actually recovers that case, bounded by its own cadence rather
     ///       than instant.
     /// Intended to be driven off GuardianConvergenceScheduler's existing ~5s priority
-    /// lane - no new thread. Scoped to Dead only: a missed Faulted/Recovered toggle is
-    /// health-reporting-only (no enforcement break, no keys_ mutation), lower
-    /// severity, and not backstopped here.
+    /// lane - no new thread. Only a Dead subscription is acted on (reported like a Lost).
+    /// A Faulted answer also sets PerKey::faulted (#4415), which a missed Faulted event would
+    /// otherwise leave clear: an identical re-push consults the live health itself
+    /// (attach_core), so this is the backstop for the full_sync scoped detach, not the skip
+    /// decision's only source. It never clears the bit (a Recovered event does).
     void revalidate_subscriptions();
 
     /// Drain buffered emits through `send`. `send(const OutboxEntry&) -> SendResult`.
@@ -1199,6 +1215,10 @@ private:
         bool active{true};            ///< registry_mu_-guarded; uncommitted wedge desire or committed rule state
         bool emit_compliant_edge{true};
         RuleAssertion assertion;
+        /// #4415: immutable identity of this generation's pushed content (assertion_content_id()
+        /// in the .cpp; expected_hash is deliberately NOT part of it, see reuse_existing_locked).
+        /// Set once in attach_core() before the generation is shared.
+        std::string content_id;
         /// Mutated only under the key's eval_mu (single serialisation domain); evaluate_key's
         /// COMMIT also holds registry_mu_, so a reader holding registry_mu_ alone (attach_core, a
         /// withdrawal) never sees it torn.
@@ -1246,6 +1266,13 @@ private:
         /// priority-lane-cadence reads via that sibling; only when every entry on a
         /// key is demoted does the key itself leave the priority worklist.
         std::map<std::string, PendingState> pending_initial;
+        /// #4415: the mechanism reported this key's subscription faulted and has not yet
+        /// reported it recovered (registry_mu_-guarded; set and cleared in
+        /// on_subscription_faulted, and SET (never cleared) from the backend's own health by
+        /// sweep_key_health and the skip probe, since an event can be lost). Read by
+        /// reuse_existing_locked and detach_rules_except. A key torn down and re-armed gets a
+        /// fresh PerKey that starts clear: the skip decision does not rely on the bit alone.
+        bool faulted{false};
     };
 
     /// rung 9c R5.2: the per-key claim/queue state machine (replaces #2233 item 3's
@@ -1331,6 +1358,12 @@ private:
         std::string rule_id;
         std::uint64_t generation{0};
         SparkSpec spec;
+        /// #4415: RuleGeneration::content_id, copied here at construction. A claim's rg is
+        /// moved into rules_ when it commits, so reuse decisions read this copy, never rg.
+        std::string content_id;
+        /// #4415/#5512: the expected_hash this push carried (content_id leaves it out), so a
+        /// claim is compared on the whole push. rg->assertion's own hash may be the inherited one.
+        std::string pushed_hash;
         std::shared_ptr<RuleGeneration> rg;
         std::string rule_name;
         const char* guard_type{""};
@@ -1477,6 +1510,9 @@ private:
         /// this call OWNS NOTHING NEW - the claim is the pre-existing head's own
         /// object, already owned by whatever attach originally created it.
         std::shared_ptr<KeyClaim> claim;
+        /// #4415: set only by the reuse_existing_locked() skip (state Armed or Reobserved);
+        /// the retained-wedge re-observation paths leave it false.
+        bool skipped{false};
     };
 
 public:
@@ -1685,6 +1721,9 @@ public:
         ArmOutcomeKind kind{ArmOutcomeKind::Armed};
         std::uint64_t generation{0}; ///< valid iff kind == Armed
         ArmReceipt receipt;          ///< valid iff kind == Accepted
+        /// #4415: true iff reuse_existing_locked() skipped this push (a healthy, unchanged
+        /// committed rule, or an identical live arm already in flight); no teardown, no new claim.
+        bool skipped{false};
     };
 
     /// rung 9c PR-5c round 2 (#4221, UP-1 residual): the non-waiting attach_rule()
@@ -1952,6 +1991,45 @@ private:
     AttachCoreResult attach_core(const std::string& key, std::string rule_id, SparkSpec spec,
                                  RuleAssertion assertion, bool emit_compliant_edge,
                                  std::shared_ptr<KeyClaim>& arm_claim);
+
+    /// #4415: the backend's own answer to "is this key's subscription healthy", read by
+    /// probe_key_health() with registry_mu_ RELEASED and carried into the locked skip decision.
+    struct KeyHealthProbe {
+        std::uint64_t subscription{0}; ///< the id keys_[key] held when the probe was taken
+        SubscriptionHealth health{SubscriptionHealth::Dead};
+    };
+
+    /// #4415: snapshot-then-act health read for the skip decision. Takes registry_mu_ only to
+    /// copy keys_[key]'s subscription id, releases it, then asks the backend (the engine's own
+    /// state, the authority a lost Faulted event cannot corrupt). nullopt when there is nothing
+    /// committed to probe (stopping, no such rule or key, a claim on the key) or the backend
+    /// threw; the caller then does not skip. Must not be called with registry_mu_ held.
+    [[nodiscard]] std::optional<KeyHealthProbe>
+    probe_key_health(const std::string& key, const std::string& rule_id);
+
+    /// Set PerKey::faulted for every armed key the backend finds Faulted (registry_mu_ released
+    /// while asking; set-only, so an event delivered meanwhile is never overwritten). With
+    /// `report_dead`, a Dead subscription is reported like a Lost (the poll backstop); without
+    /// it (the scoped detach) a Dead one, and one whose health could not be read, set the bit
+    /// too so the key is rebuilt. A backend throw never escapes. A write is dropped if the key
+    /// was re-armed meanwhile (subscription id differs).
+    void sweep_key_health(bool report_dead);
+
+    /// #4415: the skip decision, called from attach_core() under registry_mu_ and before
+    /// anything is mutated. Returns Armed (a healthy committed rule whose pushed content is
+    /// identical: the existing generation, no receipt) or Reobserved (a live in-flight or
+    /// queued same-rule claim whose content is identical: that claim), else nullopt and the
+    /// caller rebuilds as before. A skip is a claim that the rule is healthy, so a rule that is
+    /// in an Unknown episode, whose key the mechanism reported faulted (the recorded bit, or
+    /// `probe` not Healthy or taken against another subscription), whose key still has any claim
+    /// other than this rule's own identical live arm (the Reobserved case), whose baseline
+    /// differs, or that has a retained wedge never reaches it (the wedge has its own
+    /// Reobserved path in attach_core). `probe` is required for the Armed skip: a null one
+    /// means health is unknown, which is not healthy. Reads only; may not throw.
+    [[nodiscard]] std::optional<AttachCoreResult>
+    reuse_existing_locked(const std::string& key, const std::string& rule_id,
+                          const SparkSpec& spec, const RuleGeneration& pushed,
+                          const std::optional<KeyHealthProbe>& probe) const noexcept;
 
     /// rung 9c PR-5c round 2 governance fold (#4221): the retained-wedge
     /// classification - a claim kind==Arm, dispatch in {Dispatching, Dispatched},
@@ -2591,7 +2669,8 @@ private:
     const Config cfg_;
     std::uint64_t gen_counter_{0};   ///< registry_mu_-guarded monotonic generation source
     /// registry_mu_-guarded; +1 as the FIRST statement of detach_all()'s locked
-    /// block (R5.7 fence, docs/spark-stage2-guardian-consumer-design.md). Names
+    /// block, which detach_rules_except() shares (#4415: bumped on every full_sync, even
+    /// when every rule is kept) (R5.7 fence, docs/spark-stage2-guardian-consumer-design.md). Names
     /// which full_sync APPLICATION a commit belongs to - the #3990 diagnostic's
     /// T2 measurement rejects any commit whose logged epoch doesn't match the
     /// application currently being measured, closing a real gap an Astra
@@ -2643,7 +2722,7 @@ private:
     [[nodiscard]] bool stage_baseline_locked(const std::string& rule_id, const std::string& path,
                                              const std::string& hash) noexcept;
     /// registry_mu_ held. A generation about to be dropped (withdrawn by detach_rule, or by
-    /// detach_all as a full_sync does before it re-arms) whose capture is committed but unstaged
+    /// detach_all / detach_rules_except as a full_sync does before it re-arms) whose capture is committed but unstaged
     /// (RuleGeneration::baseline_unstaged) stages its committed hash first, on the path of its
     /// key's spec, so the replacement generation's staged read still inherits it. Never throws;
     /// a second staging failure is counted by stage_baseline_locked, and the capture is then

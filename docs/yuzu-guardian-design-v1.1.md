@@ -2598,8 +2598,9 @@ Guardian ladder must check these.
   the agent cannot enforce (or silently drops one it can), and nothing else in
   the build catches the divergence.
 
-- **`full_sync`'s KV teardown clears `rule:` keys ONLY, never `baseline:`
-  records (#4021).** A `file-hash-equals` rule authored with no `expected_hash`
+- **`full_sync`'s KV teardown touches `rule:` keys ONLY, never `baseline:`
+  records (#4021).** (Since #4415 it deletes only the `rule:` rows the push omits and
+  conditionally rewrites the rest; it no longer clears them wholesale.) A `file-hash-equals` rule authored with no `expected_hash`
   captures a baseline on arm; that capture is persisted per `rule_id` under
   `__guardian__`/`baseline:` (fingerprint = assertion type + authored path,
   schema-versioned separately from the fingerprint content so a future schema
@@ -2649,8 +2650,10 @@ Guardian ladder must check these.
   prior generation whose capture could not be staged (an allocation failure,
   `RuleGeneration::baseline_unstaged`) has its committed hash staged first, on the
   same path, so the lookup finds it; and every withdrawal (`detach_rule`, and
-  `detach_all`, which a full_sync push runs before it re-arms anything, leaving
-  attach_core no prior generation to read) stages it before the generation is
+  `detach_all` / `detach_rules_except`, which a full_sync push runs before it re-arms
+  anything, leaving attach_core no prior generation to read for a rule the push omits; since
+  #4415 a rule the push keeps is not detached there, and attach_core either skips it or
+  replaces its prior generation as a delta push does) stages it before the generation is
   dropped (`salvage_unstaged_baseline_locked`).
   (b) `reconcile_rule_locked` holds the persister's `persist_mu_`
   (`hold_seed_fence()`) from a baseline-on-arm rule's seed read to the end of the
@@ -2912,8 +2915,8 @@ possible prior acceptance (acceptance is unknowable; there is no ack) — until 
 ages out of retention. A local gRPC `Write()` returning true is never delivery
 confirmation. **Retention eviction and quarantine are the only deletion paths, and
 every removal is counted.** Storage: `kv_store.db`, namespace `__guardian_journal__`
-(`guardian_journal_format.hpp`), distinct from `__guardian__` so it survives
-`full_sync`'s namespace clear. Owned by `GuardianEngine`, not the runtime — the
+(`guardian_journal_format.hpp`), distinct from `__guardian__` so a `full_sync`'s
+rewrite of that namespace never touches it. Owned by `GuardianEngine`, not the runtime — the
 runtime is the object built to survive the agent via a detached `SparkEngine`
 handler, so a borrowed `KvStore` there would be a dormant use-after-free.
 

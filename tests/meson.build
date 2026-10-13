@@ -320,6 +320,8 @@ agent_test_exe = executable(
     'unit/test_guardian_legacy_sink_executor.cpp',
     'unit/test_guardian_outbox_drain_worker.cpp',
     'unit/test_guardian_engine_spark_reconcile.cpp',
+    'unit/test_guardian_spark_reapply_skip_engine.cpp',   # #4415 PR-A: engine-level skip effect-set tests
+    'unit/test_guardian_spark_reapply_skip_runtime.cpp',  # #4415 PR-A: attach_core reuse / follower tests
     'unit/test_guardian_arm_ack.cpp',
     'unit/test_new_plugins.cpp',
     'unit/test_netprobe_stats.cpp',
