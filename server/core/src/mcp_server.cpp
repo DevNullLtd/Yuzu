@@ -1036,8 +1036,12 @@ static const ToolDef kTools[] = {
      "in its scope, applied before ordering and the page limit, so hidden runs never consume a "
      "page slot or shape a cursor. Input is strict: an unknown argument, an out-of-vocabulary "
      "status, a malformed workflow_id/since/until/cursor, since after until, or limit below 1 is "
-     "refused as invalid params; limit above 500 is clamped. A store failure or statement timeout "
-     "is a retryable error carrying retry_after_ms, never an empty list. Mirrors REST GET "
+     "refused as invalid params; limit above 500 is clamped. Scale: only workflow_id is indexed — "
+     "since, until and status narrow the result but not the scan — and a confined caller also pays "
+     "to check the agent list of every candidate run, so a confined caller on a large run table "
+     "should always pass workflow_id. A store failure or a read that exceeds the 1.5 s budget is a "
+     "retryable error carrying retry_after_ms, never a short or empty list: narrow by workflow_id "
+     "and retry. Mirrors REST GET "
      "/api/v1/workflow-executions. Read-only; audited as the generic mcp.list_workflow_executions "
      "on success (the gate audits a denial).",
      R"j({"type":"object","properties":{)j"
@@ -1048,7 +1052,7 @@ static const ToolDef kTools[] = {
      R"j("limit":{"type":"integer","default":50,"minimum":1,"maximum":500,"description":"Page size; above 500 is clamped"},)j"
      R"j("cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page; not combinable with latest_per_workflow"},)j"
      R"j("latest_per_workflow":{"type":"boolean","default":false,"description":"At most one (the newest visible) run per workflow, ordered by workflow_id"})j"
-     R"j(}})j",
+     R"j(},"additionalProperties":false})j",
      R"j({"type":"object","properties":{"executions":{"type":"array","items":{"type":"object","properties":{)j"
      R"j("id":{"type":"string"},"workflow_id":{"type":"string"},"workflow_name":{"type":"string"},"workflow_deleted":{"type":"boolean","description":"True when the workflow was soft-deleted; its history is kept"},"status":{"type":"string"},"current_step":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"})j"
      R"j(},"required":["id","workflow_id","workflow_name","workflow_deleted","status","current_step","started_at","completed_at"]}},)j"
@@ -11759,10 +11763,12 @@ McpServer::HandlerFn McpServer::build_handler(
             // post-fetch workflow_execution_visible() pass is needed or wanted here. Strict input, no
             // success-path audit beyond the generic mcp_audit (REST writes none).
             if (tool_name == "list_workflow_executions") {
+                // The two unwired branches carry the A4 envelope with no retry hint: both
+                // dependencies are wired once at construction, so a retry cannot succeed.
                 if (!fleet_read_fn_) {
                     spdlog::error(
                         "list_workflow_executions: fleet_read_fn_ unwired; failing closed");
-                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                    res.set_content(a4_error(kInternalError, "service unavailable"),
                                     "application/json");
                     return;
                 }
@@ -11772,11 +11778,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto query = parse_workflow_execution_list_args(args);
                 if (!query) {
                     // retry-hint-exempt: caller-input rejection, not a store fault.
-                    res.set_content(error_response(id, kInvalidParams, query.error()), "application/json");
+                    res.set_content(
+                        a4_error(kInvalidParams, query.error(),
+                                 "correct the arguments to match this tool's tools/list "
+                                 "inputSchema and re-call"),
+                        "application/json");
                     return;
                 }
                 if (!workflow_api_) {
-                    res.set_content(error_response(id, kInternalError, "Workflow engine unavailable"),
+                    res.set_content(a4_error(kInternalError, "Workflow engine unavailable"),
                                     "application/json");
                     return;
                 }
@@ -11790,8 +11800,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // (assigned key by key: a line opening `{"name",` is read by
-                // check-mcp-retry-hints.py as a new kTools entry)
+                // Assigned key by key, not built as a braced initializer: a line that opens with
+                // an initializer entry is read by check-mcp-retry-hints.py as a new tool entry.
                 nlohmann::json payload = nlohmann::json::object();
                 payload["executions"] = workflow_execution_rows_json(*page);
                 payload["next_cursor"] = workflow_execution_next_cursor_json(*page);

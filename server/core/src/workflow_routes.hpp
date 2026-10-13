@@ -20,7 +20,7 @@
 #include "response_store.hpp"
 #include "schedule_api.hpp" // ADR-0031 WS-A4 (seventh family): ScheduleApi — replaces a direct ScheduleEngine reach
 #include "tag_store.hpp"
-#include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): WorkflowApi — replaces a direct WorkflowEngine reach for the read triad
+#include "workflow_api.hpp" // ADR-0031 WS-A4 (eighth family): WorkflowApi — replaces a direct WorkflowEngine reach for the v1 workflow reads
 #include "workflow_engine.hpp"
 
 #include <httplib.h>
@@ -164,20 +164,22 @@ public:
         /// install/uninstall fan-out (`make_item_delete_fn`) — none of these
         /// has a public REST v1/MCP twin of its own, so they are deliberately
         /// OUTSIDE the `WorkflowApi` seam below (mirrors the `schedule`
-        /// family's own legacy-mutator carve-out). The three READ routes that
+        /// family's own legacy-mutator carve-out). The READ routes that
         /// DO have a public twin (`GET /api/v1/workflows[/{id}]`,
-        /// `GET /api/v1/workflow-executions/{id}`) route through
+        /// `GET /api/v1/workflow-executions[/{id}]`) route through
         /// `workflow_api` instead, below.
         WorkflowEngine* workflow_engine{nullptr};
         ExecutionTracker* execution_tracker{nullptr};
         /// ADR-0031 WS-A4 (eighth family): the workflow-read seam — replaces
         /// a direct `WorkflowEngine*` reach for `GET /api/v1/workflows`,
-        /// `GET /api/v1/workflows/{id}` and `GET /api/v1/workflow-executions/
-        /// {id}` (the seamed read triad; the legacy unversioned GET routes
-        /// and every mutator above keep their own `WorkflowEngine*` wiring,
-        /// unaffected by this seam). Unwired (default-constructed null
-        /// `shared_ptr`) ⇒ each of the three v1 routes answers its own
-        /// pre-seam "workflow engine not available" 503 exactly, since
+        /// `GET /api/v1/workflows/{id}`, `GET /api/v1/workflow-executions` and
+        /// `GET /api/v1/workflow-executions/{id}` (the seamed reads; the legacy
+        /// unversioned GET routes and every mutator above keep their own
+        /// `WorkflowEngine*` wiring, unaffected by this seam). Unwired
+        /// (default-constructed null `shared_ptr`) ⇒ each of the first three v1
+        /// routes answers its own pre-seam "workflow engine not available" 503
+        /// exactly (the list route is new and answers a plain 503 "service
+        /// unavailable"), since
         /// `workflow_api` is constructed if-and-only-if `workflow_engine_`
         /// is (server.cpp) — see `workflow_api.hpp`'s own doc comment for
         /// the full carve-out list.

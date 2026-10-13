@@ -2458,10 +2458,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 auto gate = fleet_read_fn(req, res, "Workflow", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the response.
-                std::vector<RawParam> raw;
-                raw.reserve(req.params.size());
-                for (const auto& [key, value] : req.params)
-                    raw.emplace_back(key, value);
+                std::vector<RawParam> raw(req.params.begin(), req.params.end());
                 auto query = parse_workflow_execution_list_params(raw);
                 if (!query) {
                     res.status = 400;

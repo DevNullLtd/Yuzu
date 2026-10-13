@@ -223,11 +223,14 @@ TEST_CASE("GET /api/v1/workflow-executions: the gate is the first and sole autho
         Fx fx(/*with_gate=*/false);
         auto res = fx.get("/api/v1/workflow-executions");
         CHECK(res->status == 503); // an unwired gate fails closed, never open
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
         CHECK(fx.api_calls == 0);
     }
     {
         Fx fx(/*with_gate=*/true, /*with_api=*/false);
-        CHECK(fx.get("/api/v1/workflow-executions")->status == 503);
+        auto res = fx.get("/api/v1/workflow-executions");
+        CHECK(res->status == 503);
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
         CHECK(fx.gate_calls == 1);
     }
 }
@@ -241,6 +244,7 @@ TEST_CASE("GET /api/v1/workflow-executions: a store failure is a 503 never an em
     const auto body = json::parse(res->body);
     CHECK(body["error"]["retry_after_ms"] == 5000);
     CHECK(body["error"]["message"].get<std::string>().find("pool exhausted") == std::string::npos);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
     CHECK_FALSE(body.contains("data"));
 }
 

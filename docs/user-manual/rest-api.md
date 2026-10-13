@@ -5945,8 +5945,14 @@ Input is strict: an unknown or repeated parameter, a value outside the vocabular
 mistyped filter can never read as "all runs". No audit row is written for a successful list (run
 metadata, not operator-supplied step parameters); a refusal is audited by the gate as
 `auth.fleet_read_required`. A store failure or the 1.5 s statement timeout is a `503` with
-`retry_after_ms`, never an empty `200`. On a large run table the unfiltered query scans and sorts
-(there is no `started_at` index), so prefer `workflow_id`/`since`/`until` filters.
+`retry_after_ms`, never an empty `200`.
+
+**Scale.** Only `workflow_id` is indexed (`idx_wf_exec_workflow`). `since`, `until` and `status`
+narrow the result but not the scan, and there is no `started_at` index, so a large run table is
+scanned and sorted on every call. A confined caller also pays to check the stored agent list of every
+candidate run, so a confined caller on a large table should always pass `workflow_id`. A read that
+does not finish inside the 1.5 s budget answers an honest `503` (never a short or empty page):
+narrow by `workflow_id` and retry.
 
 **Response:**
 

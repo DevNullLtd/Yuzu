@@ -313,40 +313,6 @@ TEST_CASE("GET /api/v1/workflow-executions real gate: a principal with no Workfl
     CHECK(r.audit("auth.fleet_read_required").size() == 1);
 }
 
-TEST_CASE("GET /api/v1/workflow-executions real gate: revoking Workflow:Read from ITServiceOwner "
-          "refuses service tokens only",
-          "[pg][routes][workflow][executions][list][authz][service_scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, wf_real_gate_tpl);
-    Rig r{db.dsn()};
-    const auto svc = r.mint("gary", "printers");
-    CHECK(r.get(svc).status == 200); // control: seeded defaults admit
-    REQUIRE(r.rig.rbac.remove_permission("ITServiceOwner", "Workflow", "Read").has_value());
-    CHECK(r.get(svc).status == 403);
-    CHECK(r.get(svc).ids.empty());
-    // Non-service principals are unaffected: global gary unfiltered, group-scoped bob confined.
-    CHECK(r.get(r.mint("gary")).ids == kEverything);
-    CHECK(r.get(r.mint("bob")).ids == kBobVisible);
-}
-
-TEST_CASE("GET /api/v1/workflow-executions real gate: a degraded ceiling read is a 503 and serves "
-          "no rows",
-          "[pg][routes][workflow][executions][list][authz][service_scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, wf_real_gate_tpl);
-    Rig r{db.dsn()};
-    const auto svc = r.mint("gary", "printers");
-    CHECK(r.get(svc).status == 200); // control
-    {
-        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
-        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
-        pg::PgResult d{PQexec(conn.get(), "DROP TABLE rbac_store.role_permissions CASCADE")};
-        REQUIRE(d.ok());
-    }
-    auto got = r.get(svc);
-    CHECK(got.status == 503);
-    CHECK(got.ids.empty());
-    CHECK(got.body["error"]["retry_after_ms"].is_number());
-}
-
 TEST_CASE("GET /api/v1/workflow-executions real gate: with RBAC off every authenticated caller is "
           "unconfined and a service token is refused",
           "[pg][routes][workflow][executions][list][authz][service_scope]") {

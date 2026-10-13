@@ -8,10 +8,10 @@
 /// `GET /api/v1/workflow-executions/{id}` resources (and their MCP twins
 /// `list_workflows`/`get_workflow`/`list_workflow_executions`/
 /// `get_workflow_execution`). Abstract, ZERO store-shaped dependencies — it
-/// includes only the pure `workflow_types.hpp` + std headers, so this header
-/// can be included by a future presentation-side client without dragging the
-/// server's `WorkflowEngine` (a Postgres-backed store, `workflow_engine.hpp`)
-/// along.
+/// includes only the pure, std-only `workflow_types.hpp` and `authz_model.hpp`
+/// plus std headers, so this header can be included by a future
+/// presentation-side client without dragging the server's `WorkflowEngine` (a
+/// Postgres-backed store, `workflow_engine.hpp`) along.
 ///
 /// The four methods == the four public REST v1 resources above (plus their
 /// MCP twins), so a presentation/MCP caller consumes only what the public,

@@ -5,12 +5,12 @@
 namespace yuzu::server {
 
 /// Store-backed `WorkflowApi` implementation — a thin wrap of
-/// `WorkflowEngine::list_workflows`/`get_workflow`/`get_execution` (ADR-0031
-/// WS-A4, eighth family). Behaviour preserved exactly: every one of these
-/// three engine methods already returned a checked `std::expected` to its
-/// pre-seam REST v1/MCP callers (unlike the `schedule` family's own
-/// pre-seam unchecked `query_schedules()`), so this seam introduces no new
-/// honest-empty-vs-failure distinction — it only removes the direct
+/// `WorkflowEngine::list_workflows`/`get_workflow`/`get_execution`/
+/// `query_executions_page` (ADR-0031 WS-A4, eighth family). Behaviour
+/// preserved exactly: every one of these engine methods returns a checked
+/// `std::expected` to its REST v1/MCP callers (unlike the `schedule` family's
+/// own pre-seam unchecked `query_schedules()`), so this seam introduces no
+/// new honest-empty-vs-failure distinction — it only removes the direct
 /// presentation → store reach.
 class LocalWorkflowApi final : public WorkflowApi {
 public:
@@ -34,8 +34,8 @@ public:
         return engine_.get_execution(id);
     }
 
-    // The list read added after the original triad: the store takes the scope as plain data
-    // (no authz dependency), so the set is flattened here.
+    // The store takes the scope as plain data (no authz dependency), so the set is flattened
+    // here; engaged-empty stays engaged-empty (deny-all), never widened to "no filter".
     [[nodiscard]] std::expected<WorkflowExecutionPage, std::string>
     list_workflow_executions(const WorkflowExecutionListQuery& q,
                              const authz::VisibleSet& scope) const override {

@@ -3,7 +3,7 @@
 /// @file test_workflow_api_double.hpp
 /// FnWorkflowApi — a test-only `WorkflowApi` adapter backed by plain
 /// `std::function`s, mirroring `FnScheduleApi`/`FnVerifyApi`. Lets a route/
-/// MCP test inject an ARBITRARY result for any of the three methods —
+/// MCP test inject an ARBITRARY result for any of the four methods —
 /// including a store FAILURE (`std::unexpected`) — without standing up a
 /// real `WorkflowEngine`/Postgres connection.
 ///
