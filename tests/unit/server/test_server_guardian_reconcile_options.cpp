@@ -157,9 +157,9 @@ TEST_CASE("Guardian reconcile options: what the CLI parser itself lets through o
 
 TEST_CASE("Guardian reconcile options: the post-parse check also refuses NaN and infinity",
           "[guardian][reconcile][options]") {
-    // CLI::PositiveNumber lets NaN through at parse time (the next test pins that against the real
-    // parser); the second line of defence is guardian_reconcile_options_error(). These cases fill
-    // Config directly, so they also cover infinity regardless of what the parser does with it.
+    // CLI::PositiveNumber lets NaN through at parse time (the previous test pins that against the
+    // real parser); the second line of defence is guardian_reconcile_options_error(). These cases
+    // fill Config directly, so they also cover infinity regardless of what the parser does with it.
     Config cfg;
     cfg.guardian_reconcile_budget_ms_per_s = std::numeric_limits<double>::quiet_NaN();
     CHECK(guardian_reconcile_options_error(cfg).find("--guardian-reconcile-budget-ms-per-s") !=

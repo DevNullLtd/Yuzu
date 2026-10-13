@@ -40,7 +40,9 @@ Invariants over the FLOW:
   f. A scope-evaluation error of EVERY kind except `Unresolvable` sets `scope_degraded`
      (`kind != ScopeEvalError::Kind::Unresolvable`; `Unresolvable` alone is "not a member"), and
      `if (scope_degraded)` leads to `abort_degraded(` and a `return` (send nothing; never a
-     narrowed full_sync).
+     narrowed full_sync). The abort's detail (audit row and log) is the kind name alone, with the
+     error's own detail appended only for `StoreDegraded` (another kind's detail can be a
+     caller-supplied identifier: `OwnerCheckFailed` carries a result-set id).
   g. The generation is read through `guardian_generation_cache_.get()`; the flow never calls
      `current_policy_generation(` itself.
   h. Order inside run(): decide < begin_admitted < bundle get < eval_scope_(.
@@ -160,8 +162,13 @@ Invariants over the WIRING (server.cpp):
      guardian members (budget, gate, `guardian_generation_cache_`,
      `guardian_rule_bundle_cache_`) is declared before `heartbeat_ingestion_` (so the flow dies
      first); and each of the two stores (`guaranteed_state_store_`, `baseline_store_`) is declared
-     before each of the two caches (the caches' fetch and the invalidation hooks reach the
-     stores). Each declaration must appear exactly once. Tolerated: any whitespace, comments,
+     before each of the two caches. That last pair of rules is a conservative second line, not the
+     cover for the hook direction: the invalidation hooks are installed ON the stores and call INTO
+     the caches, and stop() clears both hooks before it resets the stores. What the order covers
+     is a call still running inside a cache while it is destroyed: the generation cache's fetch
+     lambda and the loader the flow builds for the bundle cache capture `this` and read the stores
+     through it, so the stores must still be alive. The caches have no destructor that touches a
+     store. Each declaration must appear exactly once. Tolerated: any whitespace, comments,
      `guardian::` qualification, a `{...}` initializer or a bare `;`. Limits: it pins the
      relative order of these seven declarations only; a member declared elsewhere that the flow
      also borrows (for example `metrics_`, `registry_`) is not covered. Checked by
@@ -428,6 +435,12 @@ def flow_problems(src):
                    "only Unresolvable may mean 'not a member' (f)")
     if not re.search(r"\bif \( ?scope_degraded ?\) ?\{[^{}]*?\babort_degraded\([^;]*;[^{}]*?\breturn ?;", b):
         out.append("if (scope_degraded) no longer leads to abort_degraded( and a return (f)")
+    if not re.search(r"scope_degraded_detail = to_string\( ?\w+\.error\(\)\.kind ?\) ?; ?"
+                     r"if \( ?\w+\.error\(\)\.kind ?== ?ScopeEvalError::Kind::StoreDegraded ?&& ?"
+                     r"!\w+\.error\(\)\.detail\.empty\(\) ?\) ?scope_degraded_detail \+= ", b):
+        out.append("the scope-degraded detail is no longer the kind name alone for every kind except "
+                   "StoreDegraded: another kind's detail (OwnerCheckFailed carries a result-set id) "
+                   "would reach the audit row and the log (f)")
 
     if not re.search(r"guardian_generation_cache_\.get\(\)", b):
         out.append("the generation is no longer read through guardian_generation_cache_.get() (g)")
@@ -1229,6 +1242,9 @@ MUTATIONS = [
     ("call evaluate_scope_local again", _sub(EVAL, "const auto eval = registry_.evaluate_scope_local("), "(e)"),
     ("skip setting scope_degraded", _sub("scope_degraded = true;", "(void)0;"), "(f)"),
     ("skip the degraded abort", _sub(ABORT, "(void)0;"), "(f)"),
+    ("every kind's detail reaches the audit row and the log",
+     _wsub("eval.error().kind == ScopeEvalError::Kind::StoreDegraded && !eval.error().detail.empty()",
+           "!eval.error().detail.empty()"), "(f)"),
     ("only StoreDegraded aborts again (every other kind is a member decision)",
      _sub("eval.error().kind != ScopeEvalError::Kind::Unresolvable",
           "eval.error().kind == ScopeEvalError::Kind::StoreDegraded"), "(f)"),
@@ -1364,8 +1380,8 @@ MUTATIONS += [
 # Invariants that live in server.cpp; every other lettered entry above mutates the flow header.
 SERVER_LETTERS = ("(i)", "(p)", "(q)", "(v)", "(x)", "(y)", "(z)")
 # (aa) is over server.cpp too, but it is checked by declaration_order_problems alone (not part of
-# problems()), in the light half, so its mutations stay out of the heavy full-problems() sweep.
-ORDER_LETTERS = ("(aa)",)
+# problems()), in the light half, so its mutations (ORDER_MUTATIONS, below) stay out of this
+# lettered list and out of the heavy full-problems() sweep.
 
 # (w) the bundle epoch check.
 EPOCH_READ = "const auto bundle_epoch = guardian_rule_bundle_cache_.epoch();"
@@ -1520,35 +1536,67 @@ def _decl_after(moved, anchor):
     return mut
 
 
-MUTATIONS += [
+def _decl_before(moved, anchor):
+    """Cut the `moved` member declaration out and paste it right BEFORE `anchor`'s (which must come
+    earlier in the source). Every token stays present, only the order changes."""
+    def mut(s):
+        m = re.search(_SRC_DECL[moved], s, re.S)
+        a = re.search(_SRC_DECL[anchor], s, re.S)
+        assert m and a and a.start() <= m.start(), "declaration pattern stale or already out of order"
+        s = s[:m.start()] + s[m.end():]
+        return s[:a.start()] + m.group(0) + s[a.start():]
+    return mut
+
+
+def _pair(first, second):
+    """The text declaration_order_problems() emits for one violated (first, second) pair."""
+    return f"{first} is declared AFTER {second}:"
+
+
+_GS, _BS = "guaranteed_state_store_", "baseline_store_"
+_BUD, _GATE = "guardian_reconcile_budget_", "guardian_reconcile_gate_"
+_GEN, _BUN, _HB = "guardian_generation_cache_", "guardian_rule_bundle_cache_", "heartbeat_ingestion_"
+
+# (name, mutate, the EXACT set of findings it must produce). The check compares the whole set, so a
+# pair dropped from _DECL_ORDER turns the mutation that exercises it red, whichever other pairs the
+# same move also violates. Source order: gs, bs, budget, gate, generation cache, bundle cache, hb.
+ORDER_MUTATIONS = [
     ("budget declared after the gate that references it",
-     _decl_after("guardian_reconcile_budget_", "guardian_reconcile_gate_"), "(aa)"),
+     _decl_after(_BUD, _GATE), [_pair(_BUD, _GATE)]),
     ("budget declared after heartbeat_ingestion_",
-     _decl_after("guardian_reconcile_budget_", "heartbeat_ingestion_"), "(aa)"),
+     _decl_after(_BUD, _HB), [_pair(_BUD, _HB), _pair(_BUD, _GATE)]),
     ("gate declared after heartbeat_ingestion_",
-     _decl_after("guardian_reconcile_gate_", "heartbeat_ingestion_"), "(aa)"),
+     _decl_after(_GATE, _HB), [_pair(_GATE, _HB)]),
     ("generation cache declared after heartbeat_ingestion_",
-     _decl_after("guardian_generation_cache_", "heartbeat_ingestion_"), "(aa)"),
+     _decl_after(_GEN, _HB), [_pair(_GEN, _HB)]),
     ("rule bundle cache declared after heartbeat_ingestion_",
-     _decl_after("guardian_rule_bundle_cache_", "heartbeat_ingestion_"), "(aa)"),
+     _decl_after(_BUN, _HB), [_pair(_BUN, _HB)]),
     ("guaranteed-state store declared after the generation cache",
-     _decl_after("guaranteed_state_store_", "guardian_generation_cache_"), "(aa)"),
+     _decl_after(_GS, _GEN), [_pair(_GS, _GEN)]),
     ("guaranteed-state store declared after the rule bundle cache",
-     _decl_after("guaranteed_state_store_", "guardian_rule_bundle_cache_"), "(aa)"),
+     _decl_after(_GS, _BUN), [_pair(_GS, _GEN), _pair(_GS, _BUN)]),
     ("baseline store declared after the generation cache",
-     _decl_after("baseline_store_", "guardian_generation_cache_"), "(aa)"),
+     _decl_after(_BS, _GEN), [_pair(_BS, _GEN)]),
     ("baseline store declared after the rule bundle cache",
-     _decl_after("baseline_store_", "guardian_rule_bundle_cache_"), "(aa)"),
+     _decl_after(_BS, _BUN), [_pair(_BS, _GEN), _pair(_BS, _BUN)]),
+    # The bundle cache moves ABOVE the stores while the generation cache stays put, so only the
+    # (store, bundle cache) pairs fire; moving a store below the bundle cache also moves it below
+    # the generation cache, which is why these two have their own mutations.
+    ("rule bundle cache declared above both stores (generation cache unmoved)",
+     _decl_before(_BUN, _GS), [_pair(_GS, _BUN), _pair(_BS, _BUN)]),
+    ("rule bundle cache declared between the stores (generation cache unmoved)",
+     _decl_before(_BUN, _BS), [_pair(_BS, _BUN)]),
     ("heartbeat_ingestion_ declaration renamed away (order cannot be checked)",
      _sub("std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_;",
-          "std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_x_;"), "(aa)"),
+          "std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_x_;"),
+     ["no longer declares heartbeat_ingestion_ exactly once (found 0)"]),
     ("heartbeat_ingestion_ declared twice",
      _sub("std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_;",
-          "std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_;\n    std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_;"), "(aa)"),
+          "std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_;\n    std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_;"),
+     ["no longer declares heartbeat_ingestion_ exactly once (found 2)"]),
 ]
 
-ORDER_MUTATIONS = [m for m in MUTATIONS if m[2] in ORDER_LETTERS]
-FLOW_MUTATIONS = [m for m in MUTATIONS if m[2] not in SERVER_LETTERS + ORDER_LETTERS]
+FLOW_MUTATIONS = [m for m in MUTATIONS if m[2] not in SERVER_LETTERS]
 
 # (t)/(u): the wiring in server.cpp.
 LAMBDA_CALL = "reconcile_flow->run(agent_id_sv, agent_gen);"
@@ -1915,14 +1963,21 @@ class GuardianReconcileWiringLexical(unittest.TestCase):
     def test_wiring_mutations_are_caught(self):
         self._check_caught(SERVER_MUTATIONS, self.src, problems)
 
-    def test_the_server_letters_are_not_flow_letters(self):
-        # FLOW_MUTATIONS is the complement of SERVER_LETTERS, so counting the two lists proves
-        # nothing. What can go wrong is a letter that both sources claim, whose mutations would then
-        # be run against the wrong file; and a server entry whose letter is the flow's.
-        flow_letters = {m[2] for m in FLOW_MUTATIONS}
-        self.assertTrue(flow_letters)
-        self.assertEqual(flow_letters & set(SERVER_LETTERS + ORDER_LETTERS), set())
+    def test_every_lettered_mutation_is_routed_to_exactly_one_source(self):
+        # FLOW_MUTATIONS is defined as the complement of SERVER_LETTERS, so the routing cannot be
+        # checked against it. These three sets are written out independently: a NEW letter must be
+        # added to exactly one of them by hand (this test is red until it is), which is what stops a
+        # mutation being run against the wrong file or silently skipped.
+        flow_set = {"(a)", "(b)", "(c)", "(d)", "(e)", "(f)", "(g)", "(h)", "(j)", "(k)", "(l)", "(m)",
+                    "(n)", "(o)", "(r)", "(s)", "(w)"}
+        server_set = {"(i)", "(p)", "(q)", "(v)", "(x)", "(y)", "(z)"}
+        self.assertEqual(flow_set & server_set, set())
+        self.assertEqual({m[2] for m in MUTATIONS}, flow_set | server_set)
+        self.assertEqual({m[2] for m in FLOW_MUTATIONS}, flow_set)
+        self.assertEqual(set(SERVER_LETTERS), server_set)
+        # The (aa) order mutations are a separate list with their own expectation, not lettered.
         self.assertTrue(ORDER_MUTATIONS)
+        flow_letters = {m[2] for m in FLOW_MUTATIONS}
         direct = {m[2] for m in SERVER_MUTATIONS} - set(SERVER_LETTERS)  # appended to SERVER_MUTATIONS directly
         self.assertTrue(direct)
         self.assertEqual(direct & (flow_letters - {"(o)"}), set())  # (o) has a mutation in each source
@@ -1938,7 +1993,17 @@ class GuardianReconcileWiringLexical(unittest.TestCase):
                 self.assertEqual(declaration_order_problems(lex(mutated)), [])
 
     def test_declaration_order_mutations_are_caught(self):
-        self._check_caught(ORDER_MUTATIONS, self.src, lambda mutated: declaration_order_problems(lex(mutated)))
+        # Each mutation must produce EXACTLY the findings it lists (one per violated pair, each naming
+        # the pair), so removing a pair from _DECL_ORDER cannot hide behind another pair that the same
+        # move also violates.
+        for name, mutate, expected in ORDER_MUTATIONS:
+            with self.subTest(mutation=name):
+                mutated = mutate(self.src)
+                self.assertNotEqual(mutated, self.src, "mutation changed nothing (stale pattern)")
+                got = declaration_order_problems(lex(mutated))
+                self.assertEqual(len(got), len(expected), got)
+                for fragment in expected:
+                    self.assertEqual(sum(fragment in g for g in got), 1, (fragment, got))
 
     def test_push_builder_is_clean(self):
         self._check_clean(push_builder_problems(self.push_src))

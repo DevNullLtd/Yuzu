@@ -6,6 +6,7 @@
 
 #include "agent.grpc.pb.h"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 #include <spdlog/spdlog.h>
 
@@ -13,6 +14,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <string>
 
 namespace yuzu::server {
@@ -112,8 +114,23 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
             auto [ptr, ec] = std::from_chars(v.data(), v.data() + v.size(), gen);
             // Require the WHOLE tag to parse (ptr at end) — "123abc" must be
             // rejected, not silently read as 123 (cpp-expert / #1209).
-            if (ec == std::errc() && ptr == v.data() + v.size())
-                guardian_reconcile_fn_(agent_id_str, gen);
+            if (ec == std::errc() && ptr == v.data() + v.size()) {
+                // Defensive, like the quarantine hook below: a throwing reconcile
+                // dependency must not escape the heartbeat handler or skip the rest of
+                // ingestion. The agent id and the exception text are untrusted, so both
+                // go through the log-token neutralisers.
+                try {
+                    guardian_reconcile_fn_(agent_id_str, gen);
+                } catch (const std::exception& e) {
+                    spdlog::warn("[{}] Heartbeat guardian reconcile threw for agent={}: {}",
+                                 via_str, ::yuzu::log_id_token(agent_id_str),
+                                 ::yuzu::log_id_token(e.what()));
+                } catch (...) {
+                    spdlog::warn("[{}] Heartbeat guardian reconcile threw a non-standard "
+                                 "exception for agent={}",
+                                 via_str, ::yuzu::log_id_token(agent_id_str));
+                }
+            }
         }
     }
 

@@ -5946,8 +5946,12 @@ public:
             // Guardian heartbeat reconcile (M5 / #1209, #5513). The control flow (admission
             // order, early returns, abort paths, audit rows) is GuardianReconcileFlow::run in
             // guardian_reconcile_flow.hpp, where it is unit tested. What stays here is the
-            // dependency wiring: every reference below is a ServerImpl member that outlives
-            // heartbeat_ingestion_, the only holder of the flow.
+            // dependency wiring: every constructor reference below is a ServerImpl member that
+            // outlives heartbeat_ingestion_, the only holder of the flow. The lambdas that
+            // capture `this` also read the other stores through it; those declared after
+            // heartbeat_ingestion_ (custom_properties_store_) are covered by stop(), which
+            // shuts the gRPC servers down (agent_server_->Shutdown) before any member is
+            // destroyed.
             auto reconcile_flow = std::make_shared<GuardianReconcileFlow>(GuardianReconcileFlowDeps{
                 .gate = guardian_reconcile_gate_,
                 .generation_cache = guardian_generation_cache_,
@@ -21207,9 +21211,15 @@ private:
     // DECLARATION ORDER IS LOAD-BEARING: the gate holds a reference to the budget, so the
     // budget is declared first (destroyed last). The four members below (budget, gate, generation
     // cache, rule bundle cache) are also referenced by the flow that heartbeat_ingestion_ holds, so
-    // heartbeat_ingestion_ must stay declared BELOW them (destroyed first), and the two stores
-    // above (guaranteed_state_store_, baseline_store_) must stay declared above the caches.
-    // Invariant (aa) of tests/test_guardian_reconcile_wiring_lexical.py pins all of it.
+    // heartbeat_ingestion_ must stay declared BELOW them (destroyed first). The two stores above
+    // (guaranteed_state_store_, baseline_store_) are kept declared above the caches as a
+    // conservative second line: the generation cache's fetch lambda and the loader the flow builds
+    // for the rule bundle cache from its list_rules/deployed_ids callables capture `this` and
+    // read the stores through it, so a call still running inside a cache while it is destroyed
+    // finds the stores alive. The hooks run
+    // the other way (installed ON the stores, they call INTO the caches), and stop() clears both
+    // hooks before the store reset; the caches have no destructor that touches a store.
+    // Invariant (aa) of tests/test_guardian_reconcile_wiring_lexical.py pins the order.
     GuardianReconcileBudget guardian_reconcile_budget_{GuardianReconcileBudgetConfig{
         .budget_ms_per_s = cfg_.guardian_reconcile_budget_ms_per_s,
         .burst_ms = cfg_.guardian_reconcile_burst_ms,
@@ -21429,8 +21439,8 @@ private:
     /// both ingestion paths funnel through one entry point.
     /// Must stay declared BELOW the guardian reconcile members (guardian_reconcile_budget_,
     /// guardian_reconcile_gate_, guardian_generation_cache_, guardian_rule_bundle_cache_): the
-    /// reconcile flow its lambda holds references them, so this must be destroyed first (pinned
-    /// by invariant (aa) of tests/test_guardian_reconcile_wiring_lexical.py).
+    /// flow held by its lambda references them, so this must be destroyed first (pinned by
+    /// invariant (aa) of tests/test_guardian_reconcile_wiring_lexical.py).
     std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_;
     std::unique_ptr<VizRoutes> viz_routes_;
     /// Atomic kill-switch consulted by VizRoutes on every request. Defaults

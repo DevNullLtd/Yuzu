@@ -215,6 +215,49 @@ TEST_CASE("HeartbeatIngestion: a throwing quarantine reconcile fn does not abort
     CHECK_NOTHROW(ingestion.ingest(make_hb("", /*set_tag=*/false), "agent-x", "direct"));
 }
 
+// #5513: the guardian reconcile hook is caught at the ingestion call site exactly like the
+// quarantine hook, and the rest of ingestion still runs. Evidence that it ran: the quarantine
+// hook (which executes after the guardian hook) is still invoked.
+TEST_CASE("HeartbeatIngestion: a throwing guardian reconcile fn does not abort ingestion (#5513)",
+          "[heartbeat_ingestion][reconcile]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics};
+
+    int quarantine_calls = 0;
+    ingestion.set_quarantine_reconcile_fn([&](std::string_view) { ++quarantine_calls; });
+
+    SECTION("std::exception") {
+        ingestion.set_guardian_reconcile_fn(
+            [](std::string_view, std::uint64_t) { throw std::runtime_error("boom"); });
+        CHECK_NOTHROW(ingestion.ingest(make_hb("7"), "agent-x", "direct"));
+        CHECK(quarantine_calls == 1);
+    }
+    SECTION("a non-std exception") {
+        ingestion.set_guardian_reconcile_fn([](std::string_view, std::uint64_t) { throw 42; });
+        CHECK_NOTHROW(ingestion.ingest(make_hb("7"), "agent-x", "direct"));
+        CHECK(quarantine_calls == 1);
+    }
+    SECTION("the hook stays installed: a later non-throwing heartbeat still reaches it") {
+        bool throw_now = true;
+        ReconcileCapture cap;
+        ingestion.set_guardian_reconcile_fn([&](std::string_view aid, std::uint64_t gen) {
+            if (throw_now)
+                throw std::runtime_error("boom");
+            cap.called = true;
+            cap.agent_id = std::string(aid);
+            cap.generation = gen;
+        });
+        CHECK_NOTHROW(ingestion.ingest(make_hb("7"), "agent-x", "direct"));
+        throw_now = false;
+        ingestion.ingest(make_hb("8"), "agent-x", "direct");
+        CHECK(cap.called);
+        CHECK(cap.generation == 8);
+        CHECK(quarantine_calls == 2);
+    }
+}
+
 // #3425 governance Gate 3 (cpp-safety, 2026-08-24): `set_quarantine_reconcile_fn(nullptr)`
 // must be an actual drain barrier — it must not return while a concurrent
 // `ingest()` call is still inside the fn, or server.cpp's stop() sequence can

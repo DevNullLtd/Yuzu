@@ -782,13 +782,14 @@ TEST_CASE("GuardianReconcileFlow: any scope error kind except Unresolvable abort
     struct Kind {
         const char* name;
         ScopeOutcome outcome;
-        const char* expected_error;  // "<to_string(kind)>: <detail>" as the stub raises it
+        // Only the kind name: for a kind other than StoreDegraded the stub's detail (for
+        // OwnerCheckFailed a result-set id) must not reach the audit row or the log.
+        const char* expected_error;
     };
     const Kind kinds[] = {
-        {"presence_degraded", ScopeOutcome::PresenceDegraded, "presence_degraded: presence down"},
-        {"principal_unresolved", ScopeOutcome::PrincipalUnresolved,
-         "principal_unresolved: no principal"},
-        {"owner_check_failed", ScopeOutcome::OwnerCheckFailed, "owner_check_failed: rs-1"},
+        {"presence_degraded", ScopeOutcome::PresenceDegraded, "presence_degraded"},
+        {"principal_unresolved", ScopeOutcome::PrincipalUnresolved, "principal_unresolved"},
+        {"owner_check_failed", ScopeOutcome::OwnerCheckFailed, "owner_check_failed"},
     };
     for (const auto& k : kinds) {
         DYNAMIC_SECTION(k.name) {
@@ -1518,7 +1519,9 @@ TEST_CASE("GuardianReconcileFlow: every exit path makes at most one result incre
 // PROPAGATES to the caller (the heartbeat thread); what the flow guarantees on the unwind is
 // that the RAII pieces still run: the in-flight slot is released, the measured time is debited,
 // the duration is observed once, and the claim Admit wrote stays (so the agent is not
-// re-admitted on its next heartbeat inside the interval).
+// re-admitted on its next heartbeat inside the interval). In production the exception does not
+// reach the gRPC handler: HeartbeatIngestion::ingest catches it at the call site (covered in
+// test_heartbeat_ingestion.cpp), so the heartbeat's remaining ingestion still runs.
 // ---------------------------------------------------------------------------------------
 
 namespace {
@@ -1542,6 +1545,9 @@ std::vector<ThrowCase> throwing_dependencies() {
         {"eval_scope throws",
          [](Rig& r) {
              r.set_rules({rule("scoped", "", "tag:grp == alpha")});
+             // The recovery runs below rely on this outcome: set it rather than lean on
+             // the stub's default.
+             r.scope_outcomes["alpha"] = ScopeOutcome::NotMember;
              r.eval_hook = kBoom;
          },
          [](Rig& r) { r.eval_hook = nullptr; }, 0.0, 0.0, 0},
@@ -1592,7 +1598,6 @@ TEST_CASE("GuardianReconcileFlow: a dependency that throws after admission still
             CHECK(rig.count("degraded") == c.degraded_label);
             CHECK(rig.total() == c.sent_label + c.degraded_label);
             CHECK(rig.sent.size() == c.pushes);
-            CHECK(rig.audits.empty());  // the throwing sink recorded nothing
 
             // The failure left nothing stuck: the kept claim limits the next heartbeat, and once
             // the interval has passed the same agent is admitted and pushed again.

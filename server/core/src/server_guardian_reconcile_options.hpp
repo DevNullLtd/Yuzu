@@ -57,8 +57,9 @@ inline void register_guardian_reconcile_options(CLI::App& app, Config& cfg) {
 
 /// Refusal text for a configuration the server must not start with, or empty when the three
 /// values are acceptable. `CLI::PositiveNumber` already rejects <= 0 at parse time; this adds the
-/// cases it lets through (NaN and infinities, which `std::stod` accepts) and is the single place
-/// a test pins the rule. Call once after parsing.
+/// case it lets through (NaN, measured; the parser itself refuses infinity). The `isfinite`
+/// checks stay as defence in depth, so a directly assigned `Config` with an infinity is refused
+/// too. This is the single place a test pins the rule. Call once after parsing.
 [[nodiscard]] inline std::string guardian_reconcile_options_error(const Config& cfg) {
     if (!std::isfinite(cfg.guardian_reconcile_budget_ms_per_s) ||
         cfg.guardian_reconcile_budget_ms_per_s <= 0.0)

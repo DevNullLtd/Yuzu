@@ -26,8 +26,10 @@
 /// LIFETIME. Every reference handed to the constructor must outlive the flow. In production
 /// they are `ServerImpl` members, which outlive `heartbeat_ingestion_` (the only holder of the
 /// flow, through the lambda) because `heartbeat_ingestion_` is declared BELOW them and so is
-/// destroyed first. That declaration order is pinned by invariant (aa) of
-/// tests/test_guardian_reconcile_wiring_lexical.py.
+/// destroyed first. Invariant (aa) of tests/test_guardian_reconcile_wiring_lexical.py pins that
+/// order for the four guardian members it references (budget, gate, generation cache, rule
+/// bundle cache) and for the two stores' position above the caches; `metrics_` is a long-lived
+/// earlier member and is not pinned.
 ///
 /// Thread-safe to the extent its collaborators are: `run()` is called concurrently from every
 /// heartbeat thread and holds no state of its own except the shed-log throttle atomic.
@@ -442,9 +444,10 @@ public:
         // agent. It now sets scope_degraded and the reconcile is aborted below
         // through the degraded branch (counter, ABORTED audit row, log), sending
         // NOTHING; the agent keeps its current rules and is retried. The same holds
-        // for EVERY error kind except Unresolvable (none of them means "zero
-        // matches", see scope_eval_error.hpp), so a kind added to the enum later is
-        // an abort until it is deliberately classified here.
+        // for every other error kind: Unresolvable (an atom with no wired store) is the
+        // one kind this flow treats as "not a member"; every other kind is an untrusted
+        // read (see scope_eval_error.hpp), so a kind added to the enum later is an abort
+        // until it is deliberately classified here.
         bool scope_degraded = false;
         std::string scope_degraded_detail;
         std::unordered_map<std::string, bool> scope_member;
@@ -464,7 +467,12 @@ public:
                     } else if (eval.error().kind != ScopeEvalError::Kind::Unresolvable) {
                         scope_degraded = true;
                         scope_degraded_detail = to_string(eval.error().kind);
-                        if (!eval.error().detail.empty())
+                        // Only the store-degraded kind carries its detail into the log line
+                        // and the ABORTED audit row; for the other kinds the detail can be
+                        // a caller-supplied identifier (OwnerCheckFailed carries a result-set
+                        // id), so only the kind name is emitted.
+                        if (eval.error().kind == ScopeEvalError::Kind::StoreDegraded &&
+                            !eval.error().detail.empty())
                             scope_degraded_detail += ": " + eval.error().detail;
                         return false;
                     }
