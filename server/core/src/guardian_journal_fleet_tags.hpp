@@ -316,10 +316,13 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
     {"yuzu.guardian_send_order_hold_releases", "yuzu_fleet_guardian_send_order_hold_releases",
      "Fleet sum of GuardianOutboxDrainWorker cross-lane order-hold RELEASES (#3972, either "
      "lane): a lane held behind an older entry in the other lane waited out the hold (1 s) "
-     "and was released to overtake up to 64 entries. Each increment is one bounded "
-     "reordering window opened, not a loss. MONITOR-ONLY - see the alerting note; "
-     "correlate with send_stalls / send_exceptions on the same endpoint, which is what "
-     "usually caused the hold"},
+     "and was permitted to overtake it, up to 64 launches; events may have reached the "
+     "stream out of enqueue order (a release is counted even if the call launches nothing). "
+     "Not a loss, but a later-launched sender overtaking an older one can, with the "
+     "server's same-second >= tie in upsert_rule_status, keep a false compliant (#5690, "
+     "open, gates the flip). MONITOR-ONLY - see the alerting note; correlate with "
+     "send_stalls / send_exceptions on the same endpoint, which is what usually caused "
+     "the hold"},
 };
 
 /// Derived with std::size, never a literal and never sizeof-arithmetic: the sibling

@@ -2951,7 +2951,7 @@ graph-and-post-incident-review only. The only signals that currently roll up liv
 not page; their alert rules sit in the same commented-out group as everything else
 here — are two pipeline-health counters, `yuzu_fleet_guardian_journal_reporting` and
 `..._tag_rejected` — server-owned counts published every sweep including at 0, unlike
-the 30 agent-self-reported counters below, and the reason they can be sound where the
+the 33 agent-self-reported counters below, and the reason they can be sound where the
 loss-channel counters cannot.
 
 **Loss / removal channels — every one counted, all `yuzu.guardian_journal_*`
@@ -2981,7 +2981,7 @@ heartbeat tags unless noted (sparse-emit: a zero counter ships no tag; writer
 | lifecycle backpressure drop | a lifecycle entry was rejected at outbox enqueue for capacity (a staging loss, distinct from `stage_dropped`) | `guardian_journal_backpressure_drops` | integrity gap, alert |
 | drain/send exception | a per-entry drain send threw; the head is retained and that log's drain stops | `guardian_drain_exceptions` / `guardian_send_exceptions` | integrity gap, alert |
 | send stall / orphan-exception (#3953) | a `GuardianOutboxSendExecutor` send (either lane) exceeded its stall threshold before completing/reclaiming, or a reclaimed orphan's result was a thrown exception discarded for lack of anywhere correct to attribute it | `guardian_send_stalls` / `guardian_send_orphan_exceptions` | monitor (stall); diagnostic, not a loss (orphan-exception) |
-| cross-lane order-hold release (#3972) | a lane held behind the other lane's older entry waited out the hold and was released to overtake a bounded number of entries | `guardian_send_order_hold_releases` | monitor (bounded reordering, not a loss) |
+| cross-lane order-hold release (#3972) | a lane held behind the other lane's older entry waited out the hold and was permitted to overtake a bounded number of entries; events may have reached the stream out of enqueue order (counted at hold expiry, even if the call launches nothing) | `guardian_send_order_hold_releases` | monitor (not a loss; the data-integrity risk, a false server-side `compliant` via the same-second tie, is #5690, open) |
 
 Two related counters are reported alongside but are **not** journal loss channels:
 `guardian_sweep_exceptions` (a firewalled convergence-sweep throw — drift
