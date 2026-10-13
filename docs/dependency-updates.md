@@ -242,7 +242,8 @@ Yuzu embeds third-party JavaScript at build time via `embed_js.py` (chunked raw-
 | HTMX runtime | `server/core/src/static_js_bundle.cpp` (chunked at hand) | `kHtmxJs` | https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js | 2.0.4, 50,918 bytes |
 | HTMX SSE extension | same TU | `kSseJs` | https://unpkg.com/htmx-ext-sse@2.2.2/sse.js | 2.2.2, 8,897 bytes |
 | Apache ECharts | `server/core/vendor/echarts.min.js` | `kEChartsJs` | unpkg.com/echarts/dist/echarts.min.js | 5.6.0, 1,034,102 bytes |
-| Inter variable webfont | `server/core/vendor/inter/InterVariable.woff2` | `kInterVariableWoff2` | https://github.com/rsms/inter | 4.0, 345,588 bytes |
+| IBM Plex Sans webfont (400, 500, 600) | `server/core/vendor/ibm-plex/ibm-plex-sans-latin-{400,500,600}-normal.woff2` | `kIbmPlexSans{400,500,600}Woff2` | https://www.npmjs.com/package/@fontsource/ibm-plex-sans (IBM's prebuilt Latin files; never re-subset: OFL Reserved Font Name "Plex") | 5.3.0, 22,588 / 24,184 / 24,252 bytes |
+| IBM Plex Mono webfont (400, 500) | `server/core/vendor/ibm-plex/ibm-plex-mono-latin-{400,500}-normal.woff2` | `kIbmPlexMono{400,500}Woff2` | https://www.npmjs.com/package/@fontsource/ibm-plex-mono (same rule) | 5.3.0, 14,708 / 14,888 bytes |
 | Three.js (ES module) | `server/core/vendor/three.module.min.js` | `kThreeJs` | https://unpkg.com/three@0.168.0/build/three.module.min.js | r168, 685,408 bytes |
 | Three.js OrbitControls | `server/core/vendor/three-orbit-controls.js` | `kThreeOrbitJs` | https://unpkg.com/three@0.168.0/examples/jsm/controls/OrbitControls.js | r168, 32,134 bytes |
 | Yuzu chart adapter | `server/core/src/charts_js_bundle.cpp` (hand-written) | `kYuzuChartsJs` | first-party | n/a |
@@ -264,7 +265,7 @@ For HTMX / ECharts / Three.js / OrbitControls — anything we did NOT author:
 
 For Three.js specifically: r150+ is ES-module-only upstream. The OrbitControls module's top-level `import { ... } from 'three'` MUST resolve through the importmap declared in `viz_page_ui.cpp`. A refresh that splits OrbitControls into multiple files (e.g. PR-bundled with TransformControls) requires extending the importmap in lockstep. The `[viz][page]` test pins `from 'three'` and `class OrbitControls` substrings in the vendored file as a refresh canary.
 
-For Inter font: a binary `.woff2` refresh follows the same pattern but uses `embed_binary.py`, not `embed_js.py`.
+For the IBM Plex fonts: a binary `.woff2` refresh follows the same pattern but uses `embed_binary.py`, not `embed_js.py`, and one custom target per file in `server/core/meson.build` (`plex_fonts`). Take IBM's prebuilt Latin files from Fontsource or Google Fonts as-is — never subset or otherwise modify them (the OFL Reserved Font Name "Plex" forbids a modified version under that name) — and keep `server/core/vendor/ibm-plex/LICENSE.txt` alongside. Update the per-weight size pins in `test_static_js_bundle.cpp` (`kExpectedPlex`).
 
 ### Why these aren't in Dependabot
 

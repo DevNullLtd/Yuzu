@@ -212,21 +212,32 @@ yuzu_css_embed = custom_target(
   ],
 )
 
-# Build-time embed of vendored Inter variable webfont as a constexpr
-# byte array (woff2 binary; cannot use raw string literals). Symbol:
-# kInterVariableWoff2 — std::string_view of the bytes.
-inter_embed = custom_target(
-  'inter_woff2_bundle',
-  input: 'vendor/inter/InterVariable.woff2',
-  output: 'inter_woff2_bundle.cpp',
-  command: [
-    find_program('python3', 'python'),
-    files('scripts/embed_binary.py'),
-    '@INPUT@',
-    '@OUTPUT@',
-    'InterVariableWoff2',
-  ],
-)
+# Build-time embed of the vendored IBM Plex Latin webfonts (SIL OFL; IBM's
+# prebuilt woff2 files, never re-subset) as constexpr byte arrays (woff2
+# binary; cannot use raw string literals). One symbol per file, each a
+# std::string_view of the bytes: kIbmPlex<Family><Weight>Woff2.
+plex_fonts = {
+  'IbmPlexMono400Woff2': 'ibm-plex-mono-latin-400-normal.woff2',
+  'IbmPlexMono500Woff2': 'ibm-plex-mono-latin-500-normal.woff2',
+  'IbmPlexSans400Woff2': 'ibm-plex-sans-latin-400-normal.woff2',
+  'IbmPlexSans500Woff2': 'ibm-plex-sans-latin-500-normal.woff2',
+  'IbmPlexSans600Woff2': 'ibm-plex-sans-latin-600-normal.woff2',
+}
+plex_embeds = []
+foreach symbol, file : plex_fonts
+  plex_embeds += custom_target(
+    symbol.to_lower() + '_bundle',
+    input: 'vendor/ibm-plex/' + file,
+    output: symbol.to_lower() + '_bundle.cpp',
+    command: [
+      find_program('python3', 'python'),
+      files('scripts/embed_binary.py'),
+      '@INPUT@',
+      '@OUTPUT@',
+      symbol,
+    ],
+  )
+endforeach
 
 # Build-time YAML→JSON conversion for shipped Yuzu content. The
 # server iterates kBundledDefinitions / kBundledSets on startup and
@@ -365,7 +376,7 @@ yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, cytoscape_js_embed,
-   yuzu_css_embed, inter_embed, content_embed, cpe_map_embed,
+   yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
     'src/runtime_config_store.cpp',

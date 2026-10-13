@@ -16,7 +16,7 @@
  *     regenerates a `*_bundle.cpp` exposing the symbol as a
  *     `std::string` (or `std::string_view` for binary). Symbols covered
  *     here: `kEChartsJs`, `kThreeJs`, `kThreeOrbitControlsJs`,
- *     `kYuzuVizJs`, `kInterVariableWoff2`, `kYuzuCss`, `kYuzuChartsJs`.
+ *     `kYuzuVizJs`, the five `kIbmPlex*Woff2` fonts, `kYuzuCss`, `kYuzuChartsJs`.
  *
  * Plus the page HTML constant `kVizFleetPageHtml` from
  * `server/core/src/viz_page_ui.cpp` (separate TU at namespace scope).
@@ -46,7 +46,7 @@ extern const std::string kSseJs;
 
 // External symbols from build-time embed targets (governance Gate 3 QE-B1):
 //   * kEChartsJs            — embed_js.py over server/core/vendor/echarts.min.js
-//   * kInterVariableWoff2   — embed_binary.py over vendor/inter/InterVariable.woff2
+//   * kIbmPlex*Woff2        — embed_binary.py over vendor/ibm-plex/*.woff2 (one per weight)
 //   * kYuzuCss              — embed_js.py over server/core/static/yuzu.css
 //   * kYuzuChartsJs         — server/core/src/charts_js_bundle.cpp (hand-written)
 namespace yuzu::server {
@@ -54,7 +54,11 @@ extern const std::string kEChartsJs;
 extern const std::string kThreeJs;
 extern const std::string kThreeOrbitControlsJs;
 extern const std::string kYuzuVizJs;
-extern const std::string_view kInterVariableWoff2;
+extern const std::string_view kIbmPlexSans400Woff2;
+extern const std::string_view kIbmPlexSans500Woff2;
+extern const std::string_view kIbmPlexSans600Woff2;
+extern const std::string_view kIbmPlexMono400Woff2;
+extern const std::string_view kIbmPlexMono500Woff2;
 extern const std::string kYuzuCss;
 extern const std::string kYuzuChartsJs;
 } // namespace yuzu::server
@@ -70,12 +74,12 @@ namespace {
 constexpr std::size_t kExpectedHtmxBytes = 50918;
 constexpr std::size_t kExpectedSseBytes = 8897;
 // Pinned upstream byte counts. If you intentionally update vendor/, bump
-// these in lock-step. ECharts 5.6.0 minified is 1,034,102 bytes; Inter v4.0
-// variable woff2 is 345,588 bytes; Yuzu CSS bundle is content-addressed by
+// these in lock-step. ECharts 5.6.0 minified is 1,034,102 bytes; the IBM Plex
+// Latin woff2 files (Fontsource 5.3.0) are pinned per weight in kExpectedPlex
+// below; Yuzu CSS bundle is content-addressed by
 // the source file and approximate-pinned (a 1% drift tolerance lets the
 // design system iterate without re-flowing this file every commit).
 constexpr std::size_t kExpectedEChartsBytes = 1'034'102;
-constexpr std::size_t kExpectedInterWoff2Bytes = 345'588;
 constexpr std::size_t kYuzuCssMinBytes = 20'000;   // ≥20 KB sanity floor
 constexpr std::size_t kYuzuChartsMinBytes = 6'000; // ≥6 KB adapter floor
 // Three.js r168 ES-module minified bundle + OrbitControls ES module
@@ -1023,20 +1027,43 @@ TEST_CASE("viz page: nav highlights Fleet Viz when on the page", "[viz][page]") 
     CHECK_THAT(html, ContainsSubstring("href=\"/viz/fleet\" class=\"nav-link active\""));
 }
 
-// ── Inter variable webfont (woff2 binary) ───────────────────────────────────
+// ── IBM Plex webfonts (woff2 binary) ────────────────────────────────────────
 
-TEST_CASE("static_js_bundle: kInterVariableWoff2 has expected pinned size", "[static-js][inter]") {
-    CHECK(yuzu::server::kInterVariableWoff2.size() == kExpectedInterWoff2Bytes);
+namespace {
+struct PlexExpectation {
+    const char* name;
+    const std::string_view* bytes;
+    std::size_t size;
+};
+// Pinned to Fontsource @fontsource/ibm-plex-{sans,mono} 5.3.0 Latin files.
+const PlexExpectation kExpectedPlex[] = {
+    {"sans-400", &yuzu::server::kIbmPlexSans400Woff2, 22'588},
+    {"sans-500", &yuzu::server::kIbmPlexSans500Woff2, 24'184},
+    {"sans-600", &yuzu::server::kIbmPlexSans600Woff2, 24'252},
+    {"mono-400", &yuzu::server::kIbmPlexMono400Woff2, 14'708},
+    {"mono-500", &yuzu::server::kIbmPlexMono500Woff2, 14'888},
+};
+} // namespace
+
+TEST_CASE("static_js_bundle: IBM Plex woff2 fonts have the expected pinned sizes",
+          "[static-js][plex]") {
+    for (const auto& f : kExpectedPlex) {
+        INFO("font: " << f.name);
+        CHECK(f.bytes->size() == f.size);
+    }
 }
 
-TEST_CASE("static_js_bundle: kInterVariableWoff2 begins with WOFF2 magic", "[static-js][inter]") {
-    REQUIRE(yuzu::server::kInterVariableWoff2.size() >= 4);
-    // WOFF2 file format: signature 0x774F4632 ('wOF2') at offset 0.
-    auto sv = yuzu::server::kInterVariableWoff2;
-    CHECK(static_cast<unsigned char>(sv[0]) == 0x77);
-    CHECK(static_cast<unsigned char>(sv[1]) == 0x4F);
-    CHECK(static_cast<unsigned char>(sv[2]) == 0x46);
-    CHECK(static_cast<unsigned char>(sv[3]) == 0x32);
+TEST_CASE("static_js_bundle: IBM Plex woff2 fonts begin with WOFF2 magic", "[static-js][plex]") {
+    for (const auto& f : kExpectedPlex) {
+        INFO("font: " << f.name);
+        REQUIRE(f.bytes->size() >= 4);
+        // WOFF2 file format: signature 0x774F4632 ('wOF2') at offset 0.
+        auto sv = *f.bytes;
+        CHECK(static_cast<unsigned char>(sv[0]) == 0x77);
+        CHECK(static_cast<unsigned char>(sv[1]) == 0x4F);
+        CHECK(static_cast<unsigned char>(sv[2]) == 0x46);
+        CHECK(static_cast<unsigned char>(sv[3]) == 0x32);
+    }
 }
 
 // ── Yuzu Design System CSS bundle ───────────────────────────────────────────
@@ -1054,7 +1081,8 @@ TEST_CASE("static_js_bundle: kYuzuCss carries the design-system token layer",
                ContainsSubstring("--mds-color-theme-accent-primary-normal"));
     CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("--mds-color-chart-1"));
     CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("@font-face"));
-    CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'Inter'"));
+    CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'IBM Plex Sans'"));
+    CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'IBM Plex Mono'"));
 }
 
 TEST_CASE("static_js_bundle: kYuzuCss has no embedded NULs", "[static-js][yuzu-css]") {

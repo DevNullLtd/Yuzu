@@ -409,8 +409,6 @@ extern const std::string
     kYuzuVizJs; // server/core/src/yuzu_viz_js_bundle.cpp (PR 5 fleet renderer module)
 extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bundle.cpp (PR 9-pre)
 extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
-extern const std::string_view
-    kInterVariableWoff2; // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
 // kBundledDefinitions / kBundledSets / kBundledPluginDocs: bundled_content.hpp
 
 std::string trim_ascii_whitespace(std::string_view s) {
