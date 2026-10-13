@@ -2269,7 +2269,10 @@ TEST_CASE("#3972 T3: the hold clock is cumulative across changing blocker identi
     REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) == 1; }));
     const auto released_at = f.sink.nth_start(OutboxDomain::Compliance, 0)->at;
     CHECK(released_at - t0 >= kHold);                       // never before H of cumulative holding
-    CHECK(released_at - third_denied_at < kHold - 100ms * kSpinScale); // but not H from the THIRD
+    // But not H from the THIRD: a per-send timer would release >= kHold after it. The slack is
+    // capped at kHold / 4 because kSpinScale is 6 under a sanitizer and an uncapped
+    // 100 ms * 6 zeroes the bound (ASan and TSan both failed the check that way).
+    CHECK(released_at - third_denied_at < kHold - std::min<std::chrono::milliseconds>(100ms * kSpinScale, kHold / 4));
     CHECK(f.sink.n_ended(OutboxDomain::Lifecycle) == 2);    // the third send is still parked
     CHECK(f.worker->releases_for_test(OutboxDomain::Compliance) == 1);
 }
