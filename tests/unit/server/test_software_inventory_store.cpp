@@ -2911,3 +2911,97 @@ TEST_CASE("catalogue totals degrade to nullopt and never a zero", "[pg][software
         CHECK_FALSE(store.software_catalog_totals({.agent_id = "d1"}).has_value());
     }
 }
+
+TEST_CASE("source_last_seen_bulk returns the receipt time per agent and omits the unreported",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    std::vector<SoftwareEntry> rows = {{"Chrome", "119", "Google", ""}};
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+    REQUIRE(store.apply_installed_software("agent-a", h, rows, 1000) ==
+            InventoryIngestOutcome::kStored);
+    REQUIRE(store.apply_installed_software("agent-b", h, rows, 2000) ==
+            InventoryIngestOutcome::kStored);
+    auto b_before = store.source_last_seen("agent-b", "installed_software");
+    REQUIRE(b_before.has_value());
+    // A hash-only touch never regresses last_seen.
+    REQUIRE(store.apply_installed_software("agent-b", h, std::nullopt, 3000) ==
+            InventoryIngestOutcome::kTouched);
+
+    auto got = store.source_last_seen_bulk("installed_software",
+                                           {"agent-a", "agent-b", "agent-never"});
+    REQUIRE(got.has_value());
+    REQUIRE(got->size() == 2);
+    // last_seen is the SERVER receipt time (#1685), never the caller-supplied timestamp.
+    CHECK(got->at("agent-a") > 1'000'000'000); // a real wall-clock epoch, not the 1000/2000/3000 passed in
+    CHECK(got->at("agent-b") >= *b_before); // the touch never moves it backwards
+    CHECK_FALSE(got->contains("agent-never")); // absent, never a 0
+    // Same datum the Hardware record shows, read one device at a time.
+    for (const char* id : {"agent-a", "agent-b"}) {
+        auto one = store.source_last_seen(id, "installed_software");
+        REQUIRE(one.has_value());
+        CHECK(got->at(id) == *one);
+    }
+    // Another source is a different row set.
+    auto other = store.source_last_seen_bulk("device_ci", {"agent-a"});
+    REQUIRE(other.has_value());
+    CHECK(other->empty());
+}
+
+TEST_CASE("source_last_seen_bulk: empty inputs are a precondition miss, not a degrade",
+          "[pg][software_inventory]") {
+    SWINV_SHARED(store, pool);
+    auto no_ids = store.source_last_seen_bulk("installed_software", {});
+    REQUIRE(no_ids.has_value());
+    CHECK(no_ids->empty());
+    auto no_source = store.source_last_seen_bulk("", {"agent-a"});
+    REQUIRE(no_source.has_value());
+    CHECK(no_source->empty());
+}
+
+TEST_CASE("source_last_seen_bulk degrades to nullopt, never an empty map", "[pg][software_inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    SECTION("schema dropped under an open store") {
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        SoftwareInventoryStore store{pool};
+        REQUIRE(store.is_open());
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        CHECK_FALSE(store.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
+    }
+    SECTION("pool starved (the only lease is held)") {
+        PgPool one{{.conninfo = db.dsn(), .size = 1}};
+        REQUIRE(one.valid());
+        SoftwareInventoryStore store{one};
+        REQUIRE(store.is_open());
+        auto held = one.acquire();
+        CHECK_FALSE(store.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
+    }
+}
+
+TEST_CASE("source_last_seen_bulk: a store that never opened is a degrade", "[pg][software_inventory]") {
+    // DDL, so a private template clone (the macro drops it): nothing to restore if a REQUIRE throws.
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    // Rename a column the open-time projection probes, so a store fails closed (the same
+    // technique the schema-guard test uses).
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "ALTER TABLE software_inventory_store.inventory_state RENAME COLUMN last_seen TO "
+            "last_seen_gone",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    SoftwareInventoryStore broken{pool};
+    REQUIRE_FALSE(broken.is_open());
+    CHECK_FALSE(broken.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
+}
