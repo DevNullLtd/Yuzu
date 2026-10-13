@@ -333,7 +333,7 @@ a:where(:not([class])):hover { color: var(--primary-h); }
    so each sets an explicit colour, and the primary hover brightens the whole button with a
    filter rather than swapping the background (the neutral hover above skips it): a
    page-recoloured button keeps its hue and stays legible. */
-:is(.btn-primary, .btn-success, .btn.primary):hover:not(:disabled) { filter: brightness(1.2); color: var(--on-primary); }
+:is(.btn-primary, .btn-success, .btn.primary):hover:not(:disabled) { filter: brightness(1.1); color: var(--on-primary); }
 .btn-danger, .btn.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line2)); }
 :is(.btn-danger, .btn.danger):hover:not(:disabled) { background: color-mix(in srgb, var(--bad) 12%, transparent); border-color: var(--bad); color: var(--bad); }
 .btn-ghost { background: transparent; border-color: transparent; color: var(--mut); }

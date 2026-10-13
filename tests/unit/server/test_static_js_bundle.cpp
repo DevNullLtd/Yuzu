@@ -1111,7 +1111,9 @@ TEST_CASE("static_js_bundle: kYuzuCss variant hovers set an explicit colour and 
     const std::string primary =
         block(":is(.btn-primary, .btn-success, .btn.primary):hover:not(:disabled) {");
     CHECK_THAT(primary, ContainsSubstring(" color: var(--on-primary)"));
-    CHECK_THAT(primary, ContainsSubstring("filter: brightness("));
+    // 1.1, not 1.2: at 1.2 a page-local green (#3dd68c) clamps to neon #49ffa8
+    // and the unstyled blue drifts towards cyan.
+    CHECK_THAT(primary, ContainsSubstring("filter: brightness(1.1)"));
     CHECK_THAT(primary, !ContainsSubstring("background"));  // background, -color, -image
     CHECK_THAT(primary, !ContainsSubstring("gradient"));
     // The neutral hover (0,3,0) must skip the primary, or its `background`
