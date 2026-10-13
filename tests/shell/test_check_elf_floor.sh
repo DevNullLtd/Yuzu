@@ -699,6 +699,81 @@ EOF
 )"
 check "committed baseline has no 'incomplete' key (every set is a complete scan)" yes "$got"
 
+
+# ---- governance round 4 touch-ups -----------------------------------------------------
+# argparse must not expand `--enf` to `--enforce` (the workflow tripwire greps for the literal flag)
+rc=0; bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/bad" --enf > "$TMP/out" 2>&1 || rc=$?
+check "abbreviated --enf is rejected, not treated as --enforce: exit 2" 2 "$rc"
+rc=0; bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/bad" --enfo > "$TMP/out" 2>&1 || rc=$?
+check "abbreviated --enfo: exit 2" 2 "$rc"
+check "the usage error still names the argument, rendered" yes "$(has 'unrecognized arguments: --enfo')"
+
+# libstdc++-linked ELF whose GLIBCXX tags vanish (reviewer's wrapper: strip only (GLIBCXX_*))
+cat > "$TMP/stub/xxonly" <<'EOF'
+#!/bin/sh
+"$REAL_OBJDUMP" "$@" | sed -E 's/\(GLIBCXX_[0-9.]+\) +//'
+EOF
+chmod +x "$TMP/stub/xxonly"
+if command -v g++ >/dev/null 2>&1; then
+  printf '#include <string>\nint main(int c, char**){ std::string s(c, 1); return (int)s.size(); }\n' > "$F/cxx.cc"
+  mkdir -p "$TMP/cxx"; g++ -o "$TMP/cxx/c" "$F/cxx.cc"
+  rc=0; bash "$SCRIPT" --floor "$TMP/floor_loose.json" --dir "$TMP/cxx" --enforce > "$TMP/out" 2>&1 || rc=$?
+  check "(control) a real C++ ELF under a permissive floor: exit 0" 0 "$rc"
+  rc=0; env OBJDUMP="$TMP/stub/xxonly" bash "$SCRIPT" --floor "$TMP/floor_loose.json" --dir "$TMP/cxx" --enforce > "$TMP/out" 2>&1 || rc=$?
+  check "GLIBCXX tags stripped from a libstdc++ ELF importing std:: symbols: exit 1" 1 "$rc"
+  check "GLIBCXX tags stripped: named" yes "$(has 'expected GLIBCXX versioned imports (NEEDED libstdc++, std:: symbols imported), parsed none')"
+  # NEEDED libstdc++ with no std:: import is common (linked, unused) and must NOT be flagged
+  printf 'int main(void){return 0;}\n' > "$F/nostd.c"
+  mkdir -p "$TMP/nostd"; gcc -o "$TMP/nostd/n" "$F/nostd.c" -Wl,--no-as-needed -lstdc++
+  rc=0; env OBJDUMP="$TMP/stub/xxonly" bash "$SCRIPT" --floor "$TMP/floor_loose.json" --dir "$TMP/nostd" --enforce > "$TMP/out" 2>&1 || rc=$?
+  check "NEEDED libstdc++ with no std:: import is not flagged (no false positive)" 0 "$rc"
+elif [ "${GITHUB_ACTIONS:-}" = true ]; then
+  check "g++ is required for the libstdc++ parse tests (CI must not skip them)" present missing
+else
+  echo "  [skip] libstdc++ parse tests (g++ not installed)"
+fi
+
+# tripwire: new rules + the unanalysable-file exit code
+if python3 -c 'import yaml' 2>/dev/null; then
+  rc=0; python3 - "$ROOT" > "$TMP/out" 2>&1 <<'EOF' || rc=$?
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("tripwire", os.path.join(sys.argv[1], "tests/shell/elf_floor_workflow_tripwire.py"))
+tw = importlib.util.module_from_spec(spec); spec.loader.exec_module(tw)
+G = "bash scripts/ci/check-elf-floor.sh --enforce --floor f --dir d"
+def wf(step): return "jobs:\n  j:\n    steps:\n      - name: gate\n" + "".join("        %s\n" % l for l in step.splitlines())
+cases = {
+ "enforce piped to tee, no pipefail":     (True,  wf("run: %s | tee out" % G)),
+ "enforce piped, set -o pipefail":        (False, wf("run: |\n  set -o pipefail\n  %s | tee out" % G)),
+ "enforce piped, set -eo pipefail":       (False, wf("run: |\n  set -eo pipefail\n  %s | tee out" % G)),
+ "enforce piped, shell: bash":            (False, wf("shell: bash\nrun: %s | tee out" % G)),
+ "enforce piped, shell: sh":              (True,  wf("shell: sh\nrun: %s | tee out" % G)),
+ "enforce with || rc=$? (not a pipe)":    (False, wf("run: %s || rc=$?" % G)),
+ "report-only piped, no pipefail":        (False, wf("continue-on-error: true\nrun: bash scripts/ci/check-elf-floor.sh --report-only --floor f --dir d | tee out")),
+}
+import tempfile
+bad = []
+with tempfile.TemporaryDirectory() as root:
+    for name, (expect, text) in cases.items():
+        path = os.path.join(root, "wf.yml")
+        open(path, "w").write(text)
+        got = bool(tw.offenders(path, root))
+        if got != expect:
+            bad.append("%s: expected %s" % (name, "flagged" if expect else "pass"))
+    path = os.path.join(root, "deep.yml")
+    open(path, "w").write("a: " + "[" * 3000 + "]" * 3000 + "\n")
+    try:
+        tw.offenders(path, root); bad.append("deeply nested YAML did not raise Unanalysable")
+    except tw.Unanalysable:
+        pass
+print("\n".join(bad) if bad else "OK")
+sys.exit(1 if bad else 0)
+EOF
+  check "tripwire: pipe-without-pipefail rule and the nested-YAML error" "0 OK" "$rc $(cat "$TMP/out")"
+  mkdir -p "$TMP/deeproot/.github/workflows"; printf 'a: %s%s\n' "$(printf '[%.0s' $(seq 1 3000))" "$(printf ']%.0s' $(seq 1 3000))" > "$TMP/deeproot/.github/workflows/w.yml"
+  rc=0; python3 "$ROOT/tests/shell/elf_floor_workflow_tripwire.py" "$TMP/deeproot" > "$TMP/out" 2>&1 || rc=$?
+  check "tripwire on an unanalysable workflow: distinct exit 4 and a clear message, no traceback" "4 yes no" "$rc $(has 'did NOT analyse this file') $(has Traceback)"
+fi
+
 # 20. tripwire: no workflow step may run `check-elf-floor.sh --enforce` under continue-on-error
 # (a swallowed exit 1 would never gate). A GUARD, not a proof; VACUOUS TODAY (S0 wires only
 # --report-only, where continue-on-error is required). The detector is
@@ -724,7 +799,7 @@ cases = {
  "enforce+job-coe":       (True,  wf("      - name: gate\n        run: %s --enforce --floor f --dir d\n" % GATE, "    continue-on-error: true\n")),
  "enforce+||true":        (True,  S("run: %s --enforce --floor f --dir d || true" % GATE)),
  "enforce+|| exit 0":    (True,  S("run: %s --enforce --floor f --dir d || exit 0" % GATE)),
- "enforce+|| :":          (True,  S("run: %s --enforce --floor f --dir d || :" % GATE)),
+ "enforce+|| :":          (True,  S("run: |\n  %s --enforce --floor f --dir d || :" % GATE)),
  "enforce+set+e":         (True,  S("run: |\n  set +e\n  %s --enforce --floor f --dir d" % GATE)),
  "enforce split quotes":  (True,  S('continue-on-error: true\nrun: bash scripts/ci/check-elf-floor.sh --enfo""rce --floor f --dir d')),
  "enforce via env var":   (True,  S("env:\n  MODE: --enforce\ncontinue-on-error: true\nrun: %s $MODE --floor f --dir d" % GATE)),

@@ -392,12 +392,19 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   and local composite action. It flags a step that runs, or probably runs
   (mode chosen through a variable or env, a wrapper script, a composite
   action), `check-elf-floor.sh --enforce` when the step or its job has any
-  `continue-on-error` other than a literal false, or the run text has
-  `|| true` or `set +e`; report-only steps are never flagged. It is a guard,
-  not a proof: it reads text, cannot see code outside `.github/` and
-  `scripts/`, and assumes enforcement whenever it cannot tell. It is vacuous
-  today (only `--report-only` is wired); its detector is pinned on 30
-  synthetic fixtures, one per bypass shape. The test needs PyYAML: `ci.yml`'s
+  `continue-on-error` other than a literal false, when the run text has
+  `|| true`, `|| :`, `|| exit 0` or `set +e`, or when the gate's output is
+  piped (`| tee`) without `pipefail` (the default `bash -e` would report
+  `tee`'s status); report-only steps are never flagged. It is a guard, not a
+  proof, and it assumes enforcement whenever it cannot tell. **Not caught:**
+  a reusable workflow (`uses: ./.github/workflows/x.yml`) called from a job
+  with `continue-on-error`; a command held in an env var and run through
+  `bash -c "$CMD"` or `eval`; a wrapper outside `scripts/` and
+  `.github/actions/`, or code the repo does not contain; shell-level swallows
+  such as `|| echo`, `; true` or `trap`; and YAML nested so deeply that PyYAML
+  recurses out, which is reported as its own error (exit 4) rather than
+  analysed. It is vacuous today (only `--report-only` is wired); its detector
+  is pinned on synthetic fixtures, one per bypass shape. The test needs PyYAML: `ci.yml`'s
   preflight installs it hash-pinned, and the test fails (rather than skips)
   under GitHub Actions if it is missing. (e) The report
   artifact is kept 14 days and the results are not in CI history: S2 should

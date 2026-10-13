@@ -27,10 +27,26 @@ an env var or a command substitution: undecidable); or the step's env/with
 values mention `enforce`; or it calls a wrapper / composite action (undecidable).
 An enforcing step is flagged when its step or its job has any
 `continue-on-error` value other than a literal false, or its run text contains
-`|| true`, `|| :`, `|| exit 0` or `set +e`.
+`|| true`, `|| :`, `|| exit 0` or `set +e`, or a gate line is piped (`| tee`)
+in a step that has neither `set -o pipefail` nor `shell: bash` (GitHub's default
+`bash -e` has no pipefail, so the pipeline's status is tee's and the gate's exit
+1 is swallowed).
+
+NOT CAUGHT (known blind spots; this is a guard, not a proof):
+  * `uses: ./.github/workflows/x.yml` (a reusable workflow) from a job that has
+    `continue-on-error`: the caller's job-level setting is not followed into the
+    called workflow;
+  * the command held in an env var and run through `bash -c "$CMD"` or `eval`;
+  * a wrapper script outside scripts/ and .github/actions/, or code the repo
+    does not contain (a downloaded script, a remote action);
+  * shell-level swallows other than the ones listed: `|| echo ...`, `; true`,
+    `trap ... EXIT`, `if ...; then`, a subshell that discards the status;
+  * YAML so deeply nested that PyYAML hits the recursion limit: reported as a
+    distinct error (exit 4), not analysed.
 
 Usage: elf_floor_workflow_tripwire.py ROOT   (ROOT = repository root)
-Exit: 0 clean, 1 offenders found, 2 usage, 3 PyYAML missing.
+Exit: 0 clean, 1 offenders found, 2 usage, 3 PyYAML missing, 4 a file could not
+be analysed (unparseable or too deeply nested): the guard did NOT run on it.
 """
 import glob
 import os
@@ -44,7 +60,13 @@ except ImportError:
     sys.exit(3)
 
 GATE = 'check-elf-floor'
+PIPE = re.compile(r'(?<!\|)\|(?!\|)')
+PIPEFAIL = re.compile(r'\bpipefail\b')
 SWALLOW = re.compile(r'\|\|\s*(true\b|:|exit\s+0)|\bset\s+\+e\b')
+
+
+class Unanalysable(Exception):
+    pass
 
 
 def falsey(v):
@@ -148,8 +170,12 @@ def offenders(path, root):
     try:
         with open(path, encoding='utf-8') as fh:
             doc = yaml.safe_load(fh)
+    except RecursionError:
+        raise Unanalysable('%s: YAML nested too deeply for PyYAML (RecursionError); '
+                           'the tripwire did NOT analyse this file' % path)
     except (OSError, yaml.YAMLError) as exc:
-        return ['%s: unparseable (%s)' % (path, str(exc).splitlines()[0] if str(exc) else exc)]
+        raise Unanalysable('%s: unparseable (%s)'
+                           % (path, str(exc).splitlines()[0] if str(exc) else exc))
     wrap = wrappers(root)
     bad = []
     for jname, job, st in steps_of(doc):
@@ -162,8 +188,14 @@ def offenders(path, root):
         if not falsey(job.get('continue-on-error')):
             why.append('job continue-on-error=%r' % (job.get('continue-on-error'),))
         run = st.get('run') if isinstance(st.get('run'), str) else ''
-        if SWALLOW.search('\n'.join(logical_lines(run))):
+        lines = logical_lines(run)
+        if SWALLOW.search('\n'.join(lines)):
             why.append('run text swallows the exit status (|| true / set +e)')
+        if (any(GATE in ln and PIPE.search(ln) for ln in lines)
+                and not PIPEFAIL.search('\n'.join(lines))
+                and str(st.get('shell', '')).strip() != 'bash'):
+            why.append('gate output is piped without pipefail (default `bash -e`: '
+                       "the pipeline's status is the last command's)")
         if why:
             bad.append('%s: job %s, step %r: %s'
                        % (path, jname, st.get('name') or st.get('uses') or '?', '; '.join(why)))
@@ -177,11 +209,19 @@ def main(argv):
     root = argv[1]
     files = sorted(glob.glob(os.path.join(root, '.github/workflows/*.y*ml'))
                    + glob.glob(os.path.join(root, '.github/actions/**/action.y*ml'), recursive=True))
-    n = 0
+    n = unanalysed = 0
     for f in files:
-        for line in offenders(f, root):
+        try:
+            found = offenders(f, root)
+        except Unanalysable as exc:
+            print('TRIPWIRE ERROR: %s' % exc)
+            unanalysed += 1
+            continue
+        for line in found:
             print(line)
             n += 1
+    if unanalysed:
+        return 4
     return 1 if n else 0
 
 

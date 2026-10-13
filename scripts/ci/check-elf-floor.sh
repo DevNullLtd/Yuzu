@@ -68,8 +68,11 @@
 #     Residuals of rule (b) and of the libc rule below: `gcc -shared -nostdlib
 #     -Wl,--no-as-needed -lc` with no imports at all is flagged (a NEEDED
 #     library with nothing parsed); an ELF NEEDing libc.so.* must yield at least
-#     one GLIBC_* tag or it is `unreadable` (libstdc++/libm are NOT checked this
-#     way: linked-but-unused is common). Detached debug files (`*.debug`, the
+#     one GLIBC_* tag or it is `unreadable`. Likewise an ELF that NEEDs
+#     libstdc++.so.* and imports at least one std:: symbol (`_ZSt`, `_ZNSt`,
+#     `_ZNKSt` prefixes) must carry a GLIBCXX_* tag. (libm and a bare
+#     libstdc++ NEEDED are NOT checked: linked-but-unused is common, and a
+#     broad CXXABI/__cxa_* rule false-positives because __cxa_atexit is GLIBC.) Detached debug files (`*.debug`, the
 #     `-dbg` payload) make objdump say "invalid operation" and are flagged: do
 #     not scan a debug-symbol payload. A symbol name shaped like `GLIBC_2.38`
 #     (or another known version family) is taken as a moved column.
@@ -192,6 +195,7 @@ BAD_STDERR = re.compile(r"(?i)\b(error|warning|can't|cannot|not recognized|trunc
 DEFAULT_DEADLINE = 240
 MIN_ELF_BYTES = 64
 MAX_STDERR = 1 << 20
+STD_SYMBOL = re.compile(r'^_Z(NK?)?St')
 # Families whose tags are expected to look like `NAME_1.2.3`; a symbol NAME shaped
 # like one means the objdump column layout moved (see scan_elf).
 KNOWN_VERSION_FAMILIES = ('GLIBC', 'GLIBCXX', 'CXXABI', 'GCC', 'LIBSYSTEMD',
@@ -453,6 +457,13 @@ def scan_elf(rel, full, objdump, readelf, deadline, vfams):
         if hit and 'GLIBC' not in have:
             rec['status'] = (fmt + 'expected GLIBC versioned imports (NEEDED %s), parsed none '
                              '(unrecognised output format?)' % safe(hit[0]))
+        elif (any(n == 'libstdc++.so' or n.startswith('libstdc++.so.') for n in needed)
+              and any(STD_SYMBOL.match(n) for n in rec['names']) and 'GLIBCXX' not in have):
+            # Narrow on purpose: an ELF that links libstdc++ AND imports a std::
+            # symbol (_ZSt..., _ZNSt..., _ZNKSt...) always carries a GLIBCXX tag.
+            # No broad __cxa_* / CXXABI rule: __cxa_atexit is a GLIBC symbol.
+            rec['status'] = (fmt + 'expected GLIBCXX versioned imports (NEEDED libstdc++, std:: '
+                             'symbols imported), parsed none (unrecognised output format?)')
     return rec
 
 
@@ -595,7 +606,9 @@ class Parser(argparse.ArgumentParser):
 
 
 def main():
-    ap = Parser(prog='check-elf-floor.sh', add_help=True)
+    # allow_abbrev=False: `--enf` must not silently mean `--enforce` (a workflow
+    # tripwire greps for the literal flag).
+    ap = Parser(prog='check-elf-floor.sh', add_help=True, allow_abbrev=False)
     ap.add_argument('--floor', required=True)
     ap.add_argument('--dir', required=True, dest='root')
     mode = ap.add_mutually_exclusive_group()

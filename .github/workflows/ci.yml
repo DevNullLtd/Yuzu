@@ -518,11 +518,6 @@ jobs:
           bash scripts/ci/check-portable-paths.sh --selftest
           bash scripts/ci/check-portable-paths.sh
 
-      # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
-      # otherwise only runs at release time, so a regex regression would surface
-      # too late (after the full build matrix). No build deps — just bash (and
-      # python3; test_check_elf_floor.sh also needs gcc + binutils, all on the
-      # hosted ubuntu runner).
       # test_check_elf_floor.sh parses the workflows with PyYAML (its tripwire);
       # the hosted image may lack it, so install it hash-pinned like docs-lint.yml.
       - name: Install PyYAML (hash-pinned)
@@ -531,6 +526,11 @@ jobs:
             python3 -m pip install --user --break-system-packages \
               --disable-pip-version-check --require-hashes -r requirements-ci.txt
 
+      # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
+      # otherwise only runs at release time, so a regex regression would surface
+      # too late (after the full build matrix). No build deps — just bash (and
+      # python3; test_check_elf_floor.sh also needs gcc + binutils, all on the
+      # hosted ubuntu runner).
       - name: Shell gate tests
         run: |
           bash tests/shell/test_check_compose_versions.sh
