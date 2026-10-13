@@ -123,19 +123,20 @@ extern const char* const kSettingsHtml =
     .user-table {
       width: 100%; border-collapse: separate; border-spacing: 0;
       border: 1px solid var(--line); border-radius: var(--rad-panel);
-      font-size: 13.5px;
+      font-size: 13.5px; overflow: hidden;
     }
     .user-table th {
       text-align: left; padding: 8px 12px; white-space: nowrap;
       background: var(--surface2); border-bottom: 1px solid var(--line);
       color: var(--mut); font-size: 12.5px; font-weight: 500;
     }
-    .user-table thead th:first-child { border-top-left-radius: var(--rad-ctl); }
-    .user-table thead th:last-child { border-top-right-radius: var(--rad-ctl); }
     .user-table td {
       padding: var(--cell-y) 12px; border-bottom: 1px solid var(--line);
       color: var(--ink2); vertical-align: middle;
     }
+    /* A state class on a <td> must out-rank .user-table td above. */
+    .user-table td.muted { color: var(--mut); }
+    .user-table td.feedback-error { color: var(--bad); }
     .user-table tbody tr:last-child td { border-bottom: 0; }
     .user-table tbody tr:hover td { background: var(--surface2); }
     .user-table td .btn:not(.add-user-form .btn) {
