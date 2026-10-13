@@ -747,7 +747,7 @@ TEST_CASE("DEX health score: transparent composite, decomposition, suppression",
     DexFleet fleet;
     fleet.windows_online = 10;
     const auto html = render_dex_health_fragment(&store, "", 7, fleet, "default");
-    CHECK(html.find("Experience health") != std::string::npos);
+    CHECK(html.find("DEX health") != std::string::npos);
     CHECK(html.find("100 &minus; weighted deductions") != std::string::npos); // the formula is shown
     CHECK(html.find("derived &middot; secondary") != std::string::npos);
     CHECK(html.find("Why this score") != std::string::npos);
@@ -812,7 +812,7 @@ TEST_CASE("DEX overview hub: explore cards link into the three deep pages",
     const auto html = render_dex_overview_fragment(&store, "", 7, fleet);
     CHECK(html.find("Explore") != std::string::npos);
     CHECK(html.find("Signal catalogue") != std::string::npos);
-    CHECK(html.find("Experience health") != std::string::npos);
+    CHECK(html.find("DEX health") != std::string::npos);
     CHECK(html.find("Cross-OS &amp; trends") != std::string::npos);
     // each card drills into its deep page
     CHECK(html.find("/fragments/dex/catalogue?window=") != std::string::npos);
@@ -915,7 +915,7 @@ TEST_CASE("DEX overview: Experience hero — per-device distribution + D/A/N; cr
     CHECK(html.find("Experience") != std::string::npos);         // new headline section
     CHECK(html.find("Overall experience") != std::string::npos); // per-device median tile
     CHECK(html.find("great") != std::string::npos);              // the distribution bar
-    CHECK(html.find("Experience by segment") != std::string::npos); // the segment breakdown
+    CHECK(html.find("DEX score by segment") != std::string::npos); // the segment breakdown
     CHECK(html.find("Crash-free devices") != std::string::npos); // crashes demoted, not removed
 }
 
