@@ -770,7 +770,7 @@ No config or data migration is required.
 - **Devices that disconnected under 0.14.0 were deleted and are not restored.** Each reappears on `/hardware` the next time it connects.
 - **`/viz/fleet` and MCP `get_fleet_topology`** now also show a departed device, flagged stale, for 7 days, so `yuzu_viz_offline_hosts_total` rises after the upgrade.
 - **Retention.** A row is deleted 37 days after its device was last seen (the 30-day roster window plus a 7-day margin). Each replica runs the prune hourly and deletes at most 12,000 rows per hour. The first pass runs about a minute after the server starts. On the first start after the upgrade it only records its clock anchor, so deletions begin with the next hourly pass; on every later start it already deletes; a large backlog inherited from an older release drains at that rate (100,000 rows in about 8 hours).
-- **Decommission does not erase the row.** `DELETE /api/v1/sle/agents/{id}` does not cover `endpoint_state` (#5682); a decommissioned device's hostname row ages out under the 37-day rule.
+- **Decommission erases the row.** `DELETE /api/v1/sle/agents/{id}` deletes the device's `endpoint_state` row (#5682), so a decommissioned device leaves `/hardware`. A still-enrolled agent that heartbeats again re-creates it, so stop the agent first. A device that is never decommissioned ages out under the 37-day rule.
 
 ## Behaviour change: a failed device-roster read is reported instead of shown as an empty fleet (#5531)
 

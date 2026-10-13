@@ -642,9 +642,10 @@ appears as two rows until the old one ages out. The per-device record's offline
 identity fallback reads the same capped set, so an offline device outside it shows no
 identity and, with nothing else synced, reads as not found.
 
-A decommissioned device remains listed as Offline until it ages out of the 30-day
-window, and its stored record is deleted 37 days after its last contact; there is no
-operator delete today (#5682).
+A decommissioned device is removed from the roster when `DELETE /api/v1/sle/agents/{id}`
+deletes its stored record (#5682); a still-enrolled agent that heartbeats again re-creates
+it. A device that is never decommissioned stays listed as Offline for the 30-day window,
+and its stored record is deleted 37 days after its last contact.
 
 ## Access control
 
