@@ -179,9 +179,9 @@ public:
     // rows. Unknown id is a non-conflict error.
     std::expected<void, std::string> delete_baseline(const std::string& baseline_id);
 
-    /// Post-mutation hook (#5513). Called by update_baseline and delete_baseline after the
-    /// change COMMITTED and the pool lease was released: a deploy writes the new
-    /// `deployed_snapshot`, a delete tears the Baseline down, and either changes the deployed
+    /// Post-mutation hook (#5513). Called by update_baseline, delete_baseline and a deployed
+    /// create_baseline after the change COMMITTED and the pool lease was released: a deploy
+    /// writes the new `deployed_snapshot`, a delete tears the Baseline down, and either changes the deployed
     /// member set the heartbeat reconcile pushes. The hook exists so a reconcile that is already
     /// running can be told BEFORE the caller's own policy-generation bump (a separate lease,
     /// up to its write timeout) and fan-out run. It fires on every committed update, including
@@ -191,12 +191,12 @@ public:
     /// caught and logged, never propagated (the mutation is already durable); may be empty (the
     /// default). Set once during single-threaded wiring, before the store is shared; it is not
     /// synchronised against concurrent mutation. set_members and set_assignment do not fire it:
-    /// neither touches the deployed snapshot. create_baseline does not fire it either, but note
-    /// why: it accepts any lifecycle, yet every production caller creates a draft (the
-    /// Guardian route create_baseline_from_form), and a draft is not part of the deployed set.
-    /// A caller that creates a deployed baseline must fire the hook itself (or the store must
-    /// be changed to). The writer sweep in tests/test_guardian_reconcile_wiring_lexical.py
-    /// keeps every other writer of the baselines table honest.
+    /// neither touches the deployed snapshot. create_baseline fires it ONLY when the baseline
+    /// it commits is created deployed (it accepts any lifecycle, but every production caller,
+    /// the Guardian route create_baseline_from_form, creates a draft, and a draft is not part
+    /// of the deployed set, so a draft create stays silent). The writer sweep in
+    /// tests/test_guardian_reconcile_wiring_lexical.py keeps every writer of the baselines
+    /// table honest.
     void set_on_baseline_mutation(std::function<void()> hook);
 
     // ── Member Guards (M:N) ────────────────────────────────────────────────

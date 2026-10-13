@@ -42,8 +42,9 @@
 /// next reconcile reloads at once; a Baseline update or delete on that replica does the same
 /// through `BaselineStore::set_on_baseline_mutation`, which fires after the commit and BEFORE
 /// the caller's own bump (a separate lease) and fan-out, and so does every fanned-out push
-/// (`guardian_push_fn_`). All three reach one `ServerImpl` wrapper that drops both caches. (2) `max_age` bounds everything the hook cannot see:
-/// another replica's edit, or a double fault. A held bundle older than it is a miss and is
+/// (`guardian_push_fn_`). All three reach one `ServerImpl` wrapper that drops both caches.
+/// (2) `max_age` bounds everything the hook cannot see: another replica's edit, or a double
+/// fault. A held bundle older than it is a miss and is
 /// reloaded. NOTE what `max_age` heals and what it does not: it heals the MEMO. An agent that
 /// was already reconciled from a stale bundle was labelled with the current generation and
 /// stays Converged until the next bump (or its own regression); the reload does not re-push

@@ -87,6 +87,17 @@ void exec_sql(const std::string& dsn, const std::string& sql) {
     REQUIRE(r.ok());
 }
 
+// Like exec_sql but never throws and asserts nothing, for use in a destructor (ScopeExit) that
+// may run during unwinding. A failure is swallowed: the per-test database is dropped anyway.
+void exec_sql_nothrow(const std::string& dsn, const std::string& sql) noexcept {
+    PGconn* c = PQconnectdb(dsn.c_str());
+    if (c != nullptr) {
+        if (PQstatus(c) == CONNECTION_OK)
+            PQclear(PQexec(c, sql.c_str()));
+        PQfinish(c);
+    }
+}
+
 // Simulate guardian_routes.cpp's deploy_baseline handler: snapshot the
 // current member set into deployed_snapshot and flip lifecycle to deployed.
 void deploy(BaselineStore& store, const std::string& baseline_id) {
@@ -736,8 +747,16 @@ TEST_CASE("BaselineStore: a mutation that fails inside the database does not fir
     int fired = 0;
     store.set_on_baseline_mutation([&] { ++fired; });
 
-    // Break the table from a second connection: the generic SQL-error arm of both writers.
+    // Break the table from a second connection: the generic SQL-error arm of both writers. The
+    // rename back runs on EVERY exit, including a failed REQUIRE below (declared after the
+    // rename it undoes, so it destructs first).
     exec_sql(db.dsn(), "ALTER TABLE baseline_store.baselines RENAME TO baselines_broken");
+    bool renamed_back = false;
+    const auto restore_table = [&] {
+        if (!renamed_back)
+            exec_sql_nothrow(db.dsn(), "ALTER TABLE baseline_store.baselines_broken RENAME TO baselines");
+    };
+    yuzu::test::ScopeExit restore{restore_table};
     row->description = "edited";
     const auto upd = store.update_baseline(*row);
     REQUIRE_FALSE(upd.has_value());
@@ -749,6 +768,7 @@ TEST_CASE("BaselineStore: a mutation that fails inside the database does not fir
 
     // And once the table is back the same calls commit and fire.
     exec_sql(db.dsn(), "ALTER TABLE baseline_store.baselines_broken RENAME TO baselines");
+    renamed_back = true;
     REQUIRE(store.update_baseline(*row).has_value());
     REQUIRE(store.delete_baseline(id).has_value());
     CHECK(fired == 2);
@@ -781,5 +801,43 @@ TEST_CASE("BaselineStore: a mutation that cannot get a connection does not fire 
     }
     CHECK(fired == 0);
     REQUIRE(store.delete_baseline(*created).has_value());  // the lease is back: it commits and fires
+    CHECK(fired == 1);
+}
+
+TEST_CASE("BaselineStore: a create fires the baseline-mutation hook only when the baseline is created deployed",
+          "[pg][baseline_store][baseline_hook]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};  // size 1: also proves no lease is held in the hook
+    BaselineStore store{pool};
+    REQUIRE(store.is_open());
+
+    int fired = 0;
+    std::vector<std::string> deployed_seen;
+    store.set_on_baseline_mutation([&] {
+        ++fired;
+        const auto d = store.deployed_member_rule_ids();
+        deployed_seen.push_back(d.has_value() ? std::to_string(d->size()) : std::string("degraded"));
+    });
+
+    // A draft create (what every route does) changes no deployed set: silent.
+    REQUIRE(store.create_baseline(make_baseline("draft-one")).has_value());
+    CHECK(fired == 0);
+
+    // A create that is already deployed does change it: fires once, AFTER commit, so the hook
+    // already reads the new deployed set, and with no lease held (the pool has one connection).
+    auto dep = make_baseline("born-deployed");
+    dep.lifecycle = kBaselineDeployed;
+    dep.deployed_snapshot = nlohmann::json(std::vector<std::string>{"r1", "r2", "r3"}).dump();
+    dep.deployed_by = "bob";
+    REQUIRE(store.create_baseline(dep).has_value());
+    CHECK(fired == 1);
+    REQUIRE(deployed_seen.size() == 1);
+    CHECK(deployed_seen[0] == "3");
+
+    // A create that fails (name conflict, invalid lifecycle) fires nothing.
+    CHECK_FALSE(store.create_baseline(dep).has_value());
+    auto bad = make_baseline("bad-lifecycle");
+    bad.lifecycle = "bogus";
+    CHECK_FALSE(store.create_baseline(bad).has_value());
     CHECK(fired == 1);
 }

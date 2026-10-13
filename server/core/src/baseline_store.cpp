@@ -236,6 +236,12 @@ std::expected<std::string, std::string> BaselineStore::create_baseline(const Bas
         }
         return std::unexpected("insert failed: " + std::string(PQresultErrorMessage(res.get())));
     }
+    // A DEPLOYED create changes the deployed set (the Guardian routes only ever create drafts,
+    // so this is a latent path); a draft create must stay silent.
+    if (lifecycle == kBaselineDeployed) {
+        lease.reset(); // no pool lease held while the hook runs
+        notify_baseline_mutation();
+    }
     return id;
 }
 
