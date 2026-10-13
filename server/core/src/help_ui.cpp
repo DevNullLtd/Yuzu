@@ -49,15 +49,6 @@ document.body.addEventListener('showToast', function(e) {
   showToast(d.message || 'Done', d.level || 'success');
 });
 </script>
-<script>
-/* Ctrl+K / Cmd+K — navigate to dashboard command palette */
-document.addEventListener('keydown', function(e) {
-  if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
-    e.preventDefault();
-    window.location.href = '/?palette=1';
-  }
-});
-</script>
 </body></html>
 )HTM";
 
