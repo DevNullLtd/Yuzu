@@ -612,7 +612,11 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
 
     DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
     // Both buffers are zero-initialized and NUL-terminated by the crack: path + query.
-    const std::wstring target = std::wstring(path) + extra;
+    std::wstring target = std::wstring(path) + extra;
+    // An empty path with a query (`https://host?x=1`) must still start with '/': the request
+    // target is `/?x=1`, as split_http_url builds it on the other platforms.
+    if (path[0] == 0 && extra[0] != 0)
+        target.insert(0, L"/");
     HINTERNET request = WinHttpOpenRequest(connect, L"POST", target.c_str(), nullptr,
                                            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!request) {
@@ -1251,7 +1255,9 @@ std::string percent_decode_lenient(std::string_view in) {
 // (RFC 6749 3.1: a request parameter MUST NOT be included more than once, and the endpoint's pair
 // would come BEFORE Yuzu's, ahead of the value Yuzu means the IdP to use). Pairs split on '&'
 // only (';' is not a separator); the name is the text before the first '=', percent-decoded and
-// compared case-sensitively, so `client%5Fid` is the reserved `client_id` and `CLIENT_ID` is not.
+// compared ASCII case-insensitively (case-insensitive IdP stacks, ASP.NET and ADFS among them,
+// would otherwise read `CLIENT_ID` as a second `client_id`), so `client%5Fid` and `CLIENT_ID` are
+// both the reserved `client_id`.
 bool authorization_query_ok(std::string_view endpoint) {
     const auto q = endpoint.find('?');
     if (q == std::string_view::npos)
@@ -1263,7 +1269,10 @@ bool authorization_query_ok(std::string_view endpoint) {
     while (true) {
         const auto amp = query.find('&');
         const std::string_view pair = query.substr(0, amp);
-        const std::string name = percent_decode_lenient(pair.substr(0, pair.find('=')));
+        std::string name = percent_decode_lenient(pair.substr(0, pair.find('=')));
+        for (char& c : name)
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<char>(c - 'A' + 'a');
         for (const auto reserved : kReserved)
             if (name == reserved)
                 return false;

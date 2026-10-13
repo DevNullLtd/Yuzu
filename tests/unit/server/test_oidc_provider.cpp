@@ -3009,12 +3009,17 @@ TEST_CASE("OIDC: an authorization endpoint whose query uses a name Yuzu appends 
     CHECK(refused("https://idp.test/a?client%5Fid=evil"));
     CHECK(refused("https://idp.test/a?x=1&%73tate=evil"));     // %73 is 's'
     CHECK(refused("https://idp.test/a?x=1&client%5fid=evil")); // lower-case hex digits
+    // ASCII case-insensitive: case-insensitive IdP stacks would see a second `client_id`.
+    CHECK(refused("https://idp.test/a?CLIENT_ID=x"));
+    CHECK(refused("https://idp.test/a?Client_Id=x"));
+    CHECK(refused("https://idp.test/a?x=1&STATE=x"));
+    CHECK(refused("https://idp.test/a?st%41te=x")); // %41 is 'A'
 
-    // Not reserved: other case, a longer name, ordinary IdP hints, a B2C policy, a ';' pair.
-    for (const char* ok : {"https://idp.test/a?CLIENT_ID=x", "https://idp.test/a?client_idx=1",
-                           "https://idp.test/a?ui_locales=en", "https://idp.test/a?prompt=login",
-                           "https://idp.test/a?p=b2c_1_signin", "https://idp.test/a?x=1;state=2",
-                           "https://idp.test/a?x=client_id", "https://idp.test/a"}) {
+    // Not reserved: a longer name, ordinary IdP hints, a B2C policy, a ';' pair.
+    for (const char* ok : {"https://idp.test/a?client_idx=1", "https://idp.test/a?ui_locales=en",
+                           "https://idp.test/a?prompt=login", "https://idp.test/a?p=b2c_1_signin",
+                           "https://idp.test/a?x=1;state=2", "https://idp.test/a?x=client_id",
+                           "https://idp.test/a"}) {
         CAPTURE(ok);
         OidcProvider provider(explicit_authorize_cfg(ok));
         const auto flow = provider.start_auth_flow();
@@ -3038,7 +3043,7 @@ TEST_CASE(
     const std::string issuer = "https://idp.test";
     for (const char* bad :
          {"https://idp.test/a?client_id=evil", "https://idp.test/a?x=1&state=evil",
-          "https://idp.test/a?client%5Fid=evil"}) {
+          "https://idp.test/a?client%5Fid=evil", "https://idp.test/a?CLIENT_ID=evil"}) {
         CAPTURE(bad);
         const auto r = OidcProvider::parse_discovery_document(doc(bad), issuer);
         REQUIRE_FALSE(r.has_value());
@@ -3046,9 +3051,8 @@ TEST_CASE(
         CHECK(r.error() ==
               "authorization_endpoint is not an absolute https URL on the issuer's scheme");
     }
-    for (const char* ok : {"https://idp.test/a?CLIENT_ID=x", "https://idp.test/a?client_idx=1",
-                           "https://idp.test/a?ui_locales=en", "https://idp.test/a?prompt=login",
-                           "https://idp.test/a?p=b2c_1_signin",
+    for (const char* ok : {"https://idp.test/a?client_idx=1", "https://idp.test/a?ui_locales=en",
+                           "https://idp.test/a?prompt=login", "https://idp.test/a?p=b2c_1_signin",
                            "https://idp.test/realms/r/protocol/openid-connect/auth"}) {
         CAPTURE(ok);
         CHECK(OidcProvider::parse_discovery_document(doc(ok), issuer).has_value());
