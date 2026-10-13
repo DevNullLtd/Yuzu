@@ -696,6 +696,10 @@ specified silently absent:
 
 ```bash
 set -euo pipefail
+# The dump holds every local account hash and MFA enrolment: create it
+# owner-only, in an owner-only directory, exactly like the routine backup.
+umask 077
+sudo install -d -m 0700 -o "$(id -un)" /var/backups/yuzu
 STAMP=$(date +%s)
 DUMP="/var/backups/yuzu/auth-before-drop-$STAMP.dump"
 
@@ -703,6 +707,7 @@ DUMP="/var/backups/yuzu/auth-before-drop-$STAMP.dump"
 # validate the file before anything is dropped.
 pg_dump "$YUZU_POSTGRES_DSN" --schema=auth --format=custom -f "$DUMP"
 test -s "$DUMP"                              # non-empty, or stop here
+test "$(stat -c %a "$DUMP")" = 600            # owner-only, or stop here
 pg_restore --list "$DUMP" >/dev/null          # structurally valid, or stop here
 
 # Only reached if every check above succeeded.
@@ -731,11 +736,15 @@ psql "$YUZU_POSTGRES_DSN" -c "SELECT store, version FROM public.schema_meta WHER
 # "grep found nothing", which this step's own pass condition ("must be
 # ZERO, or absent entirely") cannot then distinguish from a genuine zero.
 # It ALSO only works from the server's own loopback (127.0.0.1/::1 are the
-# only addresses /metrics serves unauthenticated) and only over plain HTTP
-# (a TLS-by-default image rejects a plain http:// probe outright) — run it
-# ON the server host, not from a container bridge or a remote jump box.
+# only addresses /metrics serves unauthenticated) — run it ON the server
+# host, not from a container bridge or a remote jump box. A TLS-by-default
+# deployment rejects a plain http:// probe, so use the HTTPS port; `-k` is
+# acceptable here ONLY because the target is the server's own loopback and
+# the request carries no credential.
 set -o pipefail
 curl -fsS http://127.0.0.1:8080/metrics | grep secret_decrypt_failures_total
+# TLS-only deployment (plain HTTP disabled) — use this form instead:
+#   curl -fsSk https://127.0.0.1:8443/metrics | grep secret_decrypt_failures_total
 echo "curl+grep exit: $?"   # nonzero here means the CHECK ITSELF failed to
                              # run — re-run from the right host before
                              # trusting a "not found" result as "zero".
@@ -768,12 +777,24 @@ and a `yuzu_server_secret_decrypt_failures_total{failure_class="kek_unresolvable
 counter climbing. Capture the database dump and the keys directory as a
 pair, from the same point in time, and restore them as a pair:
 
+The key archive contains the KEK **and the CA private key**, so it is at
+least as sensitive as the dump. Create both owner-only, in an owner-only
+directory, in one `sudo sh -c` so the `umask` applies to the processes that
+write the files (the DSN is passed as an argument because `sudo` does not
+carry your environment):
+
 ```bash
-STAMP=$(date +%Y%m%dT%H%M%SZ)
-sudo -u yuzu pg_dump "$YUZU_POSTGRES_DSN" --format=custom \
-     > /var/backups/yuzu/yuzu-$STAMP.dump
-sudo tar -czf /var/backups/yuzu/yuzu-keys-$STAMP.tar.gz \
-     -C /etc/yuzu certs
+sudo sh -c 'set -eu
+  umask 077
+  install -d -m 0700 -o root -g root /var/backups/yuzu
+  stamp=$(date +%Y%m%dT%H%M%SZ)
+  pg_dump "$1" --format=custom -f /var/backups/yuzu/yuzu-$stamp.dump
+  tar -czf /var/backups/yuzu/yuzu-keys-$stamp.tar.gz -C /etc/yuzu certs
+  chmod 0600 /var/backups/yuzu/yuzu-$stamp.dump /var/backups/yuzu/yuzu-keys-$stamp.tar.gz
+  test "$(stat -c %a /var/backups/yuzu)" = 700
+  test "$(stat -c %a /var/backups/yuzu/yuzu-keys-$stamp.tar.gz)" = 600
+  pg_restore --list /var/backups/yuzu/yuzu-$stamp.dump >/dev/null
+  ls -l /var/backups/yuzu/yuzu-*$stamp*' sh "$YUZU_POSTGRES_DSN"
 ```
 
 Rules that follow: encrypt the key archive at rest, separately from the

@@ -170,7 +170,7 @@ With `--data-dir` set, users created or changed on the Settings page are written
 | File | Purpose |
 |---|---|
 | `yuzu-server.cfg` | First-boot seed for `auth.db`. Holds the initial accounts as PBKDF2-SHA256 hashes with a per-user salt. It is read at every start, but its accounts are copied into `auth.db` only when `auth.db` has no users. Keep it as the seed for disaster recovery (re-creating `auth.db` from scratch). |
-| `auth.db` | SQLite authentication database, created in `--data-dir`. Holds local user accounts (PBKDF2-SHA256 password hashes, roles), MFA enrollment — including the **plaintext TOTP seeds** and salted recovery-code hashes — failed-login lockout counters, break-glass arm state, and SSO identity fields. It does **not** hold live sessions or enrollment tokens: its `sessions`, `enrollment_tokens` and `pending_agents` tables exist, but no production code path loads from them. Sessions live only in server memory, so a restart signs every operator out. Mode `0600` (and its directory `0700`), re-applied on every open on Linux/macOS. On Windows the server applies no ACL of its own — verify with `icacls` that only SYSTEM and Administrators have access (see `docs/ops-runbooks/auth-db-recovery.md`). **This is the live source of truth for local accounts and MFA from v0.12.0 onwards.** |
+| `auth.db` | SQLite authentication database, created in `--data-dir`. Holds local user accounts (PBKDF2-SHA256 password hashes, roles), MFA enrollment — including the **plaintext TOTP seeds** and salted recovery-code hashes — failed-login lockout counters, break-glass arm state, and SSO identity fields. It does **not** hold live sessions or enrollment tokens: its `sessions`, `enrollment_tokens` and `pending_agents` tables exist, but no production code path loads from them. Sessions live only in server memory, so a restart signs every operator out. Mode `0600` (and its directory `0700`), re-applied on every open on Linux/macOS. On Windows the server applies no ACL of its own — verify with `icacls` that only SYSTEM and Administrators have access (see `docs/ops-runbooks/auth-db-recovery.md`). **This is the live source of truth for local accounts and MFA from v0.12.0 through v0.13.x.** **On `dev`-HEAD builds this file no longer exists:** `AuthDB` was migrated to the PostgreSQL `auth` schema (ADR-0006), so there is no `auth.db` to find, back up or move aside — back up the Postgres database instead (see [PostgreSQL Substrate](#postgresql-substrate) and `docs/ops-runbooks/auth-db-recovery.md` "Not in v0.13.0"). |
 | `enrollment-tokens.cfg` | The live enrollment-token store (Tier 2): token hash, label, max uses, use count, expiry and revoked flag. It is rewritten on every token create, consume and revoke. Back it up with the rest of `--data-dir`. |
 | `pending-agents.cfg` | Queue of agents awaiting manual approval (Tier 1 enrollment). Contains agent ID, hostname, IP, and registration timestamp. |
 
@@ -2402,10 +2402,16 @@ a misbehaving automation script.
 > **Verify persistence after a partial failure.** If the response body
 > reports `db_persisted: false` (or the audit row shows `result=partial`
 > with `db_error=true`), the in-memory wipe succeeded but the
-> persisted `auth.db` rows survive. A server restart will resurrect
-> those sessions. Either retry the revoke after the DB lock clears, or
-> see `docs/ops-runbooks/auth-db-recovery.md` for emergency manual
-> revocation via the SQLite CLI.
+> persisted session rows survive. **What that means depends on your build:**
+> on `v0.13.0` and earlier, sessions are in-memory only, so the wipe is
+> already complete and a restart clears everything; on a `dev`-HEAD build
+> with the durable PostgreSQL `SessionStore` (HA WS-1/1a, #4283), a restart
+> will resurrect those sessions, and there is **no SQLite table to edit** —
+> the row lives in Postgres. Retry the revoke after the database recovers
+> and confirm `db_persisted=true`. See the "Durable PostgreSQL-backed
+> operator sessions" section of `docs/ops-runbooks/auth-db-recovery.md`
+> (and the Upgrade Notes entry above on emergency revocation by restart)
+> before relying on restart or on SQLite-CLI revocation.
 
 ### Self-service "Sign out everywhere"
 

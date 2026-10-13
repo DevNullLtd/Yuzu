@@ -17,8 +17,10 @@ paragraph's "verified present" as covering all five uniformly.
 this before treating any SLO below as evidence of outage detection.** Every
 metric in sections 1-5 below is emitted BY the process that fails closed.
 During a total server or PostgreSQL outage, none of these series goes
-*bad* — they go **absent**, and an absent series computes as "budget not
-burned": a 30-day window spanning a complete outage reads as 100% met on
+*bad*: the five Yuzu-emitted series go **absent** (no process is left to emit
+them), and a failed scrape sets Prometheus's own `up` to `0` — which only
+helps if a rule actually reads it, and none of the SLO expressions below do.
+An absent series computes as "budget not burned": a 30-day window spanning a complete outage reads as 100% met on
 every one of the five SLOs. The one rule that would catch this — an
 `up == 0` dead-man's-switch — is proposed in §1 below and **not shipped**.
 This is not merely a §1 caveat: it applies identically to sections 2-5,
@@ -65,9 +67,8 @@ dead-man's-switch (`up == 0`) rule for the server process in this file
 today (tracked: #2956)"* (quoted verbatim as that doc currently reads).
 **Correction (2026-09-10, governance-reproduced, C2-3):** #2956 is
 CLOSED, and a prior revision of this document redirected the citation to
-#2459 — but #2459 does not name this gap either (verified). Treat this gap
-as **untracked; proposed** until a real tracking issue exists — do not cite
-either #2956 or #2459 as the live tracker. The practical proxy is
+#2459 — but #2459 does not name this gap either (verified). The gap is now
+tracked by **#4290** (open) — cite that, not #2956 or #2459. The practical proxy is
 Prometheus's own scrape
 health of the `/metrics` endpoint on the same server process: `up{job="yuzu-server"}`
 (`deploy/prometheus/prometheus.yml` / `prometheus-uat.yml` / `prometheus-full-uat.yml`,
@@ -76,7 +77,7 @@ job name `yuzu-server`). This proves the HTTP listener is alive; it does
 that is up but reporting a degraded store — e.g. `stores.audit` closed —
 would still show `up == 1` here). Closing that gap needs a blackbox-exporter
 job scraping `/readyz` directly and asserting on HTTP status, which is not
-part of this change — untracked; proposed (see the correction above).
+part of this change — tracked by #4290 (see the correction above).
 
 **Target:** **99.5% / 30d for a single-replica deployment** (~3h39m of
 allowed downtime/month) — what ships today. Target rises to **99.9% / 30d**
@@ -94,9 +95,9 @@ listener — see that doc's "What you get").
 ```yaml
 # PROPOSED — NOT SHIPPED. Mirrors YuzuGatewayDown's up{job=~".*gateway.*"}==0
 # pattern (docs/prometheus/yuzu-alerts.yml) applied to the server job. The
-# gap this closes is untracked (neither #2956, closed, nor #2459 names it —
-# see the correction above) — proposed for the PO/workflow owner to route
-# into the real file and file a tracking issue for.
+# gap this closes is tracked by #4290 (neither #2956, closed, nor #2459 names
+# it — see the correction above) — proposed for the PO/workflow owner to route
+# into the real file.
 - alert: YuzuServerDown
   expr: up{job="yuzu-server"} == 0
   for: 2m
@@ -294,10 +295,13 @@ is 250ms, so this is the leading indicator before persistence starts dropping
 ### 5c. Connect failures
 
 **Metric:** `yuzu_pg_connect_failed_total` (counter).
-**Target:** report the raw count; target **0 sustained (>2 minute) failure
-episodes / 30d** — a single transient blip (e.g. one dropped TCP connection
-that reconnects on the next pool acquire) is not treated as an SLO breach,
-only a failure episode that outlasts the alert's own `for: 2m` window is.
+**Target:** report the raw count; target **0 sustained failure episodes /
+30d**. The alert is only an approximation of "sustained": `rate(...[5m]) > 0`
+stays true for up to 5 minutes after even a **single** increment, so with
+`for: 2m` one transient failure (e.g. one dropped TCP connection that
+reconnects on the next pool acquire) CAN fire `YuzuPgConnectFailing`.
+Judge a firing against the raw counter — a lone increment is a blip, not an
+SLO breach; repeated increments across the window are.
 **Alert:** existing — `YuzuPgConnectFailing`, `severity: critical`:
 
 ```yaml
@@ -365,7 +369,6 @@ regardless of what that separately-tracked work eventually proves.
   non-HA, single-replica deployment this document's §1 target describes):
   tracked in issue #4135 — not part of this branch's documentation set.
 - The server dead-man's-switch gap this document's §1 proposed alert would
-  close is **untracked** — `docs/ops-runbooks/audit-store-clock-guard.md`
-  cites #2956 for it, which is closed and does not (re-)name a live
-  successor; #2459 was checked and does not name this gap either (see §1's
-  correction). File a tracking issue rather than citing either number.
+  close is tracked by **#4290** (open) — `docs/ops-runbooks/audit-store-clock-guard.md`
+  still cites #2956 for it, which is closed; #2459 does not name this gap
+  either (see §1's correction). Cite #4290.
