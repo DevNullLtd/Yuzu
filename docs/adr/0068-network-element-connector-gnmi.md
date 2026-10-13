@@ -92,7 +92,9 @@ the **only** thing that ever connects to a network element. Yuzu:
   target list gnmic loads (D6);
 - **consumes** element state through gnmic's single gNMI-server endpoint as its sole client
   (D9), and answers operator `Get` queries from gnmic's cache through the same endpoint (D10);
-- **never carries counters**: interface counters flow gnmic → the customer's Prometheus directly
+- **never carries counters**: core drops the `counters` subtree at ingest and at `Get` (the D10
+  fact table excludes it even though the `interfaces` state container contains it), and interface
+  counters flow gnmic → the customer's Prometheus directly
   (D8).
 
 gnmic's gNMI server has no per-caller authorization; all element authorization lives in Yuzu's
@@ -142,7 +144,10 @@ as a plan-hash-bound Execution Plan with approval provenance (ADR-0033 §10, #13
 before any element is ever written to, and it puts Yuzu inside the customer's network
 change-control process. Port quarantine is the obvious future use; the ADR that adds it revisits
 the credential-egress security of D6 first, and is itself subject to the ADR-0032 interlock if it
-touches the Execution-Plan machinery. Every **read** tool here is `readOnlyHint: true`,
+touches the Execution-Plan machinery. That ADR defines its own operation: `NetworkElement:Execute`
+is spent on the purview override (D5) and a `Set` path must **not** ride on it (the lesson
+recorded at `rbac_store.cpp`'s operation catalogue — reusing `ApiToken:Write` silently widened
+every other Write route). Every **read** tool here is `readOnlyHint: true`,
 `destructiveHint: false`; the write tools (registration, update, credential, delete) carry the
 annotations D10 states — they write Yuzu's own store, never an element.
 
@@ -238,7 +243,12 @@ annotations D10 states — they write Yuzu's own store, never an element.
   value, requester authority is re-checked at execution (§8), and the audit row carries both
   principals. A protection-*increasing* change (`none | out` → `in`, `out` → `none`) takes effect
   on the requester's authority alone, since it only narrows reads. `Write` is deliberately not
-  sufficient: the override changes who may be watched, not what is inventoried.
+  sufficient: the override changes who may be watched, not what is inventoried. **The override
+verb ships with ADR-0067's mechanism, not in slice 1**: it has no effect until purview derivation
+exists, and its approval parking requires the ADR-0033 §4 primitive to exist first (today's
+`Approval:Approve` flow has no per-securable `Approve`, human-root comparison or step-up). What
+slice 1 does pin is the seed: `Execute`/`Approve` stay Administrator-only and `NetworkEngineer`
+holds neither.
 - **In an EU co-determination deployment the works-council agreement precedes the first
   `network_element.register` and the first `NetworkCollector` grant** — those two audit rows are
   the evidence of that decision — **and the collector is not enabled before ADR-0067's
@@ -474,8 +484,8 @@ annotations D10 states — they write Yuzu's own store, never an element.
   stated margin or a quiet `ON_CHANGE` series flaps.
 - Labels: gnmic's `source` label is the **target name**, which the HTTP loader sets from the JSON
   key, so the key is the element id and `address` is a separate field; core also emits
-  `event-tags` `element_id` and `element_name` per target so the labels do not depend on that
-  detail. Whether gnmic's own `gnmic_*` target-health metrics carry `event-tags` is verified in the
+  `event-tags` `element_id` per target so the labels do not depend on that detail (the display
+  name is operator free text and is **not** a tag). Whether gnmic's own `gnmic_*` target-health metrics carry `event-tags` is verified in the
   slice-1 contract test; the user manual documents resolving `ne-<uuid>` via `get_network_element`
   either way. Hostnames and management addresses are never labels.
 - gnmic-side metric names follow gnmic's path-derived names, **not** `yuzu_*` — they are
@@ -647,7 +657,8 @@ subscriptions only; there is no on-demand device RPC. So under D3 there is no *l
   (the Prometheus/Grafana precedent; dependabot's docker ecosystem on `/deploy/docker` proposes
   bumps; a bump is a reviewed change). The image is **outside both Yuzu gates** — the compose
   healthcheck invariant covers the Yuzu images + postgres, and `check-compose-versions.sh` matches
-  only `yuzu-{server,gateway,agent}` — so: its healthcheck is a TCP/HTTP probe against gnmic's
+  only `ghcr.io/<owner>/yuzu-{server,gateway,agent,postgres,postgres-ha}` (with an optional
+  `-chisel` suffix), never a third-party image such as gnmic — so: its healthcheck is a TCP/HTTP probe against gnmic's
   Prometheus listener using a tool **verified present in the pinned digest — a slice-1 exit
   criterion, not a present fact** (a TCP probe proves the process is up, not that targets are
   healthy); `yuzu-server`'s `depends_on` never waits on the collector; the service appears in the
@@ -742,8 +753,9 @@ subscriptions only; there is no on-demand device RPC. So under D3 there is no *l
   implemented by this documentation PR): (1) the seeded `NetworkCollector` role and the
   one-entry engine allow-list, with the pinning tests (D5); (2) the single (address, credential)
   write method behind `set_network_element_destination` and the unit test that no other method
-  writes the address (D6); (3) the purview-override verb on `Execute`/`Approve`, with its
-  approval parking and the test that `NetworkEngineer` holds neither (D5); (4) the collector
+  writes the address (D6); (3) the test that `NetworkEngineer` holds neither `Execute` nor
+  `Approve` (D5) — the override verb itself and its approval parking are **not** slice-1 work:
+  they ship with ADR-0067's mechanism, after the ADR-0033 §4 primitive exists; (4) the collector
   secret-egress threat model, reviewed before the route (D6); (5) ingest-time LLDP
   classification into edges vs observations (D7).
 - **SOC 2** (`docs/enterprise-readiness-soc2-first-customer.md`): the "Data Inventory —
@@ -803,8 +815,8 @@ subscriptions only; there is no on-demand device RPC. So under D3 there is no *l
 
 `status: accepted` on merge to `dev` (`docs/agents/domain.md` convention — the merged file
 carries the status) **except** the purview clauses — D5's behavioural-read gate on the two presence
-verbs,
-D7's purview-derivation and per-row omission, D10's gate routing — which bind when **ADR-0067 is
+verbs and its purview-override verb and approval parking,
+D7's purview-derivation and per-row omission, D10's gate routing and the override tool — which bind when **ADR-0067 is
 accepted**; until then those reads are audited at the `device_ci` tier. This is the additional
 acceptance gate the convention lets an ADR name. D4 (no write path), D5 (global securable, whole
 table deliberate, no faked confinement, split verbs), D6 (single decrypting route, dedicated

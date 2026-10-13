@@ -80,8 +80,8 @@ deciding which subjects are which.
    an audit-persist failure denies the read even under an Incident, and on an **audit-off**
    deployment (`audit_fn` absent, where the funnel's kernel returns `true` today) in-purview reads
    are refused outright — there is no Incident without evidence — and any change to a purview
-   declaration (`purview.set` in either direction, a write on the management-group row the
-   pre-read gate never sees) is refused on its own write path. The two rules compose by *when
+   declaration (`purview.set` or `network_element.purview.override`, in either direction, a write
+   the pre-read gate never sees) is refused on its own write path. The two rules compose by *when
    audit went off*, and a declaration's classification is **never reinterpreted**: a deployment
    that **already holds declarations** and later turns audit off keeps every one — protected
    reads on those subjects are denied without evidence (declared in the response, counted) and
@@ -91,7 +91,8 @@ deciding which subjects are which.
    all of them. Turning audit back on restores Incident-gated access; nothing is re-declared.
 7. **Enforced by a pre-read, deny-capable decision in front of the single funnel.**
    `emit_behavioral_audit` (`rest_audit.hpp`) is an audit *wrapper*: it returns a persist bool,
-   REST fails closed on it, the dashboard and MCP proceed by design, MCP wraps the kernel itself,
+   REST fails closed on it, the dashboard proceeds by design, MCP callers have mixed policies
+   (some proceed on failure, some withhold the data) and wrap the kernel themselves,
    and several sites audit *after* the read. It is therefore **not** the deny point. The gate is a
    new channel-agnostic decision (working name `authorize_behavioral_read`) called **before** the
    data is fetched on **all three channels** (REST, dashboard fragment, MCP), independent of
