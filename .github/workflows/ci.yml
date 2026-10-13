@@ -520,7 +520,9 @@ jobs:
 
       # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
       # otherwise only runs at release time, so a regex regression would surface
-      # too late (after the full build matrix). No build deps — just bash.
+      # too late (after the full build matrix). No build deps — just bash (and
+      # python3; test_check_elf_floor.sh also needs gcc + binutils, all on the
+      # hosted ubuntu runner).
       - name: Shell gate tests
         run: |
           bash tests/shell/test_check_compose_versions.sh

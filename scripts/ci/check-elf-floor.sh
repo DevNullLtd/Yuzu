@@ -8,8 +8,9 @@
 # PROMISE (the floor file), never a measured value.
 #
 # S0 IS REPORT-ONLY. The default mode prints violations, emits GitHub Actions
-# `::warning::` annotations plus a job-summary table, and exits 0. `--enforce`
-# is implemented and tested but is NOT wired anywhere yet (S2 turns it on).
+# `::warning::` annotations plus a job-summary table, and exits 0 (except for a
+# usage/configuration error, exit 2). `--enforce` is implemented and tested but
+# is NOT wired anywhere yet (S2 turns it on).
 #
 # USAGE
 #   check-elf-floor.sh --floor FILE --dir STAGING [options]
@@ -30,12 +31,21 @@
 #                           large -- a CI artefact, never committed)
 #   Tools are looked up on PATH; override with OBJDUMP=... READELF=... .
 #   Needs python3 (3.8+) for parsing and JSON; there is no other dependency.
+#   Time bound: each tool call is limited to 300s and the whole scan to
+#   YUZU_ELF_FLOOR_DEADLINE seconds (default 240; a test hook). ELFs not reached
+#   by then are reported as `unreadable` ("not scanned") plus one PROBLEM line,
+#   never skipped silently. A normal scan of ~70 ELFs takes well under a second.
 #
 # EXIT STATUS
 #   0  report-only mode (whatever was found), or enforce mode and clean
-#   1  enforce mode and at least one violation / unreadable ELF / empty scan
-#   2  usage or configuration error, missing tool, unreadable floor file:
-#      always, in either mode -- a broken invocation must never look clean
+#   1  enforce mode and at least one violation / unreadable ELF or directory /
+#      empty scan
+#   2  usage or configuration error, missing tool, unreadable floor file, or an
+#      unexpected internal error: always, in either mode -- a broken invocation
+#      must never look clean
+#   In report-only mode an empty scan, an unreadable ELF or an unreadable
+#   directory is only a warning (PROBLEM / violation line, exit 0); under
+#   --enforce each one is an error.
 #
 # WHAT COUNTS
 #   * An import is an UNDEFINED dynamic symbol carrying a version tag
@@ -51,11 +61,18 @@
 #   * Non-ELF files are skipped (counted, never an error). Symlinks are not
 #     followed. A static or no-dynamic-section ELF is scanned, has no imports,
 #     and is marked "static". A stripped ELF is fine (the dynamic table
-#     survives stripping). An ELF the tools cannot read is a violation of kind
-#     `unreadable` -- an artefact that cannot be checked is not a clean one.
+#     survives stripping). An ELF the tools cannot read -- or a file with the
+#     ELF magic but fewer than 64 bytes (no room for an ELF header) -- is a
+#     violation of kind `unreadable`: an artefact that cannot be checked is not
+#     a clean one. Likewise a DIRECTORY that cannot be listed is a PROBLEM.
 #   * ZERO ELFs under --dir (after --include/--exclude) is a problem: an
 #     error in --enforce, a warning in report-only. An empty scan must never
 #     read as "clean".
+#   * Output hygiene: file names, symbol names, families and RUNPATH entries
+#     come from the artefact under test. Every line printed is rendered as
+#     printable ASCII, and any line that would begin (after whitespace) with
+#     `::` -- which the Actions runner would execute as a workflow command --
+#     is prefixed with `| `. Only the script's own annotations start with `::`.
 #   * RUNPATH / RPATH: every colon-separated entry must be anchored at
 #     $ORIGIN (or ${ORIGIN}). An absolute path, a bare relative path or an
 #     empty entry (= the current directory) is a violation of kind `runpath`.
@@ -93,13 +110,16 @@
 #             "offending": { "GLIBC_2.38": ["strlcpy", ...] },  # above floor
 #             "forbidden": ["EVP_sm4_cbc"],        # forbidden names imported
 #             "runpath": ["/opt/x"],               # non-$ORIGIN entries
+#             "unlisted": { "GCC_4.3.0": [...] },  # tags of families absent
+#                                                  # from the floor's "max"
 #             "status": "static" | "error: ..."    # omitted when ordinary
 #           }
 #         }
 #       }
 #     }
 #   }
-#   Regenerate: see docs/ci-architecture.md "Linux ELF floor gate (ADR-2003)".
+#   Regenerate: see docs/ci-architecture.md, "Linux ELF floor gate
+#   (`scripts/ci/check-elf-floor.sh`, ADR-2003 S0)".
 #
 # Contract tests: tests/shell/test_check_elf_floor.sh.
 set -euo pipefail
@@ -118,17 +138,23 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
-TAG_RE = re.compile(r'^(?P<fam>.+)_(?P<ver>[0-9]+(?:\.[0-9]+)*)$')
+# Digit runs are capped (9) so a hostile 5000-digit tag cannot reach int()
+# (Python refuses 4300+ digits); such a tag is simply a family with no version.
+TAG_RE = re.compile(r'^(?P<fam>.+)_(?P<ver>[0-9]{1,9}(?:\.[0-9]{1,9})*)$')
+VER_RE = re.compile(r'^[0-9]{1,9}(?:\.[0-9]{1,9})*$')
 ELF_MAGIC = b'\x7fELF'
 TOOL_TIMEOUT = 300
+DEFAULT_DEADLINE = 240
+MIN_ELF_BYTES = 64
 SUMMARY_ROWS = 20
 ANNOTATION_CAP = 50
 SYMS_SHOWN = 6
 
 
 def die(msg):
-    sys.stderr.write('check-elf-floor: %s\n' % msg)
+    sys.stderr.write(neutralize('check-elf-floor: %s' % safe(msg)) + '\n')
     sys.exit(2)
 
 
@@ -137,6 +163,21 @@ def safe(text):
     symbol names, RUNPATH entries): a newline in a file name must not be able
     to start a fake `::error::` workflow command on its own log line."""
     return re.sub(r'[^\x20-\x7e]', lambda m: '\\x%02x' % ord(m.group(0)), text)
+
+
+def neutralize(line):
+    """Defuse a log line: the Actions runner trims leading whitespace and runs
+    a line starting with `::` as a workflow command, so such a line gets a
+    visible marker in front. Applied to EVERY line this script prints that is
+    not one of its own annotations."""
+    return '\n'.join('| ' + ln if ln.lstrip().startswith('::') else ln
+                     for ln in line.split('\n'))
+
+
+def mdsafe(text):
+    """safe() plus what would break out of a markdown table cell/code span."""
+    return (safe(text).replace('|', '\\|').replace('`', "'")
+            .replace('<', '&lt;').replace('>', '&gt;'))
 
 
 def vtuple(ver):
@@ -166,7 +207,7 @@ def load_floor(path):
     if not isinstance(mx, dict) or not mx:
         die('floor file %s: "max" must be a non-empty object' % path)
     for fam, ver in mx.items():
-        if not isinstance(ver, str) or not re.match(r'^[0-9]+(\.[0-9]+)*$', ver):
+        if not isinstance(ver, str) or not VER_RE.match(ver):
             die('floor file %s: max[%s] must be a dotted numeric version' % (path, fam))
     allow = floor.get('allow', [])
     forb = floor.get('forbidden_symbols', [])
@@ -182,12 +223,23 @@ def load_floor(path):
 
 # --------------------------------------------------------------- discovery
 def discover(root, includes, excludes):
-    found, non_elf = [], 0
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    """-> (found [(rel, full)], non_elf_count, walk_errors [str])"""
+    found, non_elf, errs = [], 0, []
+
+    def onerror(exc):
+        # os.walk drops an unlistable directory silently unless told not to.
+        where = os.path.relpath(exc.filename, root) if exc.filename else '.'
+        errs.append('directory %s cannot be read (%s)'
+                    % (safe(where.replace(os.sep, '/')), safe(exc.strerror or 'error')))
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=onerror):
         dirnames.sort()
         for fn in sorted(filenames):
             full = os.path.join(dirpath, fn)
-            if os.path.islink(full) or not os.path.isfile(full):
+            if os.path.islink(full):
+                continue
+            if not os.path.isfile(full):
+                non_elf += 1          # FIFO, socket, device: never opened
                 continue
             rel = os.path.relpath(full, root).replace(os.sep, '/')
             try:
@@ -205,16 +257,17 @@ def discover(root, includes, excludes):
                 continue
             found.append((rel, full))
     found.sort()
-    return found, non_elf
+    return found, non_elf, sorted(errs)
 
 
 # ---------------------------------------------------------------- tool runs
-def run(cmd):
+def run(cmd, deadline):
+    limit = max(1.0, min(float(TOOL_TIMEOUT), deadline - time.monotonic()))
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           timeout=TOOL_TIMEOUT, env=dict(os.environ, LC_ALL='C'))
+                           timeout=limit, env=dict(os.environ, LC_ALL='C'))
     except subprocess.TimeoutExpired:
-        return None, '', 'timed out after %ds' % TOOL_TIMEOUT
+        return None, '', 'timed out after %ds' % limit
     except OSError as exc:
         return None, '', str(exc)
     return (p.returncode, p.stdout.decode('utf-8', 'replace'),
@@ -260,14 +313,26 @@ def parse_runpath(text):
     return out
 
 
-def scan_elf(rel, full, objdump, readelf):
+def scan_elf(rel, full, objdump, readelf, deadline):
     rec = {'tags': {}, 'names': set(), 'runpath': [], 'status': None}
-    rc, out, err = run([readelf, '-d', '--wide', full])
+    try:
+        size = os.path.getsize(full)
+    except OSError as exc:
+        rec['status'] = 'error: stat: ' + (exc.strerror or 'failed')
+        return rec
+    if size < MIN_ELF_BYTES:
+        rec['status'] = ('error: ELF magic but only %d byte(s), too small for an ELF header'
+                         % size)
+        return rec
+    # `--` ends option parsing: a path can never be read as a tool option.
+    rc, out, err = run([readelf, '-d', '--wide', '--', full], deadline)
+    err = err.replace(full, rel)          # keep the staging path out of results
     if rc is None or rc != 0 or 'Error:' in err:
         rec['status'] = 'error: readelf -d: ' + (first_line(err) or 'failed')
         return rec
     rec['runpath'] = parse_runpath(out)
-    rc, out, err = run([objdump, '-T', full])
+    rc, out, err = run([objdump, '-T', '--', full], deadline)
+    err = err.replace(full, rel)
     if rc is None or rc != 0:
         # A well-formed ELF with no dynamic symbol table (static executable,
         # relocatable object). A truncated or corrupt one is NOT this: objdump
@@ -404,20 +469,34 @@ def main():
     set_name = args.set_name or floor['name']
     if not os.path.isdir(args.root):
         die('--dir %s is not a directory' % args.root)
+    args.root = os.path.abspath(args.root)   # never option-shaped (`-w`)
+    try:
+        limit = float(os.environ.get('YUZU_ELF_FLOOR_DEADLINE', DEFAULT_DEADLINE))
+        if not 0 <= limit < 1e7:
+            raise ValueError
+    except ValueError:
+        die('YUZU_ELF_FLOOR_DEADLINE must be a number of seconds >= 0')
     objdump = os.environ.get('OBJDUMP', 'objdump')
     readelf = os.environ.get('READELF', 'readelf')
     for tool in (objdump, readelf):
         if shutil.which(tool) is None:
             die('%s not found on PATH (binutils is required)' % tool)
 
-    elfs, non_elf = discover(args.root, args.include, args.exclude)
+    elfs, non_elf, walk_errors = discover(args.root, args.include, args.exclude)
+    deadline = time.monotonic() + limit
+    unscanned = 0
 
     arts, full = {}, {}
     overall, over_count = {}, {}
     all_viol = []                       # (rel, violation)
     static_n = 0
     for rel, path in elfs:
-        rec = scan_elf(rel, path, objdump, readelf)
+        if time.monotonic() >= deadline:
+            unscanned += 1
+            rec = {'tags': {}, 'names': set(), 'runpath': [],
+                   'status': 'error: not scanned (aggregate deadline exceeded)'}
+        else:
+            rec = scan_elf(rel, path, objdump, readelf, deadline)
         maxima, viol = evaluate(floor, rec)
         for fam, ver in maxima.items():
             if fam not in overall or vtuple(ver) > vtuple(overall[fam]):
@@ -445,7 +524,10 @@ def main():
         for v in viol:
             all_viol.append((rel, v))
 
-    problems = []
+    problems = list(walk_errors)
+    if unscanned:
+        problems.append('aggregate deadline of %gs exceeded: %d of %d ELF(s) not scanned'
+                        % (limit, unscanned, len(elfs)))
     if not elfs:
         problems.append('no ELF files found under the scanned directory '
                         '(an empty scan is not a clean scan)')
@@ -453,7 +535,7 @@ def main():
     # ---------------------------------------------------------------- stdout
     out = []
     out.append('check-elf-floor: floor=%s (%s) set=%s mode=%s'
-               % (os.path.basename(args.floor), floor['name'], set_name,
+               % (safe(os.path.basename(args.floor)), safe(floor['name']), safe(set_name),
                   'enforce' if enforce else 'report-only'))
     out.append('ELF files scanned: %d (static/no dynamic section: %d); non-ELF skipped: %d'
                % (len(elfs), static_n, non_elf))
@@ -479,12 +561,12 @@ def main():
     else:
         out.append('RESULT: report-only, %d violation(s), %d problem(s); exit 0'
                    % (len(all_viol), len(problems)))
-    sys.stdout.write('\n'.join(out) + '\n')
+    sys.stdout.write(neutralize('\n'.join(out)) + '\n')
 
     # ------------------------------------------------- GitHub Actions output
     if os.environ.get('GITHUB_ACTIONS') == 'true':
         level = 'error' if enforce else 'warning'
-        title = gh_prop('Linux ELF floor (%s)' % set_name)
+        title = gh_prop('Linux ELF floor (%s)' % safe(set_name))
         by_art = {}
         for rel, v in all_viol:
             by_art.setdefault(rel, []).append(describe(v, brief=True))
@@ -502,17 +584,17 @@ def main():
             print('::%s title=%s::%s' % (level, title, gh_escape(p)))
     summ = os.environ.get('GITHUB_STEP_SUMMARY')
     if summ:
-        md = ['### Linux ELF floor: %s (%s)' % (set_name, 'enforce' if enforce else 'report-only'),
+        md = ['### Linux ELF floor: %s (%s)' % (mdsafe(set_name), 'enforce' if enforce else 'report-only'),
               '', '%d ELF(s) scanned, %d violation(s) in %d ELF(s). Floor file `%s`.'
               % (len(elfs), len(all_viol), len({r for r, _ in all_viol}),
-                 os.path.basename(args.floor)), '']
+                 mdsafe(os.path.basename(args.floor))), '']
         for p in problems:
-            md += ['**Problem:** ' + p, '']
+            md += ['**Problem:** ' + mdsafe(p), '']
         if elfs:
             md += ['| Family | Floor | Measured max | ELFs over floor |', '|---|---|---|---|']
             for fam in fams:
                 md.append('| %s | %s | %s | %d |' % (
-                    safe(fam), floor['max'].get(fam, '(unlisted)'), overall.get(fam, '-'),
+                    mdsafe(fam), floor['max'].get(fam, '(unlisted)'), overall.get(fam, '-'),
                     over_count.get(fam, 0)))
             md.append('')
         if all_viol:
@@ -521,7 +603,7 @@ def main():
                 counts[rel] = counts.get(rel, 0) + 1
             worst = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:SUMMARY_ROWS]
             md += ['| ELF (top %d by violations) | Violations |' % SUMMARY_ROWS, '|---|---|']
-            md += ['| `%s` | %d |' % (safe(rel), c) for rel, c in worst]
+            md += ['| `%s` | %d |' % (mdsafe(rel), c) for rel, c in worst]
             md.append('')
         try:
             with open(summ, 'a', encoding='utf-8') as fh:
@@ -556,5 +638,10 @@ def main():
     sys.exit(1 if (enforce and failing) else 0)
 
 
-main()
+try:
+    main()
+except Exception as exc:       # SystemExit is not an Exception: exit codes pass through
+    sys.stderr.write(neutralize('check-elf-floor: internal error: %s: %s'
+                                % (type(exc).__name__, safe(str(exc))[:200])) + '\n')
+    sys.exit(2)
 PYEOF

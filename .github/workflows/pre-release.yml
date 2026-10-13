@@ -447,12 +447,15 @@ jobs:
   # - fedora:42, gateway: the bundled OTP crypto NIF needs OpenSSL SM4
   #   symbols Red Hat's OpenSSL lacks (#5171).
   #
-  # NON-GATING legs (matrix.experimental, ADR-2003 slice S0): rockylinux:8 (the
-  # agent's glibc 2.28 floor) and amazonlinux:2023 are expected to FAIL on the
-  # 0.14.x artefacts until the EL8-built agent lands (ADR-2003 S2). They run so
-  # the gap is measured on every pre-release, and `continue-on-error` keeps a
-  # red one from failing the job or the QA report. S2 promotes them (deletes
-  # `experimental`) as it moves the floor into the build.
+  # NON-GATING legs (matrix.experimental, ADR-2003 (Proposed, PR #5631) slice
+  # S0): rockylinux:8 (the agent's glibc 2.28 floor) and amazonlinux:2023 are
+  # expected to FAIL on the 0.14.x artefacts until the EL8-built agent lands
+  # (ADR-2003 S2). They run so the gap is measured on every pre-release.
+  # `continue-on-error` keeps a red one from failing the job, so
+  # needs.install-rpm.result stays `success`: the gap is visible in the run
+  # graph and in the step summary the failed leg writes (last step), NOT in the
+  # Pre-release QA report table. S2 promotes them (deletes `experimental`) as
+  # it moves the floor into the build.
   install-rpm:
     name: "Install .rpm (${{ matrix.distro }})"
     needs: resolve
@@ -498,6 +501,11 @@ jobs:
             fi
             return 1
           }
+          # The rpm's %pre runs groupadd/useradd. amazonlinux:2023's stock image
+          # has no shadow-utils, which would fail the install for a reason
+          # unrelated to the floor under test: a test tool, not a dependency.
+          command -v groupadd >/dev/null || dnf install -y -q shadow-utils \
+            || { echo "FAIL: could not install shadow-utils for the package's %pre"; exit 1; }
           runs "dnf install of yuzu-$PKG" dnf install -y -q "/rpms/$RPM_NAME"
           rpm -q "yuzu-$PKG" >/dev/null || { echo "FAIL: yuzu-$PKG is not installed"; exit 1; }
           echo 'PASS: installed'
@@ -587,6 +595,23 @@ jobs:
             fi
           done
           exit "$FAIL"
+
+      # An experimental leg's failure is invisible in the QA report
+      # (continue-on-error => the job result is success), so say it here.
+      # `failure()` is explicit: an `if:` with no status function gets an
+      # implicit success() ANDed on and could never run after a failed step.
+      - name: Note failed experimental leg
+        if: ${{ failure() && matrix.experimental == true }}
+        env:
+          DISTRO: ${{ matrix.distro }}
+        run: |
+          {
+            echo "### EXPERIMENTAL leg failed (expected until ADR-2003 S2): .rpm install on ${DISTRO}"
+            echo
+            echo "This leg is non-gating (continue-on-error). It is expected to fail while the"
+            echo "0.14.x artefacts are built against the build host's glibc/libstdc++ (#5143)."
+            echo "It does NOT appear as a failure in the Pre-release QA report table."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Windows installer smoke test ────────────────────────────────────
   #

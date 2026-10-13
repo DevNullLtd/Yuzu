@@ -283,7 +283,8 @@ where each lives.
 
 Every Linux native artifact carries the glibc / libstdc++ floor of the host
 that built it by accident (#5143). The gate makes the floor an explicit,
-committed promise and measures every build against it. **In S0 it is
+committed promise and measures every build against it. It is specified by
+ADR-2003 (Proposed, PR #5631; the ADR is not on `dev` yet). **In S0 it is
 report-only: nothing it finds can fail a build or a release.** S2 turns it on.
 
 - **The script** runs `objdump -T` and `readelf -d` over every ELF under a
@@ -293,9 +294,12 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   numeric version. It also flags any forbidden symbol (`EVP_sm4_*`) and any
   `RUNPATH`/`RPATH` entry not anchored at `$ORIGIN`. The header of
   `scripts/ci/check-elf-floor.sh` is the canonical reference for the flags,
-  exit codes, floor-file schema and baseline schema. Two cases are errors,
-  not clean results: a directory with no ELF in it (an empty scan must never
-  read as clean) and an ELF the tools cannot read.
+  exit codes, floor-file schema and baseline schema. Four cases are never read
+  as clean: a directory with no ELF in it, an ELF the tools cannot read (or a
+  stub with the ELF magic and no room for a header), a directory that cannot be
+  listed, and ELFs not reached before the aggregate deadline. Under
+  `--enforce` each is an error; in report-only each is a warning and the exit
+  stays 0.
 - **Modes.** `--report-only` (the default) prints violations, emits
   `::warning::` annotations and a job-summary table on GitHub Actions, and
   exits 0. `--enforce` exits 1 on any violation. It is implemented and tested
@@ -306,8 +310,8 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   `deploy/packaging/linux-floor-server.json` (glibc 2.34, `GLIBCXX_3.4.29`,
   `CXXABI_1.3.13`, `OPENSSL_3.0.0`, `LIBSYSTEMD_240`, `BLKID_1.0`, forbidden
   `EVP_sm4_*`; also the gateway's ERTS and OTP). They state the promise, not a
-  measurement. Changing one is a floor decision (ADR-2003, "Floor review
-  rule"), not a tuning edit.
+  measurement. Changing one is a floor decision (ADR-2003 (Proposed, PR #5631),
+  "Floor review rule"), not a tuning edit.
 - **Baseline.** `deploy/packaging/linux-floor-baseline.json` is the measured
   gap of the v0.14.1 Linux x64 release artifacts (`agent`, `server` and
   `gateway` sets: per ELF the highest tag per family and the offending
@@ -319,36 +323,56 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   ```bash
   B=deploy/packaging/linux-floor-baseline.json; rm -f "$B"
   scripts/ci/check-elf-floor.sh --floor deploy/packaging/linux-floor-agent.json \
-    --dir <extracted yuzu-linux-x64> --exclude bin/yuzu-server --set-name agent \
-    --source "<tag> yuzu-linux-x64.tar.gz (all ELFs except bin/yuzu-server)" --emit-baseline "$B"
+    --dir <the yuzu-<VERSION>-linux-x64 directory inside the tarball> \
+    --exclude bin/yuzu-server --set-name agent \
+    --source "v0.14.1 yuzu-linux-x64.tar.gz (all ELFs except bin/yuzu-server)" --emit-baseline "$B"
   scripts/ci/check-elf-floor.sh --floor deploy/packaging/linux-floor-server.json \
-    --dir <extracted yuzu-linux-x64> --include bin/yuzu-server --set-name server \
-    --source "<tag> yuzu-linux-x64.tar.gz (bin/yuzu-server)" --emit-baseline "$B"
+    --dir <the yuzu-<VERSION>-linux-x64 directory inside the tarball> \
+    --include bin/yuzu-server --set-name server \
+    --source "v0.14.1 yuzu-linux-x64.tar.gz (bin/yuzu-server)" --emit-baseline "$B"
   scripts/ci/check-elf-floor.sh --floor deploy/packaging/linux-floor-server.json \
-    --dir <extracted yuzu-gateway-X.Y.Z-linux-x64 directory> --set-name gateway \
-    --source "<tag> yuzu-gateway-linux-x64.tar.gz" --emit-baseline "$B"
+    --dir <the yuzu-gateway-<VERSION>-linux-x64 directory inside the tarball> \
+    --set-name gateway \
+    --source "v0.14.1 yuzu-gateway-linux-x64.tar.gz (ERTS, NIFs, crypto.so)" --emit-baseline "$B"
   ```
 
-  Point `--dir` at the directory that holds `bin/` and `erts-*`, not at its
-  parent, so artifact keys carry no version. Output is deterministic (sorted,
+  Run with the real v0.14.1 tarballs this reproduces the committed file
+  byte-for-byte; for another release change the version in the `--source`
+  labels.
+
+  Point `--dir` at the directory inside the tarball (the one that holds
+  `bin/`), not at its parent, so artifact keys carry no version. Output is deterministic (sorted,
   no timestamps or paths): a refresh diffs cleanly. The floor-review rule in
-  ADR-2003 says when to refresh it.
+  ADR-2003 (Proposed, PR #5631) says when to refresh it.
 - **Release wiring.** `release.yml`'s `build-linux` job runs the script
   report-only on the staged tarball contents right after "Package archive"
   (agent set, then server set) in a `continue-on-error` step, and uploads the
   summaries, the full per-ELF reports and a `baseline.json` as the
   `linux-elf-floor-report` artifact (14 days). The artifact deliberately has no
   `yuzu-` prefix: the `release` job downloads every `yuzu-*` artifact. The
-  gateway tarball is not yet scanned in CI (S3 adds it).
+  step is bounded (`timeout-minutes: 10`, and the script's own aggregate
+  deadline of 240s per run), so a hung `objdump` cannot stall a release for
+  long. The gateway tarball is not yet scanned in CI (S3 adds it).
 - **Pre-release QA.** `pre-release.yml`'s `install-rpm` matrix gained
   `rockylinux:8` and `amazonlinux:2023` as **non-gating** legs
   (`continue-on-error` via `matrix.experimental`). They are expected to fail
-  on 0.14.x artifacts until S2; a failure there does not turn the job, or the
-  QA report, red. S2 removes `experimental` from them.
+  on 0.14.x artifacts until S2. A failure there turns neither the job nor the
+  Pre-release QA report red: a `continue-on-error` leg reports `success` to
+  `needs.install-rpm.result`, so the gap is visible in the run graph and in a
+  step summary the failed leg writes, **not** in the QA report table.
 - **Tests.** `tests/shell/test_check_elf_floor.sh` (in preflight's "Shell gate
   tests") builds fixture ELFs with `gcc` and a linker version script, so the
   tags it checks are synthesized and the result does not depend on the host's
   glibc.
+- **Notes for S2 (the slice that enforces).** (a) Only the agent promotes on
+  `rockylinux:8`: the server and gateway promise glibc 2.34 and are not
+  expected green there, so scope that leg to the agent package or keep it
+  non-gating for the others. (b) The gate scans the `${STAGING}` tarball
+  directory, but `build-deb.sh` and `build-rpm.sh` read `build-linux`
+  directly: point the package builders at the gated directory, or re-run the
+  gate on the extracted `.deb`/`.rpm` payload. (c) Flipping `--enforce` makes
+  this a release gate; add its entry to "Gates outside the tier ladder" (and a
+  routed-concern row) in that change.
 
 ### Plugin spawn lexical gate (`plugin-spawn-gate.yml`, ADR-3002 decision 10a)
 
@@ -636,10 +660,9 @@ than the tag under test (#5150). The other jobs check the following:
   start. The legs are ubuntu:22.04/24.04/26.04 and debian:12 for .deb, and
   fedora:42 and rockylinux:9 for .rpm (installed with `dnf`); rockylinux:8 and
   amazonlinux:2023 also run for .rpm but are non-gating (see "Linux ELF floor
-  gate"). If a leg's libc
-  or libstdc++ is older than the build's, the job fails and names the glibc
-  floor (#5143). A gateway whose crypto NIF cannot load is named as #5171. A
-  missing package fails; it is not skipped (#5151).
+  gate"). If a leg's libc or libstdc++ is older than the build's, the job fails
+  and names the glibc floor (#5143). A gateway whose crypto NIF cannot load is
+  named as #5171. A missing package fails; it is not skipped (#5151).
 - **install-windows**: two install/uninstall passes. With `/NOTLS` the service
   must start and stay Running. With the default TLS posture the agent must
   fail closed because no CA is pinned. The uninstall wait is bounded (#5145).

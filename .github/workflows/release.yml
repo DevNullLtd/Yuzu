@@ -293,15 +293,22 @@ jobs:
 
           tar czf "yuzu-linux-x64.tar.gz" "${STAGING}"
 
-      # Linux ELF floor gate, ADR-2003 slice S0: REPORT-ONLY. Measures the
-      # versioned-symbol requirements of everything just staged against the
-      # committed floor files (agent: glibc 2.28; server: 2.34) and records
-      # them. continue-on-error, and the script exits 0 on violations in this
-      # mode: nothing here can fail or delay a release. S2 flips it to
-      # --enforce. Contract: tests/shell/test_check_elf_floor.sh; docs/ci-architecture.md.
+      # Linux ELF floor gate, ADR-2003 (Proposed, PR #5631) slice S0:
+      # REPORT-ONLY. Measures the versioned-symbol requirements of everything
+      # just staged against the committed floor files (agent: glibc 2.28;
+      # server: 2.34) and records them. continue-on-error, and the script exits
+      # 0 on violations in this mode, so it cannot fail a release; the step is
+      # bounded to 10 minutes (the script has its own 240s deadline per run)
+      # so a hung binutils call cannot hold the runner for long. S2 flips it to
+      # --enforce. Contract: tests/shell/test_check_elf_floor.sh;
+      # docs/ci-architecture.md.
       - name: ELF floor report (report-only, ADR-2003 S0)
         continue-on-error: true
+        timeout-minutes: 10
         run: |
+          # The default shell is `bash -e` without pipefail: without this the
+          # `| tee || rc=$?` below would report tee's status, not the script's.
+          set -o pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           VERSION="${VERSION//-/_}"
           STAGING="yuzu-${VERSION}-linux-x64"
