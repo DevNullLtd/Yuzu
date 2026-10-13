@@ -3,8 +3,10 @@
 // copy, and fetch() for the JSON REST v1 routes (engine principals, #5342
 // password change/reset). Never `hx-on` — the CSP blocks it (CLAUDE.md).
 
+#include "app_shell.hpp"
+
 // NOLINTBEGIN(cert-err58-cpp)
-extern const char* const kSettingsHtml =
+const char* const kSettingsPageTemplate =
     R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -235,33 +237,7 @@ extern const char* const kSettingsHtml =
     // build-and-observability-gotchas-from-pki.md document the pattern.
     R"HTM(<body>
 
-  <nav class="nav-bar">
-    <a href="/" class="nav-brand">
-      <svg class="icon"><use href="/static/icons.svg#home"></use></svg> Yuzu
-    </a>
-    <a href="/" class="nav-link">Dashboard</a>
-    <a href="/instructions" class="nav-link">Instructions</a>
-    <a href="/compliance" class="nav-link">Compliance</a>
-    <a href="/guardian" class="nav-link">Guardian</a>
-    <a href="/dex" class="nav-link">DEX</a>
-    <a href="/tar" class="nav-link">TAR</a>
-    <a href="/hardware" class="nav-link">Hardware</a>
-    <a href="/software" class="nav-link">Software</a>
-    <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
-    <a href="/result-sets" class="nav-link">Result Sets</a>
-    <a href="/settings" class="nav-link active" id="nav-settings-link">Settings</a>
-    <span class="nav-spacer"></span>
-    <span class="nav-user" id="nav-user"></span>
-    <button class="nav-logout" hx-post="/logout">Logout</button>
-  </nav>
-  <div class="context-bar" id="context-bar">
-    <span class="context-role-badge" id="role-badge"></span>
-    <span class="context-user" id="context-user"></span>
-    <span class="context-spacer"></span>
-    <button class="context-bell" title="Notifications">
-      <svg class="icon"><use href="/static/icons.svg#bell"></use></svg>
-    </button>
-  </div>
+  <!--yuzu:shell--><!--/yuzu:shell-->
 
   <div class="content">
 
@@ -716,24 +692,12 @@ extern const char* const kSettingsHtml =
       }, 3000);
     }
 
-    /* ── Populate nav bar + context bar ─────────────────────── */
 )HTM"
     // Split here purely to keep each raw-string literal under MSVC's 16 KB
     // C2026 cap (adjacent literals concatenate byte-for-byte; the engine-
     // principals console section pushed this template over the limit). Local
     // GCC/Clang have no such cap, so this only surfaces on the Windows leg.
-    R"HTM(    fetch('/api/me').then(function(r){return r.json()}).then(function(d){
-      document.getElementById('nav-user').textContent = (d.display_name || d.username);
-      var role = d.rbac_role || d.role;
-      document.getElementById('role-badge').textContent = role;
-      document.getElementById('context-user').textContent = (d.display_name || d.username);
-      document.body.setAttribute('data-role', role);
-      if(d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
-        var sl = document.getElementById('nav-settings-link');
-        if(sl) sl.style.display = 'none';
-      }
-    });
-
+    R"HTM(
     /* Minimal vanilla JS — only for clipboard copy (no HTMX equivalent) */
     document.body.addEventListener('click', function(e) {
       if (e.target.closest('[data-copy-token]')) {
@@ -1063,4 +1027,8 @@ extern const char* const kSettingsHtml =
 </body>
 </html>
 )HTM";
+
+// The shell (sidebar + header) is rendered into the template once, at static init (app_shell.hpp).
+extern const char* const kSettingsHtml =
+    yuzu::server::shell::bake(kSettingsPageTemplate, {.active_key = "settings"});
 // NOLINTEND(cert-err58-cpp)

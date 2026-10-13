@@ -1091,10 +1091,11 @@ earlier revision of this section documented an in-memory
 site used a live session or an audit-row detail instead) and was removed
 as dead code in the #1837 governance hardening round.
 
-**Render sites.** `GET /api/me` (the legacy dashboard nav-bar
-"who am I", consumed by every page's `nav-user`/`context-user` JS) and
+**Render sites.** `GET /api/me` (the "who am I" read, consumed by the
+app shell's script, `app_shell.cpp`, which fills `nav-user`/`context-user` on
+every page) and
 `GET /api/v1/me` both now return `display_name` alongside the stable
-`username`; the dashboard JS shows `display_name`, falling back to
+`username`; the shell script shows `display_name`, falling back to
 `username` for a legacy/local session predating this field.
 
 **SAML was unaffected this slice; since resolved (ADR-2001 PR4a).** At the

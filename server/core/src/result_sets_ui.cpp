@@ -5,6 +5,7 @@
 // pin/unpin/delete actions. Compiled in its own translation unit to keep the
 // long raw string literal away from server.cpp's brace matching.
 
+#include "app_shell.hpp"
 #include "result_sets_ui.hpp"
 #include "web_utils.hpp"
 
@@ -142,7 +143,7 @@ std::string render_result_set_detail(const ResultSet& rs, const std::vector<Line
 }
 
 // NOLINTBEGIN(cert-err58-cpp)
-extern const char* const kResultSetsPageHtml = R"HTM(<!DOCTYPE html>
+const char* const kResultSetsPageTemplate = R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -239,31 +240,7 @@ extern const char* const kResultSetsPageHtml = R"HTM(<!DOCTYPE html>
 </head>
 <body>
 
-  <nav class="nav-bar">
-    <a href="/" class="nav-brand">
-      <svg class="icon"><use href="/static/icons.svg#home"></use></svg> Yuzu
-    </a>
-    <a href="/" class="nav-link">Dashboard</a>
-    <a href="/instructions" class="nav-link">Instructions</a>
-    <a href="/compliance" class="nav-link">Compliance</a>
-    <a href="/tar" class="nav-link">TAR</a>
-    <a href="/hardware" class="nav-link">Hardware</a>
-    <a href="/software" class="nav-link">Software</a>
-    <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
-    <a href="/result-sets" class="nav-link active">Result Sets</a>
-    <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
-    <span class="nav-spacer"></span>
-    <span class="nav-user" id="nav-user"></span>
-    <button class="nav-logout" hx-post="/logout">Logout</button>
-  </nav>
-  <div class="context-bar" id="context-bar">
-    <span class="context-role-badge" id="role-badge"></span>
-    <span class="context-user" id="context-user"></span>
-    <span class="context-spacer"></span>
-    <button class="context-bell" title="Notifications">
-      <svg class="icon"><use href="/static/icons.svg#bell"></use></svg>
-    </button>
-  </div>
+  <!--yuzu:shell--><!--/yuzu:shell-->
 
   <div class="rs-content">
     <h1>Result Sets</h1>
@@ -309,21 +286,12 @@ extern const char* const kResultSetsPageHtml = R"HTM(<!DOCTYPE html>
     </div>
   </div>
 
-<script>
-fetch('/api/me').then(function(r){return r.json()}).then(function(d){
-  document.getElementById('nav-user').textContent = (d.display_name || d.username);
-  var role = d.rbac_role || d.role;
-  document.getElementById('role-badge').textContent = role;
-  document.getElementById('context-user').textContent = (d.display_name || d.username);
-  document.body.setAttribute('data-role', role);
-  if(d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
-    var sl = document.getElementById('nav-settings-link');
-    if(sl) sl.style.display = 'none';
-  }
-});
-</script>
 </body></html>
 )HTM";
+
+// The shell (sidebar + header) is rendered into the template once, at static init (app_shell.hpp).
+extern const char* const kResultSetsPageHtml =
+    shell::bake(kResultSetsPageTemplate, {.active_key = "result-sets"});
 // NOLINTEND(cert-err58-cpp)
 
 } // namespace yuzu::server

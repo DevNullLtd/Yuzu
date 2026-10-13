@@ -1,8 +1,10 @@
 // Unified dashboard UI HTML — compiled in its own translation unit to isolate
 // the long raw string literal from MSVC's brace-matching in server.cpp.
 
+#include "app_shell.hpp"
+
 // NOLINTBEGIN(cert-err58-cpp)
-extern const char* const kDashboardIndexHtml =
+const char* const kDashboardIndexTemplate =
     // Part 1: CSS + HTML markup (split to stay under MSVC's 16380-byte string limit)
     R"HTM(<!DOCTYPE html>
 <html lang="en">
@@ -355,33 +357,7 @@ extern const char* const kDashboardIndexHtml =
     // compile time, so the runtime HTML is byte-identical.
     R"HTM(<body>
 
-  <nav class="nav-bar">
-    <a href="/" class="nav-brand">
-      <svg class="icon"><use href="/static/icons.svg#home"></use></svg> Yuzu
-    </a>
-    <a href="/" class="nav-link active">Dashboard</a>
-    <a href="/instructions" class="nav-link">Instructions</a>
-    <a href="/compliance" class="nav-link">Compliance</a>
-    <a href="/guardian" class="nav-link">Guardian</a>
-    <a href="/dex" class="nav-link">DEX</a>
-    <a href="/tar" class="nav-link">TAR</a>
-    <a href="/hardware" class="nav-link">Hardware</a>
-    <a href="/software" class="nav-link">Software</a>
-    <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
-    <a href="/result-sets" class="nav-link">Result Sets</a>
-    <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
-    <span class="nav-spacer"></span>
-    <span class="nav-user" id="nav-user"></span>
-    <button class="nav-logout" hx-post="/logout">Logout</button>
-  </nav>
-  <div class="context-bar" id="context-bar">
-    <span class="context-role-badge" id="role-badge"></span>
-    <span class="context-user" id="context-user"></span>
-    <span class="context-spacer"></span>
-    <button class="context-bell" title="Notifications">
-      <svg class="icon"><use href="/static/icons.svg#bell"></use></svg>
-    </button>
-  </div>
+  <!--yuzu:shell--><!--/yuzu:shell-->
 
   <div class="dash-grid">
 
@@ -903,21 +879,6 @@ extern const char* const kDashboardIndexHtml =
       }
     }
 
-    /* ── Load current user info (nav bar + context bar) ─── */
-    function loadUserInfo() {
-      fetch('/api/me').then(function(r){return r.json()}).then(function(d){
-        document.getElementById('nav-user').textContent = (d.display_name || d.username);
-        var role = d.rbac_role || d.role;
-        document.getElementById('role-badge').textContent = role;
-        document.getElementById('context-user').textContent = (d.display_name || d.username);
-        document.body.setAttribute('data-role', role);
-        if(d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
-          var sl = document.getElementById('nav-settings-link');
-          if(sl) sl.style.display = 'none';
-        }
-      });
-    }
-
     /* ── Toast notification system ─────────────────────────── */
     function showToast(message, level) {
       var c = document.getElementById('toast-container');
@@ -1335,10 +1296,9 @@ extern const char* const kDashboardIndexHtml =
     }
 
     /* ── Init ─────────────────────────────────────────────── */
-    /* Agent list, help data, and user info are loaded by HTMX
-       attributes (hx-trigger="load") — no JS init calls needed
-       except loadUserInfo which updates body data-role. */
-    loadUserInfo();
+    /* Agent list and help data are loaded by HTMX attributes
+       (hx-trigger="load") — no JS init calls needed. The signed-in user is
+       filled by the app shell's own script (app_shell.cpp). */
 
     /* Auto-open command palette if redirected from another page via ?palette=1 */
     if (new URLSearchParams(window.location.search).has('palette')) {
@@ -1404,4 +1364,8 @@ extern const char* const kDashboardIndexHtml =
 </body>
 </html>
 )HTM";
+
+// The shell (sidebar + header) is rendered into the template once, at static init (app_shell.hpp).
+extern const char* const kDashboardIndexHtml =
+    yuzu::server::shell::bake(kDashboardIndexTemplate, {.active_key = "dashboard"});
 // NOLINTEND(cert-err58-cpp)

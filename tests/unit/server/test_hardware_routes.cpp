@@ -170,6 +170,21 @@ struct HwHarness {
 
 } // namespace
 
+// ───────────────────────── Page shell ──────────────────────────────────────────
+
+// Kills: a wrong active_key literal in page_shell() — apply_shell lights nothing and says
+// nothing for an unknown key, so only a test that fetches the page can see it.
+TEST_CASE("route: /hardware lights the Hardware sidebar item and its breadcrumb leaf",
+          "[hardware][route]") {
+    HwHarness h;
+    auto page = h.sink.Get("/hardware");
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+    CHECK(contains(page->body, "/fragments/hardware/list"));
+    CHECK(contains(page->body, "<a class=\"shell-nav on\" href=\"/hardware\" aria-current=\"page\">"));
+    CHECK(contains(page->body, "<span class=\"shell-sep\">/</span><b>Hardware</b>"));
+}
+
 // ───────────────────────── CI list fragment ────────────────────────────────────
 
 TEST_CASE("route: results_only returns ONLY the #hw-results region", "[hardware][route]") {

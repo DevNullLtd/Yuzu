@@ -468,7 +468,7 @@ The old three-tab **Inventory** dashboard is gone. `/inventory` itself still exi
 route, but it now just **302-redirects to `/hardware`** (auth still gates first, so an
 unauthenticated visitor lands on `/login`, never in a redirect loop through an
 authed-only destination) — old bookmarks and links keep working, nothing to change on
-your end beyond expecting a redirect. The top nav carries two separate links in its
+your end beyond expecting a redirect. The sidebar's **Estate** group carries two separate links in its
 place, **Hardware** and **Software**, each its own page:
 
 - **`/hardware`** — a ServiceNow-style Configuration-Item list and record; the successor
