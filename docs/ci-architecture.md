@@ -1668,16 +1668,18 @@ no macOS data yet. `release.yml` build-macos is now self-hosted on BigMags too (
 signing/notarization deferred to Phase B). Only the `pre-release.yml`
 `install-macos` smoke test stays GitHub-hosted (`macos-14`, ephemeral).
 
-The macOS job installs Erlang/OTP 28 + rebar3 per run, the same pin as the Linux leg, so
-the gateway is built and its eunit/ct suites run on macOS too. It downloads the prebuilt
-`erlef/otp_builds` OTP tarball and the rebar3 escript into `$RUNNER_TEMP` (per agent, per
-job) and verifies pinned SHA-256s, rather than using `erlef/setup-beam`: setup-beam
-re-copies one `/opt/ci/tool_cache/otp/...` tree that both BigMags agents share, and a
-debug + release pair starting together raced on it (36 of 79 macOS job failures
-2026-10-03..13). Before #4841 it had no Erlang and Meson silently skipped the gateway.
+The macOS job installs Erlang/OTP 28 + rebar3 per run, on the same major/minor line as the
+Linux leg (macOS pins the exact patch, the other legs float), so the gateway is built and
+its eunit/ct suites run on macOS too. It downloads the prebuilt `erlef/otp_builds` OTP
+tarball and the rebar3 escript into `$RUNNER_TEMP` (per agent, per job) and verifies pinned
+SHA-256s, rather than using `erlef/setup-beam`: setup-beam re-copies one
+`/opt/ci/tool_cache/otp/...` tree that both BigMags agents share, and a debug + release
+pair starting together raced on it. Dependabot does not bump these pins; the bump and
+hash-mismatch procedure is in `docs/darwin-compat.md` ("Erlang gateway in macOS CI").
+Before #4841 it had no Erlang and Meson silently skipped the gateway.
 
 Every CI leg that runs tests (ci.yml Linux/Windows/macOS, nightly asan/tsan/coverage/windows-asan, sanitizer-tests asan/tsan, and the dispatch-only
-`fork-dynamic-review.yml` Linux leg, which installs Erlang the same way) now runs
+`fork-dynamic-review.yml` Linux leg, which installs Erlang the same way as the Linux legs) now runs
 `scripts/ci/assert-gateway-tests.py <builddir>` straight after configure (`meson setup`, or `scripts/setup.sh` in the fork review leg), so a missing `rebar3` (gateway tests not registered)
 fails the Configure step rather than skipping. It is deliberately a post-configure check, not the `-Drequire_gateway` project
 option: a non-default project option stored in these persistent, branch-shared build dirs makes every older branch's

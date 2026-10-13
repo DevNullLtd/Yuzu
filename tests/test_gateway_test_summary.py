@@ -556,7 +556,10 @@ class AssertGatewayTests(unittest.TestCase):
         # must get a per-run temp dir instead (#4852). Every ci.yml leg that
         # installs Erlang with setup-beam must switch on trusted_execution. The
         # macOS leg no longer uses setup-beam: it downloads a hash-pinned OTP into
-        # RUNNER_TEMP, which is per agent and per job.
+        # RUNNER_TEMP, which is per agent and per job. NOTE: this asserts the
+        # declared intent only. The actions runner applies its own RUNNER_* values
+        # after a step's env (actions/runner NodeScriptActionHandler), so a
+        # step-level RUNNER_TOOL_CACHE is not what setup-beam sees.
         import yaml
         with open(os.path.join(ROOT, '.github', 'workflows', 'ci.yml'), encoding='utf-8') as f:
             doc = yaml.safe_load(f)
@@ -570,6 +573,31 @@ class AssertGatewayTests(unittest.TestCase):
                         self.assertIn('trusted_execution', cache)
                         self.assertIn('runner.temp', cache)
         self.assertEqual(legs, {'linux'})
+
+    def test_ci_macos_erlang_step_is_hash_pinned_and_not_setup_beam(self):
+        # The macOS leg installs a prebuilt OTP + rebar3 into RUNNER_TEMP instead of
+        # erlef/setup-beam, whose rmRF + re-copy of the tool cache both BigMags agents
+        # share raced. Pin what makes that substitute safe: no action, no tool cache,
+        # and BOTH downloads checked against a pinned SHA-256 (rebar3 has no upstream
+        # attestation, so the hash IS its only integrity control).
+        import yaml
+        with open(os.path.join(ROOT, '.github', 'workflows', 'ci.yml'), encoding='utf-8') as f:
+            steps = yaml.safe_load(f)['jobs']['macos']['steps']
+        self.assertFalse([s for s in steps if 'setup-beam' in str(s.get('uses', '')).lower()])
+        step, = [s for s in steps if s.get('name') == 'Install Erlang/OTP and rebar3']
+        self.assertNotIn('uses', step)
+        env, run = step.get('env') or {}, str(step.get('run') or '')
+        self.assertRegex(str(env.get('OTP_VERSION')), r'^\d+\.\d+')
+        for var in ('OTP_SHA256', 'REBAR3_SHA256'):
+            with self.subTest(pin=var):
+                self.assertRegex(str(env.get(var)), r'^[0-9a-f]{64}$')
+                self.assertRegex(run, r'verify "\$%s" ' % var)
+        self.assertEqual(run.count('verify "$'), 2)
+        self.assertIn('openssl dgst -sha256', run)
+        self.assertRegex(run, r'(?m)^\s*set -euo pipefail')
+        self.assertIn('$RUNNER_TEMP', run)
+        self.assertNotIn('tool_cache', run.lower())
+        self.assertNotIn('tool_cache', str(step.get('env')).lower())
 
 
 if __name__ == '__main__':
