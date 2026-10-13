@@ -10,8 +10,11 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
+using yuzu::server::keyset::b64url_decode;
+using yuzu::server::keyset::b64url_encode;
 using yuzu::server::keyset::decode_cursor;
 using yuzu::server::keyset::encode_cursor;
 using yuzu::server::keyset::kCursorMaxBytes;
@@ -51,6 +54,23 @@ TEST_CASE("keyset cursor: the wire form is pinned", "[keyset][workflow][executio
     CHECK(encode_cursor(kPrefix, {1735689600, "abc"}) == "w1:1735689600:YWJj");
     CHECK(encode_cursor(kPrefix, {0, "a"}) == "w1:0:YQ");
     CHECK(encode_cursor(kPrefix, {5, std::string("\xfb\xff", 2)}) == "w1:5:-_8");
+}
+
+TEST_CASE("keyset base64url: RFC 4648 vectors round trip and decoding is strict",
+          "[keyset][workflow][executions]") {
+    // The one codec behind the workflow-execution and the software-catalogue cursors.
+    for (const auto& [plain, coded] : std::vector<std::pair<std::string, std::string>>{
+             {"", ""}, {"f", "Zg"}, {"fo", "Zm8"}, {"foo", "Zm9v"}, {"foob", "Zm9vYg"},
+             {std::string("\xfb\xff", 2), "-_8"}}) {
+        INFO(coded);
+        CHECK(b64url_encode(plain) == coded);
+        REQUIRE(b64url_decode(coded).has_value());
+        CHECK(*b64url_decode(coded) == plain);
+    }
+    // Alphabet only: padding, whitespace, the standard-alphabet characters, and a tail of one
+    // sextet (length 1 mod 4) are all refused.
+    for (const char* bad : {"Zg==", "Zm 8", "Zm+/", "Z", "Zm9vY"})
+        CHECK_FALSE(b64url_decode(bad).has_value());
 }
 
 TEST_CASE("keyset cursor: wrong or missing prefix is refused", "[keyset][workflow][executions]") {

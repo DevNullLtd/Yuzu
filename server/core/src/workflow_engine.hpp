@@ -64,14 +64,22 @@ using ConditionEvalFn = std::function<bool(
 /// visibility clause relative to `ORDER BY`/`LIMIT` are unit-pinned. `$n` placeholders only —
 /// no caller value is ever spliced into the text.
 struct ExecutionPageSql {
+    /// Runs first, in the same transaction as `sql`: the read's `SET LOCAL statement_timeout`.
+    std::string statement_timeout_sql;
     std::string sql;
     std::vector<std::string> params;
+    /// The page size the statement was built for: `q.limit` clamped to
+    /// [1, kWorkflowExecutionListMax]. `sql` selects `limit + 1` rows and the store trims to this
+    /// value, so both bounds come from this one field.
+    int limit{0};
 };
 
 /// Builds the list statement for `q` (already validated; `limit` is clamped to
 /// [1, kWorkflowExecutionListMax]). Selects `limit + 1` rows: the extra row is the sentinel
 /// `query_executions_page` trims off to decide "more exist" without a count. `visible_agents`
 /// engaged adds the confinement predicate (engaged-empty adds `1=0`, never an unfiltered read).
+/// The predicate is NOT a byte-for-byte image of `workflow_execution_visible()`: see the
+/// divergence list on `query_executions_page`.
 [[nodiscard]] ExecutionPageSql
 build_execution_page_sql(const WorkflowExecutionListQuery& q,
                          const std::optional<std::vector<std::string>>& visible_agents);
@@ -144,6 +152,17 @@ public:
     /// length can never reveal one. Engaged-empty is deny-all and answers an empty page without
     /// touching the database. Malformed or non-array `agent_ids_json` is not visible to a confined
     /// caller (fail closed).
+    ///
+    /// The image is faithful for every document the engine itself writes (a JSON array of
+    /// strings). It diverges from the C++ predicate where PostgreSQL's jsonb and nlohmann accept
+    /// different JSON, and each divergence is pinned by a test row with its direction: a document
+    /// jsonb refuses (a `\u0000` escape, a UTF-8 byte-order mark) is hidden from a confined caller
+    /// here but shown by the C++ predicate (fails closed); a document jsonb accepts and nlohmann
+    /// rejects (a number past double range, `["a1",1e400]`) is shown here when it also names an
+    /// in-scope string id, and hidden by the C++ predicate, so the list can offer a run whose
+    /// detail read answers not-visible. In `latest_per_workflow` mode either case can change which
+    /// run is a workflow's latest. No out-of-scope run is ever exposed: a shown run always names an
+    /// in-scope agent.
     ///
     /// `unexpected(msg)` (prefixed `kDbErrorPrefix`) is a genuine failure — engine not open, pool
     /// exhausted, statement timeout (`kReadStatementTimeout`) or query error — and is never an

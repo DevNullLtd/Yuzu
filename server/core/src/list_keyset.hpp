@@ -2,7 +2,8 @@
 
 /// @file list_keyset.hpp
 /// Pure keyset-pagination primitives for newest-first lists ordered by `(order key DESC, id DESC)`:
-/// a position, its opaque cursor token, and a strict bounded integer parse.
+/// a position, its opaque cursor token, a strict bounded integer parse, and the strict base64url
+/// codec the token (and the software catalogue's own cursors) are built on.
 ///
 /// std-only, no I/O, no store, no transport include — safe for REST, MCP and a presentation-side
 /// client to share. The cursor is a POSITION only: it carries no filter fingerprint, so changing a
@@ -24,8 +25,8 @@
 
 namespace yuzu::server::keyset {
 
-/// Upper bounds a decoded token must satisfy. `kCursorMaxBytes` is also the request-side cap the
-/// REST and MCP parsers apply before decoding.
+/// Upper bounds a decoded token must satisfy. `kCursorMaxBytes` is also the request-side cap a
+/// transport's request parser applies before decoding.
 inline constexpr std::size_t kCursorMaxBytes = 2048;
 inline constexpr std::size_t kIdMaxBytes = 128;
 
@@ -36,6 +37,14 @@ struct Position {
     std::string id;
     bool operator==(const Position&) const = default;
 };
+
+/// base64url (RFC 4648 section 5), no padding. The one codec for every cursor token in the server.
+[[nodiscard]] std::string b64url_encode(std::string_view in);
+
+/// Strict: alphabet only (no `=` padding, no skipped bytes) and a tail length of 1 mod 4 is never
+/// valid; nullopt otherwise. Non-canonical trailing bits are NOT detected here; a caller that
+/// needs exactly one spelling per value re-encodes and compares (`decode_cursor` does).
+[[nodiscard]] std::optional<std::string> b64url_decode(std::string_view in);
 
 [[nodiscard]] std::string encode_cursor(std::string_view prefix, const Position& p);
 
