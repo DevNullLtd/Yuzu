@@ -326,7 +326,7 @@ TEST_CASE("ids_missing_plugin: an agent whose inventory does not include the plu
     p->set_name("os_info");
     registry.register_agent(info);
 
-    const auto missing = registry.ids_missing_plugin("tar");
+    const auto missing = registry.ids_missing_plugin("tar", "sql");
     CHECK(missing.contains("dev-A"));
 }
 
@@ -341,7 +341,7 @@ TEST_CASE("ids_missing_plugin: an agent whose inventory DOES include the plugin 
     p->set_name("tar");
     registry.register_agent(info);
 
-    const auto missing = registry.ids_missing_plugin("tar");
+    const auto missing = registry.ids_missing_plugin("tar", "sql");
     CHECK_FALSE(missing.contains("dev-A"));
 }
 
@@ -357,7 +357,7 @@ TEST_CASE("ids_missing_plugin: an agent with an EMPTY reported inventory is neve
     AgentRegistry registry(bus, metrics);
     registry.register_agent(make_presence_test_info("dev-A")); // no add_plugins() call at all
 
-    const auto missing = registry.ids_missing_plugin("tar");
+    const auto missing = registry.ids_missing_plugin("tar", "sql");
     CHECK_FALSE(missing.contains("dev-A"));
 }
 
@@ -378,7 +378,7 @@ TEST_CASE("ids_missing_plugin: a mixed fleet reports exactly the agents genuinel
 
     registry.register_agent(make_presence_test_info("dev-no-inventory"));
 
-    const auto missing = registry.ids_missing_plugin("tar");
+    const auto missing = registry.ids_missing_plugin("tar", "sql");
     CHECK(missing.size() == 1);
     CHECK(missing.contains("dev-lacks-it"));
     CHECK_FALSE(missing.contains("dev-has-it"));
@@ -439,14 +439,14 @@ TEST_CASE("BR-009: ids_missing_plugin against the canonical wire plugin name "
     registry.register_agent(info);
 
     // The fix: query with the canonical wire plugin — the agent has it.
-    const auto missing_canonical = registry.ids_missing_plugin(classified->wire().plugin());
+    const auto missing_canonical = registry.ids_missing_plugin(classified->wire().plugin(), "sql");
     CHECK_FALSE(missing_canonical.contains("dev-A"));
 
     // The bug BR-009 fixed: querying with the raw caller casing instead would
     // have wrongly reported dev-A as missing the plugin it genuinely has —
     // pinned here so a future call-site regression back to the raw string is
     // caught by this same test, not just by the composition it demonstrates.
-    const auto missing_raw_caller_casing = registry.ids_missing_plugin("TAR");
+    const auto missing_raw_caller_casing = registry.ids_missing_plugin("TAR", "sql");
     CHECK(missing_raw_caller_casing.contains("dev-A"));
 }
 
