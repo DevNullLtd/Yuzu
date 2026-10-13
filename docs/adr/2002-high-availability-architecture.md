@@ -504,7 +504,7 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
 - **The re-announce/"known-session" check is PER-REPLICA in-memory** (`gateway_sessions_`) on the
   `ProxyRegister` replay branch (#4246 #3). *Update 2026-10-11: the `BatchHeartbeat` /
   `ProxyInventory` / `NotifyStreamStatus` session resolution is now directory-authoritative — see §7f
-  (implemented on branch `feat/ha-ws5-session-lookup`, no PR yet); the `ProxyRegister` known-session
+  (merged as PR #5694, 2026-10-12); the `ProxyRegister` known-session
   check itself is unchanged.* Under active-active a replay routed to a non-owning replica still takes
   the fresh branch until the safe-to-scale gate work lands.
 - **Re-announce refreshes LIVENESS (lease), not PLACEMENT** — `cluster_id`/`gateway_node` are not
@@ -1125,7 +1125,8 @@ so a wrong disposition is never edited in place, only superseded by a later row 
 "remaining 4.4 scope" in §7b's `#4555` decision text) is judged OUT of WS-4 4.4's actual scope: the
 WS-4 gate exists because "commands can't reach agents" (`docs/ha-delivery-matrix.md`), and gossip-based
 peer health/rebalancing is a capacity/load-balancing feature, not a reachability one. Tracked separately,
-not a WS-4 gate item.
+not a WS-4 gate item: as of 2026-10-13 that tracker is **WS-15** in `docs/ha-delivery-matrix.md`
+(roadmap 7.1.1, #5759), paired with WS-13's agent-side failover (roadmap 14.2, #291).
 
 **Update (2026-10-01, #1197 - server-side unknown-session verdict; INERT until the gateway consumes it).**
 `BatchHeartbeatResponse` gained `repeated string unknown_session_ids = 2` and
@@ -1904,7 +1905,7 @@ every branch this PR's own scope covers, not that one.
 
 ### 7f. Durable cross-replica gateway session resolution (WS-5 slice 2, `#4246` item #3, 2026-10-11)
 
-**Status: implemented on branch `feat/ha-ws5-session-lookup`, no PR yet. THE SAFE-TO-SCALE GATE IS NOT
+**Status: merged as PR #5694 (`eabc2b639`, 2026-10-12). THE SAFE-TO-SCALE GATE IS NOT
 LIFTED** — this closes one more `#4246` gap; it does not make a second replica safe (WS-6 6.1b/6.3, WS-13
 for gateway-fronted fleets, WS-5's remaining slice-1 scope and the WS-9 scenarios are still open — see
 `docs/ha-delivery-matrix.md`). Run exactly ONE server replica (§7c).
@@ -1952,28 +1953,36 @@ is counted under route-store failure op `session_lookup`.
   directory verified at `ProxyRegister`, which is sound only for a single replica; see "Deferred, not
   silent"); otherwise it is refused and counted
   `notify_stream_status/connected_unverified`. DISCONNECTED proceeds on the local-map check when the
-  directory read fails (it is a teardown, not an admission), and its presence-row delete is gated on
+  directory read fails (it is a teardown, not an admission), and its presence-row delete (#5678: now
+  a session clear; the row is kept for the roster) is gated on
   `removed_current_session || store_removed`. A CONNECTED on a replica with a directory row but no
   local `AgentSession` skips the registry `set_gateway_route`/unpublish (nothing local to update) and
   still announces.
 - **Presence correctness (§7a).** `OfflineEndpointStore::upsert` blank-preserves `hostname`
-  (newly; `os` has been blank-preserved since #5294, as were `agent_version`/`arch`): a blank incoming
-  value never overwrites a known non-blank one. Consequence: a presence row's `hostname` is never
-  cleared by an upsert — it is reset only by deleting the row (`remove_if_session`, or the
-  decommission cascade below). Gap recorded when this bullet was written (pre-existing, not
-  introduced by WS-5): `OfflineEndpointStore` had no `delete_agent` and was not a member of the
-  decommission cascade (`AgentDecommissionStores`), so a decommissioned agent's
-  `endpoint_state.endpoints` row (including its `hostname`) persisted indefinitely, because the only
-  delete was the session-guarded `remove_if_session`, reached from a DISCONNECTED the decommissioned
-  agent never sends. **Closed by #5682:** `OfflineEndpointStore::delete_agent` deletes the row
-  whatever its `session_id`, and it is the cascade's seventh member (`offline_endpoint`), so
-  `DELETE /api/v1/sle/agents/{id}` erases it on the shared Postgres, visible to every replica's next
-  presence read (the registry's 3 s `kPresenceCacheTtl` read cache aside). A still-enrolled agent
-  that heartbeats again re-creates the row, the same "erasure does not unenroll" posture as every
-  other cascade store. There is still no age-out pass for the table; the time-based prune stays
-  with #1545. `HeartbeatIngestion::ingest`
-  takes the resolved session id, so a heartbeat on a non-owning replica (no local `AgentSession`)
-  cannot blank the presence row's `session_id`.
+  (newly; `os` has been blank-preserved since #5294, as were `agent_version`/`arch`) and, since
+  #5678 (2026-10-12), `session_id`: a blank incoming value never overwrites a known non-blank one.
+  A graceful disconnect (`remove_if_session`) clears ONLY the row's `session_id` (session-guarded
+  `UPDATE`, #5678); `hostname` and the other fields survive so the offline-inclusive `/hardware`
+  roster keeps listing the device with its real last-seen time. Rows are aged out by a clock-guarded
+  hourly per-replica prune (`pg::run_clock_guarded_prune` on `preflight_runner_thread_`, keyed on the
+  PG-authored `last_seen_at`: 37 d = the 30 d roster window + a 7 d margin, advisory-locked, up to 12
+  passes of 1000 rows per hourly tick) (#5678, 2026-10-12), and the decommission cascade below deletes
+  a decommissioned agent's row explicitly, so a presence row's `hostname` is never cleared by an
+  upsert and goes away only when one of those two deletes removes the row. Gap recorded when this
+  bullet was written (pre-existing, not introduced by WS-5): `OfflineEndpointStore` had no
+  `delete_agent` and was not a member of the decommission cascade (`AgentDecommissionStores`), so a
+  decommissioned agent's `endpoint_state.endpoints` row (including its `hostname`) persisted
+  indefinitely, because the only delete was the session-guarded `remove_if_session`, reached from a
+  DISCONNECTED the decommissioned agent never sends. **Closed by #5682:**
+  `OfflineEndpointStore::delete_agent` deletes the row whatever its `session_id`, and it is the
+  cascade's seventh member (`offline_endpoint`), so `DELETE /api/v1/sle/agents/{id}` erases it on the
+  shared Postgres, visible to every replica's next presence read (the registry's 3 s
+  `kPresenceCacheTtl` read cache aside). A still-enrolled agent that heartbeats again re-creates the
+  row, the same "erasure does not unenroll" posture as every other cascade store. A device that is
+  never decommissioned ages out through the prune above (#5678). Reads filter by TTL or stale window,
+  so a departed row is flagged stale on `/viz` for 7 days and is invisible to scope evaluation.
+  `HeartbeatIngestion::ingest` takes the resolved session id, so a heartbeat on a non-owning replica
+  (no local `AgentSession`) cannot blank the presence row's `session_id`.
 
 **Local hydration (server-only restart).** The directory rows survive a server restart but the local
 registry and `gateway_sessions_` do not, and the gateway only replays `ProxyRegister` for ids the

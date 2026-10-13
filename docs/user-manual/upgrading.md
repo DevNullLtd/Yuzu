@@ -821,6 +821,16 @@ On Linux, `vuln_scan` (`scan`, `config_scan`) now reports a config file it could
 
 No config or data migration is required.
 
+## Behaviour change: devices that disconnect cleanly stay on `/hardware` as Offline (#5678)
+
+**Not a Breaking lead:** no flag, wire format or API shape changes. In 0.14.0 a graceful agent disconnect deleted the device's `endpoint_state` row, so the device vanished from `/hardware` instead of showing as Offline. A graceful disconnect now clears only the row's presence session, so the device stays listed with its real last-seen time.
+
+- **Migration v4 runs automatically** at server start. It is additive (`CREATE TABLE IF NOT EXISTS endpoint_state.retention_meta`), so rolling back to the previous server binary is safe: the old binary ignores the table.
+- **Devices that disconnected under 0.14.0 were deleted and are not restored.** Each reappears on `/hardware` the next time it connects.
+- **`/viz/fleet` and MCP `get_fleet_topology`** now also show a departed device, flagged stale, for 7 days, so `yuzu_viz_offline_hosts_total` rises after the upgrade.
+- **Retention.** A row is deleted 37 days after its device was last seen (the 30-day roster window plus a 7-day margin). Each replica runs the prune hourly and deletes at most 12,000 rows per hour. The first pass runs about a minute after the server starts. On the first start after the upgrade it only records its clock anchor, so deletions begin with the next hourly pass; on every later start it already deletes; a large backlog inherited from an older release drains at that rate (100,000 rows in about 8 hours).
+- **Decommission erases the row.** `DELETE /api/v1/sle/agents/{id}` deletes the device's `endpoint_state` row (#5682), so a decommissioned device leaves `/hardware`. A still-enrolled agent that heartbeats again re-creates it, so stop the agent first. A device that is never decommissioned ages out under the 37-day rule.
+
 ## Behaviour change: a failed device-roster read is reported instead of shown as an empty fleet (#5531)
 
 **Not a Breaking lead:** `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` already declared a `503` response; what changes is when it fires. (The new `400` on the record and sync routes, below, applies only to ids over 256 bytes or carrying a byte below `0x20`, which agent registration never accepts.) Before this release a failed read of the persisted device roster (pool timeout or query error) was shown as an empty roster.

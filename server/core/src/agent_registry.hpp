@@ -680,16 +680,17 @@ public:
     ///
     /// HA WS-5 governance hardening (external review finding, 2026-09-22):
     /// the return value is load-bearing for the caller's durable-presence
-    /// mirror (agent_service_impl.cpp / gateway_service_impl.cpp), which
+    /// mirror (presence_departure.hpp, used by agent_service_impl.cpp /
+    /// gateway_service_impl.cpp), which
     /// must fire OfflineEndpointStore::remove_if_session ONLY when this
     /// returns true. The durable row's own session_id column is
     /// heartbeat-driven, not registration-driven (see heartbeat_ingestion.cpp)
     /// — so on an ordinary same-replica reconnect (S1 disconnects, S2
     /// registers, S2 hasn't heartbeated yet), the durable row can still read
     /// S1's session_id even though S1 is already locally superseded by S2.
-    /// A caller that fires the durable delete unconditionally (using S1's
+    /// A caller that fires the durable clear unconditionally (using S1's
     /// own session_id, which still legitimately matches the stale row) would
-    /// delete a LIVE agent's presence row — a false-negative other replicas'
+    /// clear a LIVE agent's presence — a false-negative other replicas'
     /// evaluate_scope()/all_ids() would silently inherit. Bool was `void`
     /// before this fix; every caller was already local to this repo (grep
     /// verified two call sites, both updated in the same change).

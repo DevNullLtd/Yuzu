@@ -518,9 +518,19 @@ jobs:
           bash scripts/ci/check-portable-paths.sh --selftest
           bash scripts/ci/check-portable-paths.sh
 
+      # test_check_elf_floor.sh parses the workflows with PyYAML (its tripwire);
+      # the hosted image may lack it, so install it hash-pinned like docs-lint.yml.
+      - name: Install PyYAML (hash-pinned)
+        run: |
+          python3 -c "import yaml" 2>/dev/null || \
+            python3 -m pip install --user --break-system-packages \
+              --disable-pip-version-check --require-hashes -r requirements-ci.txt
+
       # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
       # otherwise only runs at release time, so a regex regression would surface
-      # too late (after the full build matrix). No build deps — just bash.
+      # too late (after the full build matrix). No build deps — just bash (and
+      # python3; test_check_elf_floor.sh also needs gcc + binutils, all on the
+      # hosted ubuntu runner).
       - name: Shell gate tests
         run: |
           bash tests/shell/test_check_compose_versions.sh
@@ -533,6 +543,7 @@ jobs:
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
           bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
+          bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
 
       # Prometheus HELP-text ASCII gate (#2128). Source-only, no build deps,
       # so it belongs on the PR fast path beside the shell gate above rather
