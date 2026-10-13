@@ -195,7 +195,7 @@ public:
     /// it commits is created deployed (it accepts any lifecycle, but every production caller,
     /// the Guardian route create_baseline_from_form, creates a draft, and a draft is not part
     /// of the deployed set, so a draft create stays silent). The writer sweep in
-    /// tests/test_guardian_reconcile_wiring_lexical.py (added with the reconcile wire-up) keeps every writer of the baselines
+    /// tests/test_guardian_reconcile_wiring_lexical.py keeps every writer of the baselines
     /// table honest.
     void set_on_baseline_mutation(std::function<void()> hook);
 
