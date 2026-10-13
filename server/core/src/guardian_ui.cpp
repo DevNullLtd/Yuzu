@@ -55,7 +55,6 @@ extern const char* const kGuardianHtml =
     .section-body.flush { padding: 0; }
     .gs-meta { font-size: 12.5px; font-weight: 400; color: var(--mut); }
     .gs-push { margin-left: auto; }
-    .gs-hd-note { margin-left: auto; font-size: 12.5px; font-weight: 400; color: var(--mut); }
     .gs-hd-search {
       margin-left: auto; height: 28px; max-width: 190px; padding: 0 10px; font-size: 13px;
       color: var(--ink); background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
@@ -120,25 +119,24 @@ extern const char* const kGuardianHtml =
       display: inline-flex; align-items: center; gap: 6px;
       padding: 1px 8px; border-radius: 3px; font-size: 12.5px; font-weight: 500;
     }
-    .worst-good { background: color-mix(in srgb, var(--ok) 14%, transparent);   color: var(--ok); }
-    .worst-warn { background: color-mix(in srgb, var(--warn) 15%, transparent); color: var(--warn); }
-    .worst-bad  { background: color-mix(in srgb, var(--bad) 14%, transparent);  color: var(--bad); }
+    .worst-good { background: var(--mds-color-bg-success-tinted);   color: var(--ok); }
+    .worst-warn { background: var(--mds-color-bg-warning-tinted); color: var(--warn); }
+    .worst-bad  { background: var(--mds-color-bg-error-tinted);  color: var(--bad); }
 
     /* ── Guard status badges (full taxonomy) ───────────────── */
     .gs-badge {
       display: inline-block; padding: 1px 8px; border-radius: 3px;
       font-size: 12.5px; font-weight: 500; white-space: nowrap;
     }
-    .gs-compliant          { background: color-mix(in srgb, var(--ok) 14%, transparent);   color: var(--ok); }
-    .gs-drifted            { background: color-mix(in srgb, var(--warn) 15%, transparent); color: var(--warn); }
-    .gs-remediation_failed { background: color-mix(in srgb, var(--bad) 14%, transparent);  color: var(--bad); }
-    .gs-errored            { background: color-mix(in srgb, var(--bad) 14%, transparent);  color: var(--bad); }
+    .gs-compliant          { background: var(--mds-color-bg-success-tinted);   color: var(--ok); }
+    .gs-drifted            { background: var(--mds-color-bg-warning-tinted); color: var(--warn); }
+    .gs-remediation_failed { background: var(--mds-color-bg-error-tinted);  color: var(--bad); }
+    .gs-errored            { background: var(--mds-color-bg-error-tinted);  color: var(--bad); }
     .gs-exempt, .gs-stale  { background: var(--surface2); color: var(--mut); }
 
     /* guard_healthy signal — distinct from compliance state. */
     .health-ok   { color: var(--ok); }
     .health-bad  { color: var(--bad); }
-    .health-dot  { font-size: 11px; }
 
     /* ── Segmented controls: view switcher (fleet / guard / baseline) + state chips ── */
     .view-switch, .gs-chips {
@@ -208,10 +206,10 @@ extern const char* const kGuardianHtml =
     .event-top { display: flex; align-items: center; gap: 8px; }
     .event-time { font-family: var(--mds-font-family-mono); font-size: 12.5px; color: var(--mut); }
     .event-type { padding: 1px 8px; border-radius: 3px; font-size: 12.5px; font-weight: 500; }
-    .et-drift_detected, .et-resilience_escalated { background: color-mix(in srgb, var(--warn) 15%, transparent); color: var(--warn); }
-    .et-drift_remediated    { background: color-mix(in srgb, var(--ok) 14%, transparent);   color: var(--ok); }
-    .et-remediation_failed, .et-guard_unhealthy { background: color-mix(in srgb, var(--bad) 14%, transparent); color: var(--bad); }
-    .et-guard_armed         { background: color-mix(in srgb, var(--info) 14%, transparent); color: var(--info); }
+    .et-drift_detected, .et-resilience_escalated { background: var(--mds-color-bg-warning-tinted); color: var(--warn); }
+    .et-drift_remediated    { background: var(--mds-color-bg-success-tinted);   color: var(--ok); }
+    .et-remediation_failed, .et-guard_unhealthy { background: var(--mds-color-bg-error-tinted); color: var(--bad); }
+    .et-guard_armed         { background: var(--mds-color-bg-info-tinted); color: var(--info); }
     .et-generic             { background: var(--surface2); color: var(--mut); }
     .event-detail { color: var(--mut); margin-top: 4px; }
     .event-detail strong { color: var(--ink); font-weight: 600; }
@@ -254,10 +252,10 @@ extern const char* const kGuardianHtml =
       font-size: 12.5px; font-weight: 500; border-radius: 3px; padding: 1px 8px;
       color: var(--mut); background: var(--surface2);
     }
-    .gs-cpill.sev-critical, .gs-cpill.sev-high { color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, transparent); }
-    .gs-cpill.sev-medium { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); }
-    .gs-cpill.sev-low, .gs-cpill.enforce { color: var(--info); background: color-mix(in srgb, var(--info) 14%, transparent); }
-    .gs-cpill.on { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+    .gs-cpill.sev-critical, .gs-cpill.sev-high { color: var(--bad); background: var(--mds-color-bg-error-tinted); }
+    .gs-cpill.sev-medium { color: var(--warn); background: var(--mds-color-bg-warning-tinted); }
+    .gs-cpill.sev-low, .gs-cpill.enforce { color: var(--info); background: var(--mds-color-bg-info-tinted); }
+    .gs-cpill.on { color: var(--ok); background: var(--mds-color-bg-success-tinted); }
     .gs-pbar { display: flex; gap: 2px; height: 12px; border-radius: 3px; overflow: hidden; background: var(--bg); }
     .gs-pbar > span { display: flex; align-items: center; justify-content: center; font-size: 11px; color: var(--on-primary); font-weight: 600; }
     .gs-legend { font-size: 13px; color: var(--mut); margin-top: 6px; }
@@ -268,29 +266,13 @@ extern const char* const kGuardianHtml =
     .gs-view { color: var(--primary); font-size: 13px; font-weight: 500; margin-top: 6px; }
     @media (max-width: 760px) { .gs-card { grid-template-columns: 1fr; } }
 
-    /* ── Detail panel ──────────────────────────────────────── */
-    .detail-panel { margin-top: 8px; padding: 16px; background: var(--surface);
-                    border: 1px solid var(--line); border-radius: var(--rad-panel); }
-    .detail-panel h3 { font-size: 14px; font-weight: 600; margin-bottom: 8px;
-                       display: flex; align-items: center; gap: 8px; }
+    /* ── Key / value rows ──────────────────────────────────── */
     .kv { display: grid; grid-template-columns: 130px 1fr; gap: 6px 16px;
           font-size: 13.5px; margin-bottom: 12px; }
     .kv .k { color: var(--mut); }
     .gs-mono { font-family: var(--mds-font-family-mono); font-size: 12.5px; }
     /* let long unbreakable values (registry key paths) wrap instead of clipping */
     .kv > div { min-width: 0; overflow-wrap: anywhere; }
-    .detail-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-    .detail-table th {
-      text-align: left; padding: 8px 12px; font-size: 12.5px; font-weight: 500; color: var(--mut);
-      background: var(--surface2); border-bottom: 1px solid var(--line);
-    }
-    .detail-table td { padding: 8px 12px; border-bottom: 1px solid var(--line); }
-    .detail-table tr:hover td { background: var(--surface2); }
-    pre.yaml {
-      background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
-      padding: 12px; font-family: var(--mds-font-family-mono); font-size: 12.5px;
-      overflow-x: auto; white-space: pre; color: var(--ink);
-    }
 
     /* ── Forms (create Guard / Baseline, push) ─────────────── */
     .gs-form label { display: block; font-size: 13px; font-weight: 500; color: var(--ink2); margin: 12px 0 4px; }
@@ -304,11 +286,6 @@ extern const char* const kGuardianHtml =
                         font-family: var(--mds-font-family-mono); font-size: 12.5px; }
     .form-row { display: flex; gap: 16px; }
     .form-row > div { flex: 1; }
-    .form-actions { margin-top: 16px; display: flex; gap: 8px; }
-
-    /* ── Push panel ────────────────────────────────────────── */
-    .push-row { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; }
-    .push-row > div { flex: 1; min-width: 220px; }
 
     /* ── Empty / loading states ────────────────────────────── */
     .empty-state { text-align: center; padding: 32px 16px; color: var(--mut); font-size: 13.5px; }
@@ -377,12 +354,6 @@ extern const char* const kGuardianHtml =
     .gs-advanced > summary::before { content: "\25B8\00a0"; }
     .gs-advanced[open] > summary::before { content: "\25BE\00a0"; }
     .gs-advanced[open] > summary { color: var(--ink); }
-    .gs-radio-row { display: flex; gap: 20px; margin: 4px 0 2px; }
-    .gs-radio {
-      display: flex; align-items: center; gap: 6px; margin: 0;
-      font-size: 14px; font-weight: 400; cursor: pointer; color: var(--ink);
-    }
-    .gs-radio input { width: auto; }
 
     /* New Baseline — member-guards typeahead + chips */
     .bl-guard-picker { display: flex; gap: 8px; align-items: center; }
@@ -522,7 +493,7 @@ extern const char* const kGuardianHtml =
     <div class="section">
       <div class="section-header">
         Baselines
-        <span class="gs-hd-note">
+        <span class="gs-meta gs-push">
           deploy is Baseline-level
         </span>
       </div>

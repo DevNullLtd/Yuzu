@@ -35,7 +35,7 @@ extern const char* const kGuardianDetailPageHtml =
 
     /* page header: title + actions */
     .gp-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between;
-               gap: 12px 24px; }
+               gap: 12px 24px; margin-bottom: 12px; }
     .gp-head h1 { font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2; }
     .gp-titleline { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .gp-sub { font-size: 14px; color: var(--mut); margin-top: 4px; max-width: 70ch; }
@@ -66,10 +66,10 @@ extern const char* const kGuardianDetailPageHtml =
     .gp-pill { display: inline-block; padding: 1px 8px; border-radius: 3px; font-size: 12.5px;
                font-weight: 500; white-space: nowrap; color: var(--mut); background: var(--surface2); }
     .gp-pill[class*="sev-"] { text-transform: capitalize; }
-    .gp-pill.dep { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
-    .gp-pill.sev-critical, .gp-pill.sev-high { color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, transparent); }
-    .gp-pill.sev-medium { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); }
-    .gp-pill.sev-low, .gp-pill.enforce { color: var(--info); background: color-mix(in srgb, var(--info) 14%, transparent); }
+    .gp-pill.dep { color: var(--ok); background: var(--mds-color-bg-success-tinted); }
+    .gp-pill.sev-critical, .gp-pill.sev-high { color: var(--bad); background: var(--mds-color-bg-error-tinted); }
+    .gp-pill.sev-medium { color: var(--warn); background: var(--mds-color-bg-warning-tinted); }
+    .gp-pill.sev-low, .gp-pill.enforce { color: var(--info); background: var(--mds-color-bg-info-tinted); }
 
     /* compliance hero */
     .gp-hero { display: flex; gap: 24px; align-items: center; flex-wrap: wrap; padding: 16px 18px;
@@ -105,18 +105,14 @@ extern const char* const kGuardianDetailPageHtml =
 
     /* tables: bordered region, sentence-case header on surface2, 1px row rules */
     .gp-table { width: 100%; border-collapse: separate; border-spacing: 0; background: var(--surface);
-                border: 1px solid var(--line); border-radius: var(--rad-panel); }
+                color: var(--ink2); border: 1px solid var(--line); border-radius: var(--rad-panel); overflow: hidden; }
     .gp-table th { text-align: left; padding: 8px 16px; font-size: 12.5px; font-weight: 500; color: var(--mut);
                    white-space: nowrap; background: var(--surface2); border-bottom: 1px solid var(--line); }
-    .gp-table th:first-child { border-top-left-radius: 3px; }
-    .gp-table th:last-child { border-top-right-radius: 3px; }
     /* numeric headers must right-align to sit over their right-aligned data — the
        `.gp-table th` rule above out-specifies a bare `.gp-num`, so qualify it. */
     .gp-table th.gp-num { text-align: right; }
-    .gp-table td { padding: var(--cell-y) 16px; color: var(--ink2); border-bottom: 1px solid var(--line); }
+    .gp-table td { padding: var(--cell-y) 16px; border-bottom: 1px solid var(--line); }
     .gp-table tr:last-child td { border-bottom: 0; }
-    .gp-table tr:last-child td:first-child { border-bottom-left-radius: 3px; }
-    .gp-table tr:last-child td:last-child { border-bottom-right-radius: 3px; }
     .gp-table tr.click { cursor: pointer; }
     .gp-table tbody tr:hover td { background: var(--surface2); }
     .gp-table a { color: var(--ink); font-weight: 600; text-decoration: none; }
@@ -127,14 +123,13 @@ extern const char* const kGuardianDetailPageHtml =
 
     /* filter chips: adjacent chips fuse into one segmented control (active = raised) */
     .gp-filters { display: flex; gap: 8px 10px; align-items: center; flex-wrap: wrap; margin: 12px 0 10px; }
-    .gp-chip { --rl: 0; --rr: 0; display: inline-flex; align-items: center; height: var(--ctl); padding: 0 14px;
+    .gp-chip { display: inline-flex; align-items: center; height: var(--ctl); padding: 0 14px;
                font-size: 13.5px; font-weight: 500; color: var(--mut); white-space: nowrap; cursor: pointer;
-               background: var(--bg); border: 1px solid var(--line2); text-decoration: none;
-               border-radius: var(--rl) var(--rr) var(--rr) var(--rl);
-               transition: color .12s, background-color .12s; }
-    .gp-chip + .gp-chip { margin-left: -11px; }
-    .gp-chip:not(.gp-chip + .gp-chip) { --rl: var(--rad-ctl); }
-    .gp-chip:not(:has(+ .gp-chip)) { --rr: var(--rad-ctl); }
+               background: var(--bg); border: 1px solid var(--line2); border-radius: var(--rad-ctl);
+               text-decoration: none; transition: color .12s, background-color .12s; }
+    /* only in a filter bar: the 10px column gap + 1px shared border = -11px, pulled on the leading chip so a wrapped chip never leaves the row */
+    .gp-filters .gp-chip:has(+ .gp-chip) { margin-right: -11px; border-top-right-radius: 0; border-bottom-right-radius: 0; }
+    .gp-filters .gp-chip + .gp-chip { border-top-left-radius: 0; border-bottom-left-radius: 0; }
     .gp-chip:hover { color: var(--ink); }
     .gp-chip.on { color: var(--ink); background: var(--raise); font-weight: 600; }
     .gp-search { height: var(--ctl); min-width: 200px; padding: 0 10px; font-size: 14px; color: var(--ink);
@@ -146,7 +141,7 @@ extern const char* const kGuardianDetailPageHtml =
     .gp-ev .t { color: var(--mut); white-space: nowrap; font-size: 12.5px;
                 font-family: var(--mds-font-family-mono); }
     .gp-badge { padding: 1px 8px; border-radius: 3px; font-size: 12.5px; font-weight: 500; color: var(--warn);
-                background: color-mix(in srgb, var(--warn) 15%, transparent); }
+                background: var(--mds-color-bg-warning-tinted); }
 
     .gp-placeholder { text-align: center; color: var(--mut); padding: 24px 16px; font-size: 13.5px;
                       background: var(--surface); border: 1px solid var(--line); border-radius: var(--rad-panel); }
@@ -177,7 +172,6 @@ extern const char* const kGuardianDetailPageHtml =
     .gp-fcard { display: block; padding: 14px 16px; color: var(--ink); cursor: pointer; background: var(--surface);
                 border: 1px solid var(--line); border-radius: var(--rad-panel); transition: border-color .12s; }
     .gp-fcard:hover { border-color: var(--mut); }
-    .gp-fcard.quiet { opacity: .6; }
     .gp-fcard .fn { color: var(--ink); font-weight: 600; font-size: 14px; display: flex;
                 justify-content: space-between; align-items: baseline; gap: 6px; }
     .gp-fcard .fn .cnt { font-size: 12.5px; color: var(--mut); font-weight: 400; white-space: nowrap; }
@@ -188,6 +182,8 @@ extern const char* const kGuardianDetailPageHtml =
     .gp-fcard .ftop { font-size: 12.5px; color: var(--mut); margin-top: 8px;
                 border-top: 1px solid var(--line); padding-top: 8px; }
     .gp-fcard .ftop b { color: var(--ink); font-weight: 600; }
+    .gp-fcard.quiet { border-style: dashed; }
+    .gp-fcard.quiet :is(.fn, .cnt, .fev, .fmeta, .ftop, b) { color: var(--faint); }
 )HTM"
     // MSVC caps a single string literal at ~16 KB; the page shell + component CSS
     // outgrew it, so the literal is split here (adjacent literals concatenate).
@@ -198,8 +194,7 @@ extern const char* const kGuardianDetailPageHtml =
                 border-radius: var(--rad-panel); padding: 12px 14px; }
     .gp-primary { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; padding: 14px 18px;
                 background: var(--surface); border: 1px solid var(--line); border-radius: var(--rad-panel); }
-    .gp-primary .big { font-size: 26px; font-weight: 500; letter-spacing: -.02em; color: var(--ok); line-height: 1.15; }
-    .gp-primary .big.sec { color: var(--ink); }
+    .gp-primary .big { font-size: 26px; font-weight: 500; letter-spacing: -.02em; color: var(--ink); line-height: 1.15; }
     .gp-primary .lbl { font-size: 13px; color: var(--mut); }
     .gp-primary .vdiv { width: 1px; align-self: stretch; background: var(--line); }
     .gp-composite { display: flex; gap: 24px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
@@ -234,13 +229,14 @@ extern const char* const kGuardianDetailPageHtml =
     .gp-oscards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
     .gp-oscard { background: var(--surface); border: 1px solid var(--line); border-radius: var(--rad-panel);
                 padding: 14px 16px; }
-    .gp-oscard.pending { opacity: .6; border-style: dashed; }
+    .gp-oscard.pending { border-style: dashed; }
+    .gp-oscard.pending :is(.os, .scope) { color: var(--faint); }
     .gp-oscard .os { display: flex; align-items: center; gap: 8px; font-size: 14px;
                 color: var(--ink); font-weight: 600; }
     .gp-oscard .state { font-size: 12.5px; border-radius: 3px; padding: 0 6px; color: var(--mut);
                 background: var(--surface2); }
-    .gp-oscard .state.live { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
-    .gp-oscard .state.limited { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); }
+    .gp-oscard .state.live { color: var(--ok); background: var(--mds-color-bg-success-tinted); }
+    .gp-oscard .state.limited { color: var(--warn); background: var(--mds-color-bg-warning-tinted); }
     .gp-oscard .scope { font-size: 12.5px; color: var(--mut); margin-top: 2px; }
     .gp-smgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
     .gp-sm { background: var(--surface); border: 1px solid var(--line); border-radius: var(--rad-panel);

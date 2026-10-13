@@ -52,6 +52,9 @@
 #include <string_view>
 #include <vector>
 
+// The /guardian page shell (defined in guardian_ui.cpp).
+extern const char* const kGuardianHtml;
+
 using namespace yuzu::server;
 
 namespace {
@@ -909,6 +912,38 @@ TEST_CASE("guard/baseline detail page shells serve the shell with the fragment U
     REQUIRE(b != nullptr);
     CHECK(b->status == 200);
     CHECK(b->body.find("/fragments/guardian/baseline/bl1/page") != std::string::npos);
+}
+
+// The slate restyle changed two things an operator sees and no assertion pinned either, so a
+// revert would have passed: the header's primary action is the solid btn-primary, and a guard's
+// state reads "Enabled"/"Disabled" (it was upper-case).
+TEST_CASE("/guardian shell: the New Guard header action is btn-primary",
+          "[guardian_routes][page]") {
+    const std::string_view shell{kGuardianHtml};
+    const auto label = shell.find("+ New Guard");
+    REQUIRE(label != std::string_view::npos);
+    const auto open = shell.rfind("<button", label);
+    REQUIRE(open != std::string_view::npos);
+    const auto tag = shell.substr(open, label - open);
+    CHECK(tag.find("btn-primary") != std::string_view::npos);
+    CHECK(tag.find("btn-secondary") == std::string_view::npos);
+}
+
+TEST_CASE("guards fragment: a guard state reads Enabled or Disabled and never upper-case",
+          "[pg][guardian_routes][page]") {
+    Harness h;
+    h.seed_guard("g-on", "GuardOn");
+    auto off = make_rule("g-off", "GuardOff");
+    off.enabled = false;
+    h.seed_rule(off);
+
+    auto g = h.sink.dispatch("GET", "/fragments/guardian/guards", "", "");
+    REQUIRE(g != nullptr);
+    CHECK(g->status == 200);
+    CHECK(g->body.find(">Enabled</span>") != std::string::npos);
+    CHECK(g->body.find(">Disabled</span>") != std::string::npos);
+    CHECK(g->body.find("ENABLED") == std::string::npos);
+    CHECK(g->body.find("DISABLED") == std::string::npos);
 }
 
 // Governance sec-H1: the Guard page renders `severity` into a CSS class attribute.

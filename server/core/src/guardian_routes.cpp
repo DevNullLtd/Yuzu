@@ -1149,7 +1149,7 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
     // S1). 200 + banner + list keeps the list visible and shows what failed.
     auto fail = [this, &res](const std::string& msg) {
         res.status = 200;
-        res.set_content("<div class=\"gs-banner err\">" +
+        res.set_content("<div class=\"gs-error-banner gs-banner err\">" +
                             html_escape(msg) + "</div>" + render_guards_fragment(""),
                         "text/html; charset=utf-8");
     };
@@ -1191,7 +1191,7 @@ void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib
     // is a known wart (the form re-renders blank); the banner names what to fix.
     auto fail = [&res](const std::string& msg) {
         res.status = 200;
-        const std::string banner = "<div class=\"gs-banner err\">" +
+        const std::string banner = "<div class=\"gs-error-banner gs-banner err\">" +
                                    html_escape(msg) + "</div>";
         res.set_content(guardian::render_guard_form(banner), "text/html; charset=utf-8");
     };
@@ -1332,7 +1332,7 @@ void GuardianRoutes::create_baseline_from_form(const httplib::Request& req,
         if (store_ && store_->is_open())
             for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
                 names.push_back(r.name);
-        const std::string banner = "<div class=\"gs-banner err\">" +
+        const std::string banner = "<div class=\"gs-error-banner gs-banner err\">" +
                                    html_escape(msg) + "</div>";
         res.status = 200;
         // render_baseline_form has no error slot; prepend the banner to its body.
@@ -1544,7 +1544,7 @@ void GuardianRoutes::update_baseline_from_form(const httplib::Request& req, http
     // Re-render the edit form (pre-filled from the store's current state) with an
     // inline banner on error — htmx won't swap a 4xx body.
     auto fail = [this, &res, &baseline_id](const std::string& msg) {
-        const std::string banner = "<div class=\"gs-banner err\">" +
+        const std::string banner = "<div class=\"gs-error-banner gs-banner err\">" +
                                    html_escape(msg) + "</div>";
         res.status = 200;
         res.set_content(banner + render_baseline_edit_form_fragment(baseline_id),
