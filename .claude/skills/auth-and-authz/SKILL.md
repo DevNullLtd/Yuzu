@@ -782,8 +782,10 @@ security- or evidence-relevant.)
   can strand an operator behind 403s, and an SSO-only fleet cannot pass the
   enable guard at all; **#1496** the RBAC-enable visibility lockout (a user with
   no management-group role sees no agents); **#4966** the last-Administrator
-  guard does not cover account deactivation and does not recognise SSO admins
-  (two documented residuals of A2); **#2809** a deliberately revoked built-in
+  guard now also covers account deactivation and local-admin demotion (the
+  account-lifecycle guard, `docs/user-manual/rbac.md`); what stays open is SSO
+  admin recognition (**#5182**), the inactive-admin view (**#5629**) and the
+  mixed-version-fleet window (drain old replicas); **#2809** a deliberately revoked built-in
   grant is silently restored at next boot (`seed_defaults` has no tombstone);
   **#4972** the access-review `rbac_enforcement` stamp has no freshness /
   degraded-since signal; **#4202** the `rbac.md` toggle text (the enable-path

@@ -30,9 +30,9 @@
 /// fail-closed posture `member_set_owned` already holds for result-set
 /// membership. `evaluate_scope_local` never calls into presence at all and so
 /// can never fail this way (see its own doc comment). `query_stale_within`
-/// (the viz-only read) is UNCHANGED — it stays fail-soft (empty on error),
-/// since a stale-cube viz render has no dispatch/enforce/target decision
-/// downstream of it.
+/// (the roster read: Hardware list/record, viz, MCP, and the Software page's
+/// hostname map) is typed the same way (#5531) — a failed read is
+/// `std::unexpected`, never an empty roster.
 ///
 /// Substrate contract (ADR-0008): the store holds a `PgPool&` (not a
 /// `sqlite3*`), runs its schema migration at construction on a pinned lease,
@@ -43,6 +43,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -92,7 +93,8 @@ struct PresenceIdentity {
     std::string arch;
 };
 
-/// `query_live_ids`'s typed failure surface (#4981 PR-1, Finding B).
+/// `query_live_ids`'s and `query_stale_within`'s typed failure surface (#4981 PR-1, Finding B;
+/// #5531). `query_stale_within` never produces `Truncated`.
 /// `StoreUnavailable`/`DbError` mirror `record_presence_store_failure`'s
 /// existing `reason` label vocabulary (`store_unavailable`/`db_error`,
 /// offline_endpoint_store.cpp) exactly — do not introduce a third spelling.
@@ -101,6 +103,9 @@ struct PresenceIdentity {
 /// past the cap would under-count presence, the same fail-open class a
 /// genuine DB error guards against).
 enum class PresenceReadError { StoreUnavailable, DbError, Truncated };
+
+/// One offline-roster read, as `OfflineEndpointStore::query_stale_within` returns it (#5531).
+using OfflineRosterRead = std::expected<std::vector<OfflineEndpoint>, PresenceReadError>;
 
 class OfflineEndpointStore {
 public:
@@ -142,25 +147,33 @@ public:
     /// stores remain the source of truth; this is durability on top. Single
     /// statement, autocommit, `INSERT ... ON CONFLICT ... RETURNING`.
     ///
-    /// `agent_version`/`arch` (round-3 v2 columns) and `os` (#5294): a BLANK
-    /// value on the incoming row NEVER overwrites an already-known non-blank
-    /// value — `hostname` is the ONE per-ingest source of truth (unconditional
-    /// EXCLUDED write, matching the pre-v2 columns), but a heartbeat that
-    /// raced the session lookup (registry lookup miss) supplies "" here, and
-    /// must not blank out a version/arch/os this store already learned from an
-    /// earlier heartbeat for the same agent. A non-blank `os` still overwrites,
-    /// so a genuine OS change lands on the next session-hit heartbeat.
+    /// `hostname`, `agent_version`/`arch` (round-3 v2 columns) and `os`
+    /// (#5294): a BLANK value on the incoming row NEVER overwrites an
+    /// already-known non-blank value. A heartbeat that raced the session
+    /// lookup, or one ingested on a replica that holds no local `AgentSession`
+    /// for a gateway-fronted agent (HA WS-5), supplies "" here and must not
+    /// blank out what this store already learned from the owning replica. A
+    /// non-blank value still overwrites, so a genuine hostname/OS change
+    /// lands on the next session-hit heartbeat.
     bool upsert(std::string_view agent_id, std::string_view hostname, std::string_view os,
                 std::int64_t last_heartbeat_ms, std::int64_t agent_ts,
                 std::string_view agent_version = {}, std::string_view arch = {},
                 std::string_view session_id = {});
 
     /// Every endpoint whose last heartbeat is within `window` of now, newest
-    /// first. The viz handler renders those NOT currently online as stale
-    /// cubes; rows older than `window` are withheld so a long-departed host
-    /// eventually stops cluttering the view. Empty on error (fail-soft: the
-    /// page still renders the live fleet).
-    [[nodiscard]] std::vector<OfflineEndpoint> query_stale_within(std::chrono::seconds window);
+    /// first. Its consumers (Hardware list/record, viz, MCP, and the Software
+    /// page's display-only hostname map) render those NOT currently online as
+    /// offline rows / stale cubes; rows older than `window` are withheld so a
+    /// long-departed host eventually stops cluttering the view. #5531: typed —
+    /// `std::unexpected` (`StoreUnavailable`: no connection in time; `DbError`:
+    /// the query failed) on a failed read, never an empty vector; an empty success
+    /// means "no rows". `Truncated` is never produced: the read keeps
+    /// `LIMIT kQueryRowCap` newest-first and serves the capped set. A failure
+    /// is counted on `yuzu_server_agent_presence_store_failed_total`
+    /// (`op=query_stale_within`) and logged at warn once per failed call (a
+    /// store that never opened — boot-time migration failure — answers
+    /// `StoreUnavailable` without a count or warn, as `query_live_ids` does).
+    [[nodiscard]] OfflineRosterRead query_stale_within(std::chrono::seconds window);
 
     /// HA WS-5: every agent whose `last_seen_at` is within `ttl` of the
     /// DATABASE clock (`now()` in-SQL, never the replica's own
@@ -181,9 +194,8 @@ public:
     /// "confirmed zero presence-only agents" and, under a NOT combinator
     /// elsewhere in the scope expression, would otherwise invert to a
     /// fleet-wide match built on a degraded read the caller never even
-    /// noticed. `query_stale_within` above is UNCHANGED (still fail-soft,
-    /// empty on error) — a stale-cube viz render has no
-    /// dispatch/enforce/target decision downstream of it, unlike this method.
+    /// noticed. `query_stale_within` above is typed the same way (#5531) but
+    /// its consumers are display surfaces, not dispatch decisions.
     [[nodiscard]] std::expected<std::vector<PresenceIdentity>, PresenceReadError>
     query_live_ids(std::chrono::seconds ttl);
 
@@ -201,10 +213,23 @@ public:
     /// authority).
     bool remove_if_session(std::string_view agent_id, std::string_view session_id);
 
+    /// Decommission erasure (#5682, `AgentDecommissionStores::offline_endpoint`):
+    /// deletes the agent's row whatever its `session_id`, unlike
+    /// `remove_if_session`. Returns true iff the DELETE ran (zero rows
+    /// included, so a re-issued decommission stays idempotent); false on an
+    /// empty id, a closed store, no lease in time, or a SQL error, so the
+    /// cascade records `Failed`, never a false erasure.
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
 };
+
+/// Injected roster read (#5531): lets VizRoutes / McpServer take the typed
+/// `query_stale_within` as a boundary without holding the store. An empty
+/// function means "no durable roster wired" (live-only, legacy behaviour).
+using OfflineRosterFn = std::function<OfflineRosterRead(std::chrono::seconds)>;
 
 } // namespace yuzu::server

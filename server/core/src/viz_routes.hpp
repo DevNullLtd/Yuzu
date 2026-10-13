@@ -25,6 +25,8 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "offline_endpoint_store.hpp" // OfflineRosterFn
+
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -40,7 +42,6 @@ class MetricsRegistry;
 namespace yuzu::server {
 
 class FleetTopologyStore;
-class OfflineEndpointStore;
 class HttpRouteSink;
 
 class VizRoutes {
@@ -74,19 +75,19 @@ public:
 
     /// Wire route handlers and dependency callbacks. `kill_switch` may be
     /// null; when non-null and observed `true`, both routes return 503.
-    /// `metrics` may be null; metric calls become no-ops. `offline_store` may
-    /// be null (then offline hosts are not stale-flagged — legacy behavior).
+    /// `metrics` may be null; metric calls become no-ops. `offline_roster_fn` may
+    /// be empty (then offline hosts are not stale-flagged — legacy behavior).
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          FleetTopologyStore* store, yuzu::MetricsRegistry* metrics,
                          const std::atomic<bool>* kill_switch,
-                         OfflineEndpointStore* offline_store = nullptr);
+                         OfflineRosterFn offline_roster_fn = {});
 
     /// Sink-based overload for in-process unit tests (#438 — TestRouteSink).
     /// Same registration semantics as the httplib::Server overload.
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          FleetTopologyStore* store, yuzu::MetricsRegistry* metrics,
                          const std::atomic<bool>* kill_switch,
-                         OfflineEndpointStore* offline_store = nullptr);
+                         OfflineRosterFn offline_roster_fn = {});
 
 private:
     /// Shared handler body used by both routes. `as_fragment` controls whether
@@ -106,8 +107,8 @@ private:
     FleetTopologyStore* store_{nullptr};
     yuzu::MetricsRegistry* metrics_{nullptr};
     const std::atomic<bool>* kill_switch_{nullptr};
-    /// Durable last-known endpoint store (#1320 PR 3). Borrowed; may be null.
-    OfflineEndpointStore* offline_store_{nullptr};
+    /// Durable last-known endpoint roster (#1320 PR 3, typed by #5531). Empty = unwired.
+    OfflineRosterFn offline_roster_fn_;
 };
 
 } // namespace yuzu::server
