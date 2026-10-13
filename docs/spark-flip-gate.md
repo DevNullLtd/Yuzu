@@ -1157,7 +1157,7 @@ flip, with a red-first test each:
     the safety valve's forced Reapply (one push in eleven, about every 330 s at the 30 s
     heartbeat) applies the push. Before #4415 it paid the full
     teardown and re-arm of every rule, which at R=100 rules is R kv puts, about 2R lifecycle journal
-    records and R compliant-edge events (unmeasured); since #4415 a healthy, unchanged rule
+    records and R compliant-edge events (unmeasured at the time; baseline counts are in flip precondition (c)); since #4415 a healthy, unchanged rule
     pays none of that (AC-18), and those figures describe only the rules that are rebuilt. If the
     push also holds a healthy rule of the hung call's mechanism type, the forced Reapply used to
     withdraw it and every later push was a Reapply (AC-16, AC-12); since #4415 it is skipped
@@ -1572,7 +1572,7 @@ flip, with a red-first test each:
     cases (63 pass, 1 skipped on a host with no system bus), `[guardian]`, `[spark]` and the
     10-shard agent suite all green at `a34d19103`; its first run found one more host-dependent
     test (CH-5), fixed.
-    **Flip preconditions beside AC-18** (none is done): (a) enable the `yuzu-fleet-spark`
+    **Flip preconditions beside AC-18** (none is closed; (c) is measured, with its residuals stated in it): (a) enable the `yuzu-fleet-spark`
     `armed_faulted > 0` alert (its group in `docs/prometheus/yuzu-alerts.yml` is commented out);
     (b) a bounded per-rule rebuild-reason INFO log and, optionally, a skip counter (the
     unhappy-path SRE-1 finding: with the skip, an operator cannot tell from the agent log why a
@@ -1581,11 +1581,14 @@ flip, with a red-first test each:
     (shared box; the cells that waited for a 1-minute load of 8 or less recorded it, the box
     never went below about 4) S0, S5 and S3s at R up to 5000 and S1d up to R=1000 with fake
     mechanisms, and the real Linux Service mechanism up to R=400; weecolin S0, S5 and S3s up to
-    R=5000 with fake mechanisms and the real SCM Service, File and Registry mechanisms up to
-    R=1000. A skipped re-push makes zero watch and unwatch calls and leaves no rule un-armed
-    (with the real Registry mechanism after the first few pushes, while the initial real arms of
-    400 to 1000 rules complete; the baseline never converged there). Shared faulted key (50
-    percent of the rules on one key, fault injected, 30 identical pushes, R=100/500/1000): the
+    R=5000 with fake mechanisms, the real SCM Service and File mechanisms (S0, S5 and S3m up to
+    R=1000; S1d and S3s at R=400) and the real Registry mechanism (S0f and S1d up to R=1000).
+    A skipped re-push makes zero watch and unwatch calls and leaves no rule un-armed. With the
+    real Registry mechanism this holds once the initial real arms of the 400 to 1000 rules
+    complete (the first few pushes); the baseline never converged there. Shared faulted key (50
+    percent of the rules on one key, fault injected once on a fake mechanism that is healthy again
+    after the rebuild, 30 identical pushes, R=100/500/1000; a key that keeps faulting after its
+    rebuild was not measured): the
     branch rebuilds the key once on the first push (2 backend calls) and makes 0 backend calls
     on pushes 2 to 30, while the baseline tears everything down every push (1,002 calls per
     push at R=1000). The engine `mtx_`, seen as the longest wait of a contending
@@ -1593,7 +1596,10 @@ flip, with a red-first test each:
     to 10 ms at R=1000 and 2,565 ms to 50 ms at R=5000 (S0). The health probe, isolated by a
     throwaway tree that skips only the per-rule backend call: +0.1 to +0.5 microseconds per
     skipped rule, indistinguishable from zero at R=1000 (per-rep standard deviation 0.5 to
-    1.4 microseconds); the per-key sweep stays enabled in both. There is no mechanism on macOS
+    1.4 microseconds); the per-key sweep stays enabled in both. The Linux fake cells ran at
+    1-minute load 13 to 58 (median 30), so only their counts, not their wall times, carry weight.
+    Every figure is the Spark path driven through the in-process harness with `prefer_spark=true`;
+    production does not enable it. There is no mechanism on macOS
     to measure (the File, Registry and Service factories return nothing there). Not done: a
     run on a quiet box, and the real Linux Service mechanism above R=400 (D-Bus match-rule
     limit); (d) an explicit census resync mechanism for
@@ -1642,7 +1648,7 @@ flip, with a red-first test each:
   key from the ORIGINAL `watch()` (one `watch()` call and no `unwatch()` in all), with the
   generation still acknowledged and durably stored (before #4415 it was torn down and
   re-armed, two `watch()` calls and one `unwatch()`). The valve-spent case of the same
-  push is `[5459valve]`'s. Still unmeasured for both: any real Service mechanism. FU-12 (#5547): the delta-omission obligation loss (AC-11):
+  push is `[5459valve]`'s. Not measured on a real Service mechanism for this sequence (the held-hold and acknowledgment path); the skip itself was measured on real Service, File and Registry mechanisms, see flip precondition (c) under AC-18. FU-12 (#5547): the delta-omission obligation loss (AC-11):
   a partial push that omits a still-unresolved rule drops its retry obligation. FU-13 (tracked on #5504, design input posted as a comment: https://github.com/DevNullLtd/Yuzu/issues/5504#issuecomment-6034180683; #5504's third acceptance criterion already asks for the per-agent back-off decision): an
   escalating server back-off for held agents (AC-1), reset on policy change, weighed
   against the delay it adds to the re-arm after a late failure. FU-14 (#5548): the AC-15
