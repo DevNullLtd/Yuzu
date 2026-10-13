@@ -257,7 +257,10 @@ html body{padding-left:0}
 // else the dashboard's own `?palette=1` hand-off opens it. The Ctrl+K hint in the header
 // is true on every page: a page with no handler of its own gets the same hand-off from a
 // `window` listener, which runs after every `document` listener, so a page that binds
-// Ctrl+K itself has already called preventDefault and is left alone.
+// Ctrl+K itself has already called preventDefault and is left alone. The hand-off also
+// stands down while focus is in something you type into (a text input, textarea, select,
+// contenteditable, or a role=textbox/combobox widget): navigating would throw away what was
+// typed on pages that never bound the shortcut, such as the TAR SQL box.
 //
 // The online count is `agents.online` from GET /api/health, refreshed every 30 s and when
 // the tab becomes visible. The fetch omits credentials so the server takes its cheap
@@ -287,8 +290,16 @@ constexpr std::string_view kShellScript = R"JS(<script>
     if(location.pathname==='/'){openPalette();return;}
     location.href='/?palette=1';
   });
+  function typing(t){
+    if(!t||t.nodeType!==1)return false;
+    if(t.isContentEditable||(t.closest&&t.closest('[role=textbox],[role=combobox]')))return true;
+    return t.tagName==='TEXTAREA'||t.tagName==='SELECT'||(t.tagName==='INPUT'&&!/^(button|checkbox|radio|range|file|submit|reset|image|color)$/.test(t.type));
+  }
   window.addEventListener('keydown',function(e){
-    if((e.ctrlKey||e.metaKey)&&e.key==='k'&&!e.defaultPrevented&&location.pathname!=='/'){e.preventDefault();location.href='/?palette=1';}
+    if((e.ctrlKey||e.metaKey)&&e.key==='k'&&!e.defaultPrevented&&location.pathname!=='/'){
+      if(typing(e.target)||typing(document.activeElement))return;
+      e.preventDefault();location.href='/?palette=1';
+    }
   });
 
   var inflight=false;

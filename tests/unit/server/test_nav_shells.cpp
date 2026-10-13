@@ -257,7 +257,24 @@ TEST_CASE("app shell: the Ctrl K hint is true on every page", "[nav][shell]") {
     // itself has already called preventDefault and is skipped; the dashboard is never touched.
     CHECK_THAT(html, ContainsSubstring("window.addEventListener('keydown',function(e){"));
     CHECK_THAT(html, ContainsSubstring("(e.ctrlKey||e.metaKey)&&e.key==='k'&&!e.defaultPrevented&&location.pathname!=='/'"));
-    CHECK_THAT(html, ContainsSubstring("{e.preventDefault();location.href='/?palette=1';}"));
+    CHECK_THAT(html, ContainsSubstring("e.preventDefault();location.href='/?palette=1';"));
+}
+
+TEST_CASE("app shell: Ctrl K never navigates away from a field being typed in", "[nav][shell]") {
+    const auto html = render_shell({.active_key = "dashboard"});
+    // The guard runs before the navigation, on the event target and on the focused element.
+    const auto guard = html.find("if(typing(e.target)||typing(document.activeElement))return;");
+    const auto go = html.find("e.preventDefault();location.href='/?palette=1';");
+    REQUIRE(guard != std::string::npos);
+    REQUIRE(go != std::string::npos);
+    CHECK(guard < go);
+    // What counts as typing: contenteditable, an ARIA textbox or combobox (including a child of
+    // one), a textarea, a select, and any input that takes text.
+    CHECK_THAT(html, ContainsSubstring("t.isContentEditable"));
+    CHECK_THAT(html, ContainsSubstring("t.closest('[role=textbox],[role=combobox]')"));
+    CHECK_THAT(html, ContainsSubstring("t.tagName==='TEXTAREA'"));
+    CHECK_THAT(html, ContainsSubstring("t.tagName==='SELECT'"));
+    CHECK_THAT(html, ContainsSubstring("t.tagName==='INPUT'&&!/^(button|checkbox|radio|range|file|submit|reset|image|color)$/.test(t.type)"));
 }
 
 TEST_CASE("app shell: online counter is hidden until /api/health answers and polls every 30 s",
