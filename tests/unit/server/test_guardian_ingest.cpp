@@ -527,6 +527,9 @@ TEST_CASE("guardian ingest: #4606 the server's other id-printing log lines neutr
         cap.stop();
         CHECK(cap.text().find("event ingest error (agent=agent_x_1, rule=rule-err)") !=
               std::string::npos);
+        // The store error text is wrapped too: its spaces are folded, so it cannot run on as
+        // free text in the log line.
+        CHECK(cap.text().find("): event_field_contains_an_embedded_NUL_byte") != std::string::npos);
     }
     {   // Redelivered (debug): event id, agent id and rule id are printed
         const auto resp = make_rule_event("evt r=1", "rule r=1");
