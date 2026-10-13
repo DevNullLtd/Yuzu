@@ -727,7 +727,8 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         // against the SAME spelling every agent's self-reported inventory
         // uses, or every agent that genuinely has the plugin is spuriously
         // flagged absent.
-        const auto plugin_missing = deps.registry->ids_missing_plugin(classified->wire().plugin());
+        const auto plugin_missing = deps.registry->ids_missing_plugin(
+            classified->wire().plugin(), classified->wire().action());
 
         // #5294: ids withheld by a per-OS kill switch. A degraded presence
         // read while a per-OS switch is OFF refuses the whole dispatch (fail

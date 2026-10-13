@@ -9,6 +9,7 @@
 #include "hardware_routes.hpp"
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
+#include "app_shell.hpp"
 #include "authz_model.hpp"          // authz::in_scope
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, ensure_correlation_id
@@ -45,15 +46,8 @@ std::string page_shell(const std::string& title, const std::string& fragment_url
     };
     sub("{{TITLE}}", title);
     sub("{{FRAGMENT}}", fragment_url);
-    sub("<a href=\"/guardian\" class=\"nav-link active\">Guardian</a>",
-        "<a href=\"/guardian\" class=\"nav-link\">Guardian</a>");
-    // The nav-sweep (10 shells) hasn't landed yet at this point in the branch history
-    // in a fresh checkout of this file alone — once it has, this activates the real
-    // Hardware nav link. Until then this is a silent no-op (the `sub` idiom's own
-    // known failure mode), which is exactly why test_nav_shells.cpp pins it.
-    sub("<a href=\"/hardware\" class=\"nav-link\">Hardware</a>",
-        "<a href=\"/hardware\" class=\"nav-link active\">Hardware</a>");
-    return html;
+    // test_nav_shells.cpp pins that the shared shell carries the marker apply_shell fills.
+    return shell::apply_shell(std::move(html), {.active_key = "hardware"});
 }
 
 std::string url_encode_id(const std::string& s) {

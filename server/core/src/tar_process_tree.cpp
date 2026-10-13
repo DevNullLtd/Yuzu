@@ -1277,7 +1277,7 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
     };
 
     std::string h = "<div class=\"cat-filter\" id=\"capFilter\"><span class=\"filter-label\">"
-                    "Category</span><a class=\"tar-chip on\" onclick=\"filterCap(this,'all')\">All</a>";
+                    "Category</span><span class=\"tar-seg\"><a class=\"tar-chip on\" onclick=\"filterCap(this,'all')\">All</a>";
     static const std::array<std::pair<const char*, const char*>, 5> kChips = {
         {{"Processes", "Processes"},
          {"Network connections", "Network"},
@@ -1287,7 +1287,7 @@ std::string render_tar_capture_sources(const std::string& device, const std::str
     for (const auto& [cat, label] : kChips)
         h += std::string("<a class=\"tar-chip\" onclick=\"filterCap(this,'") + cat + "')\">" + label +
              "</a>";
-    h += "</div>";
+    h += "</span></div>";
 
     h += "<table id=\"capTable\" data-device=\"" + html_escape(device) +
          "\"><thead><tr><th>Source</th><th>Category</th><th>Table</th><th>State</th>"

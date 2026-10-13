@@ -331,6 +331,7 @@ agent_test_exe = executable(
     'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_tls_policy.cpp', # #4722: shared TLS cipher policy (common/include/yuzu/tls_policy.hpp), pure
+    'unit/test_protective_actions.cpp', # shared protective-action predicate (common/include/yuzu/protective_actions.hpp), pure
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
@@ -1500,6 +1501,7 @@ if build_server
       'unit/server/test_quarantine_dispatch_gate.cpp',     # #881: containment gate at the dispatch chokepoint — pure arm/degradation logic, no store
       'unit/server/test_plugin_presence_dispatch_gate.cpp', # #3424/#3511: plugin-presence filter at the dispatch chokepoint — mirrors test_quarantine_dispatch_gate.cpp
       'unit/server/test_os_kill_switch_dispatch_gate.cpp', # #5294: per-OS kill-switch filter at the dispatch chokepoint — mirrors test_plugin_presence_dispatch_gate.cpp
+      'unit/server/test_protective_action_dispatch_gate.cpp', # protective actions are never refused by enablement - exact send-set, mirrors test_os_kill_switch_dispatch_gate.cpp
       'unit/server/test_quarantine_reapply.cpp',           # #3425: shared stored-containment re-dispatch recipe (Layer A) — pure, no store
       'unit/server/test_quarantine_containment_reconciler.cpp', # #3425: reconnect re-application state machine — real store/registry, mock dispatch
       'unit/server/test_result_set_store.cpp',
@@ -1676,9 +1678,11 @@ if build_server
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
       'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
+      'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 23 panels + static h1 on the /settings page
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
+      'unit/server/test_nav_shells.cpp',            # app shell: nav model, renderer, marker swap, per-page active item
       'unit/server/test_result_parsing.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
@@ -1762,7 +1766,7 @@ if build_server
       # keys into one source of truth. NOTE THE SCOPE: that hoist is triggered by spark's
       # rung 2, "when the wire contract changes anyway" - but the GUARDIAN JOURNAL and
       # GUARDIAN HEALTH keys are not part of that wire-contract change, so a rung-2 hoist
-      # sweeping only spark would leave the 30 yuzu.guardian_journal_* and 3
+      # sweeping only spark would leave the 33 yuzu.guardian_* journal-family counters and 3
       # yuzu.guardian_unhealthy_*/guardian_priority_demoted literals behind while this
       # comment still read as though it covered them. ALL THREE key families must move
       # together; the journal and health sides must be added to #2298's cutover-gate

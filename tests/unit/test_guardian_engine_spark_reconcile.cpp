@@ -3051,6 +3051,83 @@ TEST_CASE("journal_stats() surfaces evicted_unclassified from the engine's real 
     spark_engine.stop();
 }
 
+TEST_CASE("journal_stats() forwards the drain worker's cross-lane hold release count (#3972)",
+          "[spark][guardian][reconcile][journal][order]") {
+    using namespace std::chrono_literals;
+    // The plumbing seam the fleet-tags sizeof static_assert cannot cover: the
+    // GuardianEngine::journal_stats() assignment of send_order_hold_releases. Deleting the
+    // forward leaves every worker-level test green while the heartbeat tag is permanently
+    // ABSENT, reading as "no reordering window ever opened". prefer_spark=false constructs the
+    // drain worker without starting it, so hand-fed entries drive wrapped_send_for_test() on this
+    // thread, at the production default H = 1 s (the knob is not reachable through the engine).
+    struct Gate {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool open{false};
+    };
+    auto gate = std::make_shared<Gate>(); // shared: the parked detached send keeps it alive
+
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
+                                            std::make_unique<FakeServiceMechanism>())
+                .has_value());
+    spark_engine.start();
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [gate](const OutboxEntry& e) {
+                                 if (e.domain == yuzu::agent::OutboxDomain::Compliance) {
+                                     std::unique_lock<std::mutex> lk{gate->mu};
+                                     gate->cv.wait(lk, [&] { return gate->open; });
+                                 }
+                                 return SendResult::Sent;
+                             });
+    auto* worker = engine.drain_worker_for_test();
+    REQUIRE(worker != nullptr);
+    const auto release_gate = [&] {
+        {
+            std::lock_guard<std::mutex> lk{gate->mu};
+            gate->open = true;
+        }
+        gate->cv.notify_all();
+        CHECK(yuzu::test::spin_until([&] { return worker->active_send_workers() == 0; }));
+    };
+    bool released = false;
+    yuzu::test::ScopeExit unwind{[&] {
+        if (!released)
+            release_gate();
+    }};
+
+    CHECK(engine.journal_stats().send_order_hold_releases == 0);
+
+    // An OLDER compliance send parks in its executor (past the 200 ms offer wait) ...
+    OutboxEntry older;
+    older.domain = yuzu::agent::OutboxDomain::Compliance;
+    older.seq = 5;
+    older.event_id = older.rule_id = "c-5";
+    CHECK(worker->wrapped_send_for_test(older) == SendResult::Retain);
+
+    // ... so a YOUNGER lifecycle entry is denied until the 1 s hold expires, then released.
+    OutboxEntry younger;
+    younger.domain = yuzu::agent::OutboxDomain::Lifecycle;
+    younger.seq = 7;
+    younger.event_id = younger.rule_id = "l-7";
+    younger.lifecycle_kind = "armed";
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return worker->wrapped_send_for_test(younger) == SendResult::Sent; }, 10s));
+    REQUIRE(worker->cross_lane_order_release_count() == 1);
+
+    CHECK(engine.journal_stats().send_order_hold_releases == 1); // the forward under test
+
+    released = true;
+    release_gate();
+    engine.stop();
+    spark_engine.stop();
+}
+
 // ---------------------------------------------------------------------------
 // Death test: the drain worker taking GuardianEngine::mtx_ must ABORT, not hang.
 // ---------------------------------------------------------------------------

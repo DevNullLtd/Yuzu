@@ -376,10 +376,6 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 // Defined in dashboard_ui.cpp (separate TU to isolate MSVC raw-string issues).
 extern const char* const kDashboardIndexHtml;
 
-// Legacy UIs kept for backward compatibility (redirect to /).
-extern const char* const kChargenIndexHtml;
-extern const char* const kProcfetchIndexHtml;
-
 // Login and Settings pages (separate TUs).
 extern const char* const kLoginHtml;
 extern const char* const kSettingsHtml;
@@ -409,8 +405,6 @@ extern const std::string
     kYuzuVizJs; // server/core/src/yuzu_viz_js_bundle.cpp (PR 5 fleet renderer module)
 extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bundle.cpp (PR 9-pre)
 extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
-extern const std::string_view
-    kInterVariableWoff2; // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
 // kBundledDefinitions / kBundledSets / kBundledPluginDocs: bundled_content.hpp
 
 std::string trim_ascii_whitespace(std::string_view s) {
@@ -2664,10 +2658,10 @@ public:
         // the SAME table AgentHealthStore::recompute_metrics clears and publishes from
         // (guardian_journal_fleet_tags.hpp), so a new signal cannot ship with a gauge but
         // no HELP, or with HELP that drifts from what the rollup actually computes.
-        // Unlabelled by design; all 30 are ABSENT until some agent's journal reports.
+        // Unlabelled by design; all 33 are ABSENT until some agent's journal reports.
         // Read the type-honesty note on kGuardianJournalMetrics before writing an
         // alert: no sound alerting form exists over these fleet sums yet (neither
-        // increase() nor bare `> 0` survives a churning population), so the 30 are
+        // increase() nor bare `> 0` survives a churning population), so the 33 are
         // MONITOR-ONLY until a per-agent axis lands (#2083-class; see the note).
         for (const auto& m : detail::kGuardianJournalMetrics)
             metrics_.describe(m.gauge, m.help, "gauge");
@@ -12416,8 +12410,10 @@ private:
         // exists. `action_allowed` is fail-closed by contract — a closed store, a
         // lease timeout or a query failure all return false — so a degraded
         // config store disables the action rather than silently permitting it
-        // (ADR-0036). It is checked on EVERY dispatch and never memoized: an
-        // emergency stop that takes effect on the next cache expiry is not one.
+        // (ADR-0036). It is checked on EVERY dispatch (except a protective pair,
+        // which kill_switch_denial exempts before consulting the store) and never
+        // memoized: an emergency stop that takes effect on the next cache expiry
+        // is not one.
         auto finalized = yuzu::server::detail::finalize_classified_command(
             cap,
             plugin_config_store_ != nullptr
@@ -12493,8 +12489,9 @@ private:
     ///
     /// The quarantine plugin's OWN control channel is exempted WITHOUT
     /// touching `quarantine_store_` at all: `is_quarantine_control_plugin`
-    /// is pure, so a Postgres outage that fails every other dispatch closed
-    /// cannot also block the one action (release) that would end it.
+    /// (common/include/yuzu/protective_actions.hpp) is pure, so a Postgres
+    /// outage that fails every other dispatch closed cannot also block the one
+    /// action (release) that would end it.
     /// Keyed on the `(plugin, ACTION)` pair against a closed four-action set,
     /// NOT on the plugin name — a fifth action added later arrives gated
     /// rather than inheriting the bypass. See that predicate's own doc
@@ -15217,7 +15214,7 @@ private:
             return get_visible_agents_json(username);
         };
 
-        // #2542: page-shell/static-asset routes (25), extracted onto inline_sink
+        // #2542: page-shell/static-asset routes (29), extracted onto inline_sink
         // (this call's own HttpRouteSink seam) rather than any per-owner sink —
         // these routes are pure page-shell/static-asset serving with no owning
         // store of their own.
@@ -16308,9 +16305,13 @@ private:
         // QuarantineContainmentReconciler (#3425) — re-applies endpoint
         // containment for an active quarantine record whose device has
         // reconnected. Same shared dispatch lambda as every other
-        // background engine; the #881 gate's is_quarantine_control_plugin
-        // exemption already lets the quarantine plugin's own actions
-        // through unmodified. Joined BEFORE the stores in stop().
+        // background engine. The shared protective predicate
+        // (yuzu::protective::is_protective_action, built on
+        // is_quarantine_control_plugin) lets the quarantine plugin's own
+        // actions through every gate unmodified: the #881 containment gate, the
+        // per-plugin/action kill switch (incl. a degraded store), the per-OS
+        // withhold and its presence read, and the plugin-presence filter.
+        // Joined BEFORE the stores in stop().
         quarantine_reconciler_ =
             std::make_unique<QuarantineContainmentReconciler>(QuarantineContainmentReconciler::Deps{
                 .quarantine_store = quarantine_store_.get(),
@@ -20791,8 +20792,11 @@ private:
         const auto containment_gate = make_containment_gate(plugin, action);
         // #3424/#3511: same lifecycle as containment_gate — one registry read
         // for this dispatch. BR-009: `classified->wire().plugin()`, not the
-        // raw `plugin` local — see the /api/command sibling site's comment.
-        const auto plugin_missing = registry_.ids_missing_plugin(classified->wire().plugin());
+        // raw `plugin` local — see the /api/command sibling site's comment. The wire
+        // action is the protective-set carve-out's input; the behavioural pin is the
+        // protective case in test_command_routes.cpp (this forwarder has no unit harness).
+        const auto plugin_missing = registry_.ids_missing_plugin(
+            classified->wire().plugin(), classified->wire().action());
         // #5294: per-OS kill-switch ids; a degraded presence read while a
         // per-OS switch is OFF refuses the dispatch (fail closed). A fail-closed
         // containment gate already withholds every id and is reported first

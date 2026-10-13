@@ -7,6 +7,7 @@
 #include "network_routes.hpp"
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
+#include "app_shell.hpp"
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial
 #include "rest_audit.hpp"
@@ -61,14 +62,9 @@ void NetworkRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         };
         sub("{{TITLE}}", "Yuzu \xE2\x80\x94 Network");
         sub("{{FRAGMENT}}", "/fragments/network/overview");
-        // Network sits UNDER DEX (no standalone top-nav link), so /network marks
-        // the DEX nav item active; the overview fragment renders the DEX sub-nav
-        // with the Network tab active. The shared shell defaults Guardian active,
-        // so swap that off and DEX on. Plain string swaps on static chrome.
-        sub("<a href=\"/guardian\" class=\"nav-link active\">Guardian</a>",
-            "<a href=\"/guardian\" class=\"nav-link\">Guardian</a>");
-        sub("<a href=\"/dex\" class=\"nav-link\">DEX</a>",
-            "<a href=\"/dex\" class=\"nav-link active\">DEX</a>");
+        // Network is the sub-item of Fleet in the app shell (the shared shell is
+        // baked with Guardian active, so re-target it).
+        html = shell::apply_shell(std::move(html), {.active_key = "network"});
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_content(std::move(html), "text/html; charset=utf-8");
     });

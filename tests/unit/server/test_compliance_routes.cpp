@@ -31,6 +31,9 @@
 
 using namespace yuzu::server;
 
+// The compliance page shell is a raw-string constant in its own TU (compliance_ui.cpp).
+extern const char* const kComplianceHtml;
+
 namespace {
 
 struct AuditCall {
@@ -211,6 +214,17 @@ TEST_CASE("/fragments/compliance/summary: an ordinary session reaches the summar
     for (const auto& c : h.audit_calls) {
         CHECK(c.action != "compliance.fragment.access_denied");
     }
+}
+
+TEST_CASE("compliance page: cell text rules are table-prefixed so they outrank the td default",
+          "[compliance]") {
+    // `.policy-table td { color: var(--ink2); white-space: nowrap }` has specificity (0,1,1); a
+    // bare single-class cell rule (0,1,0) loses to it, so the muted/faint/ink hierarchy and the
+    // Scope / Detail wrapping never apply.
+    const std::string page = kComplianceHtml;
+    CHECK(page.find(".policy-table .policy-scope { color: var(--mut); white-space: normal;") !=
+          std::string::npos);
+    CHECK(page.find(".detail-table .cell-wrap { white-space: normal; }") != std::string::npos);
 }
 
 TEST_CASE("/fragments/compliance/{policy_id}: a service-scoped token is denied",

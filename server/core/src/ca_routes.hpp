@@ -143,7 +143,7 @@ using IssueCodeSigningFn = std::function<std::expected<CodeSigningIssuance, std:
 /// testable without seeding `panel_limit` certificates. The paging hint must NOT be copy-pasteable as
 /// a present-but-empty `offset=` (a 400 since #4644): it shows the placeholder escaped as `&lt;n&gt;`.
 inline std::string ca_issued_paging_hint(int panel_limit) {
-    return "<p style=\"font-size:0.72rem;color:#d29922;margin-top:0.5rem\">Showing the first " +
+    return "<p class=\"section-note\" style=\"color:var(--warn)\">Showing the first " +
            std::to_string(panel_limit) +
            " certificates. Use <code>GET /api/v1/ca/issued?offset=&lt;n&gt;</code> to page through "
            "the full inventory.</p>";

@@ -363,13 +363,14 @@ TEST_CASE("network routes: perm gating + provider degradation", "[network][route
         REQUIRE(page);
         CHECK(page->status == 200);
         CHECK(page->body.find("/fragments/network/overview") != std::string::npos);
-        // IA: Network is a DEX sub-view — the /network page shell marks DEX active
-        // in the global nav, and there is NO standalone Network top-nav link.
-        // Assert on the href (structurally stable) so a reintroduced top-nav link
-        // with any class/attribute spelling still trips this. The Network tab in
-        // the DEX sub-nav uses hx-get (not href="/network"), so this stays clean.
-        CHECK(page->body.find("class=\"nav-link active\">DEX</a>") != std::string::npos);
-        CHECK(page->body.find("href=\"/network\"") == std::string::npos);
+        // IA: Network is the sub-item of Fleet in the app shell — /network lights the Fleet
+        // family and its Network sub-item, and DEX stays unlit. (The Network tab in the
+        // DEX sub-nav uses hx-get, not href="/network", so the sub-item is the only link.)
+        CHECK(page->body.find("class=\"shell-nav on\" href=\"/viz/fleet\"") != std::string::npos);
+        CHECK(page->body.find("<a href=\"/network\" class=\"on\" aria-current=\"page\">Network</a>") !=
+              std::string::npos);
+        CHECK(page->body.find("class=\"shell-nav on\" href=\"/dex\"") == std::string::npos);
+        CHECK(page->body.find("<span class=\"shell-sep\">/</span><b>Network</b>") != std::string::npos);
     }
 }
 

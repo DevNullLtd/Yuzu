@@ -1,6 +1,7 @@
 #include "dex_routes.hpp"
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
+#include "app_shell.hpp"
 #include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "guaranteed_state_store.hpp"
 #include "http_route_sink.hpp"
@@ -2441,12 +2442,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         };
         sub("{{TITLE}}", "Yuzu \xE2\x80\x94 DEX");
         sub("{{FRAGMENT}}", "/fragments/dex/overview");
-        // The shared shell marks Guardian as the active nav item; on /dex the
-        // DEX link is the active one. Plain string swaps on the static chrome.
-        sub("<a href=\"/guardian\" class=\"nav-link active\">Guardian</a>",
-            "<a href=\"/guardian\" class=\"nav-link\">Guardian</a>");
-        sub("<a href=\"/dex\" class=\"nav-link\">DEX</a>",
-            "<a href=\"/dex\" class=\"nav-link active\">DEX</a>");
+        // The shared shell is baked with Guardian active; re-target it to DEX.
+        html = shell::apply_shell(std::move(html), {.active_key = "dex"});
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_content(std::move(html), "text/html; charset=utf-8");
     });

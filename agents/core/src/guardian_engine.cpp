@@ -1924,6 +1924,8 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
     s.send_orphan_exceptions =
         spark_drain_worker_ ? spark_drain_worker_->send_orphan_exception_count() : 0;
     s.send_stalls = spark_drain_worker_ ? spark_drain_worker_->send_stall_count() : 0;
+    s.send_order_hold_releases =
+        spark_drain_worker_ ? spark_drain_worker_->cross_lane_order_release_count() : 0;
     return s;
 }
 

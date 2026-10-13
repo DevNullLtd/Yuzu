@@ -78,7 +78,7 @@ agent_pb::AgentInfo make_agent_info(const std::string& id) {
 // path (fix #5), and one Forensics row (Wave 7 PR7.2's single-target rule)
 // mirroring the shape a real Forensics-securable row takes (a companion
 // package's app_usage.last_used, for one) rather than reclassifying it here.
-inline constexpr std::array<CommandCapability, 3> kFixture{{
+inline constexpr std::array<CommandCapability, 4> kFixture{{
     {
         .plugin = "noop",
         .action = "run",
@@ -111,6 +111,19 @@ inline constexpr std::array<CommandCapability, 3> kFixture{{
         .risk_tier = yuzu::server::authz::RiskTier::Medium,
         .system_reserved = false,
         .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+    // A protective pair (the quarantine plugin's read-only status), so the plugin-presence
+    // carve-out can be driven through the route.
+    {
+        .plugin = "quarantine",
+        .action = "status",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Security",
+        .operation = yuzu::server::authz::Operation::Read,
+        .risk_tier = yuzu::server::authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 }};
 
@@ -718,6 +731,32 @@ TEST_CASE("/api/command: targets on a kill-switched OS are withheld and counted"
     CHECK(j["withheld_kill_switched_os"] == 1);
     CHECK(h.send_to_ids_called == std::vector<std::string>{"dev-B"});
     CHECK(h.kill_switched_os_audit_counts == std::vector<std::size_t>{1});
+}
+
+// Protective-action exemption: the plugin-presence filter at this route's
+// `ids_missing_plugin` call must receive the wire action, so a protective pair is reached
+// even when the agent's reported inventory lacks its plugin, while an ordinary pair is not.
+TEST_CASE("/api/command: a protective action reaches an agent whose inventory lacks the plugin; "
+          "an ordinary one is withheld as plugin_not_found",
+          "[command_routes][protective]") {
+    CommandHarness h;
+    auto info = make_agent_info("inv-A");
+    info.add_plugins()->set_name("firewall"); // non-empty inventory without quarantine/noop
+    (void)h.registry.register_agent(info);
+
+    auto protective = h.sink.Post(
+        "/api/command", R"({"plugin":"quarantine","action":"status","agent_ids":["inv-A"]})");
+    REQUIRE(protective);
+    CHECK(protective->status == 200);
+    CHECK(h.send_to_ids_called == std::vector<std::string>{"inv-A"});
+
+    h.send_to_ids_called.clear();
+    auto ordinary =
+        h.sink.Post("/api/command", R"({"plugin":"noop","action":"run","agent_ids":["inv-A"]})");
+    REQUIRE(ordinary);
+    CHECK(ordinary->status == 503);
+    CHECK(nlohmann::json::parse(ordinary->body)["error"]["reason"] == "plugin_not_found");
+    CHECK(h.send_to_ids_called.empty());
 }
 
 TEST_CASE("/api/command: only kill-switched-OS targets reports 503 reason=kill_switched_os",

@@ -484,6 +484,64 @@ plugin and action rows read back unchanged, so nothing flips on upgrade.
   zero-reach branch. The kill-switch REST responses gain additive `os` and `source` fields,
   and the `/api/command` response gains `withheld_kill_switched_os`.
 
+## Behaviour change: protective actions exempt from plugin enablement
+
+**What changed.** Five `plugin.action` pairs are now *protective*: the quarantine plugin's
+`quarantine.quarantine`, `quarantine.unquarantine`, `quarantine.status` and `quarantine.whitelist`,
+and the Guardian rule push `__guard__.push_rules`. No plugin-enablement gate refuses them any more:
+not the per-plugin/action kill switch, not the per-OS kill switch (or its agent-presence read), not
+the plugin-presence filter, and not a degraded plugin-config store. The set is closed. The four
+quarantine actions are **newly** exempt; before this change only the containment gate exempted
+them. Decision record: the 2026-10-12 update in [ADR-3005](../adr/3005-plugin-config-store.md).
+
+A kill-switch row for one of these pairs is still accepted and displayed, but it is **kept and
+inert**: it no longer stops dispatch. A plugin-level `quarantine` / `__guard__` row never stops the
+plugin's protective actions either, and still gates any non-protective action the plugin declares
+(none today: `quarantine` declares only the four, and `__guard__` dispatches only `push_rules`). A
+`PUT` on one is audited with `protective_exempt=true` in the `plugin_config.kill_switch.set`
+detail and logs a warning. If you stopped Guardian rule delivery by switching
+`__guard__.push_rules` off, that stop **ends when you upgrade**: rules deploy on the next Baseline
+deploy or heartbeat reconcile.
+
+**Before upgrading.**
+
+1. **Find held rows.** There is no list route. Search the audit log for
+   `plugin_config.kill_switch.set` entries whose `target_id` is `__guard__.push_rules`,
+   `quarantine.<action>` or the plugin-level `__guard__` / `quarantine`, each with an optional `@<os>`
+   suffix. Each write leaves two rows (`attempted`, then `success` or `failure`) and a later
+   `enabled=true` supersedes an earlier OFF, so take the latest `result=success` row per `target_id`.
+   Confirm each with `GET /api/v1/plugin-config/<plugin>/kill-switch` at every layer: the
+   plugin row, the action row (`?action=<action>`) and each `?os=windows|linux|darwin` variant, reading `source` in the response: it names the row that wins.
+2. **Re-establish the stop through the rule lever first**, because the hold ends on upgrade. Disable
+   the Guards (`PUT /api/v1/guaranteed-state/rules/<id>` with `{"enabled": false}`) or remove them.
+   This is state-only: it disarms each Guard on the agent's next Baseline deploy or heartbeat
+   reconcile, so the latency is the reconcile cadence. It disarms the rule; it does not freeze a push
+   already in flight. No lever stops delivery while leaving armed Guards armed: the old switch did
+   that, but disabling or removing a rule disarms it on the next reconcile. It needs `GuaranteedState:Write` (disable) or `GuaranteedState:Delete`
+   (remove). `PluginConfig:Write` alone no longer stops anything, and a service-scoped token is
+   denied on rule writes. A `quarantine.*` hold has no replacement switch: those actions are
+   governed by their permission (`Security:Execute` on the catalogue rows) and any approval policy,
+   not by enablement.
+
+Also be aware of:
+
+- **Rollback.** An older server has no exemption and honours stored OFF rows again, which can strand
+  a quarantine release or hold back a rule push. Before rolling back, `PUT enabled=true` on every
+  protective-pair OFF row you found (each layer and OS), then roll back.
+- **Mixed versions.** During a rolling upgrade an older replica still honours a held row (or a degraded store or
+  plugin-inventory gap) and refuses a protective dispatch while an upgraded replica delivers it, so the outcome depends on which replica serves the
+  heartbeat or the reconcile. Lifting a hold arms rules fleet-wide on the next reconcile, including
+  `enforce` rules, so expect a burst of arming rather than a gradual one.
+- **Agents without the quarantine plugin.** The server no longer withholds a protective dispatch
+  because the agent's reported plugin inventory lacks the plugin. `dispatch_confirmed` means the
+  plugin registry **accepted the frame**; it is never proof of isolation. A
+  device whose agent lacks the plugin answers its own "plugin not found", and
+  `YuzuQuarantineEndpointUnconfirmed` can fire for it. Verify containment with `quarantine.status`,
+  and upgrade agents before you rely on quarantine.
+- **Integrations.** The kill-switch `GET` and `PUT` responses are unchanged: `enabled=false` for a
+  protective pair is a stored row, not the dispatch decision. The `os_gate_unreadable`,
+  `plugin_not_found` and `kill_switched_os` zero-reach causes are never produced for a protective
+  action.
 ## Behaviour change: Guardian full_sync agent log lines and in-place `rule:` rows (#4415)
 
 Three changes are live on every agent on upgrade, on both detection paths. The skip of healthy,

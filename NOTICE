@@ -64,7 +64,7 @@ section is maintained manually; see `vcpkg.json` and
   Three.js r168 (vendored) .............. MIT
   Three.js OrbitControls (vendored) ..... MIT
   Nayuki QR-Code-generator (vendored) ... MIT
-  Inter typeface (vendored) ............. SIL OFL 1.1
+  IBM Plex Sans / Mono (vendored) ....... SIL OFL 1.1
 
 Before cutting the first AGPL-era release, run an SBOM / attribution
 aggregator (e.g. scancode-toolkit or OSS Review Toolkit) over the

@@ -342,7 +342,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        html = "<table class=\"exec-table\"><thead><tr>"
+        html = "<div class=\"tw\"><table class=\"exec-table\"><thead><tr>"
                "<th>Status</th>"
                "<th>Definition</th>"
                "<th>Fan-out</th>"
@@ -464,7 +464,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     "<div class=\"empty-state\">Loading…</div>"
                     "</div></td></tr>";
         }
-        html += "</tbody></table>";
+        html += "</tbody></table></div>";
         res.set_content(html, "text/html; charset=utf-8");
     });
 
@@ -1443,15 +1443,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // until this fix, silently rendering a capped list as complete for an
         // operator with more schedules than the store's hard cap.
         if (result->truncated) {
-            html += "<div class=\"empty-state\" style=\"color:var(--warn-color,#c9a227)\">"
+            html += "<div class=\"note warn\">"
                    "Showing a partial list &mdash; more schedules exist than can be "
                    "displayed.</div>";
         }
+        html += "<section class=\"panel\"><div class=\"hd\"><h2>Schedules</h2></div>";
         if (scheds.empty()) {
             html += "<div class=\"empty-state\">No schedules configured.</div>";
         } else {
-            html += "<table><thead><tr><th>Name</th><th>Frequency</th><th>Enabled</th><th>Next "
-                   "Run</th><th>Count</th><th></th></tr></thead><tbody>";
+            html += "<div class=\"tw\"><table><thead><tr><th>Name</th><th>Frequency</th>"
+                   "<th>Enabled</th><th>Next Run</th><th>Count</th><th></th></tr></thead>"
+                   "<tbody>";
             for (const auto& s : scheds) {
                 html += "<tr><td>" + html_escape(s.name) +
                         "</td>"
@@ -1461,21 +1463,21 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                         "<td>" +
                         std::string(s.enabled ? "Yes" : "No") +
                         "</td>"
-                        "<td style=\"font-size:0.7rem\">" +
+                        "<td>" +
                         (s.next_execution_at > 0 ? std::to_string(s.next_execution_at) : "-") +
                         "</td>"
                         "<td>" +
                         std::to_string(s.execution_count) +
                         "</td>"
-                        "<td><button class=\"btn btn-danger\" "
-                        "style=\"font-size:0.65rem;padding:0.15rem 0.5rem\" "
+                        "<td class=\"act\"><button class=\"btn btn-danger btn-sm\" "
                         "hx-delete=\"/api/schedules/" +
                         s.id +
                         "\" hx-target=\"#tab-schedules\" hx-swap=\"innerHTML\" "
                         "hx-confirm=\"Delete schedule?\">Delete</button></td></tr>";
             }
-            html += "</tbody></table>";
+            html += "</tbody></table></div>";
         }
+        html += "</section>";
         res.set_content(html, "text/html; charset=utf-8");
     });
 
