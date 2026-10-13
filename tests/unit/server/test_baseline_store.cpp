@@ -49,6 +49,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <stdexcept>
+#include <string>
+#include <vector>
 #include <thread>
 
 using namespace yuzu::server;
@@ -594,4 +597,126 @@ TEST_CASE("Bad path (unroutable DSN) yields a closed store with sentinel returns
     CHECK_FALSE(bad.deployed_member_rule_ids("x").has_value());
     CHECK(bad.baseline_count() == 0);
     CHECK(bad.member_count("x") == 0);
+}
+
+// ── Post-mutation hook (#5513) ─────────────────────────────────────────────────
+// The heartbeat reconcile's caches are dropped by this hook on a committed update (a deploy
+// rewrites the deployed snapshot) or delete, BEFORE the caller's own policy-generation bump.
+
+TEST_CASE("BaselineStore: the baseline-mutation hook fires once per committed update and delete",
+          "[pg][baseline_store][baseline_hook]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BaselineStore store{pool};
+    REQUIRE(store.is_open());
+
+    int fired = 0;
+    std::vector<bool> present_seen;       // is the row there when the hook runs
+    std::vector<std::string> deployed_seen; // the deployed set the hook can already read
+    std::string id;
+    store.set_on_baseline_mutation([&] {
+        ++fired;
+        present_seen.push_back(!id.empty() && store.get_baseline(id).has_value());
+        const auto d = store.deployed_member_rule_ids();
+        deployed_seen.push_back(d.has_value() ? std::to_string(d->size()) : std::string("degraded"));
+    });
+
+    auto created = store.create_baseline(make_baseline("hooked"));
+    REQUIRE(created.has_value());
+    id = *created;
+    CHECK(fired == 0);  // a create is a draft: nothing deployed changed
+    REQUIRE(store.set_members(id, {"r1", "r2"}).has_value());
+    REQUIRE(store.set_assignment(id, {}).has_value());
+    CHECK(fired == 0);  // membership and assignment edits do not touch the deployed snapshot
+
+    deploy(store, id);  // update_baseline writing the deployed snapshot
+    CHECK(fired == 1);
+    REQUIRE(deployed_seen.size() == 1);
+    CHECK(deployed_seen[0] == "2");  // AFTER commit: the new deployed set is already readable
+    CHECK(present_seen[0]);
+
+    REQUIRE(store.delete_baseline(id).has_value());
+    CHECK(fired == 2);
+    REQUIRE(present_seen.size() == 2);
+    CHECK_FALSE(present_seen[1]);  // AFTER commit: the row is already gone
+    CHECK(deployed_seen[1] == "0");
+
+    // A mutation that did not commit does not fire it.
+    auto b = make_baseline("ghost");
+    b.baseline_id = "does-not-exist";
+    CHECK_FALSE(store.update_baseline(b).has_value());
+    CHECK_FALSE(store.delete_baseline("does-not-exist").has_value());
+    auto dup1 = store.create_baseline(make_baseline("dup"));
+    REQUIRE(dup1.has_value());
+    auto other = store.create_baseline(make_baseline("other"));
+    REQUIRE(other.has_value());
+    auto clash = store.get_baseline(*other);
+    REQUIRE(clash.has_value());
+    clash->name = "dup";
+    CHECK_FALSE(store.update_baseline(*clash).has_value());  // name conflict
+    CHECK(fired == 2);
+}
+
+TEST_CASE("BaselineStore: a throwing baseline-mutation hook never breaks the mutation",
+          "[pg][baseline_store][baseline_hook]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BaselineStore store{pool};
+    REQUIRE(store.is_open());
+    int fired = 0;
+    SECTION("std::exception") {
+        store.set_on_baseline_mutation([&] {
+            ++fired;
+            throw std::runtime_error("hook exploded");
+        });
+    }
+    SECTION("a non-std exception") {
+        store.set_on_baseline_mutation([&] {
+            ++fired;
+            throw 42;
+        });
+    }
+    auto created = store.create_baseline(make_baseline("throws"));
+    REQUIRE(created.has_value());
+    const std::string id = *created;
+    REQUIRE(store.set_members(id, {"r1"}).has_value());
+    deploy(store, id);  // update_baseline succeeds although the hook throws
+    const auto got = store.get_baseline(id);
+    REQUIRE(got.has_value());
+    CHECK(got->lifecycle == kBaselineDeployed);  // committed
+    REQUIRE(store.delete_baseline(id).has_value());
+    CHECK(fired == 2);
+
+    // No hook at all (the default, and what clearing it restores) is fine.
+    store.set_on_baseline_mutation({});
+    auto again = store.create_baseline(make_baseline("after"));
+    REQUIRE(again.has_value());
+    deploy(store, *again);
+    CHECK(fired == 2);
+}
+
+TEST_CASE("BaselineStore: the baseline-mutation hook runs with no pool lease held",
+          "[pg][baseline_store][baseline_hook]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    // One connection: if the mutating thread still held its lease while the hook ran, the
+    // hook's own acquire could not succeed.
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    BaselineStore store{pool};
+    REQUIRE(store.is_open());
+    int leases_granted = 0;
+    int fired = 0;
+    store.set_on_baseline_mutation([&] {
+        ++fired;
+        if (auto lease = pool.try_acquire_for(std::chrono::milliseconds(200)))
+            ++leases_granted;
+    });
+    auto created = store.create_baseline(make_baseline("leased"));
+    REQUIRE(created.has_value());
+    auto b = store.get_baseline(*created);
+    REQUIRE(b.has_value());
+    b->description = "edited";
+    REQUIRE(store.update_baseline(*b).has_value());
+    REQUIRE(store.delete_baseline(*created).has_value());
+    CHECK(fired == 2);
+    CHECK(leases_granted == 2);
 }

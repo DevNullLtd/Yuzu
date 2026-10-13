@@ -360,9 +360,11 @@ TEST_CASE("GuardianGenerationCache: a waiter that joined a flight invalidate() d
         },
         {}, clk.fn());
     std::uint64_t leader_got = 0, waiter_got = 0;
-    std::jthread leader([&] { leader_got = c.get().value(); });
+    // value_or, not value(): a regression must fail the CHECKs below, not throw out of a
+    // jthread body (std::terminate).
+    std::jthread leader([&] { leader_got = c.get().value_or(0); });
     REQUIRE(entered.wait());
-    std::jthread waiter([&] { waiter_got = c.get().value(); });
+    std::jthread waiter([&] { waiter_got = c.get().value_or(0); });
     // The waiter reads the clock (read 2) INSIDE the critical section in which it joins the
     // flight, so once that read is seen invalidate() can only run after the join.
     REQUIRE(clk.wait_for_calls(2));

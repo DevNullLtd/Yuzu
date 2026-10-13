@@ -446,11 +446,13 @@ TEST_CASE("alloc sweep: GuardianRuleBundleCache::invalidate() after a failed get
 
 // -- GuardianReconcileGate ----------------------------------------------------------------
 
-TEST_CASE("alloc sweep: GuardianReconcileGate::decide() after a failed claim insert leaves no claim and no slot",
+TEST_CASE("alloc sweep: GuardianReconcileGate::decide() after a failed claim insert leaves no claim and the agent is admitted next time",
           "[guardian][reconcile_gate][alloc_sweep]") {
     // The documented ALLOCATION FAILURE arm (guardian_reconcile_gate.hpp): decide() may throw
     // bad_alloc while inserting the claim, after try_admit() succeeded. Nothing may leak: no
-    // claim is written, no in-flight slot is held, and the agent is admitted on its next call.
+    // claim is written, the budget has counted exactly that one admission (the documented
+    // cost), and the agent is admitted on its next call. (decide() never touches the in-flight
+    // count, which only begin_admitted() raises, so it is not asserted here.)
     // The agent id is beyond the small-string buffer, so copying it into the map allocates.
     const std::string agent(40, 'a');
     int broken = 0;
@@ -479,14 +481,14 @@ TEST_CASE("alloc sweep: GuardianReconcileGate::decide() after a failed claim ins
             ++broken;  // an injected failure must surface as bad_alloc, nothing else may throw
         if (threw) {
             ++threw_points;
-            if (gate.claims_size() != 0 || gate.in_flight() != 0)
+            if (gate.claims_size() != 0 || budget.admitted_total() != 1)
                 ++broken;
         }
         // The retry: never rate limited by a claim that was not written, and it admits.
         yuzu::server::GuardianReconcileGate::ShedCause cause{};
         const auto again = threw ? gate.decide(agent, 0, 7, &cause) : yuzu::server::GuardianReconcileGate::Decision::Admit;
         if (again != yuzu::server::GuardianReconcileGate::Decision::Admit || gate.claims_size() != 1 ||
-            gate.in_flight() != 0)
+            budget.admitted_total() != (threw ? 2u : 1u))
             ++broken;
         return fired;
     });

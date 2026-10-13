@@ -400,8 +400,10 @@ public:
     /// (it sits on the REST/MCP write path); an exception is caught and logged at debug,
     /// never propagated (the mutation is already durable); may be empty (the default).
     /// Set once during single-threaded wiring, before the store is shared; it is not
-    /// synchronised against concurrent mutation. NOT invoked by bump_policy_generation()
-    /// (the Baseline deploy path, whose callers invalidate through guardian_push_fn_).
+    /// synchronised against concurrent mutation. NOT invoked by bump_policy_generation().
+    /// Baseline deploy and delete commit in BaselineStore, which has its own hook of the same
+    /// shape (BaselineStore::set_on_baseline_mutation, wired to the same two invalidations),
+    /// so they are covered before the caller's own bump and fan-out run.
     void set_on_rule_mutation(std::function<void()> hook);
 
     // Observability — lock-free cumulative counters for Prometheus scraping.
