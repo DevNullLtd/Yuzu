@@ -163,6 +163,11 @@ TEST_CASE("approvals_fragment_routes: a pending approval from ANOTHER submitter 
     CHECK(res->body.find("btn-primary") != std::string::npos); // Approve button
     CHECK(res->body.find("btn-danger") != std::string::npos);  // Reject button
     CHECK(res->body.find("/api/approvals/" + *submitted + "/approve") != std::string::npos);
+    // The restyled buttons keep their htmx wiring: a POST to the approve/reject route.
+    CHECK(res->body.find("hx-post=\"/api/approvals/" + *submitted + "/approve\"") !=
+          std::string::npos);
+    CHECK(res->body.find("hx-post=\"/api/approvals/" + *submitted + "/reject\"") !=
+          std::string::npos);
     CHECK(res->body.find("submitter1") != std::string::npos);
 }
 

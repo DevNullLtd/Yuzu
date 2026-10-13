@@ -1677,6 +1677,7 @@ if build_server
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_settings_model.cpp',        # #4028 — pure Settings read-twin builder unit tests
       'unit/server/test_settings_read_twins.cpp',   # #4028 — REST v1 read-twin route coverage
+      'unit/server/test_settings_page_ui.cpp',      # pure-string pins: 23 panels + static h1 on the /settings page
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',

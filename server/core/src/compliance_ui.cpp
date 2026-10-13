@@ -14,167 +14,142 @@ const char* const kCompliancePageTemplate =
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="/static/htmx.js"></script>
   <style>
-    body { min-height: 100vh; }
-
     /* ── Content ───────────────────────────────────────────── */
     .content {
-      max-width: 960px; margin: 1.5rem auto; padding: 0 1.5rem;
+      padding: 22px 28px 36px; display: flex; flex-direction: column; gap: 22px;
     }
 
     /* ── Page header ──────────────────────────────────────── */
     .page-header {
-      display: flex; align-items: center; justify-content: space-between;
-      margin-bottom: 1.5rem; padding-bottom: 0.75rem;
-      border-bottom: 1px solid var(--border);
+      display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 24px;
     }
-    .page-header h1 { font-size: 1.1rem; font-weight: 700; }
-    .page-header .subtitle { font-size: 0.75rem; color: var(--muted); margin-top: 0.15rem; }
+    .page-header h1 {
+      font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2;
+      color: var(--ink);
+    }
+    .page-header .subtitle { font-size: 14px; color: var(--mut); margin-top: 4px; max-width: 70ch; }
+    .page-header .btn { margin-left: auto; }
 
-    /* ── Section cards ─────────────────────────────────────── */
-    .section {
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 0.5rem; margin-bottom: 1.5rem; overflow: hidden;
-    }
+    /* ── Sections: flat group, or a bordered panel ─────────── */
+    .section { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
     .section-header {
-      padding: 0.75rem 1rem; font-size: 0.85rem; font-weight: 600;
-      border-bottom: 1px solid var(--border);
-      display: flex; align-items: center; gap: 0.5rem;
+      display: flex; align-items: center; gap: 8px;
+      font-size: 14px; font-weight: 600; color: var(--ink);
     }
-    .section-body { padding: 1rem; }
+    .cmp-panel {
+      background: var(--surface); border: 1px solid var(--line);
+      border-radius: var(--rad-panel); min-width: 0;
+    }
+    .section.cmp-panel { gap: 0; }
+    .cmp-panel > .section-header { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+    #compliance-summary { display: flex; flex-direction: column; gap: 16px; }
+    .tw { overflow-x: auto; }
 
-    /* ── Compliance bar ─────────────────────────────────────── */
+    /* ── Readout row (fleet compliance + counts) ───────────── */
     .compliance-hero {
-      display: flex; align-items: center; gap: 1.5rem;
-      margin-bottom: 0.75rem;
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      overflow: hidden; background: var(--surface);
+      border: 1px solid var(--line); border-radius: var(--rad-panel);
     }
-    .compliance-pct {
-      font-size: 2rem; font-weight: 700; line-height: 1;
-      min-width: 80px;
+    .hero-cell {
+      padding: 14px 18px; min-width: 0;
+      box-shadow: -1px 0 0 var(--line), 0 -1px 0 var(--line);
     }
-    .compliance-pct.good { color: var(--green); }
-    .compliance-pct.warn { color: var(--yellow); }
-    .compliance-pct.bad  { color: var(--red); }
-    .compliance-bar-wrap { flex: 1; }
-    .compliance-bar {
-      height: 8px; background: var(--border); border-radius: 9999px;
-      overflow: hidden;
-    }
-    .compliance-fill {
-      height: 100%; border-radius: 9999px;
-      transition: width 0.3s;
-    }
-    .compliance-fill.good { background: var(--green); }
-    .compliance-fill.warn { background: var(--yellow); }
-    .compliance-fill.bad  { background: var(--red); }
-    .compliance-stats {
-      display: flex; gap: 1.5rem; font-size: 0.75rem; color: var(--muted);
-      margin-top: 0.5rem;
-    }
-    .compliance-stats strong { color: var(--fg); }
+    .hero-v { font-size: 26px; font-weight: 500; letter-spacing: -.02em; line-height: 1.15; color: var(--ink); }
+    .hero-l { font-size: 13px; color: var(--mut); margin-top: 2px; }
+    .compliance-bar { height: 6px; margin-top: 8px; background: var(--line); border-radius: 2px; overflow: hidden; }
+    .compliance-fill { height: 100%; }
+    .compliance-fill.good { background: var(--ok); }
+    .compliance-fill.warn { background: var(--warn); }
+    .compliance-fill.bad  { background: var(--bad); }
 
-    /* ── Policy table ──────────────────────────────────────── */
-    .policy-table {
-      width: 100%; border-collapse: collapse; font-size: 0.8rem;
+    /* ── Tables ────────────────────────────────────────────── */
+    .policy-table, .detail-table { width: 100%; min-width: 640px; border-collapse: collapse; }
+    .policy-table th, .detail-table th {
+      text-align: left; padding: 8px 16px; white-space: nowrap;
+      font-size: 12.5px; font-weight: 500; color: var(--mut);
+      background: var(--surface2); border-bottom: 1px solid var(--line);
     }
-    .policy-table th {
-      text-align: left; padding: 0.4rem 0.6rem;
-      border-bottom: 2px solid var(--border); color: var(--muted);
-      font-size: 0.7rem; text-transform: uppercase;
-      letter-spacing: 0.05em; font-weight: 600;
+    .policy-table td, .detail-table td {
+      padding: var(--cell-y) 16px; white-space: nowrap;
+      color: var(--ink2); border-bottom: 1px solid var(--line);
     }
-    .policy-table td {
-      padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border);
+    .policy-table tbody tr:last-child td, .detail-table tbody tr:last-child td { border-bottom: 0; }
+    .policy-table tbody tr:hover td, .detail-table tbody tr:hover td { background: var(--surface2); }
+    .policy-table td:last-child { text-align: right; }
+    /* Cell classes carry the table prefix so they outrank the table's own td rule above */
+    .policy-table .policy-idx { color: var(--faint); }
+    .policy-table .policy-name { font-weight: 600; color: var(--ink); }
+    .policy-scope, .mono-id {
+      font-family: var(--mds-font-family-mono); font-size: 12.5px;
     }
-    .policy-table tr:hover { background: var(--mds-color-state-hover); }
-    .policy-table .policy-name {
-      font-weight: 500; color: var(--fg);
-    }
-    .policy-table .policy-scope {
-      font-size: 0.75rem; color: var(--muted); font-family: var(--mono);
-    }
-    .policy-pct {
-      font-weight: 600; font-family: var(--mono);
-    }
-    .policy-pct.good { color: var(--green); }
-    .policy-pct.warn { color: var(--yellow); }
-    .policy-pct.bad  { color: var(--red); }
+    .policy-table .policy-scope { color: var(--mut); white-space: normal; min-width: 14ch; }
+    .policy-pct { font-weight: 600; }
+    .policy-pct.good { color: var(--ok); }
+    .policy-pct.warn { color: var(--warn); }
+    .policy-pct.bad  { color: var(--bad); }
+    .policy-table .policy-count, .detail-table .cell-mut { color: var(--mut); }
+    .policy-count { font-size: 12.5px; }
+    .detail-table .cell-wrap { white-space: normal; }
 
     /* ── Mini compliance bars in table ─────────────────────── */
     .mini-bar {
-      width: 80px; height: 6px; background: var(--border);
-      border-radius: 9999px; overflow: hidden; display: inline-block;
-      vertical-align: middle; margin-left: 0.5rem;
+      width: 80px; height: 6px; background: var(--line); border-radius: 2px;
+      overflow: hidden; display: inline-block; vertical-align: middle; margin-left: 8px;
     }
-    .mini-fill {
-      height: 100%; border-radius: 9999px;
-    }
-    .mini-fill.good { background: var(--green); }
-    .mini-fill.warn { background: var(--yellow); }
-    .mini-fill.bad  { background: var(--red); }
+    .mini-fill { height: 100%; }
+    .mini-fill.good { background: var(--ok); }
+    .mini-fill.warn { background: var(--warn); }
+    .mini-fill.bad  { background: var(--bad); }
 
     /* ── Detail panel (per-policy agent breakdown) ──────── */
-    .detail-panel {
-      margin-top: 1rem; padding: 1rem;
-      background: var(--bg); border: 1px solid var(--border);
-      border-radius: 0.5rem;
-    }
     .detail-panel h3 {
-      font-size: 0.85rem; margin-bottom: 0.75rem;
-      display: flex; align-items: center; gap: 0.5rem;
+      display: flex; align-items: baseline; gap: 8px;
+      padding: 14px 16px 0; font-size: 14px; font-weight: 600; color: var(--ink);
     }
-    .detail-table {
-      width: 100%; border-collapse: collapse; font-size: 0.78rem;
-    }
-    .detail-table th {
-      text-align: left; padding: 0.35rem 0.5rem;
-      border-bottom: 2px solid var(--border); color: var(--muted);
-      font-size: 0.65rem; text-transform: uppercase;
-      letter-spacing: 0.05em; font-weight: 600;
-    }
-    .detail-table td {
-      padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border);
-    }
-    .detail-table tr:hover { background: var(--mds-color-state-hover); }
+    .detail-id { font-size: 12.5px; font-weight: 400; color: var(--mut); }
+    .detail-badges { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 16px 14px; }
 
-    /* ── Status badges ────────────────────────────────────── */
-    .status-compliant {
-      display: inline-block; padding: 0.1rem 0.5rem;
-      border-radius: 1rem; font-size: 0.7rem; font-weight: 600;
-      background: var(--mds-color-bg-success-tinted); color: var(--green);
+    /* ── Status pills ─────────────────────────────────────── */
+    .status-compliant, .status-non-compliant, .status-pending-eval, .status-remediated {
+      display: inline-flex; align-items: center; padding: 1px 8px;
+      border-radius: 3px; font-size: 12.5px; font-weight: 500; white-space: nowrap;
     }
-    .status-non-compliant {
-      display: inline-block; padding: 0.1rem 0.5rem;
-      border-radius: 1rem; font-size: 0.7rem; font-weight: 600;
-      background: var(--mds-color-bg-error-tinted); color: var(--red);
-    }
-    .status-pending-eval {
-      display: inline-block; padding: 0.1rem 0.5rem;
-      border-radius: 1rem; font-size: 0.7rem; font-weight: 600;
-      background: var(--mds-color-bg-warning-tinted); color: var(--yellow);
-    }
-    .status-remediated {
-      display: inline-block; padding: 0.1rem 0.5rem;
-      border-radius: 1rem; font-size: 0.7rem; font-weight: 600;
-      background: var(--mds-color-state-selected); color: var(--accent);
-    }
+    .status-compliant     { color: var(--ok);   background: color-mix(in srgb, var(--ok) 14%, transparent); }
+    .status-non-compliant { color: var(--bad);  background: color-mix(in srgb, var(--bad) 14%, transparent); }
+    .status-pending-eval  { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); }
+    .status-remediated    { color: var(--info); background: color-mix(in srgb, var(--info) 14%, transparent); }
 
     /* ── Empty / loading states ───────────────────────────── */
-    .empty-state {
-      text-align: center; padding: 2rem 1rem;
-      color: var(--subtle); font-size: 0.85rem;
+    .empty-state, .policy-table td.empty-state {
+      text-align: center; padding: 28px 16px; white-space: normal;
+      color: var(--mut); font-size: 14px;
     }
 
-    /* ── Button overrides for this page ───────────────────── */
-    .btn { height: auto; padding: 0.3rem 0.8rem; font-size: 0.75rem; border: none; }
-    .btn-secondary { background: var(--surface); color: var(--fg); border: 1px solid var(--border); }
-    .btn-sm { padding: 0.2rem 0.5rem; font-size: 0.7rem; }
+    /* ── Buttons ──────────────────────────────────────────── */
+    .btn.btn-secondary {
+      height: var(--ctl); padding: 0 14px; font-size: 14px; font-weight: 500;
+      color: var(--ink); background: var(--raise); border: 1px solid var(--line2);
+      border-radius: var(--rad-ctl); transition: background-color .12s, border-color .12s;
+    }
+    .btn.btn-secondary:hover:not(:disabled) { opacity: 1; background: var(--surface2); border-color: var(--mut); }
+    .btn.btn-sm { height: 28px; padding: 0 10px; font-size: 13px; }
+    /* Row action: text button at the table's right edge */
+    .policy-table .btn.btn-secondary {
+      padding: 0 6px; color: var(--primary); background: none; border-color: transparent;
+    }
+    .policy-table .btn.btn-secondary:hover:not(:disabled) {
+      background: none; border-color: transparent; text-decoration: underline;
+    }
 
     /* ── Refresh indicator ────────────────────────────────── */
     .htmx-indicator {
-      display: none; color: var(--muted); font-size: 0.75rem;
+      display: none; color: var(--mut); font-size: 13px; font-weight: 400;
     }
     .htmx-request .htmx-indicator,
     .htmx-request.htmx-indicator { display: inline; }
+
+    @media (max-width: 640px) { .content { padding: 16px; } }
   </style>
 </head>
 <body>
@@ -200,7 +175,6 @@ const char* const kCompliancePageTemplate =
     <!-- ── Fleet Compliance Summary ─────────────────────── -->
     <div class="section">
       <div class="section-header">
-        <svg class="icon"><use href="/static/icons.svg#shield"></use></svg>
         Fleet Compliance Overview
         <span class="htmx-indicator" style="margin-left:auto">Refreshing...</span>
       </div>
@@ -215,9 +189,8 @@ const char* const kCompliancePageTemplate =
     </div>
 
     <!-- ── Per-Policy Detail (loaded on demand) ─────────── -->
-    <div class="section">
+    <div class="section cmp-panel">
       <div class="section-header">
-        <svg class="icon"><use href="/static/icons.svg#list"></use></svg>
         Policy Detail
       </div>
       <div class="section-body">
