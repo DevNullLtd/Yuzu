@@ -353,6 +353,20 @@ TEST_CASE("static_js_bundle: kYuzuVizJs declares per-OS palette for linux/darwin
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("darwin:"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows:"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("pickOsColor"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("linux:   '#2dd4bf'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("darwin:  '#f5c542'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("macos:   '#f5c542'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows: '#4c9aff'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("default: '#9aa2ae'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs leaves the stage backdrop to the page CSS",
+          "[static-js][viz]") {
+    // The page's .viz-stage rule paints the backdrop so it follows the
+    // theme. That only shows through a transparent renderer, so alpha: true
+    // is load-bearing and the scene must not set an opaque background.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("alpha: true"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, !ContainsSubstring("scene.background ="));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs uses FNV-1a 32-bit hash for stable layout",
@@ -676,7 +690,7 @@ TEST_CASE("static_js_bundle: kYuzuVizJs declares CATEGORY_PALETTE for the six ca
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: '#f5c542'"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("web:      '#2dd4bf'"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("runtime:  '#a78bfa'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("other:    '#8a92a0'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("other:    '#9199a6'"));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs lays processes out on hash(pid|ppid)-mod-bucket grid",
@@ -1162,6 +1176,9 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml renders IPC graph mount point", "[
 TEST_CASE("static_js_bundle: kVizHostPageHtml renders TAR tree mount point", "[viz-host][page]") {
     std::string html(kVizHostPageHtml);
     CHECK_THAT(html, ContainsSubstring("id=\"tar-tree\""));
+    // The pane fills itself over htmx on load; losing either attribute leaves it empty.
+    CHECK_THAT(html, ContainsSubstring("hx-get=\"/fragments/tar/process-tree?device={{AGENT_ID}}\""));
+    CHECK_THAT(html, ContainsSubstring("hx-trigger=\"load\""));
 }
 
 TEST_CASE("static_js_bundle: kVizHostPageHtml binds via data-agent-id attribute",

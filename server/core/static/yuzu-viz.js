@@ -114,7 +114,7 @@ const CATEGORY_PALETTE = {
   database: '#f5c542',
   web:      '#2dd4bf',
   runtime:  '#a78bfa',
-  other:    '#8a92a0'
+  other:    '#9199a6'
 };
 function pickCategoryColor(category) {
   if (!category) return CATEGORY_PALETTE.other;
@@ -589,11 +589,11 @@ function placeSocketsOnCube(sockets) {
 
 function buildSocketSphere(socket, procName) {
   const geom = new THREE.SphereGeometry(SOCKET_DOT_RADIUS, 10, 8);
-  // Yellow (--c3, the Host map's socket colour) so listeners read as
-  // "open ports" visually distinct from the cooler-coloured process dots
-  // inside the cube. Single colour: protocol/port semantics live in the
-  // tooltip, not in the colour channel.
-  const mat = new THREE.MeshBasicMaterial({color: 0xf5c542});
+  // Coral (--c4): the one chart colour no process category or OS cube
+  // uses, so listeners read as "open ports", never as a process or a
+  // machine. Single colour: protocol/port semantics live in the tooltip,
+  // not in the colour channel.
+  const mat = new THREE.MeshBasicMaterial({color: 0xff6b7a});
   const mesh = new THREE.Mesh(geom, mat);
   mesh.userData.yuzuSocket = {
     port: socket.port,
@@ -615,7 +615,7 @@ function buildPortLabel(port) {
   ctx.fillStyle = 'rgba(20,23,28,0.7)';  // --bg
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.font = '500 22px ' + MONO_FONT;
-  ctx.fillStyle = '#f5c542';  // --c3, matches the listener sphere
+  ctx.fillStyle = '#ff6b7a';  // --c4, matches the listener sphere
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(':' + port, canvas.width / 2, canvas.height / 2);
@@ -641,7 +641,7 @@ function buildPortLabel(port) {
 const TALKING_SOCKET_DOT_RADIUS = 0.28;
 const TALKING_SOCKET_RING_RADIUS = CUBE_SIZE * 0.32;
 const TALKING_SOCKET_BOTTOM_Y = -CUBE_SIZE * 0.5 - 0.30;
-const TALKING_SOCKET_COLOR = 0x7ab6ff; // --primary-h, distinct from the yellow listener
+const TALKING_SOCKET_COLOR = 0x7ab6ff; // --primary-h, distinct from the coral listener
 
 // Walk a machine's ESTABLISHED outbound connections (rows whose src_addr
 // is one of THIS machine's local_ips) and return one entry per unique
@@ -770,7 +770,7 @@ function buildWireTube(srcPos, endPos, opts) {
   const radius = isExternal ? EDGE_TUBE_RADIUS_EXTERNAL : EDGE_TUBE_RADIUS_INTERNAL;
   const geom = new THREE.TubeGeometry(
     curve, EDGE_TUBE_SEGMENTS, radius, EDGE_TUBE_RADIAL, false);
-  const colour = isExternal ? 0x8a92a0 : 0x4c9aff;  // --faint : --c1
+  const colour = isExternal ? 0x9199a6 : 0x4c9aff;  // --faint : --c1
   const mat = new THREE.MeshBasicMaterial({
     color: colour,
     transparent: true,
@@ -1336,7 +1336,7 @@ function mount() {
           // unknown OS so it reads as "out of fleet" not "another tier".
           const ringGeom = new THREE.RingGeometry(0.22, 0.36, 16);
           const ringMat = new THREE.MeshBasicMaterial({
-            color: 0x8a92a0, transparent: true, opacity: 0.7, side: THREE.DoubleSide
+            color: 0x9199a6, transparent: true, opacity: 0.7, side: THREE.DoubleSide
           });
           const ring = new THREE.Mesh(ringGeom, ringMat);
           ring.position.copy(endPos);

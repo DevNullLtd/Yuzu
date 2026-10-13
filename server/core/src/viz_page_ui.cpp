@@ -68,7 +68,8 @@ extern const char* const kVizFleetPageHtml = R"HTM(<!DOCTYPE html>
 
   <style>
     body { display: flex; flex-direction: column; min-height: 100vh; margin: 0; }
-    /* Page body: title block, then one bordered panel that holds the stage. */
+    /* Page body: title block (.page-header), then one bordered .panel that
+       holds the stage. Header, panel and panel-header rules come from yuzu.css. */
     .viz-content {
       flex: 1;
       width: 100%;
@@ -78,36 +79,14 @@ extern const char* const kVizFleetPageHtml = R"HTM(<!DOCTYPE html>
       gap: 22px;
       padding: 22px 28px 28px;
     }
-    .viz-title h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.2; }
-    .viz-title p { margin-top: 4px; color: var(--mut); max-width: 70ch; }
     .viz-panel {
       flex: 1;
-      min-width: 0;
       min-height: 480px;
       display: flex;
       flex-direction: column;
-      background: var(--surface);
-      border: 1px solid var(--line);
-      border-radius: var(--rad-panel);
     }
-    .viz-hd {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 8px 14px;
-      padding: 12px 16px;
-      border-bottom: 1px solid var(--line);
-    }
-    .viz-hd h2 { font-size: 14px; font-weight: 600; }
-    .viz-sub { color: var(--mut); font-size: 13px; }
-    .viz-legend {
-      margin-left: auto;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px 16px;
-      font-size: 13px;
-      color: var(--mut);
-    }
+    /* .hd .end sets gap: 8px at (0,3,0); match it so the wider legend gap wins. */
+    .viz-panel .hd .viz-legend { column-gap: 16px; font-size: 13px; font-weight: 400; color: var(--mut); }
     .viz-legend i {
       display: inline-block;
       width: 10px;
@@ -234,15 +213,17 @@ extern const char* const kVizFleetPageHtml = R"HTM(<!DOCTYPE html>
   </div>
 
   <div class="viz-content">
-    <header class="viz-title">
-      <h1>Fleet</h1>
-      <p>The estate in 3D: machines by tier, processes inside.</p>
+    <header class="page-header">
+      <div>
+        <h1>Fleet</h1>
+        <div class="subtitle">The estate in 3D: machines by tier, processes inside.</div>
+      </div>
     </header>
-    <section class="viz-panel" aria-labelledby="viz-panel-title">
-      <div class="viz-hd">
+    <section class="panel viz-panel" aria-labelledby="viz-panel-title">
+      <div class="hd">
         <h2 id="viz-panel-title">Fleet topology</h2>
-        <span class="viz-sub">3 tiers, process dots inside each cube</span>
-        <div class="viz-legend">
+        <span class="sub">3 tiers, process dots inside each cube</span>
+        <div class="end viz-legend">
           <span><i style="background: var(--c1)"></i>Windows</span>
           <span><i style="background: var(--c2)"></i>Linux</span>
           <span><i style="background: var(--c3)"></i>macOS</span>

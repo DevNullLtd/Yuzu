@@ -154,7 +154,7 @@ Standing rules:
   `dst_agent_id`-when-non-empty pattern from PR 2).
 - **Renderer line construction.** For each Local edge with both `src_pid`
   and `dst_pid` set, build `THREE.LineSegments(BufferGeometry from points,
-  LineBasicMaterial({color: 0xffffff, transparent: true, opacity: 0.3}))`
+  LineBasicMaterial({color: 0xe9ecf0, transparent: true, opacity: 0.3}))`
   and add to the per-cube `processGroup`. Per-cube parenting reuses
   `clearFleet`'s `traverse(disposeNode)` walk for free disposal — no
   separate edge index needed.
@@ -175,12 +175,12 @@ Standing rules:
 
   | Category | Hex |
   |---|---|
-  | `system` | `#6e7681` |
-  | `browser` | `#58a6ff` |
-  | `database` | `#d29922` |
-  | `web` | `#56d364` |
-  | `runtime` | `#bc8cff` |
-  | `other` | `#8b949e` |
+  | `system` | `#9aa2ae` |
+  | `browser` | `#4c9aff` |
+  | `database` | `#f5c542` |
+  | `web` | `#2dd4bf` |
+  | `runtime` | `#a78bfa` |
+  | `other` | `#9199a6` |
 
 - **Interior layout.** Deterministic `hash32(pid|ppid)`-mod-bucket placement
   with `hash32('j|pid')` jitter, inside `cubeSize * 0.78` interior fraction
@@ -227,9 +227,10 @@ Standing rules:
   decision (2026-05-12); do not revert without UAT sign-off.
 - **Socket primitives.** `SphereGeometry(SOCKET_DOT_RADIUS, 10, 8)` on a
   ring of radius `CUBE_SIZE * 0.32` on the cube top face; port label
-  Sprite floats `0.55` units above each sphere. Listener sphere colour
-  is cream (`0xfff2cc`) — distinct from the cooler process-dot
-  palette so operators see them as "ports" not "processes".
+  Sprite floats `0.55` units above each sphere. Listener sphere and
+  `:port` label colour is coral (`0xff6b7a`, the `--c4` chart token) —
+  the one chart colour no process category or OS cube uses, so
+  operators see them as "ports" not "processes" or "machines".
 - **Cross-machine edges.** ESTABLISHED-state `connections` outbound
   from one cube's `local_ips` resolve to the destination's
   `listeners[]` socket position when `(dst_addr, dst_port)` matches.
@@ -290,8 +291,8 @@ Standing rules:
   cube's `local_ips`. Loopback destinations are dropped (intra-host
   loopback edges live INSIDE the cube as PR 8 `LineSegments`, not
   on the surface).
-- **Distinct colour.** `TALKING_SOCKET_COLOR = 0x7ec4f8` (cool blue)
-  — visually distinct from the listener-cream `0xfff2cc`. Operators
+- **Distinct colour.** `TALKING_SOCKET_COLOR = 0x7ab6ff` (light blue,
+  `--primary-h`) — visually distinct from the listener-coral `0xff6b7a`. Operators
   read incoming on the roof and outgoing through the floor.
 - **Position.** Ring radius `CUBE_SIZE * 0.32` (same as listeners),
   Y position `-CUBE_SIZE * 0.5 - 0.30` (bottom face, slightly below).

@@ -122,7 +122,6 @@ function graphStyle() {
       style: {
         label: "data(label)",
         "font-family": mono,
-        "border-width": 0,
       },
     },
     {
@@ -205,7 +204,6 @@ function updateStaleBanner(topo) {
     banner = document.createElement("div");
     banner.id = "stale-banner";
     banner.className = "vh-stale";
-    banner.style.display = "none";
     const root = document.getElementById("viz-host-root");
     if (root && root.firstChild) root.insertBefore(banner, root.firstChild);
   }

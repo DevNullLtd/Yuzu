@@ -47,7 +47,8 @@ extern const char* const kVizHostPageHtml = R"HTM(<!DOCTYPE html>
 
   <style>
     body { display: flex; flex-direction: column; height: 100vh; margin: 0; }
-    /* Page body: title block, toolbar, then the graph and TAR panes. */
+    /* Page body: title block (.page-header from yuzu.css), toolbar, then the
+       graph and TAR panes. The long sentence needs more than the 70ch default. */
     .vh-body {
       flex: 1;
       min-height: 0;
@@ -56,8 +57,7 @@ extern const char* const kVizHostPageHtml = R"HTM(<!DOCTYPE html>
       gap: 22px;
       padding: 22px 28px 28px;
     }
-    .vh-title h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.2; }
-    .vh-title p { margin-top: 4px; color: var(--mut); max-width: 100ch; }
+    .vh-body .subtitle { max-width: 100ch; }
     .vh-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
     /* Each pane is a bordered panel: a header row (.vh-hd) over a body
        (#ipc-graph / #tar-tree) that carries the side and bottom borders.
@@ -133,9 +133,11 @@ extern const char* const kVizHostPageHtml = R"HTM(<!DOCTYPE html>
     }
   </style>
   <div class="vh-body">
-    <header class="vh-title">
-      <h1>Host map</h1>
-      <p>{{AGENT_ID}}: processes, their sockets, and what connects to what.</p>
+    <header class="page-header">
+      <div>
+        <h1>Host map</h1>
+        <div class="subtitle">{{AGENT_ID}}: processes, their sockets, and what connects to what.</div>
+      </div>
     </header>
     <div class="vh-toolbar">
       <button id="refresh-btn" class="btn btn-secondary">Refresh</button>
