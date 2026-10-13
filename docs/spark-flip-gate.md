@@ -2827,16 +2827,20 @@ obligation. This is the pointer that was missing when `g6-ledger-row23-no-revisi
 was raised (`governance.d/3953-3966-outbox-hardening.T6I4sf.jsonl` line 15).
 
 **Flip-rollback mechanism (flip-gate obligation, owner decision required before PR-5; tracked in
-#? (follow-up issue B)).** `prefer_spark_` is `const` and fixed at construction
-(`guardian_engine.hpp`: "IMMUTABLE for object lifetime"), and `agent.cpp` constructs
-`GuardianEngine` with the default (`guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(),
-cfg_.agent_id)`, no third argument), so there is no runtime switch for it. A regression of the
-spark path after the flip is therefore mitigated only by a binary rollback. The owner must decide
-a runtime off-switch versus binary rollback before PR-5 and record the decision here; section 6
-(`--spark-disable`) is the existing rollback drill and should be read against that decision.
+#5767).** `prefer_spark_` is `const` and fixed at construction (`guardian_engine.hpp`:
+"IMMUTABLE for object lifetime"), and `agent.cpp` constructs `GuardianEngine` with the default
+(`guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id)`, no third
+argument), so there is no runtime switch for it. The existing rollback lever is the boot-time
+deploy opt-out `--spark-disable` / `YUZU_AGENT_SPARK_DISABLE` (`agent.cpp` ~1232-1248: the
+SparkEngine is not instantiated and detection stays on the legacy `IGuard` path; section 6 is the
+drill). It needs an agent restart and a deploy-time setting, cannot be pushed from the server, and
+it persists across restarts only on Linux (`EnvironmentFile=`, #3851); Windows and macOS have no
+persistence mechanism yet (#3973). The owner must decide, before PR-5, whether that boot-time
+lever (with #3973 closed) is the documented post-flip rollback or whether a server-pushed runtime
+lever is wanted, and record the decision here. There is no hold-only lever: the hold's H and N are
+compile-time defaults.
 
-**Engine-level TSan run of the real `journaled_send` (flip-gate line; tracked in #? (follow-up
-issue A)).** The production send path is `journaled_send` (`guardian_engine.cpp`, the send callback given to the
+**Engine-level TSan run of the real `journaled_send` (flip-gate line; tracked in #5766).** The production send path is `journaled_send` (`guardian_engine.cpp`, the send callback given to the
 spark runtime), whose detached send workers wear `GuardianDetachedWorkerRole`
 (`WorkerHostileMutex`'s second role). The #3972/#3980 tests drive the drain worker with a test
 sink, so nothing yet runs the real `journaled_send` through that role marker under ThreadSanitizer
