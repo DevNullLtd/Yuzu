@@ -31,7 +31,7 @@ Each capability is rated on two axes:
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `194 26 49 269`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> → `192 27 50 269`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
 > awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
 > row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
 > domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
@@ -64,10 +64,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
-Advanced     [========================--------]  129/175 done  (74%) (21 partial)
+Advanced     [=======================---------]  127/175 done  (73%) (22 partial)
 Future       [=========-----------------------]  10/35 done  (29%) (4 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [=======================---------]  194/269 done  (72%) (26 partial)
+Overall      [=======================---------]  192/269 done  (71%) (27 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -93,7 +93,7 @@ Overall      [=======================---------]  194/269 done  (72%) (26 partial
 | 19. Server: Device and Group Management | 7 | 7 | 0 | 0 |
 | 20. Server: Response Collection and Reporting | 8 | 8 | 0 | 0 |
 | 21. Server: Notifications and Audit | 6 | 5 | 0 | 1 |
-| 22. Server: System and Infrastructure | 10 | 6 | 2 | 2 |
+| 22. Server: System and Infrastructure | 10 | 4 | 3 | 3 |
 | 23. Agent-Side Key-Value Storage | 3 | 3 | 0 | 0 |
 | 24. Integration and Extensibility | 11 | 9 | 0 | 2 |
 | 25. Connector Framework | 5 | 0 | 0 | 5 |
@@ -111,9 +111,9 @@ Overall      [=======================---------]  194/269 done  (72%) (26 partial
 | 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
 | 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
-| **Subtotal (domains 1–39)** | **265** | **194** | **26** | **45** |
+| **Subtotal (domains 1–39)** | **265** | **192** | **27** | **46** |
 | 40. Reflex — Agent-Local Automated Response | 4 | 0 | 0 | 4 |
-| **TOTAL** | **269** | **194** | **26** | **49** |
+| **TOTAL** | **269** | **192** | **27** | **50** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -1024,9 +1024,9 @@ Every behavioural-PII read (device-live-info, process/network drill, DEX perf, e
 
 Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks store connectivity). Gateway health endpoint with circuit breaker status. Prometheus `/metrics` endpoint exposes server/agent/gateway metrics. `ProcessHealthSampler` provides cross-platform (Linux `/proc/self`, macOS `mach_task_info`/`getrusage`, Windows `GetProcessMemoryInfo`/`GetProcessTimes`) process telemetry sampled every 15s. New Prometheus metrics: `yuzu_server_cpu_usage_percent`, `yuzu_server_memory_bytes{type=rss|vss}`, `yuzu_server_open_connections`, `yuzu_server_command_queue_depth`, `yuzu_server_uptime_seconds`. `/health` endpoint includes `system` object with CPU, memory, connections, queue depth. Health dashboard strip shows CPU% and memory.
 
-### 22.2 System Topology View :white_check_mark: `T2`
+### 22.2 System Topology View :x: `T2`
 
-No dashboard page: the `/topology` page template (`topology_ui.cpp`) was never routed and was deleted when the app shell replaced the per-page chrome. REST: `GET /api/v1/topology`.
+No dashboard page. REST only: `GET /api/v1/topology` is a placeholder that returns a static message, not topology data. Regraded ✅ Done → ❌ Not Started. *(Evidence: the `/api/v1/topology` handler in `server/core/src/rest_api_v1.cpp`; no route serves a topology page. The fleet topology view that does exist is §28.7.)*
 
 ### 22.3 License Management :large_orange_diamond: `T2` *(verified 2026-09-07)*
 
@@ -1040,9 +1040,9 @@ No dashboard page: the `/topology` page template (`topology_ui.cpp`) was never r
 
 Full Erlang/OTP gateway (`gateway/` rebar3 project). `yuzu_gw_agent` manages agent connections, `yuzu_gw_upstream` handles server-side gRPC (batch heartbeat, proxy register, command forwarding). `yuzu_gw_heartbeat_buffer` batches heartbeats for efficiency. Circuit breaker for upstream resilience. Health endpoint with metrics. Supervision tree with restart strategies. EUnit + Common Test suites including scale tests (10K+ agents).
 
-### 22.6 Statistics Dashboard :white_check_mark: `T2`
+### 22.6 Statistics Dashboard :large_orange_diamond: `T2`
 
-No dashboard page: the `/statistics` page template (`statistics_ui.cpp`) was never routed and was deleted when the app shell replaced the per-page chrome. REST: `GET /api/v1/statistics`.
+No dashboard page. REST only: `GET /api/v1/statistics` returns fleet execution statistics (MCP twin `get_fleet_statistics`). Regraded ✅ Done → 🔶 Partial. *(Evidence: the `/api/v1/statistics` handler in `server/core/src/rest_api_v1.cpp`; no route serves a statistics page.)*
 
 ### 22.7 Binary Resource Distribution :x: `T3`
 
@@ -1222,7 +1222,7 @@ Shipped — this row duplicates §20.7 (same capability, filed under two domains
 
 ### 28.4 TAR Dashboard Page :large_orange_diamond: `T2`
 
-In progress (Phase 15.A retention + 15.D SQL frame; the **15.H process tree viewer shipped 2026-06-18**). A dedicated `/tar` page off the main dashboard nav. Surfaces, in one place, every operator-facing TAR affordance: ad-hoc SQL against agent warehouses with scope-walking-aware results (`save as result set` for downstream narrowing), retention awareness across the fleet, and the **shipped** process tree viewer (Frame 3, §28.5). The consolidation makes TAR — the headline forensics + inventory capability — a discoverable destination rather than a fragment scattered across other pages. Design: `docs/tar-dashboard.md`.
+In progress (Phase 15.A retention + 15.D SQL frame; the **15.H process tree viewer shipped 2026-06-18**). A dedicated `/tar` page in the sidebar's **Posture** group. Surfaces, in one place, every operator-facing TAR affordance: ad-hoc SQL against agent warehouses with scope-walking-aware results (`save as result set` for downstream narrowing), retention awareness across the fleet, and the **shipped** process tree viewer (Frame 3, §28.5). The consolidation makes TAR — the headline forensics + inventory capability — a discoverable destination rather than a fragment scattered across other pages. Design: `docs/tar-dashboard.md`.
 
 ### 28.5 TAR Process Tree Viewer :white_check_mark: `T2`
 

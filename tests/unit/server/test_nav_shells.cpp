@@ -220,8 +220,8 @@ TEST_CASE("app shell: styles come from tokens, never hex literals", "[nav][shell
 TEST_CASE("app shell: each raw literal in the renderer stays under MSVC's string limit",
           "[nav][shell]") {
     // The CSS and the script are the two large literals (C2026 at 16,380 bytes); each renders
-    // verbatim between its own tags, so measure each one, not the whole block. 16,000 is the
-    // same bound `wt.sh rawcheck` enforces.
+    // verbatim between its own tags, so measure each one, not the whole block. The limit is
+    // documented in docs/cpp-conventions.md; 16,000 leaves this test its own headroom.
     const auto html = render_shell({.active_key = "dashboard"});
     for (const auto& [open, close] : {std::pair<std::string_view, std::string_view>{"<style>", "</style>"},
                                       {"<script>", "</script>"}}) {
@@ -234,7 +234,7 @@ TEST_CASE("app shell: each raw literal in the renderer stays under MSVC's string
     }
 }
 
-TEST_CASE("app shell: header search is the existing Ctrl+K palette, not a new search",
+TEST_CASE("app shell: header search is the existing Ctrl+K palette and nothing new",
           "[nav][shell]") {
     const auto html = render_shell({.active_key = "dashboard"});
     CHECK(count_of(html, "id=\"shell-search\"") == 1);
@@ -245,26 +245,37 @@ TEST_CASE("app shell: header search is the existing Ctrl+K palette, not a new se
     CHECK_THAT(html, !ContainsSubstring("<input"));
     // On `/`: a synthetic Ctrl+K on document (the dashboard's own handler).
     CHECK_THAT(html, ContainsSubstring("new KeyboardEvent('keydown',{key:'k',ctrlKey:true,bubbles:true,cancelable:true})"));
-    CHECK_THAT(html, ContainsSubstring("location.pathname==='/'"));
-    // Elsewhere: a sessionStorage flag then `/`, opened on load; `?palette=1` if storage throws.
-    CHECK_THAT(html, ContainsSubstring("sessionStorage.setItem(FLAG,'1');location.href='/';"));
-    CHECK_THAT(html, ContainsSubstring("sessionStorage.removeItem(FLAG)"));
-    CHECK_THAT(html, ContainsSubstring("window.addEventListener('load',function(){setTimeout(openPalette,100);})"));
+    CHECK_THAT(html, ContainsSubstring("if(location.pathname==='/'){openPalette();return;}"));
+    // Elsewhere: the dashboard's own `?palette=1` hand-off, no second mechanism.
     CHECK_THAT(html, ContainsSubstring("location.href='/?palette=1'"));
+    CHECK_THAT(html, !ContainsSubstring("sessionStorage"));
 }
 
-TEST_CASE("app shell: online counter is hidden until /api/health answers, polls every 30 s",
+TEST_CASE("app shell: the Ctrl K hint is true on every page", "[nav][shell]") {
+    const auto html = render_shell({.active_key = "dashboard"});
+    // A `window` listener runs after every `document` listener, so a page that binds Ctrl+K
+    // itself has already called preventDefault and is skipped; the dashboard is never touched.
+    CHECK_THAT(html, ContainsSubstring("window.addEventListener('keydown',function(e){"));
+    CHECK_THAT(html, ContainsSubstring("(e.ctrlKey||e.metaKey)&&e.key==='k'&&!e.defaultPrevented&&location.pathname!=='/'"));
+    CHECK_THAT(html, ContainsSubstring("{e.preventDefault();location.href='/?palette=1';}"));
+}
+
+TEST_CASE("app shell: online counter is hidden until /api/health answers and polls every 30 s",
           "[nav][shell]") {
     const auto html = render_shell({.active_key = "dashboard"});
     CHECK_THAT(html, ContainsSubstring("<span class=\"shell-live\" id=\"shell-online\" hidden><i></i><b id=\"shell-online-n\"></b> online</span>"));
     CHECK_THAT(html, ContainsSubstring(".shell-live[hidden]{display:none}"));
-    CHECK_THAT(html, ContainsSubstring("fetch('/api/health')"));
+    // No session cookie, so the server takes its cheap unauthenticated branch; bounded to 5 s.
+    CHECK_THAT(html, ContainsSubstring("fetch('/api/health',{credentials:'omit',signal:AbortSignal.timeout(5000)})"));
     CHECK_THAT(html, ContainsSubstring("d.agents.online"));
     CHECK_THAT(html, ContainsSubstring("setInterval(pollOnline,30000)"));
-    // A failed poll is silent and keeps the last number.
-    CHECK_THAT(html, ContainsSubstring(".catch(function(){});\n  }\n  pollOnline();"));
-    // Only a number reveals the counter.
-    CHECK_THAT(html, ContainsSubstring("if(typeof n!=='number')return;"));
+    // One request at a time, and a tab coming back to the foreground polls at once.
+    CHECK_THAT(html, ContainsSubstring("if(document.hidden||inflight)return;"));
+    CHECK_THAT(html, ContainsSubstring("document.addEventListener('visibilitychange',pollOnline)"));
+    // Only a number reveals the counter, and any failed poll hides it again.
+    CHECK_THAT(html, ContainsSubstring("if(typeof n!=='number')throw new Error('payload');"));
+    CHECK_THAT(html, ContainsSubstring("if(!r.ok)throw new Error('http');"));
+    CHECK_THAT(html, ContainsSubstring(".catch(function(){el('shell-online').hidden=true;})"));
 }
 
 TEST_CASE("app shell: toasts sit below the header so one never covers Sign out", "[nav][shell]") {

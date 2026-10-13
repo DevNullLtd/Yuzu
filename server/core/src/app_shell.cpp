@@ -247,18 +247,23 @@ html body{padding-left:0}
 }
 </style>)CSS";
 
-// What each page used to do for itself: fill the signed-in user and hide Settings
-// from non-admins. The Settings group is hidden with its entry so no empty
-// heading is left behind.
+// The shell's own behaviour on every page: fill the signed-in user and hide Settings
+// from non-admins (the Settings group is hidden with its entry so no empty heading is
+// left behind), open the command palette from the header search, and keep the online
+// count current.
 //
 // Search is the existing dashboard Ctrl+K command palette, nothing new: on `/` a
 // synthetic Ctrl+K keydown goes to `document` (the dashboard's own handler); anywhere
-// else the click sets a sessionStorage flag and goes to `/`, where this same script
-// opens the palette once the page has loaded. If sessionStorage is unavailable the
-// dashboard's `?palette=1` hand-off is used instead.
+// else the dashboard's own `?palette=1` hand-off opens it. The Ctrl+K hint in the header
+// is true on every page: a page with no handler of its own gets the same hand-off from a
+// `window` listener, which runs after every `document` listener, so a page that binds
+// Ctrl+K itself has already called preventDefault and is left alone.
 //
-// The online count is `agents.online` from GET /api/health, refreshed every 30 s; the
-// counter stays hidden until the first answer and a failed poll keeps the last number.
+// The online count is `agents.online` from GET /api/health, refreshed every 30 s and when
+// the tab becomes visible. The fetch omits credentials so the server takes its cheap
+// unauthenticated branch (the count is in it), is bounded to 5 s and never overlaps
+// itself. The counter is hidden until the first answer and hidden again on any failed
+// poll (network error, non-2xx, bad payload), never left showing a stale number.
 constexpr std::string_view kShellScript = R"JS(<script>
 (function(){
   function el(i){return document.getElementById(i);}
@@ -274,31 +279,35 @@ constexpr std::string_view kShellScript = R"JS(<script>
     }
   }).catch(function(){});
 
-  var FLAG='yuzu.shell.openPalette';
   function openPalette(){
     document.dispatchEvent(new KeyboardEvent('keydown',{key:'k',ctrlKey:true,bubbles:true,cancelable:true}));
   }
   var search=el('shell-search');
   if(search)search.addEventListener('click',function(){
     if(location.pathname==='/'){openPalette();return;}
-    try{sessionStorage.setItem(FLAG,'1');location.href='/';}
-    catch(e){location.href='/?palette=1';}
+    location.href='/?palette=1';
   });
-  if(location.pathname==='/'){
-    var pending=false;
-    try{pending=sessionStorage.getItem(FLAG)==='1';sessionStorage.removeItem(FLAG);}catch(e){}
-    if(pending)window.addEventListener('load',function(){setTimeout(openPalette,100);});
-  }
+  window.addEventListener('keydown',function(e){
+    if((e.ctrlKey||e.metaKey)&&e.key==='k'&&!e.defaultPrevented&&location.pathname!=='/'){e.preventDefault();location.href='/?palette=1';}
+  });
 
+  var inflight=false;
   function pollOnline(){
-    if(document.hidden)return;
-    fetch('/api/health').then(function(r){return r.json();}).then(function(d){
+    if(document.hidden||inflight)return;
+    inflight=true;
+    Promise.resolve().then(function(){
+      return fetch('/api/health',{credentials:'omit',signal:AbortSignal.timeout(5000)});
+    }).then(function(r){
+      if(!r.ok)throw new Error('http');
+      return r.json();
+    }).then(function(d){
       var n=d&&d.agents&&d.agents.online;
-      if(typeof n!=='number')return;
+      if(typeof n!=='number')throw new Error('payload');
       el('shell-online-n').textContent=String(n);
       el('shell-online').hidden=false;
-    }).catch(function(){});
+    }).catch(function(){el('shell-online').hidden=true;}).then(function(){inflight=false;});
   }
+  document.addEventListener('visibilitychange',pollOnline);
   pollOnline();
   setInterval(pollOnline,30000);
 })();

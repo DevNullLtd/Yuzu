@@ -177,13 +177,6 @@ TEST_CASE("render_run: a genuinely pending (not degraded) live read still "
     CHECK(devices[0].bucket == "inc"); // genuinely incomplete, correctly persisted
 }
 
-// SEC-2/SEC-3 confinement-gap class (found during Gate 2 governance review):
-// resolve_targets() feeds devices_fn_(username) — the same username-keyed
-// provider fixed elsewhere in this branch — into a DISPATCH (not just a
-// read), via the shared command_dispatch_fn. Denied here, unlike the pure
-// reads elsewhere in this branch, because /fragments/auto/run mutates
-// (creates a run + dispatches commands) even though every dispatched check
-// is itself read-only.
 // Kills: a wrong active_key literal in page_shell() — apply_shell lights nothing and says
 // nothing for an unknown key, so only a test that fetches the page can see it. No store
 // or provider is wired: the page shell is auth-only chrome.
@@ -208,6 +201,13 @@ TEST_CASE("preflight routes: /auto lights Deployments under Software and its bre
     CHECK(contains(page->body, "<span class=\"shell-sep\">/</span><b>Deployments</b>"));
 }
 
+// SEC-2/SEC-3 confinement-gap class (found during Gate 2 governance review):
+// resolve_targets() feeds devices_fn_(username) — the same username-keyed
+// provider fixed elsewhere in this branch — into a DISPATCH (not just a
+// read), via the shared command_dispatch_fn. Denied here, unlike the pure
+// reads elsewhere in this branch, because /fragments/auto/run mutates
+// (creates a run + dispatches commands) even though every dispatched check
+// is itself read-only.
 TEST_CASE("preflight routes: /fragments/auto/run denies a service-scoped "
           "token, denial audited, nothing dispatched",
           "[pg][preflight][routes][security]") {
