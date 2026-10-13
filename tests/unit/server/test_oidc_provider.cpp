@@ -2550,6 +2550,37 @@ TEST_CASE("OIDC: token-endpoint answers carrying line breaks reach the log and t
     check_no_unicode_breaks(r.error());
 }
 
+TEST_CASE("OIDC token exchange: a query on the token endpoint reaches the IdP "
+          "(an empty path becomes '/')",
+          "[oidc][oidc_discovery]") {
+    // The token POST goes through httplib on Linux/macOS and through winhttp_post on Windows: this
+    // case runs on all three and pins what the IdP actually receives. The answer is an OAuth error
+    // body, so the exchange fails after the POST; only the request target is asserted.
+    struct Shape {
+        const char* advertised;
+        const char* expected_target;
+    };
+    for (const Shape& shape :
+         {Shape{"/token?p=b2c_1_signin", "/token?p=b2c_1_signin"},
+          Shape{"/token?a=1&b=two", "/token?a=1&b=two"}, Shape{"?x=1", "/?x=1"}}) {
+        CAPTURE(shape.advertised);
+        MockIdp idp;
+        idp.with([&](MockIdp& m) {
+            m.token_endpoint_advert = shape.advertised;
+            m.token_body = R"({"error":"invalid_request"})";
+        });
+        OidcProvider provider(discovery_cfg(idp));
+        const auto flow = provider.start_auth_flow();
+        const auto state = yuzu::server::test::url_query_param(flow.url, "state");
+        const auto r = provider.handle_callback("the-code", state, flow.binding_secret);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(idp.token_calls.load() == 1);
+        std::string target;
+        idp.with([&](MockIdp& m) { target = m.last_token_target; });
+        CHECK(target == shape.expected_target);
+    }
+}
+
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
 
 TEST_CASE("OIDC discovery: a refused connection fails closed", "[oidc][oidc_discovery][security]") {

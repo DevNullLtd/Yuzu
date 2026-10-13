@@ -87,6 +87,12 @@ struct MockIdp {
     // Non-empty `token_body` = POST /token answers it verbatim, with `token_status`.
     std::string token_body;
     int token_status{200};
+    // Non-empty = the discovery document advertises `base() + token_endpoint_advert` as its
+    // token_endpoint (default "/token"): "/token?p=b2c_1_signin" is a query-bearing endpoint,
+    // "?x=1" an EMPTY path with a query. `last_token_target` (under mu) is the request target
+    // (path plus query) of the last POST that reached the token handler.
+    std::string token_endpoint_advert;
+    std::string last_token_target;
     std::atomic<int> trickle_chunks_sent{0}; ///< bytes a trickle has written so far (all GETs)
     std::string last_discovery_path; ///< the request path of the last discovery GET
     std::mutex trickle_mu;
@@ -140,7 +146,9 @@ struct MockIdp {
                     if (body.empty()) {
                         body = R"({"issuer":")" + issuer + R"(","authorization_endpoint":")" +
                                base() + R"(/authorize","token_endpoint":")" + base() +
-                               R"(/token","jwks_uri":")" + base() + R"(/jwks")";
+                               (token_endpoint_advert.empty() ? std::string("/token")
+                                                              : token_endpoint_advert) +
+                               R"(","jwks_uri":")" + base() + R"(/jwks")";
                         if (pad > 0)
                             body += R"(,"x":")" + std::string(pad, 'a') + "\"";
                         body += "}";
@@ -187,11 +195,12 @@ struct MockIdp {
             res.set_redirect(req.get_param_value("redirect_uri") + "?code=the-code&state=" +
                              req.get_param_value("state"));
         });
-        svr.Post("/token", [this](const httplib::Request&, httplib::Response& res) {
+        const auto token_handler = [this](const httplib::Request& req, httplib::Response& res) {
             token_calls.fetch_add(1);
             std::string tok;
             {
                 std::lock_guard lk(mu);
+                last_token_target = req.target;
                 if (!token_body.empty()) {
                     res.status = token_status;
                     res.set_content(token_body, "application/json");
@@ -207,7 +216,9 @@ struct MockIdp {
             }
             res.set_content(R"({"id_token":")" + tok + R"(","token_type":"Bearer"})",
                             "application/json");
-        });
+        };
+        svr.Post("/token", token_handler);
+        svr.Post("/", token_handler); // an empty-path token endpoint with a query: POST /?x=1
         // Generate the shared key here, on the test thread: the first call may otherwise run on
         // a handler thread (and REQUIRE is not safe there).
         (void)shared_rsa_key();
