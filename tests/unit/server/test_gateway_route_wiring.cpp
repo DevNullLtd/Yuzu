@@ -3813,6 +3813,8 @@ TEST_CASE("NotifyStreamStatus: a STALE DISCONNECTED (superseded session) leaves 
     // A stale DISCONNECTED must not evict a live re-registered agent's pushed slot.
     CHECK(topo.pushed_map_size() == 1);
     CHECK(offline_store.remove_if_session("agent-presence-2", session2));
+}
+
 // #5686: a saturated presence pool costs a handful of bounded acquire waits per
 // batch (at most floor(log2 N)+1), not one per heartbeat. The presence store has
 // its own one-connection pool whose only lease is held, so every upsert would

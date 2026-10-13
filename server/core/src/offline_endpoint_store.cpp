@@ -319,6 +319,8 @@ int OfflineEndpointStore::run_retention_prune(std::chrono::seconds roster_window
     };
     const auto r = pg::run_clock_guarded_prune(pool_, spec, kQueryAcquireTimeout);
     return r.error ? -1 : r.deleted;
+}
+
 bool OfflineEndpointStore::delete_agent(std::string_view agent_id) {
     if (!open_ || agent_id.empty())
         return false;
