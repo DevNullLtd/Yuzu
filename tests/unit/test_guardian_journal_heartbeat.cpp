@@ -68,6 +68,24 @@ TEST_CASE("journal heartbeat: only non-zero counters are emitted, with the pinne
     CHECK(tags.find("yuzu.guardian_journal_write_failures") == tags.end());
 }
 
+TEST_CASE("journal heartbeat: send_order_hold_releases is sparse and emits its pinned key (#3972)",
+          "[guardian][journal][heartbeat]") {
+    // Zero: no tag (absent == nothing to report, same as every other counter).
+    std::map<std::string, std::string> none;
+    emit_guardian_journal_heartbeat_tags(none, GuardianJournalStats{});
+    CHECK(none.find("yuzu.guardian_send_order_hold_releases") == none.end());
+
+    // Non-zero: exactly that one tag, with the field's own value (not send_stalls').
+    GuardianJournalStats s;
+    s.send_order_hold_releases = 5;
+    s.send_stalls = 9;
+    std::map<std::string, std::string> tags;
+    emit_guardian_journal_heartbeat_tags(tags, s);
+    REQUIRE(tags.size() == 2);
+    CHECK(tags.at("yuzu.guardian_send_order_hold_releases") == "5");
+    CHECK(tags.at("yuzu.guardian_send_stalls") == "9");
+}
+
 TEST_CASE("journal heartbeat: every field has a distinct key", "[guardian][journal][heartbeat]") {
     // Every field set to a distinct non-zero value -> one distinct tag each (no key collision).
     // If a field is added without a matching put() key, or two keys collide, the size check
@@ -118,9 +136,10 @@ TEST_CASE("journal heartbeat: every field has a distinct key", "[guardian][journ
         .lifecycle_backpressure_drops = 29,
         .send_orphan_exceptions = 31,
         .send_stalls = 32,
+        .send_order_hold_releases = 33,
     };
     emit_guardian_journal_heartbeat_tags(tags, s);
-    CHECK(tags.size() == 32);
+    CHECK(tags.size() == 33);
 }
 
 TEST_CASE("journal heartbeat: the capacity/size gauges emit under their pinned keys",
@@ -189,6 +208,7 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     s.page_read_failures = s.clock_jump_skips = s.gauge_underflow = 1;
     s.send_exceptions = s.lifecycle_backpressure_drops = 1;
     s.send_orphan_exceptions = s.send_stalls = 1;
+    s.send_order_hold_releases = 1;
     emit_guardian_journal_heartbeat_tags(emitted, s);
     // Union in the AGE emitter's keys (item 6 + #2364): its tags share the
     // yuzu.guardian_ namespace this check scrapes, so documenting them without this

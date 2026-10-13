@@ -4178,6 +4178,8 @@ void GuardianSparkRuntime::on_subscription_faulted(const std::string& key,
         }
         if (!entries.empty()) {
             std::lock_guard<std::mutex> ob{outbox_mu_};
+            for (auto& e : entries)
+                stamp_seq_locked(e);
             outbox_.enqueue_all(std::move(entries)); // best-effort, same posture as
                                                       // evaluate_key's own enqueue - a
                                                       // rejected (full) enqueue is dropped
@@ -4431,6 +4433,8 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
             bool accepted = true;
             if (had_entries) {
                 std::lock_guard<std::mutex> ob{outbox_mu_};
+                for (auto& e : entries)
+                    stamp_seq_locked(e);
                 accepted = outbox_.enqueue_all(std::move(entries)); // both-or-neither
             }
 
@@ -4647,6 +4651,7 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
         std::shared_ptr<JournalRecord> record =
             build_journal_record(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
         std::lock_guard<std::mutex> ob{outbox_mu_};
+        stamp_seq_locked(entry);
         const bool accepted = lifecycle_log_.enqueue(std::move(entry)); // throwing, rolls back arm
         // #2233 item 7: a capacity-rejected lifecycle entry previously counted
         // (lifecycle_backpressure_drops(), fleet-visible via the journal heartbeat) but
@@ -4695,6 +4700,7 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
     std::lock_guard<std::mutex> ob{outbox_mu_};
     stage_pending_locked(std::move(record)); // durable disarm staged first (noexcept)
     try {
+        stamp_seq_locked(entry);
         const bool accepted = lifecycle_log_.enqueue(std::move(entry)); // best-effort live window
         // #2233 item 7 (see the ARM-side twin above for the full rationale). Distinct
         // from THIS try's own catch just below: that one covers enqueue() itself
@@ -4979,6 +4985,7 @@ GuardianSparkRuntime::try_page_batch(std::vector<OutboxEntry> entries) {
     for (auto& e : entries) {
         if (want.erase(e.event_id) == 0) // already windowed, or an intra-batch duplicate
             continue;
+        stamp_seq_locked(e); // page-time stamp: a prior-boot entry sorts after live enqueues so far
         if (lifecycle_log_.enqueue(std::move(e)))
             ++out.added;
     }
@@ -5112,11 +5119,14 @@ std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const Out
     // persistent send throw) block ALL compliance/health for the agent indefinitely - a
     // detection blackout, far worse than the narrow ordering blip it prevented (Gate 4
     // UP-3). Both logs now drain every pass; failure isolation beats strict ordering.
-    // Residual (documented NICE): a reconnect flap between the two phases, or a concurrent
-    // arm during the compliance phase, can still send a drift a pass ahead of its "armed".
-    // THIS residual is sequential/next-pass in shape (phase N+1 relative to phase N) - a
-    // DIFFERENT, same-pass residual exists too, see drain_bounded()'s own note below;
-    // #3972 tracks the watertight fix (merge-drain by global sequence) for both.
+    // THIS function's phase order is still only best-effort: it never reads OutboxEntry::seq.
+    // The cross-lane order guarantee (#3972) lives in the production caller's send wrapper,
+    // GuardianOutboxDrainWorker::wrapped_send() - see drain_bounded()'s note below for what it
+    // gives and does not give. A caller that passes a raw `send` here (the test-only
+    // GuardianOutboxDrainWorker::drain_once(), tests) gets only the phase order, and so keeps
+    // the residual the phase order alone leaves: a reconnect flap between the two phases, or a
+    // concurrent arm during the compliance phase, can still send a drift a pass ahead of its
+    // "armed".
     DrainLimits unbounded;
     return drain_bounded(send, unbounded).sent;
 }
@@ -5127,12 +5137,49 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
     // Production caller: GuardianOutboxDrainWorker::drain_bounded() (#3847/#3961), which
     // routes `send` through TWO INDEPENDENTLY SCHEDULED GuardianOutboxSendExecutor
     // instances (one per lane), each on its own bounded per-attempt wait and its own
-    // detached worker thread. This makes a SAME-PASS cross-lane wire reordering reachable
-    // that the prior single shared executor structurally prevented: a compliance/health
-    // event can land on the wire between two lifecycle entries within this one call, if
-    // the lifecycle lane's send is still detached past its own bounded wait while the
-    // compliance/health lane's completes. Distinct from drain()'s own disclosed residual
-    // above, which is sequential/next-pass, not same-pass - #3972 tracks the fix for both.
+    // detached worker thread. The two-executor split makes a SAME-PASS cross-lane wire
+    // reordering reachable that the prior single shared executor structurally prevented
+    // (a compliance/health event landing between two lifecycle entries while the lifecycle
+    // lane's send is still detached past its own bounded wait), so that wrapper additionally
+    // gates each lane's LAUNCH on the other lane (#3972). This function itself is unchanged by
+    // that gate: it neither reads seq nor knows the hold exists.
+    //
+    // GUARANTEE (wrapped_send(), guardian_outbox_drain_worker.cpp; seq is stamped under
+    // outbox_mu_ at enqueue, stamp_seq_locked()): for entries a, b on different lanes with
+    // 0 < seq(a) < seq(b), b is NOT launched while a is pending at its lane's head or running
+    // in its executor, UNLESS b's lane has been denied for a cumulative cross_lane_order_hold
+    // (H, default 1 s) in this blocking episode (it ends when the lane finds no blocker or
+    // empties). The lane is then released for up to cross_lane_release_allowance (N, default 64)
+    // overtaking launches, cleared the moment it next finds no blocker or its lane has emptied
+    // since the hold began; a further overtake needs a further H. When b launches because a's
+    // send finished, b's launch follows a's send() RETURNING, and send_guardian_outbox_entry
+    // returns after Write() under stream_write_mu_ (agent.cpp:3917-3920), so b is written after
+    // a. Within a lane FIFO is unchanged. Each release is counted
+    // (cross_lane_order_release_count(), heartbeat tag yuzu.guardian_send_order_hold_releases).
+    //
+    // NOT GIVEN:
+    //  - ordering during an allowance (at most N overtakes per H per lane);
+    //  - the same-second server tie, #5690: if the older send is still waiting on
+    //    stream_write_mu_ when the hold releases, the released entry can reach the wire first,
+    //    and a same-second compliant can then win the server's >= timestamp tie. #5690 (a
+    //    server-side tiebreak) is the remaining residual, not closed here;
+    //  - enqueued_ns is system_clock (stamped at the enqueue sites, wall = system_clock::now();
+    //    replayed lifecycle entries keep the original persisted ns):
+    //    a backward wall-clock step between an older compliant and a newer errored makes the
+    //    errored timestamp earlier, so the server keeps compliant regardless of wire order; the
+    //    hold cannot affect this (server-side, #5690);
+    //  - replayed journal entries vs live compliance (seq is stamped at page time);
+    //  - seq == 0 entries: an unstamped head is never held and never blocks (fail-open);
+    //  - entries behind a head: only each lane's HEAD (front_seq) and the one running send are
+    //    compared, so with a coalesced head (higher seq, same position) an older entry behind
+    //    it is invisible to the other lane and a coalesced head can hold its own lane for up to
+    //    H while an older entry waits behind it;
+    //  - the legacy Guardian drift-sink (agent.cpp:3878-3881) writes on the same stream and is
+    //    in neither lane, so it is unordered relative to both;
+    //  - a pending head that is link-down-Retained or persistently throwing still blocks while
+    //    pending (it holds the other lane for H, then N launches per H).
+    // `running` stays true through journaled_send's mark_batch_sent KV write after the wire
+    // write (`journaled_send` in guardian_engine.cpp): a longer hold, never a shorter one.
     std::lock_guard<std::mutex> dg{drain_mu_};
     DrainOutcome out;
 
@@ -5362,6 +5409,22 @@ std::size_t GuardianSparkRuntime::rule_count() const {
 std::size_t GuardianSparkRuntime::outbox_size() const {
     std::lock_guard<std::mutex> ob{outbox_mu_};
     return outbox_.size();
+}
+std::optional<std::uint64_t> GuardianSparkRuntime::lifecycle_front_seq() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return lifecycle_log_.front_seq();
+}
+std::optional<std::uint64_t> GuardianSparkRuntime::outbox_front_seq() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return outbox_.front_seq();
+}
+std::uint64_t GuardianSparkRuntime::lifecycle_empty_epoch() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return lifecycle_log_.empty_epoch();
+}
+std::uint64_t GuardianSparkRuntime::outbox_empty_epoch() const {
+    std::lock_guard<std::mutex> ob{outbox_mu_};
+    return outbox_.empty_epoch();
 }
 std::uint64_t GuardianSparkRuntime::outbox_backpressure_drops() const {
     std::lock_guard<std::mutex> ob{outbox_mu_};

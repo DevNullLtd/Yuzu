@@ -1765,7 +1765,7 @@ if build_server
       # keys into one source of truth. NOTE THE SCOPE: that hoist is triggered by spark's
       # rung 2, "when the wire contract changes anyway" - but the GUARDIAN JOURNAL and
       # GUARDIAN HEALTH keys are not part of that wire-contract change, so a rung-2 hoist
-      # sweeping only spark would leave the 30 yuzu.guardian_journal_* and 3
+      # sweeping only spark would leave the 33 yuzu.guardian_* journal-family counters and 3
       # yuzu.guardian_unhealthy_*/guardian_priority_demoted literals behind while this
       # comment still read as though it covered them. ALL THREE key families must move
       # together; the journal and health sides must be added to #2298's cutover-gate
