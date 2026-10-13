@@ -244,6 +244,7 @@ html body{padding-left:0}
 .shell-gt,.shell-me,.shell-cv{display:none}
 .shell-top{padding:10px 16px}
 .shell-search{flex-basis:100%;margin-left:0}
+.toast-container{top:auto;bottom:var(--sp-4)}
 }
 </style>)CSS";
 

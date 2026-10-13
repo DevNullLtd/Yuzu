@@ -297,6 +297,9 @@ TEST_CASE("app shell: online counter is hidden until /api/health answers and pol
 
 TEST_CASE("app shell: toasts sit below the header so one never covers Sign out", "[nav][shell]") {
     CHECK_THAT(render_shell({}), ContainsSubstring(".toast-container{top:calc(var(--shell-top-h) + var(--sp-4))}"));
+    // At <=820px the sidebar becomes a wrapping row above a wrapped header, so no fixed top
+    // offset clears them: toasts move to the bottom edge instead of covering the nav links.
+    CHECK_THAT(render_shell({}), ContainsSubstring(".shell-search{flex-basis:100%;margin-left:0}\n.toast-container{top:auto;bottom:var(--sp-4)}\n}"));
 }
 
 // ── apply_shell / bake ──────────────────────────────────────────────────────
