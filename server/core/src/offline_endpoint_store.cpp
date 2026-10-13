@@ -319,6 +319,26 @@ int OfflineEndpointStore::run_retention_prune(std::chrono::seconds roster_window
     };
     const auto r = pg::run_clock_guarded_prune(pool_, spec, kQueryAcquireTimeout);
     return r.error ? -1 : r.deleted;
+bool OfflineEndpointStore::delete_agent(std::string_view agent_id) {
+    if (!open_ || agent_id.empty())
+        return false;
+    // An operator request, not the heartbeat path: the longer user-facing bound.
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        spdlog::debug("OfflineEndpointStore: delete_agent skipped for agent={}, no connection in "
+                      "time ({})",
+                      agent_id, pool_.last_error());
+        return false;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "DELETE FROM endpoint_state.endpoints WHERE agent_id = $1 RETURNING agent_id",
+        std::vector<std::string>{std::string(agent_id)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::debug("OfflineEndpointStore: delete_agent failed for agent={}: {}", agent_id,
+                      PQerrorMessage(lease.get()));
+        return false;
+    }
+    return true;
 }
 
 std::expected<std::vector<OfflineEndpoint>, PresenceReadError>

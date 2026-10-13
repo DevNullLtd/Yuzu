@@ -247,6 +247,13 @@ public:
     /// decline / lock-skip / nothing to do; -1 on error or a store that is not
     /// open (the preflight_run_store contract).
     int run_retention_prune(std::chrono::seconds roster_window);
+    /// Decommission erasure (#5682, `AgentDecommissionStores::offline_endpoint`):
+    /// deletes the agent's row whatever its `session_id`, unlike
+    /// `remove_if_session`. Returns true iff the DELETE ran (zero rows
+    /// included, so a re-issued decommission stays idempotent); false on an
+    /// empty id, a closed store, no lease in time, or a SQL error, so the
+    /// cascade records `Failed`, never a false erasure.
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
 
 private:
     pg::PgPool& pool_;

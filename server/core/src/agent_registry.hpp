@@ -519,12 +519,18 @@ struct PluginMeta {
 // the trio published together by set_gateway_route, M1 review fix +
 // #4324; an earlier revision wrote gateway_node under the registry mu_
 // instead, which both raced stream_mu's readers and contradicted this
-// comment) and the atomic last_activity_epoch_ms. (Governance G3
-// cpp-safety — keep it true.)
+// comment) and the atomic last_activity_epoch_ms. `session_id` is ALSO
+// rewritten in place after publication, by AgentRegistry::map_session under
+// AgentRegistry::mu_ (an exception to the identity-field rule above): read
+// it only through session_is()/session_id_of(), never through a
+// get_session()/find_by_session() pointer after the lock is released (#5684).
+// (Governance G3 cpp-safety — keep it true.)
 
 struct AgentSession {
     std::string agent_id;
-    std::string session_id; // Unique per connection — used to prevent stale cleanup races
+    // Unique per connection — used to prevent stale cleanup races. Rewritten in place by
+    // map_session under AgentRegistry::mu_: read only via session_is()/session_id_of().
+    std::string session_id;
     std::string hostname;
     std::string os;
     std::string arch;
