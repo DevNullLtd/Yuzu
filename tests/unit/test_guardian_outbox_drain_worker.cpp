@@ -2341,6 +2341,41 @@ TEST_CASE("#3972 T4b: a leftover allowance is cleared when the lane next finds n
     CHECK(f.sink.nth_start(OutboxDomain::Compliance, 2)->at - t_pre >= kHold);
 }
 
+TEST_CASE("#3972 T4c: a leftover allowance is cleared when the held lane EMPTIES, so a new "
+          "entry behind the same blocker waits a fresh H",
+          "[spark][guardian][drain][order]") {
+    // Release with N = 2, use ONE launch, let that entry leave the compliance lane (the lane
+    // EMPTIES), then enqueue a NEW compliance entry behind the SAME older, still-running
+    // lifecycle blocker. An episode ends when the lane empties, so the leftover unit must not
+    // let the new entry overtake: it is denied and needs a further H (a second release).
+    HoldRig f;
+    f.sink.set_permits(kLifecycleIdx, 0);
+    f.lifecycle_only("L");
+    f.drift("c1");
+    f.start();
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) == 1; }));
+    REQUIRE(f.worker->releases_for_test(OutboxDomain::Compliance) == 1); // allowance 2 -> 1 left
+    REQUIRE(spin_until([&] {
+        return f.sink.n_ended(OutboxDomain::Compliance) == 1 && f.rt->outbox_size() == 0;
+    })); // c1 shipped and left the lane: it is EMPTY, the blocker `L` is still parked
+
+    REQUIRE(f.arm("c2"));
+    const auto t_pre = std::chrono::steady_clock::now();
+    const auto d0 = f.worker->denials_for_test(OutboxDomain::Compliance);
+    f.verdict("c2"); // a new compliance entry, younger than the parked `L`
+    REQUIRE(spin_until([&] {
+        return f.worker->denials_for_test(OutboxDomain::Compliance) > d0 ||
+               f.sink.n_started(OutboxDomain::Compliance) >= 2;
+    }));
+    CHECK(f.sink.n_started(OutboxDomain::Compliance) == 1); // the stale unit let nothing through
+    CHECK(f.worker->denials_for_test(OutboxDomain::Compliance) > d0);
+    CHECK(f.worker->cross_lane_order_release_count() == 1);
+
+    REQUIRE(spin_until([&] { return f.sink.n_started(OutboxDomain::Compliance) == 2; }));
+    CHECK(f.sink.nth_start(OutboxDomain::Compliance, 1)->at - t_pre >= kHold);
+    CHECK(f.worker->cross_lane_order_release_count() == 2);
+}
+
 TEST_CASE("#3972 T5: a lane that EMPTIES mid-episode restarts its hold clock",
           "[spark][guardian][drain][order]") {
     HoldRig f;

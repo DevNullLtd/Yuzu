@@ -5150,12 +5150,12 @@ GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxE
     // in its executor, UNLESS b's lane has been denied for a cumulative cross_lane_order_hold
     // (H, default 1 s) in this blocking episode (it ends when the lane finds no blocker or
     // empties). The lane is then released for up to cross_lane_release_allowance (N, default 64)
-    // overtaking launches, cleared the moment it next finds no blocker; a further overtake needs
-    // a further H. When b launches because a's send finished, b's launch follows a's send()
-    // RETURNING, and send_guardian_outbox_entry returns after Write() under stream_write_mu_
-    // (agent.cpp:3917-3920), so b is written after a. Within a lane FIFO is unchanged. Each
-    // release is counted (cross_lane_order_release_count(), heartbeat tag
-    // yuzu.guardian_send_order_hold_releases).
+    // overtaking launches, cleared the moment it next finds no blocker or its lane has emptied
+    // since the hold began; a further overtake needs a further H. When b launches because a's
+    // send finished, b's launch follows a's send() RETURNING, and send_guardian_outbox_entry
+    // returns after Write() under stream_write_mu_ (agent.cpp:3917-3920), so b is written after
+    // a. Within a lane FIFO is unchanged. Each release is counted
+    // (cross_lane_order_release_count(), heartbeat tag yuzu.guardian_send_order_hold_releases).
     //
     // NOT GIVEN:
     //  - ordering during an allowance (at most N overtakes per H per lane);

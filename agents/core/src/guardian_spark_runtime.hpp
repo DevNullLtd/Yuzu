@@ -1067,8 +1067,9 @@ public:
     /// (a leaf) and releases it before returning, so a caller may read one lane and then the
     /// other, or an executor's state, without ever nesting locks. The *_front_seq values are the
     /// head's seq (nullopt: lane empty; 0: unstamped head). The *_empty_epoch values count
-    /// removals that left that lane EMPTY and never move on enqueue/coalesce. Nothing in
-    /// production consumes these yet. The "outbox" lane is compliance + health (outbox_size()'s
+    /// removals that left that lane EMPTY and never move on enqueue/coalesce. The sole
+    /// production consumer of all four is GuardianOutboxDrainWorker::wrapped_send()
+    /// (guardian_outbox_drain_worker.cpp). The "outbox" lane is compliance + health (outbox_size()'s
     /// lane); "lifecycle" is the audit log.
     [[nodiscard]] std::optional<std::uint64_t> lifecycle_front_seq() const;
     [[nodiscard]] std::optional<std::uint64_t> outbox_front_seq() const;

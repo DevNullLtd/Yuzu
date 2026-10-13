@@ -574,7 +574,8 @@ private:
     /// in its executor; seq == 0 on either side fails open. A lane's hold clock
     /// (cross_lane_order_hold) runs across ACTUAL launch denials only; on expiry the lane is
     /// released for cross_lane_release_allowance overtaking launches, cleared the moment the
-    /// lane next finds no blocker. Each release is counted (cross_lane_order_release_count()).
+    /// lane next finds no blocker or has emptied since the hold began. Each release is counted
+    /// (cross_lane_order_release_count()).
     /// The gate lives in this wrapper only: drain_once() (test-only) calls the runtime's
     /// drain() with the raw send and bypasses it. The guarantee, what it does not give, and its
     /// bounds are stated once, at GuardianSparkRuntime::drain_bounded(); the mechanism is in the
@@ -613,7 +614,7 @@ private:
     struct LaneHold {
         std::optional<std::chrono::steady_clock::time_point> held_since; ///< cumulative hold clock
         std::size_t allowance{0};         ///< overtaking launches left after a release
-        std::uint64_t epoch_at_hold{0};   ///< this lane's empty_epoch when held_since was set
+        std::uint64_t epoch_at_hold{0};   ///< this lane's empty_epoch at the episode's first denial
         bool denied_this_pass{false};     ///< per-pass flags, reset in drain_bounded()
         bool sent_this_pass{false};
         bool blocker_running_this_pass{false};

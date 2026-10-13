@@ -343,39 +343,51 @@ SendResult GuardianOutboxDrainWorker::wrapped_send(const OutboxEntry& entry) {
     // GATE. The hold clock starts only on an ACTUAL denial (trace below), so an orphan still
     // running, a same-entry wait or a consume never arms it. A released lane keeps its allowance
     // across passes; it is cleared the moment the lane next finds no blocker, so a leftover
-    // allowance can never pre-authorise an overtake of a FUTURE older entry.
+    // allowance can never pre-authorise an overtake of a FUTURE older entry. It is also cleared
+    // when the held lane has EMPTIED since the hold began: that ends the episode, so entries
+    // that refill the lane behind the same blocker need a further H, not the stale allowance.
     bool permitted = true;
     if (!blocked) {
         h.held_since.reset();
         h.allowance = 0;
-    } else if (h.allowance == 0) {
-        permitted = false;
-        if (h.held_since) {
+    } else {
+        if (h.held_since || h.allowance > 0) {
             try {
-                // The lane emptied during the episode: the clock measured a different set of
-                // entries, so start over. A coalesce never empties a lane, so it never resets it.
-                const auto epoch = x == kLifecycleLane ? rt_.lifecycle_empty_epoch() : rt_.outbox_empty_epoch();
-                if (epoch != h.epoch_at_hold)
+                // The lane emptied since the hold began: the clock measured, and the allowance
+                // was granted for, a different set of entries, so start over. epoch_at_hold is
+                // sampled at the episode's first denial and not re-sampled at a release. A
+                // coalesce never empties a lane, so it never resets it. A throw from the epoch
+                // read fails toward clearing.
+                const auto epoch =
+                    x == kLifecycleLane ? rt_.lifecycle_empty_epoch() : rt_.outbox_empty_epoch();
+                if (epoch != h.epoch_at_hold) {
                     h.held_since.reset();
+                    h.allowance = 0;
+                }
             } catch (...) {
                 h.held_since.reset();
+                h.allowance = 0;
             }
         }
-        if (h.held_since && std::chrono::steady_clock::now() - *h.held_since >= maint_.cross_lane_order_hold) {
-            h.allowance = maint_.cross_lane_release_allowance;
-            h.releases.fetch_add(1, std::memory_order_relaxed);
-            h.held_since.reset();
-            permitted = true;
-            if (!h.logged_release) {
-                h.logged_release = true;
-                try {
-                    spdlog::warn("Guardian drain worker: {} lane launch hold released after {} ms behind an "
-                                 "older entry (blocker seq {}, held seq {}); up to {} entries may now "
-                                 "overtake it. Further releases counted only.",
-                                 x == kLifecycleLane ? "lifecycle" : "compliance",
-                                 maint_.cross_lane_order_hold.count(), blocker_seq, entry.seq,
-                                 maint_.cross_lane_release_allowance);
-                } catch (...) {
+        if (h.allowance == 0) {
+            permitted = false;
+            if (h.held_since &&
+                std::chrono::steady_clock::now() - *h.held_since >= maint_.cross_lane_order_hold) {
+                h.allowance = maint_.cross_lane_release_allowance;
+                h.releases.fetch_add(1, std::memory_order_relaxed);
+                h.held_since.reset();
+                permitted = true;
+                if (!h.logged_release) {
+                    h.logged_release = true;
+                    try {
+                        spdlog::warn("Guardian drain worker: {} lane launch hold released after {} ms behind an "
+                                     "older entry (blocker seq {}, held seq {}); up to {} entries may now "
+                                     "overtake it. Further releases counted only.",
+                                     x == kLifecycleLane ? "lifecycle" : "compliance",
+                                     maint_.cross_lane_order_hold.count(), blocker_seq, entry.seq,
+                                     maint_.cross_lane_release_allowance);
+                    } catch (...) {
+                    }
                 }
             }
         }
