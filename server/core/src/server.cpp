@@ -376,10 +376,6 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 // Defined in dashboard_ui.cpp (separate TU to isolate MSVC raw-string issues).
 extern const char* const kDashboardIndexHtml;
 
-// Legacy UIs kept for backward compatibility (redirect to /).
-extern const char* const kChargenIndexHtml;
-extern const char* const kProcfetchIndexHtml;
-
 // Login and Settings pages (separate TUs).
 extern const char* const kLoginHtml;
 extern const char* const kSettingsHtml;
@@ -409,8 +405,6 @@ extern const std::string
     kYuzuVizJs; // server/core/src/yuzu_viz_js_bundle.cpp (PR 5 fleet renderer module)
 extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bundle.cpp (PR 9-pre)
 extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
-extern const std::string_view
-    kInterVariableWoff2; // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
 // kBundledDefinitions / kBundledSets / kBundledPluginDocs: bundled_content.hpp
 
 std::string trim_ascii_whitespace(std::string_view s) {
@@ -15220,7 +15214,7 @@ private:
             return get_visible_agents_json(username);
         };
 
-        // #2542: page-shell/static-asset routes (25), extracted onto inline_sink
+        // #2542: page-shell/static-asset routes (29), extracted onto inline_sink
         // (this call's own HttpRouteSink seam) rather than any per-owner sink —
         // these routes are pure page-shell/static-asset serving with no owning
         // store of their own.

@@ -1261,6 +1261,28 @@ TEST_CASE("DEX apps list: empty store → no-data placeholder", "[pg][dex][route
     CHECK(html.find("No data") != std::string::npos);
 }
 
+// Kills: a wrong active_key literal on /dex — apply_shell lights nothing and says nothing for an
+// unknown key, so only a test that fetches the page can see it. The page handler touches only
+// auth_fn_ and apply_shell, so no store is wired and this runs without Postgres.
+TEST_CASE("DEX routes: /dex lights DEX in the sidebar and ends the breadcrumb on it",
+          "[dex][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    yuzu::server::test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, /*perm_fn=*/{}, /*store=*/nullptr, /*fleet_fn=*/{},
+                           /*audit_fn=*/{});
+
+    auto page = sink.Get("/dex");
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+    CHECK(page->body.find("/fragments/dex/overview") != std::string::npos);
+    CHECK(page->body.find("<a class=\"shell-nav on\" href=\"/dex\" aria-current=\"page\">") !=
+          std::string::npos);
+    CHECK(page->body.find("<span class=\"shell-sep\">/</span><b>DEX</b>") != std::string::npos);
+}
+
 TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
