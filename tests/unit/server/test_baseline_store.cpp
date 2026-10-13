@@ -90,12 +90,9 @@ void exec_sql(const std::string& dsn, const std::string& sql) {
 // Like exec_sql but never throws and asserts nothing, for use in a destructor (ScopeExit) that
 // may run during unwinding. A failure is swallowed: the per-test database is dropped anyway.
 void exec_sql_nothrow(const std::string& dsn, const std::string& sql) noexcept {
-    PGconn* c = PQconnectdb(dsn.c_str());
-    if (c != nullptr) {
-        if (PQstatus(c) == CONNECTION_OK)
-            PQclear(PQexec(c, sql.c_str()));
-        PQfinish(c);
-    }
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    if (PQstatus(conn.get()) == CONNECTION_OK)
+        pg::PgResult result{PQexec(conn.get(), sql.c_str())};
 }
 
 // Simulate guardian_routes.cpp's deploy_baseline handler: snapshot the
