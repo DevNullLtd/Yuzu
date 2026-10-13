@@ -799,11 +799,10 @@ std::string render_device_live_arp(const std::vector<LiveArpEntry>& rows) {
     std::string h = "<table class=\"ls-tbl\"><thead><tr><th>Interface</th><th>IP</th><th>MAC</th>"
                     "<th>Type</th></tr></thead><tbody>";
     for (const auto& r : rows) {
-        const char* cls = r.type == "static" ? "stat" : r.type == "incomplete" ? "inc" : "dyn";
         h += tr(lc(r.iface + " " + r.ip + " " + r.mac),
                 {"<span class=\"name\">" + esc(r.iface) + "</span>", "<code>" + esc(r.ip) + "</code>",
                  r.mac.empty() ? "<span class=\"gp-mute\">-</span>" : "<code>" + esc(r.mac) + "</code>",
-                 "<span class=\"ls-pill " + std::string(cls) + "\">" + esc(r.type) + "</span>"});
+                 "<span class=\"ls-pill\">" + esc(r.type) + "</span>"});
     }
     h += "</tbody></table>";
     return h;
@@ -819,7 +818,7 @@ std::string render_device_live_dns(const std::vector<LiveDnsEntry>& rows) {
     for (const auto& r : rows)
         h += tr(lc(r.name + " " + r.record_type),
                 {"<span class=\"name\">" + esc(r.name) + "</span>",
-                 "<span class=\"ls-pill type\">" + esc(r.record_type) + "</span>"});
+                 "<span class=\"ls-pill\">" + esc(r.record_type) + "</span>"});
     h += "</tbody></table>";
     return h;
 }
@@ -1006,7 +1005,7 @@ std::string render_device_live_capture_sources(const std::vector<LiveCaptureSour
                                           : std::to_string(r.live_rows);
         h += "<tr><td>" + sw + "</td><td>" + nm + "</td><td><code>$" + esc(r.dollar) +
              "_Live</code></td><td class=\"ls-num\">" + rows_cell +
-             "</td><td><span class=\"ls-pill cat\">" + esc(r.category) + "</span></td></tr>";
+             "</td><td><span class=\"ls-pill\">" + esc(r.category) + "</span></td></tr>";
     }
     h += "</tbody></table>";
     return h;

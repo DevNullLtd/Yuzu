@@ -122,7 +122,6 @@ std::string list_url(const HardwareListQuery& q, bool with_q = true, bool result
 
 std::string hw_style() {
     return R"css(<style>
-  .hw-ph{margin:0}
   .hw-h1{font-size:24px;font-weight:600;letter-spacing:-.015em;line-height:1.2;color:var(--ink)}
   .hw-sub{color:var(--mut);margin-top:4px;max-width:70ch}
   .hw-panel{min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:var(--rad-panel)}
@@ -137,7 +136,7 @@ std::string hw_style() {
   .hw-wrap .gp-btn:disabled{opacity:.5;cursor:not-allowed}
   .hw-breadcrumb{display:flex;flex-wrap:wrap;gap:6px;padding:10px 16px;border-bottom:1px solid var(--line)}
   .hw-crumb{display:inline-flex;align-items:center;gap:6px;padding:1px 8px;border-radius:3px;background:var(--surface2);color:var(--ink2);font-size:12.5px;font-weight:500}
-  .hw-crumb a{margin:0;color:var(--mut);cursor:pointer}
+  .hw-crumb a{color:var(--mut);cursor:pointer}
   .hw-crumb a:hover{color:var(--ink)}
   .hw-scroll{overflow-x:auto}
   table.hw-tbl{width:100%;border-collapse:collapse}
@@ -150,7 +149,7 @@ std::string hw_style() {
   table.hw-tbl tbody tr:hover td{background:var(--surface2)}
   table.hw-tbl tbody tr:has(.hw-sel:checked) td{background:color-mix(in srgb,var(--hl) 8%,transparent)}
   table.hw-tbl tbody tr:has(.hw-sel:checked) td:first-child{box-shadow:inset 3px 0 0 var(--hl)}
-  table.hw-tbl input[type=checkbox]{width:16px;height:16px;margin:0;accent-color:var(--primary);color-scheme:dark;vertical-align:middle}
+  table.hw-tbl input[type=checkbox]{width:16px;height:16px;accent-color:var(--primary);color-scheme:dark;vertical-align:middle}
   table.hw-tbl td.hw-mono{color:var(--ink2)}
   .hw-name{color:var(--ink);font-weight:600;text-decoration:none}
   .hw-mono{font-family:var(--mds-font-family-mono);font-size:12.5px;color:var(--mut)}
@@ -481,7 +480,7 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
 
     std::string h = hw_style();
     h += "<div class=\"hw-wrap\">";
-    h += "<header class=\"hw-ph\"><h1 class=\"hw-h1\">Hardware</h1>";
+    h += "<header><h1 class=\"hw-h1\">Hardware</h1>";
     h += "<div class=\"hw-sub\">Configuration items across the fleet &mdash; search, filter, sort.</div></header>";
 
     if (roster_unavailable) {

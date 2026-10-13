@@ -246,6 +246,48 @@ TEST_CASE("hardware row: DEX badge for a scored row; honest dash for the -1 sent
     CHECK(nth_td(first_row(render_row(unscored)), 5) == "<span class=\"hw-grey\">&mdash;</span>");
 }
 
+// Kills: swapping or dropping the DEX tone classes, or moving a threshold (>=90 ok, >=75 warn,
+// else bad). The score text alone survives all of those.
+TEST_CASE("hardware row: DEX badge tone — ok from 90, warn from 75, bad below",
+          "[hardware][ui]") {
+    const std::pair<int, const char*> cases[] = {
+        {95, "ok"}, {90, "ok"}, {82, "warn"}, {75, "warn"}, {74, "bad"}, {60, "bad"}};
+    for (const auto& [score, tone] : cases) {
+        InventoryDeviceRow row;
+        row.agent_id = "a1";
+        row.hostname = "WS-1";
+        row.dex_score = score;
+        CHECK(nth_td(first_row(render_row(row)), 5) ==
+              std::string("<span class=\"hw-pill ") + tone + "\">" + std::to_string(score) + "</span>");
+    }
+}
+
+// ── Status pill ────────────────────────────────────────────────────────────────
+
+// Kills: dropping or swapping the status pill tone, or collapsing the stale branch into offline.
+// Online wins over stale; offline (not stale) is the neutral pill with no tone class.
+TEST_CASE("hardware row: status pill — online ok, stale warn, offline neutral",
+          "[hardware][ui]") {
+    InventoryDeviceRow row;
+    row.agent_id = "a1";
+    row.hostname = "WS-1";
+
+    row.online = true;
+    CHECK(nth_td(first_row(render_row(row)), 4) == "<span class=\"hw-pill ok\">online</span>");
+
+    row.online = true;
+    row.stale = true; // a live stream outranks a stale heartbeat
+    CHECK(nth_td(first_row(render_row(row)), 4) == "<span class=\"hw-pill ok\">online</span>");
+
+    row.online = false;
+    row.stale = true;
+    CHECK(nth_td(first_row(render_row(row)), 4) == "<span class=\"hw-pill warn\">stale</span>");
+
+    row.online = false;
+    row.stale = false;
+    CHECK(nth_td(first_row(render_row(row)), 4) == "<span class=\"hw-pill\">offline</span>");
+}
+
 // ── IP cell ────────────────────────────────────────────────────────────────────
 
 TEST_CASE("hardware row: IP cell — single IP, +N suffix for multiple, honest empty",
@@ -514,6 +556,28 @@ TEST_CASE("hardware CI fragment: identity_degraded + no record -> roster unreada
         CHECK(html.find("Device not found") != std::string::npos);
         CHECK(html.find("last 30 days") != std::string::npos);
     }
+}
+
+// Kills: dropping the CI header's online/offline text pill (status must never be colour alone), or
+// inverting its tone. The header has no stale state: anything not online reads "offline".
+TEST_CASE("hardware CI fragment: header status pill — online ok, otherwise neutral offline",
+          "[hardware][ui]") {
+    HwCiAffordances aff;
+    InventoryDeviceRow identity;
+    identity.hostname = "WS-1";
+    HardwareCiDetail d;
+
+    identity.online = true;
+    d.identity = identity;
+    const auto on = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+    CHECK(on.find("<span class=\"hw-pill ok\">online</span>") != std::string::npos);
+    CHECK(on.find("<span class=\"hw-pill\">offline</span>") == std::string::npos);
+
+    identity.online = false;
+    d.identity = identity;
+    const auto off = render_hardware_ci_fragment("agent-x", d, "", 0, aff);
+    CHECK(off.find("<span class=\"hw-pill\">offline</span>") != std::string::npos);
+    CHECK(off.find("<span class=\"hw-pill ok\">online</span>") == std::string::npos);
 }
 
 // Kills: rendering the KPI strip (all zeros) above the roster-unavailable banner. The marker is
