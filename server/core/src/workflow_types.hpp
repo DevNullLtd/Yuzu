@@ -11,10 +11,13 @@
 /// without ever reaching the Postgres-backed `WorkflowEngine` class or its
 /// `pg::PgPool&` constructor dependency.
 ///
-/// No I/O, no store type, std-only — safe for a future presentation-side
-/// client to include directly.
+/// No I/O, no store type, std-only plus the equally pure `list_keyset.hpp` — safe for a future
+/// presentation-side client to include directly.
+
+#include "list_keyset.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -83,6 +86,47 @@ struct WorkflowExecution {
 struct WorkflowQuery {
     std::string name_filter;
     int limit{100};
+};
+
+/// One row of the workflow-execution LIST (`GET /api/v1/workflow-executions` / MCP
+/// `list_workflow_executions`). Metadata only: deliberately no `agent_ids` (can be ~100k ids and
+/// names the fleet), no step results and no `agents_reached` — a list row never discloses fleet
+/// size or out-of-scope agent ids to a confined caller.
+struct WorkflowExecutionSummary {
+    std::string id;
+    std::string workflow_id;
+    std::string workflow_name;
+    bool workflow_deleted{false}; // ADR-0064: a soft-deleted workflow keeps its history
+    std::string status;           // "pending", "running", "completed", "failed", "cancelled"
+    int current_step{0};
+    int64_t started_at{0};
+    int64_t completed_at{0};
+};
+
+/// Filters, paging and mode of one workflow-execution list read. Pure data — validated by
+/// `parse_workflow_execution_list_params`/`_args` (workflow_execution_list_model.hpp) before it
+/// reaches a store; the store clamps `limit` again as defence in depth.
+struct WorkflowExecutionListQuery {
+    std::string workflow_id;             // exact filter; empty = every workflow
+    std::string status;                  // exact filter; empty = every status
+    std::optional<int64_t> since;        // started_at >= since (epoch seconds)
+    std::optional<int64_t> until;        // started_at <  until (epoch seconds)
+    int limit{50};                       // page size (rows), 1..kWorkflowExecutionListMax
+    std::optional<keyset::Position> after; // resume strictly after this (started_at, id)
+    /// At most one row per workflow: its newest run among those passing every other filter AND the
+    /// caller's visibility. Ordered by workflow id, not paged (no `after`).
+    bool latest_per_workflow{false};
+};
+
+inline constexpr int kWorkflowExecutionListMax = 500;
+
+struct WorkflowExecutionPage {
+    std::vector<WorkflowExecutionSummary> rows;
+    /// Set only in the newest-first mode, only when more rows exist: the position of the last
+    /// row returned. Derived from a row the caller was allowed to see, never from a hidden one.
+    std::optional<keyset::Position> next;
+    /// `latest_per_workflow` only: more workflows matched than `limit` allowed.
+    bool truncated_by_cap{false};
 };
 
 } // namespace yuzu::server

@@ -57,6 +57,25 @@ using ConditionEvalFn = std::function<bool(
     const std::string& expression,
     const std::map<std::string, std::string>& result_fields)>;
 
+// ── Execution-list SQL ──────────────────────────────────────────────────────
+
+/// The statement and its positional parameters for one `query_executions_page` read. Built by a
+/// pure function (no database) so the exact text, the parameter order and the position of the
+/// visibility clause relative to `ORDER BY`/`LIMIT` are unit-pinned. `$n` placeholders only —
+/// no caller value is ever spliced into the text.
+struct ExecutionPageSql {
+    std::string sql;
+    std::vector<std::string> params;
+};
+
+/// Builds the list statement for `q` (already validated; `limit` is clamped to
+/// [1, kWorkflowExecutionListMax]). Selects `limit + 1` rows: the extra row is the sentinel
+/// `query_executions_page` trims off to decide "more exist" without a count. `visible_agents`
+/// engaged adds the confinement predicate (engaged-empty adds `1=0`, never an unfiltered read).
+[[nodiscard]] ExecutionPageSql
+build_execution_page_sql(const WorkflowExecutionListQuery& q,
+                         const std::optional<std::vector<std::string>>& visible_agents);
+
 // ── WorkflowEngine ──────────────────────────────────────────────────────────
 
 class WorkflowEngine {
@@ -112,6 +131,26 @@ public:
     /// List recent executions for a workflow (or all if workflow_id is empty).
     std::expected<std::vector<WorkflowExecution>, std::string> list_executions(
         const std::string& workflow_id = {}, int limit = 50) const;
+
+    /// One page of the workflow-execution LIST: newest first by `(started_at, id)`, or, with
+    /// `q.latest_per_workflow`, each workflow's newest run by workflow id. Metadata rows only
+    /// (no agent ids, no step results), joined to the workflow name in the same statement.
+    ///
+    /// `visible_agents` is the caller's admitted agent set as plain data (the `authz::VisibleSet`
+    /// shape without the authz dependency): `nullopt` = unfiltered; engaged = a run is returned
+    /// only if at least one string element of its `agent_ids_json` is in the set — the SQL image
+    /// of `workflow_execution_visible()` (workflow_model.hpp), applied BEFORE `ORDER BY`/`LIMIT`
+    /// (ADR-0017 INV-3) so an invisible run can never consume a page slot, and a cursor or page
+    /// length can never reveal one. Engaged-empty is deny-all and answers an empty page without
+    /// touching the database. Malformed or non-array `agent_ids_json` is not visible to a confined
+    /// caller (fail closed).
+    ///
+    /// `unexpected(msg)` (prefixed `kDbErrorPrefix`) is a genuine failure — engine not open, pool
+    /// exhausted, statement timeout (`kReadStatementTimeout`) or query error — and is never an
+    /// empty page. The caller must genericize it before rendering.
+    std::expected<WorkflowExecutionPage, std::string> query_executions_page(
+        const WorkflowExecutionListQuery& q,
+        const std::optional<std::vector<std::string>>& visible_agents) const;
 
     /// Cancel a running execution.
     std::expected<void, std::string> cancel_execution(const std::string& id);
