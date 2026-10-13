@@ -412,6 +412,29 @@ TEST_CASE("Settings OIDC test connection: reports what a login will find",
         CHECK(body.find("feedback-error") != std::string::npos);
         CHECK(body.find("no usable signing keys") != std::string::npos);
     }
+    SECTION(
+        "a malformed discovery document or JWKS reaches the answer without Unicode line breaks") {
+        // The JSON error text quotes the bytes it was reading: NEL, U+2028 and U+2029 must not
+        // survive into the text an admin sees (or the log it is copied from).
+        const std::string breaks = "\xC2\x85\xE2\x80\xA8\xE2\x80\xA9";
+        const auto clean = [&](const std::string& body) {
+            CHECK(body.find("feedback-error") != std::string::npos);
+            CHECK(body.find("\xC2\x85") == std::string::npos);
+            CHECK(body.find("\xE2\x80\xA8") == std::string::npos);
+            CHECK(body.find("\xE2\x80\xA9") == std::string::npos);
+        };
+        idp.with([&](MockIdp& m) { m.discovery_body = "{\"issuer\":\"" + breaks; });
+        auto body = test();
+        CHECK(body.find("not valid JSON") != std::string::npos);
+        clean(body);
+        idp.with([&](MockIdp& m) {
+            m.discovery_body.clear();
+            m.jwks_body = "{\"keys\":[\"" + breaks;
+        });
+        body = test();
+        CHECK(body.find("JWKS parse error") != std::string::npos);
+        clean(body);
+    }
     SECTION("IdP-controlled text in the answer is HTML-escaped") {
         idp.with([](MockIdp& m) { m.discovery_issuer = "<script>alert(1)</script>"; });
         const auto body = test();

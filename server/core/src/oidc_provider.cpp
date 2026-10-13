@@ -1015,7 +1015,7 @@ std::expected<std::vector<CachedJwk>, std::string> OidcProvider::parse_jwks(cons
         }
         return keys;
     } catch (const std::exception& e) {
-        return std::unexpected(std::string("JWKS parse error: ") + e.what());
+        return std::unexpected(std::string("JWKS parse error: ") + ::yuzu::log_key_token(e.what()));
     }
 }
 
@@ -1218,12 +1218,14 @@ std::string_view issuer_scheme(std::string_view issuer) {
 }
 
 // An endpoint from the discovery document: absolute, at most 2048 bytes, the issuer's scheme, a
-// well-formed host[:port] authority, and no byte that could split the request line it will be
-// sent in or the log line it is written to (`has_line_splitting_bytes`).
+// well-formed host[:port] authority, no fragment (RFC 6749 3.1 / 3.2: an endpoint URI MUST NOT
+// include one, and a browser would drop every parameter appended after it), and no byte that
+// could split the request line it will be sent in or the log line it is written to
+// (`has_line_splitting_bytes`). A query is allowed: start_auth_flow keeps it and appends with '&'.
 bool endpoint_acceptable(const std::string& value, std::string_view scheme) {
     if (value.size() > kMaxIdpUrlBytes || !value.starts_with(scheme))
         return false;
-    if (has_line_splitting_bytes(value))
+    if (has_line_splitting_bytes(value) || value.find('#') != std::string::npos)
         return false;
     return split_http_url(value).has_value();
 }
@@ -1262,8 +1264,8 @@ bool endpoint_acceptable(const std::string& value, std::string_view scheme) {
 // protected anyway: httplib::Server's constructor ignores SIGPIPE process-wide (httplib.h:10405)
 // and nothing in server/core/src installs another disposition; the read side is simply the
 // smaller hammer. Tests that drive the watchdog set SIGPIPE to ignored themselves. Windows: no
-// watchdog (no WSADuplicateSocket); only `set_max_timeout` applies there, so the TLS handshake
-// phase is NOT covered by the total bound on Windows.
+// watchdog (no WSADuplicateSocket); only httplib's own timeouts apply there (connect, read/write,
+// `set_max_timeout`), so the TLS handshake phase is NOT covered by the total bound on Windows.
 #ifndef _WIN32
 class RequestDeadlineWatchdog {
 public:
@@ -1381,9 +1383,10 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify, int
         client->set_read_timeout(t);
         client->set_write_timeout(t);
         // Those three are per operation: a server that sends one byte just inside each read
-        // timeout would hold the GET for as long as it likes. set_max_timeout bounds the
-        // connect and the response at twice the per-operation timeout (10 s by default),
-        // measured from the start of the request. It does NOT cover the TLS handshake, so on
+        // timeout would hold the GET for as long as it likes. The connect is bounded by
+        // set_connection_timeout (per candidate address); set_max_timeout bounds the response
+        // waits on the established stream at twice the per-operation timeout (10 s by default),
+        // measured from the start of the request. Neither covers the TLS handshake, so on
         // POSIX the watchdog shuts the socket down at the same deadline (and keeps doing so every
         // 50 ms); on Windows the handshake phase has no total bound (see RequestDeadlineWatchdog).
         client->set_max_timeout(2 * t);
@@ -1450,7 +1453,8 @@ OidcProvider::parse_discovery_document(const std::string& body, const std::strin
     try {
         j = nlohmann::json::parse(body);
     } catch (const std::exception& e) {
-        return std::unexpected(std::string("discovery response is not valid JSON: ") + e.what());
+        return std::unexpected(std::string("discovery response is not valid JSON: ") +
+                               ::yuzu::log_key_token(e.what()));
     }
     if (!j.is_object())
         return std::unexpected("discovery response is not a JSON object");
@@ -1500,9 +1504,9 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
     // is authoritative but still goes on the wire and into logs: refuse one that could split a
     // request or log line, as the discovered ones are.
     if (const auto& explicit_ep = pick(config_); !explicit_ep.empty()) {
-        if (has_line_splitting_bytes(explicit_ep)) {
-            spdlog::error("OidcProvider: a configured endpoint contains a space or control "
-                          "character and is refused");
+        if (has_line_splitting_bytes(explicit_ep) || explicit_ep.find('#') != std::string::npos) {
+            spdlog::error("OidcProvider: a configured endpoint contains a space, control "
+                          "character or fragment and is refused");
             return std::unexpected(std::string(kDiscoveryUnavailable));
         }
         return explicit_ep;
@@ -1642,14 +1646,21 @@ OidcProvider::AuthFlowStart OidcProvider::start_auth_flow(const std::string& req
         pending_challenges_[state] = std::move(pkce);
     }
 
-    auto url = *authorization_endpoint + "?client_id=" + url_encode(config_.client_id) +
+    // An endpoint that already carries a query keeps it: the client parameters join with '&'
+    // (none when it already ends in '?' or '&'), else they start the query with '?'.
+    const char* separator = "?";
+    if (authorization_endpoint->find('?') != std::string::npos)
+        separator = (authorization_endpoint->back() == '?' || authorization_endpoint->back() == '&')
+                        ? ""
+                        : "&";
+    auto url = *authorization_endpoint + separator + "client_id=" + url_encode(config_.client_id) +
                "&response_type=code" + "&scope=" + url_encode("openid profile email") +
                "&redirect_uri=" + url_encode(redirect_uri) + "&state=" + url_encode(state) +
                "&nonce=" + url_encode(nonce) + "&code_challenge=" + url_encode(challenge) +
                "&code_challenge_method=S256";
 
-    spdlog::debug("OIDC auth flow started: state={} redirect_uri={}", state.substr(0, 8),
-                  redirect_uri);
+    spdlog::debug("OIDC auth flow started: state={} redirect_uri={}",
+                  ::yuzu::log_key_token(state.substr(0, 8)), redirect_uri);
     return AuthFlowStart{std::move(url), std::move(binding_secret)};
 }
 
@@ -1658,7 +1669,9 @@ std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(
     bool* binding_verified) {
     if (binding_verified)
         *binding_verified = false;
-    spdlog::info("OIDC handle_callback: state={} code_len={}", state.substr(0, 8), code.size());
+    // `state` is the caller's callback parameter, unauthenticated: neutralize it for the log.
+    spdlog::info("OIDC handle_callback: state={} code_len={}",
+                 ::yuzu::log_key_token(state.substr(0, 8)), code.size());
 
     // Hash the presented secret before taking the lock. FAIL CLOSED: a digest failure is a
     // refusal that leaves the pending flow untouched, never an unbound pass.
@@ -1696,7 +1709,7 @@ std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(
                                          stored_hash.size()) == 0;
         if (!bound) {
             spdlog::error("OIDC handle_callback: browser binding mismatch (state={})",
-                          state.substr(0, 8));
+                          ::yuzu::log_key_token(state.substr(0, 8)));
             return std::unexpected(std::string(kBrowserBindingMismatch));
         }
         if (binding_verified)

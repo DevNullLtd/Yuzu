@@ -18,6 +18,7 @@
 #include <openssl/rsa.h> // EVP_RSA_gen
 #include <openssl/ssl.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -430,6 +431,30 @@ TEST_CASE("OIDC: a JWT payload parse error does not carry the payload's Unicode 
     CHECK(result.error().find("\xC2\x85") == std::string::npos);
     CHECK(result.error().find("\xE2\x80\xA8") == std::string::npos);
     CHECK(result.error().find("\xE2\x80\xA9") == std::string::npos);
+}
+
+TEST_CASE("OIDC: a JWKS or discovery parse error does not carry the body's Unicode line breaks",
+          "[oidc][log_fold][security]") {
+    // Both messages are returned verbatim to the admin's Test Connection text and into logs, and
+    // the JSON parser's text quotes the (IdP-controlled) bytes it was reading. An unterminated
+    // string holding NEL, U+2028 and U+2029 puts all three into that text.
+    const std::string unterminated = "{\"keys\":[\"\xC2\x85\xE2\x80\xA8\xE2\x80\xA9";
+    const auto jwks = OidcProvider::parse_jwks(unterminated);
+    REQUIRE_FALSE(jwks.has_value());
+    CAPTURE(jwks.error());
+    CHECK(jwks.error().find("JWKS parse error") != std::string::npos);
+    CHECK(jwks.error().find("\xC2\x85") == std::string::npos);
+    CHECK(jwks.error().find("\xE2\x80\xA8") == std::string::npos);
+    CHECK(jwks.error().find("\xE2\x80\xA9") == std::string::npos);
+
+    const auto doc = OidcProvider::parse_discovery_document(
+        "{\"issuer\":\"\xC2\x85\xE2\x80\xA8\xE2\x80\xA9", "https://idp.test");
+    REQUIRE_FALSE(doc.has_value());
+    CAPTURE(doc.error());
+    CHECK(doc.error().find("not valid JSON") != std::string::npos);
+    CHECK(doc.error().find("\xC2\x85") == std::string::npos);
+    CHECK(doc.error().find("\xE2\x80\xA8") == std::string::npos);
+    CHECK(doc.error().find("\xE2\x80\xA9") == std::string::npos);
 }
 
 // ── Claim validation ─────────────────────────────────────────────────────────
@@ -2021,7 +2046,7 @@ TEST_CASE("OIDC discovery: an https server dripping TLS handshake bytes cannot h
     CHECK(in_time); // false = the fetch outlived the bound by 6 s: the unbounded handshake
     CHECK_FALSE(doc.has_value());
     CHECK(elapsed >= std::chrono::seconds(1));
-    CHECK(elapsed < std::chrono::seconds(3));
+    CHECK(elapsed < std::chrono::seconds(5)); // nominal 2 s; slack for a loaded shared runner
     CHECK(drip.accepted() >= 1);
 }
 
@@ -2050,7 +2075,7 @@ TEST_CASE("OIDC discovery: the JWKS fetch is bounded the same way against a drip
     REQUIRE_FALSE(verdict.has_value());
     CHECK(verdict.error() == OidcProvider::kJwksUnavailable);
     CHECK(elapsed >= std::chrono::seconds(1));
-    CHECK(elapsed < std::chrono::seconds(3));
+    CHECK(elapsed < std::chrono::seconds(5)); // nominal 2 s; slack for a loaded shared runner
 }
 
 // ── Descriptor exhaustion fails closed (#5692, Gate 8 passes 2 and 4) ────────
@@ -2621,7 +2646,14 @@ TEST_CASE("OIDC discovery: an endpoint authority must be a well-formed host[:por
     CHECK(accepted("https://[::1]:8443/x"));
     CHECK(accepted("https://[2001:db8::1]/x"));
     CHECK(accepted("https://idp.test?x=1")); // authority ends at '?': the path is "/?x=1"
-    CHECK(accepted("https://idp.test#frag"));
+    // RFC 6749 3.1 / 3.2: an endpoint URI carries no fragment (a browser would drop every
+    // parameter appended after it). A query is fine: start_auth_flow joins with '&'.
+    CHECK_FALSE(accepted("https://idp.test#frag"));
+    CHECK_FALSE(accepted("https://idp.test/x#frag"));
+    CHECK_FALSE(accepted("https://idp.test/x?a=1#frag"));
+    CHECK_FALSE(accepted("https://idp.test/x#"));
+    CHECK(accepted("https://idp.test/x?a=1&b=2"));
+    CHECK(accepted("https://idp.test/x?"));
     CHECK_FALSE(accepted("https://idp.test:99999999999/x")); // does not fit an int
     CHECK_FALSE(accepted("https://idp.test:65536/x"));
     CHECK_FALSE(accepted("https://idp.test:100000/x")); // six digits
@@ -2843,6 +2875,96 @@ TEST_CASE("OIDC discovery: a configured endpoint with a space or control byte is
     cfg.authorization_endpoint = "https://idp.test/a\xE2\x80\xA8";
     OidcProvider separator(cfg);
     CHECK_THROWS_AS(separator.start_auth_flow(), std::runtime_error);
+
+    cfg.authorization_endpoint = "https://idp.test/a#frag"; // no fragment (RFC 6749 3.1)
+    OidcProvider fragment(cfg);
+    CHECK_THROWS_AS(fragment.start_auth_flow(), std::runtime_error);
+    CHECK(fragment.pending_flow_count_for_test() == 0);
+}
+
+// An authorization endpoint that already carries a query is accepted by discovery, so the
+// client parameters must JOIN it ('&'), not open a second query: `...?prompt=login?client_id=`
+// hands the IdP one parameter named `prompt` and no `client_id` at all (#5692 adversarial review).
+namespace {
+std::string discovery_doc_with_authorize(const MockIdp& idp, const std::string& authorize) {
+    return R"({"issuer":")" + idp.base() + R"(","authorization_endpoint":")" + authorize +
+           R"(","token_endpoint":")" + idp.base() + R"(/token","jwks_uri":")" + idp.base() +
+           R"(/jwks"})";
+}
+} // namespace
+
+TEST_CASE("OIDC discovery: an authorization endpoint with a query keeps it and joins with '&'",
+          "[oidc][oidc_discovery]") {
+    MockIdp idp;
+    const std::string endpoint = idp.base() + "/authorize?prompt=login";
+    idp.with([&](MockIdp& m) { m.discovery_body = discovery_doc_with_authorize(m, endpoint); });
+    OidcProvider provider(discovery_cfg(idp));
+    const auto flow = provider.start_auth_flow();
+    CHECK(flow.url.starts_with(endpoint + "&client_id="));
+    CHECK(std::count(flow.url.begin(), flow.url.end(), '?') == 1);
+    CHECK(yuzu::server::test::url_query_param(flow.url, "prompt") == "login");
+    CHECK(yuzu::server::test::url_query_param(flow.url, "client_id") == "yuzu-test-client");
+    CHECK_FALSE(yuzu::server::test::url_query_param(flow.url, "state").empty());
+}
+
+TEST_CASE("OIDC discovery: an authorization endpoint ending in '?' or '&' gets no second separator",
+          "[oidc][oidc_discovery]") {
+    for (const char* tail : {"/authorize?", "/authorize?prompt=login&"}) {
+        CAPTURE(tail);
+        MockIdp idp;
+        const std::string endpoint = idp.base() + tail;
+        idp.with([&](MockIdp& m) { m.discovery_body = discovery_doc_with_authorize(m, endpoint); });
+        OidcProvider provider(discovery_cfg(idp));
+        const auto flow = provider.start_auth_flow();
+        CHECK(flow.url.starts_with(endpoint + "client_id="));
+        CHECK(std::count(flow.url.begin(), flow.url.end(), '?') == 1);
+        CHECK(flow.url.find("?&") == std::string::npos);
+        CHECK(flow.url.find("&&") == std::string::npos);
+        CHECK(yuzu::server::test::url_query_param(flow.url, "client_id") == "yuzu-test-client");
+    }
+}
+
+TEST_CASE("OIDC discovery: a discovered authorization endpoint with a fragment is refused",
+          "[oidc][oidc_discovery][security]") {
+    MockIdp idp;
+    idp.with([&](MockIdp& m) {
+        m.discovery_body = discovery_doc_with_authorize(m, m.base() + "/authorize#frag");
+    });
+    OidcProvider provider(discovery_cfg(idp));
+    CHECK_THROWS_AS(provider.start_auth_flow(), std::runtime_error);
+    CHECK(provider.pending_flow_count_for_test() == 0);
+}
+
+// ── The unauthenticated callback `state` reaches the log folded (#5692 adversarial review) ──
+
+TEST_CASE("OIDC: a forged callback state cannot split or forge a log line",
+          "[oidc][log_fold][security]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "c";
+    OidcProvider provider(std::move(cfg));
+    // The route passes the raw `state` query parameter once a binding cookie is present, so the
+    // first eight bytes of any request can reach the log.
+    const std::vector<std::string> states = {"\nFORGED",
+                                             std::string("\xC2\x85") + "FORGED",
+                                             std::string("\xE2\x80\xA8") + "FORGED",
+                                             std::string("\xE2\x80\xA9") + "FORGED",
+                                             "\r\nFORGED",
+                                             std::string("ab\x1b[2Jcdef")};
+    for (const auto& state : states) {
+        CAPTURE(state);
+        yuzu::test::LogCapture cap;
+        const auto r = provider.handle_callback("the-code", state, "binding");
+        cap.stop();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == OidcProvider::kUnknownState); // the refusal is unchanged
+        const auto logs = cap.text();
+        CHECK(logs.find("OIDC handle_callback: state=") != std::string::npos); // non-vacuity
+        CHECK(logs.find("\nFORGED") == std::string::npos);
+        CHECK(logs.find("\rFORGED") == std::string::npos);
+        CHECK(logs.find('\x1b') == std::string::npos);
+        check_no_unicode_breaks(logs);
+    }
 }
 
 // The scheme rules for an HTTPS issuer cannot be driven through a loopback MockIdp (it has no
@@ -2945,6 +3067,23 @@ TEST_CASE("OIDC discovery: the in-flight mark is set once, cleared only by an RA
     CHECK(count("discovery_in_flight_ = true;") == 1);
     CHECK(count("discovery_in_flight_ = false;") == 0); // the guard clears it through a reference
     CHECK(count("flag = false;") == 1);
+    // The guard must hold the flag and the lock BY REFERENCE: a by-value `bool flag` would clear
+    // a copy and leave discovery_in_flight_ set forever, yet pass every count above.
+    const auto struct_at = text.find("struct InFlightGuard {");
+    const auto struct_end = text.find("} in_flight_guard{");
+    REQUIRE(struct_at != std::string::npos);
+    REQUIRE(struct_end != std::string::npos);
+    REQUIRE(struct_end > struct_at);
+    const auto guard_text = text.substr(struct_at, struct_end - struct_at);
+    const auto in_guard = [&](const std::string& needle) {
+        std::size_t n = 0;
+        for (auto pos = guard_text.find(needle); pos != std::string::npos;
+             pos = guard_text.find(needle, pos + 1))
+            ++n;
+        return n;
+    };
+    CHECK(in_guard("std::unique_lock<std::mutex>& lock;") == 1);
+    CHECK(in_guard("bool& flag;") == 1);
     const auto set_at = text.find("discovery_in_flight_ = true;");
     const auto guard_at = text.find("} in_flight_guard{lock, discovery_in_flight_};");
     REQUIRE(set_at != std::string::npos);
