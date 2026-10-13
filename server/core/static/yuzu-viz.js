@@ -76,17 +76,21 @@ function showError(rootEl, msg) {
   e.classList.add('shown');
 }
 
+// Canvas text cannot read CSS, so resolve the mono font token once.
+const MONO_FONT = getComputedStyle(document.documentElement)
+  .getPropertyValue('--mds-font-family-mono').trim() || 'monospace';
+
 // PR 6: per-OS cube colour palette. Keys match the lowercase substring we
 // expect in `MachineNode.os` from fleet_topology.v1; default covers
-// agents whose os field is empty or unknown. Hex chosen for visual
-// contrast on the dark default background; opacity is set on the
-// material, not the colour, so colour stays vivid through transparency.
+// agents whose os field is empty or unknown. Slate data colours from
+// yuzu.css (--c2, --c3, --c1, --mut); opacity is set on the material,
+// not the colour, so colour stays vivid through transparency.
 const OS_PALETTE = {
-  linux:   '#f0c674',  // tango-yellow
-  darwin:  '#a0a0a0',  // mac silver
-  macos:   '#a0a0a0',
-  windows: '#5294e2',  // win10 blue
-  default: '#666666'
+  linux:   '#2dd4bf',  // --c2
+  darwin:  '#f5c542',  // --c3
+  macos:   '#f5c542',
+  windows: '#4c9aff',  // --c1
+  default: '#9aa2ae'   // --mut
 };
 function pickOsColor(osName) {
   if (!osName) return OS_PALETTE.default;
@@ -99,17 +103,18 @@ function pickOsColor(osName) {
 
 // PR 7: per-category process-node palette. Keys exactly match the lowercase
 // strings emitted by category_to_string() in process_category.hpp; any
-// string not in the table falls through to `other`. Hex chosen for visual
-// contrast against the cube's translucent shell on the dark canvas. Pinned
+// string not in the table falls through to `other`. Slate data colours
+// from yuzu.css (--mut, --c1, --c3, --c2, --c5, --faint) for contrast
+// against the cube's translucent shell on the dark canvas. Pinned
 // in test_static_js_bundle.cpp — the palette is a UX contract; changing
 // a colour is deliberate, not incidental.
 const CATEGORY_PALETTE = {
-  system:   '#6e7681',
-  browser:  '#58a6ff',
-  database: '#d29922',
-  web:      '#56d364',
-  runtime:  '#bc8cff',
-  other:    '#8b949e'
+  system:   '#9aa2ae',
+  browser:  '#4c9aff',
+  database: '#f5c542',
+  web:      '#2dd4bf',
+  runtime:  '#a78bfa',
+  other:    '#8a92a0'
 };
 function pickCategoryColor(category) {
   if (!category) return CATEGORY_PALETTE.other;
@@ -301,7 +306,7 @@ function buildCube(machine) {
   // shell against a dark grid. Subtle, same colour as the cube.
   const wire = new THREE.LineSegments(
     new THREE.EdgesGeometry(geom),
-    new THREE.LineBasicMaterial({color: color, transparent: true, opacity: 0.55}));
+    new THREE.LineBasicMaterial({color: color, transparent: true, opacity: 0.75}));
   cube.add(wire);
   // Stash the machine on userData so the raycaster can read it back
   // without a parallel id->object map.
@@ -443,15 +448,16 @@ function buildHostnameLabel(hostname) {
   canvas.width = 256;
   canvas.height = 64;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillStyle = 'rgba(20,23,28,0.6)';  // --bg
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.font = 'bold 28px sans-serif';
-  ctx.fillStyle = '#ffffff';
+  ctx.font = '500 24px ' + MONO_FONT;
+  ctx.fillStyle = '#c4cad3';  // --ink2
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   let label = String(hostname || '(unknown)');
   if (label.length > 24) label = label.slice(0, 23) + '…';
-  ctx.fillText(label, canvas.width / 2, canvas.height / 2);
+  // maxWidth squeezes a long name to fit the plate instead of clipping it.
+  ctx.fillText(label, canvas.width / 2, canvas.height / 2, canvas.width - 16);
   const tex = new THREE.CanvasTexture(canvas);
   tex.minFilter = THREE.LinearFilter;
   // gov R6 perf-F4: hostname canvas is rendered at fixed 256x64 and never
@@ -583,11 +589,11 @@ function placeSocketsOnCube(sockets) {
 
 function buildSocketSphere(socket, procName) {
   const geom = new THREE.SphereGeometry(SOCKET_DOT_RADIUS, 10, 8);
-  // Warm cream against the dark canvas so listeners read as "open ports"
-  // visually distinct from the cooler-coloured process dots inside the
-  // cube. Single colour: protocol/port semantics live in the tooltip,
-  // not in the colour channel.
-  const mat = new THREE.MeshBasicMaterial({color: 0xfff2cc});
+  // Yellow (--c3, the Host map's socket colour) so listeners read as
+  // "open ports" visually distinct from the cooler-coloured process dots
+  // inside the cube. Single colour: protocol/port semantics live in the
+  // tooltip, not in the colour channel.
+  const mat = new THREE.MeshBasicMaterial({color: 0xf5c542});
   const mesh = new THREE.Mesh(geom, mat);
   mesh.userData.yuzuSocket = {
     port: socket.port,
@@ -606,10 +612,10 @@ function buildPortLabel(port) {
   canvas.width = 96;
   canvas.height = 40;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillStyle = 'rgba(20,23,28,0.7)';  // --bg
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.font = 'bold 22px sans-serif';
-  ctx.fillStyle = '#fff2cc';
+  ctx.font = '500 22px ' + MONO_FONT;
+  ctx.fillStyle = '#f5c542';  // --c3, matches the listener sphere
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(':' + port, canvas.width / 2, canvas.height / 2);
@@ -635,7 +641,7 @@ function buildPortLabel(port) {
 const TALKING_SOCKET_DOT_RADIUS = 0.28;
 const TALKING_SOCKET_RING_RADIUS = CUBE_SIZE * 0.32;
 const TALKING_SOCKET_BOTTOM_Y = -CUBE_SIZE * 0.5 - 0.30;
-const TALKING_SOCKET_COLOR = 0x7ec4f8; // cool blue, distinct from listener cream
+const TALKING_SOCKET_COLOR = 0x7ab6ff; // --primary-h, distinct from the yellow listener
 
 // Walk a machine's ESTABLISHED outbound connections (rows whose src_addr
 // is one of THIS machine's local_ips) and return one entry per unique
@@ -764,7 +770,7 @@ function buildWireTube(srcPos, endPos, opts) {
   const radius = isExternal ? EDGE_TUBE_RADIUS_EXTERNAL : EDGE_TUBE_RADIUS_INTERNAL;
   const geom = new THREE.TubeGeometry(
     curve, EDGE_TUBE_SEGMENTS, radius, EDGE_TUBE_RADIAL, false);
-  const colour = isExternal ? 0x8090a0 : 0x4ea8de;
+  const colour = isExternal ? 0x8a92a0 : 0x4c9aff;  // --faint : --c1
   const mat = new THREE.MeshBasicMaterial({
     color: colour,
     transparent: true,
@@ -775,11 +781,8 @@ function buildWireTube(srcPos, endPos, opts) {
 
 function buildScene() {
   const scene = new THREE.Scene();
-  // Background pulled from CSS bg token at render time so theme switches
-  // without a JS rebuild. fallback matches the dark default.
-  const bgVar = getComputedStyle(document.documentElement)
-    .getPropertyValue('--bg').trim() || '#0d1117';
-  scene.background = new THREE.Color(bgVar);
+  // No scene.background: the renderer is alpha:true and the page's
+  // .viz-stage CSS paints the backdrop, so theme switches need no JS rebuild.
 
   // Ambient + directional light gives flat translucent cubes (PR 6+) a
   // subtle face-shading hint without overwhelming the colour palette.
@@ -791,11 +794,11 @@ function buildScene() {
   // Ground grid -- subtle, dim, gives the camera spatial reference. Pulls
   // its colours from CSS tokens like the rest of the design system.
   const gridFg = getComputedStyle(document.documentElement)
-    .getPropertyValue('--mds-color-theme-text-tertiary').trim() || '#6e7681';
+    .getPropertyValue('--line2').trim() || '#3c4452';
   const grid = new THREE.GridHelper(GRID_SIZE, GRID_DIVISIONS,
                                     new THREE.Color(gridFg),
                                     new THREE.Color(gridFg));
-  grid.material.opacity = 0.25;
+  grid.material.opacity = 0.5;
   grid.material.transparent = true;
   grid.position.y = 0;
   scene.add(grid);
@@ -1142,7 +1145,7 @@ function mount() {
           if (!aPos || !bPos) continue;
           const geom = new THREE.BufferGeometry().setFromPoints([aPos, bPos]);
           const mat = new THREE.LineBasicMaterial(
-            {color: 0xffffff, transparent: true, opacity: 0.3});
+            {color: 0xe9ecf0, transparent: true, opacity: 0.3});  // --ink
           const line = new THREE.LineSegments(geom, mat);
           processGroup.add(line);
         }
@@ -1333,7 +1336,7 @@ function mount() {
           // unknown OS so it reads as "out of fleet" not "another tier".
           const ringGeom = new THREE.RingGeometry(0.22, 0.36, 16);
           const ringMat = new THREE.MeshBasicMaterial({
-            color: 0x8090a0, transparent: true, opacity: 0.7, side: THREE.DoubleSide
+            color: 0x8a92a0, transparent: true, opacity: 0.7, side: THREE.DoubleSide
           });
           const ring = new THREE.Mesh(ringGeom, ringMat);
           ring.position.copy(endPos);
@@ -1356,16 +1359,16 @@ function mount() {
     _tooltip = document.createElement('div');
     _tooltip.id = 'viz-tooltip';
     _tooltip.style.cssText =
-      'position:absolute;pointer-events:none;background:rgba(0,0,0,0.85);' +
-      'color:#fff;padding:0.4rem 0.6rem;border-radius:0.25rem;' +
-      'font-size:0.78rem;line-height:1.3;z-index:6;display:none;' +
+      'position:absolute;pointer-events:none;background:var(--raise);' +
+      'color:var(--ink2);padding:8px 12px;border-radius:var(--rad-over);' +
+      'box-shadow:var(--shadow);font-size:12.5px;line-height:1.4;z-index:6;display:none;' +
       // gov R6 UP-3: hostname / os come from agent payloads. Without
       // word-break + overflow caps a 100KB hostname turns the tooltip
       // into a screen-filling rectangle on hover. max-width caps the
       // visual footprint; word-break:break-all forces wrapping inside
       // a long unbroken string; max-height clips the worst case.
       'max-width:320px;max-height:240px;overflow:hidden;' +
-      'word-break:break-all;border:1px solid #444;';
+      'word-break:break-all;border:1px solid var(--line2);';
     root.appendChild(_tooltip);
     return _tooltip;
   }
@@ -1382,7 +1385,7 @@ function mount() {
     // template ever interpolates.
     const proc = Array.isArray(machine.processes) ? Number(machine.processes.length) | 0 : 0;
     const conn = Array.isArray(machine.connections) ? Number(machine.connections.length) | 0 : 0;
-    const stale = machine.stale ? ' <span style="color:#f0c674">(stale)</span>' : '';
+    const stale = machine.stale ? ' <span style="color:var(--warn)">(stale)</span>' : '';
     tip.innerHTML =
       '<div style="font-weight:600;margin-bottom:0.2rem">' +
       escapeHtml(machine.hostname || '(unknown)') + stale + '</div>' +
@@ -1446,7 +1449,7 @@ function mount() {
       (pid > 0
         ? '<div>pid ' + pid +
           (procName ? ': ' + escapeHtml(clampForTooltip(procName)) : '') + '</div>'
-        : '<div style="color:#888">owner pid not reported</div>');
+        : '<div style="color:var(--mut)">owner pid not reported</div>');
     const rect = canvas.getBoundingClientRect();
     tip.style.left = (evt.clientX - rect.left + 12) + 'px';
     tip.style.top = (evt.clientY - rect.top + 12) + 'px';
@@ -1480,7 +1483,7 @@ function mount() {
                 ':' + (Number(edge.dst_port) | 0);
     const proto = escapeHtml(clampForTooltip(edge.proto || 'tcp'));
     const ext = edge.external
-      ? '<div style="color:#f0c674">external destination</div>' : '';
+      ? '<div style="color:var(--warn)">external destination</div>' : '';
     tip.innerHTML =
       '<div style="font-weight:600;margin-bottom:0.2rem">' + proto + ' connection</div>' +
       '<div>' + src + ' → ' + dst + '</div>' + ext;

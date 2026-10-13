@@ -664,19 +664,19 @@ TEST_CASE("static_js_bundle: kYuzuVizJs guards camera position against NaN/Infin
 TEST_CASE("static_js_bundle: kYuzuVizJs declares CATEGORY_PALETTE for the six categories",
           "[static-js][viz][pr7]") {
     // PR 7 category palette. Each colour is a UX contract — it carries
-    // semantic meaning to the operator (browser=blue, db=amber, web=green
+    // semantic meaning to the operator (browser=blue, db=yellow, web=teal
     // etc.) so a stealth refactor that swaps a hex code is a deliberate
     // UX decision worth surfacing in PR review. Pin both the palette
     // constant name and every category=hex pair so a refactor that drops
     // or recolours a category fails this test loud.
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("CATEGORY_PALETTE"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("pickCategoryColor"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("system:   '#6e7681'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("browser:  '#58a6ff'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: '#d29922'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("web:      '#56d364'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("runtime:  '#bc8cff'"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("other:    '#8b949e'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("system:   '#9aa2ae'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("browser:  '#4c9aff'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: '#f5c542'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("web:      '#2dd4bf'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("runtime:  '#a78bfa'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("other:    '#8a92a0'"));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs lays processes out on hash(pid|ppid)-mod-bucket grid",

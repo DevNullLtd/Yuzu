@@ -68,12 +68,62 @@ extern const char* const kVizFleetPageHtml = R"HTM(<!DOCTYPE html>
 
   <style>
     body { display: flex; flex-direction: column; min-height: 100vh; margin: 0; }
+    /* Page body: title block, then one bordered panel that holds the stage. */
     .viz-content {
       flex: 1;
       width: 100%;
       box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+      padding: 22px 28px 28px;
+    }
+    .viz-title h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.2; }
+    .viz-title p { margin-top: 4px; color: var(--mut); max-width: 70ch; }
+    .viz-panel {
+      flex: 1;
+      min-width: 0;
+      min-height: 480px;
+      display: flex;
+      flex-direction: column;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--rad-panel);
+    }
+    .viz-hd {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px 14px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .viz-hd h2 { font-size: 14px; font-weight: 600; }
+    .viz-sub { color: var(--mut); font-size: 13px; }
+    .viz-legend {
+      margin-left: auto;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+      font-size: 13px;
+      color: var(--mut);
+    }
+    .viz-legend i {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      margin-right: 6px;
+      border-radius: 2px;
+      vertical-align: -1px;
+    }
+    /* The stage paints the canvas backdrop (the WebGL scene is transparent),
+       so it follows the theme without a JS read. */
+    .viz-stage {
       position: relative;
+      flex: 1;
+      min-height: 0;
       overflow: hidden;
+      background: color-mix(in srgb, var(--bg) 60%, black);
     }
     /* viz-root must survive HTMX swaps — only inner panels swap. The
        canvas and the WebGLRenderer it owns persist across navigation
@@ -83,7 +133,6 @@ extern const char* const kVizFleetPageHtml = R"HTM(<!DOCTYPE html>
       inset: 0;
       width: 100%;
       height: 100%;
-      background: var(--bg);
     }
     #viz-canvas {
       display: block;
@@ -91,46 +140,51 @@ extern const char* const kVizFleetPageHtml = R"HTM(<!DOCTYPE html>
       height: 100%;
       outline: none;
     }
-    /* Overlay panel: floating side panel for click-to-drill-in detail
-       (PR 10 wires CVE list here). Initially empty; PR 6+ may add status
-       chrome (machine count, generated-at timestamp, stale indicator). */
+    /* Overlay panel: pop-over for click-to-drill-in detail (PR 10 wires
+       CVE list here). Initially empty; PR 6+ may add status chrome
+       (machine count, generated-at timestamp, stale indicator). */
     #viz-overlay-panel {
       position: absolute;
-      top: 1rem;
-      right: 1rem;
-      max-width: 360px;
-      max-height: calc(100vh - 8rem);
+      top: 14px;
+      right: 14px;
+      width: 310px;
+      max-width: calc(100% - 28px);
+      max-height: calc(100% - 28px);
       overflow: auto;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 0.5rem;
-      padding: 0.75rem 1rem;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+      background: var(--raise);
+      border: 1px solid var(--line2);
+      border-radius: var(--rad-over);
+      padding: 14px 16px;
+      box-shadow: var(--shadow);
       pointer-events: auto;
       z-index: 5;
-      font-size: 0.85rem;
+      font-size: 13.5px;
+      color: var(--ink2);
     }
     #viz-overlay-panel:empty { display: none; }
-    /* HUD — fixed footer hint with control summary, dim by default. */
+    /* HUD — control summary, dim by default. */
     #viz-hud {
       position: absolute;
-      bottom: 0.75rem;
-      left: 0.75rem;
-      font-size: 0.75rem;
-      color: var(--mds-color-theme-text-tertiary);
-      background: rgba(0, 0, 0, 0.4);
-      padding: 0.35rem 0.6rem;
-      border-radius: 0.25rem;
+      bottom: 14px;
+      left: 14px;
+      font-family: var(--mds-font-family-mono);
+      font-size: 11px;
+      color: var(--mut);
+      background: color-mix(in srgb, var(--bg) 75%, transparent);
+      padding: 7px 11px;
+      border-radius: var(--rad-ctl);
       pointer-events: none;
       z-index: 4;
     }
     #viz-hud kbd {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 0.2rem;
-      padding: 0 0.3rem;
-      font-family: var(--mds-font-family-default);
-      font-size: 0.7rem;
+      margin: 0 2px;
+      padding: 1px 6px;
+      font-family: inherit;
+      font-size: 11px;
+      color: var(--mut);
+      background: var(--surface2);
+      border: 1px solid var(--line2);
+      border-radius: 3px;
     }
     #viz-error {
       position: absolute;
@@ -139,9 +193,9 @@ extern const char* const kVizFleetPageHtml = R"HTM(<!DOCTYPE html>
       align-items: center;
       justify-content: center;
       flex-direction: column;
-      color: var(--mds-color-theme-indicator-error);
+      color: var(--bad);
       background: var(--bg);
-      font-size: 0.95rem;
+      font-size: 14px;
       z-index: 10;
       padding: 1rem;
       text-align: center;
@@ -180,21 +234,38 @@ extern const char* const kVizFleetPageHtml = R"HTM(<!DOCTYPE html>
   </div>
 
   <div class="viz-content">
-    <!-- The data-yuzu-viz-url attribute is the load contract: yuzu-viz.js
-         locates this element on htmx:afterSettle / DOMContentLoaded and
-         mounts the renderer once. The URL points at the JSON endpoint
-         (PR 6+ adapter fetches it on demand). -->
-    <div id="viz-root" data-yuzu-viz-url="/api/v1/viz/fleet/topology">
-      <canvas id="viz-canvas" tabindex="0"
-              aria-label="Fleet topology 3D view"></canvas>
-      <div id="viz-overlay-panel"></div>
-      <div id="viz-hud">
-        <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> pan &nbsp;·&nbsp;
-        <kbd>drag</kbd> rotate &nbsp;·&nbsp;
-        <kbd>wheel</kbd> zoom
+    <header class="viz-title">
+      <h1>Fleet</h1>
+      <p>The estate in 3D: machines by tier, processes inside.</p>
+    </header>
+    <section class="viz-panel" aria-labelledby="viz-panel-title">
+      <div class="viz-hd">
+        <h2 id="viz-panel-title">Fleet topology</h2>
+        <span class="viz-sub">3 tiers, process dots inside each cube</span>
+        <div class="viz-legend">
+          <span><i style="background: var(--c1)"></i>Windows</span>
+          <span><i style="background: var(--c2)"></i>Linux</span>
+          <span><i style="background: var(--c3)"></i>macOS</span>
+        </div>
       </div>
-      <div id="viz-error" role="alert"></div>
-    </div>
+      <div class="viz-stage">
+        <!-- The data-yuzu-viz-url attribute is the load contract: yuzu-viz.js
+             locates this element on htmx:afterSettle / DOMContentLoaded and
+             mounts the renderer once. The URL points at the JSON endpoint
+             (PR 6+ adapter fetches it on demand). -->
+        <div id="viz-root" data-yuzu-viz-url="/api/v1/viz/fleet/topology">
+          <canvas id="viz-canvas" tabindex="0"
+                  aria-label="Fleet topology 3D view"></canvas>
+          <div id="viz-overlay-panel"></div>
+          <div id="viz-hud">
+            <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> pan &nbsp;·&nbsp;
+            <kbd>drag</kbd> rotate &nbsp;·&nbsp;
+            <kbd>wheel</kbd> zoom
+          </div>
+          <div id="viz-error" role="alert"></div>
+        </div>
+      </div>
+    </section>
   </div>
 
   <div id="toast-container" class="toast-container"></div>

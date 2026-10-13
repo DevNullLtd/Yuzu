@@ -45,41 +45,128 @@ extern const char* const kVizHostPageHtml = R"HTM(<!DOCTYPE html>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
   </nav>
 
-  <!-- Mount root carries agent_id via data-attribute so the renderer can
-       read it deterministically without parsing window.location. The
-       {{AGENT_ID}} placeholder is replaced by the server-side route
-       handler. -->
   <style>
-    /* Slice 4 splitter — draggable horizontal divider between the IPC
-       graph (top) and TAR tree (bottom). Ratio persists in localStorage
-       under yuzuVizHostSplitRatio so an operator's chosen layout sticks
-       across page reloads. */
-    #viz-host-root { display: flex; flex-direction: column; height: 100vh; }
-    #ipc-graph { flex: 0 0 60%; width: 100%; }
-    #tar-tree { flex: 1 1 40%; overflow: auto; }
-    #splitter {
-      flex: 0 0 6px;
-      background: var(--border, #30363d);
-      cursor: row-resize;
+    body { display: flex; flex-direction: column; height: 100vh; margin: 0; }
+    /* Page body: title block, toolbar, then the graph and TAR panes. */
+    .vh-body {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+      padding: 22px 28px 28px;
     }
-    #splitter:hover { background: var(--accent, #58a6ff); }
+    .vh-title h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.2; }
+    .vh-title p { margin-top: 4px; color: var(--mut); max-width: 100ch; }
+    .vh-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    /* Each pane is a bordered panel: a header row (.vh-hd) over a body
+       (#ipc-graph / #tar-tree) that carries the side and bottom borders.
+       The headers sit beside the panes, never inside them, because
+       Cytoscape owns #ipc-graph's children and htmx swaps #tar-tree's. */
+    .vh-hd {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px 14px;
+      padding: 12px 16px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--rad-panel) var(--rad-panel) 0 0;
+    }
+    .vh-hd h2 { font-size: 14px; font-weight: 600; }
+    .vh-sub { color: var(--mut); font-size: 13px; }
+    .vh-legend {
+      margin-left: auto;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+      font-size: 13px;
+      color: var(--mut);
+    }
+    .vh-legend i { display: inline-block; vertical-align: -1px; margin-right: 6px; }
+    .vh-sw { width: 10px; height: 10px; }
+    .vh-sw.proc { background: var(--c1); border-radius: 50%; }
+    .vh-sw.sock { background: var(--c3); border-radius: 2px; }
+    .vh-sw.owns { width: 14px; height: 0; border-top: 1px dashed var(--faint); }
+    .vh-sw.conn { width: 14px; height: 0; border-top: 2px solid var(--c2); }
+    .vh-main { flex: 1; display: flex; flex-direction: column; min-height: 520px; }
+    #viz-host-root { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+    #ipc-graph, #tar-tree {
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-top: 0;
+      border-radius: 0 0 var(--rad-panel) var(--rad-panel);
+    }
+    #ipc-graph { flex: 0 0 60%; }
+    #tar-tree { flex: 1 1 40%; overflow: auto; padding: 16px; }
+    .vh-error { padding: 16px; color: var(--ink2); }
+    .vh-stale {
+      padding: 8px 16px;
+      font-size: 13px;
+      color: var(--warn);
+      background: color-mix(in srgb, var(--warn) 12%, var(--surface));
+      border: 1px solid var(--line);
+      border-width: 0 1px 1px;
+    }
+    /* Splitter — draggable horizontal divider between the IPC graph (top)
+       and TAR tree (bottom). Ratio persists in localStorage under
+       yuzuVizHostSplitRatio so an operator's chosen layout sticks across
+       page reloads. */
+    #splitter { flex: 0 0 22px; position: relative; cursor: row-resize; }
+    #splitter::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 36px;
+      height: 3px;
+      margin: -1px 0 0 -18px;
+      border-radius: 2px;
+      background: var(--line2);
+      transition: background 0.12s;
+    }
+    #splitter:hover::after { background: var(--primary); }
     .yuzu-tar-highlight {
-      background: rgba(255, 242, 204, 0.3);
-      transition: background 0.5s ease-out;
+      background: color-mix(in srgb, var(--hl) 14%, transparent);
+      transition: background 0.12s;
     }
   </style>
-  <div id="viz-host-root" data-agent-id="{{AGENT_ID}}">
-    <div class="toolbar" style="padding:6px 12px; display:flex; gap:8px; align-items:center;">
-      <strong>Host detail</strong>
-      <span style="opacity:0.7; font-size:12px;">{{AGENT_ID}}</span>
-      <span style="flex:1"></span>
-      <button id="refresh-btn">Refresh</button>
+  <div class="vh-body">
+    <header class="vh-title">
+      <h1>Host map</h1>
+      <p>{{AGENT_ID}}: processes, their sockets, and what connects to what.</p>
+    </header>
+    <div class="vh-toolbar">
+      <button id="refresh-btn" class="btn btn-secondary">Refresh</button>
     </div>
-    <div id="ipc-graph"></div>
-    <div id="splitter"></div>
-    <div id="tar-tree"
-         hx-get="/fragments/tar/process-tree?device={{AGENT_ID}}"
-         hx-trigger="load"></div>
+    <div class="vh-main">
+      <div class="vh-hd">
+        <h2>Process connections</h2>
+        <span class="vh-sub">{{AGENT_ID}}, force-directed layout</span>
+        <div class="vh-legend">
+          <span><i class="vh-sw proc"></i>Process</span>
+          <span><i class="vh-sw sock"></i>Socket</span>
+          <span><i class="vh-sw owns"></i>Owns</span>
+          <span><i class="vh-sw conn"></i>Connection</span>
+        </div>
+      </div>
+      <!-- Mount root carries agent_id via data-attribute so the renderer can
+           read it deterministically without parsing window.location. The
+           {{AGENT_ID}} placeholder is replaced by the server-side route
+           handler. -->
+      <div id="viz-host-root" data-agent-id="{{AGENT_ID}}">
+        <div id="ipc-graph"></div>
+        <div id="splitter"></div>
+        <div class="vh-hd">
+          <h2>Process tree</h2>
+          <span class="vh-sub">From TAR, for this host</span>
+        </div>
+        <div id="tar-tree"
+             hx-get="/fragments/tar/process-tree?device={{AGENT_ID}}"
+             hx-trigger="load"></div>
+      </div>
+    </div>
   </div>
 
   <script>
