@@ -106,9 +106,9 @@ textarea{height:auto;padding:8px 10px;min-height:84px;resize:vertical;font-famil
 .yaml-legend{display:flex;gap:6px 16px;flex-wrap:wrap;margin-bottom:8px;font-size:12.5px;color:var(--mut)}
 .yaml-legend span{display:flex;align-items:center;gap:6px}
 .yaml-legend .swatch{width:10px;height:10px;border-radius:2px;display:inline-block}
-.yt{white-space:pre}
+.yt{white-space:pre-wrap;overflow-wrap:anywhere}
 .yk{color:var(--info)}.yv{color:var(--ink2)}.yc{color:var(--faint);font-style:italic}.ya{color:var(--ink);font-weight:600}
-.yq,.yap-auto{color:var(--ok)}.yact{color:var(--warn);font-weight:600}.yar{color:var(--bad);font-weight:600}.ycc{color:var(--warn)}
+.yq{color:var(--ok)}.yact{color:var(--warn);font-weight:600}.yar{color:var(--bad);font-weight:600}.ycc{color:var(--warn)}
 .yn,.yb{color:var(--c2)}.yd{color:var(--faint)}
 /* Executions tab: clickable rows + per-execution detail drawer. Status is hue + a row stripe
    (two channels); the KPI strip carries the headline, the tables the long tail. */

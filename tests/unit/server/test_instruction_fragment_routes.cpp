@@ -235,6 +235,30 @@ TEST_CASE("instruction_fragment_routes: yaml-preview renders highlighted spans a
           std::string::npos); // no errors -> empty error div
 }
 
+TEST_CASE("instruction_fragment_routes: yaml-preview wraps each line's text in a yt span "
+          "that keeps indentation and escapes values",
+          "[server][routes][instruction_fragment_routes]") {
+    // The .yl row is a flex container, which drops a whitespace-only text node, so the
+    // line text (indentation included) must sit inside one .yt span. Validation errors
+    // are irrelevant here: the highlighted lines are emitted either way.
+    const std::string yaml = "metadata:\n"
+                             "  id: a<b&c\n";
+    Harness h;
+    h.wire();
+    auto res = h.sink.Post("/fragments/instructions/yaml-preview", "yaml_source=" + url_encode(yaml),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // The wrapper is emitted and closed on a line with no indentation.
+    CHECK(res->body.find(R"(<span class="ln">1</span><span class="yt"><span class="yk">metadata)"
+                         R"(</span>:</span></div>)") != std::string::npos);
+    // Leading indentation is inside the span, ahead of the key; the value is escaped.
+    CHECK(res->body.find(R"(<span class="ln">2</span><span class="yt">  <span class="yk">id)"
+                         R"(</span>:<span class="yv"> a&lt;b&amp;c</span></span></div>)") !=
+          std::string::npos);
+    CHECK(res->body.find("a<b") == std::string::npos); // raw markup never reaches the page
+}
+
 TEST_CASE("instruction_fragment_routes: yaml-preview surfaces validate_yaml_source errors "
           "in the error div",
           "[server][routes][instruction_fragment_routes]") {

@@ -286,7 +286,7 @@ extern const char* const kResultSetsPageHtml = R"HTM(<!DOCTYPE html>
             <textarea name="device_ids" placeholder="Device IDs, one per line (CSV import)"></textarea>
             <button type="submit">Create result set</button>
           </form>
-          <div class="rs-panel-body" id="rs-sidebar"
+          <div id="rs-sidebar"
                hx-get="/fragments/result-sets/sidebar"
                hx-trigger="load, every 15s, resultSetsChanged from:body"
                hx-swap="innerHTML">
@@ -299,7 +299,7 @@ extern const char* const kResultSetsPageHtml = R"HTM(<!DOCTYPE html>
       <div class="rs-main">
         <div class="rs-panel">
           <div class="rs-panel-header">Detail</div>
-          <div class="rs-panel-body rs-detail-body" id="rs-detail">
+          <div class="rs-detail-body" id="rs-detail">
             <div class="rs-detail-empty">
               <p>Select a result set to view its lineage and scope token.</p>
             </div>
