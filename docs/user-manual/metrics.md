@@ -208,7 +208,7 @@ on today's single-replica monolith — see `docs/adr/2002-high-availability-arch
 
 ## SSO login metrics
 
-Every SAML and OIDC login attempt — success or failure — increments its provider's login counter. Both counters carry a uniform `{result, role}` label set on every series (including error paths), so a dashboard can group by either label without hitting an unlabelled/labelled split.
+Every SAML and OIDC callback outcome — success or failure — increments its provider's login counter. Both counters carry a uniform `{result, role}` label set on every series (including error paths), so a dashboard can group by either label without hitting an unlabelled/labelled split.
 
 | Metric | Type | Meaning |
 |---|---|---|
