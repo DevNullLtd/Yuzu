@@ -318,8 +318,8 @@ TEST_CASE("evaluate_scope_for_agent: equals fleet membership for the session-ide
     CHECK(stats.selective * 10 >= stats.exprs * 7);
 }
 
-TEST_CASE("evaluate_scope_for_agent: matches hard-coded expected ids (independent oracle), "
-          "no store wired",
+TEST_CASE("evaluate_scope_for_agent: matches hard-coded expected ids (independent oracle) "
+          "with no store wired",
           "[server][agent_registry][scope]") {
     EventBus bus;
     yuzu::MetricsRegistry metrics;

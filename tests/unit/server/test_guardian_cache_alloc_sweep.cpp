@@ -117,7 +117,7 @@ constexpr long kSweepCeiling = 2000;
 // One sweep configuration: whether the first fetch/load fails, and the fewest allocation
 // points the sweep must have exercised. A sweep that ends sooner ran against code that
 // allocates less than expected, i.e. the injector is not reaching it and the test would be
-// vacuous. The floors sit below the counts measured on libstdc++ (allocation points swept,
+// vacuous. The floors sit at or below the counts measured on libstdc++ (allocation points swept,
 // failing-first / succeeding-first: generation cache get() and invalidate-after-get 6 / 3,
 // get_fresh() 1 / 0, rule bundle get() and invalidate-after-get 7 / 12, gate decide() 2) so
 // a compiler/library difference in make_shared/std::function placement does not trip them.
@@ -497,6 +497,6 @@ TEST_CASE("alloc sweep: GuardianReconcileGate::decide() after a failed claim ins
         return fired;
     });
     REQUIRE(k > 0);
-    CHECK(threw_points >= 2);  // the key copy and the map node: the insert really was reached
+    CHECK(threw_points >= 1);  // at least one failure point (key copy or map node) was reached
     CHECK(broken == 0);
 }

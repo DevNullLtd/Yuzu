@@ -1206,8 +1206,9 @@ public:
     // Results:
     //   - true / false -- member / not a member.
     //   - false when `agent_id` is empty, longer than auth::kMaxAgentIdLength or contains a
-    //     NUL byte, decided BEFORE any session lookup or store read (defence in depth; the
-    //     evaluator does not rely on the stores' own guards).
+    //     NUL byte (checked after the Unresolvable checks below), decided BEFORE any session
+    //     lookup or store read (defence in
+    //     depth; the evaluator does not rely on the stores' own guards).
     //   - false when `agent_id` has no session on this replica (LocalOnly
     //     never includes presence-only ids), WITHOUT any store read. This
     //     differs from evaluate_scope_local only in that a degraded store is

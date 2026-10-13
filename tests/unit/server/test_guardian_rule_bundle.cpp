@@ -499,7 +499,7 @@ TEST_CASE("GuardianRuleBundleCache: invalidate() and a replacing install release
           "[guardian][rule_bundle]") {
     // The cache moves the old held bundle out and lets it die after mu_ is released. The lock
     // state at destruction is not observable from here (Bundle has no destructor hook); this
-    // pins the part that is: the cache keeps no extra reference, so the bundle really is
+    // checks the part that is: the cache keeps no extra reference, so the bundle really is
     // released once the caller drops its own, whether it was dropped or replaced.
     GuardianRuleBundleCache cache;
     std::atomic<int> calls{0};

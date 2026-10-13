@@ -42,9 +42,9 @@
 /// or not the bump succeeded, so the next reconcile reloads at once; a Baseline update, delete
 /// or deployed create on that replica does the same through
 /// `BaselineStore::set_on_baseline_mutation`, which fires after the commit and BEFORE the
-/// caller's own bump (a separate lease) and fan-out, and so does every fanned-out push
-/// (`guardian_push_fn_`). Once wired, all three reach one `ServerImpl` wrapper that drops both
-/// caches.
+/// caller's own bump (a separate lease) and fan-out; every fanned-out push
+/// (`guardian_push_fn_`) will do the same once wired. Once wired, all three reach one
+/// `ServerImpl` wrapper that drops both caches.
 /// (2) `max_age` bounds everything the hook cannot see: another replica's edit, or a double
 /// fault. A held bundle older than it is a miss and is reloaded. NOTE what `max_age` heals and
 /// what it does not: it heals the MEMO. An agent that was already reconciled from a stale
@@ -281,7 +281,8 @@ public:
     /// remembered failure), and the next get() starts a fresh load rather than joining it.
     void invalidate() {
         // Declared BEFORE the lock so a held bundle that this call drops is destroyed after
-        // mu_ is released (a Bundle destructor must not run under the cache mutex).
+        // mu_ is released (a Bundle destructor should not run under the cache mutex: this keeps a
+        // potentially large destructor off it).
         std::shared_ptr<const Bundle> dropped;
         std::lock_guard lk(mu_);
         dropped = std::move(held_);
@@ -340,7 +341,8 @@ private:
     void install(const Result& r, std::uint64_t generation, Clock::time_point started,
                  std::uint64_t epoch) noexcept {
         // Declared BEFORE the try/lock so the replaced bundle is destroyed after mu_ is
-        // released (a Bundle destructor must not run under the cache mutex).
+        // released (a Bundle destructor should not run under the cache mutex: this keeps a
+        // potentially large destructor off it).
         std::shared_ptr<const Bundle> replaced;
         try {
             std::lock_guard lk(mu_);

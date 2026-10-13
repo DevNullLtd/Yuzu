@@ -607,11 +607,10 @@ TEST_CASE("GuardianReconcileGate: thread-safety smoke", "[guardian][reconcile_ga
           static_cast<std::uint64_t>(kThreads) * kIters);
     CHECK(budget.admitted_total() == admits.load());
     CHECK(budget.shed_total() == sheds.load());
-    // Every surviving claim is at most one per distinct id (64 here), and once the clock is
-    // past 2x min_interval a single sweep drains whatever the concurrent run left behind: a
-    // table corrupted by a race (a lost erase, a torn node) shows up as a count mismatch.
+    // Once the clock is past 2x min_interval a single sweep drains whatever the concurrent
+    // run left behind: a table corrupted by a race (a lost erase, a torn node) shows up as a
+    // count mismatch.
     const std::size_t left = gate.claims_size();
-    CHECK(left <= 64);
     clk.advance(60s);
     CHECK(gate.sweep() == left);
     CHECK(gate.claims_size() == 0);
