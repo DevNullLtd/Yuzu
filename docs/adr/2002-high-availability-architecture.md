@@ -504,7 +504,7 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
 - **The re-announce/"known-session" check is PER-REPLICA in-memory** (`gateway_sessions_`) on the
   `ProxyRegister` replay branch (#4246 #3). *Update 2026-10-11: the `BatchHeartbeat` /
   `ProxyInventory` / `NotifyStreamStatus` session resolution is now directory-authoritative — see §7f
-  (implemented on branch `feat/ha-ws5-session-lookup`, no PR yet); the `ProxyRegister` known-session
+  (merged as PR #5694, 2026-10-12); the `ProxyRegister` known-session
   check itself is unchanged.* Under active-active a replay routed to a non-owning replica still takes
   the fresh branch until the safe-to-scale gate work lands.
 - **Re-announce refreshes LIVENESS (lease), not PLACEMENT** — `cluster_id`/`gateway_node` are not
@@ -1125,7 +1125,8 @@ so a wrong disposition is never edited in place, only superseded by a later row 
 "remaining 4.4 scope" in §7b's `#4555` decision text) is judged OUT of WS-4 4.4's actual scope: the
 WS-4 gate exists because "commands can't reach agents" (`docs/ha-delivery-matrix.md`), and gossip-based
 peer health/rebalancing is a capacity/load-balancing feature, not a reachability one. Tracked separately,
-not a WS-4 gate item.
+not a WS-4 gate item: as of 2026-10-13 that tracker is **WS-15** in `docs/ha-delivery-matrix.md`
+(roadmap 7.1.1, #5759), paired with WS-13's agent-side failover (roadmap 14.2, #291).
 
 **Update (2026-10-01, #1197 - server-side unknown-session verdict; INERT until the gateway consumes it).**
 `BatchHeartbeatResponse` gained `repeated string unknown_session_ids = 2` and
@@ -1904,7 +1905,7 @@ every branch this PR's own scope covers, not that one.
 
 ### 7f. Durable cross-replica gateway session resolution (WS-5 slice 2, `#4246` item #3, 2026-10-11)
 
-**Status: implemented on branch `feat/ha-ws5-session-lookup`, no PR yet. THE SAFE-TO-SCALE GATE IS NOT
+**Status: merged as PR #5694 (`eabc2b639`, 2026-10-12). THE SAFE-TO-SCALE GATE IS NOT
 LIFTED** — this closes one more `#4246` gap; it does not make a second replica safe (WS-6 6.1b/6.3, WS-13
 for gateway-fronted fleets, WS-5's remaining slice-1 scope and the WS-9 scenarios are still open — see
 `docs/ha-delivery-matrix.md`). Run exactly ONE server replica (§7c).
