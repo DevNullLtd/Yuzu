@@ -618,62 +618,162 @@ rc=0; env YUZU_ELF_FLOOR_DEADLINE=0 GITHUB_ACTIONS=true bash "$SCRIPT" --floor "
 check "first annotation is the scan PROBLEM, not a per-ELF line" yes \
   "$(grep '^::' "$TMP/out" | head -1 | grep -q 'deadline of 0s exceeded: 2 of 2' && echo yes || echo no)"
 
+
+# ---- governance round 3 additions ---------------------------------------------------
+cat > "$TMP/stub/nover" <<'EOF'
+#!/bin/sh
+"$REAL_OBJDUMP" "$@" | sed -E 's/\((GLIBC|GCC|CXXABI|GLIBCXX|LIBSYSTEMD|OPENSSL)[A-Za-z0-9_.]*\) +//'
+EOF
+cat > "$TMP/stub/ver2" <<'EOF'
+#!/bin/sh
+"$REAL_OBJDUMP" "$@" | sed -E 's/\((GLIB[A-Z]*_[0-9.]+)\) +(.*)$/\2 \1/'
+EOF
+cat > "$TMP/stub/loud_objdump" <<'EOF'
+#!/bin/sh
+"$REAL_OBJDUMP" "$@"
+head -c 2500000 /dev/zero | tr '\0' 'x' >&2
+EOF
+chmod +x "$TMP/stub/nover" "$TMP/stub/ver2" "$TMP/stub/loud_objdump"
+# a real libc-linked ELF (NEEDED libc.so.6), judged against a permissive floor so only
+# parsing, not the host's glibc, decides the outcome
+echo 'int main(void){return 0;}' > "$F/plain.c"
+mkdir -p "$TMP/libc"; gcc -o "$TMP/libc/plain" "$F/plain.c"
+rc=0; bash "$SCRIPT" --floor "$TMP/floor_loose.json" --dir "$TMP/libc" --enforce > "$TMP/out" 2>&1 || rc=$?
+check "(control) libc-linked ELF, real objdump, permissive floor: exit 0" 0 "$rc"
+rc=0; env OBJDUMP="$TMP/stub/nover" bash "$SCRIPT" --floor "$TMP/floor_loose.json" --dir "$TMP/libc" --enforce > "$TMP/out" 2>&1 || rc=$?
+check "version column removed, NEEDED libc.so.6: exit 1, not a false-clean OK" 1 "$rc"
+check "version column removed: named, 'expected GLIBC versioned imports'" yes "$(has 'expected GLIBC versioned imports (NEEDED libc.so.6), parsed none')"
+rc=0; env OBJDUMP="$TMP/stub/nover" bash "$SCRIPT" --floor "$TMP/floor_loose.json" --dir "$TMP/libc" > "$TMP/out" 2>&1 || rc=$?
+check "version column removed, report-only: exit 0" 0 "$rc"
+rc=0; env OBJDUMP="$TMP/stub/ver2" bash "$SCRIPT" --floor "$TMP/floor_loose.json" --dir "$TMP/libc" --enforce > "$TMP/out" 2>&1 || rc=$?
+check "version moved to a trailing column: exit 1" 1 "$rc"
+rc=0; env OBJDUMP="$TMP/stub/ver2" bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/clean" --enforce > "$TMP/out" 2>&1 || rc=$?
+check "version in the name column (no libc dependence): exit 1" 1 "$rc"
+check "version in the name column: 'shaped like a version tag'" yes "$(has 'a symbol name is shaped like a version tag')"
+# a tool that complains at length: only the first MiB is read, the rest cannot be trusted
+rc=0; env OBJDUMP="$TMP/stub/loud_objdump" timeout 60 bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/clean" --enforce > "$TMP/out" 2>&1 || rc=$?
+check "2.5 MB of objdump stderr: exit 1 under --enforce, truncation reported" "1 yes" "$rc $(has 'tool stderr exceeded 1048576 bytes')"
+
+# non-UTF-8 staging path must not leak into a baseline: an unreadable file makes readelf
+# print the full path in its message (needs a non-root user for chmod 000)
+if [ "$can_chmod" = yes ]; then
+  nu="$TMP/stage_$(printf '\377')dir"; mkdir -p "$nu"; cp "$TMP/clean/bin/ok" "$nu/locked"; chmod 000 "$nu/locked"
+  rm -f "$TMP/nu.json"
+  run --floor "$FLOOR" --dir "$nu" --emit-baseline "$TMP/nu.json"
+  check "non-UTF-8 staging path: baseline written, no staging path in it" "yes no" "$([ -f "$TMP/nu.json" ] && echo yes || echo no) $(has yuzu_test_elf_floor "$TMP/nu.json")"
+  chmod 644 "$nu/locked"
+fi
+
+# both std streams closed must not crash a report-only run
+rc=0; bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/bad" 1>&- 2>&- || rc=$?
+check "stdout and stderr both closed, report-only: exit 0" 0 "$rc"
+
+# a floor key typo silently ungates a family (unlisted families only report)
+echo '{"schema":1,"name":"typo","max":{"GLIBC":"2.28","GLIBCCXX":"3.4.25"}}' > "$TMP/floor_typo2.json"
+run --floor "$TMP/floor_typo2.json" --dir "$TMP/clean"
+check "typo'd floor key: PROBLEM names the measured family and the listed key, exit 0 (report-only)" "0 yes" \
+  "$rc $(has 'PROBLEM: family GLIBCXX is measured but not in the floor')"
+echo '{"schema":1,"name":"far","max":{"GLIBC":"2.28","GLIBCQQQ":"3.4.25"}}' > "$TMP/floor_far.json"
+run --floor "$TMP/floor_far.json" --dir "$TMP/clean" --enforce
+check "a family two or more edits from every key is not called a typo" no "$(has 'typo in the floor file')"
+run --floor "$TMP/floor_typo2.json" --dir "$TMP/clean" --enforce
+check "typo'd floor key, --enforce: exit 1" 1 "$rc"
+run --floor "$FLOOR" --dir "$TMP/clean" --enforce
+check "(control) no typo guard noise on the proper test floor" 0 "$rc"
+
+# the shipped floors keep exactly their documented family keys (a hand-edit typo fails here)
+got="$(py "$ROOT/deploy/packaging/linux-floor-agent.json" "$ROOT/deploy/packaging/linux-floor-server.json" <<'EOF'
+import json, sys
+agent = sorted(json.load(open(sys.argv[1]))["max"])
+server = sorted(json.load(open(sys.argv[2]))["max"])
+print("yes" if agent == sorted(["GLIBC", "GLIBCXX", "CXXABI", "LIBSYSTEMD", "BLKID"])
+        and server == sorted(["GLIBC", "GLIBCXX", "CXXABI", "OPENSSL", "LIBSYSTEMD", "BLKID"]) else "no: %s %s" % (agent, server))
+EOF
+)"
+check "shipped floors carry exactly the documented family keys" yes "$got"
+got="$(py "$ROOT/deploy/packaging/linux-floor-baseline.json" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print("yes" if all("incomplete" not in s for s in d["sets"].values()) else "no")
+EOF
+)"
+check "committed baseline has no 'incomplete' key (every set is a complete scan)" yes "$got"
+
 # 20. tripwire: no workflow step may run `check-elf-floor.sh --enforce` under continue-on-error
-# (a swallowed exit 1 would never gate). VACUOUS TODAY: S0 wires only --report-only; the
-# synthetic fixtures below prove the detector itself. Steps are the 6-space `- ` items; comments are ignored.
-cat > "$TMP/tripwire.py" <<'EOF'
-import re, sys
-def offenders(text):
-    steps, cur = [], []
-    for ln in text.splitlines():
-        if ln.lstrip().startswith('#'):
-            continue
-        if re.match(r'^ {6}- ', ln):
-            steps.append(cur); cur = []
-        cur.append(ln)
-    steps.append(cur)
-    bad = []
-    for st in steps:
-        body = '\n'.join(st)
-        if 'check-elf-floor.sh' in body and '--enforce' in body and re.search(r'continue-on-error:\s*true', body):
-            bad.append(st[0].strip() if st else '?')
-    return bad
-if __name__ == '__main__':
-    n = 0
-    for path in sys.argv[1:]:
-        for b in offenders(open(path, encoding='utf-8').read()):
-            print('%s: %s' % (path, b)); n += 1
-    sys.exit(1 if n else 0)
+# (a swallowed exit 1 would never gate). A GUARD, not a proof; VACUOUS TODAY (S0 wires only
+# --report-only, where continue-on-error is required). The detector is
+# tests/shell/elf_floor_workflow_tripwire.py (PyYAML); its bypass shapes are pinned below on
+# synthetic workflow fixtures, then it runs over the real tree.
+if python3 -c 'import yaml' 2>/dev/null; then
+  rc=0; python3 - "$ROOT" > "$TMP/out" 2>&1 <<'EOF' || rc=$?
+import importlib.util, os, sys, tempfile
+spec = importlib.util.spec_from_file_location("tripwire", os.path.join(sys.argv[1], "tests/shell/elf_floor_workflow_tripwire.py"))
+tw = importlib.util.module_from_spec(spec); spec.loader.exec_module(tw)
+GATE = "bash scripts/ci/check-elf-floor.sh"
+def wf(step_body, job_extra=""):
+    return "jobs:\n  j:\n%s    steps:\n%s" % (job_extra, step_body)
+S = lambda body: wf("      - name: gate\n" + "".join("        %s\n" % l for l in body.splitlines()))
+cases = {
+ # name: (expect_flagged, text)
+ "enforce+coe-true":      (True,  S("continue-on-error: true\nrun: %s --enforce --floor f --dir d" % GATE)),
+ "enforce+coe-True":      (True,  S("continue-on-error: True\nrun: %s --enforce --floor f --dir d" % GATE)),
+ "enforce+coe-'true'":    (True,  S("continue-on-error: 'true'\nrun: %s --enforce --floor f --dir d" % GATE)),
+ "enforce+coe-\"true\"":  (True,  S("continue-on-error: \"true\"\nrun: %s --enforce --floor f --dir d" % GATE)),
+ "enforce+coe-expr":      (True,  S("continue-on-error: ${{ matrix.experimental }}\nrun: %s --enforce --floor f --dir d" % GATE)),
+ "enforce+coe-exprtrue":  (True,  S("continue-on-error: ${{ true }}\nrun: %s --enforce --floor f --dir d" % GATE)),
+ "enforce+job-coe":       (True,  wf("      - name: gate\n        run: %s --enforce --floor f --dir d\n" % GATE, "    continue-on-error: true\n")),
+ "enforce+||true":        (True,  S("run: %s --enforce --floor f --dir d || true" % GATE)),
+ "enforce+|| exit 0":    (True,  S("run: %s --enforce --floor f --dir d || exit 0" % GATE)),
+ "enforce+|| :":          (True,  S("run: %s --enforce --floor f --dir d || :" % GATE)),
+ "enforce+set+e":         (True,  S("run: |\n  set +e\n  %s --enforce --floor f --dir d" % GATE)),
+ "enforce split quotes":  (True,  S('continue-on-error: true\nrun: bash scripts/ci/check-elf-floor.sh --enfo""rce --floor f --dir d')),
+ "enforce via env var":   (True,  S("env:\n  MODE: --enforce\ncontinue-on-error: true\nrun: %s $MODE --floor f --dir d" % GATE)),
+ "enforce via shell var": (True,  S("continue-on-error: true\nrun: |\n  S=scripts/ci/check-elf-floor\n  bash $S.sh --enforce --floor f --dir d")),
+ "undecidable mode var":  (True,  S("continue-on-error: true\nrun: %s ${{ matrix.mode }} --floor f --dir d" % GATE)),
+ "basename call":         (True,  S("continue-on-error: true\nrun: cd scripts/ci && ./check-elf-floor --enforce")),
+ "continuation lines":    (True,  S("continue-on-error: true\nrun: |\n  %s \\\n    --enforce --floor f --dir d" % GATE)),
+ "flow-style step":       (True,  wf('      - {name: gate, continue-on-error: true, run: "%s --enforce --floor f --dir d"}\n' % GATE)),
+ "indent 4 steps":        (True,  "jobs:\n  j:\n    steps:\n    - name: gate\n      continue-on-error: true\n      run: %s --enforce --floor f --dir d\n" % GATE),
+ "anchored first key":    (True,  wf("      - &g\n        name: gate\n        continue-on-error: true\n        run: %s --enforce --floor f --dir d\n" % GATE)),
+ "no-name step":          (True,  wf("      - continue-on-error: true\n        run: %s --enforce --floor f --dir d\n" % GATE)),
+ "CRLF file":             (True,  S("continue-on-error: true\nrun: %s --enforce --floor f --dir d" % GATE).replace("\n", "\r\n")),
+ "wrapper script":        (True,  S("continue-on-error: true\nrun: bash scripts/ci/run-floor.sh")),
+ "composite action":      (True,  S("uses: ./.github/actions/elf-floor\ncontinue-on-error: true\nwith:\n  mode: --enforce")),
+ # must PASS
+ "report-only+coe":       (False, S("continue-on-error: true\nrun: |\n  %s --report-only \\\n    --floor f --dir \"$D\" | tee out || rc=$?" % GATE)),
+ "enforce, no coe":       (False, S("run: %s --enforce --floor f --dir d" % GATE)),
+ "enforce, coe false":    (False, S("continue-on-error: false\nrun: %s --enforce --floor f --dir d" % GATE)),
+ "enforce in comment":    (False, S("continue-on-error: true\nrun: |\n  # later: --enforce\n  %s --report-only --floor f --dir d" % GATE)),
+ "unrelated coe step":    (False, S("continue-on-error: true\nrun: echo hi")),
+}
+bad = []
+with tempfile.TemporaryDirectory() as root:
+    os.makedirs(os.path.join(root, "scripts/ci")); os.makedirs(os.path.join(root, ".github/actions/elf-floor"))
+    open(os.path.join(root, "scripts/ci/run-floor.sh"), "w").write("#!/bin/sh\nbash scripts/ci/check-elf-floor.sh \"$@\"\n")
+    open(os.path.join(root, ".github/actions/elf-floor/action.yml"), "w").write(
+        "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: bash scripts/ci/check-elf-floor.sh ${{ inputs.mode }}\n")
+    for name, (expect, text) in cases.items():
+        path = os.path.join(root, "wf.yml")
+        open(path, "w", newline="").write(text)
+        got = bool(tw.offenders(path, root))
+        if got != expect:
+            bad.append("%s: expected %s, got %s" % (name, "flagged" if expect else "pass", "flagged" if got else "pass"))
+    # a composite action file is itself scanned: an enforcing step under continue-on-error
+    path = os.path.join(root, ".github/actions/elf-floor/action.yml")
+    open(path, "w").write("runs:\n  using: composite\n  steps:\n    - shell: bash\n      continue-on-error: true\n      run: bash scripts/ci/check-elf-floor.sh --enforce\n")
+    if not tw.offenders(path, root):
+        bad.append("composite action file with enforce+coe not flagged")
+print("\n".join(bad) if bad else "OK %d cases" % (len(cases) + 1))
+sys.exit(1 if bad else 0)
 EOF
-mkdir -p "$TMP/wf"
-cat > "$TMP/wf/bad.yml" <<'EOF'
-jobs:
-  j:
-    steps:
-      - name: other
-        run: echo hi
-      - name: gate
-        continue-on-error: true
-        run: |
-          bash scripts/ci/check-elf-floor.sh --enforce --floor f --dir d
-EOF
-cat > "$TMP/wf/good.yml" <<'EOF'
-jobs:
-  j:
-    steps:
-      # S2 flips this to --enforce (a comment must not trip the detector)
-      - name: report
-        continue-on-error: true
-        run: bash scripts/ci/check-elf-floor.sh --report-only --floor f --dir d
-      - name: gate
-        run: bash scripts/ci/check-elf-floor.sh --enforce --floor f --dir d
-EOF
-rc=0; python3 -I "$TMP/tripwire.py" "$TMP/wf/bad.yml" > "$TMP/out" 2>&1 || rc=$?
-check "tripwire detector flags enforce + continue-on-error (synthetic)" "1 yes" "$rc $(has 'gate')"
-rc=0; python3 -I "$TMP/tripwire.py" "$TMP/wf/good.yml" > "$TMP/out" 2>&1 || rc=$?
-check "tripwire detector passes report-only continue-on-error and a bare enforce step (synthetic)" 0 "$rc"
-rc=0; python3 -I "$TMP/tripwire.py" "$ROOT"/.github/workflows/*.yml > "$TMP/out" 2>&1 || rc=$?
-check "real workflows: no --enforce step under continue-on-error" 0 "$rc"
+  check "tripwire detector: every bypass shape flagged, every legitimate shape passes" "0 OK 30 cases" "$rc $(cat "$TMP/out")"
+  rc=0; python3 "$ROOT/tests/shell/elf_floor_workflow_tripwire.py" "$ROOT" > "$TMP/out" 2>&1 || rc=$?
+  check "real workflows + composite actions: no --enforce gate step can swallow its exit status" 0 "$rc"
+elif [ "${GITHUB_ACTIONS:-}" = true ]; then
+  check "PyYAML is required for the workflow tripwire (CI must not skip it)" present missing
+else
+  echo "  [skip] workflow tripwire (PyYAML not installed)"
+fi
 
 # ---- shipped floor + baseline files ------------------------------------------------
 for fl in agent server; do

@@ -65,6 +65,14 @@
 #     objdump output format would otherwise make every ELF "import nothing").
 #     (b) is deliberately narrow: a dynamic object with no NEEDED entry, or a
 #     static one, legitimately imports nothing and is not flagged.
+#     Residuals of rule (b) and of the libc rule below: `gcc -shared -nostdlib
+#     -Wl,--no-as-needed -lc` with no imports at all is flagged (a NEEDED
+#     library with nothing parsed); an ELF NEEDing libc.so.* must yield at least
+#     one GLIBC_* tag or it is `unreadable` (libstdc++/libm are NOT checked this
+#     way: linked-but-unused is common). Detached debug files (`*.debug`, the
+#     `-dbg` payload) make objdump say "invalid operation" and are flagged: do
+#     not scan a debug-symbol payload. A symbol name shaped like `GLIBC_2.38`
+#     (or another known version family) is taken as a moved column.
 #   * Defined symbols and unversioned imports (`Base`) never count toward the
 #     version comparison; unversioned imports still feed forbidden_symbols.
 #   * Non-ELF files are skipped (counted, never an error). Symlinks are not
@@ -81,9 +89,14 @@
 #     read as "clean".
 #   * The floor file must list GLIBC in "max" (exit 2 otherwise): a typo in a
 #     family name would silently ungate it, because other families absent from
-#     "max" are only reported. A "listed family never measured" warning was
-#     considered and NOT added: the server set legitimately lacks several
-#     families (LIBSYSTEMD, BLKID, OPENSSL), so it would cry wolf.
+#     "max" are only reported. A measured family that is exactly ONE edit away
+#     from a listed key (GLIBCCXX vs GLIBCXX) is a PROBLEM line. A "listed
+#     family never measured" warning was considered and NOT added: the server
+#     set legitimately lacks several families (LIBSYSTEMD, BLKID, OPENSSL), so it
+#     would cry wolf. The test suite pins the exact key set of each shipped floor.
+#   * Known limits: tool stderr is read up to 1 MiB (a longer one is itself an
+#     error); stdout/stderr closed by the caller are discarded, not an error;
+#     a stdout that is open but failing (/dev/full) exits 2.
 #   * Output hygiene: file names, symbol names, families and RUNPATH entries
 #     come from the artefact under test. Every line printed is rendered as
 #     printable ASCII, and any line that would begin (after whitespace) with
@@ -165,6 +178,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 # Digit runs are capped (9) so a hostile 5000-digit tag cannot reach int()
@@ -177,13 +191,21 @@ BAD_STDERR = re.compile(r"(?i)\b(error|warning|can't|cannot|not recognized|trunc
                         r"corrupt|unable|invalid|bad )")
 DEFAULT_DEADLINE = 240
 MIN_ELF_BYTES = 64
+MAX_STDERR = 1 << 20
+# Families whose tags are expected to look like `NAME_1.2.3`; a symbol NAME shaped
+# like one means the objdump column layout moved (see scan_elf).
+KNOWN_VERSION_FAMILIES = ('GLIBC', 'GLIBCXX', 'CXXABI', 'GCC', 'LIBSYSTEMD',
+                          'OPENSSL', 'BLKID')
 SUMMARY_ROWS = 20
 ANNOTATION_CAP = 50
 SYMS_SHOWN = 6
 
 
 def die(msg):
-    sys.stderr.write(neutralize('check-elf-floor: %s' % safe(msg)) + '\n')
+    try:
+        sys.stderr.write(neutralize('check-elf-floor: %s' % safe(msg)) + '\n')
+    except Exception:
+        pass                                  # stderr closed/full
     sys.exit(2)
 
 
@@ -309,14 +331,24 @@ def discover(root, includes, excludes):
 def run(cmd, deadline):
     limit = max(1.0, min(float(TOOL_TIMEOUT), deadline - time.monotonic()))
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           timeout=limit, env=dict(os.environ, LC_ALL='C'))
+        # stderr goes to a temp file and only its first MAX_STDERR bytes are read:
+        # a tool that complains at length cannot balloon this process's memory.
+        with tempfile.TemporaryFile() as errf:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=errf,
+                               timeout=limit, env=dict(os.environ, LC_ALL='C'))
+            errf.seek(0)
+            err = errf.read(MAX_STDERR)
+            if errf.read(1):
+                # Truncated: whatever came after the cap was never examined.
+                err = b'Error: tool stderr exceeded %d bytes\n' % MAX_STDERR + err
     except subprocess.TimeoutExpired:
         return None, '', 'timed out after %ds' % limit
     except OSError as exc:
         return None, '', str(exc)
-    return (p.returncode, p.stdout.decode('utf-8', 'replace'),
-            p.stderr.decode('utf-8', 'replace'))
+    # surrogateescape: a non-UTF-8 staging path round-trips, so err.replace(full, rel)
+    # still finds it and the path cannot leak into results.
+    return (p.returncode, p.stdout.decode('utf-8', 'surrogateescape'),
+            err.decode('utf-8', 'surrogateescape'))
 
 
 def first_line(text):
@@ -358,7 +390,11 @@ def parse_runpath(text):
     return out
 
 
-def scan_elf(rel, full, objdump, readelf, deadline):
+def needed_libs(readelf_out):
+    return re.findall(r'\(NEEDED\)\s+Shared library: \[([^\]]*)\]', readelf_out)
+
+
+def scan_elf(rel, full, objdump, readelf, deadline, vfams):
     rec = {'tags': {}, 'names': set(), 'runpath': [], 'status': None}
     try:
         size = os.path.getsize(full)
@@ -376,7 +412,7 @@ def scan_elf(rel, full, objdump, readelf, deadline):
         rec['status'] = 'error: readelf -d: ' + (first_line(err) or 'failed')
         return rec
     rec['runpath'] = parse_runpath(out)
-    needed = '(NEEDED)' in out
+    needed = needed_libs(out)
     rc, out, err = run([objdump, '-T', '--', full], deadline)
     err = err.replace(full, rel)
     if rc == 0 and BAD_STDERR.search(err):
@@ -393,12 +429,30 @@ def scan_elf(rel, full, objdump, readelf, deadline):
         rec['status'] = 'error: objdump -T: ' + (first_line(err) or 'failed')
         return rec
     rec['tags'], rec['names'] = parse_imports(out)
-    if needed and not rec['names']:
+    fmt = 'error: objdump -T: '
+    shaped = re.compile(r'^\(?(?:%s)_[0-9]+(?:\.[0-9]+)*\)?$'
+                        % '|'.join(map(re.escape, sorted(vfams))))
+    if any(shaped.match(n) for n in rec['names']):
+        # The version tag landed in the NAME column: the layout moved.
+        rec['status'] = fmt + 'a symbol name is shaped like a version tag (unrecognised output format?)'
+    elif needed and not rec['names']:
         # NEEDED libraries but not one undefined symbol parsed: far more likely
         # an objdump output format this parser does not know than an object
         # that links libraries and uses nothing from them.
-        rec['status'] = ('error: objdump -T: NEEDED libraries but no undefined '
+        rec['status'] = (fmt + 'NEEDED libraries but no undefined '
                          'symbol row could be parsed (unrecognised output format?)')
+    else:
+        # A real build that links libc imports at least one GLIBC versioned symbol
+        # (__libc_start_main, ...). Rows parsed but not one such tag means the
+        # VERSION column was not understood. Only libc is checked: measured on
+        # ~7,000 system ELFs, an ELF that NEEDs libstdc++ or libm without a
+        # GLIBCXX/CXXABI/GLIBC tag of that family is common (linked but unused),
+        # so checking those would be a false-positive source.
+        have = {split_tag(t)[0] for t in rec['tags'] if split_tag(t)[1] is not None}
+        hit = [n for n in needed if n == 'libc.so' or n.startswith('libc.so.')]
+        if hit and 'GLIBC' not in have:
+            rec['status'] = (fmt + 'expected GLIBC versioned imports (NEEDED %s), parsed none '
+                             '(unrecognised output format?)' % safe(hit[0]))
     return rec
 
 
@@ -434,6 +488,32 @@ def evaluate(floor, rec):
     if st and st.startswith('error'):
         viol.append({'kind': 'unreadable', 'detail': st})
     return maxima, viol
+
+
+def edit_distance(a, b):
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def typo_problems(floor, unlisted_fams):
+    """A measured family absent from the floor's "max" but within edit distance 2
+    of a key that IS there is probably a typo in the floor file, which would
+    silently ungate the family. Distance 1 only and names under 5 characters
+    exempt: distance 2 flagged real families (OPENCL~OPENSSL, BLKID_2~BLKID)
+    on a system corpus, and GLIBC~GLIBCXX is exactly 2 apart."""
+    out = []
+    for u in sorted(unlisted_fams):
+        for k in sorted(floor['max']):
+            if len(u) >= 5 and len(k) >= 5 and u != k and edit_distance(u, k) == 1:
+                out.append('family %s is measured but not in the floor\'s "max", and is '
+                           'one edit away from the listed %s: typo in the floor file?'
+                           % (safe(u), safe(k)))
+    return out
 
 
 def describe(v, brief=False):
@@ -507,7 +587,10 @@ def write_atomic(path, text):
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         # argparse echoes argv text; render it like every other untrusted string.
-        sys.stderr.write(neutralize('check-elf-floor.sh: error: %s' % safe(message)) + '\n')
+        try:
+            sys.stderr.write(neutralize('check-elf-floor.sh: error: %s' % safe(message)) + '\n')
+        except Exception:
+            pass
         sys.exit(2)
 
 
@@ -558,7 +641,8 @@ def main():
             rec = {'tags': {}, 'names': set(), 'runpath': [],
                    'status': 'error: not scanned (aggregate deadline exceeded)'}
         else:
-            rec = scan_elf(rel, path, objdump, readelf, deadline)
+            rec = scan_elf(rel, path, objdump, readelf, deadline,
+                           set(KNOWN_VERSION_FAMILIES) | set(floor['max']))
         maxima, viol = evaluate(floor, rec)
         for fam, ver in maxima.items():
             if fam not in overall or vtuple(ver) > vtuple(overall[fam]):
@@ -587,6 +671,9 @@ def main():
             all_viol.append((rel, v))
 
     problems = list(walk_errors)
+    unlisted_fams = {split_tag(t)[0] for _, e in arts.items() for t in e.get('unlisted', {})
+                     if split_tag(t)[1] is not None}
+    problems += typo_problems(floor, unlisted_fams)
     if unscanned:
         problems.append('aggregate deadline of %gs exceeded: %d of %d ELF(s) not scanned'
                         % (limit, unscanned, len(elfs)))
@@ -709,6 +796,13 @@ def main():
     sys.exit(1 if (enforce and failing) else 0)
 
 
+# A std stream closed by the caller (`>&-`) is None in Python: discard instead of
+# crashing, so a report-only run still exits 0. A stream that is OPEN but failing
+# (/dev/full) is a real error and exits 2.
+for _name in ('stdout', 'stderr'):
+    if getattr(sys, _name) is None:
+        setattr(sys, _name, open(os.devnull, 'w'))
+
 try:
     main()
 except Exception as exc:       # SystemExit is not an Exception: exit codes pass through
@@ -716,7 +810,10 @@ except Exception as exc:       # SystemExit is not an Exception: exit codes pass
         sys.stdout = open(os.devnull, 'w')   # a broken stdout must not re-fail at exit (120)
     except OSError:
         pass
-    sys.stderr.write(neutralize('check-elf-floor: internal error: %s: %s'
-                                % (type(exc).__name__, safe(str(exc))[:200])) + '\n')
+    try:
+        sys.stderr.write(neutralize('check-elf-floor: internal error: %s: %s'
+                                    % (type(exc).__name__, safe(str(exc))[:200])) + '\n')
+    except Exception:
+        pass                                  # stderr closed/full: exit 2 is all we can say
     sys.exit(2)
 PYEOF

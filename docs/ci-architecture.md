@@ -311,7 +311,11 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   `CXXABI_1.3.13`, `OPENSSL_3.0.0`, `LIBSYSTEMD_240`, `BLKID_1.0`, forbidden
   `EVP_sm4_*`; also the gateway's ERTS and OTP). They state the promise, not a
   measurement. Changing one is a floor decision (ADR-2003 (Proposed, PR #5631),
-  "Floor review rule"), not a tuning edit.
+  "Floor review rule"), not a tuning edit. A typo in a family key would silently
+  ungate that family (families absent from `max` are only reported), so the
+  loader requires `GLIBC`, the script reports a measured family one edit away
+  from a listed key, and the test pins the exact key set of both shipped
+  files.
 - **Baseline.** `deploy/packaging/linux-floor-baseline.json` is the measured
   gap of the v0.14.1 Linux x64 release artifacts (`agent`, `server` and
   `gateway` sets: per ELF the highest tag per family and the offending
@@ -383,9 +387,19 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   this a release gate; add its entry to "Gates outside the tier ladder" (and a
   routed-concern row) in that change. (d) Remove `continue-on-error: true`
   from the `release.yml` gate step when `--enforce` is wired: a swallowed exit
-  1 would never gate. `tests/shell/test_check_elf_floor.sh` carries a tripwire
-  for exactly that (it is vacuous today, since only `--report-only` is wired;
-  its detector is proven on synthetic workflow fixtures). (e) The report
+  1 would never gate. `tests/shell/test_check_elf_floor.sh` runs a tripwire
+  (`tests/shell/elf_floor_workflow_tripwire.py`, PyYAML) over every workflow
+  and local composite action. It flags a step that runs, or probably runs
+  (mode chosen through a variable or env, a wrapper script, a composite
+  action), `check-elf-floor.sh --enforce` when the step or its job has any
+  `continue-on-error` other than a literal false, or the run text has
+  `|| true` or `set +e`; report-only steps are never flagged. It is a guard,
+  not a proof: it reads text, cannot see code outside `.github/` and
+  `scripts/`, and assumes enforcement whenever it cannot tell. It is vacuous
+  today (only `--report-only` is wired); its detector is pinned on 30
+  synthetic fixtures, one per bypass shape. The test needs PyYAML: `ci.yml`'s
+  preflight installs it hash-pinned, and the test fails (rather than skips)
+  under GitHub Actions if it is missing. (e) The report
   artifact is kept 14 days and the results are not in CI history: S2 should
   persist per-release results (commit the baseline diff, or extend the
   CI-history capture) and consider running the gate on the `ci.yml` Linux

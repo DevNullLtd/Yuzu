@@ -523,6 +523,14 @@ jobs:
       # too late (after the full build matrix). No build deps — just bash (and
       # python3; test_check_elf_floor.sh also needs gcc + binutils, all on the
       # hosted ubuntu runner).
+      # test_check_elf_floor.sh parses the workflows with PyYAML (its tripwire);
+      # the hosted image may lack it, so install it hash-pinned like docs-lint.yml.
+      - name: Install PyYAML (hash-pinned)
+        run: |
+          python3 -c "import yaml" 2>/dev/null || \
+            python3 -m pip install --user --break-system-packages \
+              --disable-pip-version-check --require-hashes -r requirements-ci.txt
+
       - name: Shell gate tests
         run: |
           bash tests/shell/test_check_compose_versions.sh
