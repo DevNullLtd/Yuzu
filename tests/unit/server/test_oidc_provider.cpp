@@ -2339,6 +2339,16 @@ TEST_CASE("OIDC http_get_bounded: fifty fetches leave the open descriptor count 
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
 #endif // !_WIN32
 
+// A pure string check (no MockIdp), so it sits OUTSIDE the TSan-excluded block below: the
+// forged-callback-state case further down needs it and must keep running under ThreadSanitizer.
+namespace {
+void check_no_unicode_breaks(const std::string& text) {
+    CHECK(text.find("\xC2\x85") == std::string::npos);
+    CHECK(text.find("\xE2\x80\xA8") == std::string::npos);
+    CHECK(text.find("\xE2\x80\xA9") == std::string::npos);
+}
+} // namespace
+
 #ifndef YUZU_OIDC_MOCK_IDP_TSAN
 TEST_CASE("OIDC discovery: a malformed JWKS reaches the log with the Unicode line breaks "
           "neutralized",
@@ -2365,12 +2375,6 @@ namespace {
 // NEL, U+2028 and U+2029 in UTF-8: the three line breaks a control-byte check (< 0x20, DEL) lets by
 // and a log reader splits on.
 constexpr const char* kUnicodeBreaks = "\xC2\x85\xE2\x80\xA8\xE2\x80\xA9";
-
-void check_no_unicode_breaks(const std::string& text) {
-    CHECK(text.find("\xC2\x85") == std::string::npos);
-    CHECK(text.find("\xE2\x80\xA8") == std::string::npos);
-    CHECK(text.find("\xE2\x80\xA9") == std::string::npos);
-}
 } // namespace
 
 TEST_CASE("OIDC: IdP-controlled JWT header values reach the log and the error with the Unicode "
@@ -2882,6 +2886,7 @@ TEST_CASE("OIDC discovery: a configured endpoint with a space or control byte is
     CHECK(fragment.pending_flow_count_for_test() == 0);
 }
 
+#ifndef YUZU_OIDC_MOCK_IDP_TSAN
 // An authorization endpoint that already carries a query is accepted by discovery, so the
 // client parameters must JOIN it ('&'), not open a second query: `...?prompt=login?client_id=`
 // hands the IdP one parameter named `prompt` and no `client_id` at all (#5692 adversarial review).
@@ -2934,6 +2939,128 @@ TEST_CASE("OIDC discovery: a discovered authorization endpoint with a fragment i
     CHECK_THROWS_AS(provider.start_auth_flow(), std::runtime_error);
     CHECK(provider.pending_flow_count_for_test() == 0);
 }
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
+// The separator and the reserved-name rule are driven through a CONFIGURED endpoint (no MockIdp),
+// so they run in every build including the ThreadSanitizer leg (#5692 round 9).
+namespace {
+OidcConfig explicit_authorize_cfg(const std::string& authorization_endpoint) {
+    OidcConfig cfg;
+    cfg.issuer = "https://idp.test";
+    cfg.client_id = "yuzu-test-client";
+    cfg.redirect_uri = "http://localhost/cb";
+    cfg.authorization_endpoint = authorization_endpoint;
+    return cfg;
+}
+} // namespace
+
+TEST_CASE("OIDC: the authorize URL separator never swallows client_id (repeated '?' included)",
+          "[oidc][oidc_discovery]") {
+    struct Row {
+        const char* endpoint;
+        const char* expected_prefix; // what the URL must start with
+    };
+    const Row rows[] = {
+        {"https://idp.test/a", "https://idp.test/a?client_id="},
+        {"https://idp.test/a?", "https://idp.test/a?client_id="},
+        {"https://idp.test/a?x=1&", "https://idp.test/a?x=1&client_id="},
+        {"https://idp.test/a?x=1", "https://idp.test/a?x=1&client_id="},
+        {"https://idp.test/a?x=1?", "https://idp.test/a?x=1?&client_id="},
+        {"https://idp.test/a??", "https://idp.test/a??&client_id="},
+        {"https://idp.test/a?x=1&?", "https://idp.test/a?x=1&?&client_id="},
+        {"https://idp.test/a??x=1", "https://idp.test/a??x=1&client_id="},
+    };
+    for (const auto& row : rows) {
+        CAPTURE(row.endpoint);
+        OidcProvider provider(explicit_authorize_cfg(row.endpoint));
+        const auto flow = provider.start_auth_flow();
+        CHECK(flow.url.starts_with(row.expected_prefix));
+        // client_id is a parameter of its own, exactly once, and the other seven follow it.
+        CHECK(yuzu::server::test::url_query_param(flow.url, "client_id") == "yuzu-test-client");
+        CHECK(flow.url.find("&client_id=") == flow.url.rfind("&client_id=")); // at most one
+        CHECK(yuzu::server::test::url_query_param(flow.url, "response_type") == "code");
+        CHECK(yuzu::server::test::url_query_param(flow.url, "code_challenge_method") == "S256");
+        CHECK_FALSE(yuzu::server::test::url_query_param(flow.url, "state").empty());
+        CHECK(flow.url.find("&&") == std::string::npos);
+    }
+}
+
+TEST_CASE("OIDC: an authorization endpoint whose query uses a name Yuzu appends is refused",
+          "[oidc][oidc_discovery][security]") {
+    const char* const reserved[] = {
+        "client_id", "response_type", "scope",          "redirect_uri",
+        "state",     "nonce",         "code_challenge", "code_challenge_method"};
+    const auto refused = [](const std::string& endpoint) {
+        OidcProvider provider(explicit_authorize_cfg(endpoint));
+        bool threw = false;
+        try {
+            (void)provider.start_auth_flow();
+        } catch (const std::runtime_error& e) {
+            threw = std::string(e.what()) == OidcProvider::kDiscoveryUnavailable;
+        }
+        return threw && provider.pending_flow_count_for_test() == 0;
+    };
+    for (const char* name : reserved) {
+        CAPTURE(name);
+        CHECK(refused(std::string("https://idp.test/a?") + name + "=evil"));
+        CHECK(refused(std::string("https://idp.test/a?x=1&") + name + "=evil"));
+        CHECK(refused(std::string("https://idp.test/a?x=1&") + name)); // no '=' at all
+    }
+    CHECK(refused("https://idp.test/a?client%5Fid=evil"));
+    CHECK(refused("https://idp.test/a?x=1&%73tate=evil"));     // %73 is 's'
+    CHECK(refused("https://idp.test/a?x=1&client%5fid=evil")); // lower-case hex digits
+
+    // Not reserved: other case, a longer name, ordinary IdP hints, a B2C policy, a ';' pair.
+    for (const char* ok : {"https://idp.test/a?CLIENT_ID=x", "https://idp.test/a?client_idx=1",
+                           "https://idp.test/a?ui_locales=en", "https://idp.test/a?prompt=login",
+                           "https://idp.test/a?p=b2c_1_signin", "https://idp.test/a?x=1;state=2",
+                           "https://idp.test/a?x=client_id", "https://idp.test/a"}) {
+        CAPTURE(ok);
+        OidcProvider provider(explicit_authorize_cfg(ok));
+        const auto flow = provider.start_auth_flow();
+        CHECK(yuzu::server::test::url_query_param(flow.url, "client_id") == "yuzu-test-client");
+    }
+
+    // The rule is for the AUTHORIZATION endpoint only: a token endpoint query is not Yuzu's.
+    OidcConfig cfg = explicit_authorize_cfg("https://idp.test/a");
+    cfg.token_endpoint = "https://idp.test/t?client_id=x";
+    OidcProvider provider(cfg);
+    CHECK_NOTHROW(provider.start_auth_flow());
+}
+
+TEST_CASE(
+    "OIDC discovery: a discovered authorization endpoint with a reserved query name is refused",
+    "[oidc][oidc_discovery][security]") {
+    const auto doc = [](const std::string& auth) {
+        return R"({"issuer":"https://idp.test","authorization_endpoint":")" + auth +
+               R"(","token_endpoint":"https://idp.test/t","jwks_uri":"https://idp.test/j"})";
+    };
+    const std::string issuer = "https://idp.test";
+    for (const char* bad :
+         {"https://idp.test/a?client_id=evil", "https://idp.test/a?x=1&state=evil",
+          "https://idp.test/a?client%5Fid=evil"}) {
+        CAPTURE(bad);
+        const auto r = OidcProvider::parse_discovery_document(doc(bad), issuer);
+        REQUIRE_FALSE(r.has_value());
+        // The same refusal text as every other endpoint refusal.
+        CHECK(r.error() ==
+              "authorization_endpoint is not an absolute https URL on the issuer's scheme");
+    }
+    for (const char* ok : {"https://idp.test/a?CLIENT_ID=x", "https://idp.test/a?client_idx=1",
+                           "https://idp.test/a?ui_locales=en", "https://idp.test/a?prompt=login",
+                           "https://idp.test/a?p=b2c_1_signin",
+                           "https://idp.test/realms/r/protocol/openid-connect/auth"}) {
+        CAPTURE(ok);
+        CHECK(OidcProvider::parse_discovery_document(doc(ok), issuer).has_value());
+    }
+    // The token endpoint and the JWKS URI may carry any query: only the authorization one is Yuzu's
+    // to extend.
+    const std::string other = R"({"issuer":"https://idp.test","authorization_endpoint":)"
+                              R"("https://idp.test/a","token_endpoint":)"
+                              R"("https://idp.test/t?client_id=x","jwks_uri":)"
+                              R"("https://idp.test/j?state=y"})";
+    CHECK(OidcProvider::parse_discovery_document(other, issuer).has_value());
+}
 
 // ── The unauthenticated callback `state` reaches the log folded (#5692 adversarial review) ──
 
@@ -2965,6 +3092,24 @@ TEST_CASE("OIDC: a forged callback state cannot split or forge a log line",
         CHECK(logs.find('\x1b') == std::string::npos);
         check_no_unicode_breaks(logs);
     }
+}
+
+// The configured issuer and client id are admin-set, but the constructor logs them and the Settings
+// save path hands over whatever was typed: they reach the log folded like every other value here.
+TEST_CASE("OIDC: a configured issuer and client id reach the constructor log folded",
+          "[oidc][log_fold][security]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://idp.test\nFORGED";
+    cfg.client_id = std::string("c") + "\xC2\x85" + "FORGED2\r";
+    yuzu::test::LogCapture cap;
+    OidcProvider provider(std::move(cfg));
+    cap.stop();
+    const auto logs = cap.text();
+    CHECK(logs.find("OidcProvider: issuer=https://idp.test") != std::string::npos); // non-vacuity
+    CHECK(logs.find("\nFORGED") == std::string::npos);
+    CHECK(logs.find("\rFORGED") == std::string::npos);
+    CHECK(logs.find("FORGED2") != std::string::npos);
+    check_no_unicode_breaks(logs);
 }
 
 // The scheme rules for an HTTPS issuer cannot be driven through a loopback MockIdp (it has no
@@ -3089,8 +3234,22 @@ TEST_CASE("OIDC discovery: the in-flight mark is set once, cleared only by an RA
     REQUIRE(set_at != std::string::npos);
     REQUIRE(guard_at != std::string::npos);
     CHECK(guard_at > set_at);
-    // Nothing that can throw between the set and the guard: only the guard's own definition.
-    const auto between = text.substr(set_at, guard_at - set_at);
-    CHECK(between.find("spdlog") == std::string::npos);
-    CHECK(between.find("fetch_") == std::string::npos);
+    // Nothing that can throw between the set and the guard: after the set statement the next
+    // text that is neither whitespace nor a `//` comment line must be the guard's definition.
+    std::size_t cursor = set_at + std::string("discovery_in_flight_ = true;").size();
+    for (;;) {
+        while (cursor < text.size() &&
+               std::string_view(" \t\r\n").find(text[cursor]) != std::string_view::npos)
+            ++cursor;
+        if (text.compare(cursor, 2, "//") != 0)
+            break;
+        const auto eol = text.find('\n', cursor);
+        REQUIRE(eol != std::string::npos);
+        cursor = eol + 1;
+    }
+    CHECK(cursor == struct_at);
+    // The destructor re-takes the lock if an unwind left it released (so the flag is cleared under
+    // the lock, in the same critical section that commits the result).
+    CHECK(in_guard("lock.lock();") == 1);
+    CHECK(in_guard("owns_lock()") == 1);
 }

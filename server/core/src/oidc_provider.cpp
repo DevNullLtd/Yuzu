@@ -582,11 +582,14 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
 
     URL_COMPONENTS uc = {};
     uc.dwStructSize = sizeof(uc);
-    wchar_t host[256] = {}, path[2048] = {};
+    wchar_t host[256] = {}, path[2048] = {}, extra[2048] = {};
     uc.lpszHostName = host;
     uc.dwHostNameLength = 256;
     uc.lpszUrlPath = path;
     uc.dwUrlPathLength = 2048;
+    // The query ("?...") is returned separately from the path; without this buffer it is dropped.
+    uc.lpszExtraInfo = extra;
+    uc.dwExtraInfoLength = 2048;
 
     if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) {
         spdlog::error("WinHTTP: failed to crack URL: {}", ::yuzu::log_key_token(url));
@@ -608,8 +611,10 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
     }
 
     DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET request = WinHttpOpenRequest(connect, L"POST", path, nullptr, WINHTTP_NO_REFERER,
-                                           WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    // Both buffers are zero-initialized and NUL-terminated by the crack: path + query.
+    const std::wstring target = std::wstring(path) + extra;
+    HINTERNET request = WinHttpOpenRequest(connect, L"POST", target.c_str(), nullptr,
+                                           WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!request) {
         spdlog::error("WinHTTP: WinHttpOpenRequest failed: {}", GetLastError());
         WinHttpCloseHandle(connect);
@@ -1217,15 +1222,72 @@ std::string_view issuer_scheme(std::string_view issuer) {
     return {};
 }
 
+// A percent-decoded copy of `in`: "%XY" with two hex digits becomes that byte, anything else is
+// copied as is (so a malformed escape stays visible rather than vanishing).
+std::string percent_decode_lenient(std::string_view in) {
+    const auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+        return -1;
+    };
+    std::string out;
+    out.reserve(in.size());
+    for (std::size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == '%' && i + 2 < in.size() && hex(in[i + 1]) >= 0 && hex(in[i + 2]) >= 0) {
+            out.push_back(static_cast<char>(hex(in[i + 1]) * 16 + hex(in[i + 2])));
+            i += 2;
+        } else {
+            out.push_back(in[i]);
+        }
+    }
+    return out;
+}
+
+// The authorization endpoint's own query must not use the name of a parameter Yuzu appends
+// (RFC 6749 3.1: a request parameter MUST NOT be included more than once, and the endpoint's pair
+// would come BEFORE Yuzu's, ahead of the value Yuzu means the IdP to use). Pairs split on '&'
+// only (';' is not a separator); the name is the text before the first '=', percent-decoded and
+// compared case-sensitively, so `client%5Fid` is the reserved `client_id` and `CLIENT_ID` is not.
+bool authorization_query_ok(std::string_view endpoint) {
+    const auto q = endpoint.find('?');
+    if (q == std::string_view::npos)
+        return true;
+    constexpr std::string_view kReserved[] = {
+        "client_id", "response_type", "scope",          "redirect_uri",
+        "state",     "nonce",         "code_challenge", "code_challenge_method"};
+    std::string_view query = endpoint.substr(q + 1);
+    while (true) {
+        const auto amp = query.find('&');
+        const std::string_view pair = query.substr(0, amp);
+        const std::string name = percent_decode_lenient(pair.substr(0, pair.find('=')));
+        for (const auto reserved : kReserved)
+            if (name == reserved)
+                return false;
+        if (amp == std::string_view::npos)
+            return true;
+        query.remove_prefix(amp + 1);
+    }
+}
+
 // An endpoint from the discovery document: absolute, at most 2048 bytes, the issuer's scheme, a
 // well-formed host[:port] authority, no fragment (RFC 6749 3.1 / 3.2: an endpoint URI MUST NOT
 // include one, and a browser would drop every parameter appended after it), and no byte that
 // could split the request line it will be sent in or the log line it is written to
-// (`has_line_splitting_bytes`). A query is allowed: start_auth_flow keeps it and appends with '&'.
-bool endpoint_acceptable(const std::string& value, std::string_view scheme) {
+// (`has_line_splitting_bytes`). A query is allowed: start_auth_flow keeps it and appends with '&'
+// (the AUTHORIZATION endpoint's query additionally must not use a name Yuzu appends,
+// `authorization_query_ok`). The '#' rule is applied to jwks_uri too: one rule for every
+// discovered endpoint, harmless for a plain GET.
+bool endpoint_acceptable(const std::string& value, std::string_view scheme,
+                         bool authorization = false) {
     if (value.size() > kMaxIdpUrlBytes || !value.starts_with(scheme))
         return false;
     if (has_line_splitting_bytes(value) || value.find('#') != std::string::npos)
+        return false;
+    if (authorization && !authorization_query_ok(value))
         return false;
     return split_http_url(value).has_value();
 }
@@ -1480,7 +1542,7 @@ OidcProvider::parse_discovery_document(const std::string& body, const std::strin
     for (const auto& [name, value] : fields) {
         if (value->empty())
             return std::unexpected(std::string("discovery document has no ") + name);
-        if (!endpoint_acceptable(*value, scheme))
+        if (!endpoint_acceptable(*value, scheme, value == &doc.authorization_endpoint))
             return std::unexpected(std::string(name) + " is not an absolute " +
                                    std::string(scheme.substr(0, scheme.size() - 3)) +
                                    " URL on the issuer's scheme");
@@ -1504,9 +1566,10 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
     // is authoritative but still goes on the wire and into logs: refuse one that could split a
     // request or log line, as the discovered ones are.
     if (const auto& explicit_ep = pick(config_); !explicit_ep.empty()) {
-        if (has_line_splitting_bytes(explicit_ep) || explicit_ep.find('#') != std::string::npos) {
+        if (has_line_splitting_bytes(explicit_ep) || explicit_ep.find('#') != std::string::npos ||
+            (need == Need::Authorize && !authorization_query_ok(explicit_ep))) {
             spdlog::error("OidcProvider: a configured endpoint contains a space, control "
-                          "character or fragment and is refused");
+                          "character, fragment or reserved query parameter and is refused");
             return std::unexpected(std::string(kDiscoveryUnavailable));
         }
         return explicit_ep;
@@ -1594,7 +1657,8 @@ std::size_t OidcProvider::pending_flow_count_for_test() const {
 OidcProvider::OidcProvider(OidcConfig config) : config_(std::move(config)) {
     // No network here: endpoints are discovered lazily by ensure_discovered, so a provider can be
     // built (and a Settings save can succeed) while the IdP is briefly unreachable.
-    spdlog::info("OidcProvider: issuer={} client_id={}", config_.issuer, config_.client_id);
+    spdlog::info("OidcProvider: issuer={} client_id={}", ::yuzu::log_key_token(config_.issuer),
+                 ::yuzu::log_key_token(config_.client_id));
 }
 
 bool OidcProvider::is_enabled() const {
@@ -1646,19 +1710,23 @@ OidcProvider::AuthFlowStart OidcProvider::start_auth_flow(const std::string& req
         pending_challenges_[state] = std::move(pkce);
     }
 
-    // An endpoint that already carries a query keeps it: the client parameters join with '&'
-    // (none when it already ends in '?' or '&'), else they start the query with '?'.
+    // An endpoint that already carries a query keeps it: the client parameters join with '&',
+    // with NO separator only when the first '?' is the LAST character (an empty query) or the
+    // endpoint ends in '&'; else they start the query with '?'. A later '?' is data inside the
+    // query (`/a?x=1?` -> `/a?x=1?&client_id=`), never an opening that would swallow client_id.
     const char* separator = "?";
-    if (authorization_endpoint->find('?') != std::string::npos)
-        separator = (authorization_endpoint->back() == '?' || authorization_endpoint->back() == '&')
-                        ? ""
-                        : "&";
+    if (const auto q = authorization_endpoint->find('?'); q != std::string::npos)
+        separator =
+            (q + 1 == authorization_endpoint->size() || authorization_endpoint->back() == '&')
+                ? ""
+                : "&";
     auto url = *authorization_endpoint + separator + "client_id=" + url_encode(config_.client_id) +
                "&response_type=code" + "&scope=" + url_encode("openid profile email") +
                "&redirect_uri=" + url_encode(redirect_uri) + "&state=" + url_encode(state) +
                "&nonce=" + url_encode(nonce) + "&code_challenge=" + url_encode(challenge) +
                "&code_challenge_method=S256";
 
+    // `state` here is server-generated hex (never attacker bytes); folded for consistency.
     spdlog::debug("OIDC auth flow started: state={} redirect_uri={}",
                   ::yuzu::log_key_token(state.substr(0, 8)), redirect_uri);
     return AuthFlowStart{std::move(url), std::move(binding_secret)};
@@ -1708,6 +1776,8 @@ std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(
                            CRYPTO_memcmp(provided_hash.data(), stored_hash.data(),
                                          stored_hash.size()) == 0;
         if (!bound) {
+            // `state` already matched a pending_challenges_ key, so it is server-generated hex;
+            // folded for consistency with the unauthenticated log at the top of this function.
             spdlog::error("OIDC handle_callback: browser binding mismatch (state={})",
                           ::yuzu::log_key_token(state.substr(0, 8)));
             return std::unexpected(std::string(kBrowserBindingMismatch));
