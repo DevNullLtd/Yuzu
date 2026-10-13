@@ -420,7 +420,17 @@ rc=0; env GITHUB_ACTIONS=true GITHUB_STEP_SUMMARY="$TMP/summary3.md" \
 check "markdown table cell: pipe escaped, backtick removed" yes "$(has "| \`a\\|b'c.so\` |" "$TMP/summary3.md")"
 
 # 2. an unreadable DIRECTORY is a problem, not a silently smaller scan
-if [ "$(id -u)" -ne 0 ]; then
+# chmod-based tests prove nothing as root: skip loudly locally, FAIL in CI.
+can_chmod=yes
+if [ "$(id -u)" -eq 0 ]; then
+  can_chmod=no
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    check "permission tests need a non-root user (CI must not skip them)" "non-root" "root"
+  else
+    echo "  [skip] permission-based tests (running as root: chmod 000 does not block root)"
+  fi
+fi
+if [ "$can_chmod" = yes ]; then
   mkdir -p "$TMP/unrd/sub" "$TMP/unrd/ok"; cp "$TMP/clean/bin/ok" "$TMP/unrd/ok/"
   cp "$TMP/bad/bin/glibc_new" "$TMP/unrd/sub/"; chmod 000 "$TMP/unrd/sub"
   run --floor "$FLOOR" --dir "$TMP/unrd"
@@ -430,8 +440,6 @@ if [ "$(id -u)" -ne 0 ]; then
   run --floor "$FLOOR" --dir "$TMP/unrd" --enforce
   check "unreadable directory, --enforce: exit 1" 1 "$rc"
   chmod 755 "$TMP/unrd/sub"
-else
-  echo "  [skip] unreadable-directory test (running as root: chmod 000 does not block root)"
 fi
 
 # 3. a FIFO in the tree is never opened (a blocking open would hang the scan)
@@ -524,6 +532,148 @@ start=$SECONDS; rc=0
 env YUZU_ELF_FLOOR_DEADLINE=2 OBJDUMP="$TMP/stub/hang_objdump" timeout 40 bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/clean" --enforce > "$TMP/out" 2>&1 || rc=$?
 check "hung objdump: bounded by the deadline (finished in < 20s), exit 1 under --enforce" "1 yes" "$rc $([ $((SECONDS - start)) -lt 20 ] && echo yes || echo no)"
 check "hung objdump: reported as timed out" yes "$(has 'timed out')"
+
+
+# ---- governance round 2 additions ---------------------------------------------------
+REAL_OBJDUMP="$(command -v objdump)"; export REAL_OBJDUMP
+
+# 12. an objdump whose rows lack the `*UND*` token must not turn every ELF into "imports nothing"
+cat > "$TMP/stub/strip_und" <<'EOF'
+#!/bin/sh
+"$REAL_OBJDUMP" "$@" | sed 's/\*UND\*/UNDEF/'
+EOF
+cat > "$TMP/stub/warn_objdump" <<'EOF'
+#!/bin/sh
+"$REAL_OBJDUMP" "$@"
+echo "objdump: warning: dynamic section is damaged" >&2
+EOF
+chmod +x "$TMP/stub/strip_und" "$TMP/stub/warn_objdump"
+mkdir -p "$TMP/fmt"; cp "$TMP/bad/bin/glibc_new" "$TMP/fmt/"; cp "$TMP/odd/static_exe" "$TMP/fmt/"
+rc=0; env OBJDUMP="$TMP/stub/strip_und" bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/fmt" --enforce > "$TMP/out" 2>&1 || rc=$?
+check "unrecognised objdump format, --enforce: exit 1 (not a false-clean OK)" 1 "$rc"
+check "unrecognised objdump format: dynamic ELF named unreadable" yes "$(has 'glibc_new: unreadable: error: objdump -T: NEEDED libraries but no undefined symbol row')"
+check "unrecognised objdump format: a static ELF is NOT flagged" no "$(has 'static_exe:')"
+rc=0; env OBJDUMP="$TMP/stub/strip_und" bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/fmt" > "$TMP/out" 2>&1 || rc=$?
+check "unrecognised objdump format, report-only: exit 0" 0 "$rc"
+rc=0; env OBJDUMP="$TMP/stub/warn_objdump" bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/clean" --enforce > "$TMP/out" 2>&1 || rc=$?
+check "objdump exit 0 with a stderr warning, --enforce: exit 1" 1 "$rc"
+check "objdump stderr warning: ELF named unreadable" yes "$(has 'unreadable: error: objdump -T: objdump: warning')"
+run --floor "$FLOOR" --dir "$TMP/clean" --enforce
+check "(control) the same tree with the real objdump is clean" 0 "$rc"
+
+# 13. a typo in the floor's max must not silently ungate GLIBC
+echo '{"schema":1,"name":"x","max":{"GLIBCC":"2.28","GLIBCXX":"3.4.25"}}' > "$TMP/floor_typo.json"
+run --floor "$TMP/floor_typo.json" --dir "$TMP/clean"
+check "floor max without GLIBC: exit 2" 2 "$rc"
+
+# 14. legacy runner syntax `##[error]` is recognised anywhere in a line
+mkdir -p "$TMP/legacy"; cp "$TMP/bad/bin/glibc_new" "$TMP/legacy/x ##[error]v1 ##[add-mask]z.so"
+rc=0; env GITHUB_ACTIONS=true GITHUB_STEP_SUMMARY="$TMP/summary4.md" bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/legacy" > "$TMP/out" 2>&1 || rc=$?
+check "file name with ##[error]: no '##[' survives in any output line" 0 "$(grep -c '##\[' "$TMP/out" || true)"
+check "file name with ##[error]: still reported" yes "$(has 'x #\x23[error]v1 #\x23[add-mask]z.so')"
+rc=0; env STUB_TAG='##[add-mask]z_1.0' OBJDUMP="$TMP/stub/objdump" bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/injfam" > "$TMP/out" 2>&1 || rc=$?
+check "family with ##[add-mask]: no '##[' survives" 0 "$(grep -c '##\[' "$TMP/out" || true)"
+
+# 15. argparse usage errors echo argv: same rendering, still exit 2
+rc=0; bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/clean" $'x\n::error::y' '##[error]z' > "$TMP/out" 2>&1 || rc=$?
+check "usage error with hostile argv: exit 2" 2 "$rc"
+check "usage error: no workflow command line" 0 "$(cmd_lines)"
+check "usage error: no '##[' survives" 0 "$(grep -c '##\[' "$TMP/out" || true)"
+
+# 16. listable-but-not-searchable directory: the ELF must not quietly become 'non-ELF'
+if [ "$can_chmod" = yes ]; then
+  mkdir -p "$TMP/noexec/sub" "$TMP/noexec/ok"; cp "$TMP/clean/bin/ok" "$TMP/noexec/ok/"
+  cp "$TMP/bad/bin/glibc_new" "$TMP/noexec/sub/"; chmod 444 "$TMP/noexec/sub"
+  run --floor "$FLOOR" --dir "$TMP/noexec"
+  check "listable-not-searchable dir, report-only: exit 0" 0 "$rc"
+  check "listable-not-searchable dir: the file is a PROBLEM" yes "$(has 'PROBLEM: file sub/glibc_new cannot be examined')"
+  run --floor "$FLOOR" --dir "$TMP/noexec" --enforce
+  check "listable-not-searchable dir, --enforce: exit 1" 1 "$rc"
+  chmod 755 "$TMP/noexec/sub"
+fi
+
+# 17. an incomplete scan must say so in the baseline; a complete one stays byte-clean
+rm -f "$TMP/inc.json"
+run --floor "$FLOOR" --dir "$TMP/trunc" --set-name partial --emit-baseline "$TMP/inc.json"
+run --floor "$FLOOR" --dir "$TMP/empty" --set-name nothing --emit-baseline "$TMP/inc.json"
+run --floor "$FLOOR" --dir "$TMP/clean" --set-name whole --emit-baseline "$TMP/inc.json"
+check "baseline 'incomplete': unreadable ELF, empty scan, clean scan" "['1 ELF(s) unreadable or not scanned'] ['no ELF files found under the scanned directory (an empty scan is not a clean scan)'] absent" \
+  "$(py "$TMP/inc.json" <<'EOF'
+import json, sys
+s = json.load(open(sys.argv[1]))["sets"]
+print(s["partial"]["incomplete"], s["nothing"]["incomplete"], "absent" if "incomplete" not in s["whole"] else "present")
+EOF
+)"
+
+# 18. stdout write failure -> exit 2 (not Python's 120); empty deadline == unset
+if [ -w /dev/full ]; then
+  rc=0; bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/clean" > /dev/full 2>/dev/null || rc=$?
+  check "stdout to /dev/full: exit 2" 2 "$rc"
+fi
+rc=0; env YUZU_ELF_FLOOR_DEADLINE= bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/clean" > "$TMP/out" 2>&1 || rc=$?
+check "YUZU_ELF_FLOOR_DEADLINE set but empty behaves as unset: exit 0" 0 "$rc"
+
+# 19. PROBLEM annotations come before per-ELF ones
+rc=0; env YUZU_ELF_FLOOR_DEADLINE=0 GITHUB_ACTIONS=true bash "$SCRIPT" --floor "$FLOOR" --dir "$TMP/clean" > "$TMP/out" 2>&1 || rc=$?
+check "first annotation is the scan PROBLEM, not a per-ELF line" yes \
+  "$(grep '^::' "$TMP/out" | head -1 | grep -q 'deadline of 0s exceeded: 2 of 2' && echo yes || echo no)"
+
+# 20. tripwire: no workflow step may run `check-elf-floor.sh --enforce` under continue-on-error
+# (a swallowed exit 1 would never gate). VACUOUS TODAY: S0 wires only --report-only; the
+# synthetic fixtures below prove the detector itself. Steps are the 6-space `- ` items; comments are ignored.
+cat > "$TMP/tripwire.py" <<'EOF'
+import re, sys
+def offenders(text):
+    steps, cur = [], []
+    for ln in text.splitlines():
+        if ln.lstrip().startswith('#'):
+            continue
+        if re.match(r'^ {6}- ', ln):
+            steps.append(cur); cur = []
+        cur.append(ln)
+    steps.append(cur)
+    bad = []
+    for st in steps:
+        body = '\n'.join(st)
+        if 'check-elf-floor.sh' in body and '--enforce' in body and re.search(r'continue-on-error:\s*true', body):
+            bad.append(st[0].strip() if st else '?')
+    return bad
+if __name__ == '__main__':
+    n = 0
+    for path in sys.argv[1:]:
+        for b in offenders(open(path, encoding='utf-8').read()):
+            print('%s: %s' % (path, b)); n += 1
+    sys.exit(1 if n else 0)
+EOF
+mkdir -p "$TMP/wf"
+cat > "$TMP/wf/bad.yml" <<'EOF'
+jobs:
+  j:
+    steps:
+      - name: other
+        run: echo hi
+      - name: gate
+        continue-on-error: true
+        run: |
+          bash scripts/ci/check-elf-floor.sh --enforce --floor f --dir d
+EOF
+cat > "$TMP/wf/good.yml" <<'EOF'
+jobs:
+  j:
+    steps:
+      # S2 flips this to --enforce (a comment must not trip the detector)
+      - name: report
+        continue-on-error: true
+        run: bash scripts/ci/check-elf-floor.sh --report-only --floor f --dir d
+      - name: gate
+        run: bash scripts/ci/check-elf-floor.sh --enforce --floor f --dir d
+EOF
+rc=0; python3 -I "$TMP/tripwire.py" "$TMP/wf/bad.yml" > "$TMP/out" 2>&1 || rc=$?
+check "tripwire detector flags enforce + continue-on-error (synthetic)" "1 yes" "$rc $(has 'gate')"
+rc=0; python3 -I "$TMP/tripwire.py" "$TMP/wf/good.yml" > "$TMP/out" 2>&1 || rc=$?
+check "tripwire detector passes report-only continue-on-error and a bare enforce step (synthetic)" 0 "$rc"
+rc=0; python3 -I "$TMP/tripwire.py" "$ROOT"/.github/workflows/*.yml > "$TMP/out" 2>&1 || rc=$?
+check "real workflows: no --enforce step under continue-on-error" 0 "$rc"
 
 # ---- shipped floor + baseline files ------------------------------------------------
 for fl in agent server; do

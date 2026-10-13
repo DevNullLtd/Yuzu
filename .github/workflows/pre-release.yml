@@ -454,7 +454,9 @@ jobs:
   # `continue-on-error` keeps a red one from failing the job, so
   # needs.install-rpm.result stays `success`: the gap is visible in the run
   # graph and in the step summary the failed leg writes (last step), NOT in the
-  # Pre-release QA report table. S2 promotes them (deletes `experimental`) as
+  # Pre-release QA report table. That step runs on `failure()`, so it cannot
+  # fire after a job-level timeout or cancel; such a leg is red in the run
+  # graph only. S2 promotes them (deletes `experimental`) as
   # it moves the floor into the build.
   install-rpm:
     name: "Install .rpm (${{ matrix.distro }})"
@@ -481,6 +483,9 @@ jobs:
       - name: Test .rpm install, run and removal
         env:
           DISTRO: ${{ matrix.distro }}
+          # 'true' on the non-gating legs, empty elsewhere (matrix.experimental
+          # is only defined for the include entries).
+          EXPERIMENTAL: ${{ matrix.experimental }}
         run: |
           cat > "$RUNNER_TEMP/smoke.sh" <<'SMOKE'
           set -euo pipefail
@@ -590,7 +595,9 @@ jobs:
             if ! docker run --rm -e PKG="$PKG" -e DISTRO="$DISTRO" -e RPM_NAME="$(basename "${RPMS[0]}")" \
                  -v "$PWD/artifacts:/rpms:ro" -v "$RUNNER_TEMP/smoke.sh:/smoke.sh:ro" \
                  "$DISTRO" bash /smoke.sh; then
-              echo "::error::yuzu-$PKG failed the .rpm smoke test on $DISTRO"
+              # A non-gating leg must not paint the run with error annotations.
+              LEVEL=error; [ "$EXPERIMENTAL" = true ] && LEVEL=warning
+              echo "::$LEVEL::yuzu-$PKG failed the .rpm smoke test on $DISTRO"
               FAIL=1
             fi
           done
@@ -606,10 +613,11 @@ jobs:
           DISTRO: ${{ matrix.distro }}
         run: |
           {
-            echo "### EXPERIMENTAL leg failed (expected until ADR-2003 S2): .rpm install on ${DISTRO}"
+            echo "### EXPERIMENTAL leg failed: .rpm install on ${DISTRO}"
             echo
-            echo "This leg is non-gating (continue-on-error). It is expected to fail while the"
-            echo "0.14.x artefacts are built against the build host's glibc/libstdc++ (#5143)."
+            echo "This leg is non-gating (continue-on-error). On 0.14.x artefacts the EXPECTED"
+            echo "cause is the glibc/libstdc++ floor (#5143) - confirm that in the smoke log:"
+            echo "other causes (mirror outage, pull limits, a timeout) look identical here."
             echo "It does NOT appear as a failure in the Pre-release QA report table."
           } >> "$GITHUB_STEP_SUMMARY"
 

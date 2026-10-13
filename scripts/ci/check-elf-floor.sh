@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check-elf-floor.sh -- the Linux native-build floor gate (ADR-2003, slice S0).
+# check-elf-floor.sh -- the Linux native-build floor gate (ADR-2003 (Proposed, PR #5631), slice S0).
 #
 # Walks a staging directory, runs `objdump -T` and `readelf -d` over every ELF
 # in it (binaries, plugins, ERTS, crypto.so ...) and compares what each one
@@ -32,7 +32,8 @@
 #   Tools are looked up on PATH; override with OBJDUMP=... READELF=... .
 #   Needs python3 (3.8+) for parsing and JSON; there is no other dependency.
 #   Time bound: each tool call is limited to 300s and the whole scan to
-#   YUZU_ELF_FLOOR_DEADLINE seconds (default 240; a test hook). ELFs not reached
+#   YUZU_ELF_FLOOR_DEADLINE seconds (default 240; a test hook; set-but-empty
+#   counts as unset). ELFs not reached
 #   by then are reported as `unreadable` ("not scanned") plus one PROBLEM line,
 #   never skipped silently. A normal scan of ~70 ELFs takes well under a second.
 #
@@ -56,6 +57,14 @@
 #     libraries (libc and libm both give GLIBC_2.x) is one tag: the gate
 #     compares tags, not provenance. Tags with no numeric suffix
 #     (`GLIBC_PRIVATE`) are their own family and are reported verbatim.
+#   * A parse that could silently read as clean is an error instead. An ELF is
+#     `unreadable` when (a) readelf/objdump wrote an error/warning/"not
+#     recognized"-style message on stderr, even with exit 0 (a damaged ELF must
+#     not read as a clean partial parse), or (b) readelf shows NEEDED libraries
+#     yet no undefined symbol row could be parsed from `objdump -T` (a changed
+#     objdump output format would otherwise make every ELF "import nothing").
+#     (b) is deliberately narrow: a dynamic object with no NEEDED entry, or a
+#     static one, legitimately imports nothing and is not flagged.
 #   * Defined symbols and unversioned imports (`Base`) never count toward the
 #     version comparison; unversioned imports still feed forbidden_symbols.
 #   * Non-ELF files are skipped (counted, never an error). Symlinks are not
@@ -64,15 +73,27 @@
 #     survives stripping). An ELF the tools cannot read -- or a file with the
 #     ELF magic but fewer than 64 bytes (no room for an ELF header) -- is a
 #     violation of kind `unreadable`: an artefact that cannot be checked is not
-#     a clean one. Likewise a DIRECTORY that cannot be listed is a PROBLEM.
+#     a clean one. Likewise a DIRECTORY that cannot be listed, or a file that
+#     cannot be examined (stat fails with anything but "vanished"), is a
+#     PROBLEM.
 #   * ZERO ELFs under --dir (after --include/--exclude) is a problem: an
 #     error in --enforce, a warning in report-only. An empty scan must never
 #     read as "clean".
+#   * The floor file must list GLIBC in "max" (exit 2 otherwise): a typo in a
+#     family name would silently ungate it, because other families absent from
+#     "max" are only reported. A "listed family never measured" warning was
+#     considered and NOT added: the server set legitimately lacks several
+#     families (LIBSYSTEMD, BLKID, OPENSSL), so it would cry wolf.
 #   * Output hygiene: file names, symbol names, families and RUNPATH entries
 #     come from the artefact under test. Every line printed is rendered as
 #     printable ASCII, and any line that would begin (after whitespace) with
 #     `::` -- which the Actions runner would execute as a workflow command --
 #     is prefixed with `| `. Only the script's own annotations start with `::`.
+#     The legacy `##[error]`/`##[add-mask]` syntax (recognised anywhere in a
+#     line) is broken by rewriting `##[` to `#\x23[`. argparse usage errors and
+#     the internal-error handler go through the same rendering.
+#   * Annotation order: PROBLEM annotations first (GitHub shows only about ten
+#     per step), then per-ELF violations.
 #   * RUNPATH / RPATH: every colon-separated entry must be anchored at
 #     $ORIGIN (or ${ORIGIN}). An absolute path, a bare relative path or an
 #     empty entry (= the current directory) is a violation of kind `runpath`.
@@ -114,7 +135,12 @@
 #                                                  # from the floor's "max"
 #             "status": "static" | "error: ..."    # omitted when ordinary
 #           }
-#         }
+#         },
+#         "incomplete": ["directory x cannot be read (...)", ...]
+#                                                  # ONLY present when the scan
+#                                                  # had PROBLEMs or unreadable /
+#                                                  # unscanned ELFs: the numbers
+#                                                  # above are then a lower bound
 #       }
 #     }
 #   }
@@ -136,6 +162,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -146,6 +173,8 @@ TAG_RE = re.compile(r'^(?P<fam>.+)_(?P<ver>[0-9]{1,9}(?:\.[0-9]{1,9})*)$')
 VER_RE = re.compile(r'^[0-9]{1,9}(?:\.[0-9]{1,9})*$')
 ELF_MAGIC = b'\x7fELF'
 TOOL_TIMEOUT = 300
+BAD_STDERR = re.compile(r"(?i)\b(error|warning|can't|cannot|not recognized|truncated|"
+                        r"corrupt|unable|invalid|bad )")
 DEFAULT_DEADLINE = 240
 MIN_ELF_BYTES = 64
 SUMMARY_ROWS = 20
@@ -162,7 +191,9 @@ def safe(text):
     """Printable-ASCII rendering of attacker-influenced text (file names,
     symbol names, RUNPATH entries): a newline in a file name must not be able
     to start a fake `::error::` workflow command on its own log line."""
-    return re.sub(r'[^\x20-\x7e]', lambda m: '\\x%02x' % ord(m.group(0)), text)
+    text = re.sub(r'[^\x20-\x7e]', lambda m: '\\x%02x' % ord(m.group(0)), text)
+    # The legacy `##[error]` / `##[add-mask]` syntax matches anywhere in a line.
+    return text.replace('##[', '#\\x23[')
 
 
 def neutralize(line):
@@ -209,6 +240,9 @@ def load_floor(path):
     for fam, ver in mx.items():
         if not isinstance(ver, str) or not VER_RE.match(ver):
             die('floor file %s: max[%s] must be a dotted numeric version' % (path, fam))
+    if 'GLIBC' not in mx:
+        die('floor file %s: "max" must list GLIBC (a typo in a family name would '
+            'silently ungate it)' % path)
     allow = floor.get('allow', [])
     forb = floor.get('forbidden_symbols', [])
     for key, val in (('allow', allow), ('forbidden_symbols', forb)):
@@ -236,9 +270,20 @@ def discover(root, includes, excludes):
         dirnames.sort()
         for fn in sorted(filenames):
             full = os.path.join(dirpath, fn)
-            if os.path.islink(full):
+            relname = safe(os.path.relpath(full, root).replace(os.sep, '/'))
+            try:
+                mode = os.lstat(full).st_mode
+            except FileNotFoundError:
+                continue              # vanished between listing and stat
+            except OSError as exc:
+                # e.g. EACCES in a listable-but-not-searchable directory:
+                # isfile() would say False and the ELF would vanish silently.
+                errs.append('file %s cannot be examined (%s)'
+                            % (relname, safe(exc.strerror or 'error')))
                 continue
-            if not os.path.isfile(full):
+            if stat.S_ISLNK(mode):
+                continue
+            if not stat.S_ISREG(mode):
                 non_elf += 1          # FIFO, socket, device: never opened
                 continue
             rel = os.path.relpath(full, root).replace(os.sep, '/')
@@ -327,12 +372,16 @@ def scan_elf(rel, full, objdump, readelf, deadline):
     # `--` ends option parsing: a path can never be read as a tool option.
     rc, out, err = run([readelf, '-d', '--wide', '--', full], deadline)
     err = err.replace(full, rel)          # keep the staging path out of results
-    if rc is None or rc != 0 or 'Error:' in err:
+    if rc is None or rc != 0 or BAD_STDERR.search(err):
         rec['status'] = 'error: readelf -d: ' + (first_line(err) or 'failed')
         return rec
     rec['runpath'] = parse_runpath(out)
+    needed = '(NEEDED)' in out
     rc, out, err = run([objdump, '-T', '--', full], deadline)
     err = err.replace(full, rel)
+    if rc == 0 and BAD_STDERR.search(err):
+        rec['status'] = 'error: objdump -T: ' + first_line(err)
+        return rec
     if rc is None or rc != 0:
         # A well-formed ELF with no dynamic symbol table (static executable,
         # relocatable object). A truncated or corrupt one is NOT this: objdump
@@ -344,6 +393,12 @@ def scan_elf(rel, full, objdump, readelf, deadline):
         rec['status'] = 'error: objdump -T: ' + (first_line(err) or 'failed')
         return rec
     rec['tags'], rec['names'] = parse_imports(out)
+    if needed and not rec['names']:
+        # NEEDED libraries but not one undefined symbol parsed: far more likely
+        # an objdump output format this parser does not know than an object
+        # that links libraries and uses nothing from them.
+        rec['status'] = ('error: objdump -T: NEEDED libraries but no undefined '
+                         'symbol row could be parsed (unrecognised output format?)')
     return rec
 
 
@@ -449,8 +504,15 @@ def write_atomic(path, text):
         die('cannot write %s: %s' % (path, exc))
 
 
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse echoes argv text; render it like every other untrusted string.
+        sys.stderr.write(neutralize('check-elf-floor.sh: error: %s' % safe(message)) + '\n')
+        sys.exit(2)
+
+
 def main():
-    ap = argparse.ArgumentParser(prog='check-elf-floor.sh', add_help=True)
+    ap = Parser(prog='check-elf-floor.sh', add_help=True)
     ap.add_argument('--floor', required=True)
     ap.add_argument('--dir', required=True, dest='root')
     mode = ap.add_mutually_exclusive_group()
@@ -471,7 +533,7 @@ def main():
         die('--dir %s is not a directory' % args.root)
     args.root = os.path.abspath(args.root)   # never option-shaped (`-w`)
     try:
-        limit = float(os.environ.get('YUZU_ELF_FLOOR_DEADLINE', DEFAULT_DEADLINE))
+        limit = float(os.environ.get('YUZU_ELF_FLOOR_DEADLINE') or DEFAULT_DEADLINE)
         if not 0 <= limit < 1e7:
             raise ValueError
     except ValueError:
@@ -562,11 +624,16 @@ def main():
         out.append('RESULT: report-only, %d violation(s), %d problem(s); exit 0'
                    % (len(all_viol), len(problems)))
     sys.stdout.write(neutralize('\n'.join(out)) + '\n')
+    sys.stdout.flush()      # a failed write must surface here, as exit 2
 
     # ------------------------------------------------- GitHub Actions output
     if os.environ.get('GITHUB_ACTIONS') == 'true':
         level = 'error' if enforce else 'warning'
         title = gh_prop('Linux ELF floor (%s)' % safe(set_name))
+        # GitHub shows only ~10 annotations per step: say what is wrong with
+        # the SCAN first, then the per-ELF findings.
+        for p in problems:
+            print('::%s title=%s::%s' % (level, title, gh_escape(p)))
         by_art = {}
         for rel, v in all_viol:
             by_art.setdefault(rel, []).append(describe(v, brief=True))
@@ -580,8 +647,6 @@ def main():
             print('::%s title=%s::%s' % (level, title, gh_escape(
                 '%s: %s' % (safe(rel), '; '.join(by_art[rel])))))
             n += 1
-        for p in problems:
-            print('::%s title=%s::%s' % (level, title, gh_escape(p)))
     summ = os.environ.get('GITHUB_STEP_SUMMARY')
     if summ:
         md = ['### Linux ELF floor: %s (%s)' % (mdsafe(set_name), 'enforce' if enforce else 'report-only'),
@@ -627,6 +692,11 @@ def main():
                  'maxima': overall, 'artifacts': arts}
         if args.source:
             entry['source'] = args.source
+        bad_elfs = sum(1 for v in arts.values() if str(v.get('status', '')).startswith('error'))
+        if problems or bad_elfs:
+            # An understated baseline must say so, but a clean one stays byte-identical.
+            entry['incomplete'] = list(problems) + (
+                ['%d ELF(s) unreadable or not scanned' % bad_elfs] if bad_elfs else [])
         data['sets'][set_name] = entry
         write_atomic(args.emit_baseline, dump(data) + '\n')
     if args.full_report:
@@ -635,12 +705,17 @@ def main():
              'elf_count': len(elfs), 'maxima': overall, 'artifacts': full},
             sort_keys=True, indent=1) + '\n')
 
+    sys.stdout.flush()
     sys.exit(1 if (enforce and failing) else 0)
 
 
 try:
     main()
 except Exception as exc:       # SystemExit is not an Exception: exit codes pass through
+    try:
+        sys.stdout = open(os.devnull, 'w')   # a broken stdout must not re-fail at exit (120)
+    except OSError:
+        pass
     sys.stderr.write(neutralize('check-elf-floor: internal error: %s: %s'
                                 % (type(exc).__name__, safe(str(exc))[:200])) + '\n')
     sys.exit(2)

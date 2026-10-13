@@ -317,8 +317,13 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   `gateway` sets: per ELF the highest tag per family and the offending
   symbols). It is evidence, not an input: nothing reads it to decide pass or
   fail. To regenerate it from a release, download and extract the release
-  tarballs into empty scratch directories, then run the script once per set
-  against the same output file (each run replaces only its own set):
+  tarballs into empty scratch directories (check each against the signed
+  `SHA256SUMS`; the v0.14.1 values are `yuzu-linux-x64.tar.gz`
+  `46e42df0026eb57460414c6c62bf7ab9ef9816e1f8c799286006fde61cc0385f` and
+  `yuzu-gateway-linux-x64.tar.gz`
+  `e4d45e0f256801af5fe28c188431221df87e0274dabaa48e768464706ecae1eb`), then
+  run the script once per set against the same output file (each run replaces
+  only its own set):
 
   ```bash
   B=deploy/packaging/linux-floor-baseline.json; rm -f "$B"
@@ -341,18 +346,22 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   labels.
 
   Point `--dir` at the directory inside the tarball (the one that holds
-  `bin/`), not at its parent, so artifact keys carry no version. Output is deterministic (sorted,
-  no timestamps or paths): a refresh diffs cleanly. The floor-review rule in
-  ADR-2003 (Proposed, PR #5631) says when to refresh it.
+  `bin/`), not at its parent, so artifact keys carry no version. Output is
+  deterministic (sorted, no timestamps or paths): a refresh diffs cleanly. A
+  set whose scan was incomplete (a PROBLEM, an unreadable or unscanned ELF)
+  carries an `incomplete` list; the committed baseline has none. The
+  floor-review rule in ADR-2003 (Proposed, PR #5631) says when to refresh it.
 - **Release wiring.** `release.yml`'s `build-linux` job runs the script
   report-only on the staged tarball contents right after "Package archive"
   (agent set, then server set) in a `continue-on-error` step, and uploads the
-  summaries, the full per-ELF reports and a `baseline.json` as the
+  per-set text reports, the full per-ELF reports and a `baseline.json` as the
   `linux-elf-floor-report` artifact (14 days). The artifact deliberately has no
   `yuzu-` prefix: the `release` job downloads every `yuzu-*` artifact. The
   step is bounded (`timeout-minutes: 10`, and the script's own aggregate
   deadline of 240s per run), so a hung `objdump` cannot stall a release for
-  long. The gateway tarball is not yet scanned in CI (S3 adds it).
+  long. The release step does **not** scan the gateway at all until S3; the
+  `gateway` set in the committed baseline was measured by hand from the
+  release tarball.
 - **Pre-release QA.** `pre-release.yml`'s `install-rpm` matrix gained
   `rockylinux:8` and `amazonlinux:2023` as **non-gating** legs
   (`continue-on-error` via `matrix.experimental`). They are expected to fail
@@ -372,7 +381,18 @@ report-only: nothing it finds can fail a build or a release.** S2 turns it on.
   directly: point the package builders at the gated directory, or re-run the
   gate on the extracted `.deb`/`.rpm` payload. (c) Flipping `--enforce` makes
   this a release gate; add its entry to "Gates outside the tier ladder" (and a
-  routed-concern row) in that change.
+  routed-concern row) in that change. (d) Remove `continue-on-error: true`
+  from the `release.yml` gate step when `--enforce` is wired: a swallowed exit
+  1 would never gate. `tests/shell/test_check_elf_floor.sh` carries a tripwire
+  for exactly that (it is vacuous today, since only `--report-only` is wired;
+  its detector is proven on synthetic workflow fixtures). (e) The report
+  artifact is kept 14 days and the results are not in CI history: S2 should
+  persist per-release results (commit the baseline diff, or extend the
+  CI-history capture) and consider running the gate on the `ci.yml` Linux
+  package artifact before tagging. (f) The pre-existing "Package archive" step
+  runs `mkdir -p "$STAGING"` without clearing it, so a re-run of the same tag
+  on a reused workspace scans stale ELFs: S2 should `rm -rf "$STAGING"` first.
+  (g) The gateway is not scanned by the release step until S3.
 
 ### Plugin spawn lexical gate (`plugin-spawn-gate.yml`, ADR-3002 decision 10a)
 
