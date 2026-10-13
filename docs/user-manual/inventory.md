@@ -540,42 +540,75 @@ place, **Hardware** and **Software**, each its own page:
     records that the *result view* was shown to the operator, not whether the
     underlying action itself succeeded) — see [Audit log](audit-log.md).
 
-- **`/software`** — the fleet software catalogue. A background thread still precomputes
-  the per-title/per-version counts hourly (the mechanics changed — see "Catalogue rollup
-  grain and KPIs" under the rollup metrics below), the KPI strip still shows Titles /
-  Devices reporting / Stale / an "updated N ago" (or "building") stamp for the catalogue,
-  and the counts are still **fleet-wide, not management-group scoped** — the same ADR-0017
-  gap the REST/MCP section above describes. Three things changed:
-  - The search box is now a **real server round-trip matching title, publisher, ecosystem or source**
-    (was client-side and title-only), using the same debounced/narrow-swap-target
-    pattern as the Hardware list's search box.
-  - Each row grows a **"devices ›"** control that expands inline — independent of the
-    row's own click-to-drill-into-**installs-per-version** action — to list every device
-    running that title: hostname (linking to its Hardware CI record), version,
-    publisher, install date, signature status, ecosystem, and architecture, with its own
-    client-side filter for a popular title with many installs. The expansion carries a
-    per-row management-group drop, a 1000-row cap and the `inventory.software.query`
-    audit verb, but that per-row filter does not narrow the result today: the page sits
-    behind the global `Inventory:Read` gate, so a group-confined operator is denied before
-    the filter runs and a global operator's filter is a no-op. The page says so in its
-    own scope caveat.
+- **`/software`** — installed software by application, version and device, rebuilt on the
+  catalogue model that the REST and MCP twins (`GET /api/v1/inventory/software/catalogue`,
+  `query_software_catalogue`) share, so the page, the API and the agent tools cannot
+  disagree.
+  - **Metrics strip.** Inventory coverage (devices reporting software, devices connected
+    now, devices not seen in 48 hours), Titles and publishers, Installs with a
+    Windows/macOS/Linux bar and the average per device, Stay current (installs on their
+    title's newest version seen in the fleet, a proxy and not a vendor feed), Version
+    sprawl (titles on three or more versions; click it to filter to just those) and
+    Unsigned packages (rpm only). Figures that cannot be computed show a dash, never a
+    guess. A link under the strip reveals five faded tiles for metrics that need data
+    Yuzu does not hold yet (end-of-support, unused, unauthorised, new titles,
+    normalisation). The strip is the fleet-wide hourly rollup and does not change with
+    the filters.
+  - **Search and filters.** One search box matches title, publisher, ecosystem or the
+    source that found the software; chips narrow by kind, ecosystem and found-by; a host
+    type-ahead shows a single device's software. The type-ahead lists the first 1,000
+    named hosts by name and says so when the fleet has more; a name it does not list
+    cannot be selected, so open that device from Hardware instead. Two devices that share a
+    hostname resolve to the first one listed; open the other from Hardware. Active filters appear
+    as pills with a Clear all, the URL hash carries them (so a view can be bookmarked or shared), and the
+    exact REST call the view corresponds to is shown with a copy button. The filter box on an
+    expanded devices table filters only the rows already loaded; the catalogue search
+    and chips are server-side.
+  - **The table** lists titles most-installed first, 100 at a time with a keyset
+    **Load more**. **Installs** is the exact number of distinct devices carrying the
+    title under the active filters (a device carrying one title through two sources
+    counts once), and the count line gives the exact totals across every page. Click a
+    row for **installs per version** (share bars and a "newest in fleet" mark; the 200 most-installed versions, and the table says when a title may have more) inline, and
+    **devices** on a title or on one version for the hosts running it. The devices table
+    links each host to its Hardware record and shows OS, version, ecosystem and source,
+    install date and **Last synced** — the device's installed-software sync time, the same
+    value the Hardware record and `GET /api/v1/hardware/{id}` show. It pages 100 at a
+    time and gains a filter box once more than eight hosts are loaded; the filter applies
+    to the loaded rows only.
+  - **Exports** are plain download links to the REST routes: the matching install rows as
+    JSON or CSV (up to 10,000; the file says if it was cut off) and the titles as CSV.
+    The sprawl filter is not applied to install exports.
+  - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
+    a management group, so the fleet view, the strip and the version counts need an
+    unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused
+    (audited as denied); the notice points to Hardware and carries a
+    **Clear all filters and reload** link. A scoped account can still use the host view
+    and the devices tables for devices in its scope, but only through a hand-typed
+    `/software#host=<agent_id>` address, which has no host-name type-ahead; there the "newest in fleet" mark is
+    blanked, no fleet
+    figures are read, and device counts omit "of M". A scope wider than 10,000 devices is
+    applied after the read in at most four bounded reads, so a devices page can come back short or
+    even empty while **Load more** is still offered; keep loading. Service-scoped API
+    tokens are denied outright.
+  - **Audit.** Every call that serves data (or is refused on scope) is audited, not only the first page: `inventory.software.catalog`
+    (title pages), `inventory.software.versions` and `inventory.software.query` (devices
+    tables). A continuation page is tagged `page=continuation`; a degraded read is
+    `failure`; a refused caller is `denied`, as is a devices page that drops devices through the
+    scope post-filter or names an `agent_id` outside the caller's scope. See [Audit log](audit-log.md).
+  - **Degraded or refused.** A store that cannot answer shows an unavailable banner with
+    a Retry button on the catalogue and a plain retry notice on the version and device tables, never an empty table. A malformed filter in the URL shows a notice
+    and reads nothing; use the **Clear all filters and reload** link, which drops the
+    stored filters. A Load-more token from a different filter set or from before the
+    latest hourly refresh shows a notice and reads nothing; reload the page to restart
+    from the first page.
+  - **Removed routes.** The standalone **Find software** tab and the old Devices-tab
+    fragments are gone: `/fragments/inventory/find`, `/fragments/inventory/find/results`,
+    `/fragments/inventory/devices` and `/fragments/inventory/device` return `404` for an
+    authenticated caller (an unauthenticated request is redirected to the login page
+    first, like any other dashboard path); `/inventory` itself still redirects (`302`) to
+    `/hardware`.
 
-  The expansion replaces the standalone **Find software** tab and the old Devices-tab
-  fragments. Their routes (`/fragments/inventory/find`, `/fragments/inventory/find/results`,
-  `/fragments/inventory/devices`, `/fragments/inventory/device`) were removed and now
-  return `404` for an authenticated caller (an unauthenticated request is redirected to
-  the login page first, like any other dashboard path); `/inventory` itself still
-  redirects (`302`) to `/hardware`.
-
-  - The catalogue store now serves exact numbers under filters: **Installs is the exact
-    number of distinct devices** carrying the title under any kind/ecosystem/source
-    filter combination the store is given (a device carrying one title through two sources
-    counts once), and **search selects titles** — a matched title keeps its whole filtered slice. `%` and `_` in a
-    search term are literal characters, the term is clamped to 128 bytes, and a search that
-    exceeds its 5 s execution bound reports the catalogue as unavailable rather than showing
-    an empty table. The store's version drill now accepts the catalogue filters and a host.
-
-**On store degradation** the **`/software`** catalogue, its **devices ›** expansion, and
+**On store degradation** the **`/software`** catalogue, its inline version and devices tables, and
 the CI record's **Installed software** lens — the *authoritative* reads — show an
 explicit **"unavailable"** banner rather than an empty table, because an empty table
 would read as "installed nowhere", the fail-open the authoritative-read contract
