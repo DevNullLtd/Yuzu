@@ -201,11 +201,30 @@ extern const char* const kVizHostPageHtml = R"HTM(<!DOCTYPE html>
       const KEY = "yuzuVizHostSplitRatio";
       let ratio = parseFloat(localStorage.getItem(KEY));
       if (!Number.isFinite(ratio) || ratio < 0.1 || ratio > 0.9) ratio = 0.6;
+      // The panes split by percentage, but everything else in the root (the
+      // splitter, the "Process tree" header, a stale banner) and the tree's
+      // own padding and border cannot shrink. The top pane may take at most
+      // what is left, or the root overflows .vh-main. Measured on every
+      // apply, not hard-coded: the header height follows the font.
+      function maxRatio() {
+        const cs = getComputedStyle(bottom);
+        let fixed = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom) +
+                    parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth);
+        for (const el of root.children) {
+          if (el !== top && el !== bottom) fixed += el.offsetHeight;
+        }
+        const h = root.clientHeight;
+        return h > 0 ? Math.min(0.9, 1 - fixed / h) : 0.9;
+      }
+      // A stored ratio is clamped here, so it is safe on load and after a
+      // resize; `ratio` keeps the stored value so a larger window gets it back.
       function apply(r) {
+        r = Math.min(r, maxRatio());
         top.style.flex = "0 0 " + (r * 100) + "%";
         bottom.style.flex = "1 1 " + ((1 - r) * 100) + "%";
       }
       apply(ratio);
+      new ResizeObserver(() => apply(ratio)).observe(root);
       let dragging = false;
       splitter.addEventListener("mousedown", () => { dragging = true; });
       window.addEventListener("mouseup", () => {
@@ -216,7 +235,7 @@ extern const char* const kVizHostPageHtml = R"HTM(<!DOCTYPE html>
         if (!dragging) return;
         const rect = root.getBoundingClientRect();
         const r = (e.clientY - rect.top) / rect.height;
-        if (r > 0.1 && r < 0.9) { ratio = r; apply(r); }
+        if (r > 0.1 && r < maxRatio()) { ratio = r; apply(r); }
       });
     })();
   </script>

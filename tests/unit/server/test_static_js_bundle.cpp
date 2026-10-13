@@ -1371,6 +1371,21 @@ TEST_CASE("static_js_bundle: kVizHostPageHtml has a resizable splitter persisted
     CHECK_THAT(html, ContainsSubstring("splitter"));
 }
 
+TEST_CASE("static_js_bundle: kVizHostPageHtml clamps the splitter to the fixed chrome",
+          "[viz-host][page][splitter]") {
+    // The splitter, the "Process tree" header and the tree's own padding
+    // cannot shrink, so a bare 0.1-0.9 clamp overflows .vh-main (39 px at
+    // 1440x900 for a stored 0.9). The max ratio is measured from the root,
+    // applied on load (apply), on drag, and on resize; the old literal
+    // upper bound must not return as the only gate.
+    std::string html(kVizHostPageHtml);
+    CHECK_THAT(html, ContainsSubstring("function maxRatio()"));
+    CHECK_THAT(html, ContainsSubstring("r = Math.min(r, maxRatio());"));
+    CHECK_THAT(html, ContainsSubstring("r < maxRatio()"));
+    CHECK_THAT(html, ContainsSubstring("new ResizeObserver(() => apply(ratio)).observe(root);"));
+    CHECK_THAT(html, !ContainsSubstring("r < 0.9"));
+}
+
 TEST_CASE("static_js_bundle: kVizHostPageHtml does not reference any CDN",
           "[viz-host][page][security]") {
     // Sec invariant: no off-box dependency loading. cytoscape must be
