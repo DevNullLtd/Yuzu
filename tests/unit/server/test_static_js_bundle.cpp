@@ -75,8 +75,8 @@ constexpr std::size_t kExpectedHtmxBytes = 50918;
 constexpr std::size_t kExpectedSseBytes = 8897;
 // Pinned upstream byte counts. If you intentionally update vendor/, bump
 // these in lock-step. ECharts 5.6.0 minified is 1,034,102 bytes; the IBM Plex
-// Latin woff2 files (Fontsource 5.3.0) are pinned per weight in kExpectedPlex
-// below; Yuzu CSS bundle is content-addressed by
+// Latin1 woff2 files (IBM's @ibm/plex-sans 1.1.0 and @ibm/plex-mono 2.5.0)
+// are pinned per weight in kExpectedPlex below; Yuzu CSS bundle is content-addressed by
 // the source file and approximate-pinned (a 1% drift tolerance lets the
 // design system iterate without re-flowing this file every commit).
 constexpr std::size_t kExpectedEChartsBytes = 1'034'102;
@@ -1035,13 +1035,15 @@ struct PlexExpectation {
     const std::string_view* bytes;
     std::size_t size;
 };
-// Pinned to Fontsource @fontsource/ibm-plex-{sans,mono} 5.3.0 Latin files.
+// Pinned to IBM's own prebuilt split Latin1 files: @ibm/plex-sans 1.1.0 and
+// @ibm/plex-mono 2.5.0 (fonts/split/woff2/*-Latin1.woff2). SHA-256 per file is
+// in server/core/vendor/ibm-plex/ibm-plex-NOTICE.txt.
 const PlexExpectation kExpectedPlex[] = {
-    {"sans-400", &yuzu::server::kIbmPlexSans400Woff2, 22'588},
-    {"sans-500", &yuzu::server::kIbmPlexSans500Woff2, 24'184},
-    {"sans-600", &yuzu::server::kIbmPlexSans600Woff2, 24'252},
-    {"mono-400", &yuzu::server::kIbmPlexMono400Woff2, 14'708},
-    {"mono-500", &yuzu::server::kIbmPlexMono500Woff2, 14'888},
+    {"sans-400", &yuzu::server::kIbmPlexSans400Woff2, 20'984},
+    {"sans-500", &yuzu::server::kIbmPlexSans500Woff2, 21'960},
+    {"sans-600", &yuzu::server::kIbmPlexSans600Woff2, 22'260},
+    {"mono-400", &yuzu::server::kIbmPlexMono400Woff2, 17'544},
+    {"mono-500", &yuzu::server::kIbmPlexMono500Woff2, 17'868},
 };
 } // namespace
 

@@ -4,35 +4,49 @@ IBM Plex Sans and IBM Plex Mono
 Copyright (c) 2017 IBM Corp. with Reserved Font Name "Plex"
 
 Licensed under the SIL Open Font License, Version 1.1. The full licence text
-is in LICENSE.txt in this directory. Because of the Reserved Font Name, the
-files below are the Latin woff2 files published in the Fontsource packages
-@fontsource/ibm-plex-sans and @fontsource/ibm-plex-mono, release 5.3.0,
-vendored unmodified (byte-identical to the packages): never subset, convert
-or otherwise edit them. Fontsource builds these from the Google Fonts
-distribution of IBM Plex; they are not the files in IBM's own @ibm/plex-*
-npm packages.
+is in LICENSE.txt in this directory: IBM's own LICENSE.txt, identical in both
+packages below (the repository's .gitattributes stores it with LF line endings;
+the text is otherwise unchanged). Because of the Reserved Font Name, the files
+below are IBM's own prebuilt Latin woff2 files, vendored unmodified
+(byte-identical to the files in IBM's npm packages): never subset, convert or
+otherwise edit them. They are not Fontsource or Google Fonts builds.
 
 Source
 ------
-https://github.com/IBM/plex (design and licence)
-https://www.npmjs.com/package/@fontsource/ibm-plex-sans (release 5.3.0)
-https://www.npmjs.com/package/@fontsource/ibm-plex-mono (release 5.3.0)
-https://github.com/fontsource/font-files (package source: fonts/google/ibm-plex-sans
-and fonts/google/ibm-plex-mono)
-Vendored files: server/core/vendor/ibm-plex/*.woff2 (the files/ directory of
-each Fontsource package, latin subset, normal style)
+https://github.com/IBM/plex (design, build and licence)
+@ibm/plex-sans 1.1.0  https://www.npmjs.com/package/@ibm/plex-sans
+  tarball integrity sha512-WPgvO6Yfj2w5YbhyAr1tv95RUz4LRJlqN+CmYvBglabXteufP1D1E9BABMde+ZIKdRbFJDoKF5eQzfhpnbgZcQ==
+  (package gitHead 1da12f02587b630c07e92692d21492d722f53614; font Version 3.005)
+@ibm/plex-mono 2.5.0  https://www.npmjs.com/package/@ibm/plex-mono
+  tarball integrity sha512-STBJIPxPomOYPmBMO7z5TKPJUotAF9u3gAUumTqVgwgrAO+K4FRNh0MlhsoJjKhJKsMbBJR10/bk4inkj/wc1w==
+  (package gitHead 2f9ba1b25957d958db71a849e85d72e3ecfb845a; font Version 2.005)
 SPDX-License-Identifier: OFL-1.1
+
+Vendored file                              Path inside the npm package
+-----------------------------------------  --------------------------------------------------------
+ibm-plex-sans-latin-400-normal.woff2       @ibm/plex-sans  package/fonts/split/woff2/IBMPlexSans-Regular-Latin1.woff2
+ibm-plex-sans-latin-500-normal.woff2       @ibm/plex-sans  package/fonts/split/woff2/IBMPlexSans-Medium-Latin1.woff2
+ibm-plex-sans-latin-600-normal.woff2       @ibm/plex-sans  package/fonts/split/woff2/IBMPlexSans-SemiBold-Latin1.woff2
+ibm-plex-mono-latin-400-normal.woff2       @ibm/plex-mono  package/fonts/split/woff2/IBMPlexMono-Regular-Latin1.woff2
+ibm-plex-mono-latin-500-normal.woff2       @ibm/plex-mono  package/fonts/split/woff2/IBMPlexMono-Medium-Latin1.woff2
+
+These are IBM's "Latin1" split files (normal style): Basic Latin, Latin-1
+Supplement and the common typographic punctuation. IBM publishes further
+subsets as separate files (Latin2, Latin3, Pi, Greek, Cyrillic), none of which
+Yuzu vendors. Characters outside the Latin1 file (for example the arrows in
+the Pi file) fall back to the next family in the font stack.
 
 Integrity
 ---------
-SHA-256:
-  08949f728dc52d528e69b1667d15c89a5686a4ee9a296ff90983985f99c380f7  ibm-plex-mono-latin-400-normal.woff2
-  01d285447409c8a588692162439a038b8cbd7871309ee20267b0d2d91c6e8e22  ibm-plex-mono-latin-500-normal.woff2
-  3b646991d30055a93a4ecc499713d4347953a74a947ecab435ab72070cbdab0e  ibm-plex-sans-latin-400-normal.woff2
-  0717336fb31fcdcde4b8deb3675bb4a0f7f6d484864afcd6751ac29975962203  ibm-plex-sans-latin-500-normal.woff2
-  8960851d691c054ed38e259bdcf1a6190d157b4203ed5bb32c632a863fb8ec2f  ibm-plex-sans-latin-600-normal.woff2
+SHA-256 and size in bytes:
+  b5ad7bd39f996144915f0ad9849a90183b27d8c28ad97ed98af5b1bebc51f6b1  20984  ibm-plex-sans-latin-400-normal.woff2
+  b5610af04d0d4b5a14a621d96d974b993e945a065db1a8861918f69ef9321934  21960  ibm-plex-sans-latin-500-normal.woff2
+  fff0ab3a88b0b4aa0b693e4f0201359a15183b08e3fa5696d1918d8f0ade8ad5  22260  ibm-plex-sans-latin-600-normal.woff2
+  e8993d946649b9d01abb1ed06d574b19d8ea3e66b5c3948602db335c44c18e56  17544  ibm-plex-mono-latin-400-normal.woff2
+  41201b658a328b9d00368215c2f1102770f80b15952ab82631e4006255e6365d  17868  ibm-plex-mono-latin-500-normal.woff2
 
 Recompute with `shasum -a 256 server/core/vendor/ibm-plex/*.woff2`. The test
 suite pins each file's byte count (see kExpectedPlex in
 tests/unit/server/test_static_js_bundle.cpp). When refreshing the upstream
-release, update the hashes here and the byte counts there in lock-step.
+release, update the versions and hashes here and the byte counts there in
+lock-step.
